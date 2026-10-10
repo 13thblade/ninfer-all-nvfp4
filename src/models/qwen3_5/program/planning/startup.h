@@ -173,6 +173,13 @@ struct SequencePlanImpl {
                                        (widest_verify_window(plan) + 1U));
 }
 
+// The int32 control block a stage boundary carries for `columns` columns: cache positions,
+// RoPE positions (three rows with multimodal RoPE), KV table rows, valid columns and the source and
+// destination state slots, each at most `columns` entries, plus alignment.
+[[nodiscard]] inline std::uint64_t stage_control_bytes(std::uint64_t columns) noexcept {
+    return (8U * columns + 16U) * sizeof(std::int32_t);
+}
+
 struct SequencePlannerImpl {
     SequencePlanningInputs inputs;
     runtime::SequenceCapacityCurve curve;
