@@ -492,18 +492,23 @@ public:
                     continue;
                 }
                 if (*incoming != index.key) {
+                    if (!cdbg) { continue; }
                     // Own-session guard: a re-touch probes every stored slot, so a
                     // *different* session's response naturally mismatches a slot it does
                     // not own. Label those XSESSION-MISMATCH so they are not mistaken for a
-                    // real key-match failure of the re-touch's own checkpoint.
-                    const CatalogEntry& probe_entry = catalog_[index.slot];
-                    const bool own_session =
-                        probe_entry.session && base.context_cache().session_key &&
-                        *probe_entry.session == *base.context_cache().session_key;
+                    // real key-match failure of the re-touch's own checkpoint. A shared
+                    // entry's slot numbers the shared catalogue, which keeps no session.
+                    const char* label = "SHARED-MISMATCH";
+                    if (!index.shared) {
+                        const CatalogEntry& probe_entry = catalog_[index.slot];
+                        label = probe_entry.session && base.context_cache().session_key &&
+                                        *probe_entry.session == *base.context_cache().session_key
+                                    ? "DIGEST-MISMATCH"
+                                    : "XSESSION-MISMATCH";
+                    }
                     cdbg_log("[candgen] priv SKIP slot=%u %s frontier=%u "
                              "in=(%llx,%llx) st=(%llx,%llx)\n",
-                             index.slot, own_session ? "DIGEST-MISMATCH" : "XSESSION-MISMATCH",
-                             index.key.frontier,
+                             index.slot, label, index.key.frontier,
                              static_cast<unsigned long long>(incoming->digests[0]),
                              static_cast<unsigned long long>(incoming->digests[1]),
                              static_cast<unsigned long long>(index.key.digests[0]),
