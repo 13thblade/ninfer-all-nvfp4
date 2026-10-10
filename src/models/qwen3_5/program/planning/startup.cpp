@@ -895,7 +895,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         const std::uint64_t columns = stage_boundary_columns(plan);
         const std::size_t residual =
             static_cast<std::size_t>(columns) * static_cast<std::size_t>(config.hidden_size) * 2U;
-        const std::size_t control = (6U * static_cast<std::size_t>(columns) + 16U) * 4U;
+        const auto control = static_cast<std::size_t>(stage_control_bytes(columns));
         out.general_capacity =
             checked_add(out.general_capacity, checked_add(residual, control, "stage boundary") + 1024U,
                         "stage boundary workspace");
@@ -978,12 +978,6 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
                                     std::to_string(parameters.text.rank_count) +
                                     " pipeline stages but " + std::to_string(device.size()) +
                                     " devices are attached");
-    }
-    if (parameters.text.split_execution() && options.enable_vision) {
-        // The stage loop carries the text passes, DFlash's feature taps included; Vision is refused
-        // until it is taught the stages.
-        throw std::invalid_argument(
-            "vision is not yet supported with a multi-device --devices split");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);

@@ -154,8 +154,7 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
     const StageLinkOptions residual{.slot_bytes   = columns * hidden * sizeof(std::uint16_t),
                                     .slots        = 2,
                                     .force_staged = force_staged};
-    // Six int32 control tensors of at most `columns` entries, plus alignment.
-    const StageLinkOptions control{.slot_bytes   = (6 * columns + 16) * sizeof(std::int32_t),
+    const StageLinkOptions control{.slot_bytes   = stage_control_bytes(columns),
                                    .slots        = 2,
                                    .force_staged = force_staged};
     for (std::size_t stage = 0; stage + 1 < stages; ++stage) {

@@ -207,13 +207,22 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
         layers.push_back(cost);
     }
 
-    // The head stage keeps the embedding, the head and the final norm; MTP's layer, or a DFlash
-    // drafter's layers and feature projection, sit with them.
+    // The head stage keeps the embedding, the head and the final norm; a resident Vision tower, MTP's
+    // layer, or a DFlash drafter's layers and feature projection, sit with them.
     std::uint64_t head_bytes = parameter_bytes(reader, bindings, weights.token_embedding) +
                                parameter_bytes(reader, bindings, weights.output_head) +
                                parameter_bytes(reader, bindings, weights.final_norm);
     if (config.mtp && options.speculative == SpeculativeBackend::Mtp) {
         head_bytes += layer_bytes_total / std::max<std::size_t>(layers.size(), 1);
+    }
+    if (config.vision && options.vision && !options.host_staged_vision()) {
+        // A resident Vision tower runs where the embedding is.
+        const std::size_t first = bindings.weights.size();
+        (void)loading::bind_vision(bindings, *config.vision, text.hidden_size,
+                                   artifact::Residency::Device);
+        for (std::size_t index = first; index < bindings.weights.size(); ++index) {
+            head_bytes += parameter_bytes(reader, bindings, WeightId{index});
+        }
     }
     if (config.draft && options.masked_draft()) {
         // The drafter shares the target's embedding and head, so only what it binds anew counts.

@@ -62,14 +62,17 @@ second GPU. Distinct ids are refused on Windows.
 
 ## What is not covered yet
 
-- **Vision** is refused with a split, in every residency: overlay at load, before the weights (a
-  later stage holds whole layers and nothing a Vision window could borrow), resident and CPU Vision
-  at sequence planning, once they have loaded. The stage loop has not been taught the Vision
-  prefill.
 - **Prefill does not overlap stages.** A prefill chunk runs through the stages in turn and the
   engine synchronizes after each chunk, so at any moment one stage is busy. Overlapping stages needs
   micro-chunks inside a chunk (later stages start on micro-chunk 0 while stage 0 runs micro-chunk 1);
   that changes the chunk shapes the kernels see, and its benefit can only be measured on real cards.
+- **Vision works** across stages with resident or CPU residency. The tower, the encode workspace
+  and the scatter of the image's embeddings into the prompt stay on rank 0 with the embedding, before
+  the layers run; the only thing later stages need is the multimodal RoPE positions, three rows per
+  column, which travel in the control block (sized for them: eight int32 per boundary column). The
+  default split counts a resident tower on the head stage. Overlay residency stays refused at load,
+  before the weights: it borrows its encode window from the evict-ranked weights, and a later stage
+  holds whole layers that nothing could lend.
 - **MTP works** across stages: the replay records and their fold are per state shard, on the shard's
   own device, and the draft layer and head stay on rank 0. **DFlash and DFlash2 work** too; see
   below. **The context cache works**: its transactions copy each rank's planes and state shards on
@@ -123,8 +126,9 @@ for those three taps at that chunk, beside the residual links' own slots.
   and `0,0,0` equals `--device 0` byte for byte, since the layers run the same kernels on the same
   data. Rows: graphs and eager, forced pinned-host transport, an uneven split
   (`NINFER_TEST_STAGE_LAYERS`, 20,44 by default), MTP, DFlash or DFlash2 (whichever drafter the
-  artifact carries, each compared with the same backend on one device), and a continuation that
-  reuses the context cache. `NINFER_TEST_DEVICE_IDS=0,1` puts the stages on real cards.
+  artifact carries, each compared with the same backend on one device), Vision plain and with MTP
+  (an image prompt spanning two prefill chunks, when the artifact has a tower), and a continuation
+  that reuses the context cache. `NINFER_TEST_DEVICE_IDS=0,1` puts the stages on real cards.
 - `ninfer_qwen3_5_loading_real_test`: the default split covers the model, gives the head stage
   fewer layers, and gives a device with twice the memory more.
 
@@ -138,7 +142,7 @@ int8 KV. Neither box has peer access, so every boundary transfer goes through pi
 
 | | 2x RTX 3090 (PCIe 3.0 x16 each) | 2x RTX A4000 (x8 + x16, cross-NUMA) |
 |---|---|---|
-| `ninfer_qwen3_5_stages_real_test` | every row byte-identical to one device: 2 stages, 3 stages (devices 0,1,0), graphs and eager, forced staged transport, uneven split, MTP, prefix reuse | the model does not fit one 16 GB card, so every row is compared with the first: identical across cut points, graphs and eager, staged transport, MTP, prefix reuse |
+| `ninfer_qwen3_5_stages_real_test` | every row byte-identical to one device: 2 stages, 3 stages (devices 0,1,0), graphs and eager, forced staged transport, uneven split, MTP, Vision (plain and MTP, an image over two prefill chunks), prefix reuse | the model does not fit one 16 GB card, so every row is compared with the first: identical across cut points, graphs and eager, staged transport, MTP, prefix reuse |
 | CLI, prefill chunk 1024, splits 20/44, 44/20, 32/32 and the default | output identical to one device | output identical across splits, and identical to the 3090 output |
 | Decode, plain | 46.9 tok/s on one card, 48.5 split | 24.1 tok/s |
 | Decode, MTP3 | 100.2 tok/s on one card, 105.3 split | 52.6 tok/s |
