@@ -50,7 +50,7 @@ for product in 'apps/ninfer:ninfer' 'apps/ninfer-serve:ninfer-serve' 'bench/ninf
   cp -- "$source_path" "$destination"
 done
 cp -- "$repo_root/VERSION" "$repo_root/LICENSE" "$repo_root/$release_notes" "$product_root/"
-# The archive README must describe the archive. docs/rtx-3090-linux.md is a guide to *building* from
+# The archive README must describe the archive. docs/build-linux.md is a guide to *building* from
 # source and points at ./scripts/download-model.sh; the packager copies that to the archive root, so
 # a user following it from inside the archive got a missing-file error.
 cp -- "$repo_root/docs/release-archive-linux.md" "$product_root/README.md"

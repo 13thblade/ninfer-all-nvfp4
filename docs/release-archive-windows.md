@@ -3,7 +3,7 @@
 This is the README that ships **inside** the Windows release archive, where every file sits in one
 directory. If you are reading it in a checkout instead, the launchers and downloaders it names live
 under `scripts/`, and
-[docs/rtx-3090-windows.md](https://github.com/iamwavecut/ninfer-all/blob/master/docs/rtx-3090-windows.md)
+[docs/build-windows.md](https://github.com/iamwavecut/ninfer-all/blob/master/docs/build-windows.md)
 is the fuller guide. Links here are absolute on purpose: the archive ships no `docs/` directory.
 
 Check `VERSION` for the release this archive was cut from, and `RELEASE_NOTES_*.md` for what
@@ -12,7 +12,7 @@ changed.
 ## Requirements
 
 - Windows 11 x64
-- GeForce RTX 3090 (or 3090 Ti) with a recent NVIDIA driver
+- an RTX 30 or RTX 40 series card (the archive carries an `sm_86` build) with a recent NVIDIA driver
 - Microsoft Visual C++ 2022 runtime
 
 Everything else is in the archive: the FFmpeg and libcurl DLLs, and NVIDIA's cuBLAS runtime

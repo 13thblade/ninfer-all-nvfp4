@@ -14,8 +14,8 @@ An `89` or `120a` build does not run on an RTX 3090.
 
 ## Container image
 
-The published image, `ghcr.io/iamwavecut/ninfer-all:latest`, is the shortest path on Bazzite and
-other Linux distributions: CUDA 13.4 on Ubuntu 26.04, with an `sm_86` build for the RTX 30 and 40
+The published image, `ghcr.io/iamwavecut/ninfer-all:latest`, is the shortest path on any Linux
+distribution: CUDA 13.4 on Ubuntu 26.04, with an `sm_86` build for the RTX 30 and 40
 series and an `sm_120a` build for Blackwell, and it starts the one that matches the GPU. It needs a
 driver of the CUDA 13 branch (580 or newer) and the NVIDIA Container Toolkit; make sure that Docker
 can access the GPU first:
@@ -132,8 +132,9 @@ At run time, `NINFER_CUDA_SYNC=spin|blocking|yield|auto` selects the CUDA synchr
 
 ## Bash scripts
 
-The `scripts/` directory contains Bash versions of each Windows download, launcher, and packaging
-script. Download scripts save models under `scripts/models` by default:
+`scripts/` holds the download script, the launcher and the packager, each with a Windows twin.
+The download script saves models under `scripts/models` by default and checks their size and
+SHA-256:
 
 ```bash
 ./scripts/download-model.sh qwen38-27b
@@ -156,7 +157,7 @@ Set `NINFER_SERVER` to select another executable. Profiles and the measurements 
 
 `scripts/package-release.sh` creates the Linux `tar.gz` archive for the release named in `VERSION`,
 and `scripts/package-release.ps1` the Windows ZIP; `build.sh --package` and `build.ps1 -Package` run
-them after a build.
+them after a build ([cutting a release](maintainer/release-process.md)).
 
 ## Validation
 

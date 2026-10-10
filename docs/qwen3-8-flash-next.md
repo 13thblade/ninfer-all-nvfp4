@@ -84,159 +84,19 @@ A sliced model runs its shortened stack through the public Engine. Its outputs a
 state and numerical qualification; they do not represent full-model quality or logits at the
 same layers of a complete forward, whose input residual also includes the preceding layers.
 
-The native-Q2 ranges `3..5` and `1..4` were qualified on RTX A6000 with CUDA 13.1 and int8 KV:
-all 3,125/4,691 selected bindings and weight bytes matched the full native artifact, and the
-public Engine produced exact repeats for 32/700-token inputs and 16 generated tokens. The first
-range has no PLE and reads no n-gram rows; the second rebases PLE to layer 0 and requires its table
-companion. Both missing-companion and unused-table refusal paths passed. These checks establish
-slice conversion and execution behavior, not full-model quality.
-
 `qwen3_8_flash_next_gsq_q2` imports the trained Q2_0 routed experts into `q2_g64_fp16` planes
 with exact code and signed-scale words. Q2_0/Q8_0 shared projections retain their codes/scales as
 native Q2/Q8; other shared block formats decode and round to BF16. Other projections and the MTP
-block keep their GGUF representations. Native banks support device residency and CPU/GPU hybrid
-host residency at concurrency one; native disk residency is not implemented. A8 uses grouped integer MMA from 16 columns,
-decoding the stored native codes in registers without repacking the weights.
+block keep their GGUF representations. Native banks support device residency and host residency at
+concurrency one; native disk residency is not implemented. A8 uses grouped integer MMA from 16
+columns, decoding the stored native codes in registers without repacking the weights.
 
-On October 8, all 73,872 routed/shared native projections were checked against their source
-blocks (exact code/scale words for Q2/Q8; BF16 casts for other shared formats). The packed-plane
-import took 171.4 s versus 531.2 s for the earlier unpack/repack implementation on the same
-Xeon 8167M host, CPU PyTorch on Python 3.11, 12 OpenMP threads and 65,536-row chunks. These
-are individual runs, not repeated timing distributions; the newer run also preserved shared
-Q2 projections that the first recipe unnecessarily cast to BF16. The resulting text+MTP artifact
-is 40,651,086,080 bytes and reuses the original table artifact. Its full-model qualification
-initially exposed mixed shared gate/up formats; each projection now keeps its own format and
-activation permission.
-Its public Engine functional suite now passes K=1/4/8/15, budgets, cancellation, repeats,
-logprobs and cache isolation: zero failures, zero plain/MTP differences and five batch-composition
-differences in the tested requests. Live-prefix and disk-prefix MTP continuations match exactly.
-Cold prefill (512+218 columns) differs from prefix reuse (512+188, then 30); the cache test
-records that difference and compares live/disk continuation with the same computation history.
-
-On October 8, the public Engine scored the native-Q2 and original GGUF-Q2 artifacts on the same
-391,000 targets in the held-out quick corpus (18 windows, context 32,768, stride 16,384, BF16 KV,
-RTX A6000, CUDA 13.1). Both use the same standalone IQ4 table. Overall PPL is 4.991555 for GGUF
-and 5.004501 for native (+0.2594%, mean NLL +0.002590). The six domain changes are:
-
-| Domain | GGUF PPL | Native PPL | Change |
-|---|---:|---:|---:|
-| Wikipedia English | 6.311970 | 6.328184 | +0.2569% |
-| Wikipedia Chinese | 16.387842 | 16.439307 | +0.3140% |
-| arXiv | 7.621604 | 7.732637 | +1.4568% |
-| GitHub code | 2.240673 | 2.233451 | -0.3223% |
-| Own code | 2.286422 | 2.285044 | -0.0603% |
-| Synthetic chat | 3.804479 | 3.801502 | -0.0783% |
-
-Nine windows have higher NLL and nine lower. The worst window is arXiv index 2 (+4.2972% PPL,
-NLL +0.042074); the best is Chinese Wikipedia index 1 (-5.1888%, NLL -0.053283). Scoring took
-483.46 s for GGUF and 555.13 s for native (+14.83%); this is one sequential pair, not a timing
-distribution. These results quantify a quality difference and a measured scoring regression;
-they do not establish native throughput parity or qualify the separate HF Q4/Q5/FP8 recipe.
-Native is an explicit artifact choice for native formats and host DMA controls; it does not
-replace optimized GGUF. Retain the GGUF artifact route when its measured quality and prefill
-advantages matter. The native arithmetic passes its independent oracles, but these full-model
-and Op costs remain limitations.
-
-The native vector Op passed independent FP64 qualification for BF16/Q2/Q4/Q5/Q6/Q8, both
-layouts and A16/A8, including graph replay and fixed-profile repeats. On the same real layer-12
-Q2 weights, H=2560/I=640/top-10, a single RTX 3090, CUDA 13.1, nine timed samples after warmup:
-
-| T | GGUF warm median, reused/disjoint experts, ms | Native A8, ms | Native A16, ms |
-|---|---|---|---|
-| 1 | 0.094208 / 0.094016 | 0.089920 / 0.089088 | 0.099328 / 0.098304 |
-| 2 | 0.141312 / 0.141312 | 0.139264 / 0.141312 | 0.158816 / 0.163840 |
-| 5 | 0.284672 / 0.282624 | 0.289792 / 0.290816 | 0.331776 / 0.339968 |
-| 8 | 0.435200 / 0.431104 | 0.448512 / 0.449536 | 0.518144 / 0.533504 |
-
-A8 gains 4.6–5.2% at T=1 and regresses up to 4.3% at T=8; A16 regresses 4.4–23.8% across
-these cases. Relative L2 versus the original packed-weight FP64 oracle is 1.58–1.61e-7 for A16,
-0.00909–0.00946 for A8 and 0.00911–0.00961 for GGUF. All three repeat exactly. The benchmark
-also computes a zero-weight shared expert; its CPU oracle excludes that contribution. Samples
-after a 32 MiB memset were separately recorded, but that operation's actual L2 eviction is
-unproven. These are Op results; the full-model quality comparison above and host-throughput
-measurements below have their own workloads and limits. The native Op keeps FP32 middle/products and allocates activation scratch even
-for A16; no workspace reduction is claimed.
-
-The subsequent grouped-MMA qualification passed at T=1/2/8/9/15/16/17/31/32/33/65/129,
-including mixed gate/up formats, both layouts and graph replay. A8's wide route groups up to
-32 columns per expert. The same real layer-12 probe, nine warm samples per cell, gave:
-
-| T | GGUF, reused/cyclic experts, ms | Native A8, ms | Native A16, ms |
-|---|---|---|---|
-| 16 | 0.329 / 0.702 | 0.270 / 0.885 | 0.980 / 1.006 |
-| 31 | 0.368 / 0.730 | 0.394 / 0.956 | 1.867 / 1.930 |
-| 32 | 0.366 / 0.728 | 0.385 / 0.959 | 1.956 / 2.018 |
-| 33 | 0.372 / 0.723 | 0.427 / 0.963 | 2.019 / 2.067 |
-| 64 | 0.506 / 0.754 | 0.445 / 1.008 | 3.816 / 3.951 |
-| 128 | 0.788 / 0.950 | 0.565 / 1.143 | 7.773 / 8.026 |
-| 512 | 1.488 / 1.601 | 1.525 / 1.863 | 31.076 / 32.005 |
-
-Wide inputs repeat the eight represented BF16 columns; cyclic routing uses 80 experts, not
-disjoint sets for every wide column. All routes pass the original FP64 oracle and exact repeats.
-A8 ranges from 28.3% faster (T=128, reused) to 33.7% slower (T=64, cyclic) than GGUF here;
-A16 is slower in every wide case, up to 20.9 times at T=512, reused. At T=1/2/5/8 in this run,
-A8 ranges from 4.8% faster to 12.3% slower. The earlier eight-column MMA experiment took
-2.919/2.906 ms at T=512; 32-column grouping reduces those times but increases T=32/reused
-from 0.310 to 0.385 ms. Earlier vector measurements above remain relevant; differences between
-runs have not been attributed. These results qualify the implementation, not an overall speedup.
-
-The October 8 A16 update groups routed columns from T=16 and uses BF16 tensor-core dots.
-Integer weight codes remain exact; stored FP16 scales are applied after each 32-value dot.
-The FP32 SwiGLU intermediate uses a BF16 high part plus a BF16 residual for the down projection.
-It reuses the existing workspace capacity and route-group scratch; no persistent weight
-repacking or new model artifact is needed. A8's arithmetic remains as above.
-
-One RTX 3090, CUDA 13.1, the same layer-12 Q2 fixture and eight repeated BF16 input columns,
-nine timed samples after warmup, reused/cyclic-80 expert selection:
-
-| T | Retained vector A16, ms | Grouped A16, ms | GGUF, ms | Native A8, ms |
-|---|---|---|---|---|
-| 1 | 0.098304 / 0.098304 | 0.089088 / 0.089088 | 0.083968 / 0.083840 | 0.080672 / 0.080896 |
-| 2 | 0.158720 / 0.162816 | 0.144352 / 0.148512 | 0.124768 / 0.124928 | 0.125952 / 0.126976 |
-| 5 | 0.331776 / 0.339968 | 0.299008 / 0.308224 | 0.251808 / 0.249856 | 0.260096 / 0.262144 |
-| 8 | 0.518048 / 0.532416 | 0.470016 / 0.519168 | 0.385024 / 0.382976 | 0.415776 / 0.417792 |
-| 16 | 0.997376 / 1.021950 | 0.538624 / 1.044480 | 0.323584 / 0.692224 | 0.270336 / 0.883712 |
-| 31 | 1.894400 / 1.941500 | 0.800640 / 1.141760 | 0.364544 / 0.726848 | 0.394016 / 0.959488 |
-| 32 | 1.940480 / 1.975300 | 0.777216 / 1.129470 | 0.362496 / 0.726016 | 0.381952 / 0.964608 |
-| 33 | 2.030590 / 2.045950 | 0.805888 / 1.125380 | 0.369664 / 0.720736 | 0.424960 / 0.961536 |
-| 64 | 3.903490 / 3.961660 | 0.878592 / 1.164290 | 0.502784 / 0.750592 | 0.441344 / 1.021950 |
-| 128 | 7.772160 / 7.913470 | 1.241980 / 1.480700 | 0.785440 / 0.874336 | 0.564192 / 1.144830 |
-| 512 | 30.892000 / 31.870800 | 3.268610 / 3.350530 | 1.483650 / 1.598460 | 1.526690 / 1.855490 |
-
-Grouped A16 improves 13 of 14 wide cells by 41.2–89.5% over the retained vector executable;
-T=16/cyclic regresses 2.2%, retained as an explicit exception. A16 remains 50.9–120.3% slower
-than the optimized GGUF route in these wide cells. The T<16 route is still the vector kernel;
-its 2.5–9.9% timing differences between executables are unattributed and are not credited to
-the grouped implementation. Post-memset measurements are retained separately; the 32 MiB
-memset is not proof of a cold cache. No end-to-end speed or model-quality improvement is claimed.
-
-The existing FP64 oracle bounds were unchanged. BF16/Q2/Q4/Q5/Q6/Q8, both layouts, mixed
-projections, boundary widths, fixed-mode repeats and CUDA Graph replay passed in 12.22 s.
-On the real Q2 fixture, A16 relative L2 increases from about 1.6e-7 to 2.4e-6 for wide calls;
-all 22 oracle/repeat cases pass. The public native-Q2 Engine suite passed with
-`target_differences=3`, `batch_differences=7`, `failures=0` (previous qualification: 0/5/0).
-These mode differences remain visible under the agreed numerical/repeatability contract.
-The artifact's current activation permissions select A8 for its quantized expert banks;
-the Engine suite establishes integration and repeatability, not full-model A16 throughput.
-`scripts/pods/native_a16_checks.sh` runs the qualification;
-`scripts/pods/compare_native_moe.py JOB_DIRECTORY` compares every saved probe cell.
-
-The fused HC write/read uses the public FP32 stack boundary and supports BF16/FP32 branch
-outputs. On October 8, its independent FP64 oracle and changed-input graph checks passed on
-RTX 3090 / CUDA 13.1. Against separate public write/read calls, 61 paired graph samples per
-cell cover T=1/4/8/9/16/128/512, both dtypes, and reused/64 MiB-evicted L2 inputs. Medians are
-2.0–6.6% lower in 26/28 cells; two T=1 cells tie, with no regressions in this matrix. One graph
-node is removed per call. The text/MTP executor integration passes the full FP8-table Engine
-check, but its whole-model speed effect has not been measured.
-
-The QSA indexer uses three TF32 high/residual MMA products for T>=128 and keeps its original
-SIMT route for narrower calls. Public pooled keys remain FP32. Independent FP64 selection,
-route-boundary and graph checks pass on RTX 3090 / CUDA 13.1. With 33 rotated samples per
-candidate and reused/64 MiB-evicted L2, all 12 T=128/512 cells at 700/8192/32768 pooled-key
-capacities have 30.8–65.0% lower medians. MMA regresses short calls by up to 40%, so it is
-not selected there. The wide path adds 2048 bytes of workspace per token and one graph node;
-no whole-model or other-GPU improvement is established. BF16 pooled-key storage was rejected:
-166/288 synthetic queries change their selected set beyond the existing near-tie allowance.
+The native recipe is an explicit artifact choice; the GGUF artifacts stay the published
+representation. On the held-out quick corpus (391,000 targets, context 32,768, BF16 KV, one RTX
+A6000) the native-Q2 artifact scored 5.004501 against 4.991555 for the GGUF one (+0.26%, worst
+window +4.3%), and scoring took 15% longer. Its expert Op is within a few percent of the GGUF Op at
+decode widths with A8 activations, between 28% faster and 34% slower at prompt widths, and slower
+everywhere with A16 activations.
 
 `qwen3_8_flash_next` supports HF-source conversion: text routed experts Q4 gate/up and
 Q5 down, shared experts and GDN/QSA projections Q8, embedding Q8 and head Q6. HC, router,
@@ -277,52 +137,9 @@ MTP block then uses Q4 routed experts and BF16 elsewhere. A server that ignores 
 refused before a full shard is read. Failed copies retain a `.partial` file, never a published
 safetensors file; use a fresh output directory after resolving a failed transfer.
 
-The FP8-table experiment below was rejected by the user on October 8 because its table is
-80% larger. IQ4_NL is the selected release representation. The FP8 table and companion model
-remain private archives; their measurements are retained for reproducibility.
-
-HF table conversion reads the numbered BF16 shards in bounded chunks. It makes two passes:
-one to hash the exact quantized bytes named by the model descriptor, then one to write them.
-This needs no table-sized temporary file, but reads and quantizes the source twice. The full
-320,001,536-row payload is 51,840,248,832 bytes, 80% more row storage than IQ4_NL.
-The complete 51,840,252,928-byte artifact and its native-Q2/MTP companion were converted and
-archived privately on October 8; uploaded sizes, SHA-256, visibility and metadata were verified.
-The companion preserves all model weights and resources and changes its table descriptor.
-The full table passes public Engine plain/K=4 fixed-mode repeats and cancellation/recovery with
-direct I/O and native host experts. The final quality comparison below uses the public scoring
-Engine. Models naming an IQ4_NL table cannot substitute an FP8 table at runtime:
-the companion must record the FP8 table's format and digest.
-
-On two RTX 3090s / CUDA 13.1, the same executable scored the native-Q2 weights with each table,
-BF16 KV, context 32,768 and stride 16,384, over 391,000 held-out targets in six streams and
-18 windows. Fourteen windows improve with FP8 and four worsen. The worst change is +0.2624%
-on the first GitHub-code window; the best is -13.2749% on the last arXiv window.
-
-| domain | IQ4_NL PPL | FP8 PPL | change |
-|---|---:|---:|---:|
-| Wikipedia English | 6.372558 | 6.360064 | -0.1961% |
-| Wikipedia Chinese | 16.565810 | 16.091824 | -2.8612% |
-| arXiv | 7.995071 | 7.642498 | -4.4099% |
-| GitHub code | 2.235469 | 2.237799 | +0.1043% |
-| own code | 2.282026 | 2.284420 | +0.1049% |
-| synthetic chat | 3.804761 | 3.799902 | -0.1277% |
-| overall | 5.045081 | 4.982153 | -1.2473% |
-
-Scoring took 443.49 seconds with IQ4_NL and 446.33 with FP8 (+0.6419%) in one sequential pair;
-this does not establish a stable speed difference or a generation-throughput advantage. The
-earlier A6000 native-Q2 result (5.004501) used another source snapshot and hardware configuration,
-so it cannot isolate the later optimizations' quality effect. These table results do not erase
-the native-versus-GGUF regressions above. FP8 remains a rejected experiment with 80% more
-table storage; both code-domain aggregates worsen slightly.
-
-The converter/subset/FP8 source/table suite passes 131 tests. Three real FP8 expert matrices
-(4,915,200 values) match an independent FP64 codebook/block-product oracle exactly after
-FP32 rounding. This establishes source interpretation, not full-model quality.
-Six affected C++/GPU checks also pass
-on RTX 3090 with CUDA 13.1, including the Python-writer/reader/GPU chain across artifact part
-boundaries. A live check on the pinned revision fetched the
-5,120-byte `mtp.pre_fc_norm_embedding.weight` range and matched the stored file's SHA-256;
-the complete MTP subset has not been downloaded in this qualification.
+An FP8 table (`fp8_e4m3fn_row_fp16`, 51.8 GB) from the HF BF16 shards is supported but not
+published: it improved held-out perplexity by 1.25% (worse on both code domains) for 80% more
+table storage than IQ4_NL, which stays the release representation.
 
 `--components text,vision` (with or without `ngram`) adds the Vision tower from the release's
 `mmproj-Qwen3.8-Flash-Next-BF16.gguf` (`--source vision=PATH`): the same tower as Qwen3.5/3.6
@@ -408,9 +225,8 @@ staged misses fill the text layers' slots by recency within tiers of decayed rou
 once lately, a few times, often), so a passing decode does not evict a working set other prompts
 keep routing to, and a prompt chunk lets the cache admit its
 most routed experts by decayed counts; disk residency uses a CLOCK device cache. Disk residency
-relies on the OS page cache for repeated file reads. An additional application-managed RAM
-cache of experts is excluded from the current delivery. The device cache and bounded transfer
-buffers remain in use.
+relies on the OS page cache for repeated file reads; the engine keeps no RAM cache of experts of its
+own, only the device cache and bounded transfer buffers.
 
 With host experts the GPU holds only the dense weights (3.7 GB for the Q2_0 release), the
 per-request state and the expert cache; the host needs the expert banks in page-locked memory
@@ -419,45 +235,13 @@ reads the missing experts from the artifact's files through the OS page cache, e
 flight, into a 256 MB page-locked staging ring, so the page cache keeps whatever the system can
 spare and the rest comes from the disk.
 
-Native host banks copy every miss to the GPU by default (`--expert-dma-share 1`). Values below
-one enable experimental CPU mixing; CPU results merge in route order. A GGUF bank, including a GGUF MTP companion beside
-native text weights, retains its mapped-host GPU route; native routing profiles cover only
-native banks. Linux registers native weight objects separately; Windows uses pageable weights
-and bounded pinned staging. Use `--max-concurrency 1` for native host execution.
-
-On October 8, RTX 3090 / CUDA 13.1 / EPYC 7302P with 256 GB RAM passed the native hybrid
-FP64 oracle, scalar/AVX2 CPU tests, graph replay and stalled-worker cancellation/recovery.
-EPYC 9354 / Linux / GCC 13.3 also passed all 33 AVX-512 VNNI oracle cases. The full native-Q2
-plus GGUF-MTP artifact passed public Engine plain/K=4 repeats, active cancellation/recovery
-and profile recording. DMA=1 is the qualified host mode; further CPU-mixing qualification and
-Windows execution are excluded from this delivery by the user's October 8 decision.
-
-The full-model logit comparison used BF16 KV, prefill chunks of 512, concurrency one, no drafting,
-prefixes of 128 and 2,112 tokens, and 16 teacher-forced positions after each prefix. Every BF16
-logit word matched between one RTX 3090 with host experts at DMA=1 and two RTX 3090s with resident
-experts. All modes repeated exactly twice; all 248,077 public-vocabulary logits were finite.
-CPU shares at DMA=0/0.5 kept top-1 at all 32 positions, but maximum relative L2 error versus the
-resident logits was 0.324/0.604 (maximum KL 0.00761/0.00194). These CPU modes have not passed
-full-model numerical qualification; top-1 agreement does not establish it.
-
-Public `/completion` measurements on the single RTX 3090 / EPYC 7302P used the same 219 input
-tokens and 64 output tokens, int8 KV at context 4096, a 4 GiB expert cache, eight CPU workers,
-concurrency one and no prefix reuse. Each row contains all three requests: the first followed
-verified eviction of the table's page cache, then two warm requests. Decode uses the 63
-intervals after the first output token. All output tokens matched across these configurations.
-
-| DMA share / MTP / table I/O | decode tok/s, three requests | median tok/s | peak process RSS, GiB |
-|---|---|---:|---:|
-| 0 / K=4 / buffered | 3.106, 3.107, 3.124 | 3.107 | 35.19 |
-| 0.5 / K=4 / buffered | 5.221, 5.265, 5.264 | 5.264 | 35.19 |
-| 1 / K=4 / buffered | 31.294, 31.376, 31.388 | 31.376 | 35.19 |
-| 1 / K=4 / direct | 31.450, 31.451, 31.440 | 31.450 | 35.20 |
-| 1 / plain / buffered | 23.990, 23.984, 23.977 | 23.984 | 32.68 |
-
-K=4 improves the median decode rate by 30.8% over plain for this workload. CPU mixing is
-5.96–10.1 times slower than DMA=1. The GGUF baseline process failed at startup, so this grid
-does not compare native execution with optimized GGUF. The host had 256 GB RAM; process RSS
-does not qualify a physical 64 GB host, and the OS page cache can consume additional memory.
+Native host banks copy every miss to the GPU by default (`--expert-dma-share 1`). Values below one
+let the CPU compute a share of the missing experts; this mode is experimental: on one RTX 3090 with
+an 8-core EPYC 7302P it decoded 3.1 tok/s at a share of 0 and 5.3 at 0.5 against 31.4 at 1, and its
+logits stay within top-1 but are not numerically qualified (maximum relative L2 0.32-0.60 against
+resident experts). A GGUF bank, including a GGUF MTP companion beside native text weights, keeps
+its GPU route. Linux registers native weight objects separately; Windows uses pageable weights and
+bounded pinned staging. Use `--max-concurrency 1` for native host execution.
 
 ### The n-gram rows
 
@@ -485,38 +269,18 @@ issue `POSIX_FADV_WILLNEED`; Windows mapped readers use `PrefetchVirtualMemory`.
 reads, with duplicate rows and shared pages coalesced. Direct I/O and Windows buffered I/O start one bounded
 speculative batch in separate staging; busy workers skip extra hints. Only complete successful
 batches can supply demand reads, and hints alone admit no rows into the persistent cache.
-Windows buffered staging remains unqualified on Windows. Eager and graph checks cover B=1/8, 15 draft steps,
-16 verify columns, EOS and callback-error recovery. An initial attempt to synchronize a captured
-event failed; completion now waits for the joined compute stream, and the corrected test passes.
-The full FP8-table Engine plain/K=4 functional check also passes. Whole-model speedup remains unmeasured.
 
 Buffered/direct row misses use a bounded OS queue: io_uring on Linux and overlapped reads with
 IOCP on Windows. One worker drives the queue while device execution continues; direct reads use
 at most `--ngram-io-depth` aligned bounce buffers. A failed batch drains its outstanding reads
-before returning and admits no rows to the cache. If Linux disables io_uring (as the October 8
-A6000 rental did), the reader uses positioned-read workers. Bulk RAM/hot-set loading and mapped
-reads retain their existing paths.
+before returning and admits no rows to the cache. If Linux disables io_uring, the reader uses
+positioned-read workers. Bulk RAM/hot-set loading and mapped reads retain their existing paths.
+The Windows reader paths have not been run.
 
-The Linux queue and integrated reader passed exact byte, split-row, duplicate, bounded-depth,
-short-file/retry and overlapping-batch checks on the local Linux 7.0.14 container with GCC 12.2;
-native queue depths 1/5/64 covered buffered and direct reads. The restricted A6000 host passed
-the fallback reader checks. Bounded direct lookahead also passes exact native/fallback checks,
-including failed batches, cache admission and destruction while reads are pending. RTX 3090 /
-EPYC 7302P / CUDA 13.1 passes the updated reader, draft/verify ordering and full FP8-table Engine
-tests. Windows IOCP execution remains untested and is excluded from the current qualification.
-
-The final public Engine I/O run used the serving workload above, DMA=1, K=4 and no persistent
-row cache, on the provider's Samsung MZQLB7T6HMLA-00007 SSD. Three buffered requests achieved
-31.258/31.346/31.363 decode tok/s; direct I/O achieved 31.475/31.436/31.453. First-request table
-page eviction was verified; subsequent requests were warm. Per-request `/stats` deltas report
-2.048/2.048/4.096 microseconds of PLE stall for buffered reads and 0/2.048/2.048 microseconds
-for direct reads, over 4,464/4,544/4,544 rows. This establishes near-zero row-read stalls for
-this workload, not an end-to-end speedup attributable to the queue or lookahead. Modes ran
-sequentially. The stats endpoint initially omitted the Engine's n-gram counters; that omission
-was fixed, the report contract test passed, and both I/O modes were remeasured.
-
-The row cache remains opt-in: the qualification's first requests took 10–11% longer with a
-4 GiB cache, while repeated requests had all-row hits without an established end-to-end gain.
+On a serving workload with one RTX 3090, the table's pages evicted before the first request, the
+PLE layer waited 0 to 4 microseconds per request for its rows with buffered or direct reads. The
+row cache stays off by default: with a 4 GiB cache the first requests took 10-11% longer, and
+repeated requests that hit every row generated no faster.
 
 `--ngram-residency ram` reads the whole table into RAM at startup (2 MiB pages where Linux offers
 them), and `ram-hot` reads only the rows a hot-row profile ranks most used, as many as
@@ -551,6 +315,19 @@ are rejected rather than omitted from the profile.
 read, how many RAM served, the read latency and the time the PLE layer waited
 ([Stats](serving.md#structured-request-log)), and `ninfer` prints them after its answer.
 
+The published table carries a broad hot-row profile: 26,223,284 ranked rows counted from
+3,711,509 tokens sampled with equal per-group ceilings from four Common Corpus shards (prose, web,
+press, science) and one github-code-clean shard. On 1,103,918 held-out tokens of the same sources
+the leading rows serve this share of row reads per RAM budget:
+
+| RAM budget, MiB | 256 | 512 | 1,024 | 2,048 | 4,096 and more |
+|---|---:|---:|---:|---:|---:|
+| Held-out row hits | 33.8% | 38.5% | 42.9% | 48.5% | 49.6% |
+
+Across the 239 language and domain groups with at least 2,048 held-out tokens the hit rate at 4 GiB
+runs from 20.5% to 95.5% (median 49.4%); Japanese books have the lowest coverage. Hits measure row
+reuse, not speed or quality.
+
 ### Without the n-gram table
 
 The model was trained with its n-gram embedding, so the engine refuses a model whose table it
@@ -559,6 +336,8 @@ all-zero table gives), and warns at startup: this is a non-standard, experimenta
 practical use. On the Q2_0 release it nearly doubles WikiText-2 perplexity, 2.66 to 5.01 over the
 fourteen windows of the comparison below; short factual answers survive, but nothing measured
 improves.
+
+### Sequences, KV and the context cache
 
 `--kv-dtype` stores the KV cache of the 12 sparse-attention layers in any of the nine formats the
 Qwen3.5 family uses. A position costs 24 KiB in `bf16` (the default), 12.4 KiB in `int8`, 12.1 KiB
@@ -647,9 +426,8 @@ largest selected prefix, with acceptance bounded separately for each request. Th
 from the sampling `--min-p` filter. The full captured draft chain still runs, and `drafted_tokens`
 counts that work. Only verification shrinks; a throughput gain is not established. The floor is
 part of the disk context-cache profile, and each verification width has its own CUDA Graph.
-GPU qualification passed K=1/4, floors 0/0.3/1, fixed-mode repetition, cancellation/recovery and
-three concurrent sequences. Floor 1 agrees with K=1. The release checks below establish no gain
-from floor 0.3, so zero remains the default.
+On the published Q2 artifact a floor of 0.3 produced the same tokens and acceptance as zero, which
+stays the default.
 
 The verification leaves the sequence's state where it was: each Gated DeltaNet layer records its
 transitions and the commit replays the kept ones into the state (the Qwen3.5 family's ReplaySSM
@@ -740,340 +518,15 @@ draft-chain graph and each width its own verification graph, captured at their s
 
 ## Measurements
 
-### October 9 decode speed on one RTX 3090
+### Expert placements
 
-One RTX 3090 (24 GB, PCIe 4.0 x16) with an i9-11900KF and 125 GB RAM, driver 580.82.09 and
-CUDA 13.1 ran the Q2 model (GSQ-RCO Q2_0 with the IQ4_NL table) through `ninfer-serve` with host
-experts, int8 KV, an 8,192-position context and one request at a time. Three prompts (a Python
-LRU cache, the blue sky, the history of the Great Wall in Chinese) ran in that order twice, 256
-greedy output tokens each, so a prompt's second run follows the other two. Each binary ran every
-configuration once; the baseline is commit `a9155e0`.
+Greedy decoding, one request. Decode is measured over a short answer (78 tokens for Q2_0) and over
+the first tokens after a 4,463-token prompt; prefill is that prompt. Host memory is the process's
+peak resident set (the pinned bank for host experts); device memory the most `nvidia-smi` showed in
+use.
 
-| Mode | Baseline decode, tok/s (first / second run) | This build |
-|---|---|---|
-| plain, code / prose / Chinese | 69.2/78.4, 77.9/80.6, 74.1/79.4 | 87.3/92.3, 93.7/94.3, 93.4/94.3 |
-| MTP 2 drafts | 68.6/70.0, 71.9/73.4, 57.2/62.4 | 118.8/118.6, 117.3/114.8, 95.8/101.2 |
-| MTP 3 drafts | 66.7/66.9, 67.2/68.3, 53.0/57.5 | 121.2/122.6, 117.7/111.1, 90.0/94.6 |
-| MTP 4 drafts | 63.1/62.2, 60.5/60.9, 44.9/48.2 | 111.1/105.9, 101.9/96.2, 74.6/78.5 |
-| disk experts, code / prose (first run) | 64.5, 66.8 | 68.1, 71.4 |
-
-A 5,669-token prompt prefilled at 1,253 instead of 727 tokens/s, and its 64 output tokens decoded
-at 76.8 instead of 52.0 tokens/s, but this build computed long prompts wrongly with host experts
-(see the prefetch fix below), so these two figures do not stand. Run back to back, a repeated prompt decodes at 98.5 (code) and
-100.4 (prose) tokens/s plain and 137.6 and 123.7 with three drafts. Within each binary every mode
-(plain, MTP 2-4, disk, a CPU share of 0.5, mapped misses) produced the same tokens; the two
-binaries' outputs part after 40-70 tokens, most likely because the router's sums now split each
-row over four warps and its wide calls run as a BF16 GEMM (not isolated).
-
-The first request's time to first token is unchanged (462 and 464 ms), but a prompt's second run
-started later: 298-387 ms instead of 174-320 ms. Staged misses admitted every missing expert into
-the least recently used slot, so a decode moved the cache to its own experts and evicted the other
-prompts' (46-58 MiB copied a token in second runs, against 3-14 MiB before). Letting decayed counts
-veto an admission restored those starts but cost first runs 13-22% of their decode speed. An
-admission now takes the least recently used slot of the lowest tier of decayed route counts (below
-1.5, below 6, the rest), so the experts other prompts keep routing to outlast a passing decode. On
-a second RTX 3090 (a rented host, driver 580.82.09, CUDA 12.8, the same protocol), against recency
-alone, second runs started after 212-305 instead of 284-397 ms and first runs after 367-416 instead
-of 406-416 ms; first-run decode changed by -4.4% to -0.6% (Chinese 86.2 instead of 90.2 tokens/s),
-second-run decode by -1.6% to +1.0%, and the six requests took 19.44 instead of 19.53 s. Two tiers
-(often or not, at 6 or 12 routes) and the thresholds 1/4 and 3/12 started second runs after 208-371
-ms at a similar decode cost and took longer in total. Recency alone repeated its admissions and
-copies exactly from run to run.
-
-Measured improvements by kernel, from node traces of plain decode (each a share of a 10.1 ms
-token): Q2_0's transposed decoding took the routed up kernel from 26.8 to 18.9 µs and the down
-kernel from 25.7 to 21.5 µs per layer; Q3_K's split decoding cut its dense products from 1.06 to
-0.98 ms a token. Shared memory staging of the weights (cp.async) and unconditional clamped loads in
-the dense kernels were slower or neutral and were dropped.
-
-### October 9 fix: prefetched expert tables
-
-From commit `5118e069d` on, a host-expert prompt call of 256 tokens or more prefetched each layer's
-uncached experts into the slot pool and copied the layer's expert tables from one of two pinned
-buffers. A copy reads its buffer when it runs, and the host enqueues layers ahead of the device,
-so a later layer's tables could replace a buffer's contents before its copy ran: such calls
-multiplied some layers' tokens by other layers' experts. Each buffer is now rewritten only after
-the copy that last read it has run. Over the first 40 KB of the WikiText stream of
-`eval/corpora/perplexity-1m` (4,096-token windows, a 2,048-token stride, int8 KV) the Q2 model
-with host experts read 3.995-4.047, varying from run to run, before the fix and 2.5390 after it,
-as disk experts and the build before the prefetch (`a9155e0`, 2.5407) do. Decode steps and prompt
-calls below 256 tokens never took that path, so the decode measurements above stand. On the
-second RTX 3090 of the tier measurements, a 4,958-token prompt prefills at 1,234 tokens/s with the
-fix and 758 with `a9155e0`; its 64 output tokens decode at 79.1 and 61.2 tokens/s.
-
-### October 9 hyper-connection matrices in Q8_0
-
-The hyper-connection projections were the largest read of a decoded token: 97 down/up pairs and
-96 inject matrices, 1.27 GB in BF16. They are now ggml Q8_0 (32 inputs of a row share a binary16
-scale), 0.67 GB. The GGUF recipe quantizes the releases' BF16 matrices with ggml's
-`quantize_row_q8_0_ref` and keeps the MTP GGUF's own Q8_0 blocks, which it used to decode to
-BF16. The three public artifacts were rewritten the same way with `scripts/pods/requantize_hc.py`,
-every other object copied byte for byte: Q2_0 40,709,159,936 bytes, IQ3_S 57,902,944,256 and the
-Coder build 32,685,469,696, each 618,159,104 smaller. Over the text matrices the represented
-values differ from the BF16 ones by at most 0.0334, 4.79e-4 RMS.
-
-The read's kernels for Q8_0 (one RTX 3090, CUDA 12.8, the fused write/read as a CUDA Graph, L2
-evicted between samples, medians of 61):
-
-| Tokens | 1 | 4 | 8 | 9 | 16 | 128 | 512 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| BF16, µs | 23.6 | 28.7 | 44.0 | 43.0 | 45.1 | 98.3 | 384.0 |
-| Q8_0, µs | 19.5 | 27.6 | 38.9 | 67.6 | 68.6 | 122.9 | 403.5 |
-
-Up to eight tokens the kernels decode four weights at a time into exact FP32 values and keep the
-activations FP32; four down rows share each CTA's activation loads. A first version that gave each
-lane a whole 34-byte block made its activation loads 128 bytes apart and was 54-93% slower than
-BF16 from four tokens on. Wider calls round the Q8_0 values to BF16 for the tensor-core products,
-which costs two dequantizations of 13 µs a call: prompts and batches of nine or more tokens a step
-pay 5-57% more for these reads.
-
-Through `ninfer-serve` on the second RTX 3090 (the rented host of the tier measurements: driver
-580.82.09, CUDA 12.8) with the October 9 protocol, the Q2 model before and after the rewrite, each
-configuration run twice: plain decode went from 81.3-93.6 to 84.5-97.7 tokens/s, 3.6-6.0% faster
-for every prompt and run (a configuration's two runs within 0.6% of each other), and decode with
-three MTP drafts from 84.5-114.4 to 83.0-120.4 tokens/s, 0.4-10.0% faster per prompt on average
-(its runs within 5%; one run of the first Chinese answer was 1.8% slower). The weights on the GPU
-went from 3.38 to 2.83 GiB and the device expert cache grew from 17,340 to 17,786 MiB, but its hit
-rate moved by at most half a point, so the gain is the reads'. With the prefetch fix, a 4,958-token
-prompt prefilled at 1,268 instead of 1,234 tokens/s and its 64 output tokens decoded at 81.9
-instead of 79.1 tokens/s (one run each). Both answer coherently; their outputs part within the
-first tokens, as two quantizations do.
-
-Perplexity over the quick corpora (4,096-token windows advancing by 2,048, int8 KV, host experts,
-with the prefetch fix), the BF16 matrices against Q8_0:
-
-| Model, corpus | BF16 | Q8_0 | Change |
-|---|---:|---:|---:|
-| Q2_0, `perplexity-1m` | 3.93783 | 3.93842 | +0.015% |
-| Q2_0, `perplexity-heldout-2026-09` | 4.69573 | 4.69673 | +0.021% |
-
-Domain by domain the Q2_0 changes run from -0.11% (this repository's code) to +0.36% (new English
-Wikipedia articles). The other two builds, whose text matrices are the same bytes, were checked on
-two 40 KB slices only, the start of the WikiText stream above and of the held-out English Wikipedia
-stream (9,234 and 9,477 tokens):
-
-| Model | WikiText slice | Change | Held-out Wikipedia slice | Change |
-|---|---:|---:|---:|---:|
-| Q2_0 | 2.5390 → 2.5440 | +0.20% | 7.3517 → 7.4048 | +0.72% |
-| IQ3_S | 1.9767 → 1.9724 | -0.22% | 6.5552 → 6.5604 | +0.08% |
-| Coder | 4.2254 → 4.1985 | -0.64% | 8.9087 → 8.9281 | +0.22% |
-
-Over so few tokens one quantization moves perplexity by up to 0.7% either way; the corpora above
-are the measure.
-AIME and GPQA were not rerun: one AIME problem is 3.3 points and one GPQA-Diamond run's standard
-error about 2.5, far more than these differences could move, and the pair takes most of a day on
-one RTX 3090.
-
-### October 8 public MTP attachments
-
-The three existing public model repositories now include the shared-Q8_0 MTP block.
-Each update adds 28 physical objects (2,791,415,296 bytes) and 1,567 logical bindings.
-Readback verified every previous text/Vision object, tokenizer resource and table descriptor.
-The Coder model keeps its 256-expert text banks and the MTP block's independent 512-expert bank.
-Each repository retains the original conversion report, attachment report, qualification and checksums.
-
-All three models passed host-to-GPU and disk-to-GPU requests on one RTX 3090, CUDA 13.1,
-int8 KV, 4,096 context capacity, 128-token prefill chunks and an 8 GiB device expert cache.
-The two prompts ask for a Python function to merge sorted lists and an explanation of the blue sky.
-Each mode ran three greedy repetitions of 64 output tokens, with prefix reuse disabled and EOS ignored.
-All fixed modes repeated exactly and MTP accepted drafts. The four Q2 modes also produced identical tokens.
-Vision remained enabled: a red-image request used the existing plain fallback, then a fresh text request resumed MTP.
-The initial media check failed because it incorrectly required drafting for media; source inspection corrected that expectation.
-
-| Model / expert residency / drafts / minimum probability | Prompt 1 median (range), tok/s | Prompt 2 median (range), tok/s |
-|---|---:|---:|
-| Q2 / host / 4 / 0 | 38.43 (25.90–41.98) | 32.00 (26.02–35.37) |
-| Q2 / disk / 4 / 0 | 13.64 (10.61–13.82) | 11.72 (9.88–11.88) |
-| Q2 / host / plain / 0 | 50.68 (31.28–55.58) | 45.30 (35.36–49.92) |
-| Q2 / host / 4 / 0.3 | 38.20 (26.59–42.29) | 31.81 (26.35–35.37) |
-| IQ3 / host / 4 / 0 | 22.84 (16.28–25.07) | 13.96 (11.19–16.13) |
-| IQ3 / disk / 4 / 0 | 10.56 (6.75–10.59) | 8.47 (6.17–8.53) |
-| Coder / host / 4 / 0 | 27.01 (19.27–28.95) | 18.66 (14.69–20.90) |
-| Coder / disk / 4 / 0 | 12.06 (11.79–12.31) | 9.54 (9.46–9.70) |
-
-The Q2 MTP medians are 24.2% and 29.4% below plain decoding in this workload.
-Artifact preparation and transfers overlapped these checks, and the OS page cache was uncontrolled.
-These measurements include first requests and do not isolate an MTP speed effect or establish cold-disk throughput.
-The 0.3 confidence floor changed neither tokens nor draft/acceptance counts; zero remains the default.
-The campaign establishes working MTP attachments, fixed-mode repetition and Vision preservation, without a speedup claim.
-Physical low-RAM hosts, an RTX 3080 with 20 GB, and Windows were not qualified.
-`scripts/pods/mtp_qualify.py` retains the requests, options and all samples.
-
-### Broad n-gram profile
-
-The optional broad profile contains 26,223,284 ranked rows from 3,711,509 training tokens.
-The held-out corpus contains 1,103,918 tokens in 445 observed domain/language groups.
-It samples four Common Corpus shards at `307910e4c5d040d6f318e6edf2a2b97849155771` and one
-github-code-clean shard at `c48d40f9e70f0196f8236901ee35807f7d6c44c0`.
-Equal per-group token ceilings, document/repository separation and capped source contributions avoid selecting preferred languages.
-The sources cover prose, web, press, science and code. Labels are automatic, sparse groups remain visible,
-and exact snippet deduplication does not eliminate all near-duplicates. This finite sample does not represent every language or user traffic.
-
-| RAM budget, MiB | Held-out row hits |
-|---:|---:|
-| 256 | 33.79% |
-| 512 | 38.49% |
-| 1024 | 42.92% |
-| 2048 | 48.48% |
-| 4096 | 49.64% |
-| 8192–32768 | 49.64% |
-
-Across 239 groups with at least 2,048 held-out tokens, minimum/median/maximum hits are
-6.04%/32.85%/90.64% at 256 MiB and 20.54%/49.38%/95.47% at 4 GiB.
-Japanese books have the lowest coverage at both budgets. Row hits measure reuse, not model quality or inference speed.
-NumPy and the native C++ profiler produced byte-identical 104,893,176-byte profiles.
-Embedding the profile increases the table container by 0.364%, while preserving every IQ4 row byte and the row digest.
-The existing public table repository includes that resource and the standalone `broad-v1.hot` file.
-It also publishes the complete per-group evaluation, corpus provenance, attachment proof and Engine report.
-The private transfer bucket retains the corpus archive and a profile copy, both verified by SHA-256 readback.
-
-The Engine passed disk, embedded-profile and explicit-profile configurations on the Q2 MTP model
-and RTX 3090 above. Two prompts, two repeats and 32 output tokens matched exactly across all three modes.
-Both profile modes served resident rows from a 256 MiB RAM budget. Transfer overlap and uncontrolled page cache
-prevent isolated performance attribution. Earlier first-request regressions below remain applicable evidence; caching stays opt-in.
-`scripts/pods/ngram_corpus_build.py`, `ngram_profile_broad.py` and `ngram_profile_engine.py` retain the corpus and check procedures.
-
-### October 8 qualification and CPU prototype
-
-On two RTX 3090s with CUDA 13.1, driver 595.91.07, Q2_0 experts, the shared-Q8_0 MTP
-component and int8-group64 KV, Engine startup previously took 248.6 seconds. Removing the
-directory parser's quadratic JSON callback scan reduced observed subsequent startups to
-18.5–21.1 seconds. This compares one old startup with the qualification runs; it is not a decode
-throughput measurement. Duplicate JSON members remain rejected.
-
-The fixed-seed MTP qualification also found an ordering bug across the two GPUs: after an
-asynchronous MTP embedding copy, the next prompt chunk could overwrite GPU 0's source buffer
-before GPU 1 read it. The first seven MTP KV rows changed between otherwise identical requests,
-occasionally changing the sampled answer at generated token 30. CUDA Graphs were not the cause:
-the failure occurred with them disabled too. A source-stream wait now protects that buffer until
-the copy completes. With a temporary trace and alternating 200 ms peer-copy delays, all 24
-repeats in each graph mode agree byte for byte in the valid KV rows, MTP checkpoints, full head
-logits and answer. The corresponding run before the fix had varying KV/logits despite matching
-answers; the delay by itself was not a deterministic answer-failure trigger. The trace has been
-removed from the product; the Linux Engine regression retains the delay fixture and passes all
-48 repeats without tracing. Public Engine, output/thinking budgets, logprobs and cache checks
-pass; the greedy suite reports six plain/MTP and seven batch-composition differences, as allowed
-by the documented fixed-mode contract. The wait's
-throughput cost has not been separately measured.
-
-The experimental `bench/ops/q2_cpu_probe.cpp` evaluates the first 80 stored experts from layer 12,
-with BF16 sinusoidal inputs, uniform top-10 weights, H=2560 and I=640. Its independent FP64 oracle
-decodes Q2_0 scales and codes and evaluates the original inputs through SwiGLU and the down
-projection. Internal A8 quantization and BF16 intermediates are not oracle boundaries. Across
-T=1/2/5/8, repeated or disjoint expert sets, and 1/8/26 threads, relative L2 is 0.00911–0.00961 and
-maximum error over oracle peak is 0.00791–0.01211, within the production Op's 0.04/0.16 criteria.
-An earlier oracle reused the quantized intermediates: its approximately 9e-8 error measured that
-arithmetic alone and does not establish full mathematical accuracy.
-
-The host was a Xeon Platinum 8167M; 26 physical cores on NUMA node 0, AVX2/F16C, OpenMP static
-work sharing. Each cell is the median of nine calls, in milliseconds, shown as warm / after a
-256 MiB cache flush. These calls exclude the shared expert, GPU work, transfers and dispatch.
-
-| tokens | same 10 experts | disjoint 10 experts per token |
-|---|---:|---:|
-| 1 | 1.677 / 1.398 | 1.417 / 1.402 |
-| 2 | 2.215 / 2.311 | 2.081 / 2.423 |
-| 5 | 3.709 / 5.083 | 4.019 / 5.662 |
-| 8 | 4.273 / 9.210 | 4.410 / 9.223 |
-
-Timing varied: T=8 disjoint/warm spans 3.882–7.570 ms; T=1 is sometimes slower warm than after
-the flush. The cause has not been isolated. Eight threads take 12.204 / 22.496 ms for T=8 disjoint;
-one thread takes 95.039 / 95.113 ms. Copying these same packed expert banks from pinned memory to
-GPU 0 costs 1.19 ms for ten experts (13.824 MB), 2.37 ms for twenty, 5.93 ms for fifty and 9.48 ms
-for eighty; these are all-miss H2D measurements without GPU compute.
-
-`bench/ops/q2_gpu_probe.cpp` runs the same eight represented input/routing cases against those
-FP64 outputs. All pass the same error criteria and repeat bit for bit. GPU 0's resident medians
-are 0.094/0.095 ms at T=1 (reused/disjoint), 0.142/0.141 at T=2, 0.285/0.283 at T=5, and
-0.435/0.431 at T=8. Unlike the CPU probe, the public GPU Op also computes a shared expert with
-zero contribution. Routing, transfers and Engine dispatch are excluded. A preceding 32 MiB
-device memset gives medians approximately 6–8 microseconds lower; cache eviction was not
-verified and the cause of that timing difference remains unresolved.
-
-Adding the separately measured all-miss H2D cost to resident compute suggests that CPU compute
-could compete at T=2/5/8 when every disjoint expert misses the device cache. This sum is not a
-measured hybrid execution. Resident GPU compute is substantially cheaper; CPU work should
-therefore target cache misses. CPU execution has not been integrated into the Engine and no
-end-to-end hybrid gain has been established.
-
-The earlier n-gram qualification, before the disk row cache and advisory lookahead, runs the
-same 80-token greedy coding request with int8-group64 KV,
-context 4096 and both GPUs. All ten answers agree byte for byte. Each cold run discarded only
-the artifact table's page-cache pages and verified residency with `mincore`; one of 7,031,284
-pages remained resident before the first cold run. Each cell below reports cold / subsequent
-warm, one run of each rather than a timing distribution. Reader stall totals include startup
-and warmup, not just generation.
-
-| n-gram mode | startup, seconds | decode, tok/s | total PLE reader stall, ms |
-|---|---:|---:|---:|
-| buffered | 18.7 / 18.5 | 92.4 / 91.8 | 2.64 / 8.91 |
-| direct | 18.5 / 18.6 | 91.8 / 92.3 | 5.15 / 3.87 |
-| mmap | 18.5 / 18.5 | 92.3 / 92.1 | 4.51 / 3.90 |
-| ram | 41.1 / 29.1 | 94.2 / 94.2 | 0.11 / 0.11 |
-| ram-hot, 256 MiB | 19.3 / 20.1 | 92.2 / 92.4 | 4.22 / 3.06 |
-
-Full RAM residency consumes another 28.8 GB and adds 22.4 seconds to cold startup relative to
-buffered reads here. The profile trained on this guide and the Engine architecture contains
-216,052 rows from 22,034 tokens. On the held-out README and serving guide (56,462 tokens,
-903,392 row accesses), it covers 25.5% of accesses; increasing the budget from 256 MiB to
-32 GiB cannot improve this profile because its entire row set already fits. The coding
-generation's measured hot-row hit rate is only 0.7%. Ideal page-cache hit-rate upper bounds
-from the held-out access trace are 45.9/58.3/72.8/100% at 256/512/1024/2048 MiB; these are
-trace-derived bounds, not measured OS hit rates. These results do not establish a general
-advantage for `ram-hot` or close the planned asynchronous I/O and draft-lookahead work.
-
-The October 8 disk-cache qualification uses the native Q2 model, its IQ4_NL table companion,
-two RTX 3090s, CUDA 13.1 and int8 KV. Exact reader checks cover buffered, direct and mapped I/O,
-single-file and split rows, bounded eviction, duplicate rows and failed-batch admission. The
-Engine test uses 700 raw input tokens in 512+188 chunks and 24 output tokens, with context 4096.
-All 12 token/content/finish comparisons match within each fixed MTP setting. Every repeated
-cached request serves all its rows from the cache.
-
-| MTP K | read mode / cache | first request, s | repeated request, s |
-|---|---|---:|---:|
-| 0 | buffered / off | 0.722970 | 0.690307 |
-| 0 | buffered / 4 GiB | 0.792032 | 0.688651 |
-| 0 | direct / 4 GiB | 0.837846 | 0.689248 |
-| 4 | buffered / off | 0.855488 | 0.833481 |
-| 4 | buffered / 4 GiB | 0.953051 | 0.830672 |
-| 4 | direct / 4 GiB | 0.986878 | 0.831778 |
-
-These are one ordered sample per cell, without a controlled cold-cache distribution. With the
-same buffered I/O, enabling the cache costs 9.55%/11.40% on the first request. The repeat's summed
-reader latency falls from 13.09/12.94 ms to 2.49/2.35 ms, but generation improves by only
-0.24%/0.34%; this does not establish a repeatable throughput gain. Direct-I/O first requests are
-slower still, but change both I/O and cache relative to the disabled baseline. First-request
-reader counters include startup/warmup; the repeated-request deltas and all request times in the
-table exclude them. The cache budget includes its tags and CLOCK state; per-mode peak RSS was
-not measured. Windows cache/hint execution has not been tested.
-
-A separate CLI comparison retains the pre-cache executable and compares it with the new
-executable at an explicit 4 GiB cache budget. Both process the same 632-token prompt and 48
-greedy output tokens with MTP K=4. The table's page-cache residency was checked after eviction
-before each process; normal startup and warmup then preceded generation. Answers match exactly.
-
-| metric | pre-cache executable | new executable, 4 GiB cache |
-|---|---:|---:|
-| prefill, s | 0.448 | 0.456 |
-| decode, s | 0.343 | 0.352 |
-| generation, s | 0.795 | 0.810 |
-| n-gram read per pass, microseconds | 20,468.2 | 20,890.8 |
-| total PLE reader stall, ms | 1.24 | 15.10 |
-| rows served from RAM | 0.0% | 60.3% |
-
-This pair is also one sample per mode. Reader statistics include startup/warmup. Generation is
-1.89% slower with the cache; no end-to-end gain is claimed. Fatbinary compression differs between
-the executables, so startup comparisons would not isolate cache cost. The cache stays opt-in,
-with a zero default for `disk`; `ram-hot` retains its 4096 MiB default. This measurement predates
-the OS queue and per-step draft hints. The final I/O measurement above qualifies their row-read
-stalls on Linux; Windows execution is excluded. The broad profile above subsequently passed
-embedded and explicit resource qualification through the full-model Engine.
-
-### Earlier generation measurements
-
-Q2_0 release, greedy decoding, CUDA 12.8, 2026-10-05. Decode is measured over the 78 tokens of a
-short answer (prompt of 20 tokens) and over the first tokens after a 4,463-token prompt; prefill is
-that prompt in 512-token chunks.
+The Q2_0 release on the RTX 30 series, October 5, CUDA 12.8, the table inside the artifact, 512-token
+prefill chunks:
 
 | Hardware and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
 |---|---:|---:|---:|---:|---:|
@@ -1082,18 +535,9 @@ that prompt in 512-token chunks.
 | RTX 3090, experts on disk, artifact in the page cache | 22.6 GB | 0.9 GB + page cache | 47.0 tok/s | 39.1 tok/s | 630 tok/s |
 | RTX 3090, experts on disk, page cache dropped every second (NVMe) | 22.6 GB | 0.9 GB | 17.2 tok/s | 11.3 tok/s | 195 tok/s |
 
-Host memory is the process's peak resident set (the pinned bank for host experts). Decode after
-the long prompt covers its first five tokens only. CUDA graphs add 11% to the short-answer decode on
-the two GPUs (81.2 tok/s eager) and 7% with host experts (44.3 tok/s); disk experts decode eagerly.
-Prefill touches nearly every expert of every layer in each chunk, and with host or disk experts
-each of them crosses the bus or comes off the disk once per chunk, so larger `--prefill-chunk`
-values serve more tokens per copy: with host experts on an RTX 3090 Ti the long prompt takes 6.05 s
-in 512-token chunks and 4.58 s in 2,048 (10.97 s before the experts went through device slots).
-
-The IQ3_S release on one RTX 3090 (310 W power limit, PCIe 4.0 x16) in a host with 62 GB of RAM,
-23 cores of an AMD EPYC 7663 and an NVMe drive, 2026-10-05, with the Q2_0 release in the same
-sitting; the artifacts are single files with their n-gram tables, and decode counts the 86 tokens of
-the short answer:
+The IQ3_S release on one RTX 3090 (310 W, PCIe 4.0 x16) in a host with 62 GB of RAM, 23 cores of an
+AMD EPYC 7663 and an NVMe drive, October 5, with the Q2_0 release in the same sitting; decode counts
+the 86 tokens of the short answer:
 
 | Release and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
 |---|---:|---:|---:|---:|---:|
@@ -1104,9 +548,8 @@ the short answer:
 
 The Q2_0 release (with the separate table artifact) on RTX 4090s at 450 W (PCIe 4.0 x16, no peer
 access) in a cloud VM with two EPYC 7543 sockets of 60 vCPUs each, both GPUs on NUMA node 0, 694 GB
-of RAM and its container disk, 2026-10-06. The single-GPU rows ran pinned to node 0's CPUs
-(`taskset -c 0-59`; the container refuses a memory policy, so first touch places the pages there);
-the ranges are two runs:
+of RAM and its container disk, October 6. The single-GPU rows ran pinned to node 0's CPUs
+(`taskset -c 0-59`); the ranges are two runs:
 
 | Hardware and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
 |---|---:|---:|---:|---:|---:|
@@ -1151,33 +594,58 @@ The short answer is 78 tokens for Q2_0, and 87 (PRO 6000) or 81 (RTX 5090) for I
 | RTX 5090, experts on disk, the files' pages evicted every second | Q2_0 | 29.9 GiB | 1.0 GiB | 25.3 tok/s | 28.7 tok/s | 694 tok/s |
 | RTX 5090, experts on disk, the files' pages evicted every second | IQ3_S | 29.9 GiB | 1.1 GiB | 18.8 tok/s | 14.9 tok/s | 171 tok/s |
 
-**Native-Q2 pipeline comparison, October 8.** The same executable and artifact ran on RTX A6000
-(driver 595.91.07) and two RTX 3090s (driver 590.48.01), with int8 KV, 512-token prefill chunks,
-plain decoding and no prefix reuse. Each context has three requests and 64 generated tokens;
-model stops were disabled to keep the decode workload fixed. No warmup sample was discarded.
+- **Device expert cache.** With host or disk experts the cache takes the memory the GPU has free
+  and fills while the requests run: 94 GB of it on the PRO 6000, where nearly every expert ends up
+  resident, and 30 GB on the RTX 5090.
+- **Host link.** Host and disk experts cross the host link: PCIe 5.0 x16 on the RTX 5090 host,
+  PCIe 4.0 x16 on the PRO 6000 host, the likeliest reason the RTX 5090's host-expert row beats the
+  PRO 6000's.
+- **CUDA graphs** add 27% to the short-answer decode on the two RTX 5090s (107.0 tok/s eager), 23
+  to 26% on the PRO 6000 and 11% on the two RTX 3090 Ti; disk experts decode eagerly.
+- **Prefill chunk.** Prefill touches nearly every expert of every layer in each chunk, so with host
+  or disk experts a larger `--prefill-chunk` serves more tokens per copy: on an RTX 3090 Ti the long
+  prompt took 6.05 s in 512-token chunks and 4.58 s in 2,048.
 
-| Input tokens | A6000 request seconds, all samples | 2×3090 request seconds, all samples | Median change | Prefill tok/s, A6000 / 2×3090 | Decode tok/s, A6000 / 2×3090 |
-|---:|---|---|---:|---:|---:|
-| 4,032 | 3.974 / 3.976 / 3.992 | 2.591 / 2.583 / 2.589 | -34.88% | 1,267.9 / 2,167.7 | 79.18 / 87.19 |
-| 33,024 | 28.396 / 28.715 / 28.904 | 15.400 / 15.469 / 15.575 | -46.13% | 1,184.0 / 2,242.1 | 76.60 / 85.22 |
-| 131,008 | 128.705 / 128.904 / 128.959 | 66.493 / 66.848 / 67.172 | -48.14% | 1,023.4 / 1,983.7 | 70.88 / 78.52 |
+Every GSQ-RCO release (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S and the Coder IQ1_M) answers the generate
+test's prompts with disk and host experts, with and without CUDA graphs; with disk experts the
+process peaks at 1.05 to 1.19 GB of RAM. The published layout (models without the table, the shared
+table artifact) passed device, host and disk placements, batched against single decoding, a
+restored snapshot, an image question per release and the server's concurrency, prefix reuse and
+JSON Schema checks on one NVIDIA L40S.
 
-Phase rates use the median phase time; decode covers the 63 intervals after the first token.
-These compare the two host configurations, including their hardware and selected kernel routes;
-they do not isolate a gain from splitting the model. A test-package export also overlapped part
-of the A6000 run. Both configurations repeat exactly. Cross-host identity passes at 128K and
-fails at 4K/32K: all three samples differ in 53 of 64 tokens, beginning at output index 9, after
-the first model EOS at index 4. The prefixes through that EOS are identical. The full fixed-length
-output difference remains visible; its cause is not established by these timings or by prefix
-agreement. A completed diagnostic applied the A6000 route choices to the two RTX 3090s, using
-Op defaults for additional 3090 profile keys. Its outputs are identical to the original split
-run at every context and repeat; this route change did not remove the cross-host difference.
-It is not a calibration of those routes for the 3090. On October 9, the user accepted differences
-after EOS and closed M7. All nine cross-host comparisons match through the first EOS, and all
-fixed-mode repeats remain exact. The full-output differences and unresolved cause remain recorded.
-The comparison tool's `--eos-token 248046` option applies this accepted boundary without hiding raw differences.
+Where a decode step goes, from an Nsight Systems trace of the generate test's graph-replayed steps
+(Q2_0, every expert on that L40S): about 1,780 kernels and copies in 10.6 ms, 0.5 ms of it idle
+between them. A token read about 4 GB of weights when the hyper-connection projections were BF16,
+the largest share (1.27 GB, more than the ten routed experts of every layer, 0.66 GB); they are
+Q8_0 now, 0.67 GB.
 
-**MTP.** The Q2_0 release with Unsloth's `shared-Q8_0` MTP block, converted into one file with its
+### Host experts on one RTX 3090
+
+One RTX 3090 (24 GB, PCIe 4.0 x16) with an i9-11900KF and 125 GB RAM, driver 580.82.09 and
+CUDA 13.1 ran the Q2 model (GSQ-RCO Q2_0 with the IQ4_NL table) through `ninfer-serve` with host
+experts, int8 KV, an 8,192-position context and one request at a time. Three prompts (a Python
+LRU cache, the blue sky, the history of the Great Wall in Chinese) ran in that order twice, 256
+greedy output tokens each, so a prompt's second run follows the other two. Each binary ran every
+configuration once; the baseline is commit `a9155e0`.
+
+| Mode | Baseline decode, tok/s (first / second run) | October 9 build |
+|---|---|---|
+| plain, code / prose / Chinese | 69.2/78.4, 77.9/80.6, 74.1/79.4 | 87.3/92.3, 93.7/94.3, 93.4/94.3 |
+| MTP 2 drafts | 68.6/70.0, 71.9/73.4, 57.2/62.4 | 118.8/118.6, 117.3/114.8, 95.8/101.2 |
+| MTP 3 drafts | 66.7/66.9, 67.2/68.3, 53.0/57.5 | 121.2/122.6, 117.7/111.1, 90.0/94.6 |
+| MTP 4 drafts | 63.1/62.2, 60.5/60.9, 44.9/48.2 | 111.1/105.9, 101.9/96.2, 74.6/78.5 |
+| disk experts, code / prose (first run) | 64.5, 66.8 | 68.1, 71.4 |
+
+The baseline predates the tiered admission of staged misses and Q2_0's transposed decoding. Run
+back to back, a repeated prompt decodes at
+98.5 (code) and 100.4 (prose) tokens/s plain and 137.6 and 123.7 with three drafts. A cache that
+admitted every miss into the least recently used slot let a passing decode evict the experts other
+prompts keep routing to; the tiers (below 1.5, below 6, and more routes) restored second-run starts
+of 212-305 ms instead of 284-397 ms on a second RTX 3090 for at most 4.4% of first-run decode.
+
+### MTP
+
+The Q2_0 release with Unsloth's `shared-Q8_0` MTP block, converted into one file with its
 table, on two RTX 3090s (350 W, PCIe 4.0 x16, one GPU per socket of an EPYC 7663 host with 629 GB
 of RAM, no peer access), 2026-10-07: greedy decoding of a 117-token answer to a 37-token coding
 prompt, two runs each. Every speculative output is the plain decode's, token for token.
@@ -1192,53 +660,32 @@ prompt, two runs each. Every speculative output is the plain decode's, token for
 | RTX 3090, experts in pinned host memory | none | 39.3-44.1 tok/s | | |
 | RTX 3090, experts in pinned host memory | 3 | 47.4-49.4 tok/s | 95.6% | 3.87 |
 
-Before verification and drafting replayed CUDA graphs the same runs decoded at 89.5-90.7 tok/s plain
-(128.3-128.9, 146.2-147.9, 165.9-166.5 and 167.3-169.0 with one to four drafts). Coding answers are what MTP drafts best; a prose answer (80 tokens on the water cycle) keeps 38.6% of three drafts, 2.16 tokens a round, and decodes at 91.6 tok/s, no faster than without drafts.
+Coding answers are what MTP drafts best; a prose answer (80 tokens on the water cycle) keeps 38.6%
+of three drafts, 2.16 tokens a round, and decodes at 91.6 tok/s, no faster than without drafts.
 With host experts a verification's four columns route to up to four times as many experts, each
-missing one crossing the bus, so three drafts gain about 12% (three runs each, pinned to the GPU's NUMA node). The first prompt after startup
-prefills in 102-121 ms (379-406 ms before the startup warm-up, which loads the
-kernels the first request would otherwise load).
+missing one crossing the bus, so three drafts gained about 12% here; after the October 9
+host-expert work three drafts decode 90-123 tok/s against 87-94 plain (table above).
 
-**Device expert cache.** With host or disk experts the device expert cache takes the memory the GPU
-has free, and the generate test answers its prompts right after the load. The rows therefore
-measure a cache that is still filling: 94 GB of it on the PRO 6000, where nearly every expert ends
-up resident, and 30 GB on the RTX 5090.
+### Hyper-connections in Q8_0
 
-**Host link.** Host and disk experts cross the host link: PCIe 5.0 x16 on the RTX 5090 host,
-PCIe 4.0 x16 on the PRO 6000 host. That is the likeliest reason the RTX 5090's host-expert row beats
-the PRO 6000's.
+The hyper-connection projections (97 down/up pairs and 96 inject matrices) are stored as ggml Q8_0,
+0.67 GB instead of 1.27 GB in BF16. On the rented RTX 3090 of the tier measurements, plain decode
+went from 81.3-93.6 to 84.5-97.7 tok/s and decode with three MTP drafts from 84.5-114.4 to 83.0-120.4.
+Up to eight tokens the kernels decode the weights to exact FP32 values; wider calls round them to
+BF16 for the tensor-core products, which costs prompts and batches of nine or more tokens 5-57% more
+for these reads. Perplexity with host experts (4,096-token windows advancing by 2,048, int8 KV):
 
-**CUDA graphs.** Graphs add 27% to the short-answer decode on the two RTX 5090s (107.0 tok/s eager)
-and 23 to 26% on the PRO 6000 (111.0-111.2 tok/s eager).
+| Corpus | BF16 | Q8_0 | Change |
+|---|---:|---:|---:|
+| `perplexity-1m` | 3.93783 | 3.93842 | +0.015% |
+| `perplexity-heldout-2026-09` | 4.69573 | 4.69673 | +0.021% |
 
-On the current code every GSQ-RCO release, converted into one file with its table, answers the
-generate test's prompts (the facts and the 4,463-token needle) on that card with disk experts and
-with host experts, with CUDA graphs and without: Q2_0, IQ2_XS (39.2 GB, 35.5 GB pinned), IQ3_XXS
-(47.0 GB, 42.9 GB pinned), IQ3_S, and the Coder build's IQ1_M (29.6 GB, 256 experts, 25.1 GB pinned).
-Q2_0 also ran with its experts on two GPUs before the table moved into the artifact. With disk
-experts the process peaked at 1.05 to 1.19 GB of RAM for IQ2_XS, IQ3_XXS and IQ1_M, and at 1.10 GB
-for IQ3_S (an L40S host).
+### Against llama.cpp
 
-The published layout, each model without its table and with its Vision tower plus the shared table
-artifact, was checked on one NVIDIA L40S (an sm_86 build): the generate test with device, host and
-disk experts for Q2_0, host and disk for IQ3_S and the Coder build, three sequences decoded as one
-batch against each decoded alone, a restored snapshot, an image question per release, and the
-server's concurrency, prefix reuse and JSON Schema checks.
-
-Where a decode step goes, from an Nsight Systems trace of the generate test's graph-replayed steps
-(Q2_0, every expert on that L40S): about 1,780 kernels and copies in 10.6 ms, 0.5 ms of it idle
-between them. A token reads about 4 GB of weights, and the BF16 hyper-connection projections are
-the largest share: 97 down/up pairs of 6.5 MB each, 1.27 GB, more than the ten routed experts of
-every layer (0.66 GB). Their GEMVs take 2.2 ms, the routed experts 1.75 ms, the GGUF projections
-of the Gated DeltaNet and attention layers with the head about 2.9 ms, and the router, shared
-experts, activation quantization, recurrent and sparse-attention kernels the rest. With host
-experts on a 24 GB card the expert kernels read what the cache lacks across the bus and take most
-of the step instead.
-
-llama.cpp runs the same GGUFs with the experts on the CPU (`--n-cpu-moe 48`). On the second
-machine above (23 threads) llama-bench gives 29.6 tok/s decode (tg128) and 312 tok/s prefill
-(pp512) for IQ3_S, and 12.7 and 368 tok/s for Q2_0; the first RTX 3090's machine (32 threads) gave
-11.2 and 267 tok/s for Q2_0. Its speed follows the host CPU, and its Q2_0 CPU path is the slower one.
+llama.cpp runs the same GGUFs with the experts on the CPU (`--n-cpu-moe 48`). On the IQ3_S host
+above (23 threads) llama-bench gives 29.6 tok/s decode (tg128) and 312 tok/s prefill (pp512) for
+IQ3_S, and 12.7 and 368 tok/s for Q2_0; the Q2_0 RTX 3090 host (32 threads) gave 11.2 and 267
+tok/s for Q2_0. Its speed follows the host CPU, and its Q2_0 CPU path is the slower one.
 
 Perplexity agrees with llama.cpp: over the first 72 KB of the WikiText sample in
 `eval/corpora/perplexity-1m`, 2,560-token windows advancing by 1,024 targets (llama.cpp's
@@ -1275,6 +722,8 @@ NInfer is the CUDA 12.9 `120a` build that served the evaluation below, llama.cpp
 CUDA 12.9 and every layer on the GPUs (2026-10-06). llama.cpp's window values come from its
 running perplexity, printed to four decimals, so they are good to about 0.0003 nats. Perplexity
 runs prompt passes only; the decode steps that wrote the evaluation's answers are not part of it.
+
+### Reasoning benchmarks
 
 Accuracy on the two reasoning benchmarks of the GSQ-RCO card that EvalScope scores without a code
 sandbox, for the Q2_0 release with its table, every expert on two RTX 5090s (`--devices 0,1`), a

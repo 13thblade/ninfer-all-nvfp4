@@ -23,7 +23,7 @@ The default configuration is Release. Ninja links and archives share the single-
 
 The opt-in kernel, build and platform options (`NINFER_SM120_NATIVE`, `NINFER_PDL`,
 `NINFER_MULTICALL`, the SFU and Windows options, and the rest) are listed in the
-[Linux build guide](../rtx-3090-linux.md#build-options).
+[Linux build guide](../build-linux.md#build-options).
 
 Apps or tests enable the internal product support components: media acquisition, prompt input,
 logging and serving. This is one derived condition, not a separate user option. FFmpeg belongs

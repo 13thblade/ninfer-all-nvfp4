@@ -315,10 +315,17 @@ cmake --build build --parallel --target ninfer_benches
   --qtype fp8 --policy a8 --n 16384 --k 5120 --t 1024
 ```
 
-Linear tuning measures every valid T through 128 and the two bulk anchors, 512 and 1024.
-[Linear tuning and performance reports](../docs/maintainer/linear-tuning.md) defines workload
-priorities, dispatch tradeoffs, and the final curve and metric tables. Respect each Op's extent
-alignment; these measurement targets do not limit supported T.
+Linear tuning measures every valid T through 128 and the two bulk anchors, 512 and 1024
+([Op development](../docs/maintainer/op-development.md)). Respect each Op's extent alignment; these
+measurement targets do not limit supported T. Where a boundary between schedules should sit is a
+separate question that `ninfer_linear_schedule_bench` answers: it times every candidate launch of a
+shape at the same column count, including candidates the shape table never selects, and names the
+one the table routes to:
+
+```bash
+./build/bench/ninfer_benches ninfer_linear_schedule_bench q4:131072x5120 --repeat 11 --spread
+./build/bench/ninfer_benches ninfer_linear_schedule_bench q8:2048x16384 --tokens 24,32,40,48 --only k32,mma
+```
 
 A continuous small-T sweep reuses one packed weight and one maximum-T activation/output
 allocation:
