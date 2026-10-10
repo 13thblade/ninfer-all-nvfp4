@@ -202,13 +202,6 @@ The product `ninfer_bench` accepts the same ngram flags and preserves these
 counters in table, CSV and JSON reports. Its ordinary one-token decode seed is
 not a copy workload; see [benchmark guidance](../bench/README.md).
 
-The [scope proposal](https://github.com/Neroued/ninfer/issues/234) links RTX 5090
-copy, edit and compaction measurements with their artifacts, toolchain, commands
-and correctness checks. Those pre-v3 results belong to the source revisions in
-the [evidence release](https://github.com/remesis/ninfer/releases/tag/ngram-mod-evidence-20260912),
-not to later rebases. Remeasure the relevant workload before attributing the same
-gain to another revision or configuration.
-
 ## Real-Artifact Checks
 
 These programs run from the test bundle, for example

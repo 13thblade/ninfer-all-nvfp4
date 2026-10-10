@@ -12,7 +12,7 @@ English reference text, English long-form text, Chinese reference text, and NInf
 `full` selects all streams; `--quick` selects one stream from each domain.
 
 ```bash
-./build/apps/ninfer-perplexity models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
   --corpus eval/corpora/perplexity-1m/manifest.json \
   --quick \
   --kv-dtype int8

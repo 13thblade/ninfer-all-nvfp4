@@ -3,7 +3,7 @@
 This is the README that ships **inside** the Linux release archive, where every file sits in one
 directory. If you are reading it in a checkout instead, the launchers and downloaders it names live
 under `scripts/`, and
-[docs/rtx-3090-linux.md](https://github.com/iamwavecut/ninfer-all/blob/master/docs/rtx-3090-linux.md)
+[docs/build-linux.md](https://github.com/iamwavecut/ninfer-all/blob/master/docs/build-linux.md)
 is the guide to building from source. Links here are absolute on purpose: the archive ships no
 `docs/` directory.
 
@@ -13,7 +13,7 @@ changed.
 ## Requirements
 
 - x86-64 Linux with glibc 2.38 or newer (the binaries are built on Ubuntu 24.04)
-- GeForce RTX 3090 (or 3090 Ti) with a recent NVIDIA driver
+- an RTX 30 or RTX 40 series card (the archive carries an `sm_86` build) with a recent NVIDIA driver
 - The CUDA 12.8 runtime libraries, **including cuBLAS** (`libcudart.so.12`, `libcublas.so.12`,
   `libcublasLt.so.12`). The cuBLAS prefill route links it, so the binaries need it even when you do
   not turn that route on. From NVIDIA's CUDA repository: `sudo apt install cuda-libraries-12-8`

@@ -9,13 +9,13 @@ artifacts as a [router](#several-models-router), one Engine per loaded model.
 See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b.ninfer \
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 240000 \
   --kv-capacity 240000 \
   --max-concurrency 2 \
-  --kv-dtype int8 \
+  --kv-dtype rk4v4 \
   --device-state-slots 2 \
   --host-state-slots 8 \
   --host-kv-mib 8192 \
@@ -24,7 +24,8 @@ See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_C
   --preserve-thinking
 ```
 
-The command uses Qwen3.8-27B NVFP4. Each request has a 240,000-token logical ceiling. A shared
+The command uses the official Qwen3.8-27B `groupwise-int` artifact. Each request has a
+240,000-token logical ceiling. A shared
 240,000-token Main Text KV pool serves admitted requests; either request may use the full capacity
 when running alone, and two requests run concurrently when their complete reservations fit.
 
@@ -1676,7 +1677,7 @@ a trained `softprompt_kv` or `direct_kv` graft carries cache state that NInfer w
 (both described below).
 
 ```bash
-ninfer-serve model.ninfer --graft v1=C:/grafts/v1_q38_nf4.bin --graft red=C:/grafts/red.bin
+ninfer-serve model.ninfer --graft v1=grafts/qwen38-27b/v1.bin --graft red=grafts/qwen38-27b/red.bin
 ```
 
 A request selects one with the top-level `"graft": "NAME"` field on OpenAI Chat Completions,
@@ -1780,15 +1781,16 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | off |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
-| `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see [pipeline stages](maintainer/pipeline-parallel-plan.md)); on the Qwen3.5 family MTP, DFlash and DFlash2 run across the stages and Vision is refused; overrides `--device` | none |
+| `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see [pipeline stages](maintainer/pipeline-stages.md)); on the Qwen3.5 family MTP, DFlash and DFlash2 run across the stages and Vision is refused; overrides `--device` | none |
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
 | `--expert-residency device\|host\|disk` | Qwen3.8-Flash-Next: routed expert banks in GPU memory, in pinned host memory read across the bus, or left in the artifact's files and streamed into the device expert cache (see [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#run)) | `device` |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; `0` turns the host-mode cache off, and disk mode needs one | `auto` (what is free after startup) |
-| `--expert-dma-share F` | native host experts: fraction of distinct decode/verify cache misses copied to the GPU, `0..1`; values below `1` enable experimental CPU mixing; prefill uses the GPU | `1` |
-| `--expert-cpu-threads N` | native host experts: `1..256` CPU workers | logical thread count capped at 16 |
-| `--expert-cache-adaptive` | replace cold native experts between calls; changes the CPU/GPU arithmetic partition | off |
-| `--expert-profile PATH` | fill the native expert cache from counts for the same artifact and bank geometry | none |
-| `--expert-profile-out PATH` | record native expert counts after requests | none |
+| `--expert-misses staged\|mapped` | GGUF host experts: copy each missing expert into a device cache slot while the cached experts run (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
+| `--expert-dma-share F` | host or disk experts: the GPU's share of a call's cache misses, `0..1`; below `1` the CPU computes the rest, an experimental mode; prefill always uses the GPU | `1` |
+| `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers | automatic, at most 16 |
+| `--expert-cache-adaptive` | replace cold cached experts between calls; changes the CPU/GPU arithmetic partition | off |
+| `--expert-profile PATH` | fill the host expert cache from counts recorded for the same artifact and bank geometry | none |
+| `--expert-profile-out PATH` | record expert counts for this artifact after requests | none |
 | `--ngram-table PATH` | Qwen3.8-Flash-Next: the n-gram table artifact of a model published without its table | the model's own table |
 | `--ngram-residency disk\|ram\|ram-hot` | Qwen3.8-Flash-Next: where the n-gram rows come from: the table's file, 16 rows per token; all of the table in RAM; or the rows a hot-row profile ranks first in RAM and the rest from the file (see [the n-gram rows](qwen3-8-flash-next.md#the-n-gram-rows)) | `disk` |
 | `--ngram-io buffered\|direct\|mmap` | Qwen3.8-Flash-Next: how rows are read from the file: through the OS page cache, past it, or out of a mapping | `buffered` |
@@ -1823,7 +1825,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--ngram-archive-mib N` | RAM archive that keeps finished requests' copy sources for later requests naming the same `X-NInfer-Draft-Session` | `0` (off) |
 | `--ngram-session-mib N` | per-session share of that archive, 1 MiB up to the archive size | `128` |
 | `--ngram-native-sessions` | with the archive, also recognize the session identities Kilo, Codex and Claude send | off |
-| `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
+| `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [quality trades](maintainer/quality-trade-experiments.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
 | `--no-prefill-a8` | prefill every projection on the A16 routes instead of the integer-activation ones | integer routes |
 | `--mlp-a8-decode` | integer-activation MLP gate_up at decode and verify widths | off |

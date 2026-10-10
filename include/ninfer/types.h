@@ -52,7 +52,7 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8E4M3Row256,
     // RotorQuant rk8v4: rotated INT8 keys with a packed signed int4 value plane over a group-32
     // scale. Ported onto the kv_cache_append Op that owns KV quantization, and opt-in through
-    // --kv-dtype rk8v4. See docs/rtx-3090-windows.md.
+    // --kv-dtype rk8v4. See docs/cli.md, "Context and memory".
     RotatedInt8KeyInt4ValueGroup64,
     // NVFP4 e2m1, group-16 scale, both K and V planes packed two codes per byte.
     Nvfp4Group16,

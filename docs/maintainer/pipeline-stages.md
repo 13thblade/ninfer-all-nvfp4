@@ -5,11 +5,6 @@ layers whole: weights, the KV cache of its attention layers, the recurrent state
 and the scratch it runs in. The point is memory: a model that does not fit one card, or a context
 that does not, spreads across several with every card's memory usable for KV.
 
-This replaces the earlier expert-offload split, which moved only each layer's MLP to the second card
-and kept everything stateful on the first. That design capped KV room at whatever the first card had
-left; whole-layer stages have no such asymmetry, and they cross a device boundary once per stage
-rather than twice per layer.
-
 ## What it is and is not
 
 **It is a memory feature.** The stages run in sequence: while one computes, the others wait.
@@ -162,17 +157,14 @@ crossing per stage boundary per token is about 25 us against a ~21 ms step), and
 decode is within noise. The A4000 pair runs the 27B with its full context and its decode rate matches
 the plan's estimate for a pipeline on 448 GB/s cards.
 
-One defect turned up only on the 48-SM A4000: the GDN gating projection's route table was tuned on 82
-SMs, and its cooperative schedules need their whole grid resident, so the default `--prefill-chunk 1024`
-failed at startup. The covering route now falls through to the first later route that fits the device
-(`ninfer_gdn_gating_proj_test` checks it against an independent grid model at 30 to 84 SMs and
-that the tuned 82-SM routes are unchanged). Its performance on the A4000 has not been tuned.
+On a card with fewer SMs than the tuned route tables assume (the A4000 has 48), a GDN gating
+schedule whose cooperative grid would not be resident falls through to the first later route that
+fits the device; its speed there has not been tuned.
 
 Later checks on real pairs, none with peer access: Ternary Bonsai 2 27B on two RTX 4090s generates
 byte for byte what one GPU does in every row of the stage test, and suspends and resumes with its
-prefix reuse intact ([maintainer map](consolidated-line.md)); Qwen3.8-Flash-Next runs its experts
-over two RTX 3090 Ti, two RTX 4090 and two RTX 5090
-([measurements](../qwen3-8-flash-next.md#measurements)).
+prefix reuse intact; Qwen3.8-Flash-Next runs its experts over two RTX 3090 Ti, two RTX 4090 and two
+RTX 5090 ([measurements](../qwen3-8-flash-next.md#measurements)).
 
 ### DFlash across stages, measured (2026-10-06)
 
@@ -202,12 +194,9 @@ two by the default split, mean of two or three runs. Every split run generated t
 | 35B-A3B DFlash, long, decode | 195.8 / 205.5 | 343.0 / 337.3 | 471.7 / 462.2 | 199.2 / 197.2 |
 | 35B-A3B plain, short, decode | 206.1 / 207.9 | 274.0 / 268.7 | not run | 207.6 / 181.9 |
 
-The 3090 column comes from the first implementation, which sent a stage's taps together after its
-last layer (a second 3090 pair, rented for the final code, had its cards capped at 250 W, so one card
-ran slower than the split and its comparison means nothing; its correctness rows passed). On the 4090
-and A100 pairs both implementations ran interleaved on the same host: decode was equal within 1%,
-and sending each tap as its layer finishes raised the 35B-A3B's long prefill from 11,433 to 11,667
-tok/s (4090) and from 4,777 to 5,173 (A100). The weights per card in the default split were
+The 3090 column was measured with taps sent together after a stage's last layer; sending each tap as
+its layer finishes left decode equal within 1% on the 4090 and A100 pairs and raised the 35B-A3B's
+long prefill from 11,433 to 11,667 tok/s (4090) and from 4,777 to 5,173 (A100). The weights per card in the default split were
 10.3 + 7.74 GiB for the 27B with DFlash2 (18.0 GiB on one card) and 10.6 + 9.41 GiB for the 35B-A3B
 (20.0 GiB); the 27B's workspace grew from 183.9 to 233.9 MiB per card for the boundary and the tap
 staging.
@@ -222,11 +211,6 @@ split showed the kernels themselves running longer (the MoE path kernel +21%, th
 +46%) rather than gaps opening between them. That points at the cards' clocks while they wait for each
 other (the two sit on different sockets of that host); GPU clock metrics are not permitted in the
 container, so the cause is not confirmed.
-
-Launch note for rentals: the CUDA base images carry a `compat` `libcuda.so.1` that GeForce cards
-refuse (`cudaErrorCompatNotSupportedOnDevice`); put `/usr/lib/x86_64-linux-gnu` first in
-`LD_LIBRARY_PATH`. Ubuntu 22.04 needs CMake 3.28+, FFmpeg 6 development packages and libcurl 7.85+
-built or installed separately.
 
 ## Tensor parallelism: status
 
@@ -260,5 +244,4 @@ Not built. What was established, so the next attempt starts from evidence rather
   the `linear_swiglu` Q4 kernel at 17,408 rows and `linear_add` Q5 at K=8,704, each registered for
   those exact shapes and qualified against the FP64 oracle and tuned on the target card (routes
   inherited from the full-width shapes are hypotheses); per-rank replicas of the KV pool and state
-  pool with fan-out in the transactions; and the exchange itself. Expect weeks, and the decisive
-  measurement is the probe on the machine that will run it.
+  pool with fan-out in the transactions; and the exchange itself. The decisive measurement is the probe on the machine that will run it.

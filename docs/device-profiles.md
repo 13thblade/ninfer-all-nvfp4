@@ -117,7 +117,7 @@ differently from a step that serves one, so a request's numbers depend slightly 
 steps, and a greedy answer can change where its two most likely tokens are nearly tied. In a check
 on an RTX 5090 (Ternary Bonsai 2, four lanes), one request sent four times at once matched its lone
 answer in one copy of four with the built-in profile, and in all four with `--device-profile off`
-and `NINFER_PREFILL_ALIGN=0` (as on the previous master) or without the profile's ternary small-T
+and `NINFER_PREFILL_ALIGN=0` (the compiled routes and requested chunks) or without the profile's ternary small-T
 routes; four different documents at once matched their lone answers in one or two of four with the
 profile and in three or four without it. The answers that differ part at such a word and stay
 equivalent: four 60,000-token needle documents served at once returned all twelve codes in order,

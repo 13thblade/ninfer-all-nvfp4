@@ -4,12 +4,12 @@
 `.ninfer` artifact. Build NInfer or pull the image, and download an artifact, as the
 [project README](../README.md) describes before following this guide.
 
-The examples use the Qwen3.8-27B NVFP4 artifact with INT8 KV storage.
+The examples use the official Qwen3.8-27B `groupwise-int` artifact with INT8 KV storage.
 
 ## Text input
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
   --prompt "Summarize the difference between prefill and decode." \
   --max-context 32768 \
   --max-new 8192 \
@@ -27,7 +27,7 @@ written to stderr, so stdout can be redirected independently. FFmpeg's media-dec
 records prefixed `media |`: FFmpeg errors are warnings and everything milder is `debug`.
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
   --prompt "Return one sentence." \
   --max-context 4096 \
   --max-new 64 \
@@ -75,7 +75,7 @@ For example, this allows at most 512 model-origin thinking tokens while retainin
 output capacity for the inserted suffix and the answer:
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
   --prompt "Explain speculative decoding, then give a concise conclusion." \
   --max-context 4096 \
   --max-new 1024 \
@@ -136,7 +136,7 @@ and an optional `tools` array.
 Run message files from the repository root when they contain repository-relative media paths:
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
   --messages examples/cli/messages/image_chart.json \
   --max-context 8192 \
   --max-new 128 \
@@ -229,9 +229,9 @@ guessing right.
 - **DFlash:** seven forms the measured block length eight; fifteen uses the maximum supported block
   length sixteen.
 
-The tables and sweeps are in [performance](performance.md#choosing-the-draft-count-rtx-3090-qwen38-27b).
-The published [performance results](performance.md) use MTP with three draft tokens and DFlash with
-seven, both with the optimized proposal head.
+The tables are in [performance](performance.md#mtp-draft-count-by-content); the
+[reference measurements](performance/reference-2026-09.md#draft-length) sweep one to fifteen drafts
+of both MTP and DFlash2 on four cards.
 
 ## Common options
 
@@ -249,15 +249,16 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see [pipeline stages](maintainer/pipeline-parallel-plan.md)); on the Qwen3.5 family MTP, DFlash and DFlash2 run across the stages and Vision is refused; overrides `--device` | none |
+| `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see [pipeline stages](maintainer/pipeline-stages.md)); on the Qwen3.5 family MTP, DFlash and DFlash2 run across the stages and Vision is refused; overrides `--device` | none |
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
 | `--expert-residency device\|host\|disk` | Qwen3.8-Flash-Next: routed expert banks in GPU memory, in pinned host memory read across the bus, or left in the artifact's files and streamed into the device expert cache (see [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#run)) | `device` |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; `0` turns the host-mode cache off, and disk mode needs one | `auto` (what is free after startup) |
-| `--expert-dma-share F` | native host experts: fraction of distinct decode/verify cache misses copied to the GPU, `0..1`; values below `1` enable experimental CPU mixing; prefill uses the GPU | `1` |
-| `--expert-cpu-threads N` | native host experts: `1..256` CPU workers | logical thread count capped at 16 |
-| `--expert-cache-adaptive` | replace cold native experts between calls; changes the CPU/GPU arithmetic partition | off |
-| `--expert-profile PATH` | fill the native expert cache from counts for the same artifact and bank geometry | none |
-| `--expert-profile-out PATH` | record native expert counts after requests | none |
+| `--expert-misses staged\|mapped` | GGUF host experts: copy each missing expert into a device cache slot while the cached experts run (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
+| `--expert-dma-share F` | host or disk experts: the GPU's share of a call's cache misses, `0..1`; below `1` the CPU computes the rest, an experimental mode; prefill always uses the GPU | `1` |
+| `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers | automatic, at most 16 |
+| `--expert-cache-adaptive` | replace cold cached experts between calls; changes the CPU/GPU arithmetic partition | off |
+| `--expert-profile PATH` | fill the host expert cache from counts recorded for the same artifact and bank geometry | none |
+| `--expert-profile-out PATH` | record expert counts for this artifact after requests | none |
 | `--ngram-table PATH` | Qwen3.8-Flash-Next: the n-gram table artifact of a model published without its table | the model's own table |
 | `--ngram-residency disk\|ram\|ram-hot` | Qwen3.8-Flash-Next: where the n-gram rows come from: the table's file, 16 rows per token; all of the table in RAM; or the rows a hot-row profile ranks first in RAM and the rest from the file (see [the n-gram rows](qwen3-8-flash-next.md#the-n-gram-rows)) | `disk` |
 | `--ngram-io buffered\|direct\|mmap` | Qwen3.8-Flash-Next: how rows are read from the file: through the OS page cache, past it, or out of a mapping | `buffered` |
@@ -276,7 +277,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--lookup-ngram N` | context-lookup drafting alongside `--spec`: the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
 | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
 | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
-| `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
+| `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [quality trades](maintainer/quality-trade-experiments.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
 | `--lm-head-q4`, `--lm-head-q6` | store the output head as Q4 or Q6 while loading | off |
 | `--embedding-q4`, `--embedding-q6` | store the token embedding as Q4 or Q6 while loading | off |
@@ -341,7 +342,7 @@ waiting thread sleep; the decode performance cost depends on the host. `yield` y
 while waiting.
 
 ```bash
-NINFER_CUDA_SYNC=blocking ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer --prompt "Hello"
+NINFER_CUDA_SYNC=blocking ./build/apps/ninfer models/qwen3_8_27b.ninfer --prompt "Hello"
 ```
 
 The Engine-ready log reports the selected mode. Empty or unrecognized values, or failure to apply
@@ -358,7 +359,8 @@ KV format. The artifact describes its model configuration and weight representat
 `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`, `k8v4`, `nvfp4` — are accepted on every
 build target: the Blackwell-only `mma.sync...kind::f8f6f4` restriction applies to FP8/NVFP4
 *weights and activations*, not to KV storage. Measured size, decode speed and perplexity of seven of
-them on an RTX 3090 are in [`docs/config-calculator.html`](config-calculator.html).
+them on an RTX 3090 are in [performance](performance.md#kv-formats-on-qwen38-27b) and the
+[configuration calculator](config-calculator.html).
 
 `rk8v4` is the best all-round choice: rotated INT8 keys with a packed signed int4 value plane,
 about 23% smaller than INT8 for about 0.082% perplexity, and the flattest decode curve of any

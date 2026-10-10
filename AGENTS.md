@@ -57,13 +57,14 @@ three RTX PRO 6000 editions. Upstream (`Neroued/ninfer`) targets `sm_120a` on RT
 routes that this line's `120a` build does not compile by default; its schedules, route tables and
 published measurements are not authoritative here -- every route table this fork inherited and
 re-measured on sm_86 turned out to be wrong by 12-41%. Treat an upstream tuning constant as a
-hypothesis until measured on the card in question. The Windows build environment and its
-compatibility constraints are in "Windows build environment (RTX 3090 fork host)" below.
+hypothesis until measured on the card in question. Windows builds and their toolchain constraints
+are in `docs/build-windows.md`; this repository has no Windows test host and CI does not build
+Windows.
 
 Generation uses one resident model on one GPU, or split into pipeline stages over up to eight
 (`--devices`, Linux only; each stage owns whole layers with their KV and state, and the head,
 round state and sampling stay on the first device; design in
-`docs/maintainer/pipeline-parallel-plan.md`). It runs startup-fixed concurrency of one to eight
+`docs/maintainer/pipeline-stages.md`). It runs startup-fixed concurrency of one to eight
 requests, bounded FIFO ingress, no active-request preemption, and one compact decode batch per
 round. Tensor parallelism is not built.
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
@@ -203,91 +204,6 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 
 ## Local operations
 
-### Windows build environment (RTX 3090 fork host)
-
-Verified 2026-09 by building all 444 targets and running the full 100-test suite. An earlier
-revision of this section was wrong on four points and sent at least one agent down a dead end;
-the corrections are called out at the bottom so anyone reading git history is not re-confused.
-
-**Use the existing `build-ninja/` tree. Do not reconfigure and do not delete it.** It is already
-configured correctly: Release, `CMAKE_CUDA_ARCHITECTURES=86`, `BUILD_TESTING=ON`,
-`NINFER_BUILD_APPS=ON`, FFMPEG resolved through the vcpkg manifest into
-`build-ninja/vcpkg_installed/x64-windows`. Configure on this host is slow; there is nothing to
-gain by redoing it.
-
-The one real trap is that **two MSVC toolchains are installed and the wrong one is first on
-PATH**:
-
-| | version | path |
-|---|---|---|
-| VS 2026 Community | MSVC v145 `14.50.35717` | `C:\Program Files\Microsoft Visual Studio\18\Community` |
-| VS 2022 BuildTools | MSVC v143 `14.44.35207` | `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools` |
-
-CUDA 12.8 hard-errors on v145 (`C1189: unsupported Microsoft Visual Studio version!`), and
-`nvcc` picks up whatever `cl.exe` PATH offers, which by default is VS 2026. `build-ninja`'s cache
-pins the VS 2022 compiler, so the fix is simply to put that environment in front before building.
-Note the `(x86)` in the path — that is the detail the earlier revision missed when it concluded
-VS 2022 was absent.
-
-From PowerShell, import the VS 2022 BuildTools environment and build:
-
-```powershell
-$vcvars = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
-  if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
-}
-Set-Location C:\ninfer-fork\ninfer-3090\build-ninja
-cmake --build .                                  # everything
-cmake --build . --target <name>                  # one target
-ctest -j2                                        # full suite, ~70 s
-ctest -R <regex> --output-on-failure             # one test
-```
-
-That import is reliable; the environment it produces builds cleanly. Adding only the compiler's
-`bin` directory to PATH is *not* enough — the standard library headers go missing
-(`fatal error C1083: Cannot open include file: 'cstdint'`), because `INCLUDE` and `LIB` come from
-vcvars too.
-
-For a standalone `.cu` probe outside the build tree, `nvcc` can be driven directly. Git Bash
-mangles MSVC-style flags (`/wd4819` becomes a path), so use PowerShell:
-
-```powershell
-nvcc -O3 -arch=sm_86 -allow-unsupported-compiler probe.cu -o probe.exe
-```
-
-`-allow-unsupported-compiler` is needed there and only there, because a bare `nvcc` invocation
-finds VS 2026 on PATH. It is not needed for the CMake build and is not in the cache.
-
-Other host facts:
-
-- CMake 3.31.3 at `C:\Program Files\CMake`; Ninja 1.11.1 from the Python 3.13 pip install.
-- Profilers are installed: Nsight Systems 2024.6.2 (`nsys.exe` under
-  `target-windows-x64/`) and Nsight Compute 2025.1.0 (`ncu.bat`). `ncu` needs GPU performance
-  counters, which are admin-only by default — run it from an elevated shell rather than changing
-  `RmProfilingAdminOnly`, which needs two reboots and loosens a system-wide setting.
-- Compilation needs no GPU, so building is always possible. **Executing** CUDA tests, benchmarks
-  or perplexity runs needs free VRAM, and the user often has the server loaded — ask before
-  assuming the device is free.
-- `nvcc` writes `.exp`/`.lib` next to any `-o` target; keep probe builds out of the repo root.
-- An untracked `config.bat` in the repo root is a leftover from the earlier, incorrect recipe. It
-  sets up the VS 2026 v145 environment with `-allow-unsupported-compiler` and reconfigures into
-  `build/`. It is not the supported path; prefer `build-ninja` as above.
-
-Corrections to the previous revision of this section, all verified false:
-
-1. "VS 2022 BuildTools is **not** installed, so caches pinning `14.44.35207` are stale —
-   reconfigure fresh." It is installed, under `Program Files (x86)`, and those caches are live and
-   correct. Reconfiguring is the one thing that actually breaks the build here.
-2. "Do not invoke `vcvars64.bat` from a non-interactive shell." The VS 2022 BuildTools vcvars
-   imports cleanly and non-interactively, as above. The variable flood described belongs to the
-   VS 2026 vcvars, not this one.
-3. "FFMPEG is required and was missing." It is provided by the vcpkg manifest and already present
-   in `build-ninja/vcpkg_installed/x64-windows`. No `-DFFMPEG_DIR` is needed.
-4. "Configure must pass `-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler`." Not for this build;
-   the cache carries `-Xcompiler=/Zc:__cplusplus` and nothing else, because it uses v143.
-
-## Commits
-
 Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
 causes failures or interferes with the task, and briefly explain why.
 
@@ -298,6 +214,11 @@ keeps them (by convention `build/`, `models/`, `profiles/ncu/`, `profiles/nsys/`
 Select model artifacts by explicit path, never glob order, modification time, or unqualified
 “latest”. Source checkpoints and large artifacts are prerequisites; download or regenerate them
 only when that work is in scope. Install or upgrade dependencies only when the task needs it.
+
+Compilation needs no GPU. Executing CUDA tests, benchmarks or perplexity runs needs a free GPU; GPU
+work runs on rented hosts through `scripts/pods` ([pods](scripts/pods/README.md)).
+
+## Commits
 
 Create commits only when requested. Use Conventional Commit subjects with concise lowercase types
 such as `feat`, `fix`, `perf`, `bench`, `test`, `build`, `refactor`, `docs`, or `chore`.

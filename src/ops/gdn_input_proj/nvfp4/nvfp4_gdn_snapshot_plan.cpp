@@ -59,7 +59,8 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
         throw std::invalid_argument(
             "nvfp4 gdn conv: the A16 route is registered only through T=64, and on sm_80/86/89 A16 "
             "is the only policy available for NVFP4 weights, so this artifact cannot serve a "
-            "prefill chunk wider than 64 columns on this architecture. See TODO.md section 1.");
+            "prefill chunk wider than 64 columns on this architecture. Use a groupwise-int "
+            "artifact here; an sm_120a build runs NVFP4 through AllowA4 at any width.");
     }
     if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
     if (tokens <= 3) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }

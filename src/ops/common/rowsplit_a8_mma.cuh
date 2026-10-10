@@ -27,7 +27,7 @@
 // A grid swizzle to encourage L2 reuse of the repeated passes measured within 0.5% of nothing, so
 // the passes have to be removed rather than cached.
 //
-// Everything else the probes tried is recorded in TODO.md: occupancy is worth 6%, and permuting the
+// Of everything else the probes tried, occupancy is worth 6%, and permuting the
 // weights into MMA-fragment order -- which needs a repack AGENTS.md forbids and ~9.7 GB a 24 GB
 // card does not have -- about 17%.
 //

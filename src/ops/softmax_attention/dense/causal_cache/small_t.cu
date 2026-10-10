@@ -90,8 +90,8 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
                                         KvCacheStorage storage) {
     // There used to be a SmallTMaximumSplits bump here for Fp8E4M3Row256 at tokens==1 and
     // window>8198, and the device asked for that bump for *every* quantized storage while only
-    // fp8 was granted it. TODO.md section 2c read the asymmetry as the host shortchanging nvfp4
-    // and k8v4 -- 69 splits where their kernels asked for 85 -- and proposed extending the grant.
+    // fp8 was granted it. The asymmetry read as the host shortchanging nvfp4 and k8v4 -- 69 splits
+    // where their kernels asked for 85 -- and extending the grant was proposed.
     //
     // Measured on this 3090, and it is the other way round: more splits at depth is worse.
     // Extending the grant to nvfp4 and k8v4 cost them 2.3-3.1% on the 35B at every depth, against

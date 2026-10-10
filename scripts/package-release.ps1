@@ -84,7 +84,7 @@ if (-not $Eula -or -not (Test-Path -LiteralPath $Eula)) {
 Copy-Item -LiteralPath $Eula -Destination (Join-Path $ProductRoot 'NVIDIA-CUDA-EULA.txt')
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'VERSION') -Destination $ProductRoot
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'LICENSE') -Destination $ProductRoot
-# The archive README must describe the archive. docs\rtx-3090-windows.md is written for a checkout
+# The archive README must describe the archive. docs\build-windows.md is written for a checkout
 # -- it points at scripts\download-model.bat, and the packager copies that script to the archive
 # root -- so a user following it from inside the archive got a missing-file error.
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'docs\release-archive-windows.md') -Destination (Join-Path $ProductRoot 'README.md')

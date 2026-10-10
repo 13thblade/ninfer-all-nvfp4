@@ -584,7 +584,7 @@ live KV 与 State 的 lane；未启用时每个 prefill unit 只多一次 relaxe
   可承载页数的最小值。产物为许多 Use 只存一份的 auxiliary（输入列 gather、Hadamard 符号向量）只物化在
   rank 0；Model 为每个读取它的其他 rank 保留一份副本（`AuxiliaryReplicas`，两个模型族共用），Use 读取
   权重所在设备上的那一份，因此没有 P2P 的设备之间也不会跨卡访存。设计与限制见
-  [pipeline-parallel-plan.md](pipeline-parallel-plan.md)。
+  [pipeline-stages.md](pipeline-stages.md)。
 
 容量查询消费与执行同源的逐层参数和 Use。Allocation scope 同时用于布局计算与实际执行；
 顺序互斥的 scratch 取峰值，跨阶段仍活跃的数据计入完整存活期。Vision handoff 保留至 Text
