@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <iostream>
 #include <map>
@@ -4957,6 +4958,46 @@ void test_escape_hatch_ranks_shared_prefixes_with_private_owners() {
             "rung destroyed a shared prefix whose eviction the admission did not need");
 }
 
+// NINFER_MAT_DEBUG on or off for the admission inspections that follow.
+void set_materialization_trace(bool on) {
+#ifdef _WIN32
+    _putenv_s("NINFER_MAT_DEBUG", on ? "1" : "");
+#else
+    if (on) {
+        setenv("NINFER_MAT_DEBUG", "1", 1);
+    } else {
+        unsetenv("NINFER_MAT_DEBUG");
+    }
+#endif
+}
+
+void test_mismatching_shared_prefixes_beyond_the_private_catalog() {
+    // A shared prefix-index entry's slot numbers the shared catalog. With more shared slots than
+    // private ones, a prompt whose key differs from every catalogued shared prefix must be
+    // admitted without consulting the private catalog at those slots, traced or not (issue #39:
+    // an access violation on admission). The test target checks container bounds.
+    FakeManager manager = make_manager(1, 1, 4);
+    FakeProgram program;
+    std::uint64_t order = 1;
+    for (const std::uint32_t digest : {71U, 72U, 73U}) {
+        publish_shared_prefix(manager, program, digest, order++, digest,
+                              ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    }
+    for (const bool trace : {false, true}) {
+        set_materialization_trace(trace);
+        auto inspection =
+            manager.inspect(program, FakePreparedPrompt{99}, make_base(99), order);
+        require(inspection.choice.has_value(),
+                "a prompt matching no shared prefix produced no admission choice");
+        require(inspection.choice->summary().prefix_reuse_path !=
+                    PrefixReusePath::SharedStablePrefix,
+                "a prompt reused a shared prefix whose key it does not match");
+    }
+    set_materialization_trace(false);
+    require_shared_reuse(manager, program, 72, order, true,
+                         "a matching prompt no longer reuses its shared prefix");
+}
+
 void test_automatic_shared_capture_reclaims_oldest_catalog_entry() {
     FakeManager manager = make_manager(1, 4, 2);
     FakeProgram program;
@@ -5579,6 +5620,8 @@ int main() {
              test_escape_hatch_sacrifices_oldest_first_and_demotes_the_rest);
     run_test("escape hatch ranks shared prefixes with private owners",
              test_escape_hatch_ranks_shared_prefixes_with_private_owners);
+    run_test("mismatching shared prefixes beyond the private catalog",
+             test_mismatching_shared_prefixes_beyond_the_private_catalog);
     run_test("shared capture seal failure skips instead of throwing",
              test_shared_capture_seal_failure_skips_instead_of_throwing);
     run_test("automatic reclaim picks the least recently used entry",
