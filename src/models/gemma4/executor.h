@@ -33,11 +33,32 @@ struct ExecutorOptions {
     // Drafts a speculative round may propose per sequence (0: no assistant); a verification's rows,
     // the anchors and drafts of all its sequences, are at most 8.
     std::uint32_t draft_tokens = 0;
+    // Prompt chunks may carry media (a model loaded with its vision tower): the most patches one
+    // media unit (an image or a video frame) has, which also bounds a batch of units the device
+    // tower encodes at once. 0: text only.
+    std::uint32_t vision_max_patches = 0;
+};
+
+// One media item's units in a prompt chunk: consecutive units (an image, or frames of a video) of
+// grid_w x grid_h patches, and the chunk row of each unit's first soft token; a unit's
+// (grid_w / pooling) x (grid_h / pooling) soft tokens fill the rows from there. The units come as
+// their patches, BF16 [units][grid_h * grid_w][patch features] in host memory, which the device
+// tower encodes, or as soft-token embeddings already computed (the CPU tower), BF16
+// [units][tokens][hidden] in host memory.
+struct ChunkMedia {
+    std::int32_t grid_w = 0, grid_h = 0;
+    std::span<const std::uint16_t> patches;
+    std::span<const std::uint16_t> embeddings;
+    std::vector<std::uint32_t> rows;
 };
 
 struct ExecutorMemory {
     std::uint64_t kv_bytes        = 0;
     std::uint64_t workspace_bytes = 0;
+    // A device vision tower: the scratch of one encode within workspace_bytes, and the device bytes
+    // the tower owns beside the model's weights (the streamed window and its resident copies).
+    std::uint64_t vision_encode_bytes = 0;
+    std::uint64_t vision_owned_bytes  = 0;
 };
 
 // A sequence's sliding-window rings and position, which Executor::restore resumes from; the
@@ -65,9 +86,17 @@ public:
     // Loads the kernels every route reaches, and captures the decode graphs.
     void warm_up();
     // Runs up to prefill_chunk tokens at the sequence's next positions and leaves the logits of the
-    // last `logit_rows` (at most kMaxLogitRows) in logits().
+    // last `logit_rows` (at most kMaxLogitRows) in logits(). The soft tokens of `media` take the
+    // place of their rows' placeholder embeddings, and with the vision config's bidirectional
+    // attention a unit's soft tokens see each other in the sliding-window blocks; a unit must lie
+    // whole in one chunk.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                 std::uint32_t logit_rows);
+                 std::uint32_t logit_rows, std::span<const ChunkMedia> media = {});
+    // Whether prompt chunks may carry media.
+    [[nodiscard]] bool vision() const noexcept;
+    // The device time the last forward() spent on its media (encoding and placing its soft
+    // tokens); waits for it.
+    [[nodiscard]] double last_media_seconds() const;
     // One token of each of `sequences` (distinct) at its next position; logits one column each.
     void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
     // BF16 [vocab, rows], ready on head_stream().

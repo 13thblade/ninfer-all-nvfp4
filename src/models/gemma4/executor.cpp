@@ -3,6 +3,8 @@
 #include "core/decode_graph.h"
 #include "core/weight_view.h"
 #include "models/gemma4/kernels.h"
+#include "models/gemma4/vision.h"
+#include "models/gemma4/vision_kernels.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/weight_input.h"
@@ -17,6 +19,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -130,8 +133,14 @@ struct Executor::Impl {
     DeviceBuffer rope_full;
     std::vector<std::uint32_t> positions;
     // Device staging: tokens, positions, sequences for up to max(prefill_chunk, sequences) rows.
-    // d_keys: the assistant's last visible key position per row.
-    DeviceBuffer d_tokens, d_positions, d_sequences, d_keys;
+    // d_keys: the assistant's last visible key position per row. d_blocks: a prompt chunk row's
+    // media unit (-1: text), d_unit_rows: each unit's first row, for the chunk's media.
+    DeviceBuffer d_tokens, d_positions, d_sequences, d_keys, d_blocks, d_unit_rows;
+    // The vision tower (prompt chunks with media), and events around the last chunk's media.
+    std::optional<VisionTower> vision;
+    bool vision_media = false;
+    cudaEvent_t media_begin = nullptr, media_end = nullptr;
+    bool media_timed = false;
     std::unique_ptr<PinnedHostBuffer> h_staging;
     // Recorded after the staging copies: the next stage() rewrites the pinned buffer only once
     // the previous copies have read it (a prompt chunk that keeps no logits is not synchronized).
@@ -359,13 +368,35 @@ struct Executor::Impl {
         d_positions = DeviceBuffer(rows * 4);
         d_sequences = DeviceBuffer(rows * 4);
         d_keys      = DeviceBuffer(rows * 4);
-        h_staging   = std::make_unique<PinnedHostBuffer>(4 * rows * 4);
+        d_blocks    = DeviceBuffer(rows * 4);
+        d_unit_rows = DeviceBuffer(rows * 4);
+        h_staging   = std::make_unique<PinnedHostBuffer>(kStagingRegions * rows * 4);
+        if (options.vision_max_patches > 0) {
+            if (!model.vision_config()) {
+                throw std::invalid_argument("gemma4 executor: media needs the model's vision tower");
+            }
+            vision_media = true;
+            CUDA_CHECK(cudaEventCreate(&media_begin));
+            CUDA_CHECK(cudaEventCreate(&media_end));
+            if (model.vision_placement() == VisionPlacement::Device ||
+                model.vision_placement() == VisionPlacement::Pinned) {
+                // One batch holds the largest unit, or as many smaller ones (video frames).
+                vision.emplace(model, options.vision_max_patches);
+            }
+        }
         if (options.draft_tokens > 0) { plan_assistant(); }
         staged      = std::make_unique<CudaCompletionEvent>(device);
         logits_bf16 = DeviceBuffer(std::size_t(vocab) * kMaxLogitRows * 2);
         workspace_bytes = plan_workspace();
         workspace       = std::make_unique<WorkspaceArena>(workspace_bytes);
     }
+
+    ~Impl() {
+        if (media_begin != nullptr) { cudaEventDestroy(media_begin); }
+        if (media_end != nullptr) { cudaEventDestroy(media_end); }
+    }
+    Impl(const Impl&)            = delete;
+    Impl& operator=(const Impl&) = delete;
 
     void plan_assistant() {
         const AssistantConfig& ac = *model.assistant_config();
@@ -481,7 +512,16 @@ struct Executor::Impl {
                                                        decode_splits_full) * 4 +
             kernels::decode_attention_workspace_floats(int(options.sequences), query_heads, 256,
                                                        decode_splits_sliding) * 4;
-        return bytes + moe + round_up(decode, kAlign) + gguf_scratch + (16u << 20);
+        std::size_t total = bytes + moe + round_up(decode, kAlign) + gguf_scratch + (16u << 20);
+        if (vision) {
+            // A chunk's embeddings, then one tower batch at a time beside them.
+            total = std::max(total, round_up(t * h * 4, kAlign) + vision->workspace_bytes());
+        } else if (vision_media) {
+            // Soft tokens computed on the host: one unit's at a time beside the embeddings.
+            total = std::max(total, round_up(t * h * 4, kAlign) + round_up(t * h * 2, kAlign) +
+                                        (std::size_t(4) << 20));
+        }
+        return total;
     }
 
     static constexpr int kHeadRows = 64; // LM-head columns per FP32 plane pass
@@ -524,16 +564,33 @@ struct Executor::Impl {
         }
     }
 
-    // Tokens, positions, and when given sequences and key positions, to the device.
+    static constexpr std::size_t kStagingRegions = 6;
+
+    // Tokens, positions, and when given sequences, key positions, a chunk's media unit per row and
+    // its units' first rows, to the device.
     void stage(std::span<const std::int32_t> a, std::span<const std::int32_t> b,
-               std::span<const std::int32_t> c, std::span<const std::int32_t> d = {}) {
+               std::span<const std::int32_t> c, std::span<const std::int32_t> d = {},
+               std::span<const std::int32_t> e = {}, std::span<const std::int32_t> f = {}) {
         staged->synchronize();
         auto* host = static_cast<std::int32_t*>(h_staging->data());
         const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, options.sequences);
+        if (e.size() > rows || f.size() > rows) {
+            throw std::invalid_argument("gemma4 executor: staging overflow");
+        }
         std::copy(a.begin(), a.end(), host);
         std::copy(b.begin(), b.end(), host + rows);
         std::copy(c.begin(), c.end(), host + 2 * rows);
         std::copy(d.begin(), d.end(), host + 3 * rows);
+        std::copy(e.begin(), e.end(), host + 4 * rows);
+        std::copy(f.begin(), f.end(), host + 5 * rows);
+        if (!e.empty()) {
+            CUDA_CHECK(cudaMemcpyAsync(d_blocks.p, host + 4 * rows, e.size() * 4,
+                                       cudaMemcpyHostToDevice, stream));
+        }
+        if (!f.empty()) {
+            CUDA_CHECK(cudaMemcpyAsync(d_unit_rows.p, host + 5 * rows, f.size() * 4,
+                                       cudaMemcpyHostToDevice, stream));
+        }
         CUDA_CHECK(cudaMemcpyAsync(d_tokens.p, host, a.size() * 4, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(d_positions.p, host + rows, b.size() * 4,
                                    cudaMemcpyHostToDevice, stream));
@@ -746,12 +803,68 @@ struct Executor::Impl {
 
     // ---- Prompt chunks -----------------------------------------------------------------------------
 
+    // The soft tokens of a chunk's media into its FP32 embeddings h, item by item; the device
+    // tower encodes as many of an item's units at once as its capacity holds.
+    void place_media(std::span<const ChunkMedia> media, float* h) {
+        const VisionConfig& vc = *model.vision_config();
+        const int pooling      = int(vc.pooling_kernel_size);
+        std::size_t unit_row   = 0; // this item's first entry of d_unit_rows
+        for (const ChunkMedia& item : media) {
+            const int per_unit = item.grid_w * item.grid_h;
+            const int tokens   = (item.grid_w / pooling) * (item.grid_h / pooling);
+            const int units    = int(item.rows.size());
+            const int* rows    = static_cast<const std::int32_t*>(d_unit_rows.p) + unit_row;
+            unit_row += item.rows.size();
+            if (!item.embeddings.empty()) {
+                if (item.embeddings.size() != std::size_t(units) * tokens * hidden) {
+                    throw std::invalid_argument("gemma4 forward: media embeddings do not match");
+                }
+                for (int u = 0; u < units; ++u) {
+                    auto unit_scope = workspace->scope();
+                    auto* soft      = static_cast<__nv_bfloat16*>(
+                        workspace->alloc_bytes(std::size_t(tokens) * hidden * 2).data);
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        soft, item.embeddings.data() + std::size_t(u) * tokens * hidden,
+                        std::size_t(tokens) * hidden * 2, cudaMemcpyHostToDevice, stream));
+                    vision_kernels::scatter_rows(soft, tokens, tokens, hidden, rows + u, h,
+                                                 stream);
+                }
+                continue;
+            }
+            if (!vision) { throw std::logic_error("gemma4 forward: no device vision tower"); }
+            if (item.patches.size() != std::size_t(units) * per_unit * vc.patch_features() ||
+                per_unit <= 0 || std::uint32_t(per_unit) > vision->max_patches()) {
+                throw std::invalid_argument("gemma4 forward: media patches do not match");
+            }
+            const int batch = int(vision->max_patches()) / per_unit;
+            for (int u = 0; u < units; u += batch) {
+                const int n     = std::min(batch, units - u);
+                auto batch_scope = workspace->scope();
+                const std::size_t values = std::size_t(n) * per_unit * vc.patch_features();
+                auto* patches            = static_cast<__nv_bfloat16*>(
+                    workspace->alloc_bytes(values * 2).data);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    patches,
+                    item.patches.data() + std::size_t(u) * per_unit * vc.patch_features(),
+                    values * 2, cudaMemcpyHostToDevice, stream));
+                auto* soft = static_cast<__nv_bfloat16*>(
+                    workspace->alloc_bytes(std::size_t(n) * tokens * hidden * 2).data);
+                vision->encode(patches, n, item.grid_w, item.grid_h, soft, *workspace, stream);
+                vision_kernels::scatter_rows(soft, n * tokens, tokens, hidden, rows + u, h,
+                                             stream);
+            }
+        }
+    }
+
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                 std::uint32_t logit_rows) {
+                 std::uint32_t logit_rows, std::span<const ChunkMedia> media = {}) {
         const int t = int(tokens.size());
         if (sequence >= options.sequences || t <= 0 || std::uint32_t(t) > options.prefill_chunk ||
             logit_rows == 0 || logit_rows > std::min<std::uint32_t>(t, kMaxLogitRows)) {
             throw std::invalid_argument("gemma4 forward: invalid call");
+        }
+        if (!media.empty() && !vision_media) {
+            throw std::invalid_argument("gemma4 forward: media needs an executor with vision");
         }
         const std::uint32_t first = positions[sequence];
         if (first + std::uint32_t(t) > options.max_context) {
@@ -759,19 +872,54 @@ struct Executor::Impl {
         }
         std::vector<std::int32_t> pos(t);
         for (int i = 0; i < t; ++i) { pos[i] = std::int32_t(first) + i; }
-        stage(tokens, pos, {});
+        // Each row's media unit (-1 for text) and each unit's first row.
+        std::vector<std::int32_t> blocks, unit_rows;
+        if (!media.empty()) {
+            const int pooling = int(model.vision_config()->pooling_kernel_size);
+            blocks.assign(t, -1);
+            for (const ChunkMedia& item : media) {
+                const int tokens_per_unit = (item.grid_w / pooling) * (item.grid_h / pooling);
+                if (item.grid_w <= 0 || item.grid_h <= 0 || item.grid_w % pooling != 0 ||
+                    item.grid_h % pooling != 0) {
+                    throw std::invalid_argument("gemma4 forward: invalid media grid");
+                }
+                for (const std::uint32_t row : item.rows) {
+                    if (row + std::uint32_t(tokens_per_unit) > std::uint32_t(t)) {
+                        throw std::invalid_argument("gemma4 forward: a media unit leaves the chunk");
+                    }
+                    const std::int32_t unit = std::int32_t(unit_rows.size());
+                    for (int i = 0; i < tokens_per_unit; ++i) {
+                        if (blocks[row + i] != -1) {
+                            throw std::invalid_argument("gemma4 forward: media units overlap");
+                        }
+                        blocks[row + i] = unit;
+                    }
+                    unit_rows.push_back(std::int32_t(row));
+                }
+            }
+        }
+        stage(tokens, pos, {}, {}, blocks, unit_rows);
         workspace->reset();
         auto scope = workspace->scope();
         auto* h    = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * hidden * 4).data);
         embed(t, h);
-        // Masks: the sliding ring and the full-attention prefix.
+        media_timed = !media.empty();
+        if (media_timed) {
+            CUDA_CHECK(cudaEventRecord(media_begin, stream));
+            place_media(media, h);
+            CUDA_CHECK(cudaEventRecord(media_end, stream));
+        }
+        // Masks: the sliding ring and the full-attention prefix. With bidirectional vision
+        // attention, a media unit's soft tokens see each other in the sliding ring.
+        const bool bidirectional = !media.empty() && model.vision_config()->bidirectional_attention;
         const int full_slots = int(round_up(first + t, 256));
         auto* mask_ring = static_cast<__half*>(
             workspace->alloc_bytes(std::size_t(t) * prefill_ring * 2).data);
         auto* mask_full =
             static_cast<__half*>(workspace->alloc_bytes(std::size_t(t) * full_slots * 2).data);
         kernels::build_mask(mask_ring, t, prefill_ring, int(first), prefill_ring,
-                            int(config.sliding_window), stream);
+                            int(config.sliding_window), stream,
+                            bidirectional ? static_cast<const std::int32_t*>(d_blocks.p) : nullptr);
         const int window = int(config.sliding_window);
         kernels::build_mask(mask_full, t, full_slots, int(first), 0, 0, stream);
         // Each block's normalized input rows; after the last block, the final-normed rows (q8_1
@@ -1270,6 +1418,22 @@ struct Executor::Impl {
         // The prompt route once (kernels load at first launch), then each decode batch's graph.
         const std::vector<std::int32_t> prompt(std::min<std::uint32_t>(options.prefill_chunk, 16), 2);
         forward(0, prompt, 1);
+        if (vision) {
+            // The tower's routes on one unit of a 70-token image and on two (video frames).
+            const int grid_w = 30, grid_h = 21, per_unit = grid_w * grid_h;
+            const VisionConfig& vc = *model.vision_config();
+            for (int units = 1; units <= 2 && std::uint32_t(units * per_unit) <= vision->max_patches();
+                 ++units) {
+                auto scope         = workspace->scope();
+                const std::size_t values = std::size_t(units) * per_unit * vc.patch_features();
+                auto* patches = static_cast<__nv_bfloat16*>(workspace->alloc_bytes(values * 2).data);
+                CUDA_CHECK(cudaMemsetAsync(patches, 0, values * 2, stream));
+                const std::size_t tokens = std::size_t(units) * per_unit / vc.patches_per_token();
+                auto* soft = static_cast<__nv_bfloat16*>(
+                    workspace->alloc_bytes(tokens * std::size_t(hidden) * 2).data);
+                vision->encode(patches, units, grid_w, grid_h, soft, *workspace, stream);
+            }
+        }
         if (drafting()) {
             // The assistant's and the verification's kernels, eagerly.
             const std::uint32_t s = 0;
@@ -1344,7 +1508,11 @@ Executor::~Executor() = default;
 const ExecutorOptions& Executor::options() const noexcept { return impl_->options; }
 
 ExecutorMemory Executor::memory() const noexcept {
-    return ExecutorMemory{.kv_bytes = impl_->kv_bytes, .workspace_bytes = impl_->workspace_bytes};
+    const auto& tower = impl_->vision;
+    return ExecutorMemory{.kv_bytes            = impl_->kv_bytes,
+                          .workspace_bytes     = impl_->workspace_bytes,
+                          .vision_encode_bytes = tower ? tower->workspace_bytes() : 0,
+                          .vision_owned_bytes  = tower ? tower->owned_bytes() : 0};
 }
 
 void Executor::reset(std::uint32_t sequence) {
@@ -1359,8 +1527,18 @@ std::uint32_t Executor::position(std::uint32_t sequence) const {
 void Executor::warm_up() { impl_->warm_up(); }
 
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                       std::uint32_t logit_rows) {
-    impl_->forward(sequence, tokens, logit_rows);
+                       std::uint32_t logit_rows, std::span<const ChunkMedia> media) {
+    impl_->forward(sequence, tokens, logit_rows, media);
+}
+
+bool Executor::vision() const noexcept { return impl_->vision_media; }
+
+double Executor::last_media_seconds() const {
+    if (!impl_->media_timed) { return 0.0; }
+    CUDA_CHECK(cudaEventSynchronize(impl_->media_end));
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, impl_->media_begin, impl_->media_end));
+    return double(ms) / 1000.0;
 }
 
 void Executor::decode(std::span<const std::uint32_t> sequences,

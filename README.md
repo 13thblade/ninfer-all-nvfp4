@@ -118,8 +118,9 @@ of the file.
 - **Gemma 4 26B-A4B.** Google's QAT Q4_0 GGUF release, imported block for block (13.4 GiB), or a
   mixed-format GGUF of it: the sliding-window and full-attention blocks (the latter caching values
   only), the dense MLP beside 128 routed experts, up to eight concurrent requests with prefix reuse,
-  tool calls and structured output, and Google's multi-token-prediction assistant for speculative
-  decoding. On an RTX 3090 it prefills a 10,000-token prompt at 6,045 tok/s and decodes at 215
+  tool calls and structured output, images and video through the release's vision tower (on the
+  GPU, streamed from pinned memory or on CPU threads), and Google's multi-token-prediction assistant
+  for speculative decoding. On an RTX 3090 it prefills a 10,000-token prompt at 6,045 tok/s and decodes at 215
   tok/s, 190 after 10,000 tokens, against llama.cpp's 4,697, 169 and 152 on the same GGUF; with two
   drafts a round chat answers decode at 291 tok/s instead of 209 ([Gemma 4](docs/gemma4.md)).
 
@@ -314,21 +315,25 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
 ```bash
 # The release's GGUF and its Hugging Face text files; one conversion writes the artifact.
 mkdir -p models/gemma4/hf
-for f in config.json tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json; do
+for f in config.json tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json \
+         processor_config.json; do
   curl -fsSL -o models/gemma4/hf/$f https://huggingface.co/google/gemma-4-26B-A4B-it/resolve/main/$f
 done
-hf download google/gemma-4-26B-A4B-it-qat-q4_0-gguf gemma-4-26B_q4_0-it.gguf --local-dir models/gemma4
-# With the release's QAT assistant (multi-token prediction) as the artifact's `mtp` component.
+hf download google/gemma-4-26B-A4B-it-qat-q4_0-gguf gemma-4-26B_q4_0-it.gguf gemma-4-26B-it-mmproj.gguf \
+  --local-dir models/gemma4
+# With the release's QAT assistant (multi-token prediction) as the artifact's `mtp` component and
+# its vision tower (the mmproj) as the `vision` component.
 hf download unsloth/gemma-4-26B-A4B-it-qat-GGUF mtp-gemma-4-26B-A4B-it.gguf --local-dir models/gemma4
-python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf --components text,mtp \
+python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf --components text,mtp,vision \
   --source gguf=models/gemma4/gemma-4-26B_q4_0-it.gguf \
-  --source mtp=models/gemma4/mtp-gemma-4-26B-A4B-it.gguf --name Gemma-4-26B-A4B-it-QAT \
-  --out models/gemma-4-26B-A4B-it-qat-q4_0-mtp.ninfer --device cpu
+  --source mtp=models/gemma4/mtp-gemma-4-26B-A4B-it.gguf \
+  --source vision=models/gemma4/gemma-4-26B-it-mmproj.gguf --name Gemma-4-26B-A4B-it-QAT-Q4_0-MTP \
+  --out models/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer --device cpu
 
-# Four concurrent requests over 40K-token contexts, two drafts a round; thinking stays off unless a
-# request asks.
-ninfer-serve models/gemma-4-26B-A4B-it-qat-q4_0-mtp.ninfer --model-id gemma4 \
-  --max-context 40960 --max-concurrency 4 --spec mtp --draft-tokens 2
+# Four concurrent requests over 40K-token contexts, two drafts a round, images and video; thinking
+# stays off unless a request asks.
+ninfer-serve models/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer --model-id gemma4 \
+  --max-context 40960 --max-concurrency 4 --spec mtp --draft-tokens 2 --vision
 ```
 
 </details>
@@ -402,7 +407,7 @@ The Bonsai, GSQ-RCO, Flash-Next and Gemma 4 artifacts use formats that only this
 | Qwen3.8-Flash-Next Coder GSQ-RCO IQ1_M | [WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 31.02 GiB | the expert-pruned coding build (256 experts per layer), Vision, shared-Q8_0 MTP |
 | Qwen3.8-Flash-Next n-gram table | [WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3) | 26.92 GiB | unchanged IQ4_NL rows plus an optional broad hot-row profile (`--ngram-table`) |
 | Qwen3.6-35B-A3B NVFP4 | [WaveCut/Qwen3.6-35B-A3B-NVFP4-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.6-35B-A3B-NVFP4-NInfer-v3) | 20.39 GiB | RedHatAI's NVFP4 experts code for code, Q8 projections, Vision, MTP, proposal head; `sm_120a` GPUs only |
-| Gemma 4 26B-A4B it QAT | [WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3) | 13.68 GiB | Google's QAT Q4_0 GGUF blocks byte for byte with the QAT MTP assistant; text only |
+| Gemma 4 26B-A4B it QAT | [WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3) | 14.75 GiB | Google's QAT Q4_0 GGUF blocks byte for byte with the QAT MTP assistant and the vision tower |
 
 The official NInfer artifacts (Qwen3.6-27B, Qwen3.6-35B-A3B and Qwen3.8-27B, `groupwise-int` and
 `nvfp4`) load too; the [documentation map](docs/README.md#model-artifacts) links them. Weight

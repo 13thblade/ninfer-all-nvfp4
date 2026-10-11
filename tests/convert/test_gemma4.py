@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from tools.convert import gemma4
-from tools.convert.sources.gguf import TYPE_F32, GGUFFile, write_gguf
+from tools.convert.sources.gguf import TYPE_BF16, TYPE_F32, GGUFFile, write_gguf
 
 TYPE_Q4_0 = 2
 TYPE_Q8_0 = 8
@@ -14,6 +14,21 @@ TYPE_Q6_K = 14
 
 HIDDEN, VOCAB, HEADS, HEAD_DIM, GLOBAL_DIM = 256, 512, 2, 32, 64
 WIDTH, EXPERTS, EXPERT_WIDTH = 64, 4, 32
+
+
+VISION, VISION_HEADS, VISION_WIDTH, PATCH, POSITIONS = 64, 4, 128, 4, 32
+
+
+def _vision_config(**overrides):
+    vision = dict(
+        model_type="gemma4_vision", hidden_activation="gelu_pytorch_tanh", hidden_size=VISION,
+        intermediate_size=VISION_WIDTH, num_hidden_layers=2, num_attention_heads=VISION_HEADS,
+        num_key_value_heads=VISION_HEADS, head_dim=VISION // VISION_HEADS, patch_size=PATCH,
+        pooling_kernel_size=3, position_embedding_size=POSITIONS,
+        rope_parameters={"rope_type": "default", "rope_theta": 100.0}, standardize=True,
+        default_output_length=280, use_clipped_linears=False, rms_norm_eps=1e-6)
+    vision.update(overrides)
+    return vision
 
 
 def _hf_config(**overrides):
@@ -33,7 +48,9 @@ def _hf_config(**overrides):
         rms_norm_eps=1e-6, final_logit_softcapping=30.0, tie_word_embeddings=True,
     )
     text.update(overrides)
-    return {"architectures": ["Gemma4ForConditionalGeneration"], "text_config": text}
+    return {"architectures": ["Gemma4ForConditionalGeneration"], "text_config": text,
+            "vision_config": _vision_config(), "image_token_id": 500, "video_token_id": 501,
+            "boi_token_id": 502, "eoi_token_id": 503}
 
 
 def _q4_0(generator, rows, columns):
@@ -72,6 +89,7 @@ def _release(tmp_path, value_q8=False):
     (hf / "tokenizer_config.json").write_text("{}")
     (hf / "chat_template.jinja").write_text("{{ bos_token }}")
     (hf / "generation_config.json").write_text('{"top_p": 0.95}')
+    (hf / "processor_config.json").write_text('{"image_seq_length": 280}')
 
     generator = np.random.default_rng(4)
     tensors, stored = [], {}
@@ -219,7 +237,59 @@ def _assistant(tmp_path):
     return path, stored
 
 
-def _convert(tmp_path, base_dir, gguf_path, mtp_path=None):
+def _bf16(values):
+    """FP32 values rounded to BF16, and their BF16 words."""
+    words = (values.astype(np.float32).view(np.uint32) + 0x8000 >> 16).astype(np.uint16)
+    return (words.astype(np.uint32) << 16).view(np.float32), words
+
+
+def _mmproj(tmp_path, projector="gemma4v", wide_table=False):
+    """A two-block gemma4v mmproj GGUF in llama.cpp's naming, BF16 matrices, F32 norms, and the
+    patch embedding and position table as F32 values that BF16 holds (unless `wide_table`)."""
+    generator = np.random.default_rng(6)
+    tensors, stored = [], {}
+
+    def bf16(name, shape):
+        values, words = _bf16(generator.normal(size=shape))
+        tensors.append((name, shape, TYPE_BF16, words.tobytes()))
+        stored[name] = values
+
+    def f32(name, shape, exact=True):
+        values = generator.normal(size=shape).astype(np.float32)
+        if exact:
+            values, _ = _bf16(values)
+        tensors.append((name, shape, TYPE_F32, values.tobytes()))
+        stored[name] = values
+
+    f32("v.patch_embd.weight", (VISION, 3, PATCH, PATCH))
+    f32("v.position_embd.weight", (2, POSITIONS, VISION), exact=not wide_table)
+    f32("v.std_bias", (VISION,), exact=False)
+    f32("v.std_scale", (VISION,), exact=False)
+    bf16("mm.input_projection.weight", (HIDDEN, VISION))
+    d = VISION // VISION_HEADS
+    for i in range(2):
+        g = f"v.blk.{i}."
+        for name in ("attn_q", "attn_k", "attn_v", "attn_out"):
+            bf16(g + name + ".weight", (VISION, VISION))
+        for name in ("attn_q_norm", "attn_k_norm"):
+            f32(g + name + ".weight", (d,), exact=False)
+        for name in ("ln1", "attn_post_norm", "ln2", "ffn_post_norm"):
+            f32(g + name + ".weight", (VISION,), exact=False)
+        bf16(g + "ffn_gate.weight", (VISION_WIDTH, VISION))
+        bf16(g + "ffn_up.weight", (VISION_WIDTH, VISION))
+        bf16(g + "ffn_down.weight", (VISION, VISION_WIDTH))
+    v = "clip.vision."
+    kv = {"general.architecture": "clip", "clip.has_vision_encoder": True,
+          v + "projector_type": projector, v + "embedding_length": VISION,
+          v + "feed_forward_length": VISION_WIDTH, v + "block_count": 2,
+          v + "attention.head_count": VISION_HEADS, v + "patch_size": PATCH,
+          v + "projection_dim": HIDDEN, v + "attention.layer_norm_epsilon": 1e-6}
+    path = tmp_path / "mmproj.gguf"
+    write_gguf(path, kv, tensors)
+    return path, stored
+
+
+def _convert(tmp_path, base_dir, gguf_path, mtp_path=None, vision_path=None):
     from tools.convert.pipeline import convert
     from tools.convert.recipe import Recipe
     from tools.convert.sources.safetensors import SafetensorsSource
@@ -227,7 +297,8 @@ def _convert(tmp_path, base_dir, gguf_path, mtp_path=None):
     output = tmp_path / "gemma.ninfer"
     with SafetensorsSource(base_dir) as base, GGUFFile(gguf_path) as gguf:
         mtp = GGUFFile(mtp_path) if mtp_path is not None else None
-        model = gemma4.build_model(base, gguf, mtp=mtp)
+        vision = GGUFFile(vision_path) if vision_path is not None else None
+        model = gemma4.build_model(base, gguf, mtp=mtp, vision=vision)
         recipe = Recipe(model)
         gemma4.gemma4_gguf(model, recipe, {"base": base, "gguf": gguf})
         convert(model, recipe, output, device="cpu")
@@ -289,3 +360,70 @@ def test_a_mixed_format_block_keeps_each_projection_in_its_format(tmp_path):
         assert parent("key") == parent("query")
         assert artifact.read_object(bindings[a + "value"]["object"]) == \
             stored["blk.0.attn_v.weight"].tobytes()
+
+
+def test_the_vision_tower_joins_as_the_vision_component(tmp_path):
+    from tools.artifact.reader import Artifact
+
+    hf, path, _ = _release(tmp_path)
+    vision_path, stored = _mmproj(tmp_path)
+    output = _convert(tmp_path, hf, path, vision_path=vision_path)
+    with Artifact(output) as artifact:
+        directory = artifact.directory
+        component = directory.components["vision"]
+        assert component["target"] == "text"
+        config = component["config"]
+        assert config["architectures"] == ["Gemma4VisionModel"]
+        assert (config["hidden_size"], config["num_hidden_layers"], config["head_dim"]) == \
+            (VISION, 2, VISION // VISION_HEADS)
+        assert config["projection_dim"] == HIDDEN and config["pooling_kernel_size"] == 3
+        assert config["image_token_id"] == 500 and config["eoi_token_id"] == 503
+        assert config["bidirectional_attention"] is False and config["standardize"] is True
+        assert "processor_config.json" in component["resources"]
+        bindings = directory.bindings
+        read = lambda name: artifact.read_object(bindings[name]["object"])
+
+        def bf16_values(name):
+            words = np.frombuffer(read(name), dtype=np.uint16).astype(np.uint32) << 16
+            return words.view(np.float32)
+
+        # The convolution becomes a [hidden, 3 * patch * patch] matrix over (channel, y, x).
+        assert np.array_equal(bf16_values("vision/patch_embedding"),
+                              stored["v.patch_embd.weight"].reshape(-1))
+        # The x and y position tables, one after the other, in BF16.
+        assert np.array_equal(bf16_values("vision/position_table"),
+                              stored["v.position_embd.weight"].reshape(-1))
+        assert np.array_equal(bf16_values("vision/projection"),
+                              stored["mm.input_projection.weight"].reshape(-1))
+        # Norms and the standardization stay FP32.
+        bias = np.frombuffer(read("vision/std_bias"), dtype=np.float32)
+        assert np.array_equal(bias, stored["v.std_bias"])
+        norm = np.frombuffer(read("vision/layers/1/ffn_norm"), dtype=np.float32)
+        assert np.array_equal(norm, stored["v.blk.1.ln2.weight"])
+        # Q, K and V of a block are one parent, as are gate and up.
+        a = "vision/layers/0/attention/"
+        parent = lambda name: [part["object"] for part in bindings[name]["parts"]]
+        assert parent(a + "query") == parent(a + "key") == parent(a + "value")
+        m = "vision/layers/0/mlp/"
+        assert parent(m + "gate") == parent(m + "up")
+
+
+def test_a_vision_source_of_another_projector_or_wider_values_is_refused(tmp_path):
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    hf, path, _ = _release(tmp_path)
+    other, _ = _mmproj(tmp_path, projector="gemma3")
+    with SafetensorsSource(hf) as base, GGUFFile(path) as gguf, GGUFFile(other) as vision:
+        with pytest.raises(ValueError, match="gemma4v"):
+            gemma4.build_model(base, gguf, vision=vision)
+    wide, _ = _mmproj(tmp_path, wide_table=True)
+    with SafetensorsSource(hf) as base, GGUFFile(path) as gguf, GGUFFile(wide) as vision:
+        with pytest.raises(ValueError, match="BF16"):
+            gemma4.build_model(base, gguf, vision=vision)
+    with GGUFFile(wide) as vision:
+        target = gemma4.text_config(_hf_config())
+        with pytest.raises(ValueError):
+            gemma4.vision_config(vision, dict(_hf_config(), vision_config=_vision_config(
+                hidden_size=2 * VISION)), target)
+        with pytest.raises(ValueError):
+            gemma4.vision_config(vision, _hf_config(), dict(target, hidden_size=2 * HIDDEN))

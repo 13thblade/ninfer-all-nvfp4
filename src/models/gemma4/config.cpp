@@ -136,4 +136,50 @@ AssistantConfig parse_assistant_config(const Json& value, const TextConfig& targ
     return out;
 }
 
+VisionConfig parse_vision_config(const Json& value, const TextConfig& target) {
+    const auto& architectures = value.at("architectures");
+    if (!architectures.is_array() || architectures.size() != 1 ||
+        architectures[0] != "Gemma4VisionModel") {
+        throw ArtifactError("Gemma 4 vision config: architecture mismatch");
+    }
+    VisionConfig out;
+    out.hidden_size             = integer(value, "hidden_size");
+    out.intermediate_size       = integer(value, "intermediate_size");
+    out.num_hidden_layers       = integer(value, "num_hidden_layers");
+    out.num_attention_heads     = integer(value, "num_attention_heads");
+    out.head_dim                = integer(value, "head_dim");
+    out.patch_size              = integer(value, "patch_size");
+    out.pooling_kernel_size     = integer(value, "pooling_kernel_size");
+    out.position_embedding_size = integer(value, "position_embedding_size");
+    out.projection_dim          = integer(value, "projection_dim");
+    out.default_output_length   = integer(value, "default_output_length");
+    out.rope_theta              = real(value, "rope_theta", true);
+    out.rms_norm_eps            = real(value, "rms_norm_eps", true);
+    out.standardize             = value.value("standardize", false);
+    out.bidirectional_attention = value.value("bidirectional_attention", false);
+    const auto token = [&](const char* name) {
+        const std::uint32_t id = integer(value, name);
+        if (id >= target.vocab_size) {
+            throw ArtifactError(std::string("Gemma 4 vision config: ") + name +
+                                " is outside the vocabulary");
+        }
+        return static_cast<std::int32_t>(id);
+    };
+    out.image_token_id = token("image_token_id");
+    out.video_token_id = token("video_token_id");
+    out.boi_token_id   = token("boi_token_id");
+    out.eoi_token_id   = token("eoi_token_id");
+    // The packed attention kernel's registered profile is 16 heads of 72; the rest follows the
+    // released tower.
+    if (out.num_attention_heads != 16 || out.head_dim != 72 ||
+        out.hidden_size != out.num_attention_heads * out.head_dim ||
+        out.projection_dim != target.hidden_size || out.patch_size != 16 ||
+        out.pooling_kernel_size == 0 || out.pooling_kernel_size > 4 ||
+        out.intermediate_size % 16 != 0 || out.position_embedding_size == 0 ||
+        out.num_hidden_layers == 0 || out.default_output_length == 0) {
+        throw ArtifactError("Gemma 4 vision config: geometry outside the implemented kernels");
+    }
+    return out;
+}
+
 } // namespace ninfer::models::gemma4

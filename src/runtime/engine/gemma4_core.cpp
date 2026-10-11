@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/startup.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen3_5/frontend/processor.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/logprob_topk.h"
 #include "ninfer/ops/sampling.h"
@@ -27,6 +28,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -72,8 +74,29 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    if (options.kv_cache != KvCacheStorage::BFloat16) {
+        throw std::invalid_argument(
+            "Gemma 4 keeps a 16-bit KV cache; --kv-dtype formats are not available for it");
+    }
+    // The vision tower on the device or, with --vision-residency cpu, on CPU threads; its soft
+    // tokens per image or video frame are bounded by --vision-max-merged (Gemma's budgets 70 to
+    // 1120).
+    auto vision = models::gemma4::VisionPlacement::None;
+    std::uint32_t vision_budget = 0;
     if (options.enable_vision) {
-        throw std::invalid_argument("Gemma 4 runs text only in this build (no --vision)");
+        switch (options.vision_residency) {
+        case VisionResidency::Resident:
+            vision = models::gemma4::VisionPlacement::Device;
+            break;
+        case VisionResidency::Cpu:
+            vision = models::gemma4::VisionPlacement::Host;
+            break;
+        case VisionResidency::Overlay:
+            vision = models::gemma4::VisionPlacement::Pinned;
+            break;
+        }
+        vision_budget = models::qwen3_5::frontend::gemma_budget_at_most(
+            options.vision_max_merged_tokens);
     }
     const SpeculativeOptions& speculative = options.speculative;
     const bool mtp = speculative.backend == SpeculativeBackend::Mtp;
@@ -102,8 +125,12 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         throw std::invalid_argument("--spec mtp: the artifact holds no Gemma 4 assistant "
                                     "(convert with --components text,mtp)");
     }
+    if (options.enable_vision && !models::gemma4::has_vision(reader)) {
+        throw std::invalid_argument("--vision: the artifact holds no Gemma 4 vision tower "
+                                    "(convert with --components text,vision)");
+    }
     auto model = models::gemma4::load_model(
-        reader, {.artifact = options.artifact_path, .assistant = mtp}, device,
+        reader, {.artifact = options.artifact_path, .assistant = mtp, .vision = vision}, device,
         &options.startup_observer);
     device.synchronize();
     materialize.complete();
@@ -118,10 +145,15 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     auto instance = std::make_unique<Gemma4Instance>(Gemma4Instance{
         .model    = nullptr,
         .frontend = models::qwen3_5::make_frontend(
-            model->resources(), {.chat_template_path = options.chat_template_path,
-                                 .architecture       = models::Architecture::Gemma4,
-                                 .vision_enabled     = false,
-                                 .max_context        = options.max_context}),
+            model->resources(),
+            {.chat_template_path       = options.chat_template_path,
+             .architecture             = models::Architecture::Gemma4,
+             .vision_enabled           = options.enable_vision,
+             .max_context              = options.max_context,
+             .media_cache_bytes        = options.media_cache_bytes,
+             .media_live_bytes         = options.media_live_bytes,
+             .media_preprocess_threads = options.media_preprocess_threads,
+             .vision_max_merged_tokens = options.vision_max_merged_tokens}),
         .executor = nullptr,
         .capacity = options.max_context});
     frontend_phase.complete();
@@ -136,7 +168,13 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     executor.prefill_chunk = 2048;
     executor.cuda_graphs   = options.use_cuda_graph;
     executor.draft_tokens  = mtp ? speculative.draft_tokens : 0;
+    if (options.enable_vision) {
+        executor.vision_max_patches = vision_budget * model->vision_config()->patches_per_token();
+    }
     instance->executor = std::make_unique<models::gemma4::Executor>(*model, device, executor);
+    if (vision == models::gemma4::VisionPlacement::Host) {
+        instance->cpu_vision = std::make_unique<models::gemma4::CpuVisionTower>(*model);
+    }
     device.synchronize();
     program.complete();
     {
@@ -145,6 +183,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         warm.complete();
     }
     instance->free_after_weights = free_after_weights;
+    instance->vision_budget      = vision_budget;
     instance->free_after_startup = free_bytes();
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "Gemma 4: %u sequence(s), prompt chunks of %u tokens, KV %.0f MiB, "
@@ -152,6 +191,15 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                        executor.sequences, executor.prefill_chunk,
                        double(instance->executor->memory().kv_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0);
+    if (options.enable_vision) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Gemma 4: vision tower %s, up to %u soft tokens per image or video frame",
+                           vision == models::gemma4::VisionPlacement::Host ? "on CPU threads"
+                           : vision == models::gemma4::VisionPlacement::Pinned
+                               ? "in pinned host memory, streamed through a two-block device window"
+                               : "on the device",
+                           vision_budget);
+    }
     if (mtp) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "Gemma 4: assistant speculative decoding, up to %u drafts a round%s",
@@ -209,6 +257,32 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     return out;
 }
 
+// A prompt's media unit: the soft tokens [begin, begin + count) and a key of the unit's content (its
+// item's digest, grid and frame).
+struct Gemma4MediaMark {
+    std::uint32_t begin = 0, count = 0;
+    std::uint64_t key   = 0;
+
+    friend bool operator==(const Gemma4MediaMark&, const Gemma4MediaMark&) = default;
+};
+using MediaMark = Gemma4MediaMark;
+
+static std::uint64_t unit_key(const models::qwen3_5::VisionItem& item, std::size_t unit) {
+    std::uint64_t key = 1469598103934665603ULL; // FNV-1a over the digest, grid and unit
+    const auto mix    = [&](std::uint64_t value) {
+        for (int i = 0; i < 8; ++i) {
+            key ^= (value >> (8 * i)) & 0xFFu;
+            key *= 1099511628211ULL;
+        }
+    };
+    for (const std::uint8_t byte : item.content_digest) { mix(byte); }
+    mix(std::uint64_t(item.grid.temporal));
+    mix(std::uint64_t(item.grid.height));
+    mix(std::uint64_t(item.grid.width));
+    mix(unit);
+    return key;
+}
+
 struct Gemma4Core::Request {
     std::uint64_t id = 0;
     models::qwen3_5::PreparedPrompt prompt;
@@ -236,6 +310,10 @@ struct Gemma4Core::Request {
 
     std::uint32_t anchor_at = 0;
     bool reusable           = true;
+    // Media: one mark per unit (an image or a video frame), its soft tokens' span and the identity
+    // of what they show, which a reused prefix must share as well as its tokens.
+    std::vector<MediaMark> media;
+    double vision_seconds = 0.0;
 
     std::uint32_t slot         = 0;
     std::uint32_t reused       = 0;
@@ -260,6 +338,8 @@ struct Gemma4Core::Impl {
         std::shared_ptr<Request> request;
         std::vector<TokenId> fed;
         std::vector<TokenId> anchor;
+        // The media units among fed and anchor.
+        std::vector<MediaMark> media, anchor_media;
         models::gemma4::SequenceSnapshot snapshot;
         std::uint64_t last_used = 0;
     };
@@ -502,21 +582,35 @@ struct Gemma4Core::Impl {
             slot.request = nullptr;
             slot.fed.clear();
             slot.anchor.clear();
+            slot.media.clear();
+            slot.anchor_media.clear();
         }
         complete(request, std::move(error));
     }
 
+    // The tokens `held` the prompt starts with, when its media units among them are exactly
+    // `held_media` (a placeholder token does not tell one picture from another).
     static std::uint32_t prefix_reuse(const std::vector<TokenId>& held,
-                                      const std::vector<TokenId>& prompt) {
-        if (held.empty() || held.size() >= prompt.size()) { return 0; }
-        return std::equal(held.begin(), held.end(), prompt.begin())
-                   ? static_cast<std::uint32_t>(held.size())
-                   : 0;
+                                      const std::vector<MediaMark>& held_media,
+                                      const Request& prompt) {
+        const auto& tokens = prompt.prompt_tokens;
+        if (held.empty() || held.size() >= tokens.size() ||
+            !std::equal(held.begin(), held.end(), tokens.begin())) {
+            return 0;
+        }
+        std::size_t marks = 0;
+        while (marks < prompt.media.size() && prompt.media[marks].begin < held.size()) { ++marks; }
+        if (marks != held_media.size() ||
+            !std::equal(held_media.begin(), held_media.end(), prompt.media.begin())) {
+            return 0;
+        }
+        return static_cast<std::uint32_t>(held.size());
     }
 
-    [[nodiscard]] std::uint32_t reuse(const Slot& slot, const std::vector<TokenId>& prompt) const {
+    [[nodiscard]] std::uint32_t reuse(const Slot& slot, const Request& prompt) const {
         if (!reuse_prefixes) { return 0; }
-        return std::max(prefix_reuse(slot.fed, prompt), prefix_reuse(slot.anchor, prompt));
+        return std::max(prefix_reuse(slot.fed, slot.media, prompt),
+                        prefix_reuse(slot.anchor, slot.anchor_media, prompt));
     }
 
     void admit() {
@@ -532,8 +626,8 @@ struct Gemma4Core::Impl {
                         best = s;
                         continue;
                     }
-                    const auto& prompt   = pending.front()->prompt_tokens;
-                    const auto candidate = reuse(slots[s], prompt);
+                    const Request& prompt = *pending.front();
+                    const auto candidate  = reuse(slots[s], prompt);
                     const auto current   = reuse(slots[*best], prompt);
                     if (candidate > current ||
                         (candidate == current && slots[s].last_used < slots[*best].last_used)) {
@@ -570,11 +664,12 @@ struct Gemma4Core::Impl {
         r.admitted           = Clock::now();
         std::uint32_t reused = 0;
         if (reuse_prefixes && r.reusable) {
-            const std::uint32_t live     = prefix_reuse(slot.fed, r.prompt_tokens);
-            const std::uint32_t anchored = prefix_reuse(slot.anchor, r.prompt_tokens);
+            const std::uint32_t live     = prefix_reuse(slot.fed, slot.media, r);
+            const std::uint32_t anchored = prefix_reuse(slot.anchor, slot.anchor_media, r);
             if (anchored > live) {
                 executor.restore(s, slot.snapshot);
                 slot.fed     = slot.anchor;
+                slot.media   = slot.anchor_media;
                 reused       = anchored;
                 r.reuse_path = PrefixReusePath::PrivateTurnClosure;
             } else if (live > 0) {
@@ -586,6 +681,8 @@ struct Gemma4Core::Impl {
             executor.reset(s);
             slot.fed.clear();
             slot.anchor.clear();
+            slot.media.clear();
+            slot.anchor_media.clear();
         }
         slot.request   = request;
         slot.last_used = ++use_clock;
@@ -649,11 +746,75 @@ struct Gemma4Core::Impl {
         }
     }
 
-    // The prompt tokens the request's next prefill step computes.
+    // The prompt tokens the request's next prefill step computes: a chunk ends before a media unit
+    // it would otherwise split, since a unit's soft tokens attend each other.
     [[nodiscard]] std::uint32_t prefill_step_tokens(const Request& r) const {
         const auto prompt_n       = static_cast<std::uint32_t>(r.prompt_tokens.size());
         const std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
-        return std::min(instance.executor->options().prefill_chunk, until - r.prefilled);
+        std::uint32_t end =
+            r.prefilled + std::min(instance.executor->options().prefill_chunk, until - r.prefilled);
+        for (const MediaMark& mark : r.media) {
+            if (mark.begin < end && end < mark.begin + mark.count && mark.begin > r.prefilled) {
+                end = mark.begin;
+            }
+        }
+        return end - r.prefilled;
+    }
+
+    // The media units of prompt tokens [begin, end), item by item, consecutive units of an item
+    // together; each lies whole in the range. With the CPU tower their soft tokens are computed
+    // here, into `host`, which must outlive the forward pass.
+    std::vector<models::gemma4::ChunkMedia> chunk_media(Request& r, std::uint32_t begin,
+                                                        std::uint32_t end,
+                                                        std::vector<std::vector<std::uint16_t>>& host) {
+        std::vector<models::gemma4::ChunkMedia> out;
+        if (r.media.empty()) { return out; }
+        const auto& data = models::qwen3_5::PreparedPromptAccess::view(r.prompt);
+        const auto& vc   = *instance.model->vision_config();
+        const std::size_t features = vc.patch_features();
+        for (std::size_t i = 0; i < data.vision_items.size(); ++i) {
+            const auto& item  = data.vision_items[i];
+            const int gw = item.grid.width, gh = item.grid.height;
+            const std::size_t per_unit = std::size_t(gw) * gh;
+            const auto patches         = data.media_payloads.at(i)->span();
+            std::optional<models::gemma4::ChunkMedia> run;
+            std::size_t first_unit = 0;
+            const auto flush = [&] {
+                if (!run) { return; }
+                const std::size_t units = run->rows.size();
+                run->patches = patches.subspan(first_unit * per_unit * features,
+                                               units * per_unit * features);
+                if (instance.cpu_vision) {
+                    const auto start = Clock::now();
+                    host.push_back(instance.cpu_vision->encode(run->patches, int(units), gw, gh));
+                    r.vision_seconds += seconds(start, Clock::now());
+                    run->embeddings = host.back();
+                    run->patches    = {};
+                }
+                out.push_back(std::move(*run));
+                run.reset();
+            };
+            for (std::size_t unit = 0; unit < item.token_spans.size(); ++unit) {
+                const auto& span = item.token_spans[unit];
+                const bool inside = span.begin >= begin && span.begin + span.count <= end;
+                if (!inside) {
+                    if (span.begin < end && span.begin + span.count > begin) {
+                        throw std::logic_error("gemma4: a prompt chunk splits a media unit");
+                    }
+                    flush();
+                    continue;
+                }
+                if (!run) {
+                    run.emplace();
+                    run->grid_w = gw;
+                    run->grid_h = gh;
+                    first_unit  = unit;
+                }
+                run->rows.push_back(static_cast<std::uint32_t>(span.begin - begin));
+            }
+            flush();
+        }
+        return out;
     }
 
     // Decode rounds that run before a prefill step while other requests generate: the configured
@@ -828,7 +989,8 @@ struct Gemma4Core::Impl {
         result.prefix_reuse_path               = r.reuse_path;
         if (drafts > 0) { result.speculative = r.speculative; }
         result.timings.prepare_seconds         = r.prepare_seconds;
-        result.timings.prefill_seconds         = seconds(r.prefill_start, r.prefill_end);
+        result.timings.vision_seconds          = r.vision_seconds;
+        result.timings.prefill_seconds = seconds(r.prefill_start, r.prefill_end) - r.vision_seconds;
         result.timings.decode_seconds          = seconds(r.prefill_end, r.last_token);
         result.timings.first_token_seconds = r.prepare_seconds + seconds(r.submitted, r.first_token);
         if (r.observation.phase_timings) {
@@ -856,13 +1018,25 @@ struct Gemma4Core::Impl {
             return;
         }
         const std::uint32_t n = prefill_step_tokens(r);
+        if (n == 0) { throw std::logic_error("gemma4: an empty prefill step"); }
         const auto chunk = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
-        executor.forward(r.slot, chunk, 1);
+        std::vector<std::vector<std::uint16_t>> host_embeddings;
+        const auto media = chunk_media(r, r.prefilled, r.prefilled + n, host_embeddings);
+        executor.forward(r.slot, chunk, 1, media);
+        if (!media.empty() && !instance.cpu_vision) {
+            r.vision_seconds += executor.last_media_seconds();
+        }
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
+        for (const MediaMark& mark : r.media) {
+            if (mark.begin >= r.prefilled && mark.begin < r.prefilled + n) {
+                slot.media.push_back(mark);
+            }
+        }
         r.prefilled += n;
         if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at && r.prefilled < prompt_n) {
             executor.snapshot(r.slot, slot.snapshot);
-            slot.anchor = slot.fed;
+            slot.anchor       = slot.fed;
+            slot.anchor_media = slot.media;
         }
         if (r.observation.prompt_progress) {
             CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
@@ -1363,6 +1537,8 @@ struct Gemma4Core::Impl {
         executor.reset(0);
         slots[0].fed.clear();
         slots[0].anchor.clear();
+        slots[0].media.clear();
+        slots[0].anchor_media.clear();
         std::vector<float> out;
         out.reserve(n - first_target);
         for (std::uint32_t at = 0; at + 1 < n; at += chunk) {
@@ -1520,7 +1696,19 @@ Gemma4Core::Submission Gemma4Core::submit(models::qwen3_5::PreparedPrompt prompt
         const auto& data     = models::qwen3_5::PreparedPromptAccess::view(prompt);
         const auto& identity = data.identity;
         const auto prompt_n  = static_cast<std::uint32_t>(request->prompt_tokens.size());
-        if (data.has_media()) { throw std::invalid_argument("Gemma 4 runs text only in this build"); }
+        if (data.has_media() && !impl_->instance.executor->vision()) {
+            throw std::invalid_argument("Vision is disabled for this Engine");
+        }
+        for (const auto& item : data.vision_items) {
+            for (std::size_t unit = 0; unit < item.token_spans.size(); ++unit) {
+                const auto& span = item.token_spans[unit];
+                request->media.push_back(MediaMark{.begin = std::uint32_t(span.begin),
+                                                   .count = std::uint32_t(span.count),
+                                                   .key   = unit_key(item, unit)});
+            }
+        }
+        std::sort(request->media.begin(), request->media.end(),
+                  [](const MediaMark& a, const MediaMark& b) { return a.begin < b.begin; });
         request->reusable  = identity.reusable;
         request->anchor_at = prompt_n;
         if (identity.rewrite_checkpoint &&
@@ -1567,6 +1755,9 @@ Gemma4Core::Submission Gemma4Core::submit(models::qwen3_5::PreparedPrompt prompt
 
 std::vector<float> Gemma4Core::score(models::qwen3_5::PreparedPrompt prompt,
                                      std::uint32_t first_target) {
+    if (models::qwen3_5::PreparedPromptAccess::view(prompt).has_media()) {
+        throw std::invalid_argument("Gemma 4 scores text prompts only");
+    }
     const std::vector<TokenId> tokens(prompt.token_ids().begin(), prompt.token_ids().end());
     {
         std::lock_guard lock(impl_->queue_mutex);
@@ -1604,6 +1795,22 @@ MemorySummary Gemma4Core::memory_summary() const {
     out.runtime_reservation_bytes     = memory.kv_bytes + memory.workspace_bytes;
     out.available_after_weights_bytes = impl_->instance.free_after_weights;
     out.available_after_startup_bytes = impl_->instance.free_after_startup;
+    if (impl_->instance.vision_budget > 0) {
+        const auto placement = impl_->instance.model->vision_placement();
+        VisionWorkspaceMemorySummary vision{
+            .aggregate_prompt_tokens = impl_->max_context,
+            .max_item_tokens         = impl_->instance.vision_budget,
+            .encode_peak_bytes       = memory.vision_encode_bytes,
+            .residency = placement == models::gemma4::VisionPlacement::Host ? VisionResidency::Cpu
+                         : placement == models::gemma4::VisionPlacement::Pinned
+                             ? VisionResidency::Overlay
+                             : VisionResidency::Resident};
+        if (placement == models::gemma4::VisionPlacement::Pinned) {
+            vision.window_capacity_bytes = memory.vision_owned_bytes;
+            vision.pinned_weight_bytes   = stats.pinned_bytes;
+        }
+        out.vision_workspace = vision;
+    }
     return out;
 }
 

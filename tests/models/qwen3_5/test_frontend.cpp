@@ -2830,6 +2830,160 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     return failures;
 }
 
+// Gemma 4's media through the shared frontend (Architecture::Gemma4 with the release's
+// processor_config.json): a 768 x 512 picture takes its default budget of 280 as 20 x 13 soft tokens
+// (60 x 39 patches) between <|image> and <image|>, 60 at low detail and, at high detail, the
+// --vision-max-merged bound rounded down to a budget (600: 560, 28 x 19); its patches are
+// 2 p / 255 - 1. A 40-frame 640 x 360 video gives 32 frames of 66 soft tokens, each after its
+// mm:ss timestamp. Token counting agrees with preparation.
+constexpr ninfer::TokenId kGemmaBoi = 255999, kGemmaImage = 258880, kGemmaEoi = 258882,
+                          kGemmaVideo = 258884;
+
+struct GemmaFixture {
+    std::string tokenizer_json, tokenizer_config_json, chat_template, generation_config,
+        processor_config;
+};
+
+GemmaFixture gemma_fixture() {
+    const FrontendResources base = resources();
+    GemmaFixture out;
+    out.chat_template =
+        "{%- for message in messages -%}<|turn>{{ message.role }}\n"
+        "{%- if message.content is string %}{{ message.content }}{% else %}"
+        "{%- for item in message.content %}{% if item.type == 'image' %}<|image|>"
+        "{%- elif item.type == 'video' %}<|video|>{% elif item.type == 'text' %}{{ item.text }}"
+        "{%- endif %}{% endfor %}{% endif %}<turn|>\n{% endfor -%}"
+        "{%- if add_generation_prompt %}<|turn>model\n{% endif -%}";
+    nlohmann::json tokenizer = nlohmann::json::parse(base.tokenizer_json);
+    nlohmann::json config    = nlohmann::json::parse(base.tokenizer_config_json);
+    const std::vector<std::pair<int, std::string>> gemma_tokens{
+        {40, "<|channel>"}, {41, "<channel|>"}, {42, "<|tool_call>"}, {43, "<tool_call|>"},
+        {44, "<|\"|>"},     {kGemmaBoi, "<|image>"}, {kGemmaImage, "<|image|>"},
+        {kGemmaEoi, "<image|>"}, {kGemmaVideo, "<|video|>"}};
+    for (const auto& [id, content] : gemma_tokens) {
+        tokenizer["added_tokens"].push_back(added(id, content, true));
+        config["added_tokens_decoder"][std::to_string(id)] = decoder_added(content, true);
+    }
+    config["chat_template"]   = out.chat_template;
+    out.tokenizer_json        = tokenizer.dump();
+    out.tokenizer_config_json = config.dump();
+    out.generation_config     = base.generation_config_json;
+    out.processor_config      = R"({
+      "image_processor": {"patch_size": 16, "pooling_kernel_size": 3, "max_soft_tokens": 280,
+                          "resample": 3, "rescale_factor": 0.00392156862745098,
+                          "image_mean": [0.0, 0.0, 0.0], "image_std": [1.0, 1.0, 1.0]},
+      "video_processor": {"patch_size": 16, "pooling_kernel_size": 3, "max_soft_tokens": 70,
+                          "num_frames": 32, "image_mean": [0.0, 0.0, 0.0],
+                          "image_std": [1.0, 1.0, 1.0]}})";
+    return out;
+}
+
+Frontend make_gemma_frontend(const GemmaFixture& fixture) {
+    ninfer::models::qwen3_5::FrontendResources parsed;
+    parsed.tokenizer_json         = fixture.tokenizer_json;
+    parsed.tokenizer_config_json  = fixture.tokenizer_config_json;
+    parsed.chat_template_jinja    = fixture.chat_template;
+    parsed.generation_config_json = fixture.generation_config;
+    parsed.processor_config_json  = fixture.processor_config;
+    parsed.tokenizer = std::make_shared<const fi::Tokenizer>(fi::TokenizerResources{
+        fixture.tokenizer_json, fixture.tokenizer_config_json, fixture.generation_config});
+    parsed.public_token_count = static_cast<std::uint32_t>(parsed.tokenizer->vocab_size());
+    FrontendOptions options;
+    options.architecture             = ninfer::models::Architecture::Gemma4;
+    options.vision_enabled           = true;
+    options.max_context              = 1U << 20;
+    options.vision_max_merged_tokens = 600;
+    return ninfer::models::qwen3_5::make_frontend(parsed, options);
+}
+
+int test_gemma_media_layout() {
+    const GemmaFixture fixture = gemma_fixture();
+    const Frontend frontend    = make_gemma_frontend(fixture);
+    int failures               = 0;
+    const auto bytes           = block_ppm(768, 512, 91);
+    std::vector<std::array<std::uint8_t, 32>> digests;
+    struct Case {
+        ninfer::ImageDetail detail;
+        int grid_w, grid_h;
+    };
+    for (const Case c : {Case{ninfer::ImageDetail::Auto, 60, 39}, Case{ninfer::ImageDetail::Low, 30, 18},
+                         Case{ninfer::ImageDetail::High, 84, 57}}) {
+        auto input = image_text_input(bytes, "Describe it.", "gemma.ppm");
+        input.messages[0].parts[0].media.image_detail = c.detail;
+        const std::size_t counted = frontend.count_tokens(input);
+        const auto prepared       = frontend.prepare(std::move(input));
+        const auto& data          = FrontendFactory::inspect(prepared);
+        const std::size_t tokens  = std::size_t(c.grid_w / 3) * (c.grid_h / 3);
+        if (data.vision_items.size() != 1 || data.media_payloads.size() != 1) {
+            failures += check(false, "a Gemma picture did not make one vision item");
+            continue;
+        }
+        const auto& item = data.vision_items.front();
+        digests.push_back(item.content_digest);
+        failures += check(item.grid.temporal == 1 && item.grid.width == c.grid_w &&
+                              item.grid.height == c.grid_h && item.token_spans.size() == 1 &&
+                              item.token_spans.front().count == tokens &&
+                              counted == data.token_ids.size(),
+                          "a Gemma picture's grid, soft tokens or token count is wrong");
+        const auto span = item.token_spans.front();
+        bool layout     = span.begin > 0 && data.token_ids[span.begin - 1] == kGemmaBoi &&
+                      span.begin + span.count < data.token_ids.size() &&
+                      data.token_ids[span.begin + span.count] == kGemmaEoi;
+        for (std::size_t i = span.begin; i < span.begin + span.count; ++i) {
+            layout &= data.token_ids[i] == kGemmaImage && data.token_types[i] == 1;
+        }
+        failures += check(layout, "a Gemma picture's soft tokens are not <|image> <|image|>... <image|>");
+        const auto patches = data.media_payloads.front()->span();
+        failures += check(patches.size() == std::size_t(c.grid_w) * c.grid_h * 768 &&
+                              std::all_of(patches.begin(), patches.end(),
+                                          [](std::uint16_t v) {
+                                              return v == bf16_bits(2.0F * 91.0F / 255.0F - 1.0F);
+                                          }),
+                          "a Gemma picture's patches are not 2 p / 255 - 1");
+    }
+    failures += check(digests.size() == 3 && digests[0] != digests[1] && digests[1] != digests[2],
+                      "one picture at different budgets shared a vision identity");
+
+    ninfer::MessagePart video;
+    video.kind              = ninfer::MessagePartKind::Media;
+    video.media.kind        = ninfer::MediaKind::Video;
+    video.media.bytes       = [] {
+        const std::string data = read_file(NINFER_SOURCE_DIR "/examples/cli/media/temporal_events.mp4");
+        return std::vector<std::uint8_t>(data.begin(), data.end());
+    }();
+    video.media.media_type  = "video/mp4";
+    video.media.source_name = "temporal_events.mp4";
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(std::move(video));
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    const std::size_t counted = frontend.count_tokens(input);
+    const auto prepared       = frontend.prepare(std::move(input));
+    const auto& data          = FrontendFactory::inspect(prepared);
+    if (data.vision_items.size() != 1) { return failures + check(false, "a Gemma video did not make one vision item"); }
+    const auto& item = data.vision_items.front();
+    bool frames = item.grid.temporal == 32 && item.grid.width == 33 && item.grid.height == 18 &&
+                  item.token_spans.size() == 32 && item.timestamps.size() == 32 &&
+                  counted == data.token_ids.size();
+    for (std::size_t f = 0; frames && f < item.token_spans.size(); ++f) {
+        const auto span = item.token_spans[f];
+        // Frame f is source frame f * 40 / 32 of an 8 fps video.
+        const int seconds = (int(f) * 40 / 32) / 8;
+        const auto stamp  = fixture_tokens("00:0" + std::to_string(seconds) + " ");
+        frames &= span.count == 66 && span.begin > stamp.size() &&
+                  data.token_ids[span.begin - 1] == kGemmaBoi &&
+                  data.token_ids[span.begin + span.count] == kGemmaEoi &&
+                  std::equal(stamp.begin(), stamp.end(),
+                             data.token_ids.begin() + std::ptrdiff_t(span.begin - 1 - stamp.size()));
+        for (std::size_t i = span.begin; i < span.begin + span.count; ++i) {
+            frames &= data.token_ids[i] == kGemmaVideo && data.token_types[i] == 2;
+        }
+    }
+    failures += check(frames, "a Gemma video's frames, timestamps or soft tokens are wrong");
+    return failures;
+}
+
 int test_disabled_vision() {
     auto source = resources();
     source.preprocessor_config_json.clear();
@@ -3313,5 +3467,6 @@ int main() {
     failures += test_media_preparation_cancellation();
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
+    failures += test_gemma_media_layout();
     return failures == 0 ? 0 : 1;
 }

@@ -1,7 +1,7 @@
 # Gemma 4 26B-A4B
 
-NInfer runs Google's Gemma 4 26B-A4B text model (`Gemma4ForCausalLM`, and the text component of
-`Gemma4ForConditionalGeneration`) from the official quantization-aware-trained GGUF release
+NInfer runs Google's Gemma 4 26B-A4B (`Gemma4ForConditionalGeneration`: the text model
+`Gemma4ForCausalLM` and its vision tower) from the official quantization-aware-trained GGUF release
 [`google/gemma-4-26B-A4B-it-qat-q4_0-gguf`](https://huggingface.co/google/gemma-4-26B-A4B-it-qat-q4_0-gguf).
 It is its own model family next to Qwen3.5 and Flash-Next: its own executor
 (`src/models/gemma4`) and Engine core (`src/runtime/engine/gemma4_core`), sharing the Qwen3.5
@@ -30,6 +30,9 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   target's own KV cache) drafts up to seven tokens a round (`--spec mtp --draft-tokens N`); the
   target verifies them in one pass and every token it keeps is its own sample, so the output is
   what plain decoding produces. See [below](#speculative-decoding-with-the-assistant).
+- **Images and video.** The release's vision tower (27 blocks of width 1152) turns each picture or
+  video frame into soft tokens in the prompt, on the GPU, streamed from pinned host memory, or on
+  CPU threads (`--vision-residency`); see [below](#images-and-video).
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens, prefix reuse across turns, structured output, tool calls in Gemma's
   `<|tool_call>call:NAME{...}<tool_call|>` form returned as OpenAI tool calls, streaming, reasoning
@@ -40,8 +43,8 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
 - **Sampling defaults.** The release's `generation_config.json` (temperature 1.0, top-p 0.95) with
   top-k held at the sampler's 20 candidates.
 
-Not built for this family: images and video (the vision tower), DFlash and ngram copy drafts,
-pipeline stages over several GPUs, and KV formats other than F16.
+Not built for this family: DFlash and ngram copy drafts, pipeline stages over several GPUs, and KV
+formats other than F16.
 
 ## Converting
 
@@ -50,7 +53,8 @@ config from the Hugging Face release:
 
 ```bash
 mkdir -p models/gemma4/hf
-for f in config.json tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json; do
+for f in config.json tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json \
+         processor_config.json; do
   curl -fsSL -o models/gemma4/hf/$f https://huggingface.co/google/gemma-4-26B-A4B-it/resolve/main/$f
 done
 hf download google/gemma-4-26B-A4B-it-qat-q4_0-gguf gemma-4-26B_q4_0-it.gguf --local-dir models/gemma4
@@ -75,8 +79,24 @@ python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf --componen
   --out models/gemma-4-26B-A4B-it-qat-q4_0-mtp.ninfer --device cpu
 ```
 
-An artifact with the assistant runs without it too unless `--spec mtp` asks for it. This conversion
-is published as [WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3).
+An artifact with the assistant runs without it too unless `--spec mtp` asks for it.
+
+The vision tower joins as the `vision` component from the release's llama.cpp `mmproj` GGUF
+(projector `gemma4v`): its BF16 matrices and FP32 norms as stored, the patch projection and the
+position table stored as BF16 (their F32 values are BF16 values, which the converter checks), and
+the release's `processor_config.json` for the image and video budgets (1.07 GiB more):
+
+```bash
+hf download google/gemma-4-26B-A4B-it-qat-q4_0-gguf gemma-4-26B-it-mmproj.gguf --local-dir models/gemma4
+python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf --components text,mtp,vision \
+  --source gguf=models/gemma4/gemma-4-26B_q4_0-it.gguf \
+  --source mtp=models/gemma4/mtp-gemma-4-26B-A4B-it.gguf \
+  --source vision=models/gemma4/gemma-4-26B-it-mmproj.gguf --name Gemma-4-26B-A4B-it-QAT-Q4_0-MTP \
+  --out models/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer --device cpu
+```
+
+This conversion (14.75 GiB) is published as
+[WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3).
 
 ## Running
 
@@ -91,6 +111,10 @@ ninfer models/gemma-4-26B-A4B-it-qat-q4_0.ninfer --prompt "Explain RoPE in two s
 # With the assistant drafting two tokens a round.
 ninfer-serve models/gemma-4-26B-A4B-it-qat-q4_0-mtp.ninfer --model-id gemma4 \
   --max-context 40960 --max-concurrency 4 --spec mtp --draft-tokens 2
+
+# Images and video as well.
+ninfer-serve models/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer --model-id gemma4 \
+  --max-context 40960 --max-concurrency 4 --spec mtp --draft-tokens 2 --vision
 ```
 
 On a 24 GB card the weights take 13.4 GiB (the assistant 0.25 GiB more) and the prompt-chunk
@@ -189,6 +213,59 @@ round drafts shrink as requests join (same streams as above, `--spec mtp`, tok/s
 | 3 | 354.7 | 365.7 with one draft each |
 | 4 | 397.2 | 387.6 with one draft each, so four or more decode plainly |
 
+## Images and video
+
+`--vision` loads the artifact's vision tower; the requests then take images and videos as the
+[serving protocols](serving.md) and the [CLI](cli.md) accept them. Each picture, and each sampled
+frame of a video, is a media unit that becomes soft tokens in the prompt, as the release's
+processor lays them out:
+
+- **Preprocessing.** A unit is resized (bicubic with antialiasing, aspect kept) to the largest size
+  whose sides are multiples of 48 pixels and whose 16 x 16 patches pool 3 x 3 into at most its
+  budget of soft tokens: 70, 140, 280, 560 or 1120. An image takes 280 (`"detail": "low"` 70,
+  `"detail": "high"` the `--vision-max-merged` bound, which is rounded down to a budget and defaults
+  to 1120); a video gives 32 frames sampled evenly over its length, 70 soft tokens each.
+- **Prompt.** An image becomes `<|image>`, its soft tokens and `<image|>`; a video one such run per
+  frame (its tokens `<|video|>`), each after the frame's `mm:ss` timestamp.
+- **Tower.** The patch projection plus learned x and y position rows; 27 blocks (sandwich RMS norms,
+  16 heads of 72 with Q and K norms, a V norm without gamma and 2-D RoPE that turns half of each
+  head by the patch's column and half by its row, unscaled attention over the unit's own patches,
+  GeGLU 4304); the 3 x 3 average, times sqrt(1152), standardized, RMS-normalized and projected to
+  the text model's width 2816. The soft tokens replace their placeholders' embeddings unscaled.
+- **Attention in the text model.** In the sliding-window blocks the soft tokens of one unit see
+  each other in both directions (the release's `use_bidirectional_attention: vision`); the
+  full-attention blocks stay causal. A prompt chunk never splits a unit.
+- **Prefix reuse.** A unit is identified by its content and budget: a follow-up turn over the same
+  pictures reuses the held prefix, pictures included, and a different picture in the same place
+  does not match.
+
+`--vision-residency` places the tower:
+
+| Residency | Tower | Device memory | Encoding |
+|---|---|---|---|
+| `resident` (default) | on the device | 1.07 GiB | CUDA kernels and cuBLAS |
+| `overlay` | blocks in pinned host memory, 1.07 GiB of RAM | a two-block window and the small parts, about 0.14 GiB | the same kernels; each block uploads while the one before computes |
+| `cpu` | FP32 copy in host memory, 2.1 GiB of RAM | none | CPU threads (AVX2 and FMA when the CPU has them); `--vision-max-merged` defaults to 256, so a unit takes at most 140 soft tokens |
+
+The device tower multiplies BF16 matrices by BF16 inputs into FP32 results over an FP32 residual;
+the streamed tower gives the same soft tokens bit for bit. The CPU tower computes in FP32
+throughout. One encode runs at a time per process.
+
+Encoding time on an RTX 3090, the `cpu` residency on the same host's 4-core i3-12100F (AVX2); a
+request's `vision` time in the request log, after the server's warm-up:
+
+| Media | Soft tokens | `resident` | `overlay` | `cpu` |
+|---|---:|---:|---:|---:|
+| a 768 x 512 picture | 260 | 71 ms | 76 ms | 4.5 s (126 tokens) |
+| the same, `"detail": "low"` | 60 | 15 ms | 47 ms | 2.1 s |
+| the same, `"detail": "high"` | 1,080 | 410 ms | 414 ms | |
+| two 640 x 384 pictures | 2 x 252 | 123 ms | 127 ms | 9.5 s (2 x 135) |
+| a 640 x 360 video, 32 of its 40 frames | 32 x 66 | 411 ms | 417 ms | 76.4 s |
+
+The overlay's uploads (the blocks' 1.02 GiB per encode) cost little beside a large unit and
+dominate a small one. A follow-up turn over the same picture reuses it without encoding (274 of its
+496 prompt tokens held).
+
 ## Numerical checks
 
 - The GGUF vector and matrix products at Gemma's widths (2816, 2112 and 704, the last two no whole
@@ -211,6 +288,22 @@ round drafts shrink as requests join (same streams as above, `--spec mtp`, tok/s
   of a fresh 256-token window llama.cpp gives 557.9 against the oracle's 555.7. Block by
   block, both engines drift from the oracle alike (about 10% relative error in the last blocks'
   hidden states for a 26-token prompt), the cost of 8-bit activations in a model this deep.
+- The vision tower: [`tools/reference/gemma4_vision.py`](../tools/reference/gemma4_vision.py), an
+  FP64 NumPy tower over the mmproj GGUF, is the oracle. transformers' own `Gemma4VisionModel` and
+  embedder with the BF16 release's weights agree with it block by block within FP64 rounding (fed
+  the same input, a relative error below 1e-7 per block). The QAT release's mmproj carries its own
+  projection into the text model, up to 0.23 away from the BF16 release's, so the comparison
+  projects with the GGUF's. On a 768 x 512 picture (260 soft tokens,
+  `ninfer_gemma4_vision_real_test`, given an artifact) the device tower's soft tokens lie within
+  2.2% relative RMS error of the oracle's, every token's cosine at least 0.988 (transformers' tower
+  in BF16: 6.9% and 0.889); the CPU tower within 0.17% and 0.999998, the error of its BF16 output;
+  the streamed tower equals the resident one bit for bit. The tower's kernels and the CPU tower's
+  products, softmax and GeGLU match FP64 oracles (`ninfer_gemma4_vision_kernels_test`,
+  `ninfer_gemma4_vision_cpu_kernels_test`), and the BF16 projections with BF16 or FP32 results the
+  FP64 product (`ninfer_linear_bf16_a16_test`).
+- The preprocessing matches transformers' `Gemma4ImageProcessor` on the same picture: the same
+  patch grid and soft-token count, pixel values within 2.2 of 255 (mean 0.08), the two bicubic
+  resamplers' difference.
 - Compare perplexity with llama.cpp on whole fresh windows only: `llama-perplexity
   --ppl-stride` on this model does not reproduce its own fresh-window result for the windows after
   the first (a window scored alone gives 487.6 nats where the strided run reports 401.3), so its

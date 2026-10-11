@@ -286,9 +286,9 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--mlp-a8-decode` | integer-activation MLP gate_up at decode and verify widths | off |
 | `--no-prefill-a8` | return full prefill tiles to their A16 routes, which is how the integer routes are measured on a whole request | integer routes |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
-| `--vision-residency resident\|overlay\|cpu` | `overlay` keeps the Vision tower host-pinned and borrows device memory per image from the evictable text weight tail (no resident Vision cost; needs CUDA VMM). `--vision-offload on\|off` is accepted as an alias for `overlay\|resident`. `cpu` encodes on CPU threads from host FP32 weights, with no device Vision memory and `--vision-max-merged` capped at 256 unless given | `resident` |
+| `--vision-residency resident\|overlay\|cpu` | `overlay` keeps the Vision tower host-pinned and borrows device memory per image from the evictable text weight tail (no resident Vision cost; needs CUDA VMM); for Gemma 4 the tower's blocks stay pinned and stream through a two-block device window. `--vision-offload on\|off` is accepted as an alias for `overlay\|resident`. `cpu` encodes on CPU threads from host FP32 weights, with no device Vision memory and `--vision-max-merged` capped at 256 unless given. Qwen3.8-Flash-Next keeps its tower resident | `resident` |
 | `--vision-cpu` | `--vision` with `--vision-residency cpu` | off |
-| `--vision-max-merged N` | merged-token budget of one media item; larger media downscales at preprocessing | 16384 |
+| `--vision-max-merged N` | merged-token budget of one media item; larger media downscales at preprocessing. Gemma 4: the most soft tokens an image or video frame may take, rounded down to its budgets 70, 140, 280, 560, 1120 (an image takes 280, 70 with `detail: low` and this bound with `detail: high`; a video frame 70) | 16384 |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--wddm-evictable-budget` | Windows builds with `-DNINFER_D3D12_RESIDENCY=ON`: budget against dedicated memory, holding the device arenas resident | off |
 | `--chat-template FILE` | use a local Jinja template | artifact template |

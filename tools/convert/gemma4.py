@@ -16,6 +16,13 @@ stay F32 vectors that the runtime applies.
 assistant (Gemma4AssistantForCausalLM, llama.cpp architecture `gemma4-assistant`) as the `mtp`
 component, its blocks imported the same way: a four-block drafter that reads the target's last
 sliding-window and full-attention KV and its final hidden state.
+
+`--components text,vision --source vision=MMPROJ.gguf` adds the vision tower (Gemma4VisionModel and
+the projection into the text model, llama.cpp's `clip` file with projector `gemma4v`) as the
+`vision` component: its BF16 matrices as `bf16`, its norms FP32, the patch embedding (llama.cpp's
+convolution [1152, 3, 16, 16], a matrix over (channel, y, x)) and the position table BF16 when
+every value is a BF16 value, and the release's processor_config.json as a resource. HF_DIR's
+config.json supplies the tower's RoPE, pooling and standardization and the media token ids.
 """
 
 from __future__ import annotations
@@ -102,20 +109,25 @@ def text_config(source: dict) -> dict:
     return out
 
 
-def _load_resources(root: Path, vocab: int, overrides: dict):
-    references, payloads = {}, {}
-    for role in TEXT_RESOURCES:
+VISION_RESOURCES = ("processor_config.json",)
+
+
+def _load_resources(root: Path, vocab: int, overrides: dict, vision: bool):
+    references, payloads = {"text": {}}, {}
+    roles = [("text", role) for role in TEXT_RESOURCES]
+    roles += [("vision", role) for role in VISION_RESOURCES] if vision else []
+    for component, role in roles:
         path = Path(overrides[role]) if role in overrides else root / role
         data = path.read_bytes()
         if not data:
             raise ValueError(f"{path}: resource is empty")
-        object_id = f"resource/text/{role}"
-        references[role] = object_id
+        object_id = f"resource/{component}/{role}"
+        references.setdefault(component, {})[role] = object_id
         payloads[object_id] = data
     tokenizer = json.loads(payloads["resource/text/tokenizer.json"])
     tokenizer_config = json.loads(payloads["resource/text/tokenizer_config.json"])
     count, special = token_domain(tokenizer, tokenizer_config, vocab)
-    return {"text": references}, payloads, count, special
+    return references, payloads, count, special
 
 
 def _direct(gguf: GGUFFile, tensor: str, shape: tuple[int, ...]) -> LogicalSource:
@@ -131,6 +143,86 @@ def _matrix(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSourc
     if stored != shape:
         raise ValueError(f"{tensor}: stored {info.shape}, expected rows x columns {shape}")
     return block_source(gguf, tensor, shape, rows())
+
+
+def _bf16_matrix(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource:
+    info = gguf.info(tensor)
+    if info.type_name not in ("BF16", "F32", "F16"):
+        raise ValueError(f"{tensor}: expected a BF16 (or F32/F16) matrix, found {info.type_name}")
+    return _exact_bf16(gguf, tensor, shape)
+
+
+def _exact_bf16(gguf: GGUFFile, tensor: str, shape: tuple[int, ...]) -> LogicalSource:
+    """`tensor` as FP32 values that BF16 holds exactly; a wider value is an error, since the tower
+    runs these weights in BF16 (llama.cpp writes the release's BF16 patch embedding and position
+    table as F32)."""
+
+    values = torch.from_numpy(
+        np.ascontiguousarray(gguf.read_direct(tensor).astype(np.float32).reshape(shape)))
+    if not torch.equal(values.to(torch.bfloat16).to(torch.float32), values):
+        raise ValueError(f"{tensor}: values are not BF16 values")
+    return array_source(values, tensor)
+
+
+def vision_config(mmproj: GGUFFile, source: dict, target: dict) -> dict:
+    """The `vision` component's config from a llama.cpp `clip` GGUF with projector `gemma4v` and
+    the release's config.json, checked against each other and against the text model."""
+
+    kv = mmproj.kv
+    if kv.get("general.architecture") != "clip" or not kv.get("clip.has_vision_encoder"):
+        raise ValueError("the vision source must be a llama.cpp clip GGUF with a vision encoder")
+    if kv.get("clip.vision.projector_type") != "gemma4v":
+        raise ValueError("the vision source's projector must be gemma4v (Gemma 4)")
+    raw = source.get("vision_config")
+    if not isinstance(raw, dict) or raw.get("model_type") != "gemma4_vision":
+        raise ValueError("config.json has no gemma4_vision vision_config")
+    if raw.get("hidden_activation") != "gelu_pytorch_tanh":
+        raise ValueError("the Gemma 4 vision MLP uses the tanh GELU")
+    if raw.get("use_clipped_linears"):
+        raise ValueError("clipped vision linears are not implemented")
+    rope = raw.get("rope_parameters") or {}
+    if rope.get("rope_type", "default") not in ("default", "axial"):
+        raise ValueError("the Gemma 4 vision tower rotates axially")
+    v = "clip.vision."
+    out = {
+        "architectures": ["Gemma4VisionModel"],
+        "hidden_size": _int(kv.get(v + "embedding_length"), "vision.embedding_length"),
+        "intermediate_size": _int(kv.get(v + "feed_forward_length"), "vision.feed_forward_length"),
+        "num_hidden_layers": _int(kv.get(v + "block_count"), "vision.block_count"),
+        "num_attention_heads": _int(kv.get(v + "attention.head_count"), "vision.head_count"),
+        "patch_size": _int(kv.get(v + "patch_size"), "vision.patch_size"),
+        "projection_dim": _int(kv.get(v + "projection_dim"), "vision.projection_dim"),
+        "rms_norm_eps": float(kv.get(v + "attention.layer_norm_epsilon", 1e-6)),
+        "head_dim": _int(raw.get("head_dim"), "vision_config.head_dim"),
+        "pooling_kernel_size": _int(raw.get("pooling_kernel_size"),
+                                    "vision_config.pooling_kernel_size"),
+        "position_embedding_size": _int(raw.get("position_embedding_size"),
+                                        "vision_config.position_embedding_size"),
+        "rope_theta": float(rope.get("rope_theta", 100.0)),
+        "standardize": bool(raw.get("standardize", False)),
+        "default_output_length": _int(raw.get("default_output_length", 280),
+                                      "vision_config.default_output_length"),
+    }
+    for key in ("hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
+                "patch_size"):
+        if raw.get(key) != out[key]:
+            raise ValueError(f"vision {key}: GGUF {out[key]} differs from config.json "
+                             f"{raw.get(key)}")
+    if out["head_dim"] * out["num_attention_heads"] != out["hidden_size"]:
+        raise ValueError("vision heads x head_dim must be the hidden size")
+    if out["head_dim"] % 4:
+        raise ValueError("vision head_dim must split into two rotated halves of pairs")
+    if out["projection_dim"] != target["hidden_size"]:
+        raise ValueError("the vision projection must reach the text hidden size")
+    if raw.get("num_key_value_heads", out["num_attention_heads"]) != out["num_attention_heads"]:
+        raise ValueError("the Gemma 4 vision tower has as many key/value heads as query heads")
+    for key in ("image_token_id", "video_token_id", "boi_token_id", "eoi_token_id"):
+        out[key] = _int(source.get(key), key)
+    text = source.get("text_config", {})
+    out["bidirectional_attention"] = text.get("use_bidirectional_attention") == "vision"
+    if text.get("use_bidirectional_attention") not in (None, "vision"):
+        raise ValueError("only the vision-block bidirectional attention is implemented")
+    return out
 
 
 def assistant_config(mtp: GGUFFile, target: dict) -> dict:
@@ -181,19 +273,24 @@ def assistant_config(mtp: GGUFFile, target: dict) -> dict:
     return out
 
 
-def build_model(base, gguf: GGUFFile, *, mtp: GGUFFile | None = None, resource_overrides=None):
-    """The text component of a Gemma 4 GGUF, every parameter's source the GGUF, and with `mtp` the
-    assistant's component from its own GGUF."""
+def build_model(base, gguf: GGUFFile, *, mtp: GGUFFile | None = None,
+                vision: GGUFFile | None = None, resource_overrides=None):
+    """The text component of a Gemma 4 GGUF, every parameter's source the GGUF, with `mtp` the
+    assistant's component from its own GGUF and with `vision` the vision tower's from an mmproj
+    GGUF."""
 
     from .model import Model, Parameter
 
     config = text_config(base.config)
     h, vocab = config["hidden_size"], config["vocab_size"]
     references, payloads, count, special = _load_resources(
-        base.root, vocab, dict(resource_overrides or {}))
+        base.root, vocab, dict(resource_overrides or {}), vision is not None)
     records = {"text": {"config": config, "resources": references["text"]}}
     if mtp is not None:
         records["mtp"] = {"config": assistant_config(mtp, config), "target": "text"}
+    if vision is not None:
+        records["vision"] = {"config": vision_config(vision, base.config, config),
+                             "resources": references["vision"], "target": "text"}
     model = Model(records, resources=payloads, token_count=count, special_token_ids=special)
 
     def matrix(name, tensor, shape, inputs, source=gguf):
@@ -269,6 +366,46 @@ def build_model(base, gguf: GGUFFile, *, mtp: GGUFFile | None = None, resource_o
             matrix(p + "mlp/gate", g + "ffn_gate.weight", (width, ah), (p + "mlp_input",), mtp)
             matrix(p + "mlp/up", g + "ffn_up.weight", (width, ah), (p + "mlp_input",), mtp)
             matrix(p + "mlp/down", g + "ffn_down.weight", (ah, width), (p + "mlp_product",), mtp)
+    if vision is not None:
+        vc = records["vision"]["config"]
+        vh, vw, patch = vc["hidden_size"], vc["intermediate_size"], vc["patch_size"]
+
+        def dense(name, tensor, shape, inputs):
+            model.add(Parameter(name, shape, _bf16_matrix(vision, tensor, shape),
+                                inputs=tuple(inputs), residency="vision"))
+
+        def table(name, tensor, shape):
+            model.add(Parameter(name, shape, _exact_bf16(vision, tensor, shape),
+                                direct_format="bf16", residency="vision"))
+
+        def norm(name, tensor, shape):
+            vector(name, tensor, shape, vision)
+
+        dense("vision/patch_embedding", "v.patch_embd.weight", (vh, 3 * patch * patch),
+              ("vision/patches",))
+        table("vision/position_table", "v.position_embd.weight",
+              (2 * vc["position_embedding_size"], vh))
+        if vc["standardize"]:
+            norm("vision/std_bias", "v.std_bias", (vh,))
+            norm("vision/std_scale", "v.std_scale", (vh,))
+        dense("vision/projection", "mm.input_projection.weight", (vc["projection_dim"], vh),
+              ("vision/soft_tokens",))
+        d = vc["head_dim"]
+        for i in range(vc["num_hidden_layers"]):
+            g, p = f"v.blk.{i}.", f"vision/layers/{i}/"
+            a = p + "attention/"
+            for part, tensor in (("query", "attn_q"), ("key", "attn_k"), ("value", "attn_v")):
+                dense(a + part, g + tensor + ".weight", (vh, vh), (p + "mixer_input",))
+            dense(a + "output", g + "attn_out.weight", (vh, vh), (p + "attention_output",))
+            norm(a + "query_norm", g + "attn_q_norm.weight", (d,))
+            norm(a + "key_norm", g + "attn_k_norm.weight", (d,))
+            norm(p + "input_norm", g + "ln1.weight", (vh,))
+            norm(p + "post_attention_norm", g + "attn_post_norm.weight", (vh,))
+            norm(p + "ffn_norm", g + "ln2.weight", (vh,))
+            norm(p + "post_ffn_norm", g + "ffn_post_norm.weight", (vh,))
+            dense(p + "mlp/gate", g + "ffn_gate.weight", (vw, vh), (p + "mlp_input",))
+            dense(p + "mlp/up", g + "ffn_up.weight", (vw, vh), (p + "mlp_input",))
+            dense(p + "mlp/down", g + "ffn_down.weight", (vh, vw), (p + "mlp_product",))
     return model
 
 
@@ -281,7 +418,12 @@ def gemma4_gguf(model, recipe, sources):
         raise ValueError("the gemma4_gguf recipe requires a Gemma 4 model")
     formats = {}
     for name, parameter in model.parameters.items():
-        if parameter.projection:
+        if name.startswith("vision/"):
+            # The tower's BF16 weights as they are; its norms and standardization FP32.
+            fmt = formats[name] = "bf16" if parameter.projection else parameter.direct_format
+            recipe.assign(name, format=fmt, method=cast_direct, source=parameter.source,
+                          **({"activation_policy": "A16Only"} if parameter.projection else {}))
+        elif parameter.projection:
             fmt = formats[name] = parameter.source.read_encoded(0, 1).format
             recipe.assign(name, format=fmt, method=import_encoded, source=parameter.source,
                           activation_policy="AllowA8")
@@ -296,6 +438,12 @@ def gemma4_gguf(model, recipe, sources):
     if "mtp" in model.components:
         mlps += [f"mtp/layers/{i}/mlp/"
                  for i in range(model.components["mtp"]["config"]["num_hidden_layers"])]
+    if "vision" in model.components:
+        layers = model.components["vision"]["config"]["num_hidden_layers"]
+        for i in range(layers):
+            a = f"vision/layers/{i}/attention/"
+            recipe.group([a + "query", a + "key", a + "value"])
+        mlps += [f"vision/layers/{i}/mlp/" for i in range(layers)]
     for p in mlps:
         if formats[p + "gate"] != formats[p + "up"]:
             raise ValueError(f"{p}: gate and up are stored in different formats")

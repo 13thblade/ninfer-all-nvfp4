@@ -59,8 +59,11 @@ void qkv_post(const QkvArgs& args, cudaStream_t stream);
 // slot s, -inf elsewhere. Linear (ring 0): slot s holds position s, visible when s <= first + t.
 // Ring: slot s holds the latest position p = s (mod ring) at or before first + tokens - 1, visible
 // when first + t - window < p <= first + t.
+// With `blocks` ([tokens], the media unit of each chunk row, -1 for text) a ring's slot holding a
+// chunk position of the query's own unit is visible too, ahead of the query (a media unit's soft
+// tokens attend each other in both directions).
 void build_mask(__half* mask, int tokens, int slots, int first, int ring, int window,
-                cudaStream_t stream);
+                cudaStream_t stream, const std::int32_t* blocks = nullptr);
 
 void f32_to_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, cudaStream_t stream);
 
