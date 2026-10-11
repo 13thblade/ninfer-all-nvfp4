@@ -685,12 +685,18 @@ commits forced thinking-control tokens through the matcher; the injected closure
 grammar in the reasoning phase. Framing and grammar state have identical rollback/commit ownership.
 
 Program reserves vocabulary bitsets in its planned persistent device arena and owns pinned host
-staging. Ordinary/prefill sampling uses the current mask. MTP supplies each current draft prefix
-to a forked matcher before launch. DFlash/DFlash2 must first generate device drafts: their graph
-captures D2H draft transfer, a CUDA host function that fills all reachable prefix masks, H2D mask
-transfer, then target verification. The host function calls no CUDA API; it captures exceptions
-for rethrow after stream synchronization and before any token can be published. All node addresses
-belong to Program and outlive graph replay.
+staging. Prefill sampling uses the mask installed with the request. An ordinary or MTP round
+starts each structured lane's mask job (a fork of its grammar; MTP supplies the round's draft
+prefixes, whose columns fill in parallel) on host threads before launch; a non-blocking upload
+stream collects the jobs in a host function, uploads their columns and records an event, and the
+round's graph waits on that event (an external event node) just before it samples, so the masks
+compute while the forward pass runs. DFlash/DFlash2 must first generate device drafts: their graph
+captures D2H draft transfer and a host function that starts the lanes' jobs from them, then target
+verification, then a host function that collects the jobs and the H2D mask transfer before the
+acceptance. Host functions call no CUDA API; they capture exceptions for rethrow after stream
+synchronization and before any token can be published. All node addresses belong to Program and
+outlive graph replay. A structured lane whose last masks took over 4 ms verifies no drafts (its
+extent is zero) until they are cheap again.
 
 Draft frames are compact at each round's actual proposal width, which may be narrower than the
 maximum ngram/copy window. D2H staging must preserve the fixed host-row pitch used by the grammar

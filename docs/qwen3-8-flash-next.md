@@ -387,7 +387,10 @@ prompt also resumes from an image on
 disk, which a later run finds there too.
 
 Structured output (`--structured-output` for the server, `--json`/`--json-schema` for the CLI) works
-as for the Qwen3.5 family: the grammar's token mask applies to every sampled token. So do
+as for Gemma 4 ([Structured output](gemma4.md#structured-output)): the grammar's token mask applies
+to every sampled token, it is computed on a thread of its own while the step runs, a row whose mask
+is late samples once it is ready without holding the others, and a request drafts while its masks
+take at most 4 ms. So do
 [token log probabilities](serving.md#token-log-probabilities): a request that asks gathers each
 sampled token's top 20 from the same logits before sampling.
 
