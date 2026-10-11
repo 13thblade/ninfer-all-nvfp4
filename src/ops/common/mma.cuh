@@ -48,12 +48,33 @@ __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& 
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// FP16 x FP16 with an FP16 accumulator: full rate on GA10x GeForce parts, where the FP32-accumulate
+// form above runs at half rate. c0 holds the accumulator pair (row g, cols 2t..2t+1) and c1 the pair
+// (row g+8, cols 2t..2t+1) as packed __half2 bits; every product and partial sum rounds to FP16, so
+// callers bound the partial range themselves.
+__device__ __forceinline__ void mma_f16_acc16(unsigned& c0, unsigned& c1, unsigned a0, unsigned a1,
+                                              unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                 : "+r"(c0), "+r"(c1)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
 __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
                                        unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// The k16 int8 shape: A is {a0,a1} (rows g and g+8, k = 4 (lane % 4) + 0..3), B is {b0}.
+__device__ __forceinline__ void mma_s8_k16(int& c0, int& c1, int& c2, int& c3, unsigned a0,
+                                           unsigned a1, unsigned b0) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                 : "r"(a0), "r"(a1), "r"(b0));
 }
 
 // On RTX 5090, block-scaled FP8 avoids the plain form's half-rate FP32 accumulation.
