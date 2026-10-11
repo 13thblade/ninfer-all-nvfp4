@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstdio>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -368,7 +369,8 @@ std::uint64_t merge_pair_key(int left, int right) noexcept {
 }
 
 BpeMergeTable load_bpe_merge_rules(const Json& model, std::string_view label,
-                                   const std::unordered_map<std::string, int>& token_to_id) {
+                                   const std::unordered_map<std::string, int>& token_to_id,
+                                   bool lenient = false) {
     const Json& merges = require_array_field(model, "merges", label);
     BpeMergeTable rules;
     rules.reset(merges.size());
@@ -402,6 +404,10 @@ BpeMergeTable load_bpe_merge_rules(const Json& model, std::string_view label,
         const auto result_id = token_to_id.find(left + right);
         if (left_id == token_to_id.end() || right_id == token_to_id.end() ||
             result_id == token_to_id.end()) {
+            if (lenient) {
+                ++rank;
+                continue;
+            }
             throw std::invalid_argument("model.merges references a symbol outside model.vocab in " +
                                         std::string(label));
         }
@@ -684,6 +690,171 @@ struct IndexedByteBoundary {
     std::size_t index  = 0;
 };
 
+// ---- SentencePiece-style BPE (Gemma 4) ----------------------------------------------------------
+
+constexpr std::string_view kSentencePieceSpace = "\xe2\x96\x81"; // U+2581
+
+bool is_sentencepiece(const Json& root) {
+    if (!root.contains("normalizer") || !root["normalizer"].is_object()) { return false; }
+    const Json& normalizer = root["normalizer"];
+    return normalizer.value("type", std::string{}) == "Replace" &&
+           normalizer.contains("pattern") && normalizer["pattern"].is_object() &&
+           normalizer["pattern"].value("String", std::string{}) == " " &&
+           normalizer.value("content", std::string{}) == kSentencePieceSpace;
+}
+
+// Every <0xXX> token of the vocabulary, by byte.
+std::array<int, 256> load_byte_fallback_ids(const std::unordered_map<std::string, int>& token_to_id) {
+    std::array<int, 256> ids;
+    ids.fill(-1);
+    for (int byte = 0; byte < 256; ++byte) {
+        char name[8];
+        std::snprintf(name, sizeof(name), "<0x%02X>", byte);
+        const auto found = token_to_id.find(name);
+        if (found != token_to_id.end()) { ids[static_cast<std::size_t>(byte)] = found->second; }
+    }
+    return ids;
+}
+
+// A vocabulary entry's bytes: <0xXX> is that byte, U+2581 is a space.
+std::string decode_sentencepiece_token(std::string_view token) {
+    if (token.size() == 6 && token.starts_with("<0x") && token.back() == '>') {
+        unsigned value = 0;
+        const auto [end, error] =
+            std::from_chars(token.data() + 3, token.data() + 5, value, 16);
+        if (error == std::errc{} && end == token.data() + 5) {
+            return std::string(1, static_cast<char>(value));
+        }
+    }
+    std::string out;
+    out.reserve(token.size());
+    for (std::size_t i = 0; i < token.size();) {
+        if (token.compare(i, kSentencePieceSpace.size(), kSentencePieceSpace) == 0) {
+            out.push_back(' ');
+            i += kSentencePieceSpace.size();
+        } else {
+            out.push_back(token[i++]);
+        }
+    }
+    return out;
+}
+
+// BPE over the code points of one ordinary run, with spaces replaced by U+2581. `ends` receives
+// each token's end in the run's original bytes.
+bool append_sentencepiece_ids(std::vector<int>& ids, std::string_view text,
+                              const BpeMergeTable& merge_rules,
+                              const std::unordered_map<std::string, int>& token_to_id,
+                              const std::array<int, 256>& byte_ids, std::size_t max_tokens,
+                              std::vector<std::size_t>* ends) {
+    if (text.empty()) { return true; }
+    if (ids.size() == max_tokens) { return false; }
+    std::vector<BpeNode> nodes;
+    nodes.reserve(text.size());
+    std::string piece;
+    for (std::size_t begin = 0; begin < text.size();) {
+        const uni::CodepointSpan cp = uni::utf8_codepoint_at(text, begin, "Tokenizer::encode input");
+        const std::size_t end       = begin + cp.length;
+        if (cp.value == ' ') {
+            piece.assign(kSentencePieceSpace);
+        } else {
+            piece.assign(text.substr(begin, cp.length));
+        }
+        const auto found = token_to_id.find(piece);
+        if (found != token_to_id.end()) {
+            nodes.push_back(BpeNode{.symbol = found->second, .end = end});
+        } else {
+            for (std::size_t b = begin; b < end; ++b) {
+                const int symbol = byte_ids[static_cast<unsigned char>(text[b])];
+                if (symbol < 0) {
+                    throw std::invalid_argument("Tokenizer::encode found no byte-fallback token");
+                }
+                nodes.push_back(BpeNode{.symbol = symbol, .end = b + 1});
+            }
+        }
+        begin = end;
+    }
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        nodes[i].previous = i == 0 ? -1 : static_cast<int>(i - 1);
+        nodes[i].next     = i + 1 == nodes.size() ? -1 : static_cast<int>(i + 1);
+    }
+    std::priority_queue<BpeCandidate, std::vector<BpeCandidate>, LaterBpeCandidate> queue;
+    const auto push_candidate = [&](int left) {
+        if (left < 0 || !nodes[static_cast<std::size_t>(left)].live) { return; }
+        const int right = nodes[static_cast<std::size_t>(left)].next;
+        if (right < 0) { return; }
+        const BpeMergeEntry* rule =
+            merge_rules.find(merge_pair_key(nodes[static_cast<std::size_t>(left)].symbol,
+                                            nodes[static_cast<std::size_t>(right)].symbol));
+        if (rule == nullptr) { return; }
+        queue.push(BpeCandidate{.rank             = rule->rank,
+                                .left             = left,
+                                .right            = right,
+                                .result           = rule->result,
+                                .left_generation  = nodes[static_cast<std::size_t>(left)].generation,
+                                .right_generation = nodes[static_cast<std::size_t>(right)].generation});
+    };
+    for (std::size_t i = 0; i + 1 < nodes.size(); ++i) { push_candidate(static_cast<int>(i)); }
+    while (!queue.empty()) {
+        const BpeCandidate candidate = queue.top();
+        queue.pop();
+        BpeNode& left  = nodes[static_cast<std::size_t>(candidate.left)];
+        BpeNode& right = nodes[static_cast<std::size_t>(candidate.right)];
+        if (!left.live || !right.live || left.next != candidate.right ||
+            left.generation != candidate.left_generation ||
+            right.generation != candidate.right_generation) {
+            continue;
+        }
+        left.symbol = candidate.result;
+        left.end    = right.end;
+        ++left.generation;
+        left.next  = right.next;
+        right.live = false;
+        ++right.generation;
+        if (left.next >= 0) { nodes[static_cast<std::size_t>(left.next)].previous = candidate.left; }
+        push_candidate(left.previous);
+        push_candidate(candidate.left);
+    }
+    for (int node = nodes.empty() ? -1 : 0; node >= 0;
+         node     = nodes[static_cast<std::size_t>(node)].next) {
+        ids.push_back(nodes[static_cast<std::size_t>(node)].symbol);
+        if (ends != nullptr) { ends->push_back(nodes[static_cast<std::size_t>(node)].end); }
+        if (ids.size() == max_tokens) { return false; }
+    }
+    return true;
+}
+
+// The SentencePiece form of append_ordinary_text: a requested boundary is exact where a token
+// ends there, else it falls back to the run's start.
+bool append_sentencepiece_text(BoundaryEncodedText& encoded, std::string_view text,
+                               std::size_t text_offset,
+                               std::span<const IndexedByteBoundary> boundaries,
+                               const BpeMergeTable& merge_rules,
+                               const std::unordered_map<std::string, int>& token_to_id,
+                               const std::array<int, 256>& byte_ids, std::size_t max_tokens) {
+    const std::size_t token_base = encoded.input_ids.size();
+    std::vector<std::size_t> ends;
+    const bool complete = append_sentencepiece_ids(encoded.input_ids, text, merge_rules,
+                                                   token_to_id, byte_ids, max_tokens, &ends);
+    for (const IndexedByteBoundary boundary : boundaries) {
+        const std::size_t local = boundary.offset - text_offset;
+        if (local == 0) {
+            encoded.boundaries[boundary.index] =
+                TokenBoundaryResult{.exact_frontier = token_base, .stable_frontier = token_base};
+            continue;
+        }
+        const auto at = std::find(ends.begin(), ends.end(), local);
+        if (at != ends.end()) {
+            const std::size_t frontier = token_base + std::size_t(at - ends.begin()) + 1;
+            encoded.boundaries[boundary.index] =
+                TokenBoundaryResult{.exact_frontier = frontier, .stable_frontier = frontier};
+        } else {
+            encoded.boundaries[boundary.index] =
+                TokenBoundaryResult{.exact_frontier = std::nullopt, .stable_frontier = token_base};
+        }
+    }
+    return complete;
+}
+
 bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
                           std::size_t text_offset, std::span<const IndexedByteBoundary> boundaries,
                           const BpeMergeTable& merge_rules,
@@ -793,6 +964,10 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     const Json tokenizer_config =
         read_json_asset(resources.tokenizer_config_json, tokenizer_config_label);
     const Json& model = require_object_field(root, "model", tokenizer_label);
+    if (is_sentencepiece(root)) {
+        load_sentencepiece(root, tokenizer_config, model, resources);
+        return;
+    }
     validate_pipeline(root, model);
 
     VocabMetadata vocab_metadata = load_vocab(model, tokenizer_label);
@@ -834,6 +1009,69 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
 }
 
+void Tokenizer::load_sentencepiece(const nlohmann::json& root, const nlohmann::json& config,
+                                   const nlohmann::json& model, TokenizerResources resources) {
+    constexpr std::string_view label = "tokenizer.json";
+    sentencepiece_                   = true;
+    if (model.value("byte_fallback", false) != true) {
+        throw std::invalid_argument("SentencePiece tokenizer.json must use byte fallback");
+    }
+    VocabMetadata vocab = load_vocab(model, label);
+    decoded_token_bytes_.resize(vocab.id_to_token.size());
+    for (std::size_t id = 0; id < vocab.id_to_token.size(); ++id) {
+        decoded_token_bytes_[id] = decode_sentencepiece_token(vocab.id_to_token[id]);
+    }
+    vocab_token_to_id_ = std::move(vocab.token_to_id);
+    valid_token_ids_.assign(decoded_token_bytes_.size(), false);
+    for (const int id : vocab.occupied_ids) { valid_token_ids_[static_cast<std::size_t>(id)] = true; }
+    // Added tokens may repeat a vocabulary entry (<bos>, <eos>, ...); their content is matched in
+    // the input text and decodes as itself.
+    const auto add = [&](AddedToken token) {
+        const auto index = static_cast<std::size_t>(token.id);
+        if (index >= decoded_token_bytes_.size()) {
+            decoded_token_bytes_.resize(index + 1);
+            valid_token_ids_.resize(index + 1, false);
+        }
+        for (const AddedToken& existing : added_tokens_) {
+            if (existing.id == token.id) { return; }
+        }
+        decoded_token_bytes_[index] = token.content;
+        valid_token_ids_[index]     = true;
+        added_tokens_.push_back(std::move(token));
+    };
+    if (root.contains("added_tokens") && root["added_tokens"].is_array()) {
+        for (const Json& item : root["added_tokens"]) { add(parse_added_token(item, label)); }
+    }
+    if (config.contains("added_tokens_decoder") && config["added_tokens_decoder"].is_object()) {
+        for (const auto& item : config["added_tokens_decoder"].items()) {
+            const int id = parse_added_token_decoder_id(item.key(), "tokenizer_config.json");
+            add(parse_added_token_decoder_entry(id, item.value(), "tokenizer_config.json"));
+        }
+    }
+    std::sort(added_tokens_.begin(), added_tokens_.end(),
+              [](const AddedToken& lhs, const AddedToken& rhs) { return lhs.id < rhs.id; });
+    // Longest content first among candidates sharing a first byte, so "<|tool_call>" wins over a
+    // shorter added token it starts with.
+    std::vector<std::size_t> order(added_tokens_.size());
+    for (std::size_t i = 0; i < order.size(); ++i) { order[i] = i; }
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return added_tokens_[a].content.size() > added_tokens_[b].content.size();
+    });
+    for (const std::size_t index : order) {
+        const std::string& content = added_tokens_[index].content;
+        if (!content.empty()) {
+            added_token_candidates_[static_cast<unsigned char>(content.front())].push_back(index);
+        }
+    }
+    special_token_ids_.assign(decoded_token_bytes_.size(), false);
+    for (const AddedToken& token : added_tokens_) {
+        special_token_ids_[static_cast<std::size_t>(token.id)] = token.special;
+    }
+    bpe_merge_rules_        = load_bpe_merge_rules(model, label, vocab_token_to_id_, true);
+    byte_token_ids_         = load_byte_fallback_ids(vocab_token_to_id_);
+    default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
+}
+
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
     BoundaryEncodedText encoded = encode_with_boundaries(text, {}, options);
     return std::move(encoded.input_ids);
@@ -872,11 +1110,15 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
     };
     const auto append_ordinary = [&](std::size_t begin, std::size_t end) {
         const std::size_t request_end = boundary_end_through(end);
+        const auto requests = std::span<const IndexedByteBoundary>(boundaries)
+                                  .subspan(boundary_cursor, request_end - boundary_cursor);
         const bool complete =
-            append_ordinary_text(encoded, text.substr(begin, end - begin), begin,
-                                 std::span<const IndexedByteBoundary>(boundaries)
-                                     .subspan(boundary_cursor, request_end - boundary_cursor),
-                                 bpe_merge_rules_, byte_token_ids_, options.max_tokens);
+            sentencepiece_
+                ? append_sentencepiece_text(encoded, text.substr(begin, end - begin), begin,
+                                            requests, bpe_merge_rules_, vocab_token_to_id_,
+                                            byte_token_ids_, options.max_tokens)
+                : append_ordinary_text(encoded, text.substr(begin, end - begin), begin, requests,
+                                       bpe_merge_rules_, byte_token_ids_, options.max_tokens);
         boundary_cursor = request_end;
         return complete;
     };

@@ -170,7 +170,9 @@ Error compare(const std::vector<float>& got, const std::vector<double>& want) {
 }
 
 // K = 1536 and K = 2560, Qwen3.8-Flash-Next's hidden width, whose 80 slices leave the vector
-// products' last pass over a row with half of a warp's lanes idle.
+// products' last pass over a row with half of a warp's lanes idle; and Gemma 4's widths 2816, 2112
+// and 704, which are no whole number of the matrix kernel's 512-value activation steps (2112 and
+// 704 not even of its 256-value weight steps).
 int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
     constexpr std::int32_t kRows = 256;
     const std::int32_t kK        = k;
@@ -180,7 +182,10 @@ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
     int failures = 0;
 
     const auto host_blocks = random_blocks(c, 2 * kRows, kK, rng);
-    DeviceBuffer blocks(host_blocks.size());
+    // Zero bytes after the last row, as a bound device tail keeps them: a row whose K is no whole
+    // number of the matrix kernel's 256-value steps reads its last step into the next row.
+    DeviceBuffer blocks(host_blocks.size() + 4096);
+    blocks.fill(0);
     blocks.copy_from_host(host_blocks.data(), host_blocks.size());
     const auto block        = gguf_block_shape(c.qtype);
     const std::int64_t row_bytes = std::int64_t(kK / block.elements) * block.bytes;
@@ -344,7 +349,8 @@ int main() {
         int failures      = 0;
         std::uint32_t seed = 9001;
         for (const auto& c : cases()) {
-            for (const std::int32_t k : {1536, 2560}) {
+            for (const std::int32_t k : {1536, 2560, 2816, 2112, 704}) {
+                if (k % gguf_block_shape(c.qtype).elements != 0) { continue; }
                 const int f = run_type(c, seed++, k);
                 std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
                           << '\n';

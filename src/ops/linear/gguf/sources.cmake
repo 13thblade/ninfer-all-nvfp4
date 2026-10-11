@@ -3,6 +3,7 @@
 set(NINFER_GGML_QUANTS_ROOT "${PROJECT_SOURCE_DIR}/third_party/ggml-quants")
 add_library(ninfer_ggml_quants STATIC
   "${CMAKE_CURRENT_LIST_DIR}/ggml_bridge.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_fattn.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq1_s.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq2_s.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq2_xs.cu"

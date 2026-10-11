@@ -6,8 +6,11 @@
 namespace ninfer::models::qwen3_5::frontend {
 namespace {
 
-constexpr std::string_view kStart       = "<|im_start|>";
-constexpr std::string_view kEnd         = "<|im_end|>";
+constexpr std::string_view kQwenStart   = "<|im_start|>";
+constexpr std::string_view kQwenEnd     = "<|im_end|>";
+// Gemma 4's turns: <|turn>role\n ... <turn|>, the assistant's role named "model".
+constexpr std::string_view kGemmaStart  = "<|turn>";
+constexpr std::string_view kGemmaEnd    = "<turn|>";
 constexpr std::string_view kVisionStart = "<|vision_start|>";
 constexpr std::string_view kVisionEnd   = "<|vision_end|>";
 
@@ -55,12 +58,17 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
                                    std::span<const Modality> media) {
     PromptLayout result;
     const std::string_view source = output.text;
+    const bool gemma =
+        find_marker(output, kQwenStart, 0) == std::string::npos &&
+        find_marker(output, kGemmaStart, 0) != std::string::npos;
+    const std::string_view kStart = gemma ? kGemmaStart : kQwenStart;
+    const std::string_view kEnd   = gemma ? kGemmaEnd : kQwenEnd;
     for (auto pos = find_marker(output, kStart, 0); pos != std::string::npos;) {
         const auto header_end = source.find('\n', pos + kStart.size());
         if (header_end == std::string::npos) break;
         const auto role = source.substr(pos + kStart.size(), header_end - pos - kStart.size());
         ChatRole parsed;
-        if (role == "assistant")
+        if (role == "assistant" || (gemma && role == "model"))
             parsed = ChatRole::Assistant;
         else if (role == "user")
             parsed = ChatRole::User;

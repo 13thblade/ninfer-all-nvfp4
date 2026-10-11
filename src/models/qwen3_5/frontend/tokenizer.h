@@ -2,6 +2,8 @@
 
 #include "text/byte_span.h"
 
+#include <nlohmann/json.hpp>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -152,7 +154,16 @@ public:
     [[nodiscard]] bool is_valid_token(int id) const noexcept;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;
 
+    // SentencePiece-style BPE (Gemma 4): spaces become U+2581, the whole text between added tokens
+    // is one BPE word over code points, and a code point outside the vocabulary falls back to its
+    // <0xXX> byte tokens. False for the byte-level Qwen tokenizer.
+    [[nodiscard]] bool sentencepiece() const noexcept { return sentencepiece_; }
+
 private:
+    void load_sentencepiece(const nlohmann::json& root, const nlohmann::json& config,
+                            const nlohmann::json& model, TokenizerResources resources);
+
+    bool sentencepiece_ = false;
     std::vector<std::string> decoded_token_bytes_;
     std::vector<bool> valid_token_ids_;
     std::vector<bool> special_token_ids_;

@@ -4,9 +4,9 @@
 
 namespace ninfer::models {
 
-// Qwen4Exp (Qwen3.8-Flash-Next) is its own family (models/qwen4_exp); the Qwen3.5 config parser
-// never resolves it.
-enum class Architecture { Qwen3_5, Qwen3_5Moe, Qwen4Exp };
+// Qwen4Exp (Qwen3.8-Flash-Next) and Gemma 4 are their own families (models/qwen4_exp,
+// models/gemma4); the Qwen3.5 config parser never resolves them.
+enum class Architecture { Qwen3_5, Qwen3_5Moe, Qwen4Exp, Gemma4 };
 
 [[nodiscard]] Architecture resolve_architecture(std::string_view architecture,
                                                 std::string_view model_type);

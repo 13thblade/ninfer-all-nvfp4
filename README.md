@@ -1,8 +1,8 @@
 # NInfer-all
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
-their fine-tunes and Ternary Bonsai 2) and Qwen3.8-Flash-Next, on the RTX 3090, RTX 4090, RTX 5090
-and RTX PRO 6000 Blackwell. It serves the OpenAI, Anthropic and llama.cpp APIs from one GPU, or from
+their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next and Gemma 4 26B-A4B, on the RTX 3090,
+RTX 4090, RTX 5090 and RTX PRO 6000 Blackwell. It serves the OpenAI, Anthropic and llama.cpp APIs from one GPU, or from
 up to eight as pipeline stages on Linux.
 
 NInfer-all continues [NInfer](https://github.com/Neroued/ninfer) through the NInfer-3090 line and
@@ -114,6 +114,12 @@ of the file.
   (`--expert-residency disk`, under 1 GB of RAM). It serves up to eight requests with prefix reuse,
   structured output, images and video, and MTP drafting. On two RTX 5090s the Q2_0 release scores
   93.3% on AIME 2025 and 86.4% on GPQA-Diamond ([Qwen3.8-Flash-Next](docs/qwen3-8-flash-next.md)).
+
+- **Gemma 4 26B-A4B.** Google's QAT Q4_0 GGUF release, imported block for block (13.4 GiB): the
+  sliding-window and full-attention blocks, the dense MLP beside 128 routed experts, up to eight
+  concurrent requests with prefix reuse, tool calls and structured output. On an RTX 3090 it
+  prefills a 10,000-token prompt at 5,695 tok/s and decodes at 208 tok/s, 177 after 10,000 tokens,
+  against llama.cpp's 4,427, 167 and 151 on the same GGUF ([Gemma 4](docs/gemma4.md)).
 
 **Speculative decoding**
 
@@ -294,6 +300,27 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
 - **Drafting.** `--spec mtp --draft-tokens 3` drafts with the MTP block the published artifacts
   carry.
 - **Images and video.** `--vision` adds the Vision tower (0.9 GB on the GPU).
+
+</details>
+
+<details>
+<summary><b>Gemma 4 26B-A4B</b>: converted from Google's QAT GGUF</summary>
+
+```bash
+# The release's GGUF and its Hugging Face text files; one conversion writes the artifact.
+mkdir -p models/gemma4/hf
+for f in config.json tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json; do
+  curl -fsSL -o models/gemma4/hf/$f https://huggingface.co/google/gemma-4-26B-A4B-it/resolve/main/$f
+done
+hf download google/gemma-4-26B-A4B-it-qat-q4_0-gguf gemma-4-26B_q4_0-it.gguf --local-dir models/gemma4
+python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf \
+  --source gguf=models/gemma4/gemma-4-26B_q4_0-it.gguf --name Gemma-4-26B-A4B-it-QAT \
+  --out models/gemma-4-26B-A4B-it-qat-q4_0.ninfer --device cpu
+
+# Four concurrent requests over 40K-token contexts; thinking stays off unless a request asks.
+ninfer-serve models/gemma-4-26B-A4B-it-qat-q4_0.ninfer --model-id gemma4 \
+  --max-context 40960 --max-concurrency 4
+```
 
 </details>
 

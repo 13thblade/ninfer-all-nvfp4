@@ -42,6 +42,12 @@ read a row at a time, unless `--ngram-residency ram` loads it. A model with PLE 
 unless `--no-ngram-table` overrides that; a qualification layer slice without PLE needs no table.
 These are the only product modes in which model weights live off
 the GPU.
+Gemma 4 26B-A4B (`Gemma4ForCausalLM`, the text component of `Gemma4ForConditionalGeneration`;
+`src/models/gemma4`, `runtime/engine/gemma4_core`) is a third explicit family converted from
+Google's QAT GGUF with its ggml blocks kept as stored. It shares the Qwen3.5 frontend (tokenizer,
+chat template, output channels and Gemma's tool-call markup), runs one to eight sequences in prompt
+chunks of 2048 tokens with an F16 KV cache, and has no vision, speculative decoding or pipeline
+stages.
 For the current Flash-Next delivery, all model and expert arithmetic runs on the GPU. Keep the
 completed native/CPU experiments and their evidence, but do not extend CPU expert execution or
 automatically select a CPU share. Develop the existing GGUF host-RAM and disk-streaming paths;

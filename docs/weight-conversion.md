@@ -75,6 +75,7 @@ The built-in recipes are ordinary Python functions in
 | `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte | `gguf` (GGUF), `vision` (mmproj GGUF) |
 | `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact or in a table artifact of their own; every hyper-connection matrix as ggml Q8_0 rows (the release's BF16 ones re-quantised); the MTP block from an MTP GGUF, its matrices in their blocks | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF), `mtp` (an MTP GGUF) |
+| `gemma4_gguf` | Gemma 4 26B-A4B from Google's QAT GGUF: every matrix in its block format (Q4_0, the tied token table Q6_K), byte for byte, the attention and the [gate; up] MLP projections grouped into one parent each, the vectors and expert scales as FP32 | `gguf` |
 
 The QUASAR Qwen3.8-27B NVFP4 checkpoint, which quantizes every Linear layer to NVFP4, has a driver
 of its own, `python3 -m tools.convert.quasar_nvfp4 --model DIR --dflash2 REFERENCE.ninfer --out
@@ -258,6 +259,15 @@ matrices, BF16 in the GSQ-RCO GGUFs, are the one thing the recipe re-quantises: 
 reference rounding, which halves the largest share of a decoded token's weight reads. Commands,
 runtime options and measurements:
 [Qwen3.8-Flash-Next](qwen3-8-flash-next.md).
+
+### Gemma 4 GGUF releases
+
+`gemma4_gguf` ([`gemma4.py`](../tools/convert/gemma4.py)) imports the text model of
+`google/gemma-4-26B-A4B-it-qat-q4_0-gguf` with `--model` holding the Hugging Face release's
+`config.json`, tokenizer, `chat_template.jinja` and `generation_config.json` and `--source
+gguf=...` the GGUF. The expert banks stay expert-major, the router's input scale and the per-expert
+output scales stay vectors the runtime applies, and the norm weights are stored as Gemma applies
+them (`w`, not `1 + w`). Commands, runtime defaults and measurements: [Gemma 4](gemma4.md).
 
 ## Change part of a recipe
 
