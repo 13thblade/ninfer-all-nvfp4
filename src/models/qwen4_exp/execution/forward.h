@@ -27,6 +27,7 @@ struct ForwardState {
     std::vector<Tensor> gdn_conv;      // per GDN block: BF16 [C, K - 1], oldest first
     std::vector<Tensor> gdn_recurrent; // per GDN block: FP32 [Dk, Dv, value heads]
     Tensor ple_conv;                   // BF16 [S*H, span, 1]: the PLE convolution history
+    Tensor ple_slot;                   // I32 [1] holding 0: ple_conv's slot, cleared with the state
     std::vector<Tensor> qsa_tails;     // per attention block: BF16 [Di, R - 1]
 };
 

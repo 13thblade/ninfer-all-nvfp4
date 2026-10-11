@@ -12,10 +12,15 @@
 // T covers both routes and their seams: 1..8 (decode), 9 (first wide), 63/64/65 (one wide column
 // tile and its edges) and 300 (interior, partial last tile).
 //
+// linear_pair over GGML weights (its decode route, T = 1..8): every ordered pair of IQ4_XS, IQ3_S
+// and Q6_K at both registered pair shapes, each output against the same FP64 oracle and bit for
+// bit against linear() on its own weight; and its admission.
+//
 // Usage: ninfer_linear_ggml_test [--format NAME] [--shape N K]
 
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/linear_pair.h"
 
 #include "core/arena.h"
 #include "core/weight.h"
@@ -253,6 +258,70 @@ int run_problem(QType format, std::int32_t n, std::int32_t k, bool add) {
     return failures;
 }
 
+// linear_pair on (first, second) at [n, k], T = 1..8: both outputs against the FP64 oracle and bit
+// for bit against linear() of each weight alone.
+int run_pair(QType first, QType second, std::int32_t n, std::int32_t k) {
+    const std::uint32_t seed = static_cast<std::uint32_t>(n * 17 + k + 97 * static_cast<int>(first) + static_cast<int>(second));
+    const auto blocks1       = make_blocks(first, n, k, seed);
+    const auto blocks2       = make_blocks(second, n, k, seed ^ 0x9e3779b9U);
+    std::vector<float> w1(static_cast<std::size_t>(n) * k), w2(w1.size());
+    test::ggml::decode_blocks(first, std::as_bytes(std::span(blocks1)), w1);
+    test::ggml::decode_blocks(second, std::as_bytes(std::span(blocks2)), w2);
+    constexpr std::int32_t kPairTokens = 8;
+    const auto x_bits = make_activation(k, kPairTokens, seed ^ 0x5bd1e995U);
+    const Q81 xq      = cast_q81(x_bits, k, kPairTokens);
+    const auto want1  = oracle(w1, xq, n, k, kPairTokens, nullptr);
+    const auto want2  = oracle(w2, xq, n, k, kPairTokens, nullptr);
+
+    DeviceBuffer d_w1(blocks1.size()), d_w2(blocks2.size());
+    d_w1.copy_from_host(blocks1.data(), blocks1.size());
+    d_w2.copy_from_host(blocks2.data(), blocks2.size());
+    DeviceBuffer d_x(x_bits.size() * 2);
+    d_x.copy_from_host(x_bits.data(), x_bits.size() * 2);
+    const std::size_t out_bytes = static_cast<std::size_t>(n) * kPairTokens * 2;
+    DeviceBuffer d_o1(out_bytes), d_o2(out_bytes), d_r1(out_bytes), d_r2(out_bytes);
+    const Weight weight1 = device_weight(first, n, k, d_w1);
+    const Weight weight2 = device_weight(second, n, k, d_w2);
+    DeviceArena workspace(256);
+
+    const std::string label = std::string("linear_pair ") + format_name(first) + "+" + format_name(second) + " [" +
+                              std::to_string(n) + "," + std::to_string(k) + "]";
+    int failures = 0;
+    for (std::int32_t t = 1; t <= kPairTokens; ++t) {
+        if (ops::linear_pair_workspace_capacity_bytes(weight1, weight2, t, t) != 0) {
+            std::cerr << label << " T=" << t << ": nonzero workspace\n";
+            ++failures;
+        }
+        Tensor x(d_x.p, DType::BF16, {k, t});
+        Tensor o1(d_o1.p, DType::BF16, {n, t}), o2(d_o2.p, DType::BF16, {n, t});
+        Tensor r1(d_r1.p, DType::BF16, {n, t}), r2(d_r2.p, DType::BF16, {n, t});
+        for (const auto* buffer : {&d_o1, &d_o2, &d_r1, &d_r2}) {
+            cuda_check(cudaMemset(buffer->p, 0xFF, out_bytes), "poison");
+        }
+        ops::linear_pair(x, weight1, weight2, o1, o2, nullptr);
+        ops::linear(x, weight1, r1, LinearPolicy::AllowA8, workspace, nullptr);
+        ops::linear(x, weight2, r2, LinearPolicy::AllowA8, workspace, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "linear_pair");
+        const std::size_t count = static_cast<std::size_t>(n) * t;
+        const auto got1 = download_bf16(d_o1.p, count), got2 = download_bf16(d_o2.p, count);
+        const auto ref1 = download_bf16(d_r1.p, count), ref2 = download_bf16(d_r2.p, count);
+        if (got1 != ref1 || got2 != ref2) {
+            std::cerr << label << " T=" << t << ": outputs differ from linear() bit for bit\n";
+            ++failures;
+        }
+        for (int which = 0; which < 2; ++which) {
+            const auto& bits = which == 0 ? got1 : got2;
+            std::vector<double> got(bits.size());
+            for (std::size_t i = 0; i < got.size(); ++i) got[i] = bf16_to_f32(bits[i]);
+            const auto& want = which == 0 ? want1 : want2;
+            failures += test::verify_reduction(label + (which == 0 ? " first" : " second") + " T=" + std::to_string(t),
+                                               got, std::span<const double>(want.data(), got.size()), kGgmlQ81Criterion);
+        }
+    }
+    if (failures == 0) { std::cout << label << ": T=1..8 equal to linear() bit for bit, within the FP64 criterion\n"; }
+    return failures;
+}
+
 // --- the cast, exactly -------------------------------------------------------------------------
 
 // Groups that pin the rounding rule: with max|x| = 127 the scale is exactly 1, so x * 127 / max
@@ -407,6 +476,20 @@ int admission() {
     return failures;
 }
 
+int pair_admission() {
+    int failures = 0;
+    DeviceBuffer a(static_cast<std::size_t>(640) * 2560), b(a.bytes);
+    const Weight iq4  = device_weight(QType::GGML_IQ4_XS, 640, 2560, a);
+    const Weight q6   = device_weight(QType::GGML_Q6_K, 640, 2560, b);
+    const Weight q8_0 = device_weight(QType::GGML_Q8_0, 2560, 640, b);
+    const Weight wide = device_weight(QType::GGML_IQ4_XS, 10240, 2560, b);
+    failures += expect_throw("pair beyond the decode route", [&] { (void)ops::linear_pair_workspace_capacity_bytes(iq4, q6, 1, 9); });
+    failures += expect_throw("pair with an unpaired format", [&] { (void)ops::linear_pair_workspace_capacity_bytes(iq4, q8_0, 1, 1); });
+    failures += expect_throw("pair of different shapes", [&] { (void)ops::linear_pair_workspace_capacity_bytes(iq4, wide, 1, 1); });
+    failures += expect_throw("pair at an unregistered pair shape", [&] { (void)ops::linear_pair_workspace_capacity_bytes(wide, wide, 1, 1); });
+    return failures;
+}
+
 QType parse_format(std::string_view name) {
     for (const QType f : {QType::GGML_IQ4_XS, QType::GGML_IQ3_S, QType::GGML_Q6_K,
                           QType::GGML_IQ4_NL, QType::GGML_Q8_0, QType::GGML_Q2_0}) {
@@ -442,6 +525,12 @@ int main(int argc, char** argv) {
         int failures = 0;
         if (!have_format && n == 0) {
             failures += admission();
+            failures += pair_admission();
+            for (const auto& shape : ops::detail::kGgmlPairShapes) {
+                for (const QType f1 : ops::detail::kGgmlPairFormats) {
+                    for (const QType f2 : ops::detail::kGgmlPairFormats) { failures += run_pair(f1, f2, shape.n, shape.k); }
+                }
+            }
             for (const std::int32_t kk : {640, 2560, 6144}) failures += cast_exact(kk, 300);
             failures += cast_probe();
         }
@@ -451,7 +540,7 @@ int main(int argc, char** argv) {
             failures += run_problem(shape.format, shape.n, shape.k, false);
             if (shape.linear_add) failures += run_problem(shape.format, shape.n, shape.k, true);
         }
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " GGML Linear/LinearAdd\n";
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " GGML Linear/LinearAdd/LinearPair\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "GGML Linear: " << error.what() << '\n';

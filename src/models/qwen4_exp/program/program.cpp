@@ -265,7 +265,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.ple           = std::size_t(c.residual_width()) * c.ple.conv_span() * 2;
     d.tail          = std::size_t(c.qsa.index_head_dim) * (c.qsa.compress_ratio - 1) * 2;
     d.state = align(c.gdn_layers * (align(d.gdn_conv) + align(d.gdn_recurrent)) + align(d.ple) +
-                    c.attention_layers * align(d.tail));
+                    c.attention_layers * align(d.tail) + align(sizeof(std::int32_t)));
     for (const std::uint64_t stride : strides) { d.frame_stride = std::max(d.frame_stride, stride); }
     if (d.frame_stride == 0) { throw std::invalid_argument("Qwen3.8-Flash-Next: no expert banks"); }
     d.staging    = static_cast<std::size_t>(kStagingSlots) * d.frame_stride;
@@ -470,6 +470,7 @@ public:
             state.qsa_tails.emplace_back(p, DType::BF16, std::initializer_list<std::int32_t>{di, r - 1});
             p += align(plan_.tail);
         }
+        state.ple_slot = Tensor(p, DType::I32, {1}); // 0 with the rest of the state at binding
 
         const std::int32_t P = dim(plan_.pages), D = dim(c_.attention.head_dim), Hkv = dim(c_.attention.kv_heads);
         execution::ForwardKV kv;
