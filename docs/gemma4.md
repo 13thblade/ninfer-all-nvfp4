@@ -75,7 +75,8 @@ python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf --componen
   --out models/gemma-4-26B-A4B-it-qat-q4_0-mtp.ninfer --device cpu
 ```
 
-An artifact with the assistant runs without it too unless `--spec mtp` asks for it.
+An artifact with the assistant runs without it too unless `--spec mtp` asks for it. This conversion
+is published as [WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3).
 
 ## Running
 
