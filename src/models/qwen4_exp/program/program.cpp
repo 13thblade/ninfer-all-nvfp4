@@ -2,11 +2,12 @@
 // (Apache-2.0).
 // Modified for NInfer-3090: the execution contract is NInfer's (see program.h); one lane over the
 // single-sequence forward of PR 8; prefix reuse, MTP, n-gram drafts, vision, the CPU miss service,
-// the SSD tier, landing frames, prefill streaming, the layer walk and /v1/decide are not ported.
+// the SSD tier, landing frames, the layer walk and /v1/decide are not ported.
 // Kept from Infernix: the device plan and its spill checks, the elastic VMM KV pool that borrows
 // from the expert frames, the expert cache (LFRU, decode promotion budget and cadence, warm-start
-// state), the VRAM control law at round boundaries, the link probe, the power-throttling opt-out
-// and the decode CUDA graph.
+// state), the VRAM control law at round boundaries, the link probe, the power-throttling opt-out,
+// the decode CUDA graph, and (PR 10) wide prefill calls whose workspace and expert-stream ring are
+// frames lent by the expert cache, with the next call's n-gram rows read while one runs.
 
 #include "models/qwen4_exp/program/program.h"
 
@@ -115,6 +116,14 @@ constexpr std::uint32_t kKvBaseTokens = 32768;
 constexpr std::uint32_t kKvGrowPages = 64;
 // Misses staged per pass of a layer's experts.
 constexpr std::int32_t kStagingSlots = 64;
+// Wide prefill calls (Infernix's 4,096-token calls): their workspace and the expert stream's ring
+// are frames lent by the expert cache for the prompt, so the static workspace stays sized for the
+// configured chunk. A prompt shorter than kStreamMinColumns runs static calls without the stream.
+constexpr std::int32_t kWideChunk        = 4096;
+constexpr std::int32_t kStreamMinColumns = 512;
+// Ring frames per half: a layer's every expert, so every non-resident one streams and a wide call
+// needs no staging pass (resident counts vary widely by layer: a 320-frame half left 29% of the
+// misses to the staging kernel, 1.5 s of a 32K prompt).
 // Promotions per layer call of a decode round (Infernix design section 19.2: one measured fastest).
 constexpr std::size_t kDecodePromotionsPerLayer = 1;
 // Once the frames are full, decode promotes only every interval-th round on the reference link.
@@ -219,7 +228,8 @@ struct IoLayout {
 };
 
 struct Layout {
-    std::int32_t chunk = 0, token_domain = 0;
+    std::int32_t chunk = 0, wide_chunk = 0, token_domain = 0;
+    std::size_t wide_work = 0; // workspace of a wide call (in the lent frames)
     std::uint32_t pages = 0, base_pages = 0;
     KvLayout kv;
     IoLayout io;
@@ -249,13 +259,15 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     }
     Layout d;
     d.chunk        = static_cast<std::int32_t>(std::min(o.prefill_chunk, o.max_context));
+    d.wide_chunk   = std::max(d.chunk, std::min(kWideChunk, static_cast<std::int32_t>(o.max_context)));
     d.token_domain = static_cast<std::int32_t>(public_tokens);
     d.pages        = (o.max_context + kPagedKVPageSize - 1) / kPagedKVPageSize;
     const std::uint32_t base_tokens = o.kv_base_tokens != 0 ? o.kv_base_tokens : kKvBaseTokens;
     d.base_pages = std::min(d.pages, std::max(1U, base_tokens / kPagedKVPageSize));
     d.kv         = KvLayout::plan(c, d.pages);
     const NgramHash hash(c.ple.ngram, 0);
-    d.io = IoLayout::plan(static_cast<std::size_t>(d.chunk), static_cast<std::size_t>(c.ple.table.row_bytes) * hash.heads());
+    d.io = IoLayout::plan(static_cast<std::size_t>(d.wide_chunk),
+                          static_cast<std::size_t>(c.ple.table.row_bytes) * hash.heads());
     d.gdn_conv      = std::size_t(c.gdn.conv_channels()) * (c.gdn.conv_kernel - 1) * 2;
     d.gdn_recurrent = std::size_t(c.gdn.key_head_dim) * c.gdn.value_head_dim * c.gdn.value_heads * 4;
     d.ple           = std::size_t(c.residual_width()) * c.ple.conv_span() * 2;
@@ -275,6 +287,9 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.work = execution::Forward::workspace_bytes(c, d.chunk, d.pages * kPagedKVPageSize,
                                                  DeviceExecutionView{nullptr, sms}) +
              ops::sampling_workspace_capacity_bytes(d.token_domain, 1, 1);
+    d.wide_work = d.wide_chunk > d.chunk ? execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
+                                                                               DeviceExecutionView{nullptr, sms})
+                                         : 0;
     d.vmm = VmmArena::supported(o.device);
 
     auto& b     = d.bytes;
@@ -286,7 +301,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.state     = d.state;
     b.io        = d.io.bytes + sizeof(float) * c.vocab_size + 2ULL * c.vocab_size + 256 * 4 +
                   sizeof(ops::SamplingConfig) + 4ULL * public_tokens + 4 * d.mask_words + 4096;
-    b.residency            = ExpertResidency::table_bytes(c, d.chunk);
+    b.residency            = ExpertResidency::table_bytes(c, d.wide_chunk);
     b.expert_record_stride = d.frame_stride;
     b.max_frames           = ExpertResidency::max_frames(c);
     b.graph_bound          = graph_bound(1, 1, 0);
@@ -385,7 +400,7 @@ public:
             banks.push_back(bank.host_records);
             bank_strides.push_back(bank.record_stride);
         }
-        residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), std::move(bank_strides), plan_.chunk,
+        residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), std::move(bank_strides), plan_.wide_chunk,
                                                        device_.device);
         allocated += plan_.bytes.residency;
         if (allocated != plan_.bytes.fixed_bytes()) {
@@ -499,6 +514,17 @@ public:
         experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
         experts.staging_slots = kStagingSlots;
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames.push_back(residency_->table(l)); }
+        if (residency_->frames() > 0 && plan_.wide_work > 0) {
+            std::vector<execution::ExpertStream::Bank> stream_banks;
+            for (const auto& bank : parameters_.model.expert_banks()) {
+                stream_banks.push_back({bank.host_records, bank.record_stride});
+            }
+            stream_ = std::make_unique<execution::ExpertStream>(c_.num_hidden_layers, c_.moe.experts, std::move(stream_banks),
+                                                                const_cast<std::uint8_t*>(residency_->frame_base()),
+                                                                residency_->frame_stride());
+            experts.stream = stream_.get();
+        }
+        ngram_next_ = PinnedHostBuffer(plan_.io.bytes - plan_.io.ngram);
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
                                                         std::move(experts));
         warm_start_experts();
@@ -656,15 +682,22 @@ public:
             throw std::logic_error("Qwen3.8-Flash-Next: prefill on a lane that is not prefilling");
         }
         const nvtx::ScopedRange range(nvtx::Name::Prefill, nvtx::Category::Prefill);
-        const std::int32_t begin = static_cast<std::int32_t>(lane_.state_tokens);
-        const std::int32_t width = std::min(plan_.chunk, static_cast<std::int32_t>(lane_.prompt_tokens) - begin);
-        const bool last          = begin + width == static_cast<std::int32_t>(lane_.prompt_tokens);
+        const std::int32_t begin     = static_cast<std::int32_t>(lane_.state_tokens);
+        const std::int32_t remaining = static_cast<std::int32_t>(lane_.prompt_tokens) - begin;
+        const bool wide              = wide_ready(remaining);
+        const std::int32_t width     = std::min(call_width(wide), remaining);
+        const bool last              = width == remaining;
         PrefillProgress out;
         out.summary                 = lane_.begin;
         out.processed_prompt_tokens = static_cast<std::uint32_t>(width);
         out.complete                = last;
         try {
-            run_call(begin, width);
+            run_call(begin, width, wide);
+            if (!last) {
+                // The next call's n-gram rows, read from the volume while the device runs this one.
+                const std::int32_t next = begin + width;
+                prefetch_rows(next, std::min(call_width(wide), remaining - width));
+            }
             lane_.state_tokens += static_cast<std::uint32_t>(width);
             const std::size_t promotions = width <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(width)) : 0;
             if (last) {
@@ -675,6 +708,7 @@ public:
                 out.timing.device_wait_ns = elapsed_ns(wait);
                 const TokenId token = sampled_token();
                 residency_->after_round(device_.stream, width, promotions);
+                return_lease();
                 apply_vram_target(false);
                 pending_token_ = token;
                 pending_       = ++transaction_;
@@ -768,7 +802,7 @@ public:
             const std::int32_t end = begin + static_cast<std::int32_t>(stride);
             while (begin < end) {
                 const std::int32_t width = std::min(plan_.chunk, end - begin);
-                run_call(begin, width);
+                run_call(begin, width, false);
                 residency_->enqueue_route_download(device_.stream, width);
                 device_.synchronize();
                 residency_->after_round(device_.stream, width, kDecodePromotionsPerLayer);
@@ -926,6 +960,13 @@ private:
     }
 
     void release_lane() noexcept {
+        if (lease_.valid()) {
+            try {
+                device_.synchronize();
+                return_lease();
+            } catch (...) {}
+        }
+        next_begin_               = -1;
         const std::uint64_t epoch = lane_.epoch;
         lane_       = Lane{};
         lane_.epoch = epoch;
@@ -986,8 +1027,72 @@ private:
         row_ids_.resize(static_cast<std::size_t>(width) * heads);
         hash_.row_ids(ngram_window_, static_cast<std::size_t>(width), row_ids_.data());
         const std::size_t row_bytes = c_.ple.table.row_bytes;
-        volume_.read_rows(row_ids_, std::span<std::byte>(host + io.ngram, row_ids_.size() * row_bytes));
-        upload_pinned(io_device_.p, io_host_.data(), io.ngram + row_ids_.size() * row_bytes, device_.stream);
+        const std::size_t rows      = static_cast<std::size_t>(width) * hash_.heads() * row_bytes;
+        if (next_begin_ == begin && next_width_ == width) {
+            std::memcpy(host + io.ngram, ngram_next_.data(), rows);
+        } else {
+            volume_.read_rows(row_ids_, std::span<std::byte>(host + io.ngram, row_ids_.size() * row_bytes));
+        }
+        next_begin_ = -1;
+        upload_pinned(io_device_.p, io_host_.data(), io.ngram + rows, device_.stream);
+    }
+
+    // Reads the n-gram rows of positions [begin, begin + width) into ngram_next_ (the next call's
+    // stage takes them from there).
+    void prefetch_rows(std::int32_t begin, std::int32_t width) {
+        const std::int32_t context = dim(c_.ple.ngram.ngram_size) - 1;
+        ngram_window_.assign(static_cast<std::size_t>(std::max(0, context - begin)), c_.eos_token_id);
+        const std::int32_t from = std::max(0, begin - context);
+        ngram_window_.insert(ngram_window_.end(), lane_.history.begin() + from, lane_.history.begin() + begin + width);
+        row_ids_.resize(static_cast<std::size_t>(width) * hash_.heads());
+        hash_.row_ids(ngram_window_, static_cast<std::size_t>(width), row_ids_.data());
+        volume_.read_rows(row_ids_, std::span<std::byte>(static_cast<std::byte*>(ngram_next_.data()),
+                                                         row_ids_.size() * c_.ple.table.row_bytes));
+        next_begin_ = begin;
+        next_width_ = width;
+    }
+
+    // The width of a prefill call. A half-width first call (to start the GPU after fewer n-gram
+    // reads) measured slower: the extra call streams the non-resident experts once more.
+    std::int32_t call_width(bool wide) const noexcept { return wide ? plan_.wide_chunk : plan_.chunk; }
+
+    // Whether this prefill call runs wide (kWideChunk columns, the expert stream, the lent workspace):
+    // the lease is held, or a prompt with at least kStreamMinColumns left takes one now.
+    bool wide_ready(std::int32_t remaining) {
+        if (lease_.valid()) { return true; }
+        if (!stream_ || plan_.wide_work == 0 || remaining < kStreamMinColumns) { return false; }
+        const std::uint64_t stride  = residency_->frame_stride();
+        const std::size_t tables    = align(stream_->table_bytes());
+        const auto work_frames      = static_cast<std::uint32_t>((tables + plan_.wide_work + stride - 1) / stride);
+        const std::uint32_t can     = residency_->lendable();
+        if (can < work_frames + 2) { return false; } // a small cache: static calls through staging
+        const std::uint32_t ring    = std::min(2 * c_.moe.experts, (can - work_frames) & ~1U);
+        lease_          = residency_->lend(work_frames + ring, device_.stream);
+        auto* base      = static_cast<std::byte*>(lease_.memory.data);
+        stream_tables_  = reinterpret_cast<std::int32_t*>(base);
+        wide_work_      = std::make_unique<WorkspaceArena>(
+            DeviceSpan{base + tables, static_cast<std::size_t>(work_frames) * stride - tables});
+        ring_first_  = lease_.first + work_frames;
+        ring_frames_ = ring;
+        ++leases_;
+        if (leases_ == 1) {
+            char line[200];
+            std::snprintf(line, sizeof(line),
+                          "prefill lends %u expert frames (%.2f GiB: %u for %d-token calls, a ring of %u for streamed experts)",
+                          lease_.count, static_cast<double>(lease_.memory.bytes) / (1ULL << 30), work_frames,
+                          plan_.wide_chunk, ring);
+            diagnostic(line);
+        }
+        return true;
+    }
+
+    // Returns the lease (the device has finished with it) and refills its frames.
+    void return_lease() {
+        if (!lease_.valid()) { return; }
+        wide_peak_ = std::max(wide_peak_, wide_work_ ? wide_work_->peak_used() : 0);
+        wide_work_.reset();
+        refilled_ += residency_->give_back(lease_, device_.stream);
+        frames_now_ = residency_->frames();
     }
 
     execution::ForwardBatch batch(std::int32_t width) const {
@@ -1005,10 +1110,25 @@ private:
     }
 
     // One eager call over positions [begin, begin + width): stage, table, forward. Not synchronized.
-    void run_call(std::int32_t begin, std::int32_t width) {
+    // A wide call allocates from the lent workspace and streams its non-resident experts.
+    void run_call(std::int32_t begin, std::int32_t width, bool wide) {
         stage(begin, width);
         residency_->before_round(device_.stream);
-        forward_->run(batch(width), logits32_);
+        if (!wide) {
+            forward_->run(batch(width), logits32_);
+        } else {
+            forward_->use_workspace(*wide_work_);
+            stream_->begin(residency_->host_table(), stream_tables_, ring_first_, ring_frames_, device_.stream);
+            try {
+                forward_->run(batch(width), logits32_);
+            } catch (...) {
+                stream_->end();
+                forward_->use_workspace(*work_);
+                throw;
+            }
+            stream_->end();
+            forward_->use_workspace(*work_);
+        }
         ops::cast_fp32_to_bf16(logits32_, logits16_, device_.stream);
     }
 
@@ -1114,7 +1234,7 @@ private:
     // At a boundary (no round in flight; `idle`: no request active): resizes the expert cache to
     // the VRAM control law's decision.
     void apply_vram_target(bool idle) {
-        if (!control_ || !monitor_) { return; }
+        if (!control_ || !monitor_ || lease_.valid()) { return; } // the pool does not resize while lent
         const double now = std::chrono::duration<double>(Clock::now() - vram_epoch_).count();
         const auto d     = control_->decide(monitor_->latest(), pool_now_, frames_now_, now, idle);
         if (d.frames == frames_now_) { return; }
@@ -1287,6 +1407,16 @@ private:
                           static_cast<unsigned long long>(n.reads - lane_.ngram_at_decode.reads),
                           seconds(n.read_ns - lane_.ngram_at_decode.read_ns), free_vram >> 20);
             diagnostic(text);
+            if (stream_ && leases_ != 0) {
+                const auto& st = stream_->stats();
+                std::snprintf(text, sizeof(text),
+                              "wide prefill since start: %llu leases, %llu experts streamed in %llu copies, %llu left to "
+                              "staging, workspace peak %zu MiB of %zu, %llu frames refilled after prefill",
+                              static_cast<unsigned long long>(leases_), static_cast<unsigned long long>(st.streamed),
+                              static_cast<unsigned long long>(st.copies), static_cast<unsigned long long>(st.left),
+                              wide_peak_ >> 20, plan_.wide_work >> 20, static_cast<unsigned long long>(refilled_));
+                diagnostic(text);
+            }
         } catch (...) {}
     }
 
@@ -1325,6 +1455,18 @@ private:
     DeviceBuffer staging_;
     std::unique_ptr<ExpertResidency> residency_;
     std::unique_ptr<execution::Forward> forward_;
+    // Wide prefill: the frames lent for the prompt (workspace, stream tables, ring), the arena over
+    // their workspace part, and the stream.
+    std::unique_ptr<execution::ExpertStream> stream_;
+    ExpertResidency::FrameLease lease_;
+    std::unique_ptr<WorkspaceArena> wide_work_;
+    std::int32_t* stream_tables_ = nullptr;
+    std::uint32_t ring_first_ = 0, ring_frames_ = 0;
+    std::size_t wide_peak_ = 0;
+    std::uint64_t leases_ = 0, refilled_ = 0;
+    // The next prefill call's n-gram rows, read while the device runs the current one.
+    PinnedHostBuffer ngram_next_{1};
+    std::int32_t next_begin_ = -1, next_width_ = 0;
     DecodeGraphDefinition graph_;
     DecodeGraphExecutable graph_exec_;
 

@@ -149,6 +149,12 @@ artifact 的 text 架构在启动时决定使用哪个实例（`runtime::artifac
   更长的请求从 expert frames 借用，结束后的下一次绑定归还）、workspace、decode CUDA Graph（首轮 eager，
   之后 capture 一次并 replay）、VRAM expert cache（LFRU frames、promotion 预算、warm-start 状态文件）、
   n-gram volume reader、VRAM 控制律（只在轮次边界与请求结束时调整 frame 数）。
+- **宽 prefill（PR 10）**：≥ 512 token 的 prompt 以 4,096 token 一次调用 prefill。第一次调用时 Program
+  向 expert cache 借一段连续 frames（`ExpertResidency::lend`）：前段作该类调用的 workspace，后段作
+  `execution/expert_stream` 的 ring，每层的非常驻 expert 提前两层由 copy engine DMA 进 ring，并以
+  per-layer frame 表发布为常驻（MoE Op 不变）。prompt 结束时归还（`give_back`）并用 LFRU 分数最高的
+  非常驻 expert 回填空 frames。借用期间 VRAM 控制律不调整 frame 数。下一调用的 n-gram 行在 GPU 执行
+  当前调用时读取。
 - **启动账本**（`runtime/engine/qwen4_exp_instance.cpp`，在 pin 之前）：RAM 账本要求所有 routed experts
   （33 GiB）与保留量同时放得下，否则拒绝并给出缺口；VRAM 检查在读取权重前确认 dense 权重与固定分配之外
   仍有 expert frames 的空间。设备分配先于 pinned bank。

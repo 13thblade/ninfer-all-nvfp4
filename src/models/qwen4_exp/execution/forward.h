@@ -4,8 +4,8 @@
 // Modified for NInfer-3090: one sequence per call (M0: teacher-forced chunks and single-sequence
 // decode); NInfer's single-sequence QSA Ops and paged INT8 KV; the PLE rows come from the caller
 // already read; experts are served by the GPU narrow route from device frames, staging slots or the
-// pinned bank (no CPU miss service, overlap streams, landing frames, prefill streaming, MTP,
-// vision, verification or prefix-cache events).
+// pinned bank, or for a wide prefill call from the expert stream's ring (no CPU miss service,
+// overlap streams, landing frames, MTP, vision, verification or prefix-cache events).
 //
 // The Qwen4Exp forward pass: embedding, the PLE injection, 48 hyper-connection blocks of GDN or QSA
 // plus the offloaded MoE, the final mixer and the LM head.
@@ -14,6 +14,7 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
+#include "models/qwen4_exp/execution/expert_stream.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "ninfer/ops/qsa.h"
 
@@ -51,6 +52,9 @@ struct ForwardExperts {
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     std::uint32_t* error        = nullptr; // optional mapped word (ops::MoeExpertSource::error)
+    // Optional prefill expert stream: while it is active the MoE reads its per-layer frame tables
+    // (streamed experts resident in the ring) and orders itself with the stream's copies.
+    ExpertStream* stream = nullptr;
 };
 
 // One call: T consecutive positions of the sequence.
@@ -83,6 +87,9 @@ public:
     // FP32 logits [V, n] of batch.logit_columns.
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
 
+    // The workspace later calls allocate from (a wide prefill call's lent arena, or the static one).
+    void use_workspace(WorkspaceArena& work) noexcept { work_ = &work; }
+
     // Workspace one call of up to `columns` columns needs, at the given context.
     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
                                                      std::uint32_t max_visible_keys, DeviceExecutionView execution);
@@ -98,7 +105,7 @@ private:
     const Parameters& parameters_;
     const TextConfig& config_;
     DeviceContext& device_;
-    WorkspaceArena& work_;
+    WorkspaceArena* work_;
     ForwardState state_;
     ForwardKV kv_;
     ForwardExperts experts_;

@@ -2,8 +2,9 @@
 
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/program/expert_residency.h (Apache-2.0).
 // Modified for NInfer-3090: frames hold ggml_expert_record_v1 records of each layer's bank (the
-// stride is the largest bank's); no SSD tier, landing frames or frame lending (their Op and Program
-// paths are not ported); uploads use core/pinned_upload.h.
+// stride is the largest bank's); no SSD tier or landing frames (their Op and Program paths are not
+// ported); frame lending for prefill, with a refill of the returned frames; uploads use
+// core/pinned_upload.h.
 //
 // The VRAM expert cache of the Qwen4Exp Program: a pool of device frames, each holding one routed
 // expert's record, the per-layer frame tables the MoE kernels read (frame or -1: stage the record
@@ -115,6 +116,25 @@ public:
     void after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget);
     // Waits for the promotion copies in flight and publishes them.
     void drain(cudaStream_t compute);
+
+    // Frame lending (Infernix design section 19.3.2): a contiguous run of frames serves prefill (the
+    // expert stream's ring and the wide calls' workspace) and comes back. Lent frames hold no expert
+    // and the pool does not resize while a lease is out.
+    struct FrameLease {
+        std::uint32_t first = 0, count = 0;
+        DeviceSpan memory; // the run's bytes
+        [[nodiscard]] bool valid() const noexcept { return count != 0; }
+    };
+    // Frames that may be lent now: backed and above the quarter serving always keeps.
+    [[nodiscard]] std::uint32_t lendable() const noexcept;
+    // Between rounds (nothing in flight on `compute`): waits for the promotion copies, evicts the
+    // experts of the cheapest run of `count` frames and uploads the table on `compute`.
+    FrameLease lend(std::uint32_t count, cudaStream_t compute);
+    // Returns a lease once `compute` has finished every access to it, then refills the free frames
+    // with the highest-score experts that are not resident (the prompt's routes updated their
+    // scores), on the copy stream behind `compute`. Returns the number of refill loads.
+    std::uint32_t give_back(FrameLease& lease, cudaStream_t compute);
+    [[nodiscard]] std::uint32_t lent_frames() const noexcept;
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
