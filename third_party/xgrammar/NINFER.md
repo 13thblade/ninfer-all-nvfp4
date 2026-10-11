@@ -29,7 +29,7 @@ CPU coverage includes test_unicode_scalar_output.cpp and the native_schema_probe
 
 Schema compatibility supplement: the text compiler distributes proven
 anyOf type/required intersections before XGrammar compilation. String-array
-uniqueness is enforced by request-owned incremental semantic masks, not by dropping
+uniqueness is enforced by request-owned incremental semantic masks (src/text/string_constraints.cpp), not by dropping
 the assertion from public JSON or by rewriting completed arrays. Object upper
 bounds use the existing vendored object generator. CPU equivalence, prefix
 reachability and committed/speculative-state regressions guard these contracts.
@@ -40,5 +40,7 @@ repetition has no cacheable token mask, so each mask re-parsed the vocabulary at
 with the count: with Gemma 4's 262,144-token vocabulary a `maxLength: 200` field took 0.4 s per
 token at its start and 3 s after 100 characters. Each chain rule starts at an ordinary, cached
 position: the same field takes about 76 ms per token (Apple M-series, one thread), flat over its
-length. The accepted language is unchanged.
+length. The accepted language is unchanged. The plain bounded strings of a schema without
+alternatives do not reach this path: `src/text/string_constraints.cpp` takes their bounds out of
+the schema this compiler sees and enforces them on the token masks itself.
 

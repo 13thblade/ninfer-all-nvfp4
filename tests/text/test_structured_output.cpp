@@ -99,6 +99,51 @@ int main() {
         require(!within(std::string(39, 'x') + "\\n\\u00e9"), "escaped scalars exceed maxLength");
         require(within(std::string(37, 'x') + "é😀\\\""), "multi-byte scalars do not count once");
 
+        // Inside an object the bounds leave the grammar and the string constraint state enforces
+        // them: the same lengths close, and the masks at the bounds say so.
+        const auto object_bounded =
+            R"({"type":"object","properties":{"s":{"type":"string","minLength":2,"maxLength":40}},"required":["s"]})";
+        const auto in_object = [&](const std::string& body) {
+            auto grammar = compiler.compile({StructuredOutputKind::JsonSchema, object_bounded});
+            std::vector<TokenId> tokens;
+            for (unsigned char ch : "{\"s\":\"" + body + "\"}") { tokens.push_back(ch); }
+            tokens.push_back(256);
+            try {
+                grammar->accept(tokens);
+                return true;
+            } catch (const std::logic_error&) { return false; }
+        };
+        require(!in_object("a"), "object string under minLength accepted");
+        require(in_object("ab"), "object string at minLength rejected");
+        require(in_object(std::string(40, 'x')), "object string at maxLength rejected");
+        require(!in_object(std::string(41, 'x')), "object string over maxLength accepted");
+        require(in_object(std::string(38, 'x') + "\\n\\u00e9"), "object escapes do not count once");
+        require(!in_object(std::string(39, 'x') + "\\n\\u00e9"), "object escapes exceed maxLength");
+        require(in_object(std::string(37, 'x') + "é😀\\\""), "object multi-byte scalars do not count once");
+        {
+            auto grammar = compiler.compile({StructuredOutputKind::JsonSchema, object_bounded});
+            std::vector<TokenId> prefix;
+            for (unsigned char ch : std::string("{\"s\":\"x")) { prefix.push_back(ch); }
+            grammar->accept(prefix);
+            grammar->fill_masks(after, {});
+            require((after['"' / 32] & (1U << ('"' % 32))) == 0, "mask closes a string under minLength");
+            std::vector<TokenId> fill(39, 'x');
+            grammar->accept(fill);
+            grammar->fill_masks(after, {});
+            require((after['"' / 32] & (1U << ('"' % 32))) != 0, "mask cannot close a string at maxLength");
+            require((after['x' / 32] & (1U << ('x' % 32))) == 0, "mask extends a string past maxLength");
+            require((after['\\' / 32] & (1U << ('\\' % 32))) == 0, "mask starts an escape past maxLength");
+            // A draft column conditioned on drafts follows the same bound.
+            auto drafted = compiler.compile({StructuredOutputKind::JsonSchema, object_bounded});
+            drafted->accept(prefix);
+            std::vector<TokenId> drafts(38, 'x');
+            std::vector<std::uint32_t> columns(words * (drafts.size() + 1));
+            drafted->fill_masks(columns, drafts);
+            const auto last = std::span(columns).subspan(drafts.size() * words, words);
+            require((last['x' / 32] & (1U << ('x' % 32))) != 0, "draft column at 39 scalars cannot extend");
+            require((last['"' / 32] & (1U << ('"' % 32))) != 0, "draft column at 39 scalars cannot close");
+        }
+
         auto whitespace          = compiler.compile({StructuredOutputKind::JsonObject, {}});
         bool too_much_whitespace = false;
         try {
