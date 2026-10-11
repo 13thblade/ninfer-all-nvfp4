@@ -62,6 +62,10 @@ def test_tojson_accepts_the_server_filter_options():
     assert render("v | tojson(sort_keys=true)") == '{"a": [1, 2], "b": "é"}'
     assert render("v | tojson(ensure_ascii=true)") == '{"b": "\\u00e9", "a": [1, 2]}'
     assert render("v | tojson(separators=[',', ':'])") == '{"b":"é","a":[1,2]}'
+    assert render("v | tojson(separators=[])") == '{"b": "é", "a": [1, 2]}'
+    assert render("v | tojson(separators=[','])") == '{"b": "é","a": [1,2]}'
+    assert render("v | tojson(separators=[',', ':', ';'])") == '{"b":"é","a":[1,2]}'
+    assert render("v | tojson(indent=1, separators=[])") == '{\n "b": "é",\n "a": [\n  1,\n  2\n ]\n}'
     assert render("v | tojson(false, 1, none, true)") == '{\n "a": [\n  1,\n  2\n ],\n "b": "é"\n}'
 
 
