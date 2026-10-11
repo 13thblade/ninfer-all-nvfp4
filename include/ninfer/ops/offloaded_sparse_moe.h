@@ -47,7 +47,8 @@ namespace ninfer::ops {
  *   A8 and rowdot are the canonical A8 arithmetic of src/ops/common/canonical_ggml.h, stated here
  *   because they are semantic: A8 of a group v[0..32) is a = max |v_j|, d = a / 127 and
  *   q_j = clamp(rint(v_j * (127 / a)), -127, 127) (FP32 operations, ties to even, q = 0 and d = 0
- *   when a = 0). rowdot sums, per 32-value sub-block s, the exact integer product P_s of the
+ *   when a = 0; a group with a < 2^-100 first scales a and v by 2^100, which is exact, so 127 / a
+ *   stays finite). rowdot sums, per 32-value sub-block s, the exact integer product P_s of the
  *   block's integer weights and the codes, scaled by the block's FP32 scale times d_s, into 32 lane
  *   partials by sub-block index modulo 32 with one fma each, in ascending s, then adds the
  *   partials pairwise at distances 16, 8, 4, 2, 1. SiLU is canon::silu_c.

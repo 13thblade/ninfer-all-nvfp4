@@ -76,16 +76,29 @@ def _ints(metadata: Mapping, key: str, length: int | None = None) -> list[int]:
     return list(value)
 
 
-def _real(metadata: Mapping, key: str) -> float:
-    value = metadata.get(key)
-    if type(value) not in (int, float) or not value > 0:
-        raise GgufError(f"{key}: expected a positive number")
+def _finite(metadata: Mapping, key: str, default: float | None = None) -> float:
+    """A finite float metadata value (NaN and +-inf are never valid, and JSON cannot hold them)."""
+    value = metadata.get(key, default)
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise GgufError(f"{key}: expected a finite number, got {value!r}")
     return float(value)
 
 
-def _f32_text(value: float) -> float:
+def _real(metadata: Mapping, key: str) -> float:
+    value = _finite(metadata, key)
+    if not value > 0:
+        raise GgufError(f"{key}: expected a positive number, got {value!r}")
+    return value
+
+
+def _f32_text(metadata: Mapping, key: str, default: float) -> float:
     """The shortest decimal that rounds to the same FP32 (GGUF stores sampling values as F32)."""
-    return float(str(np.float32(value)))
+    value = _finite(metadata, key, default)
+    with np.errstate(over="ignore"):
+        single = np.float32(value)
+    if not math.isfinite(single):
+        raise GgufError(f"{key}: {value!r} overflows FP32")
+    return float(str(single))
 
 
 # Infernix's published n-gram hash parameters (tools/flash_next/ngram.py). The GGUF's literal
@@ -244,7 +257,7 @@ def text_config(metadata: Mapping) -> dict:
     ngram = _int(m, _KEY + "ple.ngram_size")
     heads_per_ngram = _int(m, _KEY + "ple.heads_per_ngram")
     if ngram < 2:
-        raise GgufError("ple.ngram_size must be at least 2")
+        raise GgufError(f"{_KEY}ple.ngram_size: expected at least 2, got {ngram}")
     ple_heads = (ngram - 1) * heads_per_ngram
     eos = _int(m, _KEY + "ple.eos_token_id")
     if eos >= vocab_size:
@@ -502,30 +515,65 @@ def _check_shapes(gguf: GgufModel, config: dict) -> None:
     qkv = 2 * config["linear_num_key_heads"] * config["linear_key_head_dim"]
     vg = config["linear_num_value_heads"] * config["linear_value_head_dim"]
     ple_heads = (config["ngram_size"] - 1) * config["heads_per_ngram"]
-    hc_width = config["hc_count"] * h
+    hc, low = config["hc_count"], config["hc_lowrank"]
+    hc_width = hc * h
+    shared = config["shared_expert_intermediate_size"]
+    value_heads = config["linear_num_value_heads"]
     checks = {
         "token_embd.weight": (vocab, h),
+        "output_hc_down.weight": (low, hc_width),
+        "output_hc_up.weight": (hc_width, low),
+        "output_hc_norm.weight": (hc_width,),
         "output.weight": (vocab, h),
         PLE_TABLE: (ngram_table_rows(config), config["ple_embed_dim"] // ple_heads),
     }
     for layer, kind in enumerate(config["layer_types"]):
         p = f"blk.{layer}."
+        for part in ("attn", "ffn"):
+            checks[p + f"hc_{part}_down.weight"] = (low, hc_width)
+            checks[p + f"hc_{part}_up.weight"] = (hc_width, low)
+            checks[p + f"hc_{part}_inject.weight"] = (hc, hc_width)
+            checks[p + f"hc_{part}_norm.weight"] = (hc_width,)
+        checks[p + "ffn_gate_inp.weight"] = (e, h)
+        checks[p + "ffn_gate_inp_shexp.weight"] = (h,)
+        checks[p + "ffn_gate_shexp.weight"] = (shared, h)
+        checks[p + "ffn_up_shexp.weight"] = (shared, h)
+        checks[p + "ffn_down_shexp.weight"] = (h, shared)
         checks[p + "ffn_gate_exps.weight"] = (e, i, h)
         checks[p + "ffn_up_exps.weight"] = (e, i, h)
         checks[p + "ffn_down_exps.weight"] = (e, h, i)
         if kind == "linear_attention":
             checks[p + "attn_qkv.weight"] = (qkv + vg, h)
+            checks[p + "attn_gate.weight"] = (vg, h)
+            checks[p + "ssm_alpha.weight"] = (value_heads, h)
+            checks[p + "ssm_beta.weight"] = (value_heads, h)
+            checks[p + "ssm_a"] = (value_heads,)
+            checks[p + "ssm_dt.bias"] = (value_heads,)
+            checks[p + "ssm_conv1d.weight"] = (
+                qkv + vg, config["linear_conv_kernel_dim"]
+            )
             checks[p + "ssm_out.weight"] = (h, vg)
         else:
             heads, d = config["num_attention_heads"], config["head_dim"]
             checks[p + "attn_q.weight"] = (2 * heads * d, h)
+            kv = config["num_key_value_heads"] * d
+            checks[p + "attn_k.weight"] = (kv, h)
+            checks[p + "attn_v.weight"] = (kv, h)
+            checks[p + "attn_q_norm.weight"] = (d,)
+            checks[p + "attn_k_norm.weight"] = (d,)
             checks[p + "attn_output.weight"] = (h, heads * d)
+            # The indexer reads the same mixer input as attention. Its query has one
+            # indexer_head_dim vector per indexer head and its key one per key head.
             index = config["indexer_head_dim"]
             checks[p + "indexer.q_proj.weight"] = (config["indexer_n_heads"] * index, h)
             checks[p + "indexer.k_proj.weight"] = (config["indexer_kv_heads"] * index, h)
+            checks[p + "indexer.q_norm.weight"] = (index,)
+            checks[p + "indexer.k_norm.weight"] = (index,)
         if layer + 1 in config["ple_layer_ids"]:
             checks[p + "ple_key.weight"] = (hc_width, config["ple_embed_dim"])
             checks[p + "ple_value.weight"] = (h, config["ple_embed_dim"])
+    # Not checked, because nothing in the config or the repository pins their dimensions:
+    # ple_norm_* and ple_conv1d. Their hyper-connection width is only evidenced by the fixture.
     for name, shape in checks.items():
         if gguf.tensor(name).shape != tuple(shape):
             raise GgufError(f"{name}: shape {gguf.tensor(name).shape}, expected {shape}")
@@ -632,8 +680,8 @@ def tokenizer_resources(metadata: Mapping, config: dict) -> dict[str, bytes]:
         },
     }
 
-    def token(key: str) -> str:
-        index = metadata.get(key)
+    def token(key: str, index=None) -> str:
+        index = metadata.get(key) if index is None else index
         if type(index) is not int or not 0 <= index < len(tokens) or types[index] == _UNUSED:
             raise GgufError(f"{key} does not name a used token")
         return tokens[index]
@@ -654,15 +702,18 @@ def tokenizer_resources(metadata: Mapping, config: dict) -> dict[str, bytes]:
         "tokenizer_class": "Qwen2Tokenizer",
         "unk_token": None,
     }
+    token(_KEY + "ple.eos_token_id", config["eos_token_id"])
+    if metadata.get("tokenizer.ggml.bos_token_id") is not None:
+        token("tokenizer.ggml.bos_token_id")
     eos = [metadata["tokenizer.ggml.eos_token_id"], config["eos_token_id"]]
     generation = {
         "bos_token_id": metadata.get("tokenizer.ggml.bos_token_id"),
         "do_sample": True,
         "eos_token_id": list(dict.fromkeys(eos)),
         "pad_token_id": metadata["tokenizer.ggml.padding_token_id"],
-        "temperature": _f32_text(metadata.get("general.sampling.temp", 1.0)),
+        "temperature": _f32_text(metadata, "general.sampling.temp", 1.0),
         "top_k": metadata.get("general.sampling.top_k", 20),
-        "top_p": _f32_text(metadata.get("general.sampling.top_p", 1.0)),
+        "top_p": _f32_text(metadata, "general.sampling.top_p", 1.0),
     }
     template = metadata.get("tokenizer.chat_template")
     if not isinstance(template, str) or not template:
