@@ -50,10 +50,12 @@ void tail(Bindings& b, WeightId id) {
 
 } // namespace
 
-Model::Model(TextConfig config, TextWeights weights, std::vector<BoundWeight> bound,
+Model::Model(TextConfig config, TextWeights weights, std::optional<AssistantConfig> assistant_config,
+             std::optional<AssistantWeights> assistant, std::vector<BoundWeight> bound,
              FrontendResources resources, InstanceInfo info,
              artifact::MaterializedArtifact backing)
     : backing_(std::move(backing)), config_(std::move(config)), weights_(std::move(weights)),
+      assistant_config_(std::move(assistant_config)), assistant_(std::move(assistant)),
       bound_(std::move(bound)), resources_(std::move(resources)), info_(std::move(info)) {}
 
 Model::~Model() = default;
@@ -77,9 +79,12 @@ bool is_gemma4(const artifact::Reader& reader) {
            config.at("architectures")[0] == "Gemma4ForCausalLM";
 }
 
+bool has_assistant(const artifact::Reader& reader) {
+    return is_gemma4(reader) && reader.directory().components.contains("mtp");
+}
+
 std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOptions& options,
                                   DeviceContext& device, const StartupObserver* observer) {
-    (void)options;
     if (!is_gemma4(reader)) {
         throw artifact::ArtifactError("the artifact's text component is not Gemma4ForCausalLM");
     }
@@ -136,6 +141,46 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         }
         weights.layers.push_back(std::move(layer));
     }
+    std::optional<AssistantConfig> assistant_config;
+    std::optional<AssistantWeights> assistant;
+    if (options.assistant) {
+        if (!has_assistant(reader)) {
+            throw artifact::ArtifactError(
+                "the artifact holds no Gemma 4 assistant (convert with --components text,mtp)");
+        }
+        const AssistantConfig& ac = assistant_config.emplace(
+            parse_assistant_config(reader.directory().component("mtp").config, config));
+        const std::uint64_t ah = ac.hidden_size;
+        AssistantWeights aw;
+        aw.output_head     = b.parameter("mtp/output_head", {ac.vocab_size, ah},
+                                         {"mtp/final_hidden"});
+        aw.final_norm      = b.direct("mtp/final_norm", {ah}, QType::FP32);
+        aw.pre_projection  = b.parameter("mtp/pre_projection", {ah, 2 * h}, {"mtp/stem_input"});
+        aw.post_projection = b.parameter("mtp/post_projection", {h, ah}, {"mtp/final_hidden"});
+        for (std::uint32_t i = 0; i < ac.full_attention.size(); ++i) {
+            const std::string p = "mtp/layers/" + std::to_string(i) + "/";
+            const std::string a = p + "attention/";
+            const std::uint64_t d =
+                ac.full_attention[i] ? config.global_head_dim : config.head_dim;
+            const std::uint64_t q = std::uint64_t(ac.num_attention_heads) * d;
+            AssistantLayerWeights layer;
+            layer.input_norm          = b.direct(p + "input_norm", {ah}, QType::FP32);
+            layer.post_attention_norm = b.direct(p + "post_attention_norm", {ah}, QType::FP32);
+            layer.ffn_norm            = b.direct(p + "ffn_norm", {ah}, QType::FP32);
+            layer.post_ffn_norm       = b.direct(p + "post_ffn_norm", {ah}, QType::FP32);
+            layer.layer_scalar        = b.direct(p + "layer_scalar", {1}, QType::FP32);
+            layer.query      = b.parameter(a + "query", {q, ah}, {p + "mixer_input"});
+            layer.query_norm = b.direct(a + "query_norm", {d}, QType::FP32);
+            layer.output     = b.parameter(a + "output", {ah, q}, {p + "attention_output"});
+            const std::uint64_t width = ac.intermediate_size;
+            layer.mlp_gate = b.parameter(p + "mlp/gate", {width, ah}, {p + "mlp_input"});
+            layer.mlp_up   = b.parameter(p + "mlp/up", {width, ah}, {p + "mlp_input"});
+            layer.mlp_down = b.parameter(p + "mlp/down", {ah, width}, {p + "mlp_product"});
+            tail(b, layer.mlp_down);
+            aw.layers.push_back(std::move(layer));
+        }
+        assistant = std::move(aw);
+    }
     InstanceInfo info;
     info.name            = reader.directory().metadata.value("name", std::string("Gemma 4"));
     info.metadata_json   = reader.directory().metadata.dump();
@@ -146,6 +191,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     auto backing = artifact::materialize(reader, std::move(materialization), device, observer);
     auto bound   = qwen3_5::loading::resolve_weights(std::move(pending), backing);
     return std::unique_ptr<Model>(new Model(std::move(config), std::move(weights),
+                                            std::move(assistant_config), std::move(assistant),
                                             std::move(bound), std::move(resources),
                                             std::move(info), std::move(backing)));
 }

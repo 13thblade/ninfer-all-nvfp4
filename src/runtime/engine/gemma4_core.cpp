@@ -5,10 +5,14 @@
 #include "core/arena.h"
 #include "core/startup.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "ninfer/ops/argmax.h"
 #include "ninfer/ops/logprob_topk.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
 #include "runtime/contract/execution.h"
+#include "runtime/contract/lookup_draft.h"
+#include "runtime/contract/mtp_adaptive.h"
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
@@ -71,8 +75,22 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     if (options.enable_vision) {
         throw std::invalid_argument("Gemma 4 runs text only in this build (no --vision)");
     }
-    if (options.speculative.backend != SpeculativeBackend::None) {
-        throw std::invalid_argument("Gemma 4 runs without speculative decoding in this build");
+    const SpeculativeOptions& speculative = options.speculative;
+    const bool mtp = speculative.backend == SpeculativeBackend::Mtp;
+    if (speculative.backend != SpeculativeBackend::None && !mtp) {
+        throw std::invalid_argument("Gemma 4 drafts with its assistant only (--spec mtp)");
+    }
+    if (mtp && (speculative.draft_tokens == 0 || speculative.draft_tokens > 7)) {
+        throw std::invalid_argument("Gemma 4: --spec mtp requires --draft-tokens in [1,7]");
+    }
+    if (speculative.draft_min_p != 0 || speculative.mtp_attention_window != 0 ||
+        speculative.ngram_archive_bytes != 0 || speculative.proposal_head != ProposalHead::Auto) {
+        throw std::invalid_argument("Gemma 4's assistant has no --draft-min-p, n-gram archive, "
+                                    "--mtp-attention-window or proposal head");
+    }
+    if (!mtp && (speculative.lookup_ngram != 0 ||
+                 speculative.mtp_policy == MtpDraftPolicy::Adaptive)) {
+        throw std::invalid_argument("--lookup-ngram and --adaptive-mtp require --spec mtp");
     }
     if (device.size() != 1) { throw std::invalid_argument("Gemma 4 runs on one device"); }
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
@@ -80,8 +98,13 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     inspect.complete();
     install_device_route_profile_for(options, device);
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
-    auto model = models::gemma4::load_model(reader, {.artifact = options.artifact_path}, device,
-                                            &options.startup_observer);
+    if (mtp && !models::gemma4::has_assistant(reader)) {
+        throw std::invalid_argument("--spec mtp: the artifact holds no Gemma 4 assistant "
+                                    "(convert with --components text,mtp)");
+    }
+    auto model = models::gemma4::load_model(
+        reader, {.artifact = options.artifact_path, .assistant = mtp}, device,
+        &options.startup_observer);
     device.synchronize();
     materialize.complete();
     const auto free_bytes = [&] {
@@ -112,6 +135,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     // faster than 1024-token chunks; larger chunks grow the sliding-window rings (window + chunk).
     executor.prefill_chunk = 2048;
     executor.cuda_graphs   = options.use_cuda_graph;
+    executor.draft_tokens  = mtp ? speculative.draft_tokens : 0;
     instance->executor = std::make_unique<models::gemma4::Executor>(*model, device, executor);
     device.synchronize();
     program.complete();
@@ -128,6 +152,18 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                        executor.sequences, executor.prefill_chunk,
                        double(instance->executor->memory().kv_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0);
+    if (mtp) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Gemma 4: assistant speculative decoding, up to %u drafts a round%s",
+                           executor.draft_tokens,
+                           speculative.mtp_policy == MtpDraftPolicy::Adaptive ? " (adaptive)" : "");
+        if (speculative.ngram_draft_tokens != 0) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "Gemma 4 drafts with its assistant and context lookup "
+                               "(--lookup-ngram); n-gram copy proposals (--ngram-draft-tokens) "
+                               "are not available for it");
+        }
+    }
 
     ConstructedGemma4 out;
     const auto& stats              = model->storage_stats();
@@ -213,6 +249,8 @@ struct Gemma4Core::Request {
     std::vector<TokenId> generated;
     std::optional<GenerationBudget> budget;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
+    SpeculativeStats speculative;          // an Engine with the assistant only
+    runtime::MtpAdaptiveSignal mtp_signal; // how far its drafts survive, with --adaptive-mtp
 };
 
 struct Gemma4Core::Impl {
@@ -243,6 +281,10 @@ struct Gemma4Core::Impl {
     const std::uint32_t domain;
     const bool structured_output;
     const bool reuse_prefixes;
+    const std::uint32_t drafts;       // the assistant's drafts a round; 0 without speculation
+    const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
+    // With --adaptive-mtp, the drafts a round proposes and verifies, 1..drafts.
+    std::optional<runtime::MtpAdaptiveBatchController> mtp_controller;
 
     mutable std::mutex queue_mutex;
     std::condition_variable queue_cv;
@@ -265,6 +307,13 @@ struct Gemma4Core::Impl {
     DeviceBuffer logprob_ids, logprob_values, logprob_lse, logprob_flag;
     std::unique_ptr<PinnedHostBuffer> host_mask, host_sample, host_logprobs;
     std::unique_ptr<WorkspaceArena> sample_workspace;
+    // A speculative round's acceptance, a row per verified sequence: its drafts, the verification's
+    // greedy targets, the live draft count and the tokens fed before the round, and the licensed
+    // run (tokens, count, accepted drafts, last token); and every slot's token counts before the
+    // round, which a round that keeps fewer tokens than it licensed restores.
+    DeviceBuffer spec_drafts, spec_targets, spec_extents, spec_lengths, spec_licensed, spec_counts,
+        spec_accepted, spec_anchors, counts_backup;
+    std::unique_ptr<PinnedHostBuffer> host_spec;
 
     std::thread worker;
 
@@ -274,16 +323,24 @@ struct Gemma4Core::Impl {
           pending_timeout(options.pending_timeout_ms),
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
-          reuse_prefixes(options.context_cache.enabled),
+          reuse_prefixes(options.context_cache.enabled), drafts(i.executor->draft_tokens()),
+          lookup_ngram(options.speculative.lookup_ngram),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(options.decode_rounds_per_prefill != 0
                                         ? options.decode_rounds_per_prefill
                                         : std::max<std::uint32_t>(
                                               1, i.executor->options().prefill_chunk / 64)) {
+        if (drafts > 0 && options.speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
+            mtp_controller.emplace();
+            mtp_controller->reset(drafts, 1);
+        }
         const std::size_t rows = slots.size();
+        // A sampling call's columns per row: one, or a verification's drafts and bonus.
+        const std::size_t width = std::size_t(drafts) + 1;
         if (structured_output) {
-            token_mask = DeviceBuffer(rows * mask_words() * sizeof(std::uint32_t));
-            host_mask  = std::make_unique<PinnedHostBuffer>(rows * mask_words() * sizeof(std::uint32_t));
+            token_mask = DeviceBuffer(rows * width * mask_words() * sizeof(std::uint32_t));
+            host_mask  = std::make_unique<PinnedHostBuffer>(rows * width * mask_words() *
+                                                            sizeof(std::uint32_t));
         }
         sample_config   = DeviceBuffer(rows * sizeof(ops::SamplingConfig));
         sample_position = DeviceBuffer(rows * sizeof(std::int32_t));
@@ -293,21 +350,42 @@ struct Gemma4Core::Impl {
         token_counts  = DeviceBuffer(rows * domain * sizeof(std::int32_t));
         score_targets = DeviceBuffer(models::gemma4::Executor::kMaxLogitRows * sizeof(std::int32_t));
         score_out     = DeviceBuffer(models::gemma4::Executor::kMaxLogitRows * sizeof(float));
-        const std::size_t top = rows * kMaximumTokenLogprobs;
+        const std::size_t top = rows * width * kMaximumTokenLogprobs;
         logprob_ids    = DeviceBuffer(top * sizeof(std::int32_t));
         logprob_values = DeviceBuffer(top * sizeof(float));
-        logprob_lse    = DeviceBuffer(rows * sizeof(float));
+        logprob_lse    = DeviceBuffer(rows * width * sizeof(float));
         logprob_flag   = DeviceBuffer(sizeof(std::int32_t));
         host_logprobs =
             std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
         const std::int32_t enabled = 1;
         CUDA_CHECK(cudaMemcpy(logprob_flag.p, &enabled, sizeof(enabled), cudaMemcpyHostToDevice));
-        const std::size_t workspace = std::max<std::size_t>(
+        std::size_t workspace = std::max<std::size_t>(
             {ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
                                                     static_cast<std::int32_t>(rows)),
              ops::logprob_topk_workspace_capacity_bytes(static_cast<std::int32_t>(domain),
-                                                        static_cast<std::int32_t>(rows)),
+                                                        static_cast<std::int32_t>(rows * width)),
              std::size_t{256}});
+        if (drafts > 0) {
+            workspace =
+                std::max(workspace, ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
+                                        static_cast<std::int32_t>(domain), 1,
+                                        static_cast<std::int32_t>(drafts), 1,
+                                        static_cast<std::int32_t>(rows)));
+            const auto plane = [&](std::size_t count) {
+                return DeviceBuffer(rows * count * sizeof(std::int32_t));
+            };
+            spec_drafts   = plane(drafts);
+            spec_targets  = plane(width);
+            spec_licensed = plane(width);
+            spec_extents  = plane(1);
+            spec_lengths  = plane(1);
+            spec_counts   = plane(1);
+            spec_accepted = plane(1);
+            spec_anchors  = plane(1);
+            counts_backup = DeviceBuffer(rows * domain * sizeof(std::int32_t));
+            host_spec     = std::make_unique<PinnedHostBuffer>(rows * (drafts + width + 4) *
+                                                               sizeof(std::int32_t));
+        }
         sample_workspace = std::make_unique<WorkspaceArena>(workspace);
         worker           = std::thread([this] {
             device.bind_to_current_thread();
@@ -512,6 +590,17 @@ struct Gemma4Core::Impl {
         slot.request   = request;
         slot.last_used = ++use_clock;
         r.reused = r.prefilled = reused;
+        if (drafts > 0) {
+            r.speculative.backend      = SpeculativeBackend::Mtp;
+            r.speculative.enabled      = true;
+            r.speculative.draft_window = drafts;
+            r.speculative.accepted_per_position.assign(drafts, 0);
+            if (mtp_controller) {
+                r.speculative.adaptive = true;
+                r.speculative.rounds_per_window.assign(drafts, 0);
+                r.mtp_signal.reset();
+            }
+        }
         r.prefill_start        = Clock::now();
         {
             std::lock_guard lock(stats_mutex);
@@ -737,6 +826,7 @@ struct Gemma4Core::Impl {
         result.thinking.post_thinking_sampling = r.post_thinking;
         result.reused_prompt_tokens            = r.reused;
         result.prefix_reuse_path               = r.reuse_path;
+        if (drafts > 0) { result.speculative = r.speculative; }
         result.timings.prepare_seconds         = r.prepare_seconds;
         result.timings.prefill_seconds         = seconds(r.prefill_start, r.prefill_end);
         result.timings.decode_seconds          = seconds(r.prefill_end, r.last_token);
@@ -825,21 +915,42 @@ struct Gemma4Core::Impl {
         return slots.at(request->slot).request == request;
     }
 
+    // Applies the output policy to a sampled token: publishes what it accepts, then either
+    // finishes the request or queues what its next decode step feeds.
     void accept(const std::shared_ptr<Request>& request, TokenId token,
                 const runtime::RawTokenLogprob* logprob) {
-        Request& r = *request;
-        const std::span<const runtime::RawTokenLogprob> records =
-            logprob != nullptr ? std::span<const runtime::RawTokenLogprob>(logprob, 1)
-                               : std::span<const runtime::RawTokenLogprob>{};
-        const OutputDecision decision = r.output.preview_model(
-            std::span<const TokenId>(&token, 1), r.budget->remaining(), r.budget->limit_reason(),
-            records);
+        (void)accept(request, std::span<const TokenId>(&token, 1),
+                     logprob != nullptr ? std::span<const runtime::RawTokenLogprob>(logprob, 1)
+                                        : std::span<const runtime::RawTokenLogprob>{});
+        check_capacity(request);
+    }
+
+    // A request whose next feed would pass the context finishes.
+    void check_capacity(const std::shared_ptr<Request>& request) {
+        if (active(request) && request->position + request->feed.size() > max_context) {
+            finish_now(request, FinishReason::ContextCapacity);
+        }
+    }
+
+    // The same for a run of sampled tokens (a speculative round's licensed tokens), without the
+    // capacity check, which the caller makes once the round's position is known: returns how many
+    // of them the policy accepted. The next step feeds the last accepted one (the first when none
+    // was, as a single sampled token is fed whatever the policy decides).
+    std::uint32_t accept(const std::shared_ptr<Request>& request, std::span<const TokenId> tokens,
+                         std::span<const runtime::RawTokenLogprob> logprobs) {
+        Request& r                    = *request;
+        const OutputDecision decision = r.output.preview_model(tokens, r.budget->remaining(),
+                                                               r.budget->limit_reason(), logprobs);
         const auto now = Clock::now();
         if (r.first_token == Clock::time_point{}) { r.first_token = now; }
         r.last_token = now;
-        if (decision.accepted_tokens > 0) {
-            r.generated.push_back(token);
-            r.budget->commit(decision.accepted_tokens);
+        if (decision.accepted_tokens > tokens.size()) {
+            throw std::logic_error("output policy accepted more than the sampled tokens");
+        }
+        const std::uint32_t accepted = decision.accepted_tokens;
+        if (accepted > 0) {
+            r.generated.insert(r.generated.end(), tokens.begin(), tokens.begin() + accepted);
+            r.budget->commit(accepted);
         }
         std::optional<GenerationTimingObservation> timing;
         if (r.observation.live_timings) {
@@ -851,30 +962,64 @@ struct Gemma4Core::Impl {
         push_events(r, r.output.commit_preview(), timing);
         {
             std::lock_guard lock(stats_mutex);
-            stats.committed_decode_tokens += decision.accepted_tokens;
+            stats.committed_decode_tokens += accepted;
         }
         if (decision.finished()) {
             finish(request, decision.finish_reason);
-            return;
+            return accepted;
         }
-        r.feed.assign(1, token);
+        r.feed.assign(1, tokens[accepted > 0 ? accepted - 1 : 0]);
         if (r.cancelled.load(std::memory_order_acquire)) {
             finish_now(request, FinishReason::Cancelled);
-            return;
         }
-        if (active(request) && r.position + r.feed.size() > max_context) {
-            finish_now(request, FinishReason::ContextCapacity);
-        }
+        return accepted;
     }
 
+    // Whether the request's next step can be a speculative round: an Engine with drafts, an
+    // assistant state that follows the sequence, room for the round in the context and the output,
+    // and no switch of sampling parameters pending (a reasoning block that has not closed yet when
+    // the request samples its answer differently).
+    [[nodiscard]] bool speculates(const Request& r) const {
+        return drafts > 0 && r.feed.size() == 1 && instance.executor->can_draft(r.slot) &&
+               r.position + drafts + 1 <= max_context &&
+               r.output.model_token_budget_remaining(r.budget->remaining()) > 1 &&
+               !(r.options.execution.post_thinking_sampling && !r.post_thinking);
+    }
+
+    // The drafts a round takes while `decoding` requests decode at once. Each verified row routes to
+    // its own experts, so the rows a round adds cost more as requests join: measured on an RTX 3090
+    // over 384-token chat answers, two requests gain with one draft each (370.0 tok/s together
+    // against 310.1 plain) and lose most of it with three (330.0), three gain a little with one
+    // (365.7 against 354.7) and four lose with one (387.6 against 397.2).
+    [[nodiscard]] std::uint32_t round_drafts(std::size_t decoding) const noexcept {
+        return decoding == 1 ? drafts : decoding <= 3 ? 1U : 0U;
+    }
+
+    // One step of every decoding request. Those that speculate run one round together, the rest one
+    // batched decode step.
     void decode_step() {
-        auto& executor = *instance.executor;
-        std::vector<std::shared_ptr<Request>> batch;
+        std::vector<std::shared_ptr<Request>> batch, speculative;
+        std::size_t decoding = 0;
         for (const Slot& slot : slots) {
-            if (slot.request && slot.request->decoding) { batch.push_back(slot.request); }
+            if (slot.request && slot.request->decoding) { ++decoding; }
         }
-        if (batch.empty()) { return; }
+        const std::uint32_t steps = round_drafts(decoding);
+        for (const Slot& slot : slots) {
+            if (!slot.request || !slot.request->decoding) { continue; }
+            (steps > 0 && speculates(*slot.request) ? speculative : batch).push_back(slot.request);
+        }
+        if (batch.empty() && speculative.empty()) { return; }
         const auto start = Clock::now();
+        if (!batch.empty()) { plain_step(batch); }
+        if (!speculative.empty()) { speculative_round(speculative, steps); }
+        std::lock_guard lock(stats_mutex);
+        stats.decode_rounds += 1;
+        stats.decode_row_rounds += batch.size() + speculative.size();
+        stats.decode_seconds_total += seconds(start, Clock::now());
+    }
+
+    void plain_step(const std::vector<std::shared_ptr<Request>>& batch) {
+        auto& executor = *instance.executor;
         std::vector<std::uint32_t> sequences;
         std::vector<TokenId> tokens;
         for (const auto& request : batch) {
@@ -892,14 +1037,310 @@ struct Gemma4Core::Impl {
         std::vector<runtime::RawTokenLogprob> logprobs(batch.size());
         sample(rows, ops::kSamplePurposeDecode, sampled, logprobs);
         for (std::size_t b = 0; b < batch.size(); ++b) {
+            if (drafts > 0) { ++batch[b]->speculative.fallback_steps; }
             try {
                 accept(batch[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr);
             } catch (...) { fail(batch[b], std::current_exception()); }
         }
-        std::lock_guard lock(stats_mutex);
-        stats.decode_rounds += 1;
-        stats.decode_row_rounds += batch.size();
-        stats.decode_seconds_total += seconds(start, Clock::now());
+    }
+
+    // One round of each request: the assistant drafts after its anchor (or a context lookup
+    // proposes), the target verifies the anchor and the drafts at once, the acceptance licenses a
+    // run of tokens on the device (the accepted drafts and a correction or bonus, each the target's
+    // own keyed draw, so the output is what plain decoding samples), the output policy takes what
+    // it accepts of the run, and the executor commits the tokens fed up to the last of them.
+    void speculative_round(const std::vector<std::shared_ptr<Request>>& batch,
+                           std::uint32_t max_steps) {
+        auto& executor      = *instance.executor;
+        const std::size_t b = batch.size();
+        std::vector<std::uint32_t> sequences;
+        std::vector<TokenId> anchors;
+        for (const auto& request : batch) {
+            sequences.push_back(request->slot);
+            anchors.push_back(request->feed.front());
+        }
+        const auto round_start = Clock::now();
+        const std::uint32_t limit = std::min(drafts, max_steps);
+        std::uint32_t steps = limit;
+        if (mtp_controller) {
+            std::vector<const runtime::MtpAdaptiveSignal*> signals;
+            std::vector<std::uint32_t> available, room;
+            std::uint64_t cohort = 1469598103934665603ULL;
+            for (const auto& request : batch) {
+                signals.push_back(&request->mtp_signal);
+                const auto budget = request->output.model_token_budget_remaining(
+                    request->budget->remaining());
+                room.push_back(static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    {static_cast<std::uint64_t>(budget),
+                     static_cast<std::uint64_t>(max_context - request->position), 1U << 20})));
+                available.push_back(std::min(limit, room.back() > 0 ? room.back() - 1U : 0U));
+                cohort = (cohort ^ (static_cast<std::uint64_t>(request->slot) << 32U |
+                                    static_cast<std::uint32_t>(
+                                        request->admitted.time_since_epoch().count()))) *
+                         1099511628211ULL;
+            }
+            steps = std::clamp<std::uint32_t>(
+                mtp_controller->select(signals, available, room, cohort), 1, limit);
+        }
+        std::vector<TokenId> all_drafts(b * drafts);
+        std::vector<std::uint32_t> draft_extents(b, steps);
+        // Context lookup (--lookup-ngram N): a row whose last N tokens, its anchor last, appeared
+        // earlier in its sequence proposes what followed then, in place of the assistant's guess,
+        // which is weakest where the output repeats its input; verification keeps it exact.
+        std::vector<char> looked_up(b, 0);
+        std::size_t lookups = 0;
+        if (lookup_ngram != 0) {
+            for (std::size_t j = 0; j < b; ++j) {
+                std::vector<TokenId>& ledger = slots[batch[j]->slot].fed;
+                ledger.push_back(anchors[j]);
+                const std::uint32_t found = runtime::lookup_draft(
+                    ledger, lookup_ngram, steps, all_drafts.data() + j * drafts);
+                ledger.pop_back();
+                if (found != 0) {
+                    looked_up[j]     = 1;
+                    draft_extents[j] = found;
+                    ++lookups;
+                }
+            }
+        }
+        if (lookups < b) {
+            std::vector<std::uint32_t> mtp_sequences;
+            std::vector<TokenId> mtp_anchors;
+            for (std::size_t j = 0; j < b; ++j) {
+                if (looked_up[j]) { continue; }
+                mtp_sequences.push_back(sequences[j]);
+                mtp_anchors.push_back(anchors[j]);
+            }
+            std::vector<TokenId> mtp_drafts(mtp_sequences.size() * steps);
+            executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, steps);
+            for (std::size_t j = 0, m = 0; j < b; ++j) {
+                if (looked_up[j]) { continue; }
+                std::copy_n(mtp_drafts.begin() + std::ptrdiff_t(m * steps), steps,
+                            all_drafts.begin() + std::ptrdiff_t(j * drafts));
+                ++m;
+            }
+        }
+        const std::size_t k = *std::max_element(draft_extents.begin(), draft_extents.end());
+        const std::size_t w = k + 1;
+        const auto columns  = static_cast<std::int32_t>(w);
+        std::vector<TokenId> proposed;
+        proposed.reserve(b * k);
+        for (std::size_t j = 0; j < b; ++j) {
+            proposed.insert(proposed.end(), all_drafts.begin() + std::ptrdiff_t(j * drafts),
+                            all_drafts.begin() + std::ptrdiff_t(j * drafts + k));
+        }
+        std::vector<TokenId> tokens;
+        for (std::size_t j = 0; j < b; ++j) {
+            tokens.push_back(anchors[j]);
+            tokens.insert(tokens.end(), proposed.begin() + std::ptrdiff_t(j * k),
+                          proposed.begin() + std::ptrdiff_t((j + 1) * k));
+        }
+        executor.verify(sequences, tokens);
+
+        const cudaStream_t stream = executor.head_stream();
+        std::vector<SampleRow> rows;
+        for (const auto& request : batch) { rows.push_back(sample_row(*request)); }
+        // The rows' sampling, each column of a grammar's row masked as the drafts before it leave
+        // the grammar.
+        auto* configs = static_cast<ops::SamplingConfig*>(host_sample->data());
+        bool masked   = false;
+        for (std::size_t j = 0; j < b; ++j) {
+            const SampleRow& row = rows[j];
+            ops::SamplingConfig config;
+            config.temperature       = row.params->temperature;
+            config.top_k             = row.params->top_k;
+            config.top_p             = row.params->top_p;
+            config.min_p             = row.params->min_p;
+            config.presence_penalty  = row.params->presence_penalty;
+            config.frequency_penalty = row.params->frequency_penalty;
+            config.seed              = row.params->seed;
+            config.token_counts      = row.counts ? static_cast<std::int32_t*>(token_counts.p) +
+                                                        std::size_t(row.slot) * domain
+                                                  : nullptr;
+            if (row.grammar != nullptr) {
+                auto* words = static_cast<std::uint32_t*>(host_mask->data()) + j * w * mask_words();
+                row.grammar->fill_masks(std::span(words, w * mask_words()),
+                                        std::span<const TokenId>(proposed).subspan(j * k, k));
+                config.token_mask =
+                    static_cast<const std::uint32_t*>(token_mask.p) + j * w * mask_words();
+                config.token_mask_stride = static_cast<std::int32_t>(mask_words());
+                masked                   = true;
+            }
+            configs[j] = config;
+        }
+        if (masked) {
+            CUDA_CHECK(cudaMemcpyAsync(token_mask.p, host_mask->data(),
+                                       b * w * mask_words() * sizeof(std::uint32_t),
+                                       cudaMemcpyHostToDevice, stream));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(sample_config.p, configs, b * sizeof(ops::SamplingConfig),
+                                   cudaMemcpyHostToDevice, stream));
+        // Drafts, live draft counts and the tokens each request fed before the round.
+        auto* staged = static_cast<std::int32_t*>(host_spec->data());
+        std::copy(proposed.begin(), proposed.end(), staged);
+        for (std::size_t j = 0; j < b; ++j) {
+            // Acceptance respects each sequence's own extent and its output budget, correction
+            // included.
+            const auto remaining = batch[j]->output.model_token_budget_remaining(
+                batch[j]->budget->remaining());
+            staged[b * k + j] = static_cast<std::int32_t>(
+                std::min<std::size_t>(draft_extents[j], remaining - 1));
+            staged[b * k + b + j] = static_cast<std::int32_t>(batch[j]->position);
+        }
+        CUDA_CHECK(
+            cudaMemcpyAsync(spec_drafts.p, staged, b * k * 4, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(spec_extents.p, staged + b * k, b * 4, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(spec_lengths.p, staged + b * k + b, b * 4,
+                                   cudaMemcpyHostToDevice, stream));
+        const auto rows_n         = static_cast<std::int32_t>(b);
+        const Tensor logits       = executor.logits(static_cast<std::uint32_t>(b * w));
+        const auto* device_config = static_cast<const ops::SamplingConfig*>(sample_config.p);
+        const Tensor drafted(spec_drafts.p, DType::I32, {static_cast<std::int32_t>(k), rows_n});
+        // The tokens' logprob records, from the distributions their columns are drawn from,
+        // before the acceptance adds the round's tokens to the penalty counts.
+        const bool gather     = std::any_of(rows.begin(), rows.end(),
+                                            [](const SampleRow& row) { return row.logprobs; });
+        const std::size_t top = b * w * kMaximumTokenLogprobs;
+        auto* host_ids        = static_cast<std::int32_t*>(host_logprobs->data());
+        auto* host_values     = reinterpret_cast<float*>(
+            host_ids + slots.size() * (std::size_t(drafts) + 1) * kMaximumTokenLogprobs);
+        if (gather) {
+            Tensor ids(logprob_ids.p, DType::I32, {ops::kLogprobTopK, columns, rows_n});
+            Tensor values(logprob_values.p, DType::FP32, {ops::kLogprobTopK, columns, rows_n});
+            Tensor lse(logprob_lse.p, DType::FP32, {columns, rows_n});
+            const Tensor flag(logprob_flag.p, DType::I32, {1});
+            ops::logprob_topk(logits.view({logits.ne[0], columns, rows_n}), device_config, &drafted,
+                              static_cast<std::int32_t>(domain), ids, values, lse, flag,
+                              *sample_workspace, stream);
+            CUDA_CHECK(cudaMemcpyAsync(host_ids, logprob_ids.p, top * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(host_values, logprob_values.p, top * sizeof(float),
+                                       cudaMemcpyDeviceToHost, stream));
+        }
+        for (std::size_t j = 0; j < b; ++j) {
+            if (!rows[j].counts) { continue; }
+            const std::size_t at = std::size_t(rows[j].slot) * domain * sizeof(std::int32_t);
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(counts_backup.p) + at,
+                                       static_cast<const std::byte*>(token_counts.p) + at,
+                                       std::size_t(domain) * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+        Tensor targets(spec_targets.p, DType::I32, {columns * rows_n});
+        ops::argmax(logits, targets, static_cast<std::int32_t>(domain), stream);
+        Tensor extents(spec_extents.p, DType::I32, {rows_n});
+        Tensor lengths(spec_lengths.p, DType::I32, {rows_n});
+        Tensor round_anchors(spec_anchors.p, DType::I32, {rows_n});
+        Tensor licensed(spec_licensed.p, DType::I32, {columns, rows_n});
+        Tensor counts(spec_counts.p, DType::I32, {rows_n});
+        Tensor accepted(spec_accepted.p, DType::I32, {rows_n});
+        {
+            auto scope = sample_workspace->scope();
+            ops::speculative_accept_coupled_drafts(
+                targets.view({columns, rows_n}), logits.view({logits.ne[0], columns, rows_n}),
+                drafted, extents, lengths, round_anchors, licensed, counts, accepted,
+                static_cast<std::int32_t>(domain), device_config, *sample_workspace, stream);
+        }
+        auto* host = staged + b * (k + 2);
+        CUDA_CHECK(
+            cudaMemcpyAsync(host, spec_licensed.p, b * w * 4, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(host + b * w, spec_counts.p, b * 4, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(host + b * w + b, spec_accepted.p, b * 4, cudaMemcpyDeviceToHost,
+                                   stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // The output policy takes its part of each licensed run; the executor then keeps the tokens
+        // fed up to the last one taken.
+        std::vector<std::uint32_t> kept(b, 1);
+        std::vector<char> failed(b, 0);
+        for (std::size_t j = 0; j < b; ++j) {
+            const auto& request           = batch[j];
+            Request& r                    = *request;
+            const std::int32_t licensed_n = host[b * w + j];
+            const std::int32_t drafts_n   = host[b * w + b + j];
+            const std::int32_t* run       = host + j * w;
+            if (licensed_n < 1 || licensed_n > columns || run[0] == ops::kSamplerNonFiniteToken) {
+                throw std::runtime_error("Gemma 4 produced non-finite logits");
+            }
+            for (std::int32_t i = 0; i < licensed_n; ++i) {
+                if (run[i] < 0 || std::uint32_t(run[i]) >= domain) {
+                    throw std::runtime_error("Gemma 4 licensed a token outside the vocabulary");
+                }
+            }
+            std::vector<runtime::RawTokenLogprob> records;
+            if (rows[j].logprobs) {
+                for (std::int32_t i = 0; i < licensed_n; ++i) {
+                    runtime::RawTokenLogprob record{.id = run[i], .logprob = kLogprobSentinel};
+                    for (std::size_t t = 0; t < kMaximumTokenLogprobs; ++t) {
+                        const std::size_t at = (j * w + std::size_t(i)) * kMaximumTokenLogprobs + t;
+                        record.top_ids[t]    = host_ids[at];
+                        record.top_values[t] = host_values[at];
+                        if (host_ids[at] == run[i]) { record.logprob = host_values[at]; }
+                    }
+                    records.push_back(record);
+                }
+            }
+            r.speculative.rounds += 1;
+            r.speculative.drafted_tokens += draft_extents[j];
+            r.speculative.accepted_tokens += std::uint32_t(drafts_n);
+            if (looked_up[j]) {
+                // Reported with the n-gram proposals: what the context, not the model, proposed.
+                ++r.speculative.ngram_rounds;
+                r.speculative.ngram_drafted_tokens += draft_extents[j];
+                r.speculative.ngram_accepted_tokens += std::uint32_t(drafts_n);
+            } else if (mtp_controller) {
+                r.mtp_signal.observe(draft_extents[j], std::uint32_t(drafts_n));
+                ++r.speculative.rounds_per_window[steps - 1];
+                if (mtp_controller->transitioned()) { ++r.speculative.window_transitions; }
+            }
+            for (std::int32_t i = 0; i < drafts_n; ++i) {
+                ++r.speculative.accepted_per_position[i];
+            }
+            const std::span<const TokenId> run_tokens(run, std::size_t(licensed_n));
+            std::uint32_t taken = 0;
+            try {
+                taken = accept(request, run_tokens, records);
+            } catch (...) {
+                fail(request, std::current_exception());
+                failed[j] = 1;
+            }
+            // The tokens counted as sampled: those taken, or the first when none was.
+            kept[j] = std::max<std::uint32_t>(taken, 1);
+            if (kept[j] < std::uint32_t(licensed_n) && active(request) && rows[j].counts) {
+                // The acceptance counted the whole run; the request keeps only its prefix.
+                const std::size_t at = std::size_t(r.slot) * domain * sizeof(std::int32_t);
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(token_counts.p) + at,
+                                           static_cast<const std::byte*>(counts_backup.p) + at,
+                                           std::size_t(domain) * sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToDevice, stream));
+                const Tensor ids(static_cast<std::int32_t*>(spec_licensed.p) + j * w, DType::I32,
+                                 {static_cast<std::int32_t>(kept[j])});
+                Tensor row_counts(static_cast<std::int32_t*>(token_counts.p) +
+                                      std::size_t(r.slot) * domain,
+                                  DType::I32, {static_cast<std::int32_t>(domain)});
+                ops::increment_token_counts(ids, row_counts, stream);
+            }
+        }
+        executor.commit(sequences, kept);
+        // The controller measures rounds of the assistant's drafts only: a lookup changes the
+        // round's width.
+        if (mtp_controller && lookups == 0) {
+            mtp_controller->observe_execution(static_cast<std::uint32_t>(b), steps,
+                                              seconds(round_start, Clock::now()));
+        }
+        for (std::size_t j = 0; j < b; ++j) {
+            Request& r = *batch[j];
+            if (failed[j]) { continue; }
+            Slot& slot = slots[r.slot];
+            // The verification fed the anchor and the drafts; the sequence keeps the first ones.
+            slot.fed.insert(slot.fed.end(), tokens.begin() + std::ptrdiff_t(j * w),
+                            tokens.begin() + std::ptrdiff_t(j * w + kept[j]));
+            r.position += kept[j];
+            try {
+                check_capacity(batch[j]);
+            } catch (...) { fail(batch[j], std::current_exception()); }
+        }
     }
 
     std::vector<float> score(const std::vector<TokenId>& window, std::uint32_t window_target) {

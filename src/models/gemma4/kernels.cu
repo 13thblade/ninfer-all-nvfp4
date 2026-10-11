@@ -189,8 +189,10 @@ __global__ void qkv_post_kernel(QkvArgs a) {
     const std::int64_t at =
         std::int64_t(sequence) * a.seq_stride + std::int64_t(kh) * a.head_stride +
         std::int64_t(slot) * d;
-    a.k_cache[at + i]        = __float2half(n0 * c - n1 * s);
-    a.k_cache[at + i + half] = __float2half(n1 * c + n0 * s);
+    if (a.k_cache != nullptr) {
+        a.k_cache[at + i]        = __float2half(n0 * c - n1 * s);
+        a.k_cache[at + i + half] = __float2half(n1 * c + n0 * s);
+    }
     a.v_cache[at + i]        = __float2half(v0 * vinv);
     a.v_cache[at + i + half] = __float2half(v1 * vinv);
 }
@@ -214,6 +216,37 @@ __global__ void build_mask_kernel(__half* mask, int tokens, int slots, int first
     mask[std::int64_t(t) * slots + s] = visible ? __float2half(0.0f) : __float2half(-INFINITY);
 }
 
+// The key pair (i, i + D/2) from its stored value pair and its rotation (cos, sin), as qkv_post
+// rotates a key.
+__device__ __forceinline__ void derived_key_pair(float v0, float v1, float w0, float w1, float2 cs,
+                                                 __half& k0, __half& k1) {
+    const float n0 = v0 * w0, n1 = v1 * w1;
+    k0 = __float2half(n0 * cs.x - n1 * cs.y);
+    k1 = __float2half(n1 * cs.x + n0 * cs.y);
+}
+
+__global__ void rope_table_kernel(const float* __restrict__ freq, int pairs, int positions,
+                                  float2* __restrict__ rope) {
+    const std::int64_t j = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (j >= std::int64_t(positions) * pairs) { return; }
+    const int p = int(j / pairs), i = int(j % pairs);
+    const float angle = float(p) * freq[i];
+    float c = 1.0f, s = 0.0f;
+    if (freq[i] != 0.0f) { sincosf(angle, &s, &c); }
+    rope[j] = make_float2(c, s);
+}
+
+// Block (position, head): D/2 threads, one pair each.
+__global__ void derive_keys_kernel(const __half* __restrict__ v, std::int64_t head_stride, int d,
+                                   const float* __restrict__ w, const float2* __restrict__ rope,
+                                   int pairs, __half* __restrict__ k) {
+    const int p = blockIdx.x, h = blockIdx.y, i = threadIdx.x, half = d >> 1;
+    const std::int64_t at = h * head_stride + std::int64_t(p) * d;
+    const float2 cs = i < pairs ? rope[std::int64_t(p) * pairs + i] : make_float2(1.0f, 0.0f);
+    derived_key_pair(__half2float(v[at + i]), __half2float(v[at + i + half]), w[i], w[i + half],
+                     cs, k[at + i], k[at + i + half]);
+}
+
 // Block (position, head): the position's K and V rows, 16-byte words.
 __global__ void ring_copy_kernel(RingCopyArgs a) {
     const int p = a.begin + blockIdx.x, h = blockIdx.y;
@@ -231,7 +264,7 @@ __global__ void f32_to_bf16_kernel(const float* in, __nv_bfloat16* out, std::int
 }
 
 // ---- Decode attention ---------------------------------------------------------------------------
-// Block (kv head, split, row): the G query heads of the KV head over the split's keys, in tiles. Four
+// Block (row, kv head, split): the G query heads of the KV head over the split's keys, in tiles. Four
 // warps; warp w scores heads [w * HPW, (w + 1) * HPW) over keys of its key group (G < 4: the tile's
 // keys are split between 4 / G warps per head). Every thread then accumulates D / 128 dimensions of
 // every head's output.
@@ -271,11 +304,13 @@ struct DecodeShape {
 
 template <int D, int G>
 __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(DecodeAttentionArgs a) {
-    using S              = DecodeShape<D, G>;
+    constexpr int V      = G;
+    using S              = DecodeShape<D, V>;
     constexpr int kTile  = S::kTile;
-    const int kv_head    = blockIdx.x;
-    const int split      = blockIdx.y;
-    const int b          = blockIdx.z;
+    // Rows vary fastest: a verification's rows of one sequence read the same keys at once.
+    const int b          = blockIdx.x;
+    const int kv_head    = blockIdx.y;
+    const int split      = blockIdx.z;
     const int warp       = threadIdx.x >> 5;
     const int lane       = threadIdx.x & 31;
     const int position   = a.positions[b];
@@ -290,17 +325,16 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
 
     __shared__ __align__(16) __half k_s[kTile][D];
     __shared__ __align__(16) __half v_s[kTile][D];
-    __shared__ float p_s[G][kTile];
-    __shared__ float m_s[G], l_s[G], scale_s[G];
+    __shared__ float p_s[V][kTile];
+    __shared__ float m_s[V], l_s[V], scale_s[V];
 
-    const int q_head0 = kv_head * G;
-    if (threadIdx.x < G) {
+    if (threadIdx.x < V) {
         m_s[threadIdx.x] = -INFINITY;
         l_s[threadIdx.x] = 0.0f;
     }
-    float acc[G][S::kDpt];
+    float acc[V][S::kDpt];
 #pragma unroll
-    for (int g = 0; g < G; ++g) {
+    for (int g = 0; g < V; ++g) {
 #pragma unroll
         for (int j = 0; j < S::kDpt; ++j) { acc[g][j] = 0.0f; }
     }
@@ -312,7 +346,7 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
     float q_r[S::kHpw][S::kDpl];
 #pragma unroll
     for (int h = 0; h < S::kHpw; ++h) {
-        const float* q = a.q + (std::int64_t(b) * a.query_heads + q_head0 + head_base + h) * D +
+        const float* q = a.q + (std::int64_t(b) * a.query_heads + kv_head * G + head_base + h) * D +
                          lane * S::kDpl;
 #pragma unroll
         for (int j = 0; j < S::kDpl; ++j) { q_r[h][j] = q[j] * a.scale; }
@@ -391,7 +425,7 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
         __syncthreads();
         // Online softmax: warp w takes heads w, w + 4, ...; lane k the tile's key k.
         static_assert(kTile <= 32, "one lane per key of a tile");
-        for (int g = warp; g < G; g += kDecodeThreads / 32) {
+        for (int g = warp; g < V; g += kDecodeThreads / 32) {
             const float p     = lane < count ? p_s[g][lane] : -INFINITY;
             float m_tile      = p;
 #pragma unroll
@@ -410,7 +444,7 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
         }
         __syncthreads();
 #pragma unroll
-        for (int g = 0; g < G; ++g) {
+        for (int g = 0; g < V; ++g) {
             const float scale = scale_s[g];
 #pragma unroll
             for (int j = 0; j < S::kDpt; ++j) { acc[g][j] *= scale; }
@@ -420,7 +454,7 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
             for (int j = 0; j < S::kDpt; ++j) {
                 const float v = __half2float(v_s[k][threadIdx.x + j * kDecodeThreads]);
 #pragma unroll
-                for (int g = 0; g < G; ++g) { acc[g][j] += p_s[g][k] * v; }
+                for (int g = 0; g < V; ++g) { acc[g][j] += p_s[g][k] * v; }
             }
         }
         __syncthreads();
@@ -428,9 +462,9 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
     // Partials: [B][Hq][splits] rows of D values, then [B][Hq][splits] (m, l) pairs.
     const std::int64_t rows = std::int64_t(a.batch) * a.query_heads * a.splits;
 #pragma unroll
-    for (int g = 0; g < G; ++g) {
+    for (int g = 0; g < V; ++g) {
         const std::int64_t row =
-            (std::int64_t(b) * a.query_heads + q_head0 + g) * a.splits + split;
+            (std::int64_t(b) * a.query_heads + kv_head * G + g) * a.splits + split;
 #pragma unroll
         for (int j = 0; j < S::kDpt; ++j) {
             a.partial[row * D + threadIdx.x + j * kDecodeThreads] = acc[g][j];
@@ -442,12 +476,220 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
     }
 }
 
-// Block (head, row): merges the splits of one query head.
-constexpr int kDecodeCombineThreads = 256; // at least the largest split count
+// Width 512, eight query heads per KV head (the full-attention blocks): block (row, kv head, split)
+// of eight warps, warp h the group's query head h. A tile's 16 keys and values pass through shared
+// memory once for all eight heads; each lane holds dimensions [8 lane, 8 lane + 8) and [256 +
+// 8 lane, 256 + 8 lane + 8) (conflict-free 16-byte reads), and every warp keeps its own online
+// softmax, so a tile costs two barriers (three when the keys are derived from the values).
+constexpr int kWideThreads = 256;
+
+template <bool Derived>
+__launch_bounds__(kWideThreads, 2) __global__ void decode_attention_wide_kernel(DecodeAttentionArgs a) {
+    constexpr int D = 512, kTile = 16, kHalf = D / 2;
+    const int b        = blockIdx.x; // rows fastest, as decode_attention_kernel
+    const int kv_head  = blockIdx.y;
+    const int split    = blockIdx.z;
+    const int warp     = threadIdx.x >> 5;
+    const int lane     = threadIdx.x & 31;
+    const int position = a.positions[b];
+    const int sequence = a.sequences[b];
+    const int n_all    = position + 1;
+    const int active   = decode_active_splits(n_all, a.splits, kTile);
+    if (split >= active) { return; }
+    const int chunk = ((n_all + active - 1) / active + kTile - 1) / kTile * kTile;
+    const int lo    = split * chunk;
+    const int hi    = min(position + 1, lo + chunk);
+
+    __shared__ __align__(16) __half k_s[kTile][D];
+    __shared__ __align__(16) __half v_s[kTile][D];
+
+    const int head = kv_head * (kWideThreads / 32) + warp;
+    float q_r[16], acc[16];
+    {
+        const float* q = a.q + (std::int64_t(b) * a.query_heads + head) * D;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            q_r[j]     = q[8 * lane + j] * a.scale;
+            q_r[8 + j] = q[kHalf + 8 * lane + j] * a.scale;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 16; ++j) { acc[j] = 0.0f; }
+    float m = -INFINITY, l = 0.0f;
+
+    const std::int64_t base = std::int64_t(sequence) * a.seq_stride +
+                              std::int64_t(kv_head) * a.head_stride;
+    constexpr int kWords = D / 8;                         // 16-byte words per row
+    constexpr int kLoads = kTile * kWords / kWideThreads; // per thread and matrix
+    uint4 k_next[kLoads], v_next[kLoads];
+    // Derived keys: thread t < 128 turns the 8 pairs [8 (t % 8), 8 (t % 8) + 8) of row t / 8 (the
+    // first 64 pairs turn, rope_pairs == 64), with their rotations fetched beside the values.
+    static_assert(kTile * 8 <= kWideThreads, "one thread per turned 8-pair chunk");
+    float2 cs_next[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { cs_next[j] = make_float2(1.0f, 0.0f); }
+    const auto fetch = [&](int tile, int count) {
+#pragma unroll
+        for (int u = 0; u < kLoads; ++u) {
+            const int w = threadIdx.x + u * kWideThreads;
+            const int r = w / kWords, c = w % kWords;
+            k_next[u] = make_uint4(0, 0, 0, 0);
+            v_next[u] = make_uint4(0, 0, 0, 0);
+            if (r < count) {
+                const std::int64_t at = base + std::int64_t(tile + r) * D + c * 8;
+                if constexpr (!Derived) {
+                    k_next[u] = *reinterpret_cast<const uint4*>(a.k_cache + at);
+                }
+                v_next[u] = *reinterpret_cast<const uint4*>(a.v_cache + at);
+            }
+        }
+        if constexpr (Derived) {
+            const int r = threadIdx.x >> 3, c = threadIdx.x & 7;
+            if (threadIdx.x < kTile * 8 && r < count) {
+                const float4* src = reinterpret_cast<const float4*>(
+                    a.rope + std::int64_t(tile + r) * 64 + 8 * c);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float4 v = src[j];
+                    cs_next[2 * j]     = make_float2(v.x, v.y);
+                    cs_next[2 * j + 1] = make_float2(v.z, v.w);
+                }
+            }
+        }
+    };
+    // After the score butterfly lanes 2j and 2j + 1 hold key `lane_key`.
+    const int lane_key = ((lane & 16) ? 8 : 0) + ((lane & 8) ? 4 : 0) + ((lane & 4) ? 2 : 0) +
+                         ((lane & 2) ? 1 : 0);
+    if (lo < hi) { fetch(lo, min(kTile, hi - lo)); }
+    for (int tile = lo; tile < hi; tile += kTile) {
+        const int count = min(kTile, hi - tile);
+#pragma unroll
+        for (int u = 0; u < kLoads; ++u) {
+            const int w = threadIdx.x + u * kWideThreads;
+            const int r = w / kWords, c = w % kWords;
+            if constexpr (!Derived) { *reinterpret_cast<uint4*>(&k_s[r][c * 8]) = k_next[u]; }
+            *reinterpret_cast<uint4*>(&v_s[r][c * 8]) = v_next[u];
+        }
+        float2 cs[8];
+        if constexpr (Derived) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { cs[j] = cs_next[j]; }
+        }
+        __syncthreads();
+        if (tile + kTile < hi) { fetch(tile + kTile, min(kTile, hi - tile - kTile)); }
+        if constexpr (Derived) {
+            // The tile's keys from its values, 8 pairs (i, i + 256) at a time: the turned chunks
+            // (pairs below 64), then the chunks that only scale (keys past `count` are never
+            // scored).
+            const auto chunk_keys = [&](int r, int i, const float2* turn) {
+                const uint4 w0 = *reinterpret_cast<const uint4*>(&v_s[r][i]);
+                const uint4 w1 = *reinterpret_cast<const uint4*>(&v_s[r][i + kHalf]);
+                const __half2* h0 = reinterpret_cast<const __half2*>(&w0);
+                const __half2* h1 = reinterpret_cast<const __half2*>(&w1);
+                uint4 o0, o1;
+                __half2* k0 = reinterpret_cast<__half2*>(&o0);
+                __half2* k1 = reinterpret_cast<__half2*>(&o1);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f0 = __half22float2(h0[j]), f1 = __half22float2(h1[j]);
+                    const float n0 = f0.x * a.k_norm[i + 2 * j], n1 = f0.y * a.k_norm[i + 2 * j + 1];
+                    const float m0 = f1.x * a.k_norm[i + kHalf + 2 * j];
+                    const float m1 = f1.y * a.k_norm[i + kHalf + 2 * j + 1];
+                    if (turn != nullptr) {
+                        const float2 c0 = turn[2 * j], c1 = turn[2 * j + 1];
+                        k0[j] = __floats2half2_rn(n0 * c0.x - m0 * c0.y, n1 * c1.x - m1 * c1.y);
+                        k1[j] = __floats2half2_rn(m0 * c0.x + n0 * c0.y, m1 * c1.x + n1 * c1.y);
+                    } else {
+                        k0[j] = __floats2half2_rn(n0, n1);
+                        k1[j] = __floats2half2_rn(m0, m1);
+                    }
+                }
+                *reinterpret_cast<uint4*>(&k_s[r][i])         = o0;
+                *reinterpret_cast<uint4*>(&k_s[r][i + kHalf]) = o1;
+            };
+            if (threadIdx.x < kTile * 8) { chunk_keys(threadIdx.x >> 3, 8 * (threadIdx.x & 7), cs); }
+            // The 24 scaled chunks (pairs 64..255) of each of the 16 rows.
+            for (int w = threadIdx.x; w < kTile * 24; w += kWideThreads) {
+                chunk_keys(w / 24, 64 + 8 * (w % 24), nullptr);
+            }
+            __syncthreads();
+        }
+        // The 16 keys' scores: the lane's 16 dimensions each, then one butterfly.
+        float part[kTile];
+#pragma unroll
+        for (int kk = 0; kk < kTile; ++kk) {
+            const uint4 w0 = *reinterpret_cast<const uint4*>(&k_s[kk][8 * lane]);
+            const uint4 w1 = *reinterpret_cast<const uint4*>(&k_s[kk][kHalf + 8 * lane]);
+            const __half2* h0 = reinterpret_cast<const __half2*>(&w0);
+            const __half2* h1 = reinterpret_cast<const __half2*>(&w1);
+            float dot = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 f0 = __half22float2(h0[j]), f1 = __half22float2(h1[j]);
+                dot += q_r[2 * j] * f0.x + q_r[2 * j + 1] * f0.y;
+                dot += q_r[8 + 2 * j] * f1.x + q_r[8 + 2 * j + 1] * f1.y;
+            }
+            part[kk] = dot;
+        }
+        const float score = key_reduce16(part, lane);
+        const float sc    = lane_key < count ? score : -INFINITY;
+        float m_tile      = sc;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            m_tile = fmaxf(m_tile, __shfl_xor_sync(0xFFFFFFFFu, m_tile, o));
+        }
+        const float m_new = fmaxf(m, m_tile);
+        const float scale = expf(m - m_new);
+        const float p     = lane_key < count ? expf(sc - m_new) : 0.0f;
+        // Every key's probability sits on two lanes.
+        l = l * scale + 0.5f * warp_sum(p);
+        m = m_new;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) { acc[j] *= scale; }
+#pragma unroll
+        for (int kk = 0; kk < kTile; ++kk) {
+            const int src  = ((kk & 8) ? 16 : 0) | ((kk & 4) ? 8 : 0) | ((kk & 2) ? 4 : 0) |
+                             ((kk & 1) ? 2 : 0);
+            const float pk = __shfl_sync(0xFFFFFFFFu, p, src);
+            const uint4 w0 = *reinterpret_cast<const uint4*>(&v_s[kk][8 * lane]);
+            const uint4 w1 = *reinterpret_cast<const uint4*>(&v_s[kk][kHalf + 8 * lane]);
+            const __half2* h0 = reinterpret_cast<const __half2*>(&w0);
+            const __half2* h1 = reinterpret_cast<const __half2*>(&w1);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 f0 = __half22float2(h0[j]), f1 = __half22float2(h1[j]);
+                acc[2 * j] += pk * f0.x;
+                acc[2 * j + 1] += pk * f0.y;
+                acc[8 + 2 * j] += pk * f1.x;
+                acc[8 + 2 * j + 1] += pk * f1.y;
+            }
+        }
+        __syncthreads();
+    }
+    // Partials as decode_attention_kernel leaves them: [B][Hq][splits] rows of D, then (m, l).
+    const std::int64_t rows = std::int64_t(a.batch) * a.query_heads * a.splits;
+    const std::int64_t row  = (std::int64_t(b) * a.query_heads + head) * a.splits + split;
+    float* out = a.partial + row * D;
+#pragma unroll
+    for (int j = 0; j < 8; j += 4) {
+        *reinterpret_cast<float4*>(out + 8 * lane + j) =
+            make_float4(acc[j], acc[j + 1], acc[j + 2], acc[j + 3]);
+        *reinterpret_cast<float4*>(out + kHalf + 8 * lane + j) =
+            make_float4(acc[8 + j], acc[8 + j + 1], acc[8 + j + 2], acc[8 + j + 3]);
+    }
+    if (lane == 0) {
+        a.partial[rows * D + 2 * row]     = m;
+        a.partial[rows * D + 2 * row + 1] = l;
+    }
+}
+
+// Block (head, row, 128 dimensions): merges the splits of one query head.
+constexpr int kDecodeCombineThreads = 128; // at least the largest split count
 
 template <int D>
 __global__ void decode_combine_kernel(DecodeAttentionArgs a) {
     const int head = blockIdx.x, b = blockIdx.y;
+    const int d    = blockIdx.z * kDecodeCombineThreads + threadIdx.x;
     const std::int64_t rows  = std::int64_t(a.batch) * a.query_heads * a.splits;
     const std::int64_t first = (std::int64_t(b) * a.query_heads + head) * a.splits;
     const int position = a.positions[b];
@@ -475,7 +717,7 @@ __global__ void decode_combine_kernel(DecodeAttentionArgs a) {
     weight[threadIdx.x] = w_s;
     if (threadIdx.x == 0) { inv_l = 1.0f / l; }
     __syncthreads();
-    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+    {
         float o = 0.0f;
         for (int s = 0; s < active; ++s) {
             const float w = weight[s];
@@ -484,7 +726,7 @@ __global__ void decode_combine_kernel(DecodeAttentionArgs a) {
         const float y = o * inv_l;
         if (a.out_q.qs == nullptr) {
             a.out[(std::int64_t(b) * a.query_heads + head) * D + d] = __float2bfloat16(y);
-            continue;
+            return;
         }
         // One warp holds 32 consecutive values: one q8_1 block of the o-projection input.
         const int width = a.query_heads * D, at = head * D + d;
@@ -795,6 +1037,30 @@ unsigned blocks_for(std::int64_t n, int threads) {
     return static_cast<unsigned>((n + threads - 1) / threads);
 }
 
+// Block r: one row in 16-byte words.
+__global__ void copy_rows_kernel(const __nv_bfloat16* __restrict__ src,
+                                 const std::int32_t* __restrict__ src_rows,
+                                 __nv_bfloat16* __restrict__ dst,
+                                 const std::int32_t* __restrict__ dst_rows, int width) {
+    const int r  = blockIdx.x;
+    const auto* from = reinterpret_cast<const uint4*>(
+        src + std::int64_t(src_rows != nullptr ? src_rows[r] : r) * width);
+    auto* to = reinterpret_cast<uint4*>(dst + std::int64_t(dst_rows != nullptr ? dst_rows[r] : r) *
+                                                  width);
+    for (int w = threadIdx.x; w < width / 8; w += blockDim.x) { to[w] = from[w]; }
+}
+
+__global__ void stem_rows_kernel(const float* __restrict__ embedding,
+                                 const __nv_bfloat16* __restrict__ hidden, int width,
+                                 __nv_bfloat16* __restrict__ out) {
+    const int r = blockIdx.x;
+    __nv_bfloat16* row = out + std::int64_t(r) * 2 * width;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        row[i]         = __float2bfloat16(embedding[std::int64_t(r) * width + i]);
+        row[width + i] = hidden[std::int64_t(r) * width + i];
+    }
+}
+
 } // namespace
 
 void scale(float* x, std::int64_t n, float s, cudaStream_t stream) {
@@ -856,15 +1122,32 @@ void decode_attention(const DecodeAttentionArgs& args, cudaStream_t stream) {
     if (args.splits > kDecodeCombineThreads) {
         throw std::invalid_argument("gemma4 decode attention: too many splits");
     }
-    const dim3 grid(args.kv_heads, args.splits, args.batch);
-    if (args.head_dim == 256 && group == 2) {
+    // Block (row, kv head, split): the rows of a verification, one sequence's consecutive
+    // positions, run side by side over the same key ranges and share them through L2.
+    const dim3 grid(args.batch, args.kv_heads, args.splits);
+    const bool derived = args.k_cache == nullptr;
+    if (derived && (args.k_norm == nullptr || args.rope == nullptr || args.ring != 0 ||
+                    args.rope_pairs <= 0 || args.rope_pairs > args.head_dim / 2)) {
+        throw std::invalid_argument("gemma4 decode attention: derived keys need a linear cache, "
+                                    "k_norm and a rope table");
+    }
+    if (args.head_dim == 256 && group == 2 && !derived) {
         decode_attention_kernel<256, 2><<<grid, kDecodeThreads, 0, stream>>>(args);
         check_launch("decode_attention");
-        decode_combine_kernel<256><<<dim3(args.query_heads, args.batch), kDecodeCombineThreads, 0, stream>>>(args);
-    } else if (args.head_dim == 512 && group == 8) {
-        decode_attention_kernel<512, 8><<<grid, kDecodeThreads, 0, stream>>>(args);
+        decode_combine_kernel<256><<<dim3(args.query_heads, args.batch, 256 / kDecodeCombineThreads),
+                                     kDecodeCombineThreads, 0, stream>>>(args);
+    } else if (args.head_dim == 512 && group == 8 && args.ring == 0) {
+        if (derived) {
+            if (args.rope_pairs != 64) {
+                throw std::invalid_argument("gemma4 decode attention: derived keys turn 64 pairs");
+            }
+            decode_attention_wide_kernel<true><<<grid, kWideThreads, 0, stream>>>(args);
+        } else {
+            decode_attention_wide_kernel<false><<<grid, kWideThreads, 0, stream>>>(args);
+        }
         check_launch("decode_attention");
-        decode_combine_kernel<512><<<dim3(args.query_heads, args.batch), kDecodeCombineThreads, 0, stream>>>(args);
+        decode_combine_kernel<512><<<dim3(args.query_heads, args.batch, 512 / kDecodeCombineThreads),
+                                     kDecodeCombineThreads, 0, stream>>>(args);
     } else {
         throw std::invalid_argument("gemma4 decode attention: unsupported head geometry");
     }
@@ -928,6 +1211,37 @@ void softcap(const float* x, std::int64_t n, float cap, __nv_bfloat16* out, cuda
     if (n <= 0) { return; }
     softcap_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(x, n, cap, out);
     check_launch("softcap");
+}
+
+void rope_table(const float* inv_freq, int pairs, int positions, float2* rope, cudaStream_t stream) {
+    const std::int64_t n = std::int64_t(pairs) * positions;
+    if (n <= 0) { return; }
+    rope_table_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(inv_freq, pairs, positions, rope);
+    check_launch("rope_table");
+}
+
+void derive_keys(const __half* v, std::int64_t head_stride, int kv_heads, int head_dim, int count,
+                 const float* k_norm, const float2* rope, int rope_pairs, __half* k,
+                 cudaStream_t stream) {
+    if (count <= 0) { return; }
+    derive_keys_kernel<<<dim3(count, kv_heads, 1), head_dim / 2, 0, stream>>>(
+        v, head_stride, head_dim, k_norm, rope, rope_pairs, k);
+    check_launch("derive_keys");
+}
+
+void copy_rows(const __nv_bfloat16* src, const std::int32_t* src_rows, __nv_bfloat16* dst,
+               const std::int32_t* dst_rows, int rows, int width, cudaStream_t stream) {
+    if (rows <= 0) { return; }
+    if (width % 8 != 0) { throw std::invalid_argument("gemma4 copy_rows: width"); }
+    copy_rows_kernel<<<rows, 128, 0, stream>>>(src, src_rows, dst, dst_rows, width);
+    check_launch("copy_rows");
+}
+
+void stem_rows(const float* embedding, const __nv_bfloat16* hidden, int rows, int width,
+               __nv_bfloat16* out, cudaStream_t stream) {
+    if (rows <= 0) { return; }
+    stem_rows_kernel<<<rows, 256, 0, stream>>>(embedding, hidden, width, out);
+    check_launch("stem_rows");
 }
 
 } // namespace ninfer::models::gemma4::kernels

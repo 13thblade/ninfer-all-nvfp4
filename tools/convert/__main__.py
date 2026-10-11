@@ -197,19 +197,27 @@ def main(argv=None):
         flash_next = architectures[0] in QWEN4_EXP_ARCHITECTURES
         gemma4 = architectures[0] in GEMMA4_ARCHITECTURES
         if gemma4:
-            if "gguf" not in paths or args.components not in (None, "text") or args.layers:
-                raise ValueError("Gemma 4 converts its text component from --source gguf=FILE")
+            if ("gguf" not in paths or args.components not in (None, "text", "text,mtp")
+                    or args.layers or (args.components == "text,mtp") != ("mtp" in paths)):
+                raise ValueError("Gemma 4 converts its text component from --source gguf=FILE, "
+                                 "with --components text,mtp its assistant from --source "
+                                 "mtp=FILE")
             gguf = stack.enter_context(GGUFFile(paths["gguf"]))
-            model = build_gemma4(base, gguf, resource_overrides=overrides)
+            mtp = stack.enter_context(GGUFFile(paths["mtp"])) if "mtp" in paths else None
+            model = build_gemma4(base, gguf, mtp=mtp, resource_overrides=overrides)
             recipe = Recipe(model)
-            _function(args.recipe)(model, recipe, {"base": base, "gguf": gguf})
+            gemma_sources = {"base": base, "gguf": gguf} | ({"mtp": mtp} if mtp else {})
+            _function(args.recipe)(model, recipe, gemma_sources)
             if args.override:
-                _function(args.override)(model, recipe, {"base": base, "gguf": gguf})
+                _function(args.override)(model, recipe, gemma_sources)
+            source_paths = {"base": {"path": str(args.model)},
+                            "gguf": {"path": str(paths["gguf"])}}
+            if mtp is not None:
+                source_paths["mtp"] = {"path": str(paths["mtp"])}
             report = convert(
                 model, recipe, args.out, name=args.name,
                 provenance={"converter": "ninfer-v3", "recipe": args.recipe,
-                            "sources": {"base": {"path": str(args.model)},
-                                        "gguf": {"path": str(paths["gguf"])}}},
+                            "sources": source_paths},
                 device=args.device, rows_per_chunk=args.rows_per_chunk,
                 max_file_bytes=args.max_file_bytes,
                 progress=lambda index, total, job: print(

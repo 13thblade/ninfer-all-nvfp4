@@ -3,6 +3,7 @@
 #include "core/decode_graph.h"
 #include "core/weight_view.h"
 #include "models/gemma4/kernels.h"
+#include "ninfer/ops/argmax.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
@@ -48,6 +49,19 @@ Weight matrix(const Model& model, std::initializer_list<WeightId> ids) {
     return ops::prepare_linear_weight(std::span<const ops::WeightInput>(inputs)).weight;
 }
 
+// The matrices of `ids`: one when they are rows of one stored parent, else each on its own (a
+// mixed-format GGUF stores a block's Q, K and V in different formats).
+std::vector<Weight> matrices(const Model& model, std::initializer_list<WeightId> ids) {
+    std::vector<ops::WeightInput> inputs;
+    for (const WeightId id : ids) { inputs.push_back(model.input(id)); }
+    if (inputs.size() > 1 && ops::joins(inputs)) {
+        return {ops::prepare_linear_weight(std::span<const ops::WeightInput>(inputs)).weight};
+    }
+    std::vector<Weight> out;
+    for (const auto& input : inputs) { out.push_back(ops::prepare_linear_weight(input).weight); }
+    return out;
+}
+
 std::int64_t row_bytes(const Weight& w) {
     const auto block = gguf_block_shape(w.qtype);
     return std::int64_t(w.k / block.elements) * block.bytes;
@@ -56,7 +70,8 @@ std::int64_t row_bytes(const Weight& w) {
 struct LayerPlan {
     bool full    = false;
     int head_dim = 0, kv_heads = 0, qkv_rows = 0;
-    Weight qkv, output, gate_up, down;
+    std::vector<Weight> qkv; // one [Q; K (; V)] parent, or the parts of a mixed-format block
+    Weight output, gate_up, down;
     const float *input_norm = nullptr, *post_attention_norm = nullptr, *ffn_norm = nullptr,
                 *post_ffn_norm = nullptr, *layer_scalar = nullptr, *q_norm = nullptr,
                 *k_norm = nullptr;
@@ -64,13 +79,23 @@ struct LayerPlan {
     bool moe = false;
     const float *router = nullptr, *router_scale = nullptr, *expert_scale = nullptr,
                 *pre_norm = nullptr, *post_norm = nullptr, *mlp_post_norm = nullptr;
-    gguf::GgmlType expert_type{};
+    gguf::GgmlType gate_up_type{}, down_type{};
     std::int64_t gate_up_row_bytes = 0, down_row_bytes = 0;
     DeviceBuffer tables; // pointers: [E] gate, [E] up, [E] gate_up, [E] down
-    // The F16 K/V cache: [sequences][kv heads][slots][D].
+    // The F16 K/V cache: [sequences][kv heads][slots][D]. A full-attention block (K = V) keeps
+    // V only, and its keys are derived from it where they are read.
     DeviceBuffer k, v;
     int slots = 0, ring = 0;
     std::int64_t seq_stride = 0, head_stride = 0;
+};
+
+// A block of the assistant: its queries attend over the caches of the target block `target`.
+struct DraftLayer {
+    bool full = false;
+    int head_dim = 0, target = 0;
+    Weight query, output, gate_up, down;
+    const float *input_norm = nullptr, *post_attention_norm = nullptr, *ffn_norm = nullptr,
+                *post_ffn_norm = nullptr, *layer_scalar = nullptr, *q_norm = nullptr;
 };
 
 // Keys of the decode graphs: the batch size.
@@ -94,14 +119,19 @@ struct Executor::Impl {
     // (staging_k/v), while each sequence keeps only its last `ring` (the window) positions.
     int prefill_ring = 0;
     DeviceBuffer staging_k, staging_v;
+    DeviceBuffer derived_keys; // a prompt chunk's full-attention keys: [kv heads][slots][D]
     float eps = 1e-6f;
     std::vector<LayerPlan> layers;
     Weight head; // tied token table
     const float* final_norm = nullptr;
     DeviceBuffer inv_freq_sliding, inv_freq_full;
+    // The full-attention rotations of every position, (cos, sin) [slots][rotary pairs]: the keys a
+    // full block derives from its values turn by them.
+    DeviceBuffer rope_full;
     std::vector<std::uint32_t> positions;
     // Device staging: tokens, positions, sequences for up to max(prefill_chunk, sequences) rows.
-    DeviceBuffer d_tokens, d_positions, d_sequences;
+    // d_keys: the assistant's last visible key position per row.
+    DeviceBuffer d_tokens, d_positions, d_sequences, d_keys;
     std::unique_ptr<PinnedHostBuffer> h_staging;
     // Recorded after the staging copies: the next stage() rewrites the pinned buffer only once
     // the previous copies have read it (a prompt chunk that keeps no logits is not synchronized).
@@ -111,7 +141,24 @@ struct Executor::Impl {
     std::size_t workspace_bytes = 0;
     std::uint64_t kv_bytes      = 0;
     int decode_splits_full = 1, decode_splits_sliding = 1;
+    // Decode graphs by row count, verification graphs (which leave the anchors alone) by 16 + rows.
     std::map<std::uint32_t, GraphEntry> graphs;
+
+    // The assistant (options.draft_tokens > 0).
+    std::vector<DraftLayer> draft_layers;
+    Weight draft_head, pre_projection, post_projection;
+    const float* draft_final_norm = nullptr;
+    int draft_hidden = 0, draft_width = 0, draft_domain = 0;
+    float draft_eps = 1e-6f;
+    // The target's final-normed hidden state after each sequence's last fed token (BF16 [S][H]),
+    // whether it follows the sequence, and the rows of the last decode or verification ([8][H]).
+    DeviceBuffer anchor_hidden, row_hidden;
+    std::vector<char> anchored;
+    // A chain's drafts [steps][rows] (the device feeds each step the last one) and the host copy.
+    DeviceBuffer d_drafts;
+    std::unique_ptr<PinnedHostBuffer> h_drafts;
+    std::uint32_t verify_width = 0; // rows per sequence of the last verify()
+    std::map<std::uint32_t, GraphEntry> draft_graphs; // by rows << 8 | steps
 
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(o), config(m.config()) {
@@ -127,7 +174,15 @@ struct Executor::Impl {
         vocab       = int(config.vocab_size);
         eps         = config.rms_norm_eps;
         options.prefill_chunk = std::min<std::uint32_t>(options.prefill_chunk, 4096);
-        ring         = int(round_up(config.sliding_window, 256));
+        if (options.draft_tokens > std::uint32_t(gguf::kMaxVectorColumns) - 1) {
+            throw std::invalid_argument("gemma4 executor: at most 7 drafts a round");
+        }
+        if (options.draft_tokens > 0 && !model.assistant()) {
+            throw std::invalid_argument("gemma4 executor: drafting needs the model's assistant");
+        }
+        // A verification writes a round's drafts past the window before keeping only some: the
+        // ring holds them without overwriting a key the window still needs.
+        ring         = int(round_up(config.sliding_window + options.draft_tokens, 256));
         prefill_ring = int(round_up(config.sliding_window + options.prefill_chunk, 256));
         global_slots = int(round_up(options.max_context + 1, 256));
         positions.assign(options.sequences, 0);
@@ -149,6 +204,10 @@ struct Executor::Impl {
             inv_freq_sliding.copy_from_host(sliding.data(), sliding.size() * 4);
             inv_freq_full = DeviceBuffer(full.size() * 4);
             inv_freq_full.copy_from_host(full.data(), full.size() * 4);
+            rope_full = DeviceBuffer(std::size_t(global_slots) * config.rotary_pairs_full * 8);
+            kernels::rope_table(static_cast<const float*>(inv_freq_full.p),
+                                int(config.rotary_pairs_full), global_slots,
+                                static_cast<float2*>(rope_full.p), stream);
         }
         const int sequences = int(options.sequences);
         {
@@ -161,7 +220,8 @@ struct Executor::Impl {
                 const std::size_t slots = full ? global_slots : ring;
                 const std::size_t row   = 2 * std::size_t(config.layer_kv_heads(i)) *
                                         config.layer_head_dim(i) * sizeof(__half);
-                needed += slots * row * std::size_t(sequences) * (full ? 1 : 2);
+                // Sliding rings also hold a checkpoint each; a full block stores V only.
+                needed += slots * row * std::size_t(sequences) * (full ? 1 : 4) / 2;
                 if (!full) { staging = std::max(staging, std::size_t(prefill_ring) * row); }
             }
             needed += staging;
@@ -184,10 +244,11 @@ struct Executor::Impl {
             p.full     = config.full_attention[i];
             p.head_dim = int(config.layer_head_dim(i));
             p.kv_heads = int(config.layer_kv_heads(i));
-            p.qkv      = lw.attention.value
-                             ? matrix(model, {lw.attention.query, lw.attention.key, *lw.attention.value})
-                             : matrix(model, {lw.attention.query, lw.attention.key});
-            p.qkv_rows = p.qkv.n;
+            p.qkv = lw.attention.value
+                        ? matrices(model, {lw.attention.query, lw.attention.key, *lw.attention.value})
+                        : matrices(model, {lw.attention.query, lw.attention.key});
+            p.qkv_rows = 0;
+            for (const Weight& part : p.qkv) { p.qkv_rows += part.n; }
             p.output   = matrix(model, {lw.attention.output});
             p.gate_up  = matrix(model, {lw.mlp_gate, lw.mlp_up});
             p.down     = matrix(model, {lw.mlp_down});
@@ -198,8 +259,13 @@ struct Executor::Impl {
             p.layer_scalar        = fp32(model, lw.layer_scalar, 1);
             p.q_norm              = fp32(model, lw.attention.query_norm, p.head_dim);
             p.k_norm              = fp32(model, lw.attention.key_norm, p.head_dim);
-            for (const Weight* m : {&p.qkv, &p.output, &p.gate_up, &p.down}) {
+            for (const Weight* m : {&p.output, &p.gate_up, &p.down}) {
                 if (!is_gguf(m->qtype)) {
+                    throw std::invalid_argument("Gemma 4 runs GGUF block matrices");
+                }
+            }
+            for (const Weight& m : p.qkv) {
+                if (!is_gguf(m.qtype)) {
                     throw std::invalid_argument("Gemma 4 runs GGUF block matrices");
                 }
             }
@@ -215,10 +281,16 @@ struct Executor::Impl {
                 p.mlp_post_norm = fp32(model, mw.mlp_post_norm, hidden);
                 const Weight gate_up = matrix(model, {mw.gate_up});
                 const Weight down    = matrix(model, {mw.down});
-                if (gate_up.qtype != down.qtype || !is_gguf(gate_up.qtype)) {
-                    throw std::invalid_argument("Gemma 4 experts must share one GGUF block type");
+                if (!is_gguf(gate_up.qtype) || !is_gguf(down.qtype)) {
+                    throw std::invalid_argument("Gemma 4 experts must be GGUF block matrices");
                 }
-                p.expert_type       = ops::detail::gguf_type(gate_up.qtype);
+                p.gate_up_type      = ops::detail::gguf_type(gate_up.qtype);
+                p.down_type         = ops::detail::gguf_type(down.qtype);
+                if (!gguf::moe_matrix_supported(p.gate_up_type, 2 * width, hidden, true) ||
+                    !gguf::moe_matrix_supported(p.down_type, hidden, width, true)) {
+                    throw std::invalid_argument(
+                        "Gemma 4: no integer expert kernel for these expert formats");
+                }
                 p.gate_up_row_bytes = row_bytes(gate_up);
                 p.down_row_bytes    = row_bytes(down);
                 std::vector<const void*> table(4 * std::size_t(e));
@@ -239,11 +311,14 @@ struct Executor::Impl {
             p.head_stride = std::int64_t(p.slots) * p.head_dim;
             p.seq_stride  = p.head_stride * p.kv_heads;
             const std::size_t bytes = std::size_t(p.seq_stride) * sequences * sizeof(__half);
-            p.k = DeviceBuffer(bytes);
+            if (!p.full) {
+                p.k = DeviceBuffer(bytes);
+                p.k.fill(0);
+                kv_bytes += bytes;
+            }
             p.v = DeviceBuffer(bytes);
-            p.k.fill(0);
             p.v.fill(0);
-            kv_bytes += 2 * bytes;
+            kv_bytes += bytes;
             layers.push_back(std::move(p));
         }
         {
@@ -253,6 +328,17 @@ struct Executor::Impl {
                     staging = std::max(staging, std::size_t(prefill_ring) * p.kv_heads *
                                                     p.head_dim * sizeof(__half));
                 }
+            }
+            // A prompt chunk's full-attention keys, derived from one sequence's values.
+            std::size_t keys = 0;
+            for (const LayerPlan& p : layers) {
+                if (p.full) { keys = std::max(keys, std::size_t(p.seq_stride) * sizeof(__half)); }
+            }
+            if (keys != 0) {
+                // Zeroed: the slots past a chunk are masked, and a masked score must stay finite.
+                derived_keys = DeviceBuffer(keys);
+                derived_keys.fill(0);
+                kv_bytes += keys;
             }
             if (staging != 0) {
                 staging_k = DeviceBuffer(staging);
@@ -264,18 +350,71 @@ struct Executor::Impl {
         }
         const int sms = device.multiprocessor_count();
         // Upper bounds: a step uses as many as its keys fill (a tile each), so the sliding
-        // window's 1024 keys take 16 and a long full-attention context spreads over ~3 blocks per SM.
-        decode_splits_full    = std::clamp(3 * sms / std::max(1, int(config.num_global_key_value_heads)), 1, 128);
+        // window's 1024 keys take 16 and a long full-attention context fills one wave of the
+        // eight-warp kernel (two blocks per SM).
+        decode_splits_full    = std::clamp(2 * sms / std::max(1, int(config.num_global_key_value_heads)), 1, 128);
         decode_splits_sliding = 16;
         const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, sequences);
         d_tokens    = DeviceBuffer(rows * 4);
         d_positions = DeviceBuffer(rows * 4);
         d_sequences = DeviceBuffer(rows * 4);
-        h_staging   = std::make_unique<PinnedHostBuffer>(3 * rows * 4);
+        d_keys      = DeviceBuffer(rows * 4);
+        h_staging   = std::make_unique<PinnedHostBuffer>(4 * rows * 4);
+        if (options.draft_tokens > 0) { plan_assistant(); }
         staged      = std::make_unique<CudaCompletionEvent>(device);
         logits_bf16 = DeviceBuffer(std::size_t(vocab) * kMaxLogitRows * 2);
         workspace_bytes = plan_workspace();
         workspace       = std::make_unique<WorkspaceArena>(workspace_bytes);
+    }
+
+    void plan_assistant() {
+        const AssistantConfig& ac = *model.assistant_config();
+        const AssistantWeights& aw = *model.assistant();
+        draft_hidden     = int(ac.hidden_size);
+        draft_width      = int(ac.intermediate_size);
+        draft_eps        = ac.rms_norm_eps;
+        draft_domain     = int(model.resources().public_token_count);
+        draft_head       = matrix(model, {aw.output_head});
+        pre_projection   = matrix(model, {aw.pre_projection});
+        post_projection  = matrix(model, {aw.post_projection});
+        draft_final_norm = fp32(model, aw.final_norm, draft_hidden);
+        // The target's last block of each kind holds the keys the assistant reads.
+        int last_full = -1, last_sliding = -1;
+        for (int i = 0; i < int(layers.size()); ++i) { (layers[i].full ? last_full : last_sliding) = i; }
+        for (std::size_t i = 0; i < aw.layers.size(); ++i) {
+            const AssistantLayerWeights& lw = aw.layers[i];
+            DraftLayer d;
+            d.full     = ac.full_attention[i];
+            d.head_dim = int(d.full ? config.global_head_dim : config.head_dim);
+            d.target   = d.full ? last_full : last_sliding;
+            d.query    = matrix(model, {lw.query});
+            d.output   = matrix(model, {lw.output});
+            d.gate_up  = matrix(model, {lw.mlp_gate, lw.mlp_up});
+            d.down     = matrix(model, {lw.mlp_down});
+            d.input_norm          = fp32(model, lw.input_norm, draft_hidden);
+            d.post_attention_norm = fp32(model, lw.post_attention_norm, draft_hidden);
+            d.ffn_norm            = fp32(model, lw.ffn_norm, draft_hidden);
+            d.post_ffn_norm       = fp32(model, lw.post_ffn_norm, draft_hidden);
+            d.layer_scalar        = fp32(model, lw.layer_scalar, 1);
+            d.q_norm              = fp32(model, lw.query_norm, d.head_dim);
+            for (const Weight* m : {&d.query, &d.output, &d.gate_up, &d.down}) {
+                if (!is_gguf(m->qtype)) {
+                    throw std::invalid_argument("the Gemma 4 assistant runs GGUF block matrices");
+                }
+            }
+            draft_layers.push_back(std::move(d));
+        }
+        for (const Weight* m : {&draft_head, &pre_projection, &post_projection}) {
+            if (!is_gguf(m->qtype)) {
+                throw std::invalid_argument("the Gemma 4 assistant runs GGUF block matrices");
+            }
+        }
+        anchor_hidden = DeviceBuffer(std::size_t(options.sequences) * hidden * 2);
+        row_hidden    = DeviceBuffer(std::size_t(gguf::kMaxVectorColumns) * hidden * 2);
+        anchored.assign(options.sequences, 0);
+        d_drafts = DeviceBuffer(std::size_t(options.draft_tokens) * gguf::kMaxVectorColumns * 4);
+        h_drafts = std::make_unique<PinnedHostBuffer>(std::size_t(options.draft_tokens) *
+                                                      gguf::kMaxVectorColumns * 4);
     }
 
     // ---- Workspace -----------------------------------------------------------------------------
@@ -288,7 +427,9 @@ struct Executor::Impl {
         for (const LayerPlan& p : layers) {
             qkv_rows = std::max<std::size_t>(qkv_rows, p.qkv_rows);
             q_floats = std::max<std::size_t>(q_floats, std::size_t(query_heads) * p.head_dim);
-            for (const Weight* m : {&p.qkv, &p.output, &p.down}) {
+            std::vector<const Weight*> products{&p.output, &p.down};
+            for (const Weight& part : p.qkv) { products.push_back(&part); }
+            for (const Weight* m : products) {
                 const ops::detail::GgufShape shape{m->qtype, m->n, m->k};
                 gguf_scratch = std::max(gguf_scratch, ops::detail::gguf_project_workspace_bytes(
                                                           {&shape, 1}, 1, int(t)));
@@ -365,22 +506,34 @@ struct Executor::Impl {
                                              gguf::vector_activation_scales_offset(k, t));
         return q;
     }
-    void project_q8(const Q8Act& x, const Weight& w, int t, Tensor& out) {
+    void project_q8(const Q8Act& x, const Weight& w, int t, Tensor& out, int row = 0,
+                    int rows = 0) {
         gguf::VectorOutput o;
-        o.bf16          = static_cast<__nv_bfloat16*>(out.data);
-        o.column_stride = w.n;
+        o.bf16          = static_cast<__nv_bfloat16*>(out.data) + row;
+        o.column_stride = rows != 0 ? rows : w.n;
         gguf::vector_product(ops::detail::gguf_type(w.qtype), w.qdata, row_bytes(w), w.n, w.k,
                              x.base, t, o, stream);
     }
 
+    // A block's Q, K (and V) rows from q8_1 inputs, part by part when they are not one parent.
+    void project_qkv_q8(const Q8Act& x, const LayerPlan& p, int t, Tensor& out) {
+        int row = 0;
+        for (const Weight& part : p.qkv) {
+            project_q8(x, part, t, out, row, p.qkv_rows);
+            row += part.n;
+        }
+    }
+
+    // Tokens, positions, and when given sequences and key positions, to the device.
     void stage(std::span<const std::int32_t> a, std::span<const std::int32_t> b,
-               std::span<const std::int32_t> c) {
+               std::span<const std::int32_t> c, std::span<const std::int32_t> d = {}) {
         staged->synchronize();
         auto* host = static_cast<std::int32_t*>(h_staging->data());
         const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, options.sequences);
         std::copy(a.begin(), a.end(), host);
         std::copy(b.begin(), b.end(), host + rows);
         std::copy(c.begin(), c.end(), host + 2 * rows);
+        std::copy(d.begin(), d.end(), host + 3 * rows);
         CUDA_CHECK(cudaMemcpyAsync(d_tokens.p, host, a.size() * 4, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(d_positions.p, host + rows, b.size() * 4,
                                    cudaMemcpyHostToDevice, stream));
@@ -388,14 +541,18 @@ struct Executor::Impl {
             CUDA_CHECK(cudaMemcpyAsync(d_sequences.p, host + 2 * rows, c.size() * 4,
                                        cudaMemcpyHostToDevice, stream));
         }
+        if (!d.empty()) {
+            CUDA_CHECK(cudaMemcpyAsync(d_keys.p, host + 3 * rows, d.size() * 4,
+                                       cudaMemcpyHostToDevice, stream));
+        }
         staged->record(stream);
     }
 
-    // The token rows' embeddings, scaled, into the FP32 residual h [T][H].
-    void embed(int tokens, float* h) {
+    // The embeddings of `tokens` ids (the staged tokens by default), scaled, into FP32 h [T][H].
+    void embed(int tokens, float* h, const std::int32_t* ids = nullptr) {
         gguf::dequantize_rows(ops::detail::gguf_type(head.qtype), head.qdata, row_bytes(head),
-                              hidden, static_cast<const std::int32_t*>(d_tokens.p), tokens, h,
-                              hidden, stream);
+                              hidden, ids != nullptr ? ids : static_cast<const std::int32_t*>(d_tokens.p),
+                              tokens, h, hidden, stream);
         kernels::scale(h, std::int64_t(tokens) * hidden, std::sqrt(float(hidden)), stream);
     }
 
@@ -516,7 +673,7 @@ struct Executor::Impl {
                 act = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
                 gguf::quantize_vector_activation(x, hidden, t, nullptr, act, stream);
             }
-            gguf::moe_vector_swiglu(p.expert_type, gate, up, routing, max_active, k, act, t,
+            gguf::moe_vector_swiglu(p.gate_up_type, gate, up, routing, max_active, k, act, t,
                                     middle, chunk, stream, gguf::GateActivation::GeluTanh);
             void* act2 = workspace->alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
             gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, stream);
@@ -526,25 +683,25 @@ struct Executor::Impl {
             gguf::MoeOutput out;
             out.weighted = fixed;
             out.weights  = weights;
-            gguf::moe_vector_product(p.expert_type, down, routing, max_active, 1, k, act2, pairs,
+            gguf::moe_vector_product(p.down_type, down, routing, max_active, 1, k, act2, pairs,
                                      out, chunk, stream);
             combine.moe_fixed = fixed;
             return;
         }
         void* act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;
-        gguf::quantize_moe_matrix_activation(p.expert_type, x, hidden, routing, pairs, k, act,
+        gguf::quantize_moe_matrix_activation(p.gate_up_type, x, hidden, routing, pairs, k, act,
                                              stream);
         auto* gu = static_cast<float*>(
             workspace->alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
-        gguf::moe_matrix_product(p.expert_type, gate_up, routing, max_active, pairs, t, true, act,
+        gguf::moe_matrix_product(p.gate_up_type, gate_up, routing, max_active, pairs, t, true, act,
                                  gu, stream);
         kernels::geglu_rows(gu, pairs, width, middle, stream);
         void* act2 = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(width, pairs)).data;
-        gguf::quantize_moe_matrix_activation(p.expert_type, middle, width, routing, pairs, 1, act2,
+        gguf::quantize_moe_matrix_activation(p.down_type, middle, width, routing, pairs, 1, act2,
                                              stream);
         auto* rows = static_cast<float*>(
             workspace->alloc_bytes(std::size_t(pairs) * hidden * 4).data);
-        gguf::moe_matrix_product(p.expert_type, down, routing, max_active, pairs, t, true, act2,
+        gguf::moe_matrix_product(p.down_type, down, routing, max_active, pairs, t, true, act2,
                                  rows, stream);
         combine.moe_rows    = rows;
         combine.moe_weights = weights;
@@ -630,9 +787,17 @@ struct Executor::Impl {
             auto layer_scope   = workspace->scope();
             Tensor qkv = workspace->alloc(DType::BF16, {p.qkv_rows, t});
             if (q8) {
-                project_q8(xq, p.qkv, t, qkv);
+                project_qkv_q8(xq, p, t, qkv);
+            } else if (p.qkv.size() == 1) {
+                project(x, p.qkv.front(), qkv);
             } else {
-                project(x, p.qkv, qkv);
+                std::vector<ops::detail::GgufProduct> parts(p.qkv.size());
+                for (std::size_t i = 0, row = 0; i < parts.size(); row += p.qkv[i].n, ++i) {
+                    parts[i].weight = &p.qkv[i];
+                    parts[i].out    = &qkv;
+                    parts[i].row    = std::int32_t(row);
+                }
+                ops::detail::gguf_project(x, parts, *workspace, stream);
             }
             const int q_floats = query_heads * p.head_dim;
             auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
@@ -670,13 +835,20 @@ struct Executor::Impl {
                 keep.end             = int(first);
                 kernels::ring_copy(keep, stream);
             }
-            qa.k_cache     = static_cast<__half*>(p.full ? p.k.p : staging_k.p);
+            qa.k_cache     = p.full ? nullptr : static_cast<__half*>(staging_k.p);
             qa.v_cache     = static_cast<__half*>(p.full ? p.v.p : staging_v.p);
             qa.seq_stride  = p.full ? p.seq_stride : 0;
             qa.head_stride = p.full ? p.head_stride : stage_stride;
             qa.sequence    = p.full ? int(sequence) : 0;
             qa.ring        = p.full ? 0 : prefill_ring;
             kernels::qkv_post(qa, stream);
+            if (p.full) {
+                kernels::derive_keys(static_cast<const __half*>(p.v.p) + seq_offset, p.head_stride,
+                                     p.kv_heads, p.head_dim, int(first) + t, p.k_norm,
+                                     static_cast<const float2*>(rope_full.p),
+                                     int(config.rotary_pairs_full),
+                                     static_cast<__half*>(derived_keys.p), stream);
+            }
             auto* attn = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
             const std::size_t fa_bytes =
                 gguf::flash_attention_workspace_bytes(p.head_dim, query_heads, p.kv_heads, t);
@@ -688,7 +860,7 @@ struct Executor::Impl {
             fa.tokens          = t;
             fa.q               = q;
             fa.q_token_stride  = q_floats;
-            fa.k = p.full ? static_cast<const __half*>(p.k.p) + seq_offset
+            fa.k = p.full ? static_cast<const __half*>(derived_keys.p)
                           : static_cast<const __half*>(staging_k.p);
             fa.v = p.full ? static_cast<const __half*>(p.v.p) + seq_offset
                           : static_cast<const __half*>(staging_v.p);
@@ -717,8 +889,19 @@ struct Executor::Impl {
                                  std::int64_t(t) * q_floats, stream);
             Tensor o = workspace->alloc(DType::BF16, {hidden, t});
             project(attn_bf16, p.output, o);
-            block_tail(p, h, t, o, li + 1 < layers.size() ? layers[li + 1].input_norm : final_norm,
-                       q8 ? nullptr : static_cast<__nv_bfloat16*>(x.data), q8 ? &xq : nullptr);
+            const bool last = li + 1 == layers.size();
+            // The final rows in BF16 too when the assistant reads the last of them.
+            block_tail(p, h, t, o, last ? final_norm : layers[li + 1].input_norm,
+                       q8 && !(last && drafting()) ? nullptr : static_cast<__nv_bfloat16*>(x.data),
+                       q8 ? &xq : nullptr);
+        }
+        if (drafting()) {
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<__nv_bfloat16*>(anchor_hidden.p) +
+                                           std::int64_t(sequence) * hidden,
+                                       static_cast<const __nv_bfloat16*>(x.data) +
+                                           std::int64_t(t - 1) * hidden,
+                                       std::size_t(hidden) * 2, cudaMemcpyDeviceToDevice, stream));
+            anchored[sequence] = 1;
         }
         if (q8) {
             head_logits_q8(xq, t, int(logit_rows));
@@ -732,8 +915,12 @@ struct Executor::Impl {
 
     // ---- Decode ---------------------------------------------------------------------------------------
 
-    // One token per row; tokens, positions and sequences already staged on the device.
-    void decode_body(int b) {
+    [[nodiscard]] bool drafting() const noexcept { return options.draft_tokens > 0; }
+
+    // One token per row; tokens, positions and sequences already staged on the device. With the
+    // assistant, the rows' final hidden states land in row_hidden, and a decode step (not a
+    // verification, whose kept row commit() picks) makes them its sequences' anchors.
+    void decode_body(int b, bool verifying = false) {
         workspace->reset();
         auto scope = workspace->scope();
         auto* h    = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * hidden * 4).data);
@@ -746,7 +933,7 @@ struct Executor::Impl {
             const LayerPlan& p = layers[li];
             auto layer_scope   = workspace->scope();
             Tensor qkv = workspace->alloc(DType::BF16, {p.qkv_rows, b});
-            project_q8(xq, p.qkv, b, qkv);
+            project_qkv_q8(xq, p, b, qkv);
             const int q_floats = query_heads * p.head_dim;
             auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * q_floats * 4).data);
             kernels::QkvArgs qa;
@@ -762,7 +949,7 @@ struct Executor::Impl {
             qa.positions   = static_cast<const std::int32_t*>(d_positions.p);
             qa.inv_freq    = static_cast<const float*>(p.full ? inv_freq_full.p : inv_freq_sliding.p);
             qa.q_out       = q;
-            qa.k_cache     = static_cast<__half*>(p.k.p);
+            qa.k_cache     = p.full ? nullptr : static_cast<__half*>(p.k.p);
             qa.v_cache     = static_cast<__half*>(p.v.p);
             qa.seq_stride  = p.seq_stride;
             qa.head_stride = p.head_stride;
@@ -776,8 +963,11 @@ struct Executor::Impl {
             const Q8Act attn = alloc_q8(q_floats, b);
             kernels::DecodeAttentionArgs da;
             da.q           = q;
-            da.k_cache     = static_cast<const __half*>(p.k.p);
+            da.k_cache     = p.full ? nullptr : static_cast<const __half*>(p.k.p);
             da.v_cache     = static_cast<const __half*>(p.v.p);
+            da.k_norm      = p.k_norm;
+            da.rope        = static_cast<const float2*>(rope_full.p);
+            da.rope_pairs  = int(config.rotary_pairs_full);
             da.seq_stride  = p.seq_stride;
             da.head_stride = p.head_stride;
             da.sequences   = static_cast<const std::int32_t*>(d_sequences.p);
@@ -795,10 +985,38 @@ struct Executor::Impl {
             kernels::decode_attention(da, stream);
             Tensor o = workspace->alloc(DType::BF16, {hidden, b});
             project_q8(attn, p.output, b, o);
-            block_tail(p, h, b, o, li + 1 < layers.size() ? layers[li + 1].input_norm : final_norm,
-                       nullptr, &xq);
+            const bool last = li + 1 == layers.size();
+            block_tail(p, h, b, o, last ? final_norm : layers[li + 1].input_norm,
+                       last && drafting() ? static_cast<__nv_bfloat16*>(row_hidden.p) : nullptr,
+                       &xq);
         }
         head_logits_q8(xq, b, b);
+        if (drafting() && !verifying) {
+            kernels::copy_rows(static_cast<const __nv_bfloat16*>(row_hidden.p), nullptr,
+                               static_cast<__nv_bfloat16*>(anchor_hidden.p),
+                               static_cast<const std::int32_t*>(d_sequences.p), b, hidden, stream);
+        }
+    }
+
+    // Runs `body` from the graph of `key`: eagerly the first time, so every kernel is loaded
+    // before the capture, then captured and replayed.
+    template <typename Body>
+    void run_graph(std::map<std::uint32_t, GraphEntry>& table, std::uint32_t key, Body&& body) {
+        if (!options.cuda_graphs) {
+            body();
+            return;
+        }
+        GraphEntry& entry = table[key];
+        if (!entry.warmed) {
+            body();
+            entry.warmed = true;
+            return;
+        }
+        if (!entry.executable.ready()) {
+            entry.definition.capture(stream, [&] { body(); });
+            entry.executable.instantiate(entry.definition);
+        }
+        entry.executable.launch(stream);
     }
 
     void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens) {
@@ -819,28 +1037,250 @@ struct Executor::Impl {
             seq[i] = std::int32_t(sequences[i]);
         }
         stage(tokens, pos, seq);
-        if (!options.cuda_graphs) {
-            decode_body(b);
-        } else {
-            GraphEntry& entry = graphs[std::uint32_t(b)];
-            if (!entry.warmed) {
-                decode_body(b);
-                entry.warmed = true;
-            } else {
-                if (!entry.executable.ready()) {
-                    entry.definition.capture(stream, [&] { decode_body(b); });
-                    entry.executable.instantiate(entry.definition);
-                }
-                entry.executable.launch(stream);
+        run_graph(graphs, std::uint32_t(b), [&] { decode_body(b); });
+        for (int i = 0; i < b; ++i) {
+            positions[sequences[i]] += 1;
+            if (drafting()) { anchored[sequences[i]] = 1; }
+        }
+    }
+
+    // ---- Speculative rounds ------------------------------------------------------------------------
+
+    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens) {
+        const int n = int(sequences.size());
+        if (!drafting() || n <= 0 || tokens.size() % sequences.size() != 0) {
+            throw std::invalid_argument("gemma4 verify: invalid call");
+        }
+        const int w = int(tokens.size()) / n, rows = n * w;
+        if (w < 1 || std::uint32_t(w) > options.draft_tokens + 1 || rows > gguf::kMaxVectorColumns) {
+            throw std::invalid_argument("gemma4 verify: invalid width");
+        }
+        std::vector<std::int32_t> pos(rows), seq(rows);
+        for (int j = 0; j < n; ++j) {
+            const std::uint32_t s = sequences[j];
+            if (s >= options.sequences ||
+                std::count(sequences.begin(), sequences.begin() + j, s) != 0) {
+                throw std::invalid_argument("gemma4 verify: invalid sequence");
+            }
+            if (positions[s] + std::uint32_t(w) > options.max_context) {
+                throw std::invalid_argument("gemma4 verify: context capacity exceeded");
+            }
+            for (int i = 0; i < w; ++i) {
+                pos[j * w + i] = std::int32_t(positions[s]) + i;
+                seq[j * w + i] = std::int32_t(s);
             }
         }
-        for (int i = 0; i < b; ++i) { positions[sequences[i]] += 1; }
+        stage(tokens, pos, seq);
+        run_graph(graphs, 16 + std::uint32_t(rows), [&] { decode_body(rows, true); });
+        verify_width = std::uint32_t(w);
+    }
+
+    void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept) {
+        if (kept.size() != sequences.size() || verify_width == 0) {
+            throw std::invalid_argument("gemma4 commit: invalid call");
+        }
+        for (std::size_t j = 0; j < sequences.size(); ++j) {
+            const std::uint32_t s = sequences[j];
+            if (s >= options.sequences || kept[j] < 1 || kept[j] > verify_width) {
+                throw std::invalid_argument("gemma4 commit: invalid row");
+            }
+            positions[s] += kept[j];
+            // The anchor's hidden state: the row of the last token kept.
+            CUDA_CHECK(cudaMemcpyAsync(
+                static_cast<__nv_bfloat16*>(anchor_hidden.p) + std::int64_t(s) * hidden,
+                static_cast<const __nv_bfloat16*>(row_hidden.p) +
+                    std::int64_t(j * verify_width + kept[j] - 1) * hidden,
+                std::size_t(hidden) * 2, cudaMemcpyDeviceToDevice, stream));
+            anchored[s] = 1;
+        }
+        verify_width = 0;
+    }
+
+    void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
+               std::span<std::int32_t> out, std::uint32_t steps) {
+        const int n = int(sequences.size());
+        if (!drafting() || n <= 0 || n > gguf::kMaxVectorColumns ||
+            anchors.size() != sequences.size() || steps < 1 || steps > options.draft_tokens ||
+            out.size() < std::size_t(n) * steps) {
+            throw std::invalid_argument("gemma4 draft: invalid call");
+        }
+        std::vector<std::int32_t> pos(n), seq(n), keys(n);
+        for (int j = 0; j < n; ++j) {
+            const std::uint32_t s = sequences[j];
+            if (s >= options.sequences || !anchored[s] || positions[s] == 0) {
+                throw std::invalid_argument("gemma4 draft: the sequence has no anchor state");
+            }
+            // The chain runs at the anchor's position and sees the keys before it.
+            pos[j]  = std::int32_t(positions[s]);
+            keys[j] = std::int32_t(positions[s]) - 1;
+            seq[j]  = std::int32_t(s);
+        }
+        stage(anchors, pos, seq, keys);
+        run_graph(draft_graphs, std::uint32_t(n) << 8 | steps, [&] { draft_body(n, int(steps)); });
+        auto* host = static_cast<std::int32_t*>(h_drafts->data());
+        CUDA_CHECK(cudaMemcpyAsync(host, d_drafts.p, std::size_t(n) * steps * 4,
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int j = 0; j < n; ++j) {
+            for (std::uint32_t i = 0; i < steps; ++i) { out[j * steps + i] = host[i * n + j]; }
+        }
+    }
+
+    // The assistant's chain over n rows: anchors, positions, sequences and key limits staged.
+    void draft_body(int n, int steps) {
+        workspace->reset();
+        auto scope        = workspace->scope();
+        const int a       = draft_hidden;
+        auto* hidden_in   = static_cast<__nv_bfloat16*>(
+            workspace->alloc_bytes(std::size_t(n) * hidden * 2).data);
+        auto* embedding   = static_cast<float*>(workspace->alloc_bytes(std::size_t(n) * hidden * 4).data);
+        auto* stem        = static_cast<__nv_bfloat16*>(
+            workspace->alloc_bytes(std::size_t(n) * 2 * hidden * 2).data);
+        void* stem_q      = workspace->alloc_bytes(gguf::vector_activation_bytes(2 * hidden, n)).data;
+        auto* h           = static_cast<float*>(workspace->alloc_bytes(std::size_t(n) * a * 4).data);
+        const Q8Act xq    = alloc_q8(a, n);
+        auto* draft_logits = static_cast<__nv_bfloat16*>(
+            workspace->alloc_bytes(std::size_t(n) * vocab * 2).data);
+        kernels::copy_rows(static_cast<const __nv_bfloat16*>(anchor_hidden.p),
+                           static_cast<const std::int32_t*>(d_sequences.p), hidden_in, nullptr, n,
+                           hidden, stream);
+        const std::int32_t* ids = static_cast<const std::int32_t*>(d_tokens.p);
+        for (int step = 0; step < steps; ++step) {
+            embed(n, embedding, ids);
+            kernels::stem_rows(embedding, hidden_in, n, hidden, stem, stream);
+            gguf::quantize_vector_activation(stem, 2 * hidden, n, nullptr, stem_q, stream);
+            gguf::VectorOutput stem_out;
+            stem_out.f32           = h;
+            stem_out.column_stride = a;
+            gguf::vector_product(ops::detail::gguf_type(pre_projection.qtype), pre_projection.qdata,
+                                 row_bytes(pre_projection), a, 2 * hidden, stem_q, n, stem_out,
+                                 stream);
+            kernels::rms_norm(h, draft_layers.front().input_norm, a, n, draft_eps, nullptr, stream,
+                              xq.rows);
+            for (std::size_t li = 0; li < draft_layers.size(); ++li) {
+                draft_layer(li, n, h, xq);
+            }
+            // xq now holds the final-normed rows: the head's argmax is the draft.
+            gguf::VectorOutput head_out;
+            head_out.bf16          = draft_logits;
+            head_out.column_stride = vocab;
+            gguf::vector_product(ops::detail::gguf_type(draft_head.qtype), draft_head.qdata,
+                                 row_bytes(draft_head), vocab, a, xq.base, n, head_out, stream);
+            auto* drafted = static_cast<std::int32_t*>(d_drafts.p) + std::int64_t(step) * n;
+            const Tensor logits(draft_logits, DType::BF16, {vocab, n});
+            Tensor tokens(drafted, DType::I32, {n});
+            ops::argmax(logits, tokens, draft_domain, stream);
+            ids = drafted;
+            if (step + 1 < steps) {
+                gguf::VectorOutput next;
+                next.bf16          = hidden_in;
+                next.column_stride = hidden;
+                gguf::vector_product(ops::detail::gguf_type(post_projection.qtype),
+                                     post_projection.qdata, row_bytes(post_projection), hidden, a,
+                                     xq.base, n, next, stream);
+            }
+        }
+    }
+
+    // Block `li` of the assistant over its residual h; xq holds the block's normalized input in q8_1
+    // form and receives the next block's (after the last, the final-normed rows).
+    void draft_layer(std::size_t li, int n, float* h, const Q8Act& xq) {
+        const DraftLayer& d = draft_layers[li];
+        const LayerPlan& t  = layers[d.target];
+        const int a         = draft_hidden;
+        auto scope          = workspace->scope();
+        const int q_floats  = query_heads * d.head_dim;
+        Tensor qb           = workspace->alloc(DType::BF16, {q_floats, n});
+        project_q8(xq, d.query, n, qb);
+        auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(n) * q_floats * 4).data);
+        kernels::QkvArgs qa;
+        qa.qkv         = static_cast<const __nv_bfloat16*>(qb.data);
+        qa.tokens      = n;
+        qa.query_heads = query_heads;
+        qa.kv_heads    = 0; // the queries only
+        qa.head_dim    = d.head_dim;
+        qa.q_norm      = d.q_norm;
+        qa.eps         = draft_eps;
+        qa.positions   = static_cast<const std::int32_t*>(d_positions.p);
+        qa.inv_freq    = static_cast<const float*>(d.full ? inv_freq_full.p : inv_freq_sliding.p);
+        qa.q_out       = q;
+        kernels::qkv_post(qa, stream);
+        const int splits = d.full ? decode_splits_full : decode_splits_sliding;
+        auto* partial    = static_cast<float*>(
+            workspace->alloc_bytes(kernels::decode_attention_workspace_floats(
+                                       n, query_heads, d.head_dim, splits) * 4).data);
+        const Q8Act attn = alloc_q8(q_floats, n);
+        kernels::DecodeAttentionArgs da;
+        da.q           = q;
+        da.k_cache     = t.full ? nullptr : static_cast<const __half*>(t.k.p);
+        da.v_cache     = static_cast<const __half*>(t.v.p);
+        da.k_norm      = t.k_norm;
+        da.rope        = static_cast<const float2*>(rope_full.p);
+        da.rope_pairs  = int(config.rotary_pairs_full);
+        da.seq_stride  = t.seq_stride;
+        da.head_stride = t.head_stride;
+        da.sequences   = static_cast<const std::int32_t*>(d_sequences.p);
+        da.positions   = static_cast<const std::int32_t*>(d_keys.p);
+        da.batch       = n;
+        da.query_heads = query_heads;
+        da.kv_heads    = t.kv_heads;
+        da.head_dim    = d.head_dim;
+        da.ring        = t.ring;
+        da.window      = int(config.sliding_window);
+        da.splits      = splits;
+        da.scale       = 1.0f;
+        da.partial     = partial;
+        da.out_q       = attn.rows;
+        kernels::decode_attention(da, stream);
+        Tensor o = workspace->alloc(DType::BF16, {a, n});
+        project_q8(attn, d.output, n, o);
+        const Q8Act mlp_q = alloc_q8(a, n);
+        kernels::AttnResidualArgs residual;
+        residual.h        = h;
+        residual.o        = static_cast<const __nv_bfloat16*>(o.data);
+        residual.w_post   = d.post_attention_norm;
+        residual.hidden   = a;
+        residual.tokens   = n;
+        residual.eps      = draft_eps;
+        residual.ffn_norm = d.ffn_norm;
+        residual.mlp_q    = mlp_q.rows;
+        kernels::attn_residual(residual, stream);
+        Tensor middle = workspace->alloc(DType::BF16, {draft_width, n});
+        gguf::vector_swiglu(ops::detail::gguf_type(d.gate_up.qtype), d.gate_up.qdata,
+                            row_bytes(d.gate_up), draft_width, a, mlp_q.base, n,
+                            static_cast<__nv_bfloat16*>(middle.data), draft_width, stream,
+                            gguf::GateActivation::GeluTanh);
+        Tensor dense = workspace->alloc(DType::BF16, {a, n});
+        project(middle, d.down, dense);
+        kernels::FfnCombineArgs combine;
+        combine.h         = h;
+        combine.hidden    = a;
+        combine.tokens    = n;
+        combine.eps       = draft_eps;
+        combine.dense     = static_cast<const __nv_bfloat16*>(dense.data);
+        combine.w_post    = d.post_ffn_norm;
+        combine.scalar    = d.layer_scalar;
+        combine.next_norm = li + 1 < draft_layers.size() ? draft_layers[li + 1].input_norm
+                                                         : draft_final_norm;
+        combine.next_q    = xq.rows;
+        kernels::ffn_combine(combine, stream);
     }
 
     void warm_up() {
         // The prompt route once (kernels load at first launch), then each decode batch's graph.
         const std::vector<std::int32_t> prompt(std::min<std::uint32_t>(options.prefill_chunk, 16), 2);
         forward(0, prompt, 1);
+        if (drafting()) {
+            // The assistant's and the verification's kernels, eagerly.
+            const std::uint32_t s = 0;
+            std::vector<std::int32_t> drafts(options.draft_tokens);
+            draft({&s, 1}, std::vector<std::int32_t>{2}, drafts, options.draft_tokens);
+            std::vector<std::int32_t> tokens(options.draft_tokens + 1, 2);
+            verify({&s, 1}, tokens);
+            const std::uint32_t one = 1;
+            commit({&s, 1}, {&one, 1});
+            anchored[0] = 0;
+        }
         positions[0] = 0;
         std::vector<std::uint32_t> sequences;
         std::vector<std::int32_t> tokens;
@@ -852,6 +1292,7 @@ struct Executor::Impl {
                 for (const std::uint32_t s : sequences) { positions[s] = 0; }
             }
         }
+        std::fill(anchored.begin(), anchored.end(), 0);
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
@@ -890,6 +1331,7 @@ struct Executor::Impl {
             index += 2;
         }
         positions[sequence] = from.position;
+        if (drafting()) { anchored[sequence] = 0; }
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 };
@@ -905,7 +1347,10 @@ ExecutorMemory Executor::memory() const noexcept {
     return ExecutorMemory{.kv_bytes = impl_->kv_bytes, .workspace_bytes = impl_->workspace_bytes};
 }
 
-void Executor::reset(std::uint32_t sequence) { impl_->positions.at(sequence) = 0; }
+void Executor::reset(std::uint32_t sequence) {
+    impl_->positions.at(sequence) = 0;
+    if (impl_->drafting()) { impl_->anchored.at(sequence) = 0; }
+}
 
 std::uint32_t Executor::position(std::uint32_t sequence) const {
     return impl_->positions.at(sequence);
@@ -932,6 +1377,29 @@ Tensor Executor::logits(std::uint32_t rows) const {
 }
 
 cudaStream_t Executor::head_stream() const noexcept { return impl_->stream; }
+
+std::uint32_t Executor::draft_tokens() const noexcept { return impl_->options.draft_tokens; }
+
+bool Executor::can_draft(std::uint32_t sequence) const {
+    return impl_->drafting() && impl_->anchored.at(sequence) != 0 &&
+           impl_->positions.at(sequence) > 0;
+}
+
+void Executor::draft(std::span<const std::uint32_t> sequences,
+                     std::span<const std::int32_t> anchors, std::span<std::int32_t> drafts,
+                     std::uint32_t steps) {
+    impl_->draft(sequences, anchors, drafts, steps);
+}
+
+void Executor::verify(std::span<const std::uint32_t> sequences,
+                      std::span<const std::int32_t> tokens) {
+    impl_->verify(sequences, tokens);
+}
+
+void Executor::commit(std::span<const std::uint32_t> sequences,
+                      std::span<const std::uint32_t> kept) {
+    impl_->commit(sequences, kept);
+}
 
 void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
     impl_->snapshot(sequence, out);

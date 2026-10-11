@@ -52,4 +52,24 @@ struct TextConfig {
 // implemented geometry.
 [[nodiscard]] TextConfig parse_text_config(const artifact::Json& value);
 
+// The multi-token-prediction assistant (Gemma4AssistantForCausalLM), the artifact's `mtp`
+// component: a dense drafter of its own width whose blocks attend over the target's KV (its
+// sliding-window blocks the target's last sliding-window block, its full-attention block the
+// target's last full-attention block) with the target's head geometry, fed the target's embedding
+// of a token beside the target's final hidden state.
+struct AssistantConfig {
+    std::uint32_t hidden_size          = 0;
+    std::uint32_t backbone_hidden_size = 0; // the target's hidden_size
+    std::uint32_t intermediate_size    = 0;
+    std::uint32_t vocab_size           = 0;
+    std::uint32_t num_attention_heads  = 0;
+    float rms_norm_eps                 = 0;
+    std::vector<bool> full_attention;
+};
+
+// Checked against the target: equal vocabulary and attention geometry, a backbone of the target's
+// width, and both kinds of block.
+[[nodiscard]] AssistantConfig parse_assistant_config(const artifact::Json& value,
+                                                     const TextConfig& target);
+
 } // namespace ninfer::models::gemma4

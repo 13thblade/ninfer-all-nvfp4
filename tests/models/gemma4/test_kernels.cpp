@@ -1,7 +1,8 @@
 // Gemma 4's own decode kernels against FP64 oracles:
 //  - decode_attention over an F16 cache, both head geometries (D 256 with two query heads per KV
 //    head, D 512 with eight), linear and sliding-window ring caches, one and many splits, short
-//    and long contexts and two sequences in one batch; the BF16 rows and the q8_1 rows.
+//    and long contexts and two sequences in one batch; the BF16 rows and the q8_1 rows; and keys
+//    derived from the values (K = V blocks: RoPE(V * k_norm), proportional over 64 of 256 pairs).
 //  - route_select: the logits, the top-k ids and weights and the expert grouping of the pairs.
 
 #include "core/arena.h"
@@ -46,6 +47,8 @@ void expect(bool ok, const std::string& what) {
 struct AttentionCase {
     int head_dim, query_heads, kv_heads, ring, window, splits;
     std::vector<int> positions; // one per batch row
+    bool derived = false;       // keys derived from the values
+    int group    = 1;           // rows per sequence: a verification's consecutive positions
 };
 
 void attention(const AttentionCase& c, std::mt19937& rng) {
@@ -61,7 +64,35 @@ void attention(const AttentionCase& c, std::mt19937& rng) {
     std::vector<float> q(std::size_t(b) * c.query_heads * d);
     for (auto& v : q) { v = normal(rng); }
     std::vector<std::int32_t> seqs(b), pos(c.positions.begin(), c.positions.end());
-    std::iota(seqs.begin(), seqs.end(), 0);
+    for (int r = 0; r < b; ++r) { seqs[r] = r / c.group; }
+    // Derived keys: k_norm gammas near one, Gemma's full-attention frequencies (theta 1e6, the
+    // first 64 pairs turn), and the oracle's keys RoPE(V * k_norm) rounded to F16 from the stored V.
+    std::vector<float> k_norm(d), inv_freq(d / 2, 0.0f);
+    for (auto& w : k_norm) { w = 1.0f + 0.25f * normal(rng); }
+    for (int i = 0; i < 64 && i < d / 2; ++i) {
+        inv_freq[i] = float(1.0 / std::pow(1e6, double(2 * i) / double(d)));
+    }
+    if (c.derived) {
+        for (int r = 0; r < b; ++r) {
+            for (int kv = 0; kv < c.kv_heads; ++kv) {
+                for (int j = 0; j < slots; ++j) {
+                    const std::int64_t at = r * seq_stride + kv * head_stride + std::int64_t(j) * d;
+                    for (int i = 0; i < d / 2; ++i) {
+                        float co = 1.0f, si = 0.0f;
+                        if (inv_freq[i] != 0.0f) { sincosf(float(j) * inv_freq[i], &si, &co); }
+                        const double n0 = double(__half2float(vc[at + i])) * k_norm[i];
+                        const double n1 = double(__half2float(vc[at + i + d / 2])) * k_norm[i + d / 2];
+                        kc[at + i]         = __float2half(float(n0 * co - n1 * si));
+                        kc[at + i + d / 2] = __float2half(float(n1 * co + n0 * si));
+                    }
+                }
+            }
+        }
+    }
+    DeviceBuffer dw(k_norm.size() * 4), df(inv_freq.size() * 4), dr(std::size_t(slots) * 64 * 8);
+    dw.copy_from_host(k_norm.data(), k_norm.size() * 4);
+    df.copy_from_host(inv_freq.data(), inv_freq.size() * 4);
+    k::rope_table(static_cast<const float*>(df.p), 64, slots, static_cast<float2*>(dr.p), nullptr);
 
     DeviceBuffer dk(kc.size() * 2), dv(vc.size() * 2), dq(q.size() * 4), ds(b * 4), dp(b * 4);
     dk.copy_from_host(kc.data(), kc.size() * 2);
@@ -77,7 +108,10 @@ void attention(const AttentionCase& c, std::mt19937& rng) {
 
     k::DecodeAttentionArgs a;
     a.q = static_cast<const float*>(dq.p);
-    a.k_cache = static_cast<const __half*>(dk.p);
+    a.k_cache = c.derived ? nullptr : static_cast<const __half*>(dk.p);
+    a.k_norm = static_cast<const float*>(dw.p);
+    a.rope = static_cast<const float2*>(dr.p);
+    a.rope_pairs = 64;
     a.v_cache = static_cast<const __half*>(dv.p);
     a.seq_stride = seq_stride;
     a.head_stride = head_stride;
@@ -120,7 +154,7 @@ void attention(const AttentionCase& c, std::mt19937& rng) {
             double m = -1e300;
             for (int j = lo; j <= p; ++j) {
                 const int slot = c.ring != 0 ? j % c.ring : j;
-                const __half* kr = kc.data() + r * seq_stride + kv * head_stride + std::int64_t(slot) * d;
+                const __half* kr = kc.data() + seqs[r] * seq_stride + kv * head_stride + std::int64_t(slot) * d;
                 double s = 0;
                 for (int i = 0; i < d; ++i) { s += double(qh[i]) * __half2float(kr[i]); }
                 score.push_back(s);
@@ -133,7 +167,7 @@ void attention(const AttentionCase& c, std::mt19937& rng) {
                 for (int j = lo; j <= p; ++j) {
                     const int slot = c.ring != 0 ? j % c.ring : j;
                     o += score[j - lo] *
-                         __half2float(vc[r * seq_stride + kv * head_stride + std::int64_t(slot) * d + i]);
+                         __half2float(vc[seqs[r] * seq_stride + kv * head_stride + std::int64_t(slot) * d + i]);
                 }
                 o /= l;
                 const std::size_t at = std::size_t(r) * width + std::size_t(h) * d + i;
@@ -148,7 +182,9 @@ void attention(const AttentionCase& c, std::mt19937& rng) {
     }
     const double rms = std::sqrt(num / den), qrms = std::sqrt(qnum / den);
     const std::string name = "decode_attention D" + std::to_string(d) + " ring " + std::to_string(c.ring) +
-                             " splits " + std::to_string(c.splits) + " pos " + std::to_string(max_pos);
+                             " splits " + std::to_string(c.splits) + " pos " + std::to_string(max_pos) +
+                             (c.derived ? " derived keys" : "") +
+                             (c.group > 1 ? " rows of one sequence " + std::to_string(c.group) : "");
     const bool ok = rms < 6e-3 && qrms < 1.5e-2;
     std::cout << (ok ? "OK   " : "FAIL ") << name << " rms=" << rms << " q8 rms=" << qrms << '\n';
     failures += ok ? 0 : 1;
@@ -243,10 +279,18 @@ int main() {
         attention({256, 16, 8, 1024, 1024, 16, {5}}, rng);
         attention({256, 16, 8, 1024, 1024, 16, {700, 1900}}, rng);
         attention({256, 16, 8, 1280, 1024, 1, {3000}}, rng);
+        // A verification's rows: groups of one sequence's consecutive positions sharing a block.
+        attention({256, 16, 8, 1280, 1024, 16, {3000, 3001, 3002, 3003}, false, 4}, rng);
+        attention({256, 16, 8, 1280, 1024, 1, {500, 501, 2000, 2001}, false, 2}, rng);
+        attention({256, 16, 8, 1280, 1024, 16, {0, 1, 2, 3}, false, 4}, rng);
+        attention({256, 16, 8, 1280, 1024, 16, {1022, 1023, 1024}, false, 3}, rng);
         // Full layers: D 512, 16 query heads over 2, a linear cache.
         attention({512, 16, 2, 0, 0, 123, {0}}, rng);
         attention({512, 16, 2, 0, 0, 123, {40, 4999}}, rng);
         attention({512, 16, 2, 0, 0, 1, {777}}, rng);
+        attention({512, 16, 2, 0, 0, 123, {0}, true}, rng);
+        attention({512, 16, 2, 0, 0, 123, {40, 4999}, true}, rng);
+        attention({512, 16, 2, 0, 0, 1, {777}, true}, rng);
         for (const int tokens : {1, 3, 8}) { route(tokens, rng); }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Gemma 4 kernels\n";
         return failures == 0 ? 0 : 1;
