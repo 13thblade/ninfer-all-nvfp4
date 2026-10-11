@@ -115,12 +115,21 @@ struct Decoder<GGML_TYPE_Q4_0> {
 
     __device__ static const std::uint32_t* table() { return nullptr; }
 
+    // The 18-byte block starts 2-byte aligned: five aligned words cover it (the last one may reach
+    // two bytes past it, never past a 4-byte boundary of the allocation), against nine 2-byte loads.
     __device__ __forceinline__ static void decode(const std::uint8_t* b, int, const std::uint32_t*,
                                                   Slice& s) {
-        s.f[0] = half_at(b);
+        const auto at       = reinterpret_cast<std::uintptr_t>(b);
+        const auto* w       = reinterpret_cast<const std::uint32_t*>(at & ~std::uintptr_t(3));
+        const unsigned skew = unsigned(at & 2) * 8; // 0 or 16
+        std::uint32_t word[5];
+#pragma unroll
+        for (int i = 0; i < 5; ++i) { word[i] = w[i]; }
+        const std::uint32_t d = __funnelshift_rc(word[0], word[1], skew) & 0xFFFFu;
+        s.f[0]                = __half2float(__ushort_as_half(static_cast<unsigned short>(d)));
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const std::uint32_t q = u32_a2(b + 2 + 4 * j);
+            const std::uint32_t q = __funnelshift_rc(word[j], word[j + 1], 16 + skew);
             s.w[j]                = int(__vsubss4(q & 0x0F0F0F0Fu, 0x08080808u));
             s.w[j + 4]            = int(__vsubss4((q >> 4) & 0x0F0F0F0Fu, 0x08080808u));
         }
@@ -693,7 +702,7 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
         if (lane == 0) {
             if constexpr (Fused) {
 #pragma unroll
-                for (int j = 0; j < T; ++j) { vec_store(p.out, row0, j, vec_silu(acc[0][j]) * acc[1][j]); }
+                for (int j = 0; j < T; ++j) { vec_store(p.out, row0, j, vec_gate(acc[0][j], p.out.activation) * acc[1][j]); }
             } else {
 #pragma unroll
                 for (int r = 0; r < kRows; ++r) {
@@ -856,7 +865,7 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
                 if (j >= n) { break; }
                 if constexpr (Fused) {
                     p.out_bf16[std::int64_t(pair[j]) * p.rows + row0] =
-                        __float2bfloat16(vec_silu(acc[0][j]) * acc[1][j]);
+                        __float2bfloat16(vec_gate(acc[0][j], p.activation) * acc[1][j]);
                 } else {
 #pragma unroll
                     for (int r = 0; r < kRows; ++r) {
@@ -864,7 +873,7 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
                         if (row >= p.rows) { break; }
                         const std::int64_t at = std::int64_t(pair[j]) * p.rows + row;
                         float value           = acc[r][j];
-                        if (p.gate != nullptr) { value *= vec_silu(p.gate[at]); }
+                        if (p.gate != nullptr) { value *= vec_gate(p.gate[at], p.activation); }
                         if (p.weighted != nullptr) {
                             // 2^-32 fixed point, saturated far beyond any real activation.
                             atomicAdd(p.weighted + std::int64_t(pair[j] / p.per_token) * p.rows +

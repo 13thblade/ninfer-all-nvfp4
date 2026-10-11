@@ -22,6 +22,9 @@ from .recipe import Recipe
 from .sources.gguf import GGUFFile
 from .sources.safetensors import SafetensorsSource
 from .gguf_blocks import RECIPES as GGUF_RECIPES
+from .gemma4 import ARCHITECTURES as GEMMA4_ARCHITECTURES
+from .gemma4 import RECIPES as GEMMA4_RECIPES
+from .gemma4 import build_model as build_gemma4
 from .ternary import RECIPES as TERNARY_RECIPES
 
 
@@ -100,7 +103,8 @@ def _layers(value: str):
 
 
 def _function(value: str):
-    recipes = {**RECIPES, **TERNARY_RECIPES, **GGUF_RECIPES, **QWEN4_EXP_GGUF_RECIPES}
+    recipes = {**RECIPES, **TERNARY_RECIPES, **GGUF_RECIPES, **QWEN4_EXP_GGUF_RECIPES,
+               **GEMMA4_RECIPES}
     if value in recipes:
         return recipes[value]
     filename, function = _recipe_parts(value)
@@ -191,6 +195,30 @@ def main(argv=None):
         base = stack.enter_context(SafetensorsSource(args.model))
         architectures = base.config.get("architectures") or [None]
         flash_next = architectures[0] in QWEN4_EXP_ARCHITECTURES
+        gemma4 = architectures[0] in GEMMA4_ARCHITECTURES
+        if gemma4:
+            if "gguf" not in paths or args.components not in (None, "text") or args.layers:
+                raise ValueError("Gemma 4 converts its text component from --source gguf=FILE")
+            gguf = stack.enter_context(GGUFFile(paths["gguf"]))
+            model = build_gemma4(base, gguf, resource_overrides=overrides)
+            recipe = Recipe(model)
+            _function(args.recipe)(model, recipe, {"base": base, "gguf": gguf})
+            if args.override:
+                _function(args.override)(model, recipe, {"base": base, "gguf": gguf})
+            report = convert(
+                model, recipe, args.out, name=args.name,
+                provenance={"converter": "ninfer-v3", "recipe": args.recipe,
+                            "sources": {"base": {"path": str(args.model)},
+                                        "gguf": {"path": str(paths["gguf"])}}},
+                device=args.device, rows_per_chunk=args.rows_per_chunk,
+                max_file_bytes=args.max_file_bytes,
+                progress=lambda index, total, job: print(
+                    f"[{index+1}/{total}] {job.parameters[0]}"
+                    + (f" (+{len(job.parameters)-1})" if len(job.parameters) > 1 else "")
+                    + f": {job.spec.format} {job.spec.shape}", flush=True))
+            print(f"wrote {args.out}: {report['objects']} objects, {len(report['files'])} files, "
+                  f"{report['seconds']:.1f}s", flush=True)
+            return
         if args.layers is not None and not flash_next:
             raise ValueError("--layers is implemented for Qwen3.8-Flash-Next")
         # Flash-Next's MTP GGUF is read block by block, as its model shard is.

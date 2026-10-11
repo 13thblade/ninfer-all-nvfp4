@@ -522,6 +522,10 @@ bool has_matrix_kernel(GgmlType type) { return type != GgmlType::IQ1_M; }
 
 int multiprocessor_count() { return detail::device_facts().sm_count; }
 
+std::size_t vector_activation_scales_offset(int k, int columns) {
+    return detail::vec_scales_offset(k, columns);
+}
+
 std::size_t vector_activation_bytes(int k, int columns) {
     return detail::vec_scales_offset(k, columns) + std::size_t(columns) * (k / QK8_1) * sizeof(half2);
 }
@@ -549,7 +553,8 @@ void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
         throw std::invalid_argument("gguf vector product: invalid output");
     }
     const detail::VecStore store{out.bf16,     out.f32,  out.column_stride,
-                                 out.epilogue, out.gate, out.gate_column_stride};
+                                 out.epilogue, out.gate, out.gate_column_stride,
+                                 static_cast<int>(out.activation)};
     detail::vector_launch(type)(
         detail::vector_args(weight, row_bytes, rows, k, activation, columns, store), columns,
         false, stream);
@@ -557,8 +562,11 @@ void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
 
 void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                    const void* activation, int columns, __nv_bfloat16* out,
-                   std::int64_t out_column_stride, cudaStream_t stream) {
-    const detail::VecStore store{out, nullptr, out_column_stride, Epilogue::Store, nullptr, 0};
+                   std::int64_t out_column_stride, cudaStream_t stream,
+                   GateActivation gate_activation) {
+    const detail::VecStore store{out,     nullptr, out_column_stride,
+                                 Epilogue::Store, nullptr, 0,
+                                 static_cast<int>(gate_activation)};
     detail::vector_launch(type)(
         detail::vector_args(weight, row_bytes, rows, k, activation, columns, store), columns,
         true, stream);
@@ -630,18 +638,20 @@ void moe_vector_product(GgmlType type, const MoeTable& table, const MoeRouting& 
     args.out_bf16 = out.bf16;
     args.out_f32  = out.f32;
     args.weighted = out.weighted;
-    args.weights  = out.weights;
-    args.gate     = out.gate;
+    args.weights    = out.weights;
+    args.gate       = out.gate;
+    args.activation = static_cast<int>(out.activation);
     detail::moe_launcher(type)(args, max_active, chunk, false, stream);
 }
 
 void moe_vector_swiglu(GgmlType type, const MoeTable& gate, const MoeTable& up,
                        const MoeRouting& routing, int max_active, int column_group,
                        const void* activation, int columns, __nv_bfloat16* out, int chunk,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, GateActivation gate_activation) {
     if (out == nullptr) { throw std::invalid_argument("gguf moe swiglu: invalid output"); }
-    auto args     = moe_args(gate, &up, routing, column_group, 1, activation, columns);
-    args.out_bf16 = out;
+    auto args       = moe_args(gate, &up, routing, column_group, 1, activation, columns);
+    args.out_bf16   = out;
+    args.activation = static_cast<int>(gate_activation);
     detail::moe_launcher(type)(args, max_active, chunk, true, stream);
 }
 
@@ -740,10 +750,21 @@ std::size_t moe_matrix_activation_bytes(int k, int pairs) {
     return matrix_activation_bytes(moe_padded_k(k), pairs);
 }
 
+int matrix_padded_k(int k) { return moe_padded_k(k); }
+
+void quantize_matrix_activation_padded(GgmlType type, const __nv_bfloat16* x, int k, int columns,
+                                       const std::int32_t* input_columns, void* out,
+                                       cudaStream_t stream) {
+    if (k <= 0 || k % 32 != 0 || columns <= 0) {
+        throw std::invalid_argument("gguf padded matrix activation: K must be whole 32-value blocks");
+    }
+    quantize_matrix(type, x, k, moe_padded_k(k), columns, input_columns, nullptr, 1, out, stream);
+}
+
 void quantize_moe_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k,
                                     const MoeRouting& routing, int pairs, int column_group,
                                     void* out, cudaStream_t stream) {
-    if (routing.sorted == nullptr || column_group <= 0 || k <= 0 || k % 128 != 0 || pairs <= 0) {
+    if (routing.sorted == nullptr || column_group <= 0 || k <= 0 || k % 32 != 0 || pairs <= 0) {
         throw std::invalid_argument("gguf moe matrix activation: invalid routing or K");
     }
     quantize_matrix(type, x, k, moe_padded_k(k), pairs, nullptr, routing.sorted, column_group, out,
@@ -779,12 +800,12 @@ std::size_t matrix_fixup_bytes(GgmlType type, int rows, int columns) {
 
 void matrix_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                     const void* activation, int columns, float* out,
-                    std::int64_t out_column_stride, void* fixup, cudaStream_t stream) {
+                    std::int64_t out_column_stride, void* fixup, cudaStream_t stream, bool tail) {
 #define NINFER_GGUF_MATRIX_CASE(NAME)                                                              \
     case GgmlType::NAME:                                                                           \
         detail::matrix_product_impl<GGML_TYPE_##NAME>(weight, row_bytes, rows, k, activation,      \
                                                       columns, out, out_column_stride, fixup,      \
-                                                      stream);                                     \
+                                                      stream, tail);                               \
         return
     switch (type) {
         NINFER_GGUF_MATRIX_CASE(Q8_0);
@@ -886,7 +907,8 @@ void store_plane(const float* in, std::int64_t in_column_stride, int rows, int c
         throw std::invalid_argument("gguf store plane: invalid output");
     }
     const detail::VecStore store{out.bf16,     out.f32,  out.column_stride,
-                                 out.epilogue, out.gate, out.gate_column_stride};
+                                 out.epilogue, out.gate, out.gate_column_stride,
+                                 static_cast<int>(out.activation)};
     detail::store_plane_kernel<<<dim3((rows + 255) / 256, columns, 1), 256, 0, stream>>>(
         in, in_column_stride, rows, store);
     detail::check(cudaGetLastError(), "store plane launch");

@@ -49,6 +49,7 @@ gguf::VectorOutput output(const GgufProduct& p, std::int32_t first) {
     if (p.epilogue == GgufEpilogue::GateProduct) {
         out.gate               = p.gate + std::int64_t(first) * p.weight->n;
         out.gate_column_stride = p.weight->n;
+        out.activation         = p.activation;
     }
     return out;
 }
@@ -115,9 +116,9 @@ gguf::GgmlType gguf_type(QType format) {
 void require_gguf(const Weight& w, const char* label) {
     const auto block = gguf_block_shape(w.qtype);
     if (!is_gguf(w.qtype) || w.layout != QuantLayout::GgufBlocks || w.qdata == nullptr ||
-        w.n <= 0 || w.k <= 0 || w.k % block.elements != 0 || w.k % 512 != 0) {
+        w.n <= 0 || w.k <= 0 || w.k % block.elements != 0 || w.k % 32 != 0) {
         throw std::invalid_argument(std::string(label) +
-                                    ": expected a resident GGUF matrix over 512-column groups");
+                                    ": expected a resident GGUF matrix over whole blocks");
     }
 }
 
@@ -133,7 +134,7 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
     for (const GgufShape& shape : shapes) {
         const auto block = gguf_block_shape(shape.qtype);
         if (!is_gguf(shape.qtype) || shape.rows <= 0 || shape.k != k || k <= 0 ||
-            k % block.elements != 0 || k % 512 != 0) {
+            k % block.elements != 0 || k % 32 != 0) {
             throw std::invalid_argument("gguf workspace: unsupported product geometry");
         }
         const auto type = gguf_type(shape.qtype);
@@ -168,7 +169,7 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
             (void)layout.alloc_bytes(kDequantizedScratchBytes);
         }
         for (std::size_t i = 0; i < std::max<std::size_t>(layouts.size(), 1) * activations; ++i) {
-            (void)layout.alloc_bytes(gguf::matrix_activation_bytes(k, t));
+            (void)layout.alloc_bytes(gguf::matrix_activation_bytes(gguf::matrix_padded_k(k), t));
         }
         if (dequantized) { (void)layout.alloc_bytes(std::size_t(k) * t * 2); }
         widest = std::max(widest, layout.peak_bytes(1));
@@ -242,14 +243,24 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
             auto found = std::find_if(activations.begin(), activations.end(), [&](const Activation& a) {
                 return a.layout == layout && a.columns == w.input_columns;
             });
+            // Rows that are not whole 256-value steps (Gemma 4's 2112- and 704-wide inputs) read
+            // past their end into the next row and the zeros the loader places after the last
+            // one, against an activation that is zero there.
+            const bool padded = k % 512 != 0;
             if (found == activations.end()) {
-                void* data = workspace.alloc_bytes(gguf::matrix_activation_bytes(k, t)).data;
-                gguf::quantize_matrix_activation(type, xb, k, t, w.input_columns, data, stream);
+                void* data = workspace.alloc_bytes(
+                    gguf::matrix_activation_bytes(gguf::matrix_padded_k(k), t)).data;
+                if (padded) {
+                    gguf::quantize_matrix_activation_padded(type, xb, k, t, w.input_columns, data,
+                                                            stream);
+                } else {
+                    gguf::quantize_matrix_activation(type, xb, k, t, w.input_columns, data, stream);
+                }
                 activations.push_back({layout, w.input_columns, data});
                 found = activations.end() - 1;
             }
             gguf::matrix_product(type, w.qdata, row_bytes(w), w.n, k, found->data, t, out, stride,
-                                 fixup, stream);
+                                 fixup, stream, k % 256 != 0);
         } else if (t <= kDequantizedVectorColumns) {
             for (std::int32_t first = 0; first < t; first += gguf::kMaxVectorColumns) {
                 const std::int32_t columns = std::min(gguf::kMaxVectorColumns, t - first);
@@ -300,7 +311,8 @@ std::size_t gguf_swiglu_workspace_bytes(const GgufShape& gate, const GgufShape* 
 }
 
 void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor& out,
-                 WorkspaceArena& workspace, cudaStream_t stream) {
+                 WorkspaceArena& workspace, cudaStream_t stream,
+                 gguf::GateActivation activation) {
     require_activation(x, "gguf swiglu");
     require_gguf(gate, "gguf swiglu gate");
     const std::int32_t t    = x.ne[1];
@@ -314,13 +326,13 @@ void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor& 
     if (up == nullptr) {
         if (gate.n != 2 * rows) { throw std::invalid_argument("gguf swiglu: parent is not [gate; up]"); }
         if (t <= gguf::kMaxVectorColumns) {
-            void* activation =
+            void* vector_input =
                 workspace.alloc_bytes(gguf::vector_activation_bytes(gate.k, t)).data;
             gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(x.data), gate.k, t,
-                                             gate.input_columns, activation, stream);
+                                             gate.input_columns, vector_input, stream);
             gguf::vector_swiglu(gguf_type(gate.qtype), gate.qdata, row_bytes(gate), rows, gate.k,
-                                activation, t, static_cast<__nv_bfloat16*>(out.data), rows,
-                                stream);
+                                vector_input, t, static_cast<__nv_bfloat16*>(out.data), rows,
+                                stream, activation);
             return;
         }
         gate_rows.n = rows;
@@ -342,8 +354,9 @@ void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor& 
     products[0].f32_rows = rows;
     products[1].weight   = &up_rows;
     products[1].out      = &out;
-    products[1].epilogue = GgufEpilogue::GateProduct;
-    products[1].gate     = gate_plane;
+    products[1].epilogue   = GgufEpilogue::GateProduct;
+    products[1].gate       = gate_plane;
+    products[1].activation = activation;
     gguf_project(x, products, workspace, stream);
 }
 

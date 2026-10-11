@@ -1,0 +1,55 @@
+#pragma once
+
+// The text config of Gemma 4 (Gemma4ForCausalLM) as tools/convert/gemma4.py writes it into the
+// artifact: sliding-window and full-attention blocks, full attention with K = V and proportional
+// RoPE, a GeGLU MLP and, in the MoE models, a routed expert bank beside it in every block.
+
+#include "artifact/schema.h"
+
+#include <cstdint>
+#include <vector>
+
+namespace ninfer::models::gemma4 {
+
+struct TextConfig {
+    std::uint32_t hidden_size             = 0;
+    std::uint32_t vocab_size              = 0;
+    std::uint32_t num_hidden_layers       = 0;
+    std::uint32_t max_position_embeddings = 0;
+    float rms_norm_eps                    = 0;
+    float final_logit_softcapping         = 0; // 0: none
+    // true: full attention; false: sliding-window attention.
+    std::vector<bool> full_attention;
+
+    std::uint32_t num_attention_heads = 0;
+    // Sliding-window blocks.
+    std::uint32_t num_key_value_heads = 0;
+    std::uint32_t head_dim            = 0;
+    std::uint32_t sliding_window      = 0;
+    float rope_theta_sliding          = 0;
+    // Full-attention blocks: K is also V; RoPE turns the first `rotary_pairs_full` pairs (i, i +
+    // D/2) at theta^(-2i/D) and leaves the rest.
+    std::uint32_t num_global_key_value_heads = 0;
+    std::uint32_t global_head_dim            = 0;
+    float rope_theta_full                    = 0;
+    std::uint32_t rotary_pairs_full          = 0;
+
+    std::uint32_t intermediate_size = 0;
+    bool moe                        = false;
+    std::uint32_t num_experts       = 0;
+    std::uint32_t top_k_experts     = 0;
+    std::uint32_t moe_intermediate_size = 0;
+
+    [[nodiscard]] std::uint32_t layer_head_dim(std::uint32_t layer) const {
+        return full_attention.at(layer) ? global_head_dim : head_dim;
+    }
+    [[nodiscard]] std::uint32_t layer_kv_heads(std::uint32_t layer) const {
+        return full_attention.at(layer) ? num_global_key_value_heads : num_key_value_heads;
+    }
+};
+
+// Throws artifact::ArtifactError naming the field that is missing, malformed or outside the
+// implemented geometry.
+[[nodiscard]] TextConfig parse_text_config(const artifact::Json& value);
+
+} // namespace ninfer::models::gemma4

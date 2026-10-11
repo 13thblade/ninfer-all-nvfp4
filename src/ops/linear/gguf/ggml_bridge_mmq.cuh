@@ -112,10 +112,14 @@ void launch_matrix(const MatrixLaunch& launch, const char* weight, int stride_ro
 template <ggml_type type>
 void matrix_product_impl(const void* weight, std::int64_t row_bytes, int rows, int k,
                          const void* activation, int columns, float* out,
-                         std::int64_t out_column_stride, void* fixup, cudaStream_t stream) {
+                         std::int64_t out_column_stride, void* fixup, cudaStream_t stream,
+                         bool tail) {
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     constexpr int block_bytes = ggml_cuda_type_traits<type>::bs;
-    if (k % 256 != 0 || rows % 128 != 0 || row_bytes % block_bytes != 0 ||
+    // A row that is not a whole number of 256-value steps is read past its end (into the next row,
+    // and past the last one into the caller's zeros); its activation is zero there.
+    const bool steps = k % 256 == 0 || (tail && k % qk == 0 && k % 32 == 0);
+    if (!steps || rows % 128 != 0 || row_bytes % block_bytes != 0 ||
         row_bytes < std::int64_t(k / qk) * block_bytes) {
         throw std::invalid_argument("gguf matrix product: unsupported geometry");
     }
@@ -200,7 +204,7 @@ MatrixLaunch select_moe_launch(int rows, int k, int columns, bool tail) {
     for (const int J : kMatrixColumnTiles) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, false, device.cc);
         const bool steps = k % config.K_vram == 0 ||
-                           (tail && config.K_vram == MMQ_ITER_K && k % qk == 0 && k % 128 == 0);
+                           (tail && config.K_vram == MMQ_ITER_K && k % qk == 0 && k % 32 == 0);
         if (config.type == GGML_TYPE_COUNT || rows % config.I != 0 || !steps) { continue; }
         const std::size_t shared = mmq_get_nbytes_shared(config, device.cc);
         if (shared > device.shared_per_block_optin) { continue; }
@@ -282,7 +286,7 @@ void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes,
     template std::size_t ninfer::ops::gguf::detail::matrix_fixup_bytes_impl<TYPE>(int, int);       \
     template void ninfer::ops::gguf::detail::matrix_product_impl<TYPE>(                            \
         const void*, std::int64_t, int, int, const void*, int, float*, std::int64_t, void*,        \
-        cudaStream_t);                                                                             \
+        cudaStream_t, bool);                                                                       \
     template bool ninfer::ops::gguf::detail::moe_matrix_fits_impl<TYPE>(int, int, bool);           \
     template void ninfer::ops::gguf::detail::moe_matrix_product_impl<TYPE>(                        \
         const void* const*, std::int64_t, int, int, const ninfer::ops::gguf::MoeRouting&, int,     \

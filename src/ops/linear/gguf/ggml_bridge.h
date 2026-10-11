@@ -53,6 +53,9 @@ inline constexpr int kMaxVectorColumns = 8;
 
 // Activation for the vector kernel: q8_1 blocks of 32 values, [columns][k / 32].
 [[nodiscard]] std::size_t vector_activation_bytes(int k, int columns);
+// Its layout: int8 values [columns][k] from byte 0, then half2 (d, sum) pairs [columns][k / 32]
+// from this byte offset; d = max|x| / 127 over the 32 values, sum their (unquantized) total.
+[[nodiscard]] std::size_t vector_activation_scales_offset(int k, int columns);
 // `input_columns` (optional, [k]) makes element c of each column x[input_columns[c]].
 void quantize_vector_activation(const __nv_bfloat16* x, int k, int columns,
                                 const std::int32_t* input_columns, void* out, cudaStream_t stream);
@@ -60,7 +63,14 @@ void quantize_vector_activation(const __nv_bfloat16* x, int k, int columns,
 enum class Epilogue : int {
     Store,       // out = y
     Accumulate,  // out = out + y
-    GateProduct, // out = silu(gate) * y, gate read from a float plane
+    GateProduct, // out = act(gate) * y, gate read from a float plane
+};
+
+// The activation a gated product applies to its gate: SiLU (SwiGLU) or tanh-approximated GELU
+// (GeGLU, Gemma 4).
+enum class GateActivation : int {
+    Silu     = 0,
+    GeluTanh = 1,
 };
 
 struct VectorOutput {
@@ -70,6 +80,7 @@ struct VectorOutput {
     Epilogue epilogue          = Epilogue::Store;
     const float* gate          = nullptr; // GateProduct only
     std::int64_t gate_column_stride = 0;
+    GateActivation activation       = GateActivation::Silu; // GateProduct only
 };
 
 // out[r, c] <- epilogue(sum_k W[r, k] x[k, c]) for rows [0, rows) and columns [0, columns),
@@ -78,11 +89,12 @@ void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
                     const void* activation, int columns, const VectorOutput& out,
                     cudaStream_t stream);
 
-// out[r, c] = silu(gate_r . x_c) * (up_r . x_c) where gate row r and up row r are rows r and
+// out[r, c] = act(gate_r . x_c) * (up_r . x_c) where gate row r and up row r are rows r and
 // rows + r of one parent of this type.
 void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                    const void* activation, int columns, __nv_bfloat16* out,
-                   std::int64_t out_column_stride, cudaStream_t stream);
+                   std::int64_t out_column_stride, cudaStream_t stream,
+                   GateActivation gate_activation = GateActivation::Silu);
 
 // Activation for the matrix kernel, laid out for the type's scale/sum schedule. Types that share a
 // schedule share an activation, see matrix_activation_layout().
@@ -95,10 +107,21 @@ void quantize_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k, in
 // device (zero when the tiles divide evenly across the machine).
 [[nodiscard]] std::size_t matrix_fixup_bytes(GgmlType type, int rows, int columns);
 
-// out[c * out_column_stride + r] = sum_k W[r, k] x[k, c] in FP32.
+// out[c * out_column_stride + r] = sum_k W[r, k] x[k, c] in FP32. `k` is a whole number of the
+// kernel's 256-value steps. A matrix whose rows are shorter (row_bytes holds fewer than k values) is
+// read past each row's end into the next row, and past the last row into zeros the caller promises
+// (`tail`); its activation must be zero from the row width up to k (quantize_matrix_activation_padded).
 void matrix_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                     const void* activation, int columns, float* out,
-                    std::int64_t out_column_stride, void* fixup, cudaStream_t stream);
+                    std::int64_t out_column_stride, void* fixup, cudaStream_t stream,
+                    bool tail = false);
+// The 256-value step a padded matrix product covers for rows of `k` values.
+[[nodiscard]] int matrix_padded_k(int k);
+// The activation of a padded product: x BF16 [k, columns] quantized with zeros from k up to
+// matrix_padded_k(k), into matrix_activation_bytes(matrix_padded_k(k), columns).
+void quantize_matrix_activation_padded(GgmlType type, const __nv_bfloat16* x, int k, int columns,
+                                       const std::int32_t* input_columns, void* out,
+                                       cudaStream_t stream);
 
 // out <- epilogue(in) for an FP32 [rows, columns] plane whose columns are `in_column_stride` apart.
 void store_plane(const float* in, std::int64_t in_column_stride, int rows, int columns,
@@ -157,8 +180,9 @@ struct MoeOutput {
     // not depend on the order the experts finish in. The caller zeroes it first.
     unsigned long long* weighted = nullptr;
     const float* weights         = nullptr; // [pairs], with `weighted`
-    // Multiplies the value by silu(gate[p][r]) first ([pairs][rows]).
+    // Multiplies the value by act(gate[p][r]) first ([pairs][rows]).
     const float* gate = nullptr;
+    GateActivation activation = GateActivation::Silu;
 };
 
 // Activation column of pair p is p / column_group: the token's (column_group = per_token) for the
@@ -173,7 +197,7 @@ void moe_vector_product(GgmlType type, const MoeTable& table, const MoeRouting& 
 void moe_vector_swiglu(GgmlType type, const MoeTable& gate, const MoeTable& up,
                        const MoeRouting& routing, int max_active, int column_group,
                        const void* activation, int columns, __nv_bfloat16* out, int chunk,
-                       cudaStream_t stream);
+                       cudaStream_t stream, GateActivation gate_activation = GateActivation::Silu);
 
 // One decode or verification call's experts (up to 8 tokens) in few launches: moe_decode_up writes
 // silu(gate . x) * (up . x) of every listed pair to `middle`, quantizing its tokens' BF16 inputs

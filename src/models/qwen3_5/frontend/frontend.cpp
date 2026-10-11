@@ -4,6 +4,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/frontend/chat_template.h"
+#include "models/qwen3_5/frontend/gemma_output.h"
 #include "models/qwen3_5/frontend/media_cache.h"
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
@@ -200,8 +201,9 @@ void validate_tokenizer_config(const FrontendResources& resources) {
 }
 
 fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources,
-                                               const std::filesystem::path& override_path) {
-    validate_tokenizer_config(resources);
+                                               const std::filesystem::path& override_path,
+                                               bool qwen = true) {
+    if (qwen) { validate_tokenizer_config(resources); }
     nlohmann::ordered_json tokens = nlohmann::ordered_json::object();
     const auto config             = nlohmann::ordered_json::parse(resources.tokenizer_config_json);
     for (const char* key : {"bos_token", "eos_token", "pad_token", "unk_token", "sep_token",
@@ -787,6 +789,19 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
 
 ModelSamplingDefaults default_sampling(Architecture architecture) {
     ModelSamplingDefaults sampling;
+    if (architecture == Architecture::Gemma4) {
+        // generation_config.json of the Gemma 4 releases (top_k 64), thinking or not, with
+        // top_k held at the 20 candidates the sampler keeps.
+        sampling.thinking      = {.temperature       = 1.0F,
+                                  .top_k             = 20,
+                                  .top_p             = 0.95F,
+                                  .min_p             = 0.0F,
+                                  .presence_penalty  = 0.0F,
+                                  .frequency_penalty = 0.0F};
+        sampling.non_thinking  = sampling.thinking;
+        sampling.post_thinking = sampling.thinking;
+        return sampling;
+    }
     sampling.thinking     = {.temperature      = 1.0F,
                              .top_k            = 20,
                              .top_p            = 0.95F,
@@ -807,7 +822,8 @@ ModelSamplingDefaults default_sampling(Architecture architecture) {
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, FrontendOptions options)
-        : chat_template(compile_chat_template(resources, options.chat_template_path)),
+        : chat_template(compile_chat_template(resources, options.chat_template_path,
+                                              options.architecture != Architecture::Gemma4)),
           tokenizer(resources.tokenizer),
           processor(options.vision_enabled ? processor_options(resources) : fi::ProcessorOptions{}),
           vision_enabled(options.vision_enabled), max_context(options.max_context),
@@ -855,6 +871,11 @@ public:
                     "generation_config.json contains a stop token outside the vocabulary");
             }
             defaults.token_ids.push_back(token);
+        }
+        if (options.architecture == Architecture::Gemma4) {
+            // Gemma's reasoning channel has no early-close control: thinking budgets do not apply.
+            gemma = std::make_shared<const fi::GemmaMarkers>(fi::GemmaMarkers::from(*tokenizer));
+            return;
         }
         std::string control_suffix(kThinkingControl);
         const char* control_name = "canonical thinking control suffix";
@@ -919,6 +940,7 @@ public:
     StopPolicy defaults;
     ModelSamplingDefaults sampling;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
+    std::shared_ptr<const fi::GemmaMarkers> gemma; // the Gemma 4 dialect, null for Qwen
     bool ngram_sources_enabled = false;
     bool ngram_archive_enabled = false;
     std::vector<TokenId> ngram_think_open, ngram_think_close;
@@ -1408,9 +1430,10 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
         grammar = impl_->grammar_compiler->compile(structured, envelope);
     }
     if (output.raw) { policy.publish_stop_token = true; }
-    return OutputSession(
-        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning, thinking,
-        impl_->thinking_control_tokens, prompt.data_->tool_call_output, std::move(grammar));
+    return OutputSession(impl_->tokenizer, std::move(policy), output,
+                         prompt.data_->starts_in_reasoning, thinking,
+                         impl_->thinking_control_tokens, prompt.data_->tool_call_output,
+                         std::move(grammar), impl_->gemma);
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

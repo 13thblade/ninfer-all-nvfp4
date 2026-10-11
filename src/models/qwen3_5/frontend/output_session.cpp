@@ -1,6 +1,7 @@
 #include "models/qwen3_5/frontend/output_session.h"
 #include "text/structured_output.h"
 #include "models/qwen3_5/frontend/chat_template.h"
+#include "models/qwen3_5/frontend/gemma_output.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "text/unicode.h"
@@ -181,6 +182,9 @@ struct HeldLogprob {
 struct DecoderState {
     std::string utf8_pending;
     std::string think_marker_pending;
+    // Gemma: inside a channel's header (`thought\n` after <|channel>), and its bytes so far.
+    bool gemma_header = false;
+    std::string gemma_header_text;
     std::array<std::string, 2> stop_pending;
     bool in_reasoning              = false;
     bool strip_content_leading     = false;
@@ -434,13 +438,15 @@ public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
          bool starts_in_reasoning, ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
-         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_)
-        : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
+         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_,
+         std::shared_ptr<const fi::GemmaMarkers> gemma_)
+        : gemma(output.raw ? nullptr : std::move(gemma_)), tokenizer(std::move(tokenizer_)),
+          policy(std::move(policy_)),
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
-          tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
-                           output.tool_name_max_length) {
+          // Copied, not moved: the body still asks whether the request declared tools.
+          tool_call_output(output.raw ? nullptr : tool_call_output_, output.tool_name_max_length) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
@@ -456,8 +462,13 @@ public:
         // semantic tracker dormant unless a cap needs it, so the default unlimited path does not
         // decode every model token twice.
         semantic.in_reasoning = starts_in_reasoning && semantic.budget.has_value();
+        if (gemma && tool_call_output_ != nullptr) { gemma_tools.emplace(); }
     }
 
+    // Gemma's dialect: channel markers open and close reasoning, tool-call markup stays in the
+    // content for gemma_tools (present when the request declared tools).
+    std::shared_ptr<const fi::GemmaMarkers> gemma;
+    std::optional<fi::GemmaToolCallDecoder> gemma_tools;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
@@ -551,10 +562,11 @@ OutputSession::OutputSession(
     bool starts_in_reasoning, ThinkingControlOptions thinking,
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
-    std::shared_ptr<text::GrammarState> grammar)
-    : impl_(std::make_unique<Impl>(
-          std::move(tokenizer), std::move(policy), output, starts_in_reasoning, thinking,
-          std::move(thinking_control_tokens), std::move(tool_call_output))) {
+    std::shared_ptr<text::GrammarState> grammar, std::shared_ptr<const frontend::GemmaMarkers> gemma)
+    : impl_(std::make_unique<Impl>(std::move(tokenizer), std::move(policy), output,
+                                   starts_in_reasoning, thinking,
+                                   std::move(thinking_control_tokens), std::move(tool_call_output),
+                                   std::move(gemma))) {
     impl_->grammar = std::move(grammar);
 }
 
@@ -644,8 +656,33 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         }
 
         StopMatch match;
-        const std::string_view bytes =
+        std::string_view bytes =
             !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
+        if (impl_->gemma) {
+            const fi::GemmaMarkers& markers = *impl_->gemma;
+            DecoderState& decoder           = impl_->preview_state;
+            if (token == markers.channel_open) {
+                decoder.gemma_header = true;
+                decoder.gemma_header_text.clear();
+                bytes = {};
+            } else if (decoder.gemma_header) {
+                // The channel's name and its newline; whatever follows in the token is reasoning.
+                decoder.gemma_header_text.append(decoded.bytes);
+                const std::size_t newline = decoder.gemma_header_text.find('\n');
+                bytes                     = {};
+                if (newline != std::string::npos) {
+                    decoder.gemma_header = false;
+                    decoder.in_reasoning = true;
+                    const std::size_t rest =
+                        decoder.gemma_header_text.size() - newline - 1;
+                    bytes = decoded.bytes.substr(decoded.bytes.size() - rest);
+                }
+            } else if (token == markers.channel_close) {
+                bytes = decoder.in_reasoning ? std::string_view("</think>\n") : std::string_view{};
+            } else if (markers.markup(token)) {
+                bytes = decoded.bytes;
+            }
+        }
         const std::uint64_t fed_before = impl_->preview_state.content_fed;
         feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
                          &match);
@@ -812,11 +849,20 @@ PublishedOutput OutputSession::commit_preview() {
 
     for (OutputDelta& delta : output) {
         if (delta.channel == OutputChannel::Content) {
-            delta.text = impl_->tool_call_output.feed(delta.text);
+            delta.text = impl_->gemma_tools ? impl_->gemma_tools->feed(delta.text)
+                                            : impl_->tool_call_output.feed(delta.text);
         }
     }
     if (impl_->state.terminal) {
-        fi::ToolCallOutputDecoder::Terminal terminal = impl_->tool_call_output.finish();
+        fi::ToolCallOutputDecoder::Terminal terminal;
+        if (impl_->gemma_tools) {
+            auto gemma          = impl_->gemma_tools->finish();
+            terminal.content    = std::move(gemma.content);
+            terminal.tool_calls = std::move(gemma.tool_calls);
+            terminal.diagnostics = gemma.diagnostics;
+        } else {
+            terminal = impl_->tool_call_output.finish();
+        }
         impl_->tool_calls                            = std::move(terminal.tool_calls);
         impl_->tool_call_parse                       = terminal.diagnostics;
         if (!terminal.content.empty()) {

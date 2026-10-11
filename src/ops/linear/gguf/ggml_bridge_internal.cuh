@@ -59,6 +59,7 @@ struct VecStore {
     Epilogue epilogue;
     const float* gate;
     std::int64_t gate_column_stride;
+    int activation; // GateActivation of the gate product and of a fused [gate; up] product
 };
 
 struct VecArgs {
@@ -91,6 +92,7 @@ struct MoeVecArgs {
     unsigned long long* weighted;
     const float* weights;
     const float* gate;
+    int activation; // GateActivation of `gate` and of the fused form
 };
 
 template <ggml_type type>
@@ -112,10 +114,17 @@ void vec_launch(const VecArgs& args, int columns, bool fused, cudaStream_t strea
 
 __device__ __forceinline__ float vec_silu(float x) { return x / (1.0f + expf(-x)); }
 
+// GateActivation: 0 SiLU, 1 tanh-approximated GELU.
+__device__ __forceinline__ float vec_gate(float x, int activation) {
+    if (activation == 0) { return vec_silu(x); }
+    const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+    return 0.5f * x * (1.0f + tanhf(inner));
+}
+
 __device__ __forceinline__ void vec_store(const VecStore& out, int row, int column, float value) {
     const std::int64_t at = column * out.column_stride + row;
     if (out.epilogue == Epilogue::GateProduct) {
-        value *= vec_silu(out.gate[column * out.gate_column_stride + row]);
+        value *= vec_gate(out.gate[column * out.gate_column_stride + row], out.activation);
     }
     if (out.f32 != nullptr) {
         out.f32[at] = out.epilogue == Epilogue::Accumulate ? out.f32[at] + value : value;
@@ -128,6 +137,7 @@ __device__ __forceinline__ void vec_store(const VecStore& out, int row, int colu
 template <ggml_type type>
 void matrix_product_impl(const void* weight, std::int64_t row_bytes, int rows, int k,
                          const void* activation, int columns, float* out,
-                         std::int64_t out_column_stride, void* fixup, cudaStream_t stream);
+                         std::int64_t out_column_stride, void* fixup, cudaStream_t stream,
+                         bool tail);
 
 } // namespace ninfer::ops::gguf::detail
