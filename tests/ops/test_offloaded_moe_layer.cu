@@ -6,6 +6,8 @@
 //     FP64.
 //   - moe_dispatch: counts, offsets, jobs and entries exactly, on the one-CTA and three-kernel routes.
 //   - moe_combine against FP64 over its represented inputs.
+//   - malformed inputs: a short shared gate and a non-unit third extent are rejected on the host;
+//     an id outside [0, E) is logged but not dispatched, on both dispatch routes.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -19,6 +21,7 @@
 #include <cstdlib>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -214,6 +217,70 @@ void test_combine() {
     }
 }
 
+template <class F>
+bool rejects(F&& f) {
+    try {
+        f();
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+    return false;
+}
+
+void test_malformed() {
+    constexpr int kExperts = 8;
+    for (int entries : {6, 1500}) { // the one-CTA route and the three-kernel route
+        std::vector<std::int32_t> ids(entries);
+        for (int i = 0; i < entries; ++i) { ids[i] = i % kExperts; }
+        ids[1]           = -1;
+        ids[entries / 2] = 1 << 30;
+        ids[entries - 1] = kExperts;
+        DeviceBuffer d_ids(ids.size() * 4), d_log(ids.size() * 4), d_dispatch(ops::moe_dispatch_bytes(kExperts, entries));
+        d_ids.copy_from_host(ids.data(), ids.size() * 4);
+        ops::MoeRouting routing;
+        routing.ids = Tensor(d_ids.p, DType::I32, {2, entries / 2});
+        auto view   = ops::carve_moe_dispatch(d_dispatch.p, kExperts, entries);
+        ops::moe_dispatch(routing, kExperts, view, static_cast<std::int32_t*>(d_log.p), nullptr);
+        cuda_ok(cudaDeviceSynchronize(), "dispatch of out-of-range ids");
+        check(download<std::int32_t>(d_log.p, ids.size()) == ids, "route_log copies every id");
+        const auto counts  = download<std::int32_t>(view.counts, kExperts);
+        const auto offsets = download<std::int32_t>(view.offsets, kExperts + 1);
+        std::vector<int> want(kExperts, 0);
+        int valid = 0;
+        for (const int id : ids) {
+            if (id >= 0 && id < kExperts) {
+                ++want[id];
+                ++valid;
+            }
+        }
+        int at = 0;
+        for (int e = 0; e < kExperts; ++e) {
+            check(counts[e] == want[e] && offsets[e] == at, "out-of-range ids change no expert's dispatch");
+            at += want[e];
+        }
+        check(offsets[kExperts] == valid, "out-of-range ids are not dispatched");
+    }
+    // Host rejections: a shared gate shorter than the columns, and a non-unit third extent.
+    constexpr int kH = 4, kT = 2;
+    DeviceBuffer out(kH * kT * 2), shared(kH * kT * 2), y(kH * kT * 2), weights(kT * 4), gate(kT * 4),
+        ids(kT * 4), logits((kExperts + 1) * kT * 4);
+    ops::MoeRouting routing;
+    routing.ids         = Tensor(ids.p, DType::I32, {1, kT});
+    routing.weights     = Tensor(weights.p, DType::FP32, {1, kT});
+    routing.shared_gate = Tensor(gate.p, DType::FP32, {kT - 1});
+    const Tensor ot(out.p, DType::BF16, {kH, kT});
+    const Tensor st(shared.p, DType::BF16, {kH, kT});
+    Tensor yt(y.p, DType::BF16, {kH, kT});
+    check(rejects([&] { ops::moe_combine(ot, routing, st, yt, nullptr); }), "combine accepted a short shared gate");
+    // One column whose logits carry a second slice: every 2-D shape agrees, only ne[2] does not.
+    routing.ids         = Tensor(ids.p, DType::I32, {1, 1});
+    routing.weights     = Tensor(weights.p, DType::FP32, {1, 1});
+    routing.shared_gate = Tensor(gate.p, DType::FP32, {1});
+    const Tensor deep(logits.p, DType::FP32, {kExperts + 1, 1, 2});
+    check(rejects([&] { ops::moe_route(deep, 1, routing, nullptr); }), "route accepted a non-unit third extent");
+    std::printf("malformed: out-of-range ids not dispatched on both routes; short gate and extra extent rejected\n");
+}
+
 } // namespace
 
 int main() {
@@ -225,6 +292,7 @@ int main() {
     }
     test_route_and_dispatch();
     test_combine();
+    test_malformed();
     std::printf("offloaded_moe_layer: passed\n");
     return 0;
 }

@@ -214,9 +214,7 @@ void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs) {
     if (static_cast<int>(jobs.size()) > t.max_jobs) { throw std::invalid_argument("CpuExpertTeam: too many jobs"); }
     for (std::size_t j = 0; j < jobs.size(); ++j) {
         const auto& job = jobs[j];
-        if (job.ncols < 1 || job.ncols > kMaxColumns || job.record == nullptr) {
-            throw std::invalid_argument("CpuExpertTeam: invalid job");
-        }
+        detail::require_expert_job("CpuExpertTeam", job.record, job.ncols, job.x, job.y);
         t.geometry[j] = record_geometry(job.format);
     }
     t.jobs = jobs;
