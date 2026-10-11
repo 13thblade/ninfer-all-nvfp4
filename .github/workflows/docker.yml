@@ -1,6 +1,7 @@
 # Publishes ghcr.io/<owner>/<repo> after CI passes on master: the runtime image around the
 # binaries that CI built and tested (its dist-sm86 and dist-sm120a artifacts), so nothing is
-# compiled twice and nothing unpublished by CI reaches the image. Tags:
+# compiled twice and nothing unpublished by CI reaches the image. A CI run that changed nothing the
+# binaries are built from builds none, and the image it would publish is the one already there. Tags:
 #   latest            the newest master commit that passed CI
 #   <VERSION>         the newest such commit of that release line
 #   sha-<12 hex>      the published commit
@@ -20,9 +21,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  binaries:
+    name: Find the binaries
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    outputs:
+      built: ${{ steps.find.outputs.built }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          count="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
+            --jq '[.artifacts[] | select(.name | startswith("dist-"))] | length')"
+          echo "CI run $RUN_ID uploaded $count dist artifacts"
+          if (( count > 0 )); then echo built=true; else echo built=false; fi >> "$GITHUB_OUTPUT"
+
   publish:
     name: Publish the image
-    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    needs: binaries
+    if: needs.binaries.outputs.built == 'true'
     runs-on: ubuntu-24.04
     permissions:
       actions: read

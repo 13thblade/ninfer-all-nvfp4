@@ -22,6 +22,11 @@
 #     then CTest. The toolchain stage is published as ghcr.io/<owner>/<repo>-toolchain once per
 #     change of its definition (.github/scripts/toolchain-image.sh); ccache carries over between
 #     runs; the binaries go to the image.
+#
+# The last two run only when a file they build, test or ship from differs from the base: the
+# branch a pull request merges into, or on master the commit the published image was built from
+# (.github/scripts/build-inputs.sh). A change to documentation or to tooling that neither CTest nor
+# the image reads builds nothing, and master keeps the image it has.
 name: CI
 
 on:
@@ -37,6 +42,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  build-inputs:
+    name: Build inputs changed
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # A pull request's merge commit and the branch head it merges into.
+          fetch-depth: 2
+      - id: compare
+        run: .github/scripts/build-inputs.sh >> "$GITHUB_OUTPUT"
+
   calculator:
     name: Config calculator arithmetic
     runs-on: ubuntu-latest
@@ -128,6 +146,8 @@ jobs:
 
   docker-build-cache:
     name: Dockerfile build cache
+    needs: build-inputs
+    if: needs.build-inputs.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -154,6 +174,8 @@ jobs:
 
   cuda:
     name: CUDA build and tests (sm_${{ matrix.arch }}, no GPU)
+    needs: build-inputs
+    if: needs.build-inputs.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     permissions:
