@@ -567,7 +567,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         structured_round = std::make_unique<qwen3_5::StructuredRound>(
             plan.persistent.grammar_masks->bind(backing),
             parameters.model.resources().public_token_count, widest_verify_window() + 1U,
-            max_concurrency);
+            max_concurrency,
+            speculative_backend == SpeculativeBackend::DFlash ||
+                speculative_backend == SpeculativeBackend::DFlash2);
         io.structured = structured_round.get();
     }
     active_continuations.fill(continuation_capacity);

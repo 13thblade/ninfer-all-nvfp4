@@ -9,6 +9,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_set>
 
 namespace ninfer::text {
@@ -272,30 +273,48 @@ void GrammarState::fill_masks(std::span<std::uint32_t> masks,
     const int words = xgrammar::GetBitmaskSize(impl_->vocab_size);
     if (masks.size() != (drafts.size() + 1) * words)
         throw std::logic_error("incorrect grammar mask shape");
+    std::fill(masks.begin(), masks.end(), ~std::uint32_t{0});
+    // The grammar after each prefix of the drafts the grammar admits, made in order (accepting a
+    // token is cheap); the masks, the costly part, then fill one column per thread. A draft the
+    // grammar rejects leaves the columns after it unrestricted.
+    struct Column {
+        xgrammar::GrammarMatcher matcher;
+        std::unique_ptr<StringConstraintState> strings;
+    };
+    std::vector<Column> columns;
+    columns.reserve(drafts.size() + 1);
     auto matcher = impl_->matcher.Fork();
     auto strings = impl_->strings ? std::make_unique<StringConstraintState>(*impl_->strings) : nullptr;
-    std::fill(masks.begin(), masks.end(), ~std::uint32_t{0});
     for (std::size_t col = 0; col <= drafts.size(); ++col) {
         if (matcher.IsTerminated()) break;
+        columns.push_back({matcher.Fork(), strings ? std::make_unique<StringConstraintState>(*strings) : nullptr});
+        if (col == drafts.size()) break;
+        const TokenId token = drafts[col];
+        if (token < 0 || token >= impl_->vocab_size || !matcher.AcceptToken(token)) break;
+        if (strings && !strings->accept(impl_->semantic_bytes(token))) break;
+    }
+    const auto fill = [&](std::size_t col) {
+        Column& column        = columns[col];
         std::int64_t shape[2] = {1, words};
         DLTensor tensor{};
         tensor.data = masks.data() + col * words;
         tensor.device = {kDLCPU, 0}; tensor.ndim = 2;
         tensor.dtype = {kDLInt, 32, 1}; tensor.shape = shape;
-        matcher.FillNextTokenBitmask(&tensor);
+        column.matcher.FillNextTokenBitmask(&tensor);
         if (impl_->vocab_size % 32)
             masks[(col + 1) * words - 1] &= (1U << (impl_->vocab_size % 32)) - 1;
         auto row = masks.subspan(col * words, words);
         // Semantic work is absent for ordinary schemas, and for a bounded string far from its
         // bounds.
-        if (strings && strings->needs_scan(impl_->longest_token)) {
+        const auto& constraint = column.strings;
+        if (constraint && constraint->needs_scan(impl_->longest_token)) {
             for (int word = 0; word < words; ++word) {
                 auto candidates = row[word];
                 while (candidates) {
                     const int bit = std::countr_zero(candidates);
                     const TokenId token = word * 32 + bit;
                     const auto bytes = impl_->semantic_bytes(token);
-                    if (!(*impl_->stops)[token] && strings->needs_check(bytes) && !strings->accepts(bytes))
+                    if (!(*impl_->stops)[token] && constraint->needs_check(bytes) && !constraint->accepts(bytes))
                         row[word] &= ~(1U << bit);
                     candidates &= candidates - 1;
                 }
@@ -303,13 +322,20 @@ void GrammarState::fill_masks(std::span<std::uint32_t> masks,
         }
         if (std::none_of(row.begin(), row.end(), [](auto word) { return word != 0; }))
             throw std::runtime_error("structured output grammar has no admissible next token");
-        if (col < drafts.size()) {
-            const TokenId token = drafts[col];
-            if (token < 0 || token >= impl_->vocab_size || !(row[token / 32] & (1U << (token % 32)))) break;
-            if (!matcher.AcceptToken(token)) break;
-            if (strings && !strings->accept(impl_->semantic_bytes(token)))
-                throw std::logic_error("admissible draft violated semantic grammar state");
-        }
+    };
+    std::vector<std::exception_ptr> errors(columns.size());
+    std::vector<std::thread> threads;
+    for (std::size_t col = 1; col < columns.size(); ++col) {
+        threads.emplace_back([&, col] {
+            try { fill(col); } catch (...) { errors[col] = std::current_exception(); }
+        });
+    }
+    if (!columns.empty()) {
+        try { fill(0); } catch (...) { errors[0] = std::current_exception(); }
+    }
+    for (auto& thread : threads) thread.join();
+    for (const auto& error : errors) {
+        if (error) std::rethrow_exception(error);
     }
 }
 

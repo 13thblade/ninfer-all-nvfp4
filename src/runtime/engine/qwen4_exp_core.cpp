@@ -14,6 +14,7 @@
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
 #include "runtime/contract/execution.h"
+#include "runtime/contract/grammar_masks.h"
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
 #include "runtime/engine/diagnostics.h"
@@ -36,6 +37,7 @@
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -387,6 +389,16 @@ struct Qwen4ExpCore::Request {
     PrefixReusePath reuse_path = PrefixReusePath::Root; // where they came from
     std::uint32_t prefilled = 0; // prompt tokens its sequence holds, the reused ones included
     std::uint32_t prefill_skips = 0; // prefill steps other prompts ran since its last one
+    // With a grammar (structured output): the mask of the token it samples next, computed off the
+    // worker. A decode step runs without waiting for it: when the mask is late, the row's logits
+    // are kept (saved_logits) and the token is sampled once the mask is ready.
+    bool constrained = false;
+    std::shared_ptr<runtime::GrammarMaskJob> mask;
+    runtime::GrammarMaskCost mask_cost; // whether its masks are cheap enough to speculate
+    bool awaiting_sample          = false;
+    std::int32_t awaiting_purpose = 0;
+    // Its last accepted token, which the progress watchdog measures a decoding request from.
+    Clock::time_point progress;
     bool decoding           = false;
     bool penalties          = false;
     bool post_thinking      = false;
@@ -418,7 +430,7 @@ struct Qwen4ExpCore::Impl {
         std::uint32_t slot                       = 0;
         bool counts                              = false;
         bool logprobs                            = false;
-        const text::GrammarState* grammar        = nullptr;
+        const std::uint32_t* mask                = nullptr; // a grammar's next-token mask
     };
 
     Qwen4ExpInstance& instance;
@@ -458,6 +470,10 @@ struct Qwen4ExpCore::Impl {
     // bitmasks too. The host side is staged in pinned memory: configs, positions, sampled tokens.
     DeviceBuffer sample_config, sample_position, sample_out, token_counts, score_targets, score_out;
     DeviceBuffer token_mask;
+    // A row's logits kept while its grammar mask is late (one per sequence), and those of the rows
+    // sampled together afterwards, side by side.
+    DeviceBuffer saved_logits, deferred_logits;
+    std::size_t vocab_rows = 0; // logits per row
     // The logprob gather of a sampling call whose rows ask for it: [kLogprobTopK, rows] ids and
     // values, [rows] log-sum-exps and the gather's enabling flag, with the host copy.
     DeviceBuffer logprob_ids, logprob_values, logprob_lse, logprob_flag;
@@ -522,6 +538,9 @@ struct Qwen4ExpCore::Impl {
             token_mask = DeviceBuffer(rows * width * mask_words() * sizeof(std::uint32_t));
             host_mask  = std::make_unique<PinnedHostBuffer>(rows * width * mask_words() *
                                                             sizeof(std::uint32_t));
+            vocab_rows      = static_cast<std::size_t>(i.executor->logits(1).ne[0]);
+            saved_logits    = DeviceBuffer(rows * vocab_rows * sizeof(__nv_bfloat16));
+            deferred_logits = DeviceBuffer(rows * vocab_rows * sizeof(__nv_bfloat16));
         }
         sample_config   = DeviceBuffer(rows * sizeof(ops::SamplingConfig));
         sample_position = DeviceBuffer(rows * sizeof(std::int32_t));
@@ -604,6 +623,80 @@ struct Qwen4ExpCore::Impl {
         return (std::size_t(domain) + 31) / 32;
     }
 
+    // A decoding request that accepts no token for this long fails with an explicit error rather
+    // than holding its sequence, so a stall surfaces as errors. A prompt waiting for its chunks is
+    // not measured: with the experts off the GPU a prompt step lasts seconds.
+    static constexpr auto kProgressTimeout = std::chrono::seconds(120);
+    // One grammar mask over this budget fails its request: the grammar is too costly to serve.
+    static constexpr double kMaskBudgetSeconds = 5.0;
+    Clock::time_point progress_checked{};
+
+    // Starts the mask of a structured-output request's next token, from its grammar's state now.
+    void schedule_mask(Request& r) {
+        const auto grammar = r.output.grammar_state();
+        r.mask = grammar ? runtime::GrammarMaskJob::start(*grammar, mask_words()) : nullptr;
+    }
+
+    // After a structured request's accepted tokens: one that decodes plainly starts its next mask
+    // now, a step ahead; one that speculates fills its round's columns during the verification.
+    void next_mask(const std::shared_ptr<Request>& request) {
+        Request& r = *request;
+        if (r.constrained && active(request) && !(drafts > 0 && r.mask_cost.speculates())) {
+            schedule_mask(r);
+        } else {
+            r.mask.reset();
+        }
+    }
+
+    [[nodiscard]] static bool mask_ready(const Request& r) { return !r.mask || r.mask->ready(); }
+
+    // After its mask is ready: false (the request failed) when the grammar had no admissible token
+    // or took over the budget.
+    bool mask_usable(const std::shared_ptr<Request>& request) {
+        const auto& job = request->mask;
+        if (!job) { return true; }
+        request->mask_cost.observe(job->seconds());
+        const std::string problem = mask_problem(*job);
+        if (problem.empty()) { return true; }
+        fail(request, std::make_exception_ptr(RequestError(
+                          RequestErrorKind::Unavailable, "structured output: " + problem)));
+        return false;
+    }
+
+    // Why a finished mask job cannot serve: its grammar had no admissible token, or it took over
+    // the budget. Empty when it can.
+    [[nodiscard]] static std::string mask_problem(const runtime::GrammarMaskJob& job) {
+        if (job.error()) {
+            try {
+                std::rethrow_exception(job.error());
+            } catch (const std::exception& e) {
+                return e.what();
+            } catch (...) { return "the grammar mask failed"; }
+        }
+        if (job.seconds() > kMaskBudgetSeconds) {
+            return "the grammar mask took " + std::to_string(job.seconds()) + " s, over the " +
+                   std::to_string(kMaskBudgetSeconds) + " s budget";
+        }
+        return {};
+    }
+
+    // Fails each decoding request that has made no progress for kProgressTimeout.
+    void check_progress() {
+        const auto now = Clock::now();
+        if (now - progress_checked < std::chrono::seconds(1)) { return; }
+        progress_checked = now;
+        for (const Slot& slot : slots) {
+            const auto request = slot.request;
+            if (!request || !request->decoding || now - request->progress < kProgressTimeout) {
+                continue;
+            }
+            fail(request, std::make_exception_ptr(RequestError(
+                              RequestErrorKind::Unavailable,
+                              "inference request made no progress for " +
+                                  std::to_string(kProgressTimeout.count()) + " s")));
+        }
+    }
+
     void complete(const std::shared_ptr<Request>& request, std::exception_ptr error) {
         {
             std::lock_guard lock(request->mutex);
@@ -666,9 +759,11 @@ struct Qwen4ExpCore::Impl {
                     return;
                 }
             }
+            bool worked = true;
             try {
                 admit();
-                step();
+                worked = step();
+                check_progress();
             } catch (const ops::CpuExpertCancelled&) {
                 // Native hybrid execution is C1 and has drained every CPU task before throwing.
                 // A partially advanced layer stack is discarded; it must never enter the prefix cache.
@@ -687,6 +782,12 @@ struct Qwen4ExpCore::Impl {
                 fail_engine(std::current_exception());
             }
             publish_stats();
+            if (!worked) {
+                // Every active request waits for its grammar mask.
+                std::unique_lock lock(queue_mutex);
+                queue_cv.wait_for(lock, std::chrono::milliseconds(1),
+                                  [&] { return stopping || !pending.empty(); });
+            }
         }
     }
 
@@ -1106,6 +1207,8 @@ struct Qwen4ExpCore::Impl {
             }
         }
         r.prefill_start        = Clock::now();
+        r.constrained          = r.output.grammar_state() != nullptr;
+        if (r.constrained) { schedule_mask(r); } // the first token's, while the prompt prefills
         {
             std::lock_guard lock(stats_mutex);
             stats.reused_prompt_tokens += reused;
@@ -1144,7 +1247,9 @@ struct Qwen4ExpCore::Impl {
         return a.id < b.id;
     }
 
-    void step() {
+    // One prompt step or one decode round; false when there was nothing to run (every active
+    // request waits for its grammar mask).
+    bool step() {
         auto& executor = *instance.executor;
         const auto cancellation_owner = executor.hybrid_experts() ? slots.front().request : nullptr;
         struct CancellationBorrow {
@@ -1157,7 +1262,8 @@ struct Qwen4ExpCore::Impl {
         for (const Slot& slot : slots) {
             if (!slot.request) { continue; }
             if (slot.request->decoding) {
-                decoding = true;
+                // A request runs a decode step unless its kept logits still wait for their mask.
+                decoding = decoding || !slot.request->awaiting_sample || mask_ready(*slot.request);
             } else if (!prefilling || prefills_before(*slot.request, *prefilling)) {
                 prefilling = slot.request;
             }
@@ -1179,10 +1285,12 @@ struct Qwen4ExpCore::Impl {
             try {
                 prefill_step(prefilling);
             } catch (...) { fail(prefilling, std::current_exception()); }
-        } else if (decoding) {
-            decode_run += decode_run != UINT32_MAX;
-            decode_step();
+            return true;
         }
+        if (!decoding) { return false; }
+        decode_run += decode_run != UINT32_MAX;
+        decode_step();
+        return true;
     }
 
     [[nodiscard]] std::uint32_t decode_rounds_before(std::uint32_t tokens) const {
@@ -1242,11 +1350,12 @@ struct Qwen4ExpCore::Impl {
         if (streaming) { r.cv.notify_all(); }
     }
 
-    // Samples one token per row from the first rows.size() columns of the head logits; a grammar
-    // restricts its row to the tokens its current state allows. A row that asks for logprobs gets
-    // the sampled token's record in `logprobs`, under the distribution its token was drawn from.
+    // Samples one token per row from the first rows.size() columns of the head logits (or of
+    // `source`); a grammar's mask restricts its row to the tokens its state allows. A row that asks
+    // for logprobs gets the sampled token's record in `logprobs`, under the distribution its token
+    // was drawn from.
     void sample(std::span<const SampleRow> rows, std::int32_t purpose, std::span<TokenId> out,
-                std::span<runtime::RawTokenLogprob> logprobs) {
+                std::span<runtime::RawTokenLogprob> logprobs, const Tensor* source = nullptr) {
         RankBinding bind(device, instance.executor->head_rank());
         const cudaStream_t stream = instance.executor->head_stream();
         const std::size_t n       = rows.size();
@@ -1267,9 +1376,9 @@ struct Qwen4ExpCore::Impl {
             config.token_counts =
                 row.counts ? static_cast<std::int32_t*>(token_counts.p) + std::size_t(row.slot) * domain
                            : nullptr;
-            if (row.grammar != nullptr) {
+            if (row.mask != nullptr) {
                 auto* words = static_cast<std::uint32_t*>(host_mask->data()) + b * mask_words();
-                row.grammar->fill_masks(std::span(words, mask_words()), {});
+                std::copy_n(row.mask, mask_words(), words);
                 config.token_mask =
                     static_cast<const std::uint32_t*>(token_mask.p) + b * mask_words();
                 config.token_mask_stride = static_cast<std::int32_t>(mask_words());
@@ -1290,7 +1399,8 @@ struct Qwen4ExpCore::Impl {
         const auto width = static_cast<std::int32_t>(n);
         Tensor sampled(sample_out.p, DType::I32, {width});
         const Tensor logical(sample_position.p, DType::I32, {width});
-        const Tensor logits = instance.executor->logits(static_cast<std::uint32_t>(n));
+        const Tensor logits =
+            source != nullptr ? *source : instance.executor->logits(static_cast<std::uint32_t>(n));
         const auto* device_configs = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const bool gather = std::any_of(rows.begin(), rows.end(),
                                         [](const SampleRow& row) { return row.logprobs; });
@@ -1349,7 +1459,7 @@ struct Qwen4ExpCore::Impl {
                          .slot     = r.slot,
                          .counts   = r.penalties,
                          .logprobs = exec.logprobs,
-                         .grammar  = r.output.grammar_state().get()};
+                         .mask     = r.mask ? r.mask->masks() : nullptr};
     }
 
     // Frees the request's sequence (keeping its state for the context cache) and completes it.
@@ -1484,12 +1594,21 @@ struct Qwen4ExpCore::Impl {
         }
         r.position         = prompt_n;
         r.decoding         = true;
+        r.progress         = Clock::now();
+        // The first token's mask began with the request; when it is not done yet, the prompt's
+        // last logits wait for it instead of the worker.
+        if (!mask_ready(r)) {
+            defer_sample(r, executor.logits(1), 0, ops::kSamplePurposePrefill);
+            return;
+        }
+        if (!mask_usable(request)) { return; }
         const SampleRow row = sample_row(r);
         TokenId token       = 0;
         runtime::RawTokenLogprob logprob;
         sample(std::span(&row, 1), ops::kSamplePurposePrefill, std::span(&token, 1),
                std::span(&logprob, 1));
         accept(request, token, row.logprobs ? &logprob : nullptr);
+        next_mask(request);
     }
 
     // Applies the output policy to a sampled token: publishes what it accepts, then either
@@ -1526,6 +1645,7 @@ struct Qwen4ExpCore::Impl {
         const auto now = Clock::now();
         if (r.first_token == Clock::time_point{}) { r.first_token = now; }
         r.last_token = now;
+        r.progress   = now;
         if (decision.accepted_tokens > tokens.size()) {
             throw std::logic_error("output policy accepted more than the sampled tokens");
         }
@@ -1575,7 +1695,10 @@ struct Qwen4ExpCore::Impl {
     // switch of sampling parameters pending (a reasoning block that has not closed yet when the
     // request samples its answer differently).
     [[nodiscard]] bool speculates(const Request& r) const {
-        return drafts > 0 && r.feed.size() == 1 && instance.executor->can_draft(r.slot) &&
+        // A structured row speculates while its masks are cheap enough for the round to fill its
+        // columns during the verification; otherwise it decodes plainly, a mask ahead.
+        return drafts > 0 && (!r.constrained || r.mask_cost.speculates()) && r.feed.size() == 1 &&
+               instance.executor->can_draft(r.slot) &&
                r.position + drafts + 1 <= max_context &&
                r.output.model_token_budget_remaining(r.budget->remaining()) > 1 &&
                !(r.options.execution.post_thinking_sampling && !r.post_thinking);
@@ -1586,60 +1709,162 @@ struct Qwen4ExpCore::Impl {
     // feeding a thinking-control suffix runs alone.
     void decode_step() {
         auto& executor = *instance.executor;
-        std::vector<std::shared_ptr<Request>> batch, alone, speculative;
+        std::vector<std::shared_ptr<Request>> batch, alone, speculative, deferred;
         for (const Slot& slot : slots) {
-            if (!slot.request || !slot.request->decoding) { continue; }
-            if (speculates(*slot.request)) {
-                speculative.push_back(slot.request);
+            // A copy: finishing or failing the request clears its slot.
+            const std::shared_ptr<Request> request = slot.request;
+            if (!request || !request->decoding) { continue; }
+            if (request->awaiting_sample) {
+                // Its logits wait for its grammar mask; a cancellation need not.
+                if (mask_ready(*request)) {
+                    if (mask_usable(request)) { deferred.push_back(request); }
+                } else if (request->cancelled.load(std::memory_order_acquire)) {
+                    finish_now(request, FinishReason::Cancelled);
+                }
+                continue;
+            }
+            if (speculates(*request)) {
+                speculative.push_back(request);
             } else {
-                (slot.request->feed.size() == 1 ? batch : alone).push_back(slot.request);
+                (request->feed.size() == 1 ? batch : alone).push_back(request);
             }
         }
+        if (batch.empty() && alone.empty() && speculative.empty() && deferred.empty()) { return; }
         const auto start = Clock::now();
+        if (!deferred.empty()) { sample_deferred(deferred); }
         for (const auto& request : alone) {
             Request& r = *request;
+            // A structured row without its mask yet starts it now, to fill while the step runs.
+            if (r.constrained && !r.mask) { schedule_mask(r); }
             executor.forward(r.slot, r.feed, 1);
             Slot& slot = slots[r.slot];
             slot.fed.insert(slot.fed.end(), r.feed.begin(), r.feed.end());
             r.position += static_cast<std::uint32_t>(r.feed.size());
+            if (!mask_ready(r)) {
+                defer_sample(r, executor.logits(1), 0, ops::kSamplePurposeDecode);
+                continue;
+            }
             const SampleRow row = sample_row(r);
             TokenId token       = 0;
             runtime::RawTokenLogprob logprob;
             sample(std::span(&row, 1), ops::kSamplePurposeDecode, std::span(&token, 1),
                    std::span(&logprob, 1));
             try {
+                if (!mask_usable(request)) { continue; }
                 accept(request, token, row.logprobs ? &logprob : nullptr);
+                next_mask(request);
             } catch (...) { fail(request, std::current_exception()); }
         }
-        if (!batch.empty()) {
-            std::vector<std::uint32_t> sequences;
-            std::vector<TokenId> tokens;
-            for (const auto& request : batch) {
-                sequences.push_back(request->slot);
-                tokens.push_back(request->feed.front());
-            }
-            executor.decode(sequences, tokens);
-            std::vector<SampleRow> rows;
-            for (const auto& request : batch) {
-                slots[request->slot].fed.push_back(request->feed.front());
-                request->position += 1;
-                rows.push_back(sample_row(*request));
-            }
-            std::vector<TokenId> sampled(batch.size());
-            std::vector<runtime::RawTokenLogprob> logprobs(batch.size());
-            sample(rows, ops::kSamplePurposeDecode, sampled, logprobs);
-            for (std::size_t b = 0; b < batch.size(); ++b) {
-                if (drafts > 0) { ++batch[b]->speculative.fallback_steps; }
-                try {
-                    accept(batch[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr);
-                } catch (...) { fail(batch[b], std::current_exception()); }
-            }
-        }
+        if (!batch.empty()) { plain_step(batch); }
         if (!speculative.empty()) { speculative_round(speculative); }
         std::lock_guard lock(stats_mutex);
         stats.decode_rounds += 1;
         stats.decode_row_rounds += batch.size() + alone.size() + speculative.size();
         stats.decode_seconds_total += seconds(start, Clock::now());
+    }
+
+    // Keeps logits row `row` of `source` for the request until its grammar mask is ready.
+    void defer_sample(Request& r, const Tensor& source, std::size_t row, std::int32_t purpose) {
+        RankBinding bind(device, instance.executor->head_rank());
+        const std::size_t bytes = vocab_rows * sizeof(__nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(saved_logits.p) + std::size_t(r.slot) * bytes,
+                                   static_cast<const std::uint8_t*>(source.data) + row * bytes, bytes,
+                                   cudaMemcpyDeviceToDevice, instance.executor->head_stream()));
+        r.awaiting_sample  = true;
+        r.awaiting_purpose = purpose;
+    }
+
+    // Samples requests whose kept logits now have their masks.
+    void sample_deferred(const std::vector<std::shared_ptr<Request>>& ready) {
+        RankBinding bind(device, instance.executor->head_rank());
+        const std::size_t bytes = vocab_rows * sizeof(__nv_bfloat16);
+        for (const std::int32_t purpose : {ops::kSamplePurposePrefill, ops::kSamplePurposeDecode}) {
+            std::vector<std::shared_ptr<Request>> group;
+            for (const auto& request : ready) {
+                if (request->awaiting_purpose == purpose) { group.push_back(request); }
+            }
+            if (group.empty()) { continue; }
+            std::vector<SampleRow> rows;
+            for (std::size_t j = 0; j < group.size(); ++j) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<std::uint8_t*>(deferred_logits.p) + j * bytes,
+                    static_cast<const std::uint8_t*>(saved_logits.p) + std::size_t(group[j]->slot) * bytes,
+                    bytes, cudaMemcpyDeviceToDevice, instance.executor->head_stream()));
+                rows.push_back(sample_row(*group[j]));
+            }
+            const Tensor source(deferred_logits.p, DType::BF16,
+                                {static_cast<std::int32_t>(vocab_rows), static_cast<std::int32_t>(group.size())});
+            std::vector<TokenId> sampled(group.size());
+            std::vector<runtime::RawTokenLogprob> logprobs(group.size());
+            sample(rows, purpose, sampled, logprobs, &source);
+            for (std::size_t j = 0; j < group.size(); ++j) {
+                group[j]->awaiting_sample = false;
+                if (purpose == ops::kSamplePurposeDecode && drafts > 0) {
+                    ++group[j]->speculative.fallback_steps;
+                }
+                try {
+                    accept(group[j], sampled[j], rows[j].logprobs ? &logprobs[j] : nullptr);
+                    next_mask(group[j]);
+                } catch (...) { fail(group[j], std::current_exception()); }
+            }
+        }
+    }
+
+    // One batched decode step of the requests that feed one token, whose experts read their weights
+    // once. A grammar row whose mask is still being computed keeps its logits for later; the step
+    // itself does not wait for the mask.
+    void plain_step(const std::vector<std::shared_ptr<Request>>& batch) {
+        auto& executor = *instance.executor;
+        std::vector<std::uint32_t> sequences;
+        std::vector<TokenId> tokens;
+        for (const auto& request : batch) {
+            sequences.push_back(request->slot);
+            tokens.push_back(request->feed.front());
+            // A structured row without its mask yet starts it now, to fill while the step runs.
+            if (request->constrained && !request->mask) { schedule_mask(*request); }
+        }
+        executor.decode(sequences, tokens);
+        const Tensor logits = executor.logits(static_cast<std::uint32_t>(batch.size()));
+        std::vector<std::shared_ptr<Request>> now;
+        std::vector<std::size_t> columns;
+        for (std::size_t b = 0; b < batch.size(); ++b) {
+            const auto& request = batch[b];
+            slots[request->slot].fed.push_back(request->feed.front());
+            request->position += 1;
+            if (mask_ready(*request)) {
+                now.push_back(request);
+                columns.push_back(b);
+            } else {
+                defer_sample(*request, logits, b, ops::kSamplePurposeDecode);
+            }
+        }
+        std::vector<SampleRow> rows;
+        for (const auto& request : now) { rows.push_back(sample_row(*request)); }
+        std::optional<Tensor> source;
+        if (now.size() != batch.size() && !now.empty()) {
+            RankBinding bind(device, executor.head_rank());
+            const std::size_t bytes = vocab_rows * sizeof(__nv_bfloat16);
+            for (std::size_t j = 0; j < now.size(); ++j) {
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(deferred_logits.p) + j * bytes,
+                                           static_cast<const std::uint8_t*>(logits.data) + columns[j] * bytes,
+                                           bytes, cudaMemcpyDeviceToDevice, executor.head_stream()));
+            }
+            source.emplace(Tensor(deferred_logits.p, DType::BF16,
+                                  {static_cast<std::int32_t>(vocab_rows), static_cast<std::int32_t>(now.size())}));
+        }
+        std::vector<TokenId> sampled(now.size());
+        std::vector<runtime::RawTokenLogprob> logprobs(now.size());
+        if (!now.empty()) {
+            sample(rows, ops::kSamplePurposeDecode, sampled, logprobs, source ? &*source : nullptr);
+        }
+        for (std::size_t b = 0; b < now.size(); ++b) {
+            if (drafts > 0) { ++now[b]->speculative.fallback_steps; }
+            try {
+                if (!mask_usable(now[b])) { continue; }
+                accept(now[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr);
+                next_mask(now[b]);
+            } catch (...) { fail(now[b], std::current_exception()); }
+        }
     }
 
     // One MTP round of each request: the MTP block drafts from its anchor, the target verifies the
@@ -1737,16 +1962,28 @@ struct Qwen4ExpCore::Impl {
             tokens.insert(tokens.end(), proposed.begin() + std::ptrdiff_t(j * k),
                           proposed.begin() + std::ptrdiff_t((j + 1) * k));
         }
+        // A structured row's masks, one per column after its own drafts, fill in parallel while
+        // the verification runs.
+        std::vector<std::shared_ptr<runtime::GrammarMaskJob>> column_masks(b);
+        for (std::size_t j = 0; j < b; ++j) {
+            if (!batch[j]->constrained) { continue; }
+            const std::size_t own = std::min<std::size_t>(draft_extents[j], k);
+            column_masks[j] = runtime::GrammarMaskJob::start(
+                *batch[j]->output.grammar_state(), mask_words(),
+                std::vector<TokenId>(proposed.begin() + std::ptrdiff_t(j * k),
+                                     proposed.begin() + std::ptrdiff_t(j * k + own)));
+        }
         executor.verify(sequences, tokens);
 
         RankBinding bind(device, executor.head_rank());
         const cudaStream_t stream = executor.head_stream();
         std::vector<SampleRow> rows;
         for (const auto& request : batch) { rows.push_back(sample_row(*request)); }
-        // The rows' sampling, each column of a grammar's row masked as the drafts before it leave
-        // the grammar.
+        // The rows' sampling, each column of a structured row masked as its drafts before it leave
+        // the grammar. A row whose grammar cannot serve samples unmasked and fails after the round.
         auto* configs = static_cast<ops::SamplingConfig*>(host_sample->data());
-        bool masked   = false;
+        std::vector<std::string> mask_failures(b);
+        bool masked = false;
         for (std::size_t j = 0; j < b; ++j) {
             const SampleRow& row = rows[j];
             ops::SamplingConfig config;
@@ -1760,14 +1997,21 @@ struct Qwen4ExpCore::Impl {
             config.token_counts      = row.counts ? static_cast<std::int32_t*>(token_counts.p) +
                                                         std::size_t(row.slot) * domain
                                                   : nullptr;
-            if (row.grammar != nullptr) {
-                auto* words = static_cast<std::uint32_t*>(host_mask->data()) + j * w * mask_words();
-                row.grammar->fill_masks(std::span(words, w * mask_words()),
-                                        std::span<const TokenId>(proposed).subspan(j * k, k));
-                config.token_mask =
-                    static_cast<const std::uint32_t*>(token_mask.p) + j * w * mask_words();
-                config.token_mask_stride = static_cast<std::int32_t>(mask_words());
-                masked                   = true;
+            if (const auto& job = column_masks[j]) {
+                job->wait();
+                batch[j]->mask_cost.observe(job->seconds());
+                mask_failures[j] = mask_problem(*job);
+                if (mask_failures[j].empty()) {
+                    // Columns past the row's own drafts are never taken; they stay unrestricted.
+                    auto* words = static_cast<std::uint32_t*>(host_mask->data()) + j * w * mask_words();
+                    std::copy_n(job->masks(), job->columns() * mask_words(), words);
+                    std::fill(words + job->columns() * mask_words(), words + w * mask_words(),
+                              ~std::uint32_t{0});
+                    config.token_mask =
+                        static_cast<const std::uint32_t*>(token_mask.p) + j * w * mask_words();
+                    config.token_mask_stride = static_cast<std::int32_t>(mask_words());
+                    masked                   = true;
+                }
             }
             configs[j] = config;
         }
@@ -1905,11 +2149,17 @@ struct Qwen4ExpCore::Impl {
             }
             const std::span<const TokenId> run_tokens(run, std::size_t(licensed_n));
             std::uint32_t taken = 0;
-            try {
-                taken = accept(request, run_tokens, records);
-            } catch (...) {
-                fail(request, std::current_exception());
+            if (!mask_failures[j].empty()) {
+                fail(request, std::make_exception_ptr(RequestError(
+                                  RequestErrorKind::Unavailable, "structured output: " + mask_failures[j])));
                 failed[j] = 1;
+            } else {
+                try {
+                    taken = accept(request, run_tokens, records);
+                } catch (...) {
+                    fail(request, std::current_exception());
+                    failed[j] = 1;
+                }
             }
             // The tokens counted as sampled: those taken, or the first when none was.
             kept[j] = std::max<std::uint32_t>(taken, 1);
@@ -1946,6 +2196,7 @@ struct Qwen4ExpCore::Impl {
             try {
                 check_capacity(batch[j]);
             } catch (...) { fail(batch[j], std::current_exception()); }
+            if (r.constrained) { next_mask(batch[j]); }
         }
     }
 

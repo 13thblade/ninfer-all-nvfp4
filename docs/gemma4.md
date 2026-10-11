@@ -373,8 +373,11 @@ A request with `response_format` (with `--structured-output`) samples under its 
 mask. The mask of its next token is computed on a thread of its own from the grammar's state
 after the last accepted token, while the GPU runs the decode step that produces the token's
 logits: the step does not wait for the mask, and a row whose mask is late keeps its logits and is
-sampled once the mask is ready, while the other requests go on. Such a request decodes without
-drafts. A single mask over 5 s, or a grammar with no admissible token, fails the request with an
+sampled once the mask is ready, while the other requests go on. With `--spec mtp` such a request
+also drafts while its masks take at most 4 ms: a speculative round fills one mask per draft
+position in parallel while the verification runs. A request whose masks cost more decodes without
+drafts, its next mask starting as soon as a token is accepted, and drafts again once they are
+cheap. A single mask over 5 s, or a grammar with no admissible token, fails the request with an
 explicit error.
 
 String length bounds (`minLength`, `maxLength`) cost the most: a position inside a counted string

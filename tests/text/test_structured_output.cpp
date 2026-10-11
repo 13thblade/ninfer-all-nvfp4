@@ -1,5 +1,6 @@
 #include "text/structured_output.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 using namespace ninfer;
@@ -142,6 +143,32 @@ int main() {
             const auto last = std::span(columns).subspan(drafts.size() * words, words);
             require((last['x' / 32] & (1U << ('x' % 32))) != 0, "draft column at 39 scalars cannot extend");
             require((last['"' / 32] & (1U << ('"' % 32))) != 0, "draft column at 39 scalars cannot close");
+            // The columns, filled in parallel, equal the masks of the grammar after each draft
+            // prefix one at a time; after a rejected draft they are unrestricted.
+            for (const std::string draft : {std::string(45, 'x'), std::string("xx\"}") + std::string(3, 'x')}) {
+                auto parallel = compiler.compile({StructuredOutputKind::JsonSchema, object_bounded});
+                parallel->accept(prefix);
+                const std::vector<TokenId> ids(draft.begin(), draft.end());
+                std::vector<std::uint32_t> all(words * (ids.size() + 1));
+                parallel->fill_masks(all, ids);
+                bool reachable = true;
+                for (std::size_t j = 0; j <= ids.size(); ++j) {
+                    std::vector<std::uint32_t> single(words, ~std::uint32_t{0});
+                    if (reachable) {
+                        auto one = compiler.compile({StructuredOutputKind::JsonSchema, object_bounded});
+                        one->accept(prefix);
+                        try {
+                            one->accept(std::span(ids.data(), j));
+                            one->fill_masks(single, {});
+                        } catch (const std::logic_error&) {
+                            reachable = false;
+                            std::fill(single.begin(), single.end(), ~std::uint32_t{0});
+                        }
+                    }
+                    require(std::equal(single.begin(), single.end(), all.begin() + j * words),
+                            "a parallel draft column differs from its sequential mask");
+                }
+            }
         }
 
         auto whitespace          = compiler.compile({StructuredOutputKind::JsonObject, {}});

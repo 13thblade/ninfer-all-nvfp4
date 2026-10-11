@@ -96,7 +96,7 @@ jobs:
             -Ithird_party/xgrammar/include -Ithird_party/xgrammar/3rdparty/dlpack/include \
             src/text/*.cpp
           clang++ -std=c++20 -stdlib=libc++ -O2 -Isrc -Ithird_party \
-            src/text/unique_strings.cpp tests/text/test_unique_strings.cpp -o unique_strings_test
+            src/text/string_constraints.cpp tests/text/test_unique_strings.cpp -o unique_strings_test
           ./unique_strings_test
           clang++ -std=c++20 -stdlib=libc++ -Wall -Wextra -Werror -Isrc -Iinclude \
             tests/host/test_checkpoint_recovery_impact.cpp -o checkpoint_recovery_impact_test

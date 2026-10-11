@@ -1,4 +1,5 @@
 #pragma once
+#include "runtime/contract/grammar_masks.h"
 #include "runtime/contract/mtp_adaptive.h"
 #include "models/qwen3_5/program/internal.h"
 
@@ -529,6 +530,8 @@ struct RequestControl {
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
     std::shared_ptr<text::GrammarState> grammar;
+    // With a grammar: whether its masks are cheap enough for its rounds to verify drafts.
+    runtime::GrammarMaskCost mask_cost;
     bool logprobs = false;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
@@ -1674,6 +1677,11 @@ private:
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
+    // The drafts a lane's round may verify: none for a structured lane whose masks cost more than
+    // a verification hides, so its round computes one mask for it.
+    [[nodiscard]] static std::uint32_t speculative_extent(const RequestControl& request) noexcept;
+    // After a round: rethrows a mask job's error and updates each structured lane's mask cost.
+    void observe_masks(std::span<const std::uint32_t> lanes);
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
     [[nodiscard]] std::vector<NgramProposer::Match>
     propose_ngram(std::span<const std::uint32_t> lanes,

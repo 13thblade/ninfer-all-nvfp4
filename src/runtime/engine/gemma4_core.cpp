@@ -12,6 +12,7 @@
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
 #include "runtime/contract/execution.h"
+#include "runtime/contract/grammar_masks.h"
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
 #include "runtime/engine/diagnostics.h"
@@ -284,16 +285,6 @@ static std::uint64_t unit_key(const models::qwen3_5::VisionItem& item, std::size
     return key;
 }
 
-// The next token's grammar mask of a structured-output request, computed on a thread of its own
-// from a fork of the grammar after the last accepted token, so that a costly grammar slows only its
-// own request: the engine thread samples the request once `done` is set and skips it until then.
-struct GrammarMaskJob {
-    std::vector<std::uint32_t> words;
-    double seconds = 0.0;
-    std::exception_ptr error;
-    std::atomic<bool> done{false};
-};
-
 struct Gemma4Core::Request {
     std::uint64_t id = 0;
     models::qwen3_5::PreparedPrompt prompt;
@@ -321,10 +312,14 @@ struct Gemma4Core::Request {
 
     std::uint32_t anchor_at = 0;
     bool reusable           = true;
-    // With a grammar (structured output): the mask of the token it samples next. A decode step
-    // runs without waiting for it: when the mask is late, the row's logits are kept (saved_logits)
-    // and the token is sampled once the mask is ready.
-    std::shared_ptr<GrammarMaskJob> mask;
+    // With a grammar (structured output): the mask of the token it samples next, started once a
+    // token is accepted when the request decodes plainly, else by the plain step that needs it. A
+    // decode step runs without waiting for it: when the mask is late, the row's logits are kept
+    // (saved_logits) and the token is sampled once the mask is ready. A speculative round fills
+    // its own masks, one per column after its drafts.
+    bool constrained = false;
+    std::shared_ptr<runtime::GrammarMaskJob> mask;
+    runtime::GrammarMaskCost mask_cost;
     bool awaiting_sample           = false;
     std::int32_t awaiting_purpose  = 0;
     // The last prompt chunk or accepted token, which the progress watchdog measures from.
@@ -573,45 +568,50 @@ struct Gemma4Core::Impl {
     // Starts the mask of a structured-output request's next token, from its grammar's state now.
     void schedule_mask(Request& r) {
         const auto grammar = r.output.grammar_state();
-        if (!grammar) {
-            r.mask.reset();
-            return;
-        }
-        auto job = std::make_shared<GrammarMaskJob>();
-        job->words.resize(mask_words());
-        std::thread([job, state = std::shared_ptr<text::GrammarState>(grammar->fork())] {
-            const auto start = Clock::now();
-            try {
-                state->fill_masks(job->words, {});
-            } catch (...) { job->error = std::current_exception(); }
-            job->seconds = seconds(start, Clock::now());
-            job->done.store(true, std::memory_order_release);
-        }).detach();
-        r.mask = std::move(job);
+        r.mask = grammar ? runtime::GrammarMaskJob::start(*grammar, mask_words()) : nullptr;
     }
 
-    [[nodiscard]] static bool mask_ready(const Request& r) {
-        return !r.mask || r.mask->done.load(std::memory_order_acquire);
+    // After a structured request's accepted tokens: one that decodes plainly starts its next mask
+    // now, a step ahead; one that speculates fills its round's columns during the verification.
+    void next_mask(const std::shared_ptr<Request>& request) {
+        Request& r = *request;
+        if (r.constrained && active(request) && !(drafts > 0 && r.mask_cost.speculates())) {
+            schedule_mask(r);
+        } else {
+            r.mask.reset();
+        }
     }
+
+    [[nodiscard]] static bool mask_ready(const Request& r) { return !r.mask || r.mask->ready(); }
 
     // After its mask is ready: false (the request failed) when the grammar had no admissible token
     // or took over the budget.
     bool mask_usable(const std::shared_ptr<Request>& request) {
         const auto& job = request->mask;
         if (!job) { return true; }
-        std::string problem;
-        if (job->error) {
-            try {
-                std::rethrow_exception(job->error);
-            } catch (const std::exception& e) { problem = e.what(); }
-        } else if (job->seconds > kMaskBudgetSeconds) {
-            problem = "one token's grammar mask took " + std::to_string(job->seconds) +
-                      " s, over the " + std::to_string(kMaskBudgetSeconds) + " s budget";
-        }
+        request->mask_cost.observe(job->seconds());
+        const std::string problem = mask_problem(*job);
         if (problem.empty()) { return true; }
         fail(request, std::make_exception_ptr(RequestError(
                           RequestErrorKind::Unavailable, "structured output: " + problem)));
         return false;
+    }
+
+    // Why a finished mask job cannot serve: its grammar had no admissible token, or it took over
+    // the budget. Empty when it can.
+    [[nodiscard]] static std::string mask_problem(const runtime::GrammarMaskJob& job) {
+        if (job.error()) {
+            try {
+                std::rethrow_exception(job.error());
+            } catch (const std::exception& e) {
+                return e.what();
+            } catch (...) { return "the grammar mask failed"; }
+        }
+        if (job.seconds() > kMaskBudgetSeconds) {
+            return "the grammar mask took " + std::to_string(job.seconds()) + " s, over the " +
+                   std::to_string(kMaskBudgetSeconds) + " s budget";
+        }
+        return {};
     }
 
     // Fails each request that has made no progress for kProgressTimeout.
@@ -969,7 +969,8 @@ struct Gemma4Core::Impl {
         }
         r.prefill_start        = Clock::now();
         r.progress             = r.prefill_start;
-        schedule_mask(r); // the first token's, while the prompt prefills
+        r.constrained          = r.output.grammar_state() != nullptr;
+        if (r.constrained) { schedule_mask(r); } // the first token's, while the prompt prefills
         {
             std::lock_guard lock(stats_mutex);
             stats.reused_prompt_tokens += reused;
@@ -1244,7 +1245,7 @@ struct Gemma4Core::Impl {
                          .slot     = r.slot,
                          .counts   = r.penalties,
                          .logprobs = exec.logprobs,
-                         .mask     = r.mask ? r.mask->words.data() : nullptr};
+                         .mask     = r.mask ? r.mask->masks() : nullptr};
     }
 
     void finish(const std::shared_ptr<Request>& request, FinishReason reason) {
@@ -1392,7 +1393,7 @@ struct Gemma4Core::Impl {
         sample(std::span(&row, 1), ops::kSamplePurposePrefill, std::span(&token, 1),
                std::span(&logprob, 1));
         accept(request, token, row.logprobs ? &logprob : nullptr);
-        if (active(request)) { schedule_mask(r); }
+        next_mask(request);
     }
 
     [[nodiscard]] bool active(const std::shared_ptr<Request>& request) const {
@@ -1465,8 +1466,10 @@ struct Gemma4Core::Impl {
     // and no switch of sampling parameters pending (a reasoning block that has not closed yet when
     // the request samples its answer differently).
     [[nodiscard]] bool speculates(const Request& r) const {
-        // A grammar's row decodes plainly: its masks come one token ahead, off the engine thread.
-        return drafts > 0 && !r.mask && r.feed.size() == 1 && instance.executor->can_draft(r.slot) &&
+        // A structured row speculates while its masks are cheap enough for the round to fill its
+        // columns during the verification; otherwise it decodes plainly, a mask ahead.
+        return drafts > 0 && (!r.constrained || r.mask_cost.speculates()) && r.feed.size() == 1 &&
+               instance.executor->can_draft(r.slot) &&
                r.position + drafts + 1 <= max_context &&
                r.output.model_token_budget_remaining(r.budget->remaining()) > 1 &&
                !(r.options.execution.post_thinking_sampling && !r.post_thinking);
@@ -1556,7 +1559,7 @@ struct Gemma4Core::Impl {
                 }
                 try {
                     accept(group[j], sampled[j], rows[j].logprobs ? &logprobs[j] : nullptr);
-                    if (active(group[j])) { schedule_mask(*group[j]); }
+                    next_mask(group[j]);
                 } catch (...) { fail(group[j], std::current_exception()); }
             }
         }
@@ -1569,6 +1572,8 @@ struct Gemma4Core::Impl {
         for (const auto& request : batch) {
             sequences.push_back(request->slot);
             tokens.push_back(request->feed.front());
+            // A structured row without its mask yet starts it now, to fill while the step runs.
+            if (request->constrained && !request->mask) { schedule_mask(*request); }
         }
         executor.decode(sequences, tokens);
         // A grammar row whose mask is still being computed keeps its logits for later; the decode
@@ -1610,7 +1615,7 @@ struct Gemma4Core::Impl {
             try {
                 if (!mask_usable(now[b])) { continue; }
                 accept(now[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr);
-                if (active(now[b]) && now[b]->mask) { schedule_mask(*now[b]); }
+                next_mask(now[b]);
             } catch (...) { fail(now[b], std::current_exception()); }
         }
     }
@@ -1706,13 +1711,27 @@ struct Gemma4Core::Impl {
             tokens.insert(tokens.end(), proposed.begin() + std::ptrdiff_t(j * k),
                           proposed.begin() + std::ptrdiff_t((j + 1) * k));
         }
+        // A structured row's masks, one per column after its own drafts, fill in parallel while
+        // the verification runs.
+        std::vector<std::shared_ptr<runtime::GrammarMaskJob>> column_masks(b);
+        for (std::size_t j = 0; j < b; ++j) {
+            if (!batch[j]->constrained) { continue; }
+            const std::size_t own = std::min<std::size_t>(draft_extents[j], k);
+            column_masks[j] = runtime::GrammarMaskJob::start(
+                *batch[j]->output.grammar_state(), mask_words(),
+                std::vector<TokenId>(proposed.begin() + std::ptrdiff_t(j * k),
+                                     proposed.begin() + std::ptrdiff_t(j * k + own)));
+        }
         executor.verify(sequences, tokens);
 
         const cudaStream_t stream = executor.head_stream();
         std::vector<SampleRow> rows;
         for (const auto& request : batch) { rows.push_back(sample_row(*request)); }
-        // The rows' sampling (a grammar's row never speculates).
+        // The rows' sampling, each column of a structured row masked as its drafts before it leave
+        // the grammar. A row whose grammar cannot serve samples unmasked and fails after the round.
         auto* configs = static_cast<ops::SamplingConfig*>(host_sample->data());
+        std::vector<std::string> mask_failures(b);
+        bool masked = false;
         for (std::size_t j = 0; j < b; ++j) {
             const SampleRow& row = rows[j];
             ops::SamplingConfig config;
@@ -1726,10 +1745,28 @@ struct Gemma4Core::Impl {
             config.token_counts      = row.counts ? static_cast<std::int32_t*>(token_counts.p) +
                                                         std::size_t(row.slot) * domain
                                                   : nullptr;
-            if (row.mask != nullptr) {
-                throw std::logic_error("gemma4: a structured-output row in a speculative round");
+            if (const auto& job = column_masks[j]) {
+                job->wait();
+                batch[j]->mask_cost.observe(job->seconds());
+                mask_failures[j] = mask_problem(*job);
+                if (mask_failures[j].empty()) {
+                    // Columns past the row's own drafts are never taken; they stay unrestricted.
+                    auto* words = static_cast<std::uint32_t*>(host_mask->data()) + j * w * mask_words();
+                    std::copy_n(job->masks(), job->columns() * mask_words(), words);
+                    std::fill(words + job->columns() * mask_words(), words + w * mask_words(),
+                              ~std::uint32_t{0});
+                    config.token_mask =
+                        static_cast<const std::uint32_t*>(token_mask.p) + j * w * mask_words();
+                    config.token_mask_stride = static_cast<std::int32_t>(mask_words());
+                    masked                   = true;
+                }
             }
             configs[j] = config;
+        }
+        if (masked) {
+            CUDA_CHECK(cudaMemcpyAsync(token_mask.p, host_mask->data(),
+                                       b * w * mask_words() * sizeof(std::uint32_t),
+                                       cudaMemcpyHostToDevice, stream));
         }
         CUDA_CHECK(cudaMemcpyAsync(sample_config.p, configs, b * sizeof(ops::SamplingConfig),
                                    cudaMemcpyHostToDevice, stream));
@@ -1857,11 +1894,17 @@ struct Gemma4Core::Impl {
             }
             const std::span<const TokenId> run_tokens(run, std::size_t(licensed_n));
             std::uint32_t taken = 0;
-            try {
-                taken = accept(request, run_tokens, records);
-            } catch (...) {
-                fail(request, std::current_exception());
+            if (!mask_failures[j].empty()) {
+                fail(request, std::make_exception_ptr(RequestError(
+                                  RequestErrorKind::Unavailable, "structured output: " + mask_failures[j])));
                 failed[j] = 1;
+            } else {
+                try {
+                    taken = accept(request, run_tokens, records);
+                } catch (...) {
+                    fail(request, std::current_exception());
+                    failed[j] = 1;
+                }
             }
             // The tokens counted as sampled: those taken, or the first when none was.
             kept[j] = std::max<std::uint32_t>(taken, 1);
@@ -1898,6 +1941,7 @@ struct Gemma4Core::Impl {
             try {
                 check_capacity(batch[j]);
             } catch (...) { fail(batch[j], std::current_exception()); }
+            if (r.constrained) { next_mask(batch[j]); }
         }
     }
 

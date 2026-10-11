@@ -216,14 +216,23 @@ MTP, DFlash, and DFlash2 share the same target sampling contract, including CUDA
 streaming, prefix reuse, and mixed constrained/unconstrained concurrent requests. The
 `minLength`/`maxLength` of plain string values in a schema without `anyOf` are enforced beside
 the grammar, which keeps their token masks cached (a counted string otherwise costs tens of
-milliseconds per token with a large vocabulary). Gemma 4 computes a constrained request's mask
-on a thread of its own while the decode step runs, and decodes that request without drafts, so
-a costly grammar slows only its own request; a mask over 5 s fails the request with an explicit
-error ([Gemma 4](gemma4.md#structured-output)).
+milliseconds per token with a large vocabulary).
+
+Every model computes a constrained request's masks on host threads while the GPU runs the step
+that needs them: the next token's mask, or in a speculative round one mask per draft position,
+filled in parallel. Speculation is automatic: a constrained request verifies drafts (MTP,
+DFlash/DFlash2, a context lookup) while its masks take at most 4 ms, which the verification
+hides, and decodes without drafts while they cost more, resuming once they are cheap again.
+Gemma 4 and Qwen3.8-Flash-Next do not hold a decode step for a late mask: the row keeps its
+logits and samples once the mask is ready while the other requests go on, and a mask over 5 s or
+a decoding request without a token for 120 s fails with an explicit error
+([Gemma 4](gemma4.md#structured-output)). The Qwen3.5 family's round samples every row at its
+end, so it waits there for the round's masks.
 
 It is opt-in: start the server with `--structured-output` (the CLI's `--json` and `--json-schema`
-enable it for their run). That reserves one grammar mask plane per draft position and lane, and a
-DFlash or DFlash2 round then carries a host grammar stage even when no request is constrained.
+enable it for their run). That reserves one grammar mask plane per draft position and lane; a
+DFlash or DFlash2 round then carries two host grammar stages, and another round waits on the
+masks' upload event before sampling, even when no request is constrained.
 Without it the server keeps the default path unchanged and refuses a constrained request with HTTP
 400 `response_format_not_supported`; with `--unconstrained-response-format` it generates such a
 request unconstrained instead, for clients that send a JSON format on every request and parse the
