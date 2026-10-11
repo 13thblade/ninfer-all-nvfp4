@@ -4,7 +4,8 @@
 //   - Bitwise: every routed (column, expert) output of moe_experts equals the CPU engine's
 //     (CpuExpertTeam, which equals expert_forward_cpu bit for bit) for each record format at
 //     T in {9, 64, 65, 2048, 4096}, with the records in device frames, read zero-copy, staged through
-//     64 or 3 slots (passes of 3 jobs), and mixed. Logits make a few experts hot, so each call holds
+//     64 or 3 slots (passes of 3 jobs), mixed, and staged under the zero-copy rule (a pass with at
+//     most 2 misses reads them from the host bank, the decode setting). Logits make a few experts hot, so each call holds
 //     wide experts at the route's boundaries (9 columns, exactly one 64-column tile, 65 = two tiles)
 //     beside narrow ones; at 2048 and 4096 nearly every expert is wide.
 //   - FP64: a sample of entries per (format, T) against the expert oracle over the independently
@@ -166,13 +167,15 @@ struct Placement {
     std::string name;
     int resident_every = 0; // 0: none resident; 1: all; n: every n-th
     int staging_slots  = 0;
+    int zero_copy      = 0; // ops::MoeExpertSource::zero_copy_misses
 };
 
 std::vector<Placement> placements(int columns) {
-    std::vector<Placement> p = {{"device", 1, 0}, {"zero-copy", 0, 0}, {"staged-64", 0, 64}, {"staged-3", 0, 3},
-                                {"mixed-staged-4", 3, 4}};
+    std::vector<Placement> p = {{"device", 1, 0},         {"zero-copy", 0, 0},          {"staged-64", 0, 64},
+                                {"staged-3", 0, 3},        {"mixed-staged-4", 3, 4},     {"staged-3-zc-2", 0, 3, 2},
+                                {"mixed-staged-4-zc-2", 3, 4, 2}};
     if (g_small) { return {p[0], p[3]}; }
-    if (columns >= 2048) { return {p[0], p[2], p[3]}; }
+    if (columns >= 2048) { return {p[0], p[2], p[3], p[5]}; }
     return p;
 }
 
@@ -205,6 +208,7 @@ Run run_experts(const Bank& bank, const Placement& placement, const DeviceRoutin
     source.record_stride = bank.stride;
     source.staging_base  = staging ? static_cast<std::uint8_t*>(staging->p) : nullptr;
     source.staging_slots = placement.staging_slots;
+    source.zero_copy_misses = placement.zero_copy;
     const Tensor x(x_dev.p, DType::BF16, {om::kHidden, columns});
     Tensor out(outputs.p, DType::BF16, {om::kHidden, k * columns});
     cudaEvent_t start = nullptr, stop = nullptr;
