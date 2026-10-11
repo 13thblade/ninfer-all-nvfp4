@@ -1,8 +1,9 @@
 # Cutting a release
 
 This repository publishes its binaries as the Docker image, which CI builds from every `master`
-commit that passes it ([README](../../README.md#docker)); the image is tagged `latest`,
-`sha-<commit>` and the contents of `VERSION`. Release archives for Windows and Linux are an
+commit that passes it and changes a file the image is built from
+([README](../../README.md#docker)); the image is tagged `latest`, `sha-<commit>` and the contents of
+`VERSION`. Release archives for Windows and Linux are an
 additional, manual path that no release has used yet. This page is that path.
 
 ## The flow

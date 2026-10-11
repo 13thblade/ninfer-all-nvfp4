@@ -411,8 +411,9 @@ conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b
 
 ## Docker
 
-`ghcr.io/iamwavecut/ninfer-all:latest` is built from every `master` commit that passes CI, on CUDA
-13.4 and Ubuntu 26.04. It carries two builds and starts the one that matches the GPU: `sm_86` for
+`ghcr.io/iamwavecut/ninfer-all:latest` is built from the newest `master` commit that passes CI, on
+CUDA 13.4 and Ubuntu 26.04; a commit that changes only documentation or tooling the image does not
+carry keeps the image before it. It carries two builds and starts the one that matches the GPU: `sm_86` for
 the RTX 30 and RTX 40 series, `sm_120a` for the RTX 50 series and the RTX PRO 6000 Blackwell.
 
 - **Host.** An NVIDIA driver of the CUDA 13 branch (580 or newer) and the
