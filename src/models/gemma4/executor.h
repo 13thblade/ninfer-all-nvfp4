@@ -1,9 +1,15 @@
 #pragma once
 
-// The forward pass of Gemma 4 over a loaded Model. Each sequence owns an F16 K/V cache per block:
-// a ring of the last window plus a prompt chunk for the sliding-window blocks, every position for
-// the full-attention blocks. Prompt chunks run llama.cpp's tensor-core flash attention; decode steps
-// run one token of each of several sequences at once, replayed from a CUDA graph per batch size.
+// The forward pass of Gemma 4 over a loaded Model. Each sequence owns an F16 cache per block: keys
+// and values in a ring of the last window (and a round's drafts) for the sliding-window blocks, the
+// values of every position for the full-attention blocks, whose keys (K = V) are derived from them
+// where they are read. Prompt chunks run llama.cpp's tensor-core flash attention; decode steps run
+// one token of each of several sequences at once, replayed from a CUDA graph per batch size.
+//
+// With draft_tokens, the model's assistant drafts: from a sequence's next token (its anchor) and the
+// target's final hidden state before it, a chain of steps at the anchor's position, each attending
+// over the target's caches, proposes the tokens after it; verify() runs the anchor and the drafts
+// of each sequence as decode rows, and commit() keeps the first ones.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -24,6 +30,9 @@ struct ExecutorOptions {
     std::uint32_t prefill_chunk = 1024; // prompt tokens per forward()
     std::uint32_t sequences     = 1;
     bool cuda_graphs            = true;
+    // Drafts a speculative round may propose per sequence (0: no assistant); a verification's rows,
+    // the anchors and drafts of all its sequences, are at most 8.
+    std::uint32_t draft_tokens = 0;
 };
 
 struct ExecutorMemory {
@@ -63,6 +72,21 @@ public:
     void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
     // BF16 [vocab, rows], ready on head_stream().
     [[nodiscard]] Tensor logits(std::uint32_t rows) const;
+
+    // The assistant (draft_tokens > 0). A sequence can draft once a prompt chunk, a decode step or
+    // a commit has left the target's hidden state after its last fed token.
+    [[nodiscard]] std::uint32_t draft_tokens() const noexcept;
+    [[nodiscard]] bool can_draft(std::uint32_t sequence) const;
+    // `steps` (1..draft_tokens) greedy drafts after each sequence's anchor, the token its next
+    // position takes: drafts[j * steps + i] is sequence j's i-th draft.
+    void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
+               std::span<std::int32_t> drafts, std::uint32_t steps);
+    // tokens.size() / sequences.size() tokens of each sequence (its anchor, then its drafts) at its
+    // next positions, as decode rows: logits one column each, sequence by sequence. The positions
+    // advance only with commit().
+    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
+    // Keeps the first kept[j] (1..width) of sequence j's verified tokens.
+    void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept);
     [[nodiscard]] cudaStream_t head_stream() const noexcept;
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);

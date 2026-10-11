@@ -11,6 +11,11 @@ stay F32 vectors that the runtime applies.
 
 `HF_DIR` holds the release's `config.json`, `tokenizer.json`, `tokenizer_config.json`,
 `chat_template.jinja` and `generation_config.json` (no weights are read from it).
+
+`--components text,mtp --source mtp=ASSISTANT.gguf` adds the release's multi-token-prediction
+assistant (Gemma4AssistantForCausalLM, llama.cpp architecture `gemma4-assistant`) as the `mtp`
+component, its blocks imported the same way: a four-block drafter that reads the target's last
+sliding-window and full-attention KV and its final hidden state.
 """
 
 from __future__ import annotations
@@ -128,8 +133,57 @@ def _matrix(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSourc
     return block_source(gguf, tensor, shape, rows())
 
 
-def build_model(base, gguf: GGUFFile, *, resource_overrides=None):
-    """The text component of a Gemma 4 GGUF: every parameter's source is the GGUF."""
+def assistant_config(mtp: GGUFFile, target: dict) -> dict:
+    """The `mtp` component's config from a gemma4-assistant GGUF, checked against the target whose
+    KV and hidden state it reads."""
+
+    kv = mtp.kv
+    if kv.get("general.architecture") != "gemma4-assistant":
+        raise ValueError("the MTP source must be a gemma4-assistant GGUF")
+    a = "gemma4-assistant."
+    layers = kv.get(a + "block_count")
+    sliding = kv.get(a + "attention.sliding_window_pattern")
+    if not isinstance(sliding, list) or len(sliding) != layers:
+        raise ValueError("gemma4-assistant: sliding_window_pattern must name every block")
+    heads_kv = kv.get(a + "attention.head_count_kv")
+    if not isinstance(heads_kv, list) or len(heads_kv) != layers:
+        raise ValueError("gemma4-assistant: head_count_kv must give every block")
+    if kv.get(a + "attention.shared_kv_layers") != layers:
+        raise ValueError("gemma4-assistant: every block must read the target's KV")
+    vocab, hidden = mtp.info("token_embd.weight").shape
+    out = {
+        "architectures": ["Gemma4AssistantForCausalLM"],
+        "hidden_size": int(kv[a + "embedding_length"]),
+        "backbone_hidden_size": int(kv[a + "embedding_length_out"]),
+        "intermediate_size": int(kv[a + "feed_forward_length"]),
+        "num_hidden_layers": int(layers),
+        "layer_types": ["sliding_attention" if s else "full_attention" for s in sliding],
+        "num_attention_heads": int(kv[a + "attention.head_count"]),
+        "num_key_value_heads": int(next(h for h, s in zip(heads_kv, sliding) if s)),
+        "num_global_key_value_heads": int(next(h for h, s in zip(heads_kv, sliding) if not s)),
+        "head_dim": int(kv[a + "attention.key_length_swa"]),
+        "global_head_dim": int(kv[a + "attention.key_length"]),
+        "sliding_window": int(kv[a + "attention.sliding_window"]),
+        "rms_norm_eps": float(kv[a + "attention.layer_norm_rms_epsilon"]),
+        "vocab_size": int(vocab),
+    }
+    if hidden != out["hidden_size"]:
+        raise ValueError("gemma4-assistant: token table width differs from embedding_length")
+    for key in ("vocab_size", "num_attention_heads", "num_key_value_heads",
+                "num_global_key_value_heads", "head_dim", "global_head_dim", "sliding_window"):
+        if out[key] != target[key]:
+            raise ValueError(f"gemma4-assistant: {key} {out[key]} differs from the target's "
+                             f"{target[key]}")
+    if out["backbone_hidden_size"] != target["hidden_size"]:
+        raise ValueError("gemma4-assistant: embedding_length_out must be the target hidden size")
+    if not any(sliding) or all(sliding):
+        raise ValueError("gemma4-assistant: needs sliding-window and full-attention blocks")
+    return out
+
+
+def build_model(base, gguf: GGUFFile, *, mtp: GGUFFile | None = None, resource_overrides=None):
+    """The text component of a Gemma 4 GGUF, every parameter's source the GGUF, and with `mtp` the
+    assistant's component from its own GGUF."""
 
     from .model import Model, Parameter
 
@@ -138,13 +192,17 @@ def build_model(base, gguf: GGUFFile, *, resource_overrides=None):
     references, payloads, count, special = _load_resources(
         base.root, vocab, dict(resource_overrides or {}))
     records = {"text": {"config": config, "resources": references["text"]}}
+    if mtp is not None:
+        records["mtp"] = {"config": assistant_config(mtp, config), "target": "text"}
     model = Model(records, resources=payloads, token_count=count, special_token_ids=special)
 
-    def matrix(name, tensor, shape, inputs):
-        model.add(Parameter(name, shape, _matrix(gguf, tensor, shape), inputs=tuple(inputs)))
+    def matrix(name, tensor, shape, inputs, source=gguf):
+        model.add(Parameter(name, shape, _matrix(source, tensor, shape), inputs=tuple(inputs),
+                            residency=name.split("/", 1)[0]))
 
-    def vector(name, tensor, shape):
-        model.add(Parameter(name, shape, _direct(gguf, tensor, shape), direct_format="fp32"))
+    def vector(name, tensor, shape, source=gguf):
+        model.add(Parameter(name, shape, _direct(source, tensor, shape), direct_format="fp32",
+                            residency=name.split("/", 1)[0]))
 
     # The tied table: the head reads it as a projection, the embedding gathers its rows.
     matrix("text/output_head", "token_embd.weight", (vocab, h), ("text/final_hidden",))
@@ -183,18 +241,48 @@ def build_model(base, gguf: GGUFFile, *, resource_overrides=None):
             vector(m + "expert_scale", g + "ffn_down_exps.scale", (e,))
             matrix(m + "gate_up", g + "ffn_gate_up_exps.weight", (e * 2 * w, h), (m + "input",))
             matrix(m + "down", g + "ffn_down_exps.weight", (e * h, w), (m + "product",))
+    if mtp is not None:
+        assistant = records["mtp"]["config"]
+        ah, b = assistant["hidden_size"], assistant["backbone_hidden_size"]
+        # The tied table: the drafter's head reads it; its inputs are the target's embeddings.
+        matrix("mtp/output_head", "token_embd.weight", (vocab, ah), ("mtp/final_hidden",), mtp)
+        vector("mtp/final_norm", "output_norm.weight", (ah,), mtp)
+        matrix("mtp/pre_projection", "nextn.pre_projection.weight", (ah, 2 * b),
+               ("mtp/stem_input",), mtp)
+        matrix("mtp/post_projection", "nextn.post_projection.weight", (b, ah),
+               ("mtp/final_hidden",), mtp)
+        for i, kind in enumerate(assistant["layer_types"]):
+            g, p = f"blk.{i}.", f"mtp/layers/{i}/"
+            d = assistant["global_head_dim" if kind == "full_attention" else "head_dim"]
+            q = assistant["num_attention_heads"] * d
+            a = p + "attention/"
+            matrix(a + "query", g + "attn_q.weight", (q, ah), (p + "mixer_input",), mtp)
+            matrix(a + "output", g + "attn_output.weight", (ah, q), (p + "attention_output",),
+                   mtp)
+            vector(a + "query_norm", g + "attn_q_norm.weight", (d,), mtp)
+            vector(p + "input_norm", g + "attn_norm.weight", (ah,), mtp)
+            vector(p + "post_attention_norm", g + "post_attention_norm.weight", (ah,), mtp)
+            vector(p + "ffn_norm", g + "ffn_norm.weight", (ah,), mtp)
+            vector(p + "post_ffn_norm", g + "post_ffw_norm.weight", (ah,), mtp)
+            vector(p + "layer_scalar", g + "layer_output_scale.weight", (1,), mtp)
+            width = assistant["intermediate_size"]
+            matrix(p + "mlp/gate", g + "ffn_gate.weight", (width, ah), (p + "mlp_input",), mtp)
+            matrix(p + "mlp/up", g + "ffn_up.weight", (width, ah), (p + "mlp_input",), mtp)
+            matrix(p + "mlp/down", g + "ffn_down.weight", (ah, width), (p + "mlp_product",), mtp)
     return model
 
 
 def gemma4_gguf(model, recipe, sources):
-    """Every matrix keeps its GGUF blocks; vectors are FP32. Q, K and V of a layer share one parent,
-    as do the dense FFN's gate and up rows."""
+    """Every matrix keeps its GGUF blocks; vectors are FP32. Q, K and V of a layer share one parent
+    when the GGUF stores them in one format (a mixed-format quantization such as Q4_K_M keeps V
+    apart), and the dense FFN's gate and up rows share one."""
 
     if model.config.get("architectures") != ["Gemma4ForCausalLM"]:
         raise ValueError("the gemma4_gguf recipe requires a Gemma 4 model")
+    formats = {}
     for name, parameter in model.parameters.items():
         if parameter.projection:
-            fmt = parameter.source.read_encoded(0, 1).format
+            fmt = formats[name] = parameter.source.read_encoded(0, 1).format
             recipe.assign(name, format=fmt, method=import_encoded, source=parameter.source,
                           activation_policy="AllowA8")
         else:
@@ -202,8 +290,15 @@ def gemma4_gguf(model, recipe, sources):
     for i, kind in enumerate(model.config["layer_types"]):
         a = f"text/layers/{i}/attention/"
         group = [a + "query", a + "key"] + ([] if kind == "full_attention" else [a + "value"])
-        recipe.group(group)
-        p = f"text/layers/{i}/mlp/"
+        if len({formats[name] for name in group}) == 1:
+            recipe.group(group)
+    mlps = [f"text/layers/{i}/mlp/" for i in range(len(model.config["layer_types"]))]
+    if "mtp" in model.components:
+        mlps += [f"mtp/layers/{i}/mlp/"
+                 for i in range(model.components["mtp"]["config"]["num_hidden_layers"])]
+    for p in mlps:
+        if formats[p + "gate"] != formats[p + "up"]:
+            raise ValueError(f"{p}: gate and up are stored in different formats")
         recipe.group([p + "gate", p + "up"])
 
 

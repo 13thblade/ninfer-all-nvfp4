@@ -115,11 +115,13 @@ of the file.
   structured output, images and video, and MTP drafting. On two RTX 5090s the Q2_0 release scores
   93.3% on AIME 2025 and 86.4% on GPQA-Diamond ([Qwen3.8-Flash-Next](docs/qwen3-8-flash-next.md)).
 
-- **Gemma 4 26B-A4B.** Google's QAT Q4_0 GGUF release, imported block for block (13.4 GiB): the
-  sliding-window and full-attention blocks, the dense MLP beside 128 routed experts, up to eight
-  concurrent requests with prefix reuse, tool calls and structured output. On an RTX 3090 it
-  prefills a 10,000-token prompt at 5,695 tok/s and decodes at 208 tok/s, 177 after 10,000 tokens,
-  against llama.cpp's 4,427, 167 and 151 on the same GGUF ([Gemma 4](docs/gemma4.md)).
+- **Gemma 4 26B-A4B.** Google's QAT Q4_0 GGUF release, imported block for block (13.4 GiB), or a
+  mixed-format GGUF of it: the sliding-window and full-attention blocks (the latter caching values
+  only), the dense MLP beside 128 routed experts, up to eight concurrent requests with prefix reuse,
+  tool calls and structured output, and Google's multi-token-prediction assistant for speculative
+  decoding. On an RTX 3090 it prefills a 10,000-token prompt at 6,045 tok/s and decodes at 215
+  tok/s, 190 after 10,000 tokens, against llama.cpp's 4,697, 169 and 152 on the same GGUF; with two
+  drafts a round chat answers decode at 291 tok/s instead of 209 ([Gemma 4](docs/gemma4.md)).
 
 **Speculative decoding**
 
@@ -127,6 +129,9 @@ of the file.
   stores one. Under MTP and DFlash a sampled request keeps a draft only while it equals the model's
   own keyed draw, so every emitted token is the model's sample; DFlash2 verifies its proposal
   distribution by rejection sampling.
+- Gemma 4 drafts with Google's multi-token-prediction assistant (`--spec mtp`, 1 to 7 drafts), four
+  blocks that read the model's own KV cache; its verification rows are bit for bit plain decode rows,
+  so the output is the one plain decoding gives.
 - `--adaptive-mtp` picks each round's width from measured draft survival and round cost.
 - N-gram copy drafting beside the neural drafter (on with `--spec`) verifies up to 15 tokens copied
   from earlier prompt, tool-result or output text ([ngram copy proposals](docs/ngram.md)).
@@ -313,13 +318,17 @@ for f in config.json tokenizer.json tokenizer_config.json chat_template.jinja ge
   curl -fsSL -o models/gemma4/hf/$f https://huggingface.co/google/gemma-4-26B-A4B-it/resolve/main/$f
 done
 hf download google/gemma-4-26B-A4B-it-qat-q4_0-gguf gemma-4-26B_q4_0-it.gguf --local-dir models/gemma4
-python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf \
-  --source gguf=models/gemma4/gemma-4-26B_q4_0-it.gguf --name Gemma-4-26B-A4B-it-QAT \
-  --out models/gemma-4-26B-A4B-it-qat-q4_0.ninfer --device cpu
+# With the release's QAT assistant (multi-token prediction) as the artifact's `mtp` component.
+hf download unsloth/gemma-4-26B-A4B-it-qat-GGUF mtp-gemma-4-26B-A4B-it.gguf --local-dir models/gemma4
+python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf --components text,mtp \
+  --source gguf=models/gemma4/gemma-4-26B_q4_0-it.gguf \
+  --source mtp=models/gemma4/mtp-gemma-4-26B-A4B-it.gguf --name Gemma-4-26B-A4B-it-QAT \
+  --out models/gemma-4-26B-A4B-it-qat-q4_0-mtp.ninfer --device cpu
 
-# Four concurrent requests over 40K-token contexts; thinking stays off unless a request asks.
-ninfer-serve models/gemma-4-26B-A4B-it-qat-q4_0.ninfer --model-id gemma4 \
-  --max-context 40960 --max-concurrency 4
+# Four concurrent requests over 40K-token contexts, two drafts a round; thinking stays off unless a
+# request asks.
+ninfer-serve models/gemma-4-26B-A4B-it-qat-q4_0-mtp.ninfer --model-id gemma4 \
+  --max-context 40960 --max-concurrency 4 --spec mtp --draft-tokens 2
 ```
 
 </details>

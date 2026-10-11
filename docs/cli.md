@@ -268,8 +268,8 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--ngram-lock` | `ram`, `ram-hot`: lock the resident rows in physical memory (`mlock`, `VirtualLock`) | off |
 | `--no-ngram-table` | Qwen3.8-Flash-Next: run without the n-gram table, a non-standard experimental mode (the Q2_0 release's WikiText-2 perplexity rises from 2.66 to 5.01) | off |
 | `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; all nine are accepted on every build target (see [Context and memory](#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV | `bf16` |
-| `--spec mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)) | off |
-| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
+| `--spec mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)), Gemma 4 from one converted with its assistant (see [Gemma 4](gemma4.md#speculative-decoding-with-the-assistant)) | off |
+| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2; `1..7` for Gemma 4's assistant | unset |
 | `--draft-min-p P` | Flash-Next MTP only: verify through the first draft at or below this absolute probability; the full draft chain still runs; see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding) | `0` (off) |
 | `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |
 | `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |

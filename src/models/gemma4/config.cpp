@@ -1,5 +1,6 @@
 #include "models/gemma4/config.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -88,6 +89,49 @@ TextConfig parse_text_config(const Json& value) {
         out.rotary_pairs_full == 0 || out.rotary_pairs_full > out.global_head_dim / 2 ||
         out.hidden_size % 256 != 0 || out.intermediate_size % 32 != 0) {
         throw ArtifactError("Gemma 4 config: attention geometry outside the implemented kernels");
+    }
+    return out;
+}
+
+AssistantConfig parse_assistant_config(const Json& value, const TextConfig& target) {
+    const auto& architectures = value.at("architectures");
+    if (!architectures.is_array() || architectures.size() != 1 ||
+        architectures[0] != "Gemma4AssistantForCausalLM") {
+        throw ArtifactError("Gemma 4 assistant config: architecture mismatch");
+    }
+    AssistantConfig out;
+    out.hidden_size          = integer(value, "hidden_size");
+    out.backbone_hidden_size = integer(value, "backbone_hidden_size");
+    out.intermediate_size    = integer(value, "intermediate_size");
+    out.vocab_size           = integer(value, "vocab_size");
+    out.num_attention_heads  = integer(value, "num_attention_heads");
+    out.rms_norm_eps         = real(value, "rms_norm_eps", true);
+    const auto& layers       = value.at("layer_types");
+    if (!layers.is_array() || layers.size() != integer(value, "num_hidden_layers")) {
+        throw ArtifactError("Gemma 4 assistant config: layer_types must name every block");
+    }
+    for (const auto& kind : layers) {
+        if (kind != "full_attention" && kind != "sliding_attention") {
+            throw ArtifactError("Gemma 4 assistant config: unknown layer type");
+        }
+        out.full_attention.push_back(kind == "full_attention");
+    }
+    const auto full = std::count(out.full_attention.begin(), out.full_attention.end(), true);
+    const auto sliding = std::ptrdiff_t(out.full_attention.size()) - full;
+    if (full == 0 || sliding == 0 || std::count(target.full_attention.begin(),
+                                                target.full_attention.end(), true) == 0) {
+        throw ArtifactError("Gemma 4 assistant config: needs both kinds of attention block");
+    }
+    // It reads the target's caches with the target's kernels: the same heads and widths.
+    if (out.backbone_hidden_size != target.hidden_size || out.vocab_size != target.vocab_size ||
+        out.num_attention_heads != target.num_attention_heads ||
+        integer(value, "num_key_value_heads") != target.num_key_value_heads ||
+        integer(value, "num_global_key_value_heads") != target.num_global_key_value_heads ||
+        integer(value, "head_dim") != target.head_dim ||
+        integer(value, "global_head_dim") != target.global_head_dim ||
+        integer(value, "sliding_window") != target.sliding_window ||
+        out.hidden_size % 256 != 0 || out.intermediate_size % 32 != 0) {
+        throw ArtifactError("Gemma 4 assistant config: geometry differs from the target's");
     }
     return out;
 }

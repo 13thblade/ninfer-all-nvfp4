@@ -53,8 +53,24 @@ struct TextWeights {
     std::vector<LayerWeights> layers;
 };
 
+// The assistant's block: queries only, since it attends over the target's keys and values.
+struct AssistantLayerWeights {
+    WeightId input_norm, post_attention_norm, ffn_norm, post_ffn_norm, layer_scalar;
+    WeightId query, query_norm, output;
+    WeightId mlp_gate, mlp_up, mlp_down;
+};
+
+struct AssistantWeights {
+    WeightId output_head, final_norm; // its own tied table, read as the head only
+    WeightId pre_projection;          // [H_a, 2 H]: target embedding and hidden state in
+    WeightId post_projection;         // [H, H_a]: the next step's hidden state out
+    std::vector<AssistantLayerWeights> layers;
+};
+
 struct LoadOptions {
     std::filesystem::path artifact;
+    // Binds the artifact's `mtp` component, which must then exist.
+    bool assistant = false;
 };
 
 class Model {
@@ -65,6 +81,13 @@ public:
 
     [[nodiscard]] const TextConfig& config() const noexcept { return config_; }
     [[nodiscard]] const TextWeights& weights() const noexcept { return weights_; }
+    // Present when loaded with LoadOptions::assistant.
+    [[nodiscard]] const std::optional<AssistantConfig>& assistant_config() const noexcept {
+        return assistant_config_;
+    }
+    [[nodiscard]] const std::optional<AssistantWeights>& assistant() const noexcept {
+        return assistant_;
+    }
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
     [[nodiscard]] ops::WeightInput input(WeightId id) const;
@@ -77,12 +100,15 @@ public:
 private:
     friend std::unique_ptr<Model> load_model(const artifact::Reader&, const LoadOptions&,
                                              DeviceContext&, const StartupObserver*);
-    Model(TextConfig config, TextWeights weights, std::vector<BoundWeight> bound,
+    Model(TextConfig config, TextWeights weights, std::optional<AssistantConfig> assistant_config,
+          std::optional<AssistantWeights> assistant, std::vector<BoundWeight> bound,
           FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing);
 
     artifact::MaterializedArtifact backing_;
     TextConfig config_;
     TextWeights weights_;
+    std::optional<AssistantConfig> assistant_config_;
+    std::optional<AssistantWeights> assistant_;
     std::vector<BoundWeight> bound_;
     FrontendResources resources_;
     InstanceInfo info_;
@@ -90,6 +116,8 @@ private:
 
 // Whether the artifact's text component is Gemma 4.
 [[nodiscard]] bool is_gemma4(const artifact::Reader& reader);
+// Whether it also holds the multi-token-prediction assistant.
+[[nodiscard]] bool has_assistant(const artifact::Reader& reader);
 
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader,
                                                 const LoadOptions& options, DeviceContext& device,

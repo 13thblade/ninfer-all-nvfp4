@@ -32,6 +32,8 @@ void rms_norm(const float* x, const float* w, int hidden, int tokens, float eps,
 // gammas, V without), RoPE on Q and K (pair (i, i + D/2) turns by position * inv_freq[i]; a zero
 // frequency leaves the pair), Q to FP32 [T][Hq][D], K and V to the F16 cache slots of their
 // positions. V is the block's own rows, or with `has_v` false the raw K rows (K = V attention).
+// A null k_cache stores V only: the keys are then RoPE(V * k_norm), derived where they are read
+// (derive_keys, decode_attention) with the same rotations (rope_table).
 struct QkvArgs {
     const __nv_bfloat16* qkv = nullptr; // [T][Hq*D + Hkv*D (+ Hkv*D)]
     int tokens = 0, query_heads = 0, kv_heads = 0, head_dim = 0;
@@ -77,11 +79,16 @@ void ring_copy(const RingCopyArgs& args, cudaStream_t stream);
 
 // One token per row b of `batch` at positions[b] of sequence sequences[b]: attention over its
 // sequence's cache (linear: positions 0..p; ring: the window ending at p), split over `splits`
-// key ranges and merged. Head widths 256 (two query heads per KV head) and 512 (eight).
+// key ranges and merged. Head widths 256 (two query heads per KV head) and 512 (eight). With a
+// null k_cache the key of position j is RoPE_j(V_j * k_norm), the rotation of pair i < rope_pairs
+// read from rope[j * rope_pairs + i] (rope_table), rounded to F16 as a stored key is.
 struct DecodeAttentionArgs {
     const float* q         = nullptr; // [B][Hq][D]
     const __half* k_cache  = nullptr;
     const __half* v_cache  = nullptr;
+    const float* k_norm    = nullptr; // [D], with k_cache null
+    const float2* rope     = nullptr; // [positions][rope_pairs] (cos, sin), with k_cache null
+    int rope_pairs         = 0;
     std::int64_t seq_stride = 0, head_stride = 0; // elements, as QkvArgs
     const std::int32_t* sequences = nullptr;      // [B]
     const std::int32_t* positions = nullptr;      // [B]
@@ -165,7 +172,27 @@ struct FfnCombineArgs {
 };
 void ffn_combine(const FfnCombineArgs& args, cudaStream_t stream);
 
+// rope[p * pairs + i] = (cos, sin) of p * inv_freq[i] for positions [0, positions), computed as
+// qkv_post computes a rotation, so a derived key equals the key qkv_post would have stored from the
+// same (F16) value.
+void rope_table(const float* inv_freq, int pairs, int positions, float2* rope, cudaStream_t stream);
+
+// The keys of positions [0, count) of one sequence from its values: k[h][p] = RoPE_p(v[h][p] *
+// k_norm) in F16, both [kv heads][slots][D] with heads head_stride elements apart (linear caches).
+void derive_keys(const __half* v, std::int64_t head_stride, int kv_heads, int head_dim, int count,
+                 const float* k_norm, const float2* rope, int rope_pairs, __half* k,
+                 cudaStream_t stream);
+
 // out = bf16(cap * tanh(x / cap)) (cap 0: bf16(x)).
 void softcap(const float* x, std::int64_t n, float cap, __nv_bfloat16* out, cudaStream_t stream);
+
+// dst row (dst_rows ? dst_rows[r] : r) = src row (src_rows ? src_rows[r] : r) for r < rows, rows of
+// `width` BF16 values (a multiple of 8).
+void copy_rows(const __nv_bfloat16* src, const std::int32_t* src_rows, __nv_bfloat16* dst,
+               const std::int32_t* dst_rows, int rows, int width, cudaStream_t stream);
+
+// The assistant's input rows: out[r] = [bf16(embedding[r]) ; hidden[r]], BF16 [rows][2 width].
+void stem_rows(const float* embedding, const __nv_bfloat16* hidden, int rows, int width,
+               __nv_bfloat16* out, cudaStream_t stream);
 
 } // namespace ninfer::models::gemma4::kernels

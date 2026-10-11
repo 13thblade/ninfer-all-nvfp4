@@ -8,6 +8,11 @@
 // sequence keeps its state when its request ends, and a snapshot of its sliding-window rings where
 // the prompt's last user turn closes: a later prompt that starts with what the sequence holds, or
 // with the prompt up to that point, resumes there instead of prefilling it again.
+//
+// With --spec mtp the model's assistant drafts: requests that can run a speculative round draft
+// after their next token (the configured drafts for a request alone, one each while two or three
+// decode, none beyond) and verify it and the drafts in one pass; the acceptance keeps drafts while
+// they equal the request's own keyed draw, so the output is plain decoding's.
 #include "core/device.h"
 #include "models/gemma4/executor.h"
 #include "models/gemma4/model.h"

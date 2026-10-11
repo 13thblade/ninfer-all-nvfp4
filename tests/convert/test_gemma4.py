@@ -9,6 +9,7 @@ from tools.convert import gemma4
 from tools.convert.sources.gguf import TYPE_F32, GGUFFile, write_gguf
 
 TYPE_Q4_0 = 2
+TYPE_Q8_0 = 8
 TYPE_Q6_K = 14
 
 HIDDEN, VOCAB, HEADS, HEAD_DIM, GLOBAL_DIM = 256, 512, 2, 32, 64
@@ -49,8 +50,17 @@ def _q6_k(generator, rows, columns):
     return blocks.reshape(rows, -1)
 
 
-def _release(tmp_path):
-    """A two-block Gemma 4 release: the HF text files and a GGUF in llama.cpp's naming."""
+def _q8_0(generator, rows, columns):
+    blocks = generator.integers(0, 256, size=(rows, columns // 32, 34), dtype=np.uint8)
+    scales = generator.uniform(0.01, 0.02, size=(rows, columns // 32)).astype(np.float16)
+    blocks[:, :, :2] = scales.view(np.uint8).reshape(rows, columns // 32, 2)
+    return blocks.reshape(rows, -1)
+
+
+def _release(tmp_path, value_q8=False):
+    """A two-block Gemma 4 release: the HF text files and a GGUF in llama.cpp's naming. With
+    `value_q8` the sliding block's V is Q8_0 beside Q4_0 Q and K, as a mixed-format quantization
+    stores it."""
     hf = tmp_path / "hf"
     hf.mkdir()
     (hf / "config.json").write_text(json.dumps(_hf_config()))
@@ -82,7 +92,9 @@ def _release(tmp_path):
         d = GLOBAL_DIM if full else HEAD_DIM
         block(g + "attn_q.weight", (HEADS * d, HIDDEN), TYPE_Q4_0, _q4_0(generator, HEADS * d, HIDDEN))
         block(g + "attn_k.weight", (d, HIDDEN), TYPE_Q4_0, _q4_0(generator, d, HIDDEN))
-        if not full:
+        if not full and value_q8:
+            block(g + "attn_v.weight", (d, HIDDEN), TYPE_Q8_0, _q8_0(generator, d, HIDDEN))
+        elif not full:
             block(g + "attn_v.weight", (d, HIDDEN), TYPE_Q4_0, _q4_0(generator, d, HIDDEN))
         block(g + "attn_output.weight", (HIDDEN, HEADS * d), TYPE_Q4_0,
               _q4_0(generator, HIDDEN, HEADS * d))
@@ -156,3 +168,124 @@ def test_the_artifact_stores_the_gguf_rows_and_vectors_as_they_are(tmp_path):
         assert np.array_equal(router, stored["blk.0.ffn_gate_inp.weight"].reshape(-1))
         scale = np.frombuffer(stored_bytes("text/layers/1/moe/expert_scale"), dtype=np.float32)
         assert np.array_equal(scale, stored["blk.1.ffn_down_exps.scale"])
+
+
+ASSISTANT = 256  # the assistant's width
+
+
+def _assistant(tmp_path):
+    """A two-block gemma4-assistant GGUF for the release above (sliding, full)."""
+    generator = np.random.default_rng(5)
+    tensors, stored = [], {}
+
+    def block(name, shape, rows):
+        tensors.append((name, shape, TYPE_Q4_0, rows.tobytes()))
+        stored[name] = rows
+
+    def vector(name, shape):
+        values = generator.normal(size=shape).astype(np.float32)
+        tensors.append((name, shape, TYPE_F32, values.tobytes()))
+        stored[name] = values
+
+    block("token_embd.weight", (VOCAB, ASSISTANT), _q4_0(generator, VOCAB, ASSISTANT))
+    vector("output_norm.weight", (ASSISTANT,))
+    block("nextn.pre_projection.weight", (ASSISTANT, 2 * HIDDEN),
+          _q4_0(generator, ASSISTANT, 2 * HIDDEN))
+    block("nextn.post_projection.weight", (HIDDEN, ASSISTANT),
+          _q4_0(generator, HIDDEN, ASSISTANT))
+    for i, full in enumerate((False, True)):
+        g = f"blk.{i}."
+        d = GLOBAL_DIM if full else HEAD_DIM
+        block(g + "attn_q.weight", (HEADS * d, ASSISTANT), _q4_0(generator, HEADS * d, ASSISTANT))
+        block(g + "attn_output.weight", (ASSISTANT, HEADS * d),
+              _q4_0(generator, ASSISTANT, HEADS * d))
+        vector(g + "attn_q_norm.weight", (d,))
+        for name in ("attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm"):
+            vector(g + name + ".weight", (ASSISTANT,))
+        vector(g + "layer_output_scale.weight", (1,))
+        block(g + "ffn_gate.weight", (WIDTH, ASSISTANT), _q4_0(generator, WIDTH, ASSISTANT))
+        block(g + "ffn_up.weight", (WIDTH, ASSISTANT), _q4_0(generator, WIDTH, ASSISTANT))
+        block(g + "ffn_down.weight", (ASSISTANT, WIDTH), _q4_0(generator, ASSISTANT, WIDTH))
+    a = "gemma4-assistant."
+    kv = {"general.architecture": "gemma4-assistant", a + "block_count": 2,
+          a + "embedding_length": ASSISTANT, a + "embedding_length_out": HIDDEN,
+          a + "feed_forward_length": WIDTH, a + "attention.head_count": HEADS,
+          a + "attention.head_count_kv": [1, 1], a + "attention.shared_kv_layers": 2,
+          a + "attention.sliding_window_pattern": [True, False],
+          a + "attention.key_length": GLOBAL_DIM, a + "attention.key_length_swa": HEAD_DIM,
+          a + "attention.sliding_window": 128, a + "attention.layer_norm_rms_epsilon": 1e-6}
+    path = tmp_path / "assistant.gguf"
+    write_gguf(path, kv, tensors)
+    return path, stored
+
+
+def _convert(tmp_path, base_dir, gguf_path, mtp_path=None):
+    from tools.convert.pipeline import convert
+    from tools.convert.recipe import Recipe
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    output = tmp_path / "gemma.ninfer"
+    with SafetensorsSource(base_dir) as base, GGUFFile(gguf_path) as gguf:
+        mtp = GGUFFile(mtp_path) if mtp_path is not None else None
+        model = gemma4.build_model(base, gguf, mtp=mtp)
+        recipe = Recipe(model)
+        gemma4.gemma4_gguf(model, recipe, {"base": base, "gguf": gguf})
+        convert(model, recipe, output, device="cpu")
+    return output
+
+
+def test_the_assistant_joins_as_the_mtp_component(tmp_path):
+    from tools.artifact.reader import Artifact
+
+    hf, path, _ = _release(tmp_path)
+    mtp_path, stored = _assistant(tmp_path)
+    output = _convert(tmp_path, hf, path, mtp_path)
+    with Artifact(output) as artifact:
+        directory = artifact.directory
+        config = directory.components["mtp"]["config"]
+        assert directory.components["mtp"]["target"] == "text"
+        assert config["architectures"] == ["Gemma4AssistantForCausalLM"]
+        assert config["hidden_size"] == ASSISTANT and config["backbone_hidden_size"] == HIDDEN
+        assert config["layer_types"] == ["sliding_attention", "full_attention"]
+        assert config["num_key_value_heads"] == 1 and config["num_global_key_value_heads"] == 1
+        bindings = directory.bindings
+        read = lambda name: artifact.read_object(bindings[name]["object"])
+        # The assistant's blocks stay the GGUF's rows; it has queries only.
+        assert read("mtp/output_head") == stored["token_embd.weight"].tobytes()
+        assert read("mtp/pre_projection") == stored["nextn.pre_projection.weight"].tobytes()
+        assert "mtp/layers/1/attention/query" in bindings
+        assert not any(name.startswith("mtp/") and name.endswith(("/key", "/value"))
+                       for name in bindings)
+        scalar = np.frombuffer(read("mtp/layers/1/layer_scalar"), dtype=np.float32)
+        assert np.array_equal(scalar, stored["blk.1.layer_output_scale.weight"])
+
+
+def test_an_assistant_of_other_geometry_is_refused(tmp_path):
+    _, path, _ = _release(tmp_path)
+    mtp_path, _ = _assistant(tmp_path)
+    with GGUFFile(mtp_path) as mtp:
+        target = gemma4.text_config(_hf_config())
+        assert gemma4.assistant_config(mtp, target)["vocab_size"] == VOCAB
+        with pytest.raises(ValueError):
+            gemma4.assistant_config(mtp, dict(target, head_dim=2 * HEAD_DIM))
+        with pytest.raises(ValueError):
+            gemma4.assistant_config(mtp, dict(target, hidden_size=2 * HIDDEN))
+
+
+def test_a_mixed_format_block_keeps_each_projection_in_its_format(tmp_path):
+    from tools.artifact.reader import Artifact
+
+    hf, path, stored = _release(tmp_path, value_q8=True)
+    output = _convert(tmp_path, hf, path)
+    with Artifact(output) as artifact:
+        bindings = artifact.directory.bindings
+        a = "text/layers/0/attention/"
+        # A block whose Q, K and V differ in format keeps each its own object; the full-attention
+        # block's Q and K, both Q4_0, still share one parent.
+        objects = {bindings[a + name]["object"] for name in ("query", "key", "value")}
+        assert len(objects) == 3
+        f = "text/layers/1/attention/"
+        parent = lambda name: [part["object"] for part in bindings[f + name]["parts"]]
+        assert parent("key") == parent("query")
+        assert artifact.read_object(bindings[a + "value"]["object"]) == \
+            stored["blk.0.attn_v.weight"].tobytes()
