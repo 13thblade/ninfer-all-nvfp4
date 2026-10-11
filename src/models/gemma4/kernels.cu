@@ -1,6 +1,7 @@
 #include "models/gemma4/kernels.h"
 
 #include "core/device.h"
+#include "models/gemma4/kv_codec.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -185,7 +186,7 @@ __global__ void qkv_post_kernel(QkvArgs a) {
     const float vinv = rsqrtf(block_sum(v0 * v0 + v1 * v1) / float(d) + a.eps);
     const float n0 = k0 * kinv * a.k_norm[i], n1 = k1 * kinv * a.k_norm[i + half];
     const int sequence = a.sequences != nullptr ? a.sequences[t] : a.sequence;
-    const int slot     = a.ring != 0 ? position % a.ring : position;
+    const int slot     = a.row_slots ? t : a.ring != 0 ? position % a.ring : position;
     const std::int64_t at =
         std::int64_t(sequence) * a.seq_stride + std::int64_t(kh) * a.head_stride +
         std::int64_t(slot) * d;
@@ -296,6 +297,52 @@ __device__ __forceinline__ int decode_active_splits(int keys, int splits, int ti
     return min(splits, max(1, (keys + tile - 1) / tile));
 }
 
+// A tile's K or V words in registers between their fetch and their store to shared memory: F16 16-byte
+// words as they are, or a quantized plane's chunk bytes and scales, decoded at the store.
+template <KvCoding C, int N>
+struct TileRegs {
+    typename kv::Chunk<C>::Raw raw[N];
+    typename kv::Chunk<C>::Scale scale[N];
+};
+template <int N>
+struct TileRegs<KvCoding::F16, N> {
+    uint4 raw[N];
+};
+
+// Word u of the tile: chunk c of the row at `slot` (a quantized plane), or the F16 word at element
+// `at` of `cache`.
+template <KvCoding C, int N>
+__device__ __forceinline__ void tile_fetch(TileRegs<C, N>& t, int u, bool valid, const __half* cache,
+                                           std::int64_t at, const KvPlaneView& plane, int sequence,
+                                           int head, int slot, int c) {
+    if constexpr (C == KvCoding::F16) {
+        t.raw[u] = valid ? *reinterpret_cast<const uint4*>(cache + at) : make_uint4(0, 0, 0, 0);
+    } else {
+        using K = kv::Chunk<C>;
+        t.raw[u]   = typename K::Raw{};
+        t.scale[u] = typename K::Scale{};
+        if (valid) {
+            const std::uint8_t* codes = plane.codes + sequence * plane.code_seq +
+                                        head * plane.code_head + slot * plane.code_row;
+            const std::uint8_t* scales = plane.scales + sequence * plane.scale_seq +
+                                         head * plane.scale_head + slot * plane.scale_row;
+            t.raw[u]   = K::load(codes, c);
+            t.scale[u] = K::scale(scales, c);
+        }
+    }
+}
+
+template <KvCoding C, int N>
+__device__ __forceinline__ uint4 tile_word(const TileRegs<C, N>& t, int u) {
+    if constexpr (C == KvCoding::F16) {
+        return t.raw[u];
+    } else {
+        float f[8];
+        kv::Chunk<C>::decode(t.raw[u], t.scale[u], f);
+        return kv::pack8(f);
+    }
+}
+
 template <int D, int G>
 struct DecodeShape {
     static constexpr int kTile      = D == 512 ? 16 : 32;
@@ -305,7 +352,7 @@ struct DecodeShape {
     static constexpr int kDpt       = D / kDecodeThreads;   // dims per thread (PV)
 };
 
-template <int D, int G>
+template <int D, int G, KvCoding KC = KvCoding::F16, KvCoding VC = KvCoding::F16>
 __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(DecodeAttentionArgs a) {
     constexpr int V      = G;
     using S              = DecodeShape<D, V>;
@@ -362,21 +409,18 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
     constexpr int kWords = D / 8;
     constexpr int kLoads = kTile * kWords / kDecodeThreads;
     static_assert(kTile * kWords % kDecodeThreads == 0);
-    uint4 k_next[kLoads], v_next[kLoads];
+    TileRegs<KC, kLoads> k_next;
+    TileRegs<VC, kLoads> v_next;
     const auto fetch = [&](int tile, int count) {
 #pragma unroll
         for (int u = 0; u < kLoads; ++u) {
             const int w = threadIdx.x + u * kDecodeThreads;
             const int r = w / kWords, c = w % kWords;
-            k_next[u] = make_uint4(0, 0, 0, 0);
-            v_next[u] = make_uint4(0, 0, 0, 0);
-            if (r < count) {
-                const int p    = tile + r;
-                const int slot = a.ring != 0 ? p % a.ring : p;
-                const std::int64_t at = base + std::int64_t(slot) * D + c * 8;
-                k_next[u] = *reinterpret_cast<const uint4*>(a.k_cache + at);
-                v_next[u] = *reinterpret_cast<const uint4*>(a.v_cache + at);
-            }
+            const int p    = tile + r;
+            const int slot = a.ring != 0 ? p % a.ring : p;
+            const std::int64_t at = base + std::int64_t(slot) * D + c * 8;
+            tile_fetch(k_next, u, r < count, a.k_cache, at, a.k_plane, sequence, kv_head, slot, c);
+            tile_fetch(v_next, u, r < count, a.v_cache, at, a.v_plane, sequence, kv_head, slot, c);
         }
     };
     if (lo < hi) { fetch(lo, min(kTile, hi - lo)); }
@@ -386,8 +430,8 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
         for (int u = 0; u < kLoads; ++u) {
             const int w = threadIdx.x + u * kDecodeThreads;
             const int r = w / kWords, c = w % kWords;
-            *reinterpret_cast<uint4*>(&k_s[r][c * 8]) = k_next[u];
-            *reinterpret_cast<uint4*>(&v_s[r][c * 8]) = v_next[u];
+            *reinterpret_cast<uint4*>(&k_s[r][c * 8]) = tile_word(k_next, u);
+            *reinterpret_cast<uint4*>(&v_s[r][c * 8]) = tile_word(v_next, u);
         }
         __syncthreads();
         if (tile + kTile < hi) { fetch(tile + kTile, min(kTile, hi - tile - kTile)); }
@@ -486,7 +530,7 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
 // softmax, so a tile costs two barriers (three when the keys are derived from the values).
 constexpr int kWideThreads = 256;
 
-template <bool Derived>
+template <bool Derived, KvCoding VC = KvCoding::F16>
 __launch_bounds__(kWideThreads, 2) __global__ void decode_attention_wide_kernel(DecodeAttentionArgs a) {
     constexpr int D = 512, kTile = 16, kHalf = D / 2;
     const int b        = blockIdx.x; // rows fastest, as decode_attention_kernel
@@ -524,7 +568,8 @@ __launch_bounds__(kWideThreads, 2) __global__ void decode_attention_wide_kernel(
                               std::int64_t(kv_head) * a.head_stride;
     constexpr int kWords = D / 8;                         // 16-byte words per row
     constexpr int kLoads = kTile * kWords / kWideThreads; // per thread and matrix
-    uint4 k_next[kLoads], v_next[kLoads];
+    uint4 k_next[kLoads];
+    TileRegs<VC, kLoads> v_next;
     // Derived keys: thread t < 128 turns the 8 pairs [8 (t % 8), 8 (t % 8) + 8) of row t / 8 (the
     // first 64 pairs turn, rope_pairs == 64), with their rotations fetched beside the values.
     static_assert(kTile * 8 <= kWideThreads, "one thread per turned 8-pair chunk");
@@ -536,15 +581,12 @@ __launch_bounds__(kWideThreads, 2) __global__ void decode_attention_wide_kernel(
         for (int u = 0; u < kLoads; ++u) {
             const int w = threadIdx.x + u * kWideThreads;
             const int r = w / kWords, c = w % kWords;
+            const std::int64_t at = base + std::int64_t(tile + r) * D + c * 8;
             k_next[u] = make_uint4(0, 0, 0, 0);
-            v_next[u] = make_uint4(0, 0, 0, 0);
-            if (r < count) {
-                const std::int64_t at = base + std::int64_t(tile + r) * D + c * 8;
-                if constexpr (!Derived) {
-                    k_next[u] = *reinterpret_cast<const uint4*>(a.k_cache + at);
-                }
-                v_next[u] = *reinterpret_cast<const uint4*>(a.v_cache + at);
+            if constexpr (!Derived) {
+                if (r < count) { k_next[u] = *reinterpret_cast<const uint4*>(a.k_cache + at); }
             }
+            tile_fetch(v_next, u, r < count, a.v_cache, at, a.v_plane, sequence, kv_head, tile + r, c);
         }
         if constexpr (Derived) {
             const int r = threadIdx.x >> 3, c = threadIdx.x & 7;
@@ -571,7 +613,7 @@ __launch_bounds__(kWideThreads, 2) __global__ void decode_attention_wide_kernel(
             const int w = threadIdx.x + u * kWideThreads;
             const int r = w / kWords, c = w % kWords;
             if constexpr (!Derived) { *reinterpret_cast<uint4*>(&k_s[r][c * 8]) = k_next[u]; }
-            *reinterpret_cast<uint4*>(&v_s[r][c * 8]) = v_next[u];
+            *reinterpret_cast<uint4*>(&v_s[r][c * 8]) = tile_word(v_next, u);
         }
         float2 cs[8];
         if constexpr (Derived) {
@@ -686,11 +728,13 @@ __launch_bounds__(kWideThreads, 2) __global__ void decode_attention_wide_kernel(
     }
 }
 
-// Block (head, row, 128 dimensions): merges the splits of one query head.
+// Block (head, row, 128 dimensions): merges the splits of one query head. Rotated (a rotated value
+// plane, D 256): block (head, row) of 256 threads, which turn the merged row back before its output.
 constexpr int kDecodeCombineThreads = 128; // at least the largest split count
 
-template <int D>
+template <int D, bool Rotated = false>
 __global__ void decode_combine_kernel(DecodeAttentionArgs a) {
+    static_assert(!Rotated || D == kKvBlockDims, "a rotated row is one 256-wide block");
     const int head = blockIdx.x, b = blockIdx.y;
     const int d    = blockIdx.z * kDecodeCombineThreads + threadIdx.x;
     const std::int64_t rows  = std::int64_t(a.batch) * a.query_heads * a.splits;
@@ -699,7 +743,7 @@ __global__ void decode_combine_kernel(DecodeAttentionArgs a) {
     const int lo_all   = a.ring != 0 ? max(0, position - a.window + 1) : 0;
     const int active   = decode_active_splits(position + 1 - lo_all, a.splits, D == 512 ? 16 : 32);
     // Each split's weight exp(m_s - m) once, in shared memory (blockDim >= splits).
-    __shared__ float weight[kDecodeCombineThreads];
+    __shared__ float weight[Rotated ? kKvBlockDims : kDecodeCombineThreads];
     __shared__ float max_s, inv_l;
     const int s0   = threadIdx.x;
     const float ms = s0 < active ? a.partial[rows * D + 2 * (first + s0)] : -INFINITY;
@@ -726,7 +770,22 @@ __global__ void decode_combine_kernel(DecodeAttentionArgs a) {
             const float w = weight[s];
             if (w != 0.0f) { o += a.partial[(first + s) * D + d] * w; }
         }
-        const float y = o * inv_l;
+        float y = o * inv_l;
+        if constexpr (Rotated) {
+            __shared__ float row[kKvBlockDims];
+            row[threadIdx.x] = y;
+            __syncthreads();
+            if (threadIdx.x < 32) {
+                float v[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { v[i] = row[threadIdx.x + 32 * i]; }
+                ops::normalized_hadamard_d256_inplace(v, int(threadIdx.x));
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { row[threadIdx.x + 32 * i] = v[i]; }
+            }
+            __syncthreads();
+            y = row[threadIdx.x];
+        }
         if (a.out_q.qs == nullptr) {
             a.out[(std::int64_t(b) * a.query_heads + head) * D + d] = __float2bfloat16(y);
             return;
@@ -1120,6 +1179,47 @@ std::size_t decode_attention_workspace_floats(int batch, int query_heads, int he
     return rows * head_dim + 2 * rows;
 }
 
+namespace {
+
+template <KvCoding KC, KvCoding VC>
+void launch_sliding(const DecodeAttentionArgs& args, dim3 grid, cudaStream_t stream) {
+    decode_attention_kernel<256, 2, KC, VC><<<grid, kDecodeThreads, 0, stream>>>(args);
+}
+
+// The sliding blocks' (key, value) codings of the KV formats (kv_format.h).
+void dispatch_sliding(const DecodeAttentionArgs& args, dim3 grid, cudaStream_t stream) {
+    const KvCoding k = args.k_plane.codes != nullptr ? args.k_plane.coding : KvCoding::F16;
+    const KvCoding v = args.v_plane.codes != nullptr ? args.v_plane.coding : KvCoding::F16;
+    using C = KvCoding;
+    if (k == C::F16 && v == C::F16) { return launch_sliding<C::F16, C::F16>(args, grid, stream); }
+    if (k == C::Int8G64 && v == C::Int8G64) { return launch_sliding<C::Int8G64, C::Int8G64>(args, grid, stream); }
+    if (k == C::Fp8Row && v == C::Fp8Row) { return launch_sliding<C::Fp8Row, C::Fp8Row>(args, grid, stream); }
+    if (k == C::Int8G64 && v == C::Int4G32) { return launch_sliding<C::Int8G64, C::Int4G32>(args, grid, stream); }
+    if (k == C::Nvfp4G16 && v == C::Nvfp4G16) { return launch_sliding<C::Nvfp4G16, C::Nvfp4G16>(args, grid, stream); }
+    if (k == C::Fp8Row && v == C::Nvfp4G16) { return launch_sliding<C::Fp8Row, C::Nvfp4G16>(args, grid, stream); }
+    if (k == C::Lloyd4 && v == C::Int4G32) { return launch_sliding<C::Lloyd4, C::Int4G32>(args, grid, stream); }
+    if (k == C::Int4E8 && v == C::Int4G32) { return launch_sliding<C::Int4E8, C::Int4G32>(args, grid, stream); }
+    if (k == C::RootE8 && v == C::Int4G32) { return launch_sliding<C::RootE8, C::Int4G32>(args, grid, stream); }
+    throw std::invalid_argument("gemma4 decode attention: no kernel for this key/value coding");
+}
+
+// The full-attention blocks' value plane, keys derived from it.
+void dispatch_derived(const DecodeAttentionArgs& args, dim3 grid, cudaStream_t stream) {
+    const KvCoding v = args.v_plane.codes != nullptr ? args.v_plane.coding : KvCoding::F16;
+    using C = KvCoding;
+    switch (v) {
+    case C::F16: decode_attention_wide_kernel<true><<<grid, kWideThreads, 0, stream>>>(args); return;
+    case C::Int8G64: decode_attention_wide_kernel<true, C::Int8G64><<<grid, kWideThreads, 0, stream>>>(args); return;
+    case C::Int4G32: decode_attention_wide_kernel<true, C::Int4G32><<<grid, kWideThreads, 0, stream>>>(args); return;
+    case C::Fp8Row: decode_attention_wide_kernel<true, C::Fp8Row><<<grid, kWideThreads, 0, stream>>>(args); return;
+    case C::Nvfp4G16: decode_attention_wide_kernel<true, C::Nvfp4G16><<<grid, kWideThreads, 0, stream>>>(args); return;
+    default: break;
+    }
+    throw std::invalid_argument("gemma4 decode attention: no derived-key kernel for this coding");
+}
+
+} // namespace
+
 void decode_attention(const DecodeAttentionArgs& args, cudaStream_t stream) {
     const int group = args.query_heads / args.kv_heads;
     if (args.splits > kDecodeCombineThreads) {
@@ -1128,25 +1228,39 @@ void decode_attention(const DecodeAttentionArgs& args, cudaStream_t stream) {
     // Block (row, kv head, split): the rows of a verification, one sequence's consecutive
     // positions, run side by side over the same key ranges and share them through L2.
     const dim3 grid(args.batch, args.kv_heads, args.splits);
-    const bool derived = args.k_cache == nullptr;
+    const bool k_planed = args.k_plane.codes != nullptr;
+    const bool v_planed = args.v_plane.codes != nullptr;
+    const bool derived  = args.k_cache == nullptr && !k_planed;
     if (derived && (args.k_norm == nullptr || args.rope == nullptr || args.ring != 0 ||
                     args.rope_pairs <= 0 || args.rope_pairs > args.head_dim / 2)) {
         throw std::invalid_argument("gemma4 decode attention: derived keys need a linear cache, "
                                     "k_norm and a rope table");
     }
     if (args.head_dim == 256 && group == 2 && !derived) {
-        decode_attention_kernel<256, 2><<<grid, kDecodeThreads, 0, stream>>>(args);
+        dispatch_sliding(args, grid, stream);
         check_launch("decode_attention");
-        decode_combine_kernel<256><<<dim3(args.query_heads, args.batch, 256 / kDecodeCombineThreads),
-                                     kDecodeCombineThreads, 0, stream>>>(args);
+        if (v_planed && args.v_plane.rotated) {
+            decode_combine_kernel<256, true>
+                <<<dim3(args.query_heads, args.batch, 1), kKvBlockDims, 0, stream>>>(args);
+        } else {
+            decode_combine_kernel<256>
+                <<<dim3(args.query_heads, args.batch, 256 / kDecodeCombineThreads),
+                   kDecodeCombineThreads, 0, stream>>>(args);
+        }
     } else if (args.head_dim == 512 && group == 8 && args.ring == 0) {
         if (derived) {
             if (args.rope_pairs != 64) {
                 throw std::invalid_argument("gemma4 decode attention: derived keys turn 64 pairs");
             }
-            decode_attention_wide_kernel<true><<<grid, kWideThreads, 0, stream>>>(args);
-        } else {
+            if (v_planed && args.v_plane.rotated) {
+                throw std::invalid_argument("gemma4 decode attention: derived keys need an "
+                                            "unrotated value plane");
+            }
+            dispatch_derived(args, grid, stream);
+        } else if (!k_planed && !v_planed) {
             decode_attention_wide_kernel<false><<<grid, kWideThreads, 0, stream>>>(args);
+        } else {
+            throw std::invalid_argument("gemma4 decode attention: width 512 stores no quantized keys");
         }
         check_launch("decode_attention");
         decode_combine_kernel<512><<<dim3(args.query_heads, args.batch, 512 / kDecodeCombineThreads),

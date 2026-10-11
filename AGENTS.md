@@ -46,8 +46,9 @@ Gemma 4 26B-A4B (`Gemma4ForCausalLM`, the text component of `Gemma4ForConditiona
 `src/models/gemma4`, `runtime/engine/gemma4_core`) is a third explicit family converted from
 Google's QAT GGUF (or a mixed-format GGUF of the same model) with its ggml blocks kept as stored.
 It shares the Qwen3.5 frontend (tokenizer, chat template, output channels and Gemma's tool-call
-markup), runs one to eight sequences in prompt chunks of 2048 tokens with an F16 KV cache, drafts
-with the release's multi-token-prediction assistant (the artifact's `mtp` component, `--spec mtp`),
+markup), runs one to eight sequences in prompt chunks of 2048 tokens with an F16 KV cache or any
+`--kv-dtype` format, drafts with the release's multi-token-prediction assistant (the artifact's
+`mtp` component, `--spec mtp`),
 encodes images and video with the release's vision tower (the artifact's `vision` component, from
 its llama.cpp mmproj; resident, streamed from pinned memory, or FP32 on CPU threads), and has no
 pipeline stages.

@@ -3,6 +3,8 @@
 // Gemma 4's own elementwise, normalization, routing and decode-attention kernels. Activations are
 // token-major: an FP32 residual h[t][i], BF16 projection inputs x[t][k] (a [K, T] Tensor).
 
+#include "models/gemma4/kv_format.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -52,8 +54,79 @@ struct QkvArgs {
     const std::int32_t* sequences = nullptr; // [T]; null: every token is `sequence`'s
     int sequence = 0;
     int ring     = 0;
+    // Token t's K and V at slot t rather than at its position's (rows a quantized cache stores from,
+    // kv_store).
+    bool row_slots = false;
 };
 void qkv_post(const QkvArgs& args, cudaStream_t stream);
+
+// A quantized cache plane (kv_format.h). Row (sequence, head, slot) has its codes at codes +
+// sequence * code_seq + head * code_head + slot * code_row and its scales likewise; a row is
+// `blocks` 256-wide blocks.
+struct KvPlaneView {
+    std::uint8_t* codes  = nullptr;
+    std::uint8_t* scales = nullptr;
+    std::int64_t code_row = 0, scale_row = 0, code_head = 0, scale_head = 0, code_seq = 0,
+                 scale_seq = 0;
+    KvCoding coding = KvCoding::F16;
+    bool rotated    = false;
+    int blocks      = 1;
+};
+
+// Stores F16 rows into a quantized plane: the row of position p (positions[r], or first + r) of
+// sequence sequences[r] (or `sequence`) at slot p % dst_ring (dst_ring 0: slot p), turned first for a
+// rotated plane. A source row is head h's at src + h * src_head_stride + slot * D, slot p % src_ring
+// (src_ring 0: slot r). Positions below store_from are not stored (a prompt chunk longer than a
+// ring keeps its last ones); with write_back every source row becomes the value its codes
+// represent, unrotated, so a prompt chunk attends to what its decode steps will read.
+struct KvStoreArgs {
+    __half* src = nullptr;
+    std::int64_t src_head_stride = 0;
+    int src_ring = 0;
+    const std::int32_t* positions = nullptr;
+    int first = 0;
+    const std::int32_t* sequences = nullptr;
+    int sequence = 0;
+    int rows = 0, heads = 0;
+    KvPlaneView dst;
+    int dst_ring   = 0;
+    int store_from = 0;
+    bool write_back = false;
+};
+void kv_store(const KvStoreArgs& args, cudaStream_t stream);
+
+// The F16 values of positions [begin, end) of one sequence's quantized plane, unrotated, into dst:
+// head h's row of position p at dst + h * dst_head_stride + slot * D, slot p % dst_ring (dst_ring 0:
+// slot p); the plane's row at slot p % src_ring (src_ring 0: slot p).
+struct KvLoadArgs {
+    KvPlaneView src;
+    int src_ring = 0, sequence = 0, begin = 0, end = 0, heads = 0;
+    __half* dst = nullptr;
+    std::int64_t dst_head_stride = 0;
+    int dst_ring = 0;
+};
+void kv_load(const KvLoadArgs& args, cudaStream_t stream);
+
+// x[r] = H x[r] for rows of 256 floats, H the normalized Sylvester-Hadamard transform of the engine's
+// rotated planes: queries meeting rotated keys.
+void rotate_rows(float* x, int rows, cudaStream_t stream);
+
+// A decode step's rows into a block's quantized planes in one launch: row r's K (unless k_plane has
+// no codes) and V, head h at k / v + h * head_stride + r * D, stored at slot positions[r] % ring
+// (ring 0: the position) of sequence sequences[r]; and, with q, q_rows rows of 256 floats turned as
+// rotate_rows turns them.
+struct KvRowsArgs {
+    const __half* k = nullptr;
+    const __half* v = nullptr;
+    std::int64_t head_stride = 0;
+    const std::int32_t* positions = nullptr;
+    const std::int32_t* sequences = nullptr;
+    int rows = 0, heads = 0, ring = 0;
+    KvPlaneView k_plane, v_plane;
+    float* q   = nullptr;
+    int q_rows = 0;
+};
+void kv_store_rows(const KvRowsArgs& args, cudaStream_t stream);
 
 // The prompt attention mask, F16 [tokens][slots]: 0 where the query at position first + t sees
 // slot s, -inf elsewhere. Linear (ring 0): slot s holds position s, visible when s <= first + t.
@@ -83,12 +156,15 @@ void ring_copy(const RingCopyArgs& args, cudaStream_t stream);
 // One token per row b of `batch` at positions[b] of sequence sequences[b]: attention over its
 // sequence's cache (linear: positions 0..p; ring: the window ending at p), split over `splits`
 // key ranges and merged. Head widths 256 (two query heads per KV head) and 512 (eight). With a
-// null k_cache the key of position j is RoPE_j(V_j * k_norm), the rotation of pair i < rope_pairs
-// read from rope[j * rope_pairs + i] (rope_table), rounded to F16 as a stored key is.
+// null k_cache (and no k_plane) the key of position j is RoPE_j(V_j * k_norm), the rotation of pair
+// i < rope_pairs read from rope[j * rope_pairs + i] (rope_table), rounded to F16 as a stored key is.
+// Quantized planes take the place of k_cache / v_cache: q must already be turned for a rotated key
+// plane (rotate_rows), and a rotated value plane's output is turned back here.
 struct DecodeAttentionArgs {
     const float* q         = nullptr; // [B][Hq][D]
     const __half* k_cache  = nullptr;
     const __half* v_cache  = nullptr;
+    KvPlaneView k_plane, v_plane; // quantized, codes non-null
     const float* k_norm    = nullptr; // [D], with k_cache null
     const float2* rope     = nullptr; // [positions][rope_pairs] (cos, sin), with k_cache null
     int rope_pairs         = 0;

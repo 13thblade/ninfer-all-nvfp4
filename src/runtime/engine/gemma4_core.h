@@ -7,7 +7,11 @@
 // request advances one token, all of them in one batched pass. With the context cache on, a
 // sequence keeps its state when its request ends, and a snapshot of its sliding-window rings where
 // the prompt's last user turn closes: a later prompt that starts with what the sequence holds, or
-// with the prompt up to that point, resumes there instead of prefilling it again.
+// with the prompt up to that point, resumes there instead of prefilling it again. What a sequence
+// holds before another request takes it, and its state at the end of a prompt's shared prefixes
+// (the leading system messages and tool declarations, a declared cache boundary), go to images in
+// pinned host memory within --host-cache-mib; a prompt on any sequence resumes from the longest
+// image it starts with, including one stored while it waited for its first prompt chunk.
 //
 // With --spec mtp the model's assistant drafts: requests that can run a speculative round draft
 // after their next token (the configured drafts for a request alone, one each while two or three
