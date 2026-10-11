@@ -798,8 +798,10 @@ void MarkdownCodeTracker::end_line() {
         }
     } else if (!line.empty() && (line[0] == '`' || line[0] == '~') && run_of_three(line, line[0]) &&
                line.substr(3).find(std::string(3, line[0])) == std::string_view::npos) {
-        // A ``` or ~~~ opener whose run is not closed on the same line (that is inline code).
+        // A ``` or ~~~ opener whose run is not closed on the same line (that is inline code). The
+        // fence ends the paragraph, so a backtick left unmatched before it opens nothing after it.
         fence_ = line[0];
+        ticks_ = 0;
     } else if (line.empty()) {
         ticks_ = 0; // a blank line ends the paragraph and any inline code left open in it
     } else {

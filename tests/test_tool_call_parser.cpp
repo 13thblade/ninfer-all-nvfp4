@@ -1130,7 +1130,10 @@ int test_markdown_quoted_calls() {
         {"`a` and `b` " + call, "`a` and `b`"},
         {"~~~\nx\n~~~\n\n" + call, "~~~\nx\n~~~"},
         // A closing fence may be longer than the opener's three and carry trailing whitespace.
-        {"~~~\nx\n~~~~  \n" + call, "~~~\nx\n~~~~"}};
+        {"~~~\nx\n~~~~  \n" + call, "~~~\nx\n~~~~"},
+        // A fence ends the paragraph, so a backtick left unmatched before it opens no inline code
+        // after the fence closes.
+        {"Use a ` here\n```\ncode\n```\n" + call, "Use a ` here\n```\ncode\n```"}};
     for (const auto& [body, content] : real) {
         failures += check(outcome(body) == Outcome({args}, content),
                           "a top-level call after closed Markdown code did not fire exactly: " +
