@@ -1910,6 +1910,102 @@ void test_consuming_rewind_resets_proven_progress_to_the_adopted_prefix() {
             "an abandoned deep branch remained the proof after a consuming rewind");
 }
 
+Key concat(Key head, const Key& tail) {
+    head.insert(head.end(), tail.begin(), tail.end());
+    return head;
+}
+
+void test_rewritten_dialogue_outlives_its_abandoned_branch() {
+    // Host: the abandoned endpoint, the live endpoint and an external 16-byte resident.
+    Fixture f(48);
+    (void)f.program.host_block(16, true);
+    const auto shared = f.program.add(tokens(16));
+    f.publish(shared);
+    const Base first{.tokens = tokens(400)};
+    const auto owner = f.begin(first, shared);
+    const auto early = f.program.add(tokens(400), {}, Role::Continuation);
+    f.cache.publish(f.program, owner, early);
+    f.cache.finish(f.program, owner, first, f.next_order);
+    const Base append{.tokens = tokens(800)};
+    require(f.begin(append, early) == owner && f.cache.retention(owner).reused,
+            "fixture append did not prove the original dialogue");
+    const auto abandoned =
+        f.program.add(tokens(800), {f.program.host_block(16)}, Role::Continuation);
+    f.cache.publish(f.program, owner, abandoned);
+    f.cache.finish(f.program, owner, append, f.next_order);
+    const auto proof = f.cache.retention(owner);
+
+    // A sibling sharing only the marked prefix is independent work, not a rewrite.
+    const Base sibling{.tokens = concat(tokens(16), tokens(300, 5000))};
+    const auto sibling_owner = f.begin(sibling, shared);
+    require(!f.cache.retention(sibling_owner).reused && f.cache.retention(owner).reused &&
+                f.cache.retention(owner).last_demand == proof.last_demand,
+            "a sibling of the marked prefix demoted an unrelated dialogue");
+    f.cache.abandon(f.program, sibling_owner);
+
+    // An edit below every point of the dialogue starts a new owner from the shared prefix.
+    const Base edit{.tokens = concat(tokens(600), tokens(50, 9000))};
+    const auto live = f.begin(edit, shared);
+    require(live != owner && f.cache.retention(live).reused &&
+                f.cache.retention(live).last_demand > proof.last_demand &&
+                !f.cache.retention(owner).reused,
+            "the live continuation of a rewritten dialogue did not take its proven retention");
+    const auto endpoint =
+        f.program.add(edit.tokens, {f.program.host_block(16)}, Role::Continuation);
+    f.cache.publish(f.program, live, endpoint);
+    f.cache.finish(f.program, live, edit, f.next_order);
+
+    // The live branch's next optional capture may displace the abandoned history.
+    const Base next{.tokens = concat(edit.tokens, tokens(50, 20000))};
+    const auto admission = f.cache.capture_admission(
+        f.program, live, next, static_cast<std::uint32_t>(next.tokens.size()));
+    const auto victims = f.cache.host_victims(f.program, 16, std::nullopt, {}, {}, admission);
+    require(victims && *victims == std::vector<Handle>{abandoned},
+            "the live branch could not save its next point over the abandoned branch");
+
+    // Host pressure evicts the abandoned branch, never the live continuation.
+    require(f.cache.reclaim(f.program, {.host_bytes = 16}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                !f.program.valid_checkpoint(abandoned) && f.program.valid_checkpoint(endpoint),
+            "Host pressure evicted the live branch before the abandoned one");
+}
+
+void test_failed_demotion_releases_superseded_history_before_the_live_branch() {
+    // Host: the abandoned endpoint and two external 16-byte residents; 16 bytes stay free.
+    Fixture f(64);
+    (void)f.program.host_block(16, true);
+    (void)f.program.host_block(16, true);
+    const auto shared                             = f.program.add(tokens(16));
+    f.program.contents[shared.index].device_state = false;
+    f.publish(shared);
+    const Base first{.tokens = tokens(400)};
+    const auto owner = f.begin(first, shared);
+    const auto early = f.program.add(tokens(400), {}, Role::Continuation);
+    f.cache.publish(f.program, owner, early);
+    f.cache.finish(f.program, owner, first, f.next_order);
+    const Base append{.tokens = tokens(800)};
+    require(f.begin(append, early) == owner, "fixture append did not continue the dialogue");
+    const auto abandoned =
+        f.program.add(tokens(800), {f.program.host_block(16)}, Role::Continuation);
+    f.program.contents[abandoned.index].device_state = false;
+    f.cache.publish(f.program, owner, abandoned);
+    f.cache.finish(f.program, owner, append, f.next_order);
+
+    const Base edit{.tokens = concat(tokens(600), tokens(50, 9000))};
+    const auto live = f.begin(edit, shared);
+    // The live endpoint is Device-only; its Host destination fails although the bytes fit.
+    const auto endpoint = f.program.add(edit.tokens, {}, Role::Continuation);
+    f.program.contents[endpoint.index].demotion_bytes   = 16;
+    f.program.contents[endpoint.index].demotion_blocked = true;
+    f.cache.publish(f.program, live, endpoint);
+    f.cache.finish(f.program, live, edit, f.next_order);
+
+    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                !f.program.valid_checkpoint(abandoned) && f.program.valid_checkpoint(endpoint),
+            "a failed demotion deleted the live branch while superseded Host history remained");
+}
+
 } // namespace
 
 int main() {
@@ -1927,6 +2023,8 @@ int main() {
         test_free_host_preserves_an_unproven_suffix_instead_of_deleting_it();
         test_proven_deep_progress_survives_a_shallow_fallback_and_fork();
         test_consuming_rewind_resets_proven_progress_to_the_adopted_prefix();
+        test_rewritten_dialogue_outlives_its_abandoned_branch();
+        test_failed_demotion_releases_superseded_history_before_the_live_branch();
         test_inherited_owner_heat_cannot_spend_a_full_other_continuation();
         test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallback();
         test_old_candidate_demand_cannot_borrow_a_new_owner_epoch();
