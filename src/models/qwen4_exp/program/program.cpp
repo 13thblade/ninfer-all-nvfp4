@@ -115,6 +115,10 @@ constexpr std::uint32_t kKvBaseTokens = 32768;
 constexpr std::uint32_t kKvGrowPages = 64;
 // Misses staged per pass of a layer's experts.
 constexpr std::int32_t kStagingSlots = 64;
+// A layer call with at most this many misses reads them zero-copy instead of staging them: one or
+// two misses stream over PCIe beside the resident experts' compute faster than a stage copy that
+// precedes it (PR 11 measurements in flash-next-plan.md).
+constexpr std::int32_t kZeroCopyMisses = 2;
 // Promotions per layer call of a decode round (Infernix design section 19.2: one measured fastest).
 constexpr std::size_t kDecodePromotionsPerLayer = 1;
 // Once the frames are full, decode promotes only every interval-th round on the reference link.
@@ -498,6 +502,7 @@ public:
         experts.route_stride  = residency_->route_stride();
         experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
         experts.staging_slots = kStagingSlots;
+        experts.zero_copy_misses = kZeroCopyMisses;
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames.push_back(residency_->table(l)); }
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
                                                         std::move(experts));

@@ -163,6 +163,17 @@ __global__ void __launch_bounds__(kThreads)
         }
         __syncthreads();
     }
+    if (misses <= source.zero_copy_misses) {
+        // Few misses: the expert kernels read them from the host bank (NInfer-3090; a stage copy
+        // that precedes the compute costs more than their slices streamed beside it).
+        if (blockIdx.x == 0) {
+            for (int m = threadIdx.x; m < misses; m += blockDim.x) {
+                const int job    = miss_jobs[m];
+                job_records[job] = source.host_records + static_cast<std::uint64_t>(dispatch.jobs[job]) * source.record_stride;
+            }
+        }
+        return;
+    }
     const int chunks = static_cast<int>((record_bytes + kStageChunk - 1) / kStageChunk);
     constexpr int kVec = kStageChunk / 16;
     const int total    = misses * chunks;

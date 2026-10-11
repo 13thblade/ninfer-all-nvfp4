@@ -356,7 +356,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                 .frame_stride  = experts_.frame_stride,
                                 .error         = experts_.error,
                                 .staging_base  = experts_.staging_base,
-                                .staging_slots = experts_.staging_slots};
+                                .staging_slots = experts_.staging_slots,
+                                .zero_copy_misses = experts_.zero_copy_misses};
     Tensor outputs              = work_.alloc(DType::BF16, {H, K * T});
     const std::int32_t max_jobs = std::min(E, K * T);
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T));
