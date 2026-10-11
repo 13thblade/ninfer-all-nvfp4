@@ -135,6 +135,7 @@ The platform guides cover GPU checks, Docker, native builds and model mounts:
 | `run qwen36-35b-a3b` | Qwen3.6-35B-A3B, MTP3, cuBLAS prefill, vision; 213K with two lanes on Windows, 262K with three on Linux |
 | `run qwen38-27b int8` | Reference profile: one user, INT8 KV (the quality default), 64K context |
 | `run qwen38-27b c8` | Reference profile: eight lanes at 8K, highest aggregate throughput |
+| `run.bat qwen38-flash-next` | **Preview, Windows.** Qwen3.8-Flash-Next from the IQ2_XS GGUF: one user, 32K, text only, no speculation; needs ~38 GiB of free host RAM. See [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) |
 
 Every default profile serves images (vision in overlay residency, which costs about 10 MiB of
 device reservation), uses `rk4v4` KV, and backs the context cache with 8 GiB of pinned host RAM
@@ -275,6 +276,26 @@ chunk 512). That route's larger runtime reservation costs context beside a deskt
 
 Measured 2026-09-24. With `rk8v4` the same profile needed the ~1.5 GiB a desktop holds, so Windows
 ran one user at 147,456 tokens; `rk4v4` stores the same context in 31% less memory.
+
+### Qwen3.8-Flash-Next (preview)
+
+The 48-layer, 512-expert Qwen3.8-Flash-Next runs from the ISTA DASLab GSQ-RCO IQ2_XS GGUF,
+converted exactly (no re-quantization) into a 39.2 GB `.ninfer` plus a 29.1 GB n-gram volume
+beside it (`tools/convert/qwen4_exp.py`; [plan](docs/maintainer/flash-next-plan.md)). Start it with:
+
+```bat
+set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs.ninfer
+run.bat qwen38-flash-next
+```
+
+It pins all 33 GiB of routed experts in host RAM (startup refuses, saying how much is missing, when
+Windows cannot keep 2 GiB free beside them), keeps the most-used ~11,000-12,500 experts in a VRAM
+cache whose state is saved beside the model so the next start is warm, and serves one request at a
+time at up to 32K tokens with INT8 KV. Not yet: prefix reuse (every request prefills its whole
+prompt), MTP, vision, more than one lane, and fast prefill (PR 10). Measured on this RTX 3090
+with a warm expert cache: 78 / 77 / 76 tok/s decode after 1K / 8K / 32K prompts (Strata plain 71 /
+70 / 66; Strata with MTP 105-112), and 650-700 tok/s prefill. Decode speed and its breakdown are in [the plan](docs/maintainer/flash-next-plan.md#pr-9-m1-measurements); the server reference is
+[docs/serving.md](docs/serving.md#qwen38-flash-next-preview).
 
 ## Building from source
 
@@ -662,6 +683,8 @@ and the design are in `docs/maintainer/pipeline-parallel-plan.md`.
 - The shared KV pool is fixed at startup and is not divided statically among request lanes.
 - This is bounded small-scale batching, not preemptive large-scale continuous batching.
 - Tool calls are returned to the client but are not executed by NInfer.
+- Qwen3.8-Flash-Next (preview) serves one text request at a time with INT8 KV, no speculation and no
+  prefix reuse; it has been built and run on Windows only (Linux is neither built nor tested).
 - This fork targets `sm_86`. NVFP4 A4, FP8 A8 and TMA *weight and activation* kernels require
   Blackwell and are unavailable; FP8 and NVFP4 weights are admitted through their A16 dequantizing
   routes. KV-cache storage is a separate axis: all seven KV formats, including row-scaled FP8 E4M3,
@@ -683,8 +706,10 @@ features, or a role in project decisions.
 
 The Qwen3.8-Flash-Next work adapts code from [Infernix](https://github.com/wallawalla47/infernix)
 by [wallawalla47](https://github.com/wallawalla47) (Apache-2.0), itself a fork of NInfer: so far the n-gram volume format, the
-model's config keys and n-gram hash derivation, and the offloaded sparse-MoE Op (its contract,
-routing, dispatch, staging, CPU worker team and miss service, and its canonical-arithmetic method).
+model's config keys and n-gram hash derivation, the offloaded sparse-MoE Op (its contract,
+routing, dispatch, staging, CPU worker team and miss service, and its canonical-arithmetic method),
+the model's forward pass, and its Program pieces: the VRAM expert cache (LFRU frames, warm-start
+state), the RAM and VRAM ledgers, the elastic VMM KV pool, the VRAM monitor and the Engine instance.
 Each adapted file says so in its header.
 
 ## Contributors

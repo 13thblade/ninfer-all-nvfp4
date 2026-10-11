@@ -70,6 +70,28 @@ int main() {
     failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
                       "artifact model id was not selected by default");
 
+    // Qwen3.8-Flash-Next options: defaults leave every path and headroom to the Engine; each flag
+    // reaches EngineOptions::flash_next.
+    failures += check(defaults.flash_next.ngram_volume_path.empty() &&
+                          defaults.flash_next.expert_state_path.empty() &&
+                          defaults.flash_next.save_expert_state && !defaults.flash_next.vram_headroom_bytes &&
+                          !defaults.flash_next.expert_cache_bytes &&
+                          defaults.flash_next.ram_headroom_bytes == (2ULL << 30),
+                      "Flash-Next defaults mismatch");
+    const ServeOptions flash = parse({"ninfer-serve", "model.ninfer", "--ngram-volume", "K:/v.ngram",
+                                      "--expert-state", "K:/s.state", "--vram-headroom-mib", "300",
+                                      "--ram-headroom-mib", "4096", "--expert-cache-mib", "1024"});
+    failures += check(flash.flash_next.ngram_volume_path == "K:/v.ngram" &&
+                          flash.flash_next.expert_state_path == "K:/s.state" &&
+                          flash.flash_next.vram_headroom_bytes == (300ULL << 20) &&
+                          flash.flash_next.ram_headroom_bytes == (4096ULL << 20) &&
+                          flash.flash_next.expert_cache_bytes == (1024ULL << 20),
+                      "Flash-Next flags were not parsed");
+    failures += check(make_engine_options(flash).flash_next.expert_cache_bytes == (1024ULL << 20),
+                      "Flash-Next options do not reach the Engine");
+    failures += check(!parse({"ninfer-serve", "model.ninfer", "--no-expert-state"}).flash_next.save_expert_state,
+                      "--no-expert-state did not turn the saved state off");
+
     // Without --default-max-tokens an omitted request limit is derived per request as the prompt's
     // remaining context, bounded above by --max-context; the flag replaces it with a fixed cap.
     const ServeOptions long_context =

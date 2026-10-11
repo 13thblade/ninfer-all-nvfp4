@@ -268,6 +268,29 @@ struct GraftSource {
     std::filesystem::path path;
 };
 
+// Qwen3.8-Flash-Next (Qwen4ExpForCausalLM) only; other models ignore these.
+struct FlashNextOptions {
+    // The per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
+    std::filesystem::path ngram_volume_path;
+    // The VRAM expert cache's saved state: read at startup to fill the cache with the experts the
+    // last session used most (warm start), written at shutdown and between requests every 10
+    // minutes. Empty uses `<artifact>.expert-state`; `save_expert_state = false` neither reads nor
+    // writes it.
+    std::filesystem::path expert_state_path;
+    bool save_expert_state = true;
+    // Device memory the expert cache leaves free for the display and other programs once every
+    // fixed allocation is made. Empty: 512 MiB with a display attached, 256 MiB headless.
+    std::optional<std::uint64_t> vram_headroom_bytes;
+    // At most this much device memory for the expert cache (measurement; empty: what fits).
+    std::optional<std::uint64_t> expert_cache_bytes;
+    // Physical Host memory left free for Windows and other programs once every expert is pinned;
+    // startup refuses when it cannot be kept.
+    std::uint64_t ram_headroom_bytes = 2ULL << 30;
+    // Tokens of KV backed at startup; requests needing more borrow it from the expert cache (0:
+    // 32,768). Measurement and tests.
+    std::uint32_t kv_base_tokens = 0;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -346,6 +369,7 @@ struct EngineOptions {
     std::vector<GraftSource> grafts;
     StartupObserver startup_observer;
     ContextStoreOptions context_store;
+    FlashNextOptions flash_next;
     // Called on the worker thread for each host-side worker failure, after recovery or latch.
     // Must be quick; exceptions are ignored.
     std::function<void(const EngineFaultEvent& event)> fault_listener;

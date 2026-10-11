@@ -148,6 +148,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--default-max-tokens N] [--max-output-tokens N] [--default-thinking-budget N] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
+           "[--ngram-volume FILE] [--expert-state FILE|--no-expert-state] [--vram-headroom-mib N] "
+           "[--ram-headroom-mib N] [--expert-cache-mib N] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16] "
@@ -187,6 +189,14 @@ std::string serve_usage_text(const char* argv0) {
            "       --lookup-ngram N adds context-lookup drafting alongside --spec: the last N tokens "
            "are matched against the sequence so far and what followed is proposed; it is exact, and "
            "0 (the default) disables it\n"
+           "       Qwen3.8-Flash-Next (one request at a time, --kv-dtype int8, no prefix reuse): "
+           "--ngram-volume FILE is its n-gram table (default <model>.ngram); --expert-state FILE "
+           "keeps the VRAM expert cache's state across restarts (default <model>.expert-state; "
+           "--no-expert-state starts it empty and saves nothing); --vram-headroom-mib N is the VRAM "
+           "the expert cache leaves free for the desktop (default 512 with a display, 256 without); "
+           "--ram-headroom-mib N is the RAM left free for Windows once every expert is pinned "
+           "(default 2048; startup refuses when it cannot be kept); --expert-cache-mib N caps the "
+           "expert cache (for measurement)\n"
            "       --no-prefix-reuse disables cross-request history; request pause/replay "
            "resources remain available\n"
            "       --context-store DIR keeps retained sessions on disk so a restart or crash does "
@@ -484,6 +494,24 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.vision_max_merged_tokens = static_cast<std::uint32_t>(merged);
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--ngram-volume") {
+            options.flash_next.ngram_volume_path = require_value("--ngram-volume");
+        } else if (arg == "--expert-state") {
+            options.flash_next.expert_state_path = require_value("--expert-state");
+            if (options.flash_next.expert_state_path.empty()) {
+                throw std::invalid_argument("--expert-state must not be empty");
+            }
+        } else if (arg == "--no-expert-state") {
+            options.flash_next.save_expert_state = false;
+        } else if (arg == "--vram-headroom-mib") {
+            options.flash_next.vram_headroom_bytes =
+                parse_u64(require_value("--vram-headroom-mib"), "vram-headroom-mib") << 20U;
+        } else if (arg == "--ram-headroom-mib") {
+            options.flash_next.ram_headroom_bytes =
+                parse_u64(require_value("--ram-headroom-mib"), "ram-headroom-mib") << 20U;
+        } else if (arg == "--expert-cache-mib") {
+            options.flash_next.expert_cache_bytes =
+                parse_u64(require_value("--expert-cache-mib"), "expert-cache-mib") << 20U;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--context-store") {

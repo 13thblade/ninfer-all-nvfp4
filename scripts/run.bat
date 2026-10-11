@@ -8,6 +8,13 @@ rem
 rem   model             profiles
 rem   qwen38-27b        tuned (default), int8, c8   <- recommended
 rem   qwen36-35b-a3b    tuned (default)
+rem   qwen38-flash-next tuned (default)      <- Qwen3.8-Flash-Next from the IQ2_XS GGUF (preview)
+rem
+rem QWEN3.8-FLASH-NEXT: one request at a time, 32,768 tokens of context, INT8 KV, text only, no
+rem speculation and no prefix reuse yet (every request prefills its whole prompt). It pins all 33 GiB
+rem of routed experts in host RAM and caches the most-used ones in VRAM; startup refuses, saying how
+rem much is missing, when Windows cannot keep 2 GiB free beside them. The expert cache's state is
+rem saved beside the model, so the second start is warm. NINFER_CONTEXT overrides the context.
 rem
 rem `tuned` is the recommended profile: rk4v4 KV, speculation plus the draft head, the memory
 rem flags, vision in overlay residency, and an 8 GiB pinned Host context budget for the cache.
@@ -115,6 +122,11 @@ if /i "%MODEL_KEY%"=="qwen36-35b-a3b" (
   set "TITLE=Qwen3.6-35B-A3B"
   goto :model_known
 )
+if /i "%MODEL_KEY%"=="qwen38-flash-next" (
+  set "ARTIFACT=qwen4exp-iq2xs.ninfer"
+  set "TITLE=Qwen3.8-Flash-Next (IQ2_XS)"
+  goto :model_known
+)
 echo Unknown model: %MODEL_KEY% 1>&2
 call :usage 1>&2
 exit /b 2
@@ -125,9 +137,12 @@ rem no console to read from; that must not silently pick a model.
 echo Which model?
 echo   1  Qwen3.8-27B  (recommended)
 echo   2  Qwen3.6-35B-A3B
-choice /c 12 /n /m "Choose 1 or 2: "
+echo   3  Qwen3.8-Flash-Next  (preview: one request at a time, 32K context)
+choice /c 123 /n /m "Choose 1, 2 or 3: "
 if errorlevel 255 exit /b 2
-if errorlevel 2 (
+if errorlevel 3 (
+  set "MODEL_KEY=qwen38-flash-next"
+) else if errorlevel 2 (
   set "MODEL_KEY=qwen36-35b-a3b"
 ) else (
   set "MODEL_KEY=qwen38-27b"
@@ -179,6 +194,7 @@ set "PREFILL_NOTE="
 set "HINT="
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b/tuned" goto :profile_27b_tuned
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen36-35b-a3b/tuned" goto :profile_35b_tuned
+if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-flash-next/tuned" goto :profile_flash_next
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b/int8" goto :profile_27b_int8
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b/c8" goto :profile_27b_c8
 echo Model %MODEL_KEY% has no profile %PROFILE% 1>&2
@@ -277,6 +293,19 @@ if /i "%SPEC%"=="mtp" set "SPEC_LABEL=MTP%DRAFT_TOKENS% + draft head"
 set "PROFILE_ARGS=--max-concurrency %CONCURRENCY% --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype %KV_DTYPE% %SPEC_ARGS% --gdn-state-fp16 --prefill-cublas --prefill-chunk %PREFILL_CHUNK%"
 set "LABEL=C%CONCURRENCY%  ^|  context %CONTEXT%  ^|  %KV_DTYPE% KV  ^|  %SPEC_LABEL%"
 goto :profile_tuned_common
+
+:profile_flash_next
+rem The only serving shape this release supports: one lane, INT8 KV. The step-down ladder does not
+rem apply (its refusals are another model's); a refusal here says what to change. PROFILE is
+rem renamed so the tuned profiles' cache and sampling notes are not printed for it.
+set "LADDER=0"
+set "PROFILE=flash-next"
+set "CONTEXT=32768"
+if not "%NINFER_CONTEXT%"=="" set "CONTEXT=%NINFER_CONTEXT%"
+set "PROFILE_ARGS=--max-concurrency 1 --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype int8 --prefill-chunk 1024 --max-pending-requests 16 --pending-timeout-ms 600000"
+set "LABEL=one request  ^|  context %CONTEXT%  ^|  INT8 KV  ^|  text only, no speculation"
+set "PREFILL_NOTE=Loads in about 2 minutes: 33 GiB of experts are pinned in host RAM"
+goto :launch
 
 :profile_27b_int8
 set "PROFILE_ARGS=--max-context 65536 --kv-capacity 65536 --max-concurrency 1 --max-pending-requests 16 --pending-timeout-ms 600000 --prefill-chunk 1024 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft"
@@ -494,4 +523,5 @@ endlocal & exit /b %SERVER_STATUS%
 echo usage: run.bat ^<model^> [profile]
 echo   qwen38-27b       tuned (default), int8, c8   (recommended)
 echo   qwen36-35b-a3b   tuned (default)
+echo   qwen38-flash-next tuned (default)   (preview)
 exit /b 0

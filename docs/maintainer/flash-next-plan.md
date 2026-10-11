@@ -19,7 +19,7 @@ references, `engine-architecture.md`).
 | 7a | `offloaded_sparse_moe` contract, routing, dispatch, combine, canonical A8 arithmetic, CPU expert engine (scalar, AVX2, worker team) | done |
 | 7b | `offloaded_sparse_moe` GPU narrow route (device frames, staging, zero-copy), CPU miss channel and service | done (perf gate missed, see below) |
 | 8 | M0: the qwen4exp model from Infernix (config, binding, forward, n-gram hash, n-gram volume reader with keep-alive), the full conversion, the FP64 reference and block check, `forward_real`; the quality gate | done (gate below) |
-| 9 | Program and Engine integration, serving | not started |
+| 9 | M1: Program and Engine integration (one lane, elastic VMM KV, VRAM expert cache with LFRU and warm start, RAM/VRAM ledgers, decode CUDA graph, `EngineCore<Qwen4ExpInstance>`), serving and the `qwen38-flash-next` launcher profile | done (measurements below) |
 | 10 | Prefill: GPU wide expert route | not started |
 | 11-14 | Residency policy and miss split, 128K, MTP, vision | not started |
 
@@ -117,6 +117,52 @@ over positions): hyper-connection mixers 0.2-1.0%, GDN 0.7-1.0%, QSA 2.5-2.9% (t
 exact K/V, the engine INT8-G64), MoE <= 0.07% (most positions bit-equal after BF16 rounding),
 residual updates <= 0.6%, layers 0-3, 7-9, 46 and 47.
 
+## PR 9 (M1) measurements
+
+RTX 3090 (WDDM, display attached), CUDA 12.8, Ryzen 9 5950X, DDR4-2133; artifact and volume on K:
+(SATA). Through the public Engine (`ninfer_qwen4_exp_engine_real_test`) and `ninfer-serve`.
+
+**Gates.**
+
+| Gate | Result |
+|---|---|
+| Serving smoke (`run.bat qwen38-flash-next` + chat completions, streaming, tool call required and auto, the tool result answered, Anthropic Messages, greedy repeat) | 7/7 |
+| Greedy ids identical at C = 1 across expert-cache states | identical: cold, warm (same Engine), warm start from the saved state, a 1 GiB cache (710 frames, evicting every round) with a 64-token KV base and no CUDA graph; a 5,120-token prompt (past QSA's 2,048-token budget, the KV base growing) identical between the default and the small-cache Engine |
+| RAM ledger refuses cleanly | an Engine keeping 1 TiB free refuses before pinning: "... 1017.0 GiB short. Close other programs ..." |
+
+**Decode, plain, 512 greedy tokens** after Strata's PR 0 prompts (the same token ids), one model
+load, a warm-up request then 18 requests in ABBA order over the tiers (6 per tier), the expert cache
+warm-started from an earlier session. Wall clock after the prompt (every host step included):
+
+| Prompt | NInfer tok/s, median [min-max] | Strata plain (PR 0) | Strata MTP (PR 0) | decode hit rate |
+|---|---:|---:|---:|---:|
+| 1K | **78.1** [75.5-79.5] | 71.3 | 105.1 | 98.0% |
+| 8K | **76.7** [75.7-78.7] | 69.6 | 112.4 | 97.2% |
+| 32K | **75.6** [74.1-77.1] | 66.2 | 107.1 | 96.6% |
+
+- 1.10×, 1.10× and 1.14× Strata's plain decode; 0.68-0.74× its MTP decode. The Infernix-normalized
+  8K range (spec 8.2: 80-120) is not reached: 76.7 is 4% below its bottom.
+- An earlier identical run (Program-timed) gave 77.9 / 76.8 / 75.9 by the same wall formula.
+- Prefill, not gated here (PR 10): 650-700 tok/s from a warm cache at 1K-32K (Strata 1,900-2,400).
+- Expert cache: 11,063 frames at startup, grown by the VRAM control law to 11,951 (16.8 GiB)
+  within the first minute; Strata holds 12,375-12,583. Decode promotes ~2-3 experts per token.
+
+**Where a decode token's time goes** (8K, warm cache, nsys with graph nodes traced; kernel times per
+round, which the profiler inflates by roughly 5%: the GPU is busy ~13.7 ms of a 13 ms token, so
+decode is GPU-bound and the host adds ~0.08 ms per token outside the rounds):
+
+| Work | ms / token | Note |
+|---|---:|---|
+| Routed experts | 4.27 | `stage_kernel` 2.08 (48 launches: ~43 µs each even with ~97% hits, a fixed per-layer cost), `gate_up` 1.46, `down` 0.73 (#239's narrow route at 28-30% of bandwidth) |
+| Dense GGML linears | 3.89 | 301 MMVQ launches (shared experts, attention, GDN, head) |
+| HC mixer and inject | 2.78 | #236's 97 fused calls |
+| MoE route, dispatch, combine | 0.55 | |
+| FP32 projections (router, indexer) | 0.51 | |
+| QSA (prep, select, attention), GDN, norms, copies | ~1.7 | QSA attention 15 µs per layer here |
+
+The cheapest next win is the stage pass of layers with no misses (~2 ms); the narrow route's
+bandwidth and the HC mixer are PR 11's (spec 8.2).
+
 ## Artifact decisions
 
 Taken in PR 1 and revised in PR 2b, which aligned the artifact with Infernix (the model code and
@@ -197,6 +243,16 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `src/models/qwen4_exp/program/ngram_volume.{h,cpp}` | same path | Version 2 volume; keep-alive after Strata's PLE reader |
 | `tests/models/qwen4_exp/test_{ngram_hash,ngram_volume,forward_real}.cpp`, `tests/fixtures/qwen4_exp/ngram_rows.txt` | same paths (`forward_real` with `45f20fb9`'s taps) | One sequence; INT8 KV built directly; timed decode |
 | `tools/flash_next/{ngram,reference,block_check,strata_compare}.py` | same paths | The reference reads the `.ninfer` through the exact GGML decoders, with the canonical A8 cast |
+| `src/core/{vmm_arena.{h,cu},cuda_vmm.h,vram_budget.{h,cpp},copy_batch.{h,cpp},link_probe.{h,cpp},power_throttling.{h,cpp}}` | same paths | Namespace; `CopyBatch` takes CUDA 12.8's `cudaMemcpyBatchAsync` form and falls back to single copies |
+| `src/core/host_memory.{h,cpp}` | same path | The snapshot and working-set reserve only |
+| `src/core/pinned_upload.{h,cu}` | `src/core/device.{h,cu}` (`upload_pinned`) | Own translation unit |
+| `src/models/qwen4_exp/memory_plan.{h,cpp}` | same path | Full RAM mode only (fits or refuses; no SSD tier, no `--expert-ram-mib`); the VRAM sizing and control law unchanged |
+| `src/models/qwen4_exp/program/expert_cache/expert_{cache,state}.{h,cpp}` | same paths | Verbatim |
+| `src/models/qwen4_exp/program/expert_residency.{h,cpp}` | same path | Per-layer record strides in one frame size; no SSD tier, landing or lending |
+| `src/models/qwen4_exp/program/vram_monitor.{h,cpp}` | same path | Verbatim |
+| `src/models/qwen4_exp/program/program.{h,cpp}` | `program/program.{h,cpp}`, `program/program_impl.h` | NInfer's execution contract (prefix reuse off, one lane); device plan, elastic KV, decode budget, warm start, VRAM control, link probe and decode graph from Infernix |
+| `src/runtime/engine/qwen4_exp_instance.{h,cpp}` | same path | NInfer's EngineCore and ResourceManager with the context cache off; refuses unsupported options |
+| `tests/models/qwen4_exp/test_{expert_cache,memory_plan}.cpp`, `tests/fixtures/expert_cache/lfru_conformance.txt` | same paths | The memory plan's RAM tests rewritten for full mode |
 
 ## Export conventions of this GGUF
 

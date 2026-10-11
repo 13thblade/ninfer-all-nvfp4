@@ -2,11 +2,13 @@
 
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/model.h and load.h (Apache-2.0).
 // Modified for NInfer-3090: GGML expert record banks (each layer's record format, no per-expert
-// scales); no frontend resources, expert store, vision or MTP (the M0 model runs through the
-// real-artifact test; the Program, Engine and frontend arrive with PR 9).
+// scales); no expert store, vision or MTP. The load is planned first (the RAM ledger reads the
+// plan's pinned bytes before anything is pinned) and then materialized, as Infernix's plan_load.
 
 #include "artifact/materializer.h"
+#include "artifact/reader.h"
 #include "core/device.h"
+#include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/weights.h"
 
@@ -14,13 +16,13 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
-namespace ninfer::artifact {
-class Reader;
-}
-
 namespace ninfer::models::qwen4_exp {
+
+// The Qwen3.5 frontend (tokenizer, chat template, thinking control) reads the same resources.
+using FrontendResources = qwen3_5::FrontendResources;
 
 // The routed experts of one MoE layer: the pinned host bank of ggml_expert_record_v1 records, read
 // by the GPU through `device_records` (the same memory, device-addressable) and by the CPU through
@@ -33,6 +35,35 @@ struct ExpertBank {
     const std::uint8_t* device_records  = nullptr;
 };
 
+struct InstanceInfo {
+    std::string name;
+    artifact::ArtifactId artifact_id{};
+};
+
+class LoadPlan {
+public:
+    LoadPlan(LoadPlan&&) noexcept;
+    LoadPlan& operator=(LoadPlan&&) noexcept;
+    ~LoadPlan();
+
+    [[nodiscard]] const TextConfig& config() const;
+    [[nodiscard]] const FrontendResources& resources() const;
+    // Device bytes of the dense weights, and the page-locked Host bytes (the expert banks).
+    [[nodiscard]] std::uint64_t device_bytes() const;
+    [[nodiscard]] std::uint64_t pinned_bytes() const;
+    // Each layer's expert record stride (the bank's record format).
+    [[nodiscard]] const std::vector<std::uint64_t>& expert_record_strides() const;
+
+    struct Impl;
+
+private:
+    explicit LoadPlan(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+    friend LoadPlan plan_load(const artifact::Reader&);
+    friend class Model;
+    friend std::unique_ptr<class Model> materialize_model(LoadPlan&&, DeviceContext&, const StartupObserver*);
+};
+
 class Model {
 public:
     ~Model();
@@ -43,12 +74,14 @@ public:
     [[nodiscard]] const TextWeights& weights() const noexcept { return weights_; }
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
     [[nodiscard]] std::span<const ExpertBank> expert_banks() const noexcept { return banks_; }
+    [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
+    [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept { return backing_.stats(); }
 
 private:
-    friend std::unique_ptr<Model> load_model(const artifact::Reader&, DeviceContext&);
+    friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&, const StartupObserver*);
     Model(TextConfig config, TextWeights weights, std::vector<BoundWeight> bound, std::vector<ExpertBank> banks,
-          artifact::MaterializedArtifact backing);
+          FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing);
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
     artifact::MaterializedArtifact backing_;
@@ -56,13 +89,22 @@ private:
     TextWeights weights_;
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBank> banks_;
+    FrontendResources resources_;
+    InstanceInfo info_;
 };
 
 // True when the artifact's text component is Qwen4Exp.
 [[nodiscard]] bool is_qwen4_exp(const artifact::Reader& reader);
 
 // Binds every parameter (dense weights on the device, expert banks in one pinned host block) and
-// materializes them. Device memory is allocated before the pinned block.
+// the frontend resources, reading nothing but the resources.
+[[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader);
+
+// Materializes a plan. Device memory is allocated before the pinned block.
+[[nodiscard]] std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
+                                                       const StartupObserver* observer = nullptr);
+
+// plan_load then materialize_model.
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device);
 
 } // namespace ninfer::models::qwen4_exp

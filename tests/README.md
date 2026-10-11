@@ -250,6 +250,27 @@ build-ninja\tests\ninfer_tests.exe ninfer_qwen4_exp_forward_real_test "@DIR\code
 python -m tools.flash_next.strata_compare --texts DIR
 ```
 
+The Program and Engine integration adds two host-only tests and one Engine-level real test.
+`ninfer_qwen4_exp_expert_cache_test` (lifted from Infernix with the expert cache) checks the LFRU
+policy decision for decision against `tests/fixtures/expert_cache/lfru_conformance.txt` (the
+replay tool's victims), residency words, frame epochs, pool resizes and relocations, load serials,
+lending, landing, the tier gates and the warm-start state file. `ninfer_qwen4_exp_memory_plan_test`
+checks the RAM ledger (fits or refuses, the reserve applied once, lock overhead, the page-file
+limit, the refusal's shortfall) and the VRAM sizing and control law. `ninfer_qwen4_exp_engine_real_test`
+(skips without `NINFER_TEST_QWEN4EXP_ARTIFACT`) runs the M1 gates through the public Engine: an
+Engine asked to keep 1 TiB free must refuse before pinning; then one greedy request's ids must be
+identical with the expert cache cold, warm, warm-started from the first Engine's saved state, and
+capped at 1 GiB (evicting every round) with a 64-token KV base and no CUDA graph; and a ~5,100-token
+prompt (every fixture text: past QSA's 2,048-token selection budget, and past the small Engine's KV
+base, which grows) must give the same ids in the default and the small-cache Engine. It loads the model three times (about five minutes). With `--bench` it loads once and
+runs each `@FILE` prompt in order with greedy output and model stops off (`--generate N`, default
+512), printing prefill and decode rates; the Program logs each request's expert hit rate:
+
+```powershell
+build-ninja\tests\ninfer_tests.exe ninfer_qwen4_exp_engine_real_test --bench --max-context 33792 `
+  "@prompts\1k-r0.ids" "@prompts\8k-r0.ids" "@prompts\32k-r0.ids"
+```
+
 The real loading test accepts an explicit artifact path and optional component selection:
 
 ```bash
