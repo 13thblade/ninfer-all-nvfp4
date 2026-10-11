@@ -1129,7 +1129,10 @@ int test_markdown_quoted_calls() {
         {"`a` and `b` " + call, "`a` and `b`"},
         {"~~~\nx\n~~~\n\n" + call, "~~~\nx\n~~~"},
         // A closing fence may be longer than the opener's three and carry trailing whitespace.
-        {"~~~\nx\n~~~~  \n" + call, "~~~\nx\n~~~~"}};
+        {"~~~\nx\n~~~~  \n" + call, "~~~\nx\n~~~~"},
+        // A fence ends the paragraph, so a backtick left unmatched before it opens no inline code
+        // after the fence closes.
+        {"Use a ` here\n```\ncode\n```\n" + call, "Use a ` here\n```\ncode\n```"}};
     const std::string example = "Example:\n```\n" + call + "\n```\nNow for real.";
     for (const bool mode : {false, true}) {
         tolerant = mode;
