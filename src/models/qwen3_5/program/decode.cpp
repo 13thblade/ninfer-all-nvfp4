@@ -21,6 +21,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -185,6 +186,7 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
         structured_round->fill(sequence.lane, *request.grammar, device.stream);
     }
     request.mask_cost = {};
+    request.next_mask.reset();
     request.speculative_stats = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
@@ -443,6 +445,50 @@ std::uint32_t ProgramImpl::speculative_extent(const RequestControl& request) noe
                : std::numeric_limits<std::uint32_t>::max();
 }
 
+StructuredReadiness ProgramImpl::structured_readiness(SequenceHandle handle) {
+    if (!structured_round || !valid_sequence(handle)) { return {}; }
+    const std::uint32_t lane = ContractAccess::lane(handle).value;
+    RequestControl& request  = requests[lane];
+    if (!request.grammar || request.mask_cost.speculates()) {
+        request.next_mask.reset();
+        return {};
+    }
+    // The grammar moves on only when the Engine commits tokens, which advances the ledger: a job
+    // started at another frontier is for another position.
+    const std::uint32_t frontier = active_sequence(lane).ledger_frontier;
+    if (request.next_mask && request.next_mask_frontier != frontier) { request.next_mask.reset(); }
+    if (!request.next_mask) {
+        request.next_mask = runtime::GrammarMaskJob::start(
+            *request.grammar, static_cast<std::size_t>(structured_round->stride()));
+        request.next_mask_frontier = frontier;
+        request.next_mask_started  = Clock::now();
+    }
+    if (!request.next_mask->ready()) {
+        const double waited =
+            std::chrono::duration<double>(Clock::now() - request.next_mask_started).count();
+        if (waited > runtime::kGrammarMaskBudgetSeconds) {
+            return {.ready   = false,
+                    .failure = "the grammar mask took over " +
+                               std::to_string(runtime::kGrammarMaskBudgetSeconds) + " s"};
+        }
+        return {.ready = false};
+    }
+    std::string problem = runtime::grammar_mask_problem(*request.next_mask);
+    if (!problem.empty()) { return {.ready = false, .failure = std::move(problem)}; }
+    return {};
+}
+
+std::shared_ptr<runtime::GrammarMaskJob>
+ProgramImpl::take_next_mask(RequestControl& request, const SequenceState& sequence,
+                            std::uint32_t extent) {
+    if (extent != 0 || !request.next_mask || !request.next_mask->ready() ||
+        request.next_mask_frontier != sequence.ledger_frontier) {
+        request.next_mask.reset();
+        return nullptr;
+    }
+    return std::exchange(request.next_mask, nullptr);
+}
+
 void ProgramImpl::observe_masks(std::span<const std::uint32_t> lanes) {
     if (!structured_round) { return; }
     structured_round->check();
@@ -516,7 +562,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         if (structured_round) { structured_round->begin(); }
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence            = active_sequence(lanes[row]);
-            const RequestControl& request      = requests[lanes[row]];
+            RequestControl& request            = requests[lanes[row]];
             const std::uint32_t frontier       = sequence.execution_frontier;
             ordinary_host_ingress->tokens[row] = sequence.ledger.back();
             ordinary_host_ingress->cache_positions[row] =
@@ -531,7 +577,13 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
-            if (request.grammar) { structured_round->start(sequence.lane, *request.grammar, {}); }
+            if (request.grammar) {
+                if (auto ready = take_next_mask(request, sequence, 0)) {
+                    structured_round->adopt(sequence.lane, std::move(ready));
+                } else {
+                    structured_round->start(sequence.lane, *request.grammar, {});
+                }
+            }
             logprobs = logprobs || request.logprobs;
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
@@ -702,7 +754,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         bool logprobs = false;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = active_sequence(lanes[row]);
-            const RequestControl& request     = requests[lanes[row]];
+            RequestControl& request           = requests[lanes[row]];
             const std::uint32_t frontier      = sequence.execution_frontier;
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
@@ -741,9 +793,13 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             logprobs = logprobs || request.logprobs;
             if (request.grammar) {
-                structured_round->start(
-                    sequence.lane, *request.grammar,
-                    {mtp_host_ingress->current_drafts.data() + row * verify_window, extent});
+                if (auto ready = take_next_mask(request, sequence, extent)) {
+                    structured_round->adopt(sequence.lane, std::move(ready));
+                } else {
+                    structured_round->start(
+                        sequence.lane, *request.grammar,
+                        {mtp_host_ingress->current_drafts.data() + row * verify_window, extent});
+                }
             }
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + draft_window));
@@ -1022,9 +1078,17 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         if (structured_round) {
             structured_round->begin();
             for (std::size_t row = 0; row < lanes.size(); ++row) {
-                structured_round->set_dflash_row(row, lanes[row],
-                                                 dflash_host_ingress->proposal_extents[row],
-                                                 requests[lanes[row]].grammar);
+                RequestControl& request     = requests[lanes[row]];
+                const std::uint32_t extent  = static_cast<std::uint32_t>(
+                    dflash_host_ingress->proposal_extents[row]);
+                auto ready = request.grammar
+                                 ? take_next_mask(request, active_sequence(lanes[row]), extent)
+                                 : nullptr;
+                // A lane whose mask was computed ahead hands it over; the round starts no job
+                // for it.
+                structured_round->set_dflash_row(row, lanes[row], extent,
+                                                 ready ? nullptr : request.grammar);
+                if (ready) { structured_round->adopt(lanes[row], std::move(ready)); }
             }
         }
         execution::DFlashBatchContext schedule_state{

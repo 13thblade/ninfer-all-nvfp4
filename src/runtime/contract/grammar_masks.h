@@ -20,6 +20,7 @@
 #include <exception>
 #include <memory>
 #include <span>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -29,6 +30,8 @@ namespace ninfer::runtime {
 // The mask time above which a structured request decodes without drafts: about what a
 // verification hides on the GPU.
 inline constexpr double kSpeculativeMaskSeconds = 0.004;
+// One mask over this budget fails its request: the grammar is too costly to serve.
+inline constexpr double kGrammarMaskBudgetSeconds = 5.0;
 
 // A structured request's recent mask time: how long its next token's mask, or a speculative round's
 // columns filled in parallel, took to compute.
@@ -91,5 +94,22 @@ private:
     std::exception_ptr error_;
     std::atomic<bool> done_{false};
 };
+
+// Why a finished mask job cannot serve: its grammar had no admissible token, or it took over the
+// budget. Empty when it can.
+[[nodiscard]] inline std::string grammar_mask_problem(const GrammarMaskJob& job) {
+    if (job.error()) {
+        try {
+            std::rethrow_exception(job.error());
+        } catch (const std::exception& e) {
+            return e.what();
+        } catch (...) { return "the grammar mask failed"; }
+    }
+    if (job.seconds() > kGrammarMaskBudgetSeconds) {
+        return "the grammar mask took " + std::to_string(job.seconds()) + " s, over the " +
+               std::to_string(kGrammarMaskBudgetSeconds) + " s budget";
+    }
+    return {};
+}
 
 } // namespace ninfer::runtime

@@ -696,7 +696,11 @@ verification, then a host function that collects the jobs and the H2D mask trans
 acceptance. Host functions call no CUDA API; they capture exceptions for rethrow after stream
 synchronization and before any token can be published. All node addresses belong to Program and
 outlive graph replay. A structured lane whose last masks took over 4 ms verifies no drafts (its
-extent is zero) until they are cheap again.
+extent is zero) until they are cheap again. Its next mask then computes ahead: the Engine asks
+`Program::structured_readiness` for every decode-ready lane before a round, which starts the
+lane's job at its committed ledger frontier and leaves the lane out of rounds until the job is
+ready; the round adopts the finished job instead of starting one. A job that fails, or runs over
+5 s, ends that request with an explicit error.
 
 Draft frames are compact at each round's actual proposal width, which may be narrower than the
 maximum ngram/copy window. D2H staging must preserve the fixed host-row pitch used by the grammar

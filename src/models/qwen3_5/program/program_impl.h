@@ -530,8 +530,13 @@ struct RequestControl {
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
     std::shared_ptr<text::GrammarState> grammar;
-    // With a grammar: whether its masks are cheap enough for its rounds to verify drafts.
+    // With a grammar: whether its masks are cheap enough for its rounds to verify drafts, and
+    // while they are not, the mask of its next token computing ahead of its next round, started
+    // at the ledger frontier it was computed for.
     runtime::GrammarMaskCost mask_cost;
+    std::shared_ptr<runtime::GrammarMaskJob> next_mask;
+    std::uint32_t next_mask_frontier = 0;
+    std::chrono::steady_clock::time_point next_mask_started;
     bool logprobs = false;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
@@ -686,6 +691,7 @@ public:
     // the lane must not be given a prefill unit, and every other lane keeps running.
     [[nodiscard]] bool vision_pending(SequenceHandle sequence) const noexcept;
     void update_sampling(SequenceHandle sequence, const ResolvedSamplingParameters& sampling);
+    [[nodiscard]] StructuredReadiness structured_readiness(SequenceHandle sequence);
     [[nodiscard]] bool wait_context_transfer() noexcept;
     [[nodiscard]] bool try_claim_seal_window() noexcept;
     void release_seal_window() noexcept;
@@ -1680,6 +1686,10 @@ private:
     // The drafts a lane's round may verify: none for a structured lane whose masks cost more than
     // a verification hides, so its round computes one mask for it.
     [[nodiscard]] static std::uint32_t speculative_extent(const RequestControl& request) noexcept;
+    // The lane's next mask computed ahead (structured_readiness), handed to the round when it
+    // verifies no drafts; otherwise none and the round starts the lane's masks itself.
+    [[nodiscard]] std::shared_ptr<runtime::GrammarMaskJob>
+    take_next_mask(RequestControl& request, const SequenceState& sequence, std::uint32_t extent);
     // After a round: rethrows a mask job's error and updates each structured lane's mask cost.
     void observe_masks(std::span<const std::uint32_t> lanes);
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;

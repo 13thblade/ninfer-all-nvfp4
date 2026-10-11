@@ -223,11 +223,12 @@ that needs them: the next token's mask, or in a speculative round one mask per d
 filled in parallel. Speculation is automatic: a constrained request verifies drafts (MTP,
 DFlash/DFlash2, a context lookup) while its masks take at most 4 ms, which the verification
 hides, and decodes without drafts while they cost more, resuming once they are cheap again.
-Gemma 4 and Qwen3.8-Flash-Next do not hold a decode step for a late mask: the row keeps its
-logits and samples once the mask is ready while the other requests go on, and a mask over 5 s or
-a decoding request without a token for 120 s fails with an explicit error
-([Gemma 4](gemma4.md#structured-output)). The Qwen3.5 family's round samples every row at its
-end, so it waits there for the round's masks.
+A costly mask holds only its own request. Gemma 4 and Qwen3.8-Flash-Next run the decode step
+without it: the row keeps its logits and samples once the mask is ready, while the other requests
+go on. The Qwen3.5 family computes such a request's next mask after each of its tokens and leaves
+the request out of decode rounds until the mask is ready. A mask over 5 s fails its request with
+an explicit error, and so does a Gemma 4 or Flash-Next decoding request without a token for 120 s
+([Gemma 4](gemma4.md#structured-output)).
 
 It is opt-in: start the server with `--structured-output` (the CLI's `--json` and `--json-schema`
 enable it for their run). That reserves one grammar mask plane per draft position and lane; a

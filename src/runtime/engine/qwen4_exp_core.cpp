@@ -256,9 +256,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         StartupPhaseScope warm(options.startup_observer, StartupPhase::CudaGraphPrepare);
         instance->executor->warm_up();
         // With --expert-cache-mib auto, what startup left free beyond a margin for lazily loaded
-        // kernels and the CUDA Graphs the first requests capture becomes expert slots; an
-        // explicit size is the cache's size.
-        if (!options.expert_cache_bytes) { instance->executor->grow_expert_cache(kGrowthMargin); }
+        // kernels and the CUDA Graphs the first requests capture becomes expert slots, less what
+        // the context cache's per-sequence snapshots take when their first prompts reach an anchor
+        // (they are sized then); an explicit size is the cache's size.
+        if (!options.expert_cache_bytes) {
+            const std::uint64_t snapshots =
+                options.context_cache.enabled
+                    ? std::uint64_t(options.max_concurrency) * instance->executor->snapshot_bytes()
+                    : 0;
+            instance->executor->grow_expert_cache(kGrowthMargin + snapshots);
+        }
         warm.complete();
     }
     instance->free_after_weights = free_after_weights;
@@ -627,8 +634,6 @@ struct Qwen4ExpCore::Impl {
     // than holding its sequence, so a stall surfaces as errors. A prompt waiting for its chunks is
     // not measured: with the experts off the GPU a prompt step lasts seconds.
     static constexpr auto kProgressTimeout = std::chrono::seconds(120);
-    // One grammar mask over this budget fails its request: the grammar is too costly to serve.
-    static constexpr double kMaskBudgetSeconds = 5.0;
     Clock::time_point progress_checked{};
 
     // Starts the mask of a structured-output request's next token, from its grammar's state now.
@@ -656,28 +661,11 @@ struct Qwen4ExpCore::Impl {
         const auto& job = request->mask;
         if (!job) { return true; }
         request->mask_cost.observe(job->seconds());
-        const std::string problem = mask_problem(*job);
+        const std::string problem = runtime::grammar_mask_problem(*job);
         if (problem.empty()) { return true; }
         fail(request, std::make_exception_ptr(RequestError(
                           RequestErrorKind::Unavailable, "structured output: " + problem)));
         return false;
-    }
-
-    // Why a finished mask job cannot serve: its grammar had no admissible token, or it took over
-    // the budget. Empty when it can.
-    [[nodiscard]] static std::string mask_problem(const runtime::GrammarMaskJob& job) {
-        if (job.error()) {
-            try {
-                std::rethrow_exception(job.error());
-            } catch (const std::exception& e) {
-                return e.what();
-            } catch (...) { return "the grammar mask failed"; }
-        }
-        if (job.seconds() > kMaskBudgetSeconds) {
-            return "the grammar mask took " + std::to_string(job.seconds()) + " s, over the " +
-                   std::to_string(kMaskBudgetSeconds) + " s budget";
-        }
-        return {};
     }
 
     // Fails each decoding request that has made no progress for kProgressTimeout.
@@ -2000,7 +1988,7 @@ struct Qwen4ExpCore::Impl {
             if (const auto& job = column_masks[j]) {
                 job->wait();
                 batch[j]->mask_cost.observe(job->seconds());
-                mask_failures[j] = mask_problem(*job);
+                mask_failures[j] = runtime::grammar_mask_problem(*job);
                 if (mask_failures[j].empty()) {
                     // Columns past the row's own drafts are never taken; they stay unrestricted.
                     auto* words = static_cast<std::uint32_t*>(host_mask->data()) + j * w * mask_words();

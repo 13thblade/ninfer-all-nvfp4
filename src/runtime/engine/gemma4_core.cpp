@@ -561,8 +561,6 @@ struct Gemma4Core::Impl {
     // A request that neither computes a prompt chunk nor accepts a token for this long fails with
     // an explicit error rather than holding its sequence, so a stall surfaces as errors.
     static constexpr auto kProgressTimeout = std::chrono::seconds(120);
-    // One grammar mask over this budget fails its request: the grammar is too costly to serve.
-    static constexpr double kMaskBudgetSeconds = 5.0;
     Clock::time_point progress_checked{};
 
     // Starts the mask of a structured-output request's next token, from its grammar's state now.
@@ -590,28 +588,11 @@ struct Gemma4Core::Impl {
         const auto& job = request->mask;
         if (!job) { return true; }
         request->mask_cost.observe(job->seconds());
-        const std::string problem = mask_problem(*job);
+        const std::string problem = runtime::grammar_mask_problem(*job);
         if (problem.empty()) { return true; }
         fail(request, std::make_exception_ptr(RequestError(
                           RequestErrorKind::Unavailable, "structured output: " + problem)));
         return false;
-    }
-
-    // Why a finished mask job cannot serve: its grammar had no admissible token, or it took over
-    // the budget. Empty when it can.
-    [[nodiscard]] static std::string mask_problem(const runtime::GrammarMaskJob& job) {
-        if (job.error()) {
-            try {
-                std::rethrow_exception(job.error());
-            } catch (const std::exception& e) {
-                return e.what();
-            } catch (...) { return "the grammar mask failed"; }
-        }
-        if (job.seconds() > kMaskBudgetSeconds) {
-            return "the grammar mask took " + std::to_string(job.seconds()) + " s, over the " +
-                   std::to_string(kMaskBudgetSeconds) + " s budget";
-        }
-        return {};
     }
 
     // Fails each request that has made no progress for kProgressTimeout.
@@ -1748,7 +1729,7 @@ struct Gemma4Core::Impl {
             if (const auto& job = column_masks[j]) {
                 job->wait();
                 batch[j]->mask_cost.observe(job->seconds());
-                mask_failures[j] = mask_problem(*job);
+                mask_failures[j] = runtime::grammar_mask_problem(*job);
                 if (mask_failures[j].empty()) {
                     // Columns past the row's own drafts are never taken; they stay unrestricted.
                     auto* words = static_cast<std::uint32_t*>(host_mask->data()) + j * w * mask_words();

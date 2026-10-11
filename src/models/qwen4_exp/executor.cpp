@@ -3388,6 +3388,18 @@ struct Executor::Impl {
         mtp_catch_up(committed);
     }
 
+    std::uint64_t snapshot_bytes() const {
+        const SequenceState& sequence = sequences.at(0);
+        std::uint64_t bytes = 0;
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            for (const auto& region : recurrent_regions(sequence.layers[i])) {
+                if (region.first != nullptr) { bytes += region.second; }
+            }
+        }
+        if (mtp) { bytes += sequence.mtp.tail.bytes + sequence.mtp_pending.bytes; }
+        return bytes;
+    }
+
     void snapshot(std::uint32_t s, SequenceSnapshot& out) {
         SequenceState& sequence = sequences.at(s);
         if (out.layers.size() != layers.size()) {
@@ -3610,6 +3622,8 @@ void Executor::decode(std::span<const std::uint32_t> sequences,
 void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
     impl_->snapshot(sequence, out);
 }
+
+std::uint64_t Executor::snapshot_bytes() const { return impl_->snapshot_bytes(); }
 
 void Executor::restore(std::uint32_t sequence, const SequenceSnapshot& from) {
     impl_->restore(sequence, from);
