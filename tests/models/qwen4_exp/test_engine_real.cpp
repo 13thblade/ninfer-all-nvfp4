@@ -17,7 +17,10 @@
 // Program logs each request's expert-cache hit rate.
 //
 //   ninfer_qwen4_exp_engine_real_test --bench [--max-context N] [--generate N] [--no-graph]
-//       [--expert-cache-mib N] [--no-expert-state] TOKENS...
+//       [--expert-cache-mib N] [--no-expert-state] [--split N] TOKENS...
+//
+// --split N streams each request with live timings and also reports decode tok/s over generated
+// tokens 2..N and N+1..end (decode right after a prefill, while the expert cache refills).
 //
 // TOKENS is @FILE (ids separated by commas or whitespace) or a comma-separated id list.
 
@@ -108,9 +111,30 @@ struct Run {
     std::vector<TokenId> ids;
     GenerationTimings timings;
     double wall = 0;
+    // With a split: the time from the first generated token to token `split` and to the last one.
+    std::uint32_t split = 0;
+    double to_split = 0, to_last = 0;
 };
 
-Run generate(Engine& engine, const std::vector<TokenId>& prompt, std::uint32_t tokens) {
+// Records the Engine's live timing observations (one per committed token) of a streamed request.
+class SplitSink final : public OutputSink {
+public:
+    explicit SplitSink(std::uint32_t split) : split_(split) {}
+    void start(GenerationStart) override {}
+    void progress(PromptProgress) override {}
+    void publish(OutputDelta) override {}
+    void timing(GenerationTimingObservation t) override {
+        const double s = static_cast<double>(t.generation_elapsed_ns) * 1e-9;
+        if (t.generated_tokens <= split_) { to_split = s; }
+        to_last = s;
+    }
+    double to_split = 0, to_last = 0;
+
+private:
+    std::uint32_t split_;
+};
+
+Run generate(Engine& engine, const std::vector<TokenId>& prompt, std::uint32_t tokens, std::uint32_t split = 0) {
     RequestOptions request;
     request.execution.requested_output_tokens = tokens;
     request.execution.allow_prefix_reuse      = false;
@@ -118,8 +142,19 @@ Run generate(Engine& engine, const std::vector<TokenId>& prompt, std::uint32_t t
     request.stop.include_model_defaults       = false;
     request.output.raw                        = true;
     const auto start = std::chrono::steady_clock::now();
-    auto result      = engine.generate(engine.prepare_tokens(prompt, false), request);
+    GenerationResult result;
+    SplitSink sink(split);
+    if (split == 0) {
+        result = engine.generate(engine.prepare_tokens(prompt, false), request);
+    } else {
+        auto handle = engine.submit(engine.prepare_tokens(prompt, false), request, OutputConsumerMode::Streaming,
+                                    GenerationObservationOptions{.live_timings = true});
+        result      = handle.wait(&sink);
+    }
     Run out;
+    out.split    = split;
+    out.to_split = sink.to_split;
+    out.to_last  = sink.to_last;
     out.ids     = std::move(result.generated_token_ids);
     out.timings = result.timings;
     out.wall    = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -145,6 +180,11 @@ void print_run(const char* label, const Run& run, std::size_t prompt) {
                 run.timings.prefill_seconds > 0 ? static_cast<double>(prompt) / run.timings.prefill_seconds : 0.0,
                 run.timings.decode_seconds, decode, after_prefill, wall_decode, run.wall,
                 static_cast<unsigned long long>(hash));
+    if (run.split > 1 && run.ids.size() > run.split && run.to_split > 0 && run.to_last > run.to_split) {
+        std::printf("%s: split at %u: tokens 2-%u %.2f tok/s, tokens %u-%zu %.2f tok/s\n", label, run.split,
+                    run.split, static_cast<double>(run.split - 1) / run.to_split, run.split + 1, run.ids.size(),
+                    static_cast<double>(run.ids.size() - run.split) / (run.to_last - run.to_split));
+    }
     std::fflush(stdout);
 }
 
@@ -160,7 +200,7 @@ bool same(const char* label, const std::vector<TokenId>& reference, const std::v
 }
 
 int bench(const std::string& artifact, const std::vector<std::string>& args) {
-    std::uint32_t max_context = 33'792, tokens = 512;
+    std::uint32_t max_context = 33'792, tokens = 512, split = 0;
     bool graph = true, state = true;
     std::optional<std::uint64_t> cache;
     std::vector<std::string> jobs;
@@ -176,6 +216,8 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
             tokens = static_cast<std::uint32_t>(value());
         } else if (a == "--expert-cache-mib") {
             cache = value() << 20U;
+        } else if (a == "--split") {
+            split = static_cast<std::uint32_t>(value());
         } else if (a == "--no-graph") {
             graph = false;
         } else if (a == "--no-expert-state") {
@@ -193,7 +235,7 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
     std::printf("engine loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - load).count());
     for (const std::string& job : jobs) {
         const auto prompt = parse_tokens(job);
-        const Run run     = generate(engine, prompt, tokens);
+        const Run run     = generate(engine, prompt, tokens, split);
         print_run(job.c_str(), run, prompt.size());
     }
     return 0;
