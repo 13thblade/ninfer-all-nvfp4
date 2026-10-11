@@ -105,8 +105,8 @@ Qwen3.8-27B groupwise-int, `--kv-dtype int8`, both arms on the same build and ca
 | **`--prefill-cublas --prefill-chunk 4096`** | **2,379.8** | **2,988.7** | **2,609.0** | **1,904.1** |
 | change | +42.8% | +82.9% | +73.5% | +53.5% |
 
-Decode is untouched (45.1 against 45.7 tok/s, the route is gated to wide token counts), and the
-workspace grows from 155.6 MiB to 661.2 MiB.
+Decode is untouched (45.1 against 45.7 tok/s, the route is gated to calls of at least 129 tokens,
+above the widest 128-column verify round), and the workspace grows from 155.6 MiB to 661.2 MiB.
 
 **It is off by default because it is a quality trade, not a free win.** cuBLAS reduces over the
 whole of K, so it cannot see a scale per 64 columns: the weight carries one scale per row and the
@@ -532,9 +532,11 @@ Three stays the default: it is best or within 2% on prose, and larger counts los
 When the output mostly reproduces the input -- refactoring, renaming, applying an edit and
 returning the whole file -- the draft head predicts it almost perfectly and every extra position is
 nearly free, so 11 to 15 is up to 1.85x faster than three. For a coding assistant that mostly
-writes new code, seven is about 10% faster than three. `--lookup-ngram` adds nothing on top of MTP
-there: the head already copies (K=15 with and without `--lookup-ngram 8`: 262.4 and 262.6 tok/s,
-the same tokens per round). For comparison, DFlash2 at its default seven is still faster at one
+writes new code, seven is about 10% faster than three. The former MTP-only context lookup added
+nothing on top of MTP there: the head already copies (K=15 with and without `--lookup-ngram 8`:
+262.4 and 262.6 tok/s, the same tokens per round). It verified at the same width as the head, so
+it could never widen a round; it has been removed, and n-gram copy drafting, which verifies a copy
+wider than the neural window, is being built to replace it. For comparison, DFlash2 at its default seven is still faster at one
 stream on the same runs (268.5 tok/s editing code, 115.7 explaining); MTP is the backend that fits
 the full context and a second lane. Draft counts of eight and above add a second CUDA Graph
 topology class on the 27B (its wide verify moves between the prompt and chunked attention routes),
