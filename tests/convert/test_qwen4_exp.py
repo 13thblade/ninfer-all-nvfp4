@@ -366,6 +366,29 @@ def test_cli_writes_then_reuses_a_volume(tmp_path):
         main([*base, "--components", "text,vision", "--out", str(tmp_path / "z.ninfer")])
 
 
+def test_cli_rolls_back_the_artifact_when_the_volume_fails(tmp_path, monkeypatch):
+    path = _record_gguf(tmp_path)
+    dev = qwen4_exp.Subset(frozenset({"blk.0.attn_qkv.weight"}), frozenset(), frozenset({0}), 10)
+    monkeypatch.setitem(qwen4_exp.SUBSETS, "dev", dev)
+    out = tmp_path / "cli.ninfer"
+    args = ["--model", str(path), "--recipe", "qwen4_exp_gguf", "--device", "cpu",
+            "--subset", "dev", "--out", str(out)]
+    rows = qwen4_exp.ngram_rows
+
+    def failing_rows(gguf, count):
+        yield from rows(gguf, count // 2)
+        raise OSError("source read failed")
+
+    monkeypatch.setattr(qwen4_exp, "ngram_rows", failing_rows)
+    with pytest.raises(OSError, match="source read failed"):
+        main(args)
+    # Neither an artifact naming a missing volume, its report, nor a partial volume remains.
+    assert list(tmp_path.iterdir()) == [path]
+    monkeypatch.setattr(qwen4_exp, "ngram_rows", rows)
+    main(args)  # the retry at the same --out is not blocked
+    assert out.exists() and (tmp_path / "cli.ninfer.ngram").exists()
+
+
 def test_synthesized_tokenizer_and_override_check(gguf_path, tmp_path):
     with GgufModel(gguf_path) as gguf:
         config = qwen4_exp.text_config(gguf.metadata)
