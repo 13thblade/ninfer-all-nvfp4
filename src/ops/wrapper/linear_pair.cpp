@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_pair.h"
 
+#include "ops/linear/ggml/ggml_dispatch.h"
+#include "ops/linear/ggml/ggml_shapes.h"
 #include "ops/linear_pair/q8/q8_pair_plan.h"
 
 #include <array>
@@ -87,11 +89,66 @@ void require_nonoverlap(const Tensor& x, const Weight& first_weight, const Weigh
     }
 }
 
+bool ggml_pair(const Weight& first_weight, const Weight& second_weight) {
+    return first_weight.layout == QuantLayout::GgmlBlocks || second_weight.layout == QuantLayout::GgmlBlocks;
+}
+
+void require_ggml_pair(const Weight& first_weight, const Weight& second_weight) {
+    if (first_weight.layout != QuantLayout::GgmlBlocks || second_weight.layout != QuantLayout::GgmlBlocks ||
+        first_weight.ndim != 2 || second_weight.ndim != 2 || first_weight.n != second_weight.n ||
+        first_weight.k != second_weight.k ||
+        !detail::ggml_pair_registered(first_weight.qtype, second_weight.qtype, first_weight.n, first_weight.k)) {
+        throw std::invalid_argument("linear_pair: unsupported GGML format pair or shape");
+    }
+}
+
+std::uint64_t ggml_payload_bytes(const Weight& weight) {
+    const GgmlBlock block = ggml_block(weight.qtype);
+    return static_cast<std::uint64_t>(weight.n) * (static_cast<std::uint64_t>(weight.k) / block.values) * block.bytes;
+}
+
+void require_ggml_nonoverlap(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
+                             const Tensor& first_out, const Tensor& second_out) {
+    struct Range {
+        const void* pointer;
+        std::uint64_t bytes;
+        const char* label;
+    };
+    const std::uint64_t cols = static_cast<std::uint64_t>(x.ne[1]);
+    const std::uint64_t n    = static_cast<std::uint64_t>(first_weight.n);
+    const std::array<Range, 5> ranges{{
+        {x.data, static_cast<std::uint64_t>(x.ne[0]) * cols * 2u, "x"},
+        {first_out.data, n * cols * 2u, "first output"},
+        {second_out.data, n * cols * 2u, "second output"},
+        {first_weight.qdata, ggml_payload_bytes(first_weight), "first weight"},
+        {second_weight.qdata, ggml_payload_bytes(second_weight), "second weight"},
+    }};
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const auto first_begin = reinterpret_cast<std::uintptr_t>(ranges[i].pointer);
+        const auto first_end   = first_begin + ranges[i].bytes;
+        for (std::size_t j = i + 1; j < ranges.size(); ++j) {
+            const auto second_begin = reinterpret_cast<std::uintptr_t>(ranges[j].pointer);
+            const auto second_end   = second_begin + ranges[j].bytes;
+            if (first_begin < second_end && second_begin < first_end) {
+                throw std::invalid_argument(std::string("linear_pair: ") + ranges[i].label + " overlaps " +
+                                            ranges[j].label);
+            }
+        }
+    }
+}
+
 } // namespace
 
 std::size_t linear_pair_workspace_capacity_bytes(const Weight& first_weight,
                                                  const Weight& second_weight,
                                                  std::int32_t min_tokens, std::int32_t max_tokens) {
+    if (ggml_pair(first_weight, second_weight)) {
+        require_ggml_pair(first_weight, second_weight);
+        if (min_tokens <= 0 || max_tokens < min_tokens || max_tokens > detail::kGgmlDecodeMaxTokens) {
+            throw std::invalid_argument("linear_pair: GGML weights take 1 to 8 columns");
+        }
+        return 0;
+    }
     if (min_tokens <= 0 || max_tokens < min_tokens ||
         (first_weight.k != 5120 && first_weight.k != 2048)) {
         throw std::invalid_argument("linear_pair: unsupported weight/column geometry");
@@ -104,6 +161,15 @@ std::size_t linear_pair_workspace_capacity_bytes(const Weight& first_weight,
 void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
                  Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
+    if (ggml_pair(first_weight, second_weight)) {
+        require_ggml_pair(first_weight, second_weight);
+        require_matrix(x, first_weight.k, cols, "x");
+        require_matrix(first_out, first_weight.n, cols, "first output");
+        require_matrix(second_out, first_weight.n, cols, "second output");
+        require_ggml_nonoverlap(x, first_weight, second_weight, first_out, second_out);
+        detail::ggml_pair_dispatch(x, first_weight, second_weight, first_out, second_out, stream);
+        return;
+    }
     if (x.ne[0] != 5120 && x.ne[0] != 2048) {
         throw std::invalid_argument("linear_pair: x K must be 5120 or 2048");
     }

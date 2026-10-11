@@ -253,6 +253,10 @@ struct MoeExpertSource {
     std::uint32_t* error        = nullptr;
     std::uint8_t* staging_base  = nullptr; // device slots, record_stride apart
     std::int32_t staging_slots  = 0;       // 0: misses are read zero-copy
+    // A staging pass with at most this many misses reads them zero-copy instead of copying them to
+    // slots first: the expert kernels' CTAs of a miss then fetch its slices over PCIe while the
+    // resident jobs' CTAs compute. 0: every miss of a staged call is staged.
+    std::int32_t zero_copy_misses = 0;
     MoeCpuChannel cpu;
 };
 
@@ -265,7 +269,9 @@ struct MoeExpertSource {
 ///
 /// Non-resident records are first copied to `staging_slots` device slots by a few CTAs that keep
 /// their reads within a compact address window, then read from there; the jobs run in passes of
-/// staging_slots jobs. staging_slots == 0 reads misses zero-copy.
+/// staging_slots jobs. staging_slots == 0 reads misses zero-copy, and so does a pass with at most
+/// source.zero_copy_misses misses (decided on the device, so a captured call follows each replay's
+/// routing).
 ///
 /// Routes: an expert with at most offloaded_moe::kMaxColumns columns in the call takes the narrow
 /// route (dp4a rowdots); one with more takes the wide route (integer tensor-core GEMM tiles of 64

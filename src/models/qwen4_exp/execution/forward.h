@@ -28,6 +28,7 @@ struct ForwardState {
     std::vector<Tensor> gdn_conv;      // per GDN block: BF16 [C, K - 1], oldest first
     std::vector<Tensor> gdn_recurrent; // per GDN block: FP32 [Dk, Dv, value heads]
     Tensor ple_conv;                   // BF16 [S*H, span, 1]: the PLE convolution history
+    Tensor ple_slot;                   // I32 [1] holding 0: ple_conv's slot, cleared with the state
     std::vector<Tensor> qsa_tails;     // per attention block: BF16 [Di, R - 1]
 };
 
@@ -52,6 +53,9 @@ struct ForwardExperts {
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     std::uint32_t* error        = nullptr; // optional mapped word (ops::MoeExpertSource::error)
+    // A staged call with at most this many misses reads them zero-copy instead
+    // (ops::MoeExpertSource::zero_copy_misses).
+    std::int32_t zero_copy_misses = 0;
     // Optional prefill expert stream: while it is active the MoE reads its per-layer frame tables
     // (streamed experts resident in the ring) and orders itself with the stream's copies.
     ExpertStream* stream = nullptr;
@@ -88,13 +92,24 @@ public:
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
 
     // The workspace later calls allocate from (a wide prefill call's lent arena, or the static one).
+    // Not between run_front and run_back: the front's residual lives in the workspace.
     void use_workspace(WorkspaceArena& work) noexcept { work_ = &work; }
+
+    // The same call in two parts: run_front(batch, end) runs the embedding and layers [0, end), at
+    // most up to rows_layer(), so it reads no batch.ngram_rows (a caller may still be writing them);
+    // run_back(batch, end, logits) runs the remaining layers and the head on the front's residual.
+    // Nothing else may use the workspace in between. run() is run_front(0) then run_back(0).
+    void run_front(const ForwardBatch& batch, std::uint32_t end, const ForwardTap* tap = nullptr);
+    void run_back(const ForwardBatch& batch, std::uint32_t begin, Tensor& logits, const ForwardTap* tap = nullptr);
+    // The first layer that reads the n-gram rows (the PLE layer); the layer count when none does.
+    [[nodiscard]] std::uint32_t rows_layer() const noexcept;
 
     // Workspace one call of up to `columns` columns needs, at the given context.
     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
                                                      std::uint32_t max_visible_keys, DeviceExecutionView execution);
 
 private:
+    void layers(std::uint32_t begin, std::uint32_t end, const ForwardBatch& batch, const ForwardTap* tap);
     void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap);
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
@@ -109,6 +124,7 @@ private:
     ForwardState state_;
     ForwardKV kv_;
     ForwardExperts experts_;
+    Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back
 };
 
 // The QSA indexer geometry of the configuration.

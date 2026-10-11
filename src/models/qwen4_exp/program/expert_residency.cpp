@@ -9,9 +9,11 @@
 #include "core/pinned_upload.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 namespace ninfer::models::qwen4_exp {
 namespace {
@@ -25,6 +27,11 @@ using expert_cache::ResidencyState;
 // retired frame and drains the queue before the next round, so slack frames would never hold an
 // expert.
 constexpr std::uint32_t kSlackFrames = 0;
+
+// A chunk the driver placed in system memory is given back and retried this many times, the n-th
+// after n times this wait, before the pool stops growing.
+constexpr int kSpillRetries = 3;
+constexpr std::chrono::milliseconds kSpillRetryWait{100};
 
 } // namespace
 
@@ -147,6 +154,7 @@ ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream
         frames_ = frames;
     } else if (frames > frames_) {
         const std::size_t need = static_cast<std::size_t>(frames) * stride_;
+        int retries = 0;
         while (arena_->mapped_bytes() < need) {
             guard.begin();
             if (!arena_->map_chunk()) {
@@ -160,9 +168,18 @@ ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream
             if (const std::uint64_t spilled = guard.end(arena_->chunk_bytes()); spilled != 0) {
                 out.at_spill = vram.query();
                 arena_->unmap_chunk();
+                // WDDM places a chunk in system memory transiently while it settles the residency of
+                // the allocations before it (startup measured one at 2 GiB free, then the same
+                // growth succeeded a minute later): give it back, wait and try again a few times.
+                if (retries < kSpillRetries) {
+                    ++retries;
+                    std::this_thread::sleep_for(kSpillRetryWait * retries);
+                    continue;
+                }
                 out.spilled = spilled;
                 break;
             }
+            retries = 0;
         }
         const auto backed = static_cast<std::uint32_t>(std::min<std::uint64_t>(frames, arena_->mapped_bytes() / stride_));
         if (backed > frames_) {

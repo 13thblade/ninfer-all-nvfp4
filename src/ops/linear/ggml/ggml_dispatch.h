@@ -31,4 +31,9 @@ std::size_t ggml_linear_workspace_capacity_bytes(QType format, std::int32_t n, s
 void ggml_linear_dispatch(const Tensor& x, const Weight& w, Tensor& out, bool residual,
                           WorkspaceArena* workspace, cudaStream_t stream);
 
+// linear_pair over GGML weights: validates both weights, the registered pair problem and
+// 1 <= T <= kGgmlDecodeMaxTokens, then runs first_out = W1 x and second_out = W2 x in one launch.
+void ggml_pair_dispatch(const Tensor& x, const Weight& first, const Weight& second, Tensor& first_out,
+                        Tensor& second_out, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail
