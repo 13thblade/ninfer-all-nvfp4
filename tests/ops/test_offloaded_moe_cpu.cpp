@@ -38,7 +38,7 @@ void test_a8_cast() {
         for (float& x : v) { x = n(rng); }
         switch (kind) {
         case 0: for (float& x : v) { x = 0.0F; } break;                           // a = 0
-        case 1: for (float& x : v) { x *= 1e-38F; } break;                        // subnormal: 127 / a overflows
+        case 1: for (float& x : v) { x *= 1e-38F; } break;                        // tiny a: 127 / a would overflow without the 2^100 prescale
         case 2: for (int j = 0; j < 32; ++j) { v[j] = static_cast<float>(j - 16) * 0.5F; } break; // ties
         case 3: v[5] = std::numeric_limits<float>::quiet_NaN(); break;            // NaN ignored, code 0
         case 4: for (float& x : v) { x *= 3e4F; } break;                          // large

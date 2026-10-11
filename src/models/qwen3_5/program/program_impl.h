@@ -66,6 +66,10 @@ struct RequestBasePlanImpl {
     PrefixShortlistDigests prefix_digests;
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
+    // The prepared n-gram copy index, moved out of the prompt at planning and into the request's
+    // control by its one fresh binding; a resumed binding carries the control's own. Only the
+    // Engine worker touches it after planning.
+    mutable std::unique_ptr<NgramRequestIndex> ngram_index;
 
     [[nodiscard]] bool accepts_capture(std::uint32_t frontier) const noexcept;
     [[nodiscard]] CaptureGroup capture_group(std::uint32_t frontier) const;
@@ -78,6 +82,9 @@ struct PendingCandidate {
     std::uint32_t base_S        = 0;
     std::uint32_t prompt_tokens = 0;
     std::uint32_t produced      = 0;
+    // Speculative only: the round family's verify_drafts. Every row of a round shares it, and the
+    // round's egress and ReplaySSM records are laid out at verify_drafts + 1 columns per row.
+    std::uint32_t verify_drafts = 0;
 };
 enum class Lifecycle : std::uint8_t {
     Empty,
@@ -138,6 +145,21 @@ struct DecodeGraphFamily {
     std::vector<DecodeGraphTopology> topologies;
     DecodeGraphProfile& select(std::uint32_t batch_size, std::uint32_t frontier);
     DecodeGraphExecutable& install(DecodeGraphProfile& profile);
+};
+
+// A speculative round family (see SpeculativeRoundShape) and its captured Forward/Finish graphs,
+// which are empty without CUDA Graphs.
+struct SpeculativeRoundFamily {
+    SpeculativeRoundShape shape;
+    DecodeGraphFamily forward;
+    DecodeGraphFamily finish;
+};
+
+// ReplaySSM records viewed densely at a family narrower than the widest, with the fold that reads
+// them. The view aliases the native records; only one round is pending at a time.
+struct NarrowReplayView {
+    GdnReplayRecords records;
+    ops::GdnReplayFoldPlan fold;
 };
 
 // A Forward stage publishes these IDs before target execution finishes. Program owns the
@@ -203,6 +225,9 @@ struct RequestControl {
     std::vector<CaptureGroup> capture_groups;
     std::size_t next_capture = 0;
     bool capture_pending     = false;
+    // This request's n-gram copy index (null unless the Frontend builds them). It lives with the
+    // control, which a pause moves into the ResumeState together with the ledger it indexes.
+    std::unique_ptr<NgramRequestIndex> ngram;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -360,9 +385,10 @@ public:
     const std::uint32_t max_concurrency;
     const ContextCacheOptions context_cache;
     const std::uint32_t prefill_chunk;
+    // The draft model's own proposal width.
     const std::uint32_t draft_window;
-    // Context-lookup drafting n-gram (MTP only); zero disables it.
-    const std::uint32_t lookup_ngram;
+    // The widest round family's verify_drafts; per-round buffers are allocated at it.
+    const std::uint32_t max_verify_drafts;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
@@ -413,6 +439,11 @@ public:
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::vector<std::unique_ptr<GdnReplayRecords>> extra_replay_records;
     std::vector<std::unique_ptr<ops::GdnReplayFoldPlan>> extra_replay_fold;
+    // First-shard views for each family narrower than the widest.
+    std::vector<NarrowReplayView> narrow_replay_views;
+    [[nodiscard]] const GdnReplayRecords* round_replay_records(std::uint32_t verify_drafts) const;
+    [[nodiscard]] const ops::GdnReplayFoldPlan&
+    round_replay_fold(std::uint32_t verify_drafts) const;
     // Only when the model is split over several devices: the state shards, replay records and
     // links a forward pass crosses.
     std::unique_ptr<execution::StageRuntime> stage_runtime;
@@ -535,8 +566,10 @@ public:
     // Captured transfers and external events reference the buffers and events declared above.
     // Families are destroyed first, including when startup throws.
     DecodeGraphFamily ordinary_graphs;
-    DecodeGraphFamily speculative_forward_graphs;
-    DecodeGraphFamily speculative_finish_graphs;
+    std::vector<SpeculativeRoundFamily> round_families;
+    // The narrowest family of `kind` that verifies at least `drafts`.
+    [[nodiscard]] SpeculativeRoundFamily& round_family(SpeculativeRoundKind kind,
+                                                       std::uint32_t drafts);
 
     [[nodiscard]] std::uint32_t initial_mtp_extent(const RequestBasePlanImpl&) const;
     [[nodiscard]] UnitDemand prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
