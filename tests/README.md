@@ -115,6 +115,11 @@ The variable-width DFlash2 target-attention subset can be run with
 cache codecs, W=2..16, B=1..8, request-local prefixes, cache effects, and Graph metadata/input
 updates. The default executable also runs the existing attention geometries and prefill tests.
 
+`ninfer_qsa_test` qualifies the four QSA Ops (index query, pooled keys, block selection, attention
+over selected blocks) against their FP64 and exact oracles. `--small` runs the quick subset used
+under compute-sanitizer:
+`compute-sanitizer --tool memcheck build/tests/ninfer_tests ninfer_qsa_test --small`.
+
 Linear tests are independently runnable by weight and activation-compute profile:
 
 ```bash
@@ -163,6 +168,32 @@ python3 -m pytest \
 The Python suites exercise conversion, encoded output and measurement tools without model inference.
 The maintained environment uses Python 3.11 with the dependencies for those suites. C++ binding and Engine tests
 cover consumption of their resulting representation.
+
+The GGML block decoders, Python (`tests/artifact/test_ggml_codecs.py`) and C++
+(`ninfer_ggml_blocks_decode_test`, for the host oracle `tests/ops/ggml_blocks_decode.h`), are
+checked against committed golden fixtures from ggml's reference `dequantize_row_*`
+(`tests/fixtures/ggml/<format>.blocks` and `.f32`). `ninfer_artifact_ggml_real_test` loads a real
+GGML artifact named by `NINFER_TEST_ARTIFACT` (such as `--subset dev` below) through Device, Pinned
+and Host residency and requires the C++ and Python decoders to agree bit for bit on sampled blocks;
+it skips without the variable or when that artifact has no GGML tensor. Optional environment
+variables extend the Python GGML and GGUF checks:
+
+| Variable | Adds |
+|---|---|
+| `NINFER_GGML_BASE_DLL` | the live oracle: ggml-base (`.dll` or `.so`) of llama.cpp b11316 decodes 100,000 random blocks per format, and 1,000 real blocks per format with `NINFER_TEST_GGUF` |
+| `NINFER_TEST_GGUF` | the real Qwen3.8-Flash-Next GGUF (first split file): tensor inventory, whole-model name map, export conventions, and a `--subset dev` conversion compared byte for byte (~2.9 GB in the test's temporary directory) |
+| `NINFER_TEST_QWEN4EXP_SUBSET` | verify that existing `--subset dev` artifact instead of converting one |
+| `NINFER_TEST_QWEN38_ARTIFACT` | a Qwen3.8 `.ninfer` whose tokenizer the GGUF vocabulary must equal |
+
+`python -m tools.artifact.gen_ggml_fixtures --dll PATH` regenerates the fixtures.
+
+`ninfer_linear_ggml_test` qualifies Linear and LinearAdd over the six GGML formats they register,
+at every registered problem and T in {1..8, 9, 63, 64, 65, 300}: the weight is decoded by that host
+oracle, the activation passes through an independent host copy of the contract's Q8_1 cast, and
+the output is compared with the FP64 product. It also checks the cast exactly, byte for byte against
+the wide route's cast kernel and through the public Op on both routes, and the admission rules.
+`--format NAME` and `--shape N K` select problems; the full run takes about a minute, most of it the
+host oracle.
 
 The real loading test accepts an explicit artifact path and optional component selection:
 
