@@ -56,6 +56,17 @@ distinct weight copies (the per-call cost inside a decode graph).
 The 80% HC gate is not met: the fused mixer is latency-bound on sm_86, and above T = 2 it is
 slower than the composed route. See the PR 6 description.
 
+Rejected in PR 11 (same bench, ABBA against the two-kernel route, which measured 26.6-27.0 us):
+- **One kernel of persistent CTAs** (each claims an A item and a B item from ticket counters and
+  issues both weights' loads up front; B waits on a count of finished A items and runs unclaimed A
+  items itself, so it cannot deadlock without co-residency): **47-50 us**. Per-CTA timestamps show
+  the A partials finishing only once most of both weights have landed (W_down does not arrive ahead
+  of W_up), then ~10 us of B work after the wait. Without the wait (timing probe) it was still 44 us.
+- **Activations first** (R, the norm weights, partials and the residual slice copied to shared
+  memory with `cp.async` before the weight loads, T <= 2): 27.4 us, no gain.
+
+## PR 7 measurements
+
 ## PR 7 measurements
 
 RTX 3090, CUDA 12.8, 5950X with DDR4-2133; random records with finite scales (record bytes are
@@ -75,8 +86,25 @@ synthetic and on the subset artifact's real IQ2_S, IQ2_XXS and IQ1_M banks.
 
 The narrow route stays at the speed of Strata's native MMVQ grouped kernels on the same records:
 both run two dependent kernels (gate/up, then down) over 15 MB, and neither reaches the read
-roofline at T = 1. A sweep of CTA geometry and grids in shared memory moved T = 1 by at most ~15%;
-reaching 70% needs a different structure (one persistent two-phase kernel), left open.
+roofline at T = 1. A sweep of CTA geometry and grids in shared memory moved T = 1 by at most ~15%.
+
+PR 11 tried the persistent two-phase kernel and found the route is not bandwidth-bound:
+- **Persistent kernel** (CTAs claim gate/up then down tiles in ticket order through a ring of
+  `cp.async` slots; down tiles wait on per-job counters; bit-identical outputs): 2 slots matched the
+  two-kernel route (IQ2_S / IQ2_XXS / IQ1_M T = 1: 55 / 47 / 48 us), 3 slots was slower, 4 slots
+  (one CTA per SM) 70-74 us. Zero-copy calls were 2.4x slower (fewer bytes in flight over PCIe).
+- **Weights in L2**: with every job reading the same frame (about 1.5 MB, L2-resident) the
+  two-kernel route still takes 43 / 41 / 42 us at T = 1, against 47 / 46 / 45 us from DRAM. At most
+  ~10% of the time is DRAM.
+- **Grid gathers**: forcing every IQ grid index to 0 (timing only): 54 → 48 us (IQ2_S), unchanged
+  (IQ2_XXS), 48 → 44 us (IQ1_M).
+- **Activation reads first** (x prefetched to registers, h copied ahead of the down weights): T = 1
+  unchanged, T = 4 / 8 5-12% slower.
+- Per-CTA timestamps (gate/up, IQ2_S, T = 1): the first wave's slices land at ~11 us, then a CTA
+  computes for ~12 us at three CTAs per SM, and the second wave follows; down adds ~12 us.
+
+So the bound is per-CTA arithmetic latency at low occupancy, not memory, phase overlap or grid
+gathers. Not yet attributed per instruction (Nsight Compute needs an elevated shell).
 
 ## PR 8 (M0) measurements
 
