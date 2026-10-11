@@ -69,6 +69,13 @@ struct DeviceKVPages {
     std::uint32_t backend = 0;
 };
 
+// Whether a structured-output sequence can join the next decode round: not while the mask of its
+// next token is still computing, and never once that mask failed (`failure` says why).
+struct StructuredReadiness {
+    bool ready = true;
+    std::optional<std::string> failure;
+};
+
 enum class TextPhase {
     Prefill,
     Verify,
@@ -1071,6 +1078,10 @@ public:
     // Replaces the sampling of an active sequence from its next round; the grammar mask and the
     // penalty counts carry over.
     void update_sampling(SequenceHandle sequence, const ResolvedSamplingParameters& sampling);
+    // A decode-ready sequence whose grammar masks are costly decodes without drafts, its next mask
+    // computing on a thread of its own from the first call after its last commit; the Engine
+    // leaves the lane out of rounds until it is ready, so its mask holds no other lane's round.
+    [[nodiscard]] StructuredReadiness structured_readiness(SequenceHandle sequence);
     // Blocks until the open context transaction's submitted Host transfer completes, so an idle
     // worker resumes the transaction as soon as it can progress. Returns false, without
     // waiting, when no transfer is in flight. A failed transfer surfaces at the next progress.

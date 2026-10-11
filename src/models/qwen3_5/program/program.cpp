@@ -442,6 +442,10 @@ void Program::update_sampling(SequenceHandle sequence, const ResolvedSamplingPar
     impl_->update_sampling(sequence, sampling);
 }
 
+StructuredReadiness Program::structured_readiness(SequenceHandle sequence) {
+    return impl_->structured_readiness(sequence);
+}
+
 bool Program::wait_context_transfer() noexcept { return impl_->wait_context_transfer(); }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,

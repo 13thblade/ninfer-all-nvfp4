@@ -41,6 +41,8 @@ public:
     // publish() their upload; the round's sampling waits for it (wait()).
     void start(std::uint32_t lane, const text::GrammarState& grammar,
                std::span<const TokenId> drafts);
+    // A lane's mask computed ahead of the round (one column), used as the lane's job.
+    void adopt(std::uint32_t lane, std::shared_ptr<runtime::GrammarMaskJob> job);
     void publish();
 
     // A DFlash round: the rows' lanes, draft extents and grammars, then from inside the round the

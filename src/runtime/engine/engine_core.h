@@ -1577,6 +1577,52 @@ private:
         }
     }
 
+    // Structured output: a lane whose next grammar mask is still computing sits out the round
+    // (the others run without it), and one whose mask failed ends with an explicit error.
+    void admit_structured_lanes(RoundMembership& membership, HostPhaseMeasurement& boundary) {
+        if (!structured_output_ || membership.empty()) { return; }
+        const bool transaction = instance_.program->has_context_transaction();
+        std::size_t kept       = 0;
+        for (std::size_t row = 0; row < membership.size; ++row) {
+            const auto readiness =
+                instance_.program->structured_readiness(membership.sequences[row]);
+            if (readiness.failure && !transaction) {
+                fail_active_request(membership.lanes[row],
+                                    std::make_exception_ptr(RequestError(
+                                        RequestErrorKind::Unavailable,
+                                        "structured output: " + *readiness.failure)),
+                                    boundary);
+                continue;
+            }
+            if (!readiness.ready) { continue; }
+            membership.lanes[kept]     = membership.lanes[row];
+            membership.sequences[kept] = membership.sequences[row];
+            membership.budgets[kept]   = membership.budgets[row];
+            ++kept;
+        }
+        membership.size = kept;
+    }
+
+    // Ends an active request with `error`; its sequence keeps nothing it had not published.
+    void fail_active_request(std::uint32_t lane, std::exception_ptr error,
+                             HostPhaseMeasurement& boundary) {
+        // A copy: remove_completed_slot below resets the slot.
+        const auto request = slots_[lane];
+        if (request == nullptr || request->capture_pending) { return; }
+        if (!request->sequence || !request->lane || request->lane->value != lane) {
+            throw std::logic_error("failing request has no sequence binding");
+        }
+        auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
+        request->generation_timings = aborted.timings;
+        request->speculative_stats  = std::move(aborted.speculative);
+        if (aborted.salvaged) { ++cumulative_stats_.salvaged_continuations; }
+        finish_engine_phase(boundary, EngineHostPhase::Boundary);
+        remove_completed_slot(lane);
+        publish_runtime_stats();
+        complete_error(request, std::move(error));
+        boundary = begin_host_phase();
+    }
+
     [[nodiscard]] bool expire_pending_requests() {
         std::vector<std::shared_ptr<Request>> cancelled;
         std::vector<std::shared_ptr<Request>> expired;
@@ -3059,6 +3105,7 @@ private:
                     continue;
                 }
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
+                admit_structured_lanes(membership, boundary);
 
                 const std::uint64_t prefill_mask = scheduler_.prefill_lane_mask();
                 for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {

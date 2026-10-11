@@ -48,6 +48,10 @@ void StructuredRound::start(std::uint32_t lane, const text::GrammarState& gramma
         grammar, static_cast<std::size_t>(words_), std::vector<TokenId>(drafts.begin(), drafts.end()));
 }
 
+void StructuredRound::adopt(std::uint32_t lane, std::shared_ptr<runtime::GrammarMaskJob> job) {
+    jobs_.at(lane) = std::move(job);
+}
+
 void StructuredRound::publish() {
     // The upload stream collects the jobs, uploads their columns and records the event the round's
     // sampling waits on; with no structured lane the event is recorded at once.

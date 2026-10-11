@@ -160,6 +160,8 @@ public:
     void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
     // Copies the sequence's recurrent state into `out`, and back; both wait for the copies.
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
+    // Device bytes one SequenceSnapshot's buffers take once its first snapshot sizes them.
+    [[nodiscard]] std::uint64_t snapshot_bytes() const;
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);
     // Bytes of an image at `position`.
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;

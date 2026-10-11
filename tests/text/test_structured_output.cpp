@@ -77,28 +77,43 @@ int main() {
         bounded->fill_masks(after, {});
         require((after[8] & 1U) != 0, "bounded string did not count Unicode code points");
 
-        // A wider bound compiles to a chain of rules (one per count still allowed): every length
-        // from minLength to maxLength closes, escapes and multi-byte scalars count once, and
-        // neither a shorter nor a longer string does.
-        const auto within = [&](const std::string& body) {
-            auto grammar = compiler.compile(
-                {StructuredOutputKind::JsonSchema, R"({"type":"string","minLength":2,"maxLength":40})"});
-            std::vector<TokenId> tokens{'"'};
-            for (unsigned char ch : body) { tokens.push_back(ch); }
-            tokens.push_back('"');
-            tokens.push_back(256);
-            try {
-                grammar->accept(tokens);
-                return true;
-            } catch (const std::logic_error&) { return false; }
-        };
-        require(!within("a"), "string under minLength accepted");
-        require(within("ab"), "string at minLength rejected");
-        require(within(std::string(40, 'x')), "string at maxLength rejected");
-        require(!within(std::string(41, 'x')), "string over maxLength accepted");
-        require(within(std::string(38, 'x') + "\\n\\u00e9"), "escapes do not count as one scalar");
-        require(!within(std::string(39, 'x') + "\\n\\u00e9"), "escaped scalars exceed maxLength");
-        require(within(std::string(37, 'x') + "é😀\\\""), "multi-byte scalars do not count once");
+        // A root string's bounds leave the grammar like those inside an object; under anyOf they
+        // stay and compile to a chain of rules (one per count still allowed). Either way every
+        // length from minLength to maxLength closes, escapes and multi-byte scalars count once,
+        // and neither a shorter nor a longer string does.
+        const auto root_bounded = R"({"type":"string","minLength":2,"maxLength":40})";
+        const auto chained =
+            R"({"anyOf":[{"type":"string","minLength":2,"maxLength":40},{"type":"integer"}]})";
+        for (const char* schema : {root_bounded, chained}) {
+            const auto within = [&](const std::string& body) {
+                auto grammar = compiler.compile({StructuredOutputKind::JsonSchema, schema});
+                std::vector<TokenId> tokens{'"'};
+                for (unsigned char ch : body) { tokens.push_back(ch); }
+                tokens.push_back('"');
+                tokens.push_back(256);
+                try {
+                    grammar->accept(tokens);
+                    return true;
+                } catch (const std::logic_error&) { return false; }
+            };
+            require(!within("a"), "string under minLength accepted");
+            require(within("ab"), "string at minLength rejected");
+            require(within(std::string(40, 'x')), "string at maxLength rejected");
+            require(!within(std::string(41, 'x')), "string over maxLength accepted");
+            require(within(std::string(38, 'x') + "\\n\\u00e9"), "escapes do not count as one scalar");
+            require(!within(std::string(39, 'x') + "\\n\\u00e9"), "escaped scalars exceed maxLength");
+            require(within(std::string(37, 'x') + "é😀\\\""), "multi-byte scalars do not count once");
+        }
+        {
+            auto grammar = compiler.compile({StructuredOutputKind::JsonSchema, root_bounded});
+            grammar->accept(std::vector<TokenId>{'"', 'x'});
+            grammar->fill_masks(after, {});
+            require((after['"' / 32] & (1U << ('"' % 32))) == 0, "mask closes a root string under minLength");
+            grammar->accept(std::vector<TokenId>(39, 'x'));
+            grammar->fill_masks(after, {});
+            require((after['"' / 32] & (1U << ('"' % 32))) != 0, "mask cannot close a root string at maxLength");
+            require((after['x' / 32] & (1U << ('x' % 32))) == 0, "mask extends a root string past maxLength");
+        }
 
         // Inside an object the bounds leave the grammar and the string constraint state enforces
         // them: the same lengths close, and the masks at the bounds say so.

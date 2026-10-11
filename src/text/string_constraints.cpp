@@ -122,6 +122,7 @@ struct Plan {
     Json yes = true;
     Json no = false;
     bool constrained = false; // unique string arrays
+    bool string_root = false; // the output is one JSON string
     // String values whose minLength/maxLength this state enforces, taken out of the schema the
     // grammar compiles: a counted string in the grammar has no cacheable token masks.
     std::unordered_map<const Json*, LengthBound> lengths;
@@ -135,15 +136,17 @@ struct Plan {
             walk({&root}, false, visited);
         }
         grammar_schema = schema;
-        // The parser follows a JSON object or array output (another root is opaque to it).
-        bool container = false;
+        // The parser follows a JSON object, array or string output (another root is opaque to it).
+        bool followed = false;
         try {
             const Json* top = &root;
             for (int hops = 0; top->is_object() && top->contains("$ref") && hops < 16; ++hops) top = &ref(*top);
-            container = top->is_object() && top->contains("type") &&
-                        (top->at("type") == "object" || top->at("type") == "array");
+            if (top->is_object() && top->contains("type")) {
+                string_root = top->at("type") == "string";
+                followed    = string_root || top->at("type") == "object" || top->at("type") == "array";
+            }
         } catch (const std::invalid_argument&) {}
-        if (container && !has_alternatives(root)) {
+        if (followed && !has_alternatives(root)) {
             std::vector<Json::json_pointer> bounded;
             find_lengths(root, Json::json_pointer(), bounded);
             if (!bounded.empty()) {
@@ -854,7 +857,7 @@ struct Parser {
                 if (whitespace(c)) continue;
                 // Native tool envelopes are separate alternatives, intentionally
                 // outside the final-content JSON contract.
-                if (c != '{' && c != '[') { mode = Mode::Opaque; return true; }
+                if (c != '{' && c != '[' && !(c == '"' && plan->string_root)) { mode = Mode::Opaque; return true; }
                 mode = Mode::JSON;
             }
             if (!json_byte(c)) return false;
