@@ -2,8 +2,10 @@
 
 // Adapted from Infernix a3edb450 include/infernix/ops/offloaded_sparse_moe.h (Apache-2.0).
 // Modified for NInfer-3090: GGML expert records (three record formats, canonical A8 arithmetic)
-// instead of NVFP4 records with per-expert scales; the SSD tier, fetch channel, landing, streamed
-// records, overlap/fork streams, L2 warming and the wide route are not part of this contract yet.
+// instead of NVFP4 records with per-expert scales; an exact wide route (Infernix's W4A16 contract,
+// not its W4A4 one, which only met an FP64 bound); the SSD tier, fetch channel, landing, streamed
+// records, overlap/fork streams and L2 warming are not part of this contract (prefill streaming lives
+// in the model, which publishes streamed records as resident frames).
 
 #include "core/tensor.h"
 #include "core/weight.h"
@@ -264,6 +266,13 @@ struct MoeExpertSource {
 /// Non-resident records are first copied to `staging_slots` device slots by a few CTAs that keep
 /// their reads within a compact address window, then read from there; the jobs run in passes of
 /// staging_slots jobs. staging_slots == 0 reads misses zero-copy.
+///
+/// Routes: an expert with at most offloaded_moe::kMaxColumns columns in the call takes the narrow
+/// route (dp4a rowdots); one with more takes the wide route (integer tensor-core GEMM tiles of 64
+/// columns, the sub-blocks visited in the order of the canonical butterfly's leaves); in a call of
+/// 512 columns or more every expert takes the wide route. Both produce the canonical bits, so the
+/// route is invisible in the outputs. A call of more than kMaxColumns
+/// columns needs the larger workspace moe_experts_workspace_bytes returns for it.
 ///
 /// With wait_for_cpu == false the call returns before placing CPU-served outputs; the caller may
 /// enqueue unrelated work (the shared expert) and must call moe_experts_cpu_wait with the same

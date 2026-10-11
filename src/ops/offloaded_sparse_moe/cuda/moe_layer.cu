@@ -1,8 +1,8 @@
 // Adapted from Infernix a3edb450 src/ops/offloaded_sparse_moe/cuda/moe_layer.cu (Apache-2.0).
 // Modified for NInfer-3090: GGML expert records with the canonical A8 arithmetic (narrow route
-// only); routing, dispatch, staging, the CPU channel and the combine are Infernix's, without the
-// SSD tier, fetch channel, landing, streamed records, overlap/fork streams, L2 warming and the
-// wide route.
+// here; the wide route is wide_expert.cu); routing, dispatch, staging, the CPU channel and the
+// combine are Infernix's, without the SSD tier, fetch channel, landing, streamed records,
+// overlap/fork streams and L2 warming.
 //
 // offloaded_sparse_moe on the GPU. Expert kernels read each record from wherever it lives: a
 // device frame, a staging slot, or the pinned host bank over PCIe (zero-copy). A gate/up CTA owns
@@ -19,6 +19,7 @@
 
 #include "ops/common/canonical_ggml.h"
 #include "ops/offloaded_sparse_moe/cuda/expert_decode.cuh"
+#include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
 #include <cuda_bf16.h>
 
@@ -989,9 +990,14 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
     check_launch("scatter");
 }
 
+// A call wider than a narrow job may route an expert more than kMaxColumns columns: the wide route's
+// workspace follows the narrow route's.
+static bool wide_call(std::int32_t columns) { return columns > moe::kMaxColumns; }
+
 std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns) {
     require(max_jobs > 0 && entries > 0 && columns > 0, "experts workspace needs positive extents");
-    return carve_workspace(nullptr, max_jobs, entries).bytes;
+    const std::size_t narrow = carve_workspace(nullptr, max_jobs, entries).bytes;
+    return narrow + (wide_call(columns) ? moe::wide::workspace_bytes(max_jobs, entries, columns) : 0);
 }
 
 void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
@@ -1036,6 +1042,18 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const Geometry g          = device_geometry(geometry);
     // Passes of at most staging_slots jobs (one pass covering every job without staging).
     const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
+    // A wide call: experts with more than kMaxColumns columns take the wide route (the narrow kernels
+    // skip them through `narrow_flags`); the stage kernel still stages their misses.
+    const bool wide = wide_call(x.ne[1]);
+    moe::wide::Workspace wide_ws;
+    const std::int32_t* narrow_flags = flags;
+    if (wide) {
+        wide_ws = moe::wide::carve(static_cast<std::uint8_t*>(workspace) + layout.bytes, max_jobs, outputs.ne[1], x.ne[1]);
+        moe::wide::prepare(static_cast<const std::uint16_t*>(x.data), x.ne[1], dispatch, max_jobs, pass_jobs, flags,
+                           wide_ws, stream);
+        narrow_flags = wide_ws.skip;
+    }
+    const moe::wide::Geometry wide_geometry{g.up_offset, g.down_offset, g.gate_up_row_bytes, g.down_row_bytes};
     for (int base = 0; base < max_jobs; base += pass_jobs) {
         const int jobs = std::min(pass_jobs, max_jobs - base);
         // Without staging the expert kernels resolve their records themselves.
@@ -1046,8 +1064,15 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
             check_launch("stage");
             records = layout.job_records;
         }
-        launch_pass(geometry.gate_up, x.ne[1], static_cast<const bf16*>(x.data), dispatch, source, g, top_k, records,
-                    flags, base, jobs, layout.h_rows, static_cast<bf16*>(outputs.data), stream);
+        if (!wide || !moe::wide::all_wide(x.ne[1])) {
+            launch_pass(geometry.gate_up, x.ne[1], static_cast<const bf16*>(x.data), dispatch, source, g, top_k,
+                        records, narrow_flags, base, jobs, layout.h_rows, static_cast<bf16*>(outputs.data), stream);
+        }
+        if (wide) {
+            moe::wide::run_pass(geometry.gate_up, dispatch, source, wide_geometry, top_k, max_jobs, pass_jobs,
+                                base / pass_jobs, records, wide_ws, layout.h_rows,
+                                static_cast<std::uint16_t*>(outputs.data), stream);
+        }
     }
     if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
 }

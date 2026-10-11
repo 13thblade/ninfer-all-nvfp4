@@ -210,6 +210,14 @@ GGML linears and the combine, against FP64. With `NINFER_TEST_ARTIFACT` it repea
 32 real experts of every expert bank of the artifact. `--small` runs a reduced set for
 compute-sanitizer.
 
+`ninfer_offloaded_moe_wide_test` qualifies the wide expert route (experts with more than 8 columns
+in a call): every routed output must equal the CPU engine's bits at T in {9, 64, 65, 2048, 4096}
+for each record format, with records in device frames, read zero-copy, staged through 64 or 3 slots
+(passes of 3 jobs) and mixed; hot experts put wide jobs at the route's boundaries (9 columns, one
+64-column tile, two tiles). A sample of entries is checked against the FP64 expert oracle. With
+`NINFER_TEST_ARTIFACT` it checks 32 real experts of every bank at T in {64, 2048}. `--small` is the
+compute-sanitizer set; `--bench` times 512 resident experts at T in {256, 1024, 2048, 4096}.
+
 The Qwen3.8-Flash-Next Ops ported from Infernix have their own suites, each a few seconds:
 `ninfer_hyper_connection_test` (the mixer against its FP64 formula on both arithmetic profiles,
 fused T ≤ 16 and composed above, column invariance, graph equal to eager; inject and expand exact),
