@@ -9,6 +9,7 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -201,6 +202,9 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
                 norm_weight.data != nullptr && norm_weight.dtype == DType::FP32 &&
                 norm_weight.is_contiguous() && streams > 0 && rank > 0,
             "mix requires contiguous BF16 residual and x and an FP32 norm weight");
+    // The fused route reads each stream's slice of residual with 16-byte loads.
+    require(reinterpret_cast<std::uintptr_t>(residual.data) % 16 == 0,
+            "mix residual must be 16-byte aligned");
     const std::int32_t T = residual.ne[1], hidden = x.ne[0];
     require(T > 0 && x.ne[1] == T && residual.ne[0] == streams * hidden && hidden % 8 == 0 &&
                 norm_weight.numel() == residual.ne[0] && down.k == residual.ne[0] &&
