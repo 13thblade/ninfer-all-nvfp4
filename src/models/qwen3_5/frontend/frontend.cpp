@@ -432,7 +432,8 @@ VisionItem convert_vision_item(fi::VisionItem item) {
 
 StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& caller) {
     StopPolicy result;
-    result.publish_stop_token = caller.publish_stop_token;
+    result.include_model_defaults = caller.include_model_defaults;
+    result.publish_stop_token     = caller.publish_stop_token;
     const auto append_token   = [&](TokenId token) {
         if (!tokenizer.is_valid_token(token)) {
             throw std::invalid_argument("stop token id is outside the checkpoint vocabulary: " +
