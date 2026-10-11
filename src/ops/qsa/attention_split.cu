@@ -412,7 +412,9 @@ __global__ void __launch_bounds__(kThreads)
     if (warp != 0) { return; }
 
     if (splits == 1) {
-        const float inv_lo = 1.0F / sum_lo, inv_hi = 1.0F / sum_hi;
+        // An empty token set (sum 0) gives 0, as on the wide route.
+        const float inv_lo = sum_lo > 0.0F ? 1.0F / sum_lo : 0.0F;
+        const float inv_hi = sum_hi > 0.0F ? 1.0F / sum_hi : 0.0F;
 #pragma unroll
         for (int i = 0; i < 32; ++i) {
 #pragma unroll
@@ -471,7 +473,9 @@ __global__ void __launch_bounds__(kD) merge_kernel(const float* __restrict__ par
         sum += partial[stats_offset + 2 * row + 1] * f;
         value += partial[row * kD + d] * f;
     }
-    out[(static_cast<std::int64_t>(column) * kHq + head) * kD + d] = __float2bfloat16_rn(value / sum);
+    // Every split empty (an empty token set) gives 0, as on the wide route.
+    out[(static_cast<std::int64_t>(column) * kHq + head) * kD + d] =
+        __float2bfloat16_rn(sum > 0.0F ? value / sum : 0.0F);
 }
 
 template <int Stages>
