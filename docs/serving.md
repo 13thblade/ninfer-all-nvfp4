@@ -699,9 +699,13 @@ parameters, so only the calls before it are kept, as on the constrained route.
 
 The flag **never** keeps a call whose parameter value was cut off before its closing tag: a cut path,
 command or patch would run as something the model did not write. Such a call is dropped (or, when
-it is the only one, the output stays text). The flag also never applies to calls recovered from
-unclosed thinking, which must parse exactly. A repaired turn reports `tolerant_recovered` in the
-[structured request log](#structured-request-log) and logs one Info line.
+it is the only one, the output stays text). For the same reason it drops nothing that holds a
+`</parameter>`, `</param>`, `</function>` or `</invoke>` closer before the next call marker: a
+value that quotes a closer followed by the next token (`echo '</parameter>` then `</function>'`)
+would have been split there, so the region stays text as under strict parsing. The flag also
+never applies to calls recovered from unclosed thinking, which must parse exactly. A repaired turn
+reports `tolerant_recovered` in the [structured request log](#structured-request-log) and logs one
+Info line.
 
 ### Tool constraints
 

@@ -1549,6 +1549,36 @@ int test_tolerant_never_keeps_cut_value() {
             kept_as_text(tolerant_turn(bash, quoted_closer, reason, failures), quoted_closer),
             "a cut value quoting a closer was kept at " + reason_label(reason));
     }
+    // A value quoting a closer followed by the format's next token splits there. A closer of the
+    // call's structure after the call shows the split may have cut the value, so repair does not
+    // discard that text to keep the call, whether its wrapper is missing, present or absent.
+    const std::string quoted_pair = "<parameter=command>\necho '</parameter>\n</function>";
+    const std::vector<std::string> split = {
+        "<tool_call>\n<function=bash>\n" + quoted_pair + "'\n</parameter>\n</function>",
+        "<tool_call>\n<function=bash>\n" + quoted_pair + "\n</tool_call>'\n</parameter>\n"
+        "</function>\n</tool_call>",
+        "<function=bash>\n" + quoted_pair + "'\n</parameter>\n</function>",
+        "<function_calls>\n<function=bash>\n" + quoted_pair +
+            "'\n</parameter>\n</function>\n</function_calls>",
+    };
+    for (const std::string& text : split) {
+        for (const FinishReason reason : kAllFinishReasons) {
+            failures += check(kept_as_text(tolerant_turn(bash, text, reason, failures), text),
+                              "a value split at a quoted closer was kept at " +
+                                  reason_label(reason) + ": " + text.substr(0, 40));
+        }
+        failures += check(
+            kept_as_text(tolerant_turn(bash, text, FinishReason::StopToken, failures, false), text),
+            "strict parsing kept a value split at a quoted closer: " + text.substr(0, 40));
+    }
+    // A quoted closer the format's next token does not follow stays in the value, and the call
+    // missing only its wrapper close is still kept whole.
+    const std::string whole_quote = "<tool_call>\n<function=bash>\n<parameter=command>\n"
+                                    "echo '</parameter>' done\n</parameter>\n</function>";
+    failures += check(
+        repaired_to(tolerant_turn(bash, whole_quote, FinishReason::StopToken, failures), "",
+                    {{"bash", R"({"command":"echo '</parameter>' done"})"}}),
+        "a call quoting a closer and missing its wrapper close was not kept whole");
     // After a complete call, only the complete call is published.
     const std::string after = tool_call("delete_file", {{"filePath", "/tmp/a"}}) + "\n" +
                               "<tool_call>\n<function=delete_file>\n<parameter=filePath>\n/tmp/ou";

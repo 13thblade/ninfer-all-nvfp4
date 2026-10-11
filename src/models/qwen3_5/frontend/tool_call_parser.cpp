@@ -475,7 +475,8 @@ public:
                 // the calls before it may be an example the prose quotes, and the caller tries the
                 // later region instead.
                 if (repairing() &&
-                    find_first_tool_marker(text_.substr(pos)) == std::string_view::npos) {
+                    find_first_tool_marker(text_.substr(pos)) == std::string_view::npos &&
+                    discardable(pos)) {
                     repaired_ = true;
                     return FallbackReason::None;
                 }
@@ -493,6 +494,27 @@ private:
 
     [[nodiscard]] bool repairing() const noexcept { return repair_ != ToolCallRepair::None; }
 
+    // Whether repair may drop the text at `pos` to keep the complete calls before it. A
+    // parameter or function closer there, before any call opener, means a value before it may
+    // have been split at a closer it quotes (`echo '</parameter>\n</function>'`); the strict
+    // format rejects that text, and dropping it would publish the cut value.
+    [[nodiscard]] bool discardable(std::size_t pos) const {
+        std::size_t header_begin = 0;
+        std::string_view function_close;
+        if (starts_with_at(text_, pos, kToolOpen) || function_open_header_begin(text_, pos) != 0 ||
+            repair_function_opener(pos, header_begin, function_close)) {
+            return true; // a later call attempt, not text a value spilled
+        }
+        std::string_view rest = text_.substr(pos);
+        rest                  = rest.substr(0, find_first_tool_marker(rest));
+        for (const std::string_view closer :
+             {std::string_view("</parameter>"), std::string_view("</param>"),
+              std::string_view("</function>"), std::string_view("</invoke>")}) {
+            if (rest.find(closer) != std::string_view::npos) { return false; }
+        }
+        return true;
+    }
+
     // A call failed to parse. Repair keeps a final call that is only missing its closing tags
     // when the model ended the turn itself, and otherwise ends the region after the complete
     // calls before it; the strict parser fails the region. A later `<tool_call>` wrapper makes the
@@ -508,7 +530,8 @@ private:
             return FallbackReason::None;
         }
         if (repairing() && !calls.empty() &&
-            text_.find(kToolOpen, call_begin + 1) == std::string_view::npos) {
+            text_.find(kToolOpen, call_begin + 1) == std::string_view::npos &&
+            discardable(call_begin)) {
             // The discarded call's repeated parameters are not part of the published turn.
             duplicate_parameters_repaired_ = repairs_before;
             repaired_                      = true;
