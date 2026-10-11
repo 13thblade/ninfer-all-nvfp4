@@ -371,10 +371,17 @@ round drafts shrink as requests join (same streams as above, `--spec mtp`, tok/s
 
 A request with `response_format` (with `--structured-output`) samples under its grammar's token
 mask. The mask of its next token is computed on a thread of its own from the grammar's state
-after the last accepted token, while the engine runs the other requests; the request joins a
-decode round once its mask is ready, and decodes without drafts. A costly grammar therefore slows
-only its own request. A single mask over 5 s, or a grammar with no admissible token, fails the
-request with an explicit error.
+after the last accepted token, while the GPU runs the decode step that produces the token's
+logits: the step does not wait for the mask, and a row whose mask is late keeps its logits and is
+sampled once the mask is ready, while the other requests go on. Such a request decodes without
+drafts. A single mask over 5 s, or a grammar with no admissible token, fails the request with an
+explicit error.
+
+String length bounds (`minLength`, `maxLength`) cost the most: a position inside a counted string
+has no cached mask. For plain string values in a schema without alternatives the bounds are
+therefore enforced beside the grammar, which compiles the string unbounded: with Gemma's
+262,144-token vocabulary a two-string schema with `maxLength: 2800` compiles in 0.9 s instead of
+28 s and its masks take 0.08 ms instead of ~80 ms (one Apple M-series core).
 
 Every running request must make progress: one that neither computes a prompt chunk nor accepts a
 token for 120 s fails with `inference request made no progress for 120 s` instead of holding its

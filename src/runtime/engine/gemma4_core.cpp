@@ -321,8 +321,12 @@ struct Gemma4Core::Request {
 
     std::uint32_t anchor_at = 0;
     bool reusable           = true;
-    // With a grammar (structured output): the mask of the token it samples next.
+    // With a grammar (structured output): the mask of the token it samples next. A decode step
+    // runs without waiting for it: when the mask is late, the row's logits are kept (saved_logits)
+    // and the token is sampled once the mask is ready.
     std::shared_ptr<GrammarMaskJob> mask;
+    bool awaiting_sample           = false;
+    std::int32_t awaiting_purpose  = 0;
     // The last prompt chunk or accepted token, which the progress watchdog measures from.
     Clock::time_point progress;
     // Prefixes other prompts are expected to share (the end of the leading system messages, of
@@ -430,6 +434,10 @@ struct Gemma4Core::Impl {
     std::uint32_t decode_rounds_per_prefill = 1;
 
     DeviceBuffer sample_config, sample_position, sample_out, token_counts, score_targets, score_out;
+    // A row's logits kept while its grammar mask is late (one per sequence), and those of the rows
+    // sampled together afterwards, side by side.
+    DeviceBuffer saved_logits, deferred_logits;
+    std::size_t vocab_rows = 0; // logits per row
     DeviceBuffer token_mask;
     DeviceBuffer logprob_ids, logprob_values, logprob_lse, logprob_flag;
     std::unique_ptr<PinnedHostBuffer> host_mask, host_sample, host_logprobs;
@@ -487,6 +495,11 @@ struct Gemma4Core::Impl {
             token_mask = DeviceBuffer(rows * width * mask_words() * sizeof(std::uint32_t));
             host_mask  = std::make_unique<PinnedHostBuffer>(rows * width * mask_words() *
                                                             sizeof(std::uint32_t));
+        }
+        if (structured_output) {
+            vocab_rows      = static_cast<std::size_t>(instance.executor->logits(1).ne[0]);
+            saved_logits    = DeviceBuffer(rows * vocab_rows * sizeof(__nv_bfloat16));
+            deferred_logits = DeviceBuffer(rows * vocab_rows * sizeof(__nv_bfloat16));
         }
         sample_config   = DeviceBuffer(rows * sizeof(ops::SamplingConfig));
         sample_position = DeviceBuffer(rows * sizeof(std::int32_t));
@@ -990,7 +1003,8 @@ struct Gemma4Core::Impl {
         for (const Slot& slot : slots) {
             if (!slot.request) { continue; }
             if (slot.request->decoding) {
-                decoding = decoding || mask_ready(*slot.request);
+                // A request runs a decode step unless its kept logits still wait for their mask.
+                decoding = decoding || !slot.request->awaiting_sample || mask_ready(*slot.request);
             } else if (!prefilling || prefills_before(*slot.request, *prefilling)) {
                 prefilling = slot.request;
             }
@@ -1127,7 +1141,7 @@ struct Gemma4Core::Impl {
     }
 
     void sample(std::span<const SampleRow> rows, std::int32_t purpose, std::span<TokenId> out,
-                std::span<runtime::RawTokenLogprob> logprobs) {
+                std::span<runtime::RawTokenLogprob> logprobs, const Tensor* source = nullptr) {
         const cudaStream_t stream = instance.executor->head_stream();
         const std::size_t n       = rows.size();
         auto* configs             = static_cast<ops::SamplingConfig*>(host_sample->data());
@@ -1170,7 +1184,8 @@ struct Gemma4Core::Impl {
         const auto width = static_cast<std::int32_t>(n);
         Tensor sampled(sample_out.p, DType::I32, {width});
         const Tensor logical(sample_position.p, DType::I32, {width});
-        const Tensor logits        = instance.executor->logits(static_cast<std::uint32_t>(n));
+        const Tensor logits =
+            source != nullptr ? *source : instance.executor->logits(static_cast<std::uint32_t>(n));
         const auto* device_configs = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const bool gather = std::any_of(rows.begin(), rows.end(),
                                         [](const SampleRow& row) { return row.logprobs; });
@@ -1364,18 +1379,10 @@ struct Gemma4Core::Impl {
         }
         r.position = prompt_n;
         r.decoding = true;
-        // The first token's mask began with the request and is usually done; waiting for it holds
-        // the engine thread, so only for the mask budget.
-        const auto deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
-                                                 std::chrono::duration<double>(kMaskBudgetSeconds));
-        while (!mask_ready(r) && Clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-        }
+        // The first token's mask began with the request; when it is not done yet, the prompt's
+        // last logits wait for it instead of the engine thread.
         if (!mask_ready(r)) {
-            fail(request, std::make_exception_ptr(RequestError(
-                              RequestErrorKind::Unavailable,
-                              "structured output: the first token's grammar mask took over the " +
-                                  std::to_string(kMaskBudgetSeconds) + " s budget")));
+            defer_sample(r, executor.logits(1), 0, ops::kSamplePurposePrefill);
             return;
         }
         if (!mask_usable(request)) { return; }
@@ -1483,28 +1490,76 @@ struct Gemma4Core::Impl {
             if (slot.request && slot.request->decoding) { ++decoding; }
         }
         const std::uint32_t steps = round_drafts(decoding);
+        std::vector<std::shared_ptr<Request>> deferred;
         for (const Slot& slot : slots) {
             // A copy: finishing or failing the request clears its slot.
             const std::shared_ptr<Request> request = slot.request;
             if (!request || !request->decoding) { continue; }
-            if (!mask_ready(*request)) {
-                // It waits for its grammar mask; a cancellation need not.
-                if (request->cancelled.load(std::memory_order_acquire)) {
+            if (request->awaiting_sample) {
+                // Its logits wait for its grammar mask; a cancellation need not.
+                if (mask_ready(*request)) {
+                    if (mask_usable(request)) { deferred.push_back(request); }
+                } else if (request->cancelled.load(std::memory_order_acquire)) {
                     finish_now(request, FinishReason::Cancelled);
                 }
                 continue;
             }
-            if (!mask_usable(request)) { continue; }
             (steps > 0 && speculates(*request) ? speculative : batch).push_back(request);
         }
-        if (batch.empty() && speculative.empty()) { return; }
+        if (batch.empty() && speculative.empty() && deferred.empty()) { return; }
         const auto start = Clock::now();
+        if (!deferred.empty()) { sample_deferred(deferred); }
         if (!batch.empty()) { plain_step(batch); }
         if (!speculative.empty()) { speculative_round(speculative, steps); }
         std::lock_guard lock(stats_mutex);
         stats.decode_rounds += 1;
         stats.decode_row_rounds += batch.size() + speculative.size();
         stats.decode_seconds_total += seconds(start, Clock::now());
+    }
+
+    // Keeps logits row `row` of `source` for the request until its grammar mask is ready.
+    void defer_sample(Request& r, const Tensor& source, std::size_t row, std::int32_t purpose) {
+        const std::size_t bytes = vocab_rows * sizeof(__nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(saved_logits.p) + std::size_t(r.slot) * bytes,
+                                   static_cast<const std::uint8_t*>(source.data) + row * bytes, bytes,
+                                   cudaMemcpyDeviceToDevice, instance.executor->head_stream()));
+        r.awaiting_sample  = true;
+        r.awaiting_purpose = purpose;
+    }
+
+    // Samples requests whose kept logits now have their masks.
+    void sample_deferred(const std::vector<std::shared_ptr<Request>>& ready) {
+        const std::size_t bytes = vocab_rows * sizeof(__nv_bfloat16);
+        for (const std::int32_t purpose : {ops::kSamplePurposePrefill, ops::kSamplePurposeDecode}) {
+            std::vector<std::shared_ptr<Request>> group;
+            for (const auto& request : ready) {
+                if (request->awaiting_purpose == purpose) { group.push_back(request); }
+            }
+            if (group.empty()) { continue; }
+            std::vector<SampleRow> rows;
+            for (std::size_t j = 0; j < group.size(); ++j) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<std::uint8_t*>(deferred_logits.p) + j * bytes,
+                    static_cast<const std::uint8_t*>(saved_logits.p) + std::size_t(group[j]->slot) * bytes,
+                    bytes, cudaMemcpyDeviceToDevice, instance.executor->head_stream()));
+                rows.push_back(sample_row(*group[j]));
+            }
+            const Tensor source(deferred_logits.p, DType::BF16,
+                                {static_cast<std::int32_t>(vocab_rows), static_cast<std::int32_t>(group.size())});
+            std::vector<TokenId> sampled(group.size());
+            std::vector<runtime::RawTokenLogprob> logprobs(group.size());
+            sample(rows, purpose, sampled, logprobs, &source);
+            for (std::size_t j = 0; j < group.size(); ++j) {
+                group[j]->awaiting_sample = false;
+                if (purpose == ops::kSamplePurposeDecode && drafts > 0) {
+                    ++group[j]->speculative.fallback_steps;
+                }
+                try {
+                    accept(group[j], sampled[j], rows[j].logprobs ? &logprobs[j] : nullptr);
+                    if (active(group[j])) { schedule_mask(*group[j]); }
+                } catch (...) { fail(group[j], std::current_exception()); }
+            }
+        }
     }
 
     void plain_step(const std::vector<std::shared_ptr<Request>>& batch) {
@@ -1516,21 +1571,47 @@ struct Gemma4Core::Impl {
             tokens.push_back(request->feed.front());
         }
         executor.decode(sequences, tokens);
-        std::vector<SampleRow> rows;
-        for (const auto& request : batch) {
+        // A grammar row whose mask is still being computed keeps its logits for later; the decode
+        // step itself did not wait for the mask.
+        const Tensor logits = executor.logits(static_cast<std::uint32_t>(batch.size()));
+        std::vector<std::shared_ptr<Request>> now;
+        std::vector<std::size_t> columns;
+        for (std::size_t b = 0; b < batch.size(); ++b) {
+            const auto& request = batch[b];
             slots[request->slot].fed.push_back(request->feed.front());
             request->position += 1;
-            rows.push_back(sample_row(*request));
+            if (mask_ready(*request)) {
+                now.push_back(request);
+                columns.push_back(b);
+            } else {
+                defer_sample(*request, logits, b, ops::kSamplePurposeDecode);
+            }
         }
-        std::vector<TokenId> sampled(batch.size());
-        std::vector<runtime::RawTokenLogprob> logprobs(batch.size());
-        sample(rows, ops::kSamplePurposeDecode, sampled, logprobs);
-        for (std::size_t b = 0; b < batch.size(); ++b) {
-            if (drafts > 0) { ++batch[b]->speculative.fallback_steps; }
+        std::vector<SampleRow> rows;
+        for (const auto& request : now) { rows.push_back(sample_row(*request)); }
+        std::optional<Tensor> source;
+        if (now.size() != batch.size() && !now.empty()) {
+            const std::size_t bytes = vocab_rows * sizeof(__nv_bfloat16);
+            for (std::size_t j = 0; j < now.size(); ++j) {
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(deferred_logits.p) + j * bytes,
+                                           static_cast<const std::uint8_t*>(logits.data) + columns[j] * bytes,
+                                           bytes, cudaMemcpyDeviceToDevice, executor.head_stream()));
+            }
+            source.emplace(Tensor(deferred_logits.p, DType::BF16,
+                                  {static_cast<std::int32_t>(vocab_rows), static_cast<std::int32_t>(now.size())}));
+        }
+        std::vector<TokenId> sampled(now.size());
+        std::vector<runtime::RawTokenLogprob> logprobs(now.size());
+        if (!now.empty()) {
+            sample(rows, ops::kSamplePurposeDecode, sampled, logprobs, source ? &*source : nullptr);
+        }
+        for (std::size_t b = 0; b < now.size(); ++b) {
+            if (drafts > 0) { ++now[b]->speculative.fallback_steps; }
             try {
-                accept(batch[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr);
-                if (active(batch[b]) && batch[b]->mask) { schedule_mask(*batch[b]); }
-            } catch (...) { fail(batch[b], std::current_exception()); }
+                if (!mask_usable(now[b])) { continue; }
+                accept(now[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr);
+                if (active(now[b]) && now[b]->mask) { schedule_mask(*now[b]); }
+            } catch (...) { fail(now[b], std::current_exception()); }
         }
     }
 
