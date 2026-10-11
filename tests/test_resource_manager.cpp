@@ -2821,16 +2821,16 @@ void test_endpoint_anchor_frontier_keeps_a_matched_endpoint_far_above_its_anchor
     FakeManager near_manager = make_manager(1, 2);
     FakeProgram near_program;
     near_program.finish_long_anchor_frontiers = {4096 - kEndpointAnchorMinimumGainTokens + 1};
-    const ActiveRequest near = start_active(near_manager, near_program, 7, make_base(7), 1);
-    (void)finish_active(near_manager, near_program, near, 4096);
-    near_program.matched_tokens[near.sequence.id] = 4200;
+    const ActiveRequest nearby = start_active(near_manager, near_program, 7, make_base(7), 1);
+    (void)finish_active(near_manager, near_program, nearby, 4096);
+    near_program.matched_tokens[nearby.sequence.id] = 4200;
     require(!near_manager.endpoint_anchor_frontier(near_program, prompt),
             "an endpoint within the minimum gain of an anchor was anchored again");
     near_program.finish_long_anchor_frontiers = {4096 - kEndpointAnchorMinimumGainTokens};
     FakeManager far_manager = make_manager(1, 2);
-    const ActiveRequest far = start_active(far_manager, near_program, 7, make_base(7), 1);
-    (void)finish_active(far_manager, near_program, far, 4096);
-    near_program.matched_tokens[far.sequence.id] = 4200;
+    const ActiveRequest distant = start_active(far_manager, near_program, 7, make_base(7), 1);
+    (void)finish_active(far_manager, near_program, distant, 4096);
+    near_program.matched_tokens[distant.sequence.id] = 4200;
     require(far_manager.endpoint_anchor_frontier(near_program, prompt) == 4096U,
             "an endpoint a full minimum gain above an anchor was not anchored");
 }

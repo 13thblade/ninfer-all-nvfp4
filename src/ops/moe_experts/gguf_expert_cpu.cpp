@@ -90,10 +90,42 @@ void rows_scalar(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_beg
 } // namespace gguf_cpu_detail
 
 namespace {
+#if defined(NINFER_CPU_EXPERT_X86) && defined(_MSC_VER)
+// MSVC has no __builtin_cpu_supports: CPUID leaves 1 and 7 and the register state the OS saves
+// (XCR0) answer the same questions.
+struct CpuFeatures {
+    unsigned leaf1_ecx = 0, leaf7_ebx = 0, leaf7_ecx = 0;
+    unsigned long long xcr0 = 0;
+};
+
+CpuFeatures cpu_features() noexcept {
+    CpuFeatures out;
+    int regs[4];
+    __cpuid(regs, 0);
+    if (regs[0] < 7) { return out; }
+    __cpuid(regs, 1);
+    out.leaf1_ecx = static_cast<unsigned>(regs[2]);
+    if ((out.leaf1_ecx & (1U << 27)) == 0) { return out; } // no OSXSAVE: no AVX state
+    out.xcr0 = _xgetbv(0);
+    __cpuidex(regs, 7, 0);
+    out.leaf7_ebx = static_cast<unsigned>(regs[1]);
+    out.leaf7_ecx = static_cast<unsigned>(regs[2]);
+    return out;
+}
+
+constexpr bool all_bits(unsigned value, unsigned mask) noexcept { return (value & mask) == mask; }
+#endif
+
 bool cpu_has_avx2() noexcept {
 #if defined(NINFER_CPU_EXPERT_X86) && (defined(__GNUC__) || defined(__clang__))
     return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
            __builtin_cpu_supports("f16c");
+#elif defined(NINFER_CPU_EXPERT_X86) && defined(_MSC_VER)
+    const CpuFeatures cpu = cpu_features();
+    // XCR0 SSE and AVX state; leaf 1 FMA, AVX, F16C; leaf 7 AVX2.
+    return (cpu.xcr0 & 0x6U) == 0x6U &&
+           all_bits(cpu.leaf1_ecx, (1U << 12) | (1U << 28) | (1U << 29)) &&
+           all_bits(cpu.leaf7_ebx, 1U << 5);
 #else
     return false;
 #endif
@@ -104,6 +136,12 @@ bool cpu_has_avx512_vnni() noexcept {
     return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
            __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512dq") &&
            __builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("f16c");
+#elif defined(NINFER_CPU_EXPERT_X86) && defined(_MSC_VER)
+    const CpuFeatures cpu = cpu_features();
+    // XCR0 SSE, AVX, opmask and both ZMM halves; leaf 1 F16C; leaf 7 AVX512F, DQ, BW, VL and VNNI.
+    return (cpu.xcr0 & 0xe6U) == 0xe6U && all_bits(cpu.leaf1_ecx, 1U << 29) &&
+           all_bits(cpu.leaf7_ebx, (1U << 16) | (1U << 17) | (1U << 30) | (1U << 31)) &&
+           all_bits(cpu.leaf7_ecx, 1U << 11);
 #else
     return false;
 #endif
