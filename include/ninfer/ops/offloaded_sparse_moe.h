@@ -167,6 +167,9 @@ public:
         int max_jobs        = 16; // per round
         int spin_iterations = 1 << 16;
         std::vector<int> cpus; // optional CPU of worker i (worker 0 is the caller, not pinned)
+        // Optional liveness word: every worker atomically increments it as it takes each work item,
+        // so it keeps changing for as long as a round makes progress (CpuMissService's heartbeat).
+        std::uint32_t* progress = nullptr;
     };
     explicit CpuExpertTeam(Options options);
     ~CpuExpertTeam();

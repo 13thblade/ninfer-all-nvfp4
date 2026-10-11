@@ -14,6 +14,8 @@
 //     Op outputs rounded to BF16, their observable boundaries), and moe_combine.
 //   - With NINFER_TEST_ARTIFACT: the same placements on 32 real experts of each expert bank of the
 //     artifact (layers of IQ2_S, IQ2_XXS and IQ1_M), GPU = CPU bit for bit and FP64 per expert.
+//   - A CPU miss service whose thread has failed: its heartbeat stops, failure() says why, and a call
+//     that hands it misses ends after the heartbeat timeout with kErrorHostSilent in the error word.
 //   - malformed inputs: a short shared gate and a non-unit third extent are rejected on the host;
 //     an id outside [0, E) is logged but not dispatched, on both dispatch routes.
 //
@@ -32,6 +34,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <cstdio>
@@ -330,8 +333,11 @@ std::vector<std::uint16_t> expected_outputs(const Bank& bank, const std::vector<
     return out;
 }
 
+// `external`, when set, serves the call instead of a service built from cfg; the call must leave
+// `want_error` in the error word.
 std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const DeviceRouting& r,
-                                      const DeviceBuffer& x_dev, int columns) {
+                                      const DeviceBuffer& x_dev, int columns,
+                                      om::CpuMissService* external = nullptr, std::uint32_t want_error = 0) {
     const int k        = r.k;
     const int max_jobs = std::min(bank.experts, k * columns);
     std::vector<std::int32_t> frames(bank.experts, -1);
@@ -357,18 +363,20 @@ std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const
     source.error         = reinterpret_cast<std::uint32_t*>(error.device);
     source.staging_base  = staging ? static_cast<std::uint8_t*>(staging->p) : nullptr;
     source.staging_slots = cfg.staging_slots;
-    std::unique_ptr<om::CpuMissService> service;
-    if (cfg.cpu_workers > 0) {
+    std::unique_ptr<om::CpuMissService> owned;
+    om::CpuMissService* service = external;
+    if (service == nullptr && cfg.cpu_workers > 0) {
         om::CpuMissService::Options o;
         o.workers         = cfg.cpu_workers;
         o.max_jobs        = cfg.cpu_max_jobs;
         o.max_columns     = 64;
         o.pcie_divisor    = cfg.cpu_divisor;
         o.max_job_columns = cfg.cpu_job_columns;
-        service = std::make_unique<om::CpuMissService>(
+        owned = std::make_unique<om::CpuMissService>(
             std::vector<om::CpuMissService::Layer>{{bank.pinned->host, bank.stride, bank.format}}, o);
-        source.cpu = service->channel(0);
+        service = owned.get();
     }
+    if (service != nullptr) { source.cpu = service->channel(0); }
     const Tensor x(x_dev.p, DType::BF16, {om::kHidden, columns});
     Tensor out(outputs.p, DType::BF16, {om::kHidden, k * columns});
     ops::moe_experts(x, r.view, source, k, max_jobs, workspace.p, out, nullptr);
@@ -391,8 +399,10 @@ std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     cuda_ok(cudaDeviceSynchronize(), cfg.name.c_str());
-    check(*reinterpret_cast<volatile std::uint32_t*>(error.host) == 0, "the error word stays clear");
-    if (service) {
+    check(*reinterpret_cast<volatile std::uint32_t*>(error.host) == want_error,
+          cfg.name + ": error word " + std::to_string(*reinterpret_cast<volatile std::uint32_t*>(error.host)) +
+              ", want " + std::to_string(want_error));
+    if (service != nullptr && want_error == 0) {
         check(service->failure().empty(), "the CPU service failed: " + service->failure());
         if (cfg.cpu_max_jobs > 0 && cfg.resident_every != 1 && columns <= 64) {
             check(service->served_requests() > 0, cfg.name + ": the CPU service served no request");
@@ -450,6 +460,52 @@ void test_synthetic_banks() {
         const auto bank = make_bank(format, records, align256(om::record_geometry(format).bytes));
         check_bank(bank, kTopK, g_small ? std::vector<int>{1, 8} : std::vector<int>{1, 2, 7, 8, 16}, rng, true);
     }
+}
+
+// The host-silent path: a service request for a layer the service does not have makes its thread
+// fail. Its heartbeat must then stop, and a call that hands it misses must end after
+// kHeartbeatTimeoutNs with kErrorHostSilent (layer 0) in the error word rather than wait forever.
+void test_host_silent() {
+    std::mt19937 rng(404);
+    constexpr int kExperts = 16, kTopK = 4, kColumns = 2;
+    const QType format = kRecordFormats[0];
+    std::vector<std::vector<std::uint8_t>> records;
+    for (int e = 0; e < kExperts; ++e) { records.push_back(random_record(format, rng)); }
+    const auto bank = make_bank(format, records, align256(om::record_geometry(format).bytes));
+    om::CpuMissService::Options o;
+    o.workers      = 1;
+    o.max_jobs     = 4;
+    o.max_columns  = 64;
+    o.pcie_divisor = 0;
+    om::CpuMissService service({{bank.pinned->host, bank.stride, bank.format}}, o);
+    const auto channel     = service.channel(0);
+    channel.request->layer = 1;
+    channel.request->jobs  = 0;
+    std::atomic_thread_fence(std::memory_order_release);
+    *reinterpret_cast<volatile std::uint32_t*>(&channel.request->sequence) = 1;
+    const auto start = std::chrono::steady_clock::now();
+    while (service.failure().empty() && std::chrono::steady_clock::now() - start < std::chrono::seconds(10)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    check(!service.failure().empty(), "a request for an unknown layer did not fail the service");
+    const auto* beat           = reinterpret_cast<const volatile std::uint32_t*>(channel.heartbeat);
+    const std::uint32_t before = *beat;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    check(*beat == before, "a failed service's heartbeat keeps changing");
+
+    std::vector<float> f32;
+    (void)random_logits(kExperts, kColumns, rng, f32);
+    DeviceRouting r(f32, kExperts, kTopK, kColumns);
+    const auto x = random_x(kColumns, rng);
+    DeviceBuffer x_dev(x.size() * 2);
+    x_dev.copy_from_host(x.data(), x.size() * 2);
+    const Config cfg{"cpu-silent", 0, 0, 1, 4, 0};
+    const auto call = std::chrono::steady_clock::now();
+    (void)run_config(bank, cfg, r, x_dev, kColumns, &service, om::kErrorHostSilent);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - call).count();
+    check(seconds >= 0.5, "the silent-host wait ended before the heartbeat timeout");
+    std::printf("host-silent: failed service (%s) -> kErrorHostSilent after %.2f s\n", service.failure().c_str(),
+                seconds);
 }
 
 // ------------------------------------------------------------------------------ layer against FP64
@@ -690,6 +746,7 @@ int main(int argc, char** argv) {
     test_combine();
     test_synthetic_banks();
     test_layer_fp64();
+    test_host_silent();
     if (const char* path = std::getenv("NINFER_TEST_ARTIFACT"); path != nullptr && *path != 0) {
         test_real_banks(path);
     } else {
