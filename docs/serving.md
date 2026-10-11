@@ -654,8 +654,8 @@ the structured turn, and any quoted markup before it stays ordinary content. A m
 Markdown code fence (```` ``` ```` or `~~~`) or inline code of the answer is a quoted example and
 stays content even when it is a complete call; only the text before the marker decides, so streamed
 and complete responses agree. A marker after a closed fence, or after a sentence on the same line,
-still opens a call. Inline code is tracked per paragraph, so an unpaired backtick earlier in the
-same paragraph also makes a later marker text.
+still opens a call. Inline code is tracked per paragraph (a blank line or a fence ends one), so an
+unpaired backtick earlier in the same paragraph also makes a later marker text.
 
 ### Tool constraints
 
