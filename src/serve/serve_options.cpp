@@ -154,7 +154,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16] "
            "[--mlp-a8-decode] [--no-prefill-a8] "
-           "[--prefill-cublas [--no-prefill-cublas-projections]] [--lookup-ngram N] "
+           "[--prefill-cublas [--no-prefill-cublas-projections]] "
            "[--no-thinking] [--preserve-thinking] [--tolerant-tool-calls] "
            "[--graft NAME=PATH]... [--default-graft NAME] "
            "[--reasoning-effort minimal|low|medium|high|xhigh|max] [--cors] "
