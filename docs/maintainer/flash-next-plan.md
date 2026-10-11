@@ -21,7 +21,8 @@ references, `engine-architecture.md`).
 | 8 | M0: the qwen4exp model from Infernix (config, binding, forward, n-gram hash, n-gram volume reader with keep-alive), the full conversion, the FP64 reference and block check, `forward_real`; the quality gate | done (gate below) |
 | 9 | M1: Program and Engine integration (one lane, elastic VMM KV, VRAM expert cache with LFRU and warm start, RAM/VRAM ledgers, decode CUDA graph, `EngineCore<Qwen4ExpInstance>`), serving and the `qwen38-flash-next` launcher profile | done (measurements below) |
 | 10 | Prefill: GPU wide expert route | not started |
-| 11-14 | Residency policy and miss split, 128K, MTP, vision | not started |
+| 11 | Decode (M2 gate): few misses zero-copy (11a), fewer decode-graph nodes and the GGML `linear_pair` (11b), the decode graph split around the n-gram row read and the startup frame retry (11c) | done (measurements below) |
+| 12-14 | 128K, MTP, vision | not started |
 
 The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
 the six dense formats (PR 3); offloaded_sparse_moe executes the three expert record formats (PR 7).
@@ -153,15 +154,107 @@ decode is GPU-bound and the host adds ~0.08 ms per token outside the rounds):
 
 | Work | ms / token | Note |
 |---|---:|---|
-| Routed experts | 4.27 | `stage_kernel` 2.08 (48 launches: ~43 µs each even with ~97% hits, a fixed per-layer cost), `gate_up` 1.46, `down` 0.73 (#239's narrow route at 28-30% of bandwidth) |
+| Routed experts | 4.27 | `stage_kernel` 2.08 (48 launches; PR 11 found this is the misses' PCIe copy, not a fixed cost: half the launches take 2 µs, the rest 40-400 µs), `gate_up` 1.46, `down` 0.73 (#239's narrow route at 28-30% of bandwidth) |
 | Dense GGML linears | 3.89 | 301 MMVQ launches (shared experts, attention, GDN, head) |
 | HC mixer and inject | 2.78 | #236's 97 fused calls |
 | MoE route, dispatch, combine | 0.55 | |
 | FP32 projections (router, indexer) | 0.51 | |
 | QSA (prep, select, attention), GDN, norms, copies | ~1.7 | QSA attention 15 µs per layer here |
 
-The cheapest next win is the stage pass of layers with no misses (~2 ms); the narrow route's
-bandwidth and the HC mixer are PR 11's (spec 8.2).
+The narrow route's bandwidth and the HC mixer are PR 11's (spec 8.2); PR 11 below corrects the
+stage attribution.
+
+## PR 11 (M2 decode) measurements
+
+RTX 3090 (WDDM, display attached), CUDA 12.8, MSVC 14.44, Ryzen 9 5950X, DDR4-2133; artifact and
+volume on K: (SATA). Decode is 512 greedy tokens after Strata's PR 0 prompts, wall clock after the
+prompt; one model load per process, a warm-up request, then the requests named. Every GPU run held
+the shared GPU lock.
+
+**Gate (spec 8.4), ABBA over builds:** base (07457ce9) and PR 11 processes in the order A B B A, each
+process a warm-up then 18 requests in ABBA order over the tiers; 12 requests per tier per build.
+Greedy ids are identical between the builds on every request.
+
+| Prompt | PR 9 base, median [min-max] | PR 11, median [min-max] | change | Strata plain | PR 11 / Strata |
+|---|---:|---:|---:|---:|---:|
+| 1K | 77.42 [74.90-78.80] | **81.15** [77.18-82.77] | +4.8% | 71.3 | 1.14× |
+| 8K | 76.30 [74.69-77.95] | **79.88** [77.99-81.62] | +4.7% | 69.6 | 1.15× |
+| 32K | 75.49 [70.97-77.08] | **78.96** [75.24-81.11] | +4.6% | 66.2 | 1.19× |
+
+The blocking gate (≥ 1.0× Strata plain at 1K/8K/32K) holds. The non-blocking 8K target of 80 tok/s
+is met by the mean of an earlier 16-request run (80.14) and missed by this run's median (79.88,
+mean 79.92); the stretch (1.3× Strata, ~91) is not reached.
+
+**Attribution, 8K** (16 requests per row unless noted, two processes in ABBA order):
+
+| Build | tok/s, median [min-max] |
+|---|---:|
+| base | 75.36 [70.12-77.14] |
+| + route log in the dispatch, PLE slot as state (11b, two of three parts) | 76.98 [73.83-78.56] |
+| + zero-copy rule, threshold 1 / 2 / 4 (11a) | 77.76 / 77.90 / 77.91 |
+| + `linear_pair` for shared gate/up and attention key/value (11b) | 79.51 [75.94-80.80] |
+| + decode graph split around the n-gram read, startup frame retry (11c) | 80.47 [75.92-82.14] |
+
+The last row's +1.2% (+0.96 tok/s) is 1.6 pooled standard errors: suggestive, not established. Its
+processes started with 12,268 frames against 10,796-10,930 for the row above.
+
+**Zero-copy rule (11a).** `offloaded_moe_bench --misses N`, T = 1, 10 experts, graph µs
+(IQ2_S / IQ2_XXS / IQ1_M): one miss staged 122 / 120 / 93, under the rule 90 / 80 / 78; two misses
+165 / 159 / 144 vs 162 / 142 / 138; three and four equal within noise. Rejected: the stage copy on
+a forked high-priority stream beside the resident experts (with the shared expert in between) was
+slower at every miss count (one miss 157 / 144 / 139 µs): the resident pass's 400 CTAs occupy the
+SMs before the copy starts (~25 µs later in nsys) and the join edge adds 15-40 µs.
+
+**Miss split and worker count (spec 3.3).** One cold expert on the CPU worker team at T = 1: 119 /
+98 / 146 µs at 6 workers, 70 / 85 / 82 µs at 12, 67 / 70 / 84 µs at 16 (IQ2_S / IQ2_XXS / IQ1_M,
+GPU idle). Zero-copy adds 30-45 µs to a layer for one miss, so a CPU leg that waits ≥ 67 µs plus the
+handshake cannot win for the one or two misses a decode layer usually has (half the layer calls
+have none; ~10% have three or more). The CPU route stays unwired; not measured end to end.
+
+**Promotion cadence.** Interval 2 / 4 (the link-derived default) / 8 rounds once the frames are
+full: 80.28 / 80.14 / 79.73 tok/s at 8K (16 each; the 8-round runs include one 66 tok/s request);
+within noise, so the default stays.
+
+**Startup frames.** The pool stopped growing at startup when one 64 MiB chunk read as placed in
+system memory (free memory did not drop) with ~2.1 GB free; the control law grew it a minute later
+anyway. Retrying such a chunk up to three times (100-300 ms apart) gave the full sizing in the
+runs measured: 12,268 frames at startup (was 10,796-11,107). The steady state still settles at
+11,9xx frames: the control law keeps the 512 MiB display headroom and the reserve free, and frames
+are sized for the widest record (IQ2_S, 1.51 MB), which wastes ~3.5% of the pool on the IQ2_XXS and
+IQ1_M layers. Strata holds 12,375-12,583.
+
+**Host and n-gram rows (11c).** The decode round now runs the layers before the PLE layer (two of
+48) as one graph while the host reads the round's n-gram rows from the volume (median 0.6 ms, p90
+1.2 ms per token under nsys), then the rest as a second graph.
+
+**Not changed, with reasons.** Power throttling: the opt-out exists since PR 9. WDDM event batching:
+a decode round queries at most a few promotion events and records two per promotion batch; nothing
+to batch. L2-warm replacement: Infernix warms L2 while the host computes CPU-served misses; without
+the CPU route there is no window.
+
+**Where a token goes now** (8K, a warm request after an identical one, 114 rounds, nsys with graph
+nodes traced; kernel time per round, which the profiler inflates; the GPU is busy 11.8 ms of a
+13.9 ms profiled round):
+
+| Work | ms / token | Note |
+|---|---:|---|
+| Dense GGML linears | 3.82 | 181 MMVQ launches + 60 pair launches (0.43); the large IQ4_XS ones near PR 3's 74%, IQ3_S at ~42% |
+| HC mixer and inject | 2.80 | unchanged (#236; the rewrites in #247 were slower) |
+| Routed experts | 2.63 | `gate_up` 1.63, `down` 0.77, stage 0.22 (this request's hit rate was high; most layers have no miss) |
+| MoE route, dispatch, combine; FP32 projections | 1.08 | |
+| QSA, GDN, norms, copies | ~1.5 | 216 GDN head-tiling copy nodes, 0.25 |
+| GPU idle waiting for the host's n-gram rows | 1.8 under nsys | the front graph (two layers, ~0.5 ms) hides part of the row read (median 0.6 ms, p90 1.2 ms); graph launches are much slower under the profiler, so the real exposed share is smaller (11c measured +1.2%) |
+
+Remaining levers, largest first: the HC mixer and the narrow expert route (both latency-bound per
+#247; instruction-level work with Nsight Compute), IQ3_S decode in the GEMV (~0.5 ms at 42% of
+bandwidth), the row read (a host row cache or prefetching the next token's candidates), the
+head-tiling copies, and per-format frame pools (~3.5% more frames).
+
+One profiling run of the final build (three 8K requests of 160 tokens) ended with an access
+violation after the trace was written; the same arguments ran cleanly without the profiler and
+under nsys at 48 and 128 tokens, and every bench and test process exited cleanly. Not reproduced.
+
+
 
 ## Artifact decisions
 

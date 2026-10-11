@@ -87,11 +87,21 @@ public:
     // FP32 logits [V, n] of batch.logit_columns.
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
 
+    // The same call in two parts: run_front(batch, end) runs the embedding and layers [0, end), at
+    // most up to rows_layer(), so it reads no batch.ngram_rows (a caller may still be writing them);
+    // run_back(batch, end, logits) runs the remaining layers and the head on the front's residual.
+    // Nothing else may use the workspace in between. run() is run_front(0) then run_back(0).
+    void run_front(const ForwardBatch& batch, std::uint32_t end, const ForwardTap* tap = nullptr);
+    void run_back(const ForwardBatch& batch, std::uint32_t begin, Tensor& logits, const ForwardTap* tap = nullptr);
+    // The first layer that reads the n-gram rows (the PLE layer); the layer count when none does.
+    [[nodiscard]] std::uint32_t rows_layer() const noexcept;
+
     // Workspace one call of up to `columns` columns needs, at the given context.
     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
                                                      std::uint32_t max_visible_keys, DeviceExecutionView execution);
 
 private:
+    void layers(std::uint32_t begin, std::uint32_t end, const ForwardBatch& batch, const ForwardTap* tap);
     void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap);
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
@@ -106,6 +116,7 @@ private:
     ForwardState state_;
     ForwardKV kv_;
     ForwardExperts experts_;
+    Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back
 };
 
 // The QSA indexer geometry of the configuration.

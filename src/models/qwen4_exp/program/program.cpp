@@ -293,7 +293,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.residency            = ExpertResidency::table_bytes(c, d.chunk);
     b.expert_record_stride = d.frame_stride;
     b.max_frames           = ExpertResidency::max_frames(c);
-    b.graph_bound          = graph_bound(1, 1, 0);
+    b.graph_bound          = 2 * graph_bound(1, 1, 0); // the decode forward in two parts
     return d;
 }
 
@@ -720,14 +720,24 @@ public:
         const nvtx::ScopedRange range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode);
         try {
             const std::int32_t position = static_cast<std::int32_t>(lane_.state_tokens);
-            stage(position, 1);
+            // The layers before the PLE layer run while the host reads the round's n-gram rows from
+            // the volume; the rest of the forward follows their upload.
+            upload_inputs(position, 1);
             residency_->before_round(device_.stream);
-            run_decode();
+            run_decode(Part::Front);
+            {
+                const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
+                upload_rows(position, 1);
+            }
+            run_decode(Part::Back);
             lane_.state_tokens += 1;
             const bool failed_constraint = sample(position, masks);
             residency_->enqueue_route_download(device_.stream, 1);
             const auto wait = Clock::now();
-            device_.synchronize();
+            {
+                const nvtx::ScopedRange waiting(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Decode);
+                device_.synchronize();
+            }
             runtime::ExecutionTiming timing;
             timing.device_wait_ns = elapsed_ns(wait);
             pending_token_        = sampled_token();
@@ -964,10 +974,28 @@ private:
         upload_pinned(io_device_.p, io_host_.data(), tokens.size() * 4, device_.stream);
     }
 
-    // Stages the inputs of positions [begin, begin + width) of the lane's history: ids, positions,
-    // RoPE positions (text: every axis equals the position), the pooled-block start and the
-    // n-gram rows each column reads, then uploads them.
+    // Stages the inputs of positions [begin, begin + width) of the lane's history and uploads them:
+    // write_inputs' words, then the n-gram rows.
     void stage(std::int32_t begin, std::int32_t width) {
+        write_inputs(begin, width);
+        const std::size_t rows = read_rows(begin, width);
+        upload_pinned(io_device_.p, io_host_.data(), plan_.io.ngram + rows, device_.stream);
+    }
+
+    // The same in two uploads, so the forward's front can start before the rows are read.
+    void upload_inputs(std::int32_t begin, std::int32_t width) {
+        write_inputs(begin, width);
+        upload_pinned(io_device_.p, io_host_.data(), plan_.io.ngram, device_.stream);
+    }
+    void upload_rows(std::int32_t begin, std::int32_t width) {
+        const std::size_t rows = read_rows(begin, width);
+        upload_pinned(static_cast<std::byte*>(io_device_.p) + plan_.io.ngram,
+                      static_cast<std::byte*>(io_host_.data()) + plan_.io.ngram, rows, device_.stream);
+    }
+
+    // Writes the input words of the call to the pinned block: ids, positions, RoPE positions (text:
+    // every axis equals the position), the pooled-block start and the logit column.
+    void write_inputs(std::int32_t begin, std::int32_t width) {
         const auto& io = plan_.io;
         auto* host     = static_cast<std::byte*>(io_host_.data());
         auto* ids      = reinterpret_cast<std::int32_t*>(host + io.ids);
@@ -983,6 +1011,12 @@ private:
         const std::int32_t r = dim(c_.qsa.compress_ratio);
         for (int a = 0; a < 3; ++a) { block[a] = begin / r * r; }
         columns[0] = width - 1;
+    }
+
+    // Reads the n-gram rows each column reads into the pinned block; returns their bytes.
+    std::size_t read_rows(std::int32_t begin, std::int32_t width) {
+        const auto& io = plan_.io;
+        auto* host     = static_cast<std::byte*>(io_host_.data());
         // n-gram rows: the window of ngram_size - 1 earlier tokens, EOS-padded at the start.
         const std::int32_t context = dim(c_.ple.ngram.ngram_size) - 1;
         ngram_window_.assign(static_cast<std::size_t>(std::max(0, context - begin)), c_.eos_token_id);
@@ -993,7 +1027,7 @@ private:
         hash_.row_ids(ngram_window_, static_cast<std::size_t>(width), row_ids_.data());
         const std::size_t row_bytes = c_.ple.table.row_bytes;
         volume_.read_rows(row_ids_, std::span<std::byte>(host + io.ngram, row_ids_.size() * row_bytes));
-        upload_pinned(io_device_.p, io_host_.data(), io.ngram + row_ids_.size() * row_bytes, device_.stream);
+        return row_ids_.size() * row_bytes;
     }
 
     execution::ForwardBatch batch(std::int32_t width) const {
@@ -1018,23 +1052,32 @@ private:
         ops::cast_fp32_to_bf16(logits32_, logits16_, device_.stream);
     }
 
-    // The decode forward: eager on the first round (the kernels' one-time setup runs outside a
-    // capture), then captured once and replayed. Inputs were staged at fixed addresses.
-    void run_decode() {
-        const auto body = [this] {
-            forward_->run(batch(1), logits32_);
+    // One part of the decode forward: eager on the first round (the kernels' one-time setup runs
+    // outside a capture), then each part captured once and replayed. The front runs the layers
+    // before the PLE layer, the back the rest and the head. Inputs were staged at fixed addresses.
+    enum class Part : std::uint8_t { Front, Back };
+    void run_decode(Part part) {
+        const std::uint32_t split = forward_->rows_layer();
+        const auto body = [this, part, split] {
+            if (part == Part::Front) {
+                forward_->run_front(batch(1), split);
+                return;
+            }
+            forward_->run_back(batch(1), split, logits32_);
             ops::cast_fp32_to_bf16(logits32_, logits16_, device_.stream);
         };
         if (!options_.use_cuda_graph || decode_rounds_ == 0) {
             body();
             return;
         }
-        if (!graph_exec_.ready()) {
-            graph_.capture(device_.stream, body);
-            graph_exec_.instantiate(graph_);
-            graph_exec_.upload(device_.stream);
+        auto& graph = part == Part::Front ? front_graph_ : back_graph_;
+        auto& exec  = part == Part::Front ? front_exec_ : back_exec_;
+        if (!exec.ready()) {
+            graph.capture(device_.stream, body);
+            exec.instantiate(graph);
+            exec.upload(device_.stream);
         }
-        graph_exec_.launch(device_.stream);
+        exec.launch(device_.stream);
     }
 
     // Samples the next token from the last call's logits at `position` into sampled_, with the
@@ -1331,8 +1374,8 @@ private:
     DeviceBuffer staging_;
     std::unique_ptr<ExpertResidency> residency_;
     std::unique_ptr<execution::Forward> forward_;
-    DecodeGraphDefinition graph_;
-    DecodeGraphExecutable graph_exec_;
+    DecodeGraphDefinition front_graph_, back_graph_;
+    DecodeGraphExecutable front_exec_, back_exec_;
 
     Lane lane_;
     std::uint64_t epoch_       = 0;

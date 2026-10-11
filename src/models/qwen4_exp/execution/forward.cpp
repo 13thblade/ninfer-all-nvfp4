@@ -131,30 +131,60 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
 }
 
 void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap) {
+    if (logits.dtype != DType::FP32 || logits.ne[0] != dim(config_.vocab_size) ||
+        logits.ne[1] != batch.logit_columns.ne[0]) {
+        throw std::invalid_argument("Qwen4Exp forward: batch geometry is invalid");
+    }
+    run_front(batch, 0, tap);
+    run_back(batch, 0, logits, tap);
+}
+
+std::uint32_t Forward::rows_layer() const noexcept {
+    for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) {
+        if (parameters_.layers[l].ple) { return l; }
+    }
+    return config_.num_hidden_layers;
+}
+
+void Forward::run_front(const ForwardBatch& batch, std::uint32_t end, const ForwardTap* tap) {
     const cudaStream_t s = device_.stream;
     const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size), W = dim(config_.residual_width());
     if (T <= 0 || batch.positions.ne[0] != T || batch.rope_positions.ne[0] != T || batch.rope_positions.ne[1] != 3 ||
-        batch.block_start_rope.ne[0] != 3 || logits.dtype != DType::FP32 ||
-        logits.ne[0] != dim(config_.vocab_size) || logits.ne[1] != batch.logit_columns.ne[0]) {
+        batch.block_start_rope.ne[0] != 3 || end > rows_layer()) {
         throw std::invalid_argument("Qwen4Exp forward: batch geometry is invalid");
     }
     work_.reset();
-    Tensor residual = work_.alloc(DType::BF16, {W, T});
+    residual_ = work_.alloc(DType::BF16, {W, T});
     {
         auto scope = work_.scope();
         Tensor x0  = work_.alloc(DType::BF16, {H, T});
         ops::embedding(batch.ids, parameters_.token_embedding, x0, s);
-        ops::hyper_connection_expand(x0, dim(config_.hc.streams), residual, s);
+        ops::hyper_connection_expand(x0, dim(config_.hc.streams), residual_, s);
     }
-    for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) {
+    layers(0, end, batch, tap);
+}
+
+void Forward::layers(std::uint32_t begin, std::uint32_t end, const ForwardBatch& batch, const ForwardTap* tap) {
+    for (std::uint32_t l = begin; l < end; ++l) {
         try {
-            layer(l, batch, residual, tap);
+            layer(l, batch, residual_, tap);
         } catch (const std::exception& error) {
             throw std::runtime_error("qwen4_exp/layers/" + std::to_string(l) + ": " + error.what());
         }
     }
-    auto scope     = work_.scope();
-    Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
+}
+
+void Forward::run_back(const ForwardBatch& batch, std::uint32_t begin, Tensor& logits, const ForwardTap* tap) {
+    const cudaStream_t s = device_.stream;
+    const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size);
+    if (residual_.data == nullptr || residual_.ne[1] != T || logits.dtype != DType::FP32 ||
+        logits.ne[0] != dim(config_.vocab_size) || logits.ne[1] != batch.logit_columns.ne[0]) {
+        throw std::invalid_argument("Qwen4Exp forward: the back part needs its front's batch and FP32 logits");
+    }
+    layers(begin, config_.num_hidden_layers, batch, tap);
+    Tensor& residual = residual_;
+    auto scope       = work_.scope();
+    Tensor final_x   = mix(parameters_.final_mixer, residual, nullptr);
     Tensor last    = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
     ops::gather_columns(final_x, batch.logit_columns, last, s);
     ops::projection_fp32(last, parameters_.output_head, logits, s);
