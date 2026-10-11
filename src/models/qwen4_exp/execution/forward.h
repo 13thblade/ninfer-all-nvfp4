@@ -42,7 +42,12 @@ struct ForwardKV {
 // pinned host bank otherwise, through `staging_slots` device slots (0: zero-copy).
 struct ForwardExperts {
     const std::uint8_t* frame_base = nullptr;
+    std::uint64_t frame_stride     = 0;      // bytes between frames (0: each layer's record stride)
     std::vector<const std::int32_t*> frames; // per layer, device I32 [E]: frame or -1
+    // Optional route log (the expert cache's): layer l's routed ids [top k, T] are copied to
+    // route_log + l * route_stride every call.
+    std::int32_t* route_log  = nullptr;
+    std::size_t route_stride = 0;
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     std::uint32_t* error        = nullptr; // optional mapped word (ops::MoeExpertSource::error)

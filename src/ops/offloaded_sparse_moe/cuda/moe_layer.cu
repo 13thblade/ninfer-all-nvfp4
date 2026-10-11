@@ -93,13 +93,18 @@ __device__ __forceinline__ void stage_wait() { asm volatile("cp.async.wait_group
 // slice while the second half lands).
 __device__ __forceinline__ void stage_wait_but_one() { asm volatile("cp.async.wait_group 1;\n" ::: "memory"); }
 
+// The distance between device frames (MoeExpertSource::frame_stride, record_stride when zero).
+__device__ __forceinline__ std::uint64_t frame_stride(const MoeExpertSource& source) {
+    return source.frame_stride != 0 ? source.frame_stride : source.record_stride;
+}
+
 // A job's record: resolved by the stage kernel (job_records) when the call stages its misses, else
 // read where it lives, a device frame or the mapped host bank.
 __device__ __forceinline__ const std::uint8_t* job_record(const MoeExpertSource& source,
                                                           const std::uint8_t* const* job_records, int expert, int job) {
     if (job_records != nullptr) { return job_records[job]; }
     const int frame = source.frames[expert];
-    return frame >= 0 ? source.frame_base + static_cast<std::uint64_t>(frame) * source.record_stride
+    return frame >= 0 ? source.frame_base + static_cast<std::uint64_t>(frame) * frame_stride(source)
                       : source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
 }
 
@@ -135,7 +140,7 @@ __global__ void __launch_bounds__(kThreads)
             const int expert = dispatch.jobs[job_base + j];
             const int frame  = source.frames[expert];
             if (frame >= 0) {
-                record = source.frame_base + static_cast<std::uint64_t>(frame) * source.record_stride;
+                record = source.frame_base + static_cast<std::uint64_t>(frame) * frame_stride(source);
             } else if (source.staging_slots > 0) {
                 miss = true;
             } else {
@@ -1006,6 +1011,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const moe::RecordGeometry geometry = moe::record_geometry(source.format);
     require(max_jobs > 0 && max_jobs <= 65535 && source.frames != nullptr && source.host_records != nullptr &&
                 source.record_stride >= geometry.bytes && source.record_stride % 16 == 0 &&
+                (source.frame_stride == 0 ||
+                 (source.frame_stride >= source.record_stride && source.frame_stride % 16 == 0)) &&
                 reinterpret_cast<std::uintptr_t>(source.host_records) % 16 == 0 &&
                 (source.frame_base == nullptr || reinterpret_cast<std::uintptr_t>(source.frame_base) % 16 == 0) &&
                 source.staging_slots >= 0 && (source.staging_slots == 0 || source.staging_base != nullptr) &&

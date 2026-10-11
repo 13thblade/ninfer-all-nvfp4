@@ -7,7 +7,8 @@
 //   - moe_dispatch: counts, offsets, jobs and entries exactly, on the one-CTA and three-kernel routes.
 //   - moe_experts: every routed (column, expert) output equals the CPU engine's (expert_forward_cpu,
 //     scalar) bit for bit, for each record format at T in {1, 2, 7, 8, 16}, with the records in
-//     device frames, read zero-copy, staged through 1, 3 or 64 slots, mixed, and served by the CPU
+//     device frames (record-stride apart, or wider: frame_stride), read zero-copy, staged through
+//     1, 3 or 64 slots, mixed, and served by the CPU
 //     miss service at 1 and 6 workers.
 //   - The whole layer against FP64: route weights, the routed experts (FP64 over the decoded
 //     records and A8-cast activations), a shared expert composed of GGML linears and silu_mul (its
@@ -288,11 +289,15 @@ struct Config {
     int cpu_max_jobs   = 0;
     int cpu_divisor    = 3;
     int cpu_job_columns = om::kMaxColumns;
+    // Device frames frame_stride apart, wider than the record (a frame pool shared by layers whose
+    // record formats differ in size): MoeExpertSource::frame_stride.
+    bool wide_frames = false;
 };
 
 std::vector<Config> configs() {
     std::vector<Config> c = {
         {"device", 1, 0},
+        {"device-wide", 1, 0, 0, 0, 3, om::kMaxColumns, true},
         {"zero-copy", 0, 0},
         {"staged-64", 0, 64},
         {"staged-3", 0, 3},
@@ -301,7 +306,7 @@ std::vector<Config> configs() {
         {"cpu-1w-all", 3, 0, 1, 64, 0},
         {"cpu-6w-div3", 0, 4, 6, 4, 3, 2},
     };
-    if (g_small) { c = {c[0], c[1], c[3], c[6]}; }
+    if (g_small) { c = {c[0], c[1], c[2], c[4], c[7]}; }
     return c;
 }
 
@@ -337,6 +342,16 @@ std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const
     }
     DeviceBuffer d_frames(frames.size() * 4);
     d_frames.copy_from_host(frames.data(), frames.size() * 4);
+    // Wide frames: every record frame_stride (record stride + 4 KiB) apart, the gaps poisoned.
+    const std::uint64_t frame_stride = cfg.wide_frames ? bank.stride + 4096 : 0;
+    std::unique_ptr<DeviceBuffer> wide;
+    if (cfg.wide_frames) {
+        wide = std::make_unique<DeviceBuffer>(static_cast<std::size_t>(bank.experts) * frame_stride);
+        cuda_ok(cudaMemset(wide->p, 0xA5, wide->bytes), "poison wide frames");
+        for (int e = 0; e < bank.experts; ++e) {
+            wide->copy_from_host(bank.record(e), bank.stride, static_cast<std::size_t>(e) * frame_stride);
+        }
+    }
     std::unique_ptr<DeviceBuffer> staging;
     if (cfg.staging_slots > 0) { staging = std::make_unique<DeviceBuffer>(bank.stride * cfg.staging_slots); }
     DeviceBuffer workspace(ops::moe_experts_workspace_bytes(max_jobs, k * columns, columns));
@@ -347,7 +362,8 @@ std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const
 
     ops::MoeExpertSource source;
     source.format        = bank.format;
-    source.frame_base    = static_cast<const std::uint8_t*>(bank.frames->p);
+    source.frame_base    = static_cast<const std::uint8_t*>(wide ? wide->p : bank.frames->p);
+    source.frame_stride  = frame_stride;
     source.frames        = static_cast<const std::int32_t*>(d_frames.p);
     source.host_records  = bank.pinned->device;
     source.record_stride = bank.stride;

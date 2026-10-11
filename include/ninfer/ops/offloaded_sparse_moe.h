@@ -243,6 +243,9 @@ struct MoeExpertSource {
     const std::int32_t* frames       = nullptr; // device [E]: frame of a resident expert, else -1
     const std::uint8_t* host_records = nullptr; // pinned host bank, device-readable (mapped)
     std::uint64_t record_stride      = 0;       // >= record bytes, a multiple of 16
+    // Device frames are frame_stride apart (0: record_stride), so one frame pool can hold the
+    // records of layers whose formats differ in size; >= record_stride and a multiple of 16.
+    std::uint64_t frame_stride       = 0;
     // Optional mapped word: a call whose host stopped answering writes layer << 16 | code there;
     // that call's outputs are undefined and the caller must fail the round. The caller clears it.
     std::uint32_t* error        = nullptr;
