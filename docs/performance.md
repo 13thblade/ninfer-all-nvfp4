@@ -571,7 +571,9 @@ corpus prompt:
 | 2,048 | 3, one copying | 48.9 ms | 118.9 | 2.43 |
 | 2,048 | 4, one copying | 58.7 ms | 138.8 | 2.36 |
 
-(The 131,072 row is from the one-lane measurement before two lanes were built.) A full copy round
+(The 131,072 row is from the one-lane measurement before two lanes were built; the three- and
+four-lane rows are from before copy rounds were limited to two lanes, and the bench now rejects
+`--copy-width` above `--batch 2`.) A full copy round
 yields 16 tokens for 1.2-1.4 DFlash2 rounds, which yield about 7.4 on copyable text. Beside a lane
 that does not copy it costs 1.44-1.49 rounds, so the other lane decodes **about a third slower in
 those rounds**; a two-lane round therefore copies only when the longest copy offers at least 12

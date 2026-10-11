@@ -1045,7 +1045,8 @@ acceptance. Transaction correctness is covered by the state and Engine tests.
 For n-gram copy rounds (DFlash2, `--corpus` for a realistic prompt):
 
 - `--copy-width W [--copy-lanes N]` records the request's own greedy continuation and hands it to
-  the first `N` lanes (default: all of `--batch`) as a proposal-only source, so their copy rounds
+  the first `N` lanes (default: all of `--batch`, which must be 1 or 2 because copy rounds run at
+  most two lanes) as a proposal-only source, so their copy rounds
   verify a full `W-1` drafts; the other lanes decode the same prompt without copies. It times the
   rounds in which every copying lane accepts all of its drafts: the cost of a `W`-column copy round,
   and with `--batch 2 --copy-lanes 1` the cost a copying lane imposes on a drafting one.
