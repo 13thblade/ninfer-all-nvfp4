@@ -148,6 +148,8 @@ def test_name_map_covers_every_tensor_once(gguf_path):
     conv = model.parameters["text/layers/0/gdn/convolution"]
     assert conv.direct_format == "bf16" and conv.shape == (4, 128)  # [K, C], the GGUF transposed
     assert model.parameters["text/layers/0/attn_hc/norm"].direct_format == "fp32"
+    # The GGUF's F16 PLE convolution is widened exactly to FP32, the ple_conv_inject operand.
+    assert model.parameters["text/layers/1/ple/convolution"].direct_format == "fp32"
     bank = model.parameters["text/layers/0/moe/experts"]
     assert bank.shape == (fixture.E, fixture.H, fixture.F)
     assert bank.inputs == ("text/layers/0/ffn_input",)
@@ -189,6 +191,16 @@ def test_name_map_covers_every_tensor_once(gguf_path):
 def test_name_map_rejects_missing_misplaced_and_unknown_tensors(tmp_path, drop, extra, message):
     path = fixture.write(tmp_path / "bad.gguf", drop=drop, extra=extra)
     with GgufModel(path) as gguf, pytest.raises(GgufError, match=message):
+        qwen4_exp.build_model(gguf)
+
+
+@pytest.mark.parametrize("kind", [fixture.F16, fixture.BF16])
+def test_narrowed_tensors_must_be_f32(tmp_path, kind):
+    name = "blk.3.attn_q_norm.weight"
+    with GgufModel(fixture.write(tmp_path / "ok.gguf")) as gguf:
+        ne = gguf.tensor(name).ne
+    path = fixture.write(tmp_path / "bad.gguf", drop=(name,), extra=((name, kind, ne),))
+    with GgufModel(path) as gguf, pytest.raises(GgufError, match="a narrowed tensor must be F32"):
         qwen4_exp.build_model(gguf)
 
 

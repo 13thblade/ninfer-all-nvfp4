@@ -8,6 +8,7 @@
 // mapped memory and answers with the request's sequence.
 
 #include "ninfer/ops/offloaded_sparse_moe.h"
+#include "ops/offloaded_sparse_moe/cpu/expert_cpu.h"
 
 #include <cuda_runtime.h>
 
@@ -19,15 +20,6 @@
 #include <string>
 #include <thread>
 
-#if defined(_WIN32)
-#    ifndef WIN32_LEAN_AND_MEAN
-#        define WIN32_LEAN_AND_MEAN
-#    endif
-#    ifndef NOMINMAX
-#        define NOMINMAX
-#    endif
-#    include <windows.h>
-#endif
 #if defined(__x86_64__) || defined(_M_X64)
 #    include <immintrin.h>
 #endif
@@ -47,14 +39,6 @@ void relax() {
 #endif
 }
 
-void pin(int cpu) {
-#if defined(_WIN32)
-    if (cpu >= 0 && cpu < 64) { (void)SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR{1} << cpu); }
-#else
-    (void)cpu;
-#endif
-}
-
 } // namespace
 
 struct CpuMissService::Impl {
@@ -64,13 +48,29 @@ struct CpuMissService::Impl {
     std::uint16_t* x         = nullptr; // mapped BF16 [H, max_columns]
     std::uint16_t* y         = nullptr; // mapped BF16 [H, max_jobs * kMaxColumns]
     std::uint32_t* done      = nullptr; // mapped
-    std::uint32_t* heartbeat = nullptr; // mapped, beside done
+    std::uint32_t* heartbeat = nullptr; // mapped, beside done; incremented atomically (see beat())
     std::uint32_t* sequence  = nullptr; // device
     std::atomic<bool> stop{false};
     std::atomic<std::uint64_t> served{0}, experts{0};
     mutable std::mutex failure_mutex;
     std::string failure;
     std::thread thread;
+
+    // Owns every resource, so a constructor that throws part-way releases what it allocated; a
+    // constructed service stops and joins its thread before anything is freed.
+    ~Impl() {
+        stop.store(true, std::memory_order_release);
+        if (thread.joinable()) { thread.join(); }
+        if (sequence != nullptr) { cudaFree(sequence); }
+        for (void* p : {static_cast<void*>(done), static_cast<void*>(y), static_cast<void*>(x),
+                        static_cast<void*>(request)}) {
+            if (p != nullptr) { cudaFreeHost(p); }
+        }
+    }
+
+    // The heartbeat changes while the service polls and, through the team's progress word, while
+    // it computes, so a long request is not mistaken for a silent host. It stops when serve() ends.
+    void beat() const { std::atomic_ref<std::uint32_t>(*heartbeat).fetch_add(1, std::memory_order_relaxed); }
 
     void record_failure(std::string what) noexcept {
         try {
@@ -81,14 +81,16 @@ struct CpuMissService::Impl {
 
     void serve() {
         try {
-            pin(options.cpus.empty() ? -1 : options.cpus[0]);
-            CpuExpertTeam team({.workers = options.workers, .isa = options.isa, .max_jobs = options.max_jobs,
-                                .cpus = options.cpus});
+            detail::pin_current_thread(options.cpus.empty() ? -1 : options.cpus[0]);
+            beat();
+            CpuExpertTeam team({.workers  = options.workers,
+                                .isa      = options.isa,
+                                .max_jobs = options.max_jobs,
+                                .cpus     = options.cpus,
+                                .progress = heartbeat});
             std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(options.max_jobs));
-            auto* volatile_beat     = reinterpret_cast<volatile std::uint32_t*>(heartbeat);
             auto* volatile_sequence = reinterpret_cast<volatile std::uint32_t*>(&request->sequence);
             auto* volatile_done     = reinterpret_cast<volatile std::uint32_t*>(done);
-            std::uint32_t beat      = 0;
             // The last answered sequence is 0 at construction (the request is zeroed and the device
             // counter starts at 0). It must not be read here: building the team takes long enough
             // that a call may already have published request 1, which would then never be served.
@@ -98,7 +100,7 @@ struct CpuMissService::Impl {
             std::uint32_t polls     = 0;
             while (!stop.load(std::memory_order_acquire)) {
                 const std::uint32_t current = *volatile_sequence;
-                *volatile_beat              = ++beat;
+                beat();
                 if (current == seen) {
                     relax();
                     // Spin while decoding; after 20 ms without a request, poll every 50 us.
@@ -172,16 +174,7 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options) : imp
     s.thread = std::thread([&s] { s.serve(); });
 }
 
-CpuMissService::~CpuMissService() {
-    Impl& s = *impl_;
-    s.stop.store(true, std::memory_order_release);
-    if (s.thread.joinable()) { s.thread.join(); }
-    cudaFree(s.sequence);
-    cudaFreeHost(s.done);
-    cudaFreeHost(s.y);
-    cudaFreeHost(s.x);
-    cudaFreeHost(s.request);
-}
+CpuMissService::~CpuMissService() = default;
 
 MoeCpuChannel CpuMissService::channel(int layer) const {
     const Impl& s = *impl_;

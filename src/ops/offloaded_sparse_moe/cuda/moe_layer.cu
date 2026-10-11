@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -61,7 +62,11 @@ void check_launch(const char* what) {
     }
 }
 
-bool contiguous(const Tensor& t, DType dtype) { return t.data != nullptr && t.dtype == dtype && t.is_contiguous(); }
+// Every tensor of this Op is a contiguous matrix or vector: a non-unit third or fourth extent would
+// be silently truncated by the kernels, so it is rejected.
+bool contiguous(const Tensor& t, DType dtype) {
+    return t.data != nullptr && t.dtype == dtype && t.is_contiguous() && t.ne[2] == 1 && t.ne[3] == 1;
+}
 
 // The record geometry the kernels read (offloaded_moe::RecordGeometry, device-copyable).
 struct Geometry {
@@ -324,25 +329,24 @@ __global__ void __launch_bounds__(kDispatchThreads)
     const int i = threadIdx.x;
     count[i]    = 0;
     __syncthreads();
-    const int id = i < entries ? ids[i] : 0;
-    if (i < entries) {
-        atomicAdd(&count[id], 1);
-        if (route_log != nullptr) { route_log[i] = id; }
-    }
+    const int id     = i < entries ? ids[i] : 0;
+    const bool valid = i < entries && id >= 0 && id < experts;
+    if (i < entries && route_log != nullptr) { route_log[i] = id; }
+    if (valid) { atomicAdd(&count[id], 1); }
     __syncthreads();
     const int c = count[i];
     if (i < experts) { dispatch.counts[i] = c; }
     dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
     __syncthreads();
-    if (i < entries) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
+    if (valid) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
 }
 
-__global__ void count_kernel(const std::int32_t* __restrict__ ids, int entries, std::int32_t* __restrict__ counts,
-                             std::int32_t* __restrict__ route_log) {
+__global__ void count_kernel(const std::int32_t* __restrict__ ids, int entries, int experts,
+                             std::int32_t* __restrict__ counts, std::int32_t* __restrict__ route_log) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < entries) {
         const int id = ids[i];
-        atomicAdd(&counts[id], 1);
+        if (id >= 0 && id < experts) { atomicAdd(&counts[id], 1); }
         if (route_log != nullptr) { route_log[i] = id; }
     }
 }
@@ -356,10 +360,12 @@ __global__ void __launch_bounds__(kDispatchThreads)
     dispatch_scan(e < experts ? counts[e] : 0, experts, offsets, cursor, jobs, job_count, warp_totals);
 }
 
-__global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries, std::int32_t* __restrict__ cursor,
-                               std::int32_t* __restrict__ out) {
+__global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries, int experts,
+                               std::int32_t* __restrict__ cursor, std::int32_t* __restrict__ out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < entries) { out[atomicAdd(&cursor[ids[i]], 1)] = i; }
+    if (i >= entries) { return; }
+    const int id = ids[i];
+    if (id >= 0 && id < experts) { out[atomicAdd(&cursor[id], 1)] = i; }
 }
 
 // --------------------------------------------------------------------------------------- experts
@@ -965,6 +971,9 @@ MoeDispatch carve_moe_dispatch(void* base, std::int32_t experts, std::int32_t en
 void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch, std::int32_t* route_log,
                   cudaStream_t stream) {
     require(experts > 0 && experts <= kDispatchThreads, "dispatch supports up to 1024 experts");
+    require(contiguous(routing.ids, DType::I32), "dispatch requires contiguous I32 ids");
+    require(routing.ids.numel() > 0 && routing.ids.numel() <= std::numeric_limits<int>::max(),
+            "dispatch entries must be in [1, INT_MAX]");
     const int entries = static_cast<int>(routing.ids.numel());
     const auto* ids   = static_cast<const std::int32_t*>(routing.ids.data);
     if (entries <= kDispatchThreads) {
@@ -974,13 +983,14 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
     }
     require(cudaMemsetAsync(dispatch.counts, 0, sizeof(std::int32_t) * experts, stream) == cudaSuccess,
             "dispatch could not clear its counts");
-    count_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(ids, entries, dispatch.counts, route_log);
+    count_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(ids, entries, experts, dispatch.counts,
+                                                                             route_log);
     check_launch("count");
     scan_kernel<<<1, kDispatchThreads, 0, stream>>>(dispatch.counts, experts, dispatch.offsets, dispatch.cursor,
                                                     dispatch.jobs, dispatch.job_count);
     check_launch("scan");
-    scatter_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(ids, entries, dispatch.cursor,
-                                                                                 dispatch.entries);
+    scatter_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(ids, entries, experts,
+                                                                                 dispatch.cursor, dispatch.entries);
     check_launch("scatter");
 }
 
@@ -1052,7 +1062,8 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
             "combine requires contiguous BF16 tensors and FP32 routing");
     const int hidden = y.ne[0], columns = y.ne[1], top_k = routing.weights.ne[0];
     require(outputs.ne[0] == hidden && outputs.ne[1] == columns * top_k && shared.ne[0] == hidden &&
-                shared.ne[1] == columns && routing.weights.ne[1] == columns,
+                shared.ne[1] == columns && routing.weights.ne[1] == columns &&
+                routing.shared_gate.numel() == columns,
             "combine shapes disagree");
     combine_kernel<<<dim3((hidden + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
         static_cast<const bf16*>(outputs.data), static_cast<const float*>(routing.weights.data),

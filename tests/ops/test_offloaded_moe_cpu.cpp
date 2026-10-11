@@ -5,7 +5,9 @@
 //     reference value (tests/ops/ggml_blocks_decode.h) bit for bit;
 //   - expert_forward_cpu (scalar) against the FP64 expert oracle over the decoded record and the
 //     A8-cast activations, for each record format at T in {1, 2, 7, 8};
-//   - AVX2 = scalar, and the worker team at 1, 2, 3, 8 and 16 workers = scalar, bit for bit.
+//   - AVX2 = scalar, and the worker team at 1, 2, 3, 8 and 16 workers = scalar, bit for bit;
+//   - both entry points reject a job with a null record or a null active x/y column; the team's
+//     optional progress word advances during a round.
 
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "offloaded_moe_fixtures.h"
@@ -18,6 +20,7 @@
 #include <cstring>
 #include <limits>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -194,6 +197,57 @@ void test_team() {
     }
 }
 
+template <class F>
+bool rejects(F&& f) {
+    try {
+        f();
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+    return false;
+}
+
+void test_rejects_missing_columns() {
+    using ops::offloaded_moe::CpuIsa;
+    std::mt19937 rng(37);
+    const QType format = kRecordFormats[0];
+    const auto record  = random_record(format, rng);
+    const auto x       = random_x(2, rng);
+    std::vector<std::uint16_t> y0(om::kHidden), y1(om::kHidden);
+    const std::uint16_t* xs[om::kMaxColumns] = {x.data(), x.data() + om::kHidden};
+    std::uint16_t* ys[om::kMaxColumns]       = {y0.data(), y1.data()};
+    const std::uint16_t* xs_gap[om::kMaxColumns] = {x.data(), nullptr};
+    std::uint16_t* ys_gap[om::kMaxColumns]       = {y0.data(), nullptr};
+    auto forward = [&](const std::uint8_t* r, const std::uint16_t* const* xp, std::uint16_t* const* yp) {
+        return rejects([&] { ops::offloaded_moe::expert_forward_cpu(CpuIsa::kScalar, format, r, 2, xp, yp); });
+    };
+    check(forward(nullptr, xs, ys), "expert_forward_cpu accepted a null record");
+    check(forward(record.data(), xs_gap, ys), "expert_forward_cpu accepted a null active x");
+    check(forward(record.data(), xs, ys_gap), "expert_forward_cpu accepted a null active y");
+    ops::offloaded_moe::CpuExpertTeam team({.workers = 2, .isa = CpuIsa::kScalar, .max_jobs = 1});
+    ops::offloaded_moe::CpuExpertJob job;
+    job.record = record.data();
+    job.format = format;
+    job.ncols  = 2;
+    job.x[0]   = x.data();
+    job.y[0]   = y0.data();
+    job.y[1]   = y1.data(); // x[1] stays null
+    check(rejects([&] { team.run({&job, 1}); }), "CpuExpertTeam accepted a null active x");
+    job.x[1] = x.data() + om::kHidden;
+    job.y[1] = nullptr;
+    check(rejects([&] { team.run({&job, 1}); }), "CpuExpertTeam accepted a null active y");
+    job.y[1] = y1.data();
+    team.run({&job, 1}); // the same team still runs a valid job after the rejections
+    // The optional progress word (CpuMissService's heartbeat) advances during every round.
+    std::uint32_t progress = 0;
+    ops::offloaded_moe::CpuExpertTeam ticking({.workers = 3, .isa = CpuIsa::kScalar, .max_jobs = 1, .progress = &progress});
+    ticking.run({&job, 1});
+    const std::uint32_t after_one = progress;
+    ticking.run({&job, 1});
+    check(after_one > 0 && progress > after_one, "the team's progress word did not advance during a round");
+    std::printf("rejects a null record and null active columns; the progress word advances\n");
+}
+
 } // namespace
 
 int main() {
@@ -201,6 +255,7 @@ int main() {
     test_decode();
     test_oracle_and_isa();
     test_team();
+    test_rejects_missing_columns();
     std::printf("offloaded_moe_cpu: passed\n");
     return 0;
 }
