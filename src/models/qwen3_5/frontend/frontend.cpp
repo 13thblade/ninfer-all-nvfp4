@@ -185,6 +185,53 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
     return options;
 }
 
+// Gemma 4's processor_config.json: patches of 16 pooled 3 x 3, pixels rescaled by 1/255 with no
+// normalization (or a mean of 0 and a deviation of 1), bicubic resizing, and the soft-token
+// budgets of an image and of a video frame.
+fi::GemmaMediaOptions gemma_media_options(const FrontendResources& resources) {
+    constexpr std::string_view kResource = "processor_config.json";
+    const Json config = parse_resource_json(resources.processor_config_json, kResource);
+    const Json& image = require_object(config, "image_processor", kResource);
+    const Json& video = require_object(config, "video_processor", kResource);
+    fi::GemmaMediaOptions out;
+    for (const auto* processor : {&image, &video}) {
+        if (require_integer(*processor, "patch_size", kResource) != out.patch ||
+            require_integer(*processor, "pooling_kernel_size", kResource) != out.pooling) {
+            throw std::invalid_argument(
+                "processor_config.json does not match the compiled Gemma 4 patch geometry");
+        }
+        if (processor->contains("resample") && (!(*processor)["resample"].is_number_integer() ||
+                                                (*processor)["resample"].get<int>() != 3)) {
+            throw std::invalid_argument(
+                "processor_config.json resample must select bicubic interpolation");
+        }
+        if (number_or_default(*processor, "rescale_factor", kResource, 1.0 / 255.0) !=
+            1.0 / 255.0) {
+            throw std::invalid_argument(
+                "processor_config.json rescale_factor does not match the compiled pixels");
+        }
+        for (const char* field : {"image_mean", "image_std"}) {
+            if (!processor->contains(field)) { continue; }
+            const Json& values = processor->at(field);
+            const double expected = std::string_view(field) == "image_mean" ? 0.0 : 1.0;
+            if (!values.is_array() || values.size() != 3 ||
+                std::any_of(values.begin(), values.end(), [&](const Json& value) {
+                    return !value.is_number() || value.get<double>() != expected;
+                })) {
+                throw std::invalid_argument(
+                    "processor_config.json normalization does not match the compiled pixels");
+            }
+        }
+    }
+    out.image_tokens = fi::gemma_budget_at_most(static_cast<std::uint64_t>(
+        positive_u64(require_integer(image, "max_soft_tokens", kResource), "max_soft_tokens")));
+    out.video_tokens = fi::gemma_budget_at_most(static_cast<std::uint64_t>(
+        positive_u64(require_integer(video, "max_soft_tokens", kResource), "max_soft_tokens")));
+    out.frames = static_cast<int>(
+        positive_u64(integer_or_default(video, "num_frames", kResource, 32), "num_frames"));
+    return out;
+}
+
 void validate_tokenizer_config(const FrontendResources& resources) {
     const Json tokenizer_config =
         parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
@@ -825,22 +872,40 @@ public:
         : chat_template(compile_chat_template(resources, options.chat_template_path,
                                               options.architecture != Architecture::Gemma4)),
           tokenizer(resources.tokenizer),
-          processor(options.vision_enabled ? processor_options(resources) : fi::ProcessorOptions{}),
+          processor(!options.vision_enabled                    ? fi::ProcessorOptions{}
+                    : options.architecture == Architecture::Gemma4 ? fi::ProcessorOptions{}
+                                                                   : processor_options(resources)),
           vision_enabled(options.vision_enabled), max_context(options.max_context),
           automatic_long_anchors(options.automatic_long_anchors),
           long_anchor_min_spacing_tokens(options.long_anchor_min_spacing_tokens),
           grafts(std::move(options.grafts)) {
-        fi::bound_merged_tokens(processor, options.vision_max_merged_tokens);
+        const bool gemma_media = options.architecture == Architecture::Gemma4 && vision_enabled;
+        if (gemma_media) {
+            fi::GemmaMediaOptions& g = processor.gemma.emplace(gemma_media_options(resources));
+            g.max_tokens   = fi::gemma_budget_at_most(options.vision_max_merged_tokens);
+            g.image_tokens = std::min(g.image_tokens, g.max_tokens);
+            g.video_tokens = std::min(g.video_tokens, g.max_tokens);
+        } else {
+            fi::bound_merged_tokens(processor, options.vision_max_merged_tokens);
+        }
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
         const std::uint64_t vision_tokens =
             std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
+        // Raw patches per soft token and values per patch: Gemma 4 pools 3 x 3 patches of
+        // 3 x 16 x 16, Qwen merges 2 x 2 patches of 2 x 3 x 16 x 16.
+        const std::uint64_t patches_per_token =
+            gemma_media ? std::uint64_t(processor.gemma->pooling) * processor.gemma->pooling
+                  : kRawPatchesPerVisionToken;
+        const std::uint64_t patch_features =
+            gemma_media ? std::uint64_t(3) * processor.gemma->patch * processor.gemma->patch
+                  : kPreparedVisionPatchFeatures;
         processor.max_vision_tokens = vision_tokens;
-        processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
+        processor.max_raw_patches   = vision_tokens * patches_per_token;
         if (vision_enabled) {
             const std::uint64_t minimum_live =
-                processor.max_raw_patches * kPreparedVisionPatchFeatures * sizeof(std::uint16_t);
+                processor.max_raw_patches * patch_features * sizeof(std::uint16_t);
             if (minimum_live > options.media_live_bytes) {
                 throw std::invalid_argument(
                     "media live-byte capacity cannot hold the maximum supported Vision prompt");

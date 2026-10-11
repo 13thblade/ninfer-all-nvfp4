@@ -93,11 +93,13 @@ inline constexpr std::int32_t kCublasPrefillMinTokens = 512;
  * @f]
  *
  * `out` stores a BF16 approximation of this ideal result under the named numerical criterion for
- * the selected private activation-compute path.
+ * the selected private activation-compute path; with a BF16 weight it may instead be FP32, the
+ * unrounded FP32 accumulation.
  *
  * @par Logical tensors and layout
  * `x` is contiguous, non-null, 16-byte-aligned BF16 `[K,T]`, `w` has logical shape `[N,K]`, and
- * `out` is contiguous, non-null, 16-byte-aligned BF16 `[N,T]`. Every logical extent is positive;
+ * `out` is contiguous, non-null, 16-byte-aligned BF16 `[N,T]` (FP32 `[N,T]` is accepted for a BF16
+ * `w` only). Every logical extent is positive;
  * in particular, `T=0` is invalid rather than a no-op. Dimension zero is stored fastest. The Op has
  * no bias, activation, residual addition, or transpose mode.
  *
@@ -110,16 +112,18 @@ inline constexpr std::int32_t kCublasPrefillMinTokens = 512;
  * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4
  * problems register the five non-vocabulary FP8 geometries and accept every positive T. Q8 also
  * registers `[5120,25600]` at every positive T. BF16 registers `[14336,5120]`,
- * `[5120,6144]`, and `[256,5120]` at every positive T. Text and MTP packed-weight problems accept
- * every positive column extent T. Registered Vision problems accept raw-patch P in
+ * `[5120,6144]`, and `[256,5120]` at every positive T; any other BF16 `[N,K]` (the Gemma 4 vision
+ * tower's projections, for instance), and every BF16 problem with an FP32 `out`, runs a
+ * runtime-shape GEMM, cuBLAS's tensor-core BF16 GEMM with an FP32 accumulator from T=64 on. Text and MTP packed-weight problems accept every positive
+ * column extent T. Registered Vision problems accept raw-patch P in
  * `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does not inherently
- * represent a text token. FP32 is unsupported.
+ * represent a text token. FP32 `x`, and FP32 `out` with a non-BF16 weight, are unsupported.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
  * The one Linear oracle accepts that matrix and the FP32 values represented by the BF16 activation,
  * evaluates every complete dot product with naive FP64 accumulation, and retains the FP64 result.
- * The BF16 output is promoted and compared against that result. Output representation,
+ * The BF16 or FP32 output is promoted and compared against that result. Output representation,
  * accumulator precision, activation quantization, staging, reduction order, and kernel schedule
  * are private implementation effects covered by the named tolerance for the selected
  * activation-compute path; none is copied into the oracle. Kernel, schedule, template instance,

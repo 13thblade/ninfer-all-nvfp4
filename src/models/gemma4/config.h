@@ -72,4 +72,41 @@ struct AssistantConfig {
 [[nodiscard]] AssistantConfig parse_assistant_config(const artifact::Json& value,
                                                      const TextConfig& target);
 
+// The vision tower (Gemma4VisionModel and the projection into the text model), the artifact's
+// `vision` component. A media unit (an image, or one frame of a video) is a grid of patch x patch
+// pixels; the tower's blocks attend over all of its patches, and its average over pooling x pooling
+// neighbourhoods, standardized and projected, gives the unit's soft tokens, which take the place
+// of the prompt's media placeholders. In the text model's sliding-window blocks one unit's soft
+// tokens attend each other in both directions when `bidirectional_attention`.
+struct VisionConfig {
+    std::uint32_t hidden_size             = 0;
+    std::uint32_t intermediate_size       = 0;
+    std::uint32_t num_hidden_layers       = 0;
+    std::uint32_t num_attention_heads     = 0;
+    std::uint32_t head_dim                = 0;
+    std::uint32_t patch_size              = 0;
+    std::uint32_t pooling_kernel_size     = 0;
+    std::uint32_t position_embedding_size = 0; // rows of each of the x and y tables
+    std::uint32_t projection_dim          = 0; // the text model's hidden size
+    std::uint32_t default_output_length   = 0; // soft tokens of an image by default
+    float rope_theta                      = 0;
+    float rms_norm_eps                    = 0;
+    bool standardize                      = false;
+    bool bidirectional_attention          = false;
+    std::int32_t image_token_id = -1, video_token_id = -1, boi_token_id = -1, eoi_token_id = -1;
+
+    // Values of one patch, (channel, y, x) with x fastest.
+    [[nodiscard]] std::uint32_t patch_features() const noexcept {
+        return 3 * patch_size * patch_size;
+    }
+    [[nodiscard]] std::uint32_t patches_per_token() const noexcept {
+        return pooling_kernel_size * pooling_kernel_size;
+    }
+};
+
+// Checked against the target and against the implemented kernels (a 1152-wide tower of 16 heads of
+// 72, a projection to the target's width).
+[[nodiscard]] VisionConfig parse_vision_config(const artifact::Json& value,
+                                               const TextConfig& target);
+
 } // namespace ninfer::models::gemma4

@@ -48,7 +48,9 @@ Google's QAT GGUF (or a mixed-format GGUF of the same model) with its ggml block
 It shares the Qwen3.5 frontend (tokenizer, chat template, output channels and Gemma's tool-call
 markup), runs one to eight sequences in prompt chunks of 2048 tokens with an F16 KV cache, drafts
 with the release's multi-token-prediction assistant (the artifact's `mtp` component, `--spec mtp`),
-and has no vision or pipeline stages.
+encodes images and video with the release's vision tower (the artifact's `vision` component, from
+its llama.cpp mmproj; resident, streamed from pinned memory, or FP32 on CPU threads), and has no
+pipeline stages.
 For the current Flash-Next delivery, all model and expert arithmetic runs on the GPU. Keep the
 completed native/CPU experiments and their evidence, but do not extend CPU expert execution or
 automatically select a CPU share. Develop the existing GGUF host-RAM and disk-streaming paths;

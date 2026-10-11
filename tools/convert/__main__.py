@@ -197,23 +197,32 @@ def main(argv=None):
         flash_next = architectures[0] in QWEN4_EXP_ARCHITECTURES
         gemma4 = architectures[0] in GEMMA4_ARCHITECTURES
         if gemma4:
-            if ("gguf" not in paths or args.components not in (None, "text", "text,mtp")
-                    or args.layers or (args.components == "text,mtp") != ("mtp" in paths)):
-                raise ValueError("Gemma 4 converts its text component from --source gguf=FILE, "
-                                 "with --components text,mtp its assistant from --source "
-                                 "mtp=FILE")
+            wanted = (args.components or "text").split(",")
+            if ("gguf" not in paths or args.layers or wanted[0] != "text"
+                    or not set(wanted) <= {"text", "mtp", "vision"}
+                    or len(set(wanted)) != len(wanted)
+                    or ("mtp" in wanted) != ("mtp" in paths)
+                    or ("vision" in wanted) != ("vision" in paths)):
+                raise ValueError("Gemma 4 converts its text component from --source gguf=FILE; "
+                                 "--components text,mtp adds its assistant from --source "
+                                 "mtp=FILE and text,vision its vision tower from --source "
+                                 "vision=MMPROJ.gguf")
             gguf = stack.enter_context(GGUFFile(paths["gguf"]))
             mtp = stack.enter_context(GGUFFile(paths["mtp"])) if "mtp" in paths else None
-            model = build_gemma4(base, gguf, mtp=mtp, resource_overrides=overrides)
+            vision = stack.enter_context(GGUFFile(paths["vision"])) if "vision" in paths else None
+            model = build_gemma4(base, gguf, mtp=mtp, vision=vision,
+                                 resource_overrides=overrides)
             recipe = Recipe(model)
-            gemma_sources = {"base": base, "gguf": gguf} | ({"mtp": mtp} if mtp else {})
+            gemma_sources = ({"base": base, "gguf": gguf} | ({"mtp": mtp} if mtp else {})
+                             | ({"vision": vision} if vision else {}))
             _function(args.recipe)(model, recipe, gemma_sources)
             if args.override:
                 _function(args.override)(model, recipe, gemma_sources)
             source_paths = {"base": {"path": str(args.model)},
                             "gguf": {"path": str(paths["gguf"])}}
-            if mtp is not None:
-                source_paths["mtp"] = {"path": str(paths["mtp"])}
+            for name in ("mtp", "vision"):
+                if name in paths:
+                    source_paths[name] = {"path": str(paths[name])}
             report = convert(
                 model, recipe, args.out, name=args.name,
                 provenance={"converter": "ninfer-v3", "recipe": args.recipe,

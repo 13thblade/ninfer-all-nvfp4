@@ -16,6 +16,7 @@
 #include "core/device.h"
 #include "models/gemma4/executor.h"
 #include "models/gemma4/model.h"
+#include "models/gemma4/vision_cpu.h"
 #include "models/qwen3_5/frontend/frontend.h"
 #include "ninfer/types.h"
 #include "runtime/contract/request.h"
@@ -33,6 +34,10 @@ struct Gemma4Instance {
     std::unique_ptr<models::gemma4::Model> model;
     models::qwen3_5::Frontend frontend;
     std::unique_ptr<models::gemma4::Executor> executor;
+    // With --vision-residency cpu: the vision tower on CPU threads.
+    std::unique_ptr<models::gemma4::CpuVisionTower> cpu_vision;
+    // With --vision: the most soft tokens one image or video frame takes.
+    std::uint32_t vision_budget = 0;
     std::uint32_t capacity = 0;
     std::size_t free_after_weights = 0;
     std::size_t free_after_startup = 0;

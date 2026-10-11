@@ -67,10 +67,37 @@ struct AssistantWeights {
     std::vector<AssistantLayerWeights> layers;
 };
 
+// The vision tower: BF16 matrices (Q, K and V of a block one parent, gate and up another), FP32
+// norms, the BF16 patch embedding [hidden, patch features] and position table [2 x positions,
+// hidden] (x rows, then y rows).
+struct VisionLayerWeights {
+    WeightId input_norm, post_attention_norm, ffn_norm, post_ffn_norm;
+    WeightId query, key, value, output, query_norm, key_norm;
+    WeightId mlp_gate, mlp_up, mlp_down;
+};
+
+struct VisionWeights {
+    WeightId patch_embedding, position_table, projection;
+    std::optional<WeightId> std_bias, std_scale; // with VisionConfig::standardize
+    std::vector<VisionLayerWeights> layers;
+};
+
+// Where the vision tower's weights live: on the device for the tower's CUDA kernels; in pinned
+// host memory, streamed block by block through a small device window as the tower runs; or in
+// host memory for its CPU encoder.
+enum class VisionPlacement : std::uint8_t {
+    None,
+    Device,
+    Pinned,
+    Host,
+};
+
 struct LoadOptions {
     std::filesystem::path artifact;
     // Binds the artifact's `mtp` component, which must then exist.
     bool assistant = false;
+    // Binds the artifact's `vision` component, which must then exist, in this placement.
+    VisionPlacement vision = VisionPlacement::None;
 };
 
 class Model {
@@ -88,6 +115,12 @@ public:
     [[nodiscard]] const std::optional<AssistantWeights>& assistant() const noexcept {
         return assistant_;
     }
+    // Present when loaded with LoadOptions::vision.
+    [[nodiscard]] const std::optional<VisionConfig>& vision_config() const noexcept {
+        return vision_config_;
+    }
+    [[nodiscard]] const std::optional<VisionWeights>& vision() const noexcept { return vision_; }
+    [[nodiscard]] VisionPlacement vision_placement() const noexcept { return vision_placement_; }
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
     [[nodiscard]] ops::WeightInput input(WeightId id) const;
@@ -100,15 +133,24 @@ public:
 private:
     friend std::unique_ptr<Model> load_model(const artifact::Reader&, const LoadOptions&,
                                              DeviceContext&, const StartupObserver*);
+    struct VisionParts {
+        std::optional<VisionConfig> config;
+        std::optional<VisionWeights> weights;
+        VisionPlacement placement = VisionPlacement::None;
+    };
     Model(TextConfig config, TextWeights weights, std::optional<AssistantConfig> assistant_config,
-          std::optional<AssistantWeights> assistant, std::vector<BoundWeight> bound,
-          FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing);
+          std::optional<AssistantWeights> assistant, VisionParts vision,
+          std::vector<BoundWeight> bound, FrontendResources resources, InstanceInfo info,
+          artifact::MaterializedArtifact backing);
 
     artifact::MaterializedArtifact backing_;
     TextConfig config_;
     TextWeights weights_;
     std::optional<AssistantConfig> assistant_config_;
     std::optional<AssistantWeights> assistant_;
+    std::optional<VisionConfig> vision_config_;
+    std::optional<VisionWeights> vision_;
+    VisionPlacement vision_placement_ = VisionPlacement::None;
     std::vector<BoundWeight> bound_;
     FrontendResources resources_;
     InstanceInfo info_;
@@ -118,6 +160,8 @@ private:
 [[nodiscard]] bool is_gemma4(const artifact::Reader& reader);
 // Whether it also holds the multi-token-prediction assistant.
 [[nodiscard]] bool has_assistant(const artifact::Reader& reader);
+// Whether it also holds the vision tower.
+[[nodiscard]] bool has_vision(const artifact::Reader& reader);
 
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader,
                                                 const LoadOptions& options, DeviceContext& device,

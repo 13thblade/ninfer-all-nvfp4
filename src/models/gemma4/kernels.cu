@@ -198,7 +198,7 @@ __global__ void qkv_post_kernel(QkvArgs a) {
 }
 
 __global__ void build_mask_kernel(__half* mask, int tokens, int slots, int first, int ring,
-                                  int window) {
+                                  int window, const std::int32_t* __restrict__ blocks) {
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (s >= slots) { return; }
@@ -211,6 +211,9 @@ __global__ void build_mask_kernel(__half* mask, int tokens, int slots, int first
         if (s <= last) {
             const int p = s + ((last - s) / ring) * ring; // latest position in slot s
             visible     = p <= query && p > query - window;
+            if (!visible && blocks != nullptr && p > query && p <= last && blocks[t] >= 0) {
+                visible = blocks[p - first] == blocks[t];
+            }
         }
     }
     mask[std::int64_t(t) * slots + s] = visible ? __float2half(0.0f) : __float2half(-INFINITY);
@@ -1092,9 +1095,9 @@ void qkv_post(const QkvArgs& args, cudaStream_t stream) {
 }
 
 void build_mask(__half* mask, int tokens, int slots, int first, int ring, int window,
-                cudaStream_t stream) {
+                cudaStream_t stream, const std::int32_t* blocks) {
     const dim3 grid(blocks_for(slots, 256), tokens, 1);
-    build_mask_kernel<<<grid, 256, 0, stream>>>(mask, tokens, slots, first, ring, window);
+    build_mask_kernel<<<grid, 256, 0, stream>>>(mask, tokens, slots, first, ring, window, blocks);
     check_launch("build_mask");
 }
 
