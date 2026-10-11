@@ -12,6 +12,7 @@
 // (block-scaled FP8/FP4 MMA, TMA, mbarrier) and do not know the rk8v4/rk4v4 codings, so they are
 // kept in the tree but neither compiled nor routed to on these architectures.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_i8_fa2_plan.h"
 #else
 #include "ops/softmax_attention/dense/causal_cache/fp8/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/fp8/launch.h"
@@ -387,6 +388,8 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
                 // share INT8's cutoff; rk8v4 and rk4v4 used to fall through to small-T. On the 27B
                 // (2026-09-24) that made 9-16 columns over 64-224 keys 1.1-1.9x faster, except
                 // rk8v4 at 9 columns over 224 keys (12% slower), the same trade INT8 makes there.
+                // That was measured on the tiled prompt kernel; the FA2-style kernel that replaced
+                // it takes 0.73-0.95x its time on these launches (2026-10-10).
                 prompt_limit = width <= 8 ? 0 : 256;
                 break;
             case KvCacheStorage::Fp8E4M3Row256:
@@ -450,8 +453,19 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
                                                execution.multiprocessor_count);
 
 #if defined(NINFER_SM8X_COMPAT)
-    // The sm_86 quantized routes size their split grid from fixed per-geometry caps measured on
-    // the RTX 3090 (see geometry.cuh), not from the device SM count.
+    // The sm_86 small-T routes size their split grid from fixed per-geometry caps measured on the
+    // RTX 3090 (see geometry.cuh); the INT8-family prompt route plans its key splits from the
+    // device SM count at the envelope's maximum, which bounds every launch inside the envelope
+    // (prompt_i8_fa2_plan.h).
+    const bool int8_family = cache_storage == KvCacheStorage::Int8Group64 ||
+                             cache_storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+                             cache_storage == KvCacheStorage::RotatedLloyd4KeyInt4Value;
+    const auto prompt_capacity = [&](std::int32_t width) {
+        if (!int8_family) { return std::size_t{0}; }
+        const detail::CausalPromptFa2Plan plan = detail::causal_prompt_fa2_plan(
+            q_heads, width, envelope.max_visible_keys, execution.multiprocessor_count);
+        return detail::causal_prompt_fa2_split_bytes(q_heads, width, plan.splits);
+    };
     const auto chunk_capacity = [&](std::int32_t width) {
         const std::int32_t splits = detail::causal_attention_split_capacity(
             q_heads, width, cache_storage, envelope, batch_size);
@@ -462,7 +476,7 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::CausalAttentionRoute route = detail::causal_attention_resolve_route(
             q_heads, width, batch_size, cache_storage, envelope);
-        if (route == detail::CausalAttentionRoute::Prompt) { return std::size_t{0}; }
+        if (route == detail::CausalAttentionRoute::Prompt) { return prompt_capacity(width); }
         if (route == detail::CausalAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
         for (std::int32_t begin = 0; begin < width;
@@ -482,6 +496,16 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         const std::int32_t last = std::min(max_width, kMaximumVerifyTokens);
         for (std::int32_t width = min_width; width <= last; ++width) {
             maximum = std::max(maximum, exact_capacity(width));
+        }
+    }
+    // Wider calls are single-row prompt launches; only an INT8-family split needs scratch, and a
+    // split needs at least two runs of kCausalPromptFa2MinPagesPerSplit pages.
+    if (max_width > kMaximumVerifyTokens && int8_family &&
+        detail::causal_prompt_fa2_pages(envelope.max_visible_keys) >=
+            2 * detail::kCausalPromptFa2MinPagesPerSplit) {
+        for (std::int32_t width = std::max(min_width, kMaximumVerifyTokens + 1);
+             width <= max_width; ++width) {
+            maximum = std::max(maximum, prompt_capacity(width));
         }
     }
     return maximum;
@@ -508,9 +532,11 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
 
 CausalAttentionLaunchShape causal_softmax_attention_launch_shape(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
-    CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t tokens) {
+    CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t tokens,
+    DeviceExecutionView execution) {
     require_causal_geometry(geometry, "causal_softmax_attention launch shape");
-    if (!supported_cache_storage(cache_storage) || batch_size <= 0 ||
+    if (execution.multiprocessor_count <= 0 || !supported_cache_storage(cache_storage) ||
+        batch_size <= 0 ||
         batch_size > kMaximumBatchSize || tokens <= 0 ||
         (batch_size > 1 && tokens > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
@@ -523,7 +549,22 @@ CausalAttentionLaunchShape causal_softmax_attention_launch_shape(
     // The prompt route appends the new K/V and then attends; a small-T launch appends inside its
     // partial kernel and then reduces. Both are two kernels, and the chunked route repeats the
     // small-T pair once per chunk. BF16 is either grouped + merge or append + tiled: two kernels.
+    // An INT8-family prompt launch's CTA shape and split choice are distinct kernel instantiations
+    // and part of the route, and a launch that splits its keys adds the merge kernel.
     CausalAttentionLaunchShape shape{.route = static_cast<std::uint32_t>(route), .kernel_nodes = 2U};
+    if (route == detail::CausalAttentionRoute::Prompt &&
+        (cache_storage == KvCacheStorage::Int8Group64 ||
+         cache_storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+         cache_storage == KvCacheStorage::RotatedLloyd4KeyInt4Value)) {
+        const detail::CausalPromptFa2Plan plan = detail::causal_prompt_fa2_plan(
+            geometry.query_heads, tokens, envelope.max_visible_keys,
+            execution.multiprocessor_count);
+        shape.route |= (plan.warps == 4 ? 1U : 0U) << 16U;
+        if (plan.splits > 1) {
+            shape.route |= 1U << 17U;
+            shape.kernel_nodes = 3U;
+        }
+    }
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
         const auto chunk = static_cast<std::uint32_t>(causal_attention_chunk_tokens(
             geometry.query_heads, tokens, batch_size, cache_storage, envelope));
@@ -534,6 +575,7 @@ CausalAttentionLaunchShape causal_softmax_attention_launch_shape(
 #else
     // Upstream's per-format plans keep W<=16 update-compatible across envelopes.
     (void)envelope;
+    (void)execution;
     return {.route = static_cast<std::uint32_t>(cache_storage), .kernel_nodes = 2U};
 #endif
 }
@@ -588,7 +630,8 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     }
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                           cache, out, stream);
+                                           cache, envelope, workspace,
+                                           execution.multiprocessor_count, out, stream);
 #else
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         detail::fp8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
@@ -654,7 +697,8 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
             q, positions, scale, cache, envelope, partial.acc, partial.m, partial.l, out, stream);
         return;
     }
-    detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
+    detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, envelope, workspace,
+                                                     execution.multiprocessor_count, out, stream);
 #else
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         detail::fp8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
