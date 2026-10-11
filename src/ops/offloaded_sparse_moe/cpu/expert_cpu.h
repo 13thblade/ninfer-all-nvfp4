@@ -9,6 +9,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::offloaded_moe::detail {
 
@@ -18,6 +20,20 @@ inline constexpr int kUnitRows     = canon::kA8Values;                 // interm
 inline constexpr int kUnits        = kIntermediate / kUnitRows;        // 20
 inline constexpr int kDownRowsPerItem = 64;                            // down rows per team item
 inline constexpr int kDownItems       = kHidden / kDownRowsPerItem;    // 40
+
+// The shared preflight of expert_forward_cpu and CpuExpertTeam::run: a record, 1..8 columns and a
+// non-null x and y for every active column (the workers dereference all of them).
+inline void require_expert_job(const char* who, const std::uint8_t* record, int ncols,
+                               const std::uint16_t* const* x, std::uint16_t* const* y) {
+    if (record == nullptr) { throw std::invalid_argument(std::string(who) + ": null record"); }
+    if (ncols < 1 || ncols > kMaxColumns) { throw std::invalid_argument(std::string(who) + ": ncols must be in [1, 8]"); }
+    if (x == nullptr || y == nullptr) { throw std::invalid_argument(std::string(who) + ": null column arrays"); }
+    for (int c = 0; c < ncols; ++c) {
+        if (x[c] == nullptr || y[c] == nullptr) {
+            throw std::invalid_argument(std::string(who) + ": null x or y of an active column");
+        }
+    }
+}
 
 // One A8-cast activation column: k codes and k / 32 scales.
 struct A8Act {
