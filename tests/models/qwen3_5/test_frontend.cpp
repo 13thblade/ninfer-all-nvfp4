@@ -2338,6 +2338,16 @@ int test_open_reasoning_tool_recovery() {
         failures += check(model_stop.calls.size() == 1 && model_stop.diagnostics.recovered_from_reasoning,
                           "the checkpoint stop token stopped recovering calls beside a caller stop");
     }
+    // With the defaults disabled, a caller id equal to the checkpoint's eos is still the caller's.
+    {
+        ninfer::StopPolicy caller_eos;
+        caller_eos.include_model_defaults = false;
+        caller_eos.token_ids.push_back(eos);
+        failures += rejected(run(planning + call, true, false, caller_eos),
+                             "a caller stop id equal to a disabled checkpoint default");
+        failures += rejected(run(planning + call, true, true, caller_eos),
+                             "a caller stop id equal to a disabled checkpoint default across rounds");
+    }
     return failures;
 }
 
