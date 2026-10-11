@@ -1792,6 +1792,112 @@ private:
         request->source_wait_started.reset();
     }
 
+    // A wait must save at least this much prefill over the best source available now.
+    static constexpr std::uint32_t kSiblingWaitMinimumTokens = 1024;
+
+    // Prompt position the resident sibling has committed, or nullopt when it is not prefilling.
+    [[nodiscard]] std::optional<std::uint32_t> sibling_cursor(const Request& sibling) const {
+        if (!sibling.base_plan || sibling.cancelled.load(std::memory_order_acquire)) {
+            return std::nullopt;
+        }
+        std::uint32_t cursor = 0;
+        if (materializing_ && materializing_->request.get() == &sibling) {
+            if (materializing_->resumed) { return std::nullopt; }
+            cursor = materializing_->summary.reused_prompt_tokens;
+        } else if (sibling.admitted_begin && sibling.lane) {
+            cursor = sibling.admitted_begin->reused_prompt_tokens + sibling.computed_prompt_tokens;
+        } else {
+            return std::nullopt;
+        }
+        return cursor;
+    }
+
+    [[nodiscard]] std::vector<std::shared_ptr<Request>> prefilling_siblings() const {
+        std::vector<std::shared_ptr<Request>> out;
+        if (materializing_ && !materializing_->resumed) { out.push_back(materializing_->request); }
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane]) { out.push_back(slots_[lane]); }
+        }
+        return out;
+    }
+
+    // Single flight for concurrent siblings: a fresh request whose prompt shares a prefix with a
+    // resident request still prefilling it, past a capture that resident has planned but not yet
+    // published, waits for that checkpoint instead of prefilling the same tokens on another lane.
+    // The wait is bounded by the predicted remaining prefill and is taken at most once.
+    bool await_sibling(const std::shared_ptr<Request>& request,
+                       const std::vector<typename ResourceManagement::SourceChoice>& sources) {
+        if (request->sibling_wait_used || max_concurrency_ < 2 ||
+            !request->base_plan->summary().publish_continuation) {
+            return false;
+        }
+        const auto& base   = *request->base_plan;
+        const auto prompt  = base.summary().prompt_tokens;
+        std::uint32_t best = 0;
+        for (const auto& choice : sources) { best = std::max(best, choice.source.reused_tokens); }
+        std::optional<SiblingWait> chosen;
+        for (const auto& sibling : prefilling_siblings()) {
+            const auto cursor = sibling_cursor(*sibling);
+            if (!cursor || !sibling->base_plan->summary().publish_continuation) { continue; }
+            const auto& other = *sibling->base_plan;
+            // Longest common prompt prefix, by digest bisection.
+            std::uint32_t low = 0, high = std::min(prompt, other.summary().prompt_tokens);
+            while (low < high) {
+                const auto middle = low + (high - low + 1U) / 2U;
+                const auto mine   = base.prefix_shortlist_key(middle);
+                const auto theirs = other.prefix_shortlist_key(middle);
+                if (mine && theirs && *mine == *theirs) {
+                    low = middle;
+                } else {
+                    high = middle - 1U;
+                }
+            }
+            std::uint32_t target = 0;
+            for (const auto frontier : other.capture_frontiers()) {
+                if (frontier > *cursor && frontier <= low && frontier > best) {
+                    target = std::max(target, frontier);
+                }
+            }
+            if (target < best + kSiblingWaitMinimumTokens) { continue; }
+            // The sibling's remaining prefill to the checkpoint, doubled because other lanes'
+            // units interleave with it, bounds the wait.
+            const auto predicted = std::chrono::nanoseconds(
+                2 * resources_.prefill_ns(PrefillWork{.tokens = target - *cursor}));
+            if (predicted > pending_timeout_ / 2) { continue; }
+            if (!chosen || target > chosen->frontier) {
+                chosen = SiblingWait{request, sibling->id, target,
+                                     Clock::now() + predicted + std::chrono::seconds(1)};
+            }
+        }
+        if (!chosen) { return false; }
+        request->awaiting_sibling  = true;
+        request->sibling_wait_used = true;
+        if (!request->source_wait_started) { request->source_wait_started = Clock::now(); }
+        sibling_waits_.push_back(std::move(*chosen));
+        return true;
+    }
+
+    // Releases a waiter once its sibling has published or passed the awaited checkpoint, left
+    // the lanes, or overran the predicted wait. The waiter is then offered for admission again.
+    void process_sibling_waits() {
+        if (sibling_waits_.empty()) { return; }
+        const auto now      = Clock::now();
+        const auto siblings = prefilling_siblings();
+        std::erase_if(sibling_waits_, [&](SiblingWait& wait) {
+            const auto found   = std::find_if(siblings.begin(), siblings.end(),
+                                              [&](const auto& r) { return r->id == wait.sibling; });
+            const auto cursor  = found == siblings.end() ? std::nullopt : sibling_cursor(**found);
+            const bool pending = cursor && now < wait.deadline &&
+                                 !wait.waiter->cancelled.load(std::memory_order_acquire) &&
+                                 (*cursor < wait.frontier || (*found)->capture_pending);
+            if (pending) { return false; }
+            wait.waiter->awaiting_sibling     = false;
+            wait.waiter->admission_generation = 0;
+            request_admission_check();
+            return true;
+        });
+    }
+
     void retain_admission_source(const std::shared_ptr<Request>& request,
                                  const typename ResourceManagement::SourceChoice& choice,
                                  bool restoring) {
@@ -1840,7 +1946,7 @@ private:
                 if (!restoring) {
                     scheduler_.admission_candidate_checked(request->id);
                     // Its stored session is being read back; offered again once that settles.
-                    if (request->hydrating) { continue; }
+                    if (request->hydrating || request->awaiting_sibling) { continue; }
                     if (request->admission_generation == admission_generation_) { continue; }
                     request->admission_generation = admission_generation_;
                     consume_armed_planning_failure();
@@ -1873,6 +1979,7 @@ private:
                                                     request->id, request->publication_order);
                 }
                 if (!restoring && start_hydration(request, sources)) { continue; }
+                if (!restoring && await_sibling(request, sources)) { continue; }
                 if (!restoring && !sources.empty()) {
                     const auto preferred = sources.front().source.reused_tokens;
                     if (!request->admission_observed) {
@@ -2994,6 +3101,7 @@ private:
                 (void)expire_pending_requests();
                 executed = progress_context_transaction(boundary);
                 process_hydrations();
+                process_sibling_waits();
                 if (!instance_.program->has_context_transaction()) {
                     for (const auto& request : slots_) {
                         if (request && request->capture_pending) {
@@ -3219,6 +3327,15 @@ private:
     std::uint64_t next_publication_order_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<MaterializingRequest> materializing_;
+
+    struct SiblingWait {
+        std::shared_ptr<Request> waiter;
+        std::uint64_t sibling;
+        std::uint32_t frontier;
+        Clock::time_point deadline;
+    };
+
+    std::vector<SiblingWait> sibling_waits_;
     std::optional<AdmissionDecision> admission_decision_;
     std::uint64_t admission_generation_ = 1;
     std::array<std::optional<CaptureDecision>, kMaximumConcurrency> capture_decisions_;
