@@ -231,7 +231,7 @@ void gate_case(int T, cudaStream_t stream) {
 
 struct ConvInputs {
     std::vector<std::uint16_t> gated, normalized, residual, states;
-    std::vector<std::uint16_t> weight; // FP16 bits [K, C]: channel c's taps at c*K + j
+    std::vector<std::uint16_t> weight; // FP16 bits [K, C] (the GGUF's words): channel c's taps at c*K + j
 };
 
 ConvInputs conv_inputs(int T, std::uint32_t seed) {
@@ -270,13 +270,17 @@ ConvResult run_conv(const ConvInputs& in, int T, const std::vector<std::int32_t>
     };
     Buffer<std::uint16_t> d_gated(slice(in.gated)), d_norm(slice(in.normalized)),
         d_res(residual_override ? slice(*residual_override) : slice(in.residual)),
-        d_states(states_override ? *states_override : in.states), d_weight(in.weight);
+        d_states(states_override ? *states_override : in.states);
+    // The Op takes the FP32 widening the converter stores (exact for every FP16 word).
+    std::vector<float> weight32(in.weight.size());
+    for (std::size_t i = 0; i < weight32.size(); ++i) { weight32[i] = half_value(in.weight[i]); }
+    Buffer<float> d_weight(weight32);
     Buffer<std::int32_t> d_src(source), d_dst(destination.empty() ? std::vector<std::int32_t>{0} : destination);
     Tensor residual(d_res.p, DType::BF16, {kC, T}), states(d_states.p, DType::BF16, {kC, kSpan, kSlots});
     const Tensor dst = destination.empty() ? Tensor{} : Tensor(d_dst.p, DType::I32, {sequences});
     ninfer::ops::ple_conv_inject(Tensor(d_gated.p, DType::BF16, {kC, T}),
                                  Tensor(d_norm.p, DType::BF16, {kC, T}),
-                                 Tensor(d_weight.p, DType::FP16, {kTaps, kC}), kDilation, states,
+                                 Tensor(d_weight.p, DType::FP32, {kTaps, kC}), kDilation, states,
                                  Tensor(d_src.p, DType::I32, {sequences}), dst, residual, stream);
     t::cuda_check(cudaStreamSynchronize(stream), "conv");
     return {d_res.read(), d_states.read()};

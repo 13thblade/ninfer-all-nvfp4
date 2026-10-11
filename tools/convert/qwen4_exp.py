@@ -891,6 +891,10 @@ def build_model(
         direct_format = tensor.type.format if tensor.type.dtype is not None else "fp32"
         rule = NARROWED.get(layer_suffix(item.gguf))
         if rule is not None:
+            # The rules (and the verifier's inverse) are defined on the F32 words; any other source
+            # representation would be reinterpreted rather than narrowed.
+            if tensor.type.name != "F32":
+                raise GgufError(f"{item.gguf}: a narrowed tensor must be F32, got {tensor.type.name}")
             values = source.values().reshape(source.shape)
             narrowed = narrow_exactly(item.gguf, values.T.contiguous() if transposed else values, rule)
             source, direct_format = array_source(narrowed, item.gguf), "bf16"

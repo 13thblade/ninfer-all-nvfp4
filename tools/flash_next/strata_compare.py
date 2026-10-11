@@ -42,9 +42,14 @@ def read_logpos(path: Path) -> list[list[dict]]:
 
 
 def engine_rows(path: Path):
-    header = np.fromfile(path, dtype=np.int32, count=2)
-    vocab, rows = int(header[0]), int(header[1])
-    return np.memmap(path, dtype=np.float32, mode="r", offset=8, shape=(rows, vocab))
+    """The FP32 [rows, vocab] logits of a dump; refuses a header that disagrees with the file size."""
+    size = path.stat().st_size
+    if size < 8:
+        raise ValueError(f"{path}: {size} bytes is shorter than the 8-byte header")
+    vocab, rows = (int(v) for v in np.fromfile(path, dtype="<i4", count=2))
+    if vocab <= 0 or rows <= 0 or size != 8 + 4 * vocab * rows:
+        raise ValueError(f"{path}: header says {rows} rows of {vocab} logits, the file holds {size - 8} payload bytes")
+    return np.memmap(path, dtype="<f4", mode="r", offset=8, shape=(rows, vocab))
 
 
 def log_softmax(row: np.ndarray) -> np.ndarray:
@@ -54,11 +59,20 @@ def log_softmax(row: np.ndarray) -> np.ndarray:
 
 
 def compare(ids: list[int], logits, strata: list[dict]) -> dict:
+    rows, vocab = logits.shape
+    if not strata:
+        raise ValueError("Strata scored no position of this text")
     nll_n, nll_s, kl, agree, top_n, top_s = [], [], [], 0, 0, 0
     for row in strata:
         pos, target = row["pos"], row["target"]
-        if pos + 1 >= len(ids) or ids[pos + 1] != target:
+        if pos < 0 or pos + 1 >= len(ids):
+            raise ValueError(f"Strata position {pos} is outside the text's predictions 0..{len(ids) - 2}")
+        if pos >= rows:
+            raise ValueError(f"Strata position {pos} has no row: the dump holds {rows}")
+        if ids[pos + 1] != target:
             raise ValueError(f"Strata position {pos} targets {target}, the text has {ids[pos + 1]}")
+        if not all(0 <= i < vocab for i in (target, row["top"], *(i for i, _ in row["topk"]))):
+            raise ValueError(f"Strata position {pos} names a token outside the dump's {vocab}-token vocabulary")
         lp = log_softmax(np.asarray(logits[pos]))
         nll_n.append(-lp[target])
         nll_s.append(-row["logprob"])

@@ -136,7 +136,7 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `include/ninfer/ops/hyper_connection.h` | `include/infernix/ops/hyper_connection.h` | FP32 multiplier norm weight; no Q8 weight form |
 | `src/ops/hyper_connection/hyper_connection.cu` | `src/ops/hyper_connection/hyper_connection.cu` | BF16 weights only |
 | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | Grids re-fitted to 82 SMs |
-| `include/ninfer/ops/ple.h`, `src/ops/ple/ple.cu` | `include/infernix/ops/ple.h`, `src/ops/ple/ple.cu` | IQ4_NL `ple_embed`; FP32 multiplier norms; FP16 `[K, C]` conv weight |
+| `include/ninfer/ops/ple.h`, `src/ops/ple/ple.cu` | `include/infernix/ops/ple.h`, `src/ops/ple/ple.cu` | IQ4_NL `ple_embed`; FP32 multiplier norms; FP32 `[K, C]` conv weight (GGUF F16 widened exactly) |
 | `include/ninfer/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | `include/infernix/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | BF16 segment form plus a GGML IQ4_XS head |
 | `include/ninfer/ops/rows.h`, `src/ops/rows/rows.cu` | `include/infernix/ops/rows.h`, `src/ops/rows/rows.cu` | Verbatim |
 | `tests/ops/test_hyper_connection.cpp`, `test_projection_fp32.cpp`, `test_rows.cpp` | `tests/ops/test_hyper_connection.cpp`, `tests/ops/linear/test_projection_fp32.cpp`, `tests/ops/test_rows.cpp` | Ported with their Ops |
