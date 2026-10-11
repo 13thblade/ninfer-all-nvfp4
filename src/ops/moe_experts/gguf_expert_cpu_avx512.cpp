@@ -10,7 +10,8 @@ namespace {
 inline float half_at(const std::uint8_t* p) {
     std::uint16_t bits;
     std::memcpy(&bits, p, 2);
-    return _cvtsh_ss(bits);
+    // The vector F16C form: MSVC does not declare the scalar _cvtsh_ss.
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)));
 }
 
 // Q2_0: one 16-byte code load per 64 weights, expanded once and reused by every token. The four

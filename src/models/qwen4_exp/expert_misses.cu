@@ -35,6 +35,19 @@
 namespace ninfer::models::qwen4_exp {
 namespace {
 
+// One turn of a spin wait: the processor's pause hint where it has one, a yield elsewhere.
+// YieldProcessor() is the Windows SDK's portable spelling; the GCC/Clang builtin is not known to
+// nvcc's front end in MSVC mode.
+inline void spin_hint() {
+#if defined(_WIN32)
+    YieldProcessor();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+
 constexpr int kTop            = 10;
 constexpr int kHidden         = 2560;
 constexpr int kWidth          = 640;
@@ -200,9 +213,9 @@ bool capturing(cudaStream_t stream) {
     return status != cudaStreamCaptureStatusNone;
 }
 
-class ReadFile {
+class File {
 public:
-    explicit ReadFile(const std::filesystem::path& path) {
+    explicit File(const std::filesystem::path& path) {
 #ifdef _WIN32
         handle_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
@@ -217,15 +230,15 @@ public:
         }
 #endif
     }
-    ~ReadFile() {
+    ~File() {
 #ifdef _WIN32
         if (handle_ != INVALID_HANDLE_VALUE) { CloseHandle(handle_); }
 #else
         if (descriptor_ >= 0) { ::close(descriptor_); }
 #endif
     }
-    ReadFile(const ReadFile&)            = delete;
-    ReadFile& operator=(const ReadFile&) = delete;
+    File(const File&)            = delete;
+    File& operator=(const File&) = delete;
 
     void read(std::uint64_t offset, std::byte* out, std::size_t bytes) const {
         while (bytes > 0) {
@@ -307,7 +320,7 @@ public:
         }
         wake_.notify_all();
         drain();
-        while (done_.load(std::memory_order_acquire) != count) { pause(); }
+        while (done_.load(std::memory_order_acquire) != count) { spin_hint(); }
         if (failure_) {
             auto failure = std::exchange(failure_, nullptr);
             std::rethrow_exception(failure);
@@ -315,13 +328,6 @@ public:
     }
 
 private:
-    static void pause() {
-#if defined(__x86_64__) || defined(_M_X64)
-        __builtin_ia32_pause();
-#else
-        std::this_thread::yield();
-#endif
-    }
     void drain() {
         std::uint64_t ticket = ticket_.load(std::memory_order_acquire);
         for (;;) {
@@ -353,7 +359,7 @@ private:
                 continue;
             }
             if (spinning_.load(std::memory_order_relaxed)) {
-                pause();
+                spin_hint();
                 continue;
             }
             std::unique_lock lock(mutex_);
@@ -432,7 +438,7 @@ struct ExpertMisses::Impl {
     // Per layer: its cached blocks as four device words, read by the kernels (captured graphs
     // see a change).
     std::vector<DeviceBuffer> ranges;
-    std::vector<std::unique_ptr<ReadFile>> files;
+    std::vector<std::unique_ptr<File>> files;
     MissOptions options;
     std::vector<Rank> ranks;
     std::uint32_t pair_capacity = 0;
@@ -505,7 +511,7 @@ struct ExpertMisses::Impl {
             stamp_host[r] = std::make_unique<PinnedHostBuffer>(admitting[r] * kMaxExperts * 4);
             std::memset(stamp_host[r]->data(), 0, stamp_host[r]->size());
         }
-        for (const auto& path : paths) { files.push_back(std::make_unique<ReadFile>(path)); }
+        for (const auto& path : paths) { files.push_back(std::make_unique<File>(path)); }
         half_bytes = std::max<std::uint64_t>(options.staging_bytes / 2, largest * 2);
         half_bytes = half_bytes / kAlign * kAlign;
         file_half_bytes = disk ? half_bytes : 0;
@@ -977,13 +983,7 @@ struct ExpertMisses::Impl {
                                         now_ns() + 500'000'000),
                                std::memory_order_release);
             }
-            if (!worked) {
-#if defined(__x86_64__) || defined(_M_X64)
-                __builtin_ia32_pause();
-#else
-                std::this_thread::yield();
-#endif
-            }
+            if (!worked) { spin_hint(); }
         }
     }
 
