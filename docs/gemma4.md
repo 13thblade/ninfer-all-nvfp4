@@ -367,6 +367,19 @@ round drafts shrink as requests join (same streams as above, `--spec mtp`, tok/s
 | 3 | 354.7 | 365.7 with one draft each |
 | 4 | 397.2 | 387.6 with one draft each, so four or more decode plainly |
 
+## Structured output
+
+A request with `response_format` (with `--structured-output`) samples under its grammar's token
+mask. The mask of its next token is computed on a thread of its own from the grammar's state
+after the last accepted token, while the engine runs the other requests; the request joins a
+decode round once its mask is ready, and decodes without drafts. A costly grammar therefore slows
+only its own request. A single mask over 5 s, or a grammar with no admissible token, fails the
+request with an explicit error.
+
+Every running request must make progress: one that neither computes a prompt chunk nor accepts a
+token for 120 s fails with `inference request made no progress for 120 s` instead of holding its
+sequence.
+
 ## Images and video
 
 `--vision` loads the artifact's vision tower; the requests then take images and videos as the

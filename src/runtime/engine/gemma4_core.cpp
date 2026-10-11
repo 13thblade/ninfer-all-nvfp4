@@ -284,6 +284,16 @@ static std::uint64_t unit_key(const models::qwen3_5::VisionItem& item, std::size
     return key;
 }
 
+// The next token's grammar mask of a structured-output request, computed on a thread of its own
+// from a fork of the grammar after the last accepted token, so that a costly grammar slows only its
+// own request: the engine thread samples the request once `done` is set and skips it until then.
+struct GrammarMaskJob {
+    std::vector<std::uint32_t> words;
+    double seconds = 0.0;
+    std::exception_ptr error;
+    std::atomic<bool> done{false};
+};
+
 struct Gemma4Core::Request {
     std::uint64_t id = 0;
     models::qwen3_5::PreparedPrompt prompt;
@@ -311,6 +321,10 @@ struct Gemma4Core::Request {
 
     std::uint32_t anchor_at = 0;
     bool reusable           = true;
+    // With a grammar (structured output): the mask of the token it samples next.
+    std::shared_ptr<GrammarMaskJob> mask;
+    // The last prompt chunk or accepted token, which the progress watchdog measures from.
+    Clock::time_point progress;
     // Prefixes other prompts are expected to share (the end of the leading system messages, of
     // tool declarations, of a declared cache boundary), ascending and below anchor_at: a prompt
     // chunk ends at each, and the state there goes to the host store for them.
@@ -355,7 +369,7 @@ struct Gemma4Core::Impl {
         std::uint32_t slot                       = 0;
         bool counts                              = false;
         bool logprobs                            = false;
-        const text::GrammarState* grammar        = nullptr;
+        const std::uint32_t* mask                = nullptr; // a grammar's next-token mask
     };
 
     Gemma4Instance& instance;
@@ -536,6 +550,72 @@ struct Gemma4Core::Impl {
 
     [[nodiscard]] std::size_t mask_words() const noexcept { return (std::size_t(domain) + 31) / 32; }
 
+    // A request that neither computes a prompt chunk nor accepts a token for this long fails with
+    // an explicit error rather than holding its sequence, so a stall surfaces as errors.
+    static constexpr auto kProgressTimeout = std::chrono::seconds(120);
+    // One grammar mask over this budget fails its request: the grammar is too costly to serve.
+    static constexpr double kMaskBudgetSeconds = 5.0;
+    Clock::time_point progress_checked{};
+
+    // Starts the mask of a structured-output request's next token, from its grammar's state now.
+    void schedule_mask(Request& r) {
+        const auto grammar = r.output.grammar_state();
+        if (!grammar) {
+            r.mask.reset();
+            return;
+        }
+        auto job = std::make_shared<GrammarMaskJob>();
+        job->words.resize(mask_words());
+        std::thread([job, state = std::shared_ptr<text::GrammarState>(grammar->fork())] {
+            const auto start = Clock::now();
+            try {
+                state->fill_masks(job->words, {});
+            } catch (...) { job->error = std::current_exception(); }
+            job->seconds = seconds(start, Clock::now());
+            job->done.store(true, std::memory_order_release);
+        }).detach();
+        r.mask = std::move(job);
+    }
+
+    [[nodiscard]] static bool mask_ready(const Request& r) {
+        return !r.mask || r.mask->done.load(std::memory_order_acquire);
+    }
+
+    // After its mask is ready: false (the request failed) when the grammar had no admissible token
+    // or took over the budget.
+    bool mask_usable(const std::shared_ptr<Request>& request) {
+        const auto& job = request->mask;
+        if (!job) { return true; }
+        std::string problem;
+        if (job->error) {
+            try {
+                std::rethrow_exception(job->error);
+            } catch (const std::exception& e) { problem = e.what(); }
+        } else if (job->seconds > kMaskBudgetSeconds) {
+            problem = "one token's grammar mask took " + std::to_string(job->seconds) +
+                      " s, over the " + std::to_string(kMaskBudgetSeconds) + " s budget";
+        }
+        if (problem.empty()) { return true; }
+        fail(request, std::make_exception_ptr(RequestError(
+                          RequestErrorKind::Unavailable, "structured output: " + problem)));
+        return false;
+    }
+
+    // Fails each request that has made no progress for kProgressTimeout.
+    void check_progress() {
+        const auto now = Clock::now();
+        if (now - progress_checked < std::chrono::seconds(1)) { return; }
+        progress_checked = now;
+        for (const Slot& slot : slots) {
+            const auto request = slot.request;
+            if (!request || now - request->progress < kProgressTimeout) { continue; }
+            fail(request, std::make_exception_ptr(RequestError(
+                              RequestErrorKind::Unavailable,
+                              "inference request made no progress for " +
+                                  std::to_string(kProgressTimeout.count()) + " s")));
+        }
+    }
+
     void complete(const std::shared_ptr<Request>& request, std::exception_ptr error) {
         {
             std::lock_guard lock(request->mutex);
@@ -598,11 +678,19 @@ struct Gemma4Core::Impl {
                     return;
                 }
             }
+            bool worked = true;
             try {
                 admit();
-                step();
+                worked = step();
+                check_progress();
             } catch (...) { fail_engine(std::current_exception()); }
             publish_stats();
+            if (!worked) {
+                // Every active request waits for its grammar mask.
+                std::unique_lock lock(queue_mutex);
+                queue_cv.wait_for(lock, std::chrono::milliseconds(1),
+                                  [&] { return stopping || !pending.empty(); });
+            }
         }
     }
 
@@ -867,6 +955,8 @@ struct Gemma4Core::Impl {
             }
         }
         r.prefill_start        = Clock::now();
+        r.progress             = r.prefill_start;
+        schedule_mask(r); // the first token's, while the prompt prefills
         {
             std::lock_guard lock(stats_mutex);
             stats.reused_prompt_tokens += reused;
@@ -892,13 +982,15 @@ struct Gemma4Core::Impl {
         return a.id < b.id;
     }
 
-    void step() {
+    // One prompt chunk or one decode round; false when there was nothing to run (every active
+    // request waits for its grammar mask).
+    bool step() {
         std::shared_ptr<Request> prefilling;
         bool decoding = false;
         for (const Slot& slot : slots) {
             if (!slot.request) { continue; }
             if (slot.request->decoding) {
-                decoding = true;
+                decoding = decoding || mask_ready(*slot.request);
             } else if (!prefilling || prefills_before(*slot.request, *prefilling)) {
                 prefilling = slot.request;
             }
@@ -908,10 +1000,12 @@ struct Gemma4Core::Impl {
             try {
                 prefill_step(prefilling);
             } catch (...) { fail(prefilling, std::current_exception()); }
-        } else if (decoding) {
-            decode_run += decode_run != UINT32_MAX;
-            decode_step();
+            return true;
         }
+        if (!decoding) { return false; }
+        decode_run += decode_run != UINT32_MAX;
+        decode_step();
+        return true;
     }
 
     // The prompt tokens the request's next prefill step computes: a chunk ends before a media unit
@@ -1053,9 +1147,9 @@ struct Gemma4Core::Impl {
             config.token_counts      = row.counts ? static_cast<std::int32_t*>(token_counts.p) +
                                                         std::size_t(row.slot) * domain
                                                   : nullptr;
-            if (row.grammar != nullptr) {
+            if (row.mask != nullptr) {
                 auto* words = static_cast<std::uint32_t*>(host_mask->data()) + b * mask_words();
-                row.grammar->fill_masks(std::span(words, mask_words()), {});
+                std::copy_n(row.mask, mask_words(), words);
                 config.token_mask =
                     static_cast<const std::uint32_t*>(token_mask.p) + b * mask_words();
                 config.token_mask_stride = static_cast<std::int32_t>(mask_words());
@@ -1135,7 +1229,7 @@ struct Gemma4Core::Impl {
                          .slot     = r.slot,
                          .counts   = r.penalties,
                          .logprobs = exec.logprobs,
-                         .grammar  = r.output.grammar_state().get()};
+                         .mask     = r.mask ? r.mask->words.data() : nullptr};
     }
 
     void finish(const std::shared_ptr<Request>& request, FinishReason reason) {
@@ -1221,6 +1315,7 @@ struct Gemma4Core::Impl {
             }
         }
         r.prefilled += n;
+        r.progress = Clock::now();
         if (reuse_prefixes && r.reusable &&
             std::binary_search(r.shared_at.begin(), r.shared_at.end(), r.prefilled)) {
             store_image(r.slot, slot.fed, slot.media, nullptr, PrefixReusePath::SharedStablePrefix);
@@ -1267,14 +1362,30 @@ struct Gemma4Core::Impl {
                                        0, std::size_t(domain) * sizeof(std::int32_t),
                                        executor.head_stream()));
         }
-        r.position          = prompt_n;
-        r.decoding          = true;
+        r.position = prompt_n;
+        r.decoding = true;
+        // The first token's mask began with the request and is usually done; waiting for it holds
+        // the engine thread, so only for the mask budget.
+        const auto deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+                                                 std::chrono::duration<double>(kMaskBudgetSeconds));
+        while (!mask_ready(r) && Clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        if (!mask_ready(r)) {
+            fail(request, std::make_exception_ptr(RequestError(
+                              RequestErrorKind::Unavailable,
+                              "structured output: the first token's grammar mask took over the " +
+                                  std::to_string(kMaskBudgetSeconds) + " s budget")));
+            return;
+        }
+        if (!mask_usable(request)) { return; }
         const SampleRow row = sample_row(r);
         TokenId token       = 0;
         runtime::RawTokenLogprob logprob;
         sample(std::span(&row, 1), ops::kSamplePurposePrefill, std::span(&token, 1),
                std::span(&logprob, 1));
         accept(request, token, row.logprobs ? &logprob : nullptr);
+        if (active(request)) { schedule_mask(r); }
     }
 
     [[nodiscard]] bool active(const std::shared_ptr<Request>& request) const {
@@ -1310,6 +1421,7 @@ struct Gemma4Core::Impl {
         const auto now = Clock::now();
         if (r.first_token == Clock::time_point{}) { r.first_token = now; }
         r.last_token = now;
+        r.progress   = now;
         if (decision.accepted_tokens > tokens.size()) {
             throw std::logic_error("output policy accepted more than the sampled tokens");
         }
@@ -1346,7 +1458,8 @@ struct Gemma4Core::Impl {
     // and no switch of sampling parameters pending (a reasoning block that has not closed yet when
     // the request samples its answer differently).
     [[nodiscard]] bool speculates(const Request& r) const {
-        return drafts > 0 && r.feed.size() == 1 && instance.executor->can_draft(r.slot) &&
+        // A grammar's row decodes plainly: its masks come one token ahead, off the engine thread.
+        return drafts > 0 && !r.mask && r.feed.size() == 1 && instance.executor->can_draft(r.slot) &&
                r.position + drafts + 1 <= max_context &&
                r.output.model_token_budget_remaining(r.budget->remaining()) > 1 &&
                !(r.options.execution.post_thinking_sampling && !r.post_thinking);
@@ -1371,8 +1484,18 @@ struct Gemma4Core::Impl {
         }
         const std::uint32_t steps = round_drafts(decoding);
         for (const Slot& slot : slots) {
-            if (!slot.request || !slot.request->decoding) { continue; }
-            (steps > 0 && speculates(*slot.request) ? speculative : batch).push_back(slot.request);
+            // A copy: finishing or failing the request clears its slot.
+            const std::shared_ptr<Request> request = slot.request;
+            if (!request || !request->decoding) { continue; }
+            if (!mask_ready(*request)) {
+                // It waits for its grammar mask; a cancellation need not.
+                if (request->cancelled.load(std::memory_order_acquire)) {
+                    finish_now(request, FinishReason::Cancelled);
+                }
+                continue;
+            }
+            if (!mask_usable(request)) { continue; }
+            (steps > 0 && speculates(*request) ? speculative : batch).push_back(request);
         }
         if (batch.empty() && speculative.empty()) { return; }
         const auto start = Clock::now();
@@ -1406,6 +1529,7 @@ struct Gemma4Core::Impl {
             if (drafts > 0) { ++batch[b]->speculative.fallback_steps; }
             try {
                 accept(batch[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr);
+                if (active(batch[b]) && batch[b]->mask) { schedule_mask(*batch[b]); }
             } catch (...) { fail(batch[b], std::current_exception()); }
         }
     }
@@ -1506,10 +1630,8 @@ struct Gemma4Core::Impl {
         const cudaStream_t stream = executor.head_stream();
         std::vector<SampleRow> rows;
         for (const auto& request : batch) { rows.push_back(sample_row(*request)); }
-        // The rows' sampling, each column of a grammar's row masked as the drafts before it leave
-        // the grammar.
+        // The rows' sampling (a grammar's row never speculates).
         auto* configs = static_cast<ops::SamplingConfig*>(host_sample->data());
-        bool masked   = false;
         for (std::size_t j = 0; j < b; ++j) {
             const SampleRow& row = rows[j];
             ops::SamplingConfig config;
@@ -1523,21 +1645,10 @@ struct Gemma4Core::Impl {
             config.token_counts      = row.counts ? static_cast<std::int32_t*>(token_counts.p) +
                                                         std::size_t(row.slot) * domain
                                                   : nullptr;
-            if (row.grammar != nullptr) {
-                auto* words = static_cast<std::uint32_t*>(host_mask->data()) + j * w * mask_words();
-                row.grammar->fill_masks(std::span(words, w * mask_words()),
-                                        std::span<const TokenId>(proposed).subspan(j * k, k));
-                config.token_mask =
-                    static_cast<const std::uint32_t*>(token_mask.p) + j * w * mask_words();
-                config.token_mask_stride = static_cast<std::int32_t>(mask_words());
-                masked                   = true;
+            if (row.mask != nullptr) {
+                throw std::logic_error("gemma4: a structured-output row in a speculative round");
             }
             configs[j] = config;
-        }
-        if (masked) {
-            CUDA_CHECK(cudaMemcpyAsync(token_mask.p, host_mask->data(),
-                                       b * w * mask_words() * sizeof(std::uint32_t),
-                                       cudaMemcpyHostToDevice, stream));
         }
         CUDA_CHECK(cudaMemcpyAsync(sample_config.p, configs, b * sizeof(ops::SamplingConfig),
                                    cudaMemcpyHostToDevice, stream));

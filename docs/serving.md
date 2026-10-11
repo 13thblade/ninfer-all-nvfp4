@@ -213,7 +213,10 @@ whose catalog is its one model.
 NInfer uses the vendored XGrammar v0.2.7 C++ compiler and token matcher to constrain final
 response content. This requires no model conversion or additional weights. Ordinary decoding,
 MTP, DFlash, and DFlash2 share the same target sampling contract, including CUDA Graphs,
-streaming, prefix reuse, and mixed constrained/unconstrained concurrent requests.
+streaming, prefix reuse, and mixed constrained/unconstrained concurrent requests. Gemma 4 computes
+a constrained request's mask one token ahead on a thread of its own and decodes that request
+without drafts, so a costly grammar slows only its own request; a mask over 5 s fails the request
+with an explicit error ([Gemma 4](gemma4.md#structured-output)).
 
 It is opt-in: start the server with `--structured-output` (the CLI's `--json` and `--json-schema`
 enable it for their run). That reserves one grammar mask plane per draft position and lane, and a
