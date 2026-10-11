@@ -17,6 +17,7 @@
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/host_memory.h"
 #include "runtime/engine/model_instance.h"
 #include "text/structured_output.h"
 
@@ -73,10 +74,6 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     const auto start = Clock::now();
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
-    }
-    if (options.kv_cache != KvCacheStorage::BFloat16) {
-        throw std::invalid_argument(
-            "Gemma 4 keeps a 16-bit KV cache; --kv-dtype formats are not available for it");
     }
     // The vision tower on the device or, with --vision-residency cpu, on CPU threads; its soft
     // tokens per image or video frame are bounded by --vision-max-merged (Gemma's budgets 70 to
@@ -168,6 +165,10 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     executor.prefill_chunk = 2048;
     executor.cuda_graphs   = options.use_cuda_graph;
     executor.draft_tokens  = mtp ? speculative.draft_tokens : 0;
+    executor.kv_cache      = options.kv_cache;
+    // Causal scoring keeps no context between requests.
+    executor.checkpoints   = options.context_cache.enabled &&
+                           options.purpose == EnginePurpose::Generation;
     if (options.enable_vision) {
         executor.vision_max_patches = vision_budget * model->vision_config()->patches_per_token();
     }
@@ -310,6 +311,10 @@ struct Gemma4Core::Request {
 
     std::uint32_t anchor_at = 0;
     bool reusable           = true;
+    // Prefixes other prompts are expected to share (the end of the leading system messages, of
+    // tool declarations, of a declared cache boundary), ascending and below anchor_at: a prompt
+    // chunk ends at each, and the state there goes to the host store for them.
+    std::vector<std::uint32_t> shared_at;
     // Media: one mark per unit (an image or a video frame), its soft tokens' span and the identity
     // of what they show, which a reused prefix must share as well as its tokens.
     std::vector<MediaMark> media;
@@ -379,6 +384,34 @@ struct Gemma4Core::Impl {
 
     std::vector<Slot> slots;
     std::uint64_t use_clock                 = 0;
+
+    // The context cache past the sequences: images of the prefixes they give up (the state a turn
+    // closed at, and where a sequence ended) and of shared prefixes, in pinned host memory up to a
+    // budget, the least recently used dropped first. A prompt resumes from the longest stored
+    // prefix when no free sequence serves more of it.
+    struct Stored {
+        std::vector<TokenId> tokens;
+        std::vector<MediaMark> media;
+        models::gemma4::SequenceImage header;
+        PrefixReusePath path = PrefixReusePath::PrivateEndpoint;
+        std::vector<std::byte*> pages; // slices of host_pages
+        std::uint64_t bytes     = 0;
+        std::uint64_t last_used = 0;
+    };
+    // The images live in pages of one buffer pinned at startup: pinning and unpinning each image
+    // would stall every sequence, and since nothing is freed, the copies need no host wait (the
+    // executor's stream orders a page's reuse after the copies before it).
+    static constexpr std::size_t kHostPageBytes = std::size_t(8) << 20;
+    std::unique_ptr<PinnedHostBuffer> host_pages;
+    std::vector<std::byte*> free_pages;
+    // An image holds the sliding rings whatever its length (about 100 MiB in rk8v4, 250 MiB in F16
+    // with the assistant), which copy back in a few milliseconds against about 0.2 ms of prefill per
+    // token: the bound is the budget. A conversation's prefixes are many and keep 1024 tokens or
+    // more; a shared prefix, which many requests reuse, from 256.
+    static constexpr std::size_t kMinStoredTokens = 1024;
+    static constexpr std::size_t kMinSharedTokens = 256;
+    std::vector<Stored> stored;
+    std::uint64_t host_budget = 0, host_used = 0;
     std::uint32_t decode_run                = 0;
     std::uint32_t decode_rounds_per_prefill = 1;
 
@@ -403,7 +436,7 @@ struct Gemma4Core::Impl {
           pending_timeout(options.pending_timeout_ms),
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
-          reuse_prefixes(options.context_cache.enabled), drafts(i.executor->draft_tokens()),
+          reuse_prefixes(i.executor->options().checkpoints), drafts(i.executor->draft_tokens()),
           lookup_ngram(options.speculative.lookup_ngram),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(options.decode_rounds_per_prefill != 0
@@ -413,6 +446,25 @@ struct Gemma4Core::Impl {
         if (drafts > 0 && options.speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
             mtp_controller.emplace();
             mtp_controller->reset(drafts, 1);
+        }
+        if (reuse_prefixes) {
+            // The host tier's budget, sized here once the weights and the vision tower are loaded
+            // when it is automatic, and pinned now in whole pages.
+            const ContextCacheOptions& cache = options.context_cache;
+            const ContextCacheOptions sized  = resolve_auto_host_cache_now(
+                cache, options.enable_vision ? std::uint64_t(options.media_cache_bytes) +
+                                                   options.media_live_bytes
+                                             : 0U);
+            const std::uint64_t budget =
+                sized.host_cache_budget_bytes.value_or(cache.host_kv_capacity_bytes);
+            const std::size_t pages = static_cast<std::size_t>(budget / kHostPageBytes);
+            host_budget             = std::uint64_t(pages) * kHostPageBytes;
+            if (pages > 0) {
+                host_pages = std::make_unique<PinnedHostBuffer>(host_budget);
+                auto* base = static_cast<std::byte*>(host_pages->data());
+                free_pages.reserve(pages);
+                for (std::size_t i = pages; i-- > 0;) { free_pages.push_back(base + i * kHostPageBytes); }
+            }
         }
         const std::size_t rows = slots.size();
         // A sampling call's columns per row: one, or a verification's drafts and bonus.
@@ -607,6 +659,101 @@ struct Gemma4Core::Impl {
         return static_cast<std::uint32_t>(held.size());
     }
 
+    // Frees pages for an image of `bytes`, dropping the least recently used images; false when
+    // the budget cannot hold it at all.
+    bool make_host_room(std::uint64_t bytes) {
+        const std::size_t pages = static_cast<std::size_t>((bytes + kHostPageBytes - 1) / kHostPageBytes);
+        if (pages > host_budget / kHostPageBytes) { return false; }
+        while (free_pages.size() < pages) {
+            const auto oldest = std::min_element(stored.begin(), stored.end(), [](const Stored& a, const Stored& b) {
+                return a.last_used < b.last_used;
+            });
+            if (oldest == stored.end()) { return false; }
+            free_pages.insert(free_pages.end(), oldest->pages.begin(), oldest->pages.end());
+            host_used -= oldest->pages.size() * kHostPageBytes;
+            stored.erase(oldest);
+        }
+        return true;
+    }
+
+    [[nodiscard]] std::optional<std::size_t> stored_index(const std::vector<TokenId>& tokens,
+                                                          const std::vector<MediaMark>& media) const {
+        for (std::size_t i = 0; i < stored.size(); ++i) {
+            if (stored[i].tokens == tokens && stored[i].media == media) { return i; }
+        }
+        return std::nullopt;
+    }
+
+    // The stored image that serves the most of the prompt, and how much.
+    [[nodiscard]] std::pair<std::size_t, std::uint32_t> find_stored(const Request& prompt) const {
+        std::pair<std::size_t, std::uint32_t> best{0, 0};
+        for (std::size_t i = 0; i < stored.size(); ++i) {
+            const std::uint32_t length = prefix_reuse(stored[i].tokens, stored[i].media, prompt);
+            if (length > best.second) { best = {i, length}; }
+        }
+        return best;
+    }
+
+    // Keeps the state of sequence `s` up to `tokens` (its live state, or its checkpoint `at`) in
+    // the store, unless the store already holds that prefix or it is too short to be worth it.
+    void store_image(std::uint32_t s, const std::vector<TokenId>& tokens,
+                     const std::vector<MediaMark>& media,
+                     const models::gemma4::SequenceSnapshot* at, PrefixReusePath path) {
+        const std::size_t least =
+            path == PrefixReusePath::SharedStablePrefix ? kMinSharedTokens : kMinStoredTokens;
+        if (tokens.size() < least || host_budget == 0) { return; }
+        if (const auto known = stored_index(tokens, media)) {
+            stored[*known].last_used = ++use_clock;
+            return;
+        }
+        auto& executor      = *instance.executor;
+        const auto position = at != nullptr ? at->position : executor.position(s);
+        if (position != tokens.size()) { return; } // the state holds other tokens
+        const std::uint64_t bytes = executor.image_bytes(position);
+        if (!make_host_room(bytes)) { return; }
+        Stored image;
+        image.tokens = tokens;
+        image.media  = media;
+        image.path   = path;
+        image.bytes  = bytes;
+        const auto count = static_cast<std::ptrdiff_t>((bytes + kHostPageBytes - 1) / kHostPageBytes);
+        image.pages.assign(free_pages.end() - count, free_pages.end());
+        free_pages.erase(free_pages.end() - count, free_pages.end());
+        image.header    = executor.save_image(s, at, image.pages, kHostPageBytes);
+        image.last_used = ++use_clock;
+        host_used += image.pages.size() * kHostPageBytes;
+        stored.push_back(std::move(image));
+        std::lock_guard lock(stats_mutex);
+        stats.state_d2h_count += 1;
+        stats.state_d2h_bytes += bytes;
+        stats.host_kv_occupied_bytes = host_used;
+    }
+
+    // Keeps what sequence `s` holds before its state goes: the prefix its last prompt's turn
+    // closed at, and where it ended.
+    void retire(std::uint32_t s) {
+        Slot& slot          = slots[s];
+        const bool anchored = !slot.anchor.empty() && slot.anchor.size() <= slot.fed.size() &&
+                              std::equal(slot.anchor.begin(), slot.anchor.end(), slot.fed.begin());
+        if (anchored) {
+            store_image(s, slot.anchor, slot.anchor_media, &slot.snapshot,
+                        PrefixReusePath::PrivateTurnClosure);
+        }
+        if (slot.fed != slot.anchor) {
+            store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
+        }
+    }
+
+    // Loads stored image `index` into sequence `s`.
+    void restore_stored(std::uint32_t s, std::size_t index) {
+        Stored& image = stored.at(index);
+        instance.executor->load_image(s, image.header, image.pages, kHostPageBytes);
+        image.last_used = ++use_clock;
+        std::lock_guard lock(stats_mutex);
+        stats.state_h2d_count += 1;
+        stats.state_h2d_bytes += image.bytes;
+    }
+
     [[nodiscard]] std::uint32_t reuse(const Slot& slot, const Request& prompt) const {
         if (!reuse_prefixes) { return 0; }
         return std::max(prefix_reuse(slot.fed, slot.media, prompt),
@@ -662,11 +809,31 @@ struct Gemma4Core::Impl {
                                "prepared prompt exceeds Engine max_context");
         }
         r.admitted           = Clock::now();
+        // Resume from the sequence's live state when the prompt continues it, else from its
+        // checkpoint at the end of its last prompt when the prompt continues that, else from the
+        // longest prefix the store keeps; what the sequence held goes to the store first.
         std::uint32_t reused = 0;
         if (reuse_prefixes && r.reusable) {
-            const std::uint32_t live     = prefix_reuse(slot.fed, slot.media, r);
-            const std::uint32_t anchored = prefix_reuse(slot.anchor, slot.anchor_media, r);
-            if (anchored > live) {
+            const std::uint32_t live       = prefix_reuse(slot.fed, slot.media, r);
+            const std::uint32_t anchored   = prefix_reuse(slot.anchor, slot.anchor_media, r);
+            const auto [image, from_store] = find_stored(r);
+            if (from_store > std::max(live, anchored)) {
+                std::vector<TokenId> tokens      = stored[image].tokens;
+                std::vector<MediaMark> media     = stored[image].media;
+                const PrefixReusePath path       = stored[image].path;
+                retire(s);
+                // Retiring may have dropped or moved the image: find it again.
+                if (const auto index = stored_index(tokens, media)) {
+                    restore_stored(s, *index);
+                    slot.fed   = std::move(tokens);
+                    slot.media = std::move(media);
+                    slot.anchor.clear();
+                    slot.anchor_media.clear();
+                    reused       = from_store;
+                    r.reuse_path = path;
+                }
+            } else if (anchored > live) {
+                retire(s);
                 executor.restore(s, slot.snapshot);
                 slot.fed     = slot.anchor;
                 slot.media   = slot.anchor_media;
@@ -678,6 +845,7 @@ struct Gemma4Core::Impl {
             }
         }
         if (reused == 0) {
+            if (reuse_prefixes) { retire(s); }
             executor.reset(s);
             slot.fed.clear();
             slot.anchor.clear();
@@ -749,8 +917,14 @@ struct Gemma4Core::Impl {
     // The prompt tokens the request's next prefill step computes: a chunk ends before a media unit
     // it would otherwise split, since a unit's soft tokens attend each other.
     [[nodiscard]] std::uint32_t prefill_step_tokens(const Request& r) const {
-        const auto prompt_n       = static_cast<std::uint32_t>(r.prompt_tokens.size());
-        const std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
+        for (const std::uint32_t frontier : r.shared_at) {
+            if (frontier > r.prefilled) {
+                until = std::min(until, frontier);
+                break;
+            }
+        }
         std::uint32_t end =
             r.prefilled + std::min(instance.executor->options().prefill_chunk, until - r.prefilled);
         for (const MediaMark& mark : r.media) {
@@ -1017,6 +1191,20 @@ struct Gemma4Core::Impl {
             finish_now(request, FinishReason::Cancelled);
             return;
         }
+        // A prompt admitted with nothing to resume may find a prefix another request stored while
+        // it waited (the shared system prompt of requests that arrived together): start there.
+        if (reuse_prefixes && r.reusable && r.prefilled == 0) {
+            const auto [image, from_store] = find_stored(r);
+            if (from_store > 0) {
+                restore_stored(r.slot, image);
+                slot.fed     = stored[image].tokens;
+                slot.media   = stored[image].media;
+                r.reuse_path = stored[image].path;
+                r.reused = r.prefilled = from_store;
+                std::lock_guard lock(stats_mutex);
+                stats.reused_prompt_tokens += from_store;
+            }
+        }
         const std::uint32_t n = prefill_step_tokens(r);
         if (n == 0) { throw std::logic_error("gemma4: an empty prefill step"); }
         const auto chunk = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
@@ -1033,6 +1221,10 @@ struct Gemma4Core::Impl {
             }
         }
         r.prefilled += n;
+        if (reuse_prefixes && r.reusable &&
+            std::binary_search(r.shared_at.begin(), r.shared_at.end(), r.prefilled)) {
+            store_image(r.slot, slot.fed, slot.media, nullptr, PrefixReusePath::SharedStablePrefix);
+        }
         if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at && r.prefilled < prompt_n) {
             executor.snapshot(r.slot, slot.snapshot);
             slot.anchor       = slot.fed;
@@ -1718,6 +1910,24 @@ Gemma4Core::Submission Gemma4Core::submit(models::qwen3_5::PreparedPrompt prompt
             identity.rewrite_checkpoint->frontier < prompt_n) {
             request->anchor_at = identity.rewrite_checkpoint->frontier;
         }
+        // Shared prefixes worth an image of their own: a structural or declared boundary, not one
+        // the engine merely observed (the prompt's end, a grid point).
+        for (const auto& opportunity : data.context_cache.opportunities) {
+            const auto evidence   = opportunity.evidence;
+            const bool structural = has_shared_candidate_evidence(
+                evidence, SharedCandidateEvidence::ExplicitBoundary |
+                              SharedCandidateEvidence::RequestedAutomatic |
+                              SharedCandidateEvidence::DefaultAutomatic |
+                              SharedCandidateEvidence::EngineStructural);
+            const std::uint32_t frontier = opportunity.frontier;
+            if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix && structural &&
+                frontier >= Impl::kMinSharedTokens && frontier < request->anchor_at) {
+                request->shared_at.push_back(frontier);
+            }
+        }
+        std::sort(request->shared_at.begin(), request->shared_at.end());
+        request->shared_at.erase(std::unique(request->shared_at.begin(), request->shared_at.end()),
+                                 request->shared_at.end());
     }
     request->prompt_summary  = prompt_summary;
     request->prepare_seconds = prepare_seconds;
@@ -1788,6 +1998,12 @@ MemorySummary Gemma4Core::memory_summary() const {
     out.device      = impl_->device.rank(0).device;
     out.max_context = impl_->max_context;
     out.kv_capacity = impl_->max_context;
+    out.kv_cache    = impl_->instance.executor->options().kv_cache;
+    out.host_kv_capacity_bytes = impl_->host_budget;
+    {
+        std::lock_guard lock(impl_->stats_mutex);
+        out.host_kv_occupied_bytes = impl_->stats.host_kv_occupied_bytes;
+    }
     out.weights   = arena(stats.device_capacity_by_rank.empty() ? 0 : stats.device_capacity_by_rank[0]);
     out.sequence  = arena(memory.kv_bytes);
     out.workspace = arena(memory.workspace_bytes);

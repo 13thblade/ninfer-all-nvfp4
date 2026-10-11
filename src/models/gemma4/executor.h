@@ -1,9 +1,9 @@
 #pragma once
 
-// The forward pass of Gemma 4 over a loaded Model. Each sequence owns an F16 cache per block: keys
-// and values in a ring of the last window (and a round's drafts) for the sliding-window blocks, the
-// values of every position for the full-attention blocks, whose keys (K = V) are derived from them
-// where they are read. Prompt chunks run llama.cpp's tensor-core flash attention; decode steps run
+// The forward pass of Gemma 4 over a loaded Model. Each sequence owns a cache per block, F16 or a
+// quantized format (kv_format.h): keys and values in a ring of the last window (and a round's
+// drafts) for the sliding-window blocks, the values of every position for the full-attention blocks,
+// whose keys (K = V) are derived from them where they are read. Prompt chunks run llama.cpp's tensor-core flash attention; decode steps run
 // one token of each of several sequences at once, replayed from a CUDA graph per batch size.
 //
 // With draft_tokens, the model's assistant drafts: from a sequence's next token (its anchor) and the
@@ -14,6 +14,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "models/gemma4/kv_format.h"
 #include "models/gemma4/model.h"
 
 #include <cuda_runtime.h>
@@ -37,6 +38,10 @@ struct ExecutorOptions {
     // media unit (an image or a video frame) has, which also bounds a batch of units the device
     // tower encodes at once. 0: text only.
     std::uint32_t vision_max_patches = 0;
+    // The caches' storage (kv_format.h); BFloat16 selects the F16 cache.
+    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    // One checkpoint of every sequence's rings (snapshot/restore), allocated with the caches.
+    bool checkpoints = true;
 };
 
 // One media item's units in a prompt chunk: consecutive units (an image, or frames of a video) of
@@ -61,11 +66,18 @@ struct ExecutorMemory {
     std::uint64_t vision_owned_bytes  = 0;
 };
 
-// A sequence's sliding-window rings and position, which Executor::restore resumes from; the
-// full-attention caches of earlier positions are not copied, since a sequence only writes
-// positions at or past its own.
+// A sequence's checkpoint: its sliding-window rings, kept in the executor's checkpoint storage of
+// that sequence (one per sequence), and its position, which Executor::restore resumes from. The
+// full-attention caches of earlier positions are not copied, since a sequence only writes positions
+// at or past its own.
 struct SequenceSnapshot {
-    std::vector<DeviceBuffer> rings;
+    std::uint32_t position = 0;
+};
+
+// A sequence's state in host memory, laid out as image_bytes() sizes it: its sliding-window rings
+// and its full-attention rows below `position`. The context cache keeps prefixes this way beyond
+// the device's sequences; the header travels beside the bytes.
+struct SequenceImage {
     std::uint32_t position = 0;
 };
 
@@ -119,6 +131,19 @@ public:
     [[nodiscard]] cudaStream_t head_stream() const noexcept;
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);
+    // Bytes of an image at `position`.
+    [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;
+    // Copies the sequence's state into `pages`, pinned host memory that holds image_bytes() of its
+    // position in consecutive slices of `page_bytes` (the last one may be partly used): its live
+    // state, or the state at `at`, its checkpoint, whose positions it has not written since.
+    // Snapshots, restores and image copies are enqueued on the executor's stream, ordered with
+    // the work around them, and the host does not wait for them: device work enqueued later sees
+    // them done, and pages are only to be rewritten by later image copies.
+    SequenceImage save_image(std::uint32_t sequence, const SequenceSnapshot* at,
+                             std::span<std::byte* const> pages, std::size_t page_bytes);
+    // Makes the sequence hold the image's state.
+    void load_image(std::uint32_t sequence, const SequenceImage& image,
+                    std::span<std::byte* const> pages, std::size_t page_bytes);
 
 private:
     struct Impl;

@@ -117,8 +117,9 @@ of the file.
 
 - **Gemma 4 26B-A4B.** Google's QAT Q4_0 GGUF release, imported block for block (13.4 GiB), or a
   mixed-format GGUF of it: the sliding-window and full-attention blocks (the latter caching values
-  only), the dense MLP beside 128 routed experts, up to eight concurrent requests with prefix reuse,
-  tool calls and structured output, images and video through the release's vision tower (on the
+  only), the dense MLP beside 128 routed experts, every `--kv-dtype` format, up to eight concurrent
+  requests with prefix reuse through host memory and shared system prompts, tool calls and
+  structured output, images and video through the release's vision tower (on the
   GPU, streamed from pinned memory or on CPU threads), and Google's multi-token-prediction assistant
   for speculative decoding. On an RTX 3090 it prefills a 10,000-token prompt at 6,045 tok/s and decodes at 215
   tok/s, 190 after 10,000 tokens, against llama.cpp's 4,697, 169 and 152 on the same GGUF; with two

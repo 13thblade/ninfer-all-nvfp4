@@ -25,6 +25,9 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   key norm's gamma, rotated: the cache keeps V (10 KiB per token for the five blocks) and the
   attention derives each key from it as it reads it, with the same rotations the keys were stored
   with.
+- **Every KV-cache format of the engine.** `--kv-dtype` keeps the caches in F16 (`bf16`, the
+  default) or in int8, fp8, rk8v4, nvfp4, k8v4, rk4v4, rk4v4-e8 or rk2v4-e8, the engine's own
+  codecs; see [below](#kv-cache-formats).
 - **Speculative decoding with the release's assistant.** The multi-token-prediction drafter Google
   publishes beside the model (`Gemma4AssistantForCausalLM`, four blocks of width 1024 that read the
   target's own KV cache) drafts up to seven tokens a round (`--spec mtp --draft-tokens N`); the
@@ -34,7 +37,8 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   video frame into soft tokens in the prompt, on the GPU, streamed from pinned host memory, or on
   CPU threads (`--vision-residency`); see [below](#images-and-video).
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
-  tokens, prefix reuse across turns, structured output, tool calls in Gemma's
+  tokens, prefix reuse across turns and requests with host-memory images
+  ([below](#prefix-reuse)), structured output, tool calls in Gemma's
   `<|tool_call>call:NAME{...}<tool_call|>` form returned as OpenAI tool calls, streaming, reasoning
   in its own channel when thinking is on, and causal scoring (`ninfer-perplexity`).
 - **Thinking.** Off unless asked for, as the release's chat template has it: a request turns it on
@@ -43,8 +47,8 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
 - **Sampling defaults.** The release's `generation_config.json` (temperature 1.0, top-p 0.95) with
   top-k held at the sampler's 20 candidates.
 
-Not built for this family: DFlash and ngram copy drafts, pipeline stages over several GPUs, and KV
-formats other than F16.
+Not built for this family: DFlash and ngram copy drafts, pipeline stages over several GPUs, and of
+the context cache the shared paged KV pool, the disk tier and session slots.
 
 ## Converting
 
@@ -118,14 +122,164 @@ ninfer-serve models/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer --model-id 
 ```
 
 On a 24 GB card the weights take 13.4 GiB (the assistant 0.25 GiB more) and the prompt-chunk
-workspace about 1.1 GiB. Every sequence holds its whole context from the start: 200 MiB for the
-1024-token windows of the 25 sliding blocks (250 MiB with `--spec mtp`, whose rounds write their
-drafts past the window; up to as much again for a prefix checkpoint) and 10 KiB per token for the
-values of the five full-attention blocks. Shared by all sequences: a 24 MiB staging ring for prompt
-chunks, the keys a chunk derives from the values (2 KiB per context token) and the rotation table
-(0.5 KiB per context token). One sequence of 40,960 tokens takes 0.7 GiB, four of 16,384 tokens
-1.5 GiB and eight of 32,768 tokens 4.2 GiB. A configuration that does not fit is refused at startup
-with the numbers.
+workspace about 1.1 GiB. Every sequence holds its whole context from the start: the rings of the 25
+sliding blocks (their 1024-token windows; 1280 rows with `--spec mtp`, whose rounds write their
+drafts past the window), as much again for the rings' checkpoint while the context cache is on (the
+default; `--no-prefix-reuse` drops it), and the values of the five full-attention blocks for every
+context token. In F16 the rings take 200 MiB (250 MiB with `--spec mtp`) and the values 10 KiB per
+token; the other formats' sizes are [below](#memory-and-context). Shared by all sequences: a 24 MiB
+staging ring for prompt chunks, the keys a chunk derives from the values (2 KiB per context token),
+with a quantized cache the F16 values a chunk reads back (2 KiB per context token), and the rotation
+table (0.5 KiB per context token). In F16 with `--spec mtp`, one sequence of 40,960 tokens takes
+1.0 GiB, four of 16,384 tokens 2.6 GiB and eight of 16,384 tokens 5.2 GiB. A configuration that
+does not fit is refused at startup with the numbers.
+
+## KV-cache formats
+
+`--kv-dtype` selects the caches' storage. The 16-bit default keeps F16 rows (the prompt kernels'
+type). Every other format of the engine stores its codes and scales per 256-wide block with the
+engine's D256 codecs (`ops/kv_cache`), each block's codes and scales in two planes:
+
+| `--kv-dtype` | sliding blocks: keys | sliding blocks: values | full-attention plane |
+|---|---|---|---|
+| `bf16` | F16 | F16 | F16 |
+| `int8` | rotated INT8, G64 | INT8, G64 | INT8, G64 |
+| `fp8` | rotated E4M3, one scale per 256 | E4M3, one scale per 256 | E4M3, one scale per 256 |
+| `rk8v4` | rotated INT8, G64 | INT4, G32 | INT8, G64 |
+| `nvfp4` | rotated NVFP4, G16 | rotated NVFP4, G16 | NVFP4, G16 |
+| `k8v4` | rotated E4M3, one scale per 256 | rotated NVFP4, G16 | E4M3, one scale per 256 |
+| `rk4v4` | rotated Lloyd-Max 4-bit, G64 | INT4, G32 | INT4, G32 |
+| `rk4v4-e8` | rotated E8-lattice INT4, G64 | INT4, G32 | INT4, G32 |
+| `rk2v4-e8` | rotated E8 roots (2 bytes per 8), G64 | INT4, G32 | INT4, G32 |
+
+Rotated rows hold the normalized Sylvester-Hadamard transform of each block, as the engine's
+formats store keys (and NVFP4 values): a decode step turns its queries to meet them, and a turned
+value plane's output turns back. The full-attention blocks keep one plane, their values, from which
+each key is derived (RoPE(v * k_norm)); the rotation by position rules out a Hadamard-rotated plane,
+so it takes an unrotated coding at least as fine as the format's keys, or the packed INT4 value coding
+for the 4-bit and 2-bit key formats.
+
+A decode step stores its rows into the planes and its attention decodes them as it loads each tile
+into shared memory. A prompt chunk still runs the F16 tensor-core attention: the window before it
+comes back from the sequence's ring, its own rows are stored and replaced by the values they
+represent, and a full-attention block's values come back from the plane up to the chunk's end, so a
+chunk attends to what its decode steps will read. Speculative verification, the assistant's drafts
+and prefix checkpoints read and copy the same planes.
+
+### Memory and context
+
+Per sequence, by format: the sliding blocks' rings (twice that with the context cache's checkpoint)
+and the full-attention values per context token. The shared buffers above come on top.
+
+| `--kv-dtype` | rings, plain | rings, `--spec mtp` | full-attention values per token |
+|---|---:|---:|---:|
+| `bf16` | 200.0 MiB | 250.0 MiB | 10,240 B |
+| `int8` | 103.1 MiB | 128.9 MiB | 5,280 B |
+| `fp8` | 100.8 MiB | 126.0 MiB | 5,160 B |
+| `rk8v4` | 79.7 MiB | 99.6 MiB | 5,280 B |
+| `k8v4` | 78.5 MiB | 98.1 MiB | 5,160 B |
+| `nvfp4` | 56.2 MiB | 70.3 MiB | 2,880 B |
+| `rk4v4`, `rk4v4-e8` | 54.7 MiB | 68.4 MiB | 2,880 B |
+| `rk2v4-e8` | 42.2 MiB | 52.7 MiB | 2,880 B |
+
+The longest `--max-context` that `ninfer-serve --max-concurrency 8` starts with on the 24 GB RTX
+3090, HauhauCS artifact (its mixed-format weights leave 7.50 GiB free with the assistant, 7.72 GiB
+without), context cache on, no vision tower; each leaves 0.35 to 0.46 GiB free after startup for
+the CUDA graphs captured while serving:
+
+| `--kv-dtype` | 8 sequences, `--spec mtp --draft-tokens 2` | 8 sequences, no drafts |
+|---|---:|---:|
+| `bf16` | 24,576 | 36,864 |
+| `int8` | 82,944 | 96,256 |
+| `fp8` | 84,992 | 98,304 |
+| `rk8v4` | 92,160 | 103,424 |
+| `k8v4` | 94,208 | 105,472 |
+| `nvfp4` | 163,840 | 179,200 |
+| `rk4v4`, `rk4v4-e8` | 164,864 | 180,224 |
+| `rk2v4-e8` | 173,056 | 186,368 |
+
+The startup check counts everything that grows with the context or the sequences (the caches, the
+checkpoints, the prompt chunk's derived keys, F16 values and full-attention mask) and keeps 1.5 GiB
+for the rest of the workspace and the CUDA graphs.
+
+### Quality and speed
+
+Perplexity of eight disjoint 8,192-token windows of the NInfer source stream (65,528 scored tokens,
+`ninfer-perplexity --context 8192 --disjoint`), for Google's QAT conversion and for HauhauCS's
+Balanced tune of it:
+
+| `--kv-dtype` | Google QAT | HauhauCS Balanced |
+|---|---:|---:|
+| `bf16` | 21.061 | 19.592 |
+| `int8` | 21.170 | 19.984 |
+| `fp8` | 21.070 | 19.697 |
+| `rk8v4` | 20.281 | 18.518 |
+| `nvfp4` | 22.465 | 21.501 |
+| `k8v4` | 24.096 | 21.735 |
+| `rk4v4` | 20.419 | 18.758 |
+| `rk4v4-e8` | 19.472 | 17.437 |
+| `rk2v4-e8` | 21.937 | 20.875 |
+
+The formats whose sliding values are INT4 score below F16 on both checkpoints, and the NVFP4 values
+of `nvfp4` and `k8v4` above it. The kernels match their FP64 oracles (see
+[Numerical checks](#numerical-checks)); why a coarser value cache lowers this perplexity is not
+established, so take the 8-bit formats' agreement with F16 as the measure of their fidelity and
+check a 4-bit format on the task it will serve.
+
+llama.cpp (`c83f3058b`) on the same QAT GGUF moves too, and not monotonically:
+`llama-perplexity -c 8192 --chunks 8 -fa on` over the same text (it scores the second half of
+each window, so its values sit on another scale) gives 18.337 with an F16 cache, 18.780 with q4_0
+values, 18.298 with q8_0 values, 18.243 with q8_0 keys and values, 18.851 with q8_0 keys and q4_0
+values, and 18.243 with q4_0 keys and values.
+
+Decode tok/s of 128 tokens on a rented RTX 3090 held at 300 W (so below the 350 W numbers in
+[Measurements](#measurements)), HauhauCS artifact, one request, no drafts, `ninfer_bench`, three
+repetitions; `bf16`, `k8v4` and `rk4v4` are the means of two runs, which differed by at most 0.9%:
+
+| `--kv-dtype` | empty context | after 10,000 | after 40,000 |
+|---|---:|---:|---:|
+| `bf16` | 199.8 | 176.3 | 150.4 |
+| `int8` | 195.0 | 175.2 | 149.2 |
+| `rk8v4` | 194.6 | 175.9 | 149.7 |
+| `rk4v4` | 193.8 | 175.5 | 150.5 |
+| `rk4v4-e8` | 192.6 | 174.8 | 149.7 |
+| `rk2v4-e8` | 185.6 | 167.7 | 144.7 |
+| `fp8` | 177.9 | 154.7 | 130.5 |
+| `k8v4` | 177.0 | 152.6 | 129.1 |
+| `nvfp4` | 176.8 | 149.7 | 125.5 |
+
+The INT8 and INT4 formats decode within 4% of F16 (within 1% after 10,000 tokens); `rk2v4-e8`
+loses 4-7%; the FP8 and NVFP4 formats lose 11-17%, already on an empty context, where the cache
+reads are few: the RTX 3090 has no E4M3 or E2M1 conversion instruction (sm_89 adds them) and those
+decodes run in software. Prefill of 2,048, 10,000 and 40,000 tokens stays within 1.5% of F16 in every
+format, the spread between runs.
+
+## Prefix reuse
+
+With the context cache on (the default), a prompt resumes from a state a sequence or the host store
+keeps instead of prefilling those tokens again:
+
+- **On its sequence.** A sequence keeps its state when its request ends, and a checkpoint of its
+  sliding blocks' rings where the prompt's last user turn closes; the next turn of a conversation
+  resumes from either.
+- **From host memory.** Before another request takes a sequence, what it held (the conversation's
+  end and its checkpoint) goes to an image in pinned host memory: the rings and the full-attention
+  values up to its length, in the cache's format (150 MiB for 10,000 tokens in `rk8v4` with the
+  assistant, 348 MiB in F16). A prompt on any sequence resumes from the longest image it starts
+  with. `--host-kv-mib` (or `--host-cache-mib`) sets the store, 8 GiB by default, pinned at
+  startup in 8 MiB pages; the least recently used images go first, and a conversation's prefixes
+  shorter than 1,024 tokens are not kept. The copies queue on the GPU's stream behind the work
+  before them, so no sequence waits for the host.
+- **Shared prefixes.** A prompt chunk also ends where the frontend marks a prefix other requests
+  share (the end of the leading system messages, of the tool declarations, a declared cache
+  boundary), and the state there goes to an image too, from 256 tokens on: requests with the same
+  system prompt resume after it on any sequence, also when they arrive together, since a prompt
+  that has not started prefilling looks for images again at its first chunk.
+
+A sliding-window state cannot be cut back: the rings at a position hold the window before it, and
+each block's window reaches further back through the blocks below. A prompt therefore resumes only
+where a state was kept (a sequence's end, its checkpoint, a stored image), not at an arbitrary
+common prefix.
 
 ## Measurements
 
@@ -275,6 +429,18 @@ dominate a small one. A follow-up turn over the same picture reuses it without e
   consecutive positions), its q8_1 output and the decode routing match FP64 oracles
   (`ninfer_gemma4_kernels_test`); Gemma's tool-call markup parses as streamed
   (`ninfer_gemma4_output_test`).
+- The KV-cache formats (`ninfer_gemma4_kv_test`), each of the eight quantized ones: the codes and
+  scales a store writes, decoded on the host by the engine's codec oracles (and turned back in FP64
+  for a rotated plane), stay within the coding's error of the rows stored; a ring's load and a prompt
+  chunk's stored-and-replaced rows equal that host decode; and the decode attention over the planes
+  matches FP64 attention over the host-decoded rows, for a sliding block (rotated keys, turned
+  queries, NVFP4 values turned back) and a full-attention block whose keys derive from its plane.
+  With an artifact and `NINFER_GEMMA4_KV` set, `ninfer_gemma4_assistant_real_test` also runs the
+  assistant, a prefix checkpoint's restore, a host image's round trip through pages, and the
+  prompt route against the decode route past the sliding window in that format: prefilled at once,
+  the decode route's greedy text gets the same greedy tokens over its last 256 positions (all of
+  them in every format but `k8v4`, 255 there). That text repeats itself by then, so this checks
+  that a prompt chunk reads the stored window and its own stored rows, not their precision.
 - The assistant: [`tools/reference/gemma4.py`](../tools/reference/gemma4.py) `--assistant` runs
   transformers' drafting algorithm in FP64 over the decoded GGUFs. On a 40-token prompt its three
   drafts after the greedy anchor (top-2 margins 15.4, 18.0 and 12.5 logits) are NInfer's

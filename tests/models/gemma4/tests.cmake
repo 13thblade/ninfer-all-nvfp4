@@ -24,3 +24,8 @@ ninfer_add_test(ninfer_gemma4_vision_cpu_kernels_test
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
   target_compile_definitions(ninfer_gemma4_vision_cpu_kernels_test PRIVATE NINFER_VISION_CPU_X86=1)
 endif()
+
+ninfer_add_test(ninfer_gemma4_kv_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_gemma4_kv_test PROPERTIES SKIP_RETURN_CODE 77)
