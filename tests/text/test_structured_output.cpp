@@ -76,6 +76,29 @@ int main() {
         bounded->fill_masks(after, {});
         require((after[8] & 1U) != 0, "bounded string did not count Unicode code points");
 
+        // A wider bound compiles to a chain of rules (one per count still allowed): every length
+        // from minLength to maxLength closes, escapes and multi-byte scalars count once, and
+        // neither a shorter nor a longer string does.
+        const auto within = [&](const std::string& body) {
+            auto grammar = compiler.compile(
+                {StructuredOutputKind::JsonSchema, R"({"type":"string","minLength":2,"maxLength":40})"});
+            std::vector<TokenId> tokens{'"'};
+            for (unsigned char ch : body) { tokens.push_back(ch); }
+            tokens.push_back('"');
+            tokens.push_back(256);
+            try {
+                grammar->accept(tokens);
+                return true;
+            } catch (const std::logic_error&) { return false; }
+        };
+        require(!within("a"), "string under minLength accepted");
+        require(within("ab"), "string at minLength rejected");
+        require(within(std::string(40, 'x')), "string at maxLength rejected");
+        require(!within(std::string(41, 'x')), "string over maxLength accepted");
+        require(within(std::string(38, 'x') + "\\n\\u00e9"), "escapes do not count as one scalar");
+        require(!within(std::string(39, 'x') + "\\n\\u00e9"), "escaped scalars exceed maxLength");
+        require(within(std::string(37, 'x') + "é😀\\\""), "multi-byte scalars do not count once");
+
         auto whitespace          = compiler.compile({StructuredOutputKind::JsonObject, {}});
         bool too_much_whitespace = false;
         try {

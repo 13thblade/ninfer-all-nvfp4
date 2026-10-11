@@ -2552,10 +2552,29 @@ int32_t JSONSchemaConverter::GenerateString(const StringSpec& spec, const std::s
   }
   // Check for length constraints
   if (spec.min_length != 0 || spec.max_length != -1) {
-    // One repeated FSM atom represents one decoded Unicode scalar, irrespective of JSON spelling.
+    // One FSM atom represents one decoded Unicode scalar, irrespective of JSON spelling.
     int32_t character = RegexExpression(R"([\u0000-\u{10ffff}])", true);
-    int32_t body = Repeat(rule_name + "_characters", character, spec.min_length, spec.max_length);
-    return Sequence({ByteString("\""), body, ByteString("\"")});
+    if (spec.max_length == -1) {
+      int32_t body = Repeat(rule_name + "_characters", character, spec.min_length, -1);
+      return Sequence({ByteString("\""), body, ByteString("\"")});
+    }
+    // NInfer: a bounded string is a chain of rules, one per count still allowed, instead of a
+    // counted repetition. A position inside a counted repetition has no cacheable token mask, so
+    // every mask re-parsed the whole vocabulary with a cost growing with the count (seconds per
+    // token for a 262,144-token vocabulary at maxLength 200); each chain rule's start is an
+    // ordinary rule position whose mask the compiler caches.
+    int32_t tail = Empty();
+    for (int remaining = 1; remaining <= spec.max_length - spec.min_length; ++remaining) {
+      tail = RuleRef(builder_.AddRuleWithHint(
+          rule_name + "_up_to_" + std::to_string(remaining),
+          Choice({Empty(), Sequence({character, tail})})
+      ));
+    }
+    std::vector<int32_t> parts{ByteString("\"")};
+    parts.insert(parts.end(), spec.min_length, character);
+    parts.push_back(tail);
+    parts.push_back(ByteString("\""));
+    return Sequence(parts);
   }
   // Default string
   return Sequence({ByteString("\""), RegexExpression(R"([\u0000-\u{10ffff}]*)", true), ByteString("\"")});
