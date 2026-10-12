@@ -183,7 +183,7 @@ if defined NGRAM_NAME if not "!FETCH_OK!"=="1" exit /b 1
 
 echo Model ready: !MODEL!
 if defined NGRAM_NAME call :ngram_summary
-echo Point the tests at it with:  set %TESTS_VARIABLE%=%MODEL%
+echo Point the tests at it with:  set %TESTS_VARIABLE%=!MODEL!
 call :fetch_graft
 exit /b 0
 
@@ -271,7 +271,7 @@ echo Qwen3.8-Flash-Next reads its 27.1 GiB n-gram volume on every prompt, and th
 echo at load. Prompts were processed 1.1-1.4x faster with the volume on an NVMe drive than on a
 echo SATA SSD, so put it on your fastest drive (28 GiB free). The model can stay where it is.
 echo.
-echo   Model folder: %MODEL_DIR_FULL%
+echo   Model folder: !MODEL_DIR_FULL!
 echo.
 rem set /p leaves the answer empty when nothing is typed or there is no console to read.
 set "NGRAM_ANSWER="
@@ -279,9 +279,17 @@ set /p "NGRAM_ANSWER=Folder or drive for the n-gram volume, for example D: (Ente
 if not defined NGRAM_ANSWER goto :ngram_dir_chosen
 set "NGRAM_ANSWER=!NGRAM_ANSWER:"=!"
 if not defined NGRAM_ANSWER goto :ngram_dir_chosen
-rem A bare drive gets a folder of its own rather than the drive's root.
-if "!NGRAM_ANSWER:~1!"==":" set "NGRAM_ANSWER=!NGRAM_ANSWER!\ninfer-models"
-if "!NGRAM_ANSWER:~1!"==":\" set "NGRAM_ANSWER=!NGRAM_ANSWER!ninfer-models"
+rem A bare drive gets a folder of its own rather than the drive's root. D: and D:\ are separate
+rem branches, so the result of the first is never tested by the second (D: -> D:\ninfer-models).
+if "!NGRAM_ANSWER:~1!"==":" goto :ngram_bare_drive
+if "!NGRAM_ANSWER:~1!"==":\" goto :ngram_bare_drive_root
+goto :ngram_answer_set
+:ngram_bare_drive
+set "NGRAM_ANSWER=!NGRAM_ANSWER!\ninfer-models"
+goto :ngram_answer_set
+:ngram_bare_drive_root
+set "NGRAM_ANSWER=!NGRAM_ANSWER!ninfer-models"
+:ngram_answer_set
 set "NGRAM_DIR=!NGRAM_ANSWER!"
 :ngram_dir_chosen
 call :ngram_dir_check
