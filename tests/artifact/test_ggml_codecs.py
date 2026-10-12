@@ -147,6 +147,8 @@ def test_expert_record_geometry_at_the_real_shapes():
         "ggml_rec_iq2_s_q2_0": (524_800, 1_510_400),
         "ggml_rec_iq2_xxs_q2_0": (422_400, 1_305_600),
         "ggml_rec_iq1_m_q2_0": (358_400, 1_177_600),
+        # The MTP drafter's bank: 707,788,800 B, Strata's mtp-q2_0.gguf expert bytes.
+        "ggml_rec_q2_0_q2_0": (460_800, 1_382_400),
     }
     assert set(expected) == set(GGML_RECORD_FORMATS)
     for name, (gate_bytes, record_bytes) in expected.items():

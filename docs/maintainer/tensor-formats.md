@@ -61,13 +61,19 @@ formats (Section 3.6):
 | `ggml_rec_iq2_s_q2_0` | `ggml_iq2_s` | `ggml_q2_0` |
 | `ggml_rec_iq2_xxs_q2_0` | `ggml_iq2_xxs` | `ggml_q2_0` |
 | `ggml_rec_iq1_m_q2_0` | `ggml_iq1_m` | `ggml_q2_0` |
+| `ggml_rec_q2_0_q2_0` | `ggml_q2_0` | `ggml_q2_0` |
+
+`ggml_rec_q2_0_q2_0` holds the Qwen3.8-Flash-Next MTP drafter's experts (Strata's
+`mtp-q2_0.gguf`, whose fused `gate_up_proj` the converter splits into each record's gate and up
+rows).
 
 The C++ registry accepts the GGML block and expert record formats and materializes them to Device,
 Host or Pinned memory unchanged. Linear and LinearAdd consume `ggml_iq4_xs`, `ggml_iq3_s`, `ggml_q6_k`,
 `ggml_iq4_nl`, `ggml_q8_0` and `ggml_q2_0` at the registered problems in
 [`linear.h`](../../include/ninfer/ops/linear.h) and
 [`linear_add.h`](../../include/ninfer/ops/linear_add.h), through their Q8_1 activation profile.
-offloaded_sparse_moe consumes the three expert record formats through its canonical A8 arithmetic
+offloaded_sparse_moe consumes the three text expert record formats through its canonical A8
+arithmetic, and `ggml_rec_q2_0_q2_0` on its narrow route only
 ([`offloaded_sparse_moe.h`](../../include/ninfer/ops/offloaded_sparse_moe.h)). An Op that consumes
 a format declares its own support.
 

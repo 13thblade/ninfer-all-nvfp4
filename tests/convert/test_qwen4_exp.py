@@ -278,6 +278,58 @@ def test_conversion_stores_gguf_bytes_exactly(tmp_path):
     assert {"ggml_q8_0", "ggml_iq4_nl", "ggml_q2_0", "bf16", "fp32"} <= formats
 
 
+def test_mtp_drafter_is_stored_exactly(tmp_path):
+    from tools.artifact.reader import Artifact
+
+    path = _record_gguf(tmp_path)
+    mtp_path = fixture.write_mtp(tmp_path / "mtp.gguf")
+    out = tmp_path / "mtp.ninfer"
+    with GgufModel(path) as gguf, GgufModel(mtp_path) as mtp:
+        model = qwen4_exp.build_model(gguf, mtp=mtp)
+        qwen4_exp.bind_ngram_volume(model, os.urandom(16))
+        recipe = Recipe(model)
+        qwen4_exp_gguf(model, recipe, {"base": gguf})
+        report = convert(model, recipe, out, device="cpu")
+        summary = verify(out, gguf, mtp=mtp)
+    # One record bank, every other MTP parameter in its own object except the two packed mixers.
+    assert summary["mtp_records"] == 1
+    mtp_parameters = [name for name in model.parameters if name.startswith("mtp/")]
+    assert summary["mtp_identical"] == len(mtp_parameters) - 1 - len(qwen4_exp.MTP_PACKED)
+    banks = [m for m in report["methods"] if list(m["parameters"]) == [qwen4_exp.MTP_EXPERTS]]
+    assert [(m["format"], m["layout"], tuple(m["shape"])) for m in banks] == [
+        ("ggml_rec_q2_0_q2_0", "ggml_expert_record_v1", (fixture.E, fixture.H, fixture.F))
+    ]
+    with Artifact(out) as artifact:
+        assert artifact.directory.components["mtp"] == {
+            "config": {"architectures": ["Qwen4ExpMTP"]}, "target": "text"
+        }
+        # The drafter reuses the text head, so the head has an explicit use for each hidden state.
+        uses = {(u["parameter"], u["input"]) for u in artifact.directory.uses}
+        assert ("text/output_head", "text/final_hidden") in uses
+        assert ("text/output_head", "mtp/final_hidden") in uses
+
+
+def test_mtp_gguf_is_checked(tmp_path):
+    path = _record_gguf(tmp_path)
+    with GgufModel(path) as gguf:
+        with GgufModel(fixture.write_mtp(tmp_path / "a.gguf", architecture="qwen35")) as mtp:
+            with pytest.raises(GgufError, match="general.architecture"):
+                qwen4_exp.build_model(gguf, mtp=mtp)
+        dropped = "mtp.layers.0.self_attn.k_norm.weight"
+        with GgufModel(fixture.write_mtp(tmp_path / "b.gguf", drop=(dropped,))) as mtp:
+            with pytest.raises(GgufError, match="missing"):
+                qwen4_exp.build_model(gguf, mtp=mtp)
+
+
+def test_unit_offset_multiplier_is_the_fp32_sum():
+    gamma = torch.tensor([0.5, -0.25, 3.0, 6.47e-6], dtype=torch.float32)
+    gamma = (gamma.view(torch.int32) & ~0xFFFF).view(torch.float32)
+    stored = qwen4_exp.unit_offset_exactly("norm", gamma)
+    assert torch.equal(stored, (torch.ones(4) + gamma).to(torch.float32))
+    with pytest.raises(GgufError, match="BF16 words"):
+        qwen4_exp.unit_offset_exactly("norm", torch.tensor([1.0 + 2**-20]))
+
+
 def test_conversion_requires_a_bound_volume(gguf_path, tmp_path):
     with GgufModel(gguf_path) as gguf:
         model = qwen4_exp.build_model(gguf)

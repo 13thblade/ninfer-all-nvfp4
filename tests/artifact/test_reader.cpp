@@ -191,6 +191,9 @@ void ggml_geometry() {
                    422400, 1305600},
         RecordCase{"ggml_rec_iq1_m_q2_0", QType::GGML_REC_IQ1_M_Q2_0, QType::GGML_IQ1_M, 358400,
                    1177600},
+        // The MTP drafter's bank (not one of the 48 text layers).
+        RecordCase{"ggml_rec_q2_0_q2_0", QType::GGML_REC_Q2_0_Q2_0, QType::GGML_Q2_0, 460800,
+                   1382400},
     };
     require(parse_layout("ggml_expert_record_v1") == QuantLayout::GgmlExpertRecord &&
                 layout_name(QuantLayout::GgmlExpertRecord) == "ggml_expert_record_v1",
@@ -231,7 +234,8 @@ void ggml_geometry() {
             "an expert bank reached the native Weight");
         model_bytes += (item.format == QType::GGML_REC_IQ2_S_Q2_0     ? 34
                         : item.format == QType::GGML_REC_IQ2_XXS_Q2_0 ? 11
-                                                                       : 3) *
+                        : item.format == QType::GGML_REC_IQ1_M_Q2_0   ? 3
+                                                                       : 0) *
                        g.bytes;
     }
     require(model_bytes == 35454976000ULL, "the 48 banks differ from the GGUF's expert bytes");

@@ -173,3 +173,58 @@ def _bytes(name: str, kind: int, ne: tuple[int, ...], seed: int) -> bytes:
 
 def write(path: Path, *, metadata_changes=None, drop=(), extra=()) -> Path:
     return write_gguf(path, metadata(**(metadata_changes or {})), tensors(drop, extra))
+
+
+def mtp_tensors(drop=()) -> list[tuple[str, int, tuple[int, ...], bytes]]:
+    """The MTP drafter GGUF of the tiny model (Strata's mtp-q2_0.gguf layout): BF16 matrices,
+    F32 raw-gamma norms (BF16 words), Q2_0 experts with gate and up fused per expert."""
+    w, heads, kv, d, index = HC * H, 2, 1, 32, 3 * 16
+    p = "mtp.layers.0."
+    specs = [
+        ("mtp.fc_embedding.weight", BF16, (H, H)),
+        ("mtp.fc_hidden.weight", BF16, (H, H)),
+        ("mtp.pre_fc_norm_embedding.weight", F32, (H,)),
+        ("mtp.pre_fc_norm_hidden.weight", F32, (w,)),
+        ("mtp.hyper_connection_mixer.hc_norm.weight", F32, (w,)),
+        ("mtp.hyper_connection_mixer.input_mix_weight_down.weight", BF16, (w, LOW)),
+        ("mtp.hyper_connection_mixer.input_mix_weight_up.weight", BF16, (LOW, w)),
+        (p + "self_attn.q_proj.weight", BF16, (H, 2 * heads * d)),
+        (p + "self_attn.k_proj.weight", BF16, (H, kv * d)),
+        (p + "self_attn.v_proj.weight", BF16, (H, kv * d)),
+        (p + "self_attn.o_proj.weight", BF16, (heads * d, H)),
+        (p + "self_attn.q_norm.weight", F32, (d,)),
+        (p + "self_attn.k_norm.weight", F32, (d,)),
+        (p + "self_attn.indexer.index_qk_proj.weight", BF16, (H, index)),
+        (p + "self_attn.indexer.q_layernorm.weight", F32, (16,)),
+        (p + "self_attn.indexer.k_layernorm.weight", F32, (16,)),
+        (p + "mlp.gate.weight", BF16, (H, E)),
+        (p + "mlp.shared_expert_gate.weight", BF16, (H, 1)),
+        (p + "mlp.shared_expert.gate_proj.weight", BF16, (H, F)),
+        (p + "mlp.shared_expert.up_proj.weight", BF16, (H, F)),
+        (p + "mlp.shared_expert.down_proj.weight", BF16, (F, H)),
+        (p + "mlp.experts.gate_up_proj", Q2_0, (H, 2 * F, E)),
+        (p + "mlp.experts.down_proj", Q2_0, (F, H, E)),
+    ]
+    for mixer in ("attn_hyper_connection", "mlp_hyper_connection"):
+        q = p + mixer + "."
+        specs += [
+            (q + "hc_norm.weight", F32, (w,)),
+            (q + "input_mix_weight_down.weight", BF16, (w, LOW)),
+            (q + "input_mix_weight_up.weight", BF16, (LOW, w)),
+            (q + "block_inject_weight.weight", BF16, (w, HC)),
+        ]
+    out = []
+    for index_, (name, kind, ne) in enumerate(spec for spec in specs if spec[0] not in drop):
+        if kind == F32:
+            rng = np.random.default_rng(1000 + index_)
+            words = rng.uniform(-1.0, 1.0, prod(ne)).astype(np.float32)
+            data = ((words.view(np.uint32) >> 16) << 16).view(np.float32).astype("<f4").tobytes()
+        else:
+            data = tensor_bytes(kind, ne, seed=1000 + index_)
+        out.append((name, kind, ne, data))
+    return out
+
+
+def write_mtp(path: Path, *, architecture="qwen4exp-mtp", drop=()) -> Path:
+    items = [("general.architecture", 8, architecture), ("strata.mtp.expert_format", 8, "q2_0")]
+    return write_gguf(path, items, mtp_tensors(drop))

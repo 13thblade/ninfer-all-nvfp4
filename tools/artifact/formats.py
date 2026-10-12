@@ -106,6 +106,8 @@ GGML_REC_IQ2_XXS_Q2_0 = GgmlExpertRecordFormat(
     "ggml_rec_iq2_xxs_q2_0", GGML_IQ2_XXS, GGML_Q2_0
 )
 GGML_REC_IQ1_M_Q2_0 = GgmlExpertRecordFormat("ggml_rec_iq1_m_q2_0", GGML_IQ1_M, GGML_Q2_0)
+# The MTP drafter's routed experts (Strata's mtp-q2_0.gguf): Q2_0 gate/up and down.
+GGML_REC_Q2_0_Q2_0 = GgmlExpertRecordFormat("ggml_rec_q2_0_q2_0", GGML_Q2_0, GGML_Q2_0)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
@@ -133,7 +135,9 @@ GGML_BLOCK_FORMATS = MappingProxyType(
 GGML_RECORD_FORMATS = MappingProxyType(
     {
         item.name: item
-        for item in (GGML_REC_IQ2_S_Q2_0, GGML_REC_IQ2_XXS_Q2_0, GGML_REC_IQ1_M_Q2_0)
+        for item in (
+            GGML_REC_IQ2_S_Q2_0, GGML_REC_IQ2_XXS_Q2_0, GGML_REC_IQ1_M_Q2_0, GGML_REC_Q2_0_Q2_0
+        )
     }
 )
 NUMERIC_FORMATS = MappingProxyType(
@@ -247,6 +251,7 @@ __all__ = [
     "GGML_REC_IQ2_S_Q2_0",
     "GGML_REC_IQ2_XXS_Q2_0",
     "GGML_REC_IQ1_M_Q2_0",
+    "GGML_REC_Q2_0_Q2_0",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
     "NVFP4_FORMATS",
