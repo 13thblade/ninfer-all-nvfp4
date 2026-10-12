@@ -49,6 +49,12 @@ ninfer_add_op_test(ninfer_offloaded_moe_cpu_test
 ninfer_add_op_test(ninfer_offloaded_moe_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
   LIBRARIES ninfer_ops ninfer_artifact)
+# The wide expert route (experts with more than 8 columns in a call): bit for bit against the CPU
+# engine at T in {9, 64, 65, 2048, 4096} in every placement, FP64 on a sample of entries, and with
+# NINFER_TEST_ARTIFACT the real expert banks.
+ninfer_add_op_test(ninfer_offloaded_moe_wide_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_wide.cu"
+  LIBRARIES ninfer_ops ninfer_artifact)
 
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"

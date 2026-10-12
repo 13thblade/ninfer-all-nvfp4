@@ -9,10 +9,12 @@
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
+#include "core/vmm_arena.h"
 #include "core/vram_budget.h"
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/registry.h"
+#include "runtime/engine/validate_options.h"
 
 #include <chrono>
 #include <cstdio>
@@ -30,6 +32,10 @@ constexpr std::uint64_t kLoadStagingBytes = 4ULL * (64ULL << 20) + (8ULL << 20);
 // Below this many expert frames most routed experts miss the VRAM cache and decode slows down
 // markedly (Infernix design section 19.2).
 constexpr std::uint32_t kFewFrames = 2048;
+// The CLI bounds its MiB options to 1 TiB (serve_options.cpp: the planners add these to other byte
+// counts, convert them to signed 64-bit and divide them into 32-bit frame counts); a caller that
+// builds EngineOptions directly gets the same bound.
+constexpr std::uint64_t kMaxByteOption = 1ULL << 40;
 
 unsigned long long mib(std::uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20); }
 
@@ -44,17 +50,41 @@ void validate(const EngineOptions& options) {
     const auto refuse = [](const std::string& why) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: " + why);
     };
+    validate_engine_options(options);
     if (options.purpose != EnginePurpose::Generation) {
         refuse("serves generation only (perplexity scoring is not available for this model yet)");
     }
     if (options.max_concurrency != 1) { refuse("serves one request at a time in this release: use --max-concurrency 1"); }
     if (options.kv_cache != KvCacheStorage::Int8Group64) { refuse("its attention cache is INT8: use --kv-dtype int8"); }
-    if (options.speculative.backend != SpeculativeBackend::None || options.speculative.ngram_draft_tokens != 0) {
-        refuse("has no speculative decoding in this release: remove --spec and --ngram-draft-tokens");
+    // Every speculative field, not just the backend and n-gram window: a direct EngineOptions caller
+    // can set draft_tokens or proposal_head with the backend off, and the Program would run plain
+    // decode without saying so.
+    const SpeculativeOptions no_speculation{};
+    const auto& spec = options.speculative;
+    if (spec.backend != no_speculation.backend || spec.draft_tokens != no_speculation.draft_tokens ||
+        spec.proposal_head != no_speculation.proposal_head ||
+        spec.ngram_draft_tokens != no_speculation.ngram_draft_tokens ||
+        spec.ngram_min_match != no_speculation.ngram_min_match) {
+        refuse("has no speculative decoding in this release: remove --spec, --ngram-draft-tokens and the other "
+               "speculative flags");
     }
     if (options.kv_capacity.mode == KvCapacityMode::Automatic) {
         refuse("sizes its KV pool itself from free VRAM (it grows and shrinks per request): remove "
                "--kv-capacity auto");
+    }
+    if (options.kv_capacity.explicit_tokens != options.max_context) {
+        refuse("sizes its KV pool from --max-context, so --kv-capacity must equal it (pass the same value to "
+               "both)");
+    }
+    if (options.fit_context_floor != 0) {
+        refuse("has no context fit (its KV grows per request): remove --fit-context");
+    }
+    const auto& next = options.flash_next;
+    if (next.ram_headroom_bytes > kMaxByteOption ||
+        (next.vram_headroom_bytes && *next.vram_headroom_bytes > kMaxByteOption) ||
+        (next.expert_cache_bytes && *next.expert_cache_bytes > kMaxByteOption)) {
+        refuse("a memory option is out of range: --vram-headroom-mib, --ram-headroom-mib and "
+               "--expert-cache-mib are at most 1048576");
     }
     if (options.enable_vision) { refuse("serves text only in this release: remove --vision"); }
     if (!options.grafts.empty()) { refuse("has no prompt grafts: remove --graft"); }
@@ -167,6 +197,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     {
         models::qwen4_exp::VramDemand check_demand;
         check_demand.headroom    = next.vram_headroom_bytes;
+        // The same condition the Program sizes with (program.cpp: residency_->elastic() && vram_monitor;
+        // the expert arena exists exactly when the VMM path is supported), so the display headroom
+        // here is the 512 MiB elastic default and not the 1 GiB fixed one.
+        check_demand.elastic     = VmmArena::supported(device.device) && program_options.vram_monitor;
         check_demand.graphs      = device_plan.graph_bound;
         check_demand.fixed       = dense + device_plan.fixed_bytes();
         check_demand.frame_bytes = device_plan.expert_record_stride;
@@ -226,6 +260,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const MemorySummary memory               = instance->program->memory_summary();
     auto& resolution                         = instance->kv_capacity_resolution;
     resolution.mode                          = KvCapacityMode::Explicit;
+    resolution.requested_context             = options.max_context;
     resolution.main_page_groups              = memory.kv_capacity_page_groups;
     resolution.maximum_main_page_groups      = memory.kv_capacity_max_page_groups;
     resolution.resolved_tokens               = memory.kv_capacity;

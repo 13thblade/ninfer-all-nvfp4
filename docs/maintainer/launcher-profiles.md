@@ -8,7 +8,7 @@ run.sh <model> [profile]
 
 | model | profiles | default profile on Linux | on Windows |
 |---|---|---|---|
-| `qwen38-27b` | `tuned`, `int8`, `c8` | DFlash2, one lane, 262,144 tokens | DFlash2, one lane, 188,416 tokens |
+| `qwen38-27b` | `tuned`, `int8`, `c8` | DFlash2, one lane, up to 262,144 tokens | DFlash2, one lane, up to 188,416 tokens |
 | `qwen36-35b-a3b` | `tuned` | MTP3, three lanes, 262,144-token pool, cuBLAS prefill | MTP3, two lanes, 212,992-token pool, cuBLAS prefill |
 
 Lanes share one KV pool: `--kv-capacity` is the pool and `--max-context` the per-request cap, and
@@ -85,7 +85,7 @@ outputs and MLP down in layers 36-63 hold 0.7 GiB less on the device under DFlas
 that day with the desktop holding 1.6 GiB (more than above), it starts at 188,416 with 721 MiB free
 and is refused at 196,608, so the default is 188,416; the upstream artifact under the same
 conditions had stepped down to 150,720. The Linux defaults are the headless extrapolation -- the full context for
-DFlash2 and three 35B lanes -- and the step-down ladder catches a card that falls short. DFlash2 and
+DFlash2 and three 35B lanes -- and `--fit-context` fits a card that falls short (below). DFlash2 and
 MTP generation on `rk4v4` were checked end to end through the server at these settings.
 
 The sections below record the measurements behind the earlier `rk8v4` defaults. Both are measured in
@@ -108,22 +108,33 @@ defaults stay as measured: `NINFER_MAX_OUTPUT_TOKENS`, `NINFER_MLP_A8_DECODE=on`
 `NINFER_CONTEXT_STORE` (+ `NINFER_CONTEXT_STORE_MAX_GIB`) and `NINFER_AUTO_HOST_CACHE=on` (+
 `NINFER_HOST_CACHE_PERCENT`, `_RESERVE_MIB`, `_MAX_MIB`). `--auto-host-cache` sizes the Host context budget
 itself and refuses `--host-context-mib`, so with it on the launcher drops that flag and
-`NINFER_HOST_CONTEXT_MIB` (and the step-down's halving of it) is ignored.
+`NINFER_HOST_CONTEXT_MIB` (and the host retry's halving of it) is ignored.
 
 **When the card is busy.** A desktop or another job holding VRAM can leave too little for the default
-context, and a machine short of RAM can fail to pin the Host context budget, so there are two ways
-to be refused: the engine's runtime reservation, or pinning host memory. The `tuned` profile
-therefore steps down when startup is refused for either reason (the launcher looks for the engine's
-own `runtime reservation requires` and `cudaMallocHost failed` messages): an eighth of the context at
-a time, at most five times, with the prefill chunk capped at 2048 from the second step and
-`--host-context-mib` halved every second step (8192, 8192, 4096, 4096, 2048, 2048; floor 0).
-`--kv-capacity auto` was tried first and does not help, because the engine still has to reserve room
-for one full `--max-context` sequence. Measured on this fork's 3090 with a Windows desktop holding
-2.8 GiB, on the earlier engine: `run.bat qwen38-27b` was refused at 131,072, 114,688 and 98,304 and
-started at 81,920 (chunk 2048), and the same launcher on Linux under WSL sees the same card. Values
-the caller sets (`NINFER_CONTEXT`, `NINFER_PREFILL_CHUNK`, `NINFER_HOST_CONTEXT_MIB`,
-`NINFER_KV_CAPACITY`) are never second-guessed, `NINFER_FALLBACK=off` disables the step-down, and the
-`int8` and `c8` profiles never step down.
+context, and a machine short of RAM can fail to pin the Host context budget.
+
+For VRAM, the `tuned` profiles pass `--fit-context 32768`, which makes `--max-context` a ceiling the
+server fits itself: after the weights load it plans candidate contexts with the same sequence
+planner as the real plan and starts at the largest multiple of 1,024 tokens whose reservation fits
+the free memory less 256 MiB (`kFitContextHeadroomBytes`), `--kv-capacity` following. It logs one
+`context lowered to N tokens (asked for M)` warning when it lowered anything, and refuses below
+32,768 with the missing amount; the launcher then adds a plain "close other programs that use the
+GPU" note. The 256 MiB is for desktop growth after startup (140-230 MB was observed on this
+desktop between days); it costs about 15K tokens of rk4v4 context on the 27B. `--kv-capacity auto`
+does not do this, because the engine still reserves one full `--max-context` sequence.
+
+This replaced a launcher step-down ladder (an eighth of the context per retry, five retries, chunk
+2048 and a halved Host budget on later rungs). Measured 2026-10-12 on the desktop RTX 3090 (desktop
+holding 944 MiB), master's `run.bat qwen38-27b` was refused at 188,416 by 187 MB, printed an
+`ERROR`/`FATAL` pair, reloaded the 17 GiB of weights and started at 164,864 with 1.39 GiB free: it
+started, but through an alarming failure, a second load, and a context 23,552 tokens below what
+fit.
+
+For host RAM the launcher still retries: when pinning fails (`cudaMallocHost failed`), it halves
+`--host-context-mib` and starts again (8192, 4096, 2048, 0). Values the caller sets are never
+second-guessed: `NINFER_CONTEXT` or `NINFER_KV_CAPACITY` turn the fit off, `NINFER_HOST_CONTEXT_MIB`
+or `NINFER_AUTO_HOST_CACHE=on` the host retry, `NINFER_FALLBACK=off` both, and the `int8` and `c8`
+profiles use neither.
 
 What follows is the measurement history behind the `tuned` defaults, moved here from the launchers'
 own headers so the launchers stay readable. Figures marked "MTP profile" predate the cuBLAS prefill

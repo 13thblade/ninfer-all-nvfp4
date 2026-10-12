@@ -118,6 +118,16 @@ void test_lock_limit() {
     require(plan_host_memory(s, d).fits, "a lock limit above the pinned total fits");
     s.lock_limit.reset();
     require(plan_host_memory(s, d).fits, "no lock limit fits");
+    // The pinned load staging counts toward the limit while it overlaps the banks, up to the later pins.
+    HostMemoryDemand staged = d;
+    staged.later_pinned     = 0;
+    staged.load_staging     = 2 * kGiB;
+    const std::uint64_t peak = staged.expert_banks + staged.other_pinned + staged.load_staging;
+    s.lock_limit             = peak;
+    require(plan_host_memory(s, staged).pinned_total == peak && !plan_host_memory(s, staged).lock_limited,
+            "a lock limit equal to the staging peak fits");
+    s.lock_limit = peak - 1;
+    require(plan_host_memory(s, staged).lock_limited, "a lock limit one byte under the staging peak refuses");
 }
 
 void test_starved_and_describe() {

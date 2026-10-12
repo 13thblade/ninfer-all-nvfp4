@@ -1,26 +1,29 @@
 #include "runtime/engine/model_instance.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
+#include "core/paged_kv_cache.h"
 #include "core/startup.h"
 #include "models/qwen3_5/frontend/graft.h"
+#include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
 #include "runtime/engine/host_cache.h"
+#include "runtime/engine/validate_options.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <limits>
 #include <set>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
 namespace ninfer::runtime {
-namespace {
-using Clock = std::chrono::steady_clock;
 
-void validate_options(const EngineOptions& options) {
+void validate_engine_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
@@ -49,6 +52,35 @@ void validate_options(const EngineOptions& options) {
     default:
         throw std::invalid_argument("Engine kv_capacity mode is invalid");
     }
+    if (options.fit_context_floor != 0) {
+        if (options.purpose != EnginePurpose::Generation) {
+            throw std::invalid_argument("Engine context fit applies to Generation only");
+        }
+        if (options.fit_context_floor > options.max_context) {
+            throw std::invalid_argument("Engine fit_context_floor must not exceed max_context");
+        }
+        if (options.kv_capacity.mode != KvCapacityMode::Explicit ||
+            options.kv_capacity.explicit_tokens != options.max_context) {
+            throw std::invalid_argument(
+                "Engine context fit sizes kv_capacity with max_context; it must be explicit and "
+                "equal to max_context");
+        }
+        // Overlay Vision sizes its encode window from the context before the fit runs, so a fit
+        // may not lower the per-item token bound that window was planned for. Resident Vision
+        // plans its workspace from the fitted context, so it has no such constraint.
+        if (models::load_options(options).overlay_vision()) {
+            const std::uint64_t requested = options.vision_max_merged_tokens == 0
+                                                ? models::qwen3_5::kMaximumVisionItemTokens
+                                                : options.vision_max_merged_tokens;
+            const std::uint64_t item_bound = std::min<std::uint64_t>(
+                {options.max_context, models::qwen3_5::kMaximumVisionItemTokens, requested});
+            if (options.fit_context_floor < item_bound) {
+                throw std::invalid_argument(
+                    "with Vision, the context fit floor must be at least " +
+                    std::to_string(item_bound) + " tokens, one media item's bound");
+            }
+        }
+    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
@@ -64,6 +96,9 @@ void validate_options(const EngineOptions& options) {
     }
 }
 
+namespace {
+using Clock = std::chrono::steady_clock;
+
 std::size_t current_free_device_bytes() {
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
@@ -71,10 +106,12 @@ std::size_t current_free_device_bytes() {
     return free_bytes;
 }
 
-// Free memory on each rank's device, in rank order. Ranks that share a physical device (the
-// `--devices 0,0` mode that exercises the stage path on one card) split what is free between
-// them, since each one's budget is spent from the same memory.
-std::vector<std::size_t> free_bytes_by_rank(const DeviceContext& device) {
+// Free memory on each rank's device, in rank order, less `reserve_bytes` kept spare once per
+// physical device. Ranks that share a physical device (the `--devices 0,0` mode that exercises the
+// stage path on one card) split what is left between them, since each one's budget is spent from
+// the same memory.
+std::vector<std::size_t> free_bytes_by_rank(const DeviceContext& device,
+                                            std::size_t reserve_bytes = 0) {
     std::vector<std::size_t> out;
     out.reserve(device.size());
     for (std::size_t rank = 0; rank < device.size(); ++rank) {
@@ -83,9 +120,101 @@ std::vector<std::size_t> free_bytes_by_rank(const DeviceContext& device) {
             if (device.same_physical_device(rank, other)) { ++sharing; }
         }
         const RankBinding bind(device, rank);
-        out.push_back(current_free_device_bytes() / sharing);
+        const std::size_t free_bytes = current_free_device_bytes();
+        out.push_back((free_bytes > reserve_bytes ? free_bytes - reserve_bytes : 0) / sharing);
     }
     return out;
+}
+
+std::string gib_text(std::size_t bytes) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.2f GiB",
+                  static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
+    return text;
+}
+
+std::string token_text(std::uint32_t tokens) {
+    std::string digits = std::to_string(tokens);
+    for (std::size_t at = digits.size(); at > 3; at -= 3) { digits.insert(at - 3, ","); }
+    return digits;
+}
+
+// EngineOptions::fit_context_floor: lowers max_context and kv_capacity together to the largest
+// context whose plan fits the device memory free now, less kFitContextHeadroomBytes. Each candidate
+// is planned exactly as the real plan will be, so the answer is the planner's, not an estimate.
+void fit_context_to_device(EngineOptions& options, ModelInstance& instance, DeviceContext& device) {
+    const std::vector<std::size_t> budgets = free_bytes_by_rank(device, kFitContextHeadroomBytes);
+    const std::size_t primary              = budgets.front();
+    const std::vector<std::size_t> extras(budgets.begin() + 1, budgets.end());
+    const std::uint32_t ceiling       = options.max_context;
+    const KvCapacityPolicy ceiling_kv = options.kv_capacity;
+    // The frontend rejects a graft with slots >= max_context, so no candidate may sit at or below
+    // the largest loaded graft; the planner's reservation knows nothing of grafts.
+    std::uint32_t largest_graft_slots = 0;
+    for (const auto& graft : instance.frontend.grafts()) {
+        const std::size_t slots = graft.kind == models::qwen3_5::GraftKind::PrefillKV
+                                      ? graft.tokens.size()
+                                      : graft.n_slots;
+        largest_graft_slots     = std::max<std::uint32_t>(
+            largest_graft_slots,
+            static_cast<std::uint32_t>(std::min<std::size_t>(
+                slots, std::numeric_limits<std::uint32_t>::max())));
+    }
+    // Every candidate must also be one the planner accepts: it rejects an explicit capacity under
+    // max_concurrency pages (e.g. --fit-context 1 with 8 lanes), which would throw from the probe
+    // instead of simply not fitting. Clamp the floor so no probed candidate is planner-invalid.
+    const std::uint32_t floor = std::max(
+        effective_fit_floor(options.fit_context_floor, largest_graft_slots),
+        minimum_plannable_context(options.max_concurrency,
+                                  static_cast<std::uint32_t>(kPagedKVPageSize)));
+    if (floor > ceiling) {
+        throw std::invalid_argument(
+            "the context fit floor, " + token_text(floor) +
+            " tokens (raised to clear the loaded prompt grafts and one page per concurrent "
+            "sequence), is above the context, " + token_text(ceiling) + " tokens");
+    }
+    // Each candidate is planned from the real options with only the context changed.
+    const auto curve_at = [&](std::uint32_t context) {
+        options.max_context = context;
+        options.kv_capacity = KvCapacityPolicy::explicit_capacity(context);
+        try {
+            auto planner = models::qwen3_5::make_sequence_planner(instance.parameters, device, options);
+            SequenceCapacityCurve curve = planner.capacity_curve();
+            options.max_context         = ceiling;
+            options.kv_capacity         = ceiling_kv;
+            return curve;
+        } catch (...) {
+            options.max_context = ceiling;
+            options.kv_capacity = ceiling_kv;
+            throw;
+        }
+    };
+    const auto fitted = fit_context(floor, ceiling, kFitContextStepTokens,
+                                    [&](std::uint32_t context) {
+                                        return explicit_capacity_fits(context, curve_at(context),
+                                                                      primary, extras);
+                                    });
+    if (!fitted) {
+        const auto short_rank = explicit_capacity_shortfall(floor, curve_at(floor), primary, extras);
+        if (!short_rank) {
+            throw std::invalid_argument(
+                "the context fit floor, " + token_text(floor) +
+                " tokens, is outside the range the planner can size");
+        }
+        const std::vector<std::size_t> free_now = free_bytes_by_rank(device);
+        throw std::invalid_argument(
+            "not enough free GPU memory to start: even the smallest context allowed, " +
+            token_text(floor) + " tokens, needs " + gib_text(short_rank->need_bytes) +
+            " beside the model weights plus " +
+            std::to_string(kFitContextHeadroomBytes / (1024U * 1024U)) +
+            " MiB kept spare, and only " + gib_text(free_now[short_rank->rank]) + " is free" +
+            (free_now.size() > 1 ? " on device " + std::to_string(short_rank->rank) : std::string()) +
+            ". Close other programs that use the GPU and start again");
+    }
+    if (*fitted == ceiling) { return; }
+    options.max_context = *fitted;
+    options.kv_capacity = KvCapacityPolicy::explicit_capacity(*fitted);
+    instance.refit_context(options);
 }
 
 } // namespace
@@ -149,23 +278,39 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     return options;
 }
 
+namespace {
+
+models::qwen3_5::Frontend make_instance_frontend(const models::qwen3_5::Model& model,
+                                                 const EngineOptions& options) {
+    return models::qwen3_5::make_frontend(
+        model.resources(), {.chat_template_path       = options.chat_template_path,
+                            .grammar_cache_bytes      = options.grammar_cache_bytes,
+                            .architecture             = model.config().text.architecture,
+                            .vision_enabled           = options.enable_vision,
+                            .max_context              = options.max_context,
+                            .media_cache_bytes        = options.media_cache_bytes,
+                            .media_live_bytes         = options.media_live_bytes,
+                            .media_preprocess_threads = options.media_preprocess_threads,
+                            .vision_max_merged_tokens = options.vision_max_merged_tokens,
+                            .grafts                   = models::qwen3_5::load_prompt_grafts(
+                                options.grafts, model.config().text),
+                            .ngram_index = options.speculative.ngram_draft_tokens != 0});
+}
+
+} // namespace
+
 ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                              const EngineOptions& options)
     : model(std::move(source)), parameters(*model),
-      frontend(models::qwen3_5::make_frontend(
-          model->resources(), {.chat_template_path       = options.chat_template_path,
-                               .grammar_cache_bytes      = options.grammar_cache_bytes,
-                               .architecture             = model->config().text.architecture,
-                               .vision_enabled           = options.enable_vision,
-                               .max_context              = options.max_context,
-                               .media_cache_bytes        = options.media_cache_bytes,
-                               .media_live_bytes         = options.media_live_bytes,
-                               .media_preprocess_threads = options.media_preprocess_threads,
-                               .vision_max_merged_tokens = options.vision_max_merged_tokens,
-                               .grafts                   = models::qwen3_5::load_prompt_grafts(
-                                   options.grafts, model->config().text),
-                               .ngram_index = options.speculative.ngram_draft_tokens != 0})),
-      capacity(options.max_context) {}
+      frontend(make_instance_frontend(*model, options)), capacity(options.max_context) {}
+
+void ModelInstance::refit_context(const EngineOptions& options) {
+    if (program != nullptr) {
+        throw std::logic_error("the context cannot be refitted once the Program exists");
+    }
+    frontend = make_instance_frontend(*model, options);
+    capacity = options.max_context;
+}
 
 ModelInstance::~ModelInstance() = default;
 
@@ -192,7 +337,7 @@ void ModelInstance::install_external_checkpoints() {
 }
 
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
-    validate_options(options);
+    validate_engine_options(options);
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
@@ -257,6 +402,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
             resolve_host_capacity_bytes(options.context_cache, *available, environment);
         options.context_cache.auto_host_cache = false;
     }
+    const std::uint32_t requested_context = options.max_context;
+    if (options.fit_context_floor != 0) { fit_context_to_device(options, *instance, device); }
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
         {.hardware_class =
@@ -277,6 +424,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     }
     options.context_cache.host_capacity_bytes = sequence.host_capacity_bytes();
     instance->kv_capacity_resolution          = resolution;
+    instance->kv_capacity_resolution.requested_context = requested_context;
     planning.complete();
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
