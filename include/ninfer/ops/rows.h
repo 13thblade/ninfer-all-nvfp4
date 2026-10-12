@@ -37,7 +37,7 @@ void split_rows(const Tensor& in, std::span<Tensor* const> outs, cudaStream_t st
  * Logical shapes:
  *   in BF16 [R, T]; columns I32 [N], each in [0, T); out BF16 [R, N].
  *
- * Supported domain: contiguous tensors.
+ * Supported domain: contiguous, non-null tensors; columns is rank one.
  * Effects: writes out; in and columns are read only and must not overlap out.
  * Workspace: none. Execution: stream-ordered; graph capturable.
  */
