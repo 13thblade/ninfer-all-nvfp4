@@ -62,6 +62,10 @@ def test_tojson_accepts_the_server_filter_options():
     assert render("v | tojson(sort_keys=true)") == '{"a": [1, 2], "b": "é"}'
     assert render("v | tojson(ensure_ascii=true)") == '{"b": "\\u00e9", "a": [1, 2]}'
     assert render("v | tojson(separators=[',', ':'])") == '{"b":"é","a":[1,2]}'
+    assert render("v | tojson(separators=[])") == '{"b": "é", "a": [1, 2]}'
+    assert render("v | tojson(separators=[','])") == '{"b": "é","a": [1,2]}'
+    assert render("v | tojson(separators=[',', ':', ';'])") == '{"b":"é","a":[1,2]}'
+    assert render("v | tojson(indent=1, separators=[])") == '{\n "b": "é",\n "a": [\n  1,\n  2\n ]\n}'
     assert render("v | tojson(false, 1, none, true)") == '{\n "a": [\n  1,\n  2\n ],\n "b": "é"\n}'
 
 
@@ -87,6 +91,7 @@ def _write_run(tmp_path, *, server_tokens, logged):
     (run / "turns.jsonl").write_text(json.dumps({
         "session": 0, "turn": 0, "copy": False, "prompt_tokens": server_tokens,
         "error": None}) + "\n", encoding="utf-8")
+    (run / "summary.json").write_text('{"complete": true}\n', encoding="utf-8")
     if logged:
         (run / "output_token_ids.jsonl").write_text("", encoding="utf-8")
     return run, resources
@@ -117,3 +122,35 @@ def test_export_fails_when_request_log_lacks_an_output(tmp_path):
     out = tmp_path / "streams.jsonl"
     assert export(run, None, resources, out) == 1
     assert not out.exists()
+
+
+def test_export_refuses_a_run_without_summary_json(tmp_path):
+    from tools.bench.agent_replay.export import export
+
+    run, resources = _write_run(tmp_path, server_tokens=1, logged=False)
+    (run / "summary.json").unlink()
+    out = tmp_path / "streams.jsonl"
+    assert export(run, None, resources, out) == 1
+    assert not out.exists()
+
+
+def test_export_refuses_a_run_not_marked_complete(tmp_path):
+    from tools.bench.agent_replay.export import export
+
+    run, resources = _write_run(tmp_path, server_tokens=1, logged=False)
+    out = tmp_path / "streams.jsonl"
+    for body in ('{"complete": false}\n', "{}\n", "not json"):
+        (run / "summary.json").write_text(body, encoding="utf-8")
+        assert export(run, None, resources, out) == 1
+        assert not out.exists()
+
+
+def test_export_removes_a_stale_stream_when_it_refuses_an_incomplete_run(tmp_path):
+    from tools.bench.agent_replay.export import TOKEN_STREAM_NAME, export
+
+    run, resources = _write_run(tmp_path, server_tokens=1, logged=False)
+    (run / "summary.json").write_text('{"complete": false}\n', encoding="utf-8")
+    stale = run / TOKEN_STREAM_NAME
+    stale.write_text("stale\n", encoding="utf-8")
+    assert export(run, None, resources, stale) == 1
+    assert not stale.exists()

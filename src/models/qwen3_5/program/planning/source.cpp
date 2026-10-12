@@ -22,6 +22,22 @@ bool ProgramImpl::checkpoint_matches(CheckpointHandle handle, const RequestBaseP
                           record.identity->prefix_identity, record.frontier);
 }
 
+runtime::PrefillWork ProgramImpl::prefill_work(const RequestBasePlan& base, std::uint32_t begin,
+                                               std::uint32_t end) const {
+    const auto& prompt = *base.impl_->prompt;
+    auto work          = runtime::make_prefill_work(begin, end > begin ? end - begin : 0, 0, 0,
+                                                    prefill_chunk);
+    for (const auto& item : prompt.vision_items) {
+        if (std::any_of(item.token_spans.begin(), item.token_spans.end(), [&](const auto& span) {
+                return span.begin + span.count > begin && span.begin < end;
+            })) {
+            ++work.vision_items;
+            work.vision_patches += item.patch_count;
+        }
+    }
+    return work;
+}
+
 std::optional<SourceCandidate>
 ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> handle,
                             bool consume_source, std::span<const CheckpointHandle> private_points,
@@ -38,17 +54,8 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         !checkpoint(*handle).tail_hidden_valid) {
         return std::nullopt;
     }
-    candidate.remaining_work = runtime::make_prefill_work(
-        candidate.reused_tokens, base.summary().prompt_tokens - candidate.reused_tokens, 0, 0,
-        prefill_chunk);
-    for (const auto& item : prompt.vision_items) {
-        if (std::any_of(item.token_spans.begin(), item.token_spans.end(), [&](const auto& span) {
-                return span.begin + span.count > candidate.reused_tokens;
-            })) {
-            ++candidate.remaining_work.vision_items;
-            candidate.remaining_work.vision_patches += item.patch_count;
-        }
-    }
+    candidate.remaining_work =
+        prefill_work(base, candidate.reused_tokens, base.summary().prompt_tokens);
     if (!handle) { return candidate; }
     const auto& record       = checkpoint(*handle);
     candidate.consume_source = consume_source;

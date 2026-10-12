@@ -115,6 +115,11 @@ The variable-width DFlash2 target-attention subset can be run with
 cache codecs, W=2..16, B=1..8, request-local prefixes, cache effects, and Graph metadata/input
 updates. The default executable also runs the existing attention geometries and prefill tests.
 
+`ninfer_qsa_test` qualifies the four QSA Ops (index query, pooled keys, block selection, attention
+over selected blocks) against their FP64 and exact oracles. `--small` runs the quick subset used
+under compute-sanitizer:
+`compute-sanitizer --tool memcheck build/tests/ninfer_tests ninfer_qsa_test --small`.
+
 Linear tests are independently runnable by weight and activation-compute profile:
 
 ```bash
@@ -156,7 +161,7 @@ Run the native Python suites with the project Python environment:
 
 ```bash
 python3 -m pytest \
-  tests/artifact tests/convert tests/bench/ttft \
+  tests/artifact tests/convert tests/flash_next tests/bench/ttft \
   tests/test_serve_corpus.py
 ```
 
@@ -164,17 +169,115 @@ The Python suites exercise conversion, encoded output and measurement tools with
 The maintained environment uses Python 3.11 with the dependencies for those suites. C++ binding and Engine tests
 cover consumption of their resulting representation.
 
-The GGML block decoders are checked against committed golden fixtures from ggml's reference
-`dequantize_row_*`. Optional environment variables extend the GGML and GGUF checks:
+The GGML block decoders, Python (`tests/artifact/test_ggml_codecs.py`) and C++
+(`ninfer_ggml_blocks_decode_test`, for the host oracle `tests/ops/ggml_blocks_decode.h`), are
+checked against committed golden fixtures from ggml's reference `dequantize_row_*`
+(`tests/fixtures/ggml/<format>.blocks` and `.f32`). `ninfer_artifact_ggml_real_test` loads a real
+GGML artifact named by `NINFER_TEST_ARTIFACT` (such as `--subset dev` below) through Device, Pinned
+and Host residency and requires the C++ and Python decoders to agree bit for bit on sampled blocks,
+including blocks of every part of the expert records; it skips without the variable or when that
+artifact has no GGML tensor. `tests/artifact/test_ngram_volume.py` covers the n-gram volume file
+(header fields, block geometry at the real table, exact row placement, the 512-row reuse check).
+Optional environment variables extend the Python GGML and GGUF checks:
 
 | Variable | Adds |
 |---|---|
 | `NINFER_GGML_BASE_DLL` | the live oracle: ggml-base (`.dll` or `.so`) of llama.cpp b11316 decodes 100,000 random blocks per format, and 1,000 real blocks per format with `NINFER_TEST_GGUF` |
-| `NINFER_TEST_GGUF` | the real Qwen3.8-Flash-Next GGUF (first split file): tensor inventory, whole-model name map, export conventions, and a `--subset dev` conversion compared byte for byte (~2.9 GB in the test's temporary directory) |
-| `NINFER_TEST_QWEN4EXP_SUBSET` | verify that existing `--subset dev` artifact instead of converting one |
+| `NINFER_TEST_GGUF` | the real Qwen3.8-Flash-Next GGUF (first split file): tensor inventory, whole-model name map and expert record bytes, export conventions and hash parameters, and a `--subset dev` conversion and its n-gram volume compared byte for byte against the GGUF, expert records through their exact inverse (~2.9 GB in the test's temporary directory) |
+| `NINFER_TEST_QWEN4EXP_SUBSET` | verify that existing `--subset dev` artifact, and the volume beside it as `<artifact>.ngram`, instead of converting one |
 | `NINFER_TEST_QWEN38_ARTIFACT` | a Qwen3.8 `.ninfer` whose tokenizer the GGUF vocabulary must equal |
 
 `python -m tools.artifact.gen_ggml_fixtures --dll PATH` regenerates the fixtures.
+
+`ninfer_linear_ggml_test` qualifies Linear and LinearAdd over the six GGML formats they register,
+at every registered problem and T in {1..8, 9, 63, 64, 65, 300}: the weight is decoded by that host
+oracle, the activation passes through an independent host copy of the contract's Q8_1 cast, and
+the output is compared with the FP64 product. It also checks the cast exactly, byte for byte against
+the wide route's cast kernel and through the public Op on both routes, and the admission rules.
+`--format NAME` and `--shape N K` select problems; the full run takes about a minute, most of it the
+host oracle.
+
+`ninfer_offloaded_moe_cpu_test` (host only) and `ninfer_offloaded_moe_layer_test` qualify
+offloaded_sparse_moe over the three GGML expert record formats. The CPU test checks the canonical A8
+cast bit for bit against an independent FP64 formulation, the exact sub-block decode of IQ2_S,
+IQ2_XXS, IQ1_M and Q2_0 against the host decoder above, the CPU expert engine against the FP64
+expert oracle at T in {1, 2, 7, 8}, and AVX2, scalar and the worker team at 1-16 workers for equal
+bits. The layer test checks routing (exact top-10 with ties to the lower id) and dispatch exactly,
+then requires every routed output of the GPU narrow route to equal the CPU engine's bits for records
+in device frames, read zero-copy, staged through 1, 3 or 64 slots, and served by the CPU miss service
+at 1 and 6 workers (T in {1, 2, 7, 8, 16}), and the whole layer, with a shared expert composed of
+GGML linears and the combine, against FP64. With `NINFER_TEST_ARTIFACT` it repeats the placements on
+32 real experts of every expert bank of the artifact. `--small` runs a reduced set for
+compute-sanitizer.
+
+`ninfer_offloaded_moe_wide_test` qualifies the wide expert route (experts with more than 8 columns
+in a call): every routed output must equal the CPU engine's bits at T in {9, 64, 65, 2048, 4096}
+for each record format, with records in device frames, read zero-copy, staged through 64 or 3 slots
+(passes of 3 jobs) and mixed; hot experts put wide jobs at the route's boundaries (9 columns, one
+64-column tile, two tiles). A sample of entries is checked against the FP64 expert oracle. With
+`NINFER_TEST_ARTIFACT` it checks 32 real experts of every bank at T in {64, 2048}. `--small` is the
+compute-sanitizer set; `--bench` times 512 resident experts at T in {256, 1024, 2048, 4096}.
+
+The Qwen3.8-Flash-Next Ops ported from Infernix have their own suites, each a few seconds:
+`ninfer_hyper_connection_test` (the mixer against its FP64 formula on both arithmetic profiles,
+fused T ≤ 16 and composed above, column invariance, graph equal to eager; inject and expand exact),
+`ninfer_ple_test` (the IQ4_NL row decode exact against the host decoder; the gate and the stateful
+convolution against FP64, states bit for bit, split calls equal to one call, commit equal to the
+in-place update), `ninfer_projection_fp32_test` (BF16 router segments and the IQ4_XS head against
+FP64 within the FP32 accumulation bound, column invariance) and `ninfer_rows_test` (exact splits and
+gathers with guard bytes). Their model also uses `ninfer_embedding_test`'s GGML IQ4_XS table (exact
+against the host decoder), `ninfer_gdn_gating_test`'s decay form (the GGUF's stored
+`-exp(A_log)`), and `ninfer_gated_rmsnorm_test`'s sigmoid gate.
+
+The qwen4exp model itself (`src/models/qwen4_exp`) has two host-only tests,
+`ninfer_qwen4_exp_ngram_hash_test` (the PLE n-gram row ids exactly against
+`tests/fixtures/qwen4_exp/ngram_rows.txt`, Infernix's fixture written by
+`tools/flash_next/ngram.py`, and the Flash-Next GGUF's literal hash tables) and
+`ninfer_qwen4_exp_ngram_volume_test` (the volume reader on a 190 MB synthetic version 2 volume:
+one read per distinct block, ring wrap, the host cache and its slot collisions, the threaded route
+of a prefill-sized call, refusals of another size, version, row format or id, and the keep-alive).
+`ninfer_qwen4_exp_forward_real_test` runs the whole model on the converted artifact named by
+`NINFER_TEST_QWEN4EXP_ARTIFACT` (the n-gram volume is `NINFER_TEST_QWEN4EXP_NGRAM` or
+`<artifact>.ngram`; it skips without them). It pins ~33 GiB of expert records in host memory, so
+check the available memory first. Given a token list it prefills it once, writes the optional
+`--logits`, `--residuals`, `--routes` and `--blocks` taps, then prefills all but the last
+`--decode N` tokens again and decodes them one call each (timed), and requires the last decode's
+top token to equal the single prefill's. With `--dump-logits OUT.bin [--chunk N]` after each of
+several token lists it scores them teacher-forced in Strata's `--dump-logits` layout instead.
+`tests/fixtures/qwen4_exp/` holds the PR 0 token sets (`ppl_tokens`, `infernix_texts`; JSON and
+`strata_compare`'s `.ids`). The FP64 reference that checks it is `tools/flash_next`:
+
+```powershell
+$env:NINFER_TEST_QWEN4EXP_ARTIFACT = "K:\ninfer-models\qwen4exp\qwen4exp-iq2xs.ninfer"
+build-ninja\tests\ninfer_tests.exe ninfer_qwen4_exp_forward_real_test "@ids.txt" --blocks blocks.bin `
+  --residuals residuals.bin --decode 8
+python -m tools.flash_next.block_check --artifact $env:NINFER_TEST_QWEN4EXP_ARTIFACT --tokens "@ids.txt" `
+  --blocks blocks.bin --residuals residuals.bin --layers 0,1,3
+build-ninja\tests\ninfer_tests.exe ninfer_qwen4_exp_forward_real_test "@DIR\code.ids" `
+  --dump-logits DIR\ninfer-code.bin "@DIR\doc.ids" --dump-logits DIR\ninfer-doc.bin
+python -m tools.flash_next.strata_compare --texts DIR
+```
+
+The Program and Engine integration adds two host-only tests and one Engine-level real test.
+`ninfer_qwen4_exp_expert_cache_test` (lifted from Infernix with the expert cache) checks the LFRU
+policy decision for decision against `tests/fixtures/expert_cache/lfru_conformance.txt` (the
+replay tool's victims), residency words, frame epochs, pool resizes and relocations, load serials,
+lending, landing, the tier gates and the warm-start state file. `ninfer_qwen4_exp_memory_plan_test`
+checks the RAM ledger (fits or refuses, the reserve applied once, lock overhead, the page-file
+limit, the refusal's shortfall) and the VRAM sizing and control law. `ninfer_qwen4_exp_engine_real_test`
+(skips without `NINFER_TEST_QWEN4EXP_ARTIFACT`) runs the M1 gates through the public Engine: an
+Engine asked to keep 1 TiB free must refuse before pinning; then one greedy request's ids must be
+identical with the expert cache cold, warm, warm-started from the first Engine's saved state, and
+capped at 1 GiB (evicting every round) with a 64-token KV base and no CUDA graph; and a ~5,100-token
+prompt (every fixture text: past QSA's 2,048-token selection budget, and past the small Engine's KV
+base, which grows) must give the same ids in the default and the small-cache Engine. It loads the model three times (about five minutes). With `--bench` it loads once and
+runs each `@FILE` prompt in order with greedy output and model stops off (`--generate N`, default
+512), printing prefill and decode rates; the Program logs each request's expert hit rate:
+
+```powershell
+build-ninja\tests\ninfer_tests.exe ninfer_qwen4_exp_engine_real_test --bench --max-context 33792 `
+  "@prompts\1k-r0.ids" "@prompts\8k-r0.ids" "@prompts\32k-r0.ids"
+```
 
 The real loading test accepts an explicit artifact path and optional component selection:
 

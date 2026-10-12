@@ -28,6 +28,10 @@ struct ServeOptions {
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
+    // --fit-context MIN: --max-context becomes a ceiling the Engine lowers to what fits, never
+    // below MIN (EngineOptions::fit_context_floor). 0 = off. After startup, max_context and
+    // kv_capacity hold what the Engine resolved.
+    std::uint32_t fit_context_floor    = 0;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     // Admission waits behind the active set, so the deadline has to cover the generation
@@ -58,6 +62,8 @@ struct ServeOptions {
     VisionResidency vision_residency       = VisionResidency::Resident;
     std::uint32_t vision_max_merged_tokens = 16384;
     bool use_cuda_graph     = true;
+    // Qwen3.8-Flash-Next only: its n-gram volume, expert-cache state and memory headrooms.
+    FlashNextOptions flash_next;
     bool lm_head_q4         = false;
     bool lm_head_q6         = false;
     bool embedding_q4       = false;
@@ -89,6 +95,9 @@ struct ServeOptions {
     bool exit_on_engine_failure = true;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
+    // --tolerant-tool-calls: repair free (`tool_constraints:"auto"`) tool-call markup the strict
+    // parser returns as text. Off keeps the strict all-or-nothing parse.
+    bool tolerant_tool_calls = false;
     // --graft NAME=PATH, repeatable: phantom-kv grafts a request may select with "graft": NAME.
     std::vector<GraftSource> grafts;
     // --default-graft NAME: graft applied to a request that states none ("graft": "" opts out).

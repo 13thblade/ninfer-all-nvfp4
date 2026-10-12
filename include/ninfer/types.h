@@ -61,6 +61,11 @@ enum class KvCapacityMode : std::uint8_t {
 };
 
 inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
+// EngineOptions::fit_context_floor: the device memory a fitted context leaves free beyond its plan,
+// so a desktop that grows after startup (140-230 MB measured on a Windows desktop) does not push
+// the card into paging, and the step between fitted contexts.
+inline constexpr std::size_t kFitContextHeadroomBytes = 256ULL * 1024ULL * 1024ULL;
+inline constexpr std::uint32_t kFitContextStepTokens  = 1024;
 
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
@@ -99,7 +104,7 @@ struct SpeculativeOptions {
     // request (its prompt, a tool result or its own output), a round verifies what followed it,
     // up to this many drafts, instead of the draft model's proposal. Verification licenses every
     // token, so a wrong copy costs throughput and never changes output. 0 disables it. The product
-    // flags accept only 15; the Engine accepts 1..15 above draft_tokens so benchmarks can measure
+    // flags accept only 15; the Engine accepts 1..15 at least draft_tokens so benchmarks can measure
     // other verify widths. Requires DFlash2.
     std::uint32_t ngram_draft_tokens = 0;
     // Tail tokens a copy must match before it is proposed, 4..64.
@@ -271,6 +276,29 @@ struct GraftSource {
     std::filesystem::path path;
 };
 
+// Qwen3.8-Flash-Next (Qwen4ExpForCausalLM) only; other models ignore these.
+struct FlashNextOptions {
+    // The per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
+    std::filesystem::path ngram_volume_path;
+    // The VRAM expert cache's saved state: read at startup to fill the cache with the experts the
+    // last session used most (warm start), written at shutdown and between requests every 10
+    // minutes. Empty uses `<artifact>.expert-state`; `save_expert_state = false` neither reads nor
+    // writes it.
+    std::filesystem::path expert_state_path;
+    bool save_expert_state = true;
+    // Device memory the expert cache leaves free for the display and other programs once every
+    // fixed allocation is made. Empty: 512 MiB with a display attached, 256 MiB headless.
+    std::optional<std::uint64_t> vram_headroom_bytes;
+    // At most this much device memory for the expert cache (measurement; empty: what fits).
+    std::optional<std::uint64_t> expert_cache_bytes;
+    // Physical Host memory left free for Windows and other programs once every expert is pinned;
+    // startup refuses when it cannot be kept.
+    std::uint64_t ram_headroom_bytes = 2ULL << 30;
+    // Tokens of KV backed at startup; requests needing more borrow it from the expert cache (0:
+    // 32,768). Measurement and tests.
+    std::uint32_t kv_base_tokens = 0;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -288,6 +316,12 @@ struct EngineOptions {
     std::vector<std::uint32_t> stage_layers;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    // Nonzero makes max_context a ceiling (Generation only; kv_capacity must be explicit and equal
+    // to it): when the plan at max_context does not fit the device memory free after the weights
+    // less kFitContextHeadroomBytes, construction lowers max_context and kv_capacity together to
+    // the largest multiple of kFitContextStepTokens that does, never below this floor, and fails
+    // with the missing amount when not even the floor fits. The options then hold the result.
+    std::uint32_t fit_context_floor    = 0;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
@@ -349,6 +383,7 @@ struct EngineOptions {
     std::vector<GraftSource> grafts;
     StartupObserver startup_observer;
     ContextStoreOptions context_store;
+    FlashNextOptions flash_next;
     // Called on the worker thread for each host-side worker failure, after recovery or latch.
     // Must be quick; exceptions are ignored.
     std::function<void(const EngineFaultEvent& event)> fault_listener;
@@ -418,6 +453,9 @@ struct StopPolicy {
     std::vector<StopString> strings;
     bool include_model_defaults = true;
     bool publish_stop_token     = false;
+    // Set by the frontend's merge: the stop ids in token_ids that only the checkpoint defaults
+    // supplied (not also listed by the caller). Empty on a caller-built policy.
+    std::vector<TokenId> model_default_token_ids;
 };
 
 // What the reasoning-loop guard does when the open thinking keeps repeating whole passages (every
@@ -457,6 +495,10 @@ struct OutputOptions {
     // Presentation constraint supplied by the protocol adapter. It bounds only Qwen's emitted
     // function-name grammar; it does not require the name to match a currently declared tool.
     std::uint32_t tool_name_max_length = 128;
+    // Repair Qwen tool-call markup the strict free parser rejects (`--tolerant-tool-calls`). Only
+    // free tool output consults it; constrained tool contracts already admit only exact calls.
+    // A call whose parameter value was cut is never kept.
+    bool tolerant_tool_calls = false;
 };
 
 enum class OutputConstraintKind : std::uint8_t { Grammar, JsonObject, JsonSchema, Choice, Regex };
@@ -548,7 +590,6 @@ struct GeneratedToolCall {
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
-    DuplicateParameter,
     InvalidToolName,
     UndeclaredTool,
     TrailingContent,
@@ -561,8 +602,6 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "none";
     case ToolCallParseFallbackReason::MalformedStructure:
         return "malformed_structure";
-    case ToolCallParseFallbackReason::DuplicateParameter:
-        return "duplicate_parameter";
     case ToolCallParseFallbackReason::InvalidToolName:
         return "invalid_tool_name";
     case ToolCallParseFallbackReason::UndeclaredTool:
@@ -578,7 +617,15 @@ struct ToolCallParseDiagnostics {
     std::uint32_t structured_call_count         = 0;
     std::uint32_t empty_arguments_omitted       = 0;
     std::uint32_t schema_mismatch_arguments     = 0;
+    // Repeated parameter names in a published call; the last value is kept.
+    std::uint32_t duplicate_parameters_repaired = 0;
     ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
+    // The structured calls came from free tool output whose turn ended inside unclosed thinking.
+    bool recovered_from_reasoning = false;
+    // Tolerant tool-call parsing repaired markup the strict parser rejects to produce the
+    // structured calls: a discarded suffix or malformed later call, a repaired opener, a kept
+    // undeclared name, or closing tags missing at the end of a turn the model ended itself.
+    bool tolerant_recovered = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
@@ -1165,6 +1212,9 @@ struct VisionWorkspaceMemorySummary {
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
+    // The max_context the Engine was asked for; larger than max_context when fit_context_floor
+    // lowered it to what the device could hold.
+    std::uint32_t requested_max_context       = 0;
     KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
     std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
     std::uint32_t kv_capacity_page_groups     = 0;

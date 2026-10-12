@@ -9,35 +9,441 @@ references, `engine-architecture.md`).
 
 | PR | Scope | Status |
 |---|---|---|
-| 0 | Strata baselines: decode, MTP, prefill, teacher-forced log-probs on frozen token ids | not started |
+| 0 | Strata baselines: decode, MTP, prefill, teacher-forced log-probs on frozen token ids | done (measurement; token sets in `tests/fixtures/qwen4_exp/`) |
 | 1 | GGUF reader, nine exact GGML block formats, `ggml_blocks_v1` / `ggml_rows_page4k_v1`, `qwen4_exp` name map, tokenizer synthesis, `--subset dev` | done (Python only) |
-| 2 | C++ registration and materialization of the GGML formats and layouts; host exact decoder | next |
-| 3-9 | Dense GGML linears, hyper-connections and FP32 head, QSA, PLE frontend and stream residency, model skeleton, MoE on GPU, MoE on CPU | not started |
-| 10 | Whole model at 32K, quality gate against Strata | not started |
-| 11-14 | Residency policy and miss split, 128K, MTP, vision | not started |
+| 2 | C++ registration and materialization of the GGML formats and layouts; host exact decoder | done |
+| 2b | Infernix-aligned artifact: `ggml_expert_record_v1` expert banks and three record formats (Python and C++), the n-gram table as an Infernix-format volume with IQ4_NL rows, Infernix's text config keys; replaces PR 1's two-object banks and `ggml_rows_page4k_v1` | done |
+| 3 | Dense GGML linears: `linear`/`linear_add` for IQ4_XS, IQ3_S, Q6_K, IQ4_NL, Q8_0, Q2_0 at the model's 19 dense problems, Q8_1 activation profile | done (perf gates below) |
+| 4 | PLE frontend and stream residency | not started |
+| 5 | QSA Ops from Infernix: index query, pooled keys, block selection, attention (Int8Group64) | done |
+| 6 | Ops from Infernix: `hyper_connection` (mix, inject, expand), `ple` (IQ4_NL `ple_embed`, gate, stateful convolution, commit), `projection_fp32` (BF16 router; IQ4_XS head on PR 3's decode route), `rows` | done (HC perf gate missed, below) |
+| 7a | `offloaded_sparse_moe` contract, routing, dispatch, combine, canonical A8 arithmetic, CPU expert engine (scalar, AVX2, worker team) | done |
+| 7b | `offloaded_sparse_moe` GPU narrow route (device frames, staging, zero-copy), CPU miss channel and service | done (perf gate missed, see below) |
+| 8 | M0: the qwen4exp model from Infernix (config, binding, forward, n-gram hash, n-gram volume reader with keep-alive), the full conversion, the FP64 reference and block check, `forward_real`; the quality gate | done (gate below) |
+| 9 | M1: Program and Engine integration (one lane, elastic VMM KV, VRAM expert cache with LFRU and warm start, RAM/VRAM ledgers, decode CUDA graph, `EngineCore<Qwen4ExpInstance>`), serving and the `qwen38-flash-next` launcher profile | done (measurements below) |
+| 10 | Prefill: exact GPU wide expert route (int8 `mma.sync`, cp.async), prefill expert streaming into lent frames, 4,096-token calls, n-gram row prefetch | done (prefill gate missed by 3-5%, below) |
+| 11 | Decode (M2 gate): few misses zero-copy (11a), fewer decode-graph nodes and the GGML `linear_pair` (11b), the decode graph split around the n-gram row read and the startup frame retry (11c) | done (measurements below) |
+| 12 | 128K through the elastic KV: growth takes expert frames before it maps (12a, the crash and 128K prefill fix); prefill lending restores the experts it displaced and is sized to the prompt (12b, the decode fix) | done (measurements below) |
+| 13-14 | MTP, vision | not started |
 
-Until PR 2 the C++ reader rejects every artifact that uses a `ggml_*` format.
+The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
+the six dense formats (PR 3); offloaded_sparse_moe executes the three expert record formats (PR 7).
 
-## Artifact decisions taken in PR 1
+## PR 3 measurements
+
+RTX 3090, CUDA 12.8, cold L2. Decode is IQ4_XS [10240, 2560] (13.93 MB); wide compares the Q8_1
+cast plus int8 MMA with dequantize-to-FP16 plus cuBLAS (`cublasGemmEx`, FP32 compute).
+
+| Workload | Result |
+|---|---|
+| Decode T = 1, kernel (nsys) | 20.2 us = 74% of the 936 GB/s spec; a plain read of the same bytes takes 17.2-17.7 us (79-81%) |
+| Decode T = 1, public Op in a graph (events) | 22.5 us = 66% |
+| Decode vs Strata `native_mmvq`, same bytes (nsys) | T = 1: 20.2 vs 21.1 us (+2.1 us Strata quantize); T = 8: 30.9 vs 62.9 us |
+| Wide, T = 512 / 4096, ours over dequant + cuBLAS | 1.02-2.02x for five formats; Q6_K 0.96x / 0.77x |
+
+The 80% decode gate is not met; see the PR 3 description for the tuning that was tried.
+
+## PR 6 measurements
+
+RTX 3090, CUDA 12.8, L2 flushed before each graph replay. "Chained" is 8 calls per graph on
+distinct weight copies (the per-call cost inside a decode graph).
+
+| Workload | Result |
+|---|---|
+| `hyper_connection_mix`, T = 1, 13.2 MB BF16 (block mixer / final mixer) | chained 28.2 / 26.8 us = 50% / 52% of 936 GB/s; single call 30.7 / 28.7 us |
+| Same bytes, loads only (a probe of a rejected one-kernel variant, chained) | 17.3 us = 81% |
+| `hyper_connection_mix`, fused route T = 2 / 4 / 8 / 16; composed route T = 17 / 64 | 35 / 49 / 76 / 122 us; 34 / 66 us |
+| `projection_fp32` IQ4_XS head [248320, 2560], T = 1 / 2 / 8 | 392 / 396-400 / 583 us = 92% / 91% / 63% |
+| `projection_fp32` BF16 router + shared gate [513, 2560], T = 1 / 8 / 9 | 10.2 / 14.3 / 26.6 us |
+
+The 80% HC gate is not met: the fused mixer is latency-bound on sm_86, and above T = 2 it is
+slower than the composed route. See the PR 6 description.
+
+## Files ported from Infernix
+
+Infernix (Apache-2.0) at commit `a3edb450`. Each file carries its own adaptation notice.
+
+| Ours | Infernix |
+|---|---|
+| `include/ninfer/ops/hyper_connection.h` | `include/infernix/ops/hyper_connection.h` |
+| `src/ops/hyper_connection/hyper_connection.cu` | `src/ops/hyper_connection/hyper_connection.cu` |
+| `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` |
+| `include/ninfer/ops/ple.h`, `src/ops/ple/ple.cu` | `include/infernix/ops/ple.h`, `src/ops/ple/ple.cu` |
+| `include/ninfer/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | `include/infernix/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` |
+| `include/ninfer/ops/rows.h`, `src/ops/rows/rows.cu` | `include/infernix/ops/rows.h`, `src/ops/rows/rows.cu` |
+| `tests/ops/test_hyper_connection.cpp`, `test_projection_fp32.cpp`, `test_rows.cpp` | `tests/ops/test_hyper_connection.cpp`, `tests/ops/linear/test_projection_fp32.cpp`, `tests/ops/test_rows.cpp` |
+
+## PR 7 measurements
+
+RTX 3090, CUDA 12.8, 5950X with DDR4-2133; random records with finite scales (record bytes are
+fixed per format); 10 experts each routed every column; cold L2; medians. Bit-exactness (CPU scalar
+= AVX2 = team at 1-16 workers = GPU in device frames, staged and zero-copy, and CPU-served) holds on
+synthetic and on the subset artifact's real IQ2_S, IQ2_XXS and IQ1_M banks.
+
+| Workload | IQ2_S | IQ2_XXS | IQ1_M | Gate |
+|---|---|---|---|---|
+| Narrow route T = 1, resident, graph replay | 53.2 us, 284 GB/s (30%) | 46.1 us, 283 GB/s (30%) | 45.1 us, 261 GB/s (28%) | >= 70% of 936 GB/s: **missed** |
+| Same, kernels (nsys median): gate/up + down | 35.4 + 16.9 us | 33.4 + 16.9 us | 28.8 + 16.9 us | |
+| Plain read of the same bytes | 22.5 us (670 GB/s) | 19.5 us | 17.4 us | |
+| Strata native grouped kernels, same records (quantize + grouped) | 61.4 us | 53.2 us | 52.2 us | |
+| Canonical / native, T = 1, 2, 4, 8 | 0.90, 0.99, 0.88, 0.90 | 0.92, 1.02, 0.89, 0.76 | 0.90, 0.93, 0.81, 0.71 | K7: within 5% of native, **not triggered** |
+| Staged misses T = 1 (10 misses), effective PCIe | 24.2 GB/s | 24.2 GB/s | 15.8-23.8 GB/s (one outlier run) | >= 18 GB/s: met (IQ1_M once below) |
+| One cold CPU expert T = 1, 16 workers (sweep 1-16 in the PR) | 72.6 us, 20.8 GB/s | 88.9 us, 14.7 GB/s | 122.5 us, 9.6 GB/s | recorded |
+
+The narrow route stays at the speed of Strata's native MMVQ grouped kernels on the same records:
+both run two dependent kernels (gate/up, then down) over 15 MB, and neither reaches the read
+roofline at T = 1. A sweep of CTA geometry and grids in shared memory moved T = 1 by at most ~15%;
+reaching 70% needs a different structure (one persistent two-phase kernel), left open.
+
+## PR 8 (M0) measurements
+
+RTX 3090 (WDDM, sm_86), CUDA 12.8, Ryzen 9 5950X, DDR4-2133. Artifact and volume on K: (Samsung 860
+QVO SATA); every routed expert in one 33.02 GiB pinned host block, served by the GPU narrow route
+through 64 staging slots; INT8-G64 KV; one sequence. No speed gate applies to M0; these are recorded.
+
+| Workload | Result |
+|---|---|
+| Full conversion (GGUF on C:, output to K:) | artifact 39.2 GB in two files and volume 29.1 GB; 802 s artifact + 346 s volume on the first run; 906 s for the artifact alone reusing the volume (QLC write cache exhausted); peak working set 0.62 GiB, peak private 1.73 GiB |
+| Full artifact and volume against the GGUF (`qwen4_exp_verify`) | exact: 994 objects (48 record banks inverted, 825 identical, 120 narrowed, 1 widened), all 320,001,536 volume rows; 260 s |
+| Load from K: | 93-104 s: 3.50 GiB device, 33.02 GiB pinned; process private 37.2 GiB; system available fell from ~44 to ~11.6 GiB |
+| Teacher-forced scoring, chunks of 256 | 126-134 tok/s (1,023-position texts), including n-gram row reads (0.4 s per text) |
+| Prefill of 300 tokens as one call | 3.13-3.24 s (~95 tok/s) |
+| Decode, one call per token after 268 tokens (32 steps) | median 43.5 ms per token (23.0 tok/s) through 64 staging slots, 45.9 ms (21.8 tok/s) zero-copy; uncaptured, no expert resident in VRAM |
+| Determinism and placement | two loads score bit-identical logits on all six texts; staged and zero-copy runs give bit-identical logits, block taps and routes |
+
+Quality gate (spec 8.4) against Strata 0.1.38 IQ2_XS (`tools/flash_next/strata_compare.py`, ΔNLL =
+NInfer - Strata, ± its paired standard error):
+
+| Set / text | Positions | ppl NInfer | ppl Strata | ΔNLL | top-1 agree | KL mean / p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| PR 0 code | 511 | 1.5225 | 1.5259 | -0.0022 ± 0.0036 | 99.6% | 0.0014 / 0.025 |
+| PR 0 document | 1,023 | 21.4595 | 21.4299 | +0.0014 ± 0.0043 | 96.1% | 0.0050 / 0.035 |
+| PR 0 chat | 1,023 | 6.5936 | 6.4902 | +0.0158 ± 0.0050 | 97.0% | 0.0048 / 0.050 |
+| **PR 0 all** | 2,557 | 7.8876 | 7.8371 | **+0.0064 ± 0.0027** | **97.1%** | 0.0042 / 0.039 |
+| Infernix code | 511 | 1.9616 | 1.9526 | +0.0046 ± 0.0035 | 98.4% | 0.0017 / 0.023 |
+| Infernix document | 1,023 | 7.8517 | 7.8698 | -0.0023 ± 0.0043 | 96.3% | 0.0061 / 0.042 |
+| Infernix chat (substitute) | 1,023 | 5.2231 | 5.2137 | +0.0018 ± 0.0043 | 98.0% | 0.0034 / 0.031 |
+| **Infernix all** | 2,557 | **5.0555** | 5.0518 | **+0.0007 ± 0.0025** | **97.4%** | 0.0041 / 0.038 |
+
+Strata against itself (PR 0, same metrics): top-1 agreement 96.5-99.2%, KL mean up to 0.064. Every
+ΔNLL is within +0.02 nats. Two are more than 2 SE above zero: PR 0 chat (+0.0158, 3.2 SE) and the
+PR 0 set overall (+0.0064, 2.4 SE); the Infernix set is within 1.2 SE on every text.
+
+FP64 block check (`tools/flash_next/block_check.py`, 48 chat tokens; relative L2 per position, max
+over positions): hyper-connection mixers 0.2-1.0%, GDN 0.7-1.0%, QSA 2.5-2.9% (the reference keeps
+exact K/V, the engine INT8-G64), MoE <= 0.07% (most positions bit-equal after BF16 rounding),
+residual updates <= 0.6%, layers 0-3, 7-9, 46 and 47.
+
+## PR 9 (M1) measurements
+
+RTX 3090 (WDDM, display attached), CUDA 12.8, Ryzen 9 5950X, DDR4-2133; artifact and volume on K:
+(SATA). Through the public Engine (`ninfer_qwen4_exp_engine_real_test`) and `ninfer-serve`.
+
+**Gates.**
+
+| Gate | Result |
+|---|---|
+| Serving smoke (`run.bat qwen38-flash-next` + chat completions, streaming, tool call required and auto, the tool result answered, Anthropic Messages, greedy repeat) | 7/7 |
+| Greedy ids identical at C = 1 across expert-cache states | identical: cold, warm (same Engine), warm start from the saved state, a 1 GiB cache (710 frames, evicting every round) with a 64-token KV base and no CUDA graph; a 5,120-token prompt (past QSA's 2,048-token budget, the KV base growing) identical between the default and the small-cache Engine |
+| RAM ledger refuses cleanly | an Engine keeping 1 TiB free refuses before pinning: "... 1017.0 GiB short. Close other programs ..." |
+
+**Decode, plain, 512 greedy tokens** after Strata's PR 0 prompts (the same token ids), one model
+load, a warm-up request then 18 requests in ABBA order over the tiers (6 per tier), the expert cache
+warm-started from an earlier session. Wall clock after the prompt (every host step included):
+
+| Prompt | NInfer tok/s, median [min-max] | Strata plain (PR 0) | Strata MTP (PR 0) | decode hit rate |
+|---|---:|---:|---:|---:|
+| 1K | **78.1** [75.5-79.5] | 71.3 | 105.1 | 98.0% |
+| 8K | **76.7** [75.7-78.7] | 69.6 | 112.4 | 97.2% |
+| 32K | **75.6** [74.1-77.1] | 66.2 | 107.1 | 96.6% |
+
+- 1.10×, 1.10× and 1.14× Strata's plain decode; 0.68-0.74× its MTP decode. The Infernix-normalized
+  8K range (spec 8.2: 80-120) is not reached: 76.7 is 4% below its bottom.
+- An earlier identical run (Program-timed) gave 77.9 / 76.8 / 75.9 by the same wall formula.
+- Prefill, not gated here (PR 10): 650-700 tok/s from a warm cache at 1K-32K (Strata 1,900-2,400).
+- Expert cache: 11,063 frames at startup, grown by the VRAM control law to 11,951 (16.8 GiB)
+  within the first minute; Strata holds 12,375-12,583. Decode promotes ~2-3 experts per token.
+
+**Where a decode token's time goes** (8K, warm cache, nsys with graph nodes traced; kernel times per
+round, which the profiler inflates by roughly 5%: the GPU is busy ~13.7 ms of a 13 ms token, so
+decode is GPU-bound and the host adds ~0.08 ms per token outside the rounds):
+
+| Work | ms / token | Note |
+|---|---:|---|
+| Routed experts | 4.27 | `stage_kernel` 2.08 (48 launches; PR 11 found this is the misses' PCIe copy, not a fixed cost: half the launches take 2 µs, the rest 40-400 µs), `gate_up` 1.46, `down` 0.73 (#239's narrow route at 28-30% of bandwidth) |
+| Dense GGML linears | 3.89 | 301 MMVQ launches (shared experts, attention, GDN, head) |
+| HC mixer and inject | 2.78 | #236's 97 fused calls |
+| MoE route, dispatch, combine | 0.55 | |
+| FP32 projections (router, indexer) | 0.51 | |
+| QSA (prep, select, attention), GDN, norms, copies | ~1.7 | QSA attention 15 µs per layer here |
+
+The narrow route's bandwidth and the HC mixer are PR 11's (spec 8.2); PR 11 below corrects the
+stage attribution.
+
+## PR 11 (M2 decode) measurements
+
+RTX 3090 (WDDM, display attached), CUDA 12.8, MSVC 14.44, Ryzen 9 5950X, DDR4-2133; artifact and
+volume on K: (SATA). Decode is 512 greedy tokens after Strata's PR 0 prompts, wall clock after the
+prompt; one model load per process, a warm-up request, then the requests named. Every GPU run held
+the shared GPU lock.
+
+**Gate (spec 8.4), ABBA over builds:** base (07457ce9) and PR 11 processes in the order A B B A, each
+process a warm-up then 18 requests in ABBA order over the tiers; 12 requests per tier per build.
+Greedy ids are identical between the builds on every request.
+
+| Prompt | PR 9 base, median [min-max] | PR 11, median [min-max] | change | Strata plain | PR 11 / Strata |
+|---|---:|---:|---:|---:|---:|
+| 1K | 77.42 [74.90-78.80] | **81.15** [77.18-82.77] | +4.8% | 71.3 | 1.14× |
+| 8K | 76.30 [74.69-77.95] | **79.88** [77.99-81.62] | +4.7% | 69.6 | 1.15× |
+| 32K | 75.49 [70.97-77.08] | **78.96** [75.24-81.11] | +4.6% | 66.2 | 1.19× |
+
+The blocking gate (≥ 1.0× Strata plain at 1K/8K/32K) holds. The non-blocking 8K target of 80 tok/s
+is met by the mean of an earlier 16-request run (80.14) and missed by this run's median (79.88,
+mean 79.92); the stretch (1.3× Strata, ~91) is not reached.
+
+**Attribution, 8K** (16 requests per row unless noted, two processes in ABBA order):
+
+| Build | tok/s, median [min-max] |
+|---|---:|
+| base | 75.36 [70.12-77.14] |
+| + route log in the dispatch, PLE slot as state (11b, two of three parts) | 76.98 [73.83-78.56] |
+| + zero-copy rule, threshold 1 / 2 / 4 (11a) | 77.76 / 77.90 / 77.91 |
+| + `linear_pair` for shared gate/up and attention key/value (11b) | 79.51 [75.94-80.80] |
+| + decode graph split around the n-gram read, startup frame retry (11c) | 80.47 [75.92-82.14] |
+
+The last row's +1.2% (+0.96 tok/s) is 1.6 pooled standard errors: suggestive, not established. Its
+processes started with 12,268 frames against 10,796-10,930 for the row above.
+
+**Zero-copy rule (11a).** `offloaded_moe_bench --misses N`, T = 1, 10 experts, graph µs
+(IQ2_S / IQ2_XXS / IQ1_M): one miss staged 122 / 120 / 93, under the rule 90 / 80 / 78; two misses
+165 / 159 / 144 vs 162 / 142 / 138; three and four equal within noise. Rejected: the stage copy on
+a forked high-priority stream beside the resident experts (with the shared expert in between) was
+slower at every miss count (one miss 157 / 144 / 139 µs): the resident pass's 400 CTAs occupy the
+SMs before the copy starts (~25 µs later in nsys) and the join edge adds 15-40 µs.
+
+**Miss split and worker count (spec 3.3).** One cold expert on the CPU worker team at T = 1: 119 /
+98 / 146 µs at 6 workers, 70 / 85 / 82 µs at 12, 67 / 70 / 84 µs at 16 (IQ2_S / IQ2_XXS / IQ1_M,
+GPU idle). Zero-copy adds 30-45 µs to a layer for one miss, so a CPU leg that waits ≥ 67 µs plus the
+handshake cannot win for the one or two misses a decode layer usually has (half the layer calls
+have none; ~10% have three or more). The CPU route stays unwired; not measured end to end.
+
+**Promotion cadence.** Interval 2 / 4 (the link-derived default) / 8 rounds once the frames are
+full: 80.28 / 80.14 / 79.73 tok/s at 8K (16 each; the 8-round runs include one 66 tok/s request);
+within noise, so the default stays.
+
+**Startup frames.** The pool stopped growing at startup when one 64 MiB chunk read as placed in
+system memory (free memory did not drop) with ~2.1 GB free; the control law grew it a minute later
+anyway. Retrying such a chunk up to three times (100-300 ms apart) gave the full sizing in the
+runs measured: 12,268 frames at startup (was 10,796-11,107). The steady state still settles at
+11,9xx frames: the control law keeps the 512 MiB display headroom and the reserve free, and frames
+are sized for the widest record (IQ2_S, 1.51 MB), which wastes ~3.5% of the pool on the IQ2_XXS and
+IQ1_M layers. Strata holds 12,375-12,583.
+
+**Host and n-gram rows (11c).** The decode round now runs the layers before the PLE layer (two of
+48) as one graph while the host reads the round's n-gram rows from the volume (median 0.6 ms, p90
+1.2 ms per token under nsys), then the rest as a second graph.
+
+**Not changed, with reasons.** Power throttling: the opt-out exists since PR 9. WDDM event batching:
+a decode round queries at most a few promotion events and records two per promotion batch; nothing
+to batch. L2-warm replacement: Infernix warms L2 while the host computes CPU-served misses; without
+the CPU route there is no window.
+
+**Where a token goes now** (8K, a warm request after an identical one, 114 rounds, nsys with graph
+nodes traced; kernel time per round, which the profiler inflates; the GPU is busy 11.8 ms of a
+13.9 ms profiled round):
+
+| Work | ms / token | Note |
+|---|---:|---|
+| Dense GGML linears | 3.82 | 181 MMVQ launches + 60 pair launches (0.43); the large IQ4_XS ones near PR 3's 74%, IQ3_S at ~42% |
+| HC mixer and inject | 2.80 | unchanged (#236; the rewrites in #247 were slower) |
+| Routed experts | 2.63 | `gate_up` 1.63, `down` 0.77, stage 0.22 (this request's hit rate was high; most layers have no miss) |
+| MoE route, dispatch, combine; FP32 projections | 1.08 | |
+| QSA, GDN, norms, copies | ~1.5 | 216 GDN head-tiling copy nodes, 0.25 |
+| GPU idle waiting for the host's n-gram rows | 1.8 under nsys | the front graph (two layers, ~0.5 ms) hides part of the row read (median 0.6 ms, p90 1.2 ms); graph launches are much slower under the profiler, so the real exposed share is smaller (11c measured +1.2%) |
+
+Remaining levers, largest first: the HC mixer and the narrow expert route (both latency-bound per
+#247; instruction-level work with Nsight Compute), IQ3_S decode in the GEMV (~0.5 ms at 42% of
+bandwidth), the row read (a host row cache or prefetching the next token's candidates), the
+head-tiling copies, and per-format frame pools (~3.5% more frames).
+
+One profiling run of the final build (three 8K requests of 160 tokens) ended with an access
+violation after the trace was written; the same arguments ran cleanly without the profiler and
+under nsys at 48 and 128 tokens, and every bench and test process exited cleanly. Not reproduced.
+
+
+
+## PR 10 measurements
+
+RTX 3090 (WDDM, display attached), CUDA 12.8, MSVC 14.44, Ryzen 9 5950X, DDR4-2133; artifact and
+n-gram volume on K: (Samsung 860 QVO, SATA). Strata's PR 0 runs read their PLE rows from C: (NVMe).
+
+**Prefill** through the Engine (`ninfer_qwen4_exp_engine_real_test --bench`), Strata's PR 0 prompt
+ids, 4 generated tokens, one model load: a 4K warm-up then 6 requests per tier in ABBA order; 128K in
+its own load (135,168-token context), 3 requests. Prompt tokens over the Program's prefill time:
+
+| Prompt | PR 9 (same session, same method) | PR 10, median [min-max] | Strata (PR 0) | PR 10 / Strata |
+|---|---:|---:|---:|---:|
+| 4K | 524 [188-585] | **1,824** [1,348-2,120] | 1,912 | **0.95** |
+| 32K | 503 [253-547] | **2,329** [1,817-2,371] | 2,397 | **0.97** |
+| 128K | not run | **2,069** [1,906-2,329] (n = 3) | 2,184 | 0.95 |
+
+- The prefill gate (≥ 1.0× Strata at 4K and 32K) is **missed by 5% and 3%**. Each tier's first
+  requests are the slow ones (cold n-gram rows and expert cache); the best 4K run is 2,120.
+- Greedy ids were identical for every repeat of a prompt, and the Engine test's 5,120-token prompt
+  gives the same ids through the wide streamed path and the small-cache static path.
+
+**Where a 32K prompt's prefill goes** (nsys, kernel time summed per prompt):
+
+| | PR 9: 32 calls of 1,024 | PR 10: 8 calls of 4,096 |
+|---|---:|---:|
+| Routed experts | 51.2 s: staging 24.8, narrow gate/up 17.8, narrow down 8.6 | 5.74 s: wide gate/up 4.45, wide down 1.29 |
+| Dense GGML linears (MMQ) | 3.00 s | 2.62 s |
+| BF16 linears (HC composed route, PLE) | 1.75 s | 1.32 s |
+| QSA attention, FP32 projections, row splits, HC, GDN, norms, other | ~3.6 s | ~3.2 s |
+| Kernel total | 59.5 s | 12.9 s |
+| Host time before each call's kernels (its n-gram rows) | 1-2.9 s per call under nsys | none after the first call: the next call's rows are read while the GPU runs |
+| Expert copies (H2D) | none (staged by SMs) | 23 GB per call at 26 GB/s on the copy engine, overlapped |
+
+**Wide expert route** (512 resident experts, near-uniform routing, `--bench`): T = 4,096 in
+14.5-15.8 ms per layer call (26-28 TOPS of routed multiply-adds), T = 2,048 in 7.2-7.6 ms. Its
+outputs equal the CPU engine's bits (`ninfer_offloaded_moe_wide_test`, every format and placement,
+the 48 real banks).
+
+## PR 12 measurements
+
+RTX 3090 (WDDM, display attached), CUDA 12.8, MSVC 14.44, Ryzen 9 5950X, DDR4-2133; artifact and
+n-gram volume on K: (SATA). Process-level ABBA against the integration build (`integ/qwen4exp-m1`,
+#256) and #253 (decode); greedy ids, 512 generated tokens for decode, 4 for prefill.
+
+**The crash and the 128K prefill collapse had one cause.** The KV pool grew by mapping new memory
+first and took expert frames only if a map failed. On a VRAM the startup sizing had filled (~400 MiB
+free), a 128K growth (+1,344 MiB) put the process ~900 MiB over its WDDM budget and past physical
+memory, so the OS paged device memory (128K prefill at 447 tok/s), and when the VRAM monitor's
+`cudaMemGetInfo` ran meanwhile, `cuMemSetAccess` returned `CUDA_ERROR_NOT_READY`. A standalone probe
+reproduces it (map-first growth past the budget with a concurrent `cudaMemGetInfo` fails at the
+physical limit, 2 of 3 runs; none with only DXGI queries, within the budget, or with take-first growth in 48 cycles).
+The growth now releases frames first (Infernix's `grow_kv` order).
+
+| Check | Integration (#256) | PR 12 |
+|---|---|---|
+| 4K/32K/128K alternating, 21 requests + warm-up, max-context 135,168 | every process crashed (2-3 growths) | no crash; process at 22.8-22.9 GiB dedicated, shared memory flat (no demotion), adapter ≤ 23.4 of 24 GiB |
+| 128K prefill in that alternation (n = 7) | 447, 1,243 (n = 2) | **2,105** [1,949-2,348] tok/s = 0.96× Strata (2,184) |
+| Decode after a 128K prompt / after a 32K prompt (wall, 512 tokens) | 21-42 tok/s for the first 64 tokens | **74.0** [72.3-75.2] / 78.1 [75.9-78.4] = 0.95×; first 64 tokens 74.7 |
+| Needles (10/50/90% depth) at 32K, 64K, 128K | not run (crash) | 9 of 9 retrieved |
+
+**Decode** (1K/8K/32K, D I B B I D, 6 requests per tier per process):
+
+| Prompt | #253 | Integration | PR 12 | PR 12 / #253 (paired) | PR 12 / integration (paired) | decode hits #253 / integ / PR 12 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1K | 81.2 | 79.8 | **81.9** | 1.002 ± 0.003 | 1.021 ± 0.003 | 98.0 / 96.8 / 98.2% |
+| 8K | 80.1 | 78.6 | **80.3** | 1.005 ± 0.002 | 1.027 ± 0.003 | 97.1 / 95.9 / 97.5% |
+| 32K | 79.0 | 76.9 | **78.8** | 0.998 ± 0.006 | 1.028 ± 0.002 | 96.5 / 95.2 / 96.8% |
+
+The integration's refill gave the lent frames to the experts the prompt's own calls had just used;
+restoring the displaced ones returns the cache to the set decode had (prefill calls promote nothing).
+The 8K target (80 tok/s) is met at 80.3 (range 79.2-83.8).
+
+**Prefill** (4K warm-up + 12 requests, 4 tokens, max-context 33,792; three sessions, I B B I twice and
+B I I B once): PR 12 / integration paired 4K **1.000** (0.998, 1.000, 1.001), 32K **0.994** (0.989 ±
+0.006, 0.991 ± 0.006, 1.000 ± 0.003). The I B B I deficit was mostly the second process of the session
+(slow in either build); what remains is the first 32K prompt after startup, 1-5% slower in every
+session (the cache holds the restored decode set instead of the warm-up prompt's experts); later
+32K prompts are equal. 0.95× / 0.97× Strata at 4K / 32K, as before.
+
+Quality (#243's method): logit dumps byte-identical to the integration's on all six texts (the
+forward does not use the Program). Greedy ids equal the integration's for every prompt measured.
+## Artifact decisions
+
+Taken in PR 1 and revised in PR 2b, which aligned the artifact with Infernix (the model code and
+expert cache are lifted from it in PRs 7-9).
 
 - Logical parameters mirror the GGUF tensors one to one, named under `text/`; shapes are the
-  reversed GGUF dimensions, so every object holds the GGUF bytes unchanged. The exceptions: routed
-  experts are split into per-expert `moe/experts/E/{gate,up,down}` parameters, and
-  `ffn_gate_inp_shexp` becomes `moe/shared_score` of shape `[1, 2560]`. The map is the table in
+  reversed GGUF dimensions, so every object holds the GGUF bytes unchanged. The exceptions: a
+  layer's three routed-expert tensors are one expert bank, and `ffn_gate_inp_shexp` becomes
+  `moe/shared_score` of shape `[1, 2560]`. The map is the table in
   [`tools/convert/qwen4_exp.py`](../../tools/convert/qwen4_exp.py); unknown, missing or misplaced
   GGUF tensors are errors.
-- Each layer's routed experts are two objects: `gate|up` of shape `[512 * 1280, 2560]` with expert
-  `e`'s 640 gate rows then its 640 up rows, and `down` of shape `[512 * 2560, 640]`. These are the
-  `[512, 1280, 2560]` and `[512, 2560, 640]` banks with identical bytes; the 2-D form is what the
-  existing packing groups and per-expert bindings produce, as for Qwen3.5 MoE.
-- The n-gram embedding table (`text/ple/table`) uses `ggml_rows_page4k_v1`: 7,111,146 pages,
-  29,127,254,016 bytes. It is written in 16 MiB chunks of whole pages.
-- GGML-format projections record `AllowA8` (ggml's Q8_1 activation path); BF16 projections keep
-  `A16Only`.
+- **Expert banks (PR 2b).** Each layer's routed experts are one parameter
+  `text/layers/L/moe/experts` of shape `[512, 2560, 640]` in `ggml_expert_record_v1`: one record
+  per expert holding its gate, up and down blocks, in one of three record formats
+  (`ggml_rec_iq2_s_q2_0`, `ggml_rec_iq2_xxs_q2_0`, `ggml_rec_iq1_m_q2_0`). Infernix's frame pool,
+  residency table, staging and CPU jobs treat an expert as one opaque record with one
+  `record_stride`; packing records on the host at load would be runtime repacking, so the converter
+  writes them. Records are 1,510,400 / 1,305,600 / 1,177,600 bytes, back to back: the stride is
+  rounded to 256 bytes, not Infernix's 4 KiB, because only the deferred SSD expert tier reads
+  records in place with direct I/O, and 4 KiB rounding would cost 1.5% (0.5 GiB) of host RAM. This
+  replaces PR 1's two objects per layer (gate|up interleaved, and down).
+- **n-gram volume (PR 2b).** The PLE n-gram table is not an artifact object. It is Infernix's
+  `NINFERNG` volume, version 2 with a row-format field (`ggml_iq4_nl`): 45 rows of 90 bytes per
+  4 KiB block, exactly PR 1's page geometry, after a 4 KiB header; 29,127,258,112 bytes. The
+  artifact's `ngram_table` records the geometry and the volume id; `--ngram-out` and
+  `--ngram-reuse` follow Infernix, including its 512-row reuse check. This replaces
+  `ggml_rows_page4k_v1`, which no longer exists.
+- **Text config (PR 2b).** The keys are exactly Infernix `parse_config`'s (`hc_lowrank`,
+  `indexer_n_heads`, `indexer_budget`, one-based `ple_layer_ids`, `ple_embed_dim` = 16 heads x 160,
+  `eos_token_id` = the PLE EOS 248044, and so on). The GGUF's literal hash tables are replaced by
+  Infernix's derivation parameters (seed 1234, base 20,000,000, padding 128), which the converter
+  proves equal to the literals; a GGUF with other literals is refused. Facts the GGUF does not
+  record are fixed by the architecture: `output_gate_type` sigmoid (llama.cpp's and Strata's GDN
+  both apply a sigmoid gate), `norm_topk_prob` true, one indexer key head (checked against
+  `indexer.k_proj`), and `split_ngram_parts` 1 (the GGUF holds the table as one tensor; Infernix
+  parses the key and does not use it). The GGUF's `ple.image_token_id` is not carried: Infernix has
+  no such key and vision is PR 14.
+- GGML-format projections and the expert banks record `AllowA8` (ggml's Q8_1 activation path);
+  BF16 projections keep `A16Only`.
+- **Operand layouts (PR 8).** BF16 projections over one input share a parent: each mixer's
+  `down|inject` ([324, 10240], the HC Op's operand), the GDN `a|b` ([96, 2560]) and the PLE
+  `key|value` ([12800, 2560]); registered BF16 Linear shapes. The attention and indexer q/k norms
+  are stored as BF16 `gamma` (unit offset), `gdn/norm` and `gdn/convolution` as BF16, after an
+  exactness check that refuses any rounding; `gdn/convolution` is transposed to the `[K, C]`
+  operand of the convolution Op. The PLE convolution stays the exact FP32 widening of the F16
+  taps; `ple_conv_inject` now takes FP32 weights.
 - The development subset is a builder option (`--subset dev`), not a second recipe, because a
-  recipe cannot drop parameters or shorten the n-gram table. It is 2,930,421,760 bytes, not the
-  ~1.2 GB first estimated: the token embedding and output head alone are 675 MB and the three
-  expert banks 2.04 GB.
+  recipe cannot drop parameters or shorten the n-gram table. It is 2,928,979,712 bytes plus a
+  413,696-byte volume of 4,500 rows: the token embedding and output head alone are 675 MB and the
+  three expert banks 2.04 GB.
+
+## Code adapted from Infernix
+
+Infernix is Apache-2.0; each adapted file carries the notice the spec's licensing rule fixes.
+
+| NInfer file | Infernix source (`a3edb450`) | Adaptation |
+|---|---|---|
+| `tools/artifact/ngram_volume.py` | `tools/convert/qwen4_exp.py` (`ngram_geometry`, `read_ngram_volume_id`, `write_ngram_volume`) | Version 2 header with a row-format field; streams GGML rows from any source |
+| `tools/convert/qwen4_exp.py` (config keys, `layer_multipliers`, `head_tables`, expert bank parameter, volume binding) | `src/models/qwen4_exp/config.cpp`, `tools/flash_next/ngram.py`, `tools/convert/qwen4_exp.py` (`ExpertBankSource`, `import_expert_bank`), `tools/convert/__main__.py` | Sourced from GGUF metadata; GGML expert records instead of NVFP4 banks |
+| `include/ninfer/ops/offloaded_sparse_moe.h` | `include/infernix/ops/offloaded_sparse_moe.h` | GGML record formats, no per-expert scales; an exact wide route (PR 10); SSD tier, fetch channel, landing, streamed records, overlap/fork streams and L2 warming not carried |
+| `src/ops/common/canonical_math.h` | `src/ops/common/canonical_math.h` (`0cf68068`) | IEEE helpers, BF16, exp and SiLU only |
+| `src/ops/offloaded_sparse_moe/cpu/expert_team.cpp` | `src/ops/offloaded_sparse_moe/cpu/expert_team.{h,cpp}` | GGML jobs; units of 32 intermediates; no A16, AVX-VNNI or AVX-512 |
+| `src/ops/offloaded_sparse_moe/cpu/miss_service.cpp` | `src/ops/offloaded_sparse_moe/cpu/miss_service.{h,cpp}` | No tiered requests; fixes a startup race (the first request could be taken as already answered) |
+| `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` (`398cf2cc`) | Route, dispatch, staging, CPU plan/wait and combine kept; narrow kernels rewritten for GGML sub-blocks |
+| `src/ops/offloaded_sparse_moe/cuda/wide_expert.{h,cu}` (PR 10) | `src/ops/offloaded_sparse_moe/cuda/wide_expert.{h,cu}` (`17681db5`) | The plan kernel (tiles per pass) kept; the GEMMs are new: exact int8 `mma.sync` over decoded GGML codes in the canonical leaf order, cp.async instead of TMA/mbarrier, the A8 cast of h fused into gate/up |
+| `src/models/qwen4_exp/execution/expert_stream.{h,cpp}` (PR 10) | `src/models/qwen4_exp/execution/expert_stream.{h,cpp}` | The ring is lent frames, published as per-layer frame tables (no `prefetched` source); 2-D run copies; no gated chunks or SSD holds |
+| `include/ninfer/ops/hyper_connection.h` | `include/infernix/ops/hyper_connection.h` | FP32 multiplier norm weight; no Q8 weight form |
+| `src/ops/hyper_connection/hyper_connection.cu` | `src/ops/hyper_connection/hyper_connection.cu` | BF16 weights only |
+| `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | Grids re-fitted to 82 SMs |
+| `include/ninfer/ops/ple.h`, `src/ops/ple/ple.cu` | `include/infernix/ops/ple.h`, `src/ops/ple/ple.cu` | IQ4_NL `ple_embed`; FP32 multiplier norms; FP32 `[K, C]` conv weight (the F16 taps widened) |
+| `include/ninfer/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | `include/infernix/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | BF16 segment form plus a GGML IQ4_XS head |
+| `include/ninfer/ops/rows.h`, `src/ops/rows/rows.cu` | `include/infernix/ops/rows.h`, `src/ops/rows/rows.cu` | Verbatim |
+| `tests/ops/test_hyper_connection.cpp`, `test_projection_fp32.cpp`, `test_rows.cpp` | `tests/ops/test_hyper_connection.cpp`, `tests/ops/linear/test_projection_fp32.cpp`, `tests/ops/test_rows.cpp` | Ported with their Ops |
+| `src/core/read_only_file{.h,_win32.cpp,_posix.cpp}` | `src/core/read_only_file*` | Unbuffered reads only (no mapping); each `read_direct` waits on its own event |
+| `src/models/qwen4_exp/config.{h,cpp}` | `src/models/qwen4_exp/config.{h,cpp}` | IQ4_NL volume rows; no load options, vision, MTP or YaRN |
+| `src/models/qwen4_exp/frontend/ngram_hash.{h,cpp}` | same path | Verbatim |
+| `src/models/qwen4_exp/weights.h`, `model.h`, `load.cpp` | `weights.h`, `model.h`, `load.{h,cpp}` | GGUF-mirroring parameters; record banks with no scales |
+| `src/models/qwen4_exp/execution/parameters.{h,cpp}` | same path | One Linear per GGUF tensor |
+| `src/models/qwen4_exp/execution/forward.{h,cpp}` | same path | One sequence; NInfer's single-sequence QSA Ops; interleaved query/gate rows; tiled GDN heads |
+| `src/models/qwen4_exp/program/ngram_volume.{h,cpp}` | same path | Version 2 volume; keep-alive after Strata's PLE reader |
+| `tests/models/qwen4_exp/test_{ngram_hash,ngram_volume,forward_real}.cpp`, `tests/fixtures/qwen4_exp/ngram_rows.txt` | same paths (`forward_real` with `45f20fb9`'s taps) | One sequence; INT8 KV built directly; timed decode |
+| `tools/flash_next/{ngram,reference,block_check,strata_compare}.py` | same paths | The reference reads the `.ninfer` through the exact GGML decoders, with the canonical A8 cast |
+| `src/core/{vmm_arena.{h,cu},cuda_vmm.h,vram_budget.{h,cpp},copy_batch.{h,cpp},link_probe.{h,cpp},power_throttling.{h,cpp}}` | same paths | Namespace; `CopyBatch` takes CUDA 12.8's `cudaMemcpyBatchAsync` form and falls back to single copies; a `cuMemSetAccess` that WDDM cannot make resident (`CUDA_ERROR_NOT_READY`) is a refusal, like an out-of-memory `cuMemCreate` (PR 12) |
+| `src/core/host_memory.{h,cpp}` | same path | The snapshot and working-set reserve only |
+| `src/core/pinned_upload.{h,cu}` | `src/core/device.{h,cu}` (`upload_pinned`) | Own translation unit |
+| `src/models/qwen4_exp/memory_plan.{h,cpp}` | same path | Full RAM mode only (fits or refuses; no SSD tier, no `--expert-ram-mib`); the VRAM sizing and control law unchanged; `kv_growth_frames` is `grow_kv`'s arithmetic as a pure function (PR 12) |
+| `src/models/qwen4_exp/program/expert_cache/expert_{cache,state}.{h,cpp}` | same paths | Verbatim but for `lend` reporting the keys it evicts (PR 12) |
+| `src/models/qwen4_exp/program/expert_residency.{h,cpp}` | same path | Per-layer record strides in one frame size; no SSD tier or landing; frame lending (PR 10) whose give-back restores the displaced experts first (PR 12); a grow refills its new frames by score |
+| `src/models/qwen4_exp/program/vram_monitor.{h,cpp}` | same path | Verbatim |
+| `src/models/qwen4_exp/program/program.{h,cpp}` | `program/program.{h,cpp}`, `program/program_impl.h` | NInfer's execution contract (prefix reuse off, one lane); device plan, elastic KV (PR 12: `grow_kv`'s order, frames released before the pool maps; the pool shrinks at the next admission that needs less instead of after 60 s idle, and a growth that does not fit fails the request), decode budget, warm start, VRAM control, link probe and decode graph from Infernix |
+| `src/runtime/engine/qwen4_exp_instance.{h,cpp}` | same path | NInfer's EngineCore and ResourceManager with the context cache off; refuses unsupported options |
+| `tests/models/qwen4_exp/test_{expert_cache,memory_plan}.cpp`, `tests/fixtures/expert_cache/lfru_conformance.txt` | same paths | The memory plan's RAM tests rewritten for full mode |
 
 ## Export conventions of this GGUF
 
@@ -50,17 +456,20 @@ Settled by evidence in PR 1 (`tests/convert/test_qwen4_exp_real.py` reproduces t
 | PLE hash constants | The literal multipliers equal splitmix64 with seed 1234, PLE index 0 and the 248,320-row vocabulary; the head sizes are the 16 consecutive primes from 20,000,000; the table rows are their sum rounded up to 128 | data check against the Infernix derivation |
 | `attention/query_gate` | per head, 256 query rows then 256 gate rows | llama.cpp graph, Strata `layer.cpp`, Infernix mapping |
 
-Still inferred, to be confirmed by the PR 7 FP64 block reference:
+Settled in PR 8 by running the whole model (teacher-forced on the PR 0 set, 2,557 positions,
+against Strata), changing one convention at a time from the shipped choice:
 
-- **GDN value-head order is tiled** (value head `h` pairs with key head `h % 16`) in `gdn/qkv`'s
-  value rows, `gdn/z`, `gdn/a_projection`, `gdn/b_projection`, `gdn/a`, `gdn/dt_bias`,
-  `gdn/convolution` and the K axis of `gdn/output`. The basis is provenance: the file's names and
-  conventions match llama.cpp's `Qwen4ExpTextModel`, which inherits the grouped-to-tiled reorder,
-  and Strata, which runs this file, pairs heads by modulo with no runtime permutation. No HF
-  checkpoint is local to compare against.
-- **Decision:** the converter keeps the tiled order. `gdn/output`'s K axis cannot be permuted
-  exactly in a block format, so the qwen4exp GDN path adopts the tiled order throughout rather than
-  the converter undoing it for the other tensors only.
+| Convention | Shipped | Alternative tried | Result of the alternative (shipped: ppl 7.888, ΔNLL +0.0064) |
+|---|---|---|---|
+| GDN value-head pairing | tiled: value head `h` reads key head `h % 16` | grouped (`h / 3`) | ppl 9,429, ΔNLL +7.09, top-1 agreement 7.3% |
+| GDN output gate | sigmoid | SiLU | ppl 505,835, ΔNLL +11.08 |
+| PLE convolution taps | tap `j` reads `nrm[t - (K-1-j) * 3]` (GGUF order) | reversed | ppl 8.232, ΔNLL +0.049 ± 0.012, top-1 agreement 86.9% |
+| Attention query/gate rows | interleaved per head (256 + 256) | blocked (all query rows, then all gate rows) | ppl 213.5, ΔNLL +3.30, top-1 agreement 34.1% |
+| GDN convolution taps | GGUF order | reversed | ppl 3,936, ΔNLL +6.22, top-1 agreement 4.7% |
+
+The hyper-connection `down|inject` parent (down rows, then injection rows) and the `1 + gamma`
+norms are confirmed by the shipped result itself (any error there is not a small loss), and the
+FP64 block check agrees per op chain.
 
 ## Tokenizer
 
@@ -73,7 +482,7 @@ say. `--resource tokenizer.json=PATH` keeps the Hugging Face flags after checkin
 the GGUF. Whether Flash-Next's own Hugging Face tokenizer equals Qwen3.8-27B's is assumed, not
 checked. The GGUF's chat template is used as is; it differs from the NInfer Qwen3.8-27B template.
 
-## PR 1 measurements
+## Measurements
 
 Host: Ryzen 9 5950X, Samsung 980 PRO (C:), Python 3.12.7, numpy 2.5.3, torch 2.11 (CPU).
 
@@ -83,4 +492,11 @@ Host: Ryzen 9 5950X, Samsung 980 PRO (C:), Python 3.12.7, numpy 2.5.3, torch 2.1
 | Full n-gram table paging, output discarded | 28.80 GB read in 43 s (0.67 GB/s, CPU-bound in Python); peak working set 0.57 GiB |
 | GGUF header parse (73 keys, 248,320-token vocabulary, 1,224 tensors) | 0.7 s |
 
-The full-model conversion has not been run; it needs ~68.4 GB free on C: (see the spec's disk plan).
+PR 2b, same host, GGUF on C: to C:, peak working set from `psutil` after the run:
+
+| Workload | Result |
+|---|---|
+| `--subset dev` conversion with its 4,500-row volume | 2.93 GB artifact and 0.41 MB volume in 20.0 s; peak working set 0.62 GiB |
+| Whole n-gram volume through the writer, output discarded | 320,001,536 rows, 7,111,146 blocks, 29,127,258,112 bytes in 51.4 s (0.56 GB/s read); peak working set 0.60 GiB |
+
+The full-model conversion ran in PR 8 (to K:; see the PR 8 measurements).

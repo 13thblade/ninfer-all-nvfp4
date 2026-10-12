@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "models/qwen3_5/frontend/test_access.h"
+#include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/kv_capacity.h"
 
@@ -30,7 +31,7 @@
 //                  verification/acceptance and host publication
 //   --copy-width W teacher-forced n-gram copy rounds (DFlash2): the bench first records the
 //                  request's own greedy continuation, then gives identical requests in the first
-//                  --copy-lanes lanes (default: all) that continuation as an n-gram proposal
+//                  --copy-lanes lanes (default: all, --batch 1 or 2) that continuation as an n-gram proposal
 //                  source, so every copy round can verify a full W-1 drafts; the other lanes run
 //                  the same prompt without copies, which the draft model proposes for beside them.
 //                  Only rounds in which every copying lane accepts all of its drafts are timed,
@@ -181,6 +182,13 @@ Options parse_options(int argc, char** argv) {
                              options.backend != ninfer::SpeculativeBackend::DFlash2)) {
         throw std::invalid_argument(
             "--copy-width and --ngram-idle need DFlash2 and a width in [draft-tokens+1,16]");
+    }
+    // The decode loop runs copy rounds at batch one and two only; a wider copy batch would time
+    // neural rounds and produce no full-copy sample.
+    if (options.copy_width != 0 &&
+        options.batch_size > ninfer::models::qwen3_5::detail::kMaximumCopyRoundBatch) {
+        throw std::invalid_argument("--copy-width needs --batch 1 or 2 (copy rounds run at most "
+                                    "two lanes)");
     }
     if (options.copy_lanes == 0) { options.copy_lanes = options.batch_size; }
     if (options.copy_lanes > options.batch_size ||

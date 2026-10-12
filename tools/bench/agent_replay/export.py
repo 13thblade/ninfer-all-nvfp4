@@ -81,11 +81,14 @@ def _compile_template(source: str) -> Any:
     def tojson(value: Any, ensure_ascii: bool = False, indent: int | None = None,
                separators: Any = None, sort_keys: bool = False) -> str:
         """The server's filter (third_party/llama-jinja value.cpp): positional order is
-        ensure_ascii, indent, separators, sort_keys; UTF-8 and ", "/": " unless told otherwise."""
-        if separators is not None:
-            separators = tuple(separators)
-            if len(separators) == 1:
-                separators += (": ",)
+        ensure_ascii, indent, separators, sort_keys; UTF-8 and ", "/": " unless told otherwise.
+        Like the server, a non-list or empty `separators` keeps the indent-dependent defaults, a
+        missing key separator is ": ", and entries past the second are ignored."""
+        separators = list(separators) if isinstance(separators, (list, tuple)) else []
+        if separators:
+            separators = (separators[0], separators[1] if len(separators) > 1 else ": ")
+        else:
+            separators = None
         return json.dumps(value, ensure_ascii=bool(ensure_ascii), indent=indent,
                           separators=separators, sort_keys=bool(sort_keys))
 
@@ -189,8 +192,24 @@ def _output_text(message: dict[str, Any]) -> str:
     return "\n".join(p for p in parts if p)
 
 
+# Default export file inside a run directory; run.py clears it with the run's own artifacts.
+TOKEN_STREAM_NAME = "token_streams.jsonl"
+
+
 def export(run_dir: Path, artifact: Path | None, tokenizer_dir: Path | None,
            out_path: Path) -> int:
+    # Drop any earlier stream first so a refused or failed export can never leave one behind.
+    out_path.unlink(missing_ok=True)
+    summary_path = run_dir / "summary.json"
+    try:
+        complete = json.loads(summary_path.read_text(encoding="utf-8")).get("complete") is True
+    except (OSError, ValueError, AttributeError):
+        complete = False
+    if not complete:
+        print(f"error: {run_dir} has no complete run (summary.json missing or not marked "
+              "complete: the run failed, had errored/unjoined turns or measured none); "
+              "rerun tools.bench.agent_replay run and export again", file=sys.stderr)
+        return 1
     tokenizer_json, template_source, template_tokens = _load_resources(artifact, tokenizer_dir)
     encoder = _PromptEncoder(tokenizer_json)
     template = _compile_template(template_source)

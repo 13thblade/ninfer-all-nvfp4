@@ -1,0 +1,497 @@
+// Qwen3.8-Flash-Next through the public Engine on the real artifact (milestone M1). Skips (77)
+// unless NINFER_TEST_QWEN4EXP_ARTIFACT names a Qwen4Exp artifact (its n-gram volume beside it).
+//
+// Default mode (the M1 gates):
+//   1. Placement invariance end to end: greedy ids of one request are identical with the expert
+//      cache cold (first request of a fresh Engine), warm (the same request again), warm-started
+//      from the saved state of the first Engine (a second Engine), and small (a 1 GiB cache that
+//      must evict every round, in a third Engine whose KV pool starts at 64 tokens and grows from the
+//      expert frames, and which decodes without the CUDA graph, so graph replay = eager as well).
+//   2. The RAM ledger refuses cleanly: an Engine asked to keep more RAM free than the machine has
+//      fails before anything is pinned, with a message that says how much is missing.
+//   3. The elastic KV pool's grow/shrink cycle on a full expert cache (kv_cycle below): three
+//      short/long alternations stay within the OS video-memory budget at every sample, and greedy
+//      ids repeat. --kv-cycle runs only this check.
+//
+//   ninfer_qwen4_exp_engine_real_test [TOKENS] [--generate N] [--max-context N] [--kv-cycle]
+//
+// Bench mode: one Engine, then each job in order (a prompt and greedy output tokens with model
+// stops disabled, so every request runs to N). Reports prefill and decode tok/s per job; the
+// Program logs each request's expert-cache hit rate.
+//
+//   ninfer_qwen4_exp_engine_real_test --bench [--max-context N] [--generate N] [--no-graph]
+//       [--expert-cache-mib N] [--no-expert-state] [--split N] [--print-ids] TOKENS...
+//
+// --split N streams each request with live timings and also reports decode tok/s over generated
+// tokens 2..N and N+1..end (decode right after a prefill, while the expert cache refills).
+// --print-ids prints each job's generated ids (a needle check decodes them).
+//
+// TOKENS is @FILE (ids separated by commas or whitespace) or a comma-separated id list.
+
+#include "core/vram_budget.h"
+#include "ninfer/engine.h"
+#include "ninfer/types.h"
+
+#include <cuda_runtime.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#ifdef _WIN32
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#endif
+#include <thread>
+
+#ifndef NINFER_SOURCE_DIR
+#    define NINFER_SOURCE_DIR "."
+#endif
+
+using namespace ninfer;
+
+namespace {
+
+std::vector<TokenId> parse_tokens(const std::string& argument) {
+    std::string text = argument;
+    if (!text.empty() && text.front() == '@') {
+        std::ifstream file(text.substr(1));
+        if (!file) { throw std::invalid_argument("cannot read " + text.substr(1)); }
+        text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    }
+    for (char& ch : text) {
+        if (ch == ',' || ch == '\n' || ch == '\r' || ch == '\t') { ch = ' '; }
+    }
+    std::vector<TokenId> out;
+    std::stringstream stream(text);
+    TokenId id = 0;
+    while (stream >> id) { out.push_back(id); }
+    return out;
+}
+
+double available_ram_gib() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) { return static_cast<double>(status.ullAvailPhys) / (1ULL << 30); }
+#endif
+    return 0.0;
+}
+
+// Between Engines: says how much host RAM came back after one was destroyed, waiting up to a minute
+// for it to return near `before`.
+void wait_for_ram(double before) {
+    const auto start = std::chrono::steady_clock::now();
+    double now       = available_ram_gib();
+    while (now < before - 1.0 && std::chrono::steady_clock::now() - start < std::chrono::seconds(60)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        now = available_ram_gib();
+    }
+    std::printf("available RAM %.1f GiB (%.1f before the Engine) after %.1f s\n", now, before,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+}
+
+EngineOptions base_options(const std::string& artifact, std::uint32_t max_context) {
+    EngineOptions options;
+    options.artifact_path         = artifact;
+    options.max_context           = max_context;
+    options.kv_capacity           = KvCapacityPolicy::explicit_capacity(max_context);
+    options.max_concurrency       = 1;
+    options.prefill_chunk         = 1024;
+    options.kv_cache              = KvCacheStorage::Int8Group64;
+    options.context_cache.enabled = false;
+    options.pending_timeout_ms    = 3'600'000;
+    return options;
+}
+
+struct Run {
+    std::vector<TokenId> ids;
+    GenerationTimings timings;
+    double wall = 0;
+    // With a split: the time from the first generated token to token `split` and to the last one.
+    std::uint32_t split = 0;
+    double to_split = 0, to_last = 0;
+};
+
+// Records the Engine's live timing observations (one per committed token) of a streamed request.
+class SplitSink final : public OutputSink {
+public:
+    explicit SplitSink(std::uint32_t split) : split_(split) {}
+    void start(GenerationStart) override {}
+    void progress(PromptProgress) override {}
+    void publish(OutputDelta) override {}
+    void timing(GenerationTimingObservation t) override {
+        const double s = static_cast<double>(t.generation_elapsed_ns) * 1e-9;
+        if (t.generated_tokens <= split_) { to_split = s; }
+        to_last = s;
+    }
+    double to_split = 0, to_last = 0;
+
+private:
+    std::uint32_t split_;
+};
+
+Run generate(Engine& engine, const std::vector<TokenId>& prompt, std::uint32_t tokens, std::uint32_t split = 0) {
+    RequestOptions request;
+    request.execution.requested_output_tokens = tokens;
+    request.execution.allow_prefix_reuse      = false;
+    request.execution.sampling.temperature    = 0.0F;
+    request.stop.include_model_defaults       = false;
+    request.output.raw                        = true;
+    const auto start = std::chrono::steady_clock::now();
+    GenerationResult result;
+    SplitSink sink(split);
+    if (split == 0) {
+        result = engine.generate(engine.prepare_tokens(prompt, false), request);
+    } else {
+        auto handle = engine.submit(engine.prepare_tokens(prompt, false), request, OutputConsumerMode::Streaming,
+                                    GenerationObservationOptions{.live_timings = true});
+        result      = handle.wait(&sink);
+    }
+    Run out;
+    out.split    = split;
+    out.to_split = sink.to_split;
+    out.to_last  = sink.to_last;
+    out.ids     = std::move(result.generated_token_ids);
+    out.timings = result.timings;
+    out.wall    = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    return out;
+}
+
+void print_run(const char* label, const Run& run, std::size_t prompt) {
+    const double decode = run.ids.size() > 1 && run.timings.decode_seconds > 0
+                              ? static_cast<double>(run.ids.size() - 1) / run.timings.decode_seconds
+                              : 0.0;
+    // Wall-clock decode: N - 1 tokens over the request's wall time after its prefill, which counts
+    // every host step between rounds (commit, the expert cache's update, n-gram reads).
+    const double after_prefill = run.wall - run.timings.prefill_seconds;
+    const double wall_decode   = run.ids.size() > 1 && after_prefill > 0
+                                     ? static_cast<double>(run.ids.size() - 1) / after_prefill
+                                     : 0.0;
+    // FNV-1a over the generated ids: equal hashes across runs of one prompt mean equal outputs.
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (const TokenId id : run.ids) {
+        hash ^= static_cast<std::uint32_t>(id);
+        hash *= 1099511628211ULL;
+    }
+    std::printf("%s: %zu prompt tokens, %zu generated; prefill %.2f s (%.1f tok/s), decode %.2f s (%.2f tok/s), "
+                "after prefill %.2f s (%.2f tok/s), wall %.2f s, ids %016llx\n",
+                label, prompt, run.ids.size(), run.timings.prefill_seconds,
+                run.timings.prefill_seconds > 0 ? static_cast<double>(prompt) / run.timings.prefill_seconds : 0.0,
+                run.timings.decode_seconds, decode, after_prefill, wall_decode, run.wall,
+                static_cast<unsigned long long>(hash));
+    if (run.split > 1 && run.ids.size() > run.split && run.to_split > 0 && run.to_last > run.to_split) {
+        std::printf("%s: split at %u: tokens 2-%u %.2f tok/s, tokens %u-%zu %.2f tok/s\n", label, run.split,
+                    run.split, static_cast<double>(run.split - 1) / run.to_split, run.split + 1, run.ids.size(),
+                    static_cast<double>(run.ids.size() - run.split) / (run.to_last - run.to_split));
+    }
+    std::fflush(stdout);
+}
+
+bool same(const char* label, const std::vector<TokenId>& reference, const std::vector<TokenId>& ids);
+
+// Reads this process's video memory (free memory and, under WDDM, its OS budget and usage) every
+// millisecond on its own thread, as the Program's VRAM monitor does, and records the largest usage
+// over the budget.
+class VramSampler {
+public:
+    VramSampler() : source_(open_vram_budget_source(0)), thread_([this] { run(); }) {}
+    ~VramSampler() {
+        stop_ = true;
+        thread_.join();
+    }
+    VramSampler(const VramSampler&)            = delete;
+    VramSampler& operator=(const VramSampler&) = delete;
+    // Bytes of usage over the budget at the worst sample so far (0: never over), and the samples.
+    [[nodiscard]] std::uint64_t worst_over() const { return worst_.load(); }
+    [[nodiscard]] std::uint64_t samples() const { return samples_.load(); }
+    [[nodiscard]] bool has_budget() const { return has_budget_.load(); }
+    // This process's device memory now (the OS budget's usage; free memory's complement without one).
+    [[nodiscard]] static std::uint64_t usage() {
+        const VramSnapshot s = open_vram_budget_source(0)->query(); // its own source: not shared with the thread
+        return s.has_budget ? s.local_usage : s.device_total - s.device_free;
+    }
+
+private:
+    void run() {
+        if (cudaSetDevice(0) != cudaSuccess) { return; }
+        while (!stop_.load()) {
+            VramSnapshot s;
+            try {
+                s = source_->query();
+            } catch (...) {
+                // Like the production monitor: a failed read is no sample, and sampling stops.
+                has_budget_ = false;
+                return;
+            }
+            has_budget_ = s.has_budget;
+            if (s.has_budget && s.local_usage > s.local_budget) {
+                const std::uint64_t over = s.local_usage - s.local_budget;
+                if (over > worst_.load()) { worst_ = over; }
+            }
+            ++samples_;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    std::unique_ptr<VramBudgetSource> source_;
+    std::atomic<bool> stop_{false}, has_budget_{false};
+    std::atomic<std::uint64_t> worst_{0}, samples_{0};
+    std::thread thread_;
+};
+
+// The elastic KV pool's grow/shrink cycle on a full expert cache (the production sizing: VRAM filled
+// to the headroom): a short and a long prompt alternate, so the pool grows from its 1,024-token base
+// by ~0.5 GiB, more than the free memory, and shrinks back at the next admission, three times. The
+// growth must take its memory from the frames before it maps it: the process stays within its OS
+// budget at every sample (the VRAM sampler reads free memory throughout, as the monitor does, which
+// is what turned the earlier overcommit into cuMemSetAccess CUDA_ERROR_NOT_READY), no request fails,
+// greedy ids repeat exactly, and every frame a growth took comes back after the shrink.
+bool kv_cycle(const std::string& artifact, const std::vector<TokenId>& prompt, const std::vector<TokenId>& long_part) {
+    std::vector<TokenId> long_prompt;
+    while (long_prompt.size() < 40'000) { long_prompt.insert(long_prompt.end(), long_part.begin(), long_part.end()); }
+    long_prompt.resize(40'000);
+    EngineOptions options                = base_options(artifact, 65'536);
+    options.flash_next.save_expert_state = false;
+    options.flash_next.kv_base_tokens    = 1024;
+    Engine engine(options);
+    VramSampler sampler;
+    bool ok = true;
+    std::vector<TokenId> short_ids, long_ids;
+    std::uint64_t first_usage = 0, last_usage = 0;
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        const Run small = generate(engine, prompt, 8);
+        print_run("kv cycle, short prompt", small, prompt.size());
+        // The pool has shrunk back and the frames have taken their memory again.
+        (cycle == 0 ? first_usage : last_usage) = sampler.usage();
+        const Run large = generate(engine, long_prompt, 8);
+        print_run("kv cycle, long prompt (KV grown from the frames)", large, long_prompt.size());
+        if (cycle == 0) {
+            short_ids = small.ids;
+            long_ids  = large.ids;
+            ok        = ok && short_ids.size() == 8 && long_ids.size() == 8;
+        } else {
+            ok = same("kv cycle, short prompt again", short_ids, small.ids) && ok;
+            ok = same("kv cycle, long prompt again", long_ids, large.ids) && ok;
+        }
+    }
+    const std::uint64_t over = sampler.worst_over();
+    // No sample at all means the sampler failed: fail. Without an OS budget (not WDDM) the over-budget
+    // check cannot run: say so explicitly rather than reporting it as verified.
+    const bool sampled = sampler.samples() > 0;
+    if (!sampled) { std::printf("FAIL: kv cycle: the VRAM sampler produced no samples\n"); }
+    if (sampled && !sampler.has_budget()) {
+        std::printf("SKIP: kv cycle: no OS budget telemetry on this platform; the over-budget check did not run\n");
+    }
+    std::printf("%s: kv cycle: %llu VRAM samples, OS budget %s, worst usage over the budget %llu MiB\n",
+                over == 0 ? "ok" : "FAIL", static_cast<unsigned long long>(sampler.samples()),
+                sampler.has_budget() ? "read" : "unavailable", static_cast<unsigned long long>(over >> 20));
+    // Every frame a growth took comes back: the device holds as much after the third shrink as after
+    // the first (a leak loses a 64 MiB frame chunk per cycle).
+    const bool kept = last_usage + (32ULL << 20) >= first_usage;
+    std::printf("%s: kv cycle: device usage after the short prompt %llu MiB (first cycle), %llu MiB (third)\n",
+                kept ? "ok" : "FAIL", static_cast<unsigned long long>(first_usage >> 20),
+                static_cast<unsigned long long>(last_usage >> 20));
+    return ok && sampled && over == 0 && kept;
+}
+
+bool same(const char* label, const std::vector<TokenId>& reference, const std::vector<TokenId>& ids) {
+    if (ids == reference) {
+        std::printf("%s: %zu ids identical\n", label, ids.size());
+        return true;
+    }
+    std::size_t first = 0;
+    while (first < ids.size() && first < reference.size() && ids[first] == reference[first]) { ++first; }
+    std::printf("FAIL: %s differs from the cold run at generated token %zu\n", label, first);
+    return false;
+}
+
+int bench(const std::string& artifact, const std::vector<std::string>& args) {
+    std::uint32_t max_context = 33'792, tokens = 512, split = 0;
+    bool graph = true, state = true, print_ids = false;
+    std::optional<std::uint64_t> cache;
+    std::vector<std::string> jobs;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        const auto value     = [&] {
+            if (i + 1 >= args.size()) { throw std::invalid_argument(a + " needs a value"); }
+            return std::stoull(args[++i]);
+        };
+        if (a == "--max-context") {
+            max_context = static_cast<std::uint32_t>(value());
+        } else if (a == "--generate") {
+            tokens = static_cast<std::uint32_t>(value());
+        } else if (a == "--expert-cache-mib") {
+            cache = value() << 20U;
+        } else if (a == "--split") {
+            split = static_cast<std::uint32_t>(value());
+        } else if (a == "--no-graph") {
+            graph = false;
+        } else if (a == "--no-expert-state") {
+            state = false;
+        } else if (a == "--print-ids") {
+            print_ids = true;
+        } else {
+            jobs.push_back(a);
+        }
+    }
+    EngineOptions options                  = base_options(artifact, max_context);
+    options.use_cuda_graph                 = graph;
+    options.flash_next.expert_cache_bytes  = cache;
+    options.flash_next.save_expert_state   = state;
+    const auto load = std::chrono::steady_clock::now();
+    Engine engine(options);
+    std::printf("engine loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - load).count());
+    for (const std::string& job : jobs) {
+        const auto prompt = parse_tokens(job);
+        const Run run     = generate(engine, prompt, tokens, split);
+        print_run(job.c_str(), run, prompt.size());
+        if (print_ids) {
+            std::string ids;
+            for (const TokenId id : run.ids) { ids += (ids.empty() ? "" : ",") + std::to_string(id); }
+            std::printf("%s: ids: %s\n", job.c_str(), ids.c_str());
+        }
+    }
+    return 0;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    const char* artifact_env = std::getenv("NINFER_TEST_QWEN4EXP_ARTIFACT");
+    if (artifact_env == nullptr) {
+        std::printf("SKIP: set NINFER_TEST_QWEN4EXP_ARTIFACT to a Qwen3.8-Flash-Next artifact\n");
+        return 77;
+    }
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    try {
+        const std::string artifact = artifact_env;
+        std::vector<std::string> args(argv + 1, argv + argc);
+        if (!args.empty() && args.front() == "--bench") {
+            return bench(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        std::string tokens_arg = "@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/ppl_tokens-chat.ids";
+        std::uint32_t generate_tokens = 48, max_context = 8192, prompt_tokens = 300;
+        bool kv_cycle_only = false;
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            if (args[i] == "--kv-cycle") {
+                kv_cycle_only = true;
+            } else if (args[i] == "--generate" && i + 1 < args.size()) {
+                generate_tokens = static_cast<std::uint32_t>(std::stoul(args[++i]));
+            } else if (args[i] == "--max-context" && i + 1 < args.size()) {
+                max_context = static_cast<std::uint32_t>(std::stoul(args[++i]));
+            } else if (args[i] == "--prompt" && i + 1 < args.size()) {
+                prompt_tokens = static_cast<std::uint32_t>(std::stoul(args[++i]));
+            } else {
+                tokens_arg = args[i];
+            }
+        }
+        auto prompt = parse_tokens(tokens_arg);
+        if (prompt.size() > prompt_tokens) { prompt.resize(prompt_tokens); }
+        if (prompt.empty()) { throw std::invalid_argument("empty prompt"); }
+        // A long prompt (every fixture text, ~5,100 tokens): past QSA's 2,048-token selection
+        // budget, so attention drops blocks, and past one KV chunk per plane, so the small-cache
+        // Engine's 64-token KV base must grow from the expert frames.
+        std::vector<TokenId> long_prompt;
+        for (const char* name : {"ppl_tokens-code", "ppl_tokens-doc", "ppl_tokens-chat", "infernix_texts-code",
+                                 "infernix_texts-doc", "infernix_texts-chat"}) {
+            const auto part = parse_tokens("@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/" + name + ".ids");
+            long_prompt.insert(long_prompt.end(), part.begin(), part.end());
+        }
+        if (kv_cycle_only) {
+            const bool cycled = kv_cycle(artifact, prompt, long_prompt);
+            std::printf(cycled ? "qwen4_exp kv cycle passed\n" : "FAIL: qwen4_exp kv cycle\n");
+            return cycled ? 0 : 1;
+        }
+        const std::uint32_t long_tokens = 24;
+        std::vector<TokenId> long_cold;
+        const auto state_path = std::filesystem::temp_directory_path() / "ninfer-qwen4exp-test.expert-state";
+        std::filesystem::remove(state_path);
+        bool ok = true;
+
+        // 2 first: the refusal costs no load. More reserve than the machine has must refuse before
+        // anything is pinned, naming the shortfall.
+        {
+            EngineOptions options                 = base_options(artifact, max_context);
+            options.flash_next.ram_headroom_bytes = 1ULL << 40; // 1 TiB
+            try {
+                Engine refused(options);
+                std::printf("FAIL: an Engine keeping 1 TiB of RAM free started\n");
+                ok = false;
+            } catch (const std::exception& error) {
+                const std::string what = error.what();
+                const bool clean = what.find("cannot start") != std::string::npos && what.find("short") != std::string::npos;
+                std::printf("%s: RAM ledger refusal: %s\n", clean ? "ok" : "FAIL", what.c_str());
+                ok = ok && clean;
+            }
+        }
+
+        const double ram_before = available_ram_gib();
+        std::vector<TokenId> cold;
+        {
+            EngineOptions options                = base_options(artifact, max_context);
+            options.flash_next.expert_state_path = state_path;
+            Engine engine(options);
+            const Run first = generate(engine, prompt, generate_tokens);
+            print_run("cold cache", first, prompt.size());
+            cold = first.ids;
+            ok   = ok && cold.size() == generate_tokens;
+            const Run again = generate(engine, prompt, generate_tokens);
+            print_run("warm cache (same Engine)", again, prompt.size());
+            ok = same("warm cache (same Engine)", cold, again.ids) && ok;
+            const Run long_run = generate(engine, long_prompt, long_tokens);
+            print_run("long prompt", long_run, long_prompt.size());
+            long_cold = long_run.ids;
+            ok        = ok && long_cold.size() == long_tokens;
+        } // the Engine saves the expert state at shutdown
+        wait_for_ram(ram_before);
+        if (!std::filesystem::exists(state_path)) {
+            std::printf("FAIL: the expert state was not saved at shutdown\n");
+            ok = false;
+        }
+        {
+            EngineOptions options                = base_options(artifact, max_context);
+            options.flash_next.expert_state_path = state_path;
+            Engine engine(options);
+            const Run run = generate(engine, prompt, generate_tokens);
+            print_run("warm start (saved state)", run, prompt.size());
+            ok = same("warm start (saved state)", cold, run.ids) && ok;
+        }
+        wait_for_ram(ram_before);
+        {
+            EngineOptions options                 = base_options(artifact, max_context);
+            options.flash_next.save_expert_state  = false;
+            options.flash_next.expert_cache_bytes = 1ULL << 30;
+            options.flash_next.kv_base_tokens     = 64;
+            options.use_cuda_graph                = false;
+            Engine engine(options);
+            const Run run = generate(engine, prompt, generate_tokens);
+            print_run("small cache (1 GiB, evicting), elastic KV, no CUDA graph", run, prompt.size());
+            ok = same("small cache (1 GiB, evicting), elastic KV, no CUDA graph", cold, run.ids) && ok;
+            const Run graphless = generate(engine, prompt, generate_tokens);
+            ok = same("small cache, second request", cold, graphless.ids) && ok;
+            const Run long_run = generate(engine, long_prompt, long_tokens);
+            print_run("long prompt, small cache, KV grown", long_run, long_prompt.size());
+            ok = same("long prompt, small cache, KV grown", long_cold, long_run.ids) && ok;
+        }
+        wait_for_ram(ram_before);
+        ok = kv_cycle(artifact, prompt, long_prompt) && ok;
+        std::filesystem::remove(state_path);
+        std::printf(ok ? "qwen4_exp engine checks passed\n" : "FAIL: qwen4_exp engine checks\n");
+        return ok ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAIL: %s\n", error.what());
+        return 1;
+    }
+}

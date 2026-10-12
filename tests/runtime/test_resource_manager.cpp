@@ -1985,6 +1985,10 @@ void test_failed_demotion_releases_superseded_history_before_the_live_branch() {
     f.cache.finish(f.program, owner, first, f.next_order);
     const Base append{.tokens = tokens(800)};
     require(f.begin(append, early) == owner, "fixture append did not continue the dialogue");
+    // Superseded history with no Host bytes precedes the Host-resident endpoint in reclaim order.
+    const auto replay = f.program.add(tokens(300), {}, Role::InputReplay);
+    f.program.contents[replay.index].device_state = false;
+    f.cache.publish(f.program, owner, replay);
     const auto abandoned =
         f.program.add(tokens(800), {f.program.host_block(16)}, Role::Continuation);
     f.program.contents[abandoned.index].device_state = false;
@@ -2004,6 +2008,30 @@ void test_failed_demotion_releases_superseded_history_before_the_live_branch() {
                     ninfer::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(abandoned) && f.program.valid_checkpoint(endpoint),
             "a failed demotion deleted the live branch while superseded Host history remained");
+    require(f.program.valid_checkpoint(replay),
+            "the failed-demotion fallback erased superseded history with no Host bytes");
+}
+
+void test_delayed_older_rewrite_does_not_supersede_a_newer_owner() {
+    Fixture f(48);
+    const auto shared = f.program.add(tokens(16));
+    f.publish(shared);
+    const Base first{.tokens = tokens(800)};
+    const auto owner = f.begin(first, shared);
+    const auto point = f.program.add(tokens(800), {}, Role::Continuation);
+    f.cache.publish(f.program, owner, point);
+    f.cache.finish(f.program, owner, first, f.next_order + 10);
+    require(f.begin(Base{.tokens = tokens(900)}, point) == owner && f.cache.retention(owner).reused,
+            "fixture append did not prove the dialogue");
+    const auto deeper = f.program.add(tokens(900), {}, Role::Continuation);
+    f.cache.publish(f.program, owner, deeper);
+    f.cache.finish(f.program, owner, Base{.tokens = tokens(900)}, f.next_order + 10);
+
+    // A request that began before the owner's publication rewrites the same dialogue.
+    const Base edit{.tokens = concat(tokens(600), tokens(50, 9000))};
+    const auto older = f.cache.adopt(f.program, f.source(edit, shared), edit, 1);
+    require(older != owner && f.cache.retention(owner).reused,
+            "an older request superseded a newer published owner");
 }
 
 } // namespace
@@ -2024,6 +2052,7 @@ int main() {
         test_proven_deep_progress_survives_a_shallow_fallback_and_fork();
         test_consuming_rewind_resets_proven_progress_to_the_adopted_prefix();
         test_rewritten_dialogue_outlives_its_abandoned_branch();
+        test_delayed_older_rewrite_does_not_supersede_a_newer_owner();
         test_failed_demotion_releases_superseded_history_before_the_live_branch();
         test_inherited_owner_heat_cannot_spend_a_full_other_continuation();
         test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallback();

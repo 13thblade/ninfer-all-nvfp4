@@ -8,6 +8,13 @@ rem
 rem   model             profiles
 rem   qwen38-27b        tuned (default), int8, c8   <- recommended
 rem   qwen36-35b-a3b    tuned (default)
+rem   qwen38-flash-next tuned (default)      <- Qwen3.8-Flash-Next from the IQ2_XS GGUF (preview)
+rem
+rem QWEN3.8-FLASH-NEXT: one request at a time, 32,768 tokens of context, INT8 KV, text only, no
+rem speculation and no prefix reuse yet (every request prefills its whole prompt). It pins all 33 GiB
+rem of routed experts in host RAM and caches the most-used ones in VRAM; startup refuses, saying how
+rem much is missing, when Windows cannot keep 2 GiB free beside them. The expert cache's state is
+rem saved beside the model, so the second start is warm. NINFER_CONTEXT overrides the context.
 rem
 rem `tuned` is the recommended profile: rk4v4 KV, speculation plus the draft head, the memory
 rem flags, vision in overlay residency, and an 8 GiB pinned Host context budget for the cache.
@@ -20,9 +27,9 @@ rem
 rem QWEN3.8-27B, `tuned`: two flag sets, each measured (docs\performance.md, "Recommended
 rem configurations"), chosen with NINFER_SPEC. The default is the fast one.
 rem
-rem   NINFER_SPEC=dflash2 (default): fastest at one stream, 188,416 tokens of context
+rem   NINFER_SPEC=dflash2 (default): fastest at one stream, up to 188,416 tokens of context
 rem
-rem     --spec dflash2 --draft-tokens 7 --lm-head-draft
+rem     --spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15
 rem     --prefill-cublas --prefill-chunk 4096
 rem     --kv-dtype rk4v4 --gdn-state-fp16
 rem     --vision --vision-residency overlay
@@ -55,7 +62,7 @@ rem apply the loaded graft to every request that names none), NINFER_CHAT_TEMPLA
 rem Jinja file, passed straight to --chat-template; overrides the artifact's built-in template).
 rem `tuned` also: NINFER_CONTEXT,
 rem NINFER_CONCURRENCY, NINFER_KV_DTYPE, NINFER_SPEC, NINFER_DRAFT_TOKENS, NINFER_PREFILL_CHUNK,
-rem NINFER_VISION (on^|off), NINFER_VISION_RESIDENCY, NINFER_HOST_CONTEXT_MIB (8192), NINFER_MIN_P (0.03) and
+rem NINFER_NGRAM (on^|off; n-gram copy drafting, on with DFlash2 at one lane), NINFER_VISION (on^|off), NINFER_VISION_RESIDENCY, NINFER_HOST_CONTEXT_MIB (8192), NINFER_MIN_P (0.03) and
 rem NINFER_PRESENCE_PENALTY (0.5), the loop guard ("default" keeps the registered preset).
 rem
 rem SERVING KNOBS, `tuned` only. Each is passed to ninfer-serve only when set, so leaving them all
@@ -67,22 +74,27 @@ rem     NINFER_HOST_CACHE_RESERVE_MIB     --host-cache-reserve-mib N     RAM to 
 rem     NINFER_HOST_CACHE_MAX_MIB         --host-cache-max-mib N         hard cap on pinned RAM
 rem   NINFER_MAX_OUTPUT_TOKENS            --max-output-tokens N          cap every request's output budget
 rem   NINFER_MLP_A8_DECODE=on             --mlp-a8-decode                INT8-activation MLP decode
-rem   NINFER_CONTEXT_STORE                --context-store DIR            keep the context cache across restarts
-rem                                                                      and crashes, under every NINFER_SPEC
+rem   NINFER_REASONING_LOOP=stop^|conclude --reasoning-loop MODE         end (stop) or close the thinking
+rem                                                                      (conclude) when it keeps repeating
+rem                                                                      whole passages; off (the default)
+rem                                                                      leaves thinking unguarded
+rem   NINFER_CONTEXT_STORE               --context-store DIR            keep the context cache across restarts
+rem                                                                      and crashes (dflash2, mtp, none)
 rem     NINFER_CONTEXT_STORE_MAX_GIB      --context-store-max-gib N      disk budget for the store
 rem
-rem Each spec's defaults
-rem (context, lanes, chunk) are the ones measured to fit beside a desktop, which holds roughly 1.5 GiB
-rem of the card; if startup refuses, drop a rung of NINFER_CONTEXT: 229376 / 196608 / 163840 / 131072 /
-rem 98304 / 65536.
+rem Each spec's defaults (context, lanes, chunk) are the ones measured to fit beside a desktop, which
+rem holds roughly 1-1.5 GiB of the card.
 rem
 rem IF THE CARD IS BUSY. A desktop (or another job) holding VRAM can leave too little for the default
-rem context. When the `tuned` profile is refused at startup for lack of GPU memory, this launcher
-rem steps down on its own -- an eighth of the context at a time, up to five times, and from the
-rem second step also a 2048 prefill chunk and a smaller Host context budget -- and says what it did,
-rem so the first run starts instead of ending in an error. It only does that for the defaults: an
-rem explicit NINFER_CONTEXT, NINFER_PREFILL_CHUNK or NINFER_HOST_CONTEXT_MIB is honoured as given and
-rem fails loudly, and NINFER_FALLBACK=off turns the step-down off.
+rem context. The `tuned` profiles' context is therefore a ceiling: the server is started with
+rem --fit-context 32768 and, when the profile's context does not fit the GPU memory free at startup
+rem with a 256 MiB safety margin, it starts at the largest context that does (a multiple of 1,024
+rem tokens, at least 32,768) and prints one line saying so. If not even 32,768 tokens fit, it stops
+rem and says how much memory is missing. Separately, if pinning the Host context budget fails (a
+rem machine short of RAM), the launcher retries with half the budget, down to none. Values the
+rem caller sets are honoured as given and fail loudly: an explicit NINFER_CONTEXT turns the fit off,
+rem an explicit NINFER_HOST_CONTEXT_MIB (or NINFER_AUTO_HOST_CACHE=on) the host retry, and
+rem NINFER_FALLBACK=off turns both off.
 rem
 rem Loopback by default. 0.0.0.0 publishes an unauthenticated OpenAI-compatible endpoint to every
 rem network this machine is on, so it is opt-in per run rather than the shipped default:
@@ -92,13 +104,21 @@ rem ----------------------------------------------------------------------------
 
 set "MODEL_KEY=%~1"
 set "PROFILE=%~2"
-rem Step-down eligibility, decided once on the first pass: only the defaults of the tuned profile
-rem may be second-guessed. A step-down pass sets the overrides itself and jumps back to :model_known.
-if not defined RUNG (
-  set "RUNG=0"
-  set "LADDER=0"
-  if "%NINFER_CONTEXT%%NINFER_PREFILL_CHUNK%%NINFER_HOST_CONTEXT_MIB%"=="" if /i not "%NINFER_FALLBACK%"=="off" set "LADDER=1"
+rem Fit and host-retry eligibility, decided once on the first pass: only the tuned profile's
+rem defaults may be second-guessed. A host-retry pass sets NINFER_HOST_CONTEXT_MIB itself and jumps
+rem back to :model_known, so it must not count as the caller's choice.
+if not defined NINFER_RUN_DECIDED (
+  set "NINFER_RUN_DECIDED=1"
+  set "HOST_RETRY=0"
+  set "FIT=0"
+  if "%NINFER_HOST_CONTEXT_MIB%"=="" if /i not "%NINFER_FALLBACK%"=="off" set "HOST_RETRY=1"
+  if "%NINFER_CONTEXT%"=="" if /i not "%NINFER_FALLBACK%"=="off" set "FIT=1"
 )
+rem 32,768 tokens is the smallest context still worth serving; below it the server stops and says
+rem how much memory is missing.
+set "FIT_FLOOR=32768"
+set "CONTEXT_WORD=context"
+if "%FIT%"=="1" set "CONTEXT_WORD=context up to"
 if "%PROFILE%"=="" set "PROFILE=tuned"
 if "%MODEL_KEY%"=="" goto :choose_model
 :model_resolve
@@ -115,6 +135,11 @@ if /i "%MODEL_KEY%"=="qwen36-35b-a3b" (
   set "TITLE=Qwen3.6-35B-A3B"
   goto :model_known
 )
+if /i "%MODEL_KEY%"=="qwen38-flash-next" (
+  set "ARTIFACT=qwen4exp-iq2xs.ninfer"
+  set "TITLE=Qwen3.8-Flash-Next (IQ2_XS)"
+  goto :model_known
+)
 echo Unknown model: %MODEL_KEY% 1>&2
 call :usage 1>&2
 exit /b 2
@@ -125,9 +150,12 @@ rem no console to read from; that must not silently pick a model.
 echo Which model?
 echo   1  Qwen3.8-27B  (recommended)
 echo   2  Qwen3.6-35B-A3B
-choice /c 12 /n /m "Choose 1 or 2: "
+echo   3  Qwen3.8-Flash-Next  (preview: one request at a time, 32K context)
+choice /c 123 /n /m "Choose 1, 2 or 3: "
 if errorlevel 255 exit /b 2
-if errorlevel 2 (
+if errorlevel 3 (
+  set "MODEL_KEY=qwen38-flash-next"
+) else if errorlevel 2 (
   set "MODEL_KEY=qwen36-35b-a3b"
 ) else (
   set "MODEL_KEY=qwen38-27b"
@@ -179,6 +207,7 @@ set "PREFILL_NOTE="
 set "HINT="
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b/tuned" goto :profile_27b_tuned
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen36-35b-a3b/tuned" goto :profile_35b_tuned
+if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-flash-next/tuned" goto :profile_flash_next
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b/int8" goto :profile_27b_int8
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b/c8" goto :profile_27b_c8
 echo Model %MODEL_KEY% has no profile %PROFILE% 1>&2
@@ -226,13 +255,29 @@ if not "%NINFER_CONTEXT%"=="" set "CONTEXT=%NINFER_CONTEXT%"
 if not "%NINFER_CONCURRENCY%"=="" set "CONCURRENCY=%NINFER_CONCURRENCY%"
 if not "%NINFER_KV_DTYPE%"=="" set "KV_DTYPE=%NINFER_KV_DTYPE%"
 if not "%NINFER_PREFILL_CHUNK%"=="" set "PREFILL_CHUNK=%NINFER_PREFILL_CHUNK%"
+rem N-gram copy drafting rides on DFlash2. At one lane it is on: +42%% decode on agent traffic that
+rem writes back files it has read, -0.7%% on output that never copies, 170 MiB of VRAM. At two lanes
+rem a copying request slows the other one by up to 19%%, so it stays off unless NINFER_NGRAM=on.
+set "NGRAM=off"
+if /i "%SPEC%"=="dflash2" if "%CONCURRENCY%"=="1" set "NGRAM=on"
+if not "%NINFER_NGRAM%"=="" set "NGRAM=%NINFER_NGRAM%"
+if /i not "%NGRAM%"=="on" if /i not "%NGRAM%"=="off" (
+  echo NINFER_NGRAM must be on or off, got %NGRAM% 1>&2
+  exit /b 2
+)
+if /i "%NGRAM%"=="on" if /i not "%SPEC%"=="dflash2" (
+  echo NINFER_NGRAM=on needs NINFER_SPEC=dflash2 1>&2
+  exit /b 2
+)
 set "SPEC_ARGS="
 if /i not "%SPEC%"=="none" set "SPEC_ARGS=--spec %SPEC% --draft-tokens %DRAFT_TOKENS% --lm-head-draft"
+if /i "%NGRAM%"=="on" set "SPEC_ARGS=%SPEC_ARGS% --ngram-draft-tokens 15"
 if /i "%SPEC%"=="dflash2" set "SPEC_LABEL=DFlash2 K=%DRAFT_TOKENS% + draft head"
+if /i "%NGRAM%"=="on" set "SPEC_LABEL=%SPEC_LABEL% + n-gram copies"
 if /i "%SPEC%"=="mtp" set "SPEC_LABEL=MTP%DRAFT_TOKENS% + draft head, full context"
 if /i "%SPEC%"=="none" set "SPEC_LABEL=no speculation"
 set "PROFILE_ARGS=--max-concurrency %CONCURRENCY% --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype %KV_DTYPE% %SPEC_ARGS% --gdn-state-fp16 --prefill-cublas --prefill-chunk %PREFILL_CHUNK%"
-set "LABEL=C%CONCURRENCY%  ^|  context %CONTEXT%  ^|  %KV_DTYPE% KV  ^|  %SPEC_LABEL%"
+set "LABEL=C%CONCURRENCY%  ^|  %CONTEXT_WORD% %CONTEXT%  ^|  %KV_DTYPE% KV  ^|  %SPEC_LABEL%"
 set "PREFILL_NOTE=Prefill: cuBLAS route, chunk %PREFILL_CHUNK%"
 if /i "%SPEC%"=="dflash2" set "HINT=Need the full 262K context or a second lane? Set NINFER_SPEC=mtp: slower decode."
 goto :profile_tuned_common
@@ -254,6 +299,16 @@ set "CONTEXT=212992"
 set "CONCURRENCY=2"
 set "PREFILL_CHUNK=4096"
 set "DRAFT_TOKENS=3"
+rem DFlash2 is 27B-only and n-gram copy rounds ride on it, so refuse rather than ignore the flag.
+if "%NINFER_NGRAM%"=="" goto :ngram35_done
+if /i "%NINFER_NGRAM%"=="off" goto :ngram35_done
+if /i "%NINFER_NGRAM%"=="on" (
+  echo NINFER_NGRAM=on needs NINFER_SPEC=dflash2, which only qwen38-27b has 1>&2
+  exit /b 2
+)
+echo NINFER_NGRAM must be on or off, got %NINFER_NGRAM% 1>&2
+exit /b 2
+:ngram35_done
 if /i "%SPEC%"=="mtp" goto :spec35_mtp
 if /i "%SPEC%"=="none" goto :spec35_none
 echo NINFER_SPEC must be mtp or none, got %SPEC% 1>&2
@@ -275,8 +330,21 @@ set "SPEC_ARGS="
 if /i "%SPEC%"=="mtp" set "SPEC_ARGS=--spec mtp --draft-tokens %DRAFT_TOKENS% --lm-head-draft --mtp-experts-q4"
 if /i "%SPEC%"=="mtp" set "SPEC_LABEL=MTP%DRAFT_TOKENS% + draft head"
 set "PROFILE_ARGS=--max-concurrency %CONCURRENCY% --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype %KV_DTYPE% %SPEC_ARGS% --gdn-state-fp16 --prefill-cublas --prefill-chunk %PREFILL_CHUNK%"
-set "LABEL=C%CONCURRENCY%  ^|  context %CONTEXT%  ^|  %KV_DTYPE% KV  ^|  %SPEC_LABEL%"
+set "LABEL=C%CONCURRENCY%  ^|  %CONTEXT_WORD% %CONTEXT%  ^|  %KV_DTYPE% KV  ^|  %SPEC_LABEL%"
 goto :profile_tuned_common
+
+:profile_flash_next
+rem The only serving shape this release supports: one lane, INT8 KV. The step-down ladder does not
+rem apply (its refusals are another model's); a refusal here says what to change. PROFILE is
+rem renamed so the tuned profiles' cache and sampling notes are not printed for it.
+set "LADDER=0"
+set "PROFILE=flash-next"
+set "CONTEXT=32768"
+if not "%NINFER_CONTEXT%"=="" set "CONTEXT=%NINFER_CONTEXT%"
+set "PROFILE_ARGS=--max-concurrency 1 --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype int8 --prefill-chunk 1024 --max-pending-requests 16 --pending-timeout-ms 600000"
+set "LABEL=one request  ^|  context %CONTEXT%  ^|  INT8 KV  ^|  text only, no speculation"
+set "PREFILL_NOTE=Loads in about 2 minutes: 33 GiB of experts are pinned in host RAM"
+goto :launch
 
 :profile_27b_int8
 set "PROFILE_ARGS=--max-context 65536 --kv-capacity 65536 --max-concurrency 1 --max-pending-requests 16 --pending-timeout-ms 600000 --prefill-chunk 1024 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft"
@@ -341,7 +409,7 @@ if /i not "%MIN_P%"=="default" set "SAMPLING_ARGS=--min-p %MIN_P%"
 if /i not "%PRESENCE%"=="default" set "SAMPLING_ARGS=%SAMPLING_ARGS% --presence-penalty %PRESENCE%"
 rem --auto-host-cache sizes that budget from the RAM still free once the model has loaded, and
 rem refuses --host-context-mib, so it is either/or: with it on, NINFER_HOST_CONTEXT_MIB (and the
-rem step-down ladder's smaller budget) is ignored.
+rem host retry's smaller budget) is ignored.
 set "AUTO_HOST_CACHE=off"
 if not "%NINFER_AUTO_HOST_CACHE%"=="" set "AUTO_HOST_CACHE=%NINFER_AUTO_HOST_CACHE%"
 set "CACHE_ARGS="
@@ -351,6 +419,7 @@ echo NINFER_AUTO_HOST_CACHE must be on or off, got %AUTO_HOST_CACHE% 1>&2
 exit /b 2
 :cache_auto
 set "CACHE_ARGS=--auto-host-cache"
+set "HOST_RETRY=0"
 if not "%NINFER_HOST_CACHE_PERCENT%"=="" set "CACHE_ARGS=%CACHE_ARGS% --host-cache-percent %NINFER_HOST_CACHE_PERCENT%"
 if not "%NINFER_HOST_CACHE_RESERVE_MIB%"=="" set "CACHE_ARGS=%CACHE_ARGS% --host-cache-reserve-mib %NINFER_HOST_CACHE_RESERVE_MIB%"
 if not "%NINFER_HOST_CACHE_MAX_MIB%"=="" set "CACHE_ARGS=%CACHE_ARGS% --host-cache-max-mib %NINFER_HOST_CACHE_MAX_MIB%"
@@ -372,6 +441,31 @@ if not "%NINFER_MLP_A8_DECODE%"=="" if /i not "%NINFER_MLP_A8_DECODE%"=="on" if 
   echo NINFER_MLP_A8_DECODE must be on or off, got %NINFER_MLP_A8_DECODE% 1>&2
   exit /b 2
 )
+rem Reasoning-loop guard (--reasoning-loop): off unless asked for. It has never fired on the 27B in
+rem the measurements behind it (#217: 21 requests, including one written to make the model loop),
+rem and its thresholds come from other models, so turning it on by default would trade an unmeasured
+rem false-positive risk for no observed benefit. `off` is the server's own default and passes nothing.
+set "REASONING_LOOP="
+set "LOOP_NOTE="
+if "%NINFER_REASONING_LOOP%"=="" goto :loop_done
+if /i "%NINFER_REASONING_LOOP%"=="off" (
+  set "LOOP_NOTE=Reasoning-loop guard: off  (NINFER_REASONING_LOOP)"
+  goto :loop_done
+)
+if /i "%NINFER_REASONING_LOOP%"=="stop" (
+  set "REASONING_LOOP=stop"
+  set "LOOP_NOTE=Reasoning-loop guard: stop - a reply whose thinking keeps repeating itself ends early  (NINFER_REASONING_LOOP)"
+  goto :loop_done
+)
+if /i "%NINFER_REASONING_LOOP%"=="conclude" (
+  set "REASONING_LOOP=conclude"
+  set "LOOP_NOTE=Reasoning-loop guard: conclude - thinking that keeps repeating itself is closed and the model answers  (NINFER_REASONING_LOOP)"
+  goto :loop_done
+)
+echo NINFER_REASONING_LOOP must be off, stop or conclude, got %NINFER_REASONING_LOOP% 1>&2
+exit /b 2
+:loop_done
+if defined REASONING_LOOP set "KNOB_ARGS=%KNOB_ARGS% --reasoning-loop %REASONING_LOOP%"
 rem The store directory is an arbitrary path: the unquoted `set NAME=value` form puts the quotes
 rem around the expansion, as for CHAT_TEMPLATE_ARGS below, so metacharacters stay inert.
 set "STORE_ARGS="
@@ -381,7 +475,11 @@ if "%NINFER_CONTEXT_STORE%"=="" if not "%NINFER_CONTEXT_STORE_MAX_GIB%"=="" (
   echo NINFER_CONTEXT_STORE_MAX_GIB needs NINFER_CONTEXT_STORE 1>&2
   exit /b 2
 )
-set "PROFILE_ARGS=%PROFILE_ARGS% --max-pending-requests 16 --pending-timeout-ms 600000 %VISION_ARGS% %CACHE_ARGS%%KNOB_ARGS% %SAMPLING_ARGS%"
+rem The profile's context is a ceiling unless the caller chose it: --fit-context lets the server start
+rem at the largest context that fits the GPU memory free right now (never below FIT_FLOOR) and say so.
+set "FIT_ARGS="
+if "%FIT%"=="1" set "FIT_ARGS= --fit-context %FIT_FLOOR%"
+set "PROFILE_ARGS=%PROFILE_ARGS% --max-pending-requests 16 --pending-timeout-ms 600000 %VISION_ARGS% %CACHE_ARGS%%KNOB_ARGS%%FIT_ARGS% %SAMPLING_ARGS%"
 
 :launch
 set "GRAFT_ARGS="
@@ -423,6 +521,7 @@ echo %TITLE%  ^|  %LABEL%
 if not "%PREFILL_NOTE%"=="" echo %PREFILL_NOTE%
 if /i "%PROFILE%"=="tuned" echo %CACHE_NOTE%
 if /i "%PROFILE%"=="tuned" echo Sampling guard: min-p %MIN_P%, presence penalty %PRESENCE%  (NINFER_MIN_P, NINFER_PRESENCE_PENALTY; "default" = registered preset)
+if /i "%PROFILE%"=="tuned" if defined LOOP_NOTE echo %LOOP_NOTE%
 rem GRAFT_ARGS carries literal embedded quotes (--graft "godmode=<path>"), so re-quoting it for a
 rem string comparison here garbles the quoting and breaks the if statement. `defined` sidesteps
 rem that: it tests the variable directly, with no substitution.
@@ -440,46 +539,39 @@ rem Not a parenthesised block: NINFER_CHAT_TEMPLATE (like NINFER_GRAFT_DIR) is a
 rem path and may contain ")" (e.g. "C:\templates\customer (v2)\chat.jinja"). Expanded inside a
 rem "( ... )" command group, that character can be taken as the group's own closing paren and
 rem break the batch parse, quoting notwithstanding -- so this invocation runs unparenthesised, with
-rem goto standing in for the ladder/non-ladder branch instead.
-if /i not "%PROFILE%"=="tuned" set "LADDER=0"
-if not "%LADDER%"=="0" goto :launch_ladder
+rem goto standing in for the logged/unlogged branch instead.
+if /i "%PROFILE%"=="tuned" goto :launch_logged
 "%SERVER%" "%MODEL%" --host %HOST% --port %PORT% %PROFILE_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS%
 endlocal
 exit /b %ERRORLEVEL%
 
-:launch_ladder
-rem Run the server with its output shown and kept, so a refusal for lack of memory can be told apart
-rem from any other failure. Only that failure steps down; a crash or a bad artifact does not. The log
-rem is written as ASCII on purpose: Tee-Object writes UTF-16, which findstr cannot search.
-if "%RUNG%"=="0" (
-  set "BASE_CONTEXT=%CONTEXT%"
-  set "BASE_CHUNK=%PREFILL_CHUNK%"
-  set "BASE_HOST_MIB=%HOST_CONTEXT_MIB%"
-)
+:launch_logged
+rem Run the server with its output shown and kept, so a failure the launcher can explain or retry is
+rem told apart from any other. Only a failed host pin retries; a crash or a bad artifact does not.
+rem The log is written as ASCII on purpose: Tee-Object writes UTF-16, which findstr cannot search.
 set "SERVER_LOG=%TEMP%\ninfer-run-%RANDOM%%RANDOM%.log"
 "%SERVER%" "%MODEL%" --host %HOST% --port %PORT% %PROFILE_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS% 2>&1 | powershell -NoProfile -Command "$input | ForEach-Object { $_; Add-Content -LiteralPath '%SERVER_LOG%' -Value $_ -Encoding Ascii }"
-findstr /c:"runtime reservation requires" /c:"cudaMallocHost failed" "%SERVER_LOG%" >nul 2>&1
+findstr /c:"not enough free GPU memory" "%SERVER_LOG%" >nul 2>&1
+if not errorlevel 1 goto :memory_advice
+if not "%HOST_RETRY%"=="1" goto :server_done
+if "%HOST_CONTEXT_MIB%"=="0" goto :server_done
+findstr /c:"cudaMallocHost failed" "%SERVER_LOG%" >nul 2>&1
 if errorlevel 1 goto :server_done
-if %RUNG% GEQ 5 goto :server_done
-set /a NEXT=RUNG+1
-set /a NEXT_CONTEXT=BASE_CONTEXT*(8-NEXT)/8/1024*1024
-rem The first step trims context only: an eighth of it frees more than a card that just misses
-rem needs, and prefill speed and cached prefixes are worth keeping. Later steps also give up the
-rem wider prefill chunk and halve the Host context budget every other step (floor 0).
-set "NEXT_CHUNK=%BASE_CHUNK%"
-if %NEXT% GEQ 2 if %BASE_CHUNK% GTR 2048 set "NEXT_CHUNK=2048"
-set /a "NEXT_HOST_MIB=BASE_HOST_MIB>>(NEXT/2)"
-if %NEXT_HOST_MIB% LSS 0 set "NEXT_HOST_MIB=0"
+set "NEXT_HOST_MIB=0"
+if %HOST_CONTEXT_MIB% GTR 2048 set /a NEXT_HOST_MIB=HOST_CONTEXT_MIB/2
 echo.
-echo Not enough free memory to start at context %CONTEXT%. Retrying at %NEXT_CONTEXT% (prefill chunk %NEXT_CHUNK%, %NEXT_HOST_MIB% MiB host context).
-echo Set NINFER_CONTEXT to choose your own, or NINFER_FALLBACK=off to fail instead.
+echo Could not pin %HOST_CONTEXT_MIB% MiB of host RAM for the context cache. Retrying with %NEXT_HOST_MIB% MiB.
+echo Set NINFER_HOST_CONTEXT_MIB to choose your own, or NINFER_FALLBACK=off to fail instead.
 echo.
 del "%SERVER_LOG%" >nul 2>&1
-set "NINFER_CONTEXT=%NEXT_CONTEXT%"
-set "NINFER_PREFILL_CHUNK=%NEXT_CHUNK%"
 set "NINFER_HOST_CONTEXT_MIB=%NEXT_HOST_MIB%"
-set "RUNG=%NEXT%"
 goto :model_known
+
+:memory_advice
+echo.
+echo %TITLE% could not start: the graphics card does not have enough free memory, even for a
+echo reduced context. Close other programs that use the GPU (games, video, other AI tools)
+echo and run this again. `nvidia-smi` lists what is using it.
 
 :server_done
 rem The pipe hides the server's own exit status, so report failure from what it logged.
@@ -493,4 +585,5 @@ endlocal & exit /b %SERVER_STATUS%
 echo usage: run.bat ^<model^> [profile]
 echo   qwen38-27b       tuned (default), int8, c8   (recommended)
 echo   qwen36-35b-a3b   tuned (default)
+echo   qwen38-flash-next tuned (default)   (preview)
 exit /b 0

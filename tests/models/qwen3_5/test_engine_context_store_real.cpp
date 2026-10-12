@@ -212,20 +212,23 @@ int check_continuation(const ninfer::GenerationResult& next, const Control& cont
     if (got.rounds != want.rounds || got.drafted_tokens != want.drafted_tokens ||
         got.accepted_tokens != want.accepted_tokens ||
         got.ngram_rounds != want.ngram_rounds ||
+        got.ngram_drafted_tokens != want.ngram_drafted_tokens ||
         got.ngram_accepted_tokens != want.ngram_accepted_tokens) {
         std::cerr << label << ": speculation differs from the warm control: rounds " << got.rounds
                   << " vs " << want.rounds << ", accepted " << got.accepted_tokens << '/'
                   << got.drafted_tokens << " vs " << want.accepted_tokens << '/'
-                  << want.drafted_tokens << ", copies accepted " << got.ngram_accepted_tokens
-                  << " vs " << want.ngram_accepted_tokens << '\n';
+                  << want.drafted_tokens << ", copy rounds " << got.ngram_rounds << " vs "
+                  << want.ngram_rounds << ", copies accepted " << got.ngram_accepted_tokens << '/'
+                  << got.ngram_drafted_tokens << " vs " << want.ngram_accepted_tokens << '/'
+                  << want.ngram_drafted_tokens << '\n';
         return 1;
     }
     if (draft_model_spec()) {
         std::cout << label << ": " << next.generated_token_ids.size() << " tokens in "
                   << got.rounds << " rounds, accepted " << got.accepted_tokens << '/'
                   << got.drafted_tokens << " (copy rounds " << got.ngram_rounds
-                  << ", copies accepted " << got.ngram_accepted_tokens
-                  << "), identical to the warm control\n";
+                  << ", copies accepted " << got.ngram_accepted_tokens << '/'
+                  << got.ngram_drafted_tokens << "), identical to the warm control\n";
     }
     return 0;
 }

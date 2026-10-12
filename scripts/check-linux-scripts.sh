@@ -131,12 +131,19 @@ expect_exit() { # expect_exit <status> <label> <command...>: the command exits w
 # Qwen3.8-27B `tuned`: the two measured flag sets and the speculation-free variant.
 recorded="$(record dflash2 -- qwen38-27b)"
 expect_flags '27B default' "$recorded" \
-  '--spec dflash2 --draft-tokens 7 --lm-head-draft' \
+  '--spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15' \
   '--prefill-cublas --prefill-chunk 4096' \
   '--kv-dtype rk4v4' '--gdn-state-fp16' \
   '--vision --vision-residency overlay' '--max-context 262144' '--max-concurrency 1'
 refuse_flag '27B default' "$recorded" '--lm-head-q6'
 refuse_flag '27B default' "$recorded" '--embedding-q4'
+
+# N-gram copies: on with DFlash2 at one lane, off at two unless asked for, never without DFlash2.
+refuse_flag '27B NINFER_NGRAM=off' "$(record ngram_off NINFER_NGRAM=off -- qwen38-27b)" '--ngram-draft-tokens'
+refuse_flag '27B DFlash2 two lanes' "$(record ngram_c2 NINFER_CONCURRENCY=2 -- qwen38-27b)" '--ngram-draft-tokens'
+expect_flags '27B DFlash2 two lanes, NINFER_NGRAM=on' \
+  "$(record ngram_c2_on NINFER_CONCURRENCY=2 NINFER_NGRAM=on -- qwen38-27b)" '--ngram-draft-tokens 15'
+refuse_flag '27B NINFER_SPEC=mtp' "$(record ngram_mtp NINFER_SPEC=mtp -- qwen38-27b)" '--ngram-draft-tokens'
 
 recorded="$(record mtp NINFER_SPEC=mtp -- qwen38-27b tuned)"
 expect_flags '27B NINFER_SPEC=mtp' "$recorded" \
@@ -169,6 +176,30 @@ expect_flags '27B chat template override' \
   "$(record chat_template NINFER_CHAT_TEMPLATE="$tmp/custom.jinja" -- qwen38-27b)" \
   "--chat-template $tmp/custom.jinja"
 refuse_flag '27B no chat template override' "$(record no_chat_template -- qwen38-27b)" '--chat-template'
+
+# The reasoning-loop guard is opt-in: unset or off passes nothing (the server default is off), stop
+# and conclude pass through on both models, the reference profiles stay minimal, and the banner
+# says which mode is in force.
+refuse_flag '27B reasoning loop unset' "$(record loop_unset -- qwen38-27b)" '--reasoning-loop'
+refuse_flag '27B NINFER_REASONING_LOOP=off' "$(record loop_off NINFER_REASONING_LOOP=off -- qwen38-27b)" '--reasoning-loop'
+expect_flags '27B NINFER_REASONING_LOOP=stop' \
+  "$(record loop_stop NINFER_REASONING_LOOP=stop -- qwen38-27b)" '--reasoning-loop stop'
+expect_flags '35B NINFER_REASONING_LOOP=conclude' \
+  "$(record loop_conclude35 NINFER_REASONING_LOOP=conclude -- qwen36-35b-a3b)" '--reasoning-loop conclude'
+refuse_flag '27B int8 NINFER_REASONING_LOOP=stop' \
+  "$(record loop_int8 NINFER_REASONING_LOOP=stop -- qwen38-27b int8)" '--reasoning-loop'
+banner="$(clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unused.args" \
+  NINFER_MODEL_DIR="$tmp" NINFER_REASONING_LOOP=conclude "$root/run.sh" qwen38-27b)"
+[[ "$banner" == *'Reasoning-loop guard: conclude'* ]] || {
+  printf 'run.sh banner does not report NINFER_REASONING_LOOP: %s\n' "$banner" >&2
+  exit 1
+}
+banner="$(clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unused.args" \
+  NINFER_MODEL_DIR="$tmp" "$root/run.sh" qwen38-27b)"
+[[ "$banner" != *'Reasoning-loop guard'* ]] || {
+  printf 'run.sh banner reports a reasoning-loop guard nobody asked for: %s\n' "$banner" >&2
+  exit 1
+}
 
 # The banner reports what is being served: an explicit vision residency shows up in it, not the
 # default. (The stub server prints nothing, so stdout here is the launcher's own.)
@@ -210,72 +241,108 @@ expect_exit 2 'unknown model' clear_env "${serve_env[@]}" "$root/run.sh" gpt
 expect_exit 2 'profile the model lacks' clear_env "${serve_env[@]}" "$root/run.sh" qwen36-35b-a3b c8
 expect_exit 2 'unknown profile' clear_env "${serve_env[@]}" "$root/run.sh" qwen38-27b fastest
 expect_exit 2 'unknown NINFER_SPEC' clear_env "${serve_env[@]}" NINFER_SPEC=bogus "$root/run.sh" qwen38-27b
+expect_exit 2 'unknown NINFER_NGRAM' clear_env "${serve_env[@]}" NINFER_NGRAM=yes "$root/run.sh" qwen38-27b
+expect_exit 2 'NINFER_NGRAM=on without DFlash2' clear_env "${serve_env[@]}" NINFER_SPEC=mtp NINFER_NGRAM=on \
+  "$root/run.sh" qwen38-27b
+expect_exit 2 'NINFER_NGRAM=on on the 35B' clear_env "${serve_env[@]}" NINFER_NGRAM=on "$root/run.sh" qwen36-35b-a3b
+expect_exit 2 'unknown NINFER_NGRAM on the 35B' clear_env "${serve_env[@]}" NINFER_NGRAM=yes "$root/run.sh" qwen36-35b-a3b
+expect_exit 2 'unknown NINFER_REASONING_LOOP' clear_env "${serve_env[@]}" NINFER_REASONING_LOOP=on \
+  "$root/run.sh" qwen38-27b
 expect_exit 0 '--help' clear_env "${serve_env[@]}" "$root/run.sh" --help
 
-# Step-down ladder. A desktop holding VRAM can leave too little for the default context, and the
-# tuned profile is meant to start anyway: refused for lack of memory, it retries with a smaller
-# context, a 2048 chunk and fewer host state slots. The stub refuses (with the engine's own message)
-# until the requested context fits, and logs every attempt it is given.
+# A desktop holding VRAM can leave too little for the default context, and the tuned profile is
+# meant to start anyway: its context is a ceiling the server fits to the free memory
+# (--fit-context, with the floor below which it refuses). A context the caller chose is theirs, and
+# NINFER_FALLBACK=off turns the fit off. The reference profiles are fixed shapes.
+expect_flags '27B default fits its context' "$(record fit -- qwen38-27b)" \
+  '--max-context 262144 --kv-capacity 262144' '--fit-context 32768'
+expect_flags '35B default fits its context' "$(record fit35 -- qwen36-35b-a3b)" '--fit-context 32768'
+refuse_flag '27B NINFER_CONTEXT' "$(record fit_context NINFER_CONTEXT=131072 -- qwen38-27b)" '--fit-context'
+refuse_flag '27B NINFER_KV_CAPACITY' "$(record fit_kv NINFER_KV_CAPACITY=300000 -- qwen38-27b)" '--fit-context'
+refuse_flag '27B NINFER_FALLBACK=off' "$(record fit_off NINFER_FALLBACK=off -- qwen38-27b)" '--fit-context'
+refuse_flag '27B int8' "$(record fit_int8 -- qwen38-27b int8)" '--fit-context'
+refuse_flag '27B c8' "$(record fit_c8 -- qwen38-27b c8)" '--fit-context'
+banner="$(clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unused.args" \
+  NINFER_MODEL_DIR="$tmp" "$root/run.sh" qwen38-27b)"
+[[ "$banner" == *'context up to 262144'* ]] || {
+  printf 'run.sh banner does not say the context is a ceiling: %s\n' "$banner" >&2
+  exit 1
+}
+
+# Host retry. A machine short of RAM can fail to pin the Host context budget; the tuned profile then
+# retries with half of it, down to none. The stub refuses (with the engine's own message) until the
+# requested budget fits, and logs every attempt it is given.
 cat > "$tmp/ninfer-serve-tight" <<'TIGHT'
 #!/usr/bin/env bash
-context=''; previous=''
-for argument in "$@"; do [[ "$previous" == '--max-context' ]] && context="$argument"; previous="$argument"; done
+host=''; previous=''
+for argument in "$@"; do [[ "$previous" == '--host-context-mib' ]] && host="$argument"; previous="$argument"; done
 printf '%s\n' "$*" >> "$NINFER_TEST_LOG"
-if (( context > ${NINFER_TEST_FITS:-0} )); then
-  echo "${NINFER_TEST_FAILURE:-FATAL server failed during startup | requested Engine runtime reservation requires 5173992960 bytes, but only 1 bytes are available}"
+if (( ${host:-0} > ${NINFER_TEST_FITS:-0} )); then
+  echo "${NINFER_TEST_FAILURE:-FATAL server failed during startup | cudaMallocHost failed to pin 8589934592 bytes}"
   exit 1
 fi
 TIGHT
 chmod +x "$tmp/ninfer-serve-tight"
-attempts() { # attempts <fits> [NAME=value ...] -> log of every attempt; sets $ladder_status
+attempts() { # attempts <fits> [NAME=value ...] -> log of every attempt; sets $ladder_status, $ladder_out
   local fits="$1"; shift
   ladder_log="$tmp/ladder.$RANDOM.log"; : > "$ladder_log"
   ladder_status=0
-  clear_env NINFER_SERVER="$tmp/ninfer-serve-tight" NINFER_MODEL_DIR="$tmp" NINFER_TEST_LOG="$ladder_log" \
-    NINFER_TEST_FITS="$fits" ${@+"$@"} "$root/run.sh" qwen38-27b >/dev/null 2>&1 || ladder_status=$?
+  ladder_out="$(clear_env NINFER_SERVER="$tmp/ninfer-serve-tight" NINFER_MODEL_DIR="$tmp" \
+    NINFER_TEST_LOG="$ladder_log" NINFER_TEST_FITS="$fits" ${@+"$@"} "$root/run.sh" qwen38-27b 2>&1)" ||
+    ladder_status=$?
 }
 field() { # field <flag>: that flag's value on each logged attempt, space separated
   awk -v flag="$1" '{ for (i = 1; i < NF; i++) if ($i == flag) printf "%s ", $(i + 1) } END { print "" }' "$ladder_log"
 }
 expect_eq() { # expect_eq <label> <got> <want>
   [[ "$2" == "$3" ]] && return 0
-  printf 'run.sh ladder (%s): got "%s", expected "%s"\n' "$1" "$2" "$3" >&2
+  printf 'run.sh retry (%s): got "%s", expected "%s"\n' "$1" "$2" "$3" >&2
   exit 1
 }
 
-attempts 100000
-expect_eq 'contexts stepped' "$(field --max-context)" '262144 229376 196608 163840 131072 98304 '
-expect_eq 'chunk drops to 2048' "$(field --prefill-chunk)" '4096 4096 2048 2048 2048 2048 '
-expect_eq 'host context halves' "$(field --host-context-mib)" '8192 8192 4096 4096 2048 2048 '
+attempts 2048
+expect_eq 'host budget halves until it pins' "$(field --host-context-mib)" '8192 4096 2048 '
+expect_eq 'the context is left to the fit' "$(field --max-context)" '262144 262144 262144 '
+expect_eq 'every retry still fits its context' "$(field --fit-context)" '32768 32768 32768 '
 expect_eq 'it started, so it exits 0' "$ladder_status" '0'
 
-attempts 1000
-expect_eq 'never fits: six attempts, then stops' "$(field --max-context)" '262144 229376 196608 163840 131072 98304 '
-expect_eq 'never fits: reports the failure' "$ladder_status" '1'
+attempts -1
+expect_eq 'never pins: down to none, then stops' "$(field --host-context-mib)" '8192 4096 2048 0 '
+expect_eq 'never pins: reports the failure' "$ladder_status" '1'
 
-# Values the caller chose are theirs, and a switch turns the ladder off: one attempt, loud failure.
-attempts 1000 NINFER_CONTEXT=131072
-expect_eq 'explicit context is not second-guessed' "$(field --max-context)" '131072 '
-attempts 1000 NINFER_HOST_CONTEXT_MIB=8192
-expect_eq 'explicit host context is not second-guessed' "$(field --max-context)" '262144 '
-attempts 1000 NINFER_FALLBACK=off
-expect_eq 'NINFER_FALLBACK=off' "$(field --max-context)" '262144 '
+# Values the caller chose are theirs, and a switch turns the retry off: one attempt, loud failure.
+attempts 0 NINFER_HOST_CONTEXT_MIB=8192
+expect_eq 'explicit host context is not second-guessed' "$(field --host-context-mib)" '8192 '
+attempts 0 NINFER_FALLBACK=off
+expect_eq 'NINFER_FALLBACK=off' "$(field --host-context-mib)" '8192 '
+attempts -1 NINFER_AUTO_HOST_CACHE=on
+expect_eq 'auto host cache is not retried' "$(wc -l < "$ladder_log" | tr -d ' ')" '1'
 
-# Only a memory refusal steps down. Any other startup failure is not something a smaller context fixes.
-attempts 1000 NINFER_TEST_FAILURE='FATAL server failed during startup | artifact is corrupt'
-expect_eq 'other failures do not retry' "$(field --max-context)" '262144 '
+# Any other startup failure is not something a smaller budget fixes.
+attempts 0 NINFER_TEST_FAILURE='FATAL server failed during startup | artifact is corrupt'
+expect_eq 'other failures do not retry' "$(field --host-context-mib)" '8192 '
 
-# NINFER_CHAT_TEMPLATE plays no part in the step-down math, but it must still ride along on every
-# retry -- a value set once should not silently drop off a later rung.
-attempts 1000 NINFER_CHAT_TEMPLATE="$tmp/custom.jinja"
-expect_eq 'chat template rides every rung' "$(field --chat-template)" \
-  "$tmp/custom.jinja $tmp/custom.jinja $tmp/custom.jinja $tmp/custom.jinja $tmp/custom.jinja $tmp/custom.jinja "
+# When not even the fit's floor fits the GPU, the server refuses and the launcher says, in plain
+# words, what to do -- once, without retrying anything.
+attempts 0 NINFER_TEST_FAILURE='FATAL server failed during startup | not enough free GPU memory to start: ...'
+expect_eq 'a GPU memory refusal does not retry' "$(field --host-context-mib)" '8192 '
+expect_eq 'a GPU memory refusal fails' "$ladder_status" '1'
+[[ "$ladder_out" == *'Close other programs that use the GPU'* ]] || {
+  printf 'run.sh gave no advice on a GPU memory refusal:\n%s\n' "$ladder_out" >&2
+  exit 1
+}
 
-# The reference profiles are fixed shapes and never step down.
+# NINFER_CHAT_TEMPLATE plays no part in the retry, but it must still ride along on every attempt --
+# a value set once should not silently drop off a later one.
+attempts 2048 NINFER_CHAT_TEMPLATE="$tmp/custom.jinja"
+expect_eq 'chat template rides every retry' "$(field --chat-template)" \
+  "$tmp/custom.jinja $tmp/custom.jinja $tmp/custom.jinja "
+
+# The reference profiles are fixed shapes and never retry.
 ladder_log="$tmp/ladder.fixed.log"; : > "$ladder_log"
 clear_env NINFER_SERVER="$tmp/ninfer-serve-tight" NINFER_MODEL_DIR="$tmp" NINFER_TEST_LOG="$ladder_log" \
-  NINFER_TEST_FITS=1000 "$root/run.sh" qwen38-27b int8 >/dev/null 2>&1 || true
-expect_eq 'int8 profile has no ladder' "$(field --max-context)" '65536 '
+  NINFER_TEST_FITS=-1 "$root/run.sh" qwen38-27b c8 >/dev/null 2>&1 || true
+expect_eq 'c8 profile has no retry' "$(field --host-context-mib)" '8192 '
 
 # run.sh ships *inside* the release archive as well as living here, and README calls it the Linux
 # entry point. It once resolved both the server and the artifact from `dirname(script)/..` -- the

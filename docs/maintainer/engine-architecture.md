@@ -23,7 +23,8 @@ Program，窗口使用临时 State 与 Main KV，不进入 Generation Scheduler 
 
 模型代码拥有数学公式、调用顺序、组件交接和状态转移。Config 提供层数、维度、Attention/GDN
 分布和 expert 几何等实例参数。架构入口为 `Qwen3_5ForCausalLM` 与 `Qwen3_5MoeForCausalLM`；
-训练实例和物理权重分配作为数据进入对应实现。
+训练实例和物理权重分配作为数据进入对应实现。`Qwen4ExpForCausalLM`（Qwen3.8-Flash-Next）是
+独立的模型、Program 与 Engine core 变体，见 §2.6。
 
 V3 artifact 保存配置、物理对象、逻辑参数 Binding、使用位置的 Use 和 Frontend 资源。
 Converter 负责源映射、量化或保值导入、融合存储、packing 和 layout 转换；loader 根据实际绑定
@@ -129,6 +130,37 @@ View 保留 parent 几何、planes 和元素范围，共享对象只驻留一次
 Reader、binder、原生参数准备、容量查询、warmup 和执行各自检查所消费的合同。可执行范围由实际
 消费者决定。数学公式、权重表示值和实现精度分别解释；不同量化、batch、prefill 或 speculative 路径的
 数值与状态正确性按 [Op 合同](op-development.md)及独立 oracle 验证。
+
+### 2.6 Qwen4Exp（Qwen3.8-Flash-Next）
+
+`Engine::Impl` 的 core 是 variant：Qwen3.5 的 `EngineCore<ModelInstance>` 与 `CausalScoreCore`，
+以及 `EngineCore<Qwen4ExpInstance>`。同一个 `EngineCore`、Scheduler 与 ResourceManager 模板驱动
+`models/qwen4_exp/program/program.h` 的 Program；它实现与 Qwen3.5 Program 相同的执行合同（同名
+方法与类型，checkpoint 等被动数据类型直接复用），未修改 EngineCore、Scheduler 或 ResourceManager。
+artifact 的 text 架构在启动时决定使用哪个实例（`runtime::artifact_is_qwen4_exp`）。
+
+本阶段（M1）的约束与所有权：
+
+- **前缀复用关闭。** Engine 对该模型强制 `context_cache.enabled=false`；Program 不产生 checkpoint、
+  不 capture，只提供 root source，所有 checkpoint 查询按空缓存回答。context store、graft 被拒绝。
+- **一个 lane。** Program 在 binding 时为请求的整个 extent（prompt + 有效输出）备好 KV，因此执行单元
+  从不缺资源，也就不会暂停或 Replay（`start_pause` 拒绝）。`--max-concurrency` 大于 1 被拒绝。
+- **Program 拥有**：lane 的 GDN/PLE/QSA 状态、INT8-G64 paged KV（VMM 弹性池：启动时映射 32,768 tokens，
+  更长的请求从 expert frames 借用，结束后的下一次绑定归还）、workspace、decode CUDA Graph（首轮 eager，
+  之后 capture 一次并 replay）、VRAM expert cache（LFRU frames、promotion 预算、warm-start 状态文件）、
+  n-gram volume reader、VRAM 控制律（只在轮次边界与请求结束时调整 frame 数）。
+- **宽 prefill（PR 10）**：≥ 512 token 的 prompt 以 4,096 token 一次调用 prefill。第一次调用时 Program
+  向 expert cache 借一段连续 frames（`ExpertResidency::lend`）：前段作该类调用的 workspace，后段作
+  `execution/expert_stream` 的 ring，每层的非常驻 expert 提前两层由 copy engine DMA 进 ring，并以
+  per-layer frame 表发布为常驻（MoE Op 不变）。prompt 结束时归还（`give_back`）并先恢复借用时被挤出的
+  expert（prefill 不做 promotion，它们就是 prompt 之前 decode 的常驻集合），再用 LFRU 分数最高的
+  非常驻 expert 回填剩余空 frames。借用期间 VRAM 控制律不调整 frame 数。下一调用的 n-gram 行在 GPU 执行
+  当前调用时读取。
+- **启动账本**（`runtime/engine/qwen4_exp_instance.cpp`，在 pin 之前）：RAM 账本要求所有 routed experts
+  （33 GiB）与保留量同时放得下，否则拒绝并给出缺口；VRAM 检查在读取权重前确认 dense 权重与固定分配之外
+  仍有 expert frames 的空间。设备分配先于 pinned bank。
+
+expert 输出与放置无关（`ops/offloaded_sparse_moe.h`），所以缓存状态只改变速度，不改变任何 bit。
 
 ## 3. 请求生命周期
 

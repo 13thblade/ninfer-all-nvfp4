@@ -37,6 +37,7 @@ int main() {
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
+    failures += check(!defaults.tolerant_tool_calls, "tolerant tool calls are on by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
@@ -69,6 +70,28 @@ int main() {
         "server defaults unexpectedly override registered model sampling");
     failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
                       "artifact model id was not selected by default");
+
+    // Qwen3.8-Flash-Next options: defaults leave every path and headroom to the Engine; each flag
+    // reaches EngineOptions::flash_next.
+    failures += check(defaults.flash_next.ngram_volume_path.empty() &&
+                          defaults.flash_next.expert_state_path.empty() &&
+                          defaults.flash_next.save_expert_state && !defaults.flash_next.vram_headroom_bytes &&
+                          !defaults.flash_next.expert_cache_bytes &&
+                          defaults.flash_next.ram_headroom_bytes == (2ULL << 30),
+                      "Flash-Next defaults mismatch");
+    const ServeOptions flash = parse({"ninfer-serve", "model.ninfer", "--ngram-volume", "K:/v.ngram",
+                                      "--expert-state", "K:/s.state", "--vram-headroom-mib", "300",
+                                      "--ram-headroom-mib", "4096", "--expert-cache-mib", "1024"});
+    failures += check(flash.flash_next.ngram_volume_path == "K:/v.ngram" &&
+                          flash.flash_next.expert_state_path == "K:/s.state" &&
+                          flash.flash_next.vram_headroom_bytes == (300ULL << 20) &&
+                          flash.flash_next.ram_headroom_bytes == (4096ULL << 20) &&
+                          flash.flash_next.expert_cache_bytes == (1024ULL << 20),
+                      "Flash-Next flags were not parsed");
+    failures += check(make_engine_options(flash).flash_next.expert_cache_bytes == (1024ULL << 20),
+                      "Flash-Next options do not reach the Engine");
+    failures += check(!parse({"ninfer-serve", "model.ninfer", "--no-expert-state"}).flash_next.save_expert_state,
+                      "--no-expert-state did not turn the saved state off");
 
     // Without --default-max-tokens an omitted request limit is derived per request as the prompt's
     // remaining context, bounded above by --max-context; the flag replaces it with a fixed cap.
@@ -179,6 +202,16 @@ int main() {
                                      "--draft-tokens", "7", "--ngram-draft-tokens", "31"},
                                     "31, 63"),
                       "serve accepted a copy window other than 15, or did not name the wider ones");
+    // 2^44 MiB shifted by 20 bits wraps a uint64_t to 0; it must be refused, not wrapped.
+    for (const char* flag : {"--vram-headroom-mib", "--ram-headroom-mib", "--expert-cache-mib"}) {
+        failures += check(serve_rejects({"ninfer-serve", "model.ninfer", flag, "17592186044416"}, "out of range"),
+                          "a MiB flag accepted a value whose byte count wraps");
+    }
+    // Above 1 TiB the planners' signed and 32-bit frame-count arithmetic is no longer safe.
+    for (const char* flag : {"--vram-headroom-mib", "--ram-headroom-mib", "--expert-cache-mib"}) {
+        failures += check(serve_rejects({"ninfer-serve", "model.ninfer", flag, "1048577"}, "out of range"),
+                          "a MiB flag accepted a value above the planners' arithmetic domain");
+    }
     failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--ngram-draft-tokens", "15"},
                                     "--spec dflash2"),
                       "serve accepted n-gram copy drafting without DFlash2");
@@ -307,6 +340,7 @@ int main() {
                                            "--log-stats-interval-ms",
                                            "0",
                                            "--preserve-thinking",
+                                           "--tolerant-tool-calls",
                                            "--media-cache-mib",
                                            "256",
                                            "--media-live-mib",
@@ -324,6 +358,8 @@ int main() {
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures += check(configured.preserve_thinking == true,
                       "--preserve-thinking did not reach serving options");
+    failures += check(configured.tolerant_tool_calls,
+                      "--tolerant-tool-calls did not reach serving options");
     failures +=
         check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
     failures += check(configured.max_context == 4096 &&
@@ -626,6 +662,10 @@ int main() {
     failures +=
         check(!to_request_options(request, defaults, semantics, false).execution.allow_prefix_reuse,
               "resolved disabled cache policy inherited external enablement");
+    failures += check(
+        !to_request_options(request, defaults, semantics, true).output.tolerant_tool_calls &&
+            to_request_options(request, configured, semantics, true).output.tolerant_tool_calls,
+        "--tolerant-tool-calls did not reach Engine output options");
     const ninfer::RequestOptions inherited_sampling =
         to_request_options(request, sampling, semantics, sampling.allow_prefix_reuse);
     failures += check(inherited_sampling.execution.sampling.temperature == 0.0F &&
@@ -752,6 +792,10 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--tolerant-tool-calls repairs") !=
+                  std::string::npos,
+              "serve help does not explain --tolerant-tool-calls");
     failures += check(serve_usage_text("ninfer-serve").find("--default-thinking-budget") !=
                           std::string::npos,
                       "serve help omits --default-thinking-budget");
@@ -788,6 +832,31 @@ int main() {
                           automatic.kv_capacity.automatic_headroom_bytes ==
                               ninfer::kDefaultKvCapacityHeadroomBytes,
                       "--kv-capacity auto did not select automatic sizing");
+
+    const ServeOptions fitted =
+        parse({"ninfer-serve", "model.ninfer", "--max-context", "188416", "--kv-capacity", "188416",
+               "--fit-context", "32768"});
+    failures += check(fitted.fit_context_floor == 32768 &&
+                          make_engine_options(fitted).fit_context_floor == 32768 &&
+                          parse({"ninfer-serve", "model.ninfer"}).fit_context_floor == 0,
+                      "--fit-context did not reach the Engine options or is on by default");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--max-context", "16384",
+                                     "--fit-context", "32768"},
+                                    "must not exceed --max-context"),
+                      "--fit-context accepted a floor above the context");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--max-context", "65536",
+                                     "--kv-capacity", "auto", "--fit-context", "32768"},
+                                    "--kv-capacity"),
+                      "--fit-context accepted an automatic KV pool");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--max-context", "65536",
+                                     "--kv-capacity", "131072", "--fit-context", "32768"},
+                                    "--kv-capacity"),
+                      "--fit-context accepted a KV pool other than the context");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--fit-context", "0"},
+                                    "positive"),
+                      "--fit-context accepted zero");
+    failures += check(serve_usage_text("ninfer-serve").find("--fit-context") != std::string::npos,
+                      "serve help omits --fit-context");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});

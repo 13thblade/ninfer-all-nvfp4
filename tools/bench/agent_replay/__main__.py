@@ -71,10 +71,10 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.command == "export":
-        from tools.bench.agent_replay.export import export
+        from tools.bench.agent_replay.export import TOKEN_STREAM_NAME, export
 
         return export(args.run, args.artifact, args.tokenizer_dir,
-                      args.out or args.run / "token_streams.jsonl")
+                      args.out or args.run / TOKEN_STREAM_NAME)
 
     if args.min_context > args.max_context:
         parser.error("--min-context must not exceed --max-context")

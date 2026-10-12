@@ -290,6 +290,9 @@ public:
     [[nodiscard]] CheckpointHandle install_external_checkpoint(const PromptGraft&);
     [[nodiscard]] std::uint32_t prefix_identity_tag() const noexcept;
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&&, std::uint32_t first_target);
+    // Prefill cost features for prompt positions [begin, end) of a planned request.
+    [[nodiscard]] runtime::PrefillWork prefill_work(const RequestBasePlan&, std::uint32_t begin,
+                                                   std::uint32_t end) const;
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan&, std::optional<CheckpointHandle>, bool = false,
                    std::span<const CheckpointHandle> = {},

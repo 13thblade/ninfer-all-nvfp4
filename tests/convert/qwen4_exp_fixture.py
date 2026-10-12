@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+from math import prod
 from pathlib import Path
+
+import numpy as np
+
+from tools.convert.qwen4_exp import NARROWED, head_tables, layer_multipliers
 
 from .gguf_writer import tensor_bytes, write_gguf
 
-H, F, E, HC, LOW = 64, 128, 4, 2, 8
-F32, F16, Q8_0, IQ4_NL, BF16, Q2_0 = 0, 1, 8, 20, 30, 42
-PLE_ROWS, PLE_DIM = 300, 32
+# H is one 256-value super-block so the routed experts can use the IQ record formats.
+H, F, E, HC, LOW = 256, 128, 4, 2, 8
+F32, F16, Q8_0, IQ2_XXS, IQ4_NL, IQ2_S, IQ1_M, BF16, Q2_0 = 0, 1, 8, 16, 20, 22, 29, 30, 42
+# Gate/up type of each layer's experts (down is Q2_0): all three expert record formats.
+EXPERT_TYPES = (IQ2_S, IQ2_XXS, IQ1_M, IQ2_S)
+# Four PLE heads (two per n-gram order) of 32 values: head sizes are the consecutive primes from
+# 101 (101, 103, 107, 109), whose sum 420 pads to 512 table rows, Infernix's derivation.
+PLE_HEADS, PLE_DIM, PLE_BASE = 4, 32, 101
+PLE_SIZES, PLE_OFFSETS, PLE_ROWS = head_tables(PLE_BASE, PLE_HEADS, 128, 0)
 TOKENS = [chr(ord("a") + i) for i in range(10)] + [
     "<|endoftext|>",
     "<|im_start|>",
@@ -58,9 +69,9 @@ def metadata(**changes) -> list[tuple[str, int, object]]:
         a + "ple.eos_token_id": (4, 10),
         a + "ple.image_token_id": (4, 11),
         a + "embedding_length_per_layer_input": (4, PLE_DIM),
-        a + "ple.layer_multipliers": (9, (11, [11, 13, 17])),
-        a + "ple.head_offsets": (9, (11, [0, 5, 12, 23])),
-        a + "ple.head_vocab_sizes": (9, (11, [5, 7, 11, 13])),
+        a + "ple.layer_multipliers": (9, (11, layer_multipliers(len(TOKENS), 3, 1234, 0))),
+        a + "ple.head_offsets": (9, (11, PLE_OFFSETS)),
+        a + "ple.head_vocab_sizes": (9, (11, PLE_SIZES)),
         "tokenizer.ggml.model": (8, "gpt2"),
         "tokenizer.ggml.pre": (8, "qwen35"),
         "tokenizer.ggml.tokens": (9, (8, TOKENS)),
@@ -103,8 +114,8 @@ def tensors(drop=(), extra=()) -> list[tuple[str, int, tuple[int, ...], bytes]]:
             (p + "ffn_gate_shexp.weight", Q8_0, (H, F)),
             (p + "ffn_up_shexp.weight", IQ4_NL, (H, F)),
             (p + "ffn_down_shexp.weight", Q2_0, (F, H)),
-            (p + "ffn_gate_exps.weight", Q8_0, (H, F, E)),
-            (p + "ffn_up_exps.weight", Q8_0, (H, F, E)),
+            (p + "ffn_gate_exps.weight", EXPERT_TYPES[layer], (H, F, E)),
+            (p + "ffn_up_exps.weight", EXPERT_TYPES[layer], (H, F, E)),
             (p + "ffn_down_exps.weight", Q2_0, (F, H, E)),
         ]
         if layer == 3:
@@ -112,7 +123,7 @@ def tensors(drop=(), extra=()) -> list[tuple[str, int, tuple[int, ...], bytes]]:
                 (p + "attn_q.weight", Q8_0, (H, 128)),
                 (p + "attn_k.weight", Q8_0, (H, 32)),
                 (p + "attn_v.weight", IQ4_NL, (H, 32)),
-                (p + "attn_output.weight", Q8_0, (H, H)),
+                (p + "attn_output.weight", Q8_0, (64, H)),
                 (p + "attn_q_norm.weight", F32, (32,)),
                 (p + "attn_k_norm.weight", F32, (32,)),
                 (p + "indexer.q_proj.weight", BF16, (H, 32)),
@@ -134,8 +145,8 @@ def tensors(drop=(), extra=()) -> list[tuple[str, int, tuple[int, ...], bytes]]:
             ]
         if layer == 1:
             specs += [
-                (p + "ple_key.weight", BF16, (PLE_DIM * 2, HC * H)),
-                (p + "ple_value.weight", BF16, (PLE_DIM * 2, H)),
+                (p + "ple_key.weight", BF16, (PLE_DIM * PLE_HEADS, HC * H)),
+                (p + "ple_value.weight", BF16, (PLE_DIM * PLE_HEADS, H)),
                 (p + "ple_norm_key.weight", F32, (HC * H,)),
                 (p + "ple_norm_query.weight", F32, (HC * H,)),
                 (p + "ple_norm_conv.weight", F32, (HC * H,)),
@@ -143,9 +154,21 @@ def tensors(drop=(), extra=()) -> list[tuple[str, int, tuple[int, ...], bytes]]:
             ]
     specs = [spec for spec in specs if spec[0] not in drop] + list(extra)
     return [
-        (name, kind, ne, tensor_bytes(kind, ne, seed=index))
+        (name, kind, ne, _bytes(name, kind, ne, index))
         for index, (name, kind, ne) in enumerate(specs)
     ]
+
+
+def _bytes(name: str, kind: int, ne: tuple[int, ...], seed: int) -> bytes:
+    """Random tensor bytes; the narrowed F32 tensors hold values with exact BF16 forms, as the
+    real GGUF's do: BF16 words, or ``fl32(1 + gamma)`` of a BF16 gamma for the q/k norms."""
+    rule = NARROWED.get(name.split(".", 2)[-1]) if name.startswith("blk.") else None
+    if rule is None or kind != F32:
+        return tensor_bytes(kind, ne, seed=seed)
+    rng = np.random.default_rng(seed)
+    words = rng.uniform(-0.5, 0.5, prod(ne)).astype(np.float32)
+    words = ((words.view(np.uint32) >> 16) << 16).view(np.float32)
+    return (np.float32(1.0) + words if rule == "gamma" else words).astype("<f4").tobytes()
 
 
 def write(path: Path, *, metadata_changes=None, drop=(), extra=()) -> Path:

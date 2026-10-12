@@ -30,7 +30,8 @@ pp4096 on the cuBLAS route the launcher enables, `rk4v4` KV (upstream 3,196, a t
 perplexity for the route). The earlier 187 and 523 came from runs whose workload was not recorded
 and that this harness does not reproduce on either artifact. The 35B prefill was measured the same day with its launcher settings (cuBLAS route, chunk 4096, `rk4v4`; 5,470 tok/s on the previous default-route chunk 512); its decode rows were not re-measured.
 The 27B's 262,144 was measured with MTP3 and the draft head; the default DFlash2 profile reaches it
-on a headless card by extrapolation and steps down if refused. Sources and conditions are in
+on a headless card by extrapolation, and the server fits the context to the free memory where it
+does not. Sources and conditions are in
 [Performance on an RTX 3090](#performance-on-an-rtx-3090).
 
 ![Qwen3.8-27B: upstream artifact vs this fork's 3090 conversion](docs/assets/qwen38-artifact-gains.svg)
@@ -100,7 +101,7 @@ platforms need an RTX 3090 or 3090 Ti and a recent NVIDIA driver.
 
 ```powershell
 .\download-model.bat qwen38-27b          # downloads qwen3_8_27b.ninfer (~19 GB, resumable)
-.\run.bat qwen38-27b                      # serves on 127.0.0.1:8080, one user, 188,416 tokens, DFlash2
+.\run.bat qwen38-27b                      # serves on 127.0.0.1:8080, one user, up to 188,416 tokens, DFlash2
 ```
 
 Double-clicking either file asks which model instead; Qwen3.8-27B is the recommended choice. The
@@ -134,6 +135,7 @@ The platform guides cover GPU checks, Docker, native builds and model mounts:
 | `run qwen36-35b-a3b` | Qwen3.6-35B-A3B, MTP3, cuBLAS prefill, vision; 213K with two lanes on Windows, 262K with three on Linux |
 | `run qwen38-27b int8` | Reference profile: one user, INT8 KV (the quality default), 64K context |
 | `run qwen38-27b c8` | Reference profile: eight lanes at 8K, highest aggregate throughput |
+| `run.bat qwen38-flash-next` | **Preview, Windows.** Qwen3.8-Flash-Next from the IQ2_XS GGUF: one user, 32K, text only, no speculation; needs ~38 GiB of free host RAM. See [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) |
 
 Every default profile serves images (vision in overlay residency, which costs about 10 MiB of
 device reservation), uses `rk4v4` KV, and backs the context cache with 8 GiB of pinned host RAM
@@ -145,7 +147,7 @@ now pins all of it too (earlier releases clamped it there to about 4.6 GiB).
 `NINFER_CHAT_TEMPLATE` for every profile, plus `NINFER_CONTEXT`, `NINFER_CONCURRENCY`,
 `NINFER_KV_CAPACITY`, `NINFER_KV_DTYPE`, `NINFER_SPEC`, `NINFER_DRAFT_TOKENS`, `NINFER_PREFILL_CHUNK`,
 `NINFER_VISION`, `NINFER_HOST_CONTEXT_MIB` (8192), `NINFER_MIN_P` (0.03) and `NINFER_PRESENCE_PENALTY` (0.5) for the
-default ones; the last two are the loop guard, and `default` leaves the registered sampling preset in force. Other serving flags are opt-in overrides too: `NINFER_AUTO_HOST_CACHE=on`, `NINFER_MAX_OUTPUT_TOKENS`, `NINFER_MLP_A8_DECODE=on` and `NINFER_CONTEXT_STORE` (listed with their caps at the top of `run.sh` / `run.bat`). The launchers bind `127.0.0.1`;
+default ones; the last two are the loop guard, and `default` leaves the registered sampling preset in force. Other serving flags are opt-in overrides too: `NINFER_AUTO_HOST_CACHE=on`, `NINFER_MAX_OUTPUT_TOKENS`, `NINFER_MLP_A8_DECODE=on`, `NINFER_CONTEXT_STORE` and `NINFER_REASONING_LOOP=stop|conclude` (listed with their caps at the top of `run.sh` / `run.bat`). The reasoning-loop guard stays off unless set: it has not yet fired on a real Qwen3.8 run, and its thresholds were measured on other models ([serving](docs/serving.md#openai-chat-completions), under `--reasoning-loop`). The launchers bind `127.0.0.1`;
 `NINFER_HOST=0.0.0.0` exposes the server to the LAN, **unauthenticated**. On Windows,
 `set NINFER_SPEC=mtp && run.bat qwen38-27b`; on Linux, `NINFER_SPEC=mtp ./run.sh qwen38-27b`.
 
@@ -179,11 +181,15 @@ front; when the pool runs short the server first drops retained cache entries, t
 younger request (saving a snapshot to host memory, or replaying its tokens later) and resumes it
 once there is room. A lane adds only its fixed state, not a second pool.
 
-**If startup refuses** for lack of GPU memory, the default profiles step down on their own — an
-eighth of the context at a time, up to five times — and say what they did. An explicit
-`NINFER_CONTEXT`, `NINFER_PREFILL_CHUNK`, `NINFER_HOST_CONTEXT_MIB` or `NINFER_KV_CAPACITY` is
-honoured as given and fails loudly; `NINFER_FALLBACK=off` turns the step-down off. By hand, drop a
-lane or a context rung first, then speculation (worth 992 MiB on the 35B-A3B), and vision last.
+**If the GPU is busy** (a desktop, a browser or a game holding VRAM), the default profiles still
+start: their context is a ceiling, and the server starts at the largest context that fits the
+memory free at launch, keeping 256 MiB spare, and prints one line saying what it chose
+(`context lowered to 172,032 tokens (asked for 188,416) ...`). Closing what holds the GPU and
+restarting gets the full context back. If not even 32,768 tokens fit, it stops and says how much
+memory is missing. An explicit `NINFER_CONTEXT` (or `NINFER_KV_CAPACITY`) is honoured as given and
+fails loudly; `NINFER_FALLBACK=off` makes the profile's context exact. Directly,
+`ninfer-serve --max-context N --fit-context MIN` does the same. By hand, drop a lane first, then
+speculation (worth 992 MiB on the 35B-A3B), and vision last.
 
 **To size a profile that is not listed, open [`docs/config-calculator.html`](docs/config-calculator.html)
 in a browser.** It is a single self-contained file with no network access that takes a model, a
@@ -200,7 +206,7 @@ The recommended model. A dense model rather than an MoE, so slower per token but
 
 ```powershell
 .\download-model.bat qwen38-27b          # downloads qwen3_8_27b.ninfer (~19 GB, resumable)
-.\run.bat qwen38-27b                      # one user, 188,416 tokens, DFlash2, cuBLAS prefill, rk4v4, vision
+.\run.bat qwen38-27b                      # one user, up to 188,416 tokens, DFlash2, cuBLAS prefill, rk4v4, vision
 ```
 
 ```bash
@@ -211,9 +217,13 @@ The recommended model. A dense model rather than an MoE, so slower per token but
 The default is the fast profile — about 1.7x the previous prefill and 1.39x the decode:
 
 ```
---spec dflash2 --draft-tokens 7 --lm-head-draft --prefill-cublas --prefill-chunk 4096
---kv-dtype rk4v4 --gdn-state-fp16 --vision --vision-residency overlay
+--spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15
+--prefill-cublas --prefill-chunk 4096 --kv-dtype rk4v4 --gdn-state-fp16 --vision --vision-residency overlay
 ```
+
+`--ngram-draft-tokens 15` copies text the conversation already contains (a file it read, a tool
+result) instead of drafting it: agent turns that write back a file decode 53-76% faster. Set
+`NINFER_NGRAM=off` to turn it off.
 
 `NINFER_SPEC=mtp` swaps to `--spec mtp --draft-tokens 3` and `--prefill-chunk 2048`, which runs
 the full 262,144 tokens with two lanes sharing the pool:
@@ -221,7 +231,7 @@ the full 262,144 tokens with two lanes sharing the pool:
 | Profile | lanes | context | KV | measured beside a desktop |
 |---|---|---|---|---|
 | **`tuned`** (default, DFlash2), Windows | 1 | 188,416 | rk4v4 | starts with 721 MiB spare; 196,608 refused |
-| `tuned` (default, DFlash2), Linux | 1 | 262,144 | rk4v4 | headless extrapolation; steps down if refused |
+| `tuned` (default, DFlash2), Linux | 1 | 262,144 | rk4v4 | headless extrapolation; fitted to the free memory if it does not fit |
 | `NINFER_SPEC=mtp` | 2 | 262,144 | rk4v4 | 23.4 of 24.5 GiB used |
 | `int8` | 1 | 65,536 | int8 | 2.85 GiB left unused |
 
@@ -267,13 +277,33 @@ chunk 512). That route's larger runtime reservation costs context beside a deskt
 
 | Profile (`rk4v4`, MTP3 + draft, vision) | lanes | context | starts beside a desktop |
 |---|---|---|---|
-| **Linux — default** | 3 | 262,144 | not re-measured with the cuBLAS route; steps down if refused |
+| **Linux — default** | 3 | 262,144 | not re-measured with the cuBLAS route; fitted to the free memory if it does not fit |
 | **Windows — default** | 2 | 212,992 | yes, 220 MiB free (229,376 refused, 27 MB short) |
 | `NINFER_PREFILL_CHUNK=1024` on Windows | 2 | 262,144 | yes, 138 MiB free; 7,140 tok/s prefill, default route |
 | `NINFER_CONCURRENCY=4` | 4 | 262,144 | no, 48 MB short; a headless card should fit |
 
 Measured 2026-09-24. With `rk8v4` the same profile needed the ~1.5 GiB a desktop holds, so Windows
 ran one user at 147,456 tokens; `rk4v4` stores the same context in 31% less memory.
+
+### Qwen3.8-Flash-Next (preview)
+
+The 48-layer, 512-expert Qwen3.8-Flash-Next runs from the ISTA DASLab GSQ-RCO IQ2_XS GGUF,
+converted exactly (no re-quantization) into a 39.2 GB `.ninfer` plus a 29.1 GB n-gram volume
+beside it (`tools/convert/qwen4_exp.py`; [plan](docs/maintainer/flash-next-plan.md)). Start it with:
+
+```bat
+set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs.ninfer
+run.bat qwen38-flash-next
+```
+
+It pins all 33 GiB of routed experts in host RAM (startup refuses, saying how much is missing, when
+Windows cannot keep 2 GiB free beside them), keeps the most-used ~11,000-12,500 experts in a VRAM
+cache whose state is saved beside the model so the next start is warm, and serves one request at a
+time at up to 32K tokens with INT8 KV. Not yet: prefix reuse (every request prefills its whole
+prompt), MTP, vision, more than one lane, and fast prefill (PR 10). Measured on this RTX 3090
+with a warm expert cache: 78 / 77 / 76 tok/s decode after 1K / 8K / 32K prompts (Strata plain 71 /
+70 / 66; Strata with MTP 105-112), and 650-700 tok/s prefill. Decode speed and its breakdown are in [the plan](docs/maintainer/flash-next-plan.md#pr-9-m1-measurements); the server reference is
+[docs/serving.md](docs/serving.md#qwen38-flash-next-preview).
 
 ## Building from source
 
@@ -661,6 +691,8 @@ and the design are in `docs/maintainer/pipeline-parallel-plan.md`.
 - The shared KV pool is fixed at startup and is not divided statically among request lanes.
 - This is bounded small-scale batching, not preemptive large-scale continuous batching.
 - Tool calls are returned to the client but are not executed by NInfer.
+- Qwen3.8-Flash-Next (preview) serves one text request at a time with INT8 KV, no speculation and no
+  prefix reuse; it has been built and run on Windows only (Linux is neither built nor tested).
 - This fork targets `sm_86`. NVFP4 A4, FP8 A8 and TMA *weight and activation* kernels require
   Blackwell and are unavailable; FP8 and NVFP4 weights are admitted through their A16 dequantizing
   routes. KV-cache storage is a separate axis: all seven KV formats, including row-scaled FP8 E4M3,
@@ -679,6 +711,14 @@ Upstream NInfer is a personal project its author develops out of interest. If yo
 you can [support upstream on Ko-fi](https://ko-fi.com/neroued). Support is entirely voluntary. It is
 not a purchase or investment and does not come with financial returns, promised services or
 features, or a role in project decisions.
+
+The Qwen3.8-Flash-Next work adapts code from [Infernix](https://github.com/wallawalla47/infernix)
+by [wallawalla47](https://github.com/wallawalla47) (Apache-2.0), itself a fork of NInfer: so far the n-gram volume format, the
+model's config keys and n-gram hash derivation, the offloaded sparse-MoE Op (its contract,
+routing, dispatch, staging, CPU worker team and miss service, and its canonical-arithmetic method),
+the model's forward pass, and its Program pieces: the VRAM expert cache (LFRU frames, warm-start
+state), the RAM and VRAM ledgers, the elastic VMM KV pool, the VRAM monitor and the Engine instance.
+Each adapted file says so in its header.
 
 ## Contributors
 
