@@ -630,13 +630,11 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         }
 
         if (stop_token) {
-            // With the defaults disabled every stop id is the caller's, even one that is
-            // normally a checkpoint default.
-            const auto& defaults = impl_->tokenizer->default_stop_token_ids();
+            // Only an id the checkpoint alone supplied is the model's own end; one the caller
+            // listed (even a default) or any id with the defaults disabled is the client's.
+            const auto& defaults = impl_->policy.model_default_token_ids;
             impl_->preview_stop_is_model_default =
-                impl_->policy.include_model_defaults &&
-                std::find(defaults.begin(), defaults.end(), static_cast<int>(token)) !=
-                    defaults.end();
+                std::find(defaults.begin(), defaults.end(), token) != defaults.end();
             if (!impl_->policy.publish_stop_token) {
                 impl_->preview_state  = std::move(before_state);
                 impl_->preview_output = std::move(before_output);
