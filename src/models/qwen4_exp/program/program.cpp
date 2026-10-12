@@ -762,6 +762,7 @@ public:
         ngram_next_ = PinnedHostBuffer(plan_.io.bytes - plan_.io.ngram);
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
                                                         std::move(experts), std::move(drafter));
+        warm_vision();
         warm_start_experts();
         device_.synchronize();
         report_startup();
@@ -1551,6 +1552,51 @@ private:
                       items.size(), plan.tokens, lane_.vision_seconds * 1e3,
                       static_cast<double>(plan.window_bytes) / (1 << 20), static_cast<double>(plan.handoff_bytes) / (1 << 20),
                       handoff_frames + window_frames, static_cast<double>(lane_.vision_uploaded) / (1 << 20));
+        diagnostic(line);
+    }
+
+    // One encode of a blank image of the processor's smallest size (16 x 16 patches) at startup, in
+    // lent frames like a request's: the tower's kernels and Linear routes set themselves up here
+    // (2-7 s measured on the first image of a process) instead of in the first request.
+    void warm_vision() {
+        if (!parameters_.vision || residency_->frames() == 0) { return; }
+        const auto& model  = parameters_.model;
+        const auto& config = *model.vision_config();
+        const std::int32_t side = 16;
+        qwen3_5::PreparedPromptData prompt;
+        const std::size_t patches = static_cast<std::size_t>(side) * side, merged = patches / 4;
+        prompt.token_types.assign(merged + 2, 0);
+        std::fill(prompt.token_types.begin() + 1, prompt.token_types.begin() + 1 + static_cast<std::ptrdiff_t>(merged),
+                  static_cast<std::uint8_t>(qwen3_5::PromptModality::Image));
+        prompt.token_ids.assign(prompt.token_types.size(), 0);
+        prompt.vision_items.push_back(qwen3_5::VisionItem{.modality    = qwen3_5::PromptModality::Image,
+                                                          .grid        = {.temporal = 1, .height = side, .width = side},
+                                                          .patch_begin = 0,
+                                                          .patch_count = patches,
+                                                          .token_spans = {{1, merged}}});
+        prompt.prepare.media_items   = 1;
+        prompt.prepare.raw_patches   = patches;
+        prompt.prepare.vision_tokens = merged;
+        const auto control = qwen3_5::build_vision_control(prompt, qwen3_5::plan_vision_control(prompt, config), 0);
+        const std::vector<std::uint16_t> blank(patches * config.patch_width(), 0);
+        const std::size_t counts[] = {merged};
+        const auto plan = execution::plan_vision_pass(config, *parameters_.vision, *model.vision_layout(), counts);
+        const std::uint32_t handoff_frames = frames_for(plan.handoff_bytes), window_frames = frames_for(plan.window_bytes);
+        if (handoff_frames + window_frames > residency_->lendable()) { return; }
+        const auto start = Clock::now();
+        auto handoff_lease = residency_->lend(handoff_frames, device_.stream);
+        auto window        = residency_->lend(window_frames, device_.stream);
+        Tensor handoff(handoff_lease.memory.data, DType::BF16, {plan.out, static_cast<std::int32_t>(plan.tokens)});
+        const execution::VisionEncodeItem item{blank, &control.items.front()};
+        (void)execution::encode_vision(device_, config, *parameters_.vision, *model.vision_layout(), model.pinned_weights(),
+                                       std::span<const execution::VisionEncodeItem>(&item, 1), plan, window.memory, handoff,
+                                       device_.stream);
+        device_.synchronize();
+        (void)residency_->give_back(window, device_.stream);
+        (void)residency_->give_back(handoff_lease, device_.stream);
+        char line[120];
+        std::snprintf(line, sizeof(line), "vision: tower warmed up in %.1f s",
+                      std::chrono::duration<double>(Clock::now() - start).count());
         diagnostic(line);
     }
 
