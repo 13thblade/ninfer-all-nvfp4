@@ -867,6 +867,14 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
+    // Decode and verify rounds run the target's projections with the same Linear policies as
+    // prefill, one call over every lane's verify columns. The cuBLAS prefill route has to stay out
+    // of them -- it would put a weight-sized scratch into every round workspace and change decode
+    // numerics -- so the widest round must sit below its width gate. Every speculative backend caps
+    // its window at 15.
+    static_assert(kMaximumConcurrency * (kMtpDecodeMaximumDrafts + 1) <
+                      static_cast<std::uint32_t>(ops::kCublasPrefillMinTokens),
+                  "the widest decode/verify round must stay below the cuBLAS prefill width gate");
     if (parameters.text.rank_count != device.size() ||
         parameters.text.rank_count != std::max<std::size_t>(options.devices.size(), 1)) {
         throw std::invalid_argument("the model is split into " +
@@ -995,18 +1003,20 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // Definitions remain per execution profile, but only one executable is instantiated for
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
+        // Speculative classes break on the target's attention routes.
+        const auto& attention = *impl->parameters->model.config().text.attention;
+        const MtpGraphAttention target_attention{
+            .geometry             = {dimension(attention.head_dim),
+                                     dimension(attention.num_attention_heads),
+                                     dimension(attention.num_key_value_heads)},
+            .storage              = impl->kv_storage,
+            .multiprocessor_count = impl->multiprocessor_count};
         if (impl->speculative_backend == SpeculativeBackend::None) {
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            const auto& attention = *impl->parameters->model.config().text.attention;
-            const auto profiles   = mtp_graph_profiles(
-                impl->capacity, impl->draft_window,
-                {.geometry = {dimension(attention.head_dim),
-                              dimension(attention.num_attention_heads),
-                              dimension(attention.num_key_value_heads)},
-                 .storage              = impl->kv_storage,
-                 .multiprocessor_count = impl->multiprocessor_count});
+            const auto profiles =
+                mtp_graph_profiles(impl->capacity, impl->draft_window, target_attention);
             const std::size_t per_batch_allowance = graph_topology_allowance(
                 profiles,
                 [&](GraphExecutionProfile profile) {
@@ -1032,8 +1042,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             const auto class_allowance = [&](const SpeculativeRoundShape& shape,
                                              std::uint32_t batch_size) {
                 const std::uint32_t verify_drafts = shape.verify_drafts;
-                const auto profiles = dflash_graph_profiles(
-                    impl->speculative_backend, impl->capacity, verify_drafts, batch_size);
+                const auto profiles =
+                    dflash_graph_profiles(impl->speculative_backend, impl->capacity,
+                                          verify_drafts, batch_size, target_attention);
                 return graph_topology_allowance(
                     profiles,
                     [&](GraphExecutionProfile profile) {
