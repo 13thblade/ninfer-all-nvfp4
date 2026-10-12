@@ -2240,6 +2240,188 @@ int test_structured_tool_output() {
     return failures;
 }
 
+// Free tool output recovers calls the model stranded in thinking it never closed; a closed
+// thinking, a quoted marker or a turn cut by its budget keeps everything as reasoning.
+int test_open_reasoning_tool_recovery() {
+    const Frontend frontend = make_frontend(resources());
+    ninfer::PromptInput input;
+    input.messages.push_back({.role  = ninfer::ChatRole::User,
+                              .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "x"}}});
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
+    const auto prompt = frontend.prepare(std::move(input));
+    ninfer::ToolChoice free_calls;
+    free_calls.constraints = ninfer::ToolConstraintMode::Automatic;
+    const ninfer::TokenId eos = frontend.default_stop_policy().token_ids.front();
+
+    const std::string planning = "The listing answers this, so I will run it.\n";
+    const std::string call =
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n"
+        "</tool_call>";
+    struct Turn {
+        std::string reasoning;
+        std::string content;
+        std::vector<ninfer::GeneratedToolCall> calls;
+        ninfer::ToolCallParseDiagnostics diagnostics;
+    };
+    // `streamed` commits one token per round, as decode does; otherwise one round holds the turn.
+    const auto run = [&](const std::string& generated, bool end_with_eos, bool streamed = false,
+                         const ninfer::StopPolicy& stop = {},
+                         std::optional<ninfer::TokenId> end_token = std::nullopt) {
+        auto session = frontend.make_output_session(
+            prompt, stop, ninfer::OutputOptions{.tool_name_max_length = 64}, {}, {}, free_calls);
+        std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
+        Turn turn;
+        const auto commit = [&] {
+            const PublishedOutput output = session.commit_preview();
+            turn.reasoning += channel_text(output, ninfer::OutputChannel::Reasoning);
+            turn.content += channel_text(output, ninfer::OutputChannel::Content);
+        };
+        if (streamed) {
+            for (const ninfer::TokenId token : tokens) {
+                (void)session.preview_model(std::span(&token, 1), 1000,
+                                            ninfer::FinishReason::OutputLimit);
+                commit();
+            }
+            tokens.clear();
+        }
+        if (end_with_eos) { tokens.push_back(end_token.value_or(eos)); }
+        const auto budget = static_cast<std::uint32_t>(tokens.size() + (end_with_eos ? 8U : 0U));
+        (void)session.preview_model(tokens, budget, ninfer::FinishReason::OutputLimit);
+        commit();
+        turn.calls       = session.take_tool_calls();
+        turn.diagnostics = session.tool_call_parse_diagnostics();
+        return turn;
+    };
+
+    int failures = 0;
+    for (const bool streamed : {false, true}) {
+        const Turn turn = run(planning + call, true, streamed);
+        failures += check(turn.calls.size() == 1 && turn.calls[0].name == "bash" &&
+                              turn.calls[0].arguments_json == R"({"command":"ls"})" &&
+                              turn.diagnostics.recovered_from_reasoning &&
+                              turn.diagnostics.structured_call_count == 1 &&
+                              turn.content.empty() && turn.reasoning == planning + call,
+                          streamed ? "a call stranded in unclosed thinking was not recovered "
+                                     "across rounds"
+                                   : "a call stranded in unclosed thinking was not recovered");
+    }
+    const auto rejected = [&](const Turn& turn, const std::string& label) {
+        return check(turn.calls.empty() && !turn.diagnostics.recovered_from_reasoning &&
+                         turn.content.empty(),
+                     ("open-thinking recovery fired or leaked content for " + label).c_str());
+    };
+    failures += rejected(run(planning + call + "\n</think>\n\n", true),
+                         "a closed thinking with no content");
+    failures += rejected(run(planning + call + "\n</think>\n\n", true, true),
+                         "a thinking closed in an earlier round");
+    failures += rejected(run("I could emit <tool_call> now, but the question needs no tool.\n", true),
+                         "a quoted marker");
+    failures += rejected(run(planning + call, false), "a turn cut by its output budget");
+    // A caller-supplied stop id is the client's own end of turn, not the model's: it ends the turn
+    // without recovering the call, while the checkpoint's stop token still does.
+    {
+        const auto& defaults = frontend.default_stop_policy().token_ids;
+        // <|im_end|>: a valid fixture token that is not the checkpoint's eos and not in the text.
+        const ninfer::TokenId caller_token = 248046;
+        failures += check(std::find(defaults.begin(), defaults.end(), caller_token) == defaults.end(),
+                          "fixture caller stop token is a checkpoint default");
+        ninfer::StopPolicy caller_stop;
+        caller_stop.token_ids.push_back(caller_token);
+        failures += rejected(run(planning + call, true, false, caller_stop, caller_token),
+                             "a caller-supplied stop token");
+        failures += rejected(run(planning + call, true, true, caller_stop, caller_token),
+                             "a caller-supplied stop token across rounds");
+        const Turn model_stop = run(planning + call, true, false, caller_stop);
+        failures += check(model_stop.calls.size() == 1 && model_stop.diagnostics.recovered_from_reasoning,
+                          "the checkpoint stop token stopped recovering calls beside a caller stop");
+    }
+    // With the defaults disabled, a caller id equal to the checkpoint's eos is still the caller's.
+    {
+        ninfer::StopPolicy caller_eos;
+        caller_eos.include_model_defaults = false;
+        caller_eos.token_ids.push_back(eos);
+        failures += rejected(run(planning + call, true, false, caller_eos),
+                             "a caller stop id equal to a disabled checkpoint default");
+        failures += rejected(run(planning + call, true, true, caller_eos),
+                             "a caller stop id equal to a disabled checkpoint default across rounds");
+    }
+    // With the defaults enabled, a caller id that is also a checkpoint default is still the caller's.
+    {
+        ninfer::StopPolicy caller_eos;
+        caller_eos.token_ids.push_back(eos);
+        failures += rejected(run(planning + call, true, false, caller_eos),
+                             "a caller stop id equal to an enabled checkpoint default");
+        failures += rejected(run(planning + call, true, true, caller_eos),
+                             "a caller stop id equal to an enabled checkpoint default across rounds");
+    }
+    return failures;
+}
+
+// OutputOptions::tolerant_tool_calls reaches the session's free tool output, and the session's
+// finish reason sets what it may repair: a call missing its closing tags is kept only when the
+// model ended the turn with its stop token.
+int test_tolerant_tool_calls_session() {
+    const Frontend frontend = make_frontend(resources());
+    ninfer::PromptInput input;
+    input.messages.push_back({.role  = ninfer::ChatRole::User,
+                              .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "x"}}});
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
+    const auto prompt = frontend.prepare(std::move(input));
+    ninfer::ToolChoice free_calls;
+    free_calls.constraints = ninfer::ToolConstraintMode::Automatic;
+    const ninfer::TokenId eos = frontend.default_stop_policy().token_ids.front();
+
+    struct Turn {
+        std::string content;
+        std::vector<ninfer::GeneratedToolCall> calls;
+        ninfer::ToolCallParseDiagnostics diagnostics;
+    };
+    const auto run = [&](const std::string& generated, bool tolerant, bool end_with_eos) {
+        auto session = frontend.make_output_session(
+            prompt, {},
+            ninfer::OutputOptions{.tool_name_max_length = 64, .tolerant_tool_calls = tolerant}, {},
+            {}, free_calls);
+        std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
+        if (end_with_eos) { tokens.push_back(eos); }
+        const auto budget = static_cast<std::uint32_t>(tokens.size() + (end_with_eos ? 8U : 0U));
+        (void)session.preview_model(tokens, budget, ninfer::FinishReason::OutputLimit);
+        Turn turn;
+        turn.content     = channel_text(session.commit_preview(), ninfer::OutputChannel::Content);
+        turn.calls       = session.take_tool_calls();
+        turn.diagnostics = session.tool_call_parse_diagnostics();
+        return turn;
+    };
+    const auto kept = [](const Turn& turn) {
+        return turn.content == "Running it." && turn.calls.size() == 1 &&
+               turn.calls[0].name == "bash" &&
+               turn.calls[0].arguments_json == R"({"command":"ls"})" &&
+               turn.diagnostics.tolerant_recovered;
+    };
+
+    const std::string head =
+        "Running it.\n<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n";
+    const std::string suffixed = head + "</function>\n</tool_call>\nI'll wait for the output.";
+    int failures               = 0;
+    failures += check(kept(run(suffixed, true, true)) && kept(run(suffixed, true, false)),
+                      "the session did not keep a call before a suffix with tolerant tool calls");
+    const Turn strict = run(suffixed, false, true);
+    failures += check(strict.calls.empty() && strict.content == suffixed &&
+                          !strict.diagnostics.tolerant_recovered,
+                      "the session repaired a call without tolerant tool calls");
+    failures += check(kept(run(head, true, true)),
+                      "the session did not keep an unclosed final call at its stop token");
+    const Turn cut = run(head, true, false);
+    failures += check(cut.calls.empty() && cut.content == head &&
+                          !cut.diagnostics.tolerant_recovered,
+                      "the session kept an unclosed call the output budget cut");
+    return failures;
+}
+
 int test_reasoning_split(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -3264,6 +3446,8 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
     failures += test_tools_and_json_output();
+    failures += test_open_reasoning_tool_recovery();
+    failures += test_tolerant_tool_calls_session();
     failures += test_constraint_refuses_caller_stops(frontend);
     failures += test_reasoning_split(frontend);
     failures += test_thinking_tokens_without_budget(frontend);

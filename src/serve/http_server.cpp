@@ -613,6 +613,9 @@ void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
     }
+    // A context fit may have lowered the context at startup; the protocol limits follow it.
+    options_.max_context           = service.options().max_context;
+    options_.kv_capacity           = service.options().kv_capacity;
     const ninfer::LoadSummary load = service.load_summary();
     // memory_summary() waits for the completed worker boundary, including warmup publication, and
     // takes the Engine execution lock; read it once here, never per /v1/load poll.

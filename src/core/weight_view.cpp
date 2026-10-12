@@ -64,7 +64,83 @@ void validate_region(const WeightRegion& region) {
     }
 }
 
+// Every count here is u64: the unpaged n-gram table alone is 320 M rows x 160 = 51.2 G values.
+WeightGeometry ggml_geometry(WeightGeometry out) {
+    const auto block = ggml_block(out.format);
+    if (!block.values) {
+        throw std::invalid_argument("ggml_blocks_v1 requires a GGML block format");
+    }
+    if (out.shape.empty()) { throw std::invalid_argument("ggml_blocks_v1 requires rank >= 1"); }
+    const auto k = out.shape.back();
+    if (k % block.values) {
+        throw std::invalid_argument("GGML block K must be a multiple of the block value count");
+    }
+    out.padded_columns     = k;
+    out.group_size         = block.values;
+    out.code_bytes_per_row = mul(k / block.values, block.bytes);
+    out.bytes = out.code_bytes = mul(out.elements / k, out.code_bytes_per_row);
+    return out;
+}
+
+// [experts, hidden, intermediate]: gate [intermediate, hidden] and up of the same shape in the
+// gate/up block format, then down [hidden, intermediate] in the down format, each part on a
+// 256-byte boundary and the stride rounded up to 256 bytes.
+WeightGeometry ggml_record_geometry(WeightGeometry out) {
+    const auto parts = ggml_record_parts(out.format);
+    if (!is_ggml_block(parts.gate_up)) {
+        throw std::invalid_argument("ggml_expert_record_v1 requires a GGML expert record format");
+    }
+    if (out.shape.size() != 3) {
+        throw std::invalid_argument(
+            "ggml_expert_record_v1 requires [experts, hidden, intermediate]");
+    }
+    const auto gate_up = ggml_block(parts.gate_up);
+    const auto down    = ggml_block(parts.down);
+    const auto experts = out.shape[0], hidden = out.shape[1], inter = out.shape[2];
+    if (hidden % gate_up.values || inter % down.values) {
+        throw std::invalid_argument(
+            "expert record hidden and intermediate must be whole GGML blocks of their parts");
+    }
+    const auto gate_bytes  = mul(inter, mul(hidden / gate_up.values, gate_up.bytes));
+    const auto down_bytes  = mul(hidden, mul(inter / down.values, down.bytes));
+    out.record_up_offset   = aligned(gate_bytes, 256);
+    out.record_down_offset = aligned(add(out.record_up_offset, gate_bytes), 256);
+    out.record_bytes       = add(out.record_down_offset, down_bytes);
+    out.record_stride      = aligned(out.record_bytes, 256);
+    out.bytes = out.code_bytes = mul(experts, out.record_stride);
+    return out;
+}
+
 } // namespace
+
+std::uint64_t ggml_row_offset(const WeightGeometry& geometry, std::uint64_t row) {
+    if (geometry.layout != QuantLayout::GgmlBlocks || !geometry.code_bytes_per_row ||
+        row >= geometry.elements / geometry.padded_columns) {
+        throw std::invalid_argument("GGML row coordinate exceeds its parent");
+    }
+    return row * geometry.code_bytes_per_row;
+}
+
+GgmlRecordPart ggml_record_part(const WeightGeometry& geometry, std::uint64_t expert,
+                                ExpertPart part) {
+    if (geometry.layout != QuantLayout::GgmlExpertRecord || geometry.shape.size() != 3 ||
+        expert >= geometry.shape[0] || static_cast<unsigned>(part) > 2) {
+        throw std::invalid_argument("expert record coordinate exceeds its parent");
+    }
+    const auto parts   = ggml_record_parts(geometry.format);
+    const bool is_down = part == ExpertPart::Down;
+    GgmlRecordPart out;
+    out.format          = is_down ? parts.down : parts.gate_up;
+    out.rows            = is_down ? geometry.shape[1] : geometry.shape[2];
+    out.k               = is_down ? geometry.shape[2] : geometry.shape[1];
+    const auto block    = ggml_block(out.format);
+    out.row_bytes       = out.k / block.values * block.bytes;
+    const auto in_record = part == ExpertPart::Gate ? 0
+                           : is_down                ? geometry.record_down_offset
+                                                    : geometry.record_up_offset;
+    out.offset = expert * geometry.record_stride + in_record;
+    return out;
+}
 
 std::uint64_t weight_element_count(std::span<const std::uint64_t> shape) {
     if (shape.size() > 16) { throw std::invalid_argument("weight rank exceeds 16"); }
@@ -91,6 +167,8 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         }
         return out;
     }
+    if (layout == QuantLayout::GgmlBlocks) { return ggml_geometry(std::move(out)); }
+    if (layout == QuantLayout::GgmlExpertRecord) { return ggml_record_geometry(std::move(out)); }
     if (shape.size() != 2) { throw std::invalid_argument("quantized weight must be a matrix"); }
     const auto n       = shape[0];
     const auto k       = shape[1];
@@ -186,6 +264,10 @@ bool is_complete_weight(const WeightView& view) {
 
 std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t row,
                                   std::uint64_t group) {
+    if (geometry.layout == QuantLayout::GgmlBlocks ||
+        geometry.layout == QuantLayout::GgmlExpertRecord) {
+        throw std::invalid_argument("GGML blocks carry their scales inside each block");
+    }
     if (geometry.shape.size() != 2 || !geometry.group_size || row >= geometry.shape[0] ||
         group >= geometry.padded_columns / geometry.group_size) {
         throw std::invalid_argument("weight scale coordinate exceeds its parent");
