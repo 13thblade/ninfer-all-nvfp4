@@ -40,6 +40,12 @@ explicit_capacity_shortfall(std::uint32_t tokens, const SequenceCapacityCurve& c
 [[nodiscard]] std::uint32_t effective_fit_floor(std::uint32_t floor,
                                                 std::uint32_t largest_graft_slots);
 
+// The smallest context the planner can size an explicit capacity for: one that spans at least
+// `max_concurrency` pages of `page_tokens`, since the planner rejects fewer pages than lanes.
+// Throws std::invalid_argument for a zero argument and std::overflow_error beyond uint32.
+[[nodiscard]] std::uint32_t minimum_plannable_context(std::uint32_t max_concurrency,
+                                                      std::uint32_t page_tokens);
+
 // The largest context in [floor, ceiling] that `fits`: the ceiling itself, else the largest
 // multiple of `step` below it, else the floor; nullopt when not even the floor fits. `fits` must be
 // monotone -- every context below one that fits also fits -- and is called O(log) times.

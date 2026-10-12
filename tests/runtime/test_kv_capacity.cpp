@@ -1,5 +1,6 @@
 #include "runtime/engine/kv_capacity.h"
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -187,6 +188,31 @@ int main() {
         (void)ninfer::runtime::effective_fit_floor(1, 0xFFFFFFFFU);
     } catch (const std::overflow_error&) { graft_overflow_rejected = true; }
     failures += check(graft_overflow_rejected, "an unrepresentable graft floor was accepted");
+
+    // The planner needs at least max_concurrency pages, so a fit floor is clamped to the smallest
+    // context spanning that many pages; the clamped floor fits when the planner-valid range does.
+    failures += check(ninfer::runtime::minimum_plannable_context(1, 64) == 1 &&
+                          ninfer::runtime::minimum_plannable_context(8, 64) == 449 &&
+                          ninfer::runtime::minimum_plannable_context(2, 64) == 65,
+                      "the smallest plannable context is not one past (lanes - 1) pages");
+    {
+        const std::uint32_t low = std::max(ninfer::runtime::effective_fit_floor(1, 0),
+                                           ninfer::runtime::minimum_plannable_context(8, 64));
+        failures += check(low == 449 &&
+                              ninfer::runtime::fit_context(low, 4096, 1024, upto(1500)) == 1024 &&
+                              !ninfer::runtime::fit_context(low, 4096, 1024, upto(100)).has_value(),
+                          "a floor below the plannable minimum was probed");
+    }
+    bool plannable_zero_rejected = false;
+    try {
+        (void)ninfer::runtime::minimum_plannable_context(0, 64);
+    } catch (const std::invalid_argument&) { plannable_zero_rejected = true; }
+    bool plannable_overflow_rejected = false;
+    try {
+        (void)ninfer::runtime::minimum_plannable_context(8, 0x40000000U);
+    } catch (const std::overflow_error&) { plannable_overflow_rejected = true; }
+    failures += check(plannable_zero_rejected && plannable_overflow_rejected,
+                      "an unrepresentable plannable minimum was accepted");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

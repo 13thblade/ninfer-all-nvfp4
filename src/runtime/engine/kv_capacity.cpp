@@ -150,6 +150,19 @@ std::uint32_t effective_fit_floor(std::uint32_t floor, std::uint32_t largest_gra
     return std::max(floor, largest_graft_slots + 1U);
 }
 
+std::uint32_t minimum_plannable_context(std::uint32_t max_concurrency,
+                                        std::uint32_t page_tokens) {
+    if (max_concurrency == 0 || page_tokens == 0) {
+        throw std::invalid_argument("minimum plannable context needs nonzero concurrency and page");
+    }
+    const std::uint64_t tokens =
+        (static_cast<std::uint64_t>(max_concurrency) - 1ULL) * page_tokens + 1ULL;
+    if (tokens > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("minimum plannable context exceeds uint32");
+    }
+    return static_cast<std::uint32_t>(tokens);
+}
+
 std::optional<std::uint32_t> fit_context(std::uint32_t floor, std::uint32_t ceiling,
                                          std::uint32_t step,
                                          const std::function<bool(std::uint32_t)>& fits) {

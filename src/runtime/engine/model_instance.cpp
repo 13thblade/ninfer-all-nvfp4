@@ -1,6 +1,7 @@
 #include "runtime/engine/model_instance.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
+#include "core/paged_kv_cache.h"
 #include "core/startup.h"
 #include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -157,7 +158,19 @@ void fit_context_to_device(EngineOptions& options, ModelInstance& instance, Devi
             static_cast<std::uint32_t>(std::min<std::size_t>(
                 slots, std::numeric_limits<std::uint32_t>::max())));
     }
-    const std::uint32_t floor = effective_fit_floor(options.fit_context_floor, largest_graft_slots);
+    // Every candidate must also be one the planner accepts: it rejects an explicit capacity under
+    // max_concurrency pages (e.g. --fit-context 1 with 8 lanes), which would throw from the probe
+    // instead of simply not fitting. Clamp the floor so no probed candidate is planner-invalid.
+    const std::uint32_t floor = std::max(
+        effective_fit_floor(options.fit_context_floor, largest_graft_slots),
+        minimum_plannable_context(options.max_concurrency,
+                                  static_cast<std::uint32_t>(kPagedKVPageSize)));
+    if (floor > ceiling) {
+        throw std::invalid_argument(
+            "the context fit floor, " + token_text(floor) +
+            " tokens (raised to clear the loaded prompt grafts and one page per concurrent "
+            "sequence), is above the context, " + token_text(ceiling) + " tokens");
+    }
     // Each candidate is planned from the real options with only the context changed.
     const auto curve_at = [&](std::uint32_t context) {
         options.max_context = context;
