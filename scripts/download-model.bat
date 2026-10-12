@@ -22,28 +22,44 @@ rem   qwen36-35b-a3b   Qwen3.6-35B-A3B, 21.2 GiB, the RTX 3090-compatible vision
 rem                    v3 artifact revision: its artifact-manifest.json lists the text, vision, mtp
 rem                    and dflash components, and the DFlash bundle (from
 rem                    z-lab/Qwen3.6-35B-A3B-DFlash) is what --spec dflash needs.
+rem   qwen38-flash-next  Qwen3.8-Flash-Next (preview, Windows), this fork's exact conversion of the
+rem                    ISTA DASLab GSQ-RCO IQ2_XS GGUF with Strata's MTP drafter and the vision tower
+rem                    (WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090). Three things are fetched: the model
+rem                    file, its .part-0001 continuation (both read once, at load) and the 27.1 GiB
+rem                    n-gram volume, which is read on every prompt. The script asks where the volume
+rem                    goes (default: beside the model); a different folder is for a faster drive,
+rem                    since prefill from an NVMe drive measured 1.1-1.4x that from a SATA SSD. The
+rem                    launcher is then told with NINFER_NGRAM_VOLUME, which the script prints.
 rem
 rem To repin a model, edit its block below: take the size and sha256 from what HuggingFace reports for
 rem the new revision (X-Linked-Size and X-Linked-ETag on the resolve URL, or the revision's
 rem artifact-manifest.json), and for qwen36-35b-a3b check the manifest still lists a dflash component.
 rem Changing a pin makes the staging hazard below live rather than hypothetical.
 rem
-rem Run with no argument (for instance by double-clicking it) it shows a numbered menu of the three
+rem Run with no argument (for instance by double-clicking it) it shows a numbered menu of the
 rem models instead; an unknown name still prints the usage and exits 2. download-model.sh has no
 rem menu and always requires the name.
 rem
 rem Environment: NINFER_MODEL_DIR (default: models\ at the repo root in a checkout, or beside this
 rem file in the release archive), NINFER_SKIP_SHA256=1 to accept a file on size alone. qwen38-27b also
 rem fetches the private godmode graft when HF_TOKEN, or `hf auth login`, grants access to it.
+rem qwen38-flash-next: NINFER_NGRAM_DIR is the folder for the n-gram volume, which skips the question.
 rem
 rem Uses aria2c (16 parallel ranges) when it is on PATH, since single-stream curl against these
 rem artifacts has been observed to throttle to ~1 MB/s or stall outright; falls back to curl
 rem otherwise. Install it with `winget install aria2.aria2` or `choco install aria2` to opt in.
 
+rem Only qwen38-flash-next has continuation parts and an n-gram volume. Cleared here because setlocal
+rem inherits the caller's environment.
+set "PART_COUNT=0"
+set "NGRAM_NAME="
+set "PENDING="
+
 if "%~1"=="" goto :menu
 if /i "%~1"=="qwen38-27b" goto :model_qwen38_27b
 if /i "%~1"=="qwen36-27b" goto :model_qwen36_27b
 if /i "%~1"=="qwen36-35b-a3b" goto :model_qwen36_35b_a3b
+if /i "%~1"=="qwen38-flash-next" goto :model_qwen38_flash_next
 if /i "%~1"=="-h" goto :usage_help
 if /i "%~1"=="--help" goto :usage_help
 goto :usage_error
@@ -54,11 +70,13 @@ echo.
 echo   1 = Qwen3.8-27B (recommended)       qwen38-27b
 echo   2 = Qwen3.6-35B-A3B                 qwen36-35b-a3b
 echo   3 = Qwen3.6-27B                     qwen36-27b
+echo   4 = Qwen3.8-Flash-Next (preview)    qwen38-flash-next   (needs 64 GB of RAM)
 echo.
-choice /c 123 /n /m "Choose 1-3: "
+choice /c 1234 /n /m "Choose 1-4: "
 rem choice reports 255 when it cannot read a key (no console, closed stdin). Refuse rather than
 rem let that fall through and pick a model nobody chose.
 if errorlevel 255 exit /b 2
+if errorlevel 4 goto :model_qwen38_flash_next
 if errorlevel 3 goto :model_qwen36_27b
 if errorlevel 2 goto :model_qwen36_35b_a3b
 if errorlevel 1 goto :model_qwen38_27b
@@ -78,6 +96,7 @@ echo.
 echo   qwen38-27b (recommended)
 echo   qwen36-27b
 echo   qwen36-35b-a3b
+echo   qwen38-flash-next (preview)
 exit /b 0
 
 :model_qwen38_27b
@@ -113,7 +132,33 @@ set "LABEL=the RTX 3090-compatible Qwen3.6-35B-A3B vision model (21.2 GiB)"
 set "TESTS_VARIABLE=NINFER_QWEN3_6_35B_A3B_WEIGHTS"
 goto :model_selected
 
+rem The n-gram volume is pinned to the commit that uploaded it; the model file and its part are
+rem pinned to the revision that adds them. PENDING refuses the model until those pins are filled in.
+:model_qwen38_flash_next
+set "ARTIFACT=qwen4exp-iq2xs-mtp-vision.ninfer"
+set "OWNER=WarlaxZ"
+set "REPO=Qwen3.8-Flash-Next-NInfer-3090"
+set "PENDING=1"
+set "REVISION=PENDING_REVISION"
+set "EXPECTED_SIZE=PENDING_SIZE"
+set "EXPECTED_SHA256=PENDING_SHA256"
+set "PART_COUNT=1"
+set "PART_1_SIZE=PENDING_PART_1_SIZE"
+set "PART_1_SHA256=PENDING_PART_1_SHA256"
+set "NGRAM_NAME=qwen4exp-iq2xs-mtp-vision.ninfer.ngram"
+set "NGRAM_REVISION=95b1b0169bd25db96ceb772a8a67cc6e87088a1f"
+set "NGRAM_SIZE=29127258112"
+set "NGRAM_SHA256=7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051"
+set "LABEL=the Qwen3.8-Flash-Next model (PENDING GiB in two files)"
+set "TESTS_VARIABLE=NINFER_TEST_QWEN4EXP_ARTIFACT"
+goto :model_selected
+
 :model_selected
+if defined PENDING (
+  echo Qwen3.8-Flash-Next is not published yet: its model file is still being uploaded to 1>&2
+  echo https://huggingface.co/%OWNER%/%REPO%. Nothing was downloaded. 1>&2
+  exit /b 1
+)
 rem Two layouts share this script. In the release archive it sits at the archive root beside
 rem models\. In a checkout it sits in scripts\, one level under the repo root, and models\ (see
 rem .gitignore) is beside the repo root, not beside this script -- a directory named scripts with a
@@ -127,62 +172,139 @@ set "MODEL_DIR=%ROOT%models"
 if /i "%SCRIPT_DIRNAME%"=="scripts" if exist "%REPO_ROOT%\CMakeLists.txt" set "MODEL_DIR=%REPO_ROOT%\models"
 if defined NINFER_MODEL_DIR set "MODEL_DIR=%NINFER_MODEL_DIR%"
 set "MODEL=%MODEL_DIR%\%ARTIFACT%"
-
-rem Staged under a revision-scoped name so that curl -C - can only ever resume the same artifact.
-rem curl -C - resumes by appending at the current file length, without checking what wrote those
-rem bytes, so a leftover partial from a different revision -- for instance the previous pin's, on any
-rem machine that ran an older script -- would be spliced onto the head of this one: a file of
-rem entirely plausible size that is corrupt throughout. A name that carries the revision means a
-rem resume can only ever continue the same artifact, and the checks below are what promote it to
-rem the final name.
-set "PART=%MODEL%.%REVISION%.part"
-
 if not exist "%MODEL_DIR%" mkdir "%MODEL_DIR%"
+for %%I in ("%MODEL_DIR%") do set "MODEL_DIR_FULL=%%~fI"
 
-if exist "%MODEL%" (
-  call :verify "%MODEL%"
-  if "!VERIFY_OK!"=="1" (
-    echo Model already present: %MODEL%
-    call :fetch_graft
-    exit /b 0
-  )
-  echo Existing %MODEL% did not verify against revision %REVISION%; fetching the pinned one.
-  echo If it is the v2 file from an earlier release, you can upgrade it instead of downloading:
-  echo   python tools\upgrade_ninfer_v2_to_v3.py "%MODEL%" "%MODEL%.v3" ^&^& move /y "%MODEL%.v3" "%MODEL%"
-)
+rem Ask where the n-gram volume goes before anything is fetched, so the downloads can run unattended.
+if defined NGRAM_NAME call :choose_ngram_dir
+if defined NGRAM_NAME if not defined NGRAM_DIR exit /b 1
 
-echo Downloading %LABEL%...
-set "URL=https://huggingface.co/%OWNER%/%REPO%/resolve/%REVISION%/%ARTIFACT%"
-set "PART_NAME=%ARTIFACT%.%REVISION%.part"
-where /q aria2c
-if not errorlevel 1 (
-  rem 16 parallel ranges over one file, not single-stream curl. On the Vast rental boxes this repo
-  rem downloads at ~98 MB/s over aria2c against the same throttled-to-~1MB/s (and once outright
-  rem stalled at 11 of 21 GiB) single-stream curl -- see scripts\multi-gpu-testing\README.md. -c
-  rem resumes into the same .part name curl would use, and HuggingFace serves ranges fine.
-  aria2c -x16 -s16 -c --file-allocation=none -d "%MODEL_DIR%" -o "%PART_NAME%" "%URL%"
-) else (
-  curl.exe -L -C - --fail --output "%PART%" "%URL%"
+call :fetch_file "%MODEL_DIR%" "%ARTIFACT%" %EXPECTED_SIZE% %EXPECTED_SHA256% %REVISION% "%LABEL%" model
+if not "!FETCH_OK!"=="1" exit /b 1
+for /l %%N in (1,1,%PART_COUNT%) do (
+  call :fetch_file "%MODEL_DIR%" "%ARTIFACT%.part-000%%N" !PART_%%N_SIZE! !PART_%%N_SHA256! %REVISION% "part %%N of the model" part
+  if not "!FETCH_OK!"=="1" exit /b 1
 )
-if errorlevel 1 (
-  echo Download failed. Run this file again to resume.
-  exit /b 1
-)
+if defined NGRAM_NAME call :fetch_file "%NGRAM_DIR%" "%NGRAM_NAME%" %NGRAM_SIZE% %NGRAM_SHA256% %NGRAM_REVISION% "the n-gram volume (27.1 GiB)" volume
+if defined NGRAM_NAME if not "!FETCH_OK!"=="1" exit /b 1
 
-call :verify "%PART%"
-if not "!VERIFY_OK!"=="1" (
-  echo Downloaded file at "%PART%" failed verification against revision %REVISION%. Delete it and run this file again.
-  exit /b 1
-)
-
-move /y "%PART%" "%MODEL%" >nul
-if errorlevel 1 (
-  echo Failed to move "%PART%" to "%MODEL%". Delete "%PART%" and run this file again.
-  exit /b 1
-)
 echo Model ready: %MODEL%
+if defined NGRAM_NAME call :ngram_summary
 echo Point the tests at it with:  set %TESTS_VARIABLE%=%MODEL%
 call :fetch_graft
+exit /b 0
+
+rem Fetches one pinned file: folder %1, name %2, size %3, sha256 %4, revision %5, description %6, and
+rem kind %7 (model, part or volume). Sets FETCH_OK=1 once the file is at its final name and verified.
+rem A file already there that verifies is kept without any download.
+rem
+rem The download is staged under a revision-scoped name so that curl -C - can only ever resume the
+rem same file. curl -C - resumes by appending at the current file length, without checking what wrote
+rem those bytes, so a leftover partial from a different revision -- for instance the previous pin's,
+rem on any machine that ran an older script -- would be spliced onto the head of this one: a file of
+rem entirely plausible size that is corrupt throughout. A name that carries the revision means a
+rem resume can only ever continue the same file, and the checks below are what promote it to the
+rem final name. Written with goto rather than ( ) blocks: a folder may contain ")".
+:fetch_file
+set "FETCH_OK=0"
+set "F_DIR=%~1"
+set "F_NAME=%~2"
+set "EXPECTED_SIZE=%~3"
+set "EXPECTED_SHA256=%~4"
+set "F_REV=%~5"
+set "F_WHAT=%~6"
+set "F_KIND=%~7"
+set "F_PATH=%F_DIR%\%F_NAME%"
+set "F_PART_NAME=%F_NAME%.%F_REV%.part"
+set "F_PART=%F_DIR%\%F_PART_NAME%"
+if not exist "%F_PATH%" goto :fetch_download
+call :verify "%F_PATH%"
+if not "!VERIFY_OK!"=="1" goto :fetch_stale
+if /i "%F_KIND%"=="model" echo Model already present: %F_PATH%
+if /i not "%F_KIND%"=="model" echo Already present: %F_PATH%
+set "FETCH_OK=1"
+exit /b 0
+:fetch_stale
+echo Existing %F_PATH% did not verify against revision %F_REV%; fetching the pinned one.
+if /i not "%F_KIND%"=="model" goto :fetch_download
+if defined NGRAM_NAME goto :fetch_download
+echo If it is the v2 file from an earlier release, you can upgrade it instead of downloading:
+echo   python tools\upgrade_ninfer_v2_to_v3.py "%F_PATH%" "%F_PATH%.v3" ^&^& move /y "%F_PATH%.v3" "%F_PATH%"
+:fetch_download
+echo Downloading %F_WHAT%...
+set "URL=https://huggingface.co/%OWNER%/%REPO%/resolve/%F_REV%/%F_NAME%"
+where /q aria2c
+if errorlevel 1 goto :fetch_curl
+rem 16 parallel ranges over one file, not single-stream curl. On the Vast rental boxes this repo
+rem downloads at ~98 MB/s over aria2c against the same throttled-to-~1MB/s (and once outright
+rem stalled at 11 of 21 GiB) single-stream curl -- see scripts\multi-gpu-testing\README.md. -c
+rem resumes into the same .part name curl would use, and HuggingFace serves ranges fine.
+aria2c -x16 -s16 -c --file-allocation=none -d "%F_DIR%" -o "%F_PART_NAME%" "%URL%"
+goto :fetch_downloaded
+:fetch_curl
+curl.exe -L -C - --fail --output "%F_PART%" "%URL%"
+:fetch_downloaded
+if errorlevel 1 (
+  echo Download failed. Run this file again to resume.
+  exit /b 0
+)
+call :verify "%F_PART%"
+if not "!VERIFY_OK!"=="1" (
+  echo Downloaded file at "%F_PART%" failed verification against revision %F_REV%. Delete it and run this file again.
+  exit /b 0
+)
+move /y "%F_PART%" "%F_PATH%" >nul
+if errorlevel 1 (
+  echo Failed to move "%F_PART%" to "%F_PATH%". Delete "%F_PART%" and run this file again.
+  exit /b 0
+)
+set "FETCH_OK=1"
+exit /b 0
+
+rem Sets NGRAM_DIR, the folder for the n-gram volume: NINFER_NGRAM_DIR, else the answer to a question,
+rem else the model folder. Leaves NGRAM_DIR empty when the folder cannot be created.
+:choose_ngram_dir
+set "NGRAM_DIR=%MODEL_DIR%"
+if defined NINFER_NGRAM_DIR set "NGRAM_DIR=%NINFER_NGRAM_DIR%"
+if defined NINFER_NGRAM_DIR goto :ngram_dir_chosen
+echo.
+echo Qwen3.8-Flash-Next reads its 27.1 GiB n-gram volume on every prompt, and the model only once,
+echo at load. Prompts were processed 1.1-1.4x faster with the volume on an NVMe drive than on a
+echo SATA SSD, so put it on your fastest drive (28 GiB free). The model can stay where it is.
+echo.
+echo   Model folder: %MODEL_DIR_FULL%
+echo.
+rem set /p leaves the answer empty when nothing is typed or there is no console to read.
+set "NGRAM_ANSWER="
+set /p "NGRAM_ANSWER=Folder or drive for the n-gram volume, for example D: (Enter = the model folder): "
+if not defined NGRAM_ANSWER goto :ngram_dir_chosen
+set "NGRAM_ANSWER=!NGRAM_ANSWER:"=!"
+if not defined NGRAM_ANSWER goto :ngram_dir_chosen
+rem A bare drive gets a folder of its own rather than the drive's root.
+if "!NGRAM_ANSWER:~1!"==":" set "NGRAM_ANSWER=!NGRAM_ANSWER!\ninfer-models"
+if "!NGRAM_ANSWER:~1!"==":\" set "NGRAM_ANSWER=!NGRAM_ANSWER!ninfer-models"
+set "NGRAM_DIR=!NGRAM_ANSWER!"
+:ngram_dir_chosen
+for %%I in ("%NGRAM_DIR%") do set "NGRAM_DIR=%%~fI"
+if not exist "%NGRAM_DIR%\" mkdir "%NGRAM_DIR%" >nul 2>&1
+if exist "%NGRAM_DIR%\" goto :ngram_dir_ok
+echo Cannot create the folder "%NGRAM_DIR%" for the n-gram volume. 1>&2
+set "NGRAM_DIR="
+exit /b 0
+:ngram_dir_ok
+echo N-gram volume folder: %NGRAM_DIR%
+exit /b 0
+
+rem The launcher reads <model>.ngram beside the model unless NINFER_NGRAM_VOLUME names another file.
+:ngram_summary
+set "NGRAM_PATH=%NGRAM_DIR%\%NGRAM_NAME%"
+echo N-gram volume ready: %NGRAM_PATH%
+echo.
+echo Start it with:
+if /i not "%NGRAM_DIR%"=="%MODEL_DIR_FULL%" echo   set NINFER_NGRAM_VOLUME=%NGRAM_PATH%
+echo   set NINFER_MODEL=%MODEL%
+echo   "%ROOT%run.bat" qwen38-flash-next
+echo.
 exit /b 0
 
 rem The qwen38-27b godmode graft lives in a private repo. Fetching it is best-effort: with no token,

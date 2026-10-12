@@ -83,7 +83,7 @@ profiles read more:
 | `run.bat qwen38-27b` | `NINFER_CONTEXT`, `NINFER_CONCURRENCY`, `NINFER_KV_DTYPE`, `NINFER_SPEC` (`dflash2`, `mtp`, `none`), `NINFER_DRAFT_TOKENS`, `NINFER_PREFILL_CHUNK`, `NINFER_VISION`, `NINFER_VISION_RESIDENCY`, `NINFER_HOST_CONTEXT_MIB` (pinned host RAM for the context cache, default 8192), `NINFER_FALLBACK` (`off` makes the profile's context exact instead of fitting it to free GPU memory) |
 | `run.bat qwen36-35b-a3b` | the same, except `NINFER_SPEC` is `mtp` or `none` |
 | `run.bat qwen38-27b int8`, `run.bat qwen38-27b c8` | nothing further; every serving flag is fixed |
-| `download-model.bat <model>` | `NINFER_MODEL_DIR` |
+| `download-model.bat <model>` | `NINFER_MODEL_DIR`; `NINFER_NGRAM_DIR` (qwen38-flash-next: the folder for the n-gram volume, skipping the question) |
 
 > `NINFER_HOST=0.0.0.0` exposes the server to your network **unauthenticated**. The launchers bind
 > `127.0.0.1` for that reason. If you set it, put something in front of it.

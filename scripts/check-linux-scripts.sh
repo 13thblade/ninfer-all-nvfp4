@@ -616,6 +616,18 @@ for key in "${models[@]}"; do
   rm -f -- "$tmp/models/$model."*".part"
 done
 
+# qwen38-flash-next is listed before its model file is published. Until its pins are filled in it must
+# refuse with exit 1 before asking anything, fetching anything (both stubs fail every call) or creating
+# the models directory. Once it is pinned, this check fails and it joins the models array above.
+status=0
+pending_output="$(PATH="$tmp/failing-curl:$PATH" NINFER_MODEL_DIR="$tmp/flash-next-never-created" \
+  "$downloader" qwen38-flash-next 2>&1 </dev/null)" || status=$?
+if [[ "$status" != 1 || "$pending_output" != *'not published yet'* || -e "$tmp/flash-next-never-created" ]]; then
+  printf 'download-model.sh qwen38-flash-next did not refuse cleanly while its pins are pending (exit %s)\n' \
+    "$status" >&2
+  exit 1
+fi
+
 # The qwen38-27b godmode graft is fetched best-effort after the model is in place. It is a pair the
 # launcher trusts by the .bin alone and the loader needs whole with its .json, so the contract is
 # all-or-nothing: whatever happens, a failed fetch must leave a whole verified pair or neither file,
