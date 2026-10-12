@@ -48,6 +48,15 @@ std::uint64_t parse_u64(const char* text, const char* label) {
     return static_cast<std::uint64_t>(value);
 }
 
+// A whole-MiB option as bytes; refuses values whose byte count would not fit in 64 bits.
+std::uint64_t parse_mib_bytes(const char* text, const char* label) {
+    const std::uint64_t mib = parse_u64(text, label);
+    if (mib > (std::numeric_limits<std::uint64_t>::max() >> 20U)) {
+        throw std::invalid_argument(std::string("--") + label + " is out of range");
+    }
+    return mib << 20U;
+}
+
 std::size_t parse_host_context_mib(const char* text) {
     constexpr std::size_t bytes_per_mib = 1ULL << 20;
     constexpr std::size_t maximum       = std::numeric_limits<std::size_t>::max();
@@ -528,13 +537,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.save_expert_state = false;
         } else if (arg == "--vram-headroom-mib") {
             options.flash_next.vram_headroom_bytes =
-                parse_u64(require_value("--vram-headroom-mib"), "vram-headroom-mib") << 20U;
+                parse_mib_bytes(require_value("--vram-headroom-mib"), "vram-headroom-mib");
         } else if (arg == "--ram-headroom-mib") {
             options.flash_next.ram_headroom_bytes =
-                parse_u64(require_value("--ram-headroom-mib"), "ram-headroom-mib") << 20U;
+                parse_mib_bytes(require_value("--ram-headroom-mib"), "ram-headroom-mib");
         } else if (arg == "--expert-cache-mib") {
             options.flash_next.expert_cache_bytes =
-                parse_u64(require_value("--expert-cache-mib"), "expert-cache-mib") << 20U;
+                parse_mib_bytes(require_value("--expert-cache-mib"), "expert-cache-mib");
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--context-store") {

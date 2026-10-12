@@ -4,6 +4,8 @@
 
 #include "core/host_memory.h"
 
+#include "core/cgroup_memory.h"
+
 #include <algorithm>
 #include <stdexcept>
 
@@ -38,16 +40,6 @@ std::optional<std::uint64_t> proc_kib_field(const char* path, const std::string&
     }
     return std::nullopt;
 }
-
-// A cgroup v2 memory file holding one byte count ("max" means unlimited).
-std::optional<std::uint64_t> cgroup_bytes(const char* path) {
-    std::ifstream file(path);
-    std::string value;
-    if (!(file >> value) || value == "max") { return std::nullopt; }
-    try {
-        return std::stoull(value);
-    } catch (const std::exception&) { return std::nullopt; }
-}
 #endif
 
 } // namespace
@@ -72,11 +64,18 @@ HostMemorySnapshot host_memory_snapshot() {
     const auto available = proc_kib_field("/proc/meminfo", "MemAvailable:");
     if (!available) { throw std::runtime_error("/proc/meminfo has no MemAvailable"); }
     out.available_physical = *available;
-    if (const auto limit = cgroup_bytes("/sys/fs/cgroup/memory.max")) {
-        const std::uint64_t used = cgroup_bytes("/sys/fs/cgroup/memory.current").value_or(0);
-        out.available_physical   = std::min(out.available_physical, *limit > used ? *limit - used : 0);
+    // The effective cgroup (the process's own level and every ancestor, v1 and v2), not the mount
+    // root: a container's limit usually sits on a nested level.
+    std::ostringstream self_cgroup;
+    self_cgroup << std::ifstream("/proc/self/cgroup").rdbuf();
+    if (const auto remaining = cgroup_remaining_bytes("/sys/fs/cgroup", self_cgroup.str())) {
+        out.available_physical = std::min(out.available_physical, *remaining);
     }
-    out.available_commit = out.available_physical + proc_kib_field("/proc/meminfo", "SwapFree:").value_or(0);
+    std::uint64_t swap_free = proc_kib_field("/proc/meminfo", "SwapFree:").value_or(0);
+    if (const auto swap_room = cgroup_swap_remaining_bytes("/sys/fs/cgroup", self_cgroup.str())) {
+        swap_free = std::min(swap_free, *swap_room);
+    }
+    out.available_commit = out.available_physical + swap_free;
     out.process_private  = proc_kib_field("/proc/self/status", "VmRSS:").value_or(0);
     rlimit lock{};
     if (::getrlimit(RLIMIT_MEMLOCK, &lock) == 0 && lock.rlim_cur != RLIM_INFINITY) {
