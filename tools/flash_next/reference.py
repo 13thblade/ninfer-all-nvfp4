@@ -21,8 +21,10 @@ reference) and reads the artifact's stored values directly, never the engine:
   different quantization;
 - the PLE n-gram rows are the volume's IQ4_NL rows, decoded exactly and rounded to BF16.
 
-``--bf16-boundaries`` (default on) rounds the activations the engine stores in BF16: residual
-streams, every block input and output, projection outputs. The K/V cache is exact here; the engine
+``--bf16-boundaries`` (default on; ``--no-bf16-boundaries`` turns it off) rounds the activations
+the engine stores in BF16 between Ops: residual streams, every block input and output, projection
+outputs. Intermediates private to one Op stay FP64, notably the hyper-connection mixer's ``z``,
+``m`` and ``u``, which hyper_connection.h rounds or not depending on its route. The K/V cache is exact here; the engine
 stores INT8-G64 K/V, so attention outputs differ by that quantization. QSA selection is evaluated
 exactly; for prompts up to ``indexer_budget + compress_ratio - 1`` tokens every token is selected.
 """
@@ -429,20 +431,29 @@ class Reference:
         return record
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--volume", type=Path, help="the n-gram volume (default: ARTIFACT.ngram)")
     parser.add_argument("--tokens", required=True, help="comma-separated token ids")
     parser.add_argument("--layers", type=int, help="stop after this many layers (no logits)")
-    parser.add_argument("--no-bf16-boundaries", action="store_true")
+    parser.add_argument(
+        "--bf16-boundaries",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="round the activations the engine stores in BF16 (default: on)",
+    )
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--out", type=Path, required=True)
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
     ids = [int(v) for v in args.tokens.split(",") if v]
-    ref = Reference(args.artifact, volume=args.volume, bf16_boundaries=not args.no_bf16_boundaries)
+    ref = Reference(args.artifact, volume=args.volume, bf16_boundaries=args.bf16_boundaries)
     record = ref.forward(ids, layers=args.layers)
     arrays = {"tokens": np.array(ids, dtype=np.int64), "final_residual": record["final_residual"]}
     if "logits" in record:
