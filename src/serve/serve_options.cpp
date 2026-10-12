@@ -189,7 +189,6 @@ std::string serve_usage_text(const char* argv0) {
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
            "input projections off that route\n"
-<<<<<<< HEAD
            "       --lookup-ngram N adds context-lookup drafting alongside --spec: the last N tokens "
            "are matched against the sequence so far and what followed is proposed; it is exact, and "
            "0 (the default) disables it\n"
@@ -201,7 +200,6 @@ std::string serve_usage_text(const char* argv0) {
            "--ram-headroom-mib N is the RAM left free for Windows once every expert is pinned "
            "(default 2048; startup refuses when it cannot be kept); --expert-cache-mib N caps the "
            "expert cache (for measurement)\n"
-=======
            "       --ngram-draft-tokens 15 adds n-gram copy drafting beside --spec dflash2: when the "
            "text being written already appeared in the request (a tool result, the prompt or the "
            "output so far), a round verifies up to 15 copied tokens instead of the draft model's "
@@ -209,7 +207,6 @@ std::string serve_usage_text(const char* argv0) {
            "output. 0 (the default) disables it. It needs --max-concurrency 1 for now. "
            "--ngram-min-match N (4..64, default 12) is how many tokens must match before a copy "
            "is proposed\n"
->>>>>>> fork/feat/qwen4exp-program-core
            "       --no-prefix-reuse disables cross-request history; request pause/replay "
            "resources remain available\n"
            "       --context-store DIR keeps retained sessions on disk so a restart or crash does "
