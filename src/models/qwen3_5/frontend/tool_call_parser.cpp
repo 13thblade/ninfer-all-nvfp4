@@ -1237,6 +1237,25 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reaso
         if (status == ConstrainedToolRegionParser::Status::Invalid ||
             (!interrupted && status != ConstrainedToolRegionParser::Status::Complete))
             throw std::logic_error("committed tool grammar and parameter decoder disagree");
+        // The grammar dispatches on `<tool_call>` anywhere, so a model showing the call format
+        // inside Markdown code is forced to finish a real call. When calling was optional, that
+        // region is a quoted example: it becomes content, so a client never executes it. A
+        // required or named choice must call, so its region stays structured.
+        if (!contract_->required) {
+            MarkdownCodeTracker before_marker = region_code_;
+            before_marker.feed(std::string_view(tool_region_).substr(0, tool_region_.find(kToolOpen)));
+            if (before_marker.in_code()) {
+                std::string text = std::move(tool_region_);
+                text.erase(0, std::min(continuation_withheld_bytes_, text.size()));
+                continuation_withheld_bytes_ = 0;
+                tool_region_.clear();
+                ToolCallParseDiagnostics diagnostics;
+                diagnostics.marker_seen     = true;
+                diagnostics.fallback_reason = ToolCallParseFallbackReason::QuotedInCode;
+                return Terminal{
+                    .content = std::move(text), .tool_calls = {}, .diagnostics = diagnostics};
+            }
+        }
         result.diagnostics.structured_call_count =
             static_cast<std::uint32_t>(result.tool_calls.size());
         return result;

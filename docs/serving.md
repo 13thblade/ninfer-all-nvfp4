@@ -776,7 +776,15 @@ representations. Unsupported schemas fail with HTTP 400 before generation.
 
 For `auto` without JSON output, text can precede the first call. Required/named choices start directly with calls
 (after thinking, if enabled). Once a constrained call starts, the suffix consists of complete calls
-and model EOS. Active tool constraints require model EOS, so they cannot coexist with custom stop
+and model EOS. The grammar starts a call at a `<tool_call>` wherever it appears, including inside
+Markdown code, so a model that shows the call format in a code fence (```` ``` ```` or `~~~`) or
+inline code is made to complete a real call there. Under `auto` (calling optional, including
+`allowed_tools` with `mode:"auto"` and `parallel_tool_calls:false`), a call region that opened
+inside Markdown code is therefore returned as ordinary content, byte for byte, with no tool calls
+as a plain text answer (`stop`, Anthropic `end_turn`, Responses `completed`), so an agent client never executes an example; the
+request log records `fallback_reason: quoted_in_code`. The same Markdown rules as on the free route
+decide (only the text before `<tool_call>` counts). Required and named choices must call, so their
+calls are always structured. Active tool constraints require model EOS, so they cannot coexist with custom stop
 strings or `ignore_eos`. Basic constraints are only a default: a request that sends stop strings
 or `ignore_eos` with ordinary non-strict `auto` tools and no `tool_constraints` field falls back to
 free tool-call generation instead of being refused, because many OpenAI-compatible agent clients
@@ -1628,7 +1636,9 @@ unspecified. `enable_thinking` records whether the response starts in thinking m
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
 preserved for consumer validation, repeated parameter names resolved to their last value
 (`duplicate_parameters_repaired`), and a stable text-fallback reason. Fallback reasons are `none`,
-`malformed_structure`, `invalid_tool_name`, `undeclared_tool`, and `trailing_content`.
+`malformed_structure`, `invalid_tool_name`, `undeclared_tool`, `trailing_content`, and
+`quoted_in_code` (a constrained `auto` call opened inside Markdown code; see
+[Tool constraints](#tool-constraints)).
 `recovered_from_reasoning` is true when the structured calls came from a turn that ended inside
 its unclosed thinking. `tolerant_recovered` is true when `--tolerant-tool-calls` repaired markup
 the strict parser returns as text to produce the structured calls (see

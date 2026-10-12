@@ -569,6 +569,8 @@ enum class ToolCallParseFallbackReason : std::uint8_t {
     InvalidToolName,
     UndeclaredTool,
     TrailingContent,
+    // Constrained `auto` output opened its call inside Markdown code: a quoted example, kept as text.
+    QuotedInCode,
 };
 
 [[nodiscard]] inline constexpr const char*
@@ -584,6 +586,8 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "undeclared_tool";
     case ToolCallParseFallbackReason::TrailingContent:
         return "trailing_content";
+    case ToolCallParseFallbackReason::QuotedInCode:
+        return "quoted_in_code";
     }
     return "malformed_structure";
 }
