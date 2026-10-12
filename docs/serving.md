@@ -65,7 +65,7 @@ supports. `NINFER_CONTEXT` changes the context (up to the model's positions; KV 
 is borrowed from the expert cache). What is different from the Qwen3.5 models:
 
 - **One request at a time, text only, plain decode.** `--max-concurrency` above 1, `--kv-dtype`
-  other than `int8`, `--spec`, `--lookup-ngram`, `--vision`, `--graft`, `--context-store` and the
+  other than `int8`, `--spec`, `--ngram-draft-tokens`, `--vision`, `--graft`, `--context-store` and the
   load-time weight flags are refused at startup with the flag to change.
 - **No prefix reuse yet.** The server's context cache is switched off for this model (one line at
   startup says so), so every request prefills its whole prompt and reports 0 cached prompt tokens.
