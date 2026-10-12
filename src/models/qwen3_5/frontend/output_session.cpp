@@ -613,8 +613,11 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
             throw std::logic_error("prefix execution split exceeds the accepted token prefix");
         }
         if (impl_->grammar) {
-            impl_->preview_grammar = impl_->grammar->fork();
-            impl_->preview_grammar->accept(tokens.first(count));
+            // Installed only once it admits the round: a rejected round leaves no preview grammar
+            // for a later terminal preview to commit.
+            auto grammar = impl_->grammar->fork();
+            grammar->accept(tokens.first(count));
+            impl_->preview_grammar = std::move(grammar);
         }
         impl_->preview_ready = true;
         return runtime::OutputDecision{
@@ -800,8 +803,9 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_semantic.applied         = true;
     impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
     if (impl_->grammar) {
-        impl_->preview_grammar = impl_->grammar->fork();
-        impl_->preview_grammar->accept(tokens);
+        auto grammar = impl_->grammar->fork();
+        grammar->accept(tokens);
+        impl_->preview_grammar = std::move(grammar);
     }
     impl_->preview_ready = true;
     return runtime::OutputDecision{
@@ -825,6 +829,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     impl_->preview_semantic.control_pending = false;
     impl_->preview_output.clear();
     impl_->preview_logprobs.clear();
+    impl_->preview_grammar.reset();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
     release_logprobs(impl_->preview_state, impl_->preview_logprobs);
     impl_->preview_ready = true;

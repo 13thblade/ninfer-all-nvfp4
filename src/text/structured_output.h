@@ -3,10 +3,18 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace ninfer::text {
+// A token the request's grammar does not admit. The masks the request sampled under should have
+// excluded it, so it is an execution fault, but one confined to that request.
+class GrammarViolation final : public std::logic_error {
+public:
+    using std::logic_error::logic_error;
+};
+
 // Reject unsupported constraints instead of letting a compiler silently weaken a schema.
 void validate_structured_output(const StructuredOutputOptions& options);
 

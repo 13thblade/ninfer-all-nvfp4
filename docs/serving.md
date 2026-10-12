@@ -228,7 +228,10 @@ without it: the row keeps its logits and samples once the mask is ready, while t
 go on. The Qwen3.5 family computes such a request's next mask after each of its tokens and leaves
 the request out of decode rounds until the mask is ready. A mask over 5 s fails its request with
 an explicit error, and so does a Gemma 4 or Flash-Next decoding request without a token for 120 s
-([Gemma 4](gemma4.md#structured-output)).
+([Gemma 4](gemma4.md#structured-output)). A generated token the grammar does not admit, which the
+masks should have excluded, fails its own request with an internal error (HTTP 500) and leaves
+the others running; in the Qwen3.5 family it still fails the whole engine when it arrives while
+another request's admission or prompt-state capture holds the context cache.
 
 It is opt-in: start the server with `--structured-output` (the CLI's `--json` and `--json-schema`
 enable it for their run). That reserves one grammar mask plane per draft position and lane; a

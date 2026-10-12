@@ -252,10 +252,12 @@ that real-source check with the affected converter suite.
 Token log probabilities run through the public Engine on either family. The test checks that each
 record spells its token's text and that the drawn token tops its distribution under greedy
 decoding, that gathering them changes no generated token, that streaming, a stop string, three
-requests decoded as one batch and a JSON grammar's mask all reach the records, and that a request
+requests decoded as one batch and a JSON grammar's mask all reach the records, that schemas with an
+array, string or integer root constrain the answer from its first token, and that a request
 without them gathers none. `NINFER_LOGPROBS_ARTIFACT` names the artifact, and the test is skipped
-without it; `NINFER_LOGPROBS_NGRAM_TABLE` names a Qwen3.8-Flash-Next table artifact, and
-`NINFER_LOGPROBS_SPECULATIVE=mtp` or `dflash2` verifies the tokens in speculative rounds.
+without it; `NINFER_LOGPROBS_NGRAM_TABLE` names a Qwen3.8-Flash-Next table artifact,
+`NINFER_LOGPROBS_SPECULATIVE=mtp` or `dflash2` verifies the tokens in speculative rounds, and
+`NINFER_LOGPROBS_CONTEXT_CACHE=hybrid` admits every request through the hybrid prefix cache.
 `NINFER_LOGPROBS_DEVICES=0,1` selects a two-GPU layer pipeline:
 
 ```bash

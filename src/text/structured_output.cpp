@@ -259,10 +259,10 @@ std::unique_ptr<GrammarState> GrammarState::fork() const {
 void GrammarState::accept(std::span<const TokenId> tokens) {
     for (TokenId token : tokens) {
         if (token < 0 || token >= impl_->vocab_size || impl_->matcher.IsTerminated())
-            throw std::logic_error("generated token violates the structured output grammar");
+            throw GrammarViolation("generated token violates the structured output grammar");
         auto next = impl_->strings ? std::make_unique<StringConstraintState>(*impl_->strings) : nullptr;
         if ((next && !next->accept(impl_->semantic_bytes(token))) || !impl_->matcher.AcceptToken(token))
-            throw std::logic_error("generated token " + std::to_string(token) +
+            throw GrammarViolation("generated token " + std::to_string(token) +
                                    " violates the structured output grammar");
         if (next) impl_->strings = std::move(next);
     }
