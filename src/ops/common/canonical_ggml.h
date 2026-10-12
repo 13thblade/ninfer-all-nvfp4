@@ -10,7 +10,10 @@
 //
 //   1. The A8 cast of x, per group g of 32 consecutive values (a8_quantize_*): a = max |x_j| (NaN
 //      ignored), d_g = a / 127, q_j = clamp(rint(x_j * (127 / a)), -127, 127) with ties to even and
-//      q = 0 for a NaN product, q = 0 and d_g = 0 when a = 0. Divisions and the product are FP32.
+//      q = 0 for a NaN product, q = 0 and d_g = 0 when a = 0. Divisions and the product are FP32. A
+//      tiny group (a < 2^-100, e.g. BF16 subnormals, where 127 / a would overflow) first scales a
+//      and x by 2^100, which is exact and leaves x * (127 / a) finite (a8_prescale); every other
+//      group has scale 1, so its bits are those of the unscaled formula.
 //   2. Each 32-value sub-block s of row r decodes exactly to integer weights w_j (|w_j| <= 43), two
 //      integer half multipliers m_0 (values 0-15) and m_1 (values 16-31) and an FP32 scale c_s, with
 //      W[r, 32 s + j] = c_s * m_{j / 16} * w_j exactly (ExpertSub, per format below).
@@ -43,12 +46,18 @@ NINFER_CANON_HD float a8_amax_step(float amax, float x) {
 
 NINFER_CANON_HD float a8_scale(float amax) { return div_rn(amax, 127.0F); }
 
-NINFER_CANON_HD float a8_inverse(float amax) { return amax == 0.0F ? 0.0F : div_rn(127.0F, amax); }
+// The exact power-of-two prescale of a group: 2^100 when 127 / amax could overflow, else 1.
+NINFER_CANON_HD float a8_prescale(float amax) { return amax < 0x1p-100F ? 0x1p+100F : 1.0F; }
 
-// The code of one value: rint(x * inverse), saturated to [-127, 127] (only an overflowing 127 / a
-// can exceed it), 0 for a NaN product.
-NINFER_CANON_HD int a8_code(float x, float inverse) {
-    const float r = mul_rn(x, inverse);
+// 127 / (amax * prescale), finite for every finite amax; 0 when amax = 0.
+NINFER_CANON_HD float a8_inverse(float amax) {
+    return amax == 0.0F ? 0.0F : div_rn(127.0F, mul_rn(amax, a8_prescale(amax)));
+}
+
+// The code of one value: rint((x * prescale) * inverse), saturated to [-127, 127], 0 for a NaN
+// product.
+NINFER_CANON_HD int a8_code(float x, float prescale, float inverse) {
+    const float r = mul_rn(mul_rn(x, prescale), inverse);
     if (r != r) { return 0; }
     if (r >= 127.0F) { return 127; }
     if (r <= -127.0F) { return -127; }
@@ -59,8 +68,11 @@ NINFER_CANON_HD int a8_code(float x, float inverse) {
 NINFER_CANON_HD float a8_quantize_f32(const float* v, std::int8_t* q) {
     float amax = 0.0F;
     for (int j = 0; j < kA8Values; ++j) { amax = a8_amax_step(amax, v[j]); }
-    const float inverse = a8_inverse(amax);
-    for (int j = 0; j < kA8Values; ++j) { q[j] = static_cast<std::int8_t>(a8_code(v[j], inverse)); }
+    const float prescale = a8_prescale(amax);
+    const float inverse  = a8_inverse(amax);
+    for (int j = 0; j < kA8Values; ++j) {
+        q[j] = static_cast<std::int8_t>(a8_code(v[j], prescale, inverse));
+    }
     return a8_scale(amax);
 }
 
@@ -68,9 +80,10 @@ NINFER_CANON_HD float a8_quantize_f32(const float* v, std::int8_t* q) {
 NINFER_CANON_HD float a8_quantize_bf16(const std::uint16_t* v, std::int8_t* q) {
     float amax = 0.0F;
     for (int j = 0; j < kA8Values; ++j) { amax = a8_amax_step(amax, bf16_to_f32(v[j])); }
-    const float inverse = a8_inverse(amax);
+    const float prescale = a8_prescale(amax);
+    const float inverse  = a8_inverse(amax);
     for (int j = 0; j < kA8Values; ++j) {
-        q[j] = static_cast<std::int8_t>(a8_code(bf16_to_f32(v[j]), inverse));
+        q[j] = static_cast<std::int8_t>(a8_code(bf16_to_f32(v[j]), prescale, inverse));
     }
     return a8_scale(amax);
 }

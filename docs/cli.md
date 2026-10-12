@@ -103,6 +103,14 @@ and suppresses this insertion. The option cannot be combined with `--no-thinking
 `--reasoning-effort none`, which both disable thinking, but it can be combined with any other
 `--reasoning-effort`.
 
+`--reasoning-loop off|stop|conclude` (default `off`) ends the reply (`stop`) or closes the thinking
+with the same control span and lets the model answer (`conclude`) when the open thinking keeps
+repeating whole passages: every 512 thinking tokens, 25 % of the last 2,000 words inside a 12-word
+passage seen three times. `conclude` stops instead when the output left cannot hold the control
+span and one more token. The run summary prints `reasoning loop` when it fires. It cannot be
+combined with `--no-thinking`. The check and its limits are described in
+[serving](serving.md#openai-chat-completions), under `--reasoning-loop`.
+
 `--max-new` counts every committed generated token, including internally inserted control tokens.
 The inserted suffix is never truncated, and a request is never rejected for lacking room for it.
 When the output capacity left after the budget cannot hold the complete tokenizer-derived control
@@ -206,7 +214,8 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--spec mtp\|dflash\|dflash2` | speculative backend; see [Speculative decoding](#speculative-decoding) | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
-| `--lookup-ngram N` | context-lookup drafting alongside `--spec`: the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
+| `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. Copies run at one or two lanes in a round; see [Speculative decoding](#n-gram-copy-drafting) | `0` (off) |
+| `--ngram-min-match N` | tokens the end of the text must match before a copy is proposed, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
 | `--no-prefill-a8` | return full prefill tiles to their A16 routes, which is how the integer routes are measured on a whole request | integer routes on |
@@ -222,6 +231,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
+| `--reasoning-loop off\|stop\|conclude` | end the reply or close the thinking when it keeps repeating whole passages | `off` |
 | `--reasoning-effort none\|minimal\|low\|medium\|high\|xhigh\|max` | pass an effort value to the selected template | template default |
 | `--greedy` | exact argmax decoding, independent of the thinking options | off |
 | `--temperature F` | sampling temperature override | registered model/mode default |
@@ -301,8 +311,9 @@ guessing right.
 - **MTP:** three is the default. It is best or within 2% on prose, and larger counts lose up to 38%
   there. When the output mostly reproduces the input -- refactoring, renaming, applying an edit and
   returning the whole file -- 11 to 15 is up to 1.85x faster than three, and for a coding assistant
-  that mostly writes new code seven is about 10% faster. `--lookup-ngram` adds nothing on top of
-  MTP there, because the head already copies.
+  that mostly writes new code seven is about 10% faster. The former MTP-only context lookup
+  (`--lookup-ngram`) added nothing on top of MTP there, because the head already copies; it has
+  been removed in favour of n-gram copy drafting beside DFlash2 (below).
 - **DFlash2:** seven is the checkpoint recommendation and the best mean on this card. The best K
   still depends on the workload, so a deployment serving one kind of work should sweep its own.
   The optimized proposal head, which `--spec` now always enables, measured within noise of the full head for
@@ -314,6 +325,25 @@ The tables and sweeps are in [performance](performance.md#choosing-the-draft-cou
 The published [performance results](performance.md) use MTP with three draft tokens and DFlash with
 seven, both with the optimized proposal head. Draft counts of eight and above add a second CUDA Graph
 topology class on the 27B, which reserves about 64 MiB more per lane.
+
+### N-gram copy drafting
+
+`--ngram-draft-tokens 15` (with `--spec dflash2`) adds copy rounds. Before each round the request's
+own text is searched for the last 12 or more tokens written (`--ngram-min-match`): the prompt, each
+tool result, a de-numbered copy of each `cat -n` / Read-style numbered tool result, and the output
+so far. When they occurred before, the round verifies the 15 tokens that followed them there in one
+16-column pass and skips the draft model; otherwise it is an ordinary 8-column DFlash2 round. It
+pays when the answer repeats its input -- returning a file, applying an edit, quoting a tool result.
+As with any draft, every token is licensed by the target's own verification, and a copy that is
+wrong, or that a grammar forbids, is rejected; a request whose copies keep missing asks for a longer
+match before it copies again. With two lanes a round copies only when a copy offers at least 12
+tokens, because the other lane's row is verified at the copy width too and decodes about a third
+slower in that round; with three or more lanes in a round nothing is copied. The counters are in
+the request log and `/metrics` (see [serving](serving.md)). On an agent replay at one lane it
+decoded 42% faster overall and up to 76% faster on turns that return a file, at about 0.7% on
+output that never copies. At two lanes the replay finished 12% sooner, but a request sharing rounds
+with a copying one decoded up to a fifth slower; see
+[performance](performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b).
 
 ## CUDA synchronization
 

@@ -9,6 +9,7 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -201,6 +202,9 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
                 norm_weight.data != nullptr && norm_weight.dtype == DType::FP32 &&
                 norm_weight.is_contiguous() && streams > 0 && rank > 0,
             "mix requires contiguous BF16 residual and x and an FP32 norm weight");
+    // The fused route reads each stream's slice of residual with 16-byte loads.
+    require(reinterpret_cast<std::uintptr_t>(residual.data) % 16 == 0,
+            "mix residual must be 16-byte aligned");
     const std::int32_t T = residual.ne[1], hidden = x.ne[0];
     require(T > 0 && x.ne[1] == T && residual.ne[0] == streams * hidden && hidden % 8 == 0 &&
                 norm_weight.numel() == residual.ne[0] && down.k == residual.ne[0] &&
@@ -216,6 +220,8 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
                 "mix inject output must be FP32 [S, T]");
     }
     require(eps > 0, "mix epsilon must be positive");
+    // Checked before the route choice: the fused route never reaches linear()'s own check.
+    require(valid_linear_policy(policy), "mix requires a valid LinearPolicy");
     auto scope = workspace.scope();
     if (detail::hc_mix_fused_supported(down, up, hidden, streams, rank, T)) {
         const DeviceSpan partials =
@@ -241,6 +247,7 @@ std::size_t hyper_connection_mix_workspace_capacity_bytes(const Weight& down, co
                                                           std::int32_t max_tokens) {
     require(max_tokens > 0 && streams > 0 && rank > 0,
             "mix workspace needs positive T, streams and rank");
+    require(valid_linear_policy(policy), "mix requires a valid LinearPolicy");
     std::size_t bytes = composed_bytes(down, up, policy, rank, max_tokens);
     for (std::int32_t T = 1; T <= std::min(max_tokens, detail::kHcMixFusedMaxColumns); ++T) {
         bytes = std::max(bytes, detail::hc_mix_fused_workspace_bytes(down.n, streams, T));

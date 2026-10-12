@@ -85,12 +85,19 @@ the idea is obvious and the obstacle is not.
   one acceptance threshold. The curve is flat in the middle, so two points take most of the spread
   for one extra graph and one bit of per-sequence state.
 
-**2. Context-lookup drafting on the DFlash2 path -- smaller than it first looked.**
-`--lookup-ngram` is implemented and hooks the MTP branch only, where it is worth ~3-5% because that
-drafter already accepts 95-96%. The case for moving it to DFlash2 was K=15's 0.868 acceptance and a
-2.3x ceiling -- but K=15 is not the operating point on real generation, and at K=7 acceptance is
-0.95, which caps a perfect drafter at **+19%**. Worth doing, worth maybe half that in practice, and
-no longer the largest thing on this list.
+**2. Copy drafting on the DFlash2 path -- done at one and two lanes; on in the one-lane launchers.**
+`--ngram-draft-tokens 15` verifies n-gram copies in 16-column rounds beside DFlash2: +42% decode
+on the agent replay at one lane, up to +76% on turns that return a file; a copy-miss backoff fixed
+reverting a diff (-3.7% to -0.1%). Two lanes copy only for copies of 12+ tokens (the other lane pays
+the 16 columns, about a third slower in those rounds); three or more never copy (2.4x round cost).
+The `tuned` DFlash2 launchers pass it at one lane (+170 MiB planned, fits 188,416 tokens). Open:
+the -0.7% at one lane on output that never copies, which an nsys trace puts in the same kernels each
+running about 1% slower (not attributed; the round bench does not reproduce it); explaining turns
+read -4.8% on the replay but their answers differ between arms (round cost +0.4%). At two lanes the
+replay gains 15% in throughput while a request beside a copying one decodes up to 19% slower: a gate
+that also weighs the partner (its own tokens per round, or how often it was widened) is untried.
+Windows of 31/63 are not worth the Op work on this card (their prefill proxy costs 2-8x an 8-token
+chunk).
 
 ## Open after the 2026-09-17 upstream catch-up (v3 artifacts, `src/models/qwen3_5`)
 

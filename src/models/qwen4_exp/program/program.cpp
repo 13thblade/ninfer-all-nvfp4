@@ -43,6 +43,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -235,7 +236,7 @@ struct IoLayout {
 };
 
 struct Layout {
-    std::int32_t chunk = 0, wide_chunk = 0, token_domain = 0;
+    std::int32_t chunk = 0, wide_chunk = 0, columns = 0, token_domain = 0;
     std::size_t wide_work = 0; // workspace of a wide call (in the lent frames)
     std::uint32_t pages = 0, base_pages = 0;
     KvLayout kv;
@@ -267,14 +268,17 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     }
     Layout d;
     d.chunk        = static_cast<std::int32_t>(std::min(o.prefill_chunk, o.max_context));
-    d.wide_chunk   = std::max(d.chunk, std::min(kWideChunk, static_cast<std::int32_t>(o.max_context)));
+    // The wide route is a fixed kWideChunk columns whatever --prefill-chunk is; the IO and residency
+    // tables are sized for the wider of the two routes.
+    d.wide_chunk   = std::min(kWideChunk, static_cast<std::int32_t>(o.max_context));
+    d.columns      = std::max(d.chunk, d.wide_chunk);
     d.token_domain = static_cast<std::int32_t>(public_tokens);
     d.pages        = (o.max_context + kPagedKVPageSize - 1) / kPagedKVPageSize;
     const std::uint32_t base_tokens = o.kv_base_tokens != 0 ? o.kv_base_tokens : kKvBaseTokens;
     d.base_pages = std::min(d.pages, std::max(1U, base_tokens / kPagedKVPageSize));
     d.kv         = KvLayout::plan(c, d.pages);
     const NgramHash hash(c.ple.ngram, 0);
-    d.io = IoLayout::plan(static_cast<std::size_t>(d.wide_chunk),
+    d.io = IoLayout::plan(static_cast<std::size_t>(d.columns),
                           static_cast<std::size_t>(c.ple.table.row_bytes) * hash.heads());
     d.gdn_conv      = std::size_t(c.gdn.conv_channels()) * (c.gdn.conv_kernel - 1) * 2;
     d.gdn_recurrent = std::size_t(c.gdn.key_head_dim) * c.gdn.value_head_dim * c.gdn.value_heads * 4;
@@ -296,9 +300,8 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
                                                  DeviceExecutionView{nullptr, sms}) +
              ops::sampling_workspace_capacity_bytes(d.token_domain, 1, 1);
     d.sms       = sms;
-    d.wide_work = d.wide_chunk > d.chunk ? execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
-                                                                               DeviceExecutionView{nullptr, sms})
-                                         : 0;
+    d.wide_work = execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
+                                                      DeviceExecutionView{nullptr, sms});
     d.vmm = VmmArena::supported(o.device);
 
     auto& b     = d.bytes;
@@ -310,7 +313,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.state     = d.state;
     b.io        = d.io.bytes + sizeof(float) * c.vocab_size + 2ULL * c.vocab_size + 256 * 4 +
                   sizeof(ops::SamplingConfig) + 4ULL * public_tokens + 4 * d.mask_words + 4096;
-    b.residency            = ExpertResidency::table_bytes(c, d.wide_chunk);
+    b.residency            = ExpertResidency::table_bytes(c, d.columns);
     b.expert_record_stride = d.frame_stride;
     b.max_frames           = ExpertResidency::max_frames(c);
     b.graph_bound          = 2 * graph_bound(1, 1, 0); // the decode forward in two parts
@@ -409,7 +412,7 @@ public:
             banks.push_back(bank.host_records);
             bank_strides.push_back(bank.record_stride);
         }
-        residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), std::move(bank_strides), plan_.wide_chunk,
+        residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), std::move(bank_strides), plan_.columns,
                                                        device_.device);
         allocated += plan_.bytes.residency;
         if (allocated != plan_.bytes.fixed_bytes()) {
@@ -432,8 +435,9 @@ public:
             demand.frame_bytes = plan_.frame_stride;
             demand.max_frames  = residency_->frame_limit();
             if (options_.expert_cache_bytes) {
-                demand.max_frames = std::min<std::uint32_t>(
-                    demand.max_frames, static_cast<std::uint32_t>(*options_.expert_cache_bytes / plan_.frame_stride));
+                // Bounded before the narrowing so a huge byte budget cannot truncate to a small count.
+                demand.max_frames = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(*options_.expert_cache_bytes / plan_.frame_stride, demand.max_frames));
             }
             // The KV above the base comes out of the frames: keep room for the request's whole extent.
             const std::uint64_t kv_growth = plan_.vmm ? plan_.kv.mapped_bytes(plan_.pages) - kv_vmm_->mapped_bytes() : 0;
@@ -650,6 +654,7 @@ public:
         out.complete = true;
         if (cancellation.requested()) {
             lane_ = Lane{.epoch = lane_.epoch};
+            settle_idle(); // the same idle reconciliation a finished request gets
             return out; // not published: the Engine completes the request as cancelled
         }
         // A fresh sequence: zero recurrent state (the KV is written before it is read).
@@ -711,7 +716,10 @@ public:
                 prefetch_rows(next, std::min(call_width(wide), remaining - width));
             }
             lane_.state_tokens += static_cast<std::uint32_t>(width);
-            const std::size_t promotions = width <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(width)) : 0;
+            // No promotion while the lease is held, whatever the call's width: a trailing short call
+            // would evict residents after lend() recorded the displaced set, which give_back restores.
+            const std::size_t promotions =
+                !lease_.valid() && width <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(width)) : 0;
             if (last) {
                 const bool failed_constraint = sample(begin + width - 1, masks);
                 residency_->enqueue_route_download(device_.stream, width);
@@ -870,6 +878,7 @@ public:
                                                : runtime::CommitDisposition::CancelledReleased;
             settle_round();
             release_lane();
+            settle_idle(); // a cancelled or failed request gets the idle reconciliation a finished one does
         } else {
             if (d.accepted_tokens != 1) {
                 release_lane();
@@ -897,8 +906,10 @@ public:
         out.row_count = ContractAccess::rows(pending).size();
         ContractAccess::consume(pending);
         pending_  = 0;
-        deferred_ = false;
+        // The round ran on the device: settle its cache update before the lane goes, as a commit would.
+        try { settle_round(); } catch (...) { deferred_ = false; }
         release_lane();
+        settle_idle();
         out.status = runtime::ConsumeStatus::Consumed;
         return out;
     }
@@ -924,9 +935,19 @@ public:
             out.timings = timings();
             device_.synchronize();
             release_lane();
+            apply_vram_target(true);
+            maintain_expert_state();
             out.status = runtime::ConsumeStatus::Consumed;
         } catch (...) {}
         return out;
+    }
+
+    // Between requests, after the lane is gone: the idle VRAM target and the periodic expert state.
+    void settle_idle() noexcept {
+        try {
+            apply_vram_target(true);
+            maintain_expert_state();
+        } catch (...) {}
     }
 
     void fail_all_cleanup() noexcept {
@@ -1107,10 +1128,12 @@ private:
     bool wide_ready(std::int32_t remaining) {
         if (lease_.valid()) { return true; }
         if (!stream_ || plan_.wide_work == 0 || remaining < kStreamMinColumns) { return false; }
-        // The workspace of this prompt's widest call at the keys its extent reaches, not the
-        // planned bound (kWideChunk columns at max_context): a 1K prompt lends a quarter of it.
+        // The workspace of this prompt's widest call (not the planned wide_chunk columns). The keys
+        // stay the planned envelope: Forward::attention runs the QSA selection at
+        // kv_.max_visible_keys, whose scratch grows with it, so a smaller figure here would
+        // under-allocate the lent arena.
         const std::int32_t widest   = std::min(plan_.wide_chunk, remaining);
-        const std::uint32_t keys    = (lane_.extent + kPagedKVPageSize - 1) / kPagedKVPageSize * kPagedKVPageSize;
+        const std::uint32_t keys    = plan_.pages * kPagedKVPageSize;
         const std::size_t work      = std::min<std::size_t>(
             plan_.wide_work, execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms}));
         const std::uint64_t stride  = residency_->frame_stride();
@@ -1122,8 +1145,14 @@ private:
         lease_          = residency_->lend(work_frames + ring, device_.stream);
         auto* base      = static_cast<std::byte*>(lease_.memory.data);
         stream_tables_  = reinterpret_cast<std::int32_t*>(base);
-        wide_work_      = std::make_unique<WorkspaceArena>(
-            DeviceSpan{base + tables, static_cast<std::size_t>(work_frames) * stride - tables});
+        try {
+            wide_work_ = std::make_unique<WorkspaceArena>(
+                DeviceSpan{base + tables, static_cast<std::size_t>(work_frames) * stride - tables});
+        } catch (...) {
+            // No half-built lease: run_call dereferences wide_work_ whenever the lease is held.
+            return_lease();
+            throw;
+        }
         ring_first_  = lease_.first + work_frames;
         ring_frames_ = ring;
         ++leases_;
@@ -1143,6 +1172,8 @@ private:
     void return_lease() {
         if (!lease_.valid()) { return; }
         wide_peak_ = std::max(wide_peak_, wide_work_ ? wide_work_->peak_used() : 0);
+        // The forward must never keep pointing at the lent arena destroyed below.
+        if (forward_) { forward_->use_workspace(*work_); }
         wide_work_.reset();
         refilled_ += residency_->give_back(lease_, device_.stream);
         frames_now_ = residency_->frames();
@@ -1171,8 +1202,8 @@ private:
             forward_->run(batch(width), logits32_);
         } else {
             forward_->use_workspace(*wide_work_);
-            stream_->begin(residency_->host_table(), stream_tables_, ring_first_, ring_frames_, device_.stream);
             try {
+                stream_->begin(residency_->host_table(), stream_tables_, ring_first_, ring_frames_, device_.stream);
                 forward_->run(batch(width), logits32_);
             } catch (...) {
                 stream_->end();
@@ -1340,8 +1371,13 @@ private:
         try {
             const std::string error = expert_cache::save_expert_state(options_.expert_state, options_.expert_state_identity,
                                                                       residency_->saved_state());
-            if (!error.empty()) { diagnostic("expert state not saved: " + error); }
-            expert_state_saved_  = Clock::now();
+            // The interval restarts either way so a failing save is retried at most every
+            // kExpertStateInterval; the routed count only advances when the state reached disk.
+            expert_state_saved_ = Clock::now();
+            if (!error.empty()) {
+                diagnostic("expert state not saved: " + error);
+                return;
+            }
             expert_state_routed_ = residency_->stats().routed;
         } catch (...) {}
     }
@@ -1411,34 +1447,57 @@ private:
             const std::uint64_t spare = spare_vram();
             const std::uint32_t give =
                 kv_growth_frames(added, spare, frames, stride, ExpertResidency::kChunkBytes);
-            if (give != 0) {
-                const auto resized = residency_->resize(frames - give, device_.stream, *vram_);
-                if (resized.frames > frames - give) {
-                    throw std::logic_error("Qwen3.8-Flash-Next: the expert cache did not release frames for the KV");
+            // Growth is all or nothing: a failure unmaps what this attempt mapped, gives the frames
+            // back and refreshes the accounting the resize changed, so the next request starts from a
+            // consistent pool.
+            try {
+                if (give != 0) {
+                    const auto resized = residency_->resize(frames - give, device_.stream, *vram_);
+                    if (resized.frames > frames - give) {
+                        throw std::logic_error("Qwen3.8-Flash-Next: the expert cache did not release frames for the KV");
+                    }
                 }
-            }
-            if (!map_kv(target)) {
-                // The memory is not there after all (another program took it): put the frames back
-                // and refuse this request rather than overcommit the device.
+                if (!map_kv(target)) {
+                    // The memory is not there after all (another program took it): refuse this request
+                    // rather than overcommit the device.
+                    throw std::runtime_error("Qwen3.8-Flash-Next: no VRAM left for this request's KV");
+                }
+            } catch (...) {
+                (void)device_.synchronize_status();
                 (void)unmap_kv(backed_pages_);
-                (void)residency_->resize(frames, device_.stream, *vram_);
+                // The frames given away for this growth go back, best effort: the chunks above are
+                // free again, and a refusal here only leaves the cache smaller for the controller to regrow.
+                if (residency_->frames() < frames) {
+                    try {
+                        (void)residency_->resize(frames, device_.stream, *vram_);
+                        (void)device_.synchronize_status();
+                    } catch (...) {}
+                }
                 frames_now_ = residency_->frames();
                 pool_now_   = residency_->pool_bytes();
-                throw std::runtime_error("Qwen3.8-Flash-Next: no VRAM left for this request's KV");
+                throw;
             }
             kv_taken_ += frames - residency_->frames();
             kv_added_ += added;
             if (control_) { control_->account_fixed(static_cast<std::int64_t>(added)); }
-            const VramSnapshot after = vram_->query();
+            // The growth is final: commit the pool state before the telemetry below, which queries the
+            // device and must not be able to leave backed_pages_ behind the mapped chunks.
+            backed_pages_ = target;
+            frames_now_   = residency_->frames();
+            pool_now_     = residency_->pool_bytes();
             char line[320];
-            std::snprintf(line, sizeof(line),
-                          "KV pool grew to %u pages (%zu MiB, +%zu); expert cache %u -> %u frames (%llu MiB spare); "
-                          "VRAM free %zu MiB, OS budget %llu, used %llu",
+            std::snprintf(line, sizeof(line), "KV pool grew to %u pages (%zu MiB, +%zu); expert cache %u -> %u frames (%llu MiB spare)",
                           target, kv_vmm_->mapped_bytes() >> 20, added >> 20, frames, residency_->frames(),
-                          static_cast<unsigned long long>(spare >> 20), after.device_free >> 20,
-                          static_cast<unsigned long long>(after.local_budget >> 20),
-                          static_cast<unsigned long long>(after.local_usage >> 20));
-            diagnostic(line);
+                          static_cast<unsigned long long>(spare >> 20));
+            std::string text = line;
+            try {
+                const VramSnapshot after = vram_->query();
+                std::snprintf(line, sizeof(line), "; VRAM free %zu MiB, OS budget %llu, used %llu", after.device_free >> 20,
+                              static_cast<unsigned long long>(after.local_budget >> 20),
+                              static_cast<unsigned long long>(after.local_usage >> 20));
+                text += line;
+            } catch (...) {} // telemetry only: the line goes out without the VRAM numbers
+            diagnostic(text);
         } else {
             const std::size_t freed = unmap_kv(target);
             if (control_) { control_->account_fixed(-static_cast<std::int64_t>(freed)); }
@@ -1454,7 +1513,23 @@ private:
             kv_taken_ -= back;
             kv_added_ -= std::min<std::uint64_t>(kv_added_, freed);
             const std::uint32_t regrow = std::min(frames + back, demand_.max_frames);
-            if (regrow > frames) { (void)residency_->resize(regrow, device_.stream, *vram_); }
+            if (regrow > frames) {
+                std::exception_ptr failure;
+                try {
+                    (void)residency_->resize(regrow, device_.stream, *vram_);
+                } catch (...) { failure = std::current_exception(); }
+                // A refused mapping leaves the cache short of `regrow`: keep what was not restored as
+                // debt, so a later shrink (or the next growth's accounting) still owes it.
+                const std::uint32_t restored = residency_->frames() > frames ? residency_->frames() - frames : 0;
+                kv_taken_ += (regrow - frames) - std::min(restored, regrow - frames);
+                if (failure) {
+                    // The chunks are already unmapped: commit the pool state before propagating.
+                    backed_pages_ = target;
+                    frames_now_   = residency_->frames();
+                    pool_now_     = residency_->pool_bytes();
+                    std::rethrow_exception(failure);
+                }
+            }
             diagnostic("KV pool shrank to " + std::to_string(target) + " pages; expert cache " + std::to_string(frames) +
                        " -> " + std::to_string(residency_->frames()) + " frames");
         }

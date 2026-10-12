@@ -38,6 +38,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import struct
+import tempfile
 from typing import BinaryIO, Callable, Iterable
 
 import numpy as np
@@ -239,17 +240,26 @@ def write_volume(
     *,
     progress: Callable[[int, int], None] | None = None,
 ) -> None:
-    """Write a new volume at *path* through a temporary file; never replaces an existing one."""
+    """Write a new volume at *path*; never replaces an existing one.
+
+    As :class:`tools.artifact.writer.ArtifactWriter` publishes its files, the rows go to a
+    uniquely named temporary file beside *path* that this call owns, and ``os.link`` publishes
+    it, which fails rather than replace a file that appeared at *path* in the meantime.
+    """
     path = Path(path)
     if path.exists():
         raise FileExistsError(f"n-gram volume already exists: {path}")
-    temporary = path.with_name(path.name + ".tmp")
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
     try:
-        with temporary.open("xb") as stream:
+        with os.fdopen(fd, "wb") as stream:
             write_blocks(stream, g, volume_id, chunks, progress=progress)
         if temporary.stat().st_size != g.file_bytes:
             raise ValueError("n-gram volume size differs from its geometry")
-        os.replace(temporary, path)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            raise FileExistsError(f"n-gram volume already exists: {path}") from None
     finally:
         temporary.unlink(missing_ok=True)
 

@@ -21,6 +21,8 @@ struct RoundStateSpec {
     std::int32_t hidden          = 0;
     std::int32_t output_rows     = 0;
     std::uint32_t batch_capacity = 1;
+    // The widest round family's drafts; a speculative frame is allocated at draft_window + 1
+    // columns per row and each round views it at its own width.
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
     bool causal_scoring          = false;
@@ -100,7 +102,16 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    // N-gram copy rounds only; the other rounds transfer the fields above and stop here. Rows
+    // flagged in copy_rows verify copy_drafts, laid out [k, B] at the round's k, instead of a
+    // draft model proposal.
+    std::array<std::int32_t, kMaximumConcurrency> copy_rows{};
+    std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> copy_drafts{};
 };
+
+// The leading bytes of DFlashDecodeIngress a round without copies transfers.
+inline constexpr std::size_t kDFlashDecodeIngressNeuralBytes =
+    offsetof(DFlashDecodeIngress, copy_rows);
 
 struct DFlashDecodeEgress {
     std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumWidth> licensed_tokens{};
@@ -288,6 +299,8 @@ struct DFlashDecodeState {
     Tensor state_source_slots;
     Tensor state_destination_slots;
     const ops::SamplingConfig* sampling = nullptr;
+    Tensor copy_rows;
+    Tensor copy_drafts;
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;
@@ -308,6 +321,12 @@ struct DFlashDecodeState {
     DFlashDecodeState() = default;
     DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
                       std::uint32_t batch_capacity, std::uint32_t draft_window);
+
+    // The same storage viewed densely as a round of `k` drafts: every per-column tensor becomes
+    // [k+1 or k, batch_capacity] over its leading elements, matching host ingress/egress indexed
+    // at row * (k + 1). Append positions too: a round's context catch-up runs at its own width,
+    // so a wider previous round is caught up before a narrower one (see decode_dflash_batch).
+    [[nodiscard]] DFlashDecodeState narrowed(std::uint32_t k) const;
 };
 
 struct RoundState {
