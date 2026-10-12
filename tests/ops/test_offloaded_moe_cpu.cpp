@@ -6,7 +6,8 @@
 //   - expert_forward_cpu (scalar) against the FP64 expert oracle over the decoded record and the
 //     A8-cast activations, for each record format at T in {1, 2, 7, 8};
 //   - AVX2 = scalar, and the worker team at 1, 2, 3, 8 and 16 workers = scalar, bit for bit;
-//   - both entry points reject a job with a null record or a null active x/y column.
+//   - both entry points reject a job with a null record or a null active x/y column; the team's
+//     optional progress word advances during a round.
 
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "offloaded_moe_fixtures.h"
@@ -237,7 +238,14 @@ void test_rejects_missing_columns() {
     check(rejects([&] { team.run({&job, 1}); }), "CpuExpertTeam accepted a null active y");
     job.y[1] = y1.data();
     team.run({&job, 1}); // the same team still runs a valid job after the rejections
-    std::printf("rejects a null record and null active columns\n");
+    // The optional progress word (CpuMissService's heartbeat) advances during every round.
+    std::uint32_t progress = 0;
+    ops::offloaded_moe::CpuExpertTeam ticking({.workers = 3, .isa = CpuIsa::kScalar, .max_jobs = 1, .progress = &progress});
+    ticking.run({&job, 1});
+    const std::uint32_t after_one = progress;
+    ticking.run({&job, 1});
+    check(after_one > 0 && progress > after_one, "the team's progress word did not advance during a round");
+    std::printf("rejects a null record and null active columns; the progress word advances\n");
 }
 
 } // namespace
