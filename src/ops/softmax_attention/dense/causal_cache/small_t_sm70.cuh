@@ -742,11 +742,11 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
         const float f_a   = m_a == -CUDART_INF_F ? 0.0f : exp2_approx((m_a - max_a) * Log2E);
         const float f_b   = m_b == -CUDART_INF_F ? 0.0f : exp2_approx((m_b - max_b) * Log2E);
         float* group_acc  = combined + group * 8 * D;
-        // A row's dimension d is kept at slot_of(d, row): rows are D apart, one bank, so odd rows
-        // flip bit 2; chunked rows give the quad pairs dimensions 64 apart, also one bank, so
-        // their bits 6-7 move to 3-4. A warp's adds then meet at most two to a bank.
+        // Chunked rows keep a row's dimension d at slot_of(d, row): their quad pairs' dimensions
+        // are 64 apart, one bank, so bits 6-7 move to 3-4, and rows are D apart, so odd rows flip
+        // bit 2. A warp's adds then meet at most two to a bank.
         const auto slot_of = [](int d, int row) {
-            return d ^ ((row & 1) << 2) ^ (Chunks ? ((d >> 6) & 3) << 3 : 0);
+            return Chunks ? d ^ ((row & 1) << 2) ^ (((d >> 6) & 3) << 3) : d;
         };
         for (int w = 0; w < KeyWarps; ++w) {
             if (key_warp == w) {
