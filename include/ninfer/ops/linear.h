@@ -144,7 +144,9 @@ inline constexpr std::int32_t kCublasPrefillMinTokens = 129;
  * boundary of these formats, so the ideal result replaces `FP32(x)` with its cast. For every column
  * t and every group of 32 consecutive k (k = 32g..32g+31), with a = max |FP32(x_{k,t})| over the
  * group, d = a / 127 and q_{k,t} = rint(FP32(x_{k,t}) * (127 / a)) -- FP32 divisions and product,
- * rounding to nearest with ties to even, q = 0 when a = 0 -- the ideal is
+ * rounding to nearest with ties to even, saturated to [-127, 127], q = 0 when a = 0; a group with
+ * a < 2^-100 (where 127 / a would overflow) first scales a and x by 2^100, which is exact -- the
+ * ideal is
  * `sum_k FP32Dequant(w)_{n,k} * q_{k,t} * d_{g,t}` evaluated exactly. The oracle applies the same
  * cast to the represented activation; FP32Dequant is ggml's reference `dequantize_row_*`.
  * Non-finite activations give unspecified results.

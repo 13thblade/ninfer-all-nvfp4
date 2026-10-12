@@ -211,9 +211,13 @@ The recommended model. A dense model rather than an MoE, so slower per token but
 The default is the fast profile — about 1.7x the previous prefill and 1.39x the decode:
 
 ```
---spec dflash2 --draft-tokens 7 --lm-head-draft --prefill-cublas --prefill-chunk 4096
---kv-dtype rk4v4 --gdn-state-fp16 --vision --vision-residency overlay
+--spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15
+--prefill-cublas --prefill-chunk 4096 --kv-dtype rk4v4 --gdn-state-fp16 --vision --vision-residency overlay
 ```
+
+`--ngram-draft-tokens 15` copies text the conversation already contains (a file it read, a tool
+result) instead of drafting it: agent turns that write back a file decode 53-76% faster. Set
+`NINFER_NGRAM=off` to turn it off.
 
 `NINFER_SPEC=mtp` swaps to `--spec mtp --draft-tokens 3` and `--prefill-chunk 2048`, which runs
 the full 262,144 tokens with two lanes sharing the pool:
@@ -679,6 +683,12 @@ Upstream NInfer is a personal project its author develops out of interest. If yo
 you can [support upstream on Ko-fi](https://ko-fi.com/neroued). Support is entirely voluntary. It is
 not a purchase or investment and does not come with financial returns, promised services or
 features, or a role in project decisions.
+
+The Qwen3.8-Flash-Next work adapts code from [Infernix](https://github.com/wallawalla47/infernix)
+by [wallawalla47](https://github.com/wallawalla47) (Apache-2.0), itself a fork of NInfer: so far the n-gram volume format, the
+model's config keys and n-gram hash derivation, and the offloaded sparse-MoE Op (its contract,
+routing, dispatch, staging, CPU worker team and miss service, and its canonical-arithmetic method).
+Each adapted file says so in its header.
 
 ## Contributors
 

@@ -19,7 +19,8 @@
 //   qsa_attention    FP64 softmax attention over the decoded cache for explicit selections
 //                    (decode, split and unsplit widths, short counts) and for the selection the
 //                    FP64 scores decide (end to end), dense prefixes equal causal attention, CUDA
-//                    Graph replay with new positions, output guards and an unchanged cache.
+//                    Graph replay with new positions, output guards and an unchanged cache; an
+//                    empty token set gives zero on both routes.
 
 #include "ninfer/ops/qsa.h"
 
@@ -873,6 +874,23 @@ void test_attention(const AttentionCase& c, std::uint32_t seed) {
     expect(download<std::int8_t>(cache.dk, cache.k.size()) == k_before, c.name + ": key plane unchanged");
 }
 
+// An empty token set (count 0 at a block-aligned position: no selected block and no tail) gives a
+// zero output. 1 column takes the split route; 41 columns fill the RTX 3090's 82 SMs (2 KV heads
+// each) and take the wide one.
+void test_attention_empty(int columns, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::vector<std::int32_t> positions(columns), counts(columns, 0);
+    std::vector<std::int32_t> selected(static_cast<std::size_t>(kTop) * columns, -1);
+    for (int i = 0; i < columns; ++i) { positions[i] = (i + 1) * kR - 1; }
+    Cache cache(positions.back() + 1, 640, rng);
+    const auto q = random_bf16(rng, static_cast<std::size_t>(kD) * kHq * columns, 1.0);
+    const AttentionRun run = run_attention(cache, q, positions, selected, counts, 1.0 / 16.0);
+    const std::string name = "empty selection, " + std::to_string(columns) + " column(s)";
+    expect(std::all_of(run.out.begin(), run.out.end(), [](double v) { return v == 0.0; }),
+           name + ": output is zero");
+    expect(run.guards_ok, name + ": output guards intact");
+}
+
 // Select (decided exactly by grid-valued indexer inputs) then attention, against FP64 selection
 // and FP64 attention.
 void test_end_to_end(const std::string& name, int first, int columns, std::uint32_t seed) {
@@ -1071,6 +1089,8 @@ int run(bool small) {
         attention_cases.push_back({"prefill 48 short counts", 30000, 48, Selection::Short});
     }
     for (const auto& c : attention_cases) { test_attention(c, seed++); }
+    test_attention_empty(1, seed++);
+    test_attention_empty(41, seed++);
     test_end_to_end("decode p=5000", 5000, 1, seed++);
     test_end_to_end("prefill 24 straddling the budget", 2040, 24, seed++);
     if (!small) {
