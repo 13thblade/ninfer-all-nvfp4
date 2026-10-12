@@ -98,11 +98,25 @@ void check_round_shapes() {
     const SpeculativeRoundShape neural{SpeculativeRoundKind::Neural, 7};
     const SpeculativeRoundShape copy{SpeculativeRoundKind::Copy, 15};
     for (const std::uint32_t lanes : {1U, 2U, 3U, 8U}) {
-        expect(qwen::detail::round_family_batch_limit(neural, lanes) == lanes,
+        expect(qwen::detail::round_family_batch_limit(neural, lanes, 7) == lanes,
                "the neural family captures every batch up to " + std::to_string(lanes));
-        expect(qwen::detail::round_family_batch_limit(copy, lanes) == std::min(lanes, 2U),
+        expect(qwen::detail::round_family_batch_limit(copy, lanes, 7) == std::min(lanes, 2U),
                "the copy family captures batches up to two of " + std::to_string(lanes));
+        // The two-lane copy round was calibrated at K = 7 only: any other window keeps batch one.
+        for (const std::uint32_t window : {1U, 3U, 6U, 8U, 15U}) {
+            expect(qwen::detail::round_family_batch_limit(neural, lanes, window) == lanes,
+                   "the neural family is unchanged at window " + std::to_string(window));
+            expect(qwen::detail::round_family_batch_limit(copy, lanes, window) == 1U,
+                   "the copy family captures batch one only at window " + std::to_string(window));
+        }
     }
+    expect(qwen::detail::copy_round_batch_limit(7) == 2,
+           "the measured window copies at one and two lanes");
+    expect(qwen::detail::copy_round_batch_limit(7) == qwen::detail::kMaximumCopyRoundBatch,
+           "the measured window's limit is the maximum copy batch");
+    expect(qwen::detail::copy_round_batch_limit(3) == 1 &&
+               qwen::detail::copy_round_batch_limit(15) == 1,
+           "other windows copy at one lane only");
     expect(qwen::detail::copy_round_minimum_drafts(1) == 1,
            "at batch one any offered copy takes the round");
     expect(qwen::detail::copy_round_minimum_drafts(2) == 12,

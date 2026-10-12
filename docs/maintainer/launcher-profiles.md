@@ -54,7 +54,9 @@ while its partner balance covers it, so the batch gains 15% while turns that bar
 1% of off (they were up to 19% slower without the balance). It costs context there: the copy family
 is captured at batches one and two, and on the Windows desktop (0.9 GiB already in use) the two-lane
 start lowered the shared KV to 137,216 tokens against 156,672 without it (2026-10-12). From three lanes no round copies, so it
-is off there unless `NINFER_NGRAM=on`. `NINFER_NGRAM=on` with
+is off there unless `NINFER_NGRAM=on`. The two-lane costs were measured at `NINFER_DRAFT_TOKENS=7`
+(the profile default), so with another draft count two lanes do not copy and the copy family is
+captured at batch one only. `NINFER_NGRAM=on` with
 `mtp` or `none`, or on the 35B-A3B profile (which has no DFlash2), is refused, because copy rounds ride on DFlash2. Tables are in
 [performance](../performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b).
 

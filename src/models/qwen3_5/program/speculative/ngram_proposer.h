@@ -317,6 +317,11 @@ private:
 // A row without a copy may be widened only while its balance covers the charge, so a request that
 // never copies is slowed by at most about kCopyPartnerAllowance, while one whose own copies saved it
 // time can be widened by its partner's. Only committed rounds move a balance, never timing.
+//
+// The constants below are calibrated for DFlash2 K = 7 (8-column neural rounds against 16-column
+// copy rounds) only: r is that pair's cost ratio and the credit divides by K + 1. A two-lane batch
+// therefore copies only at that window (copy_round_batch_limit, graph_profiles.h); at any other
+// window it runs the neural round, so this balance is never consulted there.
 inline constexpr std::int64_t kCopyPartnerRoundCost = 1470; // r, thousandths of a neural round
 inline constexpr std::int64_t kCopyPartnerAllowance = 30;   // per two-lane round
 

@@ -1070,9 +1070,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             // topology classes; finish has one small executable per exact B, independently of
             // context length.
             for (const SpeculativeRoundShape& shape : impl->round_shapes) {
-                for (std::uint32_t batch_size = 1;
-                     batch_size <= round_family_batch_limit(shape, impl->max_concurrency);
-                     ++batch_size) {
+                const std::uint32_t batch_limit =
+                    round_family_batch_limit(shape, impl->max_concurrency, impl->draft_window);
+                for (std::uint32_t batch_size = 1; batch_size <= batch_limit; ++batch_size) {
                     impl->graph_allowance_bytes =
                         checked_add(impl->graph_allowance_bytes,
                                     class_allowance(shape, batch_size) + 8ULL * kMiB,

@@ -641,7 +641,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         // and therefore the same arithmetic, as an unlimited one (Infernix 53489da2).
         std::array<NgramMatch, kMaximumConcurrency> copies{};
         bool copy_round = false;
-        if (ngram_draft_tokens != 0 && lanes.size() <= kMaximumCopyRoundBatch) {
+        if (ngram_draft_tokens != 0 && lanes.size() <= copy_round_batch_limit(draft_window)) {
             const TokenId domain = dimension(parameters.model.resources().public_token_count);
             std::uint32_t longest = 0;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -878,7 +878,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                                      draft_window + 1U);
                     }
                 } else {
-                    if (lanes.size() > 1 && lanes.size() <= kMaximumCopyRoundBatch &&
+                    if (lanes.size() > 1 && lanes.size() <= copy_round_batch_limit(draft_window) &&
                         ngram_draft_tokens != 0) {
                         if (copy_round) {
                             request.ngram_partner.widened();

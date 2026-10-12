@@ -646,7 +646,10 @@ can afford the widening. Each request keeps a balance in thousandths of a two-la
 
 A request that never copies is widened at most about once in 16 of its rounds, about 3% of its
 decode-round time. One whose own copies have saved it rounds can absorb its partner's. Only
-committed rounds move a balance, never timing. Infernix has no partner rule for its Qwen3.5 lookup
+committed rounds move a balance, never timing. The constants are measured at DFlash2 K = 7 only, so
+two lanes copy at K = 7 and no other `NINFER_DRAFT_TOKENS`: at any other window a two-lane batch
+runs the neural round (batch one still copies) and the copy family is captured at batch one only.
+Infernix has no partner rule for its Qwen3.5 lookup
 drafting: any copy widens the whole batch.
 
 Same replay, `--max-concurrency 2`, 147,456-token KV. Three runs off, three with the balance and two of
