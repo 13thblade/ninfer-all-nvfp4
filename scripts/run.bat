@@ -11,7 +11,9 @@ rem   qwen36-35b-a3b    tuned (default)
 rem   qwen38-flash-next tuned (default)      <- Qwen3.8-Flash-Next from the IQ2_XS GGUF (preview)
 rem
 rem QWEN3.8-FLASH-NEXT: one request at a time, 32,768 tokens of context, INT8 KV, text only, no
-rem speculation and no prefix reuse yet (every request prefills its whole prompt). It pins all 33 GiB
+rem prefix reuse yet (every request prefills its whole prompt). MTP speculation (up to 3 drafts, 1.4x
+rem decode) is on when the model is qwen4exp-iq2xs-mtp.ninfer, which is preferred when it sits beside
+rem the plain qwen4exp-iq2xs.ninfer; NINFER_SPEC=none turns it off. It pins all 33 GiB
 rem of routed experts in host RAM and caches the most-used ones in VRAM; startup refuses, saying how
 rem much is missing, when Windows cannot keep 2 GiB free beside them. The expert cache's state is
 rem saved beside the model, so the second start is warm. NINFER_CONTEXT overrides the context.
@@ -302,8 +304,30 @@ set "LADDER=0"
 set "PROFILE=flash-next"
 set "CONTEXT=32768"
 if not "%NINFER_CONTEXT%"=="" set "CONTEXT=%NINFER_CONTEXT%"
-set "PROFILE_ARGS=--max-concurrency 1 --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype int8 --prefill-chunk 1024 --max-pending-requests 16 --pending-timeout-ms 600000"
-set "LABEL=one request  ^|  context %CONTEXT%  ^|  INT8 KV  ^|  text only, no speculation"
+rem MTP speculation needs the artifact converted with the drafter (--mtp-gguf). Without an explicit
+rem NINFER_MODEL, that artifact is preferred when it sits beside the plain one; speculation is on
+rem when the model is it. NINFER_SPEC=none turns it off, NINFER_SPEC=mtp forces it (a plain artifact
+rem then refuses at startup with the conversion to run). A ceiling of 3 drafts measured best or tied
+rem at 1K-32K (docs\maintainer\flash-next-plan.md, PR 13); each round drafts what acceptance pays for.
+for %%F in ("%MODEL%") do set "MODEL_FOLDER=%%~dpF"
+if "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%qwen4exp-iq2xs-mtp.ninfer" set "MODEL=%MODEL_FOLDER%qwen4exp-iq2xs-mtp.ninfer"
+set "SPEC=none"
+for %%F in ("%MODEL%") do if /i "%%~nF"=="qwen4exp-iq2xs-mtp" set "SPEC=mtp"
+if not "%NINFER_SPEC%"=="" set "SPEC=%NINFER_SPEC%"
+set "DRAFT_TOKENS=3"
+if not "%NINFER_DRAFT_TOKENS%"=="" set "DRAFT_TOKENS=%NINFER_DRAFT_TOKENS%"
+set "SPEC_ARGS="
+set "SPEC_LABEL=no speculation"
+if /i "%SPEC%"=="mtp" set "SPEC_ARGS=--spec mtp --draft-tokens %DRAFT_TOKENS%"
+if /i "%SPEC%"=="mtp" set "SPEC_LABEL=MTP, up to %DRAFT_TOKENS% drafts"
+if /i not "%SPEC%"=="mtp" if /i not "%SPEC%"=="none" (
+  echo NINFER_SPEC must be mtp or none for Qwen3.8-Flash-Next, got %SPEC% 1>&2
+  exit /b 2
+)
+set "PROFILE_ARGS=--max-concurrency 1 --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype int8 --prefill-chunk 1024 --max-pending-requests 16 --pending-timeout-ms 600000 %SPEC_ARGS%"
+set "LABEL=one request  ^|  context %CONTEXT%  ^|  INT8 KV  ^|  text only, %SPEC_LABEL%"
+if /i "%SPEC%"=="none" if exist "%MODEL%" for %%F in ("%MODEL%") do if /i not "%%~nF"=="qwen4exp-iq2xs-mtp" set "HINT=Faster decode: convert with --mtp-gguf to qwen4exp-iq2xs-mtp.ninfer (docs\weight-conversion.md); this launcher then uses it."
+if /i "%SPEC%"=="none" if not "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%qwen4exp-iq2xs-mtp.ninfer" for %%F in ("%MODEL%") do if /i not "%%~nF"=="qwen4exp-iq2xs-mtp" set "HINT=Faster decode: qwen4exp-iq2xs-mtp.ninfer is beside this model; clear NINFER_MODEL to use it."
 set "PREFILL_NOTE=Loads in about 2 minutes: 33 GiB of experts are pinned in host RAM"
 goto :launch
 

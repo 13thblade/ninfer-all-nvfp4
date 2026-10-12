@@ -55,14 +55,17 @@ selected for this process.
 The one command:
 
 ```bat
-set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs.ninfer
+set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs-mtp.ninfer
 scripts\run.bat qwen38-flash-next
 ```
 
 That launcher profile runs `ninfer-serve <model> --max-concurrency 1 --max-context 32768
 --kv-capacity 32768 --kv-dtype int8 --prefill-chunk 1024`, the only serving shape this release
-supports. `NINFER_CONTEXT` changes the context (up to the model's positions; KV above 32,768 tokens
-is borrowed from the expert cache). What is different from the Qwen3.5 models:
+supports, adding `--spec mtp --draft-tokens 3` when the model is `qwen4exp-iq2xs-mtp.ninfer` (the
+artifact with the MTP drafter). Without `NINFER_MODEL` the launcher prefers that artifact when it
+sits beside the plain one; `NINFER_SPEC=none` turns speculation off. `NINFER_CONTEXT` changes the
+context (up to the model's positions; KV above 32,768 tokens is borrowed from the expert cache).
+What is different from the Qwen3.5 models:
 
 - **One request at a time, text only.** `--max-concurrency` above 1, `--kv-dtype` other than
   `int8`, `--spec dflash|dflash2`, `--lookup-ngram`, `--vision`, `--graft`, `--context-store` and
@@ -71,9 +74,9 @@ is borrowed from the expert cache). What is different from the Qwen3.5 models:
   with the drafter (`--mtp-gguf`, [weight-conversion.md](weight-conversion.md)); a plain artifact
   refuses with that instruction. The output is the same as without it, token for token (greedy).
   The drafter keeps its 512 experts in VRAM (about 0.9 GiB, taken from the expert cache). `N` is a
-  ceiling: each round drafts as many tokens as the recent acceptance pays for, which measured at
-  two on prose (see the [plan's PR 13 measurements](maintainer/flash-next-plan.md#pr-13-measurements));
-  3 is the recommended ceiling.
+  ceiling: each round drafts as many tokens as the recent acceptance pays for, mostly two on prose;
+  a ceiling of 3 measured best or tied against 2 and against deeper fixed drafts (the
+  [plan's PR 13 measurements](maintainer/flash-next-plan.md#pr-13-measurements)), about 1.4x plain decode.
 - **No prefix reuse yet.** The server's context cache is switched off for this model (one line at
   startup says so), so every request prefills its whole prompt and reports 0 cached prompt tokens.
 - **Host RAM.** All 33 GiB of routed experts are pinned in host RAM at startup. Before anything is

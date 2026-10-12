@@ -23,7 +23,7 @@ references, `engine-architecture.md`).
 | 10 | Prefill: exact GPU wide expert route (int8 `mma.sync`, cp.async), prefill expert streaming into lent frames, 4,096-token calls, n-gram row prefetch | done (prefill gate missed by 3-5%, below) |
 | 11 | Decode (M2 gate): few misses zero-copy (11a), fewer decode-graph nodes and the GGML `linear_pair` (11b), the decode graph split around the n-gram row read and the startup frame retry (11c) | done (measurements below) |
 | 12 | 128K through the elastic KV: growth takes expert frames before it maps (12a, the crash and 128K prefill fix); prefill lending restores the experts it displaced and is sized to the prompt (12b, the decode fix) | done (measurements below) |
-| 13 | MTP speculation: the drafter imported exactly from Strata's `mtp-q2_0.gguf` (13a, `--mtp-gguf`, `ggml_rec_q2_0_q2_0`); Infernix's chained drafts, exact W-column verification and record commit (13b) | done (spec gate missed, below) |
+| 13 | MTP speculation: the drafter imported exactly from Strata's `mtp-q2_0.gguf` (13a, `--mtp-gguf`, `ggml_rec_q2_0_q2_0`); Infernix's chained drafts, exact W-column verification and record commit (13b); the draft ceiling and the launcher (13c) | done (spec gate missed, below) |
 | 14 | Vision | not started |
 
 The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
@@ -364,6 +364,10 @@ MTP 105 / 112 / 107, plain 71 / 70 / 66.
   1.000 at 4K / 32K; ids identical). With MTP on, prefill is 1-4% slower (the drafter's cells, and a
   ~5% smaller expert cache).
 - 4K / 32K / 128K alternation with MTP: no crash, adapter at most 23.3 of 24 GiB, no demotion.
+- **Ceiling (13c).** The policy with ceiling 3 against ceiling 2 (P2 P3 P3 P2, n = 12): 0.996 /
+  1.005 / 1.026 +- 0.015 at 1K / 8K / 32K; ceiling 2 drafts two in fewer rounds (1K: 2.16 tokens
+  per round). Fixed 2 drafts is 1-2% faster than either at 1K / 8K, but a fixed depth is a
+  measurement switch, not a serving option. The launcher uses ceiling 3 with the `-mtp` artifact.
 
 ## Artifact decisions
 

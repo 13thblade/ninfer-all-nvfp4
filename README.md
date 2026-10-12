@@ -135,7 +135,7 @@ The platform guides cover GPU checks, Docker, native builds and model mounts:
 | `run qwen36-35b-a3b` | Qwen3.6-35B-A3B, MTP3, cuBLAS prefill, vision; 213K with two lanes on Windows, 262K with three on Linux |
 | `run qwen38-27b int8` | Reference profile: one user, INT8 KV (the quality default), 64K context |
 | `run qwen38-27b c8` | Reference profile: eight lanes at 8K, highest aggregate throughput |
-| `run.bat qwen38-flash-next` | **Preview, Windows.** Qwen3.8-Flash-Next from the IQ2_XS GGUF: one user, 32K, text only, no speculation; needs ~38 GiB of free host RAM. See [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) |
+| `run.bat qwen38-flash-next` | **Preview, Windows.** Qwen3.8-Flash-Next from the IQ2_XS GGUF: one user, 32K, text only, MTP speculation with the drafter artifact; needs ~38 GiB of free host RAM. See [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) |
 
 Every default profile serves images (vision in overlay residency, which costs about 10 MiB of
 device reservation), uses `rk4v4` KV, and backs the context cache with 8 GiB of pinned host RAM
@@ -284,17 +284,23 @@ converted exactly (no re-quantization) into a 39.2 GB `.ninfer` plus a 29.1 GB n
 beside it (`tools/convert/qwen4_exp.py`; [plan](docs/maintainer/flash-next-plan.md)). Start it with:
 
 ```bat
-set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs.ninfer
+set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs-mtp.ninfer
 run.bat qwen38-flash-next
 ```
+
+The `-mtp` artifact is the same conversion with Strata's MTP drafter added (`--mtp-gguf`,
+[weight conversion](docs/weight-conversion.md)); with it the launcher turns on MTP speculation (up
+to 3 drafts per round), which gives the same output as plain decoding. A plain
+`qwen4exp-iq2xs.ninfer` runs without speculation.
 
 It pins all 33 GiB of routed experts in host RAM (startup refuses, saying how much is missing, when
 Windows cannot keep 2 GiB free beside them), keeps the most-used ~11,000-12,500 experts in a VRAM
 cache whose state is saved beside the model so the next start is warm, and serves one request at a
 time at up to 32K tokens with INT8 KV. Not yet: prefix reuse (every request prefills its whole
-prompt), MTP, vision, more than one lane, and fast prefill (PR 10). Measured on this RTX 3090
-with a warm expert cache: 78 / 77 / 76 tok/s decode after 1K / 8K / 32K prompts (Strata plain 71 /
-70 / 66; Strata with MTP 105-112), and 650-700 tok/s prefill. Decode speed and its breakdown are in [the plan](docs/maintainer/flash-next-plan.md#pr-9-m1-measurements); the server reference is
+prompt), vision and more than one lane. Measured on this RTX 3090 with a warm expert cache: decode
+after 1K / 8K / 32K prompts is 108-109 / 111 / 112-113 tok/s with MTP and 81 / 80 / 78 without
+(Strata with MTP 105 / 112 / 107, plain 71 / 70 / 66). Decode speed and its breakdown are in
+[the plan](docs/maintainer/flash-next-plan.md#pr-13-measurements); the server reference is
 [docs/serving.md](docs/serving.md#qwen38-flash-next-preview).
 
 ## Building from source
