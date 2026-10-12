@@ -11,6 +11,10 @@
 #     Windows box called the tree clean because Git Bash strips CR on read. Only real Linux bash
 #     saw it.
 #
+#   * scripts/check-windows-headers.sh -- every host C++ source compiled for syntax by MinGW-w64
+#     against the Windows headers, the nearest thing to the MSVC build this CI has: <windows.h>
+#     defining `near` and `far` and a strict <cmath> without M_PI broke that build twice.
+#
 #   * tests/host/test_host_kv_clamp.cpp -- pins the pinned-host-KV-cache clamp arithmetic
 #     (src/core/host_kv_clamp.h) used by the Windows startup path in program_impl.h.
 #
@@ -101,6 +105,44 @@ jobs:
           clang++ -std=c++20 -stdlib=libc++ -Wall -Wextra -Werror -Isrc -Iinclude \
             tests/host/test_checkpoint_recovery_impact.cpp -o checkpoint_recovery_impact_test
           ./checkpoint_recovery_impact_test
+
+  windows-headers:
+    name: Host sources against the Windows headers (MinGW-w64)
+    runs-on: ubuntu-24.04
+    # The toolchain image's distribution, so the MinGW-w64 GCC and its libstdc++ match the Linux
+    # build's own.
+    container: ubuntu:26.04
+    steps:
+      - name: Install MinGW-w64, git, CMake and the media libraries' headers
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            ca-certificates cmake g++-mingw-w64-x86-64-posix git libavcodec-dev libavformat-dev \
+            libavutil-dev libcurl4-openssl-dev libswscale-dev python3-venv zlib1g-dev
+      - uses: actions/checkout@v7
+      # Headers only, from NVIDIA's wheels: no CUDA toolkit is installed or needed.
+      - name: CUDA headers
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet --target "$RUNNER_TEMP/cuda" \
+            'nvidia-cuda-runtime-cu12==12.8.*' 'nvidia-cuda-cccl-cu12==12.8.*' \
+            'nvidia-cuda-nvcc-cu12==12.8.*' 'nvidia-nvtx-cu12==12.8.*' \
+            'nvidia-cuda-profiler-api-cu12==12.8.*'
+      - name: Run scripts/check-windows-headers.sh
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # Only the media libraries' own directories: the rest of the Linux include tree would
+          # hide headers that Windows lacks.
+          media="$RUNNER_TEMP/media"
+          mkdir -p "$media"
+          for dir in libavcodec libavformat libavutil libswscale curl; do
+            ln -s "$(dirname "$(find /usr/include -path "*/$dir/*.h" -print -quit)")" "$media/$dir"
+          done
+          ln -s /usr/include/zlib.h "$media/zlib.h"
+          ln -s "$(find /usr/include -name zconf.h -print -quit)" "$media/zconf.h"
+          cuda="$RUNNER_TEMP/cuda/nvidia"
+          CUDA_INCLUDE_DIRS="$cuda/cuda_runtime/include:$cuda/cuda_cccl/include:$cuda/cuda_nvcc/include:$cuda/nvtx/include:$cuda/cuda_profiler_api/include" \
+            bash scripts/check-windows-headers.sh "$media"
 
   linux-scripts:
     name: Linux launcher and downloader guard
