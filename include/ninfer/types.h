@@ -418,6 +418,9 @@ struct StopPolicy {
     std::vector<StopString> strings;
     bool include_model_defaults = true;
     bool publish_stop_token     = false;
+    // Set by the frontend's merge: the stop ids in token_ids that only the checkpoint defaults
+    // supplied (not also listed by the caller). Empty on a caller-built policy.
+    std::vector<TokenId> model_default_token_ids;
 };
 
 // What the reasoning-loop guard does when the open thinking keeps repeating whole passages (every
@@ -578,6 +581,8 @@ struct ToolCallParseDiagnostics {
     // Repeated parameter names in a published call; the last value is kept.
     std::uint32_t duplicate_parameters_repaired = 0;
     ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
+    // The structured calls came from free tool output whose turn ended inside unclosed thinking.
+    bool recovered_from_reasoning = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
