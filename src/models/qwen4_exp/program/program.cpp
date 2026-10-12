@@ -816,6 +816,7 @@ public:
                                                : runtime::CommitDisposition::CancelledReleased;
             settle_round();
             release_lane();
+            settle_idle(); // a cancelled or failed request gets the idle reconciliation a finished one does
         } else {
             if (d.accepted_tokens != 1) {
                 release_lane();
