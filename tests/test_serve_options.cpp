@@ -201,6 +201,11 @@ int main() {
                                      "--draft-tokens", "7", "--ngram-draft-tokens", "31"},
                                     "31, 63"),
                       "serve accepted a copy window other than 15, or did not name the wider ones");
+    // 2^44 MiB shifted by 20 bits wraps a uint64_t to 0; it must be refused, not wrapped.
+    for (const char* flag : {"--vram-headroom-mib", "--ram-headroom-mib", "--expert-cache-mib"}) {
+        failures += check(serve_rejects({"ninfer-serve", "model.ninfer", flag, "17592186044416"}, "out of range"),
+                          "a MiB flag accepted a value whose byte count wraps");
+    }
     failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--ngram-draft-tokens", "15"},
                                     "--spec dflash2"),
                       "serve accepted n-gram copy drafting without DFlash2");
