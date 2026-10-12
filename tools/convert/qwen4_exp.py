@@ -40,7 +40,7 @@ Export conventions of the GGUF (evidence in docs/maintainer/flash-next-plan.md):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -1101,6 +1101,14 @@ def add_mtp(model: Model, mtp: GgufModel) -> None:
         if mtp.tensor(name).type.format != "ggml_q2_0":
             raise GgufError(f"{name}: experts must be ggml_q2_0, got {mtp.tensor(name).type.format}")
     model.components["mtp"] = json.loads(json.dumps(MTP_COMPONENT))
+    # The drafter reuses the text output head, which therefore has a second explicit use: its
+    # logits are materialized from ``mtp/final_hidden`` (the same convention as the Qwen3.5 MTP
+    # head, qwen3_5.py: one ``<component>/final_hidden`` per speculative component).
+    head = model.parameters["text/output_head"]
+    if "mtp/final_hidden" not in head.inputs:
+        model.parameters["text/output_head"] = replace(
+            head, inputs=head.inputs + ("mtp/final_hidden",)
+        )
 
     def add(name: str, shape, source, inputs=(), direct_format="bf16"):
         model.add(

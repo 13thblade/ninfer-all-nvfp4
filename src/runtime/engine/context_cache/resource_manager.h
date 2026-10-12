@@ -80,6 +80,10 @@ public:
     explicit ResourceManager(bool enabled, ContextMachineCostModel costs)
         : enabled_(enabled), costs_(std::move(costs)) {}
 
+    [[nodiscard]] std::uint64_t prefill_ns(PrefillWork work) const noexcept {
+        return costs_.prefill_ns(work);
+    }
+
     [[nodiscard]] std::vector<SourceChoice>
     candidates(Program& program, const Base& base, std::uint32_t maximum_frontier = UINT32_MAX,
                std::optional<OwnerToken> own_resume = std::nullopt, std::uint64_t request = 0,
@@ -306,6 +310,8 @@ public:
                 if (auto* owner = find_owner(choice.owner)) {
                     priority        = {.reused = true, .last_demand = used_at};
                     proven_frontier = choice.source.reused_tokens;
+                    // A hit revives a superseded branch into ordinary ranking.
+                    owner->superseded = false;
                     // Consuming a branch replaces its proof. A shallower independent
                     // Fork has its own new evidence and leaves its donor's pair intact.
                     if (choice.take_over || proven_frontier >= owner->proven_frontier) {
@@ -318,6 +324,18 @@ public:
                 }
             }
             if (!token) {
+                // A request that rewrites an existing dialogue below all of its points (an
+                // edit served by a shallower shared prefix or the root) starts a new owner.
+                // That owner is the dialogue's live continuation: it inherits the abandoned
+                // branch's retention, and the abandoned branch is evicted first.
+                if (auto* parent = abandoned_branch(program, base, choice, publication_order)) {
+                    if (parent->priority.reused && !priority.reused) {
+                        priority        = {.reused = true, .last_demand = ++clock_};
+                        proven_frontier = choice.source.reused_tokens;
+                    }
+                    parent->priority   = {};
+                    parent->superseded = true;
+                }
                 token = ++ordinal_;
                 owners_.push_back({.token           = token,
                                    .priority        = priority,
@@ -636,7 +654,10 @@ public:
             const auto host_rank = rank_action(program, *victims, host_facts, units, evaluation);
             rank.loss            = host_rank.loss;
             rank.waiting         = host_rank.waiting;
-            rank.order           = std::max(rank.order, host_rank.order);
+            // Preserving a superseded branch is not itself evict-first work when it would
+            // displace other Host history.
+            rank.superseded = rank.superseded && (victims->empty() || host_rank.superseded);
+            rank.order      = std::max(rank.order, host_rank.order);
             if (host_rank.priority.reused &&
                 (!rank.priority.reused ||
                  host_rank.priority.last_demand > rank.priority.last_demand)) {
@@ -714,6 +735,12 @@ public:
                                                              : ReclaimProgress::Changed;
                 }
                 if (!action.host_victims.empty()) { return ReclaimProgress::Changed; }
+                // The Host destination can fail on allocation geometry although the byte
+                // quote fit. Superseded Host history goes before a live source is deleted;
+                // the demotion is quoted again on the next pass.
+                if (release_superseded_host(program, plan.host_bytes, protected_sources, cursor)) {
+                    return ReclaimProgress::Changed;
+                }
                 continue;
             }
             // Native quoted every holder required for this actual physical release.
@@ -915,9 +942,123 @@ private:
         std::uint64_t retained_at       = 0;
         std::uint64_t publication_order = 0;
         bool active                     = false;
+        // A later request rewrote this dialogue below every point and continues as a new
+        // owner. Its points stay usable (a retry of the old branch revives it) but go first.
+        bool superseded = false;
         std::optional<SessionKey> session;
         std::vector<Point> points;
     };
+
+    // A rewrite must reproduce this much of an old branch beyond its reused source before
+    // the new request counts as that branch's continuation. Siblings that share only a
+    // marked prefix plus template framing stay independent.
+    static constexpr std::uint32_t kBranchLineageTokens = 256;
+
+    // Longest common token prefix of a request and a checkpoint, by digest bisection.
+    [[nodiscard]] static std::uint32_t common_prefix(const Program& program, const Base& base,
+                                                     Handle handle) {
+        std::uint32_t low = 0;
+        std::uint32_t high =
+            std::min(program.checkpoint_metadata(handle).frontier, base.summary().prompt_tokens);
+        while (low < high) {
+            const auto middle = low + (high - low + 1U) / 2U;
+            const auto key    = base.prefix_shortlist_key(middle);
+            if (key && *key == program.checkpoint_key(handle, middle)) {
+                low = middle;
+            } else {
+                high = middle - 1U;
+            }
+        }
+        return low;
+    }
+
+    // The inactive dialogue this new owner rewrites: the one sharing the most of the request
+    // beyond the reused source, by at least kBranchLineageTokens. A named different session
+    // and the source's own donor (an independent Fork) are never a lineage. An owner published
+    // after this request is newer than it and is never superseded by it (see candidates()).
+    [[nodiscard]] Owner* abandoned_branch(const Program& program, const Base& base,
+                                          const SourceChoice& choice,
+                                          std::uint64_t publication_order) {
+        const auto& advice        = base.context_cache();
+        const auto minimum        = choice.source.reused_tokens + kBranchLineageTokens;
+        Owner* best               = nullptr;
+        std::uint32_t best_shared = 0;
+        for (auto& owner : owners_) {
+            if (owner.active || owner.token == choice.owner ||
+                owner.publication_order > publication_order ||
+                (owner.session && advice.session_key && *owner.session != *advice.session_key)) {
+                continue;
+            }
+            std::uint32_t shared = 0;
+            for (const auto& point : owner.points) {
+                if (program.valid_checkpoint(point.handle)) {
+                    shared = std::max(shared, common_prefix(program, base, point.handle));
+                }
+            }
+            if (shared < minimum) { continue; }
+            if (!best || shared > best_shared ||
+                (shared == best_shared && owner.publication_order > best->publication_order)) {
+                best        = &owner;
+                best_shared = shared;
+            }
+        }
+        return best;
+    }
+
+    // A checkpoint whose every catalog holder is a superseded branch, with no waiting reader.
+    [[nodiscard]] bool superseded_only(Handle handle) const {
+        bool held = false;
+        for (const auto& owner : owners_) {
+            for (const auto& point : owner.points) {
+                if (point.handle != handle) { continue; }
+                if (!owner.superseded) { return false; }
+                held = true;
+            }
+        }
+        if (std::any_of(shared_.begin(), shared_.end(),
+                        [&](const auto& entry) { return entry.handle == handle; })) {
+            return false;
+        }
+        for (const auto& waiting : waiting_) {
+            if (contains(waiting.held, handle)) { return false; }
+        }
+        return held;
+    }
+
+    // Releases superseded-only checkpoints, in reclaim order, until `bytes` of Host are free.
+    bool release_superseded_host(Program& program, std::size_t bytes,
+                                 std::span<const Handle> excluded, ReclaimCursor& cursor) {
+        std::vector<Handle> chosen;
+        for (const auto& victim : cursor.victims) {
+            const auto handle = victim.handle;
+            if (contains(excluded, handle) || !references(handle) ||
+                !program.valid_checkpoint(handle) || !superseded_only(handle) ||
+                !may_revoke({&handle, 1}, cursor.rights)) {
+                continue;
+            }
+            chosen.push_back(handle);
+            if (program.host_bytes_released(chosen) >= bytes) { break; }
+        }
+        // Drop victims that add no Host release (keeps aliased blocks released as a union), so
+        // Device/KV-only superseded history is not erased for a Host allocation it cannot help.
+        auto released = program.host_bytes_released(chosen);
+        for (std::size_t i = chosen.size(); i-- > 0;) {
+            auto without = chosen;
+            without.erase(without.begin() + static_cast<std::ptrdiff_t>(i));
+            if (!without.empty() && program.host_bytes_released(without) >= released) {
+                chosen = std::move(without);
+            }
+        }
+        if (chosen.empty() || !released) { return false; }
+        commit_release(program, chosen, cursor);
+        return true;
+    }
+
+    [[nodiscard]] bool superseded_only(std::span<const Handle> handles) const {
+        return !handles.empty() && std::all_of(handles.begin(), handles.end(), [&](auto handle) {
+            return superseded_only(handle);
+        });
+    }
 
     struct Shared {
         Handle handle;
@@ -1083,7 +1224,14 @@ private:
             for (const auto handle : waiting.held) { add(handle, {}, waiting.request); }
         }
         std::erase_if(ranked, [&](const auto& entry) { return pinned(entry.handle); });
-        std::stable_sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        std::vector<Handle> superseded;
+        for (const auto& entry : ranked) {
+            if (superseded_only(entry.handle)) { superseded.push_back(entry.handle); }
+        }
+        std::stable_sort(ranked.begin(), ranked.end(), [&](const auto& a, const auto& b) {
+            const bool left  = contains(superseded, a.handle),
+                       right = contains(superseded, b.handle);
+            if (left != right) { return left; }
             if (a.priority.reused != b.priority.reused) { return !a.priority.reused; }
             return (a.priority.reused ? a.priority.last_demand : a.age) <
                    (b.priority.reused ? b.priority.last_demand : b.age);
@@ -1148,6 +1296,7 @@ private:
 
     struct ActionFacts {
         CacheRetentionPriority priority;
+        bool superseded   = false;
         std::size_t order = 0;
         std::optional<std::vector<Handle>> kept;
         std::optional<std::uint64_t> loss;
@@ -1251,7 +1400,8 @@ private:
     [[nodiscard]] ActionFacts action_facts(Program& program, std::span<const Handle> sources,
                                            const ReclaimCursor& cursor,
                                            const Evaluation& evaluation) const {
-        ActionFacts facts{.priority = action_priority(program, sources, cursor, evaluation)};
+        ActionFacts facts{.priority   = action_priority(program, sources, cursor, evaluation),
+                          .superseded = superseded_only(sources)};
         if (!sources.empty()) {
             for (std::size_t i = 0; i < cursor.victims.size(); ++i) {
                 if (contains(sources, cursor.victims[i].handle)) { facts.order = i; }
@@ -1262,6 +1412,7 @@ private:
 
     struct ActionRank {
         CacheRetentionPriority priority;
+        bool superseded       = false;
         std::uint64_t loss    = 0;
         std::uint64_t units   = 0;
         std::size_t order     = 0;
@@ -1271,16 +1422,21 @@ private:
     [[nodiscard]] ActionRank rank_action(Program& program, std::span<const Handle> sources,
                                          ActionFacts& facts, std::uint64_t units,
                                          Evaluation& evaluation, bool preserving = false) const {
-        return {.priority = facts.priority,
-                .loss     = preserving ? 0 : action_loss(program, sources, facts, evaluation),
-                .units    = units,
-                .order    = facts.order,
-                .waiting  = preserving ? 0 : waiting_ticket(sources)};
+        // Superseded history is evict-first at zero loss, also as a demotion's Host victims.
+        return {.priority   = facts.priority,
+                .superseded = facts.superseded,
+                .loss       = preserving || facts.superseded
+                                  ? 0
+                                  : action_loss(program, sources, facts, evaluation),
+                .units      = units,
+                .order      = facts.order,
+                .waiting    = preserving ? 0 : waiting_ticket(sources)};
     }
 
     static bool less_rank(const ActionRank& left, const ActionRank& right) {
         if (bool(left.waiting) != bool(right.waiting)) { return !left.waiting; }
         if (left.waiting != right.waiting) { return left.waiting > right.waiting; }
+        if (left.superseded != right.superseded) { return left.superseded; }
         if (left.priority.reused != right.priority.reused) { return !left.priority.reused; }
         if (left.priority.reused && left.priority.last_demand != right.priority.last_demand) {
             return left.priority.last_demand < right.priority.last_demand;
@@ -1353,7 +1509,9 @@ private:
                               victim.last_demand >= admission->priority.last_demand)) {
             return false;
         }
-        const auto loss = preserving ? 0 : action_loss(program, removed, facts, evaluation);
+        // A superseded branch is evict-first: its loss does not count against a new write.
+        const auto loss =
+            preserving || facts.superseded ? 0 : action_loss(program, removed, facts, evaluation);
         // This outer budget also covers Host victims of a preservation transfer. A hot
         // migration source cannot lend its permissions to the capture that requested space.
         if (cursor.gain_limit && (cursor.sacrificed >= *cursor.gain_limit ||
@@ -1373,7 +1531,7 @@ private:
             throw std::logic_error("cache release lacks waiting-source revocation rights");
         }
         const auto loss =
-            cursor.gain_limit
+            cursor.gain_limit && !superseded_only(handles)
                 ? (quoted_loss
                        ? *quoted_loss
                        : program.checkpoint_recovery_loss(handles, surviving(program, handles)))

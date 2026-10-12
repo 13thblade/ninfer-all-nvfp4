@@ -41,7 +41,8 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
     out.fits       = out.expert_ram >= out.full_need;
     if (out.fits) { out.commit_limited = false; }
     // A finite Linux RLIMIT_MEMLOCK bounds every pinned byte, whatever memory is free.
-    out.pinned_total = demand.expert_banks + demand.other_pinned + demand.later_pinned;
+    // The load staging is pinned too but freed before the later pins are made, so the peak is the larger of the two.
+    out.pinned_total = demand.expert_banks + demand.other_pinned + std::max(demand.later_pinned, demand.load_staging);
     if (snapshot.lock_limit && out.pinned_total > *snapshot.lock_limit) {
         out.lock_limited = true;
         out.fits         = false;

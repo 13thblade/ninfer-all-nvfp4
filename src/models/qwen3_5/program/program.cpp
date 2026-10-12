@@ -5,6 +5,7 @@
 #include "core/evictable_weight_pool.h"
 #include "models/load_options.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -97,6 +98,19 @@ std::vector<std::uint32_t> RequestBasePlan::capture_frontiers() const {
     return frontiers;
 }
 
+std::vector<std::uint32_t> RequestBasePlan::shared_prefix_frontiers() const {
+    std::vector<std::uint32_t> frontiers;
+    if (impl_) {
+        for (const auto& group : impl_->capture_groups) {
+            if (std::find(group.roles.begin(), group.roles.end(), runtime::CheckpointRole::SharedPrefix) !=
+                group.roles.end()) {
+                frontiers.push_back(group.frontier);
+            }
+        }
+    }
+    return frontiers;
+}
+
 std::optional<PrefixShortlistKey>
 RequestBasePlan::prefix_shortlist_key(std::uint32_t frontier) const noexcept {
     if (impl_ == nullptr || frontier == 0 || frontier > impl_->prefix_digests.size()) {
@@ -139,6 +153,11 @@ std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t 
 
 CheckpointHandle Program::install_external_checkpoint(const PromptGraft& graft) {
     return impl_->install_external_checkpoint(graft);
+}
+
+runtime::PrefillWork Program::prefill_work(const RequestBasePlan& base, std::uint32_t begin,
+                                          std::uint32_t end) const {
+    return impl_->prefill_work(base, begin, end);
 }
 
 std::optional<SourceCandidate>

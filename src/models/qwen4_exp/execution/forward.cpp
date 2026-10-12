@@ -438,8 +438,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             cudaSuccess) {
         throw std::runtime_error("Qwen4Exp forward: route tap copy failed");
     }
-    // The dispatch writes the route log itself (no copy node per layer in the decode graph).
-    std::int32_t* route_log = nullptr;
+    std::int32_t* route_log = nullptr; // moe_dispatch writes the raw ids there (same layout as routing.ids)
     if (experts_.route_log != nullptr) {
         if (static_cast<std::size_t>(K) * T > experts_.route_stride) {
             throw std::logic_error("Qwen4Exp forward: the call exceeds the route log");

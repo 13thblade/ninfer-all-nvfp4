@@ -303,6 +303,10 @@ def test_mtp_drafter_is_stored_exactly(tmp_path):
         assert artifact.directory.components["mtp"] == {
             "config": {"architectures": ["Qwen4ExpMTP"]}, "target": "text"
         }
+        # The drafter reuses the text head, so the head has an explicit use for each hidden state.
+        uses = {(u["parameter"], u["input"]) for u in artifact.directory.uses}
+        assert ("text/output_head", "text/final_hidden") in uses
+        assert ("text/output_head", "mtp/final_hidden") in uses
 
 
 def test_mtp_gguf_is_checked(tmp_path):

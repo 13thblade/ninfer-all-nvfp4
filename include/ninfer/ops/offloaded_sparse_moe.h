@@ -62,9 +62,10 @@ namespace ninfer::ops {
  *   Records of format GGML_REC_IQ2_S_Q2_0, GGML_REC_IQ2_XXS_Q2_0 or GGML_REC_IQ1_M_Q2_0 in layout
  *   ggml_expert_record_v1 at [E, 2560, 640] (storage-layouts.md Section 7): one record per expert,
  *   gate, up and down at the layout's part offsets. Expert e's record is read from the device frame
- *   frame_base + frames[e] * record_stride when frames[e] >= 0, else from the pinned, mapped host
- *   bank host_records + e * record_stride (zero-copy, or first copied to a staging slot), or it is
- *   computed by the host (MoeCpuChannel). Every positive T; an expert with any number of columns.
+ *   frame_base + frames[e] * frame_stride (record_stride when frame_stride is zero) when
+ *   frames[e] >= 0, else from the pinned, mapped host bank host_records + e * record_stride
+ *   (zero-copy, or first copied to a staging slot), or it is computed by the host
+ *   (MoeCpuChannel). Every positive T; an expert with any number of columns.
  *   GGML_REC_Q2_0_Q2_0 (the MTP drafter's Q2_0 gate/up and down) is supported on the narrow route
  *   only: an expert of such a call takes at most offloaded_moe::kMaxColumns columns.
  *
@@ -262,7 +263,9 @@ struct MoeExpertSource {
     std::int32_t staging_slots  = 0;       // 0: misses are read zero-copy
     // A staging pass with at most this many misses reads them zero-copy instead of copying them to
     // slots first: the expert kernels' CTAs of a miss then fetch its slices over PCIe while the
-    // resident jobs' CTAs compute. 0: every miss of a staged call is staged.
+    // resident jobs' CTAs compute. Applies to single-column (T == 1) calls only: it was measured
+    // for decode, and a wider call stages its misses whatever this is. 0: every miss of a staged
+    // call is staged.
     std::int32_t zero_copy_misses = 0;
     MoeCpuChannel cpu;
 };
@@ -276,9 +279,9 @@ struct MoeExpertSource {
 ///
 /// Non-resident records are first copied to `staging_slots` device slots by a few CTAs that keep
 /// their reads within a compact address window, then read from there; the jobs run in passes of
-/// staging_slots jobs. staging_slots == 0 reads misses zero-copy, and so does a pass with at most
-/// source.zero_copy_misses misses (decided on the device, so a captured call follows each replay's
-/// routing).
+/// staging_slots jobs. staging_slots == 0 reads misses zero-copy, and so does a single-column
+/// (T == 1) pass with at most source.zero_copy_misses misses (decided on the device, so a captured
+/// call follows each replay's routing).
 ///
 /// Routes: an expert with at most offloaded_moe::kMaxColumns columns in the call takes the narrow
 /// route (dp4a rowdots); one with more takes the wide route (integer tensor-core GEMM tiles of 64

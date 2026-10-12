@@ -120,6 +120,8 @@ void ExpertStream::enqueue(std::uint32_t layer) {
     CUDA_CHECK(cudaEventRecord(landed_[layer], stream_));
 }
 
+void ExpertStream::drain() { CUDA_CHECK(cudaStreamSynchronize(stream_)); }
+
 void ExpertStream::before_experts(std::uint32_t layer, cudaStream_t compute) {
     if (active_ && streams_[layer] != 0) { CUDA_CHECK(cudaStreamWaitEvent(compute, landed_[layer], 0)); }
 }
