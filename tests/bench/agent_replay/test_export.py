@@ -91,6 +91,7 @@ def _write_run(tmp_path, *, server_tokens, logged):
     (run / "turns.jsonl").write_text(json.dumps({
         "session": 0, "turn": 0, "copy": False, "prompt_tokens": server_tokens,
         "error": None}) + "\n", encoding="utf-8")
+    (run / "summary.json").write_text("{}\n", encoding="utf-8")
     if logged:
         (run / "output_token_ids.jsonl").write_text("", encoding="utf-8")
     return run, resources
@@ -118,6 +119,16 @@ def test_export_fails_when_request_log_lacks_an_output(tmp_path):
     from tools.bench.agent_replay.export import export
 
     run, resources = _write_run(tmp_path, server_tokens=1, logged=True)
+    out = tmp_path / "streams.jsonl"
+    assert export(run, None, resources, out) == 1
+    assert not out.exists()
+
+
+def test_export_refuses_a_run_without_summary_json(tmp_path):
+    from tools.bench.agent_replay.export import export
+
+    run, resources = _write_run(tmp_path, server_tokens=1, logged=False)
+    (run / "summary.json").unlink()
     out = tmp_path / "streams.jsonl"
     assert export(run, None, resources, out) == 1
     assert not out.exists()

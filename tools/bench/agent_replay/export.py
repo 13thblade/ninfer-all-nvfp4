@@ -194,6 +194,10 @@ def _output_text(message: dict[str, Any]) -> str:
 
 def export(run_dir: Path, artifact: Path | None, tokenizer_dir: Path | None,
            out_path: Path) -> int:
+    if not (run_dir / "summary.json").is_file():
+        print(f"error: {run_dir} has no summary.json; the run did not complete, so its "
+              "artifacts are not trusted", file=sys.stderr)
+        return 1
     tokenizer_json, template_source, template_tokens = _load_resources(artifact, tokenizer_dir)
     encoder = _PromptEncoder(tokenizer_json)
     template = _compile_template(template_source)

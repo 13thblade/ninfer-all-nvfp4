@@ -172,3 +172,63 @@ def test_rerun_clears_every_artifact_a_previous_run_left_in_the_output_directory
     clear_run_artifacts(tmp_path)
     assert [p.name for p in tmp_path.iterdir()] == ["notes.txt"]
     clear_run_artifacts(tmp_path)  # a fresh directory is fine
+
+
+def _stale_run(out: Path) -> None:
+    from tools.bench.agent_replay.run import RUN_ARTIFACTS
+
+    out.mkdir(parents=True, exist_ok=True)
+    for name in RUN_ARTIFACTS:
+        (out / name).write_text("stale\n", encoding="utf-8")
+
+
+def _config(out: Path, **overrides):
+    from tools.bench.agent_replay.run import RunConfig
+
+    base = dict(base_url="http://127.0.0.1:1", api_key=None, repo=REPO, commit="HEAD", seed=0,
+                sessions=1, concurrency=1, min_context=1, max_context=2, obs_tokens=(1, 2),
+                max_copy_tokens=1, max_turns=1, timeout_seconds=1.0, request_log=None, out=out)
+    return RunConfig(**{**base, **overrides})
+
+
+def test_config_error_leaves_the_previous_run_untouched(tmp_path):
+    from tools.bench.agent_replay.run import RUN_ARTIFACTS, run
+
+    out = tmp_path / "out"
+    _stale_run(out)
+    for bad in ({"sessions": 0}, {"min_context": 3}, {"request_log": tmp_path / "missing.jsonl"}):
+        assert run(_config(out, **bad)) == 2
+        assert all((out / n).read_text() == "stale\n" for n in RUN_ARTIFACTS)
+
+
+def test_failed_corpus_preflight_clears_the_previous_run(tmp_path):
+    import pytest
+
+    from tools.bench.agent_replay.run import run
+
+    out = tmp_path / "out"
+    _stale_run(out)
+    with pytest.raises(Exception):
+        run(_config(out, commit="no-such-commit"))
+    assert list(out.iterdir()) == []
+
+
+def test_failed_server_preflight_clears_the_previous_run(tmp_path, monkeypatch):
+    import pytest
+
+    from tools.bench.agent_replay import run as run_module
+
+    class Down:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def discover_model(self) -> str:
+            raise ConnectionError("server down")
+
+    monkeypatch.setattr(run_module, "Corpus", lambda repo, commit: object())
+    monkeypatch.setattr(run_module, "NInferServeClient", Down)
+    out = tmp_path / "out"
+    _stale_run(out)
+    with pytest.raises(ConnectionError):
+        run_module.run(_config(out))
+    assert list(out.iterdir()) == []

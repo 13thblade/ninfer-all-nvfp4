@@ -370,17 +370,35 @@ def merge_request_log(samples: list[dict[str, Any]], done: dict[str, dict[str, A
     return merged
 
 
-def run(config: RunConfig) -> int:
+def config_error(config: RunConfig) -> str | None:
+    """The first basic problem with the settings, found before anything is touched on disk."""
     for name in ("sessions", "max_turns", "concurrency"):
         if getattr(config, name) < 1:
-            print(f"error: --{name.replace('_', '-')} must be at least 1", file=sys.stderr)
-            return 2
-    corpus = Corpus(config.repo, config.commit)
-    probe = NInferServeClient(config.base_url, config.timeout_seconds, config.api_key)
-    model = probe.discover_model()
+            return f"--{name.replace('_', '-')} must be at least 1"
+    if config.min_context > config.max_context:
+        return "--min-context must not exceed --max-context"
+    if config.request_log is not None and not config.request_log.is_file():
+        return f"--request-log {config.request_log} is not a file"
+    return None
+
+
+def run(config: RunConfig) -> int:
+    # Run lifecycle (summary.json is written last and marks a complete run):
+    #   1. config_error: a rejected config returns 2 and leaves --out exactly as it was.
+    #   2. mkdir + clear_run_artifacts: the ONLY place artifacts are removed; from here on the
+    #      directory holds nothing of a previous run, so corpus/server preflight failures,
+    #      mid-run aborts and partial writes can never be mistaken for it by export.
+    #   3. corpus + server preflight, sessions, request-log merge, then turns, transcripts, summary.
+    problem = config_error(config)
+    if problem is not None:
+        print(f"error: {problem}", file=sys.stderr)
+        return 2
     config.out.mkdir(parents=True, exist_ok=True)
     clear_run_artifacts(config.out)
     log_offset = config.request_log.stat().st_size if config.request_log else 0
+    corpus = Corpus(config.repo, config.commit)
+    probe = NInferServeClient(config.base_url, config.timeout_seconds, config.api_key)
+    model = probe.discover_model()
     lock = threading.Lock()
     samples: list[dict[str, Any]] = []
     started = time.time()
