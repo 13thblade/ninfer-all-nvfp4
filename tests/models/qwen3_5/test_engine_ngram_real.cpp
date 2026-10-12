@@ -10,8 +10,10 @@
 //   restore     a follow-up turn bound from its retained session copies again and matches the same
 //               turn prefilled from scratch, and so does one restored from the context store after
 //               an Engine restart
-//   constrained a JSON-schema answer copying a JSON blob from a tool result validates, copies were
-//               verified, and the blob's number, which the schema makes a string, never leaks
+//   constrained a JSON-schema answer copying a JSON record from a tool result equals
+//               non-speculative greedy output under the same schema, reproduces the record's
+//               strings, accepted copies, and the record's number, which the schema makes a
+//               string, never leaks
 //   lanes       two lanes, one copying the file while the other writes free text: the copying lane
 //               equals non-speculative greedy output (its copies verified beside the other lane's
 //               draft-model proposal, at the copy width), and the other lane is a valid, varied
@@ -177,9 +179,60 @@ private:
     std::atomic<bool> requested_{false};
 };
 
+// A tool result holding a JSON record, which the answer returns under a schema. The record is
+// serialized the way constrained JSON output is (compact separators, the schema's property order),
+// so the answer can copy it run by run; under any other layout the grammar rejects the copied
+// separators and greedy output stops following the record at all.
+nlohmann::ordered_json pump_record() {
+    return nlohmann::ordered_json{
+        {"name", "inlet pump"},
+        {"pressure", 101325},
+        {"unit", "Pa"},
+        {"serial", "PX-4471-B"},
+        {"location", "north header, bay 7"},
+        {"maintenance",
+         "replace the shaft seal and check the impeller clearance against the drawing, then flush "
+         "the suction line, torque the casing bolts in a star pattern to the value on the "
+         "nameplate, refit the coupling guard, run the pump for ten minutes at half speed while "
+         "watching the seal for drips, and record the discharge pressure, the motor current and "
+         "the bearing temperature in the maintenance log before handing the unit back to "
+         "operations"}};
+}
+
+ninfer::PromptInput constrained_prompt() {
+    ninfer::PromptInput input;
+    input.options.enable_thinking = false;
+    input.messages.push_back(message(
+        ninfer::ChatRole::User,
+        "Read the pump record and return it as JSON with the same keys and values."));
+    input.messages.push_back(message(ninfer::ChatRole::Tool, pump_record().dump()));
+    return input;
+}
+
+ninfer::RequestOptions constrained_options() {
+    auto options = greedy(512);
+    // Every property is a string in the record's order. "pressure" is a bare number in the record,
+    // so a copy proposes a token the grammar rejects there.
+    nlohmann::ordered_json properties = nlohmann::ordered_json::object();
+    nlohmann::ordered_json required   = nlohmann::ordered_json::array();
+    const nlohmann::ordered_json record = pump_record();
+    for (const auto& item : record.items()) {
+        properties[item.key()] = {{"type", "string"}};
+        required.push_back(item.key());
+    }
+    options.constraint = ninfer::OutputConstraint::json_schema(
+        nlohmann::ordered_json{{"type", "object"},
+                               {"properties", properties},
+                               {"required", required},
+                               {"additionalProperties", false}}
+            .dump());
+    return options;
+}
+
 struct Reference {
     std::vector<ninfer::TokenId> plain;
     std::vector<ninfer::TokenId> numbered;
+    std::vector<ninfer::TokenId> constrained;
 };
 
 Reference reference_outputs(const char* artifact, ninfer::KvCacheStorage kv, std::uint32_t budget) {
@@ -189,6 +242,9 @@ Reference reference_outputs(const char* artifact, ninfer::KvCacheStorage kv, std
                           .generated_token_ids;
     reference.numbered = engine.generate(engine.prepare(copy_prompt(true)), greedy(budget))
                              .generated_token_ids;
+    reference.constrained =
+        engine.generate(engine.prepare(constrained_prompt()), constrained_options())
+            .generated_token_ids;
     return reference;
 }
 
@@ -322,44 +378,25 @@ void check_store_restore(const char* artifact, ninfer::KvCacheStorage kv, std::u
               << restored.speculative.ngram_drafted_tokens << '\n';
 }
 
-void check_constrained(ninfer::Engine& engine) {
-    const std::string blob =
-        R"({"name": "inlet pump", "pressure": 101325, "unit": "Pa", "serial": "PX-4471-B", )"
-        R"("location": "north header, bay 7", "maintenance": "replace the shaft seal and )"
-        R"(check the impeller clearance against the drawing, then flush the suction line, )"
-        R"(torque the casing bolts in a star pattern to the value on the nameplate, refit the )"
-        R"(coupling guard, run the pump for ten minutes at half speed while watching the seal for )"
-        R"(drips, and record the discharge pressure, the motor current and the bearing )"
-        R"(temperature in the maintenance log before handing the unit back to operations"})";
-    ninfer::PromptInput input;
-    input.options.enable_thinking = false;
-    input.messages.push_back(message(
-        ninfer::ChatRole::User,
-        "Read the pump record and return it as JSON with the same keys and values."));
-    input.messages.push_back(message(ninfer::ChatRole::Tool, blob));
-    auto options = greedy(512);
-    // The schema makes "pressure" a string, so copying the record's bare number is illegal there.
-    options.constraint = ninfer::OutputConstraint::json_schema(nlohmann::json{
-        {"type", "object"},
-        {"properties",
-         {{"name", {{"type", "string"}}},
-          {"pressure", {{"type", "string"}}},
-          {"unit", {{"type", "string"}}},
-          {"serial", {{"type", "string"}}},
-          {"location", {{"type", "string"}}},
-          {"maintenance", {{"type", "string"}}}}},
-        {"required", {"name", "pressure", "unit", "serial", "location", "maintenance"}},
-        {"additionalProperties", false}}
-                                                                     .dump());
-    const auto result = engine.generate(engine.prepare(input), options);
-    const auto parsed = nlohmann::json::parse(result.content);
-    require(parsed.at("pressure").is_string() && parsed.at("serial") == "PX-4471-B" &&
-                parsed.at("maintenance").get<std::string>().find("impeller") != std::string::npos,
-            "the constrained copy did not validate or did not reproduce the record");
-    require(result.speculative.ngram_rounds > 0,
-            "the constrained answer verified no copies: " + result.content);
-    std::cout << "constrained: copy rounds " << result.speculative.ngram_rounds
-              << ", copies accepted " << result.speculative.ngram_accepted_tokens << '/'
+void check_constrained(ninfer::Engine& engine, const Reference& reference) {
+    const auto result =
+        engine.generate(engine.prepare(constrained_prompt()), constrained_options());
+    require_same(result, reference.constrained, "constrained copy");
+    const auto parsed = nlohmann::ordered_json::parse(result.content);
+    const auto record = pump_record();
+    require(parsed.at("pressure").is_string(),
+            "the record's bare number leaked into the string the schema requires: " +
+                result.content);
+    for (const char* key : {"name", "unit", "serial", "location", "maintenance"}) {
+        require(parsed.at(key) == record.at(key),
+                std::string("the constrained answer did not reproduce the record's ") + key +
+                    ": " + result.content);
+    }
+    require(result.speculative.ngram_rounds > 0 && result.speculative.ngram_accepted_tokens > 0,
+            "the constrained answer accepted no copies: " + result.content);
+    std::cout << "constrained: " << reference.constrained.size() << " tokens, copy rounds "
+              << result.speculative.ngram_rounds << ", copies accepted "
+              << result.speculative.ngram_accepted_tokens << '/'
               << result.speculative.ngram_drafted_tokens << ", pressure "
               << parsed.at("pressure").dump() << '\n';
 }
@@ -491,7 +528,7 @@ int main(int argc, char** argv) {
             check_copies(engine, reference, kBudget, graph ? "graphs" : "eager");
             if (graph) {
                 check_lifecycle(engine, reference, kBudget);
-                check_constrained(engine);
+                check_constrained(engine, reference);
                 check_restore(engine, kBudget);
             }
         }
