@@ -116,10 +116,6 @@ constexpr std::uint32_t kKvBaseTokens = 32768;
 constexpr std::uint32_t kKvGrowPages = 64;
 // Misses staged per pass of a layer's experts.
 constexpr std::int32_t kStagingSlots = 64;
-// A layer call with at most this many misses reads them zero-copy instead of staging them: one or
-// two misses stream over PCIe beside the resident experts' compute faster than a stage copy that
-// precedes it (PR 11 measurements in flash-next-plan.md).
-constexpr std::int32_t kZeroCopyMisses = 2;
 // Wide prefill calls (Infernix's 4,096-token calls): their workspace and the expert stream's ring
 // are frames lent by the expert cache for the prompt, so the static workspace stays sized for the
 // configured chunk. A prompt shorter than kStreamMinColumns runs static calls without the stream.
@@ -128,6 +124,10 @@ constexpr std::int32_t kStreamMinColumns = 512;
 // Ring frames per half: a layer's every expert, so every non-resident one streams and a wide call
 // needs no staging pass (resident counts vary widely by layer: a 320-frame half left 29% of the
 // misses to the staging kernel, 1.5 s of a 32K prompt).
+// A layer call with at most this many misses reads them zero-copy instead of staging them: one or
+// two misses stream over PCIe beside the resident experts' compute faster than a stage copy that
+// precedes it (PR 11 measurements in flash-next-plan.md).
+constexpr std::int32_t kZeroCopyMisses = 2;
 // Promotions per layer call of a decode round (Infernix design section 19.2: one measured fastest).
 constexpr std::size_t kDecodePromotionsPerLayer = 1;
 // Once the frames are full, decode promotes only every interval-th round on the reference link.
@@ -1156,6 +1156,9 @@ private:
         // The forward must never keep pointing at the lent arena destroyed below.
         if (forward_) { forward_->use_workspace(*work_); }
         wide_work_.reset();
+        // device_.synchronize() does not cover the expert copy stream: an aborted wide call can leave
+        // its copies running into the ring frames give_back is about to hand to the cache.
+        if (stream_) { stream_->drain(); }
         refilled_ += residency_->give_back(lease_, device_.stream);
         frames_now_ = residency_->frames();
     }

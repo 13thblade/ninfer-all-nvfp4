@@ -351,14 +351,22 @@ cmake --build build -j --target ninfer_benches
 records (IQ2_S, IQ2_XXS and IQ1_M gate/up with Q2_0 down). `--mode gpu` times `moe_experts` with
 `--experts` experts (default 10, the model's top-k) each routed every column, at T in {1, 2, 4, 8}
 with the records resident in device frames, and at T = 1 staged from the pinned host bank or read
-zero-copy; a 256 MiB L2 eviction read precedes every sample and CUDA events bracket the call, both
+zero-copy. Also at T = 1, `--misses` M (default 1, in [1, `--experts`]) makes experts [0, M)
+missing from device frames while the rest stay resident, placed three ways: `m-staged` (staged from
+the pinned host bank), `m-zc-rule` (staged with `MoeExpertSource::zero_copy_misses` covering the
+misses, so the stage kernel runs and copies nothing) and `m-zerocopy` (read zero-copy without
+staging). A 256 MiB L2 eviction read precedes every sample and CUDA events bracket the call, both
 replayed from a CUDA graph (the reported rate) and launched eagerly. The rate counts each record once. `--mode cpu` times one cold expert at T = 1 on the CPU worker team
 over 1-16 workers, rotating through 96 records so none is cache-resident. Records are random blocks
 with finite scales; medians of `--reps` (default 30).
 
+Options: `--mode gpu|cpu|all`, `--experts N` (1-16, default 10), `--reps N` (default 30) and
+`--misses N` (1-`--experts`, default 1).
+
 ```bash
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode cpu --reps 50
+./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode gpu --misses 3
 ```
 
 ## QSA Op benchmark

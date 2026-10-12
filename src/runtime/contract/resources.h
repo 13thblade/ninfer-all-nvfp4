@@ -153,6 +153,8 @@ struct KvCapacityResolution {
     std::size_t available_after_startup_bytes        = 0;
     std::size_t automatic_headroom_bytes             = 0;
     std::size_t planned_slack_bytes                  = 0;
+    // The context asked for, before a context fit lowered it (EngineOptions::fit_context_floor).
+    std::uint32_t requested_context                  = 0;
 };
 
 } // namespace ninfer::runtime

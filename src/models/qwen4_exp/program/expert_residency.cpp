@@ -117,6 +117,7 @@ ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream
                 const std::uint64_t spilled = guard.end(frame_memory_.bytes);
                 if (spilled == 0) { break; }
                 out.spilled   = spilled;
+                out.at_spill  = vram.query();
                 frame_memory_ = DeviceBuffer{};
                 const std::uint64_t drop = (spilled + kChunkBytes + stride_ - 1) / stride_;
                 frames = attempt == 0 && frames > drop ? frames - static_cast<std::uint32_t>(drop) : 0U;
