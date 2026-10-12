@@ -194,9 +194,15 @@ def _output_text(message: dict[str, Any]) -> str:
 
 def export(run_dir: Path, artifact: Path | None, tokenizer_dir: Path | None,
            out_path: Path) -> int:
-    if not (run_dir / "summary.json").is_file():
-        print(f"error: {run_dir} has no summary.json; the run did not complete, so its "
-              "artifacts are not trusted", file=sys.stderr)
+    summary_path = run_dir / "summary.json"
+    try:
+        complete = json.loads(summary_path.read_text(encoding="utf-8")).get("complete") is True
+    except (OSError, ValueError, AttributeError):
+        complete = False
+    if not complete:
+        print(f"error: {run_dir} has no complete run (summary.json missing or not marked "
+              "complete: the run failed, had errored/unjoined turns or measured none); "
+              "rerun tools.bench.agent_replay run and export again", file=sys.stderr)
         return 1
     tokenizer_json, template_source, template_tokens = _load_resources(artifact, tokenizer_dir)
     encoder = _PromptEncoder(tokenizer_json)

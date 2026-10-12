@@ -232,3 +232,48 @@ def test_failed_server_preflight_clears_the_previous_run(tmp_path, monkeypatch):
     with pytest.raises(ConnectionError):
         run_module.run(_config(out))
     assert list(out.iterdir()) == []
+
+
+def _run_with_fake_sessions(tmp_path, monkeypatch, samples):
+    import json
+
+    from tools.bench.agent_replay import run as run_module
+
+    class Client:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def discover_model(self) -> str:
+            return "m"
+
+    class Session:
+        def __init__(self, config, corpus, model, index, emit) -> None:
+            self.index, self.emit = index, emit
+            self.target, self.turn_index, self.stop_reason, self.messages = 1, [], "x", []
+
+        def run(self) -> None:
+            for sample in samples:
+                self.emit(dict(sample))
+
+    class FakeCorpus:
+        commit = "c"
+
+    monkeypatch.setattr(run_module, "Corpus", lambda repo, commit: FakeCorpus())
+    monkeypatch.setattr(run_module, "NInferServeClient", Client)
+    monkeypatch.setattr(run_module, "SessionRunner", Session)
+    out = tmp_path / "out"
+    code = run_module.run(_config(out))
+    return code, json.loads((out / "summary.json").read_text())
+
+
+def test_summary_is_marked_complete_only_for_a_clean_run(tmp_path, monkeypatch):
+    turn = {"session": 0, "turn": 0, "category": "x", "prompt_tokens": 1, "cached_tokens": 0,
+            "output_tokens": 1, "finish_reason": "stop", "error": None, "copy": False,
+            "overlap_covered": 0, "overlap_units": 0}
+    code, summary = _run_with_fake_sessions(tmp_path / "ok", monkeypatch, [turn])
+    assert (code, summary["complete"]) == (0, True)
+    code, summary = _run_with_fake_sessions(tmp_path / "err", monkeypatch,
+                                            [{**turn, "error": "boom"}])
+    assert (code, summary["complete"]) == (1, False)
+    code, summary = _run_with_fake_sessions(tmp_path / "none", monkeypatch, [])
+    assert (code, summary["complete"]) == (1, False)

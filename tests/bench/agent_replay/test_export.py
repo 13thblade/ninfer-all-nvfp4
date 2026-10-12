@@ -91,7 +91,7 @@ def _write_run(tmp_path, *, server_tokens, logged):
     (run / "turns.jsonl").write_text(json.dumps({
         "session": 0, "turn": 0, "copy": False, "prompt_tokens": server_tokens,
         "error": None}) + "\n", encoding="utf-8")
-    (run / "summary.json").write_text("{}\n", encoding="utf-8")
+    (run / "summary.json").write_text('{"complete": true}\n', encoding="utf-8")
     if logged:
         (run / "output_token_ids.jsonl").write_text("", encoding="utf-8")
     return run, resources
@@ -132,3 +132,14 @@ def test_export_refuses_a_run_without_summary_json(tmp_path):
     out = tmp_path / "streams.jsonl"
     assert export(run, None, resources, out) == 1
     assert not out.exists()
+
+
+def test_export_refuses_a_run_not_marked_complete(tmp_path):
+    from tools.bench.agent_replay.export import export
+
+    run, resources = _write_run(tmp_path, server_tokens=1, logged=False)
+    out = tmp_path / "streams.jsonl"
+    for body in ('{"complete": false}\n', "{}\n", "not json"):
+        (run / "summary.json").write_text(body, encoding="utf-8")
+        assert export(run, None, resources, out) == 1
+        assert not out.exists()

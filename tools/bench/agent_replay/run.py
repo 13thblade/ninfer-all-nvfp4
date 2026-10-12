@@ -383,7 +383,7 @@ def config_error(config: RunConfig) -> str | None:
 
 
 def run(config: RunConfig) -> int:
-    # Run lifecycle (summary.json is written last and marks a complete run):
+    # Run lifecycle (summary.json is written last; its "complete" field marks a clean run):
     #   1. config_error: a rejected config returns 2 and leaves --out exactly as it was.
     #   2. mkdir + clear_run_artifacts: the ONLY place artifacts are removed; from here on the
     #      directory holds nothing of a previous run, so corpus/server preflight failures,
@@ -458,6 +458,10 @@ def run(config: RunConfig) -> int:
         ],
         **summarize(samples),
     }
+    # "complete" is the only thing export trusts: true iff every check below passes, so a run
+    # with unjoined, zero or errored turns still leaves a summary.json but is never exportable.
+    summary["complete"] = (not missing and bool(samples)
+                           and all(s["error"] is None for s in samples))
     (config.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n",
                                              encoding="utf-8")
     print(json.dumps({k: summary[k] for k in ("sessions", "request_log_merged", "wall_seconds")},
@@ -472,7 +476,7 @@ def run(config: RunConfig) -> int:
         print("error: no turn was measured (every session stopped before its first request; "
               "raise --max-context or check --min-context)", file=sys.stderr)
         return 1
-    return 0 if all(s["error"] is None for s in samples) else 1
+    return 0 if summary["complete"] else 1
 
 
 def _fmt(value: Any, spec: str) -> str:
