@@ -225,7 +225,14 @@ private:
     void run() {
         if (cudaSetDevice(0) != cudaSuccess) { return; }
         while (!stop_.load()) {
-            const VramSnapshot s = source_->query();
+            VramSnapshot s;
+            try {
+                s = source_->query();
+            } catch (...) {
+                // Like the production monitor: a failed read is no sample, and sampling stops.
+                has_budget_ = false;
+                return;
+            }
             has_budget_ = s.has_budget;
             if (s.has_budget && s.local_usage > s.local_budget) {
                 const std::uint64_t over = s.local_usage - s.local_budget;
@@ -277,6 +284,13 @@ bool kv_cycle(const std::string& artifact, const std::vector<TokenId>& prompt, c
         }
     }
     const std::uint64_t over = sampler.worst_over();
+    // No sample at all means the sampler failed: fail. Without an OS budget (not WDDM) the over-budget
+    // check cannot run: say so explicitly rather than reporting it as verified.
+    const bool sampled = sampler.samples() > 0;
+    if (!sampled) { std::printf("FAIL: kv cycle: the VRAM sampler produced no samples\n"); }
+    if (sampled && !sampler.has_budget()) {
+        std::printf("SKIP: kv cycle: no OS budget telemetry on this platform; the over-budget check did not run\n");
+    }
     std::printf("%s: kv cycle: %llu VRAM samples, OS budget %s, worst usage over the budget %llu MiB\n",
                 over == 0 ? "ok" : "FAIL", static_cast<unsigned long long>(sampler.samples()),
                 sampler.has_budget() ? "read" : "unavailable", static_cast<unsigned long long>(over >> 20));
@@ -286,7 +300,7 @@ bool kv_cycle(const std::string& artifact, const std::vector<TokenId>& prompt, c
     std::printf("%s: kv cycle: device usage after the short prompt %llu MiB (first cycle), %llu MiB (third)\n",
                 kept ? "ok" : "FAIL", static_cast<unsigned long long>(first_usage >> 20),
                 static_cast<unsigned long long>(last_usage >> 20));
-    return ok && over == 0 && kept;
+    return ok && sampled && over == 0 && kept;
 }
 
 bool same(const char* label, const std::vector<TokenId>& reference, const std::vector<TokenId>& ids) {
