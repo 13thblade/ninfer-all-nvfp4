@@ -607,6 +607,9 @@ public:
     void land_restores_quietly() noexcept;
     void complete_landing(std::uint32_t lane);
     void retire_landing(std::uint32_t lane) noexcept;
+    // Returns a landing's events and descriptor buffer to the spare pools, or destroys them if the
+    // pools cannot grow. Call only once nothing queued still reads or signals them.
+    void recycle_landing_resources(LandingRestore&) noexcept;
     void enqueue_layered_restore(ContextTransaction&);
     // One event per rank: a context transaction copies on every rank's transfer stream, after that
     // rank's compute stream, and is complete only when every rank's copies are.

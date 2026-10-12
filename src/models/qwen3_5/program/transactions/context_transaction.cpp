@@ -242,20 +242,35 @@ void ProgramImpl::enqueue_layered_restore(ContextTransaction& tx) {
         // Queued gather kernels may still read the descriptors: drain the stream, then give the
         // events and the buffer back. The transaction still owns every source page and run.
         synchronize_transfer_streams();
-        try {
-            spare_restore_events_.insert(spare_restore_events_.end(), landing.events.begin(),
-                                         landing.events.end());
-            if (landing.descriptors) {
-                spare_descriptor_buffers_.push_back(std::move(*landing.descriptors));
-            }
-        } catch (...) {
-            for (const auto event : landing.events) { (void)cudaEventDestroy(event); }
-        }
+        recycle_landing_resources(landing);
         throw;
     }
     landing_restores_.push_back(std::move(landing));
     tx.layered_runs.clear();
     tx.layered_tail.reset();
+}
+
+void ProgramImpl::recycle_landing_resources(LandingRestore& landing) noexcept {
+    // Capacity is reserved for both pools before either is touched, so the transfers below cannot
+    // throw half way: a handle is then in exactly one place, a pool or destroyed, never both.
+    try {
+        spare_restore_events_.reserve(spare_restore_events_.size() + landing.events.size());
+        if (landing.descriptors) {
+            spare_descriptor_buffers_.reserve(spare_descriptor_buffers_.size() + 1);
+        }
+    } catch (...) {
+        for (const auto event : landing.events) { (void)cudaEventDestroy(event); }
+        landing.events.clear();
+        landing.descriptors.reset(); // the pinned buffer is freed instead of pooled
+        return;
+    }
+    spare_restore_events_.insert(spare_restore_events_.end(), landing.events.begin(),
+                                 landing.events.end());
+    landing.events.clear();
+    if (landing.descriptors) {
+        spare_descriptor_buffers_.push_back(std::move(*landing.descriptors));
+        landing.descriptors.reset();
+    }
 }
 
 std::span<const cudaEvent_t> ProgramImpl::take_restore_layers(std::uint32_t lane) {
@@ -317,9 +332,7 @@ void ProgramImpl::complete_landing(std::uint32_t lane) {
                 .elapsed_ns = 1,
             });
         }
-        spare_restore_events_.insert(spare_restore_events_.end(), it->events.begin(),
-                                     it->events.end());
-        if (it->descriptors) { spare_descriptor_buffers_.push_back(std::move(*it->descriptors)); }
+        recycle_landing_resources(*it);
         // The copies have landed: the source history may now be released (and its Host pages
         // reclaimed) after the landing is out of the list, so the release fence finds nothing to wait for.
         auto sources = std::move(it->sources);
@@ -337,15 +350,7 @@ void ProgramImpl::retire_landing(std::uint32_t lane) noexcept {
         }
         // The lane's pages may return to the pool: nothing may reuse them before the copies land.
         (void)cudaEventSynchronize(it->events.back());
-        try {
-            spare_restore_events_.insert(spare_restore_events_.end(), it->events.begin(),
-                                         it->events.end());
-            if (it->descriptors) {
-                spare_descriptor_buffers_.push_back(std::move(*it->descriptors));
-            }
-        } catch (...) {
-            for (const auto event : it->events) { (void)cudaEventDestroy(event); }
-        }
+        recycle_landing_resources(*it);
         auto sources = std::move(it->sources);
         it           = landing_restores_.erase(it);
         sources.clear(); // landed: release the source history now (see complete_landing)
