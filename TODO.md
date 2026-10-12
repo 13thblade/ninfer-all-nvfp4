@@ -91,8 +91,10 @@ on the agent replay at one lane, up to +76% on turns that return a file; a copy-
 reverting a diff (-3.7% to -0.1%). Two lanes copy only for copies of 12+ tokens (the other lane pays
 the 16 columns, about a third slower in those rounds); three or more never copy (2.4x round cost).
 The `tuned` DFlash2 launchers pass it at one lane (+170 MiB planned, fits 188,416 tokens). The
--0.7% at one lane on output that never copies is buffer placement, not n-gram work: 18 MiB of padding
-in the persistent arena reproduces it with copies off, and it is absent in some sessions. Explaining turns
+-0.7% at one lane on output that never copies is, as a leading hypothesis, buffer placement rather than
+n-gram work (see [performance](docs/performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b)): 18 MiB of
+padding in the persistent arena reproduced about the same cost with copies off, and the cost is absent in
+some sessions. No single buffer has been shown to carry it. Explaining turns
 read -4.8% on the replay but their answers differ between arms (round cost +0.4%). At two lanes the
 replay gains 15% in throughput while a request beside a copying one decodes up to 19% slower: a gate
 that also weighs the partner (its own tokens per round, or how often it was widened) is untried.
