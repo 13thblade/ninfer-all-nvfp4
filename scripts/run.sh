@@ -102,6 +102,13 @@ case "$model_key" in
   '') usage >&2; exit 2 ;;
   *) printf 'Unknown model: %s\n' "$model_key" >&2; usage >&2; exit 2 ;;
 esac
+# NINFER_NGRAM_VOLUME is the Qwen3.8-Flash-Next n-gram volume override in run.bat. Flash-Next runs on
+# Windows only, so none of these models has a volume: refuse rather than ignore the variable.
+if [[ -n "${NINFER_NGRAM_VOLUME:-}" ]]; then
+  printf 'NINFER_NGRAM_VOLUME is for qwen38-flash-next only (run.bat, Windows); clear it to serve %s\n' \
+    "$model_key" >&2
+  exit 2
+fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd -- "$script_dir/.." && pwd)"

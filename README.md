@@ -311,6 +311,21 @@ after 1K / 8K / 32K prompts is 108-109 / 111 / 112-113 tok/s with MTP and 81 / 8
 [the plan](docs/maintainer/flash-next-plan.md#pr-13-measurements); the server reference is
 [docs/serving.md](docs/serving.md#qwen38-flash-next-preview).
 
+**Keep the n-gram volume on your fastest drive.** The 29 GB `.ngram` file is read on every prompt,
+the 40 GB model only once at load. If the model sits on a SATA SSD or a hard disk, copy just the
+`.ngram` file to an NVMe drive and point the launcher at it; the model can stay where it is:
+
+```bat
+set NINFER_NGRAM_VOLUME=C:\ninfer-models\qwen4exp\qwen4exp-iq2xs.ninfer.ngram
+run.bat qwen38-flash-next
+```
+
+With the plain model on a SATA SSD, that made prefill 1.37x / 1.11x / 1.13x faster at 4K / 32K /
+128K prompts and steadier from one prompt to the next; plain decode barely moved (+0.8%). The plain
+and `-mtp` artifacts share one volume (the `-mtp` conversion reuses it), so one copy serves both.
+The launcher stops with a message if the file is missing, and the server refuses a volume that
+belongs to another conversion.
+
 ## Building from source
 
 Only needed if you are changing the code — the release archives are prebuilt for `sm_86`.
