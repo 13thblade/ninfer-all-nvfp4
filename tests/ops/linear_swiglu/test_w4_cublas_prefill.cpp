@@ -133,11 +133,12 @@ std::vector<float> token_column(const std::vector<std::uint16_t>& activation, st
 }
 
 // Tokens to check: the ends, the tokens either side of every tile edge the route can use at the
-// registered shapes (gate_up 1920, the split projections 5376, the down/out projections 13056),
-// and a deterministic scatter. Edges past `tokens` drop out.
+// registered shapes (gate_up 1920, the split projections 5376, the down/out projections 13056,
+// sm_70's column passes 8192), and a deterministic scatter. Edges past `tokens` drop out.
 std::vector<std::int32_t> sample_tokens(std::int32_t tokens, std::uint32_t seed) {
-    std::vector<std::int32_t> picks = {0,    1,     127,   128,   1919,  1920,  1921,  3839,
-                                       3840, 3841,  5375,  5376,  5377,  13055, 13056, 13057};
+    std::vector<std::int32_t> picks = {0,    1,    127,  128,  1919,  1920,  1921,  3839,  3840,
+                                       3841, 5375, 5376, 5377, 8191,  8192,  8193,  13055, 13056,
+                                       13057};
     picks.push_back(tokens - 1);
     for (std::uint32_t i = 0; i < 12; ++i) {
         picks.push_back(static_cast<std::int32_t>(qw::detail::mix64(seed + i * 7919U) %
@@ -434,6 +435,9 @@ int main() {
         // tokens to tile, so they get their own.
         failures += run_gate_up(4133);
         failures += run_down(13057, 6144);
+        // sm_70's wide route passes over more than 8,192 columns (a Vision item's patches): two
+        // passes, the second partial.
+        failures += run_gate_up(8192 + 263);
         for (const std::int32_t tokens : {128, 512, 1000, 5377}) {
             failures += run_gdn_input(tokens);
             failures += run_attn_input(tokens);

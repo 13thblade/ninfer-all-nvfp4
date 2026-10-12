@@ -2798,7 +2798,14 @@ int exercise_vision(ninfer::Engine& engine) {
     if (stopped.finish_reason != ninfer::FinishReason::StopToken ||
         stopped.generated_token_ids.empty() || stopped.speculative.rounds == 0 ||
         stopped.generated_token_ids.back() != stop_options.stop.token_ids.front()) {
-        std::cerr << "multimodal custom stop did not terminate at the selected token\n";
+        std::cerr << "multimodal custom stop did not terminate at the selected token: finish="
+                  << static_cast<int>(stopped.finish_reason)
+                  << " rounds=" << stopped.speculative.rounds
+                  << " reused=" << stopped.reused_prompt_tokens << " tokens";
+        for (const auto token : stopped.generated_token_ids) { std::cerr << ' ' << token; }
+        std::cerr << " baseline";
+        for (const auto token : mtp_baseline.generated_token_ids) { std::cerr << ' ' << token; }
+        std::cerr << '\n';
         return 1;
     }
     const ninfer::GenerationResult stopped_reuse =
