@@ -82,10 +82,13 @@ is borrowed from the expert cache). What is different from the Qwen3.5 models:
   request logs one line with its expert hit rate, promotions and decode speed.
 - **Prefill.** A prompt of 512 tokens or more prefills in calls of 4,096 tokens (independent of
   `--prefill-chunk`, which sizes shorter prompts and forced tokens). For the prompt, the expert cache
-  lends about 2,250 of its frames (3.2 GiB): the calls' workspace, and a ring into which each layer's
-  non-resident experts are copied two layers ahead while the GPU computes. When the prompt is done
-  the frames come back and are refilled with the experts the prompt used most, so the first decode
-  tokens find them resident. A cache too small to lend that many frames prefills in
+  lends up to about 2,250 of its frames (3.2 GiB): the calls' workspace, sized to the prompt's
+  widest call (a shorter prompt lends less), and a ring into which each layer's non-resident experts
+  are copied two layers ahead while the GPU computes. The cache promotes nothing while the frames are
+  lent. When the prompt is done the frames come back and the experts they displaced are restored
+  first (the set decode had before the prompt), then any remaining free frames are filled with the
+  experts the prompt used most, so the first decode tokens find them resident. A cache too small to
+  lend what the prompt needs prefills in
   `--prefill-chunk` calls instead (slower, same output). The next call's n-gram rows are read while
   the GPU runs the current one; a prompt's first call waits for its own rows, so the volume's disk
   speed shows in time to first token.

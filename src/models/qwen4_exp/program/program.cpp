@@ -715,7 +715,10 @@ public:
                 prefetch_rows(next, std::min(call_width(wide), remaining - width));
             }
             lane_.state_tokens += static_cast<std::uint32_t>(width);
-            const std::size_t promotions = width <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(width)) : 0;
+            // No promotion while the lease is held, whatever the call's width: a trailing short call
+            // would evict residents after lend() recorded the displaced set, which give_back restores.
+            const std::size_t promotions =
+                !lease_.valid() && width <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(width)) : 0;
             if (last) {
                 const bool failed_constraint = sample(begin + width - 1, masks);
                 residency_->enqueue_route_download(device_.stream, width);
@@ -1124,10 +1127,12 @@ private:
     bool wide_ready(std::int32_t remaining) {
         if (lease_.valid()) { return true; }
         if (!stream_ || plan_.wide_work == 0 || remaining < kStreamMinColumns) { return false; }
-        // The workspace of this prompt's widest call at the keys its extent reaches, not the
-        // planned bound (kWideChunk columns at max_context): a 1K prompt lends a quarter of it.
+        // The workspace of this prompt's widest call (not the planned wide_chunk columns). The keys
+        // stay the planned envelope: Forward::attention runs the QSA selection at
+        // kv_.max_visible_keys, whose scratch grows with it, so a smaller figure here would
+        // under-allocate the lent arena.
         const std::int32_t widest   = std::min(plan_.wide_chunk, remaining);
-        const std::uint32_t keys    = (lane_.extent + kPagedKVPageSize - 1) / kPagedKVPageSize * kPagedKVPageSize;
+        const std::uint32_t keys    = plan_.pages * kPagedKVPageSize;
         const std::size_t work      = std::min<std::size_t>(
             plan_.wide_work, execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms}));
         const std::uint64_t stride  = residency_->frame_stride();
