@@ -191,12 +191,15 @@ class SessionRunner:
                 plan = self.builder.next_turn(turn)
             staged = len(plan.observation.text) + len(plan.instruction or "")
             projected = context + est_tokens(staged) + MESSAGE_OVERHEAD_TOKENS * 4
-            if projected + plan.max_tokens > self.target:
+            # The target bounds the prompt; the output budget only has to fit max_context, so
+            # a large copy turn cannot end a session while its prompt is still below target.
+            budget = min(plan.max_tokens, self.config.max_context - projected)
+            if projected > self.target or budget < 1:
                 self.stop_reason = "target_context"
                 break
             self._stage(plan, pending, replied_text)
-            reply = send(self.client, self.model, self.messages, plan.max_tokens)
-            sample = self._sample(plan, reply)
+            reply = send(self.client, self.model, self.messages, budget)
+            sample = self._sample(plan, reply, budget)
             samples.append(sample)
             self.emit(sample)
             if reply.error is not None:
@@ -218,7 +221,7 @@ class SessionRunner:
             context = sample["prompt_tokens"] + sample["output_tokens"]
         return samples
 
-    def _sample(self, plan: TurnPlan, reply: Reply) -> dict[str, Any]:
+    def _sample(self, plan: TurnPlan, reply: Reply, max_tokens: int) -> dict[str, Any]:
         covered, total = self.sources.overlap(output_text(reply)) if reply.error is None else (0, 0)
         details = reply.usage.get("prompt_tokens_details") or {}
         counters = timing_counters(reply.timings)
@@ -232,7 +235,7 @@ class SessionRunner:
             "response_id": reply.response_id,
             "error": reply.error,
             "finish_reason": reply.finish_reason,
-            "max_tokens": plan.max_tokens,
+            "max_tokens": max_tokens,
             "prompt_tokens": int(reply.usage.get("prompt_tokens") or 0),
             "cached_tokens": int(details.get("cached_tokens") or 0),
             "output_tokens": int(reply.usage.get("completion_tokens") or 0),
@@ -268,7 +271,18 @@ def unjoined_turns(samples: list[dict[str, Any]], done: dict[str, Any]) -> list[
     """Response ids (or session/turn when none) of measured turns the request log lacks."""
     return sorted(s["response_id"] or f"session {s['session']} turn {s['turn']}"
                   for s in samples
-                  if s["error"] is None and (s.get("response_id") or "") not in done)
+                  if s["error"] is None
+                  and logged_token_ids(s, done.get(s.get("response_id") or "")) is None)
+
+
+def logged_token_ids(sample: dict[str, Any], record: dict[str, Any] | None) -> list[int] | None:
+    """The request log's generated ids, only when they account for every completion token."""
+    if record is None:
+        return None
+    ids = (record.get("result") or {}).get("generated_token_ids")
+    if not isinstance(ids, list) or len(ids) != sample["output_tokens"]:
+        return None
+    return ids
 
 
 def apply_timing(sample: dict[str, Any], done: dict[str, Any] | None) -> None:
@@ -324,8 +338,9 @@ def merge_request_log(samples: list[dict[str, Any]], done: dict[str, dict[str, A
     with token_ids_path.open("w", encoding="utf-8") as ids:
         for sample in samples:
             record = done.get(sample.get("response_id") or "")
-            if record is None:
-                continue
+            ids_list = logged_token_ids(sample, record)
+            if record is None or ids_list is None:
+                continue  # reported by unjoined_turns; export falls back to retokenized text
             merged += 1
             counters: dict[str, Any] = {}
             speculative = {k: v for k, v in (record.get("speculative") or {}).items()
@@ -341,7 +356,7 @@ def merge_request_log(samples: list[dict[str, Any]], done: dict[str, dict[str, A
             apply_timing(sample, record)
             ids.write(json.dumps({"session": sample["session"], "turn": sample["turn"],
                                   "response_id": sample["response_id"],
-                                  "generated_token_ids": result.get("generated_token_ids") or []})
+                                  "generated_token_ids": ids_list})
                       + "\n")
     return merged
 
