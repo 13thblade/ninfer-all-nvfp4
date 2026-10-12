@@ -174,15 +174,17 @@ The GGML block decoders, Python (`tests/artifact/test_ggml_codecs.py`) and C++
 checked against committed golden fixtures from ggml's reference `dequantize_row_*`
 (`tests/fixtures/ggml/<format>.blocks` and `.f32`). `ninfer_artifact_ggml_real_test` loads a real
 GGML artifact named by `NINFER_TEST_ARTIFACT` (such as `--subset dev` below) through Device, Pinned
-and Host residency and requires the C++ and Python decoders to agree bit for bit on sampled blocks;
-it skips without the variable or when that artifact has no GGML tensor. Optional environment
-variables extend the Python GGML and GGUF checks:
+and Host residency and requires the C++ and Python decoders to agree bit for bit on sampled blocks,
+including blocks of every part of the expert records; it skips without the variable or when that
+artifact has no GGML tensor. `tests/artifact/test_ngram_volume.py` covers the n-gram volume file
+(header fields, block geometry at the real table, exact row placement, the 512-row reuse check).
+Optional environment variables extend the Python GGML and GGUF checks:
 
 | Variable | Adds |
 |---|---|
 | `NINFER_GGML_BASE_DLL` | the live oracle: ggml-base (`.dll` or `.so`) of llama.cpp b11316 decodes 100,000 random blocks per format, and 1,000 real blocks per format with `NINFER_TEST_GGUF` |
-| `NINFER_TEST_GGUF` | the real Qwen3.8-Flash-Next GGUF (first split file): tensor inventory, whole-model name map, export conventions, and a `--subset dev` conversion compared byte for byte (~2.9 GB in the test's temporary directory) |
-| `NINFER_TEST_QWEN4EXP_SUBSET` | verify that existing `--subset dev` artifact instead of converting one |
+| `NINFER_TEST_GGUF` | the real Qwen3.8-Flash-Next GGUF (first split file): tensor inventory, whole-model name map and expert record bytes, export conventions and hash parameters, and a `--subset dev` conversion and its n-gram volume compared byte for byte against the GGUF, expert records through their exact inverse (~2.9 GB in the test's temporary directory) |
+| `NINFER_TEST_QWEN4EXP_SUBSET` | verify that existing `--subset dev` artifact, and the volume beside it as `<artifact>.ngram`, instead of converting one |
 | `NINFER_TEST_QWEN38_ARTIFACT` | a Qwen3.8 `.ninfer` whose tokenizer the GGUF vocabulary must equal |
 
 `python -m tools.artifact.gen_ggml_fixtures --dll PATH` regenerates the fixtures.
@@ -194,6 +196,15 @@ the output is compared with the FP64 product. It also checks the cast exactly, b
 the wide route's cast kernel and through the public Op on both routes, and the admission rules.
 `--format NAME` and `--shape N K` select problems; the full run takes about a minute, most of it the
 host oracle.
+
+The Qwen3.8-Flash-Next Ops ported from Infernix have their own suites, each a few seconds:
+`ninfer_hyper_connection_test` (the mixer against its FP64 formula on both arithmetic profiles,
+fused T ≤ 16 and composed above, column invariance, graph equal to eager; inject and expand exact),
+`ninfer_ple_test` (the IQ4_NL row decode exact against the host decoder; the gate and the stateful
+convolution against FP64, states bit for bit, split calls equal to one call, commit equal to the
+in-place update), `ninfer_projection_fp32_test` (BF16 router segments and the IQ4_XS head against
+FP64 within the FP32 accumulation bound, column invariance) and `ninfer_rows_test` (exact splits and
+gathers with guard bytes).
 
 The real loading test accepts an explicit artifact path and optional component selection:
 
