@@ -154,75 +154,106 @@ void ProgramImpl::enqueue_layered_restore(ContextTransaction& tx) {
         throw std::logic_error("Main KV planes are not a whole number per layer");
     }
     const std::size_t per_layer = planes / layers;
-    auto& landing               = landing_restores_.emplace_back(
-        LandingRestore{.lane = tx.lane, .timer = CudaEventTimer(device, transfer_streams[0])});
+    // The landing is built privately and published into `landing_restores_` only once every event
+    // is recorded, so retire_landing / abort_context / the destructor never see a partial one. The
+    // slot is reserved first so publishing cannot throw after the copies were queued.
+    landing_restores_.reserve(landing_restores_.size() + 1);
+    LandingRestore landing{.lane = tx.lane, .timer = CudaEventTimer(device, transfer_streams[0])};
     landing.page_count = tx.layered_pages;
     if (tx.source_history) { landing.sources.push_back(tx.source_history); }
     landing.events.reserve(layers);
-    for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        if (spare_restore_events_.empty()) {
-            cudaEvent_t event = nullptr;
-            CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-            spare_restore_events_.push_back(event);
+    try {
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            if (spare_restore_events_.empty()) {
+                cudaEvent_t event = nullptr;
+                CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+                try {
+                    spare_restore_events_.push_back(event);
+                } catch (...) {
+                    (void)cudaEventDestroy(event);
+                    throw;
+                }
+            }
+            landing.events.push_back(spare_restore_events_.back());
+            spare_restore_events_.pop_back();
         }
-        landing.events.push_back(spare_restore_events_.back());
-        spare_restore_events_.pop_back();
-    }
-    // Describe every layer's copies first, then run each layer as gather kernels reading their
-    // descriptors from a pinned buffer the landing keeps until it has landed: the layer's restore,
-    // then its share of a private tail, whose source may be a page that restore writes.
-    constexpr std::size_t kPieceBytes = std::size_t{64} << 10;
-    std::vector<GatherCopy> copies, layer_copies;
-    // Per layer: [restore begin, tail begin, tail end) in `copies`.
-    std::vector<std::array<std::size_t, 3>> segments(layers);
-    for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        const std::size_t begin = layer * per_layer, end = begin + per_layer;
-        segments[layer][0] = copies.size();
-        layer_copies.clear();
-        for (const auto& run : tx.layered_runs) {
-            const auto work = run.pages->physical_pool().describe_from_host(
-                run.host, run.destination, begin, end, layer_copies);
-            landing.work.payload_bytes += work.payload_bytes;
-            landing.work.copy_operations += work.copy_operations;
-        }
-        split_gather_copies(layer_copies, kPieceBytes);
-        copies.insert(copies.end(), layer_copies.begin(), layer_copies.end());
-        segments[layer][1] = copies.size();
-        if (tx.layered_tail) {
+        // Describe every layer's copies first, then run each layer as gather kernels reading their
+        // descriptors from a pinned buffer the landing keeps until it has landed: the layer's
+        // restore, then its share of a private tail, whose source may be a page that restore writes.
+        // The tail's Device source needs no pin here: its readers are on the transfer stream, and
+        // every other writer of a page recycled from it is ordered behind this landing (the lane's
+        // prefill waits per layer, all other compute work on the last layer: take_restore_layers /
+        // order_after_restores), as are all later transfers on the same stream.
+        constexpr std::size_t kPieceBytes = std::size_t{64} << 10;
+        std::vector<GatherCopy> copies, layer_copies;
+        // Per layer: [restore begin, tail begin, tail end) in `copies`.
+        std::vector<std::array<std::size_t, 3>> segments(layers);
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            const std::size_t begin = layer * per_layer, end = begin + per_layer;
+            segments[layer][0] = copies.size();
             layer_copies.clear();
-            const auto work = text_kv_pages->physical_pool().describe_page_copy(
-                tx.layered_tail->first, tx.layered_tail->second, begin, end, layer_copies);
-            landing.tail_work.payload_bytes += work.payload_bytes;
-            landing.tail_work.copy_operations += work.copy_operations;
+            for (const auto& run : tx.layered_runs) {
+                const auto work = run.pages->physical_pool().describe_from_host(
+                    run.host, run.destination, begin, end, layer_copies);
+                landing.work.payload_bytes += work.payload_bytes;
+                landing.work.copy_operations += work.copy_operations;
+            }
             split_gather_copies(layer_copies, kPieceBytes);
             copies.insert(copies.end(), layer_copies.begin(), layer_copies.end());
+            segments[layer][1] = copies.size();
+            if (tx.layered_tail) {
+                layer_copies.clear();
+                const auto work = text_kv_pages->physical_pool().describe_page_copy(
+                    tx.layered_tail->first, tx.layered_tail->second, begin, end, layer_copies);
+                landing.tail_work.payload_bytes += work.payload_bytes;
+                landing.tail_work.copy_operations += work.copy_operations;
+                split_gather_copies(layer_copies, kPieceBytes);
+                copies.insert(copies.end(), layer_copies.begin(), layer_copies.end());
+            }
+            segments[layer][2] = copies.size();
         }
-        segments[layer][2] = copies.size();
-    }
-    const std::size_t bytes = copies.size() * sizeof(GatherCopy);
-    for (auto it = spare_descriptor_buffers_.begin(); it != spare_descriptor_buffers_.end(); ++it) {
-        if (it->size() >= bytes) {
-            landing.descriptors.emplace(std::move(*it));
-            spare_descriptor_buffers_.erase(it);
-            break;
+        const std::size_t bytes = copies.size() * sizeof(GatherCopy);
+        for (auto it = spare_descriptor_buffers_.begin(); it != spare_descriptor_buffers_.end();
+             ++it) {
+            if (it->size() >= bytes) {
+                landing.descriptors.emplace(std::move(*it));
+                spare_descriptor_buffers_.erase(it);
+                break;
+            }
         }
+        if (!landing.descriptors) {
+            landing.descriptors.emplace(std::max<std::size_t>(bytes, std::size_t{1} << 20));
+        }
+        auto* staged = static_cast<GatherCopy*>(landing.descriptors->data());
+        std::copy(copies.begin(), copies.end(), staged);
+        landing.timer.start();
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            const auto [restore, tail, after] = segments[layer];
+            gather_copies(std::span<const GatherCopy>(staged + restore, tail - restore),
+                          transfer_streams[0]);
+            gather_copies(std::span<const GatherCopy>(staged + tail, after - tail),
+                          transfer_streams[0]);
+            // The last layer's event follows the timer's stop, so a reader that has waited for
+            // every layer can read the elapsed time.
+            if (layer + 1 == layers) { landing.timer.record_stop(); }
+            CUDA_CHECK(cudaEventRecord(landing.events[layer], transfer_streams[0]));
+        }
+    } catch (...) {
+        // Queued gather kernels may still read the descriptors: drain the stream, then give the
+        // events and the buffer back. The transaction still owns every source page and run.
+        synchronize_transfer_streams();
+        try {
+            spare_restore_events_.insert(spare_restore_events_.end(), landing.events.begin(),
+                                         landing.events.end());
+            if (landing.descriptors) {
+                spare_descriptor_buffers_.push_back(std::move(*landing.descriptors));
+            }
+        } catch (...) {
+            for (const auto event : landing.events) { (void)cudaEventDestroy(event); }
+        }
+        throw;
     }
-    if (!landing.descriptors) {
-        landing.descriptors.emplace(std::max<std::size_t>(bytes, std::size_t{1} << 20));
-    }
-    auto* staged = static_cast<GatherCopy*>(landing.descriptors->data());
-    std::copy(copies.begin(), copies.end(), staged);
-    landing.timer.start();
-    for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        const auto [restore, tail, after] = segments[layer];
-        gather_copies(std::span<const GatherCopy>(staged + restore, tail - restore),
-                      transfer_streams[0]);
-        gather_copies(std::span<const GatherCopy>(staged + tail, after - tail), transfer_streams[0]);
-        // The last layer's event follows the timer's stop, so a reader that has waited for every
-        // layer can read the elapsed time.
-        if (layer + 1 == layers) { landing.timer.record_stop(); }
-        CUDA_CHECK(cudaEventRecord(landing.events[layer], transfer_streams[0]));
-    }
+    landing_restores_.push_back(std::move(landing));
     tx.layered_runs.clear();
     tx.layered_tail.reset();
 }
