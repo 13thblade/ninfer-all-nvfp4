@@ -211,6 +211,12 @@ struct RequestRecord {
     std::uint32_t hydration_reuse_before = 0;
     Clock::time_point hydration_started{};
     Clock::time_point hydration_deadline{};
+
+    // Single flight: while set, a resident sibling is prefilling this request's prefix towards a
+    // checkpoint it will publish, and the request is not offered for admission. One wait at most.
+    bool awaiting_sibling  = false;
+    bool sibling_wait_used = false;
+
     bool recovery_pending                  = false;
     std::uint64_t committed_decode_tokens  = 0;
     GenerationRecoveryRoute recovery_route = GenerationRecoveryRoute::None;
