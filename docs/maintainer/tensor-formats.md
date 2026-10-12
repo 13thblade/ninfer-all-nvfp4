@@ -53,8 +53,13 @@ The GGML block formats store blocks of ggml's quantization types unchanged (Sect
 | `ggml_iq1_m` | `IQ1_M` (29) | 256 | 56 | 1.75 |
 | `ggml_q2_0` | `Q2_0` (42) | 64 | 18 | 2.25 |
 
-The GGML block formats are tooling-only for now: the Python converter writes and checks them, and
-the C++ registry rejects their names until its materialization support lands.
+The C++ registry accepts the GGML block formats and materializes them to Device, Host or Pinned
+memory unchanged. Linear and LinearAdd consume `ggml_iq4_xs`, `ggml_iq3_s`, `ggml_q6_k`,
+`ggml_iq4_nl`, `ggml_q8_0` and `ggml_q2_0` at the registered problems in
+[`linear.h`](../../include/ninfer/ops/linear.h) and
+[`linear_add.h`](../../include/ninfer/ops/linear_add.h), through their Q8_1 activation profile;
+the other three formats have no consuming Op yet. An Op that consumes a format declares its own
+support.
 
 Each name fixes a code and scale contract. The format registry is implemented in
 [`tools/artifact/formats.py`](../../tools/artifact/formats.py) and
@@ -341,9 +346,15 @@ does for NaN.
 first, and reconstructs as `binary32((q - 1) * d)`, so the codes mean −1, 0, +1 and +2.
 
 The Python decoders are
-[`tools/artifact/codecs/ggml_blocks.py`](../../tools/artifact/codecs/ggml_blocks.py); the tables
-are copied from ggml by `tools/artifact/gen_ggml_tables.py`, with ggml's MIT notice in
-[`third_party/ggml/LICENSE`](../../third_party/ggml/LICENSE). NInfer has no encoder for these
+[`tools/artifact/codecs/ggml_blocks.py`](../../tools/artifact/codecs/ggml_blocks.py), and the C++
+exact host decoder that GGML Ops are qualified against is
+[`tests/ops/ggml_blocks_decode.h`](../../tests/ops/ggml_blocks_decode.h). Both read tables that
+`tools/artifact/gen_ggml_tables.py` copies from ggml in one pass, with ggml's MIT notice in
+[`third_party/ggml/LICENSE`](../../third_party/ggml/LICENSE): the Python module
+`tools/artifact/codecs/ggml_tables.py` and the C++ header
+[`third_party/ggml/ggml-common-tables.h`](../../third_party/ggml/ggml-common-tables.h), which the
+host decoder and the device kernels of the GGML Ops (`src/ops/linear/ggml`) both include, so there
+is one C++ table set. NInfer has no encoder for these
 formats: a converter imports blocks from a source already in the same format.
 
 ## 4. Grouped signed-integer tensor model
@@ -710,7 +721,9 @@ enum spellings or private kernel layout. The retained codec and encoder evidence
   grid index, sign pattern and scale field and binary16 zeros, subnormals, extremes, infinities and
   NaNs (`tests/artifact/test_ggml_codecs.py`), 100,000 random blocks per format when
   `NINFER_GGML_BASE_DLL` names that library, and 1,000 blocks per format sampled from the real
-  Qwen3.8-Flash-Next GGUF.
+  Qwen3.8-Flash-Next GGUF; the same bit-pattern equality for the C++ host decoder on those
+  fixtures (`ninfer_ggml_blocks_decode_test`), and C++/Python agreement on blocks sampled from a
+  real GGML artifact after C++ materialization (`ninfer_artifact_ggml_real_test`).
 
 For direct formats, the independent decode oracle is the abstract logical word in Section 3.1. For
 grouped signed-integer formats, it is the binary32 reconstruction in Section 6.2. Their canonical
