@@ -177,6 +177,30 @@ expect_flags '27B chat template override' \
   "--chat-template $tmp/custom.jinja"
 refuse_flag '27B no chat template override' "$(record no_chat_template -- qwen38-27b)" '--chat-template'
 
+# The reasoning-loop guard is opt-in: unset or off passes nothing (the server default is off), stop
+# and conclude pass through on both models, the reference profiles stay minimal, and the banner
+# says which mode is in force.
+refuse_flag '27B reasoning loop unset' "$(record loop_unset -- qwen38-27b)" '--reasoning-loop'
+refuse_flag '27B NINFER_REASONING_LOOP=off' "$(record loop_off NINFER_REASONING_LOOP=off -- qwen38-27b)" '--reasoning-loop'
+expect_flags '27B NINFER_REASONING_LOOP=stop' \
+  "$(record loop_stop NINFER_REASONING_LOOP=stop -- qwen38-27b)" '--reasoning-loop stop'
+expect_flags '35B NINFER_REASONING_LOOP=conclude' \
+  "$(record loop_conclude35 NINFER_REASONING_LOOP=conclude -- qwen36-35b-a3b)" '--reasoning-loop conclude'
+refuse_flag '27B int8 NINFER_REASONING_LOOP=stop' \
+  "$(record loop_int8 NINFER_REASONING_LOOP=stop -- qwen38-27b int8)" '--reasoning-loop'
+banner="$(clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unused.args" \
+  NINFER_MODEL_DIR="$tmp" NINFER_REASONING_LOOP=conclude "$root/run.sh" qwen38-27b)"
+[[ "$banner" == *'Reasoning-loop guard: conclude'* ]] || {
+  printf 'run.sh banner does not report NINFER_REASONING_LOOP: %s\n' "$banner" >&2
+  exit 1
+}
+banner="$(clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unused.args" \
+  NINFER_MODEL_DIR="$tmp" "$root/run.sh" qwen38-27b)"
+[[ "$banner" != *'Reasoning-loop guard'* ]] || {
+  printf 'run.sh banner reports a reasoning-loop guard nobody asked for: %s\n' "$banner" >&2
+  exit 1
+}
+
 # The banner reports what is being served: an explicit vision residency shows up in it, not the
 # default. (The stub server prints nothing, so stdout here is the launcher's own.)
 banner="$(clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unused.args" \
@@ -222,6 +246,8 @@ expect_exit 2 'NINFER_NGRAM=on without DFlash2' clear_env "${serve_env[@]}" NINF
   "$root/run.sh" qwen38-27b
 expect_exit 2 'NINFER_NGRAM=on on the 35B' clear_env "${serve_env[@]}" NINFER_NGRAM=on "$root/run.sh" qwen36-35b-a3b
 expect_exit 2 'unknown NINFER_NGRAM on the 35B' clear_env "${serve_env[@]}" NINFER_NGRAM=yes "$root/run.sh" qwen36-35b-a3b
+expect_exit 2 'unknown NINFER_REASONING_LOOP' clear_env "${serve_env[@]}" NINFER_REASONING_LOOP=on \
+  "$root/run.sh" qwen38-27b
 expect_exit 0 '--help' clear_env "${serve_env[@]}" "$root/run.sh" --help
 
 # A desktop holding VRAM can leave too little for the default context, and the tuned profile is

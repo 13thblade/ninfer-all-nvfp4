@@ -74,7 +74,11 @@
 #     NINFER_HOST_CACHE_MAX_MIB         --host-cache-max-mib N         hard cap on pinned RAM
 #   NINFER_MAX_OUTPUT_TOKENS            --max-output-tokens N          cap every request's output budget
 #   NINFER_MLP_A8_DECODE=on             --mlp-a8-decode                INT8-activation MLP decode
-#   NINFER_CONTEXT_STORE                --context-store DIR            keep the context cache across restarts
+#   NINFER_REASONING_LOOP=stop|conclude --reasoning-loop MODE          end (stop) or close the thinking
+#                                                                      (conclude) when it keeps repeating
+#                                                                      whole passages; off (the default)
+#                                                                      leaves thinking unguarded
+#   NINFER_CONTEXT_STORE               --context-store DIR            keep the context cache across restarts
 #                                                                      and crashes (dflash2, mtp, none)
 #     NINFER_CONTEXT_STORE_MAX_GIB      --context-store-max-gib N      disk budget for the store
 #
@@ -296,6 +300,23 @@ if [[ "$profile" == 'tuned' ]]; then
     off) ;;
     *) printf 'NINFER_MLP_A8_DECODE must be on or off, got %s\n' "$NINFER_MLP_A8_DECODE" >&2; exit 2 ;;
   esac
+  # Reasoning-loop guard (--reasoning-loop): off unless asked for. It has never fired on the 27B in
+  # the measurements behind it (#217: 21 requests, including one written to make the model loop),
+  # and its thresholds come from other models, so turning it on by default would trade an
+  # unmeasured false-positive risk for no observed benefit. `off` is the server's own default and
+  # passes nothing.
+  loop_note=''
+  case "${NINFER_REASONING_LOOP:-}" in
+    '') ;;
+    off) loop_note='Reasoning-loop guard: off  (NINFER_REASONING_LOOP)' ;;
+    stop)
+      profile_args+=(--reasoning-loop stop)
+      loop_note='Reasoning-loop guard: stop - a reply whose thinking keeps repeating itself ends early  (NINFER_REASONING_LOOP)' ;;
+    conclude)
+      profile_args+=(--reasoning-loop conclude)
+      loop_note='Reasoning-loop guard: conclude - thinking that keeps repeating itself is closed and the model answers  (NINFER_REASONING_LOOP)' ;;
+    *) printf 'NINFER_REASONING_LOOP must be off, stop or conclude, got %s\n' "$NINFER_REASONING_LOOP" >&2; exit 2 ;;
+  esac
   if [[ -n "${NINFER_CONTEXT_STORE:-}" ]]; then
     profile_args+=(--context-store "$NINFER_CONTEXT_STORE")
     [[ -z "${NINFER_CONTEXT_STORE_MAX_GIB:-}" ]] || profile_args+=(--context-store-max-gib "$NINFER_CONTEXT_STORE_MAX_GIB")
@@ -345,6 +366,7 @@ if [[ "$profile" == 'tuned' ]]; then
   printf '%s\n' "$cache_note"
   printf 'Sampling guard: min-p %s, presence penalty %s  (NINFER_MIN_P, NINFER_PRESENCE_PENALTY; "default" = registered preset)\n' \
     "$MIN_P" "$PRESENCE_PENALTY"
+  [[ -z "$loop_note" ]] || printf '%s\n' "$loop_note"
 fi
 [[ -z "${NINFER_CHAT_TEMPLATE:-}" ]] || printf 'Chat template: %s\n' "$NINFER_CHAT_TEMPLATE"
 [[ -z "${hint:-}" ]] || printf '%s\n' "$hint"

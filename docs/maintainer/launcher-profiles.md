@@ -105,10 +105,18 @@ endpoint to every network the machine is on, so it is opt-in per run.
 
 The `tuned` profile also exposes further serving flags, each appended only when its variable is set so the
 defaults stay as measured: `NINFER_MAX_OUTPUT_TOKENS`, `NINFER_MLP_A8_DECODE=on`,
-`NINFER_CONTEXT_STORE` (+ `NINFER_CONTEXT_STORE_MAX_GIB`) and `NINFER_AUTO_HOST_CACHE=on` (+
-`NINFER_HOST_CACHE_PERCENT`, `_RESERVE_MIB`, `_MAX_MIB`). `--auto-host-cache` sizes the Host context budget
+`NINFER_CONTEXT_STORE` (+ `NINFER_CONTEXT_STORE_MAX_GIB`), `NINFER_REASONING_LOOP=off|stop|conclude` and
+`NINFER_AUTO_HOST_CACHE=on` (+ `NINFER_HOST_CACHE_PERCENT`, `_RESERVE_MIB`, `_MAX_MIB`). `--auto-host-cache` sizes the Host context budget
 itself and refuses `--host-context-mib`, so with it on the launcher drops that flag and
 `NINFER_HOST_CONTEXT_MIB` (and the host retry's halving of it) is ignored.
+
+`NINFER_REASONING_LOOP` maps to `--reasoning-loop`; any other value stops the launcher with exit 2,
+and a set value is echoed in the banner. Its default stays `off` (nothing passed, the server's own
+default) on the evidence in #217: across 21 thinking requests on the 27B, including one written to
+provoke a loop, the guard never reached its 25% repeated-passage threshold, so on-by-default would
+buy no observed benefit, while the thresholds (Strata's, from other models) leave the false-positive
+rate on legitimately repetitive thinking unmeasured here. Its cost when on was within run-to-run
+noise (0.1-0.5% decode, C=1 and C=4).
 
 **When the card is busy.** A desktop or another job holding VRAM can leave too little for the default
 context, and a machine short of RAM can fail to pin the Host context budget.
