@@ -27,7 +27,7 @@ The executable `--help` output is the exact source for command-line option spell
 | Qwen3.8-27B | `groupwise-int`, upstream | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |
 | Qwen3.8-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
 | Qwen3.6-35B-A3B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [model card](../model-cards/Qwen3.6-35B-A3B-NInfer/README.md) |
-| Qwen3.8-Flash-Next (preview) | GGUF blocks from the GSQ-RCO IQ2_XS GGUF, exact; n-gram volume beside it | [Hugging Face](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090) (pending: model file not yet uploaded) | [model card](../model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) |
+| Qwen3.8-Flash-Next (preview) | GGUF blocks from the GSQ-RCO IQ2_XS GGUF, exact; n-gram volume beside it | [Hugging Face](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090/tree/c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa) | [model card](../model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) |
 
 ## Repository-local guides
 
