@@ -21,8 +21,10 @@ reference) and reads the artifact's stored values directly, never the engine:
   different quantization;
 - the PLE n-gram rows are the volume's IQ4_NL rows, decoded exactly and rounded to BF16.
 
-``--bf16-boundaries`` (default on) rounds the activations the engine stores in BF16: residual
-streams, every block input and output, projection outputs. The K/V cache is exact here; the engine
+``--bf16-boundaries`` (default on; ``--no-bf16-boundaries`` turns it off) rounds the activations
+the engine stores in BF16 between Ops: residual streams, every block input and output, projection
+outputs. Intermediates private to one Op stay FP64, notably the hyper-connection mixer's ``z``,
+``m`` and ``u``, which hyper_connection.h rounds or not depending on its route. The K/V cache is exact here; the engine
 stores INT8-G64 K/V, so attention outputs differ by that quantization. QSA selection is evaluated
 exactly; for prompts up to ``indexer_budget + compress_ratio - 1`` tokens every token is selected.
 """
@@ -278,8 +280,8 @@ class Reference:
         q, gate = qg[..., :d], qg[..., d:].reshape(T, nh * d)
         k = self.ggml_linear(x, p + "key", (nkv * d, H)).reshape(T, nkv, d)
         v = self.ggml_linear(x, p + "value", (nkv * d, H)).reshape(T, nkv, d)
-        q = rope(self.round(rmsnorm(q, 1.0 + self.p(p + "query_norm", (d,)), self.eps)), positions, self.theta, self.rotary)
-        k = rope(self.round(rmsnorm(k, 1.0 + self.p(p + "key_norm", (d,)), self.eps)), positions, self.theta, self.rotary)
+        q = self.round(rope(self.round(rmsnorm(q, 1.0 + self.p(p + "query_norm", (d,)), self.eps)), positions, self.theta, self.rotary))
+        k = self.round(rope(self.round(rmsnorm(k, 1.0 + self.p(p + "key_norm", (d,)), self.eps)), positions, self.theta, self.rotary))
         selected = self.qsa_select(layer, x, positions)
         rep = nh // nkv
         out = torch.zeros(T, nh, d, dtype=F64)
@@ -302,7 +304,7 @@ class Reference:
         T, H = x.shape[0], self.H
         q = self.bf16_linear(x, p + "query", (nh * d, H)).reshape(T, nh, d)
         raw = self.bf16_linear(x, p + "key", (d, H))  # [T, d], cached in BF16
-        q = rope(rmsnorm(q, 1.0 + self.p(p + "query_norm", (d,)), self.eps), positions, self.theta, self.rotary)
+        q = self.round(rope(rmsnorm(q, 1.0 + self.p(p + "query_norm", (d,)), self.eps), positions, self.theta, self.rotary))
         key_norm = 1.0 + self.p(p + "key_norm", (d,))
         out = []
         for t in range(T):
@@ -313,7 +315,7 @@ class Reference:
                 pooled = self.round(raw[: blocks * ratio].reshape(blocks, ratio, d).mean(1))
                 pooled = rmsnorm(pooled, key_norm, self.eps)
                 starts = positions[torch.arange(blocks) * ratio]
-                pooled = rope(pooled[:, None, :], starts, self.theta, self.rotary)[:, 0]
+                pooled = self.round(rope(pooled[:, None, :], starts, self.theta, self.rotary))[:, 0]
                 scores = torch.relu(q[t] @ pooled.T).sum(0) / math.sqrt(d)
                 count = min(budget, blocks)
                 order = sorted(range(blocks), key=lambda b: (-float(scores[b]), b))[:count]
@@ -382,7 +384,8 @@ class Reference:
         span = (taps - 1) * dilation
         padded_in = torch.cat((torch.zeros(span, W, dtype=F64), normed), dim=0)
         conv = sum(kernel[:, j][None, :] * padded_in[j * dilation : j * dilation + T] for j in range(taps))
-        return self.round(self.round(gated) + silu(conv)), rows
+        # The contribution keeps the gated operand's BF16 boundary; the caller's residual add rounds once.
+        return self.round(gated) + silu(conv), rows
 
     # -- embedding and head
     def embed(self, ids: list[int]) -> torch.Tensor:
@@ -429,20 +432,29 @@ class Reference:
         return record
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--volume", type=Path, help="the n-gram volume (default: ARTIFACT.ngram)")
     parser.add_argument("--tokens", required=True, help="comma-separated token ids")
     parser.add_argument("--layers", type=int, help="stop after this many layers (no logits)")
-    parser.add_argument("--no-bf16-boundaries", action="store_true")
+    parser.add_argument(
+        "--bf16-boundaries",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="round the activations the engine stores in BF16 (default: on)",
+    )
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--out", type=Path, required=True)
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
     ids = [int(v) for v in args.tokens.split(",") if v]
-    ref = Reference(args.artifact, volume=args.volume, bf16_boundaries=not args.no_bf16_boundaries)
+    ref = Reference(args.artifact, volume=args.volume, bf16_boundaries=args.bf16_boundaries)
     record = ref.forward(ids, layers=args.layers)
     arrays = {"tokens": np.array(ids, dtype=np.int64), "final_residual": record["final_residual"]}
     if "logits" in record:

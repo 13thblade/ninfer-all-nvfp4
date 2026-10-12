@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -55,6 +56,18 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("offloaded_sparse_moe: ") + message); }
 }
 
+// CUDA grid limits: x takes up to 2^31-1 blocks, y and z up to 65535.
+constexpr std::int64_t kGridMaxX = 2147483647;
+constexpr std::int64_t kGridMaxY = 65535;
+
+// ceil(n / per_block) blocks, computed in 64 bits and checked against the dimension's limit, so a
+// launch extent never wraps as a signed int and never exceeds what the hardware accepts.
+unsigned grid_blocks(std::int64_t n, std::int64_t per_block, std::int64_t limit, const char* message) {
+    const std::int64_t blocks = n > 0 ? (n + per_block - 1) / per_block : 0;
+    require(blocks >= 1 && blocks <= limit, message);
+    return static_cast<unsigned>(blocks);
+}
+
 void check_launch(const char* what) {
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
@@ -62,7 +75,11 @@ void check_launch(const char* what) {
     }
 }
 
-bool contiguous(const Tensor& t, DType dtype) { return t.data != nullptr && t.dtype == dtype && t.is_contiguous(); }
+// Every tensor of this Op is a contiguous matrix or vector: a non-unit third or fourth extent would
+// be silently truncated by the kernels, so it is rejected.
+bool contiguous(const Tensor& t, DType dtype) {
+    return t.data != nullptr && t.dtype == dtype && t.is_contiguous() && t.ne[2] == 1 && t.ne[3] == 1;
+}
 
 // The record geometry the kernels read (offloaded_moe::RecordGeometry, device-copyable).
 struct Geometry {
@@ -341,25 +358,24 @@ __global__ void __launch_bounds__(kDispatchThreads)
     const int i = threadIdx.x;
     count[i]    = 0;
     __syncthreads();
-    const int id = i < entries ? ids[i] : 0;
-    if (i < entries) {
-        atomicAdd(&count[id], 1);
-        if (route_log != nullptr) { route_log[i] = id; }
-    }
+    const int id     = i < entries ? ids[i] : 0;
+    const bool valid = i < entries && id >= 0 && id < experts;
+    if (i < entries && route_log != nullptr) { route_log[i] = id; }
+    if (valid) { atomicAdd(&count[id], 1); }
     __syncthreads();
     const int c = count[i];
     if (i < experts) { dispatch.counts[i] = c; }
     dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
     __syncthreads();
-    if (i < entries) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
+    if (valid) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
 }
 
-__global__ void count_kernel(const std::int32_t* __restrict__ ids, int entries, std::int32_t* __restrict__ counts,
-                             std::int32_t* __restrict__ route_log) {
+__global__ void count_kernel(const std::int32_t* __restrict__ ids, int entries, int experts,
+                             std::int32_t* __restrict__ counts, std::int32_t* __restrict__ route_log) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < entries) {
         const int id = ids[i];
-        atomicAdd(&counts[id], 1);
+        if (id >= 0 && id < experts) { atomicAdd(&counts[id], 1); }
         if (route_log != nullptr) { route_log[i] = id; }
     }
 }
@@ -373,10 +389,12 @@ __global__ void __launch_bounds__(kDispatchThreads)
     dispatch_scan(e < experts ? counts[e] : 0, experts, offsets, cursor, jobs, job_count, warp_totals);
 }
 
-__global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries, std::int32_t* __restrict__ cursor,
-                               std::int32_t* __restrict__ out) {
+__global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries, int experts,
+                               std::int32_t* __restrict__ cursor, std::int32_t* __restrict__ out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < entries) { out[atomicAdd(&cursor[ids[i]], 1)] = i; }
+    if (i >= entries) { return; }
+    const int id = ids[i];
+    if (id >= 0 && id < experts) { out[atomicAdd(&cursor[id], 1)] = i; }
 }
 
 // --------------------------------------------------------------------------------------- experts
@@ -902,8 +920,9 @@ __global__ void __launch_bounds__(kThreads)
 __global__ void combine_kernel(const bf16* __restrict__ outputs, const float* __restrict__ weights,
                                const float* __restrict__ shared_gate, const bf16* __restrict__ shared, int hidden,
                                int top_k, int columns, bf16* __restrict__ y) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
+    // Columns ride gridDim.x (2^31-1 limit); hidden tiles ride gridDim.y (65535 limit, never reached).
+    const int d = blockIdx.y * blockDim.x + threadIdx.x;
+    const int t = blockIdx.x;
     if (d >= hidden || t >= columns) { return; }
     float sum = 0.0F;
     for (int k = 0; k < top_k; ++k) { // fixed slot order
@@ -959,7 +978,8 @@ void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cu
     require(routing.ids.ne[0] == top_k && routing.ids.ne[1] == columns && routing.weights.ne[0] == top_k &&
                 routing.weights.ne[1] == columns && routing.shared_gate.numel() == columns,
             "route output shapes disagree");
-    route_kernel<<<(columns + kWarps - 1) / kWarps, kThreads, 0, stream>>>(
+    route_kernel<<<grid_blocks(columns, kWarps, kGridMaxX, "route columns exceed the launch grid"), kThreads, 0,
+                   stream>>>(
         static_cast<const float*>(logits.data), experts, columns, top_k, static_cast<std::int32_t*>(routing.ids.data),
         static_cast<float*>(routing.weights.data), static_cast<float*>(routing.shared_gate.data));
     check_launch("route");
@@ -986,6 +1006,9 @@ MoeDispatch carve_moe_dispatch(void* base, std::int32_t experts, std::int32_t en
 void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch, std::int32_t* route_log,
                   cudaStream_t stream) {
     require(experts > 0 && experts <= kDispatchThreads, "dispatch supports up to 1024 experts");
+    require(contiguous(routing.ids, DType::I32), "dispatch requires contiguous I32 ids");
+    require(routing.ids.numel() > 0 && routing.ids.numel() <= std::numeric_limits<int>::max(),
+            "dispatch entries must be in [1, INT_MAX]");
     const int entries = static_cast<int>(routing.ids.numel());
     const auto* ids   = static_cast<const std::int32_t*>(routing.ids.data);
     if (entries <= kDispatchThreads) {
@@ -995,13 +1018,13 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
     }
     require(cudaMemsetAsync(dispatch.counts, 0, sizeof(std::int32_t) * experts, stream) == cudaSuccess,
             "dispatch could not clear its counts");
-    count_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(ids, entries, dispatch.counts, route_log);
+    const unsigned entry_blocks = grid_blocks(entries, kThreads, kGridMaxX, "dispatch entries exceed the launch grid");
+    count_kernel<<<entry_blocks, kThreads, 0, stream>>>(ids, entries, experts, dispatch.counts, route_log);
     check_launch("count");
     scan_kernel<<<1, kDispatchThreads, 0, stream>>>(dispatch.counts, experts, dispatch.offsets, dispatch.cursor,
                                                     dispatch.jobs, dispatch.job_count);
     check_launch("scan");
-    scatter_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(ids, entries, dispatch.cursor,
-                                                                                 dispatch.entries);
+    scatter_kernel<<<entry_blocks, kThreads, 0, stream>>>(ids, entries, experts, dispatch.cursor, dispatch.entries);
     check_launch("scatter");
 }
 
@@ -1097,11 +1120,20 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
     require(contiguous(outputs, DType::BF16) && contiguous(shared, DType::BF16) && contiguous(y, DType::BF16) &&
                 contiguous(routing.weights, DType::FP32) && contiguous(routing.shared_gate, DType::FP32),
             "combine requires contiguous BF16 tensors and FP32 routing");
-    const int hidden = y.ne[0], columns = y.ne[1], top_k = routing.weights.ne[0];
+    const std::int64_t hidden64 = y.ne[0], columns64 = y.ne[1], top_k64 = routing.weights.ne[0];
+    require(top_k64 >= 1 && top_k64 <= 16, "combine supports top_k in [1, 16]");
+    require(hidden64 > 0 && hidden64 <= std::numeric_limits<int>::max() && columns64 > 0 &&
+                columns64 * top_k64 <= std::numeric_limits<int>::max(),
+            "combine dimensions out of range");
+    const int hidden = static_cast<int>(hidden64), columns = static_cast<int>(columns64),
+              top_k = static_cast<int>(top_k64);
     require(outputs.ne[0] == hidden && outputs.ne[1] == columns * top_k && shared.ne[0] == hidden &&
-                shared.ne[1] == columns && routing.weights.ne[1] == columns,
+                shared.ne[1] == columns && routing.weights.ne[1] == columns &&
+                routing.shared_gate.numel() == columns,
             "combine shapes disagree");
-    combine_kernel<<<dim3((hidden + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
+    const dim3 grid(grid_blocks(columns, 1, kGridMaxX, "combine columns exceed the launch grid"),
+                    grid_blocks(hidden, kThreads, kGridMaxY, "combine hidden extent exceeds the launch grid"));
+    combine_kernel<<<grid, kThreads, 0, stream>>>(
         static_cast<const bf16*>(outputs.data), static_cast<const float*>(routing.weights.data),
         static_cast<const float*>(routing.shared_gate.data), static_cast<const bf16*>(shared.data), hidden, top_k,
         columns, static_cast<bf16*>(y.data));

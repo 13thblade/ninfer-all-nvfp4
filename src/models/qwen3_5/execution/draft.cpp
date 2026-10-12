@@ -71,14 +71,16 @@ DFlashFeatureSink prefill_feature_sink_impl(PrefillContext& state,
     }
 }
 
-DFlashFeatureSink batch_feature_sink_impl(DFlashBatchContext& state, const Tensor& lanes,
-                                          const Tensor& valid_columns, std::int32_t width,
-                                          std::int32_t batch_size) {
+// `features` is the [D, width, lanes] logical view of the widest pending-feature buffer (slice
+// dimension 1; it keeps the allocated lane and column strides).
+DFlashFeatureSink batch_feature_sink_impl(DFlashBatchContext& state, Tensor& features,
+                                          const Tensor& lanes, const Tensor& valid_columns,
+                                          std::int32_t width, std::int32_t batch_size) {
     {
         const auto& target = state.execution.parameters.model.config().text;
         const auto& config = *state.execution.parameters.model.config().draft;
         return DFlashFeatureSink{
-            .batch_features      = &dflash_state(state).pending_features,
+            .batch_features      = &features,
             .batch_lanes         = &lanes,
             .batch_valid_columns = &valid_columns,
             .batch_width         = width,
@@ -562,6 +564,51 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
     }
 }
 
+// Copies `rows` rows of `from_steps` dense steps of `step_bytes` each to the leading steps of rows
+// of `to_steps`. Both views share the frame's storage, so the rows pass through a workspace copy.
+void spread_proposal_plane(WorkspaceArena& work, const void* from, void* to, std::size_t step_bytes,
+                           std::uint32_t from_steps, std::uint32_t to_steps, std::int32_t rows,
+                           cudaStream_t stream) {
+    const std::size_t from_row = step_bytes * from_steps;
+    const std::size_t to_row   = step_bytes * to_steps;
+    const DeviceSpan staging   = work.alloc_bytes(from_row * static_cast<std::size_t>(rows));
+    CUDA_CHECK(
+        cudaMemcpyAsync(staging.data, from, staging.bytes, cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(to, to_row, staging.data, from_row, from_row,
+                                 static_cast<std::size_t>(rows), cudaMemcpyDeviceToDevice, stream));
+}
+
+// The draft model's block of `state.neural_drafts` for every row, laid out as the `k`-draft round
+// `frame` reads it: row r's proposal in its leading columns, the rest unread (each row's extent
+// bounds verification). At equal width the proposal is written straight into the frame.
+void propose_beside_copies(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
+                           std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {
+    const std::uint32_t neural = state.neural_drafts;
+    if (neural == 0 || neural > k) {
+        throw std::logic_error("a batched copy round needs a neural block within its width");
+    }
+    if (neural == k) {
+        // A copy family as wide as the neural window: the proposal already fills the frame.
+        propose_batch_impl(state, frame, batch_size, k, envelopes);
+        return;
+    }
+    qwen3_5::DFlashDecodeState proposal = state.frame.narrowed(neural);
+    propose_batch_impl(state, proposal, batch_size, neural, envelopes);
+    auto& work                = state.execution.work;
+    const cudaStream_t stream = state.execution.device.stream;
+    work.reset();
+    spread_proposal_plane(work, proposal.draft_tokens.data, frame.draft_tokens.data,
+                          sizeof(TokenId), neural, k, batch_size, stream);
+    if (frame.candidate_ids.data) {
+        const auto candidates = static_cast<std::size_t>(frame.candidate_ids.ne[0]);
+        spread_proposal_plane(work, proposal.candidate_ids.data, frame.candidate_ids.data,
+                              candidates * sizeof(TokenId), neural, k, batch_size, stream);
+        spread_proposal_plane(work, proposal.proposal_q.data, frame.proposal_q.data,
+                              candidates * sizeof(float), neural, k, batch_size, stream);
+    }
+    work.reset();
+}
+
 auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               DFlashEnvelopes envelopes,
                               ops::CausalAttentionExecutionEnvelope target_envelope,
@@ -572,12 +619,17 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             throw std::logic_error("DFlash decode batch state is incomplete");
         }
         state.execution.work.reset();
-        qwen3_5::DFlashDecodeState& frame = state.frame;
-        const std::int32_t width          = static_cast<std::int32_t>(k) + 1;
+        // Forward and Finish derive the same view of the frame at the round's width, so Finish
+        // reads what Forward wrote.
+        qwen3_5::DFlashDecodeState frame = state.frame.narrowed(k);
+        const std::int32_t width         = static_cast<std::int32_t>(k) + 1;
         if (phase == SpeculativePhase::Forward) {
-            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
-                                       sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       state.execution.device.stream));
+            // Only a copy round transfers the copy fields at the ingress tail.
+            const std::size_t ingress_bytes = state.copy_round
+                                                  ? sizeof(qwen3_5::DFlashDecodeIngress)
+                                                  : qwen3_5::kDFlashDecodeIngressNeuralBytes;
+            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress, ingress_bytes,
+                                       cudaMemcpyHostToDevice, state.execution.device.stream));
         }
 
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
@@ -606,17 +658,43 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
 
         if (phase == SpeculativePhase::Forward) {
             state.execution.work.reset();
-            Tensor compact_features = state.execution.work.alloc(
+            // Catch-up appends the previous round's columns at this round's width; a wider previous
+            // round was caught up before this one started.
+            const std::int32_t append_width = frame.append_positions.ne[0];
+            Tensor compact_features         = state.execution.work.alloc(
                 DType::BF16,
-                {dimension(state.execution.parameters.draft->feature_projection.weight.k), width,
-                 batch_size});
+                {dimension(state.execution.parameters.draft->feature_projection.weight.k),
+                         append_width, batch_size});
             ops::prepare_ragged_prefix(
-                dflash_state(state).pending_features, active_lanes, context_starts, frontiers,
-                compact_features, append_positions, append_counts, state.execution.device.stream);
+                dflash_state(state).pending_features.slice(1, 0, append_width), active_lanes,
+                context_starts, frontiers, compact_features, append_positions, append_counts,
+                state.execution.device.stream);
             append_context_impl(state, compact_features, append_positions, append_counts,
                                 state_destinations, dflash_rows, envelopes.append);
 
-            propose_batch_impl(state, frame, batch_size, k, envelopes);
+            if (state.copy_round) {
+                // A copy round verifies each flagged row's copy instead of a proposal; DFlash2's
+                // sparse verifier reads it as a one-hot law. At batch one the draft model does
+                // not run. Above it the draft model proposes its own block for every row
+                // (Infernix 760d09b0), which is spread into the leading columns of the wider
+                // frame, and the copies then replace the flagged rows.
+                if (batch_size > 1) {
+                    propose_beside_copies(state, frame, batch_size, k, envelopes);
+                }
+                Tensor copy_rows   = frame.copy_rows.slice(0, 0, batch_size);
+                Tensor copy_drafts = frame.copy_drafts.slice(1, 0, batch_size);
+                Tensor candidates  = frame.candidate_ids.data
+                                         ? frame.candidate_ids.slice(2, 0, batch_size)
+                                         : Tensor{};
+                Tensor proposal_q =
+                    frame.proposal_q.data ? frame.proposal_q.slice(2, 0, batch_size) : Tensor{};
+                ops::speculative_overlay_copy_proposals(
+                    copy_rows, copy_drafts, drafts, candidates, proposal_q,
+                    dimension(state.execution.parameters.model.resources().public_token_count),
+                    state.execution.device.stream);
+            } else {
+                propose_batch_impl(state, frame, batch_size, k, envelopes);
+            }
             const auto draft_count = static_cast<std::size_t>(k) * batch_size;
             if (state.host_drafts.size() < draft_count) {
                 throw std::logic_error("DFlash host draft buffer is too small");
@@ -638,8 +716,11 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_stage_runtime(state.execution.stages);
-        DFlashFeatureSink sink =
-            batch_feature_sink_impl(state, active_lanes, valid_columns, width, batch_size);
+        // pending_features stays allocated at the widest round (catch-up reads it at that width);
+        // a narrower round captures into the leading `width` columns of each lane.
+        Tensor pending_features = dflash_state(state).pending_features.slice(1, 0, width);
+        DFlashFeatureSink sink  = batch_feature_sink_impl(state, pending_features, active_lanes,
+                                                          valid_columns, width, batch_size);
         {
             nvtx::ScopedRange target_range(nvtx::Name::DecodeDFlashTarget, nvtx::Category::DFlash,
                                            static_cast<std::uint64_t>(width) * batch_size);

@@ -1,6 +1,7 @@
 #include "serve/serve_options.h"
 
 #include <algorithm>
+#include "product/reasoning_loop_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -45,6 +46,19 @@ std::uint64_t parse_u64(const char* text, const char* label) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
     return static_cast<std::uint64_t>(value);
+}
+
+// A whole-MiB option as bytes. The planners add these to other byte counts, convert them to signed
+// 64-bit and divide them into 32-bit frame counts, so the value is bounded to 1 TiB (far above any
+// real headroom or cache size) rather than to the 64-bit byte range.
+constexpr std::uint64_t kMaxMibOption = 1ULL << 20;
+
+std::uint64_t parse_mib_bytes(const char* text, const char* label) {
+    const std::uint64_t mib = parse_u64(text, label);
+    if (mib > kMaxMibOption) {
+        throw std::invalid_argument(std::string("--") + label + " is out of range");
+    }
+    return mib << 20U;
 }
 
 std::size_t parse_host_context_mib(const char* text) {
@@ -145,7 +159,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N] "
+           "[--ngram-draft-tokens 0|15] [--ngram-min-match N] "
            "[--default-max-tokens N] [--max-output-tokens N] [--default-thinking-budget N] "
+           "[--reasoning-loop off|stop|conclude] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
            "[--ngram-volume FILE] [--expert-state FILE|--no-expert-state] [--vram-headroom-mib N] "
@@ -154,7 +170,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16] "
            "[--mlp-a8-decode] [--no-prefill-a8] "
-           "[--prefill-cublas [--no-prefill-cublas-projections]] [--lookup-ngram N] "
+           "[--prefill-cublas [--no-prefill-cublas-projections]] "
            "[--no-thinking] [--preserve-thinking] [--graft NAME=PATH]... [--default-graft NAME] "
            "[--reasoning-effort minimal|low|medium|high|xhigh|max] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -186,9 +202,6 @@ std::string serve_usage_text(const char* argv0) {
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
            "input projections off that route\n"
-           "       --lookup-ngram N adds context-lookup drafting alongside --spec: the last N tokens "
-           "are matched against the sequence so far and what followed is proposed; it is exact, and "
-           "0 (the default) disables it\n"
            "       Qwen3.8-Flash-Next (one request at a time, --kv-dtype int8, no prefix reuse): "
            "--ngram-volume FILE is its n-gram table (default <model>.ngram); --expert-state FILE "
            "keeps the VRAM expert cache's state across restarts (default <model>.expert-state; "
@@ -197,6 +210,13 @@ std::string serve_usage_text(const char* argv0) {
            "--ram-headroom-mib N is the RAM left free for Windows once every expert is pinned "
            "(default 2048; startup refuses when it cannot be kept); --expert-cache-mib N caps the "
            "expert cache (for measurement)\n"
+           "       --ngram-draft-tokens 15 adds n-gram copy drafting beside --spec dflash2: when the "
+           "text being written already appeared in the request (a tool result, the prompt or the "
+           "output so far), a round verifies up to 15 copied tokens instead of the draft model's "
+           "proposal; verification licenses every token, so a wrong copy costs speed, never "
+           "output. 0 (the default) disables it. "
+           "--ngram-min-match N (4..64, default 12) is how many tokens must match before a copy "
+           "is proposed\n"
            "       --no-prefix-reuse disables cross-request history; request pause/replay "
            "resources remain available\n"
            "       --context-store DIR keeps retained sessions on disk so a restart or crash does "
@@ -236,6 +256,10 @@ std::string serve_usage_text(const char* argv0) {
            "--media-cache-mib and --media-live-mib\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
+           "       --reasoning-loop off (default), stop or conclude: every 512 thinking tokens, "
+           "check whether 25% of the last 2,000 words repeat 12-word passages seen 3 times; stop "
+           "ends the reply as length, conclude closes the thinking with the early-close guidance "
+           "and lets the model answer\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       --graft NAME=PATH loads a phantom-kv prefill graft (a safetensors container with a "
            ".json sidecar beside it); a request selecting it with \"graft\": \"NAME\" runs as if the "
@@ -461,6 +485,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--ngram-draft-tokens") {
+            options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));
+        } else if (arg == "--ngram-min-match") {
+            options.speculative.ngram_min_match = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--ngram-min-match"), "ngram-min-match"));
         } else if (arg == "--max-output-tokens") {
             options.max_output_tokens =
                 parse_nonnegative_int(require_value("--max-output-tokens"), "max-output-tokens");
@@ -474,6 +504,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--default-thinking-budget is out of range");
             }
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
+        } else if (arg == "--reasoning-loop") {
+            options.reasoning_loop =
+                product::parse_reasoning_loop_action(require_value("--reasoning-loop"));
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--vision-residency") {
@@ -505,13 +538,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.save_expert_state = false;
         } else if (arg == "--vram-headroom-mib") {
             options.flash_next.vram_headroom_bytes =
-                parse_u64(require_value("--vram-headroom-mib"), "vram-headroom-mib") << 20U;
+                parse_mib_bytes(require_value("--vram-headroom-mib"), "vram-headroom-mib");
         } else if (arg == "--ram-headroom-mib") {
             options.flash_next.ram_headroom_bytes =
-                parse_u64(require_value("--ram-headroom-mib"), "ram-headroom-mib") << 20U;
+                parse_mib_bytes(require_value("--ram-headroom-mib"), "ram-headroom-mib");
         } else if (arg == "--expert-cache-mib") {
             options.flash_next.expert_cache_bytes =
-                parse_u64(require_value("--expert-cache-mib"), "expert-cache-mib") << 20U;
+                parse_mib_bytes(require_value("--expert-cache-mib"), "expert-cache-mib");
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--context-store") {
@@ -575,9 +608,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.mlp_a8_decode = true;
         } else if (arg == "--no-prefill-a8") {
             options.prefill_a8 = false;
-        } else if (arg == "--lookup-ngram") {
-            options.speculative.lookup_ngram = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--lookup-ngram"), "lookup-ngram"));
         } else if (arg == "--prefill-cublas") {
             options.prefill_cublas = true;
         } else if (arg == "--no-prefill-cublas-projections") {

@@ -161,23 +161,72 @@ int main() {
     // Every one of these parses without error whether or not the service carries it to the Engine,
     // so the mapping from parsed options to Engine options is what has to be checked.
     const ninfer::EngineOptions default_engine = make_engine_options(defaults);
-    failures += check(!default_engine.prefill_cublas && default_engine.prefill_cublas_projections &&
-                          default_engine.speculative.lookup_ngram == 0,
-                      "the cuBLAS prefill route or context lookup is on by default in serving");
+    failures += check(!default_engine.prefill_cublas && default_engine.prefill_cublas_projections,
+                      "the cuBLAS prefill route is on by default in serving");
     const ServeOptions route =
         parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
-               "--lookup-ngram", "5", "--prefill-cublas", "--no-prefill-cublas-projections"});
+               "--prefill-cublas", "--no-prefill-cublas-projections"});
     const ninfer::EngineOptions route_engine = make_engine_options(route);
-    failures += check(route_engine.speculative.lookup_ngram == 5 &&
-                          route_engine.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+    failures += check(route_engine.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
                           route_engine.speculative.draft_tokens == 3,
-                      "--lookup-ngram did not reach the Engine options next to --spec");
+                      "--spec and --draft-tokens did not reach the Engine options");
     failures += check(route_engine.prefill_cublas && !route_engine.prefill_cublas_projections,
                       "the cuBLAS prefill controls did not reach the Engine options");
-    for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections", "--lookup-ngram"}) {
+    for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections"}) {
         failures += check(kv_help.find(flag) != std::string::npos,
-                          "serve help omits an accepted prefill or drafting control");
+                          "serve help omits an accepted prefill control");
     }
+    // N-gram copy drafting: 0 or 15 beside DFlash2 at one lane, carried into the Engine options.
+    const ServeOptions ngram =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+               "--ngram-draft-tokens", "15", "--ngram-min-match", "16"});
+    const ninfer::EngineOptions ngram_engine = make_engine_options(ngram);
+    failures += check(ngram_engine.speculative.ngram_draft_tokens == 15 &&
+                          ngram_engine.speculative.ngram_min_match == 16 &&
+                          default_engine.speculative.ngram_draft_tokens == 0 &&
+                          default_engine.speculative.ngram_min_match == 12,
+                      "the n-gram copy controls did not reach the Engine options");
+    failures += check(kv_help.find("--ngram-draft-tokens") != std::string::npos &&
+                          kv_help.find("--ngram-min-match") != std::string::npos,
+                      "serve help omits the n-gram copy controls");
+    const auto serve_rejects = [&](std::vector<std::string> arguments, const char* fragment) {
+        try {
+            (void)parse(std::move(arguments));
+        } catch (const std::invalid_argument& error) {
+            return std::string(error.what()).find(fragment) != std::string::npos;
+        }
+        return false;
+    };
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                     "--draft-tokens", "7", "--ngram-draft-tokens", "31"},
+                                    "31, 63"),
+                      "serve accepted a copy window other than 15, or did not name the wider ones");
+    // 2^44 MiB shifted by 20 bits wraps a uint64_t to 0; it must be refused, not wrapped.
+    for (const char* flag : {"--vram-headroom-mib", "--ram-headroom-mib", "--expert-cache-mib"}) {
+        failures += check(serve_rejects({"ninfer-serve", "model.ninfer", flag, "17592186044416"}, "out of range"),
+                          "a MiB flag accepted a value whose byte count wraps");
+    }
+    // Above 1 TiB the planners' signed and 32-bit frame-count arithmetic is no longer safe.
+    for (const char* flag : {"--vram-headroom-mib", "--ram-headroom-mib", "--expert-cache-mib"}) {
+        failures += check(serve_rejects({"ninfer-serve", "model.ninfer", flag, "1048577"}, "out of range"),
+                          "a MiB flag accepted a value above the planners' arithmetic domain");
+    }
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--ngram-draft-tokens", "15"},
+                                    "--spec dflash2"),
+                      "serve accepted n-gram copy drafting without DFlash2");
+    const auto ngram_lanes =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+               "--ngram-draft-tokens", "15", "--max-concurrency", "2"});
+    failures +=
+        check(ngram_lanes.speculative.ngram_draft_tokens == 15 && ngram_lanes.max_concurrency == 2,
+              "serve rejected n-gram copy drafting above one lane");
+    // The MTP-only context lookup was removed with no alias; n-gram copy drafting replaces it.
+    bool lookup_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--lookup-ngram", "5"});
+    } catch (const std::invalid_argument&) { lookup_rejected = true; }
+    failures += check(lookup_rejected && kv_help.find("--lookup-ngram") == std::string::npos,
+                      "serve still accepts or advertises the removed --lookup-ngram");
 
     // rk8v4 still parses to its storage value; the engine rejects it in
     // target_kv_cache_profile so the failure names the unported feature rather than an
@@ -212,6 +261,22 @@ int main() {
         (void)parse({"ninfer-serve", "model.ninfer", "--default-thinking-budget", "0"});
     } catch (const std::invalid_argument&) { zero_thinking_budget_rejected = true; }
     failures += check(zero_thinking_budget_rejected, "zero --default-thinking-budget was accepted");
+
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).reasoning_loop ==
+                          ninfer::ReasoningLoopAction::Off,
+                      "the reasoning-loop guard is not off by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--reasoning-loop", "stop"})
+                                  .reasoning_loop == ninfer::ReasoningLoopAction::Stop &&
+                          parse({"ninfer-serve", "model.ninfer", "--reasoning-loop", "conclude"})
+                                  .reasoning_loop == ninfer::ReasoningLoopAction::Conclude &&
+                          parse({"ninfer-serve", "model.ninfer", "--reasoning-loop", "off"})
+                                  .reasoning_loop == ninfer::ReasoningLoopAction::Off,
+                      "--reasoning-loop did not select its action");
+    bool bad_reasoning_loop_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--reasoning-loop", "on"});
+    } catch (const std::invalid_argument&) { bad_reasoning_loop_rejected = true; }
+    failures += check(bad_reasoning_loop_rejected, "--reasoning-loop on was accepted");
 
     bool empty_model_id_rejected = false;
     try {

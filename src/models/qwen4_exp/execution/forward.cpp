@@ -44,10 +44,12 @@ void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceA
 }
 
 // Two projections of one input: one linear_pair launch for decode-width calls over GGML weights
-// (the same outputs as two linears, bit for bit), else two linears.
+// (the same outputs as two linears, bit for bit) when both policies admit A8 (the only GGML profile;
+// linear() rejects A16Only for them, so the pair must not bypass that), else two linears.
 void project_pair(const Tensor& x, const LinearParameters& a, const LinearParameters& b, Tensor& out_a, Tensor& out_b,
                   WorkspaceArena& work, cudaStream_t s) {
-    if (x.ne[1] <= 8 && a.weight.layout == QuantLayout::GgmlBlocks && b.weight.layout == QuantLayout::GgmlBlocks) {
+    if (x.ne[1] <= 8 && a.weight.layout == QuantLayout::GgmlBlocks && b.weight.layout == QuantLayout::GgmlBlocks &&
+        ops::allows_a8(a.policy) && ops::allows_a8(b.policy)) {
         ops::linear_pair(x, a.weight, b.weight, out_a, out_b, s);
         return;
     }
