@@ -2,17 +2,22 @@
 // Modified for NInfer-3090: binds the converter's GGUF-mirroring parameters (GGML block-format
 // projections, BF16 gamma attention norms, FP32 multiplier hyper-connection and PLE norms) and
 // ggml_expert_record_v1 banks in pinned host memory, and on request the MTP drafter (BF16
-// projections, its Q2_0 expert bank in device memory); no expert scales, vision, proposal head or
-// SSD tier; the frontend resources are the Qwen3.5 frontend's.
+// projections, its Q2_0 expert bank in device memory) and the vision tower (Qwen3.5's parameters,
+// pinned after the banks in Qwen3.5's overlay groups); no expert scales, proposal head or SSD tier;
+// the frontend resources are the Qwen3.5 frontend's.
 
 #include "models/qwen4_exp/model.h"
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
 #include "artifact/views.h"
+#include "models/qwen3_5/vision_config.h"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <array>
+#include <limits>
 #include <map>
 #include <string_view>
 #include <string>
@@ -184,6 +189,119 @@ bool has_mtp_component(const artifact::Directory& directory) {
     return true;
 }
 
+// The vision tower under Qwen3.5's names, every parameter BF16 in the pinned block. The binding
+// order is the overlay layout's group order (prelude, each layer, merger), so each group's parents
+// are adjacent in the block and one copy stages a group.
+VisionWeights bind_vision(Bindings& b, const qwen3_5::VisionConfig& config, const TextConfig& text) {
+    const std::uint64_t h = config.hidden_size, intermediate = config.intermediate_size;
+    const auto parameter = [&](std::string name, Shape shape, std::string input) {
+        return b.parameter(std::move(name), std::move(shape), input, QType::BF16, Residency::Pinned);
+    };
+    const auto direct = [&](std::string name, Shape shape) {
+        return b.parameter(std::move(name), std::move(shape), {}, QType::BF16, Residency::Pinned);
+    };
+    VisionWeights out;
+    out.patch_embedding      = parameter("vision/patch_embedding", {h, config.patch_width()}, "vision/patch_input");
+    out.patch_embedding_bias = direct("vision/patch_embedding_bias", {h});
+    out.position_embedding   = direct("vision/position_embedding", {config.num_position_embeddings, h});
+    out.layers.reserve(config.depth);
+    for (std::uint32_t i = 0; i < config.depth; ++i) {
+        const auto p = "vision/layers/" + std::to_string(i) + "/";
+        VisionBlockWeights layer;
+        layer.norm1       = {direct(p + "norm1_weight", {h}), direct(p + "norm1_bias", {h})};
+        layer.norm2       = {direct(p + "norm2_weight", {h}), direct(p + "norm2_bias", {h})};
+        layer.query       = parameter(p + "attention/query", {h, h}, p + "attention_input");
+        layer.key         = parameter(p + "attention/key", {h, h}, p + "attention_input");
+        layer.value       = parameter(p + "attention/value", {h, h}, p + "attention_input");
+        layer.query_bias  = direct(p + "attention/query_bias", {h});
+        layer.key_bias    = direct(p + "attention/key_bias", {h});
+        layer.value_bias  = direct(p + "attention/value_bias", {h});
+        layer.output      = parameter(p + "attention/output", {h, h}, p + "attention_output");
+        layer.output_bias = direct(p + "attention/output_bias", {h});
+        layer.fc1         = parameter(p + "mlp/fc1", {intermediate, h}, p + "mlp_input");
+        layer.fc1_bias    = direct(p + "mlp/fc1_bias", {intermediate});
+        layer.fc2         = parameter(p + "mlp/fc2", {h, intermediate}, p + "mlp_activation");
+        layer.fc2_bias    = direct(p + "mlp/fc2_bias", {h});
+        out.layers.push_back(layer);
+    }
+    const std::uint64_t merger = config.merger_width();
+    out.merger_norm     = {direct("vision/merger/norm_weight", {h}), direct("vision/merger/norm_bias", {h})};
+    out.merger_fc1      = parameter("vision/merger/fc1", {merger, merger}, "vision/merger/input");
+    out.merger_fc1_bias = direct("vision/merger/fc1_bias", {merger});
+    out.merger_fc2      = parameter("vision/merger/fc2", {text.hidden_size, merger}, "vision/merger/activation");
+    out.merger_fc2_bias = direct("vision/merger/fc2_bias", {text.hidden_size});
+    return out;
+}
+
+bool has_vision_component(const artifact::Directory& directory) {
+    return directory.components.find("vision") != directory.components.end();
+}
+
+constexpr std::size_t kStagingAlignment = 256;
+
+std::size_t staging_align(std::size_t bytes) {
+    return (bytes + kStagingAlignment - 1) / kStagingAlignment * kStagingAlignment;
+}
+
+// The pinned extent covering exactly the parents of one group (Qwen3.5's overlay group_range): no
+// other pinned parent may fall inside it, so uploading the extent stages the group and nothing
+// else.
+qwen3_5::PinnedRange group_range(std::span<const WeightId> group, std::span<const BoundWeight> bound,
+                                 std::span<const std::byte> block) {
+    const auto* const base = block.data();
+    std::size_t begin      = std::numeric_limits<std::size_t>::max();
+    std::size_t end        = 0;
+    std::vector<const WeightParent*> members;
+    for (const WeightId id : group) {
+        for (const WeightRegion& part : bound[id.index].view.parts) {
+            const auto* data = part.parent->data;
+            if (data < base || data + part.parent->geometry.bytes > base + block.size()) {
+                throw ArtifactError(bound[id.index].name + ": a vision weight is outside the pinned block");
+            }
+            const auto offset = static_cast<std::size_t>(data - base);
+            begin             = std::min(begin, offset);
+            end               = std::max(end, offset + static_cast<std::size_t>(part.parent->geometry.bytes));
+            members.push_back(part.parent);
+        }
+    }
+    if (members.empty() || end <= begin) { throw ArtifactError("a vision weight group has no pinned weights"); }
+    for (const BoundWeight& weight : bound) {
+        for (const WeightRegion& part : weight.view.parts) {
+            const auto* data = part.parent->data;
+            if (data < base || data >= base + block.size() ||
+                std::find(members.begin(), members.end(), part.parent) != members.end()) {
+                continue;
+            }
+            const auto offset = static_cast<std::size_t>(data - base);
+            if (offset < end && offset + part.parent->geometry.bytes > begin) {
+                throw ArtifactError("a vision weight group interleaves with " + weight.name);
+            }
+        }
+    }
+    return {begin, end - begin};
+}
+
+qwen3_5::VisionOverlayLayout vision_layout(const VisionWeights& w, std::span<const BoundWeight> bound,
+                                           std::span<const std::byte> block) {
+    qwen3_5::VisionOverlayLayout out;
+    const std::array prelude{w.patch_embedding, w.patch_embedding_bias, w.position_embedding};
+    out.prelude = group_range(prelude, bound, block);
+    out.layers.reserve(w.layers.size());
+    for (const VisionBlockWeights& l : w.layers) {
+        const std::array group{l.norm1.weight, l.norm1.bias, l.norm2.weight, l.norm2.bias, l.query, l.key,
+                               l.value, l.query_bias, l.key_bias, l.value_bias, l.output, l.output_bias,
+                               l.fc1, l.fc1_bias, l.fc2, l.fc2_bias};
+        out.layers.push_back(group_range(group, bound, block));
+        out.slot_bytes = std::max(out.slot_bytes, out.layers.back().bytes);
+    }
+    const std::array merger{w.merger_norm.weight, w.merger_norm.bias, w.merger_fc1, w.merger_fc1_bias,
+                            w.merger_fc2, w.merger_fc2_bias};
+    out.merger        = group_range(merger, bound, block);
+    out.staging_bytes = staging_align(out.prelude.bytes) + staging_align(out.merger.bytes) +
+                        2 * staging_align(out.slot_bytes);
+    return out;
+}
+
 PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& prefix) {
     const std::uint64_t h = c.hidden_size, width = c.residual_width(), dim = c.ple.embed_dim;
     const std::string p = prefix + "ple/", input = p + "ngram_embedding";
@@ -249,19 +367,26 @@ ExpertBank expert_bank(const BoundWeight& weight, const TextConfig& c, bool on_d
     return bank;
 }
 
-FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& config) {
-    const auto resource = [&](std::string_view role) {
-        const auto bytes = binder.host_object(binder.resource("text", role));
+FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& config,
+                                 const std::optional<qwen3_5::VisionConfig>& vision) {
+    const auto resource = [&](std::string_view component, std::string_view role) {
+        const auto bytes = binder.host_object(binder.resource(component, role));
         return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     };
     FrontendResources out;
-    out.tokenizer_json         = resource("tokenizer.json");
-    out.tokenizer_config_json  = resource("tokenizer_config.json");
-    out.chat_template_jinja    = resource("chat_template.jinja");
-    out.generation_config_json = resource("generation_config.json");
-    // The shared frontend validates the token domain against the embedding rows.
+    out.tokenizer_json         = resource("text", "tokenizer.json");
+    out.tokenizer_config_json  = resource("text", "tokenizer_config.json");
+    out.chat_template_jinja    = resource("text", "chat_template.jinja");
+    out.generation_config_json = resource("text", "generation_config.json");
+    if (vision) {
+        out.preprocessor_config_json       = resource("vision", "preprocessor_config.json");
+        out.video_preprocessor_config_json = resource("vision", "video_preprocessor_config.json");
+    }
+    // The shared frontend validates the token domain against the embedding rows and the vision
+    // processors' patch geometry against the tower.
     qwen3_5::Config domain;
     domain.text.vocab_size = config.vocab_size;
+    domain.vision          = vision;
     qwen3_5::parse_resources(out, domain);
     return out;
 }
@@ -272,6 +397,8 @@ struct LoadPlan::Impl {
     TextConfig config;
     TextWeights weights;
     std::optional<MtpWeights> mtp;
+    std::optional<VisionWeights> vision;
+    std::optional<qwen3_5::VisionConfig> vision_config;
     std::vector<PendingWeight> pending;
     artifact::MaterializationPlan materialization;
     FrontendResources resources;
@@ -291,10 +418,13 @@ std::uint64_t LoadPlan::pinned_bytes() const { return impl_->materialization.pin
 const std::vector<std::uint64_t>& LoadPlan::expert_record_strides() const { return impl_->strides; }
 
 Model::Model(TextConfig config, TextWeights weights, std::optional<MtpWeights> mtp, std::vector<BoundWeight> bound,
-             std::vector<ExpertBank> banks, std::optional<ExpertBank> mtp_bank, FrontendResources resources,
+             std::vector<ExpertBank> banks, std::optional<ExpertBank> mtp_bank, std::optional<VisionWeights> vision,
+             std::optional<qwen3_5::VisionConfig> vision_config,
+             std::optional<qwen3_5::VisionOverlayLayout> vision_layout, FrontendResources resources,
              InstanceInfo info, artifact::MaterializedArtifact backing)
     : backing_(std::move(backing)), config_(std::move(config)), weights_(std::move(weights)), mtp_(std::move(mtp)),
-      bound_(std::move(bound)), banks_(std::move(banks)), mtp_bank_(std::move(mtp_bank)),
+      bound_(std::move(bound)), banks_(std::move(banks)), mtp_bank_(std::move(mtp_bank)), vision_(std::move(vision)),
+      vision_config_(std::move(vision_config)), vision_layout_(std::move(vision_layout)),
       resources_(std::move(resources)), info_(std::move(info)) {}
 
 Model::~Model() = default;
@@ -303,17 +433,27 @@ bool is_qwen4_exp(const artifact::Reader& reader) { return is_qwen4_exp_config(r
 
 bool has_mtp(const artifact::Reader& reader) { return has_mtp_component(reader.directory()); }
 
-LoadPlan plan_load(const artifact::Reader& reader, bool mtp) {
+bool has_vision(const artifact::Reader& reader) { return has_vision_component(reader.directory()); }
+
+LoadPlan plan_load(const artifact::Reader& reader, bool mtp, bool vision) {
     auto out    = std::make_unique<LoadPlan::Impl>();
     out->config = parse_config(reader.directory());
     if (mtp && !has_mtp_component(reader.directory())) {
         throw ArtifactError("this artifact has no MTP drafter: convert it with --mtp-gguf to use --spec mtp");
     }
+    if (vision) {
+        if (!has_vision_component(reader.directory())) {
+            throw ArtifactError("this artifact has no vision tower: convert it with --mmproj to use --vision");
+        }
+        out->vision_config = qwen3_5::parse_vision_component(reader.directory());
+    }
     artifact::Binder binder(reader);
-    out->resources = bind_resources(binder, out->config);
+    out->resources = bind_resources(binder, out->config, out->vision_config);
     Bindings bindings(binder);
     out->weights         = bind_text(bindings, out->config);
     if (mtp) { out->mtp = bind_mtp(bindings, out->config); }
+    // After the expert banks: the tower's groups follow them in the pinned block.
+    if (vision) { out->vision = bind_vision(bindings, *out->vision_config, out->config); }
     out->pending         = std::move(bindings.weights);
     for (const auto& layer : out->weights.layers) {
         const auto& parts = out->pending.at(layer.moe.experts.index).reference.binding.parts;
@@ -343,13 +483,16 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             throw ArtifactError("mtp: the drafter's experts must be ggml_rec_q2_0_q2_0 records");
         }
     }
+    std::optional<qwen3_5::VisionOverlayLayout> layout;
+    if (p.vision) { layout = vision_layout(*p.vision, bound, backing.pinned_block()); }
     return std::unique_ptr<Model>(new Model(std::move(p.config), std::move(p.weights), std::move(p.mtp), std::move(bound),
-                                            std::move(banks), std::move(mtp_bank), std::move(p.resources),
+                                            std::move(banks), std::move(mtp_bank), std::move(p.vision),
+                                            std::move(p.vision_config), std::move(layout), std::move(p.resources),
                                             std::move(p.info), std::move(backing)));
 }
 
-std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device, bool mtp) {
-    return materialize_model(plan_load(reader, mtp), device);
+std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device, bool mtp, bool vision) {
+    return materialize_model(plan_load(reader, mtp, vision), device);
 }
 
 } // namespace ninfer::models::qwen4_exp

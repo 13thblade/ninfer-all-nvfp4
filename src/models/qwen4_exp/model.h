@@ -2,14 +2,17 @@
 
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/model.h and load.h (Apache-2.0).
 // Modified for NInfer-3090: GGML expert record banks (each layer's record format, no per-expert
-// scales); the MTP drafter's Q2_0 bank in device memory; no expert store or vision. The load is
-// planned first (the RAM ledger reads the plan's pinned bytes before anything is pinned) and then
-// materialized, as Infernix's plan_load.
+// scales); the MTP drafter's Q2_0 bank in device memory; the vision tower pinned in host memory
+// with Qwen3.5's overlay layout (Infernix binds it on the device or overlays it the same way); no
+// expert store. The load is planned first (the RAM ledger reads the plan's pinned bytes before
+// anything is pinned) and then materialized, as Infernix's plan_load.
 
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "models/qwen3_5/config.h"
 #include "models/qwen3_5/frontend/resources.h"
+#include "models/qwen3_5/weights.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/weights.h"
 
@@ -60,7 +63,7 @@ public:
 private:
     explicit LoadPlan(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
-    friend LoadPlan plan_load(const artifact::Reader&, bool);
+    friend LoadPlan plan_load(const artifact::Reader&, bool, bool);
     friend class Model;
     friend std::unique_ptr<class Model> materialize_model(LoadPlan&&, DeviceContext&, const StartupObserver*);
 };
@@ -78,6 +81,14 @@ public:
     // The MTP drafter, when it was loaded (plan_load with mtp).
     [[nodiscard]] const std::optional<MtpWeights>& mtp() const noexcept { return mtp_; }
     [[nodiscard]] const ExpertBank* mtp_bank() const noexcept { return mtp_bank_ ? &*mtp_bank_ : nullptr; }
+    // The vision tower, when it was loaded (plan_load with vision): its config, its parameters in
+    // the pinned host block, and the groups a weight stream stages (Qwen3.5's overlay layout).
+    [[nodiscard]] const std::optional<VisionWeights>& vision() const noexcept { return vision_; }
+    [[nodiscard]] const std::optional<qwen3_5::VisionConfig>& vision_config() const noexcept { return vision_config_; }
+    [[nodiscard]] const std::optional<qwen3_5::VisionOverlayLayout>& vision_layout() const noexcept {
+        return vision_layout_;
+    }
+    [[nodiscard]] std::span<const std::byte> pinned_weights() const noexcept { return backing_.pinned_block(); }
     [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept { return backing_.stats(); }
@@ -85,8 +96,9 @@ public:
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&, const StartupObserver*);
     Model(TextConfig config, TextWeights weights, std::optional<MtpWeights> mtp, std::vector<BoundWeight> bound,
-          std::vector<ExpertBank> banks, std::optional<ExpertBank> mtp_bank, FrontendResources resources,
-          InstanceInfo info, artifact::MaterializedArtifact backing);
+          std::vector<ExpertBank> banks, std::optional<ExpertBank> mtp_bank, std::optional<VisionWeights> vision,
+          std::optional<qwen3_5::VisionConfig> vision_config, std::optional<qwen3_5::VisionOverlayLayout> vision_layout,
+          FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing);
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
     artifact::MaterializedArtifact backing_;
@@ -96,6 +108,9 @@ private:
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBank> banks_;
     std::optional<ExpertBank> mtp_bank_;
+    std::optional<VisionWeights> vision_;
+    std::optional<qwen3_5::VisionConfig> vision_config_;
+    std::optional<qwen3_5::VisionOverlayLayout> vision_layout_;
     FrontendResources resources_;
     InstanceInfo info_;
 };
@@ -106,10 +121,15 @@ private:
 // True when the artifact holds the MTP drafter (component mtp, architecture Qwen4ExpMTP).
 [[nodiscard]] bool has_mtp(const artifact::Reader& reader);
 
+// True when the artifact holds the vision tower (component vision).
+[[nodiscard]] bool has_vision(const artifact::Reader& reader);
+
 // Binds every parameter (dense weights on the device, expert banks in one pinned host block) and
 // the frontend resources, reading nothing but the resources. With `mtp` it binds the MTP drafter
-// too (the artifact must hold it); without, an artifact's drafter is left unread.
-[[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, bool mtp = false);
+// too (the artifact must hold it); without, an artifact's drafter is left unread. With `vision` it
+// binds the vision tower in the pinned block after the expert banks and the frontend's vision
+// resources (the artifact must hold the tower).
+[[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, bool mtp = false, bool vision = false);
 
 // Materializes a plan. Device memory is allocated before the pinned block.
 [[nodiscard]] std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
@@ -117,6 +137,6 @@ private:
 
 // plan_load then materialize_model.
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device,
-                                                bool mtp = false);
+                                                bool mtp = false, bool vision = false);
 
 } // namespace ninfer::models::qwen4_exp

@@ -25,6 +25,20 @@ ninfer_add_test(ninfer_qwen4_exp_mtp_real_test
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_ops ninfer_core)
 set_tests_properties(ninfer_qwen4_exp_mtp_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Host only: a lane's three-axis RoPE positions (media prompts, later tokens at index + delta,
+# pooled-block starts, call and MTP sub-chunk staging) and a call's visual columns.
+ninfer_add_test(ninfer_qwen4_exp_rope_positions_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rope_positions.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_core)
+
+# GPU, real artifact with the vision tower (skips otherwise): the encode the Program runs (the tower
+# streamed from the pinned block through a window) against an independent FP64 oracle on three
+# images, with two negative controls the criterion must reject.
+ninfer_add_test(ninfer_qwen4_exp_vision_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_real.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_ops ninfer_core)
+set_tests_properties(ninfer_qwen4_exp_vision_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # Host only: the expert cache (LFRU against the replay tool's decisions, frames, the controller and
 # the warm-start state file) and the startup memory plans (RAM ledger, VRAM sizing, control law).
 ninfer_add_test(ninfer_qwen4_exp_expert_cache_test

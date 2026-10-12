@@ -4,7 +4,8 @@
 // Modified for NInfer-3090: parameters mirror the GGUF tensors (tools/convert/qwen4_exp.py), so
 // the attention projections and the GDN qkv projection are separate GGML-format parameters rather
 // than one packed parent; the expert banks are ggml_expert_record_v1 parameters with no activation
-// scales (the MTP drafter's Q2_0 records included); no proposal head or vision weights.
+// scales (the MTP drafter's Q2_0 records included); the vision tower keeps Qwen3.5's parameter
+// names (Infernix binds the checkpoint's own); no proposal head.
 
 #include "core/weight_view.h"
 #include "ninfer/ops/linear.h"
@@ -90,6 +91,26 @@ struct MtpWeights {
     HyperConnectionWeights attn_hc, mlp_hc, final_mixer;
     AttentionWeights attention;
     MoeWeights moe; // experts: a ggml_rec_q2_0_q2_0 bank in device memory
+};
+
+// The vision tower (component vision, from the model's mmproj GGUF): Qwen3.5's encoder with its
+// parameter names, every parameter BF16 in pinned host memory, streamed to the device per encode.
+struct VisionNormWeights {
+    WeightId weight, bias;
+};
+
+struct VisionBlockWeights {
+    VisionNormWeights norm1, norm2;
+    WeightId query, key, value, query_bias, key_bias, value_bias;
+    WeightId output, output_bias;
+    WeightId fc1, fc1_bias, fc2, fc2_bias;
+};
+
+struct VisionWeights {
+    WeightId patch_embedding, patch_embedding_bias, position_embedding;
+    std::vector<VisionBlockWeights> layers;
+    VisionNormWeights merger_norm;
+    WeightId merger_fc1, merger_fc1_bias, merger_fc2, merger_fc2_bias;
 };
 
 } // namespace ninfer::models::qwen4_exp
