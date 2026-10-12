@@ -133,10 +133,12 @@ inline float a8_cast(const float* v, int n, std::int8_t* q) {
         for (int j = 0; j < n; ++j) { q[j] = 0; }
         return 0.0F;
     }
-    const auto a       = static_cast<float>(amax);
-    const auto inverse = static_cast<float>(127.0 / static_cast<double>(a));
+    const auto a = static_cast<float>(amax);
+    // A tiny group is scaled by 2^100 first (exact), so 127 / a stays finite.
+    const double scale   = a < 0x1p-100F ? 0x1p+100 : 1.0;
+    const auto inverse = static_cast<float>(127.0 / (static_cast<double>(a) * scale));
     for (int j = 0; j < n; ++j) {
-        const auto r = static_cast<float>(static_cast<double>(v[j]) * static_cast<double>(inverse));
+        const auto r = static_cast<float>(static_cast<double>(v[j]) * scale * static_cast<double>(inverse));
         q[j] = std::isnan(r) ? 0 : r >= 127.0F ? 127 : r <= -127.0F ? -127 : static_cast<std::int8_t>(std::nearbyint(r));
     }
     return static_cast<float>(static_cast<double>(a) / 127.0);

@@ -419,6 +419,22 @@ int main() {
                                                   kEps, x, nullptr, ws, stream);
             } catch (const std::invalid_argument&) { threw = true; }
             check(threw, "a BF16 norm weight is refused");
+            // An invalid policy is refused on a fused shape (1 column) and by the capacity query.
+            const auto bad_policy = static_cast<ninfer::ops::LinearPolicy>(0xFF);
+            Device id(static_cast<std::size_t>(kS) * 4);
+            Tensor inject(id.p, DType::FP32, {kS, 1});
+            threw = false;
+            try {
+                ninfer::ops::hyper_connection_mix(R, w, p.down_w, p.up_w, bad_policy, kS, kRank, kEps, x,
+                                                  &inject, ws, stream);
+            } catch (const std::invalid_argument&) { threw = true; }
+            check(threw, "an invalid LinearPolicy is refused on the fused route");
+            threw = false;
+            try {
+                (void)ninfer::ops::hyper_connection_mix_workspace_capacity_bytes(p.down_w, p.up_w, bad_policy,
+                                                                                 kS, kRank, 1);
+            } catch (const std::invalid_argument&) { threw = true; }
+            check(threw, "an invalid LinearPolicy is refused by the capacity query");
         }
         inject_and_expand(stream);
         cudaStreamDestroy(stream);
