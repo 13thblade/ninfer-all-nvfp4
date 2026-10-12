@@ -1399,8 +1399,9 @@ private:
             const std::uint32_t frames = residency_->frames();
             const auto give = static_cast<std::uint32_t>(
                 std::min<std::uint64_t>(frames, (added + ExpertResidency::kChunkBytes + stride - 1) / stride));
-            // Growth is all or nothing: a failure unmaps what this attempt mapped and refreshes the
-            // frame accounting the resize changed, so the next request starts from a consistent pool.
+            // Growth is all or nothing: a failure unmaps what this attempt mapped and takes back the
+            // frames it gave away (net memory use is then what it was, so the fixed-use ledger needs no
+            // entry), and refreshes the frame accounting the resize changed.
             try {
                 if (!map_kv(target)) {
                     (void)residency_->resize(frames - give, device_.stream, *vram_);
@@ -1413,6 +1414,14 @@ private:
                 const auto keep = plan_.kv.chunks(backed_pages_);
                 for (std::size_t c = 0; c < keep.size(); ++c) {
                     if (!keep[c] && kv_vmm_->mapped(c)) { kv_vmm_->unmap(c); }
+                }
+                // The frames given away for this growth go back, best effort: the chunks above are
+                // free again, and a refusal here only leaves the cache smaller for the controller to regrow.
+                if (residency_->frames() < frames) {
+                    try {
+                        (void)residency_->resize(frames, device_.stream, *vram_);
+                        (void)device_.synchronize_status();
+                    } catch (...) {}
                 }
                 frames_now_ = residency_->frames();
                 pool_now_   = residency_->pool_bytes();
