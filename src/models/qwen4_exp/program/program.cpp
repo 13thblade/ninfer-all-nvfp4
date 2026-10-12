@@ -1464,9 +1464,14 @@ private:
             } catch (...) {
                 (void)device_.synchronize_status();
                 (void)unmap_kv(backed_pages_);
-                try {
-                    (void)residency_->resize(frames, device_.stream, *vram_);
-                } catch (...) {}
+                // The frames given away for this growth go back, best effort: the chunks above are
+                // free again, and a refusal here only leaves the cache smaller for the controller to regrow.
+                if (residency_->frames() < frames) {
+                    try {
+                        (void)residency_->resize(frames, device_.stream, *vram_);
+                        (void)device_.synchronize_status();
+                    } catch (...) {}
+                }
                 frames_now_ = residency_->frames();
                 pool_now_   = residency_->pool_bytes();
                 throw;
