@@ -378,6 +378,20 @@ void iq4_xs_case(std::int32_t n, std::uint32_t seed, bool sampled) {
         } catch (const std::runtime_error&) {}
         check(threw, "iq4_xs N=" + std::to_string(bad_n) + " K=" + std::to_string(bad_k) + " is refused");
     }
+    // An activation view off the 16-byte grid is refused (the Q8_1 cast reads x with uint4 loads).
+    {
+        bool threw = false;
+        auto* dx   = device(std::vector<std::uint16_t>(static_cast<std::size_t>(k) + 1, 0));
+        float* dout = nullptr;
+        cudaMalloc(&dout, sizeof(float) * n);
+        Tensor x(dx + 1, DType::BF16, {k, 1}), out(dout, DType::FP32, {n, 1});
+        try {
+            ninfer::ops::projection_fp32(x, weight, out, nullptr);
+        } catch (const std::invalid_argument&) { threw = true; }
+        cudaFree(dx);
+        cudaFree(dout);
+        check(threw, "iq4_xs refuses a misaligned x");
+    }
     cudaFree(dw);
 }
 
