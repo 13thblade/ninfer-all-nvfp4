@@ -25,7 +25,7 @@ references, `engine-architecture.md`).
 | 11 | Decode (M2 gate): few misses zero-copy (11a), fewer decode-graph nodes and the GGML `linear_pair` (11b), the decode graph split around the n-gram row read and the startup frame retry (11c) | done (measurements below) |
 | 12 | 128K through the elastic KV: growth takes expert frames before it maps (12a, the crash and 128K prefill fix); prefill lending restores the experts it displaced and is sized to the prompt (12b, the decode fix) | done (measurements below) |
 | 13 | MTP speculation: the drafter imported exactly from Strata's `mtp-q2_0.gguf` (13a, `--mtp-gguf`, `ggml_rec_q2_0_q2_0`); Infernix's chained drafts, exact W-column verification and record commit (13b); the draft ceiling and the launcher (13c) | done (spec gate missed, below) |
-| 14 | Vision | not started |
+| 14 | Vision: the tower imported exactly from the model's mmproj GGUF (14a, `--mmproj`, Qwen3.5's vision component); bound pinned in host RAM and encoded through Qwen3.5's streamed tower in a lent window, against an FP64 oracle (14b); M-RoPE positions, the embedding scatter (text and drafter), the Engine, serving and the launcher (14c) | done (below) |
 
 The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
 the six dense formats (PR 3); offloaded_sparse_moe executes the three expert record formats (PR 7).
@@ -411,6 +411,39 @@ MTP 105 / 112 / 107, plain 71 / 70 / 66.
   per round). Fixed 2 drafts is 1-2% faster than either at 1K / 8K, but a fixed depth is a
   measurement switch, not a serving option. The launcher uses ceiling 3 with the `-mtp` artifact.
 
+## PR 14 measurements
+
+Image input, 2026-10-12. RTX 3090, CUDA 12.8, desktop attached; artifact
+`qwen4exp-iq2xs-mtp-vision.ninfer` (41.0 GB, the full artifact verified byte for byte against the
+three GGUFs).
+
+- **Tower against FP64** (`ninfer_qwen4_exp_vision_real_test`, 32 encodes of synthetic images over
+  14 grids from 2 x 2 to 12 x 40 patches, the last 8 under the final criterion): normwise 1.3e-2 to 5.5e-2 on every image the processor can produce (2.0e-1 on a
+  2 x 4 grid it cannot), within the criterion `max(2^-4, 2 E)` where E is the error of the oracle
+  itself with BF16 storage (0.017 to 0.17); the GPU is 1.4e-2 to 3.7e-2 from that BF16 estimate. The
+  tower stores its residual in BF16 and is ill-conditioned with respect to that storage; llama.cpp
+  keeps F32 activations, so Strata's image embeddings sit nearer FP64. Two wrong-mapping controls
+  land at 0.69 to 1.05. The criterion was widened twice after measuring (the PR 14b body has why).
+- **Answers** (example images): "NIFER VISION 731; three; left", "24; right", "2; 3; star", the
+  wallpaper and a 128-token scene description, all correct. MTP and plain greedy ids identical with
+  images in context (185 ids, 88 verification rounds).
+- **Against Strata 0.1.38** (same server requests, greedy): prompt tokens equal wherever both make
+  the same grid (443 / 426 / 538 / 418 / 1,021); llama.cpp caps a 1920 x 1200 image at 1,000 tokens
+  where the processor makes 2,280. Identical answers on 3 of 5 comparable cases; the others diverge
+  at token 10 ("three" / "3") and 17 ("." / ":"). Strata's own two runs diverge at tokens 4 and 17-26
+  on two of the cases; ours repeat exactly.
+- **Time** (warm): encode 0.05-0.10 s for a 768 x 512 image (384 tokens), 0.15-0.17 s for two
+  640 x 384 ones, 0.41-0.46 s for 1920 x 1200 (2,280 tokens); the whole prefill of a 426-443-token
+  image prompt 0.7-1.4 s, of the 2,301-token one 1.5-2.3 s. The first image of a process took
+  2.1-7.1 s more before the startup warm-up (now 2.2-6.9 s at startup).
+- **Memory**: no VRAM while idle (the tower is pinned host RAM, 0.84 GiB); a request lends ~130 MiB
+  plus the encode workspace and the handoff from the expert cache. The KV grow/shrink cycle with an
+  image in a 41,728-token prompt: 0 MiB over the OS budget, peak 22,856 MiB, frames returned.
+  The RAM ledger needs ~2.2 GiB more with `--vision` (the tower plus one prompt's decoded media).
+- **Text unchanged** (#264's engine against this branch with `--vision`, A B B A, s60's prompts):
+  greedy ids identical; plain decode 0.997 / 0.996 / 0.998 (+-0.002-0.003, 1K / 8K / 32K), MTP decode
+  1.001 / 0.996 / 0.999, prefill 0.998 / 1.003 (4K / 32K).
+
 ## Artifact decisions
 
 Taken in PR 1 and revised in PR 2b, which aligned the artifact with Infernix (the model code and
@@ -485,7 +518,7 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `include/ninfer/ops/rows.h`, `src/ops/rows/rows.cu` | `include/infernix/ops/rows.h`, `src/ops/rows/rows.cu` | Verbatim |
 | `tests/ops/test_hyper_connection.cpp`, `test_projection_fp32.cpp`, `test_rows.cpp` | `tests/ops/test_hyper_connection.cpp`, `tests/ops/linear/test_projection_fp32.cpp`, `tests/ops/test_rows.cpp` | Ported with their Ops |
 | `src/core/read_only_file{.h,_win32.cpp,_posix.cpp}` | `src/core/read_only_file*` | Unbuffered reads only (no mapping); each `read_direct` waits on its own event |
-| `src/models/qwen4_exp/config.{h,cpp}` | `src/models/qwen4_exp/config.{h,cpp}` | IQ4_NL volume rows; no load options, vision, MTP or YaRN |
+| `src/models/qwen4_exp/config.{h,cpp}` | `src/models/qwen4_exp/config.{h,cpp}` | IQ4_NL volume rows; no load options, MTP or YaRN; the vision config is Qwen3.5's (PR 14) |
 | `src/models/qwen4_exp/frontend/ngram_hash.{h,cpp}` | same path | Verbatim |
 | `src/models/qwen4_exp/weights.h`, `model.h`, `load.cpp` | `weights.h`, `model.h`, `load.{h,cpp}` | GGUF-mirroring parameters; record banks with no scales |
 | `src/models/qwen4_exp/execution/parameters.{h,cpp}` | same path | One Linear per GGUF tensor |
@@ -504,6 +537,9 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `src/models/qwen4_exp/execution/forward.{h,cpp}` (PR 13) | same path (`run_mtp`, `mtp_block`, the verification records) | Drafter experts through `offloaded_sparse_moe` from a device bank, the text IQ4_XS head as the draft head; verification records for the single-sequence Ops; the PLE and GDN a/b projections column by column in verification |
 | `src/ops/qsa/prep.cu` `commit_tail_kernel` (PR 13) | `src/ops/qsa/qsa.cu` | One sequence; writes every committed slot in order (a commit across two blocks equals the one-column calls bit for bit) |
 | `src/runtime/engine/qwen4_exp_instance.{h,cpp}` | same path | NInfer's EngineCore and ResourceManager with the context cache off; refuses unsupported options |
+| `src/models/qwen4_exp/execution/vision.{h,cpp}` (PR 14) | `program/vision_program.cpp` (`vision_step`), `program/vision_window.h` | Qwen3.5's per-item tower and streamed weights in one lent window; no layer-major pass or stepped placement |
+| `src/models/qwen4_exp/program/rope_positions.{h,cpp}`, `tests/models/qwen4_exp/test_rope_positions.cpp` (PR 14) | `program/rope_positions.{h,cpp}`, `program/vision_window.cpp` (`visual_slice`), their tests | Verbatim but for the namespace; the window placement not ported |
+| `src/models/qwen4_exp/program/program.cpp` (PR 14) | `program/vision_program.cpp` (`plan_vision`, `vision_reserve`, `vision_release`, `stage_vision`, `stage_mtp_vision`) | The whole encode in the first prefill unit; a startup warm-up encode |
 | `tests/models/qwen4_exp/test_{expert_cache,memory_plan}.cpp`, `tests/fixtures/expert_cache/lfru_conformance.txt` | same paths | The memory plan's RAM tests rewritten for full mode |
 
 ## Export conventions of this GGUF

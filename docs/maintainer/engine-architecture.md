@@ -139,7 +139,7 @@ Reader、binder、原生参数准备、容量查询、warmup 和执行各自检�
 方法与类型，checkpoint 等被动数据类型直接复用），未修改 EngineCore、Scheduler 或 ResourceManager。
 artifact 的 text 架构在启动时决定使用哪个实例（`runtime::artifact_is_qwen4_exp`）。
 
-本阶段（M1）的约束与所有权：
+约束与所有权：
 
 - **前缀复用关闭。** Engine 对该模型强制 `context_cache.enabled=false`；Program 不产生 checkpoint、
   不 capture，只提供 root source，所有 checkpoint 查询按空缓存回答。context store、graft 被拒绝。
@@ -159,6 +159,16 @@ artifact 的 text 架构在启动时决定使用哪个实例（`runtime::artifac
 - **启动账本**（`runtime/engine/qwen4_exp_instance.cpp`，在 pin 之前）：RAM 账本要求所有 routed experts
   （33 GiB）与保留量同时放得下，否则拒绝并给出缺口；VRAM 检查在读取权重前确认 dense 权重与固定分配之外
   仍有 expert frames 的空间。设备分配先于 pinned bank。
+- **图像输入（PR 14，`--vision`）**：artifact 的 `vision` 组件就是 Qwen3.5 的 Vision tower（Qwen3.5 的
+  config 与参数名），常驻 pinned host（位于 expert bank 之后，按 Qwen3.5 overlay 的分组排列），不占固定
+  VRAM。frontend 仍是 Qwen3.5 的：media acquisition、预处理、MRoPE prompt 构造不变。Program 在请求的
+  第一个 prefill 单元向 expert cache 借两段 frames：window（Qwen3.5 的 `VisionWeightStream` 逐层上传
+  tower，`VisionContext::encode` 逐个 item 编码）与 handoff（BF16 [2560, 图像 token]）；编码后 window
+  立即归还，handoff 保留到 prompt 最后一次调用之后。每次 prefill 调用以及 MTP drafter 的 cells 把
+  handoff 中对应列 scatter 到 token embedding 上（stream expand 之前）。每次调用按 lane 的三轴 RoPE
+  位置（`program/rope_positions`：图像 token 取 frontend 的网格位置，其后的 token 取 index + rope delta）
+  做 interleaved MRoPE；文本 token 三轴相等，与一维 rotation 逐 bit 相同。Engine 的 Vision window 调用
+  （`reserve_vision_window` 等）对该 Program 是 no-op：单 lane 时编码就在 prefill 单元内同步完成。
 
 expert 输出与放置无关（`ops/offloaded_sparse_moe.h`），所以缓存状态只改变速度，不改变任何 bit。
 

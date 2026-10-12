@@ -55,21 +55,32 @@ selected for this process.
 The one command:
 
 ```bat
-set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs-mtp.ninfer
+set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs-mtp-vision.ninfer
 scripts\run.bat qwen38-flash-next
 ```
 
 That launcher profile runs `ninfer-serve <model> --max-concurrency 1 --max-context 32768
 --kv-capacity 32768 --kv-dtype int8 --prefill-chunk 1024`, the only serving shape this release
-supports, adding `--spec mtp --draft-tokens 3` when the model is `qwen4exp-iq2xs-mtp.ninfer` (the
-artifact with the MTP drafter). Without `NINFER_MODEL` the launcher prefers that artifact when it
-sits beside the plain one; `NINFER_SPEC=none` turns speculation off. `NINFER_CONTEXT` changes the
-context (up to the model's positions; KV above 32,768 tokens is borrowed from the expert cache).
-What is different from the Qwen3.5 models:
+supports, adding `--spec mtp --draft-tokens 3` when the model is `qwen4exp-iq2xs-mtp.ninfer` or
+`qwen4exp-iq2xs-mtp-vision.ninfer` (the artifacts with the MTP drafter) and `--vision` when it is a
+`-vision` artifact (converted with the vision tower, `--mmproj`). Without `NINFER_MODEL` the launcher
+prefers `-mtp-vision`, then `-mtp`, when they sit beside the plain one; `NINFER_SPEC=none` turns
+speculation off and `NINFER_VISION=off` image input. `NINFER_CONTEXT` changes the context (up to the
+model's positions; KV above 32,768 tokens is borrowed from the expert cache). What is different from
+the Qwen3.5 models:
 
-- **One request at a time, text only.** `--max-concurrency` above 1, `--kv-dtype` other than
-  `int8`, `--spec dflash|dflash2`, `--ngram-draft-tokens`, `--vision`, `--graft`, `--context-store` and
-  the load-time weight flags are refused at startup with the flag to change.
+- **One request at a time.** `--max-concurrency` above 1, `--kv-dtype` other than `int8`,
+  `--spec dflash|dflash2`, `--ngram-draft-tokens`, `--graft`, `--context-store` and the load-time weight
+  flags are refused at startup with the flag to change.
+- **Images** (`--vision`, an artifact converted with `--mmproj`; otherwise startup refuses with that
+  instruction): OpenAI `image_url` parts (data URIs, local files) and Anthropic image blocks, through
+  the same media handling and processor as the Qwen3.5 models. The vision tower (0.84 GiB) stays
+  pinned in host RAM and costs no VRAM between images; for each prompt with images the expert cache
+  lends about 130 MiB plus the images' workspace while they are encoded, and a few MiB for their
+  embeddings until the prompt has been read. A 768 x 512 image is 384 tokens and encodes in about
+  50-100 ms; a 1920 x 1200 one, 2,280 tokens, in about 0.4 s. Startup encodes one blank image (about
+  2 s) so the first real image does not pay the tower's one-time setup. `--vision-residency` has no
+  effect for this model.
 - **MTP speculation** (`--spec mtp --draft-tokens N`, N from 1 to 7) needs an artifact converted
   with the drafter (`--mtp-gguf`, [weight-conversion.md](weight-conversion.md)); a plain artifact
   refuses with that instruction. The output is the same as without it, token for token (greedy).
@@ -79,8 +90,9 @@ What is different from the Qwen3.5 models:
   [plan's PR 13 measurements](maintainer/flash-next-plan.md#pr-13-measurements)), about 1.4x plain decode.
 - **No prefix reuse yet.** The server's context cache is switched off for this model (one line at
   startup says so), so every request prefills its whole prompt and reports 0 cached prompt tokens.
-- **Host RAM.** All 33 GiB of routed experts are pinned in host RAM at startup. Before anything is
-  pinned, a RAM ledger checks that the experts, every other planned allocation and a reserve for
+- **Host RAM.** All 33 GiB of routed experts are pinned in host RAM at startup (with `--vision` also
+  the 0.84 GiB tower, and the ledger counts up to 1.4 GiB of decoded media: about 2.2 GiB more in
+  all). Before anything is pinned, a RAM ledger checks that the experts, every other planned allocation and a reserve for
   Windows (`--ram-headroom-mib`, default 2048) fit in the memory available now; if not, startup
   refuses with the shortfall ("... 2.9 GiB short. Close other programs ..."). Loading takes about
   two minutes from a SATA SSD, less when the files are in the page cache.

@@ -82,6 +82,19 @@ computed exactly as a one-column decode (the routes are column-invariant up to 8
 output equals plain greedy decoding token for token. `K` comes from Infernix's policy (the depth
 maximizing expected tokens per round cost, width cost 0.38 per draft) bounded by `--draft-tokens`.
 
+## Vision tower
+
+Optional component `vision` (converted with `--mmproj` from the model's
+`mmproj-Qwen3.8-Flash-Next-BF16.gguf`; [weight-conversion.md](../weight-conversion.md)). It is
+Qwen3.5's vision encoder (config `qwen3_5_vision`: depth 27, width 1152, 16 heads of 72, MLP 4304,
+16 x 16 patches over two frames, a 48 x 48 position table, 2 x 2 merge) with the merger projecting
+to 2560, and its parameters carry Qwen3.5's names (`vision/...`). The mathematics are Qwen3.5's
+(`models/qwen3_5/execution/vision.cpp`): patch projection plus bias, the bilinearly interpolated
+position table, 27 pre-LayerNorm blocks (2-D RoPE over the patch grid, bidirectional attention per
+frame, `gelu_tanh` MLP), the merger's LayerNorm per patch, the 2 x 2 merge and `fc2(gelu(fc1))`.
+An image's merged embeddings replace the token embeddings of its `<|image_pad|>` positions before
+the stream expansion; the image positions keep their placeholder ids for the PLE n-gram hash.
+
 ## Logical parameters
 
 Parameters mirror the GGUF tensors (`tools/convert/qwen4_exp.py`), so most hold the GGUF bytes

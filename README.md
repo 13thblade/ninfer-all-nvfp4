@@ -135,7 +135,7 @@ The platform guides cover GPU checks, Docker, native builds and model mounts:
 | `run qwen36-35b-a3b` | Qwen3.6-35B-A3B, MTP3, cuBLAS prefill, vision; 213K with two lanes on Windows, 262K with three on Linux |
 | `run qwen38-27b int8` | Reference profile: one user, INT8 KV (the quality default), 64K context |
 | `run qwen38-27b c8` | Reference profile: eight lanes at 8K, highest aggregate throughput |
-| `run.bat qwen38-flash-next` | **Preview, Windows.** Qwen3.8-Flash-Next from the IQ2_XS GGUF: one user, 32K, text only, MTP speculation with the drafter artifact; needs ~38 GiB of free host RAM. See [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) |
+| `run.bat qwen38-flash-next` | **Preview, Windows.** Qwen3.8-Flash-Next from the IQ2_XS GGUF: one user, 32K, MTP speculation with the drafter artifact, images with the vision artifact; needs ~38 GiB of free host RAM (~40 with images). See [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) |
 
 Every default profile serves images (vision in overlay residency, which costs about 10 MiB of
 device reservation), uses `rk4v4` KV, and backs the context cache with 8 GiB of pinned host RAM
@@ -292,20 +292,23 @@ converted exactly (no re-quantization) into a 39.2 GB `.ninfer` plus a 29.1 GB n
 beside it (`tools/convert/qwen4_exp.py`; [plan](docs/maintainer/flash-next-plan.md)). Start it with:
 
 ```bat
-set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs-mtp.ninfer
+set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs-mtp-vision.ninfer
 run.bat qwen38-flash-next
 ```
 
 The `-mtp` artifact is the same conversion with Strata's MTP drafter added (`--mtp-gguf`,
 [weight conversion](docs/weight-conversion.md)); with it the launcher turns on MTP speculation (up
-to 3 drafts per round), which gives the same output as plain decoding. A plain
-`qwen4exp-iq2xs.ninfer` runs without speculation.
+to 3 drafts per round), which gives the same output as plain decoding. The `-mtp-vision` artifact
+also carries the vision tower from the model's `mmproj` GGUF (`--mmproj`); with it the launcher
+passes `--vision`, and the server answers OpenAI and Anthropic requests with images (a 768 x 512
+image is 384 tokens and encodes in about 0.1 s; the tower waits in host RAM and borrows VRAM from
+the expert cache only while it encodes). A plain `qwen4exp-iq2xs.ninfer` runs without speculation.
 
 It pins all 33 GiB of routed experts in host RAM (startup refuses, saying how much is missing, when
 Windows cannot keep 2 GiB free beside them), keeps the most-used ~11,000-12,500 experts in a VRAM
 cache whose state is saved beside the model so the next start is warm, and serves one request at a
 time at up to 32K tokens with INT8 KV. Not yet: prefix reuse (every request prefills its whole
-prompt), vision and more than one lane. Measured on this RTX 3090 with a warm expert cache: decode
+prompt) and more than one lane. Measured on this RTX 3090 with a warm expert cache: decode
 after 1K / 8K / 32K prompts is 108-109 / 111 / 112-113 tok/s with MTP and 81 / 80 / 78 without
 (Strata with MTP 105 / 112 / 107, plain 71 / 70 / 66). Decode speed and its breakdown are in
 [the plan](docs/maintainer/flash-next-plan.md#pr-13-measurements); the server reference is
@@ -697,8 +700,8 @@ and the design are in `docs/maintainer/pipeline-parallel-plan.md`.
 - The shared KV pool is fixed at startup and is not divided statically among request lanes.
 - This is bounded small-scale batching, not preemptive large-scale continuous batching.
 - Tool calls are returned to the client but are not executed by NInfer.
-- Qwen3.8-Flash-Next (preview) serves one text request at a time with INT8 KV, no speculation and no
-  prefix reuse; it has been built and run on Windows only (Linux is neither built nor tested).
+- Qwen3.8-Flash-Next (preview) serves one request at a time with INT8 KV and no prefix reuse; it
+  has been built and run on Windows only (Linux is neither built nor tested).
 - This fork targets `sm_86`. NVFP4 A4, FP8 A8 and TMA *weight and activation* kernels require
   Blackwell and are unavailable; FP8 and NVFP4 weights are admitted through their A16 dequantizing
   routes. KV-cache storage is a separate axis: all seven KV formats, including row-scaled FP8 E4M3,
@@ -723,7 +726,8 @@ by [wallawalla47](https://github.com/wallawalla47) (Apache-2.0), itself a fork o
 model's config keys and n-gram hash derivation, the offloaded sparse-MoE Op (its contract,
 routing, dispatch, staging, CPU worker team and miss service, and its canonical-arithmetic method),
 the model's forward pass, and its Program pieces: the VRAM expert cache (LFRU frames, warm-start
-state), the RAM and VRAM ledgers, the elastic VMM KV pool, the VRAM monitor and the Engine instance.
+state), the RAM and VRAM ledgers, the elastic VMM KV pool, the VRAM monitor, the Engine instance,
+and the image path's RoPE positions and encode window.
 Each adapted file says so in its header.
 
 ## Contributors
