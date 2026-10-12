@@ -135,8 +135,8 @@ Smoke-test recipe: extract the zip into the scratchpad, make `models\` a directo
 `C:\ninfer-fork\ninfer-3090\models`, set `PATH` to `C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0`
 (`run.bat` pipes through `powershell`; a bare System32/Windows `PATH` makes it fail), and call
 `cmd /c "<full path>\run.bat qwen38-27b"` with the full path. Wait for `/v1/models` to list the model,
-send one chat completion, then stop the server by matching its path, never by name alone. A step-down
-from 188,416 context is expected while the desktop holds 2 GiB.
+send one chat completion, then stop the server by matching its path, never by name alone. A
+`context lowered to ... (asked for 188,416)` warning is expected while the desktop holds VRAM.
 
 The archives embed `RELEASE_NOTES_X.Y.Z.md`, so finish the notes (including the Verification section)
 before the final package, or repackage both afterwards.

@@ -30,7 +30,8 @@ pp4096 on the cuBLAS route the launcher enables, `rk4v4` KV (upstream 3,196, a t
 perplexity for the route). The earlier 187 and 523 came from runs whose workload was not recorded
 and that this harness does not reproduce on either artifact. The 35B prefill was measured the same day with its launcher settings (cuBLAS route, chunk 4096, `rk4v4`; 5,470 tok/s on the previous default-route chunk 512); its decode rows were not re-measured.
 The 27B's 262,144 was measured with MTP3 and the draft head; the default DFlash2 profile reaches it
-on a headless card by extrapolation and steps down if refused. Sources and conditions are in
+on a headless card by extrapolation, and the server fits the context to the free memory where it
+does not. Sources and conditions are in
 [Performance on an RTX 3090](#performance-on-an-rtx-3090).
 
 ![Qwen3.8-27B: upstream artifact vs this fork's 3090 conversion](docs/assets/qwen38-artifact-gains.svg)
@@ -100,7 +101,7 @@ platforms need an RTX 3090 or 3090 Ti and a recent NVIDIA driver.
 
 ```powershell
 .\download-model.bat qwen38-27b          # downloads qwen3_8_27b.ninfer (~19 GB, resumable)
-.\run.bat qwen38-27b                      # serves on 127.0.0.1:8080, one user, 188,416 tokens, DFlash2
+.\run.bat qwen38-27b                      # serves on 127.0.0.1:8080, one user, up to 188,416 tokens, DFlash2
 ```
 
 Double-clicking either file asks which model instead; Qwen3.8-27B is the recommended choice. The
@@ -179,11 +180,15 @@ front; when the pool runs short the server first drops retained cache entries, t
 younger request (saving a snapshot to host memory, or replaying its tokens later) and resumes it
 once there is room. A lane adds only its fixed state, not a second pool.
 
-**If startup refuses** for lack of GPU memory, the default profiles step down on their own — an
-eighth of the context at a time, up to five times — and say what they did. An explicit
-`NINFER_CONTEXT`, `NINFER_PREFILL_CHUNK`, `NINFER_HOST_CONTEXT_MIB` or `NINFER_KV_CAPACITY` is
-honoured as given and fails loudly; `NINFER_FALLBACK=off` turns the step-down off. By hand, drop a
-lane or a context rung first, then speculation (worth 992 MiB on the 35B-A3B), and vision last.
+**If the GPU is busy** (a desktop, a browser or a game holding VRAM), the default profiles still
+start: their context is a ceiling, and the server starts at the largest context that fits the
+memory free at launch, keeping 256 MiB spare, and prints one line saying what it chose
+(`context lowered to 172,032 tokens (asked for 188,416) ...`). Closing what holds the GPU and
+restarting gets the full context back. If not even 32,768 tokens fit, it stops and says how much
+memory is missing. An explicit `NINFER_CONTEXT` (or `NINFER_KV_CAPACITY`) is honoured as given and
+fails loudly; `NINFER_FALLBACK=off` makes the profile's context exact. Directly,
+`ninfer-serve --max-context N --fit-context MIN` does the same. By hand, drop a lane first, then
+speculation (worth 992 MiB on the 35B-A3B), and vision last.
 
 **To size a profile that is not listed, open [`docs/config-calculator.html`](docs/config-calculator.html)
 in a browser.** It is a single self-contained file with no network access that takes a model, a
@@ -200,7 +205,7 @@ The recommended model. A dense model rather than an MoE, so slower per token but
 
 ```powershell
 .\download-model.bat qwen38-27b          # downloads qwen3_8_27b.ninfer (~19 GB, resumable)
-.\run.bat qwen38-27b                      # one user, 188,416 tokens, DFlash2, cuBLAS prefill, rk4v4, vision
+.\run.bat qwen38-27b                      # one user, up to 188,416 tokens, DFlash2, cuBLAS prefill, rk4v4, vision
 ```
 
 ```bash
@@ -225,7 +230,7 @@ the full 262,144 tokens with two lanes sharing the pool:
 | Profile | lanes | context | KV | measured beside a desktop |
 |---|---|---|---|---|
 | **`tuned`** (default, DFlash2), Windows | 1 | 188,416 | rk4v4 | starts with 721 MiB spare; 196,608 refused |
-| `tuned` (default, DFlash2), Linux | 1 | 262,144 | rk4v4 | headless extrapolation; steps down if refused |
+| `tuned` (default, DFlash2), Linux | 1 | 262,144 | rk4v4 | headless extrapolation; fitted to the free memory if it does not fit |
 | `NINFER_SPEC=mtp` | 2 | 262,144 | rk4v4 | 23.4 of 24.5 GiB used |
 | `int8` | 1 | 65,536 | int8 | 2.85 GiB left unused |
 
@@ -271,7 +276,7 @@ chunk 512). That route's larger runtime reservation costs context beside a deskt
 
 | Profile (`rk4v4`, MTP3 + draft, vision) | lanes | context | starts beside a desktop |
 |---|---|---|---|
-| **Linux — default** | 3 | 262,144 | not re-measured with the cuBLAS route; steps down if refused |
+| **Linux — default** | 3 | 262,144 | not re-measured with the cuBLAS route; fitted to the free memory if it does not fit |
 | **Windows — default** | 2 | 212,992 | yes, 220 MiB free (229,376 refused, 27 MB short) |
 | `NINFER_PREFILL_CHUNK=1024` on Windows | 2 | 262,144 | yes, 138 MiB free; 7,140 tok/s prefill, default route |
 | `NINFER_CONCURRENCY=4` | 4 | 262,144 | no, 48 MB short; a headless card should fit |
