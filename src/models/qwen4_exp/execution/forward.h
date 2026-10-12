@@ -5,13 +5,17 @@
 // decode); NInfer's single-sequence QSA Ops and paged INT8 KV; the PLE rows come from the caller
 // already read; experts are served by the GPU narrow route from device frames, staging slots or the
 // pinned bank, or for a wide prefill call from the expert stream's ring (no CPU miss service,
-// overlap streams, landing frames, MTP, vision, verification or prefix-cache events).
+// overlap streams, landing frames, vision or prefix-cache events). Speculative verification and the
+// MTP drafter follow Infernix's ForwardVerify and mtp_block; QSA tails are pooled from scratch
+// copies (this repo's qsa_pool_keys always advances the tail it is given) and committed with
+// qsa_commit_tails.
 //
 // The Qwen4Exp forward pass: embedding, the PLE injection, 48 hyper-connection blocks of GDN or QSA
 // plus the offloaded MoE, the final mixer and the LM head.
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/gdn_replay_records.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 #include "models/qwen4_exp/execution/expert_stream.h"
@@ -19,6 +23,7 @@
 #include "ninfer/ops/qsa.h"
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp::execution {
@@ -61,6 +66,41 @@ struct ForwardExperts {
     ExpertStream* stream = nullptr;
 };
 
+// A speculative verification call (Infernix ForwardVerify, one sequence): W consecutive positions
+// whose recurrent state, PLE history and QSA tails are left unchanged; what the commit of an
+// accepted prefix needs is recorded instead. K/V and pooled keys are written as usual: positions
+// past the accepted prefix are rewritten before any later query reads them. Every column's logits
+// are bitwise those of a one-column decode call at its position (the column-invariant routes, and
+// the two BF16 Linears run one column at a time).
+struct ForwardVerify {
+    GdnReplayRecords gdn;          // spec.width == W, one record row, every GDN layer
+    Tensor ple_inputs;             // BF16 [S*H, W]: the PLE convolution inputs
+    Tensor qsa_keys;               // BF16 [Di, W, attention layers]: the raw index keys
+    std::vector<Tensor> qsa_tails; // per attention layer: BF16 [Di, R - 1], a copy of the live tail
+    Tensor conv_scratch;           // BF16 [C, K - 1]: where the convolution's state output goes
+    Tensor initial_slot;           // device I32 [1] holding 0 (the one recurrent-state slot)
+};
+
+// Cells of one drafter call inside a prefill chunk (bounds the drafter's share of the workspace).
+inline constexpr std::int32_t kMtpChunkColumns = 512;
+
+// The MTP drafter's cells of a prefill or forced-token call (Infernix MtpChunk, one sequence),
+// written from the call's own residuals while they are live: cell c pairs the residual at position
+// c with the token at c + 1. The cells are `saved` (the residual of the position before the call)
+// when `prepend`, then the call's first `columns` columns; the call's last residual then replaces
+// `saved`. Sub-chunk k (kMtpChunkColumns cells) reads its RoPE positions [n_k, 3] at word
+// 3 * kMtpChunkColumns * k of `rope_positions` and its pooled-block start at word 3 * k of
+// `block_start_rope`.
+struct MtpChunk {
+    Tensor saved;        // BF16 [S*H]
+    bool prepend         = false;
+    std::int32_t columns = 0;
+    Tensor ids;          // I32 [prepend + columns]: the token after each cell
+    Tensor positions;    // I32 [prepend + columns]: the cells
+    std::int32_t* rope_positions   = nullptr;
+    std::int32_t* block_start_rope = nullptr;
+};
+
 // One call: T consecutive positions of the sequence.
 struct ForwardBatch {
     Tensor ids;              // I32 [T]
@@ -69,6 +109,50 @@ struct ForwardBatch {
     Tensor block_start_rope; // I32 [3]: RoPE position of the first pooled-block token (ops::qsa_pool_keys)
     Tensor ngram_rows;       // U8 [row bytes, heads, T]: each column's n-gram rows (NgramVolume)
     Tensor logit_columns;    // I32 [n]: the columns whose logits are produced
+    const ForwardVerify* verify = nullptr; // set for a speculative verification call (T = W >= 2)
+    Tensor residual_out;     // when set: BF16 [S*H, T] copy of the final residual (the drafter's input)
+    const MtpChunk* mtp_chunk = nullptr; // when set: the call's drafter cells (run_back writes them)
+};
+
+// The MTP drafter's own QSA layer (a 13th attention layer through the same block table) and state.
+struct ForwardMtp {
+    PagedKVLayerView kv;
+    Tensor pooled; // BF16 [Di / R, 64, 1, pages]
+    Tensor tail;   // BF16 [Di, R - 1]: the drafter's live index-key tail
+    Tensor ones;   // FP32 [S, columns] of 1: broadcasts the embedding projection to every stream
+};
+
+// One call of the MTP drafter (Infernix MtpCall, one sequence). Cell c pairs the residual at
+// position c (the main model's final residual, or the drafter's own output for a chained step)
+// with the token at c + 1 and the target's RoPE position of c; the block's output predicts the
+// token at c + 2. T consecutive cells.
+struct MtpCall {
+    Tensor residuals;        // BF16 [S*H, T]
+    Tensor ids;              // I32 [T]
+    Tensor positions;        // I32 [T]: the cells
+    Tensor rope_positions;   // I32 [T, 3]
+    Tensor block_start_rope; // I32 [3]
+    // The index-key tail the call pools from and advances: the live tail, or a scratch copy of it
+    // (draft steps and catch-up calls past the committed cells, whose keys commit later).
+    Tensor tail;
+    Tensor key_records;      // when set: BF16 [Di, T] receives the raw index keys
+    // K/V and index keys only (prompt cells and committed cells); otherwise a full step of one
+    // column: the block's output residual and the draft head's argmax.
+    bool kv_only = true;
+    Tensor residual_out;     // BF16 [S*H, 1]
+    Tensor drafts;           // I32 [1]
+    // Optional observation of a full step (reference checks): each set tensor receives a copy.
+    struct Tap {
+        Tensor fused;    // BF16 [S*H, 1]: the residual after the input fusion
+        Tensor mixer_in; // BF16 [H, 1]: the attention mixer's output (the attention input)
+        Tensor attention; // BF16 [H, 1]: the attention block's output
+        Tensor moe_in;   // BF16 [H, 1]
+        Tensor routes;   // I32 [top k, 1]
+        Tensor moe_out;  // BF16 [H, 1]
+        Tensor final_x;  // BF16 [H, 1]: the final mixer's output
+        Tensor logits;   // FP32 [V, 1]: the draft head's logits
+    };
+    const Tap* tap = nullptr;
 };
 
 // Optional observation of every block, for reference comparison: BF16 copies per block of the
@@ -86,7 +170,14 @@ struct ForwardTap {
 class Forward {
 public:
     Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, ForwardState state,
-            ForwardKV kv, ForwardExperts experts);
+            ForwardKV kv, ForwardExperts experts, std::optional<ForwardMtp> mtp = std::nullopt);
+
+    // Runs one call of the MTP drafter (requires its parameters and ForwardMtp). Uses the
+    // workspace like a forward call (not between run_front and run_back).
+    void run_mtp(const MtpCall& call);
+    // Workspace of a drafter call of up to `columns` cells (full steps run one).
+    [[nodiscard]] static std::size_t mtp_workspace_bytes(const TextConfig& config, std::int32_t columns,
+                                                         std::uint32_t max_visible_keys, DeviceExecutionView execution);
 
     // FP32 logits [V, n] of batch.logit_columns.
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
@@ -113,9 +204,15 @@ private:
     void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap);
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
-    Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index);
+    Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
     Tensor attention(const AttentionParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
     Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap);
+    // A BF16 Linear of a verification call: one column at a time, so each column takes the
+    // one-column route a decode call takes (their T > 1 routes sum in other orders).
+    void project_verify(const Tensor& x, const LinearParameters& p, Tensor& out, bool columnwise);
+    Tensor mtp_attention(const MtpParameters& p, const Tensor& x, const MtpCall& call);
+    void mtp_block(const MtpCall& call);
+    void mtp_cells(const MtpChunk& chunk, const Tensor& residual);
 
     const Parameters& parameters_;
     const TextConfig& config_;
@@ -124,6 +221,9 @@ private:
     ForwardState state_;
     ForwardKV kv_;
     ForwardExperts experts_;
+    std::optional<ForwardMtp> mtp_;
+    Tensor mtp_frames_; // I32 [E]: every drafter expert resident at its own index
+    DeviceBuffer mtp_frames_backing_;
     Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back
 };
 

@@ -5,8 +5,9 @@ from the ISTA DASLab GSQ-RCO IQ2_XS GGUF. The composition is lifted from Inferni
 `src/models/qwen4_exp`, Apache-2.0); the weights stay the GGUF's GGML blocks. Status and the staged
 plan are in [flash-next-plan.md](flash-next-plan.md); formats in [tensor-formats.md](tensor-formats.md).
 
-Milestone M0: the whole model runs through `ninfer_qwen4_exp_forward_real_test` (one sequence,
-teacher-forced or decoding). There is no Program, Engine, frontend or serving yet (PR 9).
+The model runs through the Program and Engine (one lane) and `ninfer-serve`; the whole forward is
+also checked directly by `ninfer_qwen4_exp_forward_real_test` (one sequence, teacher-forced or
+decoding).
 
 ## Shape
 
@@ -54,6 +55,33 @@ renormalized; each expert is `A8(x)`, gate/up rowdots, `SiLU(gate) * up` in FP32
 rowdot rounded to BF16; `y = sum_i w_i expert_i + sigmoid(score) * shared(x)` with the shared
 expert `W_d A8(SiLU(W_g A8(x)) * W_u A8(x))`.
 
+## MTP drafter
+
+Optional component `mtp` (`Qwen4ExpMTP`, converted with `--mtp-gguf` from Strata's
+`mtp-q2_0.gguf`; [weight-conversion.md](../weight-conversion.md)). One QSA block with its own KV
+layer, after Infernix's `run_mtp` / `mtp_block` (`execution/forward.cpp`). Its cell `c` pairs the
+text model's final residual `R_c` (before the final mixer) with the token at `c + 1`:
+
+1. `R' = fc_hidden(RMSNorm_{S*H}(R_c))` per stream, plus the broadcast
+   `fc_embedding(RMSNorm_H(embed(id_{c+1})))` (unit-offset norms; the token embedding is the text
+   model's).
+2. The text block's composition with the drafter's own weights: `attn_hc` mix, QSA (its own
+   pooled keys and tail), injection, `mlp_hc` mix, MoE over 512 Q2_0 experts (device-resident,
+   `offloaded_sparse_moe`'s narrow route with every expert a frame) plus the BF16 shared expert,
+   injection.
+3. The draft at `c + 2` is the argmax of the text model's IQ4_XS head over `final_mixer(R')` (BF16
+   logits, public tokens). `R'` is the next chained step's residual.
+
+Speculation (Program): a round runs `K` chained drafter steps from the saved residual of the last
+committed position, then verifies the anchor and the `K` drafts as `W = K + 1` columns of one
+forward that records instead of updating (GDN replay records, the QSA raw index keys, the PLE
+inputs). Greedy acceptance on the device takes the longest matching prefix plus the correction;
+the commit folds the accepted columns' records (`gdn_replay_fold`, `qsa_commit_tails`,
+`ple_conv_commit`) and the drafter writes the committed cells. Every verification column is
+computed exactly as a one-column decode (the routes are column-invariant up to 8 columns), so the
+output equals plain greedy decoding token for token. `K` comes from Infernix's policy (the depth
+maximizing expected tokens per round cost, width cost 0.38 per draft) bounded by `--draft-tokens`.
+
 ## Logical parameters
 
 Parameters mirror the GGUF tensors (`tools/convert/qwen4_exp.py`), so most hold the GGUF bytes
@@ -78,6 +106,12 @@ unchanged. Per layer `L` under `text/layers/L/`:
 
 Globals: `text/token_embedding` and `text/output_head` [248320, H] (GGML IQ4_XS),
 `text/final_mixer/{norm,down,up}`. The n-gram table is the separate volume (`<artifact>.ngram`).
+
+The drafter's parameters under `mtp/` mirror the text layer's names (`layers/0/attn_hc/...`,
+`layers/0/attention/...`, `layers/0/indexer/...`, `layers/0/moe/...`, `final_mixer/...`) plus
+`embedding_norm`, `hidden_norm`, `embedding_projection` and `hidden_projection` [H, H]. Every matrix
+is BF16; the mixer norms are FP32 multipliers `fl32(1 + gamma)`, the other norms BF16 gamma (unit
+offset); `layers/0/moe/experts` is a `ggml_rec_q2_0_q2_0` bank.
 
 ## Stored conventions
 

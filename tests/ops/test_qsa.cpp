@@ -926,6 +926,78 @@ void test_end_to_end(const std::string& name, int first, int columns, std::uint3
     expect(run.guards_ok, name + ": output guards intact");
 }
 
+// Speculative verification: in a call of up to eight columns every column's output is bitwise the
+// one-column call's (the property greedy speculative decoding relies on to reproduce plain decode).
+void test_attention_column_invariance(int first, int columns, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    const int end = first + columns;
+    Cache cache(end, 640, rng);
+    const auto q = random_bf16(rng, static_cast<std::size_t>(kD) * kHq * columns, 1.0);
+    std::vector<std::int32_t> positions(columns), counts(columns);
+    std::vector<std::int32_t> selected(static_cast<std::size_t>(kTop) * columns, -1);
+    for (int i = 0; i < columns; ++i) {
+        const int p = first + i, n = (p + 1) / kR, count = std::min(n, kTop);
+        positions[i] = p;
+        std::vector<int> all(n);
+        std::iota(all.begin(), all.end(), 0);
+        std::shuffle(all.begin(), all.end(), rng);
+        std::sort(all.begin(), all.begin() + count);
+        std::copy_n(all.begin(), count, selected.begin() + static_cast<std::ptrdiff_t>(i) * kTop);
+        counts[i] = count;
+    }
+    const AttentionRun wide = run_attention(cache, q, positions, selected, counts, 1.0 / 16.0);
+    for (int i = 0; i < columns; ++i) {
+        const std::size_t per = static_cast<std::size_t>(kD) * kHq;
+        std::vector<std::uint16_t> qi(q.begin() + static_cast<std::ptrdiff_t>(i * per),
+                                      q.begin() + static_cast<std::ptrdiff_t>((i + 1) * per));
+        std::vector<std::int32_t> si(selected.begin() + static_cast<std::ptrdiff_t>(i) * kTop,
+                                     selected.begin() + static_cast<std::ptrdiff_t>(i + 1) * kTop);
+        const AttentionRun one = run_attention(cache, qi, {positions[i]}, si, {counts[i]}, 1.0 / 16.0);
+        expect(std::equal(one.out.begin(), one.out.end(), wide.out.begin() + static_cast<std::ptrdiff_t>(i * per)),
+               "qsa_attention column " + std::to_string(i) + " of " + std::to_string(columns) + " at p=" +
+                   std::to_string(positions[i]) + " equals the one-column call bit for bit");
+    }
+}
+
+// qsa_commit_tails: the tail after committing the first n of W recorded columns, for two layers.
+void test_commit_tails(int first, int width, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    constexpr int kLayers = 2;
+    const std::size_t tail_elements = static_cast<std::size_t>(kDi) * (kR - 1);
+    // Layer tails 2 KiB apart (the commit reads a stride between layers).
+    constexpr std::size_t kStride = 2048;
+    for (int n = 0; n <= width; ++n) {
+        const auto keys = random_bf16(rng, static_cast<std::size_t>(kDi) * width * kLayers, 1.0);
+        std::vector<std::uint16_t> tails(kStride / 2 * kLayers, kCanary);
+        for (int l = 0; l < kLayers; ++l) {
+            const auto initial = random_bf16(rng, tail_elements, 1.0);
+            std::copy(initial.begin(), initial.end(), tails.begin() + static_cast<std::ptrdiff_t>(l * kStride / 2));
+        }
+        std::vector<std::int32_t> positions(width);
+        std::iota(positions.begin(), positions.end(), first);
+        const std::vector<std::int32_t> commit = {n};
+        DeviceBuffer dk = upload(keys), dt = upload(tails), dp = upload(positions), dc = upload(commit);
+        Tensor tail0(dt.p, DType::BF16, {kDi, kR - 1});
+        ops::qsa_commit_tails(Tensor(dk.p, DType::BF16, {kDi, width, kLayers}), Tensor(dp.p, DType::I32, {width}),
+                              Tensor(dc.p, DType::I32, {1}), tail0, static_cast<std::int64_t>(kStride), nullptr);
+        t::cuda_synchronize();
+        const auto got = download<std::uint16_t>(dt, tails.size());
+        auto want      = tails;
+        // What n one-column pool calls leave: each position that does not complete a block
+        // writes its slot, in order.
+        for (int l = 0; l < kLayers; ++l) {
+            for (int q = first; q < first + n; ++q) {
+                if (q % kR != kR - 1) {
+                    std::copy_n(keys.begin() + static_cast<std::ptrdiff_t>((l * width + q - first) * kDi), kDi,
+                                want.begin() + static_cast<std::ptrdiff_t>(l * kStride / 2 + (q % kR) * kDi));
+                }
+            }
+        }
+        expect(got == want, "qsa_commit_tails first=" + std::to_string(first) + " W=" + std::to_string(width) +
+                                " n=" + std::to_string(n) + " leaves the tail of n one-column calls");
+    }
+}
+
 // One captured decode call replayed with new positions and selections.
 void test_attention_graph() {
     std::mt19937 rng(99);
@@ -1089,6 +1161,12 @@ int run(bool small) {
         attention_cases.push_back({"prefill 48 short counts", 30000, 48, Selection::Short});
     }
     for (const auto& c : attention_cases) { test_attention(c, seed++); }
+    // Speculative verification widths: column invariance and the tail commit.
+    for (const int columns : {2, 5, 8}) { test_attention_column_invariance(9000 + columns, columns, seed++); }
+    if (!small) { test_attention_column_invariance(131060, 8, seed++); }
+    for (const int first : {4000, 4001, 4002, 4003}) {
+        for (const int width : {2, 5, 8}) { test_commit_tails(first, width, seed++); }
+    }
     test_attention_empty(1, seed++);
     test_attention_empty(41, seed++);
     test_end_to_end("decode p=5000", 5000, 1, seed++);

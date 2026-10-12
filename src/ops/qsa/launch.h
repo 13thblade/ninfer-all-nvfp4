@@ -47,6 +47,10 @@ void qsa_pool_keys_launch(const Tensor& raw_keys, const Tensor& positions,
                           const Tensor& block_table, Tensor& tail, Tensor& pooled_pages,
                           cudaStream_t stream);
 
+void qsa_commit_tails_launch(const Tensor& raw_keys, const Tensor& positions,
+                             const Tensor& commit_columns, Tensor& tail0,
+                             std::int64_t tail_stride_elements, cudaStream_t stream);
+
 // Selection routes, chosen per call by the wrapper (qsa.cpp):
 //  - tiled (select_tiled.cu): block scores on BF16 Tensor Cores for 16-column tiles, then one CTA
 //    per column runs a three-digit radix select over the column's scores;
@@ -79,6 +83,9 @@ void qsa_sliced_select_launch(const Tensor& index_q, const Tensor& positions,
 // Attention routes: calls whose columns x KV heads fill fewer than the SMs split each column's key
 // list (attention_split.cu, merged by a second kernel); wider calls run one CTA per (column, KV
 // head) unsplit (attention_wide.cu, from Infernix's prompt kernel).
+// Attention calls of at most this many columns split each column as a one-column call does.
+inline constexpr std::int32_t kQsaColumnInvariantTokens = 8;
+
 struct QsaAttentionPlan {
     std::int32_t splits          = 1; // key-list splits per (column, KV head)
     std::int32_t tiles_per_split = 0; // 16-token tiles per split

@@ -64,9 +64,16 @@ That launcher profile runs `ninfer-serve <model> --max-concurrency 1 --max-conte
 supports. `NINFER_CONTEXT` changes the context (up to the model's positions; KV above 32,768 tokens
 is borrowed from the expert cache). What is different from the Qwen3.5 models:
 
-- **One request at a time, text only, plain decode.** `--max-concurrency` above 1, `--kv-dtype`
-  other than `int8`, `--spec`, `--ngram-draft-tokens`, `--vision`, `--graft`, `--context-store` and the
-  load-time weight flags are refused at startup with the flag to change.
+- **One request at a time, text only.** `--max-concurrency` above 1, `--kv-dtype` other than
+  `int8`, `--spec dflash|dflash2`, `--ngram-draft-tokens`, `--vision`, `--graft`, `--context-store` and
+  the load-time weight flags are refused at startup with the flag to change.
+- **MTP speculation** (`--spec mtp --draft-tokens N`, N from 1 to 7) needs an artifact converted
+  with the drafter (`--mtp-gguf`, [weight-conversion.md](weight-conversion.md)); a plain artifact
+  refuses with that instruction. The output is the same as without it, token for token (greedy).
+  The drafter keeps its 512 experts in VRAM (about 0.9 GiB, taken from the expert cache). `N` is a
+  ceiling: each round drafts as many tokens as the recent acceptance pays for, which measured at
+  two on prose (see the [plan's PR 13 measurements](maintainer/flash-next-plan.md#pr-13-measurements));
+  3 is the recommended ceiling.
 - **No prefix reuse yet.** The server's context cache is switched off for this model (one line at
   startup says so), so every request prefills its whole prompt and reports 0 cached prompt tokens.
 - **Host RAM.** All 33 GiB of routed experts are pinned in host RAM at startup. Before anything is

@@ -24,7 +24,8 @@ references, `engine-architecture.md`).
 | 10 | Prefill: exact GPU wide expert route (int8 `mma.sync`, cp.async), prefill expert streaming into lent frames, 4,096-token calls, n-gram row prefetch | done (prefill gate missed by 3-5%, below) |
 | 11 | Decode (M2 gate): few misses zero-copy (11a), fewer decode-graph nodes and the GGML `linear_pair` (11b), the decode graph split around the n-gram row read and the startup frame retry (11c) | done (measurements below) |
 | 12 | 128K through the elastic KV: growth takes expert frames before it maps (12a, the crash and 128K prefill fix); prefill lending restores the experts it displaced and is sized to the prompt (12b, the decode fix) | done (measurements below) |
-| 13-14 | MTP, vision | not started |
+| 13 | MTP speculation: the drafter imported exactly from Strata's `mtp-q2_0.gguf` (13a, `--mtp-gguf`, `ggml_rec_q2_0_q2_0`); Infernix's chained drafts, exact W-column verification and record commit (13b) | done (spec gate missed, below) |
+| 14 | Vision | not started |
 
 The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
 the six dense formats (PR 3); offloaded_sparse_moe executes the three expert record formats (PR 7).
@@ -352,6 +353,33 @@ session (the cache holds the restored decode set instead of the warm-up prompt's
 
 Quality (#243's method): logit dumps byte-identical to the integration's on all six texts (the
 forward does not use the Program). Greedy ids equal the integration's for every prompt measured.
+
+## PR 13 measurements
+
+MTP speculation, 2026-10-12. RTX 3090, CUDA 12.8, desktop attached; s60's prompts, 512 greedy tokens;
+#258 plain brackets the MTP processes (18 measured requests each, n = 12 per cell). Strata (PR 0):
+MTP 105 / 112 / 107, plain 71 / 70 / 66.
+
+| Tier | #258 plain | MTP policy, ceiling 3 | MTP fixed 2 | fixed 2 / plain | / Strata MTP |
+|---|---:|---:|---:|---:|---:|
+| 1K | 81.4 [78.3-83.0] | 108.0 [104.5-111.3] | 110.5 [106.0-113.6] | 1.36 | 1.05 |
+| 8K | 80.2 [78.7-83.5] | 110.7 [102.4-116.0] | 112.6 [104.6-118.2] | 1.39 | 1.01 |
+| 32K | 78.2 [75.9-79.8] | 111.8 [106.3-116.3] | 111.9 [104.7-114.7] | 1.42 | 1.05 |
+
+- **Gate (spec: 8K >= 1.2x Strata MTP = 134 tok/s): missed** at 112.6. Decode after a 128K prompt:
+  102.6 [101.7-108.9] (policy, n = 3; PR 12 plain 74.0).
+- Greedy ids equal plain decoding on every request (108 of 108 above, and `--mtp-exact`).
+- Depth (fixed drafts 1-5 at 8K): 102.1, 112.0, 111.9, 96.0, 90.0 tok/s; acceptance 82 / 76 / 65 /
+  58 / 51% of drafts, 1.82 / 2.51 / 2.94 / 3.30 / 3.52 tokens per round. Two drafts is the optimum.
+- Cost model (nsys, 8K): a verification of W columns costs 17.0 / 20.0 / 23.8 ms at W = 2 / 3 / 4,
+  +3.4 ms per column against a ~12.5 ms plain step; 2.0 ms of each column is routed experts (more
+  distinct experts per layer, and their PCIe misses), 0.6 ms the mixers. A drafter step is 0.88 ms,
+  0.40 of it the IQ4_XS head. The round has no host gap to recover.
+- Plain decode and prefill unchanged against #258 (decode 1.003 / 1.000 / 0.993, prefill 0.999 /
+  1.000 at 4K / 32K; ids identical). With MTP on, prefill is 1-4% slower (the drafter's cells, and a
+  ~5% smaller expert cache).
+- 4K / 32K / 128K alternation with MTP: no crash, adapter at most 23.3 of 24 GiB, no demotion.
+
 ## Artifact decisions
 
 Taken in PR 1 and revised in PR 2b, which aligned the artifact with Infernix (the model code and
@@ -441,7 +469,9 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `src/models/qwen4_exp/program/expert_cache/expert_{cache,state}.{h,cpp}` | same paths | Verbatim but for `lend` reporting the keys it evicts (PR 12) |
 | `src/models/qwen4_exp/program/expert_residency.{h,cpp}` | same path | Per-layer record strides in one frame size; no SSD tier or landing; frame lending (PR 10) whose give-back restores the displaced experts first (PR 12); a grow refills its new frames by score |
 | `src/models/qwen4_exp/program/vram_monitor.{h,cpp}` | same path | Verbatim |
-| `src/models/qwen4_exp/program/program.{h,cpp}` | `program/program.{h,cpp}`, `program/program_impl.h` | NInfer's execution contract (prefix reuse off, one lane); device plan, elastic KV (PR 12: `grow_kv`'s order, frames released before the pool maps; the pool shrinks at the next admission that needs less instead of after 60 s idle, and a growth that does not fit fails the request), decode budget, warm start, VRAM control, link probe and decode graph from Infernix |
+| `src/models/qwen4_exp/program/program.{h,cpp}` | `program/program.{h,cpp}`, `program/program_impl.h` | NInfer's execution contract (prefix reuse off, one lane); device plan, elastic KV (PR 12: `grow_kv`'s order, frames released before the pool maps; the pool shrinks at the next admission that needs less instead of after 60 s idle, and a growth that does not fit fails the request), decode budget, warm start, VRAM control, link probe and decode graph from Infernix; PR 13: `mtp_draft`, `verify`, `commit_verified`, `mtp_catch_up` and `choose_draft_length` for one lane, the drafts read back for the n-gram rows, graphs per width |
+| `src/models/qwen4_exp/execution/forward.{h,cpp}` (PR 13) | same path (`run_mtp`, `mtp_block`, the verification records) | Drafter experts through `offloaded_sparse_moe` from a device bank, the text IQ4_XS head as the draft head; verification records for the single-sequence Ops; the PLE and GDN a/b projections column by column in verification |
+| `src/ops/qsa/prep.cu` `commit_tail_kernel` (PR 13) | `src/ops/qsa/qsa.cu` | One sequence; writes every committed slot in order (a commit across two blocks equals the one-column calls bit for bit) |
 | `src/runtime/engine/qwen4_exp_instance.{h,cpp}` | same path | NInfer's EngineCore and ResourceManager with the context cache off; refuses unsupported options |
 | `tests/models/qwen4_exp/test_{expert_cache,memory_plan}.cpp`, `tests/fixtures/expert_cache/lfru_conformance.txt` | same paths | The memory plan's RAM tests rewritten for full mode |
 
