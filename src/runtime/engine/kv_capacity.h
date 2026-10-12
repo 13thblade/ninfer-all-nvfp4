@@ -35,6 +35,11 @@ explicit_capacity_shortfall(std::uint32_t tokens, const SequenceCapacityCurve& c
                                           std::size_t available_runtime_bytes,
                                           std::span<const std::size_t> extra_rank_available_bytes = {});
 
+// The smallest context a fit may choose: `floor`, or one past `largest_graft_slots` when a loaded
+// graft would otherwise leave no room for a prompt (the frontend rejects slots >= max_context).
+[[nodiscard]] std::uint32_t effective_fit_floor(std::uint32_t floor,
+                                                std::uint32_t largest_graft_slots);
+
 // The largest context in [floor, ceiling] that `fits`: the ceiling itself, else the largest
 // multiple of `step` below it, else the floor; nullopt when not even the floor fits. `fits` must be
 // monotone -- every context below one that fits also fits -- and is called O(log) times.

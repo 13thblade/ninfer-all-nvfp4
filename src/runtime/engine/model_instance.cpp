@@ -145,6 +145,19 @@ void fit_context_to_device(EngineOptions& options, ModelInstance& instance, Devi
     const std::vector<std::size_t> extras(budgets.begin() + 1, budgets.end());
     const std::uint32_t ceiling       = options.max_context;
     const KvCapacityPolicy ceiling_kv = options.kv_capacity;
+    // The frontend rejects a graft with slots >= max_context, so no candidate may sit at or below
+    // the largest loaded graft; the planner's reservation knows nothing of grafts.
+    std::uint32_t largest_graft_slots = 0;
+    for (const auto& graft : instance.frontend.grafts()) {
+        const std::size_t slots = graft.kind == models::qwen3_5::GraftKind::PrefillKV
+                                      ? graft.tokens.size()
+                                      : graft.n_slots;
+        largest_graft_slots     = std::max<std::uint32_t>(
+            largest_graft_slots,
+            static_cast<std::uint32_t>(std::min<std::size_t>(
+                slots, std::numeric_limits<std::uint32_t>::max())));
+    }
+    const std::uint32_t floor = effective_fit_floor(options.fit_context_floor, largest_graft_slots);
     // Each candidate is planned from the real options with only the context changed.
     const auto curve_at = [&](std::uint32_t context) {
         options.max_context = context;
@@ -161,13 +174,12 @@ void fit_context_to_device(EngineOptions& options, ModelInstance& instance, Devi
             throw;
         }
     };
-    const auto fitted = fit_context(options.fit_context_floor, ceiling, kFitContextStepTokens,
+    const auto fitted = fit_context(floor, ceiling, kFitContextStepTokens,
                                     [&](std::uint32_t context) {
                                         return explicit_capacity_fits(context, curve_at(context),
                                                                       primary, extras);
                                     });
     if (!fitted) {
-        const std::uint32_t floor = options.fit_context_floor;
         const auto short_rank = explicit_capacity_shortfall(floor, curve_at(floor), primary, extras);
         if (!short_rank) {
             throw std::invalid_argument(

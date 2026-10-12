@@ -176,6 +176,18 @@ int main() {
     } catch (const std::invalid_argument&) { bad_range_rejected = true; }
     failures += check(bad_range_rejected, "a floor above the ceiling was accepted");
 
+    failures += check(ninfer::runtime::effective_fit_floor(32768, 0) == 32768 &&
+                          ninfer::runtime::effective_fit_floor(32768, 32767) == 32768,
+                      "a graft below the floor moved it");
+    failures += check(ninfer::runtime::effective_fit_floor(32768, 32768) == 32769 &&
+                          ninfer::runtime::effective_fit_floor(4096, 40000) == 40001,
+                      "the floor did not clear the largest graft's slots");
+    bool graft_overflow_rejected = false;
+    try {
+        (void)ninfer::runtime::effective_fit_floor(1, 0xFFFFFFFFU);
+    } catch (const std::overflow_error&) { graft_overflow_rejected = true; }
+    failures += check(graft_overflow_rejected, "an unrepresentable graft floor was accepted");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -143,6 +143,13 @@ bool explicit_capacity_fits(std::uint32_t tokens, const SequenceCapacityCurve& c
                                         extra_rank_available_bytes);
 }
 
+std::uint32_t effective_fit_floor(std::uint32_t floor, std::uint32_t largest_graft_slots) {
+    if (largest_graft_slots == std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("graft slot count leaves no valid context");
+    }
+    return std::max(floor, largest_graft_slots + 1U);
+}
+
 std::optional<std::uint32_t> fit_context(std::uint32_t floor, std::uint32_t ceiling,
                                          std::uint32_t step,
                                          const std::function<bool(std::uint32_t)>& fits) {
