@@ -458,6 +458,10 @@ void ProgramImpl::synchronize_transfer_streams() const noexcept {
 
 ProgramImpl::~ProgramImpl() noexcept {
     synchronize_transfer_streams();
+    for (auto& landing : landing_restores_) {
+        for (const auto event : landing.events) { (void)cudaEventDestroy(event); }
+    }
+    for (const auto event : spare_restore_events_) { (void)cudaEventDestroy(event); }
     for (std::size_t rank = 0; rank < compute_streams.size(); ++rank) {
         const cudaStream_t stream = compute_streams[rank];
         if (stream != nullptr) { (void)cudaStreamSynchronize(stream); }

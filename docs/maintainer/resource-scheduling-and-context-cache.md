@@ -493,9 +493,25 @@ Program 同时至多有一个上下文事务，可执行绑定、捕获、demoti
 Sequence、checkpoint 和 pending handle 的 owner/generation 检查防止迟到完成误用已复用描述。
 设备错误进入 Engine 统一 failure cleanup；普通资源不足返回策略层处理。
 
+**按层落地的 Host 恢复。** 初次绑定（非 Replay，单 rank）从 Host 恢复 Main KV 时，第一阶段完成事件
+只覆盖前导部分：StateImage 与 backend KV。前导落地后，Native 发布页面、准备分叉，然后在 transfer
+stream 上按 full-attention 层顺序逐层复制 Main KV，每层之后记录一个事件；绑定不等待这些层即完成。
+逐层复制由读取锁页 Host 内存的 gather kernel 执行，不使用 copy engine：Windows/WDDM 下的 GeForce
+只有一个 copy engine，批量 H2D 会让 pass 自身的小输入上传排在整个恢复之后。分叉的私有部分尾页
+在每层复制之后按层复制。
+
+该 lane 的首个 prefill pass 在每个 full-attention 层的 attention 之前等待该层事件，前几层的计算与
+后续层的复制重叠；之后的 pass 按 stream 顺序排在其后。其他 compute 提交（其他 lane 的 prefill、
+decode、Replay、强制 token、causal scoring）先等待最后一层事件；Vision 窗口只借用空闲 KV 页，不必
+等待。lane 释放或换代、导入检查点或 graft（CPU 写 Host 内存）前在 host 端等待复制落地。Device
+State 分叉的绑定仍在第二阶段等待其 State 复制，但不等待各层。Main KV 的 H2D 观测在复制落地后随该
+请求的 prefill 进度上报；按层复制的尾页只报告字节，其时间包含在恢复区间内。首个 pass 的 GPU 计时
+包含等待复制的时间。
+
 恢复取得完整目的空间，可能出现最终驻留分布可容纳、交换中间态却不能同时容纳的情况。例如 GPU
 中有 B、Host 中有 A，恢复 A 的完整目的与 B 的 Host 写回目标可能竞争同一余量。没有其他释放者
-时可以丢弃可选 B 推进。有限页组回收减少过量搬运，但不提供流式分段恢复。
+时可以丢弃可选 B 推进。有限页组回收减少过量搬运；按层落地只重叠复制与首个 pass，仍取得完整
+目的空间。
 
 <a id="examples"></a>
 ## 10. 规则在请求链中的作用

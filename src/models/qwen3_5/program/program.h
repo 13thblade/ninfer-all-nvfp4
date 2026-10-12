@@ -317,6 +317,8 @@ struct PrefillProgress {
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
+    // Main KV restored from the Host under this lane's first pass, measured once it landed.
+    std::vector<runtime::ContextTransferObservation> landed_transfers;
 };
 
 struct CommitRowResult {

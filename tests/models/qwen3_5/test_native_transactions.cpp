@@ -175,12 +175,25 @@ public:
         require(processed == tokens, "partial prefill crossed its requested frontier");
     }
 
+    // Main KV restored under a lane's first pass, reported with its prefill progress.
+    std::vector<runtime::ContextTransferObservation> landed_;
+
+    [[nodiscard]] bool landed_from_host() const {
+        return std::any_of(landed_.begin(), landed_.end(), [](const auto& transfer) {
+            return transfer.direction == runtime::ContextTransferDirection::HostToDevice &&
+                   transfer.resource == runtime::ContextResourceClass::MainKV &&
+                   transfer.work.payload_bytes != 0 && transfer.elapsed_ns != 0;
+        });
+    }
+
     void finish_prefill(qwen::SequenceHandle sequence, std::uint32_t remaining, bool terminal) {
         std::uint32_t processed = 0;
         for (unsigned iteration = 0; iteration < remaining / kChunk + 4; ++iteration) {
             const bool recovering = program_.recovery_pending(sequence);
             reserve(sequence, qwen::ExecutionUnitKind::Prefill);
             auto step = program_.advance_prefill(sequence);
+            landed_.insert(landed_.end(), step.landed_transfers.begin(),
+                           step.landed_transfers.end());
             processed += step.processed_prompt_tokens;
             if (step.capture_ready) { program_.skip_capture(sequence); }
             if (!step.complete) {
@@ -855,18 +868,38 @@ public:
         require(candidate.has_value(), "Host checkpoint is not a valid recovery source");
         require(static_cast<bool>(program_.start_binding(base, {1}, *candidate)),
                 "Host restore did not reserve its destinations");
-        // start_binding has submitted H2D. Cancellation stays asserted while poll settles it.
+        // start_binding has submitted the prelude H2D (State). Main KV lands layer by layer only
+        // after the prelude, so a binding cancelled first never submits it. Cancellation stays
+        // asserted while poll settles the prelude.
         const auto cancelled = settle(true);
         require(!cancelled.published && !cancelled.sequence &&
                     transferred(cancelled, runtime::ContextTransferDirection::HostToDevice,
                                 runtime::ContextResourceClass::State) &&
-                    transferred(cancelled, runtime::ContextTransferDirection::HostToDevice,
-                                runtime::ContextResourceClass::MainKV),
-                "restore cancellation did not settle its submitted State/KV copies");
+                    !transferred(cancelled, runtime::ContextTransferDirection::HostToDevice,
+                                 runtime::ContextResourceClass::MainKV),
+                "restore cancellation did not settle its submitted State copy alone");
         expect_usage(baseline, "cancelled H2D restore retained unpublished destinations");
-        require(program_.release_checkpoint(source),
-                "cancelled H2D restore retained source leases");
-        expect_empty("cancelled H2D restore leaked typed resources");
+
+        // A published binding whose Main KV is still landing, released before any pass reads it:
+        // the release waits for the copies, then every resource returns.
+        candidate = program_.inspect_source(base, source);
+        require(candidate.has_value() &&
+                    static_cast<bool>(program_.start_binding(base, {1}, *candidate)),
+                "Host restore could not be bound again after a cancellation");
+        const auto landing = settle();
+        require(landing.published && landing.sequence.has_value(),
+                "Host restore did not publish before its Main KV landed");
+        require(program_.abort(*landing.sequence).status == runtime::ConsumeStatus::Consumed,
+                "a landing restore's lane could not be released before its first pass");
+        for (const auto point : landing.private_points) {
+            if (program_.valid_checkpoint(point)) { (void)program_.release_checkpoint(point); }
+        }
+        // The binding may have consumed (moved) its source.
+        if (program_.valid_checkpoint(source)) {
+            require(program_.release_checkpoint(source),
+                    "released landing restore retained source leases");
+        }
+        expect_empty("a released landing restore leaked typed resources");
         next_request();
     }
 
@@ -1561,10 +1594,12 @@ public:
         candidate = program_.inspect_source(extension, source);
         require(candidate && static_cast<bool>(program_.start_binding(extension, {0}, *candidate)),
                 "cancelled mixed batch lost its retained Host prefix");
+        // Main KV lands layer by layer after the binding and is reported with the first pass;
+        // releasing the lane before any pass waits for the copies.
         const auto restored = settle();
         require(restored.sequence &&
-                    transferred(restored, runtime::ContextTransferDirection::HostToDevice,
-                                runtime::ContextResourceClass::MainKV) &&
+                    !transferred(restored, runtime::ContextTransferDirection::HostToDevice,
+                                 runtime::ContextResourceClass::MainKV) &&
                     program_.abort(*restored.sequence).status == runtime::ConsumeStatus::Consumed,
                 "cancelled mixed batch could not restore its released Device replica");
         expect_usage(baseline, "mixed batch restore retained an extra writer or destination");
@@ -1781,10 +1816,12 @@ public:
                 "imported checkpoint could not bind");
         const auto bound = settle();
         require(bound.published && bound.sequence &&
-                    transferred(bound, runtime::ContextTransferDirection::HostToDevice,
-                                runtime::ContextResourceClass::MainKV),
-                "imported checkpoint did not restore from Host");
+                    !transferred(bound, runtime::ContextTransferDirection::HostToDevice,
+                                 runtime::ContextResourceClass::MainKV),
+                "imported checkpoint binding waited for its Main KV restore");
+        landed_.clear();
         finish_prefill(*bound.sequence, next.summary().prompt_tokens - frontier, true);
+        require(landed_from_host(), "imported checkpoint did not restore Main KV from Host");
         auto finished = program_.finish(*bound.sequence);
         require(finished.status == runtime::ConsumeStatus::Consumed,
                 "request resumed from an imported checkpoint did not finish");

@@ -1499,6 +1499,11 @@ private:
         auto progress = instance_.program->advance_prefill(*request->sequence,
                                                            &program_call.failed_timing(), provider);
         program_call.finish(progress.timing);
+        if (!progress.landed_transfers.empty()) {
+            typename ModelContract::ContextProgress landed;
+            landed.transfers = std::move(progress.landed_transfers);
+            record_context_work(landed, request);
+        }
         cumulative_stats_.prefill_seconds_total +=
             static_cast<double>(progress.timing.elapsed_ns()) * 1e-9;
         if (!request->first_output_timing) {

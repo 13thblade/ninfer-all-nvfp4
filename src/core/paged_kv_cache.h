@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/host_gather.h"
 #include "core/layout.h"
 #include "core/paged_kv_storage.h"
 #include "core/tensor.h"
@@ -289,6 +290,11 @@ public:
     void zero_pages(std::span<const DeviceKVPageHandle> pages, RankStreams streams = {}) const;
     TransferWork copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
                            RankStreams streams = {}) const;
+    // Describes the copy of planes [plane_begin, plane_end) of one page into `out` for
+    // gather_copies: a private tail copied layer by layer behind a restore. One-rank pools only.
+    TransferWork describe_page_copy(DeviceKVPageHandle source, DeviceKVPageHandle destination,
+                                    std::size_t plane_begin, std::size_t plane_end,
+                                    std::vector<GatherCopy>& out) const;
 
     // One run assumes contiguous Host records and contiguous Device page IDs. Before Device
     // allocation, sum this work over known Host runs as a nominal transfer estimate.
@@ -300,6 +306,15 @@ public:
     TransferWork copy_from_host(HostKVAllocationConstView source,
                                 std::span<const DeviceKVPageHandle> destination,
                                 RankStreams streams = {}) const;
+    // Describes the H2D copies of planes [plane_begin, plane_end) of each page into `out` for
+    // gather_copies, issuing nothing: a restore copies one layer's planes at a time so a pass can
+    // start on the first layers while later ones arrive, and runs them as gather kernels because
+    // with one copy engine a bulk H2D there holds the pass's own input uploads behind the whole
+    // restore. One-rank pools only.
+    TransferWork describe_from_host(HostKVAllocationConstView source,
+                                    std::span<const DeviceKVPageHandle> destination,
+                                    std::size_t plane_begin, std::size_t plane_end,
+                                    std::vector<GatherCopy>& out) const;
     // The same copies against caller-owned memory laid out by `host`, for images that do not live
     // in a Host KV arena (session snapshots). `host` must describe this pool's geometry.
     TransferWork copy_to_host(std::span<const DeviceKVPageHandle> source, std::byte* destination,
@@ -330,7 +345,8 @@ private:
     template <bool ToHost>
     TransferWork copy_host_pages(std::span<const DeviceKVPageHandle> pages,
                                  std::conditional_t<ToHost, std::byte*, const std::byte*> host,
-                                 const RankStreams& streams) const;
+                                 const RankStreams& streams, std::size_t plane_begin,
+                                 std::size_t plane_end, std::vector<GatherCopy>* describe) const;
 
     struct HostTransferPlane {
         std::size_t host_offset    = 0;

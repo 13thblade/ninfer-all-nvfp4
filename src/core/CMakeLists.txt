@@ -2,6 +2,7 @@ add_library(ninfer_core STATIC
   arena.cu
   device.cu
   stage_link.cu
+  host_gather.cu
   dtype.cpp
   host_worker_pool.cpp
   gdn_replay_records.cpp
