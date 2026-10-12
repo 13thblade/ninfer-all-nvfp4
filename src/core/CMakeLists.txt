@@ -19,6 +19,7 @@ add_library(ninfer_core STATIC
   vmm_arena.cu
   pinned_upload.cu
   copy_batch.cpp
+  cgroup_memory.cpp
   host_memory.cpp
   link_probe.cpp
   power_throttling.cpp
