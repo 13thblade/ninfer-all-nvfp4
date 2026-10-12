@@ -258,8 +258,9 @@ set_tests_properties(ninfer_gdn_state_fp16_two_stage_test
 
 add_test(NAME ninfer_gdn_replay_fold_wide_test
   COMMAND ninfer_tests ninfer_gdn_replay_fold_test --wide-only)
+# About 300 cases with an FP64 oracle each: 11 minutes on the Tesla V100 host (Xeon E5-2683 v4).
 set_tests_properties(ninfer_gdn_replay_fold_wide_test
-  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200 RUN_SERIAL TRUE)
 
 # The fused projections once more with every width on each route table: their own routes, and
 # upstream's over the unified templates that a device profile may take per width.
