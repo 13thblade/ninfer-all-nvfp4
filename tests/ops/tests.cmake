@@ -38,9 +38,34 @@ ninfer_add_op_test(ninfer_ggml_blocks_decode_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_blocks_decode.cpp"
   LIBRARIES ninfer_core)
 
+# offloaded_sparse_moe over GGML expert records. The CPU test needs no GPU: the canonical A8 cast,
+# the exact sub-block decode, the FP64 expert oracle, AVX2 = scalar and the worker team. The layer
+# test runs routing, dispatch, every record placement, the CPU miss channel and the combine on the
+# GPU against the CPU engine (bit for bit) and FP64; with NINFER_TEST_ARTIFACT it repeats the check
+# on the real expert banks of a qwen4exp artifact.
+ninfer_add_op_test(ninfer_offloaded_moe_cpu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cpu.cpp"
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_offloaded_moe_layer_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
+  LIBRARIES ninfer_ops ninfer_artifact)
+
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)
+
+# Qwen3.8-Flash-Next (qwen4exp) Ops ported from Infernix: hyper-connection mixers, the PLE
+# injection (with its IQ4_NL row decode), FP32 projections (BF16 router, IQ4_XS head) and row
+# splits / column gathers.
+ninfer_add_op_test(ninfer_hyper_connection_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
+foreach(op IN ITEMS ple projection_fp32 rows)
+  ninfer_add_op_test(ninfer_${op}_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${op}.cpp"
+    LIBRARIES ninfer_ops)
+endforeach()
 
 # Query-sparse attention: index query, pooled keys, block selection and attention, each against its
 # FP64 or exact oracle. `--small` runs the quick subset used under compute-sanitizer.

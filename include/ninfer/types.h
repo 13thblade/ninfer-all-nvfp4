@@ -99,8 +99,8 @@ struct SpeculativeOptions {
     // request (its prompt, a tool result or its own output), a round verifies what followed it,
     // up to this many drafts, instead of the draft model's proposal. Verification licenses every
     // token, so a wrong copy costs throughput and never changes output. 0 disables it. The product
-    // flags accept only 15; the Engine accepts 1..15 above draft_tokens so benchmarks can measure
-    // other verify widths. Requires DFlash2 and, for now, max_concurrency 1.
+    // flags accept only 15; the Engine accepts 1..15 at least draft_tokens so benchmarks can measure
+    // other verify widths. Requires DFlash2.
     std::uint32_t ngram_draft_tokens = 0;
     // Tail tokens a copy must match before it is proposed, 4..64.
     std::uint32_t ngram_min_match = 12;
@@ -1362,7 +1362,11 @@ struct RuntimeStats {
     std::uint64_t context_store_corrupt        = 0; // removed because they could not be read
     std::uint64_t context_store_restored       = 0; // sessions restored into the cache at start-up
     std::uint64_t context_store_restored_bytes = 0;
-    double context_store_restore_seconds       = 0.0;
+    // Sessions found at start-up that were written under another model, configuration (KV,
+    // recurrent state, speculative backend or draft window) or image format: never read, they age
+    // out of the store.
+    std::uint64_t context_store_foreign  = 0;
+    double context_store_restore_seconds = 0.0;
     // Stored sessions brought back into the cache for a request that would otherwise have been
     // prefilled from further back, and the prompt tokens that bought.
     std::uint64_t context_store_hydrations         = 0;
