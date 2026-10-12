@@ -74,6 +74,15 @@ public:
     HostKVExtentStore(HostKVExtentStore&&)                 = delete;
     HostKVExtentStore& operator=(HostKVExtentStore&&)      = delete;
 
+    // Called before any extent's Host memory returns to the arena or is repartitioned. A consumer
+    // with asynchronous reads of that memory (a layered restore's gather kernels) waits for them
+    // there, so no release path has to know about it.
+    using ReleaseFence = void (*)(void*) noexcept;
+    void set_release_fence(ReleaseFence fence, void* context) noexcept {
+        release_fence_         = fence;
+        release_fence_context_ = context;
+    }
+
     [[nodiscard]] std::uint32_t capacity() const noexcept {
         return static_cast<std::uint32_t>(extents_.size());
     }
@@ -612,6 +621,7 @@ private:
         }
         const std::size_t released_bytes = stride * static_cast<std::size_t>(released_pages);
 
+        fence_release();
         HostKVAllocation remaining = std::move(*original.allocation);
         original.allocation.reset();
         increment_generation(original.generation);
@@ -689,7 +699,12 @@ private:
         return released_bytes;
     }
 
+    void fence_release() const noexcept {
+        if (release_fence_ != nullptr) { release_fence_(release_fence_context_); }
+    }
+
     void release_descriptor(std::uint32_t index, Extent& extent) noexcept {
+        fence_release();
         std::uint32_t node = extent.head;
         for (std::uint32_t offset = 0; offset < extent.page_count; ++offset) {
             if (node == kInvalidIndex) { std::terminate(); }
@@ -714,7 +729,9 @@ private:
         reservation.page_store_ = nullptr;
     }
 
-    HostKVArena* arena_ = nullptr;
+    HostKVArena* arena_                = nullptr;
+    ReleaseFence release_fence_        = nullptr;
+    void* release_fence_context_       = nullptr;
     std::vector<Extent> extents_;
     std::vector<std::uint32_t> free_;
     std::uint32_t free_count_ = 0;

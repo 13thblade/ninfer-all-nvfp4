@@ -1120,6 +1120,10 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                  : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
             full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
         try {
+            if (full && compact < static_cast<std::int32_t>(layer_ready_.size())) {
+                CUDA_CHECK(cudaStreamWaitEvent(ctx_.stream,
+                                               layer_ready_[static_cast<std::size_t>(compact)], 0));
+            }
             {
                 nvtx::ScopedRange mixer_range(
                     full ? (prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention)
@@ -1373,8 +1377,13 @@ template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     if (!parameters_.text.split_execution()) {
         run_stage_layers(0, x, ph, tap);
+        // Later passes are stream-ordered behind this one's restore waits.
+        layer_ready_ = {};
         return;
     }
+    // Restore events are recorded on rank 0's transfer stream; the Program lands a restore whole
+    // before a split model runs.
+    if (!layer_ready_.empty()) { throw std::logic_error("a split model cannot wait per layer"); }
     if (stage_runtime_ == nullptr) { throw std::logic_error("a split model needs its stage runtime"); }
     run_staged(x, ph, tap);
 }

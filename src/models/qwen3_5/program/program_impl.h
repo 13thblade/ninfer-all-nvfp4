@@ -561,9 +561,56 @@ public:
         bool borrow_backend        = false;
         bool borrow_state          = false;
         bool source_tail_hidden    = false;
+        // A Main KV restore planned at reservation and copied per layer after the prelude
+        // (enqueue_layered_restore), with a private partial tail copied per layer behind it.
+        bool layered_restore = false;
+        struct LayeredRun {
+            LogicalKVPageStore* pages = nullptr;
+            HostKVAllocationConstView host;
+            std::vector<DeviceKVPageHandle> destination;
+        };
+        std::vector<LayeredRun> layered_runs;
+        std::uint32_t layered_pages = 0;
+        std::optional<std::pair<DeviceKVPageHandle, DeviceKVPageHandle>> layered_tail;
     };
 
     std::optional<ContextTransaction> context_transaction_;
+    // A Bind's Main KV restore that lands after its binding completed, one event per full-attention
+    // layer on rank 0's transfer stream. The lane's first prefill pass waits for each layer just
+    // before it (`take_restore_layers`); any other compute work is ordered behind the last layer
+    // first (`order_after_restores`). A released lane and CPU writes into Host memory wait for the
+    // copies to land.
+    struct LandingRestore {
+        std::uint32_t lane = 0;
+        std::vector<cudaEvent_t> events;
+        CudaEventTimer timer;
+        TransferWork work;
+        TransferWork tail_work;
+        std::uint32_t page_count = 0;
+        bool ordered             = false;
+        // The layers' gather descriptors, read by the kernels until the restore has landed.
+        std::optional<PinnedHostBuffer> descriptors;
+        // The history a consuming Bind restored from. Its Host pages are the gather kernels'
+        // source, so it outlives the binding transaction and is released only after the landing
+        // has landed (the binding then never waits for the restore to reclaim it).
+        std::vector<std::shared_ptr<KVHistory>> sources;
+    };
+    std::vector<LandingRestore> landing_restores_;
+    std::vector<cudaEvent_t> spare_restore_events_;
+    std::vector<PinnedHostBuffer> spare_descriptor_buffers_;
+    // Landed restore observations, reported with the owner's prefill progress.
+    std::vector<runtime::ContextTransferObservation> landed_transfers_;
+    [[nodiscard]] std::span<const cudaEvent_t> take_restore_layers(std::uint32_t lane);
+    void order_after_restores();
+    void land_restores();
+    // Waits for every in-flight landing, ignoring errors: the Host extent release fence.
+    void land_restores_quietly() noexcept;
+    void complete_landing(std::uint32_t lane);
+    void retire_landing(std::uint32_t lane) noexcept;
+    // Returns a landing's events and descriptor buffer to the spare pools, or destroys them if the
+    // pools cannot grow. Call only once nothing queued still reads or signals them.
+    void recycle_landing_resources(LandingRestore&) noexcept;
+    void enqueue_layered_restore(ContextTransaction&);
     // One event per rank: a context transaction copies on every rank's transfer stream, after that
     // rank's compute stream, and is complete only when every rank's copies are.
     RankFenceSet context_source_ready_;

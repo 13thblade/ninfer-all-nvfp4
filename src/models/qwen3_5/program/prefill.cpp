@@ -82,6 +82,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
+    card.set_layer_ready(state.layer_ready);
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -107,6 +108,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
+    card.set_layer_ready(state.layer_ready);
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
@@ -547,6 +549,14 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             dflash_prefill_host_ingress,
             sequence.rope_delta};
         schedule_state.prefill_gpu_timer = &prefill_gpu_timer_;
+        schedule_state.layer_ready       = take_restore_layers(sequence.lane);
+        if (staged.cursor >= staged.prompt_tokens) {
+            // An exact hit runs no prefill chunk, so nothing waits for the restored layers before
+            // the tail hidden state is sampled and later compute reads Main KV. Wait for the
+            // landing here and retire it, as the first chunk would have.
+            schedule_state.layer_ready = {};
+            complete_landing(sequence.lane);
+        }
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -634,6 +644,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 timing.include(result.timing);
                 timing.resume_post();
+                // A chunk waits for every restored layer and synchronizes: a restore landing
+                // under this lane has landed.
+                schedule_state.layer_ready = {};
+                complete_landing(sequence.lane);
                 if (result.processed_tokens == 0 || result.processed_tokens > remaining) {
                     throw std::logic_error("ordinary prefill chunk made invalid progress");
                 }

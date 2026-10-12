@@ -148,10 +148,12 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt,
 }
 
 std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t target) {
+    impl_->order_after_restores();
     return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), target);
 }
 
 CheckpointHandle Program::install_external_checkpoint(const PromptGraft& graft) {
+    impl_->land_restores(); // a graft writes Host memory a landing restore may still read
     return impl_->install_external_checkpoint(graft);
 }
 
@@ -290,22 +292,38 @@ bool Program::has_context_transaction() const noexcept { return impl_->has_conte
 
 PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t,
                                          runtime::TokenMaskProvider* m) {
-    return impl_->advance_prefill(h, t, m);
+    // Landings complete inside this call (each lane's first prefill pass), so the list is empty on
+    // entry. A call that throws after one completed must not leave its observations for the next
+    // request's progress.
+    auto progress = [&] {
+        try {
+            return impl_->advance_prefill(h, t, m);
+        } catch (...) {
+            impl_->landed_transfers_.clear();
+            throw;
+        }
+    }();
+    progress.landed_transfers = std::move(impl_->landed_transfers_);
+    impl_->landed_transfers_.clear();
+    return progress;
 }
 
 ReplayProgress Program::advance_replay(SequenceHandle h, runtime::ExecutionTiming* t) {
+    impl_->order_after_restores();
     return impl_->advance_replay(h, t);
 }
 
 PendingBatch Program::decode(std::span<const SequenceHandle> s,
                              std::span<const runtime::RoundBudget> b, runtime::ExecutionTiming* t,
                              runtime::TokenMaskProvider* m) {
+    impl_->order_after_restores();
     return impl_->decode(s, b, t, m);
 }
 
 runtime::ExecutionTiming Program::append_forced_tokens(
     std::span<const SequenceHandle> s, std::span<const TokenId> ids, std::uint32_t stride,
     std::span<const std::optional<std::uint32_t>> splits, runtime::ExecutionTiming* t) {
+    impl_->order_after_restores();
     return impl_->append_forced_tokens(s, ids, stride, splits, t);
 }
 
@@ -343,6 +361,7 @@ std::size_t Program::checkpoint_image_host_bytes(std::span<const std::uint8_t> i
 
 std::optional<ImportedCheckpoints> Program::import_checkpoints(std::span<const std::uint8_t> image,
                                                                std::string_view binding) {
+    impl_->land_restores(); // an import writes Host memory a landing restore may still read
     return impl_->import_checkpoints(image, binding);
 }
 
@@ -352,6 +371,8 @@ SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
 }
 
 runtime::ResourceReservation Program::reserve_vision_window(SequenceHandle sequence) {
+    // No restore ordering: the Engine asks before every prefill unit, and a window borrows only free
+    // KV pages, never a landing restore's destinations.
     return impl_->reserve_vision_window(sequence);
 }
 

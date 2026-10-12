@@ -1,6 +1,7 @@
 #include "core/paged_kv_cache.h"
 
 #include "core/device.h"
+#include "core/host_gather.h"
 #include "core/host_kv_arena.h"
 
 #include <algorithm>
@@ -758,6 +759,46 @@ void DeviceKVPagePool::zero_pages(std::span<const DeviceKVPageHandle> pages,
     }
 }
 
+TransferWork DeviceKVPagePool::describe_page_copy(DeviceKVPageHandle source,
+                                                  DeviceKVPageHandle destination,
+                                                  std::size_t plane_begin, std::size_t plane_end,
+                                                  std::vector<GatherCopy>& out) const {
+    if (plane_begin >= plane_end || plane_end > planes_.size()) {
+        throw std::invalid_argument("Paged KV page copy plane range is invalid");
+    }
+    if (rank_count_ != 1) { throw std::logic_error("Paged KV gathers serve a one-rank pool"); }
+    const std::int32_t source_index      = physical_index(source);
+    const std::int32_t destination_index = physical_index(destination);
+    if (source_index == destination_index) { return {}; }
+    std::uint64_t payload = 0;
+    for (std::size_t plane_index = plane_begin; plane_index < plane_end; ++plane_index) {
+        const Tensor& plane = planes_[plane_index];
+        auto* base          = static_cast<unsigned char*>(plane.data);
+        payload += host_transfer_planes_[plane_index].page_bytes;
+        const auto destination_offset = static_cast<std::int64_t>(destination_index);
+        const auto source_offset      = static_cast<std::int64_t>(source_index);
+        if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
+            const auto page = static_cast<std::uint64_t>(plane.nb[3]);
+            out.push_back({.destination       = base + destination_offset * plane.nb[3],
+                           .source            = base + source_offset * plane.nb[3],
+                           .destination_pitch = page,
+                           .source_pitch      = page,
+                           .width             = page,
+                           .height            = 1});
+        } else {
+            const auto pitch = static_cast<std::uint64_t>(plane.nb[3]);
+            out.push_back({.destination       = base + destination_offset * plane.nb[2],
+                           .source            = base + source_offset * plane.nb[2],
+                           .destination_pitch = pitch,
+                           .source_pitch      = pitch,
+                           .width             = static_cast<std::uint64_t>(plane.nb[2]),
+                           .height            = static_cast<std::uint64_t>(plane.ne[3])});
+        }
+    }
+    return {.payload_bytes   = payload,
+            .copy_operations = static_cast<std::uint32_t>(plane_end - plane_begin)};
+}
+
 TransferWork DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
                                          RankStreams streams) const {
     const std::int32_t source_index      = physical_index(source);
@@ -787,19 +828,36 @@ template <bool ToHost>
 TransferWork
 DeviceKVPagePool::copy_host_pages(std::span<const DeviceKVPageHandle> pages,
                                   std::conditional_t<ToHost, std::byte*, const std::byte*> host,
-                                  const RankStreams& streams) const {
+                                  const RankStreams& streams, std::size_t plane_begin,
+                                  std::size_t plane_end, std::vector<GatherCopy>* describe) const {
     // Plane ranks are dense from zero, so resolving the highest one before issuing any copy makes a
     // missing rank fail the transfer as a whole instead of after some planes were written.
-    (void)streams[rank_count_ - 1];
+    if (describe == nullptr) { (void)streams[rank_count_ - 1]; }
+    if (plane_begin >= plane_end || plane_end > planes_.size()) {
+        throw std::invalid_argument("Paged KV Host transfer plane range is invalid");
+    }
+    const bool all_planes     = plane_begin == 0 && plane_end == planes_.size();
+    std::size_t range_payload = 0;
+    for (std::size_t index = plane_begin; index < plane_end; ++index) {
+        range_payload += host_transfer_planes_[index].page_bytes;
+    }
     TransferWork work;
     const auto copy = [&](std::size_t plane_index, unsigned char* device_base,
                           std::size_t device_pitch, auto* host_base, std::size_t host_pitch,
                           std::size_t width, std::size_t height) {
-        const cudaStream_t stream = streams[plane_ranks_[plane_index]];
         if constexpr (ToHost) {
+            const cudaStream_t stream = streams[plane_ranks_[plane_index]];
             CUDA_CHECK(cudaMemcpy2DAsync(host_base, host_pitch, device_base, device_pitch, width,
                                          height, cudaMemcpyDeviceToHost, stream));
+        } else if (describe != nullptr) {
+            describe->push_back({.destination       = device_base,
+                                 .source            = host_base,
+                                 .destination_pitch = device_pitch,
+                                 .source_pitch      = host_pitch,
+                                 .width             = width,
+                                 .height            = height});
         } else {
+            const cudaStream_t stream = streams[plane_ranks_[plane_index]];
             CUDA_CHECK(cudaMemcpy2DAsync(device_base, device_pitch, host_base, host_pitch, width,
                                          height, cudaMemcpyHostToDevice, stream));
         }
@@ -816,46 +874,38 @@ DeviceKVPagePool::copy_host_pages(std::span<const DeviceKVPageHandle> pages,
             throw std::overflow_error("Host KV transfer operation count exceeds uint32");
         }
         if (geometry().device_plane_order == PagedKVPlaneOrder::PageMajor) {
-            if (count < maximum_host_plane_group_) {
-                for (const auto& group : host_transfer_groups_) {
-                    if (group.copy_by_page(count)) {
-                        // A group's planes share one rank, so the first plane's stream serves all.
-                        const auto& plane  = planes_[group.first_plane];
-                        const auto& packed = host_transfer_planes_[group.first_plane];
-                        for (std::size_t page = begin; page < end; ++page) {
-                            copy(group.first_plane,
-                                 static_cast<unsigned char*>(plane.data) +
-                                     static_cast<std::int64_t>(pages[page].index_) * plane.nb[3],
-                                 group.device_pitch,
-                                 host + page * host_page_stride_ + packed.host_offset,
-                                 group.host_pitch, packed.page_bytes, group.plane_count);
-                        }
-                    } else {
-                        for (std::size_t index = group.first_plane;
-                             index < group.first_plane + group.plane_count; ++index) {
-                            const auto& plane  = planes_[index];
-                            const auto& packed = host_transfer_planes_[index];
-                            copy(index,
-                                 static_cast<unsigned char*>(plane.data) +
-                                     static_cast<std::int64_t>(first) * plane.nb[3],
-                                 plane.nb[3], host + begin * host_page_stride_ + packed.host_offset,
-                                 host_page_stride_, packed.page_bytes, count);
-                        }
+            for (const auto& group : host_transfer_groups_) {
+                // A plane range copies the part of each group inside it; the group pitches hold.
+                const std::size_t low  = std::max(group.first_plane, plane_begin);
+                const std::size_t high = std::min(group.first_plane + group.plane_count, plane_end);
+                if (low >= high) { continue; }
+                const std::size_t group_planes = high - low;
+                if (count < group_planes) {
+                    // A group's planes share one rank, so the first plane's stream serves all.
+                    const auto& plane  = planes_[low];
+                    const auto& packed = host_transfer_planes_[low];
+                    for (std::size_t page = begin; page < end; ++page) {
+                        copy(low,
+                             static_cast<unsigned char*>(plane.data) +
+                                 static_cast<std::int64_t>(pages[page].index_) * plane.nb[3],
+                             group.device_pitch,
+                             host + page * host_page_stride_ + packed.host_offset,
+                             group.host_pitch, packed.page_bytes, group_planes);
                     }
-                }
-            } else {
-                for (std::size_t index = 0; index < planes_.size(); ++index) {
-                    const auto& plane  = planes_[index];
-                    const auto& packed = host_transfer_planes_[index];
-                    copy(index,
-                         static_cast<unsigned char*>(plane.data) +
-                             static_cast<std::int64_t>(first) * plane.nb[3],
-                         plane.nb[3], host + begin * host_page_stride_ + packed.host_offset,
-                         host_page_stride_, packed.page_bytes, count);
+                } else {
+                    for (std::size_t index = low; index < high; ++index) {
+                        const auto& plane  = planes_[index];
+                        const auto& packed = host_transfer_planes_[index];
+                        copy(index,
+                             static_cast<unsigned char*>(plane.data) +
+                                 static_cast<std::int64_t>(first) * plane.nb[3],
+                             plane.nb[3], host + begin * host_page_stride_ + packed.host_offset,
+                             host_page_stride_, packed.page_bytes, count);
+                    }
                 }
             }
         } else {
-            for (std::size_t index = 0; index < planes_.size(); ++index) {
+            for (std::size_t index = plane_begin; index < plane_end; ++index) {
                 const auto& plane  = planes_[index];
                 const auto& packed = host_transfer_planes_[index];
                 auto* device_base  = static_cast<unsigned char*>(plane.data);
@@ -879,7 +929,7 @@ DeviceKVPagePool::copy_host_pages(std::span<const DeviceKVPageHandle> pages,
                 }
             }
         }
-        work.payload_bytes += run_work.payload_bytes;
+        work.payload_bytes += all_planes ? run_work.payload_bytes : range_payload * count;
         begin = end;
     }
     return work;
@@ -918,7 +968,7 @@ TransferWork DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> 
         throw std::invalid_argument("Paged KV D2H geometry or extent is inconsistent");
     }
     for (DeviceKVPageHandle page : source) { (void)physical_index(page); }
-    return copy_host_pages<true>(source, destination, streams);
+    return copy_host_pages<true>(source, destination, streams, 0, planes_.size(), nullptr);
 }
 
 TransferWork DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
@@ -939,7 +989,22 @@ TransferWork DeviceKVPagePool::copy_from_host(const std::byte* source,
         throw std::invalid_argument("Paged KV H2D geometry or extent is inconsistent");
     }
     validate_distinct_pages(destination, "Paged KV H2D destination contains duplicate pages");
-    return copy_host_pages<false>(destination, source, streams);
+    return copy_host_pages<false>(destination, source, streams, 0, planes_.size(), nullptr);
+}
+
+TransferWork DeviceKVPagePool::describe_from_host(HostKVAllocationConstView source,
+                                                  std::span<const DeviceKVPageHandle> destination,
+                                                  std::size_t plane_begin, std::size_t plane_end,
+                                                  std::vector<GatherCopy>& out) const {
+    if (rank_count_ != 1) { throw std::logic_error("Paged KV gathers serve a one-rank pool"); }
+    if (!source.valid() || source.page_count() != destination.size() ||
+        source.layout().geometry != geometry() || source.data() == nullptr ||
+        !host_layout_is_canonical(source.layout())) {
+        throw std::invalid_argument("Paged KV H2D geometry or extent is inconsistent");
+    }
+    validate_distinct_pages(destination, "Paged KV H2D destination contains duplicate pages");
+    return copy_host_pages<false>(destination, source.data(), RankStreams{}, plane_begin,
+                                  plane_end, &out);
 }
 
 std::vector<DeviceKVPageReservation>

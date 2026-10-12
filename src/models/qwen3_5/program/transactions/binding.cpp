@@ -488,6 +488,7 @@ void ProgramImpl::prepare_binding(ContextTransaction& tx) {
     }
     tx.submitted = !tx.source || !tx.transfers.empty();
     if (tx.submitted) { context_completion_.record(transfer_streams); }
+    if (tx.layered_restore) { enqueue_layered_restore(tx); }
 }
 
 void ProgramImpl::complete_binding(ContextTransaction& tx, ContextProgress& out) {

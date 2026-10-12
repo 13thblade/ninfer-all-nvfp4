@@ -1,4 +1,6 @@
+#include "core/arena.h"
 #include "core/device.h"
+#include "core/host_gather.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_address_space.h"
 #include "models/qwen3_5/program/storage/state_store.h"
@@ -7,6 +9,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -1320,6 +1323,121 @@ void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPla
            "retiring the final history and views leaked KV storage");
 }
 
+// A Host restore copies one layer's planes at a time, so a pass can start on the first layers while
+// later ones are still arriving. Each range must write exactly its planes, and the ranges together
+// must reproduce the whole-page copy, for runs shorter and longer than a page-major plane group.
+void test_plane_range_restore(ninfer::DeviceContext& context, ninfer::PagedKVPlaneOrder order) {
+    constexpr auto page_size = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+    constexpr std::uint32_t pages_used = 8;
+    constexpr std::size_t layers = 2, per_layer = 4;
+    ninfer::KVPageGeometry geometry{.device_plane_order = order};
+    for (std::size_t plane = 0; plane < layers * per_layer; ++plane) {
+        geometry.planes.push_back({ninfer::DType::I8, 8, 2, 256});
+    }
+    ninfer::LayoutBuilder builder;
+    const auto page_layout = ninfer::plan_device_kv_page_pool(
+        builder, {.page_group_count = pages_used, .geometry = geometry});
+    const auto table_layout = ninfer::plan_kv_execution_tables(
+        builder, {.logical_page_capacity = pages_used, .table_rows = 1});
+    ninfer::DeviceArena arena(builder.finish(256));
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, page_layout);
+    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, table_layout, pool);
+    store::LogicalKVPageStore pages(pool, pages_used);
+    store::KVAddressSpaceStore addresses(pages, tables, 2, pages_used);
+    const auto address = addresses.create_active(pages_used, 0, context.stream).value();
+    addresses.ensure_mapped_to_tokens(address, pages_used * page_size, context.stream);
+    std::vector<ninfer::DeviceKVPageHandle> handles;
+    for (std::uint32_t page = 0; page < pages_used; ++page) {
+        handles.push_back(addresses.physical_page(address, page));
+    }
+
+    const auto host_layout = ninfer::plan_host_kv_page_layout(geometry);
+    const std::array layouts{host_layout};
+    ninfer::HostContextArena host_backing(host_layout.page_stride * 2 * pages_used,
+                                          host_layout.page_stride);
+    ninfer::HostKVArena host_arena(host_backing, layouts);
+    auto image    = host_arena.allocate(host_layout, pages_used).value();
+    auto observed = host_arena.allocate(host_layout, pages_used).value();
+    (void)fill_device_pool(pool, context.stream);
+    const auto full = pool.copy_to_host(handles, host_arena.writable_view(image), context.stream);
+    context.synchronize();
+    std::vector<std::byte> expected(host_arena.view(image).data(),
+                                    host_arena.view(image).data() +
+                                        host_layout.page_stride * pages_used);
+
+    const auto clear_device = [&] {
+        for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+            const auto& tensor = pool.plane(plane);
+            if (cudaMemsetAsync(tensor.data, 0, tensor.bytes(), context.stream) != cudaSuccess) {
+                throw std::runtime_error("device pool clear failed");
+            }
+        }
+    };
+    const auto observe = [&] {
+        auto view = host_arena.writable_view(observed);
+        std::memset(view.data(), 0xa5, host_layout.page_stride * pages_used);
+        (void)pool.copy_to_host(handles, view, context.stream);
+        context.synchronize();
+        return std::vector<std::byte>(view.data(),
+                                      view.data() + host_layout.page_stride * pages_used);
+    };
+    // Runs of 1, 2 and 5 contiguous pages: shorter and longer than one layer's 4 planes.
+    const std::array<std::pair<std::uint32_t, std::uint32_t>, 3> runs{{{0, 1}, {1, 2}, {3, 5}}};
+    ninfer::PinnedHostBuffer descriptor_buffer(1U << 16);
+    const auto run_gathers = [&](const std::vector<ninfer::GatherCopy>& copies) {
+        auto* staged = static_cast<ninfer::GatherCopy*>(descriptor_buffer.data());
+        std::copy(copies.begin(), copies.end(), staged);
+        ninfer::gather_copies(std::span<const ninfer::GatherCopy>(staged, copies.size()),
+                              context.stream);
+        context.synchronize();
+    };
+    const auto restore_layer = [&](std::size_t layer) {
+        std::uint64_t payload = 0;
+        std::vector<ninfer::GatherCopy> copies;
+        for (const auto& [begin, count] : runs) {
+            payload += pool.describe_from_host(host_arena.view(image).subview(begin, count),
+                                               std::span(handles).subspan(begin, count),
+                                               layer * per_layer, (layer + 1) * per_layer, copies)
+                           .payload_bytes;
+        }
+        // Small pieces so the row split and several blocks sharing one copy are exercised.
+        ninfer::split_gather_copies(copies, 1000);
+        run_gathers(copies);
+        return payload;
+    };
+
+    clear_device();
+    const auto first_payload = restore_layer(0);
+    auto partial             = expected;
+    for (std::uint32_t page = 0; page < pages_used; ++page) {
+        for (std::size_t plane = per_layer; plane < layers * per_layer; ++plane) {
+            const auto& packed = host_layout.planes[plane];
+            std::memset(partial.data() + page * host_layout.page_stride + packed.offset, 0,
+                        packed.page_payload_bytes);
+        }
+    }
+    expect(observe() == partial, "one layer's plane range wrote outside its planes");
+    const auto second_payload = restore_layer(1);
+    expect(observe() == expected, "layer plane ranges did not reproduce the whole-page restore");
+    expect(first_payload + second_payload == full.payload_bytes,
+           "layer plane ranges reported a different payload than the whole-page copy");
+
+    // A private tail copied layer by layer: only that layer's planes of the destination change.
+    std::vector<ninfer::GatherCopy> tail;
+    (void)pool.describe_page_copy(handles[2], handles[6], 0, per_layer, tail);
+    run_gathers(tail);
+    auto tail_expected = expected;
+    for (std::size_t plane = 0; plane < per_layer; ++plane) {
+        const auto& packed = host_layout.planes[plane];
+        std::memcpy(tail_expected.data() + 6 * host_layout.page_stride + packed.offset,
+                    expected.data() + 2 * host_layout.page_stride + packed.offset,
+                    packed.page_payload_bytes);
+    }
+    expect(observe() == tail_expected, "a layer's tail copy wrote outside that layer's planes");
+    expect(addresses.release_after_deactivate(address) && pool.allocated_pages() == 0,
+           "plane range restore test leaked KV storage");
+}
+
 } // namespace
 
 int main() {
@@ -1339,6 +1457,8 @@ int main() {
         test_shared_kv_directory(device);
         test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::PageMajor);
         test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::HeadMajor);
+        test_plane_range_restore(device, ninfer::PagedKVPlaneOrder::PageMajor);
+        test_plane_range_restore(device, ninfer::PagedKVPlaneOrder::HeadMajor);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

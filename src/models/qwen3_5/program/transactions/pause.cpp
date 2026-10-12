@@ -10,6 +10,10 @@ namespace ninfer::models::qwen3_5::detail {
 std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& state) {
     const auto frontier = state.text_kv_valid;
     if (!frontier || !state.kv) { return std::nullopt; }
+    // A layered restore may still be writing this lane's pages from the transfer stream, which
+    // device.synchronize() does not drain. Once the pages belong to a checkpoint, a backup can drop
+    // their Device replicas (prepare_backup) and recycle them under the gather kernels.
+    retire_landing(state.lane);
     auto backing     = std::make_shared<PreparedCaptureBacking>();
     backing->digests = state.prefix_digests;
     backing->digests.truncate(frontier);

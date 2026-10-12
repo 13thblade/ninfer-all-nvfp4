@@ -96,6 +96,11 @@ public:
 
     void set_prefill_gpu_timer(CudaEventTimer* timer) noexcept { prefill_gpu_timer_ = timer; }
 
+    // One event per full-attention layer (compact index) of a Host restore still landing. The next
+    // layer pass waits for each one just before that layer's attention; later passes are
+    // stream-ordered behind it.
+    void set_layer_ready(std::span<const cudaEvent_t> events) noexcept { layer_ready_ = events; }
+
     void set_prefill_split_frontier(std::int64_t position) noexcept {
         prefill_split_frontier_ = position;
     }
@@ -246,6 +251,7 @@ private:
     Tensor& prefill_hidden_;
     // Borrowed from Program; every measured chunk retires before this pair is reused.
     CudaEventTimer* prefill_gpu_timer_ = nullptr;
+    std::span<const cudaEvent_t> layer_ready_;
     std::uint32_t prefill_chunk_;
     std::uint32_t text_kv_base_;
     const Tensor* active_cache_positions_                                          = nullptr;
