@@ -57,6 +57,11 @@ inline std::size_t granularity(int device) {
     return bytes;
 }
 
+// A result that means "no memory or residency right now": a refused grow, not a fatal error.
+inline bool grow_refused(CUresult result) {
+    return result == CUDA_ERROR_OUT_OF_MEMORY || result == CUDA_ERROR_NOT_READY;
+}
+
 // The raw result, so a caller can treat a refusal for lack of memory as a failed grow.
 inline CUresult try_set_access(CUdeviceptr va, std::size_t bytes, int device) {
     CUmemAccessDesc access{};

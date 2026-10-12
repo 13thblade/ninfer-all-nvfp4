@@ -101,6 +101,93 @@ std::uint32_t SequenceCapacityCurve::resolved_tokens(std::uint32_t main_page_gro
     return static_cast<std::uint32_t>(tokens);
 }
 
+std::size_t explicit_reservation_bytes(std::uint32_t tokens, const SequenceCapacityCurve& curve) {
+    validate_curve(curve);
+    return curve.reservation_bytes(
+        explicit_page_groups(KvCapacityPolicy::explicit_capacity(tokens), curve));
+}
+
+std::optional<CapacityShortfall>
+explicit_capacity_shortfall(std::uint32_t tokens, const SequenceCapacityCurve& curve,
+                            std::size_t available_runtime_bytes,
+                            std::span<const std::size_t> extra_rank_available_bytes) {
+    validate_curve(curve);
+    if (extra_rank_available_bytes.size() != curve.extra_ranks.size()) {
+        throw std::invalid_argument("free memory was not given for every device in the plan");
+    }
+    const std::uint32_t pages = std::clamp(
+        explicit_page_groups(KvCapacityPolicy::explicit_capacity(tokens), curve),
+        curve.minimum_main_page_groups, curve.maximum_main_page_groups);
+    const std::size_t primary = curve.reservation_bytes(pages);
+    if (primary > available_runtime_bytes) {
+        return CapacityShortfall{0, primary, available_runtime_bytes};
+    }
+    for (std::size_t index = 0; index < curve.extra_ranks.size(); ++index) {
+        const std::size_t need = curve.extra_rank_reservation_bytes(index, pages);
+        if (need > extra_rank_available_bytes[index]) {
+            return CapacityShortfall{index + 1, need, extra_rank_available_bytes[index]};
+        }
+    }
+    return std::nullopt;
+}
+
+bool explicit_capacity_fits(std::uint32_t tokens, const SequenceCapacityCurve& curve,
+                            std::size_t available_runtime_bytes,
+                            std::span<const std::size_t> extra_rank_available_bytes) {
+    const std::uint32_t pages =
+        explicit_page_groups(KvCapacityPolicy::explicit_capacity(tokens), curve);
+    if (pages < curve.minimum_main_page_groups || pages > curve.maximum_main_page_groups) {
+        return false;
+    }
+    return !explicit_capacity_shortfall(tokens, curve, available_runtime_bytes,
+                                        extra_rank_available_bytes);
+}
+
+std::uint32_t effective_fit_floor(std::uint32_t floor, std::uint32_t largest_graft_slots) {
+    if (largest_graft_slots == std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("graft slot count leaves no valid context");
+    }
+    return std::max(floor, largest_graft_slots + 1U);
+}
+
+std::uint32_t minimum_plannable_context(std::uint32_t max_concurrency,
+                                        std::uint32_t page_tokens) {
+    if (max_concurrency == 0 || page_tokens == 0) {
+        throw std::invalid_argument("minimum plannable context needs nonzero concurrency and page");
+    }
+    const std::uint64_t tokens =
+        (static_cast<std::uint64_t>(max_concurrency) - 1ULL) * page_tokens + 1ULL;
+    if (tokens > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("minimum plannable context exceeds uint32");
+    }
+    return static_cast<std::uint32_t>(tokens);
+}
+
+std::optional<std::uint32_t> fit_context(std::uint32_t floor, std::uint32_t ceiling,
+                                         std::uint32_t step,
+                                         const std::function<bool(std::uint32_t)>& fits) {
+    if (floor == 0 || floor > ceiling || step == 0) {
+        throw std::invalid_argument("context fit needs 0 < floor <= ceiling and a nonzero step");
+    }
+    if (fits(ceiling)) { return ceiling; }
+    if (floor == ceiling || !fits(floor)) { return std::nullopt; }
+    // Multiples of `step` strictly between the floor and the ceiling, as indices.
+    std::uint64_t low  = static_cast<std::uint64_t>(floor) / step + 1;
+    std::uint64_t high = (static_cast<std::uint64_t>(ceiling) - 1) / step;
+    std::uint32_t best = floor;
+    while (low <= high) {
+        const std::uint64_t middle = low + (high - low) / 2;
+        const auto candidate       = static_cast<std::uint32_t>(middle * step);
+        if (fits(candidate)) {
+            best = candidate;
+            low  = middle + 1;
+        } else {
+            high = middle - 1;
+        }
+    }
+    return best;
+}
+
 KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
                                          const SequenceCapacityCurve& curve,
                                          std::size_t available_runtime_bytes,
