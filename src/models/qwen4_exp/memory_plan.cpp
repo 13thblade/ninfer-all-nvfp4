@@ -39,6 +39,12 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
     out.expert_ram = std::min(room, out.full_need);
     out.fits       = out.expert_ram >= out.full_need;
     if (out.fits) { out.commit_limited = false; }
+    // A finite Linux RLIMIT_MEMLOCK bounds every pinned byte, whatever memory is free.
+    out.pinned_total = demand.expert_banks + demand.other_pinned + demand.later_pinned;
+    if (snapshot.lock_limit && out.pinned_total > *snapshot.lock_limit) {
+        out.lock_limited = true;
+        out.fits         = false;
+    }
     return out;
 }
 
@@ -52,13 +58,20 @@ std::string HostMemoryLedger::describe() const {
                   gib(demand.reserve), gib(demand.other_pinned), gib(demand.later_pinned), gib(demand.pageable),
                   gib(demand.load_staging), gib(demand.process_growth), gib(expert_ram), gib(full_need),
                   gib(demand.expert_banks), gib(demand.full_margin), commit_limited ? ", limited by the page file" : "",
-                  fits ? "every expert fits in RAM" : "the experts do not fit");
+                  lock_limited ? "the memory-lock limit is below the pinned total"
+                                           : fits ? "every expert fits in RAM" : "the experts do not fit");
     return line;
 }
 
 std::string HostMemoryLedger::summary() const {
     char line[512];
-    if (fits) {
+    if (lock_limited) {
+        std::snprintf(line, sizeof(line),
+                      "RAM: the memory-lock limit is %.1f GiB but Qwen3.8-Flash-Next pins %.1f GiB of experts and "
+                      "weights. Raise it (ulimit -l unlimited, or LimitMEMLOCK=infinity for a service) and start "
+                      "again",
+                      gib(*snapshot.lock_limit), gib(pinned_total));
+    } else if (fits) {
         std::snprintf(line, sizeof(line), "RAM: %.1f of %.1f GiB free; every expert fits in RAM (%.1f GiB pinned)",
                       gib(snapshot.available_physical), gib(snapshot.total_physical), gib(demand.expert_banks));
     } else {

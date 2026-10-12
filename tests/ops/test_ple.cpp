@@ -382,7 +382,7 @@ void commit_case(cudaStream_t stream) {
 void rank_refusals(cudaStream_t stream) {
     Buffer<std::uint16_t> d_act(std::vector<std::uint16_t>(static_cast<std::size_t>(kC) * 2, 0));
     Buffer<std::uint16_t> d_out(std::vector<std::uint16_t>(static_cast<std::size_t>(kC) * 2, 0));
-    Buffer<std::uint16_t> d_weight(std::vector<std::uint16_t>(static_cast<std::size_t>(kC) * kTaps, 0));
+    Buffer<float> d_weight(std::vector<float>(static_cast<std::size_t>(kC) * kTaps, 0.0F));
     Buffer<std::uint16_t> d_states(std::vector<std::uint16_t>(static_cast<std::size_t>(kC) * kSpan * kSlots, 0));
     Buffer<float> d_norm(std::vector<float>(kC, 1.0F));
     Buffer<std::int32_t> d_slots(std::vector<std::int32_t>(2, 0));
@@ -402,7 +402,7 @@ void rank_refusals(cudaStream_t stream) {
           "ple_gate refuses a [C, T, 2] key");
     Tensor states(d_states.p, DType::BF16, {kC, kSpan, kSlots});
     Tensor residual3(d_out.p, DType::BF16, {kC, 1, 2});
-    const Tensor weight(d_weight.p, DType::FP16, {kTaps, kC});
+    const Tensor weight(d_weight.p, DType::FP32, {kTaps, kC});
     const Tensor source(d_slots.p, DType::I32, {1});
     check(refuses([&] {
               ninfer::ops::ple_conv_inject(act, act, weight, kDilation, states, source, Tensor{},

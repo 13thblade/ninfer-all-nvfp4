@@ -743,7 +743,19 @@ void test_malformed() {
     routing.shared_gate = Tensor(gate.p, DType::FP32, {1});
     const Tensor deep(logits.p, DType::FP32, {kExperts + 1, 1, 2});
     check(rejects([&] { ops::moe_route(deep, 1, routing, nullptr); }), "route accepted a non-unit third extent");
-    std::printf("malformed: out-of-range ids not dispatched on both routes; short gate and extra extent rejected\n");
+    // A hidden extent past the y-grid limit (65535 tiles of 256) is refused before any launch rather
+    // than wrapping or failing at launch time. Only host shapes are read, so the small buffers suffice.
+    constexpr int kWideHidden = 65536 * 256;
+    routing.ids         = Tensor(ids.p, DType::I32, {1, 1});
+    routing.weights     = Tensor(weights.p, DType::FP32, {1, 1});
+    routing.shared_gate = Tensor(gate.p, DType::FP32, {1});
+    const Tensor ot_wide(out.p, DType::BF16, {kWideHidden, 1});
+    const Tensor st_wide(shared.p, DType::BF16, {kWideHidden, 1});
+    Tensor yt_wide(y.p, DType::BF16, {kWideHidden, 1});
+    check(rejects([&] { ops::moe_combine(ot_wide, routing, st_wide, yt_wide, nullptr); }),
+          "combine accepted a hidden extent past the grid limit");
+    std::printf("malformed: out-of-range ids not dispatched on both routes; short gate, extra extent and oversized "
+                "hidden rejected\n");
 }
 
 } // namespace
