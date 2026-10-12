@@ -127,6 +127,8 @@ std::string_view unquote(std::string_view text) {
         text.back() == text.front()) {
         return trim_format_whitespace(text.substr(1, text.size() - 2));
     }
+    // A lone leading quote is an unterminated value, which callers reject as an empty name.
+    if (!text.empty() && (text.front() == '"' || text.front() == '\'')) { return {}; }
     return text;
 }
 
@@ -151,13 +153,10 @@ std::string_view extract_name_from_tag_header(std::string_view header) {
         std::string_view value;
         if (header[i] == '"' || header[i] == '\'') {
             const std::size_t quote_end = header.find(header[i], i + 1);
-            if (quote_end == std::string_view::npos) {
-                value = header.substr(i + 1);
-                i     = header.size();
-            } else {
-                value = header.substr(i + 1, quote_end - i - 1);
-                i     = quote_end + 1;
-            }
+            // An unterminated quoted value is malformed, not a name that runs to the `>`.
+            if (quote_end == std::string_view::npos) { return {}; }
+            value = header.substr(i + 1, quote_end - i - 1);
+            i     = quote_end + 1;
         } else {
             const std::size_t value_begin = i;
             while (i < header.size() && !is_format_whitespace(header[i]) && header[i] != '/') {
@@ -784,24 +783,30 @@ void MarkdownCodeTracker::end_line() {
     std::string_view line(line_);
     const std::size_t first = line.find_first_not_of(" \t\r\f\v");
     line = first == std::string_view::npos ? std::string_view{} : line.substr(first);
-    const auto run_of_three = [](std::string_view text, char fence) {
-        return text.size() >= 3 && text[0] == fence && text[1] == fence && text[2] == fence;
+    // Length of the leading run of `fence` characters.
+    const auto run_length = [](std::string_view text, char fence) {
+        const std::size_t end = text.find_first_not_of(fence);
+        return end == std::string_view::npos ? text.size() : end;
     };
     if (fence_ != '\0') {
-        // A closing fence is a run of the opener's character followed only by whitespace, so a
-        // content line such as `~~~shell` stays inside the block.
-        const std::size_t run = line.find_first_not_of(fence_);
-        if (run_of_three(line, fence_) &&
-            (run == std::string_view::npos ||
-             line.find_first_not_of(" \t\r\f\v", run) == std::string_view::npos)) {
+        // A closing fence is a run of the opener's character at least as long as the opener's,
+        // followed only by whitespace, so a content line such as `~~~shell` or a shorter `~~~`
+        // inside a `~~~~` block stays inside the block.
+        const std::size_t run = run_length(line, fence_);
+        if (run >= fence_len_ &&
+            line.find_first_not_of(" \t\r\f\v", run) == std::string_view::npos) {
             fence_ = '\0';
         }
-    } else if (!line.empty() && (line[0] == '`' || line[0] == '~') && run_of_three(line, line[0]) &&
-               line.substr(3).find(std::string(3, line[0])) == std::string_view::npos) {
-        // A ``` or ~~~ opener whose run is not closed on the same line (that is inline code). The
-        // fence ends the paragraph, so a backtick left unmatched before it opens nothing after it.
-        fence_ = line[0];
-        ticks_ = 0;
+    } else if (!line.empty() && (line[0] == '`' || line[0] == '~') &&
+               run_length(line, line[0]) >= 3 &&
+               line.substr(run_length(line, line[0])).find(std::string(3, line[0])) ==
+                   std::string_view::npos) {
+        // A fence opener whose info string does not close it on the same line (that is inline
+        // code). The fence ends the paragraph, so a backtick left unmatched before it opens
+        // nothing after it.
+        fence_     = line[0];
+        fence_len_ = static_cast<std::uint32_t>(run_length(line, line[0]));
+        ticks_     = 0;
     } else if (line.empty()) {
         ticks_ = 0; // a blank line ends the paragraph and any inline code left open in it
     } else {
