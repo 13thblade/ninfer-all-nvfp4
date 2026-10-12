@@ -272,7 +272,7 @@ int main(int argc, char** argv) {
         else if (k == "--reps") { reps = std::atoi(argv[i + 1]); }
         else if (k == "--misses") { misses = std::atoi(argv[i + 1]); }
         else {
-            std::fprintf(stderr, "usage: %s [--mode gpu|cpu|all] [--experts N] [--reps N] [--misses N]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--mode gpu|cpu|all] [--experts 10] [--reps 30] [--misses 1]\n", argv[0]);
             return 2;
         }
     }
