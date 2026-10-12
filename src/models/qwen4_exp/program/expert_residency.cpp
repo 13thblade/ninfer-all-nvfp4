@@ -344,15 +344,25 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStrea
     // displaced experts of all of them come back as the last one returns.
     if (controller_->loaned_frames() == 0) { displaced_.clear(); }
     controller_->lend(*first, count, commands_, &displaced_);
-    auto* table = static_cast<std::int32_t*>(table_host_.data());
-    for (const auto& command : commands_) {
-        if (command.kind == CacheController::Command::Kind::kWriteEntry &&
-            ResidencyEntry::decode(command.word).state != ResidencyState::kReady && table[command.key] >= 0) {
-            table[command.key] = -1;
-            table_dirty_       = true;
+    try {
+        auto* table = static_cast<std::int32_t*>(table_host_.data());
+        for (const auto& command : commands_) {
+            if (command.kind == CacheController::Command::Kind::kWriteEntry &&
+                ResidencyEntry::decode(command.word).state != ResidencyState::kReady && table[command.key] >= 0) {
+                table[command.key] = -1;
+                table_dirty_       = true;
+            }
         }
+        if (table_dirty_) { upload_table(compute); }
+    } catch (...) {
+        // The run is lent in the controller but no lease was returned to the caller: give it back so
+        // the frames are not stranded. The evicted experts stay absent and table_dirty_ stays set,
+        // so the next table upload publishes the same state the controller holds.
+        commands_.clear();
+        controller_->give_back(*first, count, commands_);
+        if (controller_->loaned_frames() == 0) { displaced_.clear(); }
+        throw;
     }
-    if (table_dirty_) { upload_table(compute); }
     auto* base = const_cast<std::uint8_t*>(frame_base());
     return {*first, count,
             DeviceSpan{base + static_cast<std::size_t>(*first) * stride_, static_cast<std::size_t>(count) * stride_}};

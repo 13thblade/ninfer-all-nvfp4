@@ -202,10 +202,22 @@ void print_result(const char* label, const GenerationResult& r) {
     std::fflush(stdout);
 }
 
+// `word` as a whole token: not flanked by letters or digits, so the count "3" is not found inside
+// the title "731" and "two" is not found inside "network".
+bool has_token(const std::string& text, const std::string& word) {
+    const auto alnum = [](char ch) { return std::isalnum(static_cast<unsigned char>(ch)) != 0; };
+    for (std::size_t at = text.find(word); at != std::string::npos; at = text.find(word, at + 1)) {
+        const bool before = at == 0 || !alnum(text[at - 1]);
+        const bool after  = at + word.size() >= text.size() || !alnum(text[at + word.size()]);
+        if (before && after) { return true; }
+    }
+    return false;
+}
+
 bool answer_ok(const Case& c, const std::string& content) {
     const std::string text = lower(content);
     for (const auto& group : c.expect) {
-        if (std::none_of(group.begin(), group.end(), [&](const std::string& w) { return text.find(w) != std::string::npos; })) {
+        if (std::none_of(group.begin(), group.end(), [&](const std::string& w) { return has_token(text, w); })) {
             return false;
         }
     }

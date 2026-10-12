@@ -1454,6 +1454,31 @@ private:
     // NInfer-3090: every item encodes in the prompt's first prefill unit in one lent window, which
     // goes back right after; the handoff's frames stay lent until the prompt's last call ran.
 
+    // A lent run that goes back on every exit: when the scope unwinds (a failed encode, a later
+    // lend() that throws) the device is drained and the frames returned, and a throw from that is
+    // swallowed so it cannot replace the failure that unwound. `give_back()` is the success path.
+    class ScopedLease {
+    public:
+        ScopedLease(ExpertResidency& residency, DeviceContext& device, ExpertResidency::FrameLease lease)
+            : residency_(residency), device_(device), lease_(lease) {}
+        ScopedLease(const ScopedLease&)            = delete;
+        ScopedLease& operator=(const ScopedLease&) = delete;
+        ~ScopedLease() {
+            if (!lease_.valid()) { return; }
+            try {
+                device_.synchronize();
+                (void)residency_.give_back(lease_, device_.stream);
+            } catch (...) {}
+        }
+        [[nodiscard]] const ExpertResidency::FrameLease& lease() const noexcept { return lease_; }
+        std::uint32_t give_back() { return residency_.give_back(lease_, device_.stream); }
+
+    private:
+        ExpertResidency& residency_;
+        DeviceContext& device_;
+        ExpertResidency::FrameLease lease_;
+    };
+
     std::uint32_t frames_for(std::size_t bytes) const {
         const std::uint64_t stride = residency_->frame_stride();
         return static_cast<std::uint32_t>((bytes + stride - 1) / stride);
@@ -1528,22 +1553,17 @@ private:
             items.push_back({base.payloads.at(k)->span(), &base.vision->items[k]});
         }
         const auto start    = Clock::now();
-        lane_.vision_lease  = residency_->lend(handoff_frames, device_.stream); // release_lane returns it
-        auto window         = residency_->lend(window_frames, device_.stream);
-        try {
-            lane_.vision_handoff = Tensor(lane_.vision_lease.memory.data, DType::BF16,
-                                          {plan.out, static_cast<std::int32_t>(plan.tokens)});
-            lane_.vision_uploaded = execution::encode_vision(device_, *model.vision_config(), *parameters_.vision,
-                                                             *model.vision_layout(), model.pinned_weights(), items, plan,
-                                                             window.memory, lane_.vision_handoff, device_.stream);
-            device_.synchronize();
-        } catch (...) {
-            device_.synchronize();
-            refilled_ += residency_->give_back(window, device_.stream);
-            throw; // release_lane returns the handoff
-        }
+        lane_.vision_lease = residency_->lend(handoff_frames, device_.stream); // release_lane returns it
+        // The window goes back on every exit, including a throw from the encode or the sync.
+        ScopedLease window(*residency_, device_, residency_->lend(window_frames, device_.stream));
+        lane_.vision_handoff = Tensor(lane_.vision_lease.memory.data, DType::BF16,
+                                      {plan.out, static_cast<std::int32_t>(plan.tokens)});
+        lane_.vision_uploaded = execution::encode_vision(device_, *model.vision_config(), *parameters_.vision,
+                                                         *model.vision_layout(), model.pinned_weights(), items, plan,
+                                                         window.lease().memory, lane_.vision_handoff, device_.stream);
+        device_.synchronize();
         lane_.vision_seconds = std::chrono::duration<double>(Clock::now() - start).count();
-        refilled_ += residency_->give_back(window, device_.stream);
+        refilled_ += window.give_back();
         frames_now_          = residency_->frames();
         lane_.vision_encoded = true;
         char line[240];
@@ -1585,16 +1605,16 @@ private:
         const std::uint32_t handoff_frames = frames_for(plan.handoff_bytes), window_frames = frames_for(plan.window_bytes);
         if (handoff_frames + window_frames > residency_->lendable()) { return; }
         const auto start = Clock::now();
-        auto handoff_lease = residency_->lend(handoff_frames, device_.stream);
-        auto window        = residency_->lend(window_frames, device_.stream);
-        Tensor handoff(handoff_lease.memory.data, DType::BF16, {plan.out, static_cast<std::int32_t>(plan.tokens)});
+        ScopedLease handoff_lease(*residency_, device_, residency_->lend(handoff_frames, device_.stream));
+        ScopedLease window(*residency_, device_, residency_->lend(window_frames, device_.stream));
+        Tensor handoff(handoff_lease.lease().memory.data, DType::BF16, {plan.out, static_cast<std::int32_t>(plan.tokens)});
         const execution::VisionEncodeItem item{blank, &control.items.front()};
         (void)execution::encode_vision(device_, config, *parameters_.vision, *model.vision_layout(), model.pinned_weights(),
-                                       std::span<const execution::VisionEncodeItem>(&item, 1), plan, window.memory, handoff,
-                                       device_.stream);
+                                       std::span<const execution::VisionEncodeItem>(&item, 1), plan, window.lease().memory,
+                                       handoff, device_.stream);
         device_.synchronize();
-        (void)residency_->give_back(window, device_.stream);
-        (void)residency_->give_back(handoff_lease, device_.stream);
+        (void)window.give_back();
+        (void)handoff_lease.give_back();
         char line[120];
         std::snprintf(line, sizeof(line), "vision: tower warmed up in %.1f s",
                       std::chrono::duration<double>(Clock::now() - start).count());
