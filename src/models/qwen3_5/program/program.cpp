@@ -5,6 +5,7 @@
 #include "core/evictable_weight_pool.h"
 #include "models/load_options.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -93,6 +94,19 @@ std::vector<std::uint32_t> RequestBasePlan::capture_frontiers() const {
     if (impl_) {
         frontiers.reserve(impl_->capture_groups.size());
         for (const auto& group : impl_->capture_groups) { frontiers.push_back(group.frontier); }
+    }
+    return frontiers;
+}
+
+std::vector<std::uint32_t> RequestBasePlan::shared_prefix_frontiers() const {
+    std::vector<std::uint32_t> frontiers;
+    if (impl_) {
+        for (const auto& group : impl_->capture_groups) {
+            if (std::find(group.roles.begin(), group.roles.end(), runtime::CheckpointRole::SharedPrefix) !=
+                group.roles.end()) {
+                frontiers.push_back(group.frontier);
+            }
+        }
     }
     return frontiers;
 }

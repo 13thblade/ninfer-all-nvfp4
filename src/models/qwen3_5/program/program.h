@@ -111,6 +111,9 @@ public:
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
     [[nodiscard]] const PreparedContextCache& context_cache() const noexcept;
     [[nodiscard]] std::vector<std::uint32_t> capture_frontiers() const;
+    // The capture frontiers that publish a SharedPrefix checkpoint, the only role another request
+    // can use while the capturing request is still running.
+    [[nodiscard]] std::vector<std::uint32_t> shared_prefix_frontiers() const;
     [[nodiscard]] std::optional<PrefixShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept;
 

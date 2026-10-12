@@ -1857,21 +1857,34 @@ private:
                     high = middle - 1U;
                 }
             }
-            std::uint32_t target = 0;
-            for (const auto frontier : other.capture_frontiers()) {
-                if (frontier > *cursor && frontier <= low && frontier > best) {
-                    target = std::max(target, frontier);
+            // Only a SharedPrefix capture can be waited for: it is exposed to every request as soon
+            // as it is published, while an InputReplay or LongAnchor point belongs to its owner and
+            // ResourceManager::candidates() offers it only once that owner is no longer active, which
+            // the sibling is not after publishing it. Deepest first, so a frontier too costly to
+            // wait for falls back to a shallower one that still saves enough.
+            auto frontiers = other.shared_prefix_frontiers();
+            std::sort(frontiers.begin(), frontiers.end(),
+                      [](std::uint32_t a, std::uint32_t b) { return a > b; });
+            for (const auto frontier : frontiers) {
+                if (frontier <= *cursor || frontier > low || frontier <= best ||
+                    frontier < best + kSiblingWaitMinimumTokens) {
+                    continue;
                 }
-            }
-            if (target < best + kSiblingWaitMinimumTokens) { continue; }
-            // The sibling's remaining prefill to the checkpoint, doubled because other lanes'
-            // units interleave with it, bounds the wait.
-            const auto work      = instance_.program->prefill_work(other, *cursor, target);
-            const auto predicted = std::chrono::nanoseconds(2 * resources_.prefill_ns(work));
-            if (predicted > pending_timeout_ / 2) { continue; }
-            if (!chosen || target > chosen->frontier) {
-                chosen = SiblingWait{request, sibling->id, target,
-                                     Clock::now() + predicted + std::chrono::seconds(1)};
+                // The sibling's remaining prefill to the checkpoint, doubled because other lanes'
+                // units interleave with it, bounds the wait. Compared against half the limit rather
+                // than doubled first: the cost model returns UINT64_MAX when it saturates, and
+                // doubling that would wrap into a short wait.
+                const auto work              = instance_.program->prefill_work(other, *cursor, frontier);
+                const std::uint64_t cost     = resources_.prefill_ns(work);
+                const std::uint64_t limit_ns = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(pending_timeout_ / 2).count());
+                if (cost > limit_ns / 2) { continue; }
+                if (!chosen || frontier > chosen->frontier) {
+                    chosen = SiblingWait{request, sibling->id, frontier,
+                                         Clock::now() + std::chrono::nanoseconds(2 * cost) +
+                                             std::chrono::seconds(1)};
+                }
+                break;
             }
         }
         if (!chosen) { return false; }
@@ -2487,6 +2500,14 @@ private:
             } catch (...) {}
         }
         scheduler_ = Scheduling{};
+        // A latched engine never runs process_sibling_waits() again. Each waiter is in `pending`
+        // (or `paused_`) and is completed with the error below, which finishes its source wait; the
+        // list only has to stop holding the requests alive.
+        for (auto& wait : sibling_waits_) {
+            wait.waiter->awaiting_sibling     = false;
+            wait.waiter->admission_generation = 0;
+        }
+        sibling_waits_.clear();
         const std::shared_ptr<Request> materializing_request =
             materializing_ ? materializing_->request : nullptr;
         // Native retires all transfer readers before any external checkpoint owner is destroyed.
