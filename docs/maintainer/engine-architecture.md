@@ -152,8 +152,9 @@ artifact 的 text 架构在启动时决定使用哪个实例（`runtime::artifac
 - **宽 prefill（PR 10）**：≥ 512 token 的 prompt 以 4,096 token 一次调用 prefill。第一次调用时 Program
   向 expert cache 借一段连续 frames（`ExpertResidency::lend`）：前段作该类调用的 workspace，后段作
   `execution/expert_stream` 的 ring，每层的非常驻 expert 提前两层由 copy engine DMA 进 ring，并以
-  per-layer frame 表发布为常驻（MoE Op 不变）。prompt 结束时归还（`give_back`）并用 LFRU 分数最高的
-  非常驻 expert 回填空 frames。借用期间 VRAM 控制律不调整 frame 数。下一调用的 n-gram 行在 GPU 执行
+  per-layer frame 表发布为常驻（MoE Op 不变）。prompt 结束时归还（`give_back`）并先恢复借用时被挤出的
+  expert（prefill 不做 promotion，它们就是 prompt 之前 decode 的常驻集合），再用 LFRU 分数最高的
+  非常驻 expert 回填剩余空 frames。借用期间 VRAM 控制律不调整 frame 数。下一调用的 n-gram 行在 GPU 执行
   当前调用时读取。
 - **启动账本**（`runtime/engine/qwen4_exp_instance.cpp`，在 pin 之前）：RAM 账本要求所有 routed experts
   （33 GiB）与保留量同时放得下，否则拒绝并给出缺口；VRAM 检查在读取权重前确认 dense 权重与固定分配之外
