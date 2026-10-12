@@ -60,7 +60,8 @@ struct MoeWeights {
 };
 
 // key_projection and value_projection share a parent; the norms are stored FP32 multipliers and
-// the convolution FP32 [C, K] (the GGUF's F16 taps widened exactly).
+// the convolution FP32 [K, C], each channel's taps contiguous (the GGUF's F16 taps widened
+// exactly), the shape ple_conv_inject validates.
 struct PleWeights {
     WeightId key_projection, value_projection;
     WeightId key_norm, query_norm, conv_norm, convolution;
