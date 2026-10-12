@@ -436,19 +436,27 @@ export HOME="$tmp/no-login-home"
 # is) instead of an empty one: download-model.sh verifies size (and, unless
 # NINFER_SKIP_SHA256=1, sha256) before promoting the file, so an empty fixture output fails
 # verification and never reaches the file-existence assertions below.
+# NINFER_TEST_FAKE_SIZES ("name=size ...") sizes each file by the name the URL ends in, for a model
+# that fetches several files; a name it does not list gets NINFER_TEST_FAKE_SIZE, else stays empty.
 cat > "$tmp/bin/curl" <<'CURL'
 #!/usr/bin/env bash
+url=''
 while (( $# )); do
   if [[ "$1" == '--output' ]]; then
     output="$2"
     shift 2
   else
+    [[ "$1" == https://* ]] && url="$1"
     shift
   fi
 done
 : > "$output"
-if [[ -n "${NINFER_TEST_FAKE_SIZE:-}" ]]; then
-  truncate -s "$NINFER_TEST_FAKE_SIZE" "$output"
+size="${NINFER_TEST_FAKE_SIZE:-}"
+for entry in ${NINFER_TEST_FAKE_SIZES:-}; do
+  [[ "${url##*/}" == "${entry%%=*}" ]] && size="${entry#*=}"
+done
+if [[ -n "$size" ]]; then
+  truncate -s "$size" "$output"
 fi
 CURL
 chmod +x "$tmp/bin/curl"
@@ -459,18 +467,23 @@ chmod +x "$tmp/bin/curl"
 # (see download-model.sh's invocation), not curl's --output.
 cat > "$tmp/bin/aria2c" <<'ARIA2C'
 #!/usr/bin/env bash
-dir='.' out=''
+dir='.' out='' url=''
 while (( $# )); do
   case "$1" in
     -d) dir="$2"; shift 2 ;;
     -o) out="$2"; shift 2 ;;
+    https://*) url="$1"; shift ;;
     *) shift ;;
   esac
 done
 output="$dir/$out"
 : > "$output"
-if [[ -n "${NINFER_TEST_FAKE_SIZE:-}" ]]; then
-  truncate -s "$NINFER_TEST_FAKE_SIZE" "$output"
+size="${NINFER_TEST_FAKE_SIZE:-}"
+for entry in ${NINFER_TEST_FAKE_SIZES:-}; do
+  [[ "${url##*/}" == "${entry%%=*}" ]] && size="${entry#*=}"
+done
+if [[ -n "$size" ]]; then
+  truncate -s "$size" "$output"
 fi
 ARIA2C
 chmod +x "$tmp/bin/aria2c"
@@ -532,7 +545,7 @@ for bad in '' 'qwen38-27' 'qwen3_8_27b'; do
     printf 'download-model.sh %s exited %s, expected 2\n' "${bad:-<no model>}" "$status" >&2
     exit 1
   fi
-  for key in "${models[@]}"; do
+  for key in "${models[@]}" qwen38-flash-next; do
     if [[ "$usage_output" != *"$key"* ]]; then
       printf 'download-model.sh usage for %s omits %s\n' "${bad:-<no model>}" "$key" >&2
       exit 1
@@ -627,6 +640,91 @@ for key in "${models[@]}"; do
   fi
   rm -f -- "$tmp/models/$model."*".part"
 done
+
+# qwen38-flash-next fetches three pinned files through the same verify-then-promote routine: the model
+# and its .part-0001 into the models folder, and the n-gram volume into NINFER_NGRAM_DIR (with no
+# terminal to ask on and no NINFER_NGRAM_DIR, the models folder). The fixture serves each file at its
+# own pinned size, read from the downloader's block like the others. Every run has stdin closed, so the
+# script must never wait on its question.
+fn_fail() {
+  printf 'download-model.sh qwen38-flash-next: %s\n' "$1" >&2
+  exit 1
+}
+fn_artifact='qwen4exp-iq2xs-mtp-vision.ninfer'
+fn_part="$fn_artifact.part-0001"
+fn_ngram="$fn_artifact.ngram"
+fn_block="$(sed -n '/^  qwen38-flash-next)$/,/^    ;;$/p' "$downloader")"
+fn_size="$(expected_size_of qwen38-flash-next)"
+fn_part_size="$(sed -n 's/^ *part_sizes=(\([0-9]\+\))$/\1/p' <<<"$fn_block")"
+fn_ngram_size="$(sed -n 's/^ *ngram_size=\([0-9]\+\)$/\1/p' <<<"$fn_block")"
+if [[ -z "$fn_size" || -z "$fn_part_size" || -z "$fn_ngram_size" ]] ||
+   ! grep -q "^ *artifact='$fn_artifact'\$" <<<"$fn_block" || ! grep -q "^ *ngram_name='$fn_ngram'\$" <<<"$fn_block"; then
+  fn_fail 'its block no longer pins the model, one part and the volume this check expects'
+fi
+fn_sizes="$fn_artifact=$fn_size $fn_part=$fn_part_size $fn_ngram=$fn_ngram_size"
+fn_size_ok() { [[ -f "$1" && "$(wc -c < "$1" | tr -d '[:space:]')" == "$2" ]]; }
+fn_models="$tmp/fn-models"
+fn_volumes="$tmp/fn-volumes"
+fn_run() {  # PATH directory, then extra environment; prints the output, returns the status
+  local stubs="$1"
+  shift
+  PATH="$stubs:$PATH" NINFER_MODEL_DIR="$fn_models" NINFER_NGRAM_DIR="$fn_volumes" NINFER_SKIP_SHA256=1 \
+    "$@" "$downloader" qwen38-flash-next 2>&1 </dev/null
+}
+
+# A fresh fetch promotes all three at their pinned sizes, the volume into its own folder only, and the
+# closing lines tell the server where the volume is.
+fn_output="$(fn_run "$tmp/bin" env NINFER_TEST_FAKE_SIZES="$fn_sizes")" || fn_fail "a fresh fetch failed: $fn_output"
+fn_size_ok "$fn_models/$fn_artifact" "$fn_size" || fn_fail 'did not promote the model at its pinned size'
+fn_size_ok "$fn_models/$fn_part" "$fn_part_size" || fn_fail 'did not promote the part at its pinned size'
+fn_size_ok "$fn_volumes/$fn_ngram" "$fn_ngram_size" || fn_fail 'did not promote the volume into NINFER_NGRAM_DIR'
+[[ -e "$fn_models/$fn_ngram" ]] && fn_fail 'also put the volume beside the model'
+[[ "$fn_output" == *"--ngram-volume \"$fn_volumes/$fn_ngram\""* ]] ||
+  fn_fail "did not name the volume outside the model folder: $fn_output"
+compgen -G "$fn_models/*.part" >/dev/null && fn_fail 'left a staged .part behind after promoting'
+
+# Everything present and verifying: kept, each reported, and nothing fetched (both stubs fail).
+fn_output="$(fn_run "$tmp/failing-curl" env)" || fn_fail "re-fetched files that already verify: $fn_output"
+[[ "$fn_output" == *"Model already present: $fn_models/$fn_artifact"* &&
+   "$fn_output" == *"Already present: $fn_models/$fn_part"* &&
+   "$fn_output" == *"Already present: $fn_volumes/$fn_ngram"* ]] ||
+  fn_fail "did not report all three files present: $fn_output"
+
+# A corrupt (empty) part is fetched again; the verified model and volume are kept.
+: > "$fn_models/$fn_part"
+fn_output="$(fn_run "$tmp/bin" env NINFER_TEST_FAKE_SIZES="$fn_sizes")" || fn_fail "did not replace a corrupt part: $fn_output"
+fn_size_ok "$fn_models/$fn_part" "$fn_part_size" || fn_fail 'kept a corrupt part'
+[[ "$fn_output" == *'Model already present'* && "$fn_output" == *"Already present: $fn_volumes/$fn_ngram"* ]] ||
+  fn_fail "fetched the verified model or volume again: $fn_output"
+
+# A part that does not match its pin (the fixture leaves it empty) fails the run, is not promoted, and
+# stays staged under its revision-scoped name for the next run.
+rm -f -- "$fn_models/$fn_part"
+if fn_output="$(fn_run "$tmp/bin" env NINFER_TEST_FAKE_SIZES="$fn_artifact=$fn_size $fn_ngram=$fn_ngram_size")"; then
+  fn_fail "accepted a part that does not match its pin: $fn_output"
+fi
+[[ -e "$fn_models/$fn_part" ]] && fn_fail 'promoted a part that does not match its pin'
+compgen -G "$fn_models/$fn_part.*.part" >/dev/null || fn_fail 'did not stage the part under a revision-scoped name'
+rm -f -- "$fn_models/$fn_part."*".part"
+
+# A size-correct model with the wrong checksum is refused (hashing on; the stub sha256sum never matches
+# a real pin): the run fails at the model, promotes nothing and fetches nothing after it.
+fn_models="$tmp/fn-models-hash"
+fn_volumes="$tmp/fn-volumes-hash"
+if fn_output="$(PATH="$tmp/bin:$PATH" NINFER_MODEL_DIR="$fn_models" NINFER_NGRAM_DIR="$fn_volumes" \
+     NINFER_TEST_FAKE_SIZES="$fn_sizes" "$downloader" qwen38-flash-next 2>&1 </dev/null)"; then
+  fn_fail "accepted a model whose checksum does not match: $fn_output"
+fi
+[[ -e "$fn_models/$fn_artifact" ]] && fn_fail 'promoted a model that failed its checksum'
+[[ -e "$fn_models/$fn_part" || -e "$fn_volumes/$fn_ngram" ]] && fn_fail 'kept fetching after the model failed its checksum'
+
+# With no terminal and no NINFER_NGRAM_DIR the volume goes beside the model, and no override is printed.
+fn_models="$tmp/fn-models-beside"
+fn_output="$(PATH="$tmp/bin:$PATH" NINFER_MODEL_DIR="$fn_models" NINFER_SKIP_SHA256=1 \
+  NINFER_TEST_FAKE_SIZES="$fn_sizes" "$downloader" qwen38-flash-next 2>&1 </dev/null)" ||
+  fn_fail "a fetch with no volume folder failed: $fn_output"
+fn_size_ok "$fn_models/$fn_ngram" "$fn_ngram_size" || fn_fail 'did not put the volume beside the model by default'
+[[ "$fn_output" == *'--ngram-volume'* ]] && fn_fail "printed a volume override for a volume beside the model: $fn_output"
 
 # The qwen38-27b godmode graft is fetched best-effort after the model is in place. It is a pair the
 # launcher trusts by the .bin alone and the loader needs whole with its .json, so the contract is

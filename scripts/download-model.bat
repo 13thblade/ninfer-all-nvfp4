@@ -1,4 +1,10 @@
 @echo off
+rem Where this script sits is read before delayed expansion is on, so an exclamation mark in the
+rem install path survives. Everything below reads folders with !VAR!, never inside a ( ) block.
+setlocal disabledelayedexpansion
+set "ROOT=%~dp0"
+for %%I in ("%ROOT%..") do set "REPO_ROOT=%%~fI"
+for %%I in ("%ROOT%.") do set "SCRIPT_DIRNAME=%%~nxI"
 setlocal enabledelayedexpansion
 
 rem Downloads one pinned model artifact, verifies it, and only then promotes it to its final name.
@@ -22,28 +28,43 @@ rem   qwen36-35b-a3b   Qwen3.6-35B-A3B, 21.2 GiB, the RTX 3090-compatible vision
 rem                    v3 artifact revision: its artifact-manifest.json lists the text, vision, mtp
 rem                    and dflash components, and the DFlash bundle (from
 rem                    z-lab/Qwen3.6-35B-A3B-DFlash) is what --spec dflash needs.
+rem   qwen38-flash-next  Qwen3.8-Flash-Next (preview, Windows), this fork's exact conversion of the
+rem                    ISTA DASLab GSQ-RCO IQ2_XS GGUF with Strata's MTP drafter and the vision tower
+rem                    (WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090). Three things are fetched: the model
+rem                    file, its .part-0001 continuation (both read once, at load) and the 27.1 GiB
+rem                    n-gram volume, which is read on every prompt. The script asks where the volume
+rem                    goes (default: beside the model); a different folder is for a faster drive,
+rem                    since prefill from an NVMe drive measured 1.1-1.4x that from a SATA SSD. The
+rem                    launcher is then told with NINFER_NGRAM_VOLUME, which the script prints.
 rem
 rem To repin a model, edit its block below: take the size and sha256 from what HuggingFace reports for
 rem the new revision (X-Linked-Size and X-Linked-ETag on the resolve URL, or the revision's
 rem artifact-manifest.json), and for qwen36-35b-a3b check the manifest still lists a dflash component.
 rem Changing a pin makes the staging hazard below live rather than hypothetical.
 rem
-rem Run with no argument (for instance by double-clicking it) it shows a numbered menu of the three
+rem Run with no argument (for instance by double-clicking it) it shows a numbered menu of the
 rem models instead; an unknown name still prints the usage and exits 2. download-model.sh has no
 rem menu and always requires the name.
 rem
 rem Environment: NINFER_MODEL_DIR (default: models\ at the repo root in a checkout, or beside this
 rem file in the release archive), NINFER_SKIP_SHA256=1 to accept a file on size alone. qwen38-27b also
 rem fetches the private godmode graft when HF_TOKEN, or `hf auth login`, grants access to it.
+rem qwen38-flash-next: NINFER_NGRAM_DIR is the folder for the n-gram volume, which skips the question.
 rem
 rem Uses aria2c (16 parallel ranges) when it is on PATH, since single-stream curl against these
 rem artifacts has been observed to throttle to ~1 MB/s or stall outright; falls back to curl
 rem otherwise. Install it with `winget install aria2.aria2` or `choco install aria2` to opt in.
 
+rem Only qwen38-flash-next has continuation parts and an n-gram volume. Cleared here because setlocal
+rem inherits the caller's environment.
+set "PART_COUNT=0"
+set "NGRAM_NAME="
+
 if "%~1"=="" goto :menu
 if /i "%~1"=="qwen38-27b" goto :model_qwen38_27b
 if /i "%~1"=="qwen36-27b" goto :model_qwen36_27b
 if /i "%~1"=="qwen36-35b-a3b" goto :model_qwen36_35b_a3b
+if /i "%~1"=="qwen38-flash-next" goto :model_qwen38_flash_next
 if /i "%~1"=="-h" goto :usage_help
 if /i "%~1"=="--help" goto :usage_help
 goto :usage_error
@@ -54,11 +75,13 @@ echo.
 echo   1 = Qwen3.8-27B (recommended)       qwen38-27b
 echo   2 = Qwen3.6-35B-A3B                 qwen36-35b-a3b
 echo   3 = Qwen3.6-27B                     qwen36-27b
+echo   4 = Qwen3.8-Flash-Next (preview)    qwen38-flash-next   (needs 64 GB of RAM)
 echo.
-choice /c 123 /n /m "Choose 1-3: "
+choice /c 1234 /n /m "Choose 1-4: "
 rem choice reports 255 when it cannot read a key (no console, closed stdin). Refuse rather than
 rem let that fall through and pick a model nobody chose.
 if errorlevel 255 exit /b 2
+if errorlevel 4 goto :model_qwen38_flash_next
 if errorlevel 3 goto :model_qwen36_27b
 if errorlevel 2 goto :model_qwen36_35b_a3b
 if errorlevel 1 goto :model_qwen38_27b
@@ -78,6 +101,7 @@ echo.
 echo   qwen38-27b (recommended)
 echo   qwen36-27b
 echo   qwen36-35b-a3b
+echo   qwen38-flash-next (preview)
 exit /b 0
 
 :model_qwen38_27b
@@ -113,6 +137,26 @@ set "LABEL=the RTX 3090-compatible Qwen3.6-35B-A3B vision model (21.2 GiB)"
 set "TESTS_VARIABLE=NINFER_QWEN3_6_35B_A3B_WEIGHTS"
 goto :model_selected
 
+rem The n-gram volume is pinned to the commit that uploaded it; the model file and its part are
+rem pinned to the revision that published the model card with them. The volume is unchanged there.
+:model_qwen38_flash_next
+set "ARTIFACT=qwen4exp-iq2xs-mtp-vision.ninfer"
+set "OWNER=WarlaxZ"
+set "REPO=Qwen3.8-Flash-Next-NInfer-3090"
+set "REVISION=c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa"
+set "EXPECTED_SIZE=32000000000"
+set "EXPECTED_SHA256=87c871e6cc1b6392e387104e8dfb159283a8a64247f669fbf33355b19b769ef4"
+set "PART_COUNT=1"
+set "PART_1_SIZE=9012140032"
+set "PART_1_SHA256=1798c63c2f74a05cac71a609701f34368f0ba1e1eeebbf1b7641e83d0dd8d811"
+set "NGRAM_NAME=qwen4exp-iq2xs-mtp-vision.ninfer.ngram"
+set "NGRAM_REVISION=95b1b0169bd25db96ceb772a8a67cc6e87088a1f"
+set "NGRAM_SIZE=29127258112"
+set "NGRAM_SHA256=7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051"
+set "LABEL=the Qwen3.8-Flash-Next model (38.2 GiB in two files)"
+set "TESTS_VARIABLE=NINFER_TEST_QWEN4EXP_ARTIFACT"
+goto :model_selected
+
 :model_selected
 rem Two layouts share this script. In the release archive it sits at the archive root beside
 rem models\. In a checkout it sits in scripts\, one level under the repo root, and models\ (see
@@ -120,69 +164,234 @@ rem .gitignore) is beside the repo root, not beside this script -- a directory n
 rem CMakeLists.txt above it tells the two apart (a bare CMakeLists.txt probe would misfire on an
 rem archive unpacked beneath any source tree), matching run.bat's own default so a model
 rem downloaded here is found there.
-set "ROOT=%~dp0"
-for %%I in ("%ROOT%..") do set "REPO_ROOT=%%~fI"
-for %%I in ("%ROOT%.") do set "SCRIPT_DIRNAME=%%~nxI"
-set "MODEL_DIR=%ROOT%models"
-if /i "%SCRIPT_DIRNAME%"=="scripts" if exist "%REPO_ROOT%\CMakeLists.txt" set "MODEL_DIR=%REPO_ROOT%\models"
-if defined NINFER_MODEL_DIR set "MODEL_DIR=%NINFER_MODEL_DIR%"
-set "MODEL=%MODEL_DIR%\%ARTIFACT%"
-
-rem Staged under a revision-scoped name so that curl -C - can only ever resume the same artifact.
-rem curl -C - resumes by appending at the current file length, without checking what wrote those
-rem bytes, so a leftover partial from a different revision -- for instance the previous pin's, on any
-rem machine that ran an older script -- would be spliced onto the head of this one: a file of
-rem entirely plausible size that is corrupt throughout. A name that carries the revision means a
-rem resume can only ever continue the same artifact, and the checks below are what promote it to
-rem the final name.
-set "PART=%MODEL%.%REVISION%.part"
-
+rem ROOT, REPO_ROOT and SCRIPT_DIRNAME were set at the top.
+set "MODEL_DIR=!ROOT!models"
+if /i "!SCRIPT_DIRNAME!"=="scripts" if exist "!REPO_ROOT!\CMakeLists.txt" set "MODEL_DIR=!REPO_ROOT!\models"
+if defined NINFER_MODEL_DIR set "MODEL_DIR=!NINFER_MODEL_DIR!"
+set "MODEL_DIR_FULL="
+call :dir_check MODEL_DIR
+if "!DIR_BAD!"=="1" goto :model_dir_rejected
 if not exist "%MODEL_DIR%" mkdir "%MODEL_DIR%"
+for %%I in ("%MODEL_DIR%") do set "MODEL_DIR_FULL=%%~fI"
+call :trim_trailing_backslash MODEL_DIR_FULL
+rem From here on the model folder is the full path, so D: means the folder it resolved to.
+set "MODEL_DIR=!MODEL_DIR_FULL!"
+call :join_path MODEL MODEL_DIR "%ARTIFACT%"
 
-if exist "%MODEL%" (
-  call :verify "%MODEL%"
-  if "!VERIFY_OK!"=="1" (
-    echo Model already present: %MODEL%
-    call :fetch_graft
-    exit /b 0
-  )
-  echo Existing %MODEL% did not verify against revision %REVISION%; fetching the pinned one.
-  echo If it is the v2 file from an earlier release, you can upgrade it instead of downloading:
-  echo   python tools\upgrade_ninfer_v2_to_v3.py "%MODEL%" "%MODEL%.v3" ^&^& move /y "%MODEL%.v3" "%MODEL%"
-)
+rem Ask where the n-gram volume goes before anything is fetched, so the downloads can run unattended.
+if defined NGRAM_NAME call :choose_ngram_dir
+if defined NGRAM_NAME if not defined NGRAM_DIR exit /b 1
 
-echo Downloading %LABEL%...
-set "URL=https://huggingface.co/%OWNER%/%REPO%/resolve/%REVISION%/%ARTIFACT%"
-set "PART_NAME=%ARTIFACT%.%REVISION%.part"
-where /q aria2c
-if not errorlevel 1 (
-  rem 16 parallel ranges over one file, not single-stream curl. On the Vast rental boxes this repo
-  rem downloads at ~98 MB/s over aria2c against the same throttled-to-~1MB/s (and once outright
-  rem stalled at 11 of 21 GiB) single-stream curl -- see scripts\multi-gpu-testing\README.md. -c
-  rem resumes into the same .part name curl would use, and HuggingFace serves ranges fine.
-  aria2c -x16 -s16 -c --file-allocation=none -d "%MODEL_DIR%" -o "%PART_NAME%" "%URL%"
-) else (
-  curl.exe -L -C - --fail --output "%PART%" "%URL%"
-)
-if errorlevel 1 (
-  echo Download failed. Run this file again to resume.
-  exit /b 1
-)
+call :fetch_file "%MODEL_DIR%" "%ARTIFACT%" %EXPECTED_SIZE% %EXPECTED_SHA256% %REVISION% "%LABEL%" model
+if not "!FETCH_OK!"=="1" exit /b 1
+set "PART_N=1"
+:fetch_parts
+if %PART_N% gtr %PART_COUNT% goto :parts_done
+call :fetch_file "%MODEL_DIR%" "%ARTIFACT%.part-000%PART_N%" !PART_%PART_N%_SIZE! !PART_%PART_N%_SHA256! %REVISION% "part %PART_N% of the model" part
+if not "!FETCH_OK!"=="1" exit /b 1
+set /a PART_N+=1
+goto :fetch_parts
+:parts_done
+if defined NGRAM_NAME call :fetch_file "%NGRAM_DIR%" "%NGRAM_NAME%" %NGRAM_SIZE% %NGRAM_SHA256% %NGRAM_REVISION% "the n-gram volume (27.1 GiB)" volume
+if defined NGRAM_NAME if not "!FETCH_OK!"=="1" exit /b 1
 
-call :verify "%PART%"
-if not "!VERIFY_OK!"=="1" (
-  echo Downloaded file at "%PART%" failed verification against revision %REVISION%. Delete it and run this file again.
-  exit /b 1
-)
-
-move /y "%PART%" "%MODEL%" >nul
-if errorlevel 1 (
-  echo Failed to move "%PART%" to "%MODEL%". Delete "%PART%" and run this file again.
-  exit /b 1
-)
-echo Model ready: %MODEL%
-echo Point the tests at it with:  set %TESTS_VARIABLE%=%MODEL%
+echo Model ready: !MODEL!
+if defined NGRAM_NAME call :ngram_summary
+echo Point the tests at it with:  set %TESTS_VARIABLE%=!MODEL!
 call :fetch_graft
+exit /b 0
+:model_dir_rejected
+echo The model folder "!MODEL_DIR!" has a percent sign, caret or exclamation mark in its name, which 1>&2
+echo this script cannot pass on safely. Set NINFER_MODEL_DIR to a folder without those, or move this 1>&2
+echo script, and run this file again. 1>&2
+exit /b 1
+
+rem Fetches one pinned file: folder %1, name %2, size %3, sha256 %4, revision %5, description %6, and
+rem kind %7 (model, part or volume). Sets FETCH_OK=1 once the file is at its final name and verified.
+rem A file already there that verifies is kept without any download.
+rem
+rem The download is staged under a revision-scoped name so that curl -C - can only ever resume the
+rem same file. curl -C - resumes by appending at the current file length, without checking what wrote
+rem those bytes, so a leftover partial from a different revision -- for instance the previous pin's,
+rem on any machine that ran an older script -- would be spliced onto the head of this one: a file of
+rem entirely plausible size that is corrupt throughout. A name that carries the revision means a
+rem resume can only ever continue the same file, and the checks below are what promote it to the
+rem final name. Written with goto rather than ( ) blocks: a folder may contain ")". Folders are read
+rem with !VAR!, and any echo of one is given it quoted.
+:fetch_file
+set "FETCH_OK=0"
+set "F_DIR=%~1"
+set "F_NAME=%~2"
+set "EXPECTED_SIZE=%~3"
+set "EXPECTED_SHA256=%~4"
+set "F_REV=%~5"
+set "F_WHAT=%~6"
+set "F_KIND=%~7"
+set "F_PART_NAME=%F_NAME%.%F_REV%.part"
+call :join_path F_PATH F_DIR "%F_NAME%"
+call :join_path F_PART F_DIR "%F_PART_NAME%"
+call :join_path F_DOT F_DIR "."
+if not exist "!F_PATH!" goto :fetch_download
+call :verify "!F_PATH!"
+if not "!VERIFY_OK!"=="1" goto :fetch_stale
+if /i "%F_KIND%"=="model" echo Model already present: !F_PATH!
+if /i not "%F_KIND%"=="model" echo Already present: !F_PATH!
+set "FETCH_OK=1"
+exit /b 0
+:fetch_stale
+echo Existing !F_PATH! did not verify against revision %F_REV%; fetching the pinned one.
+if /i not "%F_KIND%"=="model" goto :fetch_download
+if defined NGRAM_NAME goto :fetch_download
+echo If it is the v2 file from an earlier release, you can upgrade it instead of downloading:
+echo   python tools\upgrade_ninfer_v2_to_v3.py "!F_PATH!" "!F_PATH!.v3" ^&^& move /y "!F_PATH!.v3" "!F_PATH!"
+:fetch_download
+echo Downloading %F_WHAT%...
+set "URL=https://huggingface.co/%OWNER%/%REPO%/resolve/%F_REV%/%F_NAME%"
+where /q aria2c
+if errorlevel 1 goto :fetch_curl
+rem 16 parallel ranges over one file, not single-stream curl. On the Vast rental boxes this repo
+rem downloads at ~98 MB/s over aria2c against the same throttled-to-~1MB/s (and once outright
+rem stalled at 11 of 21 GiB) single-stream curl -- see scripts\multi-gpu-testing\README.md. -c
+rem resumes into the same .part name curl would use, and HuggingFace serves ranges fine.
+rem The folder is given as "<dir>\." (F_DOT) because a drive root ends in a backslash, and a backslash
+rem before the closing quote escapes the quote for aria2c's argument parser.
+aria2c -x16 -s16 -c --file-allocation=none -d "!F_DOT!" -o "%F_PART_NAME%" "%URL%"
+goto :fetch_downloaded
+:fetch_curl
+curl.exe -L -C - --fail --output "!F_PART!" "%URL%"
+:fetch_downloaded
+if errorlevel 1 goto :fetch_download_failed
+call :verify "!F_PART!"
+if not "!VERIFY_OK!"=="1" goto :fetch_unverified
+move /y "!F_PART!" "!F_PATH!" >nul
+if errorlevel 1 goto :fetch_move_failed
+set "FETCH_OK=1"
+exit /b 0
+:fetch_download_failed
+echo Download failed. Run this file again to resume.
+exit /b 0
+:fetch_unverified
+echo Downloaded file at "!F_PART!" failed verification against revision %F_REV%. Delete it and run this file again.
+exit /b 0
+:fetch_move_failed
+echo Failed to move "!F_PART!" to "!F_PATH!". Delete "!F_PART!" and run this file again.
+exit /b 0
+
+rem Sets NGRAM_DIR, the folder for the n-gram volume: NINFER_NGRAM_DIR, else the answer to a question,
+rem else the model folder. Leaves NGRAM_DIR empty when the folder cannot be created or its name holds a
+rem character the script cannot carry safely.
+rem
+rem Folder text is user input, so it is only ever read with !VAR! (delayed expansion), whose result cmd
+rem does not parse again, and every command that shows or uses it is given it quoted or through !VAR!.
+rem Splicing a percent expansion into an unquoted echo would run whatever follows an & or | in the folder name.
+:choose_ngram_dir
+set "NGRAM_DIR=!MODEL_DIR!"
+if defined NINFER_NGRAM_DIR set "NGRAM_DIR=!NINFER_NGRAM_DIR!"
+if defined NINFER_NGRAM_DIR set "NGRAM_DIR=!NGRAM_DIR:"=!"
+if defined NINFER_NGRAM_DIR goto :ngram_dir_chosen
+echo.
+echo Qwen3.8-Flash-Next reads its 27.1 GiB n-gram volume on every prompt, and the model only once,
+echo at load. Prompts were processed 1.1-1.4x faster with the volume on an NVMe drive than on a
+echo SATA SSD, so put it on your fastest drive (28 GiB free). The model can stay where it is.
+echo.
+echo   Model folder: !MODEL_DIR_FULL!
+echo.
+rem set /p leaves the answer empty when nothing is typed or there is no console to read.
+set "NGRAM_ANSWER="
+set /p "NGRAM_ANSWER=Folder or drive for the n-gram volume, for example D: (Enter = the model folder): "
+if not defined NGRAM_ANSWER goto :ngram_dir_chosen
+set "NGRAM_ANSWER=!NGRAM_ANSWER:"=!"
+if not defined NGRAM_ANSWER goto :ngram_dir_chosen
+rem A bare drive gets a folder of its own rather than the drive's root. D: and D:\ are separate
+rem branches, so the result of the first is never tested by the second (D: -> D:\ninfer-models).
+if "!NGRAM_ANSWER:~1!"==":" goto :ngram_bare_drive
+if "!NGRAM_ANSWER:~1!"==":\" goto :ngram_bare_drive_root
+goto :ngram_answer_set
+:ngram_bare_drive
+set "NGRAM_ANSWER=!NGRAM_ANSWER!\ninfer-models"
+goto :ngram_answer_set
+:ngram_bare_drive_root
+set "NGRAM_ANSWER=!NGRAM_ANSWER!ninfer-models"
+:ngram_answer_set
+set "NGRAM_DIR=!NGRAM_ANSWER!"
+:ngram_dir_chosen
+rem A value that was only quotes is empty after they are stripped: use the model folder.
+if not defined NGRAM_DIR set "NGRAM_DIR=!MODEL_DIR!"
+call :dir_check NGRAM_DIR
+if "!DIR_BAD!"=="1" goto :ngram_dir_rejected
+for %%I in ("%NGRAM_DIR%") do set "NGRAM_DIR=%%~fI"
+call :trim_trailing_backslash NGRAM_DIR
+call :join_path NGRAM_PROBE NGRAM_DIR "."
+if not exist "!NGRAM_PROBE!" mkdir "%NGRAM_DIR%" >nul 2>&1
+if exist "!NGRAM_PROBE!" goto :ngram_dir_ok
+echo Cannot create the folder "!NGRAM_DIR!" for the n-gram volume. 1>&2
+set "NGRAM_DIR="
+exit /b 0
+:ngram_dir_rejected
+echo The n-gram folder "!NGRAM_DIR!" has a percent sign, caret or exclamation mark in its name, which 1>&2
+echo this script cannot pass on safely. Choose a folder without those, and run this file again. 1>&2
+set "NGRAM_DIR="
+exit /b 0
+:ngram_dir_ok
+echo N-gram volume folder: !NGRAM_DIR!
+exit /b 0
+
+rem Sets DIR_BAD=1 when the variable named %1 (MODEL_DIR or NGRAM_DIR) holds a percent sign, caret or exclamation mark. The folder passes
+rem through call, which doubles the first two, and through set and for lines, which eat the last, so it
+rem would silently become a different folder. Ampersand, pipe, angle brackets and parentheses need no
+rem check: the folder is quoted or read through delayed expansion everywhere, and never expanded inside
+rem a ( ) block. MODEL_DIR_FULL is cleared before the MODEL_DIR check, so `set NAME` prints one variable.
+rem
+rem The folder is never expanded on a command line here. Earlier versions did, in substitutions such as
+rem !NGRAM_DIR:^=!, where delayed expansion itself consumes the caret. Instead `set NGRAM_DIR` prints
+rem "NGRAM_DIR=<folder>" and findstr looks for one of the three characters in that output. The findstr
+rem line runs with delayed expansion off so its exclamation mark is an ordinary character; a doubled
+rem percent sign is one percent sign in a batch file; the caret sits last in the class, where it is a
+rem plain character. Each branch is a goto, so nothing conditional shares a line with an
+rem unconditional command.
+:dir_check
+set "DIR_BAD="
+setlocal disabledelayedexpansion
+set %~1 2>nul | findstr /r "[!%%^]" >nul
+if errorlevel 1 goto :dir_check_clean
+endlocal
+set "DIR_BAD=1"
+exit /b 0
+:dir_check_clean
+endlocal
+exit /b 0
+
+rem Sets the variable named %1 to folder variable %2 joined with name %3, with exactly one backslash
+rem between them: a drive root such as D:\ already ends in one. Folder text is read with !VAR! only.
+:join_path
+set "%~1=!%~2!"
+if not "!%~2:~-1!"=="\" set "%~1=!%~1!\"
+set "%~1=!%~1!%~3"
+exit /b 0
+
+rem Removes one trailing backslash from the variable named %1, except after a drive colon (D:\ is the
+rem root, and D: alone would mean the current folder on that drive). for %%~fI keeps a trailing
+rem backslash, which would double up in "<folder>\<name>" and fail a comparison with a folder
+rem written without it.
+:trim_trailing_backslash
+if not "!%~1:~-1!"=="\" exit /b 0
+if "!%~1:~-2,1!"==":" exit /b 0
+set "%~1=!%~1:~0,-1!"
+exit /b 0
+
+rem The lines that start the server. run.bat looks in the same default models folder as this script
+rem and prefers qwen4exp-iq2xs-mtp-vision.ninfer there, so it needs NINFER_MODEL_DIR only when that
+rem was set here, and NINFER_NGRAM_VOLUME only when the volume is not beside the model (it reads
+rem <model>.ngram otherwise). Not a ( ) block: a folder may contain ")".
+:ngram_summary
+call :join_path NGRAM_PATH NGRAM_DIR "%NGRAM_NAME%"
+echo N-gram volume ready: !NGRAM_PATH!
+echo.
+echo Start it with:
+if /i not "!NGRAM_DIR!"=="!MODEL_DIR_FULL!" echo   set "NINFER_NGRAM_VOLUME=!NGRAM_PATH!"
+if defined NINFER_MODEL_DIR echo   set "NINFER_MODEL_DIR=!MODEL_DIR_FULL!"
+echo   "!ROOT!run.bat" qwen38-flash-next
+echo.
 exit /b 0
 
 rem The qwen38-27b godmode graft lives in a private repo. Fetching it is best-effort: with no token,
@@ -194,8 +403,8 @@ if /i not "%ARTIFACT%"=="qwen3_8_27b.ninfer" exit /b 0
 if /i "%NINFER_GRAFTS%"=="off" exit /b 0
 set "G_REPO=WarlaxZ/Qwen3.8-27B-godmode-graft"
 set "G_REV=97a02e9bbb37d76af63256152c07fc4eeb4c40c9"
-set "G_DIR=%REPO_ROOT%\artifacts\grafts"
-if defined NINFER_GRAFT_DIR set "G_DIR=%NINFER_GRAFT_DIR%"
+set "G_DIR=!REPO_ROOT!\artifacts\grafts"
+if defined NINFER_GRAFT_DIR set "G_DIR=!NINFER_GRAFT_DIR!"
 set "G_BIN=godmode_q38_trained.bin"
 set "G_BIN_SHA=a0ddecc4ca5db8b84f600d60fbf238c97e21a74069b7182e0e0e595d7a22c391"
 set "G_JSON=godmode_q38_trained.json"
@@ -217,8 +426,8 @@ if defined HF_HOME set "G_TOKENFILE=%HF_HOME%\token"
 if defined HF_TOKEN_PATH set "G_TOKENFILE=%HF_TOKEN_PATH%"
 if not defined G_TOKEN if exist "%G_TOKENFILE%" set /p G_TOKEN=<"%G_TOKENFILE%"
 if not defined G_TOKEN goto :graft_no_token
-if not exist "%G_DIR%" mkdir "%G_DIR%" >nul 2>&1
-if not exist "%G_DIR%\" goto :graft_nodir
+if not exist "!G_DIR!" mkdir "!G_DIR!" >nul 2>&1
+if not exist "!G_DIR!\" goto :graft_nodir
 set "G_STOP="
 call :graft_fetch %G_BIN% %G_BIN_SHA%
 if defined G_STOP goto :graft_abort
@@ -227,43 +436,43 @@ if defined G_STOP goto :graft_abort
 rem Any pair already here is invalid or partial (a verified one went to :graft_ready). Clear it, binary first,
 rem so the new pair never sits beside a leftover half of the old one. Then install the sidecar first and the
 rem binary last: run.bat trusts the .bin alone, so it must never be visible without its .json.
-del "%G_DIR%\%G_BIN%" "%G_DIR%\%G_JSON%" >nul 2>&1
-move /y "%G_DIR%\%G_JSON%.part" "%G_DIR%\%G_JSON%" >nul 2>&1
+del "!G_DIR!\%G_BIN%" "!G_DIR!\%G_JSON%" >nul 2>&1
+move /y "!G_DIR!\%G_JSON%.part" "!G_DIR!\%G_JSON%" >nul 2>&1
 if errorlevel 1 goto :graft_install_failed
-move /y "%G_DIR%\%G_BIN%.part" "%G_DIR%\%G_BIN%" >nul 2>&1
+move /y "!G_DIR!\%G_BIN%.part" "!G_DIR!\%G_BIN%" >nul 2>&1
 if errorlevel 1 goto :graft_install_failed
 :graft_ready
-echo Graft ready: %G_DIR%\%G_BIN%
+echo Graft ready: !G_DIR!\%G_BIN%
 exit /b 0
 :graft_no_token
 rem Nothing can be fetched, but a lone half of the pair or a staged .part would still break a launch, so
 rem drop those. A whole pair is left alone: it may be one the user supplied.
-del "%G_DIR%\%G_BIN%.part" "%G_DIR%\%G_JSON%.part" >nul 2>&1
-if exist "%G_DIR%\%G_BIN%" if not exist "%G_DIR%\%G_JSON%" del "%G_DIR%\%G_BIN%" >nul 2>&1
-if exist "%G_DIR%\%G_JSON%" if not exist "%G_DIR%\%G_BIN%" del "%G_DIR%\%G_JSON%" >nul 2>&1
+del "!G_DIR!\%G_BIN%.part" "!G_DIR!\%G_JSON%.part" >nul 2>&1
+if exist "!G_DIR!\%G_BIN%" if not exist "!G_DIR!\%G_JSON%" del "!G_DIR!\%G_BIN%" >nul 2>&1
+if exist "!G_DIR!\%G_JSON%" if not exist "!G_DIR!\%G_BIN%" del "!G_DIR!\%G_JSON%" >nul 2>&1
 echo Graft: skipped, no Hugging Face token. Set HF_TOKEN or run "hf auth login" if you have access.
 exit /b 0
 :graft_nodir
-echo Graft: skipped, cannot create %G_DIR%. 1>&2
+echo Graft: skipped, cannot create !G_DIR!. 1>&2
 exit /b 0
 :graft_install_failed
-echo Graft: skipped, cannot install into %G_DIR%. 1>&2
+echo Graft: skipped, cannot install into !G_DIR!. 1>&2
 :graft_abort
-del "%G_DIR%\%G_BIN%" "%G_DIR%\%G_JSON%" "%G_DIR%\%G_BIN%.part" "%G_DIR%\%G_JSON%.part" >nul 2>&1
+del "!G_DIR!\%G_BIN%" "!G_DIR!\%G_JSON%" "!G_DIR!\%G_BIN%.part" "!G_DIR!\%G_JSON%.part" >nul 2>&1
 exit /b 0
 
 rem SHA_OK=1 when file %1 in the graft directory exists and its sha256 equals %2.
 :graft_present
 set "SHA_OK=0"
-if not exist "%G_DIR%\%~1" exit /b 0
-call :sha_ok "%G_DIR%\%~1" %~2
+if not exist "!G_DIR!\%~1" exit /b 0
+call :sha_ok "!G_DIR!\%~1" %~2
 exit /b 0
 
 rem Downloads one pinned graft file to its .part. Sets G_STOP on failure; the caller discards both files.
 :graft_fetch
-curl.exe -sSL --fail -H "Authorization: Bearer %G_TOKEN%" --output "%G_DIR%\%~1.part" "https://huggingface.co/%G_REPO%/resolve/%G_REV%/%~1" 2>nul
+curl.exe -sSL --fail -H "Authorization: Bearer %G_TOKEN%" --output "!G_DIR!\%~1.part" "https://huggingface.co/%G_REPO%/resolve/%G_REV%/%~1" 2>nul
 if errorlevel 1 goto :graft_denied
-call :sha_ok "%G_DIR%\%~1.part" %~2
+call :sha_ok "!G_DIR!\%~1.part" %~2
 if not "!SHA_OK!"=="1" goto :graft_corrupt
 exit /b 0
 :graft_denied
@@ -296,14 +505,12 @@ set "VERIFY_OK=0"
 set "VERIFY_PATH=%~1"
 for %%A in ("%VERIFY_PATH%") do set "VERIFY_SIZE=%%~zA"
 if not "!VERIFY_SIZE!"=="%EXPECTED_SIZE%" exit /b 0
-if "%NINFER_SKIP_SHA256%"=="1" (
-  set "VERIFY_OK=1"
-  exit /b 0
-)
+if "%NINFER_SKIP_SHA256%"=="1" goto :verify_skip_sha
 set "ACTUAL_SHA256="
-for /f "skip=1 delims=" %%H in ('certutil -hashfile "%VERIFY_PATH%" SHA256') do (
-  if not defined ACTUAL_SHA256 set "ACTUAL_SHA256=%%H"
-)
+for /f "skip=1 delims=" %%H in ('certutil -hashfile "%VERIFY_PATH%" SHA256') do if not defined ACTUAL_SHA256 set "ACTUAL_SHA256=%%H"
 set "ACTUAL_SHA256=!ACTUAL_SHA256: =!"
 if /i "!ACTUAL_SHA256!"=="%EXPECTED_SHA256%" set "VERIFY_OK=1"
+exit /b 0
+:verify_skip_sha
+set "VERIFY_OK=1"
 exit /b 0

@@ -47,7 +47,9 @@ Windows.
 N-GRAM COPIES, 2026-10-10. The `dflash2` variant passes `--ngram-draft-tokens 15` when it runs one
 lane, which is its default, or two; `NINFER_NGRAM=off` drops it. On the agent replay
 (`tools/bench/agent_replay`) it decodes 42% faster overall and 53-76% faster on turns that write back
-a file the conversation has read. Output that never copies is 0.7% slower, and it plans 170 MiB more
+a file the conversation has read. Output that never copies measured 0.7% slower in some sessions
+and the same in others, probably not copy work; the leading hypothesis is a buffer-placement
+effect, not yet confirmed (see [performance](../performance.md)). It plans 170 MiB more
 runtime memory: the Windows 188,416-token start still had 991 MiB free. With
 `NINFER_CONCURRENCY=2` it is on as well (since 2026-10-12): a lane without a copy is widened only
 while its partner balance covers it, so the batch gains 15% while turns that barely copy stay within
