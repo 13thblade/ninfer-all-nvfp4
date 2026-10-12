@@ -128,7 +128,8 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
+           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--fit-context MIN] "
+           "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
            "[--context-cost-presets FILE] "
@@ -156,7 +157,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--gdn-state-fp16] "
            "[--mlp-a8-decode] [--no-prefill-a8] "
            "[--prefill-cublas [--no-prefill-cublas-projections]] "
-           "[--no-thinking] [--preserve-thinking] [--graft NAME=PATH]... [--default-graft NAME] "
+           "[--no-thinking] [--preserve-thinking] [--tolerant-tool-calls] "
+           "[--graft NAME=PATH]... [--default-graft NAME] "
            "[--reasoning-effort minimal|low|medium|high|xhigh|max] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -183,6 +185,13 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
+           "       --fit-context MIN makes --max-context a ceiling: when it does not fit the GPU "
+           "memory free after the weights, less " +
+           std::to_string(kFitContextHeadroomBytes / (1024ULL * 1024ULL)) +
+           " MiB kept spare, the server starts at the largest multiple of " +
+           std::to_string(kFitContextStepTokens) +
+           " tokens that does (the KV pool follows) and logs the reduction; below MIN it refuses "
+           "to start\n"
            "       --prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a "
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
@@ -191,7 +200,7 @@ std::string serve_usage_text(const char* argv0) {
            "text being written already appeared in the request (a tool result, the prompt or the "
            "output so far), a round verifies up to 15 copied tokens instead of the draft model's "
            "proposal; verification licenses every token, so a wrong copy costs speed, never "
-           "output. 0 (the default) disables it. It needs --max-concurrency 1 for now. "
+           "output. 0 (the default) disables it. "
            "--ngram-min-match N (4..64, default 12) is how many tokens must match before a copy "
            "is proposed\n"
            "       --no-prefix-reuse disables cross-request history; request pause/replay "
@@ -238,6 +247,14 @@ std::string serve_usage_text(const char* argv0) {
            "ends the reply as length, conclude closes the thinking with the early-close guidance "
            "and lets the model answer\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+           "       --tolerant-tool-calls repairs tool calls the model wrote with broken markup "
+           "instead of returning them as plain text. Turn it on when an agent shows raw "
+           "<tool_call> text where a tool should have run. It affects only requests sent with "
+           "\"tool_constraints\": \"auto\"; the default constrained tool calls are always exact. "
+           "It keeps the complete calls and drops what follows them, repairs a mangled call "
+           "opener, and passes on a call to an undeclared tool name for the client to reject. "
+           "It never runs a call whose argument was cut off, and keeps a call missing its "
+           "closing tags only when the model ended its turn itself. Off by default\n"
            "       --graft NAME=PATH loads a phantom-kv prefill graft (a safetensors container with a "
            ".json sidecar beside it); a request selecting it with \"graft\": \"NAME\" runs as if the "
            "graft's hidden turn preceded its own messages. Repeatable\n"
@@ -348,6 +365,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+        } else if (arg == "--fit-context") {
+            options.fit_context_floor = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--fit-context"), "fit-context"));
+            if (options.fit_context_floor == 0) {
+                throw std::invalid_argument("--fit-context must be positive");
+            }
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
@@ -577,6 +600,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
+        } else if (arg == "--tolerant-tool-calls") {
+            options.tolerant_tool_calls = true;
         } else if (arg == "--graft") {
             const std::string_view spec = require_value("--graft");
             const std::size_t equals    = spec.find('=');
@@ -709,6 +734,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
+    if (options.fit_context_floor != 0) {
+        if (options.fit_context_floor > options.max_context) {
+            throw std::invalid_argument("--fit-context must not exceed --max-context");
+        }
+        if (options.kv_capacity.mode != KvCapacityMode::Explicit ||
+            options.kv_capacity.explicit_tokens != options.max_context) {
+            throw std::invalid_argument("--fit-context sizes the KV pool with the context; leave "
+                                        "--kv-capacity unset or equal to --max-context");
+        }
+    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");
     }
@@ -726,11 +761,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     product::apply_speculative_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);
-    if (options.speculative.ngram_draft_tokens != 0 && options.max_concurrency != 1) {
-        throw std::invalid_argument(
-            "--ngram-draft-tokens needs --max-concurrency 1; copies above one lane are not "
-            "built yet");
-    }
     if (options.vision_residency == VisionResidency::Overlay && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay requires --vision");
     }

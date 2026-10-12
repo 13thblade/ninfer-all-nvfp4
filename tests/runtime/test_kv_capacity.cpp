@@ -1,5 +1,6 @@
 #include "runtime/engine/kv_capacity.h"
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -125,6 +126,93 @@ int main() {
                           },
                           "every device"),
                       "missing free memory for a device was accepted");
+
+    // Context fit. An explicit capacity fits when its whole reservation does, on every device.
+    failures += check(ninfer::runtime::explicit_capacity_fits(129, curve, 1128) &&
+                          !ninfer::runtime::explicit_capacity_fits(129, curve, 1127) &&
+                          ninfer::runtime::explicit_reservation_bytes(129, curve) == 1128,
+                      "explicit capacity fit disagrees with its reservation");
+    failures += check(!ninfer::runtime::explicit_capacity_fits(64 * 19, split, 100000, split_available),
+                      "an explicit capacity too large for a further device was said to fit");
+    failures += check(!ninfer::runtime::explicit_capacity_fits(64 * 7, curve, 100000),
+                      "an explicit capacity beyond the curve was said to fit");
+    {
+        const auto none = ninfer::runtime::explicit_capacity_shortfall(129, curve, 1128);
+        const auto tight = ninfer::runtime::explicit_capacity_shortfall(129, curve, 1127);
+        const auto far = ninfer::runtime::explicit_capacity_shortfall(64 * 19, split, 100000,
+                                                                      split_available);
+        failures += check(!none && tight && tight->rank == 0 && tight->need_bytes == 1128 &&
+                              tight->available_bytes == 1127,
+                          "the primary device's shortfall was not reported");
+        failures += check(far && far->rank == 1 && far->need_bytes > far->available_bytes,
+                          "a further device's shortfall was not attributed to it");
+        failures += check(!ninfer::runtime::explicit_capacity_shortfall(64 * 7, curve, 100000),
+                          "a capacity beyond the curve was not held to the curve's range");
+    }
+
+    // The fit returns the ceiling when it fits, otherwise the largest step multiple below it, the
+    // floor when only the floor fits, and nothing when not even the floor does -- in O(log) probes.
+    int probes      = 0;
+    const auto upto = [&](std::uint32_t limit) {
+        return [&probes, limit](std::uint32_t context) {
+            ++probes;
+            return context <= limit;
+        };
+    };
+    failures += check(ninfer::runtime::fit_context(32768, 188416, 1024, upto(188416)) == 188416,
+                      "a ceiling that fits was lowered");
+    probes = 0;
+    failures += check(ninfer::runtime::fit_context(32768, 188416, 1024, upto(175000)) == 174080,
+                      "the fit missed the largest step multiple that fits");
+    failures += check(probes <= 2 + 9, "the fit probed more than logarithmically");
+    failures += check(ninfer::runtime::fit_context(32768, 188416, 1024, upto(33000)) == 32768,
+                      "the fit did not fall back to the floor");
+    failures += check(!ninfer::runtime::fit_context(32768, 188416, 1024, upto(30000)).has_value(),
+                      "the fit started below its floor");
+    failures += check(ninfer::runtime::fit_context(1000, 1500, 1024, upto(1499)) == 1024,
+                      "the fit did not take the only step multiple between floor and ceiling");
+    bool bad_range_rejected = false;
+    try {
+        (void)ninfer::runtime::fit_context(4096, 2048, 1024, upto(0));
+    } catch (const std::invalid_argument&) { bad_range_rejected = true; }
+    failures += check(bad_range_rejected, "a floor above the ceiling was accepted");
+
+    failures += check(ninfer::runtime::effective_fit_floor(32768, 0) == 32768 &&
+                          ninfer::runtime::effective_fit_floor(32768, 32767) == 32768,
+                      "a graft below the floor moved it");
+    failures += check(ninfer::runtime::effective_fit_floor(32768, 32768) == 32769 &&
+                          ninfer::runtime::effective_fit_floor(4096, 40000) == 40001,
+                      "the floor did not clear the largest graft's slots");
+    bool graft_overflow_rejected = false;
+    try {
+        (void)ninfer::runtime::effective_fit_floor(1, 0xFFFFFFFFU);
+    } catch (const std::overflow_error&) { graft_overflow_rejected = true; }
+    failures += check(graft_overflow_rejected, "an unrepresentable graft floor was accepted");
+
+    // The planner needs at least max_concurrency pages, so a fit floor is clamped to the smallest
+    // context spanning that many pages; the clamped floor fits when the planner-valid range does.
+    failures += check(ninfer::runtime::minimum_plannable_context(1, 64) == 1 &&
+                          ninfer::runtime::minimum_plannable_context(8, 64) == 449 &&
+                          ninfer::runtime::minimum_plannable_context(2, 64) == 65,
+                      "the smallest plannable context is not one past (lanes - 1) pages");
+    {
+        const std::uint32_t low = std::max(ninfer::runtime::effective_fit_floor(1, 0),
+                                           ninfer::runtime::minimum_plannable_context(8, 64));
+        failures += check(low == 449 &&
+                              ninfer::runtime::fit_context(low, 4096, 1024, upto(1500)) == 1024 &&
+                              !ninfer::runtime::fit_context(low, 4096, 1024, upto(100)).has_value(),
+                          "a floor below the plannable minimum was probed");
+    }
+    bool plannable_zero_rejected = false;
+    try {
+        (void)ninfer::runtime::minimum_plannable_context(0, 64);
+    } catch (const std::invalid_argument&) { plannable_zero_rejected = true; }
+    bool plannable_overflow_rejected = false;
+    try {
+        (void)ninfer::runtime::minimum_plannable_context(8, 0x40000000U);
+    } catch (const std::overflow_error&) { plannable_overflow_rejected = true; }
+    failures += check(plannable_zero_rejected && plannable_overflow_rejected,
+                      "an unrepresentable plannable minimum was accepted");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

@@ -61,6 +61,7 @@ int main() {
     options.enable_vision                  = false;
     options.allow_prefix_reuse             = true;
     options.preserve_thinking              = true;
+    options.tolerant_tool_calls            = true;
     options.default_thinking_budget        = 512;
     options.reasoning_loop                 = ninfer::ReasoningLoopAction::Conclude;
     options.sampling_overrides.temperature = 0.6F;
@@ -220,6 +221,8 @@ int main() {
         "resolved context-cache configuration missing");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");
+    failures += check(server.at("server").at("tolerant_tool_calls") == true,
+                      "server tolerant tool-call setting missing");
     failures +=
         check(server.at("sampling_defaults").at("thinking").at("temperature") == 1.0 &&
                   server.at("sampling_defaults").at("non_thinking").at("presence_penalty") == 1.5,
@@ -544,6 +547,8 @@ int main() {
                   done.at("result").at("tool_call_parse").at("structured_call_count") == 0 &&
                   done.at("result").at("tool_call_parse").at("empty_arguments_omitted") == 0 &&
                   done.at("result").at("tool_call_parse").at("schema_mismatch_arguments") == 0 &&
+                  done.at("result").at("tool_call_parse").at("duplicate_parameters_repaired") ==
+                      0 &&
                   done.at("result").at("tool_call_parse").at("fallback_reason") == "none",
               "default tool-call parse diagnostics missing");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
@@ -713,8 +718,9 @@ int main() {
         .marker_seen               = true,
         .structured_call_count     = 1,
         .empty_arguments_omitted   = 1,
-        .schema_mismatch_arguments = 2,
-        .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+        .schema_mismatch_arguments     = 2,
+        .duplicate_parameters_repaired = 3,
+        .fallback_reason               = ninfer::ToolCallParseFallbackReason::None,
     };
     const Json normalized_tool_done =
         Json::parse(format_request_done_json("serve-test", 3002, context, normalized_tool_outcome));
@@ -727,10 +733,54 @@ int main() {
             normalized_tool_done.at("result")
                     .at("tool_call_parse")
                     .at("schema_mismatch_arguments") == 2 &&
+            normalized_tool_done.at("result")
+                    .at("tool_call_parse")
+                    .at("duplicate_parameters_repaired") == 3 &&
             normalized_tool_done.at("result").at("tool_call_parse").at("fallback_reason") ==
                 "none" &&
             !render_tool_call_fallback(context, normalized_tool_outcome),
         "successful tool-call normalization diagnostics are incomplete or noisy");
+
+    GenerationOutcome reasoning_tool_outcome = normalized_tool_outcome;
+    reasoning_tool_outcome.tool_call_parse   = {
+          .marker_seen              = true,
+          .structured_call_count    = 2,
+          .recovered_from_reasoning = true,
+    };
+    const Json reasoning_tool_done =
+        Json::parse(format_request_done_json("serve-test", 3004, context, reasoning_tool_outcome));
+    const std::optional<OperationalRecord> reasoning_tool_note =
+        render_tool_call_fallback(context, reasoning_tool_outcome);
+    failures += check(
+        reasoning_tool_done.at("result").at("tool_call_parse").at("recovered_from_reasoning") ==
+                true &&
+            normalized_tool_done.at("result").at("tool_call_parse").at(
+                "recovered_from_reasoning") == false &&
+            reasoning_tool_note && reasoning_tool_note->severity == OperationalSeverity::Info &&
+            reasoning_tool_note->message ==
+                "req#7 tool calls recovered from unclosed thinking | calls=2",
+        "a tool-call recovery from unclosed thinking is not logged");
+
+    GenerationOutcome tolerant_tool_outcome = normalized_tool_outcome;
+    tolerant_tool_outcome.tool_call_parse   = {
+          .marker_seen           = true,
+          .structured_call_count = 1,
+          .tolerant_recovered    = true,
+    };
+    const Json tolerant_tool_done =
+        Json::parse(format_request_done_json("serve-test", 3005, context, tolerant_tool_outcome));
+    const std::optional<OperationalRecord> tolerant_tool_note =
+        render_tool_call_fallback(context, tolerant_tool_outcome);
+    failures += check(
+        tolerant_tool_done.at("result").at("tool_call_parse").at("tolerant_recovered") == true &&
+            tolerant_tool_done.at("result").at("tool_call_parse").at("fallback_reason") ==
+                "none" &&
+            normalized_tool_done.at("result").at("tool_call_parse").at("tolerant_recovered") ==
+                false &&
+            tolerant_tool_note && tolerant_tool_note->severity == OperationalSeverity::Info &&
+            tolerant_tool_note->message ==
+                "req#7 tool markup repaired by --tolerant-tool-calls | calls=1",
+        "a tolerant tool-call repair is not logged");
 
     GenerationOutcome fallback_outcome = outcome;
     fallback_outcome.tool_call_parse   = {
@@ -738,19 +788,19 @@ int main() {
           .structured_call_count     = 0,
           .empty_arguments_omitted   = 0,
           .schema_mismatch_arguments = 0,
-          .fallback_reason           = ninfer::ToolCallParseFallbackReason::DuplicateParameter,
+          .fallback_reason           = ninfer::ToolCallParseFallbackReason::UndeclaredTool,
     };
     const Json fallback_done =
         Json::parse(format_request_done_json("serve-test", 3003, context, fallback_outcome));
     failures += check(fallback_done.at("result").at("tool_call_parse").at("marker_seen") &&
                           fallback_done.at("result").at("tool_call_parse").at("fallback_reason") ==
-                              "duplicate_parameter",
+                              "undeclared_tool",
                       "tool-call text fallback diagnostics missing from JSONL");
     const std::optional<OperationalRecord> fallback_warning =
         render_tool_call_fallback(context, fallback_outcome);
     failures += check(
         fallback_warning && fallback_warning->severity == OperationalSeverity::Warning &&
-            fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
+            fallback_warning->message == "req#7 tool markup returned as text | undeclared tool",
         "tool-call text fallback warning is absent or exposes raw content");
 
     const Json error =

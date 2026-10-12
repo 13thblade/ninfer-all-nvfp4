@@ -96,8 +96,38 @@ void basic_contracts(ninfer::text::GrammarCompiler& compiled) {
             "generic argument syntax rejected repeated keys");
     frontend::ToolCallOutputDecoder duplicate(integer, 64);
     (void)duplicate.feed(repeated);
-    require(duplicate.finish().tool_calls.at(0).arguments_json == R"({"x":2})",
+    const auto resolved = duplicate.finish();
+    require(resolved.tool_calls.at(0).arguments_json == R"({"x":2})",
             "non-strict duplicate was not resolved to one final value");
+    // The repair is counted as on the free route, per repeated name across every call.
+    require(resolved.diagnostics.duplicate_parameters_repaired == 1 &&
+                resolved.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+            "constrained duplicate repair was not counted");
+    frontend::ToolCallOutputDecoder repeated_twice(integer, 64);
+    (void)repeated_twice.feed(repeated + "\n" + call("3"));
+    (void)repeated_twice.feed("\n" + repeated);
+    const auto twice = repeated_twice.finish();
+    require(twice.tool_calls.size() == 3 && twice.diagnostics.duplicate_parameters_repaired == 2,
+            "constrained duplicate repairs were not counted per repeat");
+    frontend::ToolCallOutputDecoder single(integer, 64);
+    (void)single.feed(call("3"));
+    require(single.finish().diagnostics.duplicate_parameters_repaired == 0,
+            "a call without repeats counted a duplicate repair");
+
+    // A repeat inside a call that never completes is discarded with that call, so it is not
+    // counted; the repeats of the calls that did complete still are.
+    const std::string unfinished = "<tool_call>\n<function=call>\n<parameter=x>\n1\n</parameter>\n"
+                                   "<parameter=x>\n2\n</parameter>\n";
+    frontend::ToolCallOutputDecoder cut_alone(integer, 64);
+    (void)cut_alone.feed(unfinished);
+    const auto alone = cut_alone.finish(ninfer::FinishReason::OutputLimit);
+    require(alone.tool_calls.empty() && alone.diagnostics.duplicate_parameters_repaired == 0,
+            "an unfinished call's duplicate repair was counted without a published call");
+    frontend::ToolCallOutputDecoder cut_after(integer, 64);
+    (void)cut_after.feed(repeated + "\n" + unfinished);
+    const auto after = cut_after.finish(ninfer::FinishReason::OutputLimit);
+    require(after.tool_calls.size() == 1 && after.diagnostics.duplicate_parameters_repaired == 1,
+            "a completed call's duplicate repair was lost or inflated by an unfinished one");
 
     // These requests share the same compiled envelope but have different value normalization.
     const auto string = contract(schema({{"type", "string"}}), false);
@@ -179,6 +209,46 @@ void selected_contracts(ninfer::text::GrammarCompiler& compiled) {
     }
 }
 
+// A constrained turn cannot end inside its thinking: the tool grammar admits EOS only after the
+// canonical close, even right after a complete call written in the thinking. The free parser's
+// recovery of calls stranded in unclosed thinking therefore never applies to constrained output.
+void thinking_cannot_end_with_eos(ninfer::text::GrammarCompiler& compiled) {
+    constexpr std::string_view close = "\n</think>\n\n";
+    ninfer::ToolChoice required;
+    required.mode = ninfer::ToolChoiceMode::Required;
+    for (const auto& bound :
+         {contract(schema({{"type", "integer"}}), false),
+          contract(schema({{"type", "integer"}}), true, required)}) {
+        require(bound->constrained, "thinking EOS check needs a constrained contract");
+        auto matcher = frontend::compile_tool_grammar(compiled, *bound, close, {});
+        std::vector<std::uint32_t> words(matcher->mask_words());
+        const auto eos_allowed = [&] {
+            require(matcher->masks({}, words) == 0, "tool grammar dead end inside thinking");
+            return (words[256 / 32] & 1u) != 0;
+        };
+        const auto feed = [&](std::string_view text) {
+            for (unsigned char c : text) {
+                require(!eos_allowed(), "tool grammar admitted EOS inside open thinking");
+                require((words[c / 32] & (1u << (c % 32))) != 0,
+                        "tool grammar rejected thinking text");
+                matcher->accept(c);
+                matcher->confirm();
+            }
+        };
+        feed("I will call it.\n" + call("2") + std::string(close.substr(0, close.size() - 1)));
+        require(!eos_allowed(), "tool grammar admitted EOS one byte before the thinking close");
+        matcher->accept(static_cast<unsigned char>(close.back()));
+        matcher->confirm();
+        for (unsigned char c : call("2")) {
+            require(matcher->masks({}, words) == 0 && (words[c / 32] & (1u << (c % 32))) != 0,
+                    "tool grammar rejected a call after the thinking close");
+            matcher->accept(c);
+            matcher->confirm();
+        }
+        require(eos_allowed(), "tool grammar did not admit EOS after a call in the answer");
+    }
+}
+
 // The serve layer lowers a free-form `custom` tool (Codex's apply_patch) to this strict schema.
 // Its top-level pure-string parameter must come back byte for byte, so a patch keeps its leading
 // spaces, blank lines and markers, and the grammar must make `input` the only, required argument.
@@ -245,6 +315,7 @@ void run() {
     auto compiled = compiler();
     basic_contracts(compiled);
     selected_contracts(compiled);
+    thinking_cannot_end_with_eos(compiled);
     custom_tool_input(compiled);
     ninfer::ToolChoice required;
     required.mode = ninfer::ToolChoiceMode::Required;

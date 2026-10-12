@@ -210,6 +210,16 @@ entry retains the preceding numerical layer. After real-scenario acceptance, a m
 promote quantized values into the C++ table. The detailed `--json` report is diagnostic provenance
 and is not a runtime input.
 
+## Hyper-connection and FP32 projection benchmarks
+
+`ninfer_hyper_connection_bench [--tokens T,...] [--chain N]` times `hyper_connection_mix` at
+Qwen3.8-Flash-Next's geometry (S = 4, H = 2560, rank 320, BF16 weights) with and without injection
+rows, from graph replays after an L2 flush: one call per graph (`single`, which includes the graph's
+launch latency) and `N` calls per graph on distinct weight copies (`chained`, the per-call cost
+inside a decode graph). `ninfer_projection_fp32_bench [--tokens T,...]` times `projection_fp32` on
+the BF16 router plus shared-expert gate [513, 2560] and the IQ4_XS LM head [248320, 2560]. Both
+call only the public Ops.
+
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
@@ -333,6 +343,22 @@ cmake --build build -j --target ninfer_benches
 ./build/bench/ninfer_benches ninfer_linear_topk_bench --columns 1,7,16,24,64,120 --repeat 25
 ./build/bench/ninfer_benches ninfer_linear_topk_bench --profile fp8-full --columns 120
 ./build/bench/ninfer_benches ninfer_linear_topk_bench --profile q4-optimized --columns 129 --repeat 60
+```
+
+## Offloaded sparse-MoE Op benchmark
+
+`ninfer_offloaded_moe_bench` measures the public offloaded_sparse_moe experts over GGML expert
+records (IQ2_S, IQ2_XXS and IQ1_M gate/up with Q2_0 down). `--mode gpu` times `moe_experts` with
+`--experts` experts (default 10, the model's top-k) each routed every column, at T in {1, 2, 4, 8}
+with the records resident in device frames, and at T = 1 staged from the pinned host bank or read
+zero-copy; a 256 MiB L2 eviction read precedes every sample and CUDA events bracket the call, both
+replayed from a CUDA graph (the reported rate) and launched eagerly. The rate counts each record once. `--mode cpu` times one cold expert at T = 1 on the CPU worker team
+over 1-16 workers, rotating through 96 records so none is cache-resident. Records are random blocks
+with finite scales; medians of `--reps` (default 30).
+
+```bash
+./build/bench/ninfer_benches ninfer_offloaded_moe_bench
+./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode cpu --reps 50
 ```
 
 ## QSA Op benchmark
@@ -1068,6 +1094,19 @@ cmake --build build --parallel \
 Run separate invocations for `K=1..15`, `full|optimized`, representative contexts, and
 `--no-cuda-graph`. This complete-round benchmark measures the DFlash model's actual greedy
 acceptance. Transaction correctness is covered by the state and Engine tests.
+
+For n-gram copy rounds (DFlash2, `--corpus` for a realistic prompt):
+
+- `--copy-width W [--copy-lanes N]` records the request's own greedy continuation and hands it to
+  the first `N` lanes (default: all of `--batch`, which must be 1 or 2 because copy rounds run at
+  most two lanes) as a proposal-only source, so their copy rounds
+  verify a full `W-1` drafts; the other lanes decode the same prompt without copies. It times the
+  rounds in which every copying lane accepts all of its drafts: the cost of a `W`-column copy round,
+  and with `--batch 2 --copy-lanes 1` the cost a copying lane imposes on a drafting one.
+- `--ngram-idle W` runs ordinary rounds with `W`-column copy rounds configured but no copy index,
+  the cost n-gram drafting adds to output that never copies.
+- `--prefill-tail N` times a final `N`-token prefill chunk at the context depth, a proxy for verify
+  widths the round Ops do not reach.
 
 ## Token-decision Op benchmarks
 

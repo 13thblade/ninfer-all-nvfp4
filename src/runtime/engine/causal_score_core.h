@@ -92,6 +92,7 @@ public:
         out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
         out.kv_capacity_headroom_bytes         = resolution.automatic_headroom_bytes;
         out.planned_slack_bytes                = resolution.planned_slack_bytes;
+        out.requested_max_context              = resolution.requested_context;
         return out;
     }
 

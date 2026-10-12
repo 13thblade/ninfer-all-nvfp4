@@ -317,8 +317,22 @@ admission actually resumes from it. On the 27B on an RTX 3090, a 7.8k-token conv
 856 MB image) read back from a warm file cache in about 1.5 s gave a first token after 1.6 s, against
 5.1 s for prefilling it and 0.1 s when it had stayed resident.
 
-The store does not support the DFlash speculative backends (their draft-side state has not been
-verified through a stored image); the Engine refuses to start with both.
+The store works with MTP and DFlash2, including the launchers' default DFlash2, and with no
+speculation. A stored recovery point carries the draft's own context with the target's: DFlash2's
+local K/V rings (40 MiB per recovery point on the 27B) inside each recurrent state. A restored
+conversation therefore drafts exactly as if it had never left the GPU: the real tests require the
+same output and the same speculative rounds and accepted drafts as the uninterrupted conversation.
+`--spec dflash` (the 35B-A3B DFlash v1 backend, not a launcher profile) is accepted but is not
+fully verified: after a restart a short conversation was restored at start-up yet its continuation
+reused no tokens, so it falls back to a cold prefill (a deep conversation restores and matches
+exactly), and its hydration, crash and recovery paths were not exercised. Treat the store as
+unsupported there.
+N-gram copy drafting (`--ngram-draft-tokens`) needs nothing stored; a restored request builds its
+copy index from its own prompt like any other. A store is bound to the speculative backend, draft
+count and proposal head it was written with (and to the model, KV format and `--gdn-state-fp16`), so
+a server restarted with another `--spec` or `--draft-tokens` restores nothing from it and prefills
+instead; the start-up log counts those sessions as written under another configuration, and they
+age out. `--ngram-draft-tokens` may change freely.
 
 An image does not depend on `--devices`/`--stage-layers`: a conversation stored by a server split
 into pipeline stages restores on one GPU and the reverse. A worker failure that clears the context
@@ -328,7 +342,8 @@ any other, and changing the configured grafts (their names or files) makes the e
 misses, as a different model would.
 
 A session image is several GB for a deep context (about 18 KB per token with `--kv-dtype rk4v4`,
-plus about 150 MB of recurrent state per recovery point), and consecutive images of one conversation
+plus about 150 MB of recurrent state per recovery point, about 80 MB with `--gdn-state-fp16`, and
+40 MiB more under DFlash2), and consecutive images of one conversation
 share almost all of it. The store therefore splits an image into fixed 32 MiB chunks named by a hash
 of their content and writes only chunks it does not already hold: keeping a long conversation current
 costs the newest pages and the endpoint state, not the whole session. Older images of a conversation
@@ -339,7 +354,9 @@ simply re-prefilled by the next request; a damaged store costs cache hits, never
 The store keeps at most `--context-store-max-gib` (default: half the free space of the volume when
 the server starts), removing the least recently used sessions first, and removes sessions unused for
 `--context-store-ttl-hours` (default 168). A store written by a different model, quantization, KV
-configuration or set of prompt grafts is ignored and ages out. The `ninfer_context_store_*` series (see
+or recurrent-state configuration, speculative configuration, set of prompt grafts or an older
+engine's image format is ignored and ages out; the start-up log line `context store | N sessions
+were written under another model, configuration or store format` says so. The `ninfer_context_store_*` series (see
 [Metrics](#metrics)) report size, writes, bytes reused, what was restored at start-up and how long it
 took. A background write is skipped while any request is waiting, binding, prefilling or replaying,
 and the write queue holds at most two images, so a slow disk does not hold up requests. Taking the
@@ -637,10 +654,78 @@ the tool consumer can report the validation error and continue the agent loop. S
 supported explicit type retain untyped inference. NInfer does not apply defaults, enforce required
 properties, or perform recursive JSON Schema validation on this route.
 
-On the unconstrained route, string parameters preserve function/tool-call markers and balanced nested
+On the unconstrained route, the parser also accepts the XML call forms agent harnesses such as
+Claude Code prompt models with: a `<function_calls>` wrapper, bare `<function ...>` and
+`<invoke ...>` calls (closed by the matching `</function>` or `</invoke>`), `name="..."` or
+`name='...'` attributes in place of `=name`, and `<param ...>...</param>` parameters. Opening and
+closing tags must match. Repeated parameter names keep the last value at the first key's position,
+as on the constrained route; `duplicate_parameters_repaired` in the
+[structured request log](#structured-request-log) counts them.
+
+String parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
-so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
-unambiguously; either causes the complete tool-call region to fall back to ordinary content.
+so a standalone `</parameter>` ends a value only when whitespace and then another parameter, the
+function's closer, or the end of the output follow it; any other one is value text, such as a shell
+command that echoes the markup. An unmatched nested parameter opener, or a quoted closer that is
+followed by the next token, cannot be represented unambiguously and makes that tool-call region
+ordinary content. Later content is still examined: the first tool-call region (any accepted marker
+form, or a later `<tool_call>` after one that failed) that parses to the end of the output becomes
+the structured turn, and any quoted markup before it stays ordinary content. A marker inside a
+Markdown code fence (```` ``` ```` or `~~~`) or inline code of the answer is a quoted example and
+stays content even when it is a complete call; only the text before the marker decides, so streamed
+and complete responses agree. A marker after a closed fence, or after a sentence on the same line,
+still opens a call. Inline code is tracked per paragraph (a blank line or a fence ends one), so an
+unpaired backtick earlier in the same paragraph also makes a later marker text.
+
+A model sometimes writes its tool calls inside its thinking and ends the turn with its stop token
+without ever closing the thinking, so no call reaches the answer. On the unconstrained route such a
+call is **executed**: when, from a marker (found by the same rules as in the answer) to the end of
+that thinking, there is nothing but complete calls to declared tools, those calls become the
+structured turn, and the operational log notes the recovery at Info severity. This means a call the
+model wrote while still thinking is returned for execution when the model ended its own turn right
+after complete, declared calls. The thinking stays reasoning, including the calls' text, and none
+of it is published as content. Nothing is recovered when the thinking was closed, when the turn
+published any content, when it ended at the output limit, context capacity, a stop string or a
+cancellation, or when prose, a quoted marker or a cut call follows the last call. Constrained tool
+output cannot end inside thinking: its grammar admits the stop token only after the canonical
+thinking close, so this recovery does not apply there.
+
+#### Tolerant tool calls
+
+By default a tool-call region the parser cannot read exactly is returned as ordinary content, so an
+agent client shows raw `<tool_call>` text where a tool should have run. `--tolerant-tool-calls`
+(off by default) repairs the common ways a model breaks that markup and returns the calls
+structurally instead. It applies only to free tool output, that is requests sent with
+`tool_constraints:"auto"` that fall back to free generation as described under
+[Tool constraints](#tool-constraints). Constrained output, the default, already admits only exact
+calls and never consults the flag.
+
+With the flag, these calls are kept whatever ended the turn:
+
+- complete calls followed by prose or by a malformed or cut call: the calls are kept and what follows
+  them is dropped. Prose that itself contains another call marker is not dropped: the calls before it
+  may be an example the answer quotes, so the later region is tried instead;
+- complete calls inside a `<function_calls>` wrapper that never closes;
+- a call whose opener the model mangled inside `<tool_call>`: a dropped or doubled `<`, a leaked
+  `<|im_start|>`, a dropped `function` keyword (`<=name>`), or a missing `>` after the function name
+  when the next tag follows on the next line;
+- a complete call to a tool name the request did not declare. It is returned for the client to
+  reject, since leaking it as text would hide the call; strict parsing returns it as text.
+
+A final call whose parameters all closed but whose `</function>` or `</tool_call>` is missing is
+kept only when the model ended the turn itself with its stop token. If the turn ended at the output
+limit, context capacity, a stop string or a cancellation, the call may have been cut between
+parameters, so only the calls before it are kept, as on the constrained route.
+
+The flag **never** keeps a call whose parameter value was cut off before its closing tag: a cut path,
+command or patch would run as something the model did not write. Such a call is dropped (or, when
+it is the only one, the output stays text). For the same reason it drops nothing that holds a
+`</parameter>`, `</param>`, `</function>` or `</invoke>` closer before the next call marker: a
+value that quotes a closer followed by the next token (`echo '</parameter>` then `</function>'`)
+would have been split there, so the region stays text as under strict parsing. The flag also
+never applies to calls recovered from unclosed thinking, which must parse exactly. A repaired turn
+reports `tolerant_recovered` in the [structured request log](#structured-request-log) and logs one
+Info line.
 
 ### Tool constraints
 
@@ -1184,7 +1269,12 @@ Function arguments use `response.function_call_arguments.delta` and `.done`; a c
 uses `response.custom_tool_call_input.delta` and `.done`. IDs, output indices,
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
-streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
+streams immediately; only a suffix that may start a tool-call marker, or the tool region after one,
+is held. On the unconstrained route every accepted marker form counts (`<tool_call>`,
+`<function_calls>`, `<function=`/`<function `, `<invoke=`/`<invoke `, and their quoted variants),
+so answer prose that writes such a tag outside Markdown code stops streaming there and the rest of
+the turn arrives at the end, as ordinary text if it does not parse as calls. Constrained output
+holds only at `<tool_call>`.
 On the unconstrained route, malformed tool markup is flushed back as ordinary text without losing bytes.
 
 ### Local response state and resources
@@ -1421,6 +1511,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name`, or architecture name |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
+| `--fit-context MIN` | treat `--max-context` as a ceiling: start at the largest context (multiple of 1,024, KV pool equal to it) that fits free GPU memory less 256 MiB, never below `MIN`; requires `--kv-capacity` unset or equal to `--max-context` | off |
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
@@ -1441,7 +1532,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
-| `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. One lane only for now; see [the CLI guide](cli.md#n-gram-copy-drafting) | `0` (off) |
+| `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. Copies run when a round holds one or two requests (at two only for copies of 12 or more tokens, since the other request's row pays the copy width too); see [the CLI guide](cli.md#n-gram-copy-drafting) | `0` (off) |
 | `--ngram-min-match N` | tokens the end of the text must match before a copy is proposed, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
@@ -1471,6 +1562,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-exit-on-engine-failure` | stay alive (answering 503) when the engine latches unavailable, instead of logging FATAL and exiting with status 3 after 5 s | exit |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
+| `--tolerant-tool-calls` | repair broken tool-call markup on `tool_constraints:"auto"` requests instead of returning it as text; never keeps a call whose argument was cut. See [Tolerant tool calls](#tolerant-tool-calls) | off |
 | `--graft NAME=PATH` | load a [prompt graft](#prompt-grafts) a request may select by name; repeatable | none |
 | `--default-graft NAME` | apply a loaded graft to requests that state none; `"graft": ""` opts out | none |
 | `--reasoning-effort minimal\|low\|medium\|high\|xhigh\|max` | effort for thinking-enabled requests that state none | template default |
@@ -1513,7 +1605,7 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v27 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v29 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -1534,9 +1626,15 @@ unspecified. `enable_thinking` records whether the response starts in thinking m
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
-preserved for consumer validation, and a stable text-fallback reason. Fallback reasons are `none`,
-`malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
-`trailing_content`. These counters contain no tool arguments or generated text.
+preserved for consumer validation, repeated parameter names resolved to their last value
+(`duplicate_parameters_repaired`), and a stable text-fallback reason. Fallback reasons are `none`,
+`malformed_structure`, `invalid_tool_name`, `undeclared_tool`, and `trailing_content`.
+`recovered_from_reasoning` is true when the structured calls came from a turn that ended inside
+its unclosed thinking. `tolerant_recovered` is true when `--tolerant-tool-calls` repaired markup
+the strict parser returns as text to produce the structured calls (see
+[Tolerant tool calls](#tolerant-tool-calls)); the fallback reason is then `none`. These counters
+contain no tool arguments or generated text. `server_start.server.tolerant_tool_calls` records the
+flag.
 
 `request_done.constraint` carries the same constraint observation as the HTTP terminal result,
 or `null` for unconstrained requests. Preparation failures and execution errors use the existing
@@ -1698,6 +1796,14 @@ outside the GPU executor and do not delay formation of the next batch.
 pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
 and leaves 1 GiB of sizing headroom; omitting the option makes it follow `--max-context`. Capacity
 resolves once at startup.
+
+`--fit-context MIN` makes `--max-context` a ceiling instead of a demand: after the weights load, if
+the plan at `--max-context` does not fit the free device memory less 256 MiB, the server plans
+smaller contexts with the same planner and starts at the largest multiple of 1,024 tokens that fits,
+with the KV pool equal to it, logging `context lowered to N tokens (asked for M)`. `/v1/models`,
+`/props`, request limits and `/metrics` report the context it started with. Below `MIN` it refuses
+to start (`not enough free GPU memory to start: ...`). It needs `--kv-capacity` unset or equal to
+`--max-context`; the launchers' default profiles pass `--fit-context 32768`.
 
 Before each prefill, decode or replay unit, the runtime reserves the additional pages and temporary
 storage required by that unit. It first reclaims inactive cache resources when capacity is short.

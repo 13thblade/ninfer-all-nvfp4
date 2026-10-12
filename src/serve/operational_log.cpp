@@ -315,6 +315,22 @@ OperationalRecord render_request_done(const RequestLogContext& context,
 std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogContext& context,
                                                            const GenerationOutcome& outcome) {
     const ninfer::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
+    if (outcome.tool_call_parse.recovered_from_reasoning) {
+        return OperationalRecord{
+            .severity = OperationalSeverity::Info,
+            .message  = "req#" + std::to_string(context.id) +
+                       " tool calls recovered from unclosed thinking | calls=" +
+                       std::to_string(outcome.tool_call_parse.structured_call_count),
+        };
+    }
+    if (outcome.tool_call_parse.tolerant_recovered) {
+        return OperationalRecord{
+            .severity = OperationalSeverity::Info,
+            .message  = "req#" + std::to_string(context.id) +
+                       " tool markup repaired by --tolerant-tool-calls | calls=" +
+                       std::to_string(outcome.tool_call_parse.structured_call_count),
+        };
+    }
     if (!outcome.tool_call_parse.marker_seen ||
         reason == ninfer::ToolCallParseFallbackReason::None) {
         return std::nullopt;
@@ -491,6 +507,15 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_count(memory.kv_capacity_max_page_groups),
                   product::format_pretty_bytes(memory.runtime_reservation_bytes),
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
+    if (memory.requested_max_context > engine.max_context) {
+        logger_->warn("context lowered to {} tokens (asked for {}): the GPU had {} free beside the "
+                      "model, {} MiB of it kept spare. Close other programs that use the GPU and "
+                      "restart for the full context",
+                      product::format_pretty_count(engine.max_context),
+                      product::format_pretty_count(memory.requested_max_context),
+                      product::format_pretty_bytes(memory.available_after_weights_bytes),
+                      ninfer::kFitContextHeadroomBytes / (1024U * 1024U));
+    }
     if (!memory.stage_runtime_reservation_bytes.empty()) {
         std::string reservations;
         for (const std::size_t bytes : memory.stage_runtime_reservation_bytes) {
@@ -517,6 +542,11 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                       stats.context_store_restored,
                       product::format_pretty_bytes(stats.context_store_restored_bytes),
                       stats.context_store_restore_seconds);
+        if (stats.context_store_foreign != 0) {
+            logger_->info("context store | {} sessions were written under another model, "
+                          "configuration or store format and are not used; they age out",
+                          stats.context_store_foreign);
+        }
     }
 
     if (service.options().enable_vision) {
