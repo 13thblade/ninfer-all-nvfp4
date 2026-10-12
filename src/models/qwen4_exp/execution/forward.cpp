@@ -338,14 +338,22 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             cudaSuccess) {
         throw std::runtime_error("Qwen4Exp forward: route tap copy failed");
     }
+    std::int32_t* route_log = nullptr; // moe_dispatch writes the raw ids there (same layout as routing.ids)
+    if (experts_.route_log != nullptr) {
+        if (static_cast<std::size_t>(K) * T > experts_.route_stride) {
+            throw std::logic_error("Qwen4Exp forward: the call exceeds the route log");
+        }
+        route_log = experts_.route_log + static_cast<std::size_t>(layer) * experts_.route_stride;
+    }
     const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
     ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
-    ops::moe_dispatch(routing, E, dispatch, nullptr, s);
+    ops::moe_dispatch(routing, E, dispatch, route_log, s);
     ops::MoeExpertSource source{.format        = p.bank->format,
                                 .frame_base    = experts_.frame_base,
                                 .frames        = experts_.frames.at(layer),
                                 .host_records  = p.bank->device_records,
                                 .record_stride = p.bank->record_stride,
+                                .frame_stride  = experts_.frame_stride,
                                 .error         = experts_.error,
                                 .staging_base  = experts_.staging_base,
                                 .staging_slots = experts_.staging_slots};

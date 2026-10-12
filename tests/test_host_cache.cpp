@@ -1,3 +1,4 @@
+#include "core/cgroup_memory.h"
 #include "runtime/engine/host_cache.h"
 #include "runtime/engine/model_instance.h"
 
@@ -110,6 +111,15 @@ int check_cgroup_probe() {
     failures += check(cgroup_limit_bytes(v1, "4:memory:/grp\n") == 8 * kGiB &&
                           !cgroup_limit_bytes(v1, "4:memory:/free\n").has_value(),
                       "a cgroup v1 limit was misread");
+
+    // Swap: the tightest memory.swap.max remainder on the path (v2 only; unset levels are "max").
+    using ninfer::cgroup_swap_remaining_bytes;
+    write(v2 / "app.slice" / "memory.swap.max", "4294967296\n");
+    write(v2 / "app.slice" / "memory.swap.current", "1073741824\n");
+    failures += check(cgroup_swap_remaining_bytes(v2, "0::/app.slice/c1/leaf\n") == 3 * kGiB &&
+                          !cgroup_swap_remaining_bytes(v2, "0::/other/place\n").has_value() &&
+                          !cgroup_swap_remaining_bytes(v1, "4:memory:/grp\n").has_value(),
+                      "the cgroup swap remainder was misread");
 
     std::filesystem::remove_all(scratch);
     return failures;

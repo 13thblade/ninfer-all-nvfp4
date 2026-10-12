@@ -16,11 +16,23 @@ add_library(ninfer_core STATIC
   decode_graph.cpp
   evictable_kv_pool.cu
   evictable_weight_pool.cu
+  vmm_arena.cu
+  pinned_upload.cu
+  copy_batch.cpp
+  cgroup_memory.cpp
+  host_memory.cpp
+  link_probe.cpp
+  power_throttling.cpp
+  vram_budget.cpp
 )
 if(WIN32)
   target_sources(ninfer_core PRIVATE read_only_file_win32.cpp)
+  # vram_budget.cpp reads the OS video-memory budget through DXGI.
+  target_link_libraries(ninfer_core PRIVATE dxgi)
 else()
   target_sources(ninfer_core PRIVATE read_only_file_posix.cpp)
+  # vram_budget.cpp loads libnvidia-ml.so.1 via dlopen/dlsym/dlclose.
+  target_link_libraries(ninfer_core PRIVATE ${CMAKE_DL_LIBS})
 endif()
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
