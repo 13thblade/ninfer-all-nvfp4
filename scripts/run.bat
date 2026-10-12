@@ -219,10 +219,12 @@ set "HINT="
 set "NGRAM_VOLUME_ARGS="
 set "NGRAM_VOLUME_NOTE="
 rem Only Flash-Next has an n-gram volume, so refuse rather than ignore the variable elsewhere.
-if not "%NINFER_NGRAM_VOLUME%"=="" if /i not "%MODEL_KEY%"=="qwen38-flash-next" (
-  echo NINFER_NGRAM_VOLUME is for qwen38-flash-next only; clear it to serve %MODEL_KEY% 1>&2
-  exit /b 2
-)
+rem Branch with goto rather than a parenthesised block, so the variable's value never sits inside one.
+if "%NINFER_NGRAM_VOLUME%"=="" goto :ngram_guard_done
+if /i "%MODEL_KEY%"=="qwen38-flash-next" goto :ngram_guard_done
+echo NINFER_NGRAM_VOLUME is for qwen38-flash-next only; clear it to serve %MODEL_KEY% 1>&2
+exit /b 2
+:ngram_guard_done
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b/tuned" goto :profile_27b_tuned
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen36-35b-a3b/tuned" goto :profile_35b_tuned
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-flash-next/tuned" goto :profile_flash_next
