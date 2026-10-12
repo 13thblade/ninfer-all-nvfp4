@@ -302,7 +302,7 @@ struct ProgramDevicePlan {
     std::uint64_t residency = 0; // the expert frame tables and route log
     std::uint64_t expert_record_stride = 0; // one expert frame
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
-    std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate
+    std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate (counts both halves of the split decode)
 
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
         return kv + workspace + staging + state + io + residency;
