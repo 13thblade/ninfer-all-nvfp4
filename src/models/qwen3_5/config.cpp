@@ -1,4 +1,5 @@
 #include "models/qwen3_5/config.h"
+#include "models/qwen3_5/vision_config.h"
 
 #include "artifact/schema.h"
 
@@ -341,6 +342,15 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         return out;
     } catch (const std::exception& error) {
         throw ArtifactError(std::string("Qwen3.5 config: ") + error.what());
+    }
+}
+
+// Declared in models/qwen3_5/vision_config.h.
+VisionConfig parse_vision_component(const artifact::Directory& directory) {
+    try {
+        return vision(companion(directory, "vision").config);
+    } catch (const std::exception& error) {
+        throw ArtifactError(std::string("Qwen3.5 Vision config: ") + error.what());
     }
 }
 

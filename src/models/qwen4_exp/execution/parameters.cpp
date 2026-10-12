@@ -74,6 +74,74 @@ public:
         return out;
     }
 
+    // ---- the vision tower: Qwen3.5's preparation (qwen3_5/execution/parameters.cpp vision())
+
+    ops::WeightInput input(WeightId id) const {
+        const auto& bound = model_.weight(id);
+        return {bound.view, bound.policy};
+    }
+
+    ops::SingleProjectionWeight projection(WeightId id) const {
+        return with_context(model_.weight(id).name, [&] { return ops::prepare_linear_weight(input(id)); });
+    }
+
+    qwen3_5::execution::NormParameters norm(const VisionNormWeights& w) const {
+        return {tensor(w.weight), tensor(w.bias)};
+    }
+
+    // The Q/K/V biases as one [3h] Tensor: the converter packs them into one parent.
+    Tensor joined_bias(const std::array<WeightId, 3>& ids) const {
+        WeightView view;
+        std::uint64_t count = 0;
+        for (const auto id : ids) {
+            const auto& part_view = model_.weight(id).view;
+            count += weight_element_count(part_view.shape);
+            for (const auto& part : part_view.parts) {
+                if (!view.parts.empty() &&
+                    (view.parts.back().parent != part.parent || view.parts.back().end != part.begin)) {
+                    throw std::invalid_argument("Vision QKV bias: this fixed call requires a contiguous bias bank");
+                }
+                view.parts.push_back(part);
+            }
+        }
+        if (count > std::uint64_t(std::numeric_limits<std::int32_t>::max())) {
+            throw std::invalid_argument("Vision bias exceeds Tensor extent");
+        }
+        view.shape = {count};
+        return weight_tensor(view, {static_cast<std::int32_t>(count)});
+    }
+
+    qwen3_5::execution::VisionParameters vision(const VisionWeights& w) const {
+        qwen3_5::execution::VisionParameters out;
+        out.patch_embedding      = projection(w.patch_embedding);
+        out.patch_embedding_bias = tensor(w.patch_embedding_bias);
+        out.position_embedding   = tensor(w.position_embedding);
+        out.layers.reserve(w.layers.size());
+        for (std::size_t i = 0; i < w.layers.size(); ++i) {
+            out.layers.push_back(with_context("vision/layers/" + std::to_string(i), [&] {
+                const auto& layer = w.layers[i];
+                const std::array qkv{input(layer.query), input(layer.key), input(layer.value)};
+                return qwen3_5::execution::VisionBlockParameters{
+                    norm(layer.norm1),
+                    norm(layer.norm2),
+                    ops::prepare_linear_weight(qkv),
+                    joined_bias({layer.query_bias, layer.key_bias, layer.value_bias}),
+                    projection(layer.output),
+                    projection(layer.fc1),
+                    projection(layer.fc2),
+                    tensor(layer.output_bias),
+                    tensor(layer.fc1_bias),
+                    tensor(layer.fc2_bias)};
+            }));
+        }
+        out.merger_norm     = norm(w.merger_norm);
+        out.merger_fc1      = projection(w.merger_fc1);
+        out.merger_fc2      = projection(w.merger_fc2);
+        out.merger_fc1_bias = tensor(w.merger_fc1_bias);
+        out.merger_fc2_bias = tensor(w.merger_fc2_bias);
+        return out;
+    }
+
 private:
     const Model& model_;
 };
@@ -157,6 +225,9 @@ Parameters::Parameters(const Model& source) : model(source) {
         p.bank                 = source.mtp_bank();
         if (p.bank == nullptr) { throw std::logic_error("Qwen4Exp: the MTP drafter has no expert bank"); }
         mtp = std::move(p);
+    }
+    if (const auto& v = source.vision()) {
+        vision = with_context("vision", [&] { return prepare.vision(*v); });
     }
 }
 

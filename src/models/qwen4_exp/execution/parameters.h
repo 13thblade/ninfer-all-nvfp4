@@ -3,11 +3,12 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/execution/parameters.h (Apache-2.0).
 // Modified for NInfer-3090: one Linear per GGUF tensor (the GGML formats of one input's
 // projections differ, so they cannot share a parent as Infernix's do); GDN decay and FP32 PLE
-// convolution; BF16 projection rows for the indexer; the MTP drafter's BF16 parameters; no
-// proposal head or vision.
+// convolution; BF16 projection rows for the indexer; the MTP drafter's BF16 parameters; the vision
+// tower as Qwen3.5's VisionParameters over the pinned host block; no proposal head.
 
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen4_exp/model.h"
 #include "ninfer/ops/linear.h"
 
@@ -99,6 +100,9 @@ public:
     HyperConnectionParameters final_mixer;
     std::vector<BlockParameters> layers;
     std::optional<MtpParameters> mtp; // when the model loaded the drafter
+    // When the model loaded the vision tower: Qwen3.5's tower parameters, addressing the pinned host
+    // block (a VisionWeightStream rebases them onto its device staging for each encode).
+    std::optional<qwen3_5::execution::VisionParameters> vision;
 };
 
 } // namespace ninfer::models::qwen4_exp::execution
