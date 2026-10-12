@@ -161,3 +161,14 @@ def test_run_rejects_settings_that_measure_nothing(tmp_path):
                 out=tmp_path)
     for bad in ({"sessions": 0}, {"max_turns": 0}):
         assert run(RunConfig(**{**base, **bad})) == 2
+
+
+def test_rerun_clears_every_artifact_a_previous_run_left_in_the_output_directory(tmp_path):
+    from tools.bench.agent_replay.run import RUN_ARTIFACTS, clear_run_artifacts
+
+    for name in RUN_ARTIFACTS:
+        (tmp_path / name).write_text("stale\n", encoding="utf-8")
+    (tmp_path / "notes.txt").write_text("keep", encoding="utf-8")
+    clear_run_artifacts(tmp_path)
+    assert [p.name for p in tmp_path.iterdir()] == ["notes.txt"]
+    clear_run_artifacts(tmp_path)  # a fresh directory is fine

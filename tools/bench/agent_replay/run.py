@@ -29,6 +29,15 @@ SCHEMA = "ninfer_agent_replay"
 SCHEMA_VERSION = 1
 # Template framing per message (role markers, tool_response wrapper) in prompt-token estimates.
 MESSAGE_OVERHEAD_TOKENS = 16
+# Every file a run writes into --out; export trusts them as one consistent set.
+RUN_ARTIFACTS = ("output_token_ids.jsonl", "turns.jsonl", "transcripts.jsonl", "summary.json")
+
+
+def clear_run_artifacts(out: Path) -> None:
+    """Drop a previous run's files so a rerun into the same --out (with or without
+    --request-log, or one that fails midway) can never leave stale ids or turns that export joins."""
+    for name in RUN_ARTIFACTS:
+        (out / name).unlink(missing_ok=True)
 
 
 @dataclass
@@ -370,6 +379,7 @@ def run(config: RunConfig) -> int:
     probe = NInferServeClient(config.base_url, config.timeout_seconds, config.api_key)
     model = probe.discover_model()
     config.out.mkdir(parents=True, exist_ok=True)
+    clear_run_artifacts(config.out)
     log_offset = config.request_log.stat().st_size if config.request_log else 0
     lock = threading.Lock()
     samples: list[dict[str, Any]] = []
