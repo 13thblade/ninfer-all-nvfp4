@@ -58,7 +58,10 @@ void validate(const EngineOptions& options) {
     }
     if (options.enable_vision) { refuse("serves text only in this release: remove --vision"); }
     if (!options.grafts.empty()) { refuse("has no prompt grafts: remove --graft"); }
-    if (options.devices.size() > 1) { refuse("runs on one GPU: remove --devices"); }
+    // A single --devices entry selects the card (Engine builds its DeviceContext from it), so it is
+    // honored; more than one entry, or per-stage layer counts, would need pipeline stages.
+    if (options.devices.size() > 1) { refuse("runs on one GPU: pass a single id to --devices"); }
+    if (!options.stage_layers.empty()) { refuse("runs on one GPU with no pipeline stages: remove --stage-layers"); }
     if (options.context_store.enabled()) { refuse("has no context store (prefix reuse is off): remove --context-store"); }
     if (options.lm_head_q4 || options.lm_head_q6 || options.embedding_q4 || options.embedding_q6 ||
         options.mtp_experts_q4 || options.mlp_a8_decode || options.prefill_cublas || options.gdn_state_fp16 || !options.prefill_a8 ||

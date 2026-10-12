@@ -60,9 +60,9 @@ namespace ninfer::ops {
  *   Records of format GGML_REC_IQ2_S_Q2_0, GGML_REC_IQ2_XXS_Q2_0 or GGML_REC_IQ1_M_Q2_0 in layout
  *   ggml_expert_record_v1 at [E, 2560, 640] (storage-layouts.md Section 7): one record per expert,
  *   gate, up and down at the layout's part offsets. Expert e's record is read from the device frame
- *   frame_base + frames[e] * record_stride when frames[e] >= 0, else from the pinned, mapped host
- *   bank host_records + e * record_stride (zero-copy, or first copied to a staging slot), or it is
- *   computed by the host (MoeCpuChannel). Every positive T; an expert with any number of columns.
+ *   frame_base + frames[e] * frame_stride (record_stride when frame_stride is zero) when
+ *   frames[e] >= 0, else from the pinned, mapped host bank host_records + e * record_stride
+ *   (zero-copy, or first copied to a staging slot), or it is computed by the host (MoeCpuChannel). Every positive T; an expert with any number of columns.
  *
  * Numeric:
  *   moe_experts is exact under its arithmetic: every output bit depends only on the record and the
