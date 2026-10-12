@@ -51,7 +51,7 @@ usage() {
 }
 
 # Only qwen38-flash-next has continuation parts and an n-gram volume.
-part_sizes=() part_sha256s=() ngram_name='' pending=''
+part_sizes=() part_sha256s=() ngram_name=''
 case "${1:-}" in
   qwen38-27b)
     artifact='qwen3_8_27b.ninfer'
@@ -84,33 +84,26 @@ case "${1:-}" in
     tests_variable='NINFER_QWEN3_6_35B_A3B_WEIGHTS'
     ;;
   # The n-gram volume is pinned to the commit that uploaded it; the model file and its part are pinned
-  # to the revision that adds them. `pending` refuses the model until those pins are filled in.
+  # to the revision that published the model card with them. The volume is unchanged in that revision.
   qwen38-flash-next)
     artifact='qwen4exp-iq2xs-mtp-vision.ninfer'
     owner='WarlaxZ'
     repo='Qwen3.8-Flash-Next-NInfer-3090'
-    pending=1
-    revision='PENDING_REVISION'
-    expected_size='PENDING_SIZE'
-    expected_sha256='PENDING_SHA256'
-    part_sizes=('PENDING_PART_1_SIZE')
-    part_sha256s=('PENDING_PART_1_SHA256')
+    revision='c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa'
+    expected_size=32000000000
+    expected_sha256='87c871e6cc1b6392e387104e8dfb159283a8a64247f669fbf33355b19b769ef4'
+    part_sizes=(9012140032)
+    part_sha256s=('1798c63c2f74a05cac71a609701f34368f0ba1e1eeebbf1b7641e83d0dd8d811')
     ngram_name='qwen4exp-iq2xs-mtp-vision.ninfer.ngram'
     ngram_revision='95b1b0169bd25db96ceb772a8a67cc6e87088a1f'
     ngram_size=29127258112
     ngram_sha256='7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051'
-    label='the Qwen3.8-Flash-Next model (PENDING GiB in two files)'
+    label='the Qwen3.8-Flash-Next model (38.2 GiB in two files)'
     tests_variable='NINFER_TEST_QWEN4EXP_ARTIFACT'
     ;;
   -h|--help) usage; exit 0 ;;
   *) usage; exit 2 ;;
 esac
-
-if [ -n "$pending" ]; then
-  printf '%s\n' "Qwen3.8-Flash-Next is not published yet: its model file is still being uploaded to" \
-    "https://huggingface.co/$owner/$repo. Nothing was downloaded." >&2
-  exit 1
-fi
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 model_dir="${NINFER_MODEL_DIR:-$root/models}"

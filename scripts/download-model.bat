@@ -53,7 +53,6 @@ rem Only qwen38-flash-next has continuation parts and an n-gram volume. Cleared 
 rem inherits the caller's environment.
 set "PART_COUNT=0"
 set "NGRAM_NAME="
-set "PENDING="
 
 if "%~1"=="" goto :menu
 if /i "%~1"=="qwen38-27b" goto :model_qwen38_27b
@@ -133,32 +132,26 @@ set "TESTS_VARIABLE=NINFER_QWEN3_6_35B_A3B_WEIGHTS"
 goto :model_selected
 
 rem The n-gram volume is pinned to the commit that uploaded it; the model file and its part are
-rem pinned to the revision that adds them. PENDING refuses the model until those pins are filled in.
+rem pinned to the revision that published the model card with them. The volume is unchanged there.
 :model_qwen38_flash_next
 set "ARTIFACT=qwen4exp-iq2xs-mtp-vision.ninfer"
 set "OWNER=WarlaxZ"
 set "REPO=Qwen3.8-Flash-Next-NInfer-3090"
-set "PENDING=1"
-set "REVISION=PENDING_REVISION"
-set "EXPECTED_SIZE=PENDING_SIZE"
-set "EXPECTED_SHA256=PENDING_SHA256"
+set "REVISION=c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa"
+set "EXPECTED_SIZE=32000000000"
+set "EXPECTED_SHA256=87c871e6cc1b6392e387104e8dfb159283a8a64247f669fbf33355b19b769ef4"
 set "PART_COUNT=1"
-set "PART_1_SIZE=PENDING_PART_1_SIZE"
-set "PART_1_SHA256=PENDING_PART_1_SHA256"
+set "PART_1_SIZE=9012140032"
+set "PART_1_SHA256=1798c63c2f74a05cac71a609701f34368f0ba1e1eeebbf1b7641e83d0dd8d811"
 set "NGRAM_NAME=qwen4exp-iq2xs-mtp-vision.ninfer.ngram"
 set "NGRAM_REVISION=95b1b0169bd25db96ceb772a8a67cc6e87088a1f"
 set "NGRAM_SIZE=29127258112"
 set "NGRAM_SHA256=7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051"
-set "LABEL=the Qwen3.8-Flash-Next model (PENDING GiB in two files)"
+set "LABEL=the Qwen3.8-Flash-Next model (38.2 GiB in two files)"
 set "TESTS_VARIABLE=NINFER_TEST_QWEN4EXP_ARTIFACT"
 goto :model_selected
 
 :model_selected
-if defined PENDING (
-  echo Qwen3.8-Flash-Next is not published yet: its model file is still being uploaded to 1>&2
-  echo https://huggingface.co/%OWNER%/%REPO%. Nothing was downloaded. 1>&2
-  exit /b 1
-)
 rem Two layouts share this script. In the release archive it sits at the archive root beside
 rem models\. In a checkout it sits in scripts\, one level under the repo root, and models\ (see
 rem .gitignore) is beside the repo root, not beside this script -- a directory named scripts with a
@@ -295,14 +288,17 @@ exit /b 0
 echo N-gram volume folder: %NGRAM_DIR%
 exit /b 0
 
-rem The launcher reads <model>.ngram beside the model unless NINFER_NGRAM_VOLUME names another file.
+rem The lines that start the server. run.bat looks in the same default models folder as this script
+rem and prefers qwen4exp-iq2xs-mtp-vision.ninfer there, so it needs NINFER_MODEL_DIR only when that
+rem was set here, and NINFER_NGRAM_VOLUME only when the volume is not beside the model (it reads
+rem <model>.ngram otherwise). Not a ( ) block: a folder may contain ")".
 :ngram_summary
 set "NGRAM_PATH=%NGRAM_DIR%\%NGRAM_NAME%"
 echo N-gram volume ready: %NGRAM_PATH%
 echo.
 echo Start it with:
 if /i not "%NGRAM_DIR%"=="%MODEL_DIR_FULL%" echo   set NINFER_NGRAM_VOLUME=%NGRAM_PATH%
-echo   set NINFER_MODEL=%MODEL%
+if defined NINFER_MODEL_DIR echo   set NINFER_MODEL_DIR=%MODEL_DIR_FULL%
 echo   "%ROOT%run.bat" qwen38-flash-next
 echo.
 exit /b 0
