@@ -1461,7 +1461,13 @@ private:
             kv_taken_ -= back;
             kv_added_ -= std::min<std::uint64_t>(kv_added_, freed);
             const std::uint32_t regrow = std::min(frames + back, demand_.max_frames);
-            if (regrow > frames) { (void)residency_->resize(regrow, device_.stream, *vram_); }
+            if (regrow > frames) {
+                (void)residency_->resize(regrow, device_.stream, *vram_);
+                // A refused mapping leaves the cache short of `regrow`: keep what was not restored as
+                // debt, so a later shrink (or the next growth's accounting) still owes it.
+                const std::uint32_t restored = residency_->frames() > frames ? residency_->frames() - frames : 0;
+                kv_taken_ += (regrow - frames) - std::min(restored, regrow - frames);
+            }
             diagnostic("KV pool shrank to " + std::to_string(target) + " pages; expert cache " + std::to_string(frames) +
                        " -> " + std::to_string(residency_->frames()) + " frames");
         }

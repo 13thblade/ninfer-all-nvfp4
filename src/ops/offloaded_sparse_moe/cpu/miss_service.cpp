@@ -148,7 +148,7 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options) : imp
     s.layers  = std::move(layers);
     s.options = std::move(options);
     const Options& o = s.options;
-    if (o.workers < 1 || o.max_jobs < 1 || o.max_jobs > kMaxCpuJobs || o.max_columns < 1 ||
+    if (o.workers < 1 || o.workers > 64 /* CpuExpertTeam limit */ || o.max_jobs < 1 || o.max_jobs > kMaxCpuJobs || o.max_columns < 1 ||
         o.max_columns > kMaxCpuCallColumns || o.max_job_columns < 1 || o.max_job_columns > kMaxColumns ||
         o.pcie_divisor < 0 || !cpu_isa_supported(o.isa)) {
         throw std::invalid_argument("CPU miss service options are out of range");
