@@ -1161,9 +1161,13 @@ VISION_PROJECTOR = "qwen3vl_merger"
 # The tower is Qwen3.5's (Qwen3-VL's) vision encoder: the runtime binds it through the Qwen3.5
 # Vision contract, so the component keeps that model type and those parameter names.
 VISION_MODEL_TYPE = "qwen3_5_vision"
-# The official Qwen3.5 / 3.6 / 3.8 processor settings. The mmproj GGUF records the patch geometry,
-# the merge size and the normalization (checked below) but no resize bounds; these are the
-# HF checkpoints' preprocessor_config.json and video_preprocessor_config.json.
+# The Qwen3.5-family processor settings. The mmproj GGUF records the patch geometry, the merge size
+# and the normalization (all checked below) but no resize bounds, so the bounds come from the HF
+# checkpoints' preprocessor_config.json and video_preprocessor_config.json. Provenance: these
+# values match those files byte for byte in the Qwen3.6-35B-A3B and Qwen3.6-27B checkpoints
+# (mlx-community/Qwen3.6-35B-A3B-4bit, Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed). The 3.8
+# Flash-Next checkpoint's own files were not available to compare, so the bounds are assumed to
+# carry over; replace them if Qwen3.8's preprocessor_config.json differs.
 PREPROCESSOR_CONFIG = {
     "size": {"longest_edge": 16777216, "shortest_edge": 65536},
     "patch_size": 16,
