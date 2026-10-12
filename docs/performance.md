@@ -637,14 +637,51 @@ gains 15%, a copying request up to 65%, and a request beside it loses up to a fi
 
 **Without copies.** The bench corpus (`ninfer_bench -n 512`, two alternating rounds) never copies.
 At one lane DFlash2 decodes 63.40 and 63.29 tok/s with the flag on against 63.96 and 63.66 off
-(-0.7%); the one-lane build before two lanes measured 63.30 and 63.18 in the same rounds. An Nsight
-Systems trace puts the difference inside the round's GPU time (28.2 ms against 27.8 ms; host submit
-+0.02 ms), spread over the same kernels with the same launch counts, each about 1% slower; no extra
-work runs in the rounds. The round bench, with the same families configured but no copy index, shows
-no difference at one lane (2K: 28.54-28.71 ms on against 28.74-28.78 off; 32K: 31.29-31.49 against
-31.47), so the cost is not attributed further. At two lanes the bench corpus decodes 87.55 and 87.57
-tok/s per batch with the flag on against 85.98 and 86.42 off (+1.6%, identical rounds and
-acceptance, also not attributed). Rounds now catch the draft context up at their own width: at two
+(-0.7%); the one-lane build before two lanes measured 63.30 and 63.18 in the same rounds. At two
+lanes the bench corpus decodes 87.55 and 87.57 tok/s per batch with the flag on against 85.98 and
+86.42 off (+1.6%, identical rounds and acceptance).
+
+*Where that cost comes from: buffer placement, not n-gram work.* It is not the lookup, the copy
+graphs or any extra GPU work; it is where the persistent buffers land, and it comes and goes between
+sessions. The evidence (2026-10-12, same bench, `ninfer_bench -n 512 -r 3`, decode tok/s):
+
+- **Same work.** In a node-level Nsight Systems trace each round runs the same 791 or 786
+  kernels with the same grid, block and shared-memory configuration, the same one or two copies
+  (1,312 or 1,316 bytes) and two memsets, and nothing is launched between rounds that the off run
+  does not launch. Kernel time per round is +171 µs (+0.6%) and the gaps +11 µs. It sits in the
+  weight-streaming linears and is not uniform: the MLP gate/up Q4 linear +1.1% (+85 µs per round),
+  the 320-CTA Q5 linears +1.2% (+56 µs), the GDN q/k projection +2.1%, while the 12288x5120 Q5 linear
+  is 0.7% faster.
+- **Not the lookup.** Two diagnostic builds, both slower than off by the same amount as on (one
+  session, ABBA order):
+  - flag on with the per-round lookup skipped: 60.14 / 59.85;
+  - flag off with the copy family configured anyway: 59.95 / 59.93;
+  - against off at 60.65 / 60.28 and on at 60.43 / 60.13.
+- **Placement inside the persistent arena.** In a 4x4 Latin square (each arm once per position;
+  the first three runs, taken right after another job, are dropped as warm-up, 51.8-59.2):
+  - off 60.27;
+  - on -0.8%;
+  - copy family without the flag -0.9%;
+  - **flag off with the persistent buffers moved by 18 MiB of padding, the copy family's
+    growth, -1.0%.**
+  - Moving whole allocations instead (64 or 170 MiB allocated before the model, or 64 MiB before
+    every arena) leaves off at its speed and on still about 1% slower. So what matters is the
+    buffers' offsets within the arena. The copy family's ReplaySSM records, pending features
+    and verify logits are allocated ahead of the target's hidden states, so they move them.
+- **It comes and goes.** Later the same day, in two interleaved 4x4 squares (8 runs per arm), the
+  unchanged build decoded 60.31 on against 60.28 off (+0.05%; ranges 60.18-60.55 and 60.13-60.65).
+  The two-lane +1.6% did not recur either. Two interleaved squares (8 runs per arm) gave 86.75
+  batch tok/s on against 86.56 off (+0.2%; ranges 86.52-87.10 and 85.81-87.10).
+
+Rejected: allocating every buffer sized by the round width after the fixed-size ones, with the
+target's hidden states first, so a copy family leaves the neural round's buffers where they are.
+In the session where the unchanged build showed no difference it measured on +0.05% and off -0.08%
+against the unchanged off (one 58.9 warm-up outlier dropped). Nothing could show it removed a cost that was absent there, and it moves
+the off configuration's buffers too, so it is not merged. The one-lane launchers keep the flag on.
+The placement effect is within the noise of a few runs and is not specific to copy rounds: any
+change to the persistent layout can move it.
+
+Rounds now catch the draft context up at their own width: at two
 lanes a configuration that never copies cost 43.68 ms per round at 32K against 43.50 off (three
 alternating pairs) when the catch-up ran at the copy width, and costs 43.50 now.
 
