@@ -221,6 +221,10 @@ struct CommitRowResult {
         std::uint64_t drafted_tokens  = 0;
         std::uint64_t accepted_tokens = 0;
         std::uint64_t fallback_steps  = 0;
+        // The Engine's n-gram copy counters; Flash-Next drafts no n-gram copies, so they stay 0.
+        std::uint64_t ngram_rounds          = 0;
+        std::uint64_t ngram_drafted_tokens  = 0;
+        std::uint64_t ngram_accepted_tokens = 0;
     } speculative_counters;
 };
 
