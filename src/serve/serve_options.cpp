@@ -48,10 +48,14 @@ std::uint64_t parse_u64(const char* text, const char* label) {
     return static_cast<std::uint64_t>(value);
 }
 
-// A whole-MiB option as bytes; refuses values whose byte count would not fit in 64 bits.
+// A whole-MiB option as bytes. The planners add these to other byte counts, convert them to signed
+// 64-bit and divide them into 32-bit frame counts, so the value is bounded to 1 TiB (far above any
+// real headroom or cache size) rather than to the 64-bit byte range.
+constexpr std::uint64_t kMaxMibOption = 1ULL << 20;
+
 std::uint64_t parse_mib_bytes(const char* text, const char* label) {
     const std::uint64_t mib = parse_u64(text, label);
-    if (mib > (std::numeric_limits<std::uint64_t>::max() >> 20U)) {
+    if (mib > kMaxMibOption) {
         throw std::invalid_argument(std::string("--") + label + " is out of range");
     }
     return mib << 20U;

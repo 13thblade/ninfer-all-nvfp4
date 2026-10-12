@@ -206,6 +206,11 @@ int main() {
         failures += check(serve_rejects({"ninfer-serve", "model.ninfer", flag, "17592186044416"}, "out of range"),
                           "a MiB flag accepted a value whose byte count wraps");
     }
+    // Above 1 TiB the planners' signed and 32-bit frame-count arithmetic is no longer safe.
+    for (const char* flag : {"--vram-headroom-mib", "--ram-headroom-mib", "--expert-cache-mib"}) {
+        failures += check(serve_rejects({"ninfer-serve", "model.ninfer", flag, "1048577"}, "out of range"),
+                          "a MiB flag accepted a value above the planners' arithmetic domain");
+    }
     failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--ngram-draft-tokens", "15"},
                                     "--spec dflash2"),
                       "serve accepted n-gram copy drafting without DFlash2");
