@@ -322,6 +322,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.device                   = options.device;
     engine_options.max_context              = options.max_context;
     engine_options.kv_capacity              = options.kv_capacity;
+    engine_options.fit_context_floor        = options.fit_context_floor;
     engine_options.max_concurrency          = options.max_concurrency;
     engine_options.max_pending_requests     = options.max_pending_requests;
     engine_options.pending_timeout_ms       = options.pending_timeout_ms;
@@ -418,6 +419,9 @@ GenerationService::GenerationService(
     engine_options.context_store.listener = std::move(store_listener);
     engine_options.fault_listener         = std::move(fault_listener);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    // A context fit may have lowered the context; every request limit follows what was resolved.
+    options_.max_context = engine_->options().max_context;
+    options_.kv_capacity = engine_->options().kv_capacity;
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }
