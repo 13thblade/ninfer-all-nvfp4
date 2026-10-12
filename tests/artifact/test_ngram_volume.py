@@ -70,7 +70,7 @@ def test_volume_round_trips_rows_exactly(tmp_path):
     assert nv.read_rows(path, g, [99]) == {99: rows[99].tobytes()}
     with pytest.raises(FileExistsError):
         nv.write_volume(path, g, VOLUME_ID, chunks)
-    assert not (tmp_path / "t.ngram.tmp").exists()
+    assert [p.name for p in tmp_path.iterdir()] == ["t.ngram"]  # no temporary file remains
 
 
 def test_writer_refuses_a_short_or_long_row_source(tmp_path):
@@ -80,6 +80,25 @@ def test_writer_refuses_a_short_or_long_row_source(tmp_path):
     with pytest.raises(ValueError, match="more rows"):
         nv.write_volume(tmp_path / "long.ngram", g, VOLUME_ID, [_rows(101)])
     assert not list(tmp_path.iterdir())
+
+
+def test_writer_owns_its_temporary_file_and_never_replaces_a_racing_volume(tmp_path):
+    g = nv.geometry("ggml_iq4_nl", 100, 160)
+    path = tmp_path / "t.ngram"
+    # Another writer's temporary file under the old fixed name is neither used nor removed.
+    other_temporary = tmp_path / "t.ngram.tmp"
+    other_temporary.write_bytes(b"other writer")
+
+    def racing_rows():
+        yield _rows(50)
+        path.write_bytes(b"published by another writer")  # appears after the existence check
+        yield _rows(50, seed=4)
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        nv.write_volume(path, g, VOLUME_ID, racing_rows())
+    assert path.read_bytes() == b"published by another writer"
+    assert other_temporary.read_bytes() == b"other writer"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["t.ngram", "t.ngram.tmp"]
 
 
 @pytest.mark.parametrize(
