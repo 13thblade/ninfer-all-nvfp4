@@ -1116,6 +1116,9 @@ private:
         // The forward must never keep pointing at the lent arena destroyed below.
         if (forward_) { forward_->use_workspace(*work_); }
         wide_work_.reset();
+        // device_.synchronize() does not cover the expert copy stream: an aborted wide call can leave
+        // its copies running into the ring frames give_back is about to hand to the cache.
+        if (stream_) { stream_->drain(); }
         refilled_ += residency_->give_back(lease_, device_.stream);
         frames_now_ = residency_->frames();
     }
