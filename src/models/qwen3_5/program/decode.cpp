@@ -662,6 +662,15 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             }
             copy_round =
                 longest >= copy_round_minimum_drafts(static_cast<std::uint32_t>(lanes.size()));
+            // Beside a partner, the round widens only rows that can absorb it: a row without a
+            // copy must have the balance for the wider round (NgramPartnerBalance).
+            if (copy_round && lanes.size() > 1) {
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    if (copies[row].tokens.empty() && !requests[lanes[row]].ngram_partner.can_widen()) {
+                        copy_round = false;
+                    }
+                }
+            }
         }
         // Every row of a round verifies at its family's width; the frame, egress and ReplaySSM
         // records are viewed at it.
@@ -864,7 +873,19 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                     request.speculative_stats.ngram_accepted_tokens +=
                         static_cast<std::uint32_t>(accepted_i);
                     request.ngram_backoff.record(extent, static_cast<std::uint32_t>(accepted_i));
+                    if (lanes.size() > 1) {
+                        request.ngram_partner.copied(static_cast<std::uint32_t>(count_i),
+                                                     draft_window + 1U);
+                    }
                 } else {
+                    if (lanes.size() > 1 && lanes.size() <= kMaximumCopyRoundBatch &&
+                        ngram_draft_tokens != 0) {
+                        if (copy_round) {
+                            request.ngram_partner.widened();
+                        } else {
+                            request.ngram_partner.neural_round();
+                        }
+                    }
                     for (std::int32_t i = 0; i < accepted_i; ++i) {
                         request.speculative_stats
                             .accepted_per_position[static_cast<std::size_t>(i)] += 1;

@@ -47,7 +47,8 @@ inline constexpr std::uint32_t kMaximumCopyRoundBatch = 2;
                                                      std::uint32_t max_concurrency) noexcept;
 // The longest copy a batch of `batch` rows needs before its round becomes a copy round: any copy
 // the proposer offers at batch one; at batch two one that, accepted, pays for the wider round
-// beside a neural partner; none above that.
+// beside a neural partner (which must also afford the widening, NgramPartnerBalance); none above
+// that.
 [[nodiscard]] std::uint32_t copy_round_minimum_drafts(std::uint32_t batch) noexcept;
 
 [[nodiscard]] std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity);

@@ -337,8 +337,12 @@ pays when the answer repeats its input -- returning a file, applying an edit, qu
 As with any draft, every token is licensed by the target's own verification, and a copy that is
 wrong, or that a grammar forbids, is rejected; a request whose copies keep missing asks for a longer
 match before it copies again. With two lanes a round copies only when a copy offers at least 12
-tokens, because the other lane's row is verified at the copy width too and decodes about a third
-slower in that round; with three or more lanes in a round nothing is copied. The counters are in
+tokens and the other lane can afford it: that lane's row is verified at the copy width too and
+decodes about a third slower in that round, so each request keeps a balance -- a small allowance per
+round it decodes, minus each widening it took, plus what its own copies saved it -- and a lane
+without a copy is widened only while its balance covers the cost. A request that never copies is
+therefore slowed by at most about 3% of its decode-round time; with three or more lanes in a round
+nothing is copied. The counters are in
 the request log and `/metrics` (see [serving](serving.md)). On an agent replay at one lane it
 decoded 42% faster overall and up to 76% faster on turns that return a file, at about 0.7% on
 output that never copies. At two lanes the replay finished 12% sooner, but a request sharing rounds

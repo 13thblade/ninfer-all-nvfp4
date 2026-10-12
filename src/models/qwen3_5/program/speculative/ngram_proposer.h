@@ -304,6 +304,45 @@ private:
     std::uint32_t level_ = 0;
 };
 
+// At two lanes one row's copy widens the whole round: measured on the RTX 3090 (27B, DFlash2 K7,
+// docs/performance.md), a two-lane round in which one row copies costs r = 1.44-1.49x a neural
+// round, so a partner without a copy takes that much longer for the same tokens. Each request keeps
+// a balance in thousandths of a two-lane neural round, moved only by its committed two-lane rounds:
+//
+// - every two-lane round it decodes in adds kCopyPartnerAllowance (the slowdown it may be charged);
+// - a copy round in which it has no copy charges r - 1;
+// - a copy round in which it copies credits what the copy saved it, committed / (K + 1) - r, where
+//   K + 1 tokens is the most a neural round can commit, so the credit never overstates the saving.
+//
+// A row without a copy may be widened only while its balance covers the charge, so a request that
+// never copies is slowed by at most about kCopyPartnerAllowance, while one whose own copies saved it
+// time can be widened by its partner's. Only committed rounds move a balance, never timing.
+inline constexpr std::int64_t kCopyPartnerRoundCost = 1470; // r, thousandths of a neural round
+inline constexpr std::int64_t kCopyPartnerAllowance = 30;   // per two-lane round
+
+class NgramPartnerBalance {
+public:
+    [[nodiscard]] bool can_widen() const noexcept {
+        return balance_ >= kCopyPartnerRoundCost - 1000;
+    }
+
+    // One committed two-lane round: a neural round, a copy round this row was widened by, or one
+    // in which it copied and committed `committed` tokens with at most `neural_tokens` per neural
+    // round.
+    void neural_round() noexcept { balance_ += kCopyPartnerAllowance; }
+    void widened() noexcept { balance_ += kCopyPartnerAllowance - (kCopyPartnerRoundCost - 1000); }
+    void copied(std::uint32_t committed, std::uint32_t neural_tokens) noexcept {
+        const std::int64_t per_round = std::max<std::uint32_t>(neural_tokens, 1U);
+        balance_ += kCopyPartnerAllowance +
+                    static_cast<std::int64_t>(committed) * 1000 / per_round - kCopyPartnerRoundCost;
+    }
+
+    [[nodiscard]] std::int64_t balance() const noexcept { return balance_; }
+
+private:
+    std::int64_t balance_ = 0;
+};
+
 struct NgramIndexCapacity {
     std::size_t tokens  = 0;
     std::size_t buckets = 0;

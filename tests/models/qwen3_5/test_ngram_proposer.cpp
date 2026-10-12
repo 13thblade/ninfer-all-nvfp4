@@ -18,6 +18,7 @@
 #include <vector>
 
 using ninfer::models::qwen3_5::detail::NgramCopyBackoff;
+using ninfer::models::qwen3_5::detail::NgramPartnerBalance;
 using ninfer::models::qwen3_5::detail::NgramProposer;
 using ninfer::models::qwen3_5::detail::NgramRequestIndex;
 using ninfer::models::qwen3_5::detail::ngram_index_capacity;
@@ -427,6 +428,48 @@ void test_numbered_sources() {
             "embedded NUL must not truncate a proposal source");
 }
 
+// The two-lane gate as decode applies it: a partner that never copies beside a lane that always
+// offers a copy is widened only as often as its allowance pays for, so its added round time stays
+// within the allowance; a lane whose own copies saved it rounds absorbs its partner's copies.
+void test_partner_balance() {
+    using ninfer::models::qwen3_5::detail::kCopyPartnerAllowance;
+    using ninfer::models::qwen3_5::detail::kCopyPartnerRoundCost;
+    constexpr std::uint32_t kNeuralTokens = 8;
+
+    NgramPartnerBalance partner;
+    require(!partner.can_widen(), "a new request cannot be widened before it has any allowance");
+    std::uint32_t widened = 0;
+    constexpr std::uint32_t kRounds = 2000;
+    for (std::uint32_t round = 0; round < kRounds; ++round) {
+        if (partner.can_widen()) {
+            partner.widened();
+            ++widened;
+        } else {
+            partner.neural_round();
+        }
+    }
+    const double extra = static_cast<double>(widened) * (kCopyPartnerRoundCost - 1000) / 1000.0;
+    const double allowed = static_cast<double>(kRounds) * kCopyPartnerAllowance / 1000.0;
+    require(widened > 0 && extra <= allowed + 1.0,
+            "a partner that never copies was widened beyond its allowance");
+    require(extra >= allowed - 1.0, "a partner that never copies was not widened as allowed");
+
+    // Whole 16-token copies credit 16 / 8 - 1.47 rounds each, enough to absorb one widening.
+    NgramPartnerBalance copier;
+    for (int round = 0; round < 10; ++round) { copier.copied(16, kNeuralTokens); }
+    for (int round = 0; round < 10; ++round) {
+        require(copier.can_widen(), "a lane whose copies saved it rounds could not be widened");
+        copier.widened();
+    }
+    // A missed copy commits one token in a wider round and costs the copier itself.
+    NgramPartnerBalance missing;
+    for (int round = 0; round < 100; ++round) { missing.neural_round(); }
+    require(missing.can_widen(), "100 neural rounds did not pay for a widening");
+    for (int round = 0; round < 3; ++round) { missing.copied(1, kNeuralTokens); }
+    require(!missing.can_widen() && missing.balance() < 0,
+            "missed copies did not charge the lane that made them");
+}
+
 } // namespace
 
 int main() {
@@ -435,6 +478,7 @@ int main() {
         test_capacity();
         test_request_index();
         test_copy_backoff();
+        test_partner_balance();
         test_numbered_sources();
         std::cout << "ngram proposer tests passed\n";
     } catch (const std::exception& error) {

@@ -230,6 +230,8 @@ struct RequestControl {
     std::unique_ptr<NgramRequestIndex> ngram;
     // How much longer a match this request's next copy needs after missed copies.
     NgramCopyBackoff ngram_backoff;
+    // How much more two-lane copy-round widening by its partner this request can absorb.
+    NgramPartnerBalance ngram_partner;
 
     struct Prefill {
         PreparedPromptData prompt;
