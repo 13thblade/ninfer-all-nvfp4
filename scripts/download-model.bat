@@ -181,7 +181,7 @@ for /l %%N in (1,1,%PART_COUNT%) do (
 if defined NGRAM_NAME call :fetch_file "%NGRAM_DIR%" "%NGRAM_NAME%" %NGRAM_SIZE% %NGRAM_SHA256% %NGRAM_REVISION% "the n-gram volume (27.1 GiB)" volume
 if defined NGRAM_NAME if not "!FETCH_OK!"=="1" exit /b 1
 
-echo Model ready: %MODEL%
+echo Model ready: !MODEL!
 if defined NGRAM_NAME call :ngram_summary
 echo Point the tests at it with:  set %TESTS_VARIABLE%=%MODEL%
 call :fetch_graft
@@ -213,12 +213,12 @@ set "F_PART=%F_DIR%\%F_PART_NAME%"
 if not exist "%F_PATH%" goto :fetch_download
 call :verify "%F_PATH%"
 if not "!VERIFY_OK!"=="1" goto :fetch_stale
-if /i "%F_KIND%"=="model" echo Model already present: %F_PATH%
-if /i not "%F_KIND%"=="model" echo Already present: %F_PATH%
+if /i "%F_KIND%"=="model" echo Model already present: !F_PATH!
+if /i not "%F_KIND%"=="model" echo Already present: !F_PATH!
 set "FETCH_OK=1"
 exit /b 0
 :fetch_stale
-echo Existing %F_PATH% did not verify against revision %F_REV%; fetching the pinned one.
+echo Existing !F_PATH! did not verify against revision %F_REV%; fetching the pinned one.
 if /i not "%F_KIND%"=="model" goto :fetch_download
 if defined NGRAM_NAME goto :fetch_download
 echo If it is the v2 file from an earlier release, you can upgrade it instead of downloading:
@@ -255,10 +255,16 @@ set "FETCH_OK=1"
 exit /b 0
 
 rem Sets NGRAM_DIR, the folder for the n-gram volume: NINFER_NGRAM_DIR, else the answer to a question,
-rem else the model folder. Leaves NGRAM_DIR empty when the folder cannot be created.
+rem else the model folder. Leaves NGRAM_DIR empty when the folder cannot be created or its name holds a
+rem character the script cannot carry safely.
+rem
+rem Folder text is user input, so it is only ever read with !VAR! (delayed expansion), whose result cmd
+rem does not parse again, and every command that shows or uses it is given it quoted or through !VAR!.
+rem Splicing a percent expansion into an unquoted echo would run whatever follows an & or | in the folder name.
 :choose_ngram_dir
-set "NGRAM_DIR=%MODEL_DIR%"
-if defined NINFER_NGRAM_DIR set "NGRAM_DIR=%NINFER_NGRAM_DIR%"
+set "NGRAM_DIR=!MODEL_DIR!"
+if defined NINFER_NGRAM_DIR set "NGRAM_DIR=!NINFER_NGRAM_DIR!"
+if defined NINFER_NGRAM_DIR set "NGRAM_DIR=!NGRAM_DIR:"=!"
 if defined NINFER_NGRAM_DIR goto :ngram_dir_chosen
 echo.
 echo Qwen3.8-Flash-Next reads its 27.1 GiB n-gram volume on every prompt, and the model only once,
@@ -278,14 +284,35 @@ if "!NGRAM_ANSWER:~1!"==":" set "NGRAM_ANSWER=!NGRAM_ANSWER!\ninfer-models"
 if "!NGRAM_ANSWER:~1!"==":\" set "NGRAM_ANSWER=!NGRAM_ANSWER!ninfer-models"
 set "NGRAM_DIR=!NGRAM_ANSWER!"
 :ngram_dir_chosen
+call :ngram_dir_check
+if "!NGRAM_BAD!"=="1" goto :ngram_dir_rejected
 for %%I in ("%NGRAM_DIR%") do set "NGRAM_DIR=%%~fI"
 if not exist "%NGRAM_DIR%\" mkdir "%NGRAM_DIR%" >nul 2>&1
 if exist "%NGRAM_DIR%\" goto :ngram_dir_ok
-echo Cannot create the folder "%NGRAM_DIR%" for the n-gram volume. 1>&2
+echo Cannot create the folder "!NGRAM_DIR!" for the n-gram volume. 1>&2
+set "NGRAM_DIR="
+exit /b 0
+:ngram_dir_rejected
+echo The n-gram folder "!NGRAM_DIR!" has a percent sign, caret or exclamation mark in its name, which 1>&2
+echo this script cannot pass on safely. Choose a folder without those, and run this file again. 1>&2
 set "NGRAM_DIR="
 exit /b 0
 :ngram_dir_ok
-echo N-gram volume folder: %NGRAM_DIR%
+echo N-gram volume folder: !NGRAM_DIR!
+exit /b 0
+
+rem Sets NGRAM_BAD=1 when NGRAM_DIR holds a percent sign, caret or exclamation mark. The folder passes
+rem through call, which doubles the first two, and through set and for lines, which eat the last, so it
+rem would silently become a different folder. Ampersand, pipe and angle brackets need no check: the
+rem folder is quoted or read through delayed expansion everywhere. The exclamation mark test runs with
+rem delayed expansion off, where it is an ordinary character.
+:ngram_dir_check
+set "NGRAM_BAD="
+if not "!NGRAM_DIR:%%=!"=="!NGRAM_DIR!" set "NGRAM_BAD=1"
+if not "!NGRAM_DIR:^=!"=="!NGRAM_DIR!" set "NGRAM_BAD=1"
+setlocal disabledelayedexpansion
+if not "%NGRAM_DIR:!=%"=="%NGRAM_DIR%" endlocal & set "NGRAM_BAD=1" & exit /b 0
+endlocal
 exit /b 0
 
 rem The lines that start the server. run.bat looks in the same default models folder as this script
@@ -294,12 +321,12 @@ rem was set here, and NINFER_NGRAM_VOLUME only when the volume is not beside the
 rem <model>.ngram otherwise). Not a ( ) block: a folder may contain ")".
 :ngram_summary
 set "NGRAM_PATH=%NGRAM_DIR%\%NGRAM_NAME%"
-echo N-gram volume ready: %NGRAM_PATH%
+echo N-gram volume ready: !NGRAM_PATH!
 echo.
 echo Start it with:
-if /i not "%NGRAM_DIR%"=="%MODEL_DIR_FULL%" echo   set NINFER_NGRAM_VOLUME=%NGRAM_PATH%
-if defined NINFER_MODEL_DIR echo   set NINFER_MODEL_DIR=%MODEL_DIR_FULL%
-echo   "%ROOT%run.bat" qwen38-flash-next
+if /i not "%NGRAM_DIR%"=="%MODEL_DIR_FULL%" echo   set "NINFER_NGRAM_VOLUME=!NGRAM_PATH!"
+if defined NINFER_MODEL_DIR echo   set "NINFER_MODEL_DIR=!MODEL_DIR_FULL!"
+echo   "!ROOT!run.bat" qwen38-flash-next
 echo.
 exit /b 0
 
