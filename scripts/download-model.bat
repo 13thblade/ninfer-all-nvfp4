@@ -167,6 +167,7 @@ if defined NINFER_MODEL_DIR set "MODEL_DIR=%NINFER_MODEL_DIR%"
 set "MODEL=%MODEL_DIR%\%ARTIFACT%"
 if not exist "%MODEL_DIR%" mkdir "%MODEL_DIR%"
 for %%I in ("%MODEL_DIR%") do set "MODEL_DIR_FULL=%%~fI"
+call :trim_trailing_backslash MODEL_DIR_FULL
 
 rem Ask where the n-gram volume goes before anything is fetched, so the downloads can run unattended.
 if defined NGRAM_NAME call :choose_ngram_dir
@@ -232,7 +233,9 @@ rem 16 parallel ranges over one file, not single-stream curl. On the Vast rental
 rem downloads at ~98 MB/s over aria2c against the same throttled-to-~1MB/s (and once outright
 rem stalled at 11 of 21 GiB) single-stream curl -- see scripts\multi-gpu-testing\README.md. -c
 rem resumes into the same .part name curl would use, and HuggingFace serves ranges fine.
-aria2c -x16 -s16 -c --file-allocation=none -d "%F_DIR%" -o "%F_PART_NAME%" "%URL%"
+rem The folder is given as "<dir>\." because a drive root ends in a backslash, and a backslash before the
+rem closing quote escapes the quote for aria2c's argument parser.
+aria2c -x16 -s16 -c --file-allocation=none -d "%F_DIR%\." -o "%F_PART_NAME%" "%URL%"
 goto :fetch_downloaded
 :fetch_curl
 curl.exe -L -C - --fail --output "%F_PART%" "%URL%"
@@ -292,9 +295,12 @@ set "NGRAM_ANSWER=!NGRAM_ANSWER!ninfer-models"
 :ngram_answer_set
 set "NGRAM_DIR=!NGRAM_ANSWER!"
 :ngram_dir_chosen
+rem A value that was only quotes is empty after they are stripped: use the model folder.
+if not defined NGRAM_DIR set "NGRAM_DIR=!MODEL_DIR!"
 call :ngram_dir_check
 if "!NGRAM_BAD!"=="1" goto :ngram_dir_rejected
 for %%I in ("%NGRAM_DIR%") do set "NGRAM_DIR=%%~fI"
+call :trim_trailing_backslash NGRAM_DIR
 if not exist "%NGRAM_DIR%\" mkdir "%NGRAM_DIR%" >nul 2>&1
 if exist "%NGRAM_DIR%\" goto :ngram_dir_ok
 echo Cannot create the folder "!NGRAM_DIR!" for the n-gram volume. 1>&2
@@ -312,15 +318,35 @@ exit /b 0
 rem Sets NGRAM_BAD=1 when NGRAM_DIR holds a percent sign, caret or exclamation mark. The folder passes
 rem through call, which doubles the first two, and through set and for lines, which eat the last, so it
 rem would silently become a different folder. Ampersand, pipe and angle brackets need no check: the
-rem folder is quoted or read through delayed expansion everywhere. The exclamation mark test runs with
-rem delayed expansion off, where it is an ordinary character.
+rem folder is quoted or read through delayed expansion everywhere.
+rem
+rem The folder is never expanded on a command line here. Earlier versions did, in substitutions such as
+rem !NGRAM_DIR:^=!, where delayed expansion itself consumes the caret. Instead `set NGRAM_DIR` prints
+rem "NGRAM_DIR=<folder>" and findstr looks for one of the three characters in that output. The findstr
+rem line runs with delayed expansion off so its exclamation mark is an ordinary character; a doubled
+rem percent sign is one percent sign in a batch file; the caret sits last in the class, where it is a
+rem plain character. Each branch is a goto, so nothing conditional shares a line with an
+rem unconditional command.
 :ngram_dir_check
 set "NGRAM_BAD="
-if not "!NGRAM_DIR:%%=!"=="!NGRAM_DIR!" set "NGRAM_BAD=1"
-if not "!NGRAM_DIR:^=!"=="!NGRAM_DIR!" set "NGRAM_BAD=1"
 setlocal disabledelayedexpansion
-if not "%NGRAM_DIR:!=%"=="%NGRAM_DIR%" endlocal & set "NGRAM_BAD=1" & exit /b 0
+set NGRAM_DIR 2>nul | findstr /r "[!%%^]" >nul
+if errorlevel 1 goto :ngram_dir_check_clean
 endlocal
+set "NGRAM_BAD=1"
+exit /b 0
+:ngram_dir_check_clean
+endlocal
+exit /b 0
+
+rem Removes one trailing backslash from the variable named %1, except after a drive colon (D:\ is the
+rem root, and D: alone would mean the current folder on that drive). for %%~fI keeps a trailing
+rem backslash, which would double up in "<folder>\<name>" and fail a comparison with a folder
+rem written without it.
+:trim_trailing_backslash
+if not "!%~1:~-1!"=="\" exit /b 0
+if "!%~1:~-2,1!"==":" exit /b 0
+set "%~1=!%~1:~0,-1!"
 exit /b 0
 
 rem The lines that start the server. run.bat looks in the same default models folder as this script
