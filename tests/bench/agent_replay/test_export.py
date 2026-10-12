@@ -143,3 +143,14 @@ def test_export_refuses_a_run_not_marked_complete(tmp_path):
         (run / "summary.json").write_text(body, encoding="utf-8")
         assert export(run, None, resources, out) == 1
         assert not out.exists()
+
+
+def test_export_removes_a_stale_stream_when_it_refuses_an_incomplete_run(tmp_path):
+    from tools.bench.agent_replay.export import TOKEN_STREAM_NAME, export
+
+    run, resources = _write_run(tmp_path, server_tokens=1, logged=False)
+    (run / "summary.json").write_text('{"complete": false}\n', encoding="utf-8")
+    stale = run / TOKEN_STREAM_NAME
+    stale.write_text("stale\n", encoding="utf-8")
+    assert export(run, None, resources, stale) == 1
+    assert not stale.exists()

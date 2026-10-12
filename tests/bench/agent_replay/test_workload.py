@@ -277,3 +277,12 @@ def test_summary_is_marked_complete_only_for_a_clean_run(tmp_path, monkeypatch):
     assert (code, summary["complete"]) == (1, False)
     code, summary = _run_with_fake_sessions(tmp_path / "none", monkeypatch, [])
     assert (code, summary["complete"]) == (1, False)
+
+
+def test_rerun_clear_removes_a_stale_exported_token_stream(tmp_path):
+    from tools.bench.agent_replay.export import TOKEN_STREAM_NAME
+    from tools.bench.agent_replay.run import clear_run_artifacts
+
+    (tmp_path / TOKEN_STREAM_NAME).write_text("stale\n", encoding="utf-8")
+    clear_run_artifacts(tmp_path)
+    assert not (tmp_path / TOKEN_STREAM_NAME).exists()

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from tools.bench.agent_replay.export import TOKEN_STREAM_NAME
 from tools.bench.agent_replay.metrics import SourceIndex, flatten_counters, summarize
 from tools.bench.agent_replay.workload import (
     SYSTEM_PROMPT,
@@ -29,8 +30,10 @@ SCHEMA = "ninfer_agent_replay"
 SCHEMA_VERSION = 1
 # Template framing per message (role markers, tool_response wrapper) in prompt-token estimates.
 MESSAGE_OVERHEAD_TOKENS = 16
-# Every file a run writes into --out; export trusts them as one consistent set.
-RUN_ARTIFACTS = ("output_token_ids.jsonl", "turns.jsonl", "transcripts.jsonl", "summary.json")
+# Every file a run writes into --out (export trusts them as one consistent set), plus the
+# exported token stream a later export writes there, so a rerun can never leave a stale one.
+RUN_ARTIFACTS = ("output_token_ids.jsonl", "turns.jsonl", "transcripts.jsonl", "summary.json",
+                 TOKEN_STREAM_NAME)
 
 
 def clear_run_artifacts(out: Path) -> None:

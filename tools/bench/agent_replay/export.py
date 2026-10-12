@@ -192,8 +192,14 @@ def _output_text(message: dict[str, Any]) -> str:
     return "\n".join(p for p in parts if p)
 
 
+# Default export file inside a run directory; run.py clears it with the run's own artifacts.
+TOKEN_STREAM_NAME = "token_streams.jsonl"
+
+
 def export(run_dir: Path, artifact: Path | None, tokenizer_dir: Path | None,
            out_path: Path) -> int:
+    # Drop any earlier stream first so a refused or failed export can never leave one behind.
+    out_path.unlink(missing_ok=True)
     summary_path = run_dir / "summary.json"
     try:
         complete = json.loads(summary_path.read_text(encoding="utf-8")).get("complete") is True
