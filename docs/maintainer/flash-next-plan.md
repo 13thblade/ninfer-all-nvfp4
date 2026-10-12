@@ -390,14 +390,14 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `src/models/qwen4_exp/program/ngram_volume.{h,cpp}` | same path | Version 2 volume; keep-alive after Strata's PLE reader |
 | `tests/models/qwen4_exp/test_{ngram_hash,ngram_volume,forward_real}.cpp`, `tests/fixtures/qwen4_exp/ngram_rows.txt` | same paths (`forward_real` with `45f20fb9`'s taps) | One sequence; INT8 KV built directly; timed decode |
 | `tools/flash_next/{ngram,reference,block_check,strata_compare}.py` | same paths | The reference reads the `.ninfer` through the exact GGML decoders, with the canonical A8 cast |
-| `src/core/{vmm_arena.{h,cu},cuda_vmm.h,vram_budget.{h,cpp},copy_batch.{h,cpp},link_probe.{h,cpp},power_throttling.{h,cpp}}` | same paths | Namespace; `CopyBatch` takes CUDA 12.8's `cudaMemcpyBatchAsync` form and falls back to single copies |
+| `src/core/{vmm_arena.{h,cu},cuda_vmm.h,vram_budget.{h,cpp},copy_batch.{h,cpp},link_probe.{h,cpp},power_throttling.{h,cpp}}` | same paths | Namespace; `CopyBatch` takes CUDA 12.8's `cudaMemcpyBatchAsync` form and falls back to single copies; a `cuMemSetAccess` that WDDM cannot make resident (`CUDA_ERROR_NOT_READY`) is a refusal, like an out-of-memory `cuMemCreate` (PR 12) |
 | `src/core/host_memory.{h,cpp}` | same path | The snapshot and working-set reserve only |
 | `src/core/pinned_upload.{h,cu}` | `src/core/device.{h,cu}` (`upload_pinned`) | Own translation unit |
-| `src/models/qwen4_exp/memory_plan.{h,cpp}` | same path | Full RAM mode only (fits or refuses; no SSD tier, no `--expert-ram-mib`); the VRAM sizing and control law unchanged |
+| `src/models/qwen4_exp/memory_plan.{h,cpp}` | same path | Full RAM mode only (fits or refuses; no SSD tier, no `--expert-ram-mib`); the VRAM sizing and control law unchanged; `kv_growth_frames` is `grow_kv`'s arithmetic as a pure function (PR 12) |
 | `src/models/qwen4_exp/program/expert_cache/expert_{cache,state}.{h,cpp}` | same paths | Verbatim |
 | `src/models/qwen4_exp/program/expert_residency.{h,cpp}` | same path | Per-layer record strides in one frame size; no SSD tier or landing; frame lending (PR 10) with a refill of the returned frames |
 | `src/models/qwen4_exp/program/vram_monitor.{h,cpp}` | same path | Verbatim |
-| `src/models/qwen4_exp/program/program.{h,cpp}` | `program/program.{h,cpp}`, `program/program_impl.h` | NInfer's execution contract (prefix reuse off, one lane); device plan, elastic KV, decode budget, warm start, VRAM control, link probe and decode graph from Infernix |
+| `src/models/qwen4_exp/program/program.{h,cpp}` | `program/program.{h,cpp}`, `program/program_impl.h` | NInfer's execution contract (prefix reuse off, one lane); device plan, elastic KV (PR 12: `grow_kv`'s order, frames released before the pool maps; the pool shrinks at the next admission that needs less instead of after 60 s idle, and a growth that does not fit fails the request), decode budget, warm start, VRAM control, link probe and decode graph from Infernix |
 | `src/runtime/engine/qwen4_exp_instance.{h,cpp}` | same path | NInfer's EngineCore and ResourceManager with the context cache off; refuses unsupported options |
 | `tests/models/qwen4_exp/test_{expert_cache,memory_plan}.cpp`, `tests/fixtures/expert_cache/lfru_conformance.txt` | same paths | The memory plan's RAM tests rewritten for full mode |
 

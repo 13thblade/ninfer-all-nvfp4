@@ -57,7 +57,11 @@ inline std::size_t granularity(int device) {
     return bytes;
 }
 
-// A result that means "no memory or residency right now": a refused grow, not a fatal error.
+// A result that means "no memory or residency right now": a refused grow, not a fatal error. Under
+// Windows WDDM, mapping past this process's video-memory budget makes the OS evict other
+// allocations; when a device-memory query (cudaMemGetInfo) runs on another thread meanwhile, the
+// driver returns CUDA_ERROR_NOT_READY from cuMemSetAccess instead of waiting (reproduced on an RTX
+// 3090, driver 616.64). The caller treats it as an out-of-memory refusal.
 inline bool grow_refused(CUresult result) {
     return result == CUDA_ERROR_OUT_OF_MEMORY || result == CUDA_ERROR_NOT_READY;
 }

@@ -9,7 +9,8 @@
 // stacking the headroom on it, the graph reserve, fixed allocations that do not fit, the frame
 // clamp, and the spill test with noisy free-memory readings. RT9, the runtime law of the elastic
 // pool: shrink on low free memory or an exceeded budget, hysteresis, the grow delay and per-boundary
-// cap, display hot-plug, and the reserve spent by the engine's own later allocations.
+// cap, display hot-plug, and the reserve spent by the engine's own later allocations. The elastic
+// KV pool's growth: the frames it takes free at least what it maps beyond the spare memory.
 
 #include "models/qwen4_exp/memory_plan.h"
 
@@ -378,6 +379,44 @@ void test_control_law() {
     require(control.decide(trimmed, pool, frames, 200.0, false).shrink, "an exceeded budget shrinks the pool");
 }
 
+// The elastic KV pool's growth takes its memory from the frames before it maps (the order whose
+// absence overcommitted WDDM and crashed 128K requests): releasing kv_growth_frames frames through
+// the frame pool's chunk rule frees at least what the KV adds beyond the spare memory, from any
+// fill level of the top chunk.
+void test_kv_growth() {
+    const std::uint64_t chunk = 64 * kMiB;
+    require(kv_growth_frames(100 * kMiB, 100 * kMiB, 1000, kMiB, chunk) == 0, "spare memory covers the growth");
+    require(kv_growth_frames(100 * kMiB, 200 * kMiB, 1000, kMiB, chunk) == 0, "more spare than growth");
+    require(kv_growth_frames(5 * kGiB, 0, 1000, kMiB, chunk) == 1000, "the growth takes at most every frame");
+    require(kv_growth_frames(kMiB, 0, 1000, 0, chunk) == 0, "no frames, nothing to take");
+    // The 128K case on the RTX 3090: 1,344 MiB of KV, IQ2 frames of 1.44 MiB, no spare memory.
+    const std::uint64_t iq2 = 1'474'560;
+    const std::uint32_t take = kv_growth_frames(1344 * kMiB, 0, 12'258, iq2, chunk);
+    require(take > 1344 * kMiB / iq2 && take <= 1344 * kMiB / iq2 + chunk / iq2 + 2, "128K growth takes ~1 chunk over");
+    for (const std::uint64_t stride : {iq2, 1'048'576ULL, 3'000'000ULL, 67'108'864ULL, 100'000'000ULL}) {
+        for (const std::uint64_t added : {2 * kMiB, 130 * kMiB, 1344 * kMiB, 3500 * kMiB}) {
+            for (const std::uint64_t spare : {0ULL, kMiB, 100 * kMiB, 2000 * kMiB}) {
+                for (const std::uint32_t frames : {3000U, 12'258U}) {
+                    // The frame pool maps whole chunks: from the frames' bytes up to one chunk above.
+                    for (const std::uint64_t slack : {0ULL, chunk / 2, chunk - 1}) {
+                        const std::uint64_t used = static_cast<std::uint64_t>(frames) * stride;
+                        const std::uint64_t mapped = (used + slack + chunk - 1) / chunk * chunk;
+                        const std::uint32_t give = kv_growth_frames(added, spare, frames, stride, chunk);
+                        const std::uint64_t keep = static_cast<std::uint64_t>(frames - give) * stride;
+                        std::uint64_t left = mapped;
+                        while (left >= keep + chunk) { left -= chunk; } // ExpertResidency::resize's release
+                        const std::uint64_t freed = mapped - left;
+                        const std::uint64_t needed = added > spare ? added - spare : 0;
+                        require(freed >= needed || give == frames,
+                                "the frames release what the KV adds (stride " + std::to_string(stride) + ", added " +
+                                    std::to_string(added >> 20) + " MiB, spare " + std::to_string(spare >> 20) + ")");
+                    }
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -394,6 +433,7 @@ int main() {
         test_sizing();
         test_spill();
         test_control_law();
+        test_kv_growth();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

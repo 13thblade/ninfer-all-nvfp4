@@ -1,5 +1,6 @@
 // Adapted from Infernix a3edb450 src/core/vmm_arena.cu (Apache-2.0).
-// Modified for NInfer-3090: NInfer's namespace.
+// Modified for NInfer-3090: NInfer's namespace; a mapping WDDM cannot make resident
+// (CUDA_ERROR_NOT_READY from cuMemSetAccess) is a refusal, like an out-of-memory cuMemCreate.
 
 #include "core/vmm_arena.h"
 
@@ -46,7 +47,6 @@ bool VmmArena::map_chunk() {
         if (vmm::grow_refused(mapped)) { return false; }
         vmm::check(mapped, "cuMemMap");
     }
-    // A mapping the OS cannot make resident is a refused grow, not a fatal error.
     if (const CUresult access = vmm::try_set_access(va, chunk_, device_); access != CUDA_SUCCESS) {
         (void)cuMemUnmap(va, chunk_);
         (void)cuMemRelease(handle);
@@ -93,7 +93,6 @@ bool VmmRange::map(std::size_t chunk) {
         if (vmm::grow_refused(mapped)) { return false; }
         vmm::check(mapped, "cuMemMap");
     }
-    // A mapping the OS cannot make resident is a refused grow, not a fatal error.
     if (const CUresult access = vmm::try_set_access(va, chunk_, device_); access != CUDA_SUCCESS) {
         (void)cuMemUnmap(va, chunk_);
         (void)cuMemRelease(handle);

@@ -127,6 +127,15 @@ struct VramSizing {
 // clamp(frame_bytes / frame size, 0, max_frames).
 [[nodiscard]] VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& demand);
 
+// The elastic KV pool's growth (design §19.3.11): the expert frames to release before the pool maps
+// `added` bytes, so the growth never makes the device hold more than it did. `spare` is the memory
+// the sizing function would give the frames anyway (free memory above the headroom and reserve);
+// the rest comes out of the frames, one frame chunk over, because the frame pool releases whole
+// chunks of `chunk_bytes` and keeps a partly used one: releasing f frames frees at least
+// f * frame_bytes - chunk_bytes. Clamped to `frames`.
+[[nodiscard]] std::uint32_t kv_growth_frames(std::uint64_t added, std::uint64_t spare, std::uint32_t frames,
+                                             std::uint64_t frame_bytes, std::uint64_t chunk_bytes) noexcept;
+
 // The runtime law of an elastic frame pool (design §19.3.7): from the latest snapshot, the pool's
 // size and the time, the frame count it should have. Pure and single-threaded; the Program guards
 // it. The reserve is spent only by NInfer's own allocations after sizing (graph executables): with

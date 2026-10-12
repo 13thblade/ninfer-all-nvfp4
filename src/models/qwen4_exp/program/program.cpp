@@ -4,10 +4,13 @@
 // single-sequence forward of PR 8; prefix reuse, MTP, n-gram drafts, vision, the CPU miss service,
 // the SSD tier, landing frames, the layer walk and /v1/decide are not ported.
 // Kept from Infernix: the device plan and its spill checks, the elastic VMM KV pool that borrows
-// from the expert frames, the expert cache (LFRU, decode promotion budget and cadence, warm-start
-// state), the VRAM control law at round boundaries, the link probe, the power-throttling opt-out,
-// the decode CUDA graph, and (PR 10) wide prefill calls whose workspace and expert-stream ring are
-// frames lent by the expert cache, with the next call's n-gram rows read while one runs.
+// from the expert frames (grow_kv's order: the frames release memory before the pool maps it), the
+// expert cache (LFRU, decode promotion budget and cadence, warm-start state), the VRAM control law
+// at round boundaries, the link probe, the power-throttling opt-out, the decode CUDA graph, and
+// (PR 10) wide prefill calls whose workspace and expert-stream ring are frames lent by the expert
+// cache, with the next call's n-gram rows read while one runs. Unlike Infernix, the pool shrinks at
+// the next admission that needs less (one lane: no idle timer), not after 60 s idle, and a growth
+// that does not fit fails the request instead of waiting for another lane.
 
 #include "models/qwen4_exp/program/program.h"
 
@@ -40,6 +43,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -436,6 +440,7 @@ public:
             // The KV above the base comes out of the frames: keep room for the request's whole extent.
             const std::uint64_t kv_growth = plan_.vmm ? plan_.kv.mapped_bytes(plan_.pages) - kv_vmm_->mapped_bytes() : 0;
             sizing_ = size_expert_frames(vram_->query(), demand);
+            demand_ = demand;
             const auto grown = residency_->resize(sizing_.frames, device_.stream, *vram_);
             if (grown.spilled != 0 || grown.refused) {
                 char reading[200] = "";
@@ -1386,8 +1391,36 @@ private:
         return true;
     }
 
-    // Backs at least `need` pages, taking the memory from the expert frames; above that lowers the
-    // pool to what `need` and the base require, returning memory to the frames. Between requests.
+    // Unmaps the chunks pages [0, pages) do not need; returns the bytes released.
+    std::size_t unmap_kv(std::uint32_t pages) {
+        const std::size_t before = kv_vmm_->mapped_bytes();
+        const auto need          = plan_.kv.chunks(pages);
+        for (std::size_t c = 0; c < need.size(); ++c) {
+            if (!need[c] && kv_vmm_->mapped(c)) { kv_vmm_->unmap(c); }
+        }
+        return before - kv_vmm_->mapped_bytes();
+    }
+
+    // Device memory the sizing function would give the expert frames now beyond what they hold:
+    // free memory (within the OS budget) above the display headroom and the reserve.
+    std::uint64_t spare_vram() {
+        VramDemand demand = demand_;
+        demand.fixed      = 0;
+        demand.max_frames = std::numeric_limits<std::uint32_t>::max();
+        const VramSizing room = size_expert_frames(vram_->query(), demand);
+        return room.frame_bytes > 0 ? static_cast<std::uint64_t>(room.frame_bytes) : 0;
+    }
+
+    // The VRAM ledger of the elastic KV pool (Infernix grow_kv / shrink_kv, design §19.3.11): one
+    // device budget holds the expert frames and the KV, so the pool grows only into memory the
+    // frames have released (or free memory above the headroom), and what it releases goes back to
+    // the frames. Backs at least `need` pages; above that lowers the pool to what `need` and the base
+    // require. Between requests.
+    //
+    // Mapping first and taking frames after (the earlier order) placed the growth on top of a VRAM
+    // the startup sizing had filled: past this process's WDDM budget and the physical memory, so
+    // the OS paged device memory (128K prefill at 447 tok/s) and, with the VRAM monitor reading
+    // free memory meanwhile, cuMemSetAccess failed with CUDA_ERROR_NOT_READY.
     void ensure_kv(std::uint32_t need) {
         if (!kv_vmm_) { return; }
         need = std::min(need, plan_.pages);
@@ -1397,27 +1430,30 @@ private:
         device_.synchronize();
         residency_->drain(device_.stream);
         const std::uint64_t stride = residency_->frame_stride();
+        const std::uint32_t frames = residency_->frames();
         if (target > backed_pages_) {
             const std::size_t added = plan_.kv.mapped_bytes(target) - kv_vmm_->mapped_bytes();
-            const std::uint32_t frames = residency_->frames();
-            const auto give = static_cast<std::uint32_t>(
-                std::min<std::uint64_t>(frames, (added + ExpertResidency::kChunkBytes + stride - 1) / stride));
-            // Growth is all or nothing: a failure unmaps what this attempt mapped and takes back the
-            // frames it gave away (net memory use is then what it was, so the fixed-use ledger needs no
-            // entry), and refreshes the frame accounting the resize changed.
+            const std::uint64_t spare = spare_vram();
+            const std::uint32_t give =
+                kv_growth_frames(added, spare, frames, stride, ExpertResidency::kChunkBytes);
+            // Growth is all or nothing: a failure unmaps what this attempt mapped, gives the frames
+            // back and refreshes the accounting the resize changed, so the next request starts from a
+            // consistent pool.
             try {
-                if (!map_kv(target)) {
-                    (void)residency_->resize(frames - give, device_.stream, *vram_);
-                    if (!map_kv(target)) {
-                        throw std::runtime_error("Qwen3.8-Flash-Next: no VRAM left for this request's KV");
+                if (give != 0) {
+                    const auto resized = residency_->resize(frames - give, device_.stream, *vram_);
+                    if (resized.frames > frames - give) {
+                        throw std::logic_error("Qwen3.8-Flash-Next: the expert cache did not release frames for the KV");
                     }
+                }
+                if (!map_kv(target)) {
+                    // The memory is not there after all (another program took it): refuse this request
+                    // rather than overcommit the device.
+                    throw std::runtime_error("Qwen3.8-Flash-Next: no VRAM left for this request's KV");
                 }
             } catch (...) {
                 (void)device_.synchronize_status();
-                const auto keep = plan_.kv.chunks(backed_pages_);
-                for (std::size_t c = 0; c < keep.size(); ++c) {
-                    if (!keep[c] && kv_vmm_->mapped(c)) { kv_vmm_->unmap(c); }
-                }
+                (void)unmap_kv(backed_pages_);
                 // The frames given away for this growth go back, best effort: the chunks above are
                 // free again, and a refusal here only leaves the cache smaller for the controller to regrow.
                 if (residency_->frames() < frames) {
@@ -1430,22 +1466,59 @@ private:
                 pool_now_   = residency_->pool_bytes();
                 throw;
             }
+            kv_taken_ += frames - residency_->frames();
+            kv_added_ += added;
             if (control_) { control_->account_fixed(static_cast<std::int64_t>(added)); }
-            diagnostic("KV pool grew to " + std::to_string(target) + " pages (" +
-                       std::to_string(kv_vmm_->mapped_bytes() >> 20) + " MiB); expert cache " + std::to_string(frames) +
-                       " -> " + std::to_string(residency_->frames()) + " frames");
+            // The growth is final: commit the pool state before the telemetry below, which queries the
+            // device and must not be able to leave backed_pages_ behind the mapped chunks.
+            backed_pages_ = target;
+            frames_now_   = residency_->frames();
+            pool_now_     = residency_->pool_bytes();
+            char line[320];
+            std::snprintf(line, sizeof(line), "KV pool grew to %u pages (%zu MiB, +%zu); expert cache %u -> %u frames (%llu MiB spare)",
+                          target, kv_vmm_->mapped_bytes() >> 20, added >> 20, frames, residency_->frames(),
+                          static_cast<unsigned long long>(spare >> 20));
+            std::string text = line;
+            try {
+                const VramSnapshot after = vram_->query();
+                std::snprintf(line, sizeof(line), "; VRAM free %zu MiB, OS budget %llu, used %llu", after.device_free >> 20,
+                              static_cast<unsigned long long>(after.local_budget >> 20),
+                              static_cast<unsigned long long>(after.local_usage >> 20));
+                text += line;
+            } catch (...) {} // telemetry only: the line goes out without the VRAM numbers
+            diagnostic(text);
         } else {
-            const std::size_t before = kv_vmm_->mapped_bytes();
-            const auto need_chunks   = plan_.kv.chunks(target);
-            for (std::size_t c = 0; c < need_chunks.size(); ++c) {
-                if (!need_chunks[c] && kv_vmm_->mapped(c)) { kv_vmm_->unmap(c); }
-            }
-            const std::size_t freed    = before - kv_vmm_->mapped_bytes();
-            const std::uint32_t frames = residency_->frames();
-            if (!options_.expert_cache_bytes) {
-                (void)residency_->resize(frames + static_cast<std::uint32_t>(freed / stride), device_.stream, *vram_);
-            }
+            const std::size_t freed = unmap_kv(target);
             if (control_) { control_->account_fixed(-static_cast<std::int64_t>(freed)); }
+            // The frames take back what the growths took from them, in proportion to the KV released
+            // (all of it once the pool is back to what it held before growing; they released up to a
+            // chunk more than the pool mapped, and memory the growths found spare stays spare), up to
+            // the cache's own limit (--expert-cache-mib).
+            std::uint32_t back = kv_taken_;
+            if (freed < kv_added_) {
+                back = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(kv_taken_, (static_cast<std::uint64_t>(kv_taken_) * freed + kv_added_ - 1) / kv_added_));
+            }
+            kv_taken_ -= back;
+            kv_added_ -= std::min<std::uint64_t>(kv_added_, freed);
+            const std::uint32_t regrow = std::min(frames + back, demand_.max_frames);
+            if (regrow > frames) {
+                std::exception_ptr failure;
+                try {
+                    (void)residency_->resize(regrow, device_.stream, *vram_);
+                } catch (...) { failure = std::current_exception(); }
+                // A refused mapping leaves the cache short of `regrow`: keep what was not restored as
+                // debt, so a later shrink (or the next growth's accounting) still owes it.
+                const std::uint32_t restored = residency_->frames() > frames ? residency_->frames() - frames : 0;
+                kv_taken_ += (regrow - frames) - std::min(restored, regrow - frames);
+                if (failure) {
+                    // The chunks are already unmapped: commit the pool state before propagating.
+                    backed_pages_ = target;
+                    frames_now_   = residency_->frames();
+                    pool_now_     = residency_->pool_bytes();
+                    std::rethrow_exception(failure);
+                }
+            }
             diagnostic("KV pool shrank to " + std::to_string(target) + " pages; expert cache " + std::to_string(frames) +
                        " -> " + std::to_string(residency_->frames()) + " frames");
         }
@@ -1535,6 +1608,7 @@ private:
 
     std::unique_ptr<VramBudgetSource> vram_;
     VramSizing sizing_;
+    VramDemand demand_; // as sized at startup: the frames' and the KV's one device ledger
     std::optional<VramControl> control_;
     std::unique_ptr<VramMonitor> monitor_;
     Clock::time_point vram_epoch_{};
@@ -1547,6 +1621,8 @@ private:
     DeviceBuffer kv_backing_;
     std::byte* kv_base_         = nullptr;
     std::uint32_t backed_pages_ = 0;
+    std::uint32_t kv_taken_     = 0; // expert frames the pool's growths took and not yet returned
+    std::uint64_t kv_added_     = 0; // the bytes those growths mapped and not yet released
     DeviceBuffer io_device_;
     PinnedHostBuffer io_host_{1};
     PinnedHostBuffer host_token_{1};
