@@ -52,6 +52,10 @@ void validate(const EngineOptions& options) {
     if (options.speculative.backend != SpeculativeBackend::None || options.speculative.ngram_draft_tokens != 0) {
         refuse("has no speculative decoding in this release: remove --spec and --ngram-draft-tokens");
     }
+    if (options.kv_capacity.mode == KvCapacityMode::Automatic) {
+        refuse("sizes its KV pool itself from free VRAM (it grows and shrinks per request): remove "
+               "--kv-capacity auto");
+    }
     if (options.enable_vision) { refuse("serves text only in this release: remove --vision"); }
     if (!options.grafts.empty()) { refuse("has no prompt grafts: remove --graft"); }
     if (options.devices.size() > 1) { refuse("runs on one GPU: remove --devices"); }
