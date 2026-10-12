@@ -955,10 +955,19 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
     profile.multiprocessors = properties.multiProcessorCount;
     profile.origin          = "calibration";
     Timer timer(options);
-    if (options.ternary) { calibrate_ternary(profile, timer, options); }
-    if (options.groupwise) { calibrate_groupwise(profile, timer, options); }
+#if defined(NINFER_SM70)
+    // The families outside the sm_70 catalog (calibration/route_catalog.cpp) steer routes that
+    // build never takes.
+    const bool projections = false;
+    const bool attention   = false;
+#else
+    const bool projections = true;
+    const bool attention   = options.attention;
+#endif
+    if (projections && options.ternary) { calibrate_ternary(profile, timer, options); }
+    if (projections && options.groupwise) { calibrate_groupwise(profile, timer, options); }
     if (options.linear_attention) { calibrate_linear_attention(profile, timer, options); }
-    if (options.attention) {
+    if (attention) {
         calibrate_attention(profile, timer, options, KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
                             "rk8v4");
         calibrate_attention(profile, timer, options, KvCacheStorage::RotatedLloyd4KeyInt4Value,

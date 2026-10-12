@@ -138,8 +138,8 @@ speed, and the kernels written for Ampere everywhere else, on emulated warp prim
 - FP8 A8 and NVFP4 W4A4 activations are not available, as on `sm_86`; those weights run their A16
   routes.
 
-The device route profile of a V100 is calibrated at first start (see
-[device profiles](device-profiles.md)). Measurements are in
+The V100-SXM2-16GB's device route profile is built in; another V100 part calibrates at first start,
+in about nine seconds (see [device profiles](device-profiles.md)). Measurements are in
 [Tesla V100 measurements](performance/tesla-v100-2026-10.md).
 
 ## Optional vcpkg dependencies

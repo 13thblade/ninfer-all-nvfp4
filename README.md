@@ -173,9 +173,9 @@ of the file.
 **Kernels and devices**
 
 - **Device route profiles.** Each card's measured profile picks the kernel route for every
-  operation and width. Profiles are built in for the RTX 3090, 4090, 5090 and the three RTX PRO
-  6000 editions; any other GPU is measured once at first start, and `ninfer-calibrate` re-measures
-  ([device profiles](docs/device-profiles.md)).
+  operation and width. Profiles are built in for the RTX 3090, 4090, 5090, the three RTX PRO
+  6000 editions and the Tesla V100-SXM2-16GB; any other GPU is measured once at first start, and
+  `ninfer-calibrate` re-measures ([device profiles](docs/device-profiles.md)).
 - **Pipeline stages.** `--devices 0,1,...` splits the layers over up to eight GPUs on Linux, each
   stage owning its weights, KV and state ([pipeline stages](docs/maintainer/pipeline-stages.md)).
 - FP8 A8 and NVFP4 W4A4 tensor-core routes on every `120a` build, an FP4 tensor-core prompt kernel

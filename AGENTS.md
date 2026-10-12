@@ -65,9 +65,9 @@ This line builds for **`sm_86`** (the RTX 30 series; that build also runs the RT
 small-T, attention and prompt routes over emulated Ampere warp primitives, built from source); the
 published Docker image carries the `86` and `120a` builds. It was tuned on the **NVIDIA GeForce
 RTX 3090** (24 GB) first, and each card's kernel routes now come from its measured device profile,
-built in for the RTX 3090, 4090, 5090 and the three RTX PRO 6000 editions. Upstream
-(`Neroued/ninfer`) targets `sm_120a` on RTX 5090 with native routes that this line's `120a` build
-does not compile by default; its schedules, route tables and
+built in for the RTX 3090, 4090, 5090, the three RTX PRO 6000 editions and the Tesla
+V100-SXM2-16GB. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090 with native routes that
+this line's `120a` build does not compile by default; its schedules, route tables and
 published measurements are not authoritative here -- every route table this fork inherited and
 re-measured on sm_86 turned out to be wrong by 12-41%. Treat an upstream tuning constant as a
 hypothesis until measured on the card in question. Windows builds and their toolchain constraints
