@@ -71,14 +71,16 @@ DFlashFeatureSink prefill_feature_sink_impl(PrefillContext& state,
     }
 }
 
-DFlashFeatureSink batch_feature_sink_impl(DFlashBatchContext& state, const Tensor& lanes,
-                                          const Tensor& valid_columns, std::int32_t width,
-                                          std::int32_t batch_size) {
+// `features` is the [D, width, lanes] logical view of the widest pending-feature buffer (slice
+// dimension 1; it keeps the allocated lane and column strides).
+DFlashFeatureSink batch_feature_sink_impl(DFlashBatchContext& state, Tensor& features,
+                                          const Tensor& lanes, const Tensor& valid_columns,
+                                          std::int32_t width, std::int32_t batch_size) {
     {
         const auto& target = state.execution.parameters.model.config().text;
         const auto& config = *state.execution.parameters.model.config().draft;
         return DFlashFeatureSink{
-            .batch_features      = &dflash_state(state).pending_features,
+            .batch_features      = &features,
             .batch_lanes         = &lanes,
             .batch_valid_columns = &valid_columns,
             .batch_width         = width,
@@ -572,12 +574,17 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             throw std::logic_error("DFlash decode batch state is incomplete");
         }
         state.execution.work.reset();
-        qwen3_5::DFlashDecodeState& frame = state.frame;
-        const std::int32_t width          = static_cast<std::int32_t>(k) + 1;
+        // Forward and Finish derive the same view of the frame at the round's width, so Finish
+        // reads what Forward wrote.
+        qwen3_5::DFlashDecodeState frame = state.frame.narrowed(k);
+        const std::int32_t width         = static_cast<std::int32_t>(k) + 1;
         if (phase == SpeculativePhase::Forward) {
-            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
-                                       sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       state.execution.device.stream));
+            // Only a copy round transfers the copy fields at the ingress tail.
+            const std::size_t ingress_bytes = state.copy_round
+                                                  ? sizeof(qwen3_5::DFlashDecodeIngress)
+                                                  : qwen3_5::kDFlashDecodeIngressNeuralBytes;
+            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress, ingress_bytes,
+                                       cudaMemcpyHostToDevice, state.execution.device.stream));
         }
 
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
@@ -606,17 +613,37 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
 
         if (phase == SpeculativePhase::Forward) {
             state.execution.work.reset();
+            // Catch-up appends the previous round's columns, at the frame's allocated width.
             Tensor compact_features = state.execution.work.alloc(
                 DType::BF16,
-                {dimension(state.execution.parameters.draft->feature_projection.weight.k), width,
-                 batch_size});
+                {dimension(state.execution.parameters.draft->feature_projection.weight.k),
+                 frame.append_positions.ne[0], batch_size});
             ops::prepare_ragged_prefix(
                 dflash_state(state).pending_features, active_lanes, context_starts, frontiers,
                 compact_features, append_positions, append_counts, state.execution.device.stream);
             append_context_impl(state, compact_features, append_positions, append_counts,
                                 state_destinations, dflash_rows, envelopes.append);
 
-            propose_batch_impl(state, frame, batch_size, k, envelopes);
+            if (state.copy_round) {
+                // A batch-one copy round verifies the copy instead of a proposal, so the draft
+                // model does not run; DFlash2's sparse verifier reads it as a one-hot law.
+                if (batch_size != 1) {
+                    throw std::logic_error("a batched n-gram copy round is not built");
+                }
+                Tensor copy_rows   = frame.copy_rows.slice(0, 0, batch_size);
+                Tensor copy_drafts = frame.copy_drafts.slice(1, 0, batch_size);
+                Tensor candidates  = frame.candidate_ids.data
+                                         ? frame.candidate_ids.slice(2, 0, batch_size)
+                                         : Tensor{};
+                Tensor proposal_q =
+                    frame.proposal_q.data ? frame.proposal_q.slice(2, 0, batch_size) : Tensor{};
+                ops::speculative_overlay_copy_proposals(
+                    copy_rows, copy_drafts, drafts, candidates, proposal_q,
+                    dimension(state.execution.parameters.model.resources().public_token_count),
+                    state.execution.device.stream);
+            } else {
+                propose_batch_impl(state, frame, batch_size, k, envelopes);
+            }
             const auto draft_count = static_cast<std::size_t>(k) * batch_size;
             if (state.host_drafts.size() < draft_count) {
                 throw std::logic_error("DFlash host draft buffer is too small");
@@ -638,8 +665,11 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_stage_runtime(state.execution.stages);
-        DFlashFeatureSink sink =
-            batch_feature_sink_impl(state, active_lanes, valid_columns, width, batch_size);
+        // pending_features stays allocated at the widest round (catch-up reads it at that width);
+        // a narrower round captures into the leading `width` columns of each lane.
+        Tensor pending_features = dflash_state(state).pending_features.slice(1, 0, width);
+        DFlashFeatureSink sink  = batch_feature_sink_impl(state, pending_features, active_lanes,
+                                                          valid_columns, width, batch_size);
         {
             nvtx::ScopedRange target_range(nvtx::Name::DecodeDFlashTarget, nvtx::Category::DFlash,
                                            static_cast<std::uint64_t>(width) * batch_size);

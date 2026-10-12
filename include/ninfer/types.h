@@ -95,12 +95,15 @@ struct SpeculativeOptions {
     // Startup-fixed K: 1..15 for MTP, DFlash and DFlash2 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
-    // Context-lookup drafting: match this many trailing tokens against the sequence so far and
-    // propose whatever followed the last time they appeared. 0 disables it. It costs no device
-    // work, it is exact (verify rejects a wrong guess), and it is strongest exactly where a draft
-    // head is weakest -- output that repeats the input. Used as a draft source alongside the
-    // configured backend, preferred whenever it finds a match.
-    std::uint32_t lookup_ngram = 0;
+    // N-gram copy drafting beside DFlash2: when the committed text's tail already occurred in the
+    // request (its prompt, a tool result or its own output), a round verifies what followed it,
+    // up to this many drafts, instead of the draft model's proposal. Verification licenses every
+    // token, so a wrong copy costs throughput and never changes output. 0 disables it. The product
+    // flags accept only 15; the Engine accepts 1..15 above draft_tokens so benchmarks can measure
+    // other verify widths. Requires DFlash2 and, for now, max_concurrency 1.
+    std::uint32_t ngram_draft_tokens = 0;
+    // Tail tokens a copy must match before it is proposed, 4..64.
+    std::uint32_t ngram_min_match = 12;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -441,6 +444,17 @@ struct StopPolicy {
     bool publish_stop_token     = false;
 };
 
+// What the reasoning-loop guard does when the open thinking keeps repeating whole passages (every
+// 512 thinking tokens, the share of the last 2,000 words inside a 12-word passage seen three times
+// reaches 25 %).
+enum class ReasoningLoopAction : std::uint8_t {
+    Off,      // no check
+    Stop,     // end the request there (FinishReason::OutputLimit)
+    Conclude, // inject the thinking-close control (as a reached thinking budget does) and let the
+              // model answer; Stop when early close is unavailable or the remaining output budget
+              // cannot hold the control span and one more token
+};
+
 struct ThinkingControlOptions {
     // Positive maximum accepted model-origin tokens while the Qwen thinking phase remains open.
     // Omitted means unlimited. Injected target-control tokens consume the total output budget but
@@ -451,6 +465,7 @@ struct ThinkingControlOptions {
     std::optional<std::uint32_t> effective_budget;
     // Whether canonical early-close guidance and control tokens can be inserted.
     bool early_close_available = true;
+    ReasoningLoopAction loop   = ReasoningLoopAction::Off;
 };
 
 struct ExecutionOptions {
@@ -1053,17 +1068,31 @@ struct SpeculativeStats {
     std::uint64_t drafted_tokens  = 0;
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
+    // Draft-model rounds only: how often draft position i was accepted. Copy rounds are counted
+    // by the n-gram fields instead.
     std::vector<std::uint64_t> accepted_per_position;
+    // N-gram copy drafting: the configured window (0 when off) and the copy rounds, which are a
+    // subset of `rounds`, `drafted_tokens` and `accepted_tokens`.
+    std::uint32_t ngram_draft_tokens    = 0;
+    std::uint64_t ngram_rounds          = 0;
+    std::uint64_t ngram_drafted_tokens  = 0;
+    std::uint64_t ngram_accepted_tokens = 0;
 };
 
 struct ThinkingBudgetStats {
     std::optional<std::uint32_t> requested_budget;
     std::optional<std::uint32_t> effective_budget;
-    // Model-origin tokens accepted while capped thinking remained open.
+    // Model-origin tokens accepted while thinking remained open, with or without a budget.
     std::uint32_t model_thinking_tokens = 0;
     // Complete tokenizer-derived target-control suffix committed by Engine.
     std::uint32_t injected_tokens = 0;
     bool applied                  = false;
+    // The reasoning-loop guard fired: after this many model-origin thinking tokens, at this
+    // repeated-passage coverage (ThinkingControlOptions::loop decided the action; `applied` tells
+    // whether it concluded).
+    bool loop_detected                 = false;
+    std::uint32_t loop_thinking_tokens = 0;
+    float loop_coverage                = 0.0F;
 };
 
 enum class ConstraintCacheAccess : std::uint8_t { Hit, Built, Waited };
@@ -1237,6 +1266,10 @@ struct RuntimeStats {
     std::uint64_t speculative_draft_tokens    = 0;
     std::uint64_t speculative_accepted_tokens = 0;
     std::uint64_t speculative_fallback_steps  = 0;
+    // N-gram copy rounds, a subset of the speculative counters above.
+    std::uint64_t speculative_ngram_rounds          = 0;
+    std::uint64_t speculative_ngram_draft_tokens    = 0;
+    std::uint64_t speculative_ngram_accepted_tokens = 0;
     // Initial prompt tokens evaluated by prefill. Reused checkpoint-prefix tokens and replay
     // recomputation are excluded; replayed_tokens separately counts that additional model work.
     std::uint64_t computed_prefill_tokens = 0;

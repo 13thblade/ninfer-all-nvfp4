@@ -298,7 +298,7 @@ CpuIsa best_cpu_isa() { return cpu_isa_supported(CpuIsa::kAvx2) ? CpuIsa::kAvx2 
 
 void expert_forward_cpu(CpuIsa isa, QType format, const std::uint8_t* record, int ncols,
                         const std::uint16_t* const* x, std::uint16_t* const* y) {
-    if (ncols < 1 || ncols > kMaxColumns) { throw std::invalid_argument("offloaded_sparse_moe: ncols must be in [1, 8]"); }
+    detail::require_expert_job("offloaded_sparse_moe", record, ncols, x, y);
     if (!cpu_isa_supported(isa)) { throw std::invalid_argument("offloaded_sparse_moe: unsupported CPU ISA"); }
     const RecordGeometry geometry = record_geometry(format);
     std::vector<std::int8_t> xq(static_cast<std::size_t>(ncols) * kHidden);

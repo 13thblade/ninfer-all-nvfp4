@@ -48,7 +48,8 @@ namespace ninfer::ops {
  *   A8 and rowdot are the canonical A8 arithmetic of src/ops/common/canonical_ggml.h, stated here
  *   because they are semantic: A8 of a group v[0..32) is a = max |v_j|, d = a / 127 and
  *   q_j = clamp(rint(v_j * (127 / a)), -127, 127) (FP32 operations, ties to even, q = 0 and d = 0
- *   when a = 0). rowdot sums, per 32-value sub-block s, the exact integer product P_s of the
+ *   when a = 0; a group with a < 2^-100 first scales a and v by 2^100, which is exact, so 127 / a
+ *   stays finite). rowdot sums, per 32-value sub-block s, the exact integer product P_s of the
  *   block's integer weights and the codes, scaled by the block's FP32 scale times d_s, into 32 lane
  *   partials by sub-block index modulo 32 with one fma each, in ascending s, then adds the
  *   partials pairwise at distances 16, 8, 4, 2, 1. SiLU is canon::silu_c.
@@ -168,6 +169,9 @@ public:
         int max_jobs        = 16; // per round
         int spin_iterations = 1 << 16;
         std::vector<int> cpus; // optional CPU of worker i (worker 0 is the caller, not pinned)
+        // Optional liveness word: every worker atomically increments it as it takes each work item,
+        // so it keeps changing for as long as a round makes progress (CpuMissService's heartbeat).
+        std::uint32_t* progress = nullptr;
     };
     explicit CpuExpertTeam(Options options);
     ~CpuExpertTeam();
@@ -211,8 +215,9 @@ struct MoeDispatch {
 [[nodiscard]] MoeDispatch carve_moe_dispatch(void* base, std::int32_t experts, std::int32_t entries);
 /// Fills `dispatch` from routing.ids: counts, offsets (exclusive scan, offsets[E] = k*T), jobs in
 /// ascending expert id, job_count, and entries grouped by expert (their order within an expert is
-/// unspecified). When `route_log` is not null it also receives a copy of the k*T ids. The arrays need
-/// no clearing between calls, so a captured call replays correctly.
+/// unspecified). When `route_log` is not null it also receives a copy of the k*T ids. An id outside
+/// [0, E) (moe_route never writes one) is logged but not dispatched, and offsets[E] counts only the
+/// dispatched entries. The arrays need no clearing between calls, so a captured call replays correctly.
 void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
                   std::int32_t* route_log, cudaStream_t stream);
 
