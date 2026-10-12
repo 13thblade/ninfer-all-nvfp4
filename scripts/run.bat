@@ -17,6 +17,15 @@ rem the plain qwen4exp-iq2xs.ninfer; NINFER_SPEC=none turns it off. It pins all 
 rem of routed experts in host RAM and caches the most-used ones in VRAM; startup refuses, saying how
 rem much is missing, when Windows cannot keep 2 GiB free beside them. The expert cache's state is
 rem saved beside the model, so the second start is warm. NINFER_CONTEXT overrides the context.
+rem The 29 GB n-gram volume (<model>.ngram) is read on every prompt, so keep it on the fastest drive:
+rem with the model on a SATA SSD, a copy of only the volume on NVMe prefilled 1.1-1.4x faster.
+rem Point NINFER_NGRAM_VOLUME at that copy (the 40 GB model can stay where it is):
+rem
+rem   set NINFER_NGRAM_VOLUME=C:\ninfer-models\qwen4exp\qwen4exp-iq2xs.ninfer.ngram
+rem
+rem One copy serves both the plain and the -mtp artifact when the -mtp one was converted with
+rem --ngram-reuse, as docs\weight-conversion.md shows; the server refuses a volume from another
+rem conversion.
 rem
 rem `tuned` is the recommended profile: rk4v4 KV, speculation plus the draft head, the memory
 rem flags, vision in overlay residency, and an 8 GiB pinned Host context budget for the cache.
@@ -207,6 +216,15 @@ set "LABEL="
 set "PROFILE_ARGS="
 set "PREFILL_NOTE="
 set "HINT="
+set "NGRAM_VOLUME_ARGS="
+set "NGRAM_VOLUME_NOTE="
+rem Only Flash-Next has an n-gram volume, so refuse rather than ignore the variable elsewhere.
+rem Branch with goto rather than a parenthesised block, so the variable's value never sits inside one.
+if "%NINFER_NGRAM_VOLUME%"=="" goto :ngram_guard_done
+if /i "%MODEL_KEY%"=="qwen38-flash-next" goto :ngram_guard_done
+echo NINFER_NGRAM_VOLUME is for qwen38-flash-next only; clear it to serve %MODEL_KEY% 1>&2
+exit /b 2
+:ngram_guard_done
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b/tuned" goto :profile_27b_tuned
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen36-35b-a3b/tuned" goto :profile_35b_tuned
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-flash-next/tuned" goto :profile_flash_next
@@ -368,6 +386,27 @@ set "LABEL=one request  ^|  context %CONTEXT%  ^|  INT8 KV  ^|  text only, %SPEC
 if /i "%SPEC%"=="none" if exist "%MODEL%" for %%F in ("%MODEL%") do if /i not "%%~nF"=="qwen4exp-iq2xs-mtp" set "HINT=Faster decode: convert with --mtp-gguf to qwen4exp-iq2xs-mtp.ninfer (docs\weight-conversion.md); this launcher then uses it."
 if /i "%SPEC%"=="none" if not "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%qwen4exp-iq2xs-mtp.ninfer" for %%F in ("%MODEL%") do if /i not "%%~nF"=="qwen4exp-iq2xs-mtp" set "HINT=Faster decode: qwen4exp-iq2xs-mtp.ninfer is beside this model; clear NINFER_MODEL to use it."
 set "PREFILL_NOTE=Loads in about 2 minutes: 33 GiB of experts are pinned in host RAM"
+rem The 29 GB n-gram volume is read unbuffered on every prompt, so its drive sets prefill speed while
+rem the 40 GB artifact is read once at load. Measured 2026-10-12 with the artifact on a SATA SSD:
+rem moving only the volume to NVMe made prefill 1.37x / 1.11x / 1.13x faster at 4K / 32K / 128K
+rem (mean per-prompt ratio; docs\serving.md). NINFER_NGRAM_VOLUME points at such a copy; the server
+rem checks it belongs to the model, so one copy serves the plain and the -mtp artifact alike when they
+rem share a volume (--ngram-reuse). Not a parenthesised block: the path may contain ")".
+set "NGRAM_VOLUME_NOTE=N-gram volume: beside the model. It is read on every prompt; if that is a SATA drive, a copy on NVMe (NINFER_NGRAM_VOLUME) prefills 1.1-1.4x faster"
+if "%NINFER_NGRAM_VOLUME%"=="" goto :ngram_volume_done
+if exist "%NINFER_NGRAM_VOLUME%\*" goto :ngram_volume_folder
+if not exist "%NINFER_NGRAM_VOLUME%" goto :ngram_volume_missing
+set NGRAM_VOLUME_ARGS=--ngram-volume "%NINFER_NGRAM_VOLUME%"
+set NGRAM_VOLUME_NOTE=N-gram volume: "%NINFER_NGRAM_VOLUME%"  (NINFER_NGRAM_VOLUME)
+goto :ngram_volume_done
+:ngram_volume_folder
+echo NINFER_NGRAM_VOLUME must name the .ngram file itself, not a folder: "%NINFER_NGRAM_VOLUME%" 1>&2
+exit /b 2
+:ngram_volume_missing
+echo NINFER_NGRAM_VOLUME names a file that does not exist: "%NINFER_NGRAM_VOLUME%" 1>&2
+echo Copy the model's .ngram file there, or clear NINFER_NGRAM_VOLUME to read the one beside the model. 1>&2
+exit /b 2
+:ngram_volume_done
 goto :launch
 
 :profile_27b_int8
@@ -543,6 +582,7 @@ if not exist "%MODEL%" (
 
 echo %TITLE%  ^|  %LABEL%
 if not "%PREFILL_NOTE%"=="" echo %PREFILL_NOTE%
+if defined NGRAM_VOLUME_NOTE echo %NGRAM_VOLUME_NOTE%
 if /i "%PROFILE%"=="tuned" echo %CACHE_NOTE%
 if /i "%PROFILE%"=="tuned" echo Sampling guard: min-p %MIN_P%, presence penalty %PRESENCE%  (NINFER_MIN_P, NINFER_PRESENCE_PENALTY; "default" = registered preset)
 if /i "%PROFILE%"=="tuned" if defined LOOP_NOTE echo %LOOP_NOTE%
@@ -565,7 +605,7 @@ rem "( ... )" command group, that character can be taken as the group's own clos
 rem break the batch parse, quoting notwithstanding -- so this invocation runs unparenthesised, with
 rem goto standing in for the logged/unlogged branch instead.
 if /i "%PROFILE%"=="tuned" goto :launch_logged
-"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% %PROFILE_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS%
+"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS%
 endlocal
 exit /b %ERRORLEVEL%
 
@@ -574,7 +614,7 @@ rem Run the server with its output shown and kept, so a failure the launcher can
 rem told apart from any other. Only a failed host pin retries; a crash or a bad artifact does not.
 rem The log is written as ASCII on purpose: Tee-Object writes UTF-16, which findstr cannot search.
 set "SERVER_LOG=%TEMP%\ninfer-run-%RANDOM%%RANDOM%.log"
-"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% %PROFILE_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS% 2>&1 | powershell -NoProfile -Command "$input | ForEach-Object { $_; Add-Content -LiteralPath '%SERVER_LOG%' -Value $_ -Encoding Ascii }"
+"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS% 2>&1 | powershell -NoProfile -Command "$input | ForEach-Object { $_; Add-Content -LiteralPath '%SERVER_LOG%' -Value $_ -Encoding Ascii }"
 findstr /c:"not enough free GPU memory" "%SERVER_LOG%" >nul 2>&1
 if not errorlevel 1 goto :memory_advice
 if not "%HOST_RETRY%"=="1" goto :server_done
