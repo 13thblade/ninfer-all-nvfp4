@@ -41,7 +41,7 @@ $lockPath = Join-Path $env:TEMP 'ninfer-gpu.lock'
 $lock = $null
 while (-not $lock) {
   try   { $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None') }
-  catch [System.IO.IOException] { Start-Sleep -Seconds 15 }   # someone else holds it
+  catch [System.IO.IOException] { Start-Sleep -Milliseconds 500 }   # someone else holds it
 }
 try {
   # ... GPU work: bench, ctest, server run ...
@@ -52,6 +52,9 @@ try {
 
 - Waiting can take hours while another agent benchmarks. Put the loop in a script and run it with
   `run_in_background`, rather than polling from the conversation.
+- Poll quickly, about every 0.5 s, as above. The lock has no queue: when it is released, the first
+  waiter to retry gets it. A waiter polling every 15 s lost to faster pollers again and again and
+  waited hours for a few minutes of tests.
 - Keep each A/B (ABBA) set inside one hold, so another agent can't run between its halves.
   Release between phases so others can get a turn.
 - For a server, keep the handle open until the server process exits, not just until it starts.
