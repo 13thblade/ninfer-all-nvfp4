@@ -104,6 +104,16 @@ void moe_decode_down_launch(const MoeDecodeDownArgs& args, int chunk, cudaStream
 template <ggml_type type>
 void moe_decode_prep_launch(const MoeDecodePrepArgs& args, cudaStream_t stream);
 
+// Whether slice_dequantize serves the type (every type but IQ1_M).
+template <ggml_type type>
+inline constexpr bool kSliceDequantize = type != GGML_TYPE_IQ1_M;
+
+// Rows of a GGUF matrix to dst_t through the vector kernels' slice decoders: one thread a 32-value
+// slice, written as 16-byte stores (ggml_bridge_vec.cuh).
+template <ggml_type type, typename dst_t>
+void slice_dequantize(const void* weight, std::int64_t row_bytes, int k, const std::int32_t* row_ids,
+                      int rows, dst_t* out, std::int64_t out_row_stride, cudaStream_t stream);
+
 // Byte offset of the scales inside a planar vector activation of `columns` x `k`.
 [[nodiscard]] constexpr std::size_t vec_scales_offset(int k, int columns) {
     return (std::size_t(k) * columns + 15) / 16 * 16;

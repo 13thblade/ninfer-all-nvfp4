@@ -455,6 +455,13 @@ void launch_dequantize(const void* weight, std::int64_t row_bytes, int k,
         rows <= 0) {
         throw std::invalid_argument("gguf dequantize: K must be whole blocks of the type");
     }
+    // The slice decoders write whole 16-byte groups; this kernel stays for the rest.
+    if constexpr (kSliceDequantize<type>) {
+        if (out_row_stride % 8 == 0 && reinterpret_cast<std::uintptr_t>(out) % 16 == 0) {
+            slice_dequantize<type>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
+            return;
+        }
+    }
     dequantize_rows_kernel<type, threads, dst_t>
         <<<dim3((k + QK_K - 1) / QK_K, rows, 1), threads, 0, stream>>>(
             static_cast<const char*>(weight), row_bytes, row_ids, out, out_row_stride, k);
