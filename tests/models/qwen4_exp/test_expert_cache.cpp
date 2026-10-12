@@ -452,9 +452,15 @@ void test_lending() {
     const std::uint32_t K     = *cache.frame_key(first);
     const std::uint64_t s1    = serial_of[K];
     const std::uint32_t capacity = cache.policy().capacity();
-    const std::uint32_t evicted  = cache.lend(first, 3, cmds);
+    std::vector<std::uint32_t> held;
+    for (std::uint32_t f = first; f < first + 3; ++f) { held.push_back(*cache.frame_key(f)); }
+    std::vector<std::uint32_t> displaced;
+    const std::uint32_t evicted = cache.lend(first, 3, cmds, &displaced);
     apply();
     check(evicted == 3, "lend evicts the three experts in the run");
+    std::sort(held.begin(), held.end());
+    std::sort(displaced.begin(), displaced.end());
+    check(displaced == held, "lend reports the keys it evicted (the give-back restores them)");
     check(cache.loaned_frames() == 3 && cache.policy().capacity() == capacity - 3, "lend shrinks the capacity by the run");
     bool clear = true;
     for (std::uint32_t f = first; f < first + 3; ++f) { clear &= !cache.frame_key(f).has_value(); }

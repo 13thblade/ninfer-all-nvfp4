@@ -1,5 +1,5 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/program/expert_cache/expert_cache.cpp (Apache-2.0).
-// Modified for NInfer-3090: NInfer's namespace.
+// Modified for NInfer-3090: NInfer's namespace; lend() reports the keys it evicted.
 
 #include "models/qwen4_exp/program/expert_cache/expert_cache.h"
 
@@ -521,7 +521,8 @@ std::optional<std::uint32_t> CacheController::choose_run(std::uint32_t count, st
     return std::nullopt;
 }
 
-std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out) {
+std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out,
+                                    std::vector<std::uint32_t>* evicted_keys) {
     if (frames_.pending_count() != 0) { throw std::logic_error("frames lent while some still retire"); }
     std::uint32_t evicted = 0;
     for (std::uint32_t f = first; f < first + count; ++f) {
@@ -530,6 +531,7 @@ std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, st
         policy_.evict(key);
         make_absent(key, out);
         frames_.release_now(f);
+        if (evicted_keys != nullptr) { evicted_keys->push_back(key); }
         ++evicted;
     }
     frames_.lend(first, count);
@@ -540,6 +542,7 @@ std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, st
     for (std::uint32_t v : victims) {
         if (table_[v].state == ResidencyState::kAbsent) { continue; } // still queued: drain drops it
         frames_.release_now(make_absent(v, out));
+        if (evicted_keys != nullptr) { evicted_keys->push_back(v); }
         ++evicted;
     }
     return evicted;

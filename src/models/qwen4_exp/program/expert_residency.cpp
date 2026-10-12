@@ -1,7 +1,8 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/program/expert_residency.cpp (Apache-2.0).
 // Modified for NInfer-3090: per-layer record strides in one frame size; no SSD tier or landing
-// frames; frame lending without the SSD tier's holds and with a refill of the returned frames; table
-// uploads through core/pinned_upload.h; drain() for the warm start and shutdown.
+// frames; frame lending without the SSD tier's holds, whose give-back restores the displaced experts
+// and fills the rest by score, as does a grow; table uploads through core/pinned_upload.h; drain()
+// for the warm start and shutdown.
 
 #include "models/qwen4_exp/program/expert_residency.h"
 
@@ -187,6 +188,10 @@ ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream
             frames_ = backed;
             if (table_dirty_) { upload_table(compute); }
             issue_loads(compute);
+            // The new frames take the best experts that are not resident (after a KV shrink: those
+            // the growth evicted, unless the request since used better ones).
+            commands_.clear();
+            out.refilled = refill(compute, {});
         }
     }
     if (table_dirty_) { upload_table(compute); }
@@ -334,7 +339,8 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStrea
     const auto first = controller_->choose_run(count, {});
     if (!first) { throw std::logic_error("expert residency: no run of frames to lend"); }
     commands_.clear();
-    controller_->lend(*first, count, commands_);
+    displaced_.clear();
+    controller_->lend(*first, count, commands_, &displaced_);
     auto* table = static_cast<std::int32_t*>(table_host_.data());
     for (const auto& command : commands_) {
         if (command.kind == CacheController::Command::Kind::kWriteEntry &&
@@ -354,23 +360,47 @@ std::uint32_t ExpertResidency::give_back(FrameLease& lease, cudaStream_t compute
     commands_.clear();
     controller_->give_back(lease.first, lease.count, commands_);
     lease = {};
-    // The best experts that are not resident, by LFRU score (ties to the lower key), into the free
-    // frames: without it the returned run would fill only at the decode promotion rate.
+    // The experts the lease displaced come back first: prefill calls promote nothing, so they are
+    // the set decode had before the prompt. Refilling by score alone took the experts the prompt's
+    // own calls had just used (they score highest), and decode after the prompt hit 1.1-1.6 points
+    // less (integration #256).
+    const std::uint32_t loaded = refill(compute, displaced_);
+    displaced_.clear();
+    return loaded;
+}
+
+std::uint32_t ExpertResidency::refill(cudaStream_t compute, std::span<const std::uint32_t> first) {
+    // `first` that is not resident, then the best other experts that are not resident, each by LFRU
+    // score, best first (ties to the lower key), into the free frames: without it free frames would
+    // fill only at the decode promotion rate. The best land first.
     const auto& policy = controller_->policy();
-    std::vector<std::pair<double, std::uint32_t>> ranked;
-    ranked.reserve(policy.num_keys());
-    for (std::uint32_t key = 0; key < policy.num_keys(); ++key) {
-        if (!policy.resident(key) && policy.count(key) > 0) { ranked.emplace_back(policy.score(key), key); }
-    }
-    const std::size_t room = controller_->free_frames();
-    const std::size_t take = std::min(room, ranked.size());
-    std::partial_sort(ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(take), ranked.end(),
-                      [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+    const auto order   = [&](std::vector<std::pair<double, std::uint32_t>>& ranked, std::size_t take) {
+        std::partial_sort(ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(take), ranked.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+    };
+    std::size_t room = controller_->free_frames();
     std::vector<std::uint32_t> keys;
-    keys.reserve(take);
+    std::vector<std::pair<double, std::uint32_t>> ranked;
+    for (const std::uint32_t key : first) {
+        if (key < policy.num_keys() && !policy.resident(key)) { ranked.emplace_back(policy.score(key), key); }
+    }
+    std::size_t take = std::min(room, ranked.size());
+    order(ranked, take);
     for (std::size_t i = 0; i < take; ++i) { keys.push_back(ranked[i].second); }
-    const std::uint32_t loaded = controller_->seed(keys, {}, commands_);
-    issue_loads(compute);
+    room -= take;
+    if (room != 0) {
+        std::vector<std::uint8_t> chosen(policy.num_keys(), 0);
+        for (const std::uint32_t key : keys) { chosen[key] = 1; }
+        ranked.clear();
+        for (std::uint32_t key = 0; key < policy.num_keys(); ++key) {
+            if (!chosen[key] && !policy.resident(key) && policy.count(key) > 0) { ranked.emplace_back(policy.score(key), key); }
+        }
+        take = std::min(room, ranked.size());
+        order(ranked, take);
+        for (std::size_t i = 0; i < take; ++i) { keys.push_back(ranked[i].second); }
+    }
+    const std::uint32_t loaded = keys.empty() ? 0 : controller_->seed(keys, {}, commands_);
+    issue_loads(compute); // with any load commands_ already held (a give-back's queued experts)
     return loaded;
 }
 

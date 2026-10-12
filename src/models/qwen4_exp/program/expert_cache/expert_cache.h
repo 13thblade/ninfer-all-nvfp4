@@ -1,7 +1,7 @@
 #pragma once
 
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/program/expert_cache/expert_cache.h (Apache-2.0).
-// Modified for NInfer-3090: NInfer's namespace.
+// Modified for NInfer-3090: NInfer's namespace; lend() reports the keys it evicted.
 
 // Host side of the Qwen3.8-Flash-Next expert cache (docs/maintainer/qwen3_8-flash-next-design.md
 // §9): the LFRU policy, the device residency-entry encoding, and the frame pool with epoch-based
@@ -225,8 +225,10 @@ public:
     [[nodiscard]] std::optional<std::uint32_t> choose_run(std::uint32_t count, std::span<const std::uint8_t> busy) const;
     // At a quiescent boundary (no retiring frame): evicts every expert held in the run (ABSENT
     // writes), lends the run and shrinks the policy's capacity by `count` (further victims are
-    // evicted elsewhere). Returns the number of evicted experts.
-    std::uint32_t lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
+    // evicted elsewhere). Returns the number of evicted experts; `evicted`, when given, receives
+    // their keys.
+    std::uint32_t lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out,
+                       std::vector<std::uint32_t>* evicted = nullptr);
     // Returns the run: capacity grows back and queued experts load into it.
     void give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
     // Warm start (design §19.3.5 S4b): sets every key's count from `counts` (empty: unchanged), then

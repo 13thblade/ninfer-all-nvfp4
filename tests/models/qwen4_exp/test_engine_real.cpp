@@ -20,10 +20,11 @@
 // Program logs each request's expert-cache hit rate.
 //
 //   ninfer_qwen4_exp_engine_real_test --bench [--max-context N] [--generate N] [--no-graph]
-//       [--expert-cache-mib N] [--no-expert-state] [--split N] TOKENS...
+//       [--expert-cache-mib N] [--no-expert-state] [--split N] [--print-ids] TOKENS...
 //
 // --split N streams each request with live timings and also reports decode tok/s over generated
 // tokens 2..N and N+1..end (decode right after a prefill, while the expert cache refills).
+// --print-ids prints each job's generated ids (a needle check decodes them).
 //
 // TOKENS is @FILE (ids separated by commas or whitespace) or a comma-separated id list.
 
@@ -301,7 +302,7 @@ bool same(const char* label, const std::vector<TokenId>& reference, const std::v
 
 int bench(const std::string& artifact, const std::vector<std::string>& args) {
     std::uint32_t max_context = 33'792, tokens = 512, split = 0;
-    bool graph = true, state = true;
+    bool graph = true, state = true, print_ids = false;
     std::optional<std::uint64_t> cache;
     std::vector<std::string> jobs;
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -322,6 +323,8 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
             graph = false;
         } else if (a == "--no-expert-state") {
             state = false;
+        } else if (a == "--print-ids") {
+            print_ids = true;
         } else {
             jobs.push_back(a);
         }
@@ -337,6 +340,11 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
         const auto prompt = parse_tokens(job);
         const Run run     = generate(engine, prompt, tokens, split);
         print_run(job.c_str(), run, prompt.size());
+        if (print_ids) {
+            std::string ids;
+            for (const TokenId id : run.ids) { ids += (ids.empty() ? "" : ",") + std::to_string(id); }
+            std::printf("%s: ids: %s\n", job.c_str(), ids.c_str());
+        }
     }
     return 0;
 }

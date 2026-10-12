@@ -22,7 +22,8 @@ references, `engine-architecture.md`).
 | 9 | M1: Program and Engine integration (one lane, elastic VMM KV, VRAM expert cache with LFRU and warm start, RAM/VRAM ledgers, decode CUDA graph, `EngineCore<Qwen4ExpInstance>`), serving and the `qwen38-flash-next` launcher profile | done (measurements below) |
 | 10 | Prefill: exact GPU wide expert route (int8 `mma.sync`, cp.async), prefill expert streaming into lent frames, 4,096-token calls, n-gram row prefetch | done (prefill gate missed by 3-5%, below) |
 | 11 | Decode (M2 gate): few misses zero-copy (11a), fewer decode-graph nodes and the GGML `linear_pair` (11b), the decode graph split around the n-gram row read and the startup frame retry (11c) | done (measurements below) |
-| 12-14 | 128K, MTP, vision | not started |
+| 12 | 128K through the elastic KV: growth takes expert frames before it maps (12a, the crash and 128K prefill fix); prefill lending restores the experts it displaced and is sized to the prompt (12b, the decode fix) | done (measurements below) |
+| 13-14 | MTP, vision | not started |
 
 The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
 the six dense formats (PR 3); offloaded_sparse_moe executes the three expert record formats (PR 7).
@@ -293,6 +294,49 @@ its own load (135,168-token context), 3 requests. Prompt tokens over the Program
 outputs equal the CPU engine's bits (`ninfer_offloaded_moe_wide_test`, every format and placement,
 the 48 real banks).
 
+## PR 12 measurements
+
+RTX 3090 (WDDM, display attached), CUDA 12.8, MSVC 14.44, Ryzen 9 5950X, DDR4-2133; artifact and
+n-gram volume on K: (SATA). Process-level ABBA against the integration build (`integ/qwen4exp-m1`,
+#256) and #253 (decode); greedy ids, 512 generated tokens for decode, 4 for prefill.
+
+**The crash and the 128K prefill collapse had one cause.** The KV pool grew by mapping new memory
+first and took expert frames only if a map failed. On a VRAM the startup sizing had filled (~400 MiB
+free), a 128K growth (+1,344 MiB) put the process ~900 MiB over its WDDM budget and past physical
+memory, so the OS paged device memory (128K prefill at 447 tok/s), and when the VRAM monitor's
+`cudaMemGetInfo` ran meanwhile, `cuMemSetAccess` returned `CUDA_ERROR_NOT_READY`. A standalone probe
+reproduces it (map-first growth past the budget with a concurrent `cudaMemGetInfo` fails at the
+physical limit, 2 of 3 runs; none with only DXGI queries, within the budget, or with take-first growth in 48 cycles).
+The growth now releases frames first (Infernix's `grow_kv` order).
+
+| Check | Integration (#256) | PR 12 |
+|---|---|---|
+| 4K/32K/128K alternating, 21 requests + warm-up, max-context 135,168 | every process crashed (2-3 growths) | no crash; process at 22.8-22.9 GiB dedicated, shared memory flat (no demotion), adapter ≤ 23.4 of 24 GiB |
+| 128K prefill in that alternation (n = 7) | 447, 1,243 (n = 2) | **2,105** [1,949-2,348] tok/s = 0.96× Strata (2,184) |
+| Decode after a 128K prompt / after a 32K prompt (wall, 512 tokens) | 21-42 tok/s for the first 64 tokens | **74.0** [72.3-75.2] / 78.1 [75.9-78.4] = 0.95×; first 64 tokens 74.7 |
+| Needles (10/50/90% depth) at 32K, 64K, 128K | not run (crash) | 9 of 9 retrieved |
+
+**Decode** (1K/8K/32K, D I B B I D, 6 requests per tier per process):
+
+| Prompt | #253 | Integration | PR 12 | PR 12 / #253 (paired) | PR 12 / integration (paired) | decode hits #253 / integ / PR 12 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1K | 81.2 | 79.8 | **81.9** | 1.002 ± 0.003 | 1.021 ± 0.003 | 98.0 / 96.8 / 98.2% |
+| 8K | 80.1 | 78.6 | **80.3** | 1.005 ± 0.002 | 1.027 ± 0.003 | 97.1 / 95.9 / 97.5% |
+| 32K | 79.0 | 76.9 | **78.8** | 0.998 ± 0.006 | 1.028 ± 0.002 | 96.5 / 95.2 / 96.8% |
+
+The integration's refill gave the lent frames to the experts the prompt's own calls had just used;
+restoring the displaced ones returns the cache to the set decode had (prefill calls promote nothing).
+The 8K target (80 tok/s) is met at 80.3 (range 79.2-83.8).
+
+**Prefill** (4K warm-up + 12 requests, 4 tokens, max-context 33,792; three sessions, I B B I twice and
+B I I B once): PR 12 / integration paired 4K **1.000** (0.998, 1.000, 1.001), 32K **0.994** (0.989 ±
+0.006, 0.991 ± 0.006, 1.000 ± 0.003). The I B B I deficit was mostly the second process of the session
+(slow in either build); what remains is the first 32K prompt after startup, 1-5% slower in every
+session (the cache holds the restored decode set instead of the warm-up prompt's experts); later
+32K prompts are equal. 0.95× / 0.97× Strata at 4K / 32K, as before.
+
+Quality (#243's method): logit dumps byte-identical to the integration's on all six texts (the
+forward does not use the Program). Greedy ids equal the integration's for every prompt measured.
 ## Artifact decisions
 
 Taken in PR 1 and revised in PR 2b, which aligned the artifact with Infernix (the model code and
@@ -379,8 +423,8 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `src/core/host_memory.{h,cpp}` | same path | The snapshot and working-set reserve only |
 | `src/core/pinned_upload.{h,cu}` | `src/core/device.{h,cu}` (`upload_pinned`) | Own translation unit |
 | `src/models/qwen4_exp/memory_plan.{h,cpp}` | same path | Full RAM mode only (fits or refuses; no SSD tier, no `--expert-ram-mib`); the VRAM sizing and control law unchanged; `kv_growth_frames` is `grow_kv`'s arithmetic as a pure function (PR 12) |
-| `src/models/qwen4_exp/program/expert_cache/expert_{cache,state}.{h,cpp}` | same paths | Verbatim |
-| `src/models/qwen4_exp/program/expert_residency.{h,cpp}` | same path | Per-layer record strides in one frame size; no SSD tier or landing; frame lending (PR 10) with a refill of the returned frames |
+| `src/models/qwen4_exp/program/expert_cache/expert_{cache,state}.{h,cpp}` | same paths | Verbatim but for `lend` reporting the keys it evicts (PR 12) |
+| `src/models/qwen4_exp/program/expert_residency.{h,cpp}` | same path | Per-layer record strides in one frame size; no SSD tier or landing; frame lending (PR 10) whose give-back restores the displaced experts first (PR 12); a grow refills its new frames by score |
 | `src/models/qwen4_exp/program/vram_monitor.{h,cpp}` | same path | Verbatim |
 | `src/models/qwen4_exp/program/program.{h,cpp}` | `program/program.{h,cpp}`, `program/program_impl.h` | NInfer's execution contract (prefix reuse off, one lane); device plan, elastic KV (PR 12: `grow_kv`'s order, frames released before the pool maps; the pool shrinks at the next admission that needs less instead of after 60 s idle, and a growth that does not fit fails the request), decode budget, warm start, VRAM control, link probe and decode graph from Infernix |
 | `src/runtime/engine/qwen4_exp_instance.{h,cpp}` | same path | NInfer's EngineCore and ResourceManager with the context cache off; refuses unsupported options |
