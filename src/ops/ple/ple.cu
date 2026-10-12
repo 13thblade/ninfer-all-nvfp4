@@ -1,7 +1,8 @@
 // Adapted from Infernix a3edb450 src/ops/ple/ple.cu (Apache-2.0).
 // Modified for NInfer-3090: ple_embed decodes GGML IQ4_NL rows (Infernix: FP8 E4M3 rows times one
-// scale), the norm weights are stored FP32 multipliers, the convolution weight is FP16 [K, C]
-// (each channel's taps contiguous), and the namespaces and includes are NInfer's.
+// scale), the norm weights are stored FP32 multipliers, the convolution weight is FP32 [K, C]
+// (each channel's taps contiguous; the GGUF's F16 words widened exactly by the converter), and the
+// namespaces and includes are NInfer's.
 
 #include "ninfer/ops/ple.h"
 
@@ -130,7 +131,7 @@ __global__ void __launch_bounds__(kThreads)
 
 // One thread per (channel, column): reads the pre-update history.
 __global__ void conv_kernel(const bf16* __restrict__ gated, const bf16* __restrict__ normalized,
-                            const __half* __restrict__ weight, int taps, int dilation, int span,
+                            const float* __restrict__ weight, int taps, int dilation, int span,
                             int channels, int width, const bf16* __restrict__ states,
                             const std::int32_t* __restrict__ source_slots, int columns,
                             bf16* __restrict__ residual) {
@@ -150,7 +151,7 @@ __global__ void conv_kernel(const bf16* __restrict__ gated, const bf16* __restri
             x = __bfloat162float(
                 states[(static_cast<std::size_t>(slot) * span + (span + source)) * channels + c]);
         }
-        acc += __half2float(weight[static_cast<std::size_t>(c) * taps + j]) * x;
+        acc += weight[static_cast<std::size_t>(c) * taps + j] * x;
     }
     const std::size_t i = static_cast<std::size_t>(t) * channels + c;
     const float out     = __bfloat162float(gated[i]) + acc * sigmoidf(acc);
@@ -255,7 +256,7 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
                      std::int32_t dilation, Tensor& states, const Tensor& source_slots,
                      const Tensor& destination_slots, Tensor& residual, cudaStream_t stream) {
     require(contiguous(gated, DType::BF16) && contiguous(normalized, DType::BF16) &&
-                contiguous(weight, DType::FP16) && contiguous(states, DType::BF16) &&
+                contiguous(weight, DType::FP32) && contiguous(states, DType::BF16) &&
                 contiguous(residual, DType::BF16) && contiguous(source_slots, DType::I32) &&
                 (destination_slots.data == nullptr || contiguous(destination_slots, DType::I32)),
             "conv requires contiguous tensors");
@@ -263,7 +264,7 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
                 rank_at_most(weight, 2) && rank_at_most(states, 3) &&
                 rank_at_most(source_slots, 1) &&
                 (destination_slots.data == nullptr || rank_at_most(destination_slots, 1)),
-            "conv requires [C, T] activations, an FP16 [K, C] weight, [C, span, slots] state and "
+            "conv requires [C, T] activations, an FP32 [K, C] weight, [C, span, slots] state and "
             "[sequences] slot vectors");
     const int channels = gated.ne[0], columns = gated.ne[1], taps = weight.ne[0];
     const int sequences = source_slots.ne[0];
@@ -274,12 +275,12 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
                 (!update || destination_slots.ne[0] == sequences) && columns % sequences == 0,
             "conv shapes disagree");
     const int span = (taps - 1) * dilation;
-    require(states.ne[0] == channels && states.ne[1] == span,
-            "conv state must be [C, span, slots]");
+    require(states.ne[0] == channels && states.ne[1] == span && states.ne[2] > 0,
+            "conv state must be [C, span, slots] with at least one slot");
     const int width = columns / sequences;
     conv_kernel<<<dim3((channels + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
         static_cast<const bf16*>(gated.data), static_cast<const bf16*>(normalized.data),
-        static_cast<const __half*>(weight.data), taps, dilation, span, channels, width,
+        static_cast<const float*>(weight.data), taps, dilation, span, channels, width,
         static_cast<const bf16*>(states.data), static_cast<const std::int32_t*>(source_slots.data),
         columns, static_cast<bf16*>(residual.data));
     check_launch("conv");
@@ -301,7 +302,7 @@ void ple_conv_commit(const Tensor& normalized, const Tensor& commit_columns, Ten
             "commit requires [C, W, B] normalized, [C, span, slots] state and [B] vectors");
     const int channels = normalized.ne[0], width = normalized.ne[1], rows = normalized.ne[2];
     require(rows > 0 && width > 0 && commit_columns.ne[0] == rows && slots.ne[0] == rows &&
-                states.ne[0] == channels && states.ne[1] > 0,
+                states.ne[0] == channels && states.ne[1] > 0 && states.ne[2] > 0,
             "commit shapes disagree");
     commit_kernel<<<dim3((channels + kThreads - 1) / kThreads, rows), kThreads, 0, stream>>>(
         static_cast<const bf16*>(normalized.data), states.ne[1], channels, width,
