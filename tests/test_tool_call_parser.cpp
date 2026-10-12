@@ -1564,6 +1564,8 @@ int test_tolerant_never_keeps_cut_value() {
     // discard that text to keep the call, whether its wrapper is missing, present or absent.
     const std::string quoted_pair = "<parameter=command>\necho '</parameter>\n</function>";
     const std::vector<std::string> split = {
+        // The value's own tail follows the quoted pair, and the wrapper close is missing.
+        "<tool_call>\n<function=bash>\n<parameter=command>\necho '</parameter>\n</function>'",
         "<tool_call>\n<function=bash>\n" + quoted_pair + "'\n</parameter>\n</function>",
         "<tool_call>\n<function=bash>\n" + quoted_pair + "\n</tool_call>'\n</parameter>\n"
         "</function>\n</tool_call>",

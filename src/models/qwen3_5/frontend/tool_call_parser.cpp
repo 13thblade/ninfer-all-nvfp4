@@ -544,11 +544,18 @@ private:
         skip_format_whitespace(text_, pos);
         const FallbackReason failure = parse_function(pos, call);
         if (failure != FallbackReason::None) { return failure; }
+        const std::size_t function_end = pos;
         skip_format_whitespace(text_, pos);
         if (consume(pos, kToolClose)) { return FallbackReason::None; }
         // The function closed but its wrapper did not. Only a turn the model ended itself treats
-        // the missing `</tool_call>` as written; what follows parses as after any call.
-        if (repair_ == ToolCallRepair::UnclosedFinalCall) {
+        // the missing `</tool_call>` as written, and only when the output ends, another call
+        // follows, or the text after it starts on its own line: text glued to `</function>`
+        // (`echo '</parameter>\n</function>'`) is the rest of a value that quoted the closers,
+        // which the call would otherwise publish cut. Prose on a later line is not told apart
+        // from a value tail; the strict parser rejects both.
+        if (repair_ == ToolCallRepair::UnclosedFinalCall &&
+            (pos >= text_.size() || starts_with_at(text_, pos, kToolOpen) ||
+             function_open_header_begin(text_, pos) != 0 || pos > function_end)) {
             repaired_ = true;
             return FallbackReason::None;
         }
