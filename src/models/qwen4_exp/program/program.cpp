@@ -1257,10 +1257,13 @@ private:
 
     void release_lane() noexcept {
         if (lease_.valid() || lane_.vision_lease.valid()) {
+            // Each step runs whatever the earlier ones did: a failed sync or lease return must not
+            // leave the other lease lent (lane_ is reset below, which would drop its only owner).
+            auto sync   = [&] { device_.synchronize(); };
+            auto lease  = [&] { return_lease(); };
+            auto vision = [&] { return_vision(); };
             try {
-                device_.synchronize();
-                return_lease();
-                return_vision();
+                run_all(sync, lease, vision);
             } catch (...) {}
         }
         call_vision_ = nullptr;
@@ -1434,7 +1437,28 @@ private:
         return true;
     }
 
-    // Returns the lease (the device has finished with it) and refills its frames.
+    // Runs every step even when an earlier one threw, then rethrows the first failure. Used where a
+    // wait (a device sync, a stream drain) precedes handing a lent run back: a failed wait must not
+    // skip the give-back, or the frames stay lent for good. The give-back itself orders its copies
+    // behind the compute stream, so returning after a failed wait is safe on a device that still
+    // accepts work, and on one that does not nothing more can be corrupted.
+    template <class... Steps>
+    static void run_all(Steps&&... steps) {
+        std::exception_ptr first;
+        const auto one = [&first](auto& step) {
+            try {
+                step();
+            } catch (...) {
+                if (!first) { first = std::current_exception(); }
+            }
+        };
+        (one(steps), ...);
+        if (first) { std::rethrow_exception(first); }
+    }
+
+    // Returns the lease (the device has finished with it) and refills its frames. The frames go back
+    // even when draining the expert stream fails; the lease stays valid only while the controller
+    // still has them lent.
     void return_lease() {
         if (!lease_.valid()) { return; }
         wide_peak_ = std::max(wide_peak_, wide_work_ ? wide_work_->peak_used() : 0);
@@ -1443,9 +1467,10 @@ private:
         wide_work_.reset();
         // device_.synchronize() does not cover the expert copy stream: an aborted wide call can leave
         // its copies running into the ring frames give_back is about to hand to the cache.
-        if (stream_) { stream_->drain(); }
-        refilled_ += residency_->give_back(lease_, device_.stream);
-        frames_now_ = residency_->frames();
+        auto drain  = [&] { if (stream_) { stream_->drain(); } };
+        auto give   = [&] { refilled_ += residency_->give_back(lease_, device_.stream); };
+        auto frames = [&] { frames_now_ = residency_->frames(); };
+        run_all(drain, give, frames);
     }
 
     // ---------------------------------------------------------------- image input
@@ -1465,9 +1490,13 @@ private:
         ScopedLease& operator=(const ScopedLease&) = delete;
         ~ScopedLease() {
             if (!lease_.valid()) { return; }
+            // The give-back runs even when the sync failed: the lease must not outlive this scope
+            // lent. ExpertResidency::give_back hands the frames to the controller before anything
+            // else can throw, so a failure here leaves them returned.
+            auto sync = [&] { device_.synchronize(); };
+            auto give = [&] { (void)residency_.give_back(lease_, device_.stream); };
             try {
-                device_.synchronize();
-                (void)residency_.give_back(lease_, device_.stream);
+                run_all(sync, give);
             } catch (...) {}
         }
         [[nodiscard]] const ExpertResidency::FrameLease& lease() const noexcept { return lease_; }

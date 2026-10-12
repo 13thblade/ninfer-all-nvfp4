@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <thread>
@@ -343,6 +344,7 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStrea
     // Several leases may be out at once (an image's handoff beside the wide calls' lease): the
     // displaced experts of all of them come back as the last one returns.
     if (controller_->loaned_frames() == 0) { displaced_.clear(); }
+    const std::size_t displaced_mark = displaced_.size();
     controller_->lend(*first, count, commands_, &displaced_);
     try {
         auto* table = static_cast<std::int32_t*>(table_host_.data());
@@ -355,12 +357,18 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStrea
         }
         if (table_dirty_) { upload_table(compute); }
     } catch (...) {
-        // The run is lent in the controller but no lease was returned to the caller: give it back so
-        // the frames are not stranded. The evicted experts stay absent and table_dirty_ stays set,
-        // so the next table upload publishes the same state the controller holds.
-        commands_.clear();
-        controller_->give_back(*first, count, commands_);
-        if (controller_->loaned_frames() == 0) { displaced_.clear(); }
+        // The run is lent in the controller but no lease reached the caller. Undo the lend exactly as
+        // a give-back does: the frames go back, the experts this lend displaced are reloaded and every
+        // load the give-back queued is issued, so the state is the one before lend() (a frame
+        // returned with its loads dropped would hold a resident that never publishes). A failure of
+        // the undo itself must not replace the one being handled; table_dirty_ stays set, so the next
+        // round's upload publishes the controller's state either way.
+        try {
+            commands_.clear();
+            controller_->give_back(*first, count, commands_);
+            (void)settle_return(compute, displaced_mark);
+        } catch (...) {}
+        displaced_.resize(std::min(displaced_.size(), displaced_mark));
         throw;
     }
     auto* base = const_cast<std::uint8_t*>(frame_base());
@@ -370,15 +378,29 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStrea
 
 std::uint32_t ExpertResidency::give_back(FrameLease& lease, cudaStream_t compute) {
     if (!lease.valid()) { return 0; }
+    // The lease stays the caller's until the controller has the frames back (a throw before that
+    // leaves it valid, to be returned again); after that only the refill can fail, which leaves the
+    // frames returned and the lease cleared.
     commands_.clear();
     controller_->give_back(lease.first, lease.count, commands_);
     lease = {};
-    // The experts the lease displaced come back first: prefill calls promote nothing, so they are
+    return settle_return(compute, 0);
+}
+
+std::uint32_t ExpertResidency::settle_return(cudaStream_t compute, std::size_t displaced_from) {
+    // The experts the run displaced come back first: prefill calls promote nothing, so they are
     // the set decode had before the prompt. Refilling by score alone took the experts the prompt's
     // own calls had just used (they score highest), and decode after the prompt hit 1.1-1.6 points
-    // less (integration #256).
-    const std::uint32_t loaded = refill(compute, displaced_);
+    // less (integration #256). commands_ holds the give-back's queued loads; refill issues them.
+    std::uint32_t loaded = 0;
+    std::exception_ptr failure;
+    try {
+        loaded = refill(compute, std::span<const std::uint32_t>(displaced_).subspan(displaced_from));
+    } catch (...) {
+        failure = std::current_exception();
+    }
     if (controller_->loaned_frames() == 0) { displaced_.clear(); }
+    if (failure) { std::rethrow_exception(failure); }
     return loaded;
 }
 
