@@ -359,7 +359,7 @@ public:
           collect_open_reasoning(split_reasoning && tool_call_output_ != nullptr &&
                                  !tool_call_output_->constrained && grammar_ == nullptr),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
-                           output.tool_name_max_length),
+                           output.tool_name_max_length, output.tolerant_tool_calls),
           grammar(std::move(grammar_)), combined(combined_) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
@@ -819,7 +819,7 @@ PublishedOutput OutputSession::commit_preview() {
             impl_->state.in_reasoning && model_ended ? std::string_view(impl_->open_reasoning)
                                                      : std::string_view{};
         fi::ToolCallOutputDecoder::Terminal terminal =
-            impl_->tool_call_output.finish(impl_->preview_finish_reason, open_reasoning);
+            impl_->tool_call_output.finish(impl_->preview_finish_reason, open_reasoning, model_ended);
         impl_->tool_calls      = std::move(terminal.tool_calls);
         impl_->tool_call_parse = terminal.diagnostics;
         if (!terminal.content.empty()) {
