@@ -141,6 +141,11 @@ CheckpointHandle Program::install_external_checkpoint(const PromptGraft& graft) 
     return impl_->install_external_checkpoint(graft);
 }
 
+runtime::PrefillWork Program::prefill_work(const RequestBasePlan& base, std::uint32_t begin,
+                                          std::uint32_t end) const {
+    return impl_->prefill_work(base, begin, end);
+}
+
 std::optional<SourceCandidate>
 Program::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
                         bool consume_source, std::span<const CheckpointHandle> private_points,

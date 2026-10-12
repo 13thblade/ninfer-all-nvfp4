@@ -1804,7 +1804,9 @@ private:
         if (materializing_ && materializing_->request.get() == &sibling) {
             if (materializing_->resumed) { return std::nullopt; }
             cursor = materializing_->summary.reused_prompt_tokens;
-        } else if (sibling.admitted_begin && sibling.lane) {
+        } else if (sibling.is_prefilling() && sibling.admitted_begin && sibling.lane) {
+            // A replaying lane keeps its earlier computed_prompt_tokens while replay advances a
+            // separate cursor, so only a lane in fresh prefill has a trustworthy position.
             cursor = sibling.admitted_begin->reused_prompt_tokens + sibling.computed_prompt_tokens;
         } else {
             return std::nullopt;
@@ -1812,7 +1814,9 @@ private:
         return cursor;
     }
 
-    [[nodiscard]] std::vector<std::shared_ptr<Request>> prefilling_siblings() const {
+    // Every request occupying a lane or the materializing slot; sibling_cursor filters to those
+    // actually prefilling.
+    [[nodiscard]] std::vector<std::shared_ptr<Request>> resident_siblings() const {
         std::vector<std::shared_ptr<Request>> out;
         if (materializing_ && !materializing_->resumed) { out.push_back(materializing_->request); }
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -1836,7 +1840,7 @@ private:
         std::uint32_t best = 0;
         for (const auto& choice : sources) { best = std::max(best, choice.source.reused_tokens); }
         std::optional<SiblingWait> chosen;
-        for (const auto& sibling : prefilling_siblings()) {
+        for (const auto& sibling : resident_siblings()) {
             const auto cursor = sibling_cursor(*sibling);
             if (!cursor || !sibling->base_plan->summary().publish_continuation) { continue; }
             const auto& other = *sibling->base_plan;
@@ -1861,8 +1865,8 @@ private:
             if (target < best + kSiblingWaitMinimumTokens) { continue; }
             // The sibling's remaining prefill to the checkpoint, doubled because other lanes'
             // units interleave with it, bounds the wait.
-            const auto predicted = std::chrono::nanoseconds(
-                2 * resources_.prefill_ns(PrefillWork{.tokens = target - *cursor}));
+            const auto work      = instance_.program->prefill_work(other, *cursor, target);
+            const auto predicted = std::chrono::nanoseconds(2 * resources_.prefill_ns(work));
             if (predicted > pending_timeout_ / 2) { continue; }
             if (!chosen || target > chosen->frontier) {
                 chosen = SiblingWait{request, sibling->id, target,
@@ -1882,7 +1886,7 @@ private:
     void process_sibling_waits() {
         if (sibling_waits_.empty()) { return; }
         const auto now      = Clock::now();
-        const auto siblings = prefilling_siblings();
+        const auto siblings = resident_siblings();
         std::erase_if(sibling_waits_, [&](SiblingWait& wait) {
             const auto found   = std::find_if(siblings.begin(), siblings.end(),
                                               [&](const auto& r) { return r->id == wait.sibling; });

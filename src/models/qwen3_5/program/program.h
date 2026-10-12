@@ -446,6 +446,9 @@ public:
     // consuming bind can select it. Draft context over the graft (MTP KV, DFlash features) is
     // zero-filled. Requires an idle Program: no request lane and no context or pending transaction.
     [[nodiscard]] CheckpointHandle install_external_checkpoint(const PromptGraft& graft);
+    // Prefill cost features for prompt positions [begin, end) of a planned request.
+    [[nodiscard]] runtime::PrefillWork prefill_work(const RequestBasePlan& base, std::uint32_t begin,
+                                                   std::uint32_t end) const;
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
                    bool consume_source                              = false,
