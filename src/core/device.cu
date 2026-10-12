@@ -46,7 +46,10 @@ std::string cuda_error_message(const char* prefix, cudaError_t err) {
 // single DeviceContext -- release() tears down streams and events, not the primary context. A
 // later DeviceContext on the same physical device must therefore not call cudaSetDeviceFlags
 // again; it reuses the schedule already active there, validating that this construction is not
-// silently asking for a different one it has no way to honor.
+// silently asking for a different one it has no way to honor. cudaDeviceMapHost is OR'd in here
+// too: mapped host allocation needs it before UVA, and it makes the cudaHostAllocMapped contract
+// in arena.cu (PinnedHostBuffer) explicit. It is not part of the schedule, so applied_flags and
+// the mismatch check stay keyed on the schedule-only flags.
 struct DeviceSyncState {
     std::mutex mutex;
     std::unordered_map<int, unsigned int> applied_flags;
@@ -69,7 +72,7 @@ void apply_sync_schedule_once(int device, unsigned int sync_flags) {
         }
         return;
     }
-    const cudaError_t err = cudaSetDeviceFlags(sync_flags);
+    const cudaError_t err = cudaSetDeviceFlags(sync_flags | cudaDeviceMapHost);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaSetDeviceFlags failed", err));
     }

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from tools.bench.agent_replay.export import TOKEN_STREAM_NAME
 from tools.bench.agent_replay.metrics import SourceIndex, flatten_counters, summarize
 from tools.bench.agent_replay.workload import (
     SYSTEM_PROMPT,
@@ -29,6 +30,17 @@ SCHEMA = "ninfer_agent_replay"
 SCHEMA_VERSION = 1
 # Template framing per message (role markers, tool_response wrapper) in prompt-token estimates.
 MESSAGE_OVERHEAD_TOKENS = 16
+# Every file a run writes into --out (export trusts them as one consistent set), plus the
+# exported token stream a later export writes there, so a rerun can never leave a stale one.
+RUN_ARTIFACTS = ("output_token_ids.jsonl", "turns.jsonl", "transcripts.jsonl", "summary.json",
+                 TOKEN_STREAM_NAME)
+
+
+def clear_run_artifacts(out: Path) -> None:
+    """Drop a previous run's files so a rerun into the same --out (with or without
+    --request-log, or one that fails midway) can never leave stale ids or turns that export joins."""
+    for name in RUN_ARTIFACTS:
+        (out / name).unlink(missing_ok=True)
 
 
 @dataclass
@@ -191,12 +203,15 @@ class SessionRunner:
                 plan = self.builder.next_turn(turn)
             staged = len(plan.observation.text) + len(plan.instruction or "")
             projected = context + est_tokens(staged) + MESSAGE_OVERHEAD_TOKENS * 4
-            if projected + plan.max_tokens > self.target:
+            # The target bounds the prompt; the output budget only has to fit max_context, so
+            # a large copy turn cannot end a session while its prompt is still below target.
+            budget = min(plan.max_tokens, self.config.max_context - projected)
+            if projected > self.target or budget < 1:
                 self.stop_reason = "target_context"
                 break
             self._stage(plan, pending, replied_text)
-            reply = send(self.client, self.model, self.messages, plan.max_tokens)
-            sample = self._sample(plan, reply)
+            reply = send(self.client, self.model, self.messages, budget)
+            sample = self._sample(plan, reply, budget)
             samples.append(sample)
             self.emit(sample)
             if reply.error is not None:
@@ -218,7 +233,7 @@ class SessionRunner:
             context = sample["prompt_tokens"] + sample["output_tokens"]
         return samples
 
-    def _sample(self, plan: TurnPlan, reply: Reply) -> dict[str, Any]:
+    def _sample(self, plan: TurnPlan, reply: Reply, max_tokens: int) -> dict[str, Any]:
         covered, total = self.sources.overlap(output_text(reply)) if reply.error is None else (0, 0)
         details = reply.usage.get("prompt_tokens_details") or {}
         counters = timing_counters(reply.timings)
@@ -232,7 +247,7 @@ class SessionRunner:
             "response_id": reply.response_id,
             "error": reply.error,
             "finish_reason": reply.finish_reason,
-            "max_tokens": plan.max_tokens,
+            "max_tokens": max_tokens,
             "prompt_tokens": int(reply.usage.get("prompt_tokens") or 0),
             "cached_tokens": int(details.get("cached_tokens") or 0),
             "output_tokens": int(reply.usage.get("completion_tokens") or 0),
@@ -268,7 +283,18 @@ def unjoined_turns(samples: list[dict[str, Any]], done: dict[str, Any]) -> list[
     """Response ids (or session/turn when none) of measured turns the request log lacks."""
     return sorted(s["response_id"] or f"session {s['session']} turn {s['turn']}"
                   for s in samples
-                  if s["error"] is None and (s.get("response_id") or "") not in done)
+                  if s["error"] is None
+                  and logged_token_ids(s, done.get(s.get("response_id") or "")) is None)
+
+
+def logged_token_ids(sample: dict[str, Any], record: dict[str, Any] | None) -> list[int] | None:
+    """The request log's generated ids, only when they account for every completion token."""
+    if record is None:
+        return None
+    ids = (record.get("result") or {}).get("generated_token_ids")
+    if not isinstance(ids, list) or len(ids) != sample["output_tokens"]:
+        return None
+    return ids
 
 
 def apply_timing(sample: dict[str, Any], done: dict[str, Any] | None) -> None:
@@ -324,8 +350,9 @@ def merge_request_log(samples: list[dict[str, Any]], done: dict[str, dict[str, A
     with token_ids_path.open("w", encoding="utf-8") as ids:
         for sample in samples:
             record = done.get(sample.get("response_id") or "")
-            if record is None:
-                continue
+            ids_list = logged_token_ids(sample, record)
+            if record is None or ids_list is None:
+                continue  # reported by unjoined_turns; export falls back to retokenized text
             merged += 1
             counters: dict[str, Any] = {}
             speculative = {k: v for k, v in (record.get("speculative") or {}).items()
@@ -341,21 +368,40 @@ def merge_request_log(samples: list[dict[str, Any]], done: dict[str, dict[str, A
             apply_timing(sample, record)
             ids.write(json.dumps({"session": sample["session"], "turn": sample["turn"],
                                   "response_id": sample["response_id"],
-                                  "generated_token_ids": result.get("generated_token_ids") or []})
+                                  "generated_token_ids": ids_list})
                       + "\n")
     return merged
 
 
-def run(config: RunConfig) -> int:
+def config_error(config: RunConfig) -> str | None:
+    """The first basic problem with the settings, found before anything is touched on disk."""
     for name in ("sessions", "max_turns", "concurrency"):
         if getattr(config, name) < 1:
-            print(f"error: --{name.replace('_', '-')} must be at least 1", file=sys.stderr)
-            return 2
+            return f"--{name.replace('_', '-')} must be at least 1"
+    if config.min_context > config.max_context:
+        return "--min-context must not exceed --max-context"
+    if config.request_log is not None and not config.request_log.is_file():
+        return f"--request-log {config.request_log} is not a file"
+    return None
+
+
+def run(config: RunConfig) -> int:
+    # Run lifecycle (summary.json is written last; its "complete" field marks a clean run):
+    #   1. config_error: a rejected config returns 2 and leaves --out exactly as it was.
+    #   2. mkdir + clear_run_artifacts: the ONLY place artifacts are removed; from here on the
+    #      directory holds nothing of a previous run, so corpus/server preflight failures,
+    #      mid-run aborts and partial writes can never be mistaken for it by export.
+    #   3. corpus + server preflight, sessions, request-log merge, then turns, transcripts, summary.
+    problem = config_error(config)
+    if problem is not None:
+        print(f"error: {problem}", file=sys.stderr)
+        return 2
+    config.out.mkdir(parents=True, exist_ok=True)
+    clear_run_artifacts(config.out)
+    log_offset = config.request_log.stat().st_size if config.request_log else 0
     corpus = Corpus(config.repo, config.commit)
     probe = NInferServeClient(config.base_url, config.timeout_seconds, config.api_key)
     model = probe.discover_model()
-    config.out.mkdir(parents=True, exist_ok=True)
-    log_offset = config.request_log.stat().st_size if config.request_log else 0
     lock = threading.Lock()
     samples: list[dict[str, Any]] = []
     started = time.time()
@@ -415,6 +461,10 @@ def run(config: RunConfig) -> int:
         ],
         **summarize(samples),
     }
+    # "complete" is the only thing export trusts: true iff every check below passes, so a run
+    # with unjoined, zero or errored turns still leaves a summary.json but is never exportable.
+    summary["complete"] = (not missing and bool(samples)
+                           and all(s["error"] is None for s in samples))
     (config.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n",
                                              encoding="utf-8")
     print(json.dumps({k: summary[k] for k in ("sessions", "request_log_merged", "wall_seconds")},
@@ -429,7 +479,7 @@ def run(config: RunConfig) -> int:
         print("error: no turn was measured (every session stopped before its first request; "
               "raise --max-context or check --min-context)", file=sys.stderr)
         return 1
-    return 0 if all(s["error"] is None for s in samples) else 1
+    return 0 if summary["complete"] else 1
 
 
 def _fmt(value: Any, spec: str) -> str:

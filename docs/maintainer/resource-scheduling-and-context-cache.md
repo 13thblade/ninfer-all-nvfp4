@@ -168,7 +168,10 @@ append 和 speculative accepted-prefix fold 由 Native 完成。尚未提交的 
 持久 context store（`--context-store`）保存的 checkpoint image 就是这些点的完整 Host 表示：
 各 KV 页（Main 与 backend KV，DFlash 的 draft full-attention KV 属于后者）、每个 StateImage
 （GDN/conv、continuation hidden，DFlash/DFlash2 的 draft local K/V ring）和精确身份，逐字节等同
-Host demotion 的内容，因此三种 speculative backend 都可写入与恢复。DFlash pending target
+Host demotion 的内容。MTP 与 DFlash2 的写入与恢复经过 real test 验证：恢复后的输出、speculative
+rounds 与 accepted drafts 与未离开 GPU 的会话一致。DFlash v1（`--spec dflash`）只接受、未支持：
+重启后短会话的 image 在启动时恢复，但续写复用 0 token、退回冷 prefill（原因未定位；深会话恢复
+一致），hydration、crash 与 recovery 路径未覆盖，与 `docs/serving.md` 的范围一致。DFlash pending target
 features 与 n-gram copy index 是 round/request 状态，不属于检查点，binding 时重建。image 绑定
 Program 配置（KV 存储、backend、proposal head、draft window、页与 StateImage 几何，含 GDN state
 dtype 与 ring 形状）和 Engine binding（模型、artifact、KV、GDN state 精度、backend、draft

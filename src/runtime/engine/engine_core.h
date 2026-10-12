@@ -287,6 +287,7 @@ public:
         out.planned_slack_bytes                = resolution.planned_slack_bytes;
         out.stage_runtime_reservation_bytes    = resolution.extra_rank_reservation_bytes;
         out.kv_capacity_binding_stage          = resolution.binding_rank;
+        out.requested_max_context              = resolution.requested_context;
         return out;
     }
 
