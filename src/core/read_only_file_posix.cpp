@@ -83,7 +83,8 @@ void ReadOnlyFile::read_direct_blocks(std::span<const std::uint64_t> offsets, st
         while (in_flight > 0 || (next < offsets.size() && !failed())) {
             while (next < offsets.size() && !idle.empty() && !failed()) {
                 const std::size_t slot = idle.back();
-                if (offsets[next] > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+                constexpr auto max_offset = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
+                if (offsets[next] > max_offset || block_bytes > max_offset - offsets[next]) {
                     failure = EOVERFLOW;
                     break;
                 }
@@ -159,7 +160,9 @@ void ReadOnlyFile::read_direct_blocks(std::span<const std::uint64_t> offsets, st
 }
 
 std::size_t ReadOnlyFile::read_direct(std::uint64_t offset, std::span<std::byte> destination) const {
-    if (offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
+    // The whole range [offset, offset + size) must be representable as off_t, like the Win32 reader.
+    constexpr auto max_offset = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
+    if (offset > max_offset || destination.size() > max_offset - offset ||
         destination.size() > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {
         throw std::overflow_error("direct file read exceeds platform I/O limits");
     }
