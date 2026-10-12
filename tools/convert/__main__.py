@@ -225,7 +225,7 @@ def main(argv=None):
             "sources": (
                 {
                     "base": {"paths": [str(file.path) for file in base.files]},
-                    **({"mtp": {"paths": [str(args.mtp_gguf)]}} if args.mtp_gguf else {}),
+                    **({"mtp": {"paths": [str(file.path) for file in mtp.files]}} if mtp is not None else {}),
                 }
                 if gguf
                 else sources.provenance()
