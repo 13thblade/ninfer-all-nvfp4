@@ -1,4 +1,10 @@
 @echo off
+rem Where this script sits is read before delayed expansion is on, so an exclamation mark in the
+rem install path survives. Everything below reads folders with !VAR!, never inside a ( ) block.
+setlocal disabledelayedexpansion
+set "ROOT=%~dp0"
+for %%I in ("%ROOT%..") do set "REPO_ROOT=%%~fI"
+for %%I in ("%ROOT%.") do set "SCRIPT_DIRNAME=%%~nxI"
 setlocal enabledelayedexpansion
 
 rem Downloads one pinned model artifact, verifies it, and only then promotes it to its final name.
@@ -158,16 +164,19 @@ rem .gitignore) is beside the repo root, not beside this script -- a directory n
 rem CMakeLists.txt above it tells the two apart (a bare CMakeLists.txt probe would misfire on an
 rem archive unpacked beneath any source tree), matching run.bat's own default so a model
 rem downloaded here is found there.
-set "ROOT=%~dp0"
-for %%I in ("%ROOT%..") do set "REPO_ROOT=%%~fI"
-for %%I in ("%ROOT%.") do set "SCRIPT_DIRNAME=%%~nxI"
-set "MODEL_DIR=%ROOT%models"
-if /i "%SCRIPT_DIRNAME%"=="scripts" if exist "%REPO_ROOT%\CMakeLists.txt" set "MODEL_DIR=%REPO_ROOT%\models"
-if defined NINFER_MODEL_DIR set "MODEL_DIR=%NINFER_MODEL_DIR%"
-set "MODEL=%MODEL_DIR%\%ARTIFACT%"
+rem ROOT, REPO_ROOT and SCRIPT_DIRNAME were set at the top.
+set "MODEL_DIR=!ROOT!models"
+if /i "!SCRIPT_DIRNAME!"=="scripts" if exist "!REPO_ROOT!\CMakeLists.txt" set "MODEL_DIR=!REPO_ROOT!\models"
+if defined NINFER_MODEL_DIR set "MODEL_DIR=!NINFER_MODEL_DIR!"
+set "MODEL_DIR_FULL="
+call :dir_check MODEL_DIR
+if "!DIR_BAD!"=="1" goto :model_dir_rejected
 if not exist "%MODEL_DIR%" mkdir "%MODEL_DIR%"
 for %%I in ("%MODEL_DIR%") do set "MODEL_DIR_FULL=%%~fI"
 call :trim_trailing_backslash MODEL_DIR_FULL
+rem From here on the model folder is the full path, so D: means the folder it resolved to.
+set "MODEL_DIR=!MODEL_DIR_FULL!"
+call :join_path MODEL MODEL_DIR "%ARTIFACT%"
 
 rem Ask where the n-gram volume goes before anything is fetched, so the downloads can run unattended.
 if defined NGRAM_NAME call :choose_ngram_dir
@@ -175,10 +184,14 @@ if defined NGRAM_NAME if not defined NGRAM_DIR exit /b 1
 
 call :fetch_file "%MODEL_DIR%" "%ARTIFACT%" %EXPECTED_SIZE% %EXPECTED_SHA256% %REVISION% "%LABEL%" model
 if not "!FETCH_OK!"=="1" exit /b 1
-for /l %%N in (1,1,%PART_COUNT%) do (
-  call :fetch_file "%MODEL_DIR%" "%ARTIFACT%.part-000%%N" !PART_%%N_SIZE! !PART_%%N_SHA256! %REVISION% "part %%N of the model" part
-  if not "!FETCH_OK!"=="1" exit /b 1
-)
+set "PART_N=1"
+:fetch_parts
+if %PART_N% gtr %PART_COUNT% goto :parts_done
+call :fetch_file "%MODEL_DIR%" "%ARTIFACT%.part-000%PART_N%" !PART_%PART_N%_SIZE! !PART_%PART_N%_SHA256! %REVISION% "part %PART_N% of the model" part
+if not "!FETCH_OK!"=="1" exit /b 1
+set /a PART_N+=1
+goto :fetch_parts
+:parts_done
 if defined NGRAM_NAME call :fetch_file "%NGRAM_DIR%" "%NGRAM_NAME%" %NGRAM_SIZE% %NGRAM_SHA256% %NGRAM_REVISION% "the n-gram volume (27.1 GiB)" volume
 if defined NGRAM_NAME if not "!FETCH_OK!"=="1" exit /b 1
 
@@ -187,6 +200,11 @@ if defined NGRAM_NAME call :ngram_summary
 echo Point the tests at it with:  set %TESTS_VARIABLE%=!MODEL!
 call :fetch_graft
 exit /b 0
+:model_dir_rejected
+echo The model folder "!MODEL_DIR!" has a percent sign, caret or exclamation mark in its name, which 1>&2
+echo this script cannot pass on safely. Set NINFER_MODEL_DIR to a folder without those, or move this 1>&2
+echo script, and run this file again. 1>&2
+exit /b 1
 
 rem Fetches one pinned file: folder %1, name %2, size %3, sha256 %4, revision %5, description %6, and
 rem kind %7 (model, part or volume). Sets FETCH_OK=1 once the file is at its final name and verified.
@@ -198,7 +216,8 @@ rem those bytes, so a leftover partial from a different revision -- for instance
 rem on any machine that ran an older script -- would be spliced onto the head of this one: a file of
 rem entirely plausible size that is corrupt throughout. A name that carries the revision means a
 rem resume can only ever continue the same file, and the checks below are what promote it to the
-rem final name. Written with goto rather than ( ) blocks: a folder may contain ")".
+rem final name. Written with goto rather than ( ) blocks: a folder may contain ")". Folders are read
+rem with !VAR!, and any echo of one is given it quoted.
 :fetch_file
 set "FETCH_OK=0"
 set "F_DIR=%~1"
@@ -208,11 +227,12 @@ set "EXPECTED_SHA256=%~4"
 set "F_REV=%~5"
 set "F_WHAT=%~6"
 set "F_KIND=%~7"
-set "F_PATH=%F_DIR%\%F_NAME%"
 set "F_PART_NAME=%F_NAME%.%F_REV%.part"
-set "F_PART=%F_DIR%\%F_PART_NAME%"
-if not exist "%F_PATH%" goto :fetch_download
-call :verify "%F_PATH%"
+call :join_path F_PATH F_DIR "%F_NAME%"
+call :join_path F_PART F_DIR "%F_PART_NAME%"
+call :join_path F_DOT F_DIR "."
+if not exist "!F_PATH!" goto :fetch_download
+call :verify "!F_PATH!"
 if not "!VERIFY_OK!"=="1" goto :fetch_stale
 if /i "%F_KIND%"=="model" echo Model already present: !F_PATH!
 if /i not "%F_KIND%"=="model" echo Already present: !F_PATH!
@@ -223,7 +243,7 @@ echo Existing !F_PATH! did not verify against revision %F_REV%; fetching the pin
 if /i not "%F_KIND%"=="model" goto :fetch_download
 if defined NGRAM_NAME goto :fetch_download
 echo If it is the v2 file from an earlier release, you can upgrade it instead of downloading:
-echo   python tools\upgrade_ninfer_v2_to_v3.py "%F_PATH%" "%F_PATH%.v3" ^&^& move /y "%F_PATH%.v3" "%F_PATH%"
+echo   python tools\upgrade_ninfer_v2_to_v3.py "!F_PATH!" "!F_PATH!.v3" ^&^& move /y "!F_PATH!.v3" "!F_PATH!"
 :fetch_download
 echo Downloading %F_WHAT%...
 set "URL=https://huggingface.co/%OWNER%/%REPO%/resolve/%F_REV%/%F_NAME%"
@@ -233,28 +253,28 @@ rem 16 parallel ranges over one file, not single-stream curl. On the Vast rental
 rem downloads at ~98 MB/s over aria2c against the same throttled-to-~1MB/s (and once outright
 rem stalled at 11 of 21 GiB) single-stream curl -- see scripts\multi-gpu-testing\README.md. -c
 rem resumes into the same .part name curl would use, and HuggingFace serves ranges fine.
-rem The folder is given as "<dir>\." because a drive root ends in a backslash, and a backslash before the
-rem closing quote escapes the quote for aria2c's argument parser.
-aria2c -x16 -s16 -c --file-allocation=none -d "%F_DIR%\." -o "%F_PART_NAME%" "%URL%"
+rem The folder is given as "<dir>\." (F_DOT) because a drive root ends in a backslash, and a backslash
+rem before the closing quote escapes the quote for aria2c's argument parser.
+aria2c -x16 -s16 -c --file-allocation=none -d "!F_DOT!" -o "%F_PART_NAME%" "%URL%"
 goto :fetch_downloaded
 :fetch_curl
-curl.exe -L -C - --fail --output "%F_PART%" "%URL%"
+curl.exe -L -C - --fail --output "!F_PART!" "%URL%"
 :fetch_downloaded
-if errorlevel 1 (
-  echo Download failed. Run this file again to resume.
-  exit /b 0
-)
-call :verify "%F_PART%"
-if not "!VERIFY_OK!"=="1" (
-  echo Downloaded file at "%F_PART%" failed verification against revision %F_REV%. Delete it and run this file again.
-  exit /b 0
-)
-move /y "%F_PART%" "%F_PATH%" >nul
-if errorlevel 1 (
-  echo Failed to move "%F_PART%" to "%F_PATH%". Delete "%F_PART%" and run this file again.
-  exit /b 0
-)
+if errorlevel 1 goto :fetch_download_failed
+call :verify "!F_PART!"
+if not "!VERIFY_OK!"=="1" goto :fetch_unverified
+move /y "!F_PART!" "!F_PATH!" >nul
+if errorlevel 1 goto :fetch_move_failed
 set "FETCH_OK=1"
+exit /b 0
+:fetch_download_failed
+echo Download failed. Run this file again to resume.
+exit /b 0
+:fetch_unverified
+echo Downloaded file at "!F_PART!" failed verification against revision %F_REV%. Delete it and run this file again.
+exit /b 0
+:fetch_move_failed
+echo Failed to move "!F_PART!" to "!F_PATH!". Delete "!F_PART!" and run this file again.
 exit /b 0
 
 rem Sets NGRAM_DIR, the folder for the n-gram volume: NINFER_NGRAM_DIR, else the answer to a question,
@@ -297,12 +317,13 @@ set "NGRAM_DIR=!NGRAM_ANSWER!"
 :ngram_dir_chosen
 rem A value that was only quotes is empty after they are stripped: use the model folder.
 if not defined NGRAM_DIR set "NGRAM_DIR=!MODEL_DIR!"
-call :ngram_dir_check
-if "!NGRAM_BAD!"=="1" goto :ngram_dir_rejected
+call :dir_check NGRAM_DIR
+if "!DIR_BAD!"=="1" goto :ngram_dir_rejected
 for %%I in ("%NGRAM_DIR%") do set "NGRAM_DIR=%%~fI"
 call :trim_trailing_backslash NGRAM_DIR
-if not exist "%NGRAM_DIR%\" mkdir "%NGRAM_DIR%" >nul 2>&1
-if exist "%NGRAM_DIR%\" goto :ngram_dir_ok
+call :join_path NGRAM_PROBE NGRAM_DIR "."
+if not exist "!NGRAM_PROBE!" mkdir "%NGRAM_DIR%" >nul 2>&1
+if exist "!NGRAM_PROBE!" goto :ngram_dir_ok
 echo Cannot create the folder "!NGRAM_DIR!" for the n-gram volume. 1>&2
 set "NGRAM_DIR="
 exit /b 0
@@ -315,10 +336,11 @@ exit /b 0
 echo N-gram volume folder: !NGRAM_DIR!
 exit /b 0
 
-rem Sets NGRAM_BAD=1 when NGRAM_DIR holds a percent sign, caret or exclamation mark. The folder passes
+rem Sets DIR_BAD=1 when the variable named %1 (MODEL_DIR or NGRAM_DIR) holds a percent sign, caret or exclamation mark. The folder passes
 rem through call, which doubles the first two, and through set and for lines, which eat the last, so it
-rem would silently become a different folder. Ampersand, pipe and angle brackets need no check: the
-rem folder is quoted or read through delayed expansion everywhere.
+rem would silently become a different folder. Ampersand, pipe, angle brackets and parentheses need no
+rem check: the folder is quoted or read through delayed expansion everywhere, and never expanded inside
+rem a ( ) block. MODEL_DIR_FULL is cleared before the MODEL_DIR check, so `set NAME` prints one variable.
 rem
 rem The folder is never expanded on a command line here. Earlier versions did, in substitutions such as
 rem !NGRAM_DIR:^=!, where delayed expansion itself consumes the caret. Instead `set NGRAM_DIR` prints
@@ -327,16 +349,24 @@ rem line runs with delayed expansion off so its exclamation mark is an ordinary 
 rem percent sign is one percent sign in a batch file; the caret sits last in the class, where it is a
 rem plain character. Each branch is a goto, so nothing conditional shares a line with an
 rem unconditional command.
-:ngram_dir_check
-set "NGRAM_BAD="
+:dir_check
+set "DIR_BAD="
 setlocal disabledelayedexpansion
-set NGRAM_DIR 2>nul | findstr /r "[!%%^]" >nul
-if errorlevel 1 goto :ngram_dir_check_clean
+set %~1 2>nul | findstr /r "[!%%^]" >nul
+if errorlevel 1 goto :dir_check_clean
 endlocal
-set "NGRAM_BAD=1"
+set "DIR_BAD=1"
 exit /b 0
-:ngram_dir_check_clean
+:dir_check_clean
 endlocal
+exit /b 0
+
+rem Sets the variable named %1 to folder variable %2 joined with name %3, with exactly one backslash
+rem between them: a drive root such as D:\ already ends in one. Folder text is read with !VAR! only.
+:join_path
+set "%~1=!%~2!"
+if not "!%~2:~-1!"=="\" set "%~1=!%~1!\"
+set "%~1=!%~1!%~3"
 exit /b 0
 
 rem Removes one trailing backslash from the variable named %1, except after a drive colon (D:\ is the
@@ -354,11 +384,11 @@ rem and prefers qwen4exp-iq2xs-mtp-vision.ninfer there, so it needs NINFER_MODEL
 rem was set here, and NINFER_NGRAM_VOLUME only when the volume is not beside the model (it reads
 rem <model>.ngram otherwise). Not a ( ) block: a folder may contain ")".
 :ngram_summary
-set "NGRAM_PATH=%NGRAM_DIR%\%NGRAM_NAME%"
+call :join_path NGRAM_PATH NGRAM_DIR "%NGRAM_NAME%"
 echo N-gram volume ready: !NGRAM_PATH!
 echo.
 echo Start it with:
-if /i not "%NGRAM_DIR%"=="%MODEL_DIR_FULL%" echo   set "NINFER_NGRAM_VOLUME=!NGRAM_PATH!"
+if /i not "!NGRAM_DIR!"=="!MODEL_DIR_FULL!" echo   set "NINFER_NGRAM_VOLUME=!NGRAM_PATH!"
 if defined NINFER_MODEL_DIR echo   set "NINFER_MODEL_DIR=!MODEL_DIR_FULL!"
 echo   "!ROOT!run.bat" qwen38-flash-next
 echo.
@@ -373,8 +403,8 @@ if /i not "%ARTIFACT%"=="qwen3_8_27b.ninfer" exit /b 0
 if /i "%NINFER_GRAFTS%"=="off" exit /b 0
 set "G_REPO=WarlaxZ/Qwen3.8-27B-godmode-graft"
 set "G_REV=97a02e9bbb37d76af63256152c07fc4eeb4c40c9"
-set "G_DIR=%REPO_ROOT%\artifacts\grafts"
-if defined NINFER_GRAFT_DIR set "G_DIR=%NINFER_GRAFT_DIR%"
+set "G_DIR=!REPO_ROOT!\artifacts\grafts"
+if defined NINFER_GRAFT_DIR set "G_DIR=!NINFER_GRAFT_DIR!"
 set "G_BIN=godmode_q38_trained.bin"
 set "G_BIN_SHA=a0ddecc4ca5db8b84f600d60fbf238c97e21a74069b7182e0e0e595d7a22c391"
 set "G_JSON=godmode_q38_trained.json"
@@ -396,8 +426,8 @@ if defined HF_HOME set "G_TOKENFILE=%HF_HOME%\token"
 if defined HF_TOKEN_PATH set "G_TOKENFILE=%HF_TOKEN_PATH%"
 if not defined G_TOKEN if exist "%G_TOKENFILE%" set /p G_TOKEN=<"%G_TOKENFILE%"
 if not defined G_TOKEN goto :graft_no_token
-if not exist "%G_DIR%" mkdir "%G_DIR%" >nul 2>&1
-if not exist "%G_DIR%\" goto :graft_nodir
+if not exist "!G_DIR!" mkdir "!G_DIR!" >nul 2>&1
+if not exist "!G_DIR!\" goto :graft_nodir
 set "G_STOP="
 call :graft_fetch %G_BIN% %G_BIN_SHA%
 if defined G_STOP goto :graft_abort
@@ -406,43 +436,43 @@ if defined G_STOP goto :graft_abort
 rem Any pair already here is invalid or partial (a verified one went to :graft_ready). Clear it, binary first,
 rem so the new pair never sits beside a leftover half of the old one. Then install the sidecar first and the
 rem binary last: run.bat trusts the .bin alone, so it must never be visible without its .json.
-del "%G_DIR%\%G_BIN%" "%G_DIR%\%G_JSON%" >nul 2>&1
-move /y "%G_DIR%\%G_JSON%.part" "%G_DIR%\%G_JSON%" >nul 2>&1
+del "!G_DIR!\%G_BIN%" "!G_DIR!\%G_JSON%" >nul 2>&1
+move /y "!G_DIR!\%G_JSON%.part" "!G_DIR!\%G_JSON%" >nul 2>&1
 if errorlevel 1 goto :graft_install_failed
-move /y "%G_DIR%\%G_BIN%.part" "%G_DIR%\%G_BIN%" >nul 2>&1
+move /y "!G_DIR!\%G_BIN%.part" "!G_DIR!\%G_BIN%" >nul 2>&1
 if errorlevel 1 goto :graft_install_failed
 :graft_ready
-echo Graft ready: %G_DIR%\%G_BIN%
+echo Graft ready: !G_DIR!\%G_BIN%
 exit /b 0
 :graft_no_token
 rem Nothing can be fetched, but a lone half of the pair or a staged .part would still break a launch, so
 rem drop those. A whole pair is left alone: it may be one the user supplied.
-del "%G_DIR%\%G_BIN%.part" "%G_DIR%\%G_JSON%.part" >nul 2>&1
-if exist "%G_DIR%\%G_BIN%" if not exist "%G_DIR%\%G_JSON%" del "%G_DIR%\%G_BIN%" >nul 2>&1
-if exist "%G_DIR%\%G_JSON%" if not exist "%G_DIR%\%G_BIN%" del "%G_DIR%\%G_JSON%" >nul 2>&1
+del "!G_DIR!\%G_BIN%.part" "!G_DIR!\%G_JSON%.part" >nul 2>&1
+if exist "!G_DIR!\%G_BIN%" if not exist "!G_DIR!\%G_JSON%" del "!G_DIR!\%G_BIN%" >nul 2>&1
+if exist "!G_DIR!\%G_JSON%" if not exist "!G_DIR!\%G_BIN%" del "!G_DIR!\%G_JSON%" >nul 2>&1
 echo Graft: skipped, no Hugging Face token. Set HF_TOKEN or run "hf auth login" if you have access.
 exit /b 0
 :graft_nodir
-echo Graft: skipped, cannot create %G_DIR%. 1>&2
+echo Graft: skipped, cannot create !G_DIR!. 1>&2
 exit /b 0
 :graft_install_failed
-echo Graft: skipped, cannot install into %G_DIR%. 1>&2
+echo Graft: skipped, cannot install into !G_DIR!. 1>&2
 :graft_abort
-del "%G_DIR%\%G_BIN%" "%G_DIR%\%G_JSON%" "%G_DIR%\%G_BIN%.part" "%G_DIR%\%G_JSON%.part" >nul 2>&1
+del "!G_DIR!\%G_BIN%" "!G_DIR!\%G_JSON%" "!G_DIR!\%G_BIN%.part" "!G_DIR!\%G_JSON%.part" >nul 2>&1
 exit /b 0
 
 rem SHA_OK=1 when file %1 in the graft directory exists and its sha256 equals %2.
 :graft_present
 set "SHA_OK=0"
-if not exist "%G_DIR%\%~1" exit /b 0
-call :sha_ok "%G_DIR%\%~1" %~2
+if not exist "!G_DIR!\%~1" exit /b 0
+call :sha_ok "!G_DIR!\%~1" %~2
 exit /b 0
 
 rem Downloads one pinned graft file to its .part. Sets G_STOP on failure; the caller discards both files.
 :graft_fetch
-curl.exe -sSL --fail -H "Authorization: Bearer %G_TOKEN%" --output "%G_DIR%\%~1.part" "https://huggingface.co/%G_REPO%/resolve/%G_REV%/%~1" 2>nul
+curl.exe -sSL --fail -H "Authorization: Bearer %G_TOKEN%" --output "!G_DIR!\%~1.part" "https://huggingface.co/%G_REPO%/resolve/%G_REV%/%~1" 2>nul
 if errorlevel 1 goto :graft_denied
-call :sha_ok "%G_DIR%\%~1.part" %~2
+call :sha_ok "!G_DIR!\%~1.part" %~2
 if not "!SHA_OK!"=="1" goto :graft_corrupt
 exit /b 0
 :graft_denied
@@ -475,14 +505,12 @@ set "VERIFY_OK=0"
 set "VERIFY_PATH=%~1"
 for %%A in ("%VERIFY_PATH%") do set "VERIFY_SIZE=%%~zA"
 if not "!VERIFY_SIZE!"=="%EXPECTED_SIZE%" exit /b 0
-if "%NINFER_SKIP_SHA256%"=="1" (
-  set "VERIFY_OK=1"
-  exit /b 0
-)
+if "%NINFER_SKIP_SHA256%"=="1" goto :verify_skip_sha
 set "ACTUAL_SHA256="
-for /f "skip=1 delims=" %%H in ('certutil -hashfile "%VERIFY_PATH%" SHA256') do (
-  if not defined ACTUAL_SHA256 set "ACTUAL_SHA256=%%H"
-)
+for /f "skip=1 delims=" %%H in ('certutil -hashfile "%VERIFY_PATH%" SHA256') do if not defined ACTUAL_SHA256 set "ACTUAL_SHA256=%%H"
 set "ACTUAL_SHA256=!ACTUAL_SHA256: =!"
 if /i "!ACTUAL_SHA256!"=="%EXPECTED_SHA256%" set "VERIFY_OK=1"
+exit /b 0
+:verify_skip_sha
+set "VERIFY_OK=1"
 exit /b 0
