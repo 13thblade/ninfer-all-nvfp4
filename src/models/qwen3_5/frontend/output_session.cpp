@@ -365,6 +365,13 @@ void feed_token_bytes(DecoderState& state, std::string_view bytes, const StopPol
     feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
 }
 
+// A `</think>` the presentation holds until the next token confirms it: the channel is still
+// reasoning, so that next token is counted as reasoning, and is uncounted again once it closes it.
+bool holds_presentation_close(const DecoderState& state) {
+    return state.in_reasoning && !state.exact_reasoning_framing && state.utf8_pending.empty() &&
+           std::string_view(state.think_marker_pending).ends_with(kThinkClose);
+}
+
 // NInfer-3090: the model's stop token after a held `</think>` ends the turn right after it, so the
 // held marker is the close; resolve it before the stop token's own bytes (published when the
 // caller asks for them) reach the decoder.
@@ -681,10 +688,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
 
         // A token that confirms a held close (its first byte is a line break, or it ends the
         // turn) is the first one after the thinking, so neither count includes it.
-        const bool presentation_held =
-            impl_->preview_state.in_reasoning && !impl_->preview_state.exact_reasoning_framing &&
-            impl_->preview_state.utf8_pending.empty() &&
-            std::string_view(impl_->preview_state.think_marker_pending).ends_with(kThinkClose);
+        const bool presentation_held = holds_presentation_close(impl_->preview_state);
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
         if (impl_->preview_semantic.in_reasoning) {
             const bool held = holds_semantic_close(impl_->preview_semantic);
@@ -734,6 +738,9 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         if (!stop_token) { uncount_confirming_token(); }
 
         if (match.found) {
+            // A stop token whose published bytes matched a stop string leaves through here, not
+            // through the stop-token branch below: reconcile the held close it confirmed first.
+            if (stop_token) { uncount_confirming_token(); }
             impl_->preview_state = terminal_state(std::move(impl_->preview_state));
             impl_->preview_state.matched_stop_order = match.declaration_order;
             impl_->preview_output                   = std::move(match.output);
@@ -855,12 +862,18 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
             boundary && *boundary == decoded.bytes.size()) {
             impl_->preview_execution_split_after = static_cast<std::uint32_t>(index + 1U);
         }
+        // The first control token can be the one confirming a `</think>` the model's own output
+        // left held: it is not thinking, exactly as in preview_model.
+        const bool presentation_held = holds_presentation_close(impl_->preview_state);
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
         feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);
         const std::string_view presentation_bytes =
             !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
         feed_token_bytes(impl_->preview_state, presentation_bytes, impl_->policy,
                          impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
+        if (presentation_held && !impl_->preview_state.in_reasoning) {
+            --impl_->preview_state.reasoning_tokens;
+        }
     }
     if (impl_->preview_semantic.in_reasoning) {
         throw std::logic_error("canonical thinking control did not close the thinking phase");

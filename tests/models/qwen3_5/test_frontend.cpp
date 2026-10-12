@@ -2722,6 +2722,24 @@ int test_held_close_accounting(const Frontend& frontend) {
                               channel_text(output, ninfer::OutputChannel::Content) == "<eos>",
                           "a published stop token after a held close kept the thinking open");
     }
+    {
+        // A stop token whose published bytes match a stop string ends the turn through the string
+        // route, not the stop-token one: the close it confirmed is still not thinking.
+        ninfer::StopPolicy by_string;
+        by_string.publish_stop_token = true;
+        by_string.strings.push_back(ninfer::StopString{.text = "<eos>"});
+        auto session = frontend.make_output_session(
+            thinking_prompt(frontend), by_string,
+            ninfer::OutputOptions{.preserve_special_tokens = true});
+        std::vector<ninfer::TokenId> tokens = thought;
+        tokens.push_back(kFixtureThinkCloseToken);
+        tokens.push_back(frontend.default_stop_policy().token_ids.front());
+        const auto decision = session.preview_model(tokens, 64, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        failures += check(decision.finish_reason == ninfer::FinishReason::StopString &&
+                              session.reasoning_tokens() == thought.size() + 1U,
+                          "a stop token matching a stop string was counted as thinking");
+    }
     return failures;
 }
 
