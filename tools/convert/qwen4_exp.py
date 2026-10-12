@@ -51,7 +51,7 @@ import torch
 
 from tools.artifact import ngram_volume
 from tools.artifact.codecs.ggml_blocks import pack_expert_records
-from tools.artifact.formats import ggml_record_format
+from tools.artifact.formats import GGML_REC_Q2_0_Q2_0, ggml_record_format
 from tools.artifact.layouts import GGML_EXPERT_RECORD_V1, ggml_expert_record_geometry
 
 from .methods import PrepareRequest, PreparedMethod
@@ -791,8 +791,13 @@ def build_model(
     *,
     subset: Subset | None = None,
     resource_overrides: Mapping[str, str | Path] | None = None,
+    mtp: GgufModel | None = None,
 ) -> Model:
-    """The logical model of a qwen4exp GGUF; bind its n-gram volume before converting it."""
+    """The logical model of a qwen4exp GGUF; bind its n-gram volume before converting it.
+
+    *mtp* is the MTP drafter's GGUF (Strata's ``mtp-q2_0.gguf``); it adds the ``mtp`` component
+    (:func:`add_mtp`).
+    """
     config = text_config(gguf.metadata)
     mappings = name_map(gguf, config)
     resources = tokenizer_resources(gguf.metadata, config)
@@ -873,7 +878,212 @@ def build_model(
         model.add(
             Parameter(name, source.shape, source, inputs=gate.inputs, direct_format=source.format)
         )
+    if mtp is not None:
+        if subset is not None:
+            raise ValueError("a development subset takes no MTP drafter")
+        add_mtp(model, mtp)
     return model
+
+
+# ---------------------------------------------------------------------------- MTP drafter
+
+MTP_ARCHITECTURE = "qwen4exp-mtp"
+MTP_COMPONENT = {"config": {"architectures": ["Qwen4ExpMTP"]}, "target": "text"}
+# Norms of the drafter GGUF hold the checkpoint's raw BF16 gamma widened to F32 (no unit offset
+# applied). "words": the gamma itself is stored as BF16 (the unit-offset RMSNorm forms take it);
+# "unit": the hyper-connection mixers' Op takes the multiplier 1 + gamma, which the converter forms
+# as fl32(1 + gamma) -- the same FP32 sum the text GGUF's export stored for every text mixer norm.
+_MTP_NORMS = {
+    "mtp.pre_fc_norm_embedding.weight": ("mtp/embedding_norm", "words"),
+    "mtp.pre_fc_norm_hidden.weight": ("mtp/hidden_norm", "words"),
+    "mtp.hyper_connection_mixer.hc_norm.weight": ("mtp/final_mixer/norm", "unit"),
+    "mtp.layers.0.attn_hyper_connection.hc_norm.weight": ("mtp/layers/0/attn_hc/norm", "unit"),
+    "mtp.layers.0.mlp_hyper_connection.hc_norm.weight": ("mtp/layers/0/mlp_hc/norm", "unit"),
+    "mtp.layers.0.self_attn.q_norm.weight": ("mtp/layers/0/attention/query_norm", "words"),
+    "mtp.layers.0.self_attn.k_norm.weight": ("mtp/layers/0/attention/key_norm", "words"),
+    "mtp.layers.0.self_attn.indexer.q_layernorm.weight": (
+        "mtp/layers/0/indexer/query_norm", "words"
+    ),
+    "mtp.layers.0.self_attn.indexer.k_layernorm.weight": ("mtp/layers/0/indexer/key_norm", "words"),
+}
+# BF16 matrices kept as BF16: GGUF name -> (parameter, mathematical inputs).
+_MTP_MATRICES = {
+    "mtp.fc_embedding.weight": ("mtp/embedding_projection", ("mtp/embedding_input",)),
+    "mtp.fc_hidden.weight": ("mtp/hidden_projection", ("mtp/hidden_input",)),
+    "mtp.hyper_connection_mixer.input_mix_weight_down.weight": (
+        "mtp/final_mixer/down", ("mtp/final_mixer/input",)
+    ),
+    "mtp.hyper_connection_mixer.input_mix_weight_up.weight": (
+        "mtp/final_mixer/up", ("mtp/final_mixer/mix_activation",)
+    ),
+    "mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight": (
+        "mtp/layers/0/attn_hc/down", ("mtp/layers/0/attn_hc/input",)
+    ),
+    "mtp.layers.0.attn_hyper_connection.input_mix_weight_up.weight": (
+        "mtp/layers/0/attn_hc/up", ("mtp/layers/0/attn_hc/mix_activation",)
+    ),
+    "mtp.layers.0.attn_hyper_connection.block_inject_weight.weight": (
+        "mtp/layers/0/attn_hc/inject", ("mtp/layers/0/attn_hc/input",)
+    ),
+    "mtp.layers.0.mlp_hyper_connection.input_mix_weight_down.weight": (
+        "mtp/layers/0/mlp_hc/down", ("mtp/layers/0/mlp_hc/input",)
+    ),
+    "mtp.layers.0.mlp_hyper_connection.input_mix_weight_up.weight": (
+        "mtp/layers/0/mlp_hc/up", ("mtp/layers/0/mlp_hc/mix_activation",)
+    ),
+    "mtp.layers.0.mlp_hyper_connection.block_inject_weight.weight": (
+        "mtp/layers/0/mlp_hc/inject", ("mtp/layers/0/mlp_hc/input",)
+    ),
+    "mtp.layers.0.self_attn.q_proj.weight": (
+        "mtp/layers/0/attention/query_gate", ("mtp/layers/0/mixer_input",)
+    ),
+    "mtp.layers.0.self_attn.k_proj.weight": (
+        "mtp/layers/0/attention/key", ("mtp/layers/0/mixer_input",)
+    ),
+    "mtp.layers.0.self_attn.v_proj.weight": (
+        "mtp/layers/0/attention/value", ("mtp/layers/0/mixer_input",)
+    ),
+    "mtp.layers.0.self_attn.o_proj.weight": (
+        "mtp/layers/0/attention/output", ("mtp/layers/0/attention/gated_output",)
+    ),
+    "mtp.layers.0.mlp.gate.weight": ("mtp/layers/0/moe/router", ("mtp/layers/0/ffn_input",)),
+    "mtp.layers.0.mlp.shared_expert_gate.weight": (
+        "mtp/layers/0/moe/shared_score", ("mtp/layers/0/ffn_input",)
+    ),
+    "mtp.layers.0.mlp.shared_expert.gate_proj.weight": (
+        "mtp/layers/0/moe/shared/gate", ("mtp/layers/0/ffn_input",)
+    ),
+    "mtp.layers.0.mlp.shared_expert.up_proj.weight": (
+        "mtp/layers/0/moe/shared/up", ("mtp/layers/0/ffn_input",)
+    ),
+    "mtp.layers.0.mlp.shared_expert.down_proj.weight": (
+        "mtp/layers/0/moe/shared/down", ("mtp/layers/0/moe/shared/product",)
+    ),
+}
+# The indexer's query rows then its key row block share one GGUF matrix.
+_MTP_INDEX = "mtp.layers.0.self_attn.indexer.index_qk_proj.weight"
+_MTP_GATE_UP = "mtp.layers.0.mlp.experts.gate_up_proj"
+_MTP_DOWN = "mtp.layers.0.mlp.experts.down_proj"
+MTP_EXPERTS = "mtp/layers/0/moe/experts"
+MTP_PACKED = (
+    ("mtp/layers/0/attn_hc/down", "mtp/layers/0/attn_hc/inject"),
+    ("mtp/layers/0/mlp_hc/down", "mtp/layers/0/mlp_hc/inject"),
+)
+
+
+def unit_offset_exactly(name: str, values: torch.Tensor) -> torch.Tensor:
+    """fl32(1 + gamma) of BF16 words *gamma* (the hyper-connection mixer's multiplier)."""
+    v = values.to(torch.float32).reshape(-1).numpy()
+    if not np.all(np.isfinite(v)) or np.any((v.view(np.uint32) & 0xFFFF) != 0):
+        raise GgufError(f"{name}: a raw gamma must be finite BF16 words")
+    return torch.from_numpy((np.float32(1.0) + v).astype(np.float32)).reshape(values.shape)
+
+
+def _mtp_shapes(config: dict) -> dict[str, tuple[int, ...]]:
+    """GGUF shapes (rows first) the drafter's tensors must have for this text config."""
+    h, e, i = config["hidden_size"], config["num_experts"], config["moe_intermediate_size"]
+    w, rank = config["hc_count"] * h, config["hc_lowrank"]
+    heads, kv, d = config["num_attention_heads"], config["num_key_value_heads"], config["head_dim"]
+    index = (config["indexer_n_heads"] + config["indexer_kv_heads"]) * config["indexer_head_dim"]
+    shared = config["shared_expert_intermediate_size"]
+    shapes = {
+        "mtp.fc_embedding.weight": (h, h),
+        "mtp.fc_hidden.weight": (h, h),
+        "mtp.pre_fc_norm_embedding.weight": (h,),
+        "mtp.pre_fc_norm_hidden.weight": (w,),
+        "mtp.hyper_connection_mixer.hc_norm.weight": (w,),
+        "mtp.hyper_connection_mixer.input_mix_weight_down.weight": (rank, w),
+        "mtp.hyper_connection_mixer.input_mix_weight_up.weight": (w, rank),
+        "mtp.layers.0.self_attn.q_proj.weight": (2 * heads * d, h),
+        "mtp.layers.0.self_attn.k_proj.weight": (kv * d, h),
+        "mtp.layers.0.self_attn.v_proj.weight": (kv * d, h),
+        "mtp.layers.0.self_attn.o_proj.weight": (h, heads * d),
+        "mtp.layers.0.self_attn.q_norm.weight": (d,),
+        "mtp.layers.0.self_attn.k_norm.weight": (d,),
+        _MTP_INDEX: (index, h),
+        "mtp.layers.0.self_attn.indexer.q_layernorm.weight": (config["indexer_head_dim"],),
+        "mtp.layers.0.self_attn.indexer.k_layernorm.weight": (config["indexer_head_dim"],),
+        "mtp.layers.0.mlp.gate.weight": (e, h),
+        "mtp.layers.0.mlp.shared_expert_gate.weight": (1, h),
+        "mtp.layers.0.mlp.shared_expert.gate_proj.weight": (shared, h),
+        "mtp.layers.0.mlp.shared_expert.up_proj.weight": (shared, h),
+        "mtp.layers.0.mlp.shared_expert.down_proj.weight": (h, shared),
+        _MTP_GATE_UP: (e, 2 * i, h),
+        _MTP_DOWN: (e, h, i),
+    }
+    for mixer in ("attn_hyper_connection", "mlp_hyper_connection"):
+        p = f"mtp.layers.0.{mixer}."
+        shapes[p + "hc_norm.weight"] = (w,)
+        shapes[p + "input_mix_weight_down.weight"] = (rank, w)
+        shapes[p + "input_mix_weight_up.weight"] = (w, rank)
+        shapes[p + "block_inject_weight.weight"] = (config["hc_count"], w)
+    return shapes
+
+
+def add_mtp(model: Model, mtp: GgufModel) -> None:
+    """Adds the MTP drafter (component ``mtp``) from its GGUF, every value kept exactly.
+
+    The drafter is one QSA block plus a routed MoE of Q2_0 experts over the text model's token
+    embedding and LM head (it has no embedding or head of its own). BF16 matrices keep their
+    words, the experts keep their Q2_0 blocks as ``ggml_rec_q2_0_q2_0`` records (the fused
+    ``gate_up_proj`` holds each expert's gate rows, then its up rows), the indexer's fused query/key
+    matrix splits into its row blocks, and norms follow ``_MTP_NORMS``.
+    """
+    if mtp.metadata.get("general.architecture") != MTP_ARCHITECTURE:
+        raise GgufError(
+            f"MTP GGUF general.architecture is {mtp.metadata.get('general.architecture')!r}, "
+            f"expected {MTP_ARCHITECTURE!r}"
+        )
+    config = model.config
+    expected = _mtp_shapes(config)
+    if set(mtp.tensors) != set(expected):
+        missing, extra = set(expected) - set(mtp.tensors), set(mtp.tensors) - set(expected)
+        raise GgufError(f"MTP GGUF tensors differ: missing {sorted(missing)}, unknown {sorted(extra)}")
+    for name, shape in expected.items():
+        if mtp.tensor(name).shape != shape:
+            raise GgufError(f"{name}: shape {mtp.tensor(name).shape}, expected {shape}")
+    for name in (_MTP_GATE_UP, _MTP_DOWN):
+        if mtp.tensor(name).type.format != "ggml_q2_0":
+            raise GgufError(f"{name}: experts must be ggml_q2_0, got {mtp.tensor(name).type.format}")
+    model.components["mtp"] = json.loads(json.dumps(MTP_COMPONENT))
+
+    def add(name: str, shape, source, inputs=(), direct_format="bf16"):
+        model.add(
+            Parameter(name, tuple(shape), source, inputs=inputs, direct_format=direct_format,
+                      residency="mtp")
+        )
+
+    for gguf_name, (name, rule) in _MTP_NORMS.items():
+        tensor = mtp.tensor(gguf_name)
+        values = tensor_source(mtp, gguf_name, shape=tensor.shape).values().reshape(tensor.shape)
+        if rule == "words":
+            add(name, tensor.shape, array_source(narrow_exactly(gguf_name, values, "words"), gguf_name))
+        else:
+            add(name, tensor.shape, array_source(unit_offset_exactly(gguf_name, values), gguf_name), (),
+                "fp32")
+    for gguf_name, (name, inputs) in _MTP_MATRICES.items():
+        tensor = mtp.tensor(gguf_name)
+        if tensor.type.format != "bf16":
+            raise GgufError(f"{gguf_name}: expected BF16, got {tensor.type.format}")
+        add(name, tensor.shape, tensor_source(mtp, gguf_name, shape=tensor.shape), inputs)
+    index = mtp.tensor(_MTP_INDEX)
+    iq = config["indexer_n_heads"] * config["indexer_head_dim"]
+    for name, rows in (("query", (0, iq)), ("key", (iq, index.rows))):
+        add(f"mtp/layers/0/indexer/{name}", (rows[1] - rows[0], index.shape[1]),
+            tensor_source(mtp, _MTP_INDEX, rows=rows), ("mtp/layers/0/mixer_input",))
+    for group in MTP_PACKED:
+        model.packing_groups.append(group)
+    gate_up, down = mtp.tensor(_MTP_GATE_UP), mtp.tensor(_MTP_DOWN)
+    experts, _, hidden = gate_up.shape
+    source = ExpertRecordSource(
+        (experts, hidden, config["moe_intermediate_size"]),
+        f"{_MTP_GATE_UP}|{_MTP_DOWN}",
+        mtp,
+        (_MTP_GATE_UP, _MTP_GATE_UP, _MTP_DOWN),
+        GGML_REC_Q2_0_Q2_0.name,
+        fused_gate_up=True,
+    )
+    add(MTP_EXPERTS, source.shape, source, ("mtp/layers/0/ffn_input",), source.format)
 
 
 def encoded_format(parameter: Parameter) -> str | None:
@@ -891,7 +1101,9 @@ class ExpertRecordSource:
     """One layer's routed experts ``[experts, hidden, intermediate]`` in the GGUF.
 
     Only :func:`import_expert_records` reads it: the bank is stored exactly, never as values.
-    ``tensors`` names the GGUF gate, up and down tensors; ``format`` is the record format.
+    ``tensors`` names the GGUF gate, up and down tensors; ``format`` is the record format. With
+    ``fused_gate_up`` the gate and up tensor is one ``[experts, 2 intermediate, hidden]`` matrix
+    holding each expert's gate rows, then its up rows (the MTP drafter's ``gate_up_proj``).
     """
 
     shape: tuple[int, int, int]
@@ -899,6 +1111,7 @@ class ExpertRecordSource:
     gguf: GgufModel
     tensors: tuple[str, str, str]
     format: str
+    fused_gate_up: bool = False
     read_encoded: object = None
     weight_divisor: object = None
     input_divisor: object = None
@@ -939,19 +1152,26 @@ def import_expert_records(request: PrepareRequest) -> PreparedMethod:
         (source.gguf.tensor(name), rows, row_bytes)
         for name, (_, _, rows, row_bytes) in zip(source.tensors, g.parts())
     ]
-    for tensor, rows, row_bytes in parts:
-        if tensor.rows != g.experts * rows or tensor.row_bytes != row_bytes:
+    # A fused gate/up tensor holds 2 * intermediate rows per expert.
+    per_expert = [2 if source.fused_gate_up and i < 2 else 1 for i in range(3)]
+    for (tensor, rows, row_bytes), factor in zip(parts, per_expert):
+        if tensor.rows != g.experts * rows * factor or tensor.row_bytes != row_bytes:
             raise ValueError(f"{tensor.name}: rows of {tensor.row_bytes} B differ from the record")
+
+    def read(index: int, first: int, count: int) -> np.ndarray:
+        tensor, rows, row_bytes = parts[index]
+        factor = per_expert[index]
+        block = source.gguf.read_rows(tensor, first * rows * factor, (first + count) * rows * factor)
+        block = block.reshape(count, rows * factor, row_bytes)
+        if factor == 1:
+            return block
+        # Expert e's gate rows are its first `rows` fused rows, its up rows the next `rows`.
+        return block[:, :rows] if index == 0 else block[:, rows:]
 
     def produce(output):
         for first in range(0, g.experts, _RECORD_CHUNK):
             count = min(_RECORD_CHUNK, g.experts - first)
-            gate, up, down = (
-                source.gguf.read_rows(tensor, first * rows, (first + count) * rows).reshape(
-                    count, rows, row_bytes
-                )
-                for tensor, rows, row_bytes in parts
-            )
+            gate, up, down = (np.ascontiguousarray(read(i, first, count)) for i in range(3))
             records = pack_expert_records(target.format, target.shape, gate, up, down)
             output.write_bytes(first * g.record_stride, records.reshape(-1).data)
 

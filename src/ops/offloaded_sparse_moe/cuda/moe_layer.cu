@@ -659,6 +659,10 @@ void launch_pass(QType gate_up, int columns, const bf16* x, const MoeDispatch& d
         launch_pass_format<QType::GGML_IQ1_M>(columns, x, dispatch, source, g, top_k, job_records, flags, base, jobs,
                                               h_rows, outputs, stream);
         return;
+    case QType::GGML_Q2_0: // the MTP drafter's records
+        launch_pass_format<QType::GGML_Q2_0>(columns, x, dispatch, source, g, top_k, job_records, flags, base, jobs,
+                                             h_rows, outputs, stream);
+        return;
     default: require(false, "unsupported gate/up format");
     }
 }

@@ -164,7 +164,7 @@ The converter currently writes these formats:
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `nvfp4` | Supply a custom quantizer | `import_encoded` |
 | `ggml_q8_0`, `ggml_q6_k`, `ggml_iq2_xxs`, `ggml_iq4_nl`, `ggml_iq3_s`, `ggml_iq2_s`, `ggml_iq4_xs`, `ggml_iq1_m`, `ggml_q2_0` | None | `import_encoded` from a GGUF |
-| `ggml_rec_iq2_s_q2_0`, `ggml_rec_iq2_xxs_q2_0`, `ggml_rec_iq1_m_q2_0` | None | `import_expert_records` from a GGUF expert layer |
+| `ggml_rec_iq2_s_q2_0`, `ggml_rec_iq2_xxs_q2_0`, `ggml_rec_iq1_m_q2_0`, `ggml_rec_q2_0_q2_0` | None | `import_expert_records` from a GGUF expert layer (the last: the MTP drafter's fused gate/up) |
 
 `grouped_absmax` stores one FP16 scale per group and signed integer codes. `grouped_search` stores
 the same words but chooses each group's scale by minimizing rounding error weighted by an activation
@@ -333,6 +333,24 @@ The artifact records the volume's geometry and a random 16-byte volume id in its
 (`ngram_table`). To convert again without rewriting the 29 GB volume, pass `--ngram-reuse PATH`:
 the converter adopts that volume's id only if its header matches this table's geometry and 512
 rows spread over the table (the first and last included) equal the GGUF's rows byte for byte.
+
+`--mtp-gguf PATH` adds the MTP drafter (component `mtp`, architecture `Qwen4ExpMTP`) from Strata's
+`mtp-q2_0.gguf` (GGUF architecture `qwen4exp-mtp`, the checkpoint's `mtp.*` tensors). Its BF16
+matrices keep their words; its 512 routed experts keep their Q2_0 blocks as one
+`ggml_rec_q2_0_q2_0` bank (the fused `gate_up_proj` holds each expert's gate rows, then its up rows);
+the indexer's fused `index_qk_proj` splits into its query and key row blocks. Its norms hold the
+checkpoint's raw BF16 gamma widened to F32: the embedding, hidden and attention norms are stored as
+those BF16 words (unit-offset RMSNorms), and the three hyper-connection mixer norms as
+`fl32(1 + gamma)`, the multiplier the mixer Op takes and the same FP32 sum the text GGUF stores for
+every text mixer norm. With the drafter the artifact is 40.1 GB (905 s on this host, n-gram volume
+reused); the Engine loads the drafter only for `--spec mtp`.
+
+```bash
+python -m tools.convert \
+  --model /models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+  --mtp-gguf /models/mtp-q2_0.gguf \
+  --recipe qwen4_exp_gguf --device cpu --out out/qwen4exp-mtp.ninfer --ngram-reuse out/qwen4exp.ninfer.ngram
+```
 
 The text config uses Infernix's Qwen4Exp keys. The GGUF stores the n-gram hash tables literally
 (multipliers, head sizes and offsets); the config records Infernix's derivation parameters (seed
