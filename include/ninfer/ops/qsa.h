@@ -181,7 +181,8 @@ void qsa_select_blocks(const Tensor& index_q, const Tensor& positions, const Ten
  * and query head h reads KV head floor(h / 12) with the shared Softmax Attention oracle of
  * softmax_attention.h over J_t (keys and values decoded from their stored codes and scales, keys in
  * original coordinates). While n(p) <= top and the selection holds every block, J_t = [0, p] and
- * the result is causal attention.
+ * the result is causal attention. An empty J_t (count 0 at a block-aligned p, p + 1 = R n(p))
+ * gives a zero output on every route.
  *
  * Numeric: Q is not quantized; keys enter as exact FP16 codes against an FP16 rounding of the
  * prepared query with their group scales applied in FP32; P x V takes one FP16 rounding of either

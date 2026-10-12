@@ -280,6 +280,14 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << '/' << product::format_pretty_count(metrics.speculative_draft_tokens) << " ("
             << product::format_pretty_percent(acceptance) << ')';
     }
+    if (metrics.speculative_ngram_drafted_tokens != 0) {
+        const double acceptance = static_cast<double>(metrics.speculative_ngram_accepted_tokens) /
+                                  static_cast<double>(metrics.speculative_ngram_drafted_tokens);
+        out << " | copies accepted "
+            << product::format_pretty_count(metrics.speculative_ngram_accepted_tokens) << '/'
+            << product::format_pretty_count(metrics.speculative_ngram_drafted_tokens) << " ("
+            << product::format_pretty_percent(acceptance) << ')';
+    }
     if (outcome.thinking.requested_budget) {
         out << " | thinking "
             << product::format_pretty_count(outcome.thinking.model_thinking_tokens) << '/'
@@ -293,6 +301,13 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         if (outcome.thinking.injected_tokens != 0) {
             out << ", control " << product::format_pretty_count(outcome.thinking.injected_tokens);
         }
+    }
+    if (outcome.thinking.loop_detected) {
+        out << " | reasoning loop after "
+            << product::format_pretty_count(outcome.thinking.loop_thinking_tokens)
+            << " thinking tokens ("
+            << static_cast<int>(outcome.thinking.loop_coverage * 100.0F + 0.5F) << "% repeated), "
+            << (outcome.thinking.applied ? "concluded" : "stopped");
     }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }

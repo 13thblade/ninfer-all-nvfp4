@@ -6,18 +6,22 @@ namespace ninfer::ops {
 
 // Apply the five lane dimensions of a Sylvester transform to independent columns. Keeping the
 // column loop inside each stage exposes their independent shuffle instructions while preserving
-// the butterfly and rounding order of every column.
+// the butterfly and rounding order of every column. The butterfly is written branch-free:
+// (-value) + peer is exactly peer - value, and a lane-dependent select between the two forms made
+// ptxas guard every shuffle with its own divergence check (BRA.DIV), which serialized them: on the
+// RTX 3090 a one-tile, 64-column FA2 prompt launch took 43.7 us with it and 33.5 us without.
 template <int Columns>
 __device__ __forceinline__ void hadamard_d32_columns_inplace(float (&values)[Columns], int lane) {
     constexpr unsigned FullMask = 0xffffffffu;
 
 #pragma unroll
     for (int stride = 1; stride <= 16; stride <<= 1) {
+        const float sign = (lane & stride) == 0 ? 1.0f : -1.0f;
 #pragma unroll
         for (int column = 0; column < Columns; ++column) {
             const float value = values[column];
             const float peer  = __shfl_xor_sync(FullMask, value, stride);
-            values[column] = (lane & stride) == 0 ? __fadd_rn(value, peer) : __fsub_rn(peer, value);
+            values[column]    = __fadd_rn(__fmul_rn(sign, value), peer);
         }
     }
 }
@@ -43,25 +47,38 @@ normalized_hadamard_d256_group_value_from_h64(float x0, float x1, float x2, floa
 // One full warp owns one D256 row. Lane l carries dimensions l+32*r in values[r]. The fixed
 // normalized Sylvester transform is shared by persistent K preparation and transient Q
 // preparation; it never materializes an intermediate row outside registers.
-__device__ __forceinline__ void normalized_hadamard_d256_inplace(float (&values)[8], int lane) {
+// `Rows` independent rows at once: row i occupies values[8i .. 8i+7] in the single-row layout.
+// Every row gets exactly the single-row arithmetic; interleaving only exposes the rows'
+// independent shuffles to the scheduler.
+template <int Rows>
+__device__ __forceinline__ void normalized_hadamard_d256_rows_inplace(float (&values)[8 * Rows],
+                                                                      int lane) {
     hadamard_d32_columns_inplace(values, lane);
 
 #pragma unroll
-    for (int span = 1; span < 8; span <<= 1) {
+    for (int row = 0; row < Rows; ++row) {
 #pragma unroll
-        for (int base = 0; base < 8; base += 2 * span) {
+        for (int span = 1; span < 8; span <<= 1) {
 #pragma unroll
-            for (int offset = 0; offset < span; ++offset) {
-                const float low              = values[base + offset];
-                const float high             = values[base + offset + span];
-                values[base + offset]        = __fadd_rn(low, high);
-                values[base + offset + span] = __fsub_rn(low, high);
+            for (int base = 0; base < 8; base += 2 * span) {
+#pragma unroll
+                for (int offset = 0; offset < span; ++offset) {
+                    const int lo     = 8 * row + base + offset;
+                    const float low  = values[lo];
+                    const float high = values[lo + span];
+                    values[lo]        = __fadd_rn(low, high);
+                    values[lo + span] = __fsub_rn(low, high);
+                }
             }
         }
     }
 
 #pragma unroll
     for (float& value : values) { value = __fmul_rn(value, 0x1p-4f); }
+}
+
+__device__ __forceinline__ void normalized_hadamard_d256_inplace(float (&values)[8], int lane) {
+    normalized_hadamard_d256_rows_inplace<1>(values, lane);
 }
 
 } // namespace ninfer::ops

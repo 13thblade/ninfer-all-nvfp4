@@ -85,12 +85,13 @@ the idea is obvious and the obstacle is not.
   one acceptance threshold. The curve is flat in the middle, so two points take most of the spread
   for one extra graph and one bit of per-sequence state.
 
-**2. Context-lookup drafting on the DFlash2 path -- smaller than it first looked.**
-`--lookup-ngram` is implemented and hooks the MTP branch only, where it is worth ~3-5% because that
-drafter already accepts 95-96%. The case for moving it to DFlash2 was K=15's 0.868 acceptance and a
-2.3x ceiling -- but K=15 is not the operating point on real generation, and at K=7 acceptance is
-0.95, which caps a perfect drafter at **+19%**. Worth doing, worth maybe half that in practice, and
-no longer the largest thing on this list.
+**2. Copy drafting on the DFlash2 path -- one lane done, two lanes next.**
+`--ngram-draft-tokens 15` verifies n-gram copies in 16-column rounds beside DFlash2 at one lane:
++38% decode on the agent replay, up to +77% on turns that return a file, -0.7% on output that never
+copies (performance.md). Open: copies above one lane (drafter at K plus overlay, and a gate on
+how long a copy must be before a whole batch pays 16 columns); attributing and removing the -0.7%;
+whether the agent launcher should turn it on by default. Windows of 31/63 are not worth the Op work
+on this card (their prefill proxy costs 2-8x an 8-token chunk).
 
 ## Open after the 2026-09-17 upstream catch-up (v3 artifacts, `src/models/qwen3_5`)
 
