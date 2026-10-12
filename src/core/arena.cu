@@ -377,10 +377,12 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     // Portable, so the buffer counts as pinned in every device's context rather than only the one
     // that was current when it was allocated. With several ranks, ingress frames are copied to each
     // stage's device from one host buffer, and a copy that treats it as pageable is neither fast nor
-    // capturable. (The error text below keeps its `cudaMallocHost` wording: launcher docs and the
+    // capturable. Mapped, so cudaHostGetDevicePointer is defined for every buffer (zero-copy
+    // consumers such as the qwen4_exp expert banks read it through the device alias); on a UVA
+    // platform the flag changes nothing but making that contract explicit. (The error text below keeps its `cudaMallocHost` wording: launcher docs and the
     // test guard match on it.)
     void* ptr             = nullptr;
-    const cudaError_t err = cudaHostAlloc(&ptr, size_bytes, cudaHostAllocPortable);
+    const cudaError_t err = cudaHostAlloc(&ptr, size_bytes, cudaHostAllocPortable | cudaHostAllocMapped);
     if (err != cudaSuccess) {
         // Say the size, and say which memory. `cudaErrorMemoryAllocation: out of memory` reads as
         // a VRAM shortfall and sends people to nvidia-smi when the shortfall is pinned system RAM.
