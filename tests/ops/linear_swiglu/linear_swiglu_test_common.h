@@ -16,6 +16,9 @@ enum class ActivationCompute : std::uint8_t {
     // Integer activations against groupwise-int weights, distinct from A8's FP8 path. Held to the
     // same A8 activation allowance.
     A8Int,
+    // A8Int plus the integer routes at decode and verify widths (LinearPolicy::AllowA8IntDecode),
+    // under the same allowance.
+    A8IntDecode,
 };
 
 struct Profile {

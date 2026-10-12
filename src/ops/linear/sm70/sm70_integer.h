@@ -1,11 +1,12 @@
 #pragma once
 
 // The integer small-T route of an sm_70 build: T2 weights times int8 activations by dp4a, at the
-// decode widths where the other targets' T2 route quantizes the activations too (t2_a8.h, under
-// the same LinearPolicy). Volta has no integer tensor cores. At one or two columns its FP16
-// tensor-core route (sm70_small.cuh) spends most of its instructions widening codes to FP16 and on
-// HMMA steps for columns it does not use; dp4a takes four ternary products per instruction and
-// leaves the projection bound by the weight stream.
+// decode and verify widths where the other targets' T2 route quantizes the activations too
+// (t2_a8.h, under the same LinearPolicy). Volta has no integer tensor cores. At one or two columns
+// its FP16 tensor-core route (sm70_small.cuh) spends most of its instructions widening codes to
+// FP16 and on HMMA steps for columns it does not use; dp4a takes four ternary products per
+// instruction and leaves the projection bound by the weight stream. Up to eight columns (a verify
+// round of up to seven drafts) dp4a still beats that route, by 10-35% (sm70_integer.cu).
 //
 // The activations are quantized once per call into the workspace, one FP16-rounded scale per
 // (column, 64-value group) as t2_small_t_i8_quantize_kernel does, with the codes of every
@@ -26,7 +27,7 @@
 
 namespace ninfer::ops::detail::sm70 {
 
-inline constexpr std::int32_t kIntegerMaxTokens = 2;
+inline constexpr std::int32_t kIntegerMaxTokens = 8;
 
 // Whether a call of `tokens` columns over weights of this format and input width, under `policy`,
 // takes the integer route in this build.

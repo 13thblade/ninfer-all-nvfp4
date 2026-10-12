@@ -37,8 +37,9 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   video frame into soft tokens in the prompt, on the GPU, streamed from pinned host memory, or on
   CPU threads (`--vision-residency`); see [below](#images-and-video).
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
-  tokens (1024 or 512 on a card without room for them, [below](#memory-and-context)), prefix reuse across turns and requests with host-memory images
-  ([below](#prefix-reuse)), structured output, tool calls in Gemma's
+  tokens (1024 or 512 on a card without room for them, [below](#memory-and-context)), prefix
+  reuse across turns and requests with host-memory images ([below](#prefix-reuse)), structured
+  output, tool calls in Gemma's
   `<|tool_call>call:NAME{...}<tool_call|>` form returned as OpenAI tool calls, streaming, reasoning
   in its own channel when thinking is on, and causal scoring (`ninfer-perplexity`).
 - **Thinking.** Off unless asked for, as the release's chat template has it: a request turns it on

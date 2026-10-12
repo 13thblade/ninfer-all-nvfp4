@@ -117,18 +117,24 @@ speed, and the kernels written for Ampere everywhere else, on emulated warp prim
   activations directly; wider calls convert them to FP16 once. From 65 columns
   (`NINFER_SM70_CUBLAS_MIN`) the weights are dequantized to FP16 32 MiB at a time and multiplied by
   cuBLAS with FP32 accumulation. Activations beyond +-65504 saturate there.
+- **T2 projections at one to eight columns** (decode, two requests, an MTP or DFlash2 verify round)
+  take an integer route where the projection's policy admits integer activations, as the other
+  targets' T2 A8 route does: the activations are quantized to int8 with one scale per 64 values,
+  and `dp4a` multiplies them by the ternary codes, 10-35% faster than the tensor-core route. The
+  MLP `gate_up` takes it only under `--mlp-a8-decode`, the flag that asks for an integer gate_up at
+  these widths; on Volta that applies to a T2 `gate_up`, and a Q4 one, which has no integer route
+  here, stays A16.
 - **Weight layout**: the row-split projection weights of the text and MTP layers (T2, Q2, Q4, Q5,
   Q6) load in the panel layout, four rows' records of a group per 128-byte line, which the
   decode reads stream at a larger share of the card's bandwidth.
 - **GGUF projections** keep NInfer's DP4A vector kernel up to eight columns and ggml's DP4A matrix
   kernel above (as llama.cpp does on Volta); GGUF dense projections from 65 columns take the cuBLAS
   route.
-- **Attention** of every KV format runs on Volta's tensor cores. Decode and verification use a
-  Volta kernel that decodes each format's keys and values to FP16 as it loads them, with the same
-  fused append, splits and reducers as the other targets. Prompt attention decodes the visible
-  pages into FP16 planes and runs ggml's Volta flash attention over them, 512 query rows at a
-  time; the planes and the mask take about 5 KiB of workspace per context token with four KV
-  heads.
+- **Attention** of every KV format runs on Volta's tensor cores with FP32 accumulation. Decode and
+  verification use a Volta kernel that decodes each format's keys and values to FP16 as it loads
+  them, with the same fused append, splits and reducers as the other targets. Prompt attention
+  gives a CTA 64 query rows of one KV head and decodes each 32-key tile of the visible pages into
+  shared memory once for all of them; it reads the pages where they are and needs no workspace.
 - FP8 A8 and NVFP4 W4A4 activations are not available, as on `sm_86`; those weights run their A16
   routes.
 
