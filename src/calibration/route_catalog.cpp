@@ -15,6 +15,11 @@ std::vector<RouteCatalogEntry> build_catalog() {
         catalog.push_back({std::move(key), std::move(candidates)});
     };
 
+#if !defined(NINFER_SM70)
+    // An sm_70 build runs its own projection, decode-attention and single-row prompt routes
+    // (ops/linear/sm70, small_t_sm70.cuh, prompt_sm70.cu), which consult none of the projection and
+    // attention keys below; it calibrates the GDN prefill switch alone.
+
     // Ternary Bonsai 2 projections: the small-T kernel's row and column tiles per shape, and the
     // small-T kernel against the prefill GEMM per width.
     const std::vector<std::string> t2_small = {"r16c8",   "r16c16", "r32c32",  "r16c8w1",
@@ -55,10 +60,13 @@ std::vector<RouteCatalogEntry> build_catalog() {
         add(key, {"unified"});
     }
 
+#endif
+
     // The two-stage GDN prefill for 48 and 32 value heads.
     add("gdn_two_stage/h48", {"on"});
     add("gdn_two_stage/h32", {"on"});
 
+#if !defined(NINFER_SM70)
     // Prompt attention switches, measured on rk8v4.
     add("attn_pv_f16", {"on"});
     add("attn_pack_gqa", {"on"});
@@ -87,6 +95,7 @@ std::vector<RouteCatalogEntry> build_catalog() {
                 std::move(tiers));
         }
     }
+#endif
 
     std::sort(catalog.begin(), catalog.end(),
               [](const RouteCatalogEntry& a, const RouteCatalogEntry& b) { return a.key < b.key; });

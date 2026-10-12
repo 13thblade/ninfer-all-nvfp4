@@ -10,6 +10,10 @@
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/sm70/sm70_dequantize.h"
+#include "ops/linear/sm70/sm70_gemm.h"
+#include "ops/linear/sm70/sm70_integer.h"
+#include "ops/linear/sm70/sm70_project.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
@@ -127,10 +131,11 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
                                                LinearPolicy::A16Only, min_tokens, max_tokens);
 }
 
-std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
-                                                std::int32_t input_rows, LinearPolicy policy,
-                                                std::int32_t min_tokens, std::int32_t max_tokens) {
-    validate_policy(policy);
+namespace {
+
+std::size_t linear_add_route_workspace_bytes(QType qtype, std::int32_t output_rows,
+                                             std::int32_t input_rows, LinearPolicy policy,
+                                             std::int32_t min_tokens, std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear_add workspace: invalid token interval");
     }
@@ -193,6 +198,20 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
 
+} // namespace
+
+std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
+                                                std::int32_t input_rows, LinearPolicy policy,
+                                                std::int32_t min_tokens, std::int32_t max_tokens) {
+    validate_policy(policy);
+    const auto routes = [&](std::int32_t lo, std::int32_t hi) {
+        return linear_add_route_workspace_bytes(qtype, output_rows, input_rows, policy, lo, hi);
+    };
+    // Every width of a dense format takes an sm_70 route there.
+    return detail::sm70::capacity(qtype, output_rows, input_rows, min_tokens, max_tokens, policy,
+                                  routes);
+}
+
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, WorkspaceArena& ws,
                 cudaStream_t stream) {
     linear_add(x, w, residual_out, LinearPolicy::A16Only, ws, stream);
@@ -211,6 +230,16 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
 
     if (is_gguf(w.qtype)) {
         detail::gguf_linear_add(x, w, residual_out, ws, stream);
+        return;
+    }
+
+    if (detail::sm70::covers(w, t)) {
+        auto scope            = ws.scope();
+        const auto activation = detail::sm70::prepare_for(
+            x, w.n, ws, stream, detail::sm70::integer_takes(w, t, policy));
+        const detail::sm70::Destination residual{
+            static_cast<__nv_bfloat16*>(residual_out.data), w.n, 0, 0, w.n, true};
+        detail::sm70::project_for(activation, w, {&residual, 1}, stream);
         return;
     }
 

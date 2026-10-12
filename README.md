@@ -2,8 +2,9 @@
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
 their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next and Gemma 4 26B-A4B, on the RTX 3090,
-RTX 4090, RTX 5090 and RTX PRO 6000 Blackwell. It serves the OpenAI, Anthropic and llama.cpp APIs from one GPU, or from
-up to eight as pipeline stages on Linux.
+RTX 4090, RTX 5090 and RTX PRO 6000 Blackwell, and on the Tesla V100 from a
+[source build](docs/build-linux.md#tesla-v100-sm_70). It serves the OpenAI, Anthropic and llama.cpp
+APIs from one GPU, or from up to eight as pipeline stages on Linux.
 
 NInfer-all continues [NInfer](https://github.com/Neroued/ninfer) through the NInfer-3090 line and
 carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits each of them.
@@ -172,9 +173,9 @@ of the file.
 **Kernels and devices**
 
 - **Device route profiles.** Each card's measured profile picks the kernel route for every
-  operation and width. Profiles are built in for the RTX 3090, 4090, 5090 and the three RTX PRO
-  6000 editions; any other GPU is measured once at first start, and `ninfer-calibrate` re-measures
-  ([device profiles](docs/device-profiles.md)).
+  operation and width. Profiles are built in for the RTX 3090, 4090, 5090, the three RTX PRO
+  6000 editions and the Tesla V100-SXM2-16GB; any other GPU is measured once at first start, and
+  `ninfer-calibrate` re-measures ([device profiles](docs/device-profiles.md)).
 - **Pipeline stages.** `--devices 0,1,...` splits the layers over up to eight GPUs on Linux, each
   stage owning its weights, KV and state ([pipeline stages](docs/maintainer/pipeline-stages.md)).
 - FP8 A8 and NVFP4 W4A4 tensor-core routes on every `120a` build, an FP4 tensor-core prompt kernel

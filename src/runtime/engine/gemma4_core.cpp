@@ -160,10 +160,6 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     // One more position than the Engine admits: scoring puts <bos> in front of a window.
     executor.max_context   = options.max_context + 1;
     executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
-    // Prompt chunks of 2048 tokens whatever was requested: the routed experts' matrix kernel fills
-    // its widest (128-column) tile only at 2048 x 8 / 128 tokens per expert, which prefills ~20%
-    // faster than 1024-token chunks; larger chunks grow the sliding-window rings (window + chunk).
-    executor.prefill_chunk = 2048;
     executor.cuda_graphs   = options.use_cuda_graph;
     executor.draft_tokens  = mtp ? speculative.draft_tokens : 0;
     executor.kv_cache      = options.kv_cache;
@@ -173,7 +169,21 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     if (options.enable_vision) {
         executor.vision_max_patches = vision_budget * model->vision_config()->patches_per_token();
     }
-    instance->executor = std::make_unique<models::gemma4::Executor>(*model, device, executor);
+    // Prompt chunks of 2048 tokens whatever was requested: the routed experts' matrix kernel fills
+    // its widest (128-column) tile only at 2048 x 8 / 128 tokens per expert, which prefills ~20%
+    // faster than 1024-token chunks; larger chunks grow the sliding-window rings (window + chunk).
+    // A device without room for that chunk's workspace (a 16 GB card) takes the widest of 1024 and
+    // 512 that fits.
+    for (const std::uint32_t chunk : {2048u, 1024u, 512u}) {
+        executor.prefill_chunk = chunk;
+        try {
+            instance->executor =
+                std::make_unique<models::gemma4::Executor>(*model, device, executor);
+            break;
+        } catch (const models::gemma4::InsufficientMemory&) {
+            if (chunk == 512) { throw; }
+        }
+    }
     if (vision == models::gemma4::VisionPlacement::Host) {
         instance->cpu_vision = std::make_unique<models::gemma4::CpuVisionTower>(*model);
     }

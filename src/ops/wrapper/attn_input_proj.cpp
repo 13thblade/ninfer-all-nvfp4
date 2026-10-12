@@ -1,7 +1,12 @@
 #include "core/weight.h"
+#include "core/weight_view.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/gguf/gguf_linear.h"
+#include "ops/linear/sm70/sm70_dequantize.h"
+#include "ops/linear/sm70/sm70_gemm.h"
+#include "ops/linear/sm70/sm70_integer.h"
+#include "ops/linear/sm70/sm70_project.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_weight_view.h"
 
@@ -16,10 +21,12 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
-#include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <vector>
 #include <stdexcept>
 #include <string>
@@ -46,7 +53,8 @@ void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, cons
     const bool q5_planes =
         qtype != QType::Q5_G64_FP16 || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
     const std::int32_t group = qtype == QType::T2_G128_FP16 ? 128 : 64;
-    if (weight.qtype != qtype || weight.layout != QuantLayout::RowSplit ||
+    // The panel layout is RowSplit's bytes permuted (sm_70 loads, read by its routes).
+    if (weight.qtype != qtype || !is_row_split(weight.layout) ||
         weight.scale_dtype != DType::FP16 ||
         weight.group_size != static_cast<std::uint32_t>(group) || weight.group != group ||
         !t2_planes || weight.ndim != 2 || weight.n != rows || weight.k != 5120 ||
@@ -109,11 +117,62 @@ LinearPolicy without_integer(LinearPolicy policy) {
     return allows_a8_int(policy) ? LinearPolicy::A16Only : policy;
 }
 
+__nv_bfloat16* plane(Tensor& t) { return static_cast<__nv_bfloat16*>(t.data); }
+
+// sm_70: one preparation of x (an FP16 conversion, or the integer route's quantization where the
+// policy admits it for both parents), then each parent's rows into the planes they belong to.
+void sm70_split(const Tensor& x, const Weight& first, std::initializer_list<Tensor*> first_planes,
+                const Weight* second, std::initializer_list<Tensor*> second_planes,
+                LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
+    auto scope = workspace.scope();
+    const bool integer =
+        detail::sm70::integer_takes(first, x.ne[1], policy) &&
+        (second == nullptr || detail::sm70::integer_takes(*second, x.ne[1], policy));
+    const auto activation = detail::sm70::prepare_for(x, std::max(first.n, second ? second->n : 0),
+                                                      workspace, stream, integer);
+    const auto destinations = [](std::initializer_list<Tensor*> planes) {
+        std::vector<detail::sm70::Destination> out;
+        std::int32_t row = 0;
+        for (Tensor* t : planes) {
+            out.push_back({plane(*t), t->ne[0], 0, row, t->ne[0], false});
+            row += t->ne[0];
+        }
+        return out;
+    };
+    detail::sm70::project_for(activation, first, destinations(first_planes), stream);
+    if (second != nullptr) {
+        detail::sm70::project_for(activation, *second, destinations(second_planes), stream);
+    }
+}
+
+// sm_70 without a workspace: up to the small-T route's direct widths, each parent row range into
+// its plane straight from the BF16 activations. False where the width needs a workspace.
+bool sm70_direct_split(const Tensor& x, const Weight& weight, std::initializer_list<Tensor*> planes,
+                       cudaStream_t stream) {
+    if (!detail::sm70::direct_tokens(x.ne[1]) || !detail::sm70::covers(weight, x.ne[1])) {
+        return false;
+    }
+    std::vector<detail::sm70::Destination> destinations;
+    std::int32_t row = 0;
+    for (Tensor* t : planes) {
+        destinations.push_back({plane(*t), t->ne[0], 0, row, t->ne[0], false});
+        row += t->ne[0];
+    }
+    detail::sm70::project_for(detail::sm70::prepare_direct(x), weight, destinations, stream);
+    return true;
+}
+
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                             cudaStream_t stream) {
     validate_policy(policy);
     policy = without_integer(policy);
+    // The parent's rows are [query; key; gate; value].
+    if (workspace != nullptr && detail::sm70::covers(weight, x.ne[1]) &&
+        weight.n == 2 * q.ne[0] + 2 * k.ne[0] && gate.ne[0] == q.ne[0] && v.ne[0] == k.ne[0]) {
+        sm70_split(x, weight, {&q, &k, &gate, &v}, nullptr, {}, policy, *workspace, stream);
+        return;
+    }
     if (weight.qtype == QType::BF16) {
         constexpr std::int32_t kHidden = 5120;
         constexpr std::int32_t kQRows  = 6144;
@@ -183,19 +242,17 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
     require_q8_rowsplit(weight, kRows, kHidden, "query/key/gate/value weight");
+    if (sm70_direct_split(x, weight, {&q, &k, &gate, &v}, stream)) { return; }
     detail::q8_attn_input_dispatch(x, weight, q, gate, k, v, stream);
 }
 
 } // namespace
 
-std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
-                                                     std::int32_t input_rows, LinearPolicy policy,
-                                                     std::int32_t min_tokens,
-                                                     std::int32_t max_tokens) {
-    validate_policy(policy);
-    if (min_tokens <= 0 || max_tokens < min_tokens) {
-        throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
-    }
+namespace {
+
+std::size_t single_parent_route_bytes(QType parent_qtype, std::int32_t parent_rows,
+                                      std::int32_t input_rows, LinearPolicy policy,
+                                      std::int32_t min_tokens, std::int32_t max_tokens) {
 
     switch (parent_qtype) {
     case QType::BF16:
@@ -233,6 +290,24 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         break;
     }
     throw std::invalid_argument("attn_input_proj workspace: unsupported parent qtype");
+}
+
+
+} // namespace
+
+std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
+                                                     std::int32_t input_rows, LinearPolicy policy,
+                                                     std::int32_t min_tokens,
+                                                     std::int32_t max_tokens) {
+    validate_policy(policy);
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
+    }
+    const auto routes = [&](std::int32_t lo, std::int32_t hi) {
+        return single_parent_route_bytes(parent_qtype, parent_rows, input_rows, policy, lo, hi);
+    };
+    return detail::sm70::capacity(parent_qtype, parent_rows, input_rows, min_tokens, max_tokens,
+                                  without_integer(policy), routes);
 }
 
 namespace {
@@ -275,6 +350,12 @@ bool t2_pair_project(const Tensor& x, const Weight& query_key_weight,
     require_matrix(v, kKvRows, cols, "v");
     require_rowsplit(query_key_weight, QType::T2_G128_FP16, kQRows + kKvRows, "query/key weight");
     require_rowsplit(gate_value_weight, QType::T2_G128_FP16, kQRows + kKvRows, "gate/value weight");
+    if (workspace != nullptr && detail::sm70::covers(query_key_weight, cols) &&
+        detail::sm70::covers(gate_value_weight, cols)) {
+        sm70_split(x, query_key_weight, {&q, &k}, &gate_value_weight, {&gate, &v}, policy,
+                   *workspace, stream);
+        return true;
+    }
     if (workspace != nullptr && detail::t2_a8_admits(policy) &&
         detail::t2_a8_supported(query_key_weight, cols) &&
         detail::t2_a8_supported(gate_value_weight, cols)) {
@@ -310,6 +391,12 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
         return;
     }
     require_split_profile(x, query_key_weight, gate_value_weight, q, gate, k, v);
+    if (detail::sm70::covers(query_key_weight, x.ne[1]) &&
+        detail::sm70::covers(gate_value_weight, x.ne[1])) {
+        sm70_split(x, query_key_weight, {&q, &k}, &gate_value_weight, {&gate, &v}, policy,
+                   workspace, stream);
+        return;
+    }
     // Both parents split into a query/gate half and a key/value half, and both read the same
     // activations, so the cuBLAS route materialises each parent once and shares one quantisation
     // across all four destinations.
@@ -337,14 +424,12 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                                       stream);
 }
 
-std::size_t attn_input_proj_split_workspace_capacity_bytes(
-    QType query_key_qtype, std::int32_t query_key_rows, QType gate_value_qtype,
-    std::int32_t gate_value_rows, std::int32_t input_rows, LinearPolicy policy,
-    std::int32_t min_tokens, std::int32_t max_tokens) {
-    validate_policy(policy);
-    if (min_tokens <= 0 || max_tokens < min_tokens) {
-        throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
-    }
+namespace {
+
+std::size_t split_route_bytes(QType query_key_qtype, std::int32_t query_key_rows,
+                              QType gate_value_qtype, std::int32_t gate_value_rows,
+                              std::int32_t input_rows, LinearPolicy policy, std::int32_t min_tokens,
+                              std::int32_t max_tokens) {
     if (query_key_qtype == QType::T2_G128_FP16 || gate_value_qtype == QType::T2_G128_FP16) {
         if (query_key_qtype != gate_value_qtype || query_key_rows != 7168 ||
             gate_value_rows != 7168 || input_rows != 5120) {
@@ -370,6 +455,30 @@ std::size_t attn_input_proj_split_workspace_capacity_bytes(
                                 std::max(min_tokens, kCublasPrefillMinTokens), max_tokens));
     }
     return a8;
+}
+
+} // namespace
+
+std::size_t
+attn_input_proj_split_workspace_capacity_bytes(QType query_key_qtype, std::int32_t query_key_rows,
+                                               QType gate_value_qtype, std::int32_t gate_value_rows,
+                                               std::int32_t input_rows, LinearPolicy policy,
+                                               std::int32_t min_tokens, std::int32_t max_tokens) {
+    validate_policy(policy);
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
+    }
+    const auto routes = [&](std::int32_t lo, std::int32_t hi) {
+        return split_route_bytes(query_key_qtype, query_key_rows, gate_value_qtype, gate_value_rows,
+                                 input_rows, policy, lo, hi);
+    };
+    // Both parents take the sm_70 routes or neither does.
+    if (!detail::sm70::covered_format(query_key_qtype, input_rows) ||
+        !detail::sm70::covered_format(gate_value_qtype, input_rows)) {
+        return routes(min_tokens, max_tokens);
+    }
+    return detail::sm70::capacity(query_key_qtype, std::max(query_key_rows, gate_value_rows),
+                                  input_rows, min_tokens, max_tokens, policy, routes);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
@@ -461,7 +570,7 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
     require_q8_rowsplit(query_key_value_weight, kRows, hidden, "query/key/value weight");
-
+    if (sm70_direct_split(x, query_key_value_weight, {&q, &k, &v}, stream)) { return; }
     detail::q8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
 }
 

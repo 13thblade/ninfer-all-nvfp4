@@ -9,9 +9,14 @@
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
+#include "ops/linear/sm70/sm70_dequantize.h"
+#include "ops/linear/sm70/sm70_gemm.h"
+#include "ops/linear/sm70/sm70_integer.h"
+#include "ops/linear/sm70/sm70_project.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_dispatch.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -76,8 +81,28 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
     validate_linear_policy(policy);
 }
 
+// The sm_70 routes take every dense format; without an arena, the widths that need none.
+bool sm70_route(const Tensor& x, const Weight& w, const Tensor& out,
+                const WorkspaceArena* workspace) {
+    return out.dtype == DType::BF16 && detail::sm70::covers(w, x.ne[1]) &&
+           (workspace != nullptr || detail::sm70::direct_tokens(x.ne[1]));
+}
+
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
+    if (sm70_route(x, w, out, workspace)) {
+        const detail::sm70::Destination all{
+            static_cast<__nv_bfloat16*>(out.data), w.n, 0, 0, w.n, false};
+        if (workspace == nullptr) {
+            detail::sm70::project_for(detail::sm70::prepare_direct(x), w, {&all, 1}, stream);
+            return;
+        }
+        auto scope            = workspace->scope();
+        const auto activation = detail::sm70::prepare_for(
+            x, w.n, *workspace, stream, detail::sm70::integer_takes(w, x.ne[1], policy));
+        detail::sm70::project_for(activation, w, {&all, 1}, stream);
+        return;
+    }
     if (is_gguf(w.qtype)) {
         if (workspace == nullptr) {
             throw std::invalid_argument("linear: a GGUF weight needs the workspace overload");
@@ -123,20 +148,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     throw std::invalid_argument("linear: unsupported weight qtype");
 }
 
-} // namespace
-
-std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
-                                            std::int32_t input_rows, LinearPolicy policy,
-                                            std::int32_t min_tokens, std::int32_t max_tokens) {
-    validate_linear_policy(policy);
-    if (min_tokens <= 0 || max_tokens < min_tokens) {
-        throw std::invalid_argument("linear workspace: invalid token interval");
-    }
-
-    if (is_gguf(qtype)) {
-        const detail::GgufShape shape{qtype, output_rows, input_rows};
-        return detail::gguf_project_workspace_bytes({&shape, 1}, min_tokens, max_tokens);
-    }
+std::size_t linear_route_workspace_bytes(QType qtype, std::int32_t output_rows,
+                                         std::int32_t input_rows, LinearPolicy policy,
+                                         std::int32_t min_tokens, std::int32_t max_tokens) {
     switch (qtype) {
     case QType::Q4_G64_FP16:
         (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
@@ -174,6 +188,29 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         break;
     }
     throw std::invalid_argument("linear workspace: unsupported weight qtype");
+}
+
+
+} // namespace
+
+std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
+                                            std::int32_t input_rows, LinearPolicy policy,
+                                            std::int32_t min_tokens, std::int32_t max_tokens) {
+    validate_linear_policy(policy);
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("linear workspace: invalid token interval");
+    }
+
+    if (is_gguf(qtype)) {
+        const detail::GgufShape shape{qtype, output_rows, input_rows};
+        return detail::gguf_project_workspace_bytes({&shape, 1}, min_tokens, max_tokens);
+    }
+    const auto routes = [&](std::int32_t lo, std::int32_t hi) {
+        return linear_route_workspace_bytes(qtype, output_rows, input_rows, policy, lo, hi);
+    };
+    // Every width of a dense format takes an sm_70 route there.
+    return detail::sm70::capacity(qtype, output_rows, input_rows, min_tokens, max_tokens, policy,
+                                  routes);
 }
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,

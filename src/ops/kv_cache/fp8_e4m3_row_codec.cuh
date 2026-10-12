@@ -75,6 +75,17 @@ __device__ __forceinline__ __half2 kv_cache_fp8_code2_to_half2(std::uint16_t sto
     return static_cast<__half2>(value);
 }
 
+// Two E4M3 codes (the low 16 bits of `codes`) as FP16 values times 2^-8, by integer operations:
+// moved into an FP16's exponent and mantissa fields, a code's bits are its value times 2^-8,
+// subnormals included (E4M3 NaN, which the cache never stores, reads as 480). Multiplying by a
+// scale times 2^8 then rounds once, exactly as the converted code times the scale does; this is
+// for targets without a hardware E4M3 conversion.
+__device__ __forceinline__ __half2 kv_cache_fp8_code2_to_half2_x2m8(unsigned codes) {
+    const unsigned pair = __byte_perm(codes, 0u, 0x4140);
+    const unsigned bits = ((pair & 0x007f007fu) << 7) | ((pair & 0x00800080u) << 8);
+    return *reinterpret_cast<const __half2*>(&bits);
+}
+
 __device__ __forceinline__ __half2 kv_cache_fp8_dequant_code2_to_half2(std::uint16_t storage,
                                                                        __half scale) {
     return __hmul2(kv_cache_fp8_code2_to_half2(storage), __halves2half2(scale, scale));

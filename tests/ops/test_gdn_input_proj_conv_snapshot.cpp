@@ -2,6 +2,7 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "ops/input_projection_test_common.h"
+#include "ops/linear/sm70/sm70_gemm.h"
 
 #include <cuda_runtime.h>
 
@@ -1177,8 +1178,14 @@ int main() {
                      "widest width\n";
         ++failures;
     }
+    // Q8 decode widths take fused kernels without workspace, except on sm_70, which materializes
+    // every width for its projection routes.
+    const std::size_t q8_decode_bytes =
+        ops::detail::sm70::enabled() ? ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                                           2048, 2048, 4096, 1, 16, 16)
+                                     : 0;
     if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 16) !=
-            0 ||
+            q8_decode_bytes ||
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 17) !=
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 17,
                                                                        17)) {

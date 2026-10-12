@@ -7,6 +7,7 @@ and builds and are not read against each other.
 | Page | What it measures | Hardware |
 |---|---|---|
 | [Reference measurements, September 2026](performance/reference-2026-09.md) | Ternary Bonsai 2 27B and Qwen3.8-27B at full context: decode and prompt time by depth, drafters, largest context per card, needles, several requests at once, what the device profiles change, and the October re-check | RTX 3090, 4090, 5090, PRO 6000 |
+| [Tesla V100, October 2026](performance/tesla-v100-2026-10.md) | a `70` build on 16 GB: what fits, engine and server rates of Ternary Bonsai 2, the Qwen3.8-27B releases, Flash-Next and Gemma 4, perplexity against other cards, llama.cpp on the same card | Tesla V100-SXM2-16GB |
 | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#measurements) | every expert placement of the GSQ-RCO releases, MTP, perplexity against llama.cpp, AIME and GPQA | RTX 3090, 4090, 5090, PRO 6000, L40S |
 | [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
 | [Quality trades](maintainer/quality-trade-experiments.md) | what each precision option costs in perplexity and buys in memory or speed | RTX 3090 |

@@ -40,6 +40,7 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
         // allows twice Linear's relative-L2 quantization allowance plus a bounded gross tail.
         return {8.0e-2, 1.0e-2, 1.2e-1};
     case ActivationCompute::A8Int:
+    case ActivationCompute::A8IntDecode:
         // Same structure as A8: gate and up are each quantized independently before feeding the
         // nonlinear product, so the same allowance applies. Only the activation format differs --
         // s8 with one scale per weight group rather than FP8.
@@ -224,6 +225,8 @@ int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& de
 void validate_profile(const Profile& profile) {
     const bool q4 = profile.qtype == QType::Q4_G64_FP16 && profile.gate_up_rows == 34816 &&
                     profile.input_rows == 5120 && profile.output_rows == 17408;
+    const bool t2 = profile.qtype == QType::T2_G128_FP16 && profile.gate_up_rows == 34816 &&
+                    profile.input_rows == 5120 && profile.output_rows == 17408;
     const bool q8_companion = profile.qtype == QType::Q8_G32_FP16 &&
                               profile.gate_up_rows == 12288 && profile.input_rows == 2048 &&
                               profile.output_rows == 6144;
@@ -233,7 +236,7 @@ void validate_profile(const Profile& profile) {
                        profile.input_rows == 5120 && profile.output_rows == 17408;
     const bool fp8 = profile.qtype == QType::FP8_E4M3FN_ROW_BF16 && profile.gate_up_rows == 34816 &&
                      profile.input_rows == 5120 && profile.output_rows == 17408;
-    if ((!q4 && !q8_companion && !q8_dflash2 && !nvfp4 && !fp8) ||
+    if ((!q4 && !t2 && !q8_companion && !q8_dflash2 && !nvfp4 && !fp8) ||
         profile.gate_up_rows != 2 * profile.output_rows) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }
@@ -242,7 +245,8 @@ void validate_profile(const Profile& profile) {
         (fp8 && profile.activation_compute != ActivationCompute::A16 &&
          profile.activation_compute != ActivationCompute::A8) ||
         (!nvfp4 && !fp8 && profile.activation_compute != ActivationCompute::A16 &&
-         profile.activation_compute != ActivationCompute::A8Int)) {
+         profile.activation_compute != ActivationCompute::A8Int &&
+         profile.activation_compute != ActivationCompute::A8IntDecode)) {
         throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");
     }
 }
@@ -304,7 +308,9 @@ int run_profile(std::string_view label, const Profile& profile,
                    ? ops::LinearPolicy::AllowA8
                    : (profile.activation_compute == ActivationCompute::A8Int
                           ? ops::LinearPolicy::AllowA8Int
-                          : ops::LinearPolicy::A16Only));
+                          : (profile.activation_compute == ActivationCompute::A8IntDecode
+                                 ? ops::LinearPolicy::AllowA8IntDecode
+                                 : ops::LinearPolicy::A16Only)));
     const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
         profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1, maximum_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));

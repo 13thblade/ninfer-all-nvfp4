@@ -160,6 +160,7 @@ void test_builtin_parts() {
         {"NVIDIA RTX PRO 6000 Blackwell Workstation Edition", 12, 0, 188},
         {"NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", 12, 0, 188},
         {"NVIDIA RTX PRO 6000 Blackwell Server Edition", 12, 0, 188},
+        {"Tesla V100-SXM2-16GB", 7, 0, 80},
     };
     for (const Part& part : parts) {
         const auto found = ninfer::runtime::find_device_route_profile(

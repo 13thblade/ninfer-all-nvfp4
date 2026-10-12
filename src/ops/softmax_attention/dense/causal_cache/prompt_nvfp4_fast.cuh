@@ -33,6 +33,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/math.h"
 #include "ops/common/mma.cuh"
+#include "ops/common/sm70_emulation.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/nvfp4_group16_codec.cuh"
 #include "ops/common/memory.cuh"
@@ -93,10 +94,14 @@ __device__ __forceinline__ void causal_prompt_rotated_fast_mma_f16_acc(unsigned&
                                                                        unsigned a0, unsigned a1,
                                                                        unsigned a2, unsigned a3,
                                                                        unsigned b0, unsigned b1) {
+#if defined(NINFER_SM70_DEVICE)
+    sm70::mma_m16n8k16_f16acc(c0, c1, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
                  "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                  : "+r"(c0), "+r"(c1)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 // Two E2M1 codes (low nibble first) widened exactly to FP16 and scaled by an exact FP16 pair.

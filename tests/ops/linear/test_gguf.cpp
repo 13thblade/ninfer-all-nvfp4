@@ -310,6 +310,13 @@ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
         out_device.copy_to_host(host.data(), host.size() * sizeof(__nv_bfloat16));
         failures += run_check("swiglu pair T=" + std::to_string(t), to_float(host), swiglu);
     }
+    // The planned capacity covers every call; the slack above it only keeps a shortfall from
+    // aborting the numerical checks before this one reports it.
+    if (workspace.peak_used() > capacity) {
+        std::cerr << "FAIL " << c.name << " workspace peak " << workspace.peak_used()
+                  << " bytes over the planned " << capacity << '\n';
+        ++failures;
+    }
 
     // The token-table gather is the exact weights rounded to BF16.
     const std::vector<std::int32_t> ids{3, 0, 255, 17, 3};

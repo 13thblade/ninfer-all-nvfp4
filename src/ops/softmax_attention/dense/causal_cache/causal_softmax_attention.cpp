@@ -10,6 +10,7 @@
 #include "ops/kv_cache/d256_profile.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_sm70.h"
 
 #include <algorithm>
 #include <cmath>
@@ -747,6 +748,14 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     }
 #endif
+    if (detail::causal_attention_prompt_sm70_applies(cache.storage, batch)) {
+        detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
+                                             stream);
+        detail::causal_attention_prompt_sm70_launch(q, positions, valid_columns, kv_table_rows,
+                                                    scale, cache, out, stream);
+        if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
+        return;
+    }
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                            cache, out, envelope.fast_prompt_kernel, stream);
     if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
@@ -784,6 +793,10 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         return;
     }
 #endif
+    if (detail::causal_attention_prompt_sm70_applies(cache.storage, 1)) {
+        detail::causal_attention_prompt_sm70_launch(q, positions, scale, cache, out, stream);
+        return;
+    }
     detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out,
                                                      envelope.fast_prompt_kernel, stream);
 }

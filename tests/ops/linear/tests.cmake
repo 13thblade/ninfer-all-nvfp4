@@ -28,6 +28,11 @@ ninfer_add_op_test(ninfer_linear_t2_a8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_t2_a8.cpp"
   LIBRARIES ninfer_linear_test_support)
 
+# A wide projection first called inside a CUDA graph capture (sm_70: the cuBLAS route's handle).
+ninfer_add_op_test(ninfer_linear_capture_first_use_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_capture_first_use.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_linear_nvfp4_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_a16.cpp"
   LIBRARIES ninfer_linear_test_support)

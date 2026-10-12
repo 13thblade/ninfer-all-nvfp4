@@ -9,6 +9,9 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8.cuh"
 #include "ops/common/device_route.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
+#if defined(NINFER_SM70)
+#    include "ops/softmax_attention/dense/causal_cache/small_t_sm70.cuh"
+#endif
 
 #include <cstdlib>
 #include <string_view>
@@ -41,6 +44,44 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     // A U8 value plane is the packed signed int4 coding (rk8v4 and the packed-key storages); a
     // U8 key plane is a packed key coding, told apart by storage.
     const bool packed_values = cache_v.dtype == DType::U8;
+#if defined(NINFER_SM70)
+    // Volta's own kernel (small_t_sm70.cuh) takes every INT8-family storage: the same grid, active
+    // splits and partial outputs. The tiled kernels below are Ampere's; a 70 build does not
+    // compile them.
+    (void)implementation_window;
+    const auto run = [&]<bool PackedValues, KvKeyCoding Keys>() {
+        const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+        constexpr int kBlock = 32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::kWarps;
+        causal_attention_small_t_sm70_i8_kernel<Geometry, TokenTile, MultiBatch, Masked, CacheInput,
+                                                PackedValues, Keys><<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), input,
+            static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
+            static_cast<std::int8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),
+            static_cast<__half*>(cache_v_scale.data),
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            invocation.valid_columns == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.table_rows == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
+            logical_capacity, wave_splits, scale, static_cast<float*>(partial_acc.data),
+            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+    };
+    if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+        run.template operator()<true, KvKeyCoding::Lloyd4>();
+    } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
+        run.template operator()<true, KvKeyCoding::Int4E8>();
+    } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
+        run.template operator()<true, KvKeyCoding::RootE8>();
+    } else if (packed_values) {
+        run.template operator()<true, KvKeyCoding::Int8>();
+    } else {
+        run.template operator()<false, KvKeyCoding::Int8>();
+    }
+    CUDA_CHECK(cudaGetLastError());
+#else
     auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena,
                       int QkSplit = 1, bool EarlyFetch = false>() {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
@@ -229,6 +270,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         launch.template operator()<8, 2, 32, false>();
     }
     CUDA_CHECK(cudaGetLastError());
+#endif
 }
 
 } // namespace small_t_i8

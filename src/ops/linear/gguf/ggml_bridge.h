@@ -5,6 +5,7 @@
 // everything here is raw pointers and cudaStream_t.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -318,6 +319,10 @@ void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, 
 // The same rows in FP32, where every value is exact.
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, float* out,
+                     std::int64_t out_row_stride, cudaStream_t stream);
+// The same rows in FP16, the operand type of sm_70's tensor cores (ops/linear/sm70).
+void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
+                     const std::int32_t* row_ids, int rows, __half* out,
                      std::int64_t out_row_stride, cudaStream_t stream);
 
 } // namespace ninfer::ops::gguf

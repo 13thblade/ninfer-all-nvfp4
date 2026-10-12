@@ -25,7 +25,7 @@ namespace {
 
 // Sums each key tile's PV products in FP16 on the packed-value INT8 prompt kernels where the
 // device profile's "attn_pv_f16" says "on"; NINFER_PROMPT_PV_F16=0|1 overrides the profile.
-bool prompt_pv_f16() {
+[[maybe_unused]] bool prompt_pv_f16() {
     static const int forced = [] {
         const char* value = std::getenv("NINFER_PROMPT_PV_F16");
         return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
@@ -49,7 +49,8 @@ bool prompt_pack_gqa() {
 // Both fast INT8 variants run one CTA per SM and every CTA of a launch sweeps a similar key range,
 // so a launch costs about (waves) x (one CTA's sweep). A four-warp CTA sweeps in about 0.72 of an
 // eight-warp CTA's time (measured on RTX 5090 at 64K context) but covers half the rows.
-bool causal_attention_prompt_i8_fast_prefers_narrow(std::int32_t tokens, std::int32_t q_heads) {
+[[maybe_unused]] bool causal_attention_prompt_i8_fast_prefers_narrow(std::int32_t tokens,
+                                                                     std::int32_t q_heads) {
     const int multiprocessors = current_device_multiprocessors(170);
     const auto waves = [&](int rows) {
         return div_up(div_up(tokens, rows) * q_heads, multiprocessors);
@@ -109,6 +110,8 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                                                   Metadata metadata, Tensor& out, bool fast,
                                                   cudaStream_t stream) {
     fast = causal_attention_prompt_fast_kernel(cache.storage, fast);
+#if !defined(NINFER_SM70)
+    // The fast kernels hold 100 KiB of shared memory, past sm_70's 96 KiB; a 70 build skips them.
     if (fast && cache.storage == KvCacheStorage::Int8Group64) {
         causal_attention_prompt_i8_fast_launch_for<Geometry, false>(q, positions, scale, cache,
                                                                     metadata, out, stream);
@@ -134,6 +137,7 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
             q, positions, scale, cache, metadata, out, stream);
         return;
     }
+#endif
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     const auto tokens     = static_cast<std::int32_t>(q.ne[2]);
@@ -171,14 +175,33 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                     static_cast<const std::int32_t*>(positions.data), scale,
                     static_cast<__nv_bfloat16*>(out.data), tokens);
             };
+#if defined(NINFER_SM70)
+            // A 70 build emulates these tiles; one variant per coding keeps ptxas within bounds.
+            (void)pack_gqa;
+            launch.template operator()<false>();
+#else
             if (pack_gqa) {
                 launch.template operator()<true>();
             } else {
                 launch.template operator()<false>();
             }
+#endif
         };
         // A U8 key plane is a packed key coding (rk4v4, rk4v4-e8 or rk2v4-e8), told apart by
         // storage; a U8 value plane is the packed signed int4 coding they share with rk8v4.
+#if defined(NINFER_SM70)
+        if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+            launch_i8.template operator()<true, KvKeyCoding::Lloyd4, false>();
+        } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
+            launch_i8.template operator()<true, KvKeyCoding::Int4E8, false>();
+        } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
+            launch_i8.template operator()<true, KvKeyCoding::RootE8, false>();
+        } else if (cache_v.dtype == DType::U8) {
+            launch_i8.template operator()<true, KvKeyCoding::Int8, false>();
+        } else {
+            launch_i8.template operator()<false, KvKeyCoding::Int8, false>();
+        }
+#else
         const bool pv_f16 = prompt_pv_f16();
         if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value && pv_f16) {
             launch_i8.template operator()<true, KvKeyCoding::Lloyd4, true>();
@@ -197,6 +220,7 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
         } else {
             launch_i8.template operator()<false, KvKeyCoding::Int8, false>();
         }
+#endif
     } else {
         // The kernel exceeds the default 48 KiB dynamic-smem ceiling.
         configure_cuda_device_once([&] {
@@ -220,6 +244,11 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
 } // namespace
 
 bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested) {
+#if defined(NINFER_SM70)
+    (void)storage;
+    (void)requested;
+    return false;
+#endif
     const bool supported = storage == KvCacheStorage::Int8Group64 ||
                            storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
                            storage == KvCacheStorage::RotatedLloyd4KeyInt4Value ||

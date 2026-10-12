@@ -8,6 +8,7 @@
 #include "ops/common/math.h"
 #include "ops/common/sampling_workspace.h"
 #include "ops/common/score_id_order.cuh"
+#include "ops/common/sm70_emulation.cuh"
 #include "ninfer/ops/sampling.h"
 
 #include <cub/block/block_merge_sort.cuh>
@@ -19,6 +20,17 @@
 #include <math_constants.h>
 
 namespace ninfer::ops {
+
+// The candidate merges reduce over the first kSamplingTileWarps lanes; redux.sync is sm_80.
+template <int Width>
+__device__ __forceinline__ unsigned int sampling_lane_max(unsigned int mask, unsigned int value) {
+#if defined(NINFER_SM70_DEVICE)
+    return ops::sm70::reduce_max<Width>(mask, value);
+#else
+    return __reduce_max_sync(mask, value);
+#endif
+}
+
 
 using SamplingPartialSort =
     cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerItemsPerThread>;
@@ -193,9 +205,9 @@ __device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamp
             const unsigned long long key =
                 storage.candidates[lane * kSamplerCandidateCap + position];
             const unsigned int high     = static_cast<unsigned int>(key >> 32);
-            const unsigned int max_high = __reduce_max_sync(kMergeMask, high);
+            const unsigned int max_high = sampling_lane_max<kSamplingTileWarps>(kMergeMask, high);
             const unsigned int low      = high == max_high ? static_cast<unsigned int>(key) : 0u;
-            const unsigned int max_low  = __reduce_max_sync(kMergeMask, low);
+            const unsigned int max_low  = sampling_lane_max<kSamplingTileWarps>(kMergeMask, low);
             const unsigned int winners =
                 __ballot_sync(kMergeMask, high == max_high && low == max_low);
             const int source = __ffs(static_cast<int>(winners)) - 1;
@@ -232,7 +244,7 @@ __device__ inline void sampling_store_bf16_tile_topk(unsigned int (&keys)[kSampl
         int position                      = 0;
         for (int rank = 0; rank < cap; ++rank) {
             const unsigned int key     = storage.candidates[lane * kSamplerCandidateCap + position];
-            const unsigned int best    = __reduce_max_sync(kMergeMask, key);
+            const unsigned int best    = sampling_lane_max<kSamplingTileWarps>(kMergeMask, key);
             const unsigned int winners = __ballot_sync(kMergeMask, key == best);
             const int source           = __ffs(static_cast<int>(winners)) - 1;
             if (lane == 0) {

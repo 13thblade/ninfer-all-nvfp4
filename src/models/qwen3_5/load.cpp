@@ -115,6 +115,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         if (out->weights.draft) { out->weights.draft->output_head = out->weights.proposal->head; }
     }
     loading::apply_storage_trades(bindings, out->config, out->weights, options);
+    loading::apply_device_layouts(bindings, out->weights);
     if (options.overlay_vision()) {
         loading::apply_vision_overlay_placement(bindings, out->weights, mtp_parameters,
                                                 draft_parameters);

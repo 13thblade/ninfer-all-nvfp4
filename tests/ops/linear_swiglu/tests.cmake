@@ -25,6 +25,10 @@ ninfer_add_op_test(ninfer_linear_swiglu_q4_a8int_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_a8int.cpp"
   LIBRARIES ninfer_linear_swiglu_test_support)
 
+ninfer_add_op_test(ninfer_linear_swiglu_t2_a8int_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_t2_a8int.cpp"
+  LIBRARIES ninfer_linear_swiglu_test_support)
+
 ninfer_add_op_test(ninfer_linear_swiglu_q4a8_int_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4a8_int.cpp"
   LIBRARIES ninfer_ops)

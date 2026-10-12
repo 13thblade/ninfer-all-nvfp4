@@ -30,6 +30,9 @@ struct DevicePlacement {
     std::size_t rank = 0;
     // Zero bytes reserved right after the object (Binder::device_tail), written by every upload.
     std::uint64_t tail = 0;
+    // Set when the row-split object is permuted into the panel layout after every upload
+    // (Binder::panel_device); the device parent then carries QuantLayout::RowSplitPanel.
+    bool panel = false;
 };
 
 // Offset inside the one page-locked Host block (Residency::Pinned).
