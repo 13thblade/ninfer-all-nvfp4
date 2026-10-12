@@ -50,6 +50,48 @@ and prefill remain outside speculative acceleration. A later request cannot enab
 omitted at startup. The artifact need only contain the Text backbone and the optional components
 selected for this process.
 
+### Qwen3.8-Flash-Next (preview)
+
+The one command:
+
+```bat
+set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs.ninfer
+scripts\run.bat qwen38-flash-next
+```
+
+That launcher profile runs `ninfer-serve <model> --max-concurrency 1 --max-context 32768
+--kv-capacity 32768 --kv-dtype int8 --prefill-chunk 1024`, the only serving shape this release
+supports. `NINFER_CONTEXT` changes the context (up to the model's positions; KV above 32,768 tokens
+is borrowed from the expert cache). What is different from the Qwen3.5 models:
+
+- **One request at a time, text only, plain decode.** `--max-concurrency` above 1, `--kv-dtype`
+  other than `int8`, `--spec`, `--ngram-draft-tokens`, `--vision`, `--graft`, `--context-store` and the
+  load-time weight flags are refused at startup with the flag to change.
+- **No prefix reuse yet.** The server's context cache is switched off for this model (one line at
+  startup says so), so every request prefills its whole prompt and reports 0 cached prompt tokens.
+- **Host RAM.** All 33 GiB of routed experts are pinned in host RAM at startup. Before anything is
+  pinned, a RAM ledger checks that the experts, every other planned allocation and a reserve for
+  Windows (`--ram-headroom-mib`, default 2048) fit in the memory available now; if not, startup
+  refuses with the shortfall ("... 2.9 GiB short. Close other programs ..."). Loading takes about
+  two minutes from a SATA SSD, less when the files are in the page cache.
+- **The VRAM expert cache.** Whatever VRAM the dense weights, the KV and the workspace leave, less
+  a headroom for the desktop, holds the most-used experts (about 11,000-12,500 of the 24,576). Its
+  state is saved beside the model (`<model>.expert-state`) at shutdown and every ten minutes
+  between requests, and loaded at the next start, so the second start is warm. A cold cache fills
+  at one promotion per layer per decoded token; decode speeds up as it fills. Each finished
+  request logs one line with its expert hit rate, promotions and decode speed.
+- **The n-gram volume** `<model>.ngram` (29 GB) is read unbuffered per token, with a 2^20-row host
+  cache; keep it on an SSD.
+
+| Flash-Next option | Meaning | Default |
+|---|---|---|
+| `--ngram-volume FILE` | the per-layer n-gram embedding volume | `<model>.ngram` |
+| `--expert-state FILE` | where the expert cache's state is saved and read | `<model>.expert-state` |
+| `--no-expert-state` | start the expert cache empty and save nothing | off |
+| `--vram-headroom-mib N` | VRAM the expert cache leaves free for the desktop and other programs | 512 with a display, 256 without |
+| `--ram-headroom-mib N` | host RAM left free for Windows once every expert is pinned; startup refuses when it cannot be kept | `2048` |
+| `--expert-cache-mib N` | cap the expert cache (measurement) | what fits |
+
 ### Vision residency
 
 `--vision` keeps the Vision tower, its encode workspace and the item handoff resident for the
@@ -1529,6 +1571,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant and `rk4v4` opt-in Lloyd-Max 4-bit keys; all seven are accepted on this fork's sm_86/sm_89 targets | `bf16` |
+| `--ngram-volume`, `--expert-state`, `--no-expert-state`, `--vram-headroom-mib`, `--ram-headroom-mib`, `--expert-cache-mib` | Qwen3.8-Flash-Next only; see [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) | see there |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |

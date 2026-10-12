@@ -19,6 +19,7 @@ using artifact::ArtifactError;
 using artifact::Json;
 using artifact::require_members;
 
+// The registry's names of Architecture::Qwen4Exp (models/registry.cpp).
 constexpr const char* kArchitecture = "Qwen4ExpForCausalLM";
 constexpr const char* kModelType    = "qwen4_exp_text";
 

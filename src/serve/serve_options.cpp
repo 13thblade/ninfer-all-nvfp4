@@ -48,6 +48,19 @@ std::uint64_t parse_u64(const char* text, const char* label) {
     return static_cast<std::uint64_t>(value);
 }
 
+// A whole-MiB option as bytes. The planners add these to other byte counts, convert them to signed
+// 64-bit and divide them into 32-bit frame counts, so the value is bounded to 1 TiB (far above any
+// real headroom or cache size) rather than to the 64-bit byte range.
+constexpr std::uint64_t kMaxMibOption = 1ULL << 20;
+
+std::uint64_t parse_mib_bytes(const char* text, const char* label) {
+    const std::uint64_t mib = parse_u64(text, label);
+    if (mib > kMaxMibOption) {
+        throw std::invalid_argument(std::string("--") + label + " is out of range");
+    }
+    return mib << 20U;
+}
+
 std::size_t parse_host_context_mib(const char* text) {
     constexpr std::size_t bytes_per_mib = 1ULL << 20;
     constexpr std::size_t maximum       = std::numeric_limits<std::size_t>::max();
@@ -152,6 +165,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--reasoning-loop off|stop|conclude] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
+           "[--ngram-volume FILE] [--expert-state FILE|--no-expert-state] [--vram-headroom-mib N] "
+           "[--ram-headroom-mib N] [--expert-cache-mib N] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16] "
@@ -196,6 +211,14 @@ std::string serve_usage_text(const char* argv0) {
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
            "input projections off that route\n"
+           "       Qwen3.8-Flash-Next (one request at a time, --kv-dtype int8, no prefix reuse): "
+           "--ngram-volume FILE is its n-gram table (default <model>.ngram); --expert-state FILE "
+           "keeps the VRAM expert cache's state across restarts (default <model>.expert-state; "
+           "--no-expert-state starts it empty and saves nothing); --vram-headroom-mib N is the VRAM "
+           "the expert cache leaves free for the desktop (default 512 with a display, 256 without); "
+           "--ram-headroom-mib N is the RAM left free for Windows once every expert is pinned "
+           "(default 2048; startup refuses when it cannot be kept); --expert-cache-mib N caps the "
+           "expert cache (for measurement)\n"
            "       --ngram-draft-tokens 15 adds n-gram copy drafting beside --spec dflash2: when the "
            "text being written already appeared in the request (a tool result, the prompt or the "
            "output so far), a round verifies up to 15 copied tokens instead of the draft model's "
@@ -527,6 +550,24 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.vision_max_merged_tokens = static_cast<std::uint32_t>(merged);
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--ngram-volume") {
+            options.flash_next.ngram_volume_path = require_value("--ngram-volume");
+        } else if (arg == "--expert-state") {
+            options.flash_next.expert_state_path = require_value("--expert-state");
+            if (options.flash_next.expert_state_path.empty()) {
+                throw std::invalid_argument("--expert-state must not be empty");
+            }
+        } else if (arg == "--no-expert-state") {
+            options.flash_next.save_expert_state = false;
+        } else if (arg == "--vram-headroom-mib") {
+            options.flash_next.vram_headroom_bytes =
+                parse_mib_bytes(require_value("--vram-headroom-mib"), "vram-headroom-mib");
+        } else if (arg == "--ram-headroom-mib") {
+            options.flash_next.ram_headroom_bytes =
+                parse_mib_bytes(require_value("--ram-headroom-mib"), "ram-headroom-mib");
+        } else if (arg == "--expert-cache-mib") {
+            options.flash_next.expert_cache_bytes =
+                parse_mib_bytes(require_value("--expert-cache-mib"), "expert-cache-mib");
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--context-store") {

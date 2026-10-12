@@ -8,6 +8,7 @@
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
 #include "runtime/engine/host_cache.h"
+#include "runtime/engine/validate_options.h"
 
 #include <algorithm>
 #include <chrono>
@@ -21,10 +22,8 @@
 #include <vector>
 
 namespace ninfer::runtime {
-namespace {
-using Clock = std::chrono::steady_clock;
 
-void validate_options(const EngineOptions& options) {
+void validate_engine_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
@@ -96,6 +95,9 @@ void validate_options(const EngineOptions& options) {
         throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
     }
 }
+
+namespace {
+using Clock = std::chrono::steady_clock;
 
 std::size_t current_free_device_bytes() {
     std::size_t free_bytes  = 0;
@@ -335,7 +337,7 @@ void ModelInstance::install_external_checkpoints() {
 }
 
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
-    validate_options(options);
+    validate_engine_options(options);
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);

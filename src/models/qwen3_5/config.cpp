@@ -112,7 +112,10 @@ TextConfig text(const Json& value, bool mtp) {
     TextConfig out;
     out.architecture = resolve_architecture(
         architecture(value), artifact::require_id(value.at("model_type"), "model_type"));
-    out.hidden_size             = dimension(value, "hidden_size");
+    if (out.architecture == Architecture::Qwen4Exp) {
+        throw ArtifactError("a Qwen4Exp (Qwen3.8-Flash-Next) artifact is not a Qwen3.5 model");
+    }
+    out.hidden_size           = dimension(value, "hidden_size");
     out.vocab_size              = dimension(value, "vocab_size");
     out.num_hidden_layers       = dimension(value, "num_hidden_layers");
     out.max_position_embeddings = dimension(value, "max_position_embeddings");

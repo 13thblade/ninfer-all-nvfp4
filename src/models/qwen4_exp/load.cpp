@@ -1,8 +1,8 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/load.cpp (Apache-2.0).
 // Modified for NInfer-3090: binds the converter's GGUF-mirroring parameters (GGML block-format
 // projections, BF16 gamma attention norms, FP32 multiplier hyper-connection and PLE norms) and
-// ggml_expert_record_v1 banks in pinned host memory; no expert scales, frontend resources, vision,
-// MTP, proposal head or SSD tier; one-step load (no separate plan).
+// ggml_expert_record_v1 banks in pinned host memory; no expert scales, vision,
+// MTP, proposal head or SSD tier; the frontend resources are the Qwen3.5 frontend's.
 
 #include "models/qwen4_exp/model.h"
 
@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <map>
+#include <string_view>
 #include <string>
 #include <utility>
 
@@ -192,33 +193,90 @@ ExpertBank expert_bank(const BoundWeight& weight, const TextConfig& c) {
     return bank;
 }
 
+FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& config) {
+    const auto resource = [&](std::string_view role) {
+        const auto bytes = binder.host_object(binder.resource("text", role));
+        return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    };
+    FrontendResources out;
+    out.tokenizer_json         = resource("tokenizer.json");
+    out.tokenizer_config_json  = resource("tokenizer_config.json");
+    out.chat_template_jinja    = resource("chat_template.jinja");
+    out.generation_config_json = resource("generation_config.json");
+    // The shared frontend validates the token domain against the embedding rows.
+    qwen3_5::Config domain;
+    domain.text.vocab_size = config.vocab_size;
+    qwen3_5::parse_resources(out, domain);
+    return out;
+}
+
 } // namespace
 
+struct LoadPlan::Impl {
+    TextConfig config;
+    TextWeights weights;
+    std::vector<PendingWeight> pending;
+    artifact::MaterializationPlan materialization;
+    FrontendResources resources;
+    InstanceInfo info;
+    std::vector<std::uint64_t> strides;
+};
+
+LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+LoadPlan::LoadPlan(LoadPlan&&) noexcept            = default;
+LoadPlan& LoadPlan::operator=(LoadPlan&&) noexcept = default;
+LoadPlan::~LoadPlan()                              = default;
+
+const TextConfig& LoadPlan::config() const { return impl_->config; }
+const FrontendResources& LoadPlan::resources() const { return impl_->resources; }
+std::uint64_t LoadPlan::device_bytes() const { return impl_->materialization.device_capacity(0); }
+std::uint64_t LoadPlan::pinned_bytes() const { return impl_->materialization.pinned_capacity_bytes; }
+const std::vector<std::uint64_t>& LoadPlan::expert_record_strides() const { return impl_->strides; }
+
 Model::Model(TextConfig config, TextWeights weights, std::vector<BoundWeight> bound, std::vector<ExpertBank> banks,
-             artifact::MaterializedArtifact backing)
+             FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing)
     : backing_(std::move(backing)), config_(std::move(config)), weights_(std::move(weights)),
-      bound_(std::move(bound)), banks_(std::move(banks)) {}
+      bound_(std::move(bound)), banks_(std::move(banks)), resources_(std::move(resources)), info_(std::move(info)) {}
 
 Model::~Model() = default;
 
 bool is_qwen4_exp(const artifact::Reader& reader) { return is_qwen4_exp_config(reader.directory()); }
 
-std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device) {
-    TextConfig config = parse_config(reader.directory());
+LoadPlan plan_load(const artifact::Reader& reader) {
+    auto out    = std::make_unique<LoadPlan::Impl>();
+    out->config = parse_config(reader.directory());
     artifact::Binder binder(reader);
+    out->resources = bind_resources(binder, out->config);
     Bindings bindings(binder);
-    TextWeights weights = bind_text(bindings, config);
-    auto pending        = std::move(bindings.weights);
-    auto backing        = artifact::materialize(reader, std::move(binder).finish(), device);
+    out->weights         = bind_text(bindings, out->config);
+    out->pending         = std::move(bindings.weights);
+    for (const auto& layer : out->weights.layers) {
+        const auto& parts = out->pending.at(layer.moe.experts.index).reference.binding.parts;
+        if (parts.size() != 1) { throw ArtifactError("an expert bank must be one complete parent"); }
+        out->strides.push_back(reader.geometry(parts.front().object).record_stride);
+    }
+    out->materialization = std::move(binder).finish();
+    out->info.name        = reader.directory().metadata.value("name", std::string("Qwen3.8-Flash-Next"));
+    out->info.artifact_id = reader.artifact_id();
+    return LoadPlan(std::move(out));
+}
+
+std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device, const StartupObserver* observer) {
+    auto& p      = *plan.impl_;
+    auto backing = artifact::materialize(*p.materialization.source, std::move(p.materialization), device, observer);
     std::vector<BoundWeight> bound;
-    bound.reserve(pending.size());
-    for (auto& item : pending) {
+    bound.reserve(p.pending.size());
+    for (auto& item : p.pending) {
         bound.push_back({item.reference.name, artifact::bind_view(item.reference, backing), item.policy});
     }
     std::vector<ExpertBank> banks;
-    for (const auto& layer : weights.layers) { banks.push_back(expert_bank(bound.at(layer.moe.experts.index), config)); }
-    return std::unique_ptr<Model>(
-        new Model(std::move(config), std::move(weights), std::move(bound), std::move(banks), std::move(backing)));
+    for (const auto& layer : p.weights.layers) { banks.push_back(expert_bank(bound.at(layer.moe.experts.index), p.config)); }
+    return std::unique_ptr<Model>(new Model(std::move(p.config), std::move(p.weights), std::move(bound), std::move(banks),
+                                            std::move(p.resources), std::move(p.info), std::move(backing)));
+}
+
+std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device) {
+    return materialize_model(plan_load(reader), device);
 }
 
 } // namespace ninfer::models::qwen4_exp

@@ -175,6 +175,11 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     for (const auto& placement : plan.device_objects) {
         total = checked_add(total, placement.bytes, "device payload bytes");
     }
+    // Pinned objects are read first and count toward the phase's progress: a model whose bulk is
+    // pinned (Qwen3.8-Flash-Next's 33 GiB of experts) would otherwise show no progress, then a
+    // wildly wrong rate, for most of its load.
+    const std::uint64_t pinned_total = plan.pinned_capacity_bytes;
+    total                            = checked_add(total, pinned_total, "pinned payload bytes");
     StartupPhaseScope phase(observer, StartupPhase::WeightsMaterialize, StartupProgressUnit::Bytes,
                             total);
     MaterializedArtifact out;
@@ -241,6 +246,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             reader.read_into(reader.directory().tensor(placement.object).offset, destination);
             out.stats_.read_bytes =
                 checked_add(out.stats_.read_bytes, placement.bytes, "pinned read bytes");
+            phase.progress(previous_end, total);
             const auto divisor =
                 read_divisor(reader, placement.object, geometry, destination, out.stats_);
             storage.pinned = WeightParent{geometry, destination.data(), divisor};
@@ -332,7 +338,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                               cudaMemcpyHostToDevice),
                    "upload transcoded weight bytes");
         transcoded_bytes = checked_add(transcoded_bytes, encoded.size(), "transcoded bytes");
-        phase.progress(transcoded_bytes, total);
+        phase.progress(checked_add(pinned_total, transcoded_bytes, "progress bytes"), total);
     }
     out.stats_.h2d_bytes = transcoded_bytes;
     std::uint64_t copied = 0;
@@ -424,7 +430,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 check_cuda(cudaEventRecord(slot.event, transfer_stream),
                            "record weight staging completion");
                 slot.pending = true;
-                phase.progress(checked_add(copied, transcoded_bytes, "uploaded bytes"), total);
+                phase.progress(checked_add(pinned_total, checked_add(copied, transcoded_bytes, "uploaded bytes"),
+                                           "progress bytes"),
+                               total);
             }
         }
         for (const auto& slot : slots) { slot->wait(); }
@@ -432,16 +440,16 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         if (next_range != ranges.size()) { throw ArtifactError("incomplete device upload"); }
     }
     if (!uploaded_any) {
-        phase.complete(transcoded_bytes, total);
+        phase.complete(checked_add(pinned_total, transcoded_bytes, "progress bytes"), total);
         return out;
     }
-    if (checked_add(copied, transcoded_bytes, "uploaded bytes") != total) {
+    if (checked_add(pinned_total, checked_add(copied, transcoded_bytes, "uploaded bytes"), "progress bytes") != total) {
         throw ArtifactError("incomplete device upload");
     }
     out.stats_.h2d_bytes = checked_add(copied, transcoded_bytes, "uploaded bytes");
     out.stats_.upload_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    phase.complete(checked_add(copied, transcoded_bytes, "uploaded bytes"), total);
+    phase.complete(checked_add(pinned_total, checked_add(copied, transcoded_bytes, "uploaded bytes"), "progress bytes"), total);
     return out;
 }
 
