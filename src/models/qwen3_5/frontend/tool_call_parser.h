@@ -34,6 +34,7 @@ private:
 
     std::string line_;           // the current, unfinished line
     char fence_          = '\0'; // the open fence's character, '\0' when none is open
+    std::uint32_t fence_len_ = 0; // the open fence's opening run length
     std::uint32_t ticks_ = 0;    // backticks of the current paragraph's finished lines
 };
 
