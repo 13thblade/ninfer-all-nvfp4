@@ -42,12 +42,23 @@ max_verify_drafts(std::span<const SpeculativeRoundShape> shapes) noexcept;
 // whole copies return. Copy rounds therefore run at batch one and two only, and their families
 // capture no larger batch.
 inline constexpr std::uint32_t kMaximumCopyRoundBatch = 2;
+// The draft window the two-lane copy round was measured and calibrated at: the 8-column neural
+// round, r = 1.44-1.49 against it, the 12-draft minimum and the partner balance's constants all
+// come from DFlash2 K = 7 with 16-column copy rounds. Another window changes the neural round's
+// cost and what a copy saves, and nothing here was measured for it, so a two-lane batch does not
+// copy there (it runs the neural round, as it does with copies off). Batch one is unaffected.
+inline constexpr std::uint32_t kMeasuredCopyPartnerDraftWindow = 7;
+// The largest batch whose rounds may be copy rounds at `draft_window`: one and two lanes at the
+// measured window, one lane elsewhere.
+[[nodiscard]] std::uint32_t copy_round_batch_limit(std::uint32_t draft_window) noexcept;
 // The largest batch a family captures and runs.
 [[nodiscard]] std::uint32_t round_family_batch_limit(const SpeculativeRoundShape& shape,
-                                                     std::uint32_t max_concurrency) noexcept;
+                                                     std::uint32_t max_concurrency,
+                                                     std::uint32_t draft_window) noexcept;
 // The longest copy a batch of `batch` rows needs before its round becomes a copy round: any copy
 // the proposer offers at batch one; at batch two one that, accepted, pays for the wider round
-// beside a neural partner; none above that.
+// beside a neural partner (which must also afford the widening, NgramPartnerBalance); none above
+// that.
 [[nodiscard]] std::uint32_t copy_round_minimum_drafts(std::uint32_t batch) noexcept;
 
 [[nodiscard]] std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity);

@@ -125,10 +125,15 @@ std::uint32_t max_verify_drafts(std::span<const SpeculativeRoundShape> shapes) n
     return widest;
 }
 
+std::uint32_t copy_round_batch_limit(std::uint32_t draft_window) noexcept {
+    return draft_window == kMeasuredCopyPartnerDraftWindow ? kMaximumCopyRoundBatch : 1U;
+}
+
 std::uint32_t round_family_batch_limit(const SpeculativeRoundShape& shape,
-                                       std::uint32_t max_concurrency) noexcept {
+                                       std::uint32_t max_concurrency,
+                                       std::uint32_t draft_window) noexcept {
     return shape.kind == SpeculativeRoundKind::Copy
-               ? std::min(max_concurrency, kMaximumCopyRoundBatch)
+               ? std::min(max_concurrency, copy_round_batch_limit(draft_window))
                : max_concurrency;
 }
 

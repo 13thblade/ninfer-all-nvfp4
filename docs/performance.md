@@ -632,8 +632,64 @@ Wall time drops from 674-677 s to 593-604 s. The losses are the other lane's: a 
 little shares its rounds with a partner that copies, and those rounds verify 16 columns for both. A
 diff revert's rounds take 78 ms against 61-65 off at the same tokens per round (6.95 against 6.97),
 an exploring turn's 76-85 ms against 52-60. Explaining turns, which mostly overlapped each other, are
-unchanged. Two lanes trade the latency of the lane that does not copy for throughput: the batch
-gains 15%, a copying request up to 65%, and a request beside it loses up to a fifth.
+unchanged. Two lanes traded the latency of the lane that does not copy for throughput: the batch
+gained 15%, a copying request up to 65%, and a request beside it lost up to a fifth.
+
+**Partner balance (2026-10-12).** A two-lane round now copies only when every row without a copy
+can afford the widening. Each request keeps a balance in thousandths of a two-lane neural round:
+
+- +30 for every two-lane round it decodes in;
+- -470 (r - 1, r = 1.47 from the table above) for a copy round in which it had no copy;
+- for a copy round in which it copied, the rounds that copy saved it,
+  committed / (K + 1) - r. K + 1 = 8 is the most a neural round commits, so the credit never
+  overstates the saving.
+
+A request that never copies is widened at most about once in 16 of its rounds, about 3% of its
+decode-round time. One whose own copies have saved it rounds can absorb its partner's. Only
+committed rounds move a balance, never timing. The constants are measured at DFlash2 K = 7 only, so
+two lanes copy at K = 7 and no other `NINFER_DRAFT_TOKENS`: at any other window a two-lane batch
+runs the neural round (batch one still copies) and the copy family is captured at batch one only.
+Infernix has no partner rule for its Qwen3.5 lookup
+drafting: any copy widens the whole batch.
+
+Same replay, `--max-concurrency 2`, 147,456-token KV. Three runs off, three with the balance and two of
+the build without it, interleaved in one session.
+
+Two measures:
+
+- **Engine rate:** committed tokens over the request's own decode-round time, the request log's
+  `engine_timing.decode` device wait plus host time. It leaves out the partner's prefill chunks and
+  queueing, which dominate short turns and made the wall-clock rate swing by up to 20% between runs
+  above.
+- **Wall rate:** output over first-to-last-token time, as in the table above.
+
+| category | off | with the balance | change, engine (run range); wall | without the balance (2 runs), engine; wall |
+|---|---:|---:|---:|---:|
+| rewrite a file | 150.4 | 224.0 | +49% (+46..+52); +53% | +60%; +50% |
+| apply a change | 145.6 | 214.2 | +47% (+42..+53); +20% | +60%; +52% |
+| edit a function | 179.9 | 231.3 | +29% (+21..+36); +26% | +38%; +37% |
+| revert a diff | 157.3 | 155.7 | **-1.0%** (-5..+4); +16% | **-14.7%** (-21..-8); -0.7% |
+| explore | 118.1 | 128.5 | +8.8% (-1..+19); -0.5% | +2.0%; -11% |
+| explain | 57.8 | 57.7 | **-0.1%** (-5..+4); -1.0% | **-4.9%** (-10..-0); -6.6% |
+| all turns | 135.3 | 170.7 | +26% (+22..+28); +22% | +27%; +23% |
+| both lanes together (output / wall) | 125.9 (123.0-127.9) | 144.6 (142.6-146.5) | **+14.9%** | 144.1 (+14.5%) |
+
+Engine rates in tok/s, means of the runs; a run range compares each run with each run of the other
+arm. Wall time drops from 641-664 s to 562-574 s (568 s twice without the balance).
+
+- **Throughput.** The balance keeps the batch gain: +14.9%, against +14.5% without it in the
+  same session.
+- **Partners.** It removes the partner losses: turns that copy little are within 1% of off where
+  they were 5-15% slower.
+- **Cost to the copying side.** It copies 15% fewer rounds (3,465 against 4,100 per run) and 60% of
+  the output against 71%. Writing back a file gains 49% instead of 60%.
+- **Determinism.** Greedy outputs are not comparable across two-lane replay runs. Even two runs of
+  the off arm differ in 47 of 112 turns, because which rows share a round changes the batch
+  arithmetic. Output identity is checked by the copy-beside-free-lane real test instead.
+
+The bench corpus, which never copies, decodes the same with and without the flag at two lanes:
+86.81 against 86.74 batch tok/s (+0.08%, 8 interleaved runs each, ranges 86.60-87.47 and
+86.41-87.67). The build without the balance gave 86.75 against 86.56 in the same session.
 
 **Without copies.** The bench corpus (`ninfer_bench -n 512`, two alternating rounds) never copies.
 At one lane DFlash2 decodes 63.40 and 63.29 tok/s with the flag on against 63.96 and 63.66 off
@@ -698,9 +754,9 @@ alternating pairs) when the catch-up ran at the copy width, and costs 43.50 now.
 **Memory.** At the Windows DFlash2 launcher profile (188,416 tokens, one lane) the planner reserves
 170 MiB more with the flag on (5,616,887,552 against 5,438,487,040 bytes, the same as the one-lane
 build), and it starts with 991 MiB of device memory free. At two lanes (65,536 tokens) it reserves
-340 MiB more, of which about 100 MiB is actually used after startup (2.61 against 2.71 GiB free).
-The `tuned` launchers pass the flag with DFlash2 at one lane, their default, and keep it off at two
-lanes unless `NINFER_NGRAM=on` (see [launcher profiles](maintainer/launcher-profiles.md)).
+340 MiB more, of which about 100 MiB is actually used after startup (2.61 against 2.71 GiB free). The two-lane launcher start on the Windows desktop (0.9 GiB in use by the desktop) fits a 137,216-token shared KV with the flag against 156,672 without it (-12%).
+The `tuned` launchers pass the flag with DFlash2 at one and two lanes, and keep it off at three or
+more unless `NINFER_NGRAM=on` (see [launcher profiles](maintainer/launcher-profiles.md)).
 
 ### Choosing a KV format (RTX 3090, Qwen3.8-27B)
 

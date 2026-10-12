@@ -479,8 +479,9 @@ void ProgramImpl::prepare_graphs() {
             auto& family       = forward ? round.forward : round.finish;
             family.profiles.reserve((forward ? forward_profiles : finish_profiles).size() *
                                     max_concurrency);
-            for (std::uint32_t batch = 1;
-                 batch <= round_family_batch_limit(round.shape, max_concurrency); ++batch) {
+            const std::uint32_t batch_limit =
+                round_family_batch_limit(round.shape, max_concurrency, draft_window);
+            for (std::uint32_t batch = 1; batch <= batch_limit; ++batch) {
                 const auto planned_profiles =
                     !forward ? finish_profiles
                     : (mtp || batch == 1) ? forward_profiles
