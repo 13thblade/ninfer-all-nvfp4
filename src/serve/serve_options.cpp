@@ -128,7 +128,8 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
+           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--fit-context MIN] "
+           "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
            "[--context-cost-presets FILE] "
@@ -184,6 +185,13 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
+           "       --fit-context MIN makes --max-context a ceiling: when it does not fit the GPU "
+           "memory free after the weights, less " +
+           std::to_string(kFitContextHeadroomBytes / (1024ULL * 1024ULL)) +
+           " MiB kept spare, the server starts at the largest multiple of " +
+           std::to_string(kFitContextStepTokens) +
+           " tokens that does (the KV pool follows) and logs the reduction; below MIN it refuses "
+           "to start\n"
            "       --prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a "
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
@@ -357,6 +365,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+        } else if (arg == "--fit-context") {
+            options.fit_context_floor = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--fit-context"), "fit-context"));
+            if (options.fit_context_floor == 0) {
+                throw std::invalid_argument("--fit-context must be positive");
+            }
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
@@ -719,6 +733,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
+    }
+    if (options.fit_context_floor != 0) {
+        if (options.fit_context_floor > options.max_context) {
+            throw std::invalid_argument("--fit-context must not exceed --max-context");
+        }
+        if (options.kv_capacity.mode != KvCapacityMode::Explicit ||
+            options.kv_capacity.explicit_tokens != options.max_context) {
+            throw std::invalid_argument("--fit-context sizes the KV pool with the context; leave "
+                                        "--kv-capacity unset or equal to --max-context");
+        }
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");

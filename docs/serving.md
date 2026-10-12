@@ -1511,6 +1511,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name`, or architecture name |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
+| `--fit-context MIN` | treat `--max-context` as a ceiling: start at the largest context (multiple of 1,024, KV pool equal to it) that fits free GPU memory less 256 MiB, never below `MIN`; requires `--kv-capacity` unset or equal to `--max-context` | off |
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
@@ -1795,6 +1796,14 @@ outside the GPU executor and do not delay formation of the next batch.
 pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
 and leaves 1 GiB of sizing headroom; omitting the option makes it follow `--max-context`. Capacity
 resolves once at startup.
+
+`--fit-context MIN` makes `--max-context` a ceiling instead of a demand: after the weights load, if
+the plan at `--max-context` does not fit the free device memory less 256 MiB, the server plans
+smaller contexts with the same planner and starts at the largest multiple of 1,024 tokens that fits,
+with the KV pool equal to it, logging `context lowered to N tokens (asked for M)`. `/v1/models`,
+`/props`, request limits and `/metrics` report the context it started with. Below `MIN` it refuses
+to start (`not enough free GPU memory to start: ...`). It needs `--kv-capacity` unset or equal to
+`--max-context`; the launchers' default profiles pass `--fit-context 32768`.
 
 Before each prefill, decode or replay unit, the runtime reserves the additional pages and temporary
 storage required by that unit. It first reclaims inactive cache resources when capacity is short.

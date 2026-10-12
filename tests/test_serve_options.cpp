@@ -801,6 +801,31 @@ int main() {
                               ninfer::kDefaultKvCapacityHeadroomBytes,
                       "--kv-capacity auto did not select automatic sizing");
 
+    const ServeOptions fitted =
+        parse({"ninfer-serve", "model.ninfer", "--max-context", "188416", "--kv-capacity", "188416",
+               "--fit-context", "32768"});
+    failures += check(fitted.fit_context_floor == 32768 &&
+                          make_engine_options(fitted).fit_context_floor == 32768 &&
+                          parse({"ninfer-serve", "model.ninfer"}).fit_context_floor == 0,
+                      "--fit-context did not reach the Engine options or is on by default");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--max-context", "16384",
+                                     "--fit-context", "32768"},
+                                    "must not exceed --max-context"),
+                      "--fit-context accepted a floor above the context");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--max-context", "65536",
+                                     "--kv-capacity", "auto", "--fit-context", "32768"},
+                                    "--kv-capacity"),
+                      "--fit-context accepted an automatic KV pool");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--max-context", "65536",
+                                     "--kv-capacity", "131072", "--fit-context", "32768"},
+                                    "--kv-capacity"),
+                      "--fit-context accepted a KV pool other than the context");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--fit-context", "0"},
+                                    "positive"),
+                      "--fit-context accepted zero");
+    failures += check(serve_usage_text("ninfer-serve").find("--fit-context") != std::string::npos,
+                      "serve help omits --fit-context");
+
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});
     failures += check(logged.request_log_jsonl == "requests.jsonl",
