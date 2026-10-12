@@ -21,7 +21,7 @@ references, `engine-architecture.md`).
 | 7b | `offloaded_sparse_moe` GPU narrow route (device frames, staging, zero-copy), CPU miss channel and service | done (perf gate missed, see below) |
 | 8 | M0: the qwen4exp model from Infernix (config, binding, forward, n-gram hash, n-gram volume reader with keep-alive), the full conversion, the FP64 reference and block check, `forward_real`; the quality gate | done (gate below) |
 | 9 | M1: Program and Engine integration (one lane, elastic VMM KV, VRAM expert cache with LFRU and warm start, RAM/VRAM ledgers, decode CUDA graph, `EngineCore<Qwen4ExpInstance>`), serving and the `qwen38-flash-next` launcher profile | done (measurements below) |
-| 10 | Prefill: GPU wide expert route | not started |
+| 10 | Prefill: exact GPU wide expert route (int8 `mma.sync`, cp.async), prefill expert streaming into lent frames, 4,096-token calls, n-gram row prefetch | done (prefill gate missed by 3-5%, below) |
 | 11-14 | Residency policy and miss split, 128K, MTP, vision | not started |
 
 The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
@@ -178,6 +178,43 @@ decode is GPU-bound and the host adds ~0.08 ms per token outside the rounds):
 The cheapest next win is the stage pass of layers with no misses (~2 ms); the narrow route's
 bandwidth and the HC mixer are PR 11's (spec 8.2).
 
+## PR 10 measurements
+
+RTX 3090 (WDDM, display attached), CUDA 12.8, MSVC 14.44, Ryzen 9 5950X, DDR4-2133; artifact and
+n-gram volume on K: (Samsung 860 QVO, SATA). Strata's PR 0 runs read their PLE rows from C: (NVMe).
+
+**Prefill** through the Engine (`ninfer_qwen4_exp_engine_real_test --bench`), Strata's PR 0 prompt
+ids, 4 generated tokens, one model load: a 4K warm-up then 6 requests per tier in ABBA order; 128K in
+its own load (135,168-token context), 3 requests. Prompt tokens over the Program's prefill time:
+
+| Prompt | PR 9 (same session, same method) | PR 10, median [min-max] | Strata (PR 0) | PR 10 / Strata |
+|---|---:|---:|---:|---:|
+| 4K | 524 [188-585] | **1,824** [1,348-2,120] | 1,912 | **0.95** |
+| 32K | 503 [253-547] | **2,329** [1,817-2,371] | 2,397 | **0.97** |
+| 128K | not run | **2,069** [1,906-2,329] (n = 3) | 2,184 | 0.95 |
+
+- The prefill gate (≥ 1.0× Strata at 4K and 32K) is **missed by 5% and 3%**. Each tier's first
+  requests are the slow ones (cold n-gram rows and expert cache); the best 4K run is 2,120.
+- Greedy ids were identical for every repeat of a prompt, and the Engine test's 5,120-token prompt
+  gives the same ids through the wide streamed path and the small-cache static path.
+
+**Where a 32K prompt's prefill goes** (nsys, kernel time summed per prompt):
+
+| | PR 9: 32 calls of 1,024 | PR 10: 8 calls of 4,096 |
+|---|---:|---:|
+| Routed experts | 51.2 s: staging 24.8, narrow gate/up 17.8, narrow down 8.6 | 5.74 s: wide gate/up 4.45, wide down 1.29 |
+| Dense GGML linears (MMQ) | 3.00 s | 2.62 s |
+| BF16 linears (HC composed route, PLE) | 1.75 s | 1.32 s |
+| QSA attention, FP32 projections, row splits, HC, GDN, norms, other | ~3.6 s | ~3.2 s |
+| Kernel total | 59.5 s | 12.9 s |
+| Host time before each call's kernels (its n-gram rows) | 1-2.9 s per call under nsys | none after the first call: the next call's rows are read while the GPU runs |
+| Expert copies (H2D) | none (staged by SMs) | 23 GB per call at 26 GB/s on the copy engine, overlapped |
+
+**Wide expert route** (512 resident experts, near-uniform routing, `--bench`): T = 4,096 in
+14.5-15.8 ms per layer call (26-28 TOPS of routed multiply-adds), T = 2,048 in 7.2-7.6 ms. Its
+outputs equal the CPU engine's bits (`ninfer_offloaded_moe_wide_test`, every format and placement,
+the 48 real banks).
+
 ## Artifact decisions
 
 Taken in PR 1 and revised in PR 2b, which aligned the artifact with Infernix (the model code and
@@ -237,11 +274,13 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 |---|---|---|
 | `tools/artifact/ngram_volume.py` | `tools/convert/qwen4_exp.py` (`ngram_geometry`, `read_ngram_volume_id`, `write_ngram_volume`) | Version 2 header with a row-format field; streams GGML rows from any source |
 | `tools/convert/qwen4_exp.py` (config keys, `layer_multipliers`, `head_tables`, expert bank parameter, volume binding) | `src/models/qwen4_exp/config.cpp`, `tools/flash_next/ngram.py`, `tools/convert/qwen4_exp.py` (`ExpertBankSource`, `import_expert_bank`), `tools/convert/__main__.py` | Sourced from GGUF metadata; GGML expert records instead of NVFP4 banks |
-| `include/ninfer/ops/offloaded_sparse_moe.h` | `include/infernix/ops/offloaded_sparse_moe.h` | GGML record formats, no per-expert scales; SSD tier, fetch channel, landing, streamed records, overlap/fork streams, L2 warming and wide route not carried |
+| `include/ninfer/ops/offloaded_sparse_moe.h` | `include/infernix/ops/offloaded_sparse_moe.h` | GGML record formats, no per-expert scales; an exact wide route (PR 10); SSD tier, fetch channel, landing, streamed records, overlap/fork streams and L2 warming not carried |
 | `src/ops/common/canonical_math.h` | `src/ops/common/canonical_math.h` (`0cf68068`) | IEEE helpers, BF16, exp and SiLU only |
 | `src/ops/offloaded_sparse_moe/cpu/expert_team.cpp` | `src/ops/offloaded_sparse_moe/cpu/expert_team.{h,cpp}` | GGML jobs; units of 32 intermediates; no A16, AVX-VNNI or AVX-512 |
 | `src/ops/offloaded_sparse_moe/cpu/miss_service.cpp` | `src/ops/offloaded_sparse_moe/cpu/miss_service.{h,cpp}` | No tiered requests; fixes a startup race (the first request could be taken as already answered) |
 | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` (`398cf2cc`) | Route, dispatch, staging, CPU plan/wait and combine kept; narrow kernels rewritten for GGML sub-blocks |
+| `src/ops/offloaded_sparse_moe/cuda/wide_expert.{h,cu}` (PR 10) | `src/ops/offloaded_sparse_moe/cuda/wide_expert.{h,cu}` (`17681db5`) | The plan kernel (tiles per pass) kept; the GEMMs are new: exact int8 `mma.sync` over decoded GGML codes in the canonical leaf order, cp.async instead of TMA/mbarrier, the A8 cast of h fused into gate/up |
+| `src/models/qwen4_exp/execution/expert_stream.{h,cpp}` (PR 10) | `src/models/qwen4_exp/execution/expert_stream.{h,cpp}` | The ring is lent frames, published as per-layer frame tables (no `prefetched` source); 2-D run copies; no gated chunks or SSD holds |
 | `include/ninfer/ops/hyper_connection.h` | `include/infernix/ops/hyper_connection.h` | FP32 multiplier norm weight; no Q8 weight form |
 | `src/ops/hyper_connection/hyper_connection.cu` | `src/ops/hyper_connection/hyper_connection.cu` | BF16 weights only |
 | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | Grids re-fitted to 82 SMs |
@@ -263,7 +302,7 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `src/core/pinned_upload.{h,cu}` | `src/core/device.{h,cu}` (`upload_pinned`) | Own translation unit |
 | `src/models/qwen4_exp/memory_plan.{h,cpp}` | same path | Full RAM mode only (fits or refuses; no SSD tier, no `--expert-ram-mib`); the VRAM sizing and control law unchanged |
 | `src/models/qwen4_exp/program/expert_cache/expert_{cache,state}.{h,cpp}` | same paths | Verbatim |
-| `src/models/qwen4_exp/program/expert_residency.{h,cpp}` | same path | Per-layer record strides in one frame size; no SSD tier, landing or lending |
+| `src/models/qwen4_exp/program/expert_residency.{h,cpp}` | same path | Per-layer record strides in one frame size; no SSD tier or landing; frame lending (PR 10) with a refill of the returned frames |
 | `src/models/qwen4_exp/program/vram_monitor.{h,cpp}` | same path | Verbatim |
 | `src/models/qwen4_exp/program/program.{h,cpp}` | `program/program.{h,cpp}`, `program/program_impl.h` | NInfer's execution contract (prefix reuse off, one lane); device plan, elastic KV, decode budget, warm start, VRAM control, link probe and decode graph from Infernix |
 | `src/runtime/engine/qwen4_exp_instance.{h,cpp}` | same path | NInfer's EngineCore and ResourceManager with the context cache off; refuses unsupported options |
