@@ -107,25 +107,40 @@ std::size_t explicit_reservation_bytes(std::uint32_t tokens, const SequenceCapac
         explicit_page_groups(KvCapacityPolicy::explicit_capacity(tokens), curve));
 }
 
-bool explicit_capacity_fits(std::uint32_t tokens, const SequenceCapacityCurve& curve,
+std::optional<CapacityShortfall>
+explicit_capacity_shortfall(std::uint32_t tokens, const SequenceCapacityCurve& curve,
                             std::size_t available_runtime_bytes,
                             std::span<const std::size_t> extra_rank_available_bytes) {
     validate_curve(curve);
     if (extra_rank_available_bytes.size() != curve.extra_ranks.size()) {
         throw std::invalid_argument("free memory was not given for every device in the plan");
     }
+    const std::uint32_t pages = std::clamp(
+        explicit_page_groups(KvCapacityPolicy::explicit_capacity(tokens), curve),
+        curve.minimum_main_page_groups, curve.maximum_main_page_groups);
+    const std::size_t primary = curve.reservation_bytes(pages);
+    if (primary > available_runtime_bytes) {
+        return CapacityShortfall{0, primary, available_runtime_bytes};
+    }
+    for (std::size_t index = 0; index < curve.extra_ranks.size(); ++index) {
+        const std::size_t need = curve.extra_rank_reservation_bytes(index, pages);
+        if (need > extra_rank_available_bytes[index]) {
+            return CapacityShortfall{index + 1, need, extra_rank_available_bytes[index]};
+        }
+    }
+    return std::nullopt;
+}
+
+bool explicit_capacity_fits(std::uint32_t tokens, const SequenceCapacityCurve& curve,
+                            std::size_t available_runtime_bytes,
+                            std::span<const std::size_t> extra_rank_available_bytes) {
     const std::uint32_t pages =
         explicit_page_groups(KvCapacityPolicy::explicit_capacity(tokens), curve);
     if (pages < curve.minimum_main_page_groups || pages > curve.maximum_main_page_groups) {
         return false;
     }
-    if (curve.reservation_bytes(pages) > available_runtime_bytes) { return false; }
-    for (std::size_t index = 0; index < curve.extra_ranks.size(); ++index) {
-        if (curve.extra_rank_reservation_bytes(index, pages) > extra_rank_available_bytes[index]) {
-            return false;
-        }
-    }
-    return true;
+    return !explicit_capacity_shortfall(tokens, curve, available_runtime_bytes,
+                                        extra_rank_available_bytes);
 }
 
 std::optional<std::uint32_t> fit_context(std::uint32_t floor, std::uint32_t ceiling,

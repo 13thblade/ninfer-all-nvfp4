@@ -14,6 +14,20 @@ namespace ninfer::runtime {
 [[nodiscard]] std::size_t explicit_reservation_bytes(std::uint32_t tokens,
                                                      const SequenceCapacityCurve& curve);
 
+// The first device, in rank order (0 is the primary), whose available bytes an explicit capacity of
+// `tokens` exceeds, with what it needs there; nullopt when every device holds it. A capacity
+// outside the curve's page range is held to the nearest end of the range, so this never throws for
+// it; explicit_capacity_fits still reports such a capacity as not fitting.
+struct CapacityShortfall {
+    std::size_t rank            = 0;
+    std::size_t need_bytes      = 0;
+    std::size_t available_bytes = 0;
+};
+[[nodiscard]] std::optional<CapacityShortfall>
+explicit_capacity_shortfall(std::uint32_t tokens, const SequenceCapacityCurve& curve,
+                            std::size_t available_runtime_bytes,
+                            std::span<const std::size_t> extra_rank_available_bytes = {});
+
 // Whether an explicit capacity of `tokens` fits `available_runtime_bytes` on the primary device and
 // each further device's entry of `extra_rank_available_bytes`. Answers instead of throwing, for
 // callers that search for a capacity that fits.

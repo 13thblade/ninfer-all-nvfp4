@@ -66,8 +66,9 @@ void validate_options(const EngineOptions& options) {
                 "equal to max_context");
         }
         // Overlay Vision sizes its encode window from the context before the fit runs, so a fit
-        // may not lower the per-item token bound that window was planned for.
-        if (options.enable_vision) {
+        // may not lower the per-item token bound that window was planned for. Resident Vision
+        // plans its workspace from the fitted context, so it has no such constraint.
+        if (models::load_options(options).overlay_vision()) {
             const std::uint64_t requested = options.vision_max_merged_tokens == 0
                                                 ? models::qwen3_5::kMaximumVisionItemTokens
                                                 : options.vision_max_merged_tokens;
@@ -102,10 +103,12 @@ std::size_t current_free_device_bytes() {
     return free_bytes;
 }
 
-// Free memory on each rank's device, in rank order. Ranks that share a physical device (the
-// `--devices 0,0` mode that exercises the stage path on one card) split what is free between
-// them, since each one's budget is spent from the same memory.
-std::vector<std::size_t> free_bytes_by_rank(const DeviceContext& device) {
+// Free memory on each rank's device, in rank order, less `reserve_bytes` kept spare once per
+// physical device. Ranks that share a physical device (the `--devices 0,0` mode that exercises the
+// stage path on one card) split what is left between them, since each one's budget is spent from
+// the same memory.
+std::vector<std::size_t> free_bytes_by_rank(const DeviceContext& device,
+                                            std::size_t reserve_bytes = 0) {
     std::vector<std::size_t> out;
     out.reserve(device.size());
     for (std::size_t rank = 0; rank < device.size(); ++rank) {
@@ -114,7 +117,8 @@ std::vector<std::size_t> free_bytes_by_rank(const DeviceContext& device) {
             if (device.same_physical_device(rank, other)) { ++sharing; }
         }
         const RankBinding bind(device, rank);
-        out.push_back(current_free_device_bytes() / sharing);
+        const std::size_t free_bytes = current_free_device_bytes();
+        out.push_back((free_bytes > reserve_bytes ? free_bytes - reserve_bytes : 0) / sharing);
     }
     return out;
 }
@@ -136,15 +140,9 @@ std::string token_text(std::uint32_t tokens) {
 // context whose plan fits the device memory free now, less kFitContextHeadroomBytes. Each candidate
 // is planned exactly as the real plan will be, so the answer is the planner's, not an estimate.
 void fit_context_to_device(EngineOptions& options, ModelInstance& instance, DeviceContext& device) {
-    const std::vector<std::size_t> free_now = free_bytes_by_rank(device);
-    const auto budget                       = [](std::size_t bytes) {
-        return bytes > kFitContextHeadroomBytes ? bytes - kFitContextHeadroomBytes : std::size_t{0};
-    };
-    const std::size_t primary = budget(free_now.front());
-    std::vector<std::size_t> extras;
-    for (std::size_t rank = 1; rank < free_now.size(); ++rank) {
-        extras.push_back(budget(free_now[rank]));
-    }
+    const std::vector<std::size_t> budgets = free_bytes_by_rank(device, kFitContextHeadroomBytes);
+    const std::size_t primary              = budgets.front();
+    const std::vector<std::size_t> extras(budgets.begin() + 1, budgets.end());
     const std::uint32_t ceiling       = options.max_context;
     const KvCapacityPolicy ceiling_kv = options.kv_capacity;
     // Each candidate is planned from the real options with only the context changed.
@@ -170,14 +168,21 @@ void fit_context_to_device(EngineOptions& options, ModelInstance& instance, Devi
                                     });
     if (!fitted) {
         const std::uint32_t floor = options.fit_context_floor;
-        const std::size_t need    = explicit_reservation_bytes(floor, curve_at(floor));
+        const auto short_rank = explicit_capacity_shortfall(floor, curve_at(floor), primary, extras);
+        if (!short_rank) {
+            throw std::invalid_argument(
+                "the context fit floor, " + token_text(floor) +
+                " tokens, is outside the range the planner can size");
+        }
+        const std::vector<std::size_t> free_now = free_bytes_by_rank(device);
         throw std::invalid_argument(
             "not enough free GPU memory to start: even the smallest context allowed, " +
-            token_text(floor) + " tokens, needs " + gib_text(need) +
+            token_text(floor) + " tokens, needs " + gib_text(short_rank->need_bytes) +
             " beside the model weights plus " +
             std::to_string(kFitContextHeadroomBytes / (1024U * 1024U)) +
-            " MiB kept spare, and only " + gib_text(free_now.front()) +
-            " is free. Close other programs that use the GPU and start again");
+            " MiB kept spare, and only " + gib_text(free_now[short_rank->rank]) + " is free" +
+            (free_now.size() > 1 ? " on device " + std::to_string(short_rank->rank) : std::string()) +
+            ". Close other programs that use the GPU and start again");
     }
     if (*fitted == ceiling) { return; }
     options.max_context = *fitted;

@@ -135,6 +135,19 @@ int main() {
                       "an explicit capacity too large for a further device was said to fit");
     failures += check(!ninfer::runtime::explicit_capacity_fits(64 * 7, curve, 100000),
                       "an explicit capacity beyond the curve was said to fit");
+    {
+        const auto none = ninfer::runtime::explicit_capacity_shortfall(129, curve, 1128);
+        const auto tight = ninfer::runtime::explicit_capacity_shortfall(129, curve, 1127);
+        const auto far = ninfer::runtime::explicit_capacity_shortfall(64 * 19, split, 100000,
+                                                                      split_available);
+        failures += check(!none && tight && tight->rank == 0 && tight->need_bytes == 1128 &&
+                              tight->available_bytes == 1127,
+                          "the primary device's shortfall was not reported");
+        failures += check(far && far->rank == 1 && far->need_bytes > far->available_bytes,
+                          "a further device's shortfall was not attributed to it");
+        failures += check(!ninfer::runtime::explicit_capacity_shortfall(64 * 7, curve, 100000),
+                          "a capacity beyond the curve was not held to the curve's range");
+    }
 
     // The fit returns the ceiling when it fits, otherwise the largest step multiple below it, the
     // floor when only the floor fits, and nothing when not even the floor does -- in O(log) probes.
