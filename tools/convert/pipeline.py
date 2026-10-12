@@ -24,6 +24,21 @@ def _json_default(value):
     raise TypeError(f"conversion report cannot serialize {type(value).__name__}")
 
 
+def _report_path(output: str | Path) -> Path:
+    return Path(str(output) + ".conversion.json")
+
+
+def discard(report: dict) -> None:
+    """Remove a conversion :func:`convert` published: its artifact files, then its report.
+
+    For a caller whose later step makes the published artifact unusable, so a failure leaves no
+    artifact behind and a retry is not blocked by the existing output.
+    """
+    for file in report["files"]:
+        Path(file["path"]).unlink(missing_ok=True)
+    _report_path(report["output"]).unlink(missing_ok=True)
+
+
 def convert(
     model: Model,
     recipe: Recipe,
@@ -37,7 +52,7 @@ def convert(
     progress: Callable[[int, int, WeightJob], None] | None = None,
 ) -> dict:
     path = Path(output)
-    report_path = Path(str(path) + ".conversion.json")
+    report_path = _report_path(path)
     if path.exists() or report_path.exists():
         raise FileExistsError(
             f"conversion output already exists: {path} or {report_path}"

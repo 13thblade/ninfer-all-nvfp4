@@ -43,8 +43,11 @@ inline void cpu_relax() {
 #endif
 }
 
-void pin_current_thread(int cpu) {
+} // namespace
+
+void detail::pin_current_thread(int cpu) {
 #if defined(__linux__)
+    if (cpu < 0 || cpu >= CPU_SETSIZE) { return; }
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
@@ -56,13 +59,12 @@ void pin_current_thread(int cpu) {
 #endif
 }
 
-} // namespace
-
 struct CpuExpertTeam::Impl {
     int workers;
     CpuIsa isa;
     int max_jobs;
     int spin_iterations;
+    std::uint32_t* progress = nullptr;
     std::vector<std::int8_t> xq; // [job][col][kHidden]
     std::vector<float> xd;       // [job][col][kGateUpGroups]
     std::vector<std::int8_t> hq; // [job][col][kIntermediate]
@@ -94,6 +96,10 @@ struct CpuExpertTeam::Impl {
         while (barrier_generation.load(std::memory_order_acquire) == generation) { cpu_relax(); }
     }
 
+    void tick() const {
+        if (progress != nullptr) { std::atomic_ref<std::uint32_t>(*progress).fetch_add(1, std::memory_order_relaxed); }
+    }
+
     detail::A8Act x_act(int j, int c) const {
         return {xq.data() + column(j, c) * kHidden, xd.data() + column(j, c) * detail::kGateUpGroups};
     }
@@ -107,6 +113,7 @@ struct CpuExpertTeam::Impl {
         const int quantize_items = n_jobs * kMaxColumns * kSlices;
         for (int i = next_quantize.fetch_add(1, std::memory_order_relaxed); i < quantize_items;
              i = next_quantize.fetch_add(1, std::memory_order_relaxed)) {
+            tick();
             const int slice = i % kSlices, c = (i / kSlices) % kMaxColumns, j = i / (kSlices * kMaxColumns);
             const CpuExpertJob& job = jobs[static_cast<std::size_t>(j)];
             if (c >= job.ncols) { continue; }
@@ -121,6 +128,7 @@ struct CpuExpertTeam::Impl {
         const int unit_items = n_jobs * detail::kUnits;
         for (int i = next_unit.fetch_add(1, std::memory_order_relaxed); i < unit_items;
              i = next_unit.fetch_add(1, std::memory_order_relaxed)) {
+            tick();
             const int j = i / detail::kUnits, u = i % detail::kUnits;
             const CpuExpertJob& job = jobs[static_cast<std::size_t>(j)];
             detail::A8Act xa[kMaxColumns];
@@ -139,6 +147,7 @@ struct CpuExpertTeam::Impl {
         const int row_items = n_jobs * detail::kDownItems;
         for (int i = next_rows.fetch_add(1, std::memory_order_relaxed); i < row_items;
              i = next_rows.fetch_add(1, std::memory_order_relaxed)) {
+            tick();
             const int j = i / detail::kDownItems, r0 = (i % detail::kDownItems) * detail::kDownRowsPerItem;
             const CpuExpertJob& job = jobs[static_cast<std::size_t>(j)];
             detail::A8Act ha[kMaxColumns];
@@ -178,6 +187,7 @@ CpuExpertTeam::CpuExpertTeam(Options options) : impl_(std::make_unique<Impl>()) 
     t.isa             = options.isa;
     t.max_jobs        = options.max_jobs;
     t.spin_iterations = options.spin_iterations;
+    t.progress        = options.progress;
     if (t.workers < 1 || t.workers > 64) { throw std::invalid_argument("CpuExpertTeam: workers must be in [1, 64]"); }
     if (t.max_jobs < 1) { throw std::invalid_argument("CpuExpertTeam: max_jobs must be positive"); }
     if (!cpu_isa_supported(t.isa)) { throw std::invalid_argument("CpuExpertTeam: unsupported CPU ISA"); }
@@ -191,7 +201,7 @@ CpuExpertTeam::CpuExpertTeam(Options options) : impl_(std::make_unique<Impl>()) 
     for (int w = 1; w < t.workers; ++w) {
         const int cpu = w < static_cast<int>(options.cpus.size()) ? options.cpus[static_cast<std::size_t>(w)] : -1;
         t.threads.emplace_back([&t, cpu] {
-            if (cpu >= 0) { pin_current_thread(cpu); }
+            detail::pin_current_thread(cpu);
             t.worker_main();
         });
     }
@@ -214,9 +224,7 @@ void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs) {
     if (static_cast<int>(jobs.size()) > t.max_jobs) { throw std::invalid_argument("CpuExpertTeam: too many jobs"); }
     for (std::size_t j = 0; j < jobs.size(); ++j) {
         const auto& job = jobs[j];
-        if (job.ncols < 1 || job.ncols > kMaxColumns || job.record == nullptr) {
-            throw std::invalid_argument("CpuExpertTeam: invalid job");
-        }
+        detail::require_expert_job("CpuExpertTeam", job.record, job.ncols, job.x, job.y);
         t.geometry[j] = record_geometry(job.format);
     }
     t.jobs = jobs;

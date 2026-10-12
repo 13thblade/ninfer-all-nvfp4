@@ -274,8 +274,8 @@ __device__ __forceinline__ void load_tables(Tables& tables, std::uint32_t* grid_
 // The Q8_1 activation cast of one 32-value group (linear.h), the only implementation both routes
 // use. It is the canonical A8 cast (ops/common/canonical_ggml.h, shared with offloaded_sparse_moe's
 // CPU and GPU routes): a = max|x|, d = a / 127, q = rint(x * (127 / a)) with ties to even, saturated
-// to [-127, 127], q = 0 when a = 0. `x` is 16-byte aligned; q lands in `words` (values 4w..4w+3 in
-// word w) and d is returned.
+// to [-127, 127], q = 0 when a = 0 (tiny a is pre-scaled by a power of two so 127 / a stays finite).
+// `x` is 16-byte aligned; q lands in `words` (values 4w..4w+3 in word w) and d is returned.
 __device__ __forceinline__ float quantize_q8_1_group(const __nv_bfloat16* x, int (&words)[8]) {
     std::uint32_t bits[16];
 #pragma unroll
@@ -294,13 +294,14 @@ __device__ __forceinline__ float quantize_q8_1_group(const __nv_bfloat16* x, int
         value[2 * i + 1] = __uint_as_float(bits[i] & 0xFFFF0000U);
         amax             = canon::a8_amax_step(canon::a8_amax_step(amax, value[2 * i]), value[2 * i + 1]);
     }
-    const float inverse = canon::a8_inverse(amax);
+    const float prescale = canon::a8_prescale(amax);
+    const float inverse  = canon::a8_inverse(amax);
 #pragma unroll
     for (int w = 0; w < 8; ++w) {
         std::uint32_t word = 0;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const int q = canon::a8_code(value[4 * w + j], inverse);
+            const int q = canon::a8_code(value[4 * w + j], prescale, inverse);
             word |= (static_cast<std::uint32_t>(q) & 0xFFU) << (8 * j);
         }
         words[w] = static_cast<int>(word);
