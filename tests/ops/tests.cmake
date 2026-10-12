@@ -32,8 +32,20 @@ foreach(op IN LISTS ninfer_op_tests)
     LIBRARIES ninfer_ops)
 endforeach()
 
+# Host-only: the exact GGML block decoder against ggml's own golden outputs. It is the oracle GGML
+# Ops are qualified against, so it is checked here independently of any kernel.
+ninfer_add_op_test(ninfer_ggml_blocks_decode_test NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_blocks_decode.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
+  LIBRARIES ninfer_ops)
+
+# Query-sparse attention: index query, pooled keys, block selection and attention, each against its
+# FP64 or exact oracle. `--small` runs the quick subset used under compute-sanitizer.
+ninfer_add_op_test(ninfer_qsa_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_candidate_selector_test
@@ -59,8 +71,8 @@ add_test(NAME ninfer_softmax_attention_k8v4_test
 # under a third of it.
 add_test(NAME ninfer_softmax_attention_dflash2_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --dflash2-only)
-# INT8-G64 FA2 prompt route: full prefill chunks and key splits over 4K-40K histories against the
-# FP64 oracle at sampled query rows.
+# INT8-family (INT8-G64, rk8v4, rk4v4) FA2 prompt route: full prefill chunks, short launches and
+# key splits over 4K-40K histories against the FP64 oracle at sampled query rows.
 add_test(NAME ninfer_softmax_attention_int8_prompt_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --int8-prompt-only)
 

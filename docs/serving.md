@@ -428,6 +428,7 @@ server restarts.
 | `ninfer_prefill_seconds_total`, `ninfer_decode_seconds_total` | prefill-unit and decode-round execution time |
 | `ninfer_decode_rounds_total`, `ninfer_decode_row_rounds_total` | decode batch executions and the sum of their batch sizes |
 | `ninfer_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total` | live native speculative work, including MTP and DFlash/DFlash2 |
+| `ninfer_spec_decode_ngram_{rounds,draft_tokens,accepted_tokens}_total` | the n-gram copy rounds among them (`--ngram-draft-tokens`); zero when it is off |
 | `ninfer_root_selections_total`, `ninfer_checkpoint_selections_total` | admissions by the context-cache source they started from: root is a miss (full prefill), checkpoint a reuse. Hit rate is `checkpoint / (root + checkpoint)` |
 | `ninfer_{preemptions,snapshot_restores,replay_restores}_total` | resource-pressure pauses and recovery routes |
 | `ninfer_waiting_cancelled_requests_total`, `ninfer_waiting_expired_requests_total`, `ninfer_waiting_abandoned_seconds_total` | requests the client cancelled, or the pending timeout expired, before admission, and the total time they had waited (a client that gives up after 60 s shows up here) |
@@ -514,6 +515,8 @@ The endpoint supports:
 - function tools, optional `strict:true` argument schemas, `tool_choice` `auto`/`none`/`required`,
   named selection, `allowed_tools`, and `parallel_tool_calls`; assistant tool-call history,
   tool-result messages, and legacy function-call history;
+- free-form [`custom` tools](#chat-custom-tools) in definitions, named selection,
+  `allowed_tools` and assistant history;
 - the top-level `reasoning_effort` field;
 - `enable_thinking` and `preserve_thinking`, either at top level or in
   `chat_template_kwargs`;
@@ -716,7 +719,7 @@ The three protocols share one constrained tool implementation:
 | `auto` | Text or calls; zero to many |
 | `none` | No tool calls; declarations remain in the prompt |
 | OpenAI `required` / Anthropic `any` | One or more calls |
-| OpenAI named function | Exactly one call to that function |
+| OpenAI named function or custom tool | Exactly one call to that tool |
 | Anthropic named `tool` | One or more calls to that tool |
 | OpenAI `parallel_tool_calls:false` / Anthropic `disable_parallel_tool_use:true` | At most one call; exactly one when a call is required |
 
@@ -877,6 +880,51 @@ finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a
 and reasoning-token details; choices carry `logprobs: null` when log probabilities were not
 requested, and aggregate assistant messages carry `refusal: null` because refusal output is not
 supported.
+
+### Chat custom tools
+
+Chat Completions accepts free-form `custom` tools in the OpenAI Chat shape:
+
+```json
+{
+  "type": "custom",
+  "custom": {
+    "name": "apply_patch",
+    "description": "Edit files with a patch.",
+    "format": {"type": "grammar", "grammar": {"syntax": "lark", "definition": "start: ..."}}
+  }
+}
+```
+
+`format` is omitted, `{"type":"text"}`, or a `grammar` with `syntax` `lark` or `regex` and a string
+`definition`. A custom tool is lowered exactly as on [Responses](#custom-tools): the model sees a
+strict function under the tool's name with one required string parameter, `input`, whose
+description carries the grammar. The grammar is **advisory** (shown, not enforced); the strict
+lowering is enforced, so `input` is the call's only argument and its text is returned byte for byte,
+except that it cannot contain a line break directly followed by `</parameter>`. Like any strict tool,
+a request declaring a custom tool is constrained even with `tool_constraints:"auto"`, so it cannot
+use custom `stop` strings or `ignore_eos` (HTTP 400 on `stop`/`ignore_eos`).
+
+A generated call is answered in the OpenAI Chat custom tool call shape, in `message.tool_calls`:
+
+```json
+{"id": "call_...", "type": "custom", "custom": {"name": "apply_patch", "input": "*** Begin Patch
+..."}}
+```
+
+Streaming sends the same object with its `index` in one `delta.tool_calls` entry
+(`{"index":0,"id":"call_...","type":"custom","custom":{"name":"apply_patch","input":"..."}}`); as for
+function calls, the complete input is sent once generation finishes, so the streamed `input`
+pieces concatenate to the aggregate value. `finish_reason` is `tool_calls`.
+
+Custom tools may be forced with `tool_choice: {"type":"custom","custom":{"name":...}}` and listed in
+`allowed_tools` as `{"type":"custom","custom":{"name":...}}` (the flat `{"type":"custom","name":...}`
+is also accepted there, as it is for function entries). An assistant history entry
+`{"id":...,"type":"custom","custom":{"name":...,"input":"..."}}` is replayed as the same Engine call
+(`{"input": "..."}` arguments); its result is an ordinary `tool` message. Referring to a declared
+custom tool as a function, or the reverse, fails with HTTP 400: `duplicate_tool_name` when both are
+declared in `tools`, `invalid_tool_choice` in `tool_choice`, and `invalid_tool_history` in
+`messages`. Calls of undeclared tools in history are accepted, as for functions.
 
 ### Multimodal request
 
@@ -1142,8 +1190,8 @@ carrying the input, `response.custom_tool_call_input.done` with the complete inp
 The client returns its result as a `custom_tool_call_output` Item. Custom tools may be named by
 `tool_choice: {"type":"custom","name":...}` and listed as `custom` entries in `allowed_tools`.
 Referring to a custom tool as a function, or the reverse, fails (`duplicate_tool_name` in `tools`,
-`invalid_tool_choice` in `tool_choice`, `invalid_tool_history` in `input`). Custom tools are
-accepted only on the Responses endpoint; Chat Completions still rejects them.
+`invalid_tool_choice` in `tool_choice`, `invalid_tool_history` in `input`). Chat Completions
+accepts custom tools in its own wire shape; see [Chat custom tools](#chat-custom-tools).
 
 Hosted tools, remote MCP tools, deferred loading, output schemas, and caller restrictions that
 exclude direct invocation remain unsupported.
@@ -1466,6 +1514,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
+| `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. One lane only for now; see [the CLI guide](cli.md#n-gram-copy-drafting) | `0` (off) |
+| `--ngram-min-match N` | tokens the end of the text must match before a copy is proposed, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
 | `--default-max-tokens N` | output limit when omitted by a request; see [default output limit](#default-output-limit) | the remaining context |
@@ -1574,7 +1624,10 @@ rejection/error records rather than successful constraint outcomes.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
-`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
+`drafted_tokens`, `accepted_tokens`, `fallback_steps`, `accepted_per_position` (draft-model rounds
+only), `ngram_draft_tokens` (the copy window, 0 when off), and `ngram_rounds`, `ngram_drafted_tokens`
+and `ngram_accepted_tokens`, the copy rounds, which are a subset of the round and token counts above.
+The stderr request line adds `copies accepted A/D (P%)` when the request verified copies. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 `generation.scheduling` records preemptions, snapshot/replay restores, replayed tokens, paused time
 and request-owned transfer bytes. Replay rebuilds committed state without adding new output usage.

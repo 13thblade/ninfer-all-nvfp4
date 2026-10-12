@@ -7,6 +7,7 @@
 #include "core/layout.h"
 #include "core/tensor.h"
 #include "models/qwen3_5/state/decoder_state.h"
+#include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/state/state_image.h"
 #include "models/load_options.h"
@@ -92,6 +93,9 @@ struct SequencePlanningInputs {
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
     std::uint32_t draft_window              = 0;
+    // N-gram copy drafting: the copy window (0 when off) and the tail match it requires.
+    std::uint32_t ngram_draft_tokens        = 0;
+    std::uint32_t ngram_min_match           = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
@@ -111,6 +115,9 @@ struct SequencePlanImpl {
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
     std::uint32_t draft_window              = 0;
+    // N-gram copy drafting: the copy window (0 when off) and the tail match it requires.
+    std::uint32_t ngram_draft_tokens        = 0;
+    std::uint32_t ngram_min_match           = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
@@ -120,6 +127,7 @@ struct SequencePlanImpl {
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
+    std::vector<SpeculativeRoundShape> round_shapes;
     PersistentLayout persistent;
     WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;
@@ -132,9 +140,9 @@ struct SequencePlanImpl {
 // The widest forward pass a pipeline stage boundary carries: prefill columns, or every lane's
 // verification columns. Sizes the boundary links and the scratch each stage needs around its layers.
 [[nodiscard]] inline std::uint64_t stage_boundary_columns(const SequencePlanImpl& plan) noexcept {
-    return std::max<std::uint64_t>(
-        std::min(plan.prefill_chunk, plan.capacity),
-        static_cast<std::uint64_t>(plan.max_concurrency) * (plan.draft_window + 1U));
+    return std::max<std::uint64_t>(std::min(plan.prefill_chunk, plan.capacity),
+                                   static_cast<std::uint64_t>(plan.max_concurrency) *
+                                       (max_verify_drafts(plan.round_shapes) + 1U));
 }
 
 // How many of the masked draft's feature layers pipeline stage `stage` owns. Zero for stage 0, which
