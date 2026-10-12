@@ -641,9 +641,11 @@ At one lane DFlash2 decodes 63.40 and 63.29 tok/s with the flag on against 63.96
 lanes the bench corpus decodes 87.55 and 87.57 tok/s per batch with the flag on against 85.98 and
 86.42 off (+1.6%, identical rounds and acceptance).
 
-*Where that cost comes from: buffer placement, not n-gram work.* It is not the lookup, the copy
-graphs or any extra GPU work; it is where the persistent buffers land, and it comes and goes between
-sessions. The evidence (2026-10-12, same bench, `ninfer_bench -n 512 -r 3`, decode tok/s):
+*Where that cost comes from: not the n-gram work; leading hypothesis, buffer placement.* The
+evidence below argues against the lookup, the copy graphs and any extra GPU work, and points at where
+the persistent buffers land within the arena. Placement is not isolated: no single buffer has been
+shown to carry the cost. The cost also comes and goes between sessions. The evidence (2026-10-12, same bench, `ninfer_bench -n 512 -r 3`,
+decode tok/s):
 
 - **Same work.** In a node-level Nsight Systems trace each round runs the same 791 or 786
   kernels with the same grid, block and shared-memory configuration, the same one or two copies
@@ -657,17 +659,23 @@ sessions. The evidence (2026-10-12, same bench, `ninfer_bench -n 512 -r 3`, deco
   - flag on with the per-round lookup skipped: 60.14 / 59.85;
   - flag off with the copy family configured anyway: 59.95 / 59.93;
   - against off at 60.65 / 60.28 and on at 60.43 / 60.13.
-- **Placement inside the persistent arena.** In a 4x4 Latin square (each arm once per position;
-  the first three runs, taken right after another job, are dropped as warm-up, 51.8-59.2):
+- **Placement inside the persistent arena.** In a 4x4 Latin square (each arm once per position).
+  The first three of its 16 runs were taken right after another job and ran at 51.8-59.2. The
+  figures below leave those three out and cover the other 13; the all-16 means are not given
+  because the three samples' individual values and arms are not recorded here:
   - off 60.27;
   - on -0.8%;
   - copy family without the flag -0.9%;
   - **flag off with the persistent buffers moved by 18 MiB of padding, the copy family's
     growth, -1.0%.**
   - Moving whole allocations instead (64 or 170 MiB allocated before the model, or 64 MiB before
-    every arena) leaves off at its speed and on still about 1% slower. So what matters is the
-    buffers' offsets within the arena. The copy family's ReplaySSM records, pending features
+    every arena) leaves off at its speed and on still about 1% slower. That points to the
+    buffers' offsets within the arena rather than their absolute addresses. The copy family's ReplaySSM records, pending features
     and verify logits are allocated ahead of the target's hidden states, so they move them.
+  - These are ~1% differences over a handful of runs per arm. The padding run shows that moving
+    the offsets can cost ~1%, not that the flag's cost is that move. Confirming it needs the padding bisected buffer by buffer in a
+    session where the on/off gap is present, with the cost following one buffer's offset and
+    vanishing when only that buffer is put back.
 - **It comes and goes.** Later the same day, in two interleaved 4x4 squares (8 runs per arm), the
   unchanged build decoded 60.31 on against 60.28 off (+0.05%; ranges 60.18-60.55 and 60.13-60.65).
   The two-lane +1.6% did not recur either. Two interleaved squares (8 runs per arm) gave 86.75
@@ -676,10 +684,12 @@ sessions. The evidence (2026-10-12, same bench, `ninfer_bench -n 512 -r 3`, deco
 Rejected: allocating every buffer sized by the round width after the fixed-size ones, with the
 target's hidden states first, so a copy family leaves the neural round's buffers where they are.
 In the session where the unchanged build showed no difference it measured on +0.05% and off -0.08%
-against the unchanged off (one 58.9 warm-up outlier dropped). Nothing could show it removed a cost that was absent there, and it moves
+against the unchanged off (one 58.9 warm-up outlier dropped; the figures exclude it, and the arm it
+belongs to is not recorded here, so they cannot be recomputed with it). Nothing could show it removed a cost that was absent there, and it moves
 the off configuration's buffers too, so it is not merged. The one-lane launchers keep the flag on.
-The placement effect is within the noise of a few runs and is not specific to copy rounds: any
-change to the persistent layout can move it.
+The effect is within the noise of a few runs. The padding result suggests it is not specific to copy
+rounds and that any change to the persistent layout may move it; that is not shown beyond the one
+padding and allocation experiments above.
 
 Rounds now catch the draft context up at their own width: at two
 lanes a configuration that never copies cost 43.68 ms per round at 32K against 43.50 off (three
