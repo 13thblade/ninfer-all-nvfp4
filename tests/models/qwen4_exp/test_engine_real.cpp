@@ -9,8 +9,11 @@
 //      expert frames, and which decodes without the CUDA graph, so graph replay = eager as well).
 //   2. The RAM ledger refuses cleanly: an Engine asked to keep more RAM free than the machine has
 //      fails before anything is pinned, with a message that says how much is missing.
+//   3. The elastic KV pool's grow/shrink cycle on a full expert cache (kv_cycle below): three
+//      short/long alternations stay within the OS video-memory budget at every sample, and greedy
+//      ids repeat. --kv-cycle runs only this check.
 //
-//   ninfer_qwen4_exp_engine_real_test [TOKENS] [--generate N] [--max-context N]
+//   ninfer_qwen4_exp_engine_real_test [TOKENS] [--generate N] [--max-context N] [--kv-cycle]
 //
 // Bench mode: one Engine, then each job in order (a prompt and greedy output tokens with model
 // stops disabled, so every request runs to N). Reports prefill and decode tok/s per job; the
@@ -24,15 +27,20 @@
 //
 // TOKENS is @FILE (ids separated by commas or whitespace) or a comma-separated id list.
 
+#include "core/vram_budget.h"
 #include "ninfer/engine.h"
 #include "ninfer/types.h"
 
+#include <cuda_runtime.h>
+
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -188,6 +196,98 @@ void print_run(const char* label, const Run& run, std::size_t prompt) {
     std::fflush(stdout);
 }
 
+bool same(const char* label, const std::vector<TokenId>& reference, const std::vector<TokenId>& ids);
+
+// Reads this process's video memory (free memory and, under WDDM, its OS budget and usage) every
+// millisecond on its own thread, as the Program's VRAM monitor does, and records the largest usage
+// over the budget.
+class VramSampler {
+public:
+    VramSampler() : source_(open_vram_budget_source(0)), thread_([this] { run(); }) {}
+    ~VramSampler() {
+        stop_ = true;
+        thread_.join();
+    }
+    VramSampler(const VramSampler&)            = delete;
+    VramSampler& operator=(const VramSampler&) = delete;
+    // Bytes of usage over the budget at the worst sample so far (0: never over), and the samples.
+    [[nodiscard]] std::uint64_t worst_over() const { return worst_.load(); }
+    [[nodiscard]] std::uint64_t samples() const { return samples_.load(); }
+    [[nodiscard]] bool has_budget() const { return has_budget_.load(); }
+    // This process's device memory now (the OS budget's usage; free memory's complement without one).
+    [[nodiscard]] static std::uint64_t usage() {
+        const VramSnapshot s = open_vram_budget_source(0)->query(); // its own source: not shared with the thread
+        return s.has_budget ? s.local_usage : s.device_total - s.device_free;
+    }
+
+private:
+    void run() {
+        if (cudaSetDevice(0) != cudaSuccess) { return; }
+        while (!stop_.load()) {
+            const VramSnapshot s = source_->query();
+            has_budget_ = s.has_budget;
+            if (s.has_budget && s.local_usage > s.local_budget) {
+                const std::uint64_t over = s.local_usage - s.local_budget;
+                if (over > worst_.load()) { worst_ = over; }
+            }
+            ++samples_;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    std::unique_ptr<VramBudgetSource> source_;
+    std::atomic<bool> stop_{false}, has_budget_{false};
+    std::atomic<std::uint64_t> worst_{0}, samples_{0};
+    std::thread thread_;
+};
+
+// The elastic KV pool's grow/shrink cycle on a full expert cache (the production sizing: VRAM filled
+// to the headroom): a short and a long prompt alternate, so the pool grows from its 1,024-token base
+// by ~0.5 GiB, more than the free memory, and shrinks back at the next admission, three times. The
+// growth must take its memory from the frames before it maps it: the process stays within its OS
+// budget at every sample (the VRAM sampler reads free memory throughout, as the monitor does, which
+// is what turned the earlier overcommit into cuMemSetAccess CUDA_ERROR_NOT_READY), no request fails,
+// greedy ids repeat exactly, and every frame a growth took comes back after the shrink.
+bool kv_cycle(const std::string& artifact, const std::vector<TokenId>& prompt, const std::vector<TokenId>& long_part) {
+    std::vector<TokenId> long_prompt;
+    while (long_prompt.size() < 40'000) { long_prompt.insert(long_prompt.end(), long_part.begin(), long_part.end()); }
+    long_prompt.resize(40'000);
+    EngineOptions options                = base_options(artifact, 65'536);
+    options.flash_next.save_expert_state = false;
+    options.flash_next.kv_base_tokens    = 1024;
+    Engine engine(options);
+    VramSampler sampler;
+    bool ok = true;
+    std::vector<TokenId> short_ids, long_ids;
+    std::uint64_t first_usage = 0, last_usage = 0;
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        const Run small = generate(engine, prompt, 8);
+        print_run("kv cycle, short prompt", small, prompt.size());
+        // The pool has shrunk back and the frames have taken their memory again.
+        (cycle == 0 ? first_usage : last_usage) = sampler.usage();
+        const Run large = generate(engine, long_prompt, 8);
+        print_run("kv cycle, long prompt (KV grown from the frames)", large, long_prompt.size());
+        if (cycle == 0) {
+            short_ids = small.ids;
+            long_ids  = large.ids;
+            ok        = ok && short_ids.size() == 8 && long_ids.size() == 8;
+        } else {
+            ok = same("kv cycle, short prompt again", short_ids, small.ids) && ok;
+            ok = same("kv cycle, long prompt again", long_ids, large.ids) && ok;
+        }
+    }
+    const std::uint64_t over = sampler.worst_over();
+    std::printf("%s: kv cycle: %llu VRAM samples, OS budget %s, worst usage over the budget %llu MiB\n",
+                over == 0 ? "ok" : "FAIL", static_cast<unsigned long long>(sampler.samples()),
+                sampler.has_budget() ? "read" : "unavailable", static_cast<unsigned long long>(over >> 20));
+    // Every frame a growth took comes back: the device holds as much after the third shrink as after
+    // the first (a leak loses a 64 MiB frame chunk per cycle).
+    const bool kept = last_usage + (32ULL << 20) >= first_usage;
+    std::printf("%s: kv cycle: device usage after the short prompt %llu MiB (first cycle), %llu MiB (third)\n",
+                kept ? "ok" : "FAIL", static_cast<unsigned long long>(first_usage >> 20),
+                static_cast<unsigned long long>(last_usage >> 20));
+    return ok && over == 0 && kept;
+}
+
 bool same(const char* label, const std::vector<TokenId>& reference, const std::vector<TokenId>& ids) {
     if (ids == reference) {
         std::printf("%s: %zu ids identical\n", label, ids.size());
@@ -258,8 +358,11 @@ int main(int argc, char** argv) {
         }
         std::string tokens_arg = "@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/ppl_tokens-chat.ids";
         std::uint32_t generate_tokens = 48, max_context = 8192, prompt_tokens = 300;
+        bool kv_cycle_only = false;
         for (std::size_t i = 0; i < args.size(); ++i) {
-            if (args[i] == "--generate" && i + 1 < args.size()) {
+            if (args[i] == "--kv-cycle") {
+                kv_cycle_only = true;
+            } else if (args[i] == "--generate" && i + 1 < args.size()) {
                 generate_tokens = static_cast<std::uint32_t>(std::stoul(args[++i]));
             } else if (args[i] == "--max-context" && i + 1 < args.size()) {
                 max_context = static_cast<std::uint32_t>(std::stoul(args[++i]));
@@ -280,6 +383,11 @@ int main(int argc, char** argv) {
                                  "infernix_texts-doc", "infernix_texts-chat"}) {
             const auto part = parse_tokens("@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/" + name + ".ids");
             long_prompt.insert(long_prompt.end(), part.begin(), part.end());
+        }
+        if (kv_cycle_only) {
+            const bool cycled = kv_cycle(artifact, prompt, long_prompt);
+            std::printf(cycled ? "qwen4_exp kv cycle passed\n" : "FAIL: qwen4_exp kv cycle\n");
+            return cycled ? 0 : 1;
         }
         const std::uint32_t long_tokens = 24;
         std::vector<TokenId> long_cold;
@@ -352,6 +460,8 @@ int main(int argc, char** argv) {
             print_run("long prompt, small cache, KV grown", long_run, long_prompt.size());
             ok = same("long prompt, small cache, KV grown", long_cold, long_run.ids) && ok;
         }
+        wait_for_ram(ram_before);
+        ok = kv_cycle(artifact, prompt, long_prompt) && ok;
         std::filesystem::remove(state_path);
         std::printf(ok ? "qwen4_exp engine checks passed\n" : "FAIL: qwen4_exp engine checks\n");
         return ok ? 0 : 1;

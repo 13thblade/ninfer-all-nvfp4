@@ -1,5 +1,6 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/memory_plan.cpp (Apache-2.0).
 // Modified for NInfer-3090: full mode only (every expert pinned in RAM); the SSD tier is not ported, so a ledger that cannot hold every expert refuses to start.
+// kv_growth_frames is Infernix's grow_kv arithmetic (program_impl.h) as a pure function.
 
 #include "models/qwen4_exp/memory_plan.h"
 
@@ -116,6 +117,13 @@ VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& de
         out.frames = static_cast<std::uint32_t>(std::min<std::uint64_t>(frames, demand.max_frames));
     }
     return out;
+}
+
+std::uint32_t kv_growth_frames(std::uint64_t added, std::uint64_t spare, std::uint32_t frames, std::uint64_t frame_bytes,
+                               std::uint64_t chunk_bytes) noexcept {
+    if (added <= spare || frame_bytes == 0) { return 0; }
+    const std::uint64_t take = (added - spare + chunk_bytes + frame_bytes - 1) / frame_bytes;
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(take, frames));
 }
 
 VramControl::VramControl(const VramDemand& demand, std::uint64_t chunk_bytes, std::uint64_t usage,

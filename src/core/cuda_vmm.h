@@ -57,12 +57,25 @@ inline std::size_t granularity(int device) {
     return bytes;
 }
 
-inline void set_access(CUdeviceptr va, std::size_t bytes, int device) {
+inline CUresult try_set_access(CUdeviceptr va, std::size_t bytes, int device) {
     CUmemAccessDesc access{};
     access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     access.location.id   = device;
     access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    check(cuMemSetAccess(va, bytes, &access, 1), "cuMemSetAccess");
+    return cuMemSetAccess(va, bytes, &access, 1);
+}
+
+inline void set_access(CUdeviceptr va, std::size_t bytes, int device) {
+    check(try_set_access(va, bytes, device), "cuMemSetAccess");
+}
+
+// Whether a cuMemSetAccess result means the device could not make the mapping resident now. Under
+// Windows WDDM, mapping past this process's video-memory budget makes the OS evict other
+// allocations; when a device-memory query (cudaMemGetInfo) runs on another thread meanwhile, the
+// driver returns CUDA_ERROR_NOT_READY instead of waiting (reproduced on an RTX 3090, driver
+// 616.64). The caller treats it as an out-of-memory refusal.
+inline bool access_refused(CUresult result) noexcept {
+    return result == CUDA_ERROR_NOT_READY || result == CUDA_ERROR_OUT_OF_MEMORY;
 }
 
 } // namespace ninfer::vmm
