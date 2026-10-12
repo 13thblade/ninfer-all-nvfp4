@@ -87,6 +87,27 @@ int main() {
                "--reasoning-effort", "medium"});
     failures += check(with_effort.thinking_budget == 8 && with_effort.reasoning_effort,
                       "thinking budget did not coexist with reasoning effort");
+    failures += check(configured.reasoning_loop == ninfer::ReasoningLoopAction::Off &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                 "--reasoning-loop", "conclude"})
+                                  .reasoning_loop == ninfer::ReasoningLoopAction::Conclude &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                 "--reasoning-loop", "stop"})
+                                  .reasoning_loop == ninfer::ReasoningLoopAction::Stop,
+                      "--reasoning-loop did not select its action (or was not off by default)");
+    failures +=
+        check(ninfer::cli::usage_text("ninfer-cli").find("--reasoning-loop") != std::string::npos,
+              "CLI help omits --reasoning-loop");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--reasoning-loop", "on"});
+                      }),
+                      "--reasoning-loop on was accepted");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--reasoning-loop", "stop", "--no-thinking"});
+                      }),
+                      "--reasoning-loop was accepted with --no-thinking");
     const ninfer::cli::Options dflash_vision =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision", "--spec", "dflash",
                "--draft-tokens", "7"});
@@ -129,21 +150,60 @@ int main() {
               "CLI help omits a production KV storage mode");
     const ninfer::cli::Options route_defaults =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"});
-    failures += check(!route_defaults.prefill_cublas && route_defaults.prefill_cublas_projections &&
-                          route_defaults.speculative.lookup_ngram == 0,
-                      "the cuBLAS prefill route or context lookup is on by default");
+    failures += check(!route_defaults.prefill_cublas && route_defaults.prefill_cublas_projections,
+                      "the cuBLAS prefill route is on by default");
     const ninfer::cli::Options route =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "mtp", "--draft-tokens",
-               "3", "--lookup-ngram", "5", "--prefill-cublas", "--no-prefill-cublas-projections"});
+               "3", "--prefill-cublas", "--no-prefill-cublas-projections"});
     failures += check(route.prefill_cublas && !route.prefill_cublas_projections &&
-                          route.speculative.lookup_ngram == 5 &&
                           route.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
                           route.speculative.draft_tokens == 3,
-                      "CLI did not parse the cuBLAS prefill and context-lookup controls");
-    for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections", "--lookup-ngram"}) {
+                      "CLI did not parse the cuBLAS prefill and drafting controls");
+    for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections"}) {
         failures += check(help.find(flag) != std::string::npos,
-                          "CLI help omits an accepted prefill or drafting control");
+                          "CLI help omits an accepted prefill control");
     }
+    // The MTP-only context lookup was removed with no alias; n-gram copy drafting replaces it.
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--lookup-ngram", "5"});
+                      }) && help.find("--lookup-ngram") == std::string::npos,
+                      "CLI still accepts or advertises the removed --lookup-ngram");
+    // N-gram copy drafting: off by default, 15 is the only window, and it rides DFlash2.
+    failures += check(route_defaults.speculative.ngram_draft_tokens == 0 &&
+                          route_defaults.speculative.ngram_min_match == 12,
+                      "n-gram copy drafting is on by default or its minimum match moved");
+    const ninfer::cli::Options ngram =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dflash2",
+               "--draft-tokens", "7", "--ngram-draft-tokens", "15", "--ngram-min-match", "8"});
+    failures += check(ngram.speculative.ngram_draft_tokens == 15 &&
+                          ngram.speculative.ngram_min_match == 8,
+                      "CLI did not parse the n-gram copy controls");
+    for (const char* window : {"7", "16", "31", "63"}) {
+        failures += check(rejects([window] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                           "--spec", "dflash2", "--draft-tokens", "7",
+                                           "--ngram-draft-tokens", window});
+                          }),
+                          "CLI accepted an n-gram copy window other than 0 or 15");
+    }
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "mtp", "--draft-tokens", "3", "--ngram-draft-tokens",
+                                       "15"});
+                      }) && rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--ngram-draft-tokens", "15"});
+                      }),
+                      "CLI accepted n-gram copy drafting without DFlash2");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--ngram-min-match", "3"});
+                      }),
+                      "CLI accepted an n-gram minimum match below 4");
+    failures += check(help.find("--ngram-draft-tokens") != std::string::npos &&
+                          help.find("--ngram-min-match") != std::string::npos,
+                      "CLI help omits the n-gram copy controls");
     const ninfer::cli::Options logging =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--log-level", "debug"});
     failures += check(logging.log_level == ninfer::product::LogLevel::Debug,
