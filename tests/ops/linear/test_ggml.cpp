@@ -379,16 +379,23 @@ int cast_exact(std::int32_t k, std::int32_t t) {
 }
 
 // The cast through the public Op on both routes. A Q8_0 [2560, 640] weight whose row r is one code
-// of 1 at column r % 640 with d = 1 makes y[r, t] = q[t, r % 640] d[t, (r % 640) / 32]. One code
-// step is at least 1 / 127 of that value, far above the 2^-9 BF16 rounding, so a single
-// mis-rounded or mis-scaled code fails the check.
+// of 1 at column r % 640 with block scale s makes y[r, t] = q[t, r % 640] d[t, (r % 640) / 32] s.
+// One code step is at least 1 / 127 of that value, far above the 2^-9 BF16 rounding, so a single
+// mis-rounded or mis-scaled code fails the check, provided y is a normal BF16. s = 1 except over
+// the subnormal group (columns 64..95), where q d is itself a BF16 subnormal (spacing 2^-133, a
+// whole step or more) and would hide its codes; there s = 2^15 lifts y into the normal range. s is
+// a power of two, so the product is exact on both routes.
 int cast_probe() {
     constexpr std::int32_t n = 2560, k = 640;
+    constexpr std::int32_t kSubnormalBlock = 2;
+    constexpr double kSubnormalLift        = 0x1p+15;
     std::vector<std::uint8_t> blocks(static_cast<std::size_t>(n) * (k / 32) * 34, 0);
-    const std::uint16_t one = fp16_bits(false, 0, 0);
+    const std::uint16_t one  = fp16_bits(false, 0, 0);
+    const std::uint16_t lift = fp16_bits(false, 15, 0);
     for (std::int32_t r = 0; r < n; ++r) {
         for (std::int32_t b = 0; b < k / 32; ++b) {
-            std::memcpy(&blocks[(static_cast<std::size_t>(r) * (k / 32) + b) * 34], &one, 2);
+            std::memcpy(&blocks[(static_cast<std::size_t>(r) * (k / 32) + b) * 34],
+                        b == kSubnormalBlock ? &lift : &one, 2);
         }
         const std::int32_t col = r % k;
         blocks[(static_cast<std::size_t>(r) * (k / 32) + col / 32) * 34 + 2 + col % 32] = 1;
@@ -415,7 +422,8 @@ int cast_probe() {
         for (std::int32_t col = 0; col < t; ++col) {
             for (std::int32_t r = 0; r < n; ++r) {
                 const std::size_t xi = static_cast<std::size_t>(col) * k + r % k;
-                const double want    = static_cast<double>(ref.q[xi]) * ref.d[xi / 32];
+                const double s       = (r % k) / 32 == kSubnormalBlock ? kSubnormalLift : 1.0;
+                const double want    = static_cast<double>(ref.q[xi]) * ref.d[xi / 32] * s;
                 const double y       = bf16_to_f32(got[static_cast<std::size_t>(col) * n + r]);
                 const bool ok = want == 0.0 ? y == 0.0 : std::fabs(y - want) <= std::fabs(want) * 0x1p-8;
                 bad += !ok;
