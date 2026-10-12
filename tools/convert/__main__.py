@@ -11,7 +11,7 @@ import sys
 from collections.abc import Mapping
 
 from .official_recipes import RECIPES
-from .pipeline import convert
+from .pipeline import convert, discard
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from .qwen3_5 import build_model
 from . import qwen4_exp
@@ -243,7 +243,13 @@ def main(argv=None):
             flush=True,
         )
         if ngram_out is not None:
-            geometry = qwen4_exp.write_ngram_volume(base, model, ngram_out)
+            # The artifact names a volume id that only this volume carries: without the volume
+            # it is unusable, and it would block a retry at the same --out.
+            try:
+                geometry = qwen4_exp.write_ngram_volume(base, model, ngram_out)
+            except BaseException:
+                discard(report)
+                raise
             print(f"wrote {ngram_out}: {geometry.blocks} blocks of {geometry.rows} rows", flush=True)
         elif gguf:
             print(f"bound {args.out} to the n-gram volume {args.ngram_reuse}", flush=True)
