@@ -843,11 +843,13 @@ def build_model(
     subset: Subset | None = None,
     resource_overrides: Mapping[str, str | Path] | None = None,
     mtp: GgufModel | None = None,
+    vision: GgufModel | None = None,
 ) -> Model:
     """The logical model of a qwen4exp GGUF; bind its n-gram volume before converting it.
 
     *mtp* is the MTP drafter's GGUF (Strata's ``mtp-q2_0.gguf``); it adds the ``mtp`` component
-    (:func:`add_mtp`).
+    (:func:`add_mtp`). *vision* is the vision tower's ``mmproj`` GGUF; it adds the ``vision``
+    component (:func:`add_vision`).
     """
     config = text_config(gguf.metadata)
     mappings = name_map(gguf, config)
@@ -937,6 +939,10 @@ def build_model(
         if subset is not None:
             raise ValueError("a development subset takes no MTP drafter")
         add_mtp(model, mtp)
+    if vision is not None:
+        if subset is not None:
+            raise ValueError("a development subset takes no vision tower")
+        add_vision(model, vision)
     return model
 
 
@@ -1147,6 +1153,202 @@ def add_mtp(model: Model, mtp: GgufModel) -> None:
         fused_gate_up=True,
     )
     add(MTP_EXPERTS, source.shape, source, ("mtp/layers/0/ffn_input",), source.format)
+
+
+# ---------------------------------------------------------------------------- vision tower
+
+VISION_PROJECTOR = "qwen3vl_merger"
+# The tower is Qwen3.5's (Qwen3-VL's) vision encoder: the runtime binds it through the Qwen3.5
+# Vision contract, so the component keeps that model type and those parameter names.
+VISION_MODEL_TYPE = "qwen3_5_vision"
+# The Qwen3.5-family processor settings. The mmproj GGUF records the patch geometry, the merge size
+# and the normalization (all checked below) but no resize bounds, so the bounds come from the HF
+# checkpoints' preprocessor_config.json and video_preprocessor_config.json. Provenance: these
+# values match those files byte for byte in the Qwen3.6-35B-A3B and Qwen3.6-27B checkpoints
+# (mlx-community/Qwen3.6-35B-A3B-4bit, Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed). The 3.8
+# Flash-Next checkpoint's own files were not available to compare, so the bounds are assumed to
+# carry over; replace them if Qwen3.8's preprocessor_config.json differs.
+PREPROCESSOR_CONFIG = {
+    "size": {"longest_edge": 16777216, "shortest_edge": 65536},
+    "patch_size": 16,
+    "temporal_patch_size": 2,
+    "merge_size": 2,
+    "image_mean": [0.5, 0.5, 0.5],
+    "image_std": [0.5, 0.5, 0.5],
+    "processor_class": "Qwen3VLProcessor",
+    "image_processor_type": "Qwen2VLImageProcessorFast",
+}
+VIDEO_PREPROCESSOR_CONFIG = {
+    "size": {"longest_edge": 25165824, "shortest_edge": 4096},
+    "patch_size": 16,
+    "temporal_patch_size": 2,
+    "merge_size": 2,
+    "image_mean": [0.5, 0.5, 0.5],
+    "image_std": [0.5, 0.5, 0.5],
+    "processor_class": "Qwen3VLProcessor",
+    "video_processor_type": "Qwen3VLVideoProcessor",
+}
+
+
+def vision_config(mmproj: GgufModel, text: Mapping) -> dict:
+    """The ``vision`` component config of an mmproj GGUF, refusing anything the tower is not."""
+    m = mmproj.metadata
+
+    def fixed(key: str, expected) -> None:
+        if m.get(key) != expected:
+            raise GgufError(f"mmproj {key} is {m.get(key)!r}, expected {expected!r}")
+
+    fixed("general.architecture", "clip")
+    fixed("clip.has_vision_encoder", True)
+    fixed("clip.projector_type", VISION_PROJECTOR)
+    fixed("clip.use_gelu", True)
+    depth = _int(m, "clip.vision.block_count")
+    fixed("clip.vision.is_deepstack_layers", [False] * depth)
+    fixed("clip.vision.projection_dim", text["hidden_size"])
+    for key in ("clip.vision.image_mean", "clip.vision.image_std"):
+        if [float(v) for v in m.get(key, ())] != [0.5, 0.5, 0.5]:
+            raise GgufError(f"mmproj {key} is {m.get(key)!r}, expected the 0.5 normalization")
+    epsilon_key = "clip.vision.attention.layer_norm_epsilon"
+    _real(m, epsilon_key)  # present and positive; no default for the tower's epsilon
+    if _f32_text(m, epsilon_key, 0.0) != float(str(np.float32(1e-6))):
+        raise GgufError("mmproj layer norm epsilon must be 1e-6 (the tower's fixed LayerNorm)")
+    # The temporal patch is split into one convolution slice per frame (llama.cpp's export).
+    temporal = 2 if "v.patch_embd.weight.1" in mmproj.tensors else 1
+    if "v.patch_embd.weight.2" in mmproj.tensors:
+        raise GgufError("mmproj patch embedding has more than two temporal slices")
+    positions = mmproj.tensor("v.position_embd.weight").shape[0]
+    config = {
+        "model_type": VISION_MODEL_TYPE,
+        "depth": depth,
+        "hidden_size": _int(m, "clip.vision.embedding_length"),
+        "intermediate_size": _int(m, "clip.vision.feed_forward_length"),
+        "num_heads": _int(m, "clip.vision.attention.head_count"),
+        "patch_size": _int(m, "clip.vision.patch_size"),
+        "temporal_patch_size": temporal,
+        "spatial_merge_size": _int(m, "clip.vision.spatial_merge_size"),
+        "num_position_embeddings": positions,
+    }
+    h, heads = config["hidden_size"], config["num_heads"]
+    if h % heads or (h // heads) % 4 or math.isqrt(positions) ** 2 != positions:
+        raise GgufError("mmproj head or square position geometry is invalid")
+    for name, key in (("patch_size", "patch_size"), ("temporal_patch_size", "temporal_patch_size"),
+                      ("merge_size", "spatial_merge_size")):
+        if PREPROCESSOR_CONFIG[name] != config[key] or VIDEO_PREPROCESSOR_CONFIG[name] != config[key]:
+            raise GgufError(f"mmproj {key} {config[key]} differs from the processor's {name}")
+    return config
+
+
+def _vision_shapes(config: dict, output: int) -> dict[str, tuple[int, ...]]:
+    """GGUF shapes (rows first) of the mmproj tensors for this vision config."""
+    h, i, ps = config["hidden_size"], config["intermediate_size"], config["patch_size"]
+    merger = config["spatial_merge_size"] ** 2 * h
+    shapes = {
+        "v.patch_embd.bias": (h,),
+        "v.position_embd.weight": (config["num_position_embeddings"], h),
+        "v.post_ln.weight": (h,),
+        "v.post_ln.bias": (h,),
+        "mm.0.weight": (merger, merger),
+        "mm.0.bias": (merger,),
+        "mm.2.weight": (output, merger),
+        "mm.2.bias": (output,),
+    }
+    for t in range(config["temporal_patch_size"]):
+        shapes["v.patch_embd.weight" + (f".{t}" if t else "")] = (h, 3, ps, ps)
+    for layer in range(config["depth"]):
+        p = f"v.blk.{layer}."
+        shapes.update({
+            p + "ln1.weight": (h,), p + "ln1.bias": (h,), p + "ln2.weight": (h,), p + "ln2.bias": (h,),
+            p + "attn_qkv.weight": (3 * h, h), p + "attn_qkv.bias": (3 * h,),
+            p + "attn_out.weight": (h, h), p + "attn_out.bias": (h,),
+            p + "ffn_up.weight": (i, h), p + "ffn_up.bias": (i,),
+            p + "ffn_down.weight": (h, i), p + "ffn_down.bias": (h,),
+        })
+    return shapes
+
+
+def add_vision(model: Model, mmproj: GgufModel) -> None:
+    """Adds the vision tower (component ``vision``) from its mmproj GGUF, every value kept exactly.
+
+    The parameters are Qwen3.5's vision parameters (``tools/convert/qwen3_5.py``), so the runtime
+    binds the tower through the same Vision contract. Mapping from llama.cpp's ``qwen3vl_merger``
+    export:
+
+    - ``v.patch_embd.weight`` and ``.weight.1`` are the two temporal slices of the patch
+      convolution ``[h, 3, 2, ps, ps]``; they are stacked back on the temporal axis, then flattened
+      to ``[h, 3 * 2 * ps * ps]`` (the processor's patch order: channel, frame, row, column);
+    - ``attn_qkv`` splits into the query, key and value row blocks (weights and biases);
+    - ``v.post_ln`` is the merger's LayerNorm (applied per patch before the 2x2 merge), and
+      ``mm.0`` / ``mm.2`` are the merger's ``linear_fc1`` / ``linear_fc2``.
+
+    The BF16 matrices keep their words. Every F32 tensor (patch convolution, biases, LayerNorms,
+    the position table) holds widened BF16 words; it is stored as BF16 after the exactness check
+    (``narrow_exactly``), which refuses any value that would round.
+    """
+    text = model.config
+    config = vision_config(mmproj, text)
+    expected = _vision_shapes(config, text["hidden_size"])
+    if set(mmproj.tensors) != set(expected):
+        missing, extra = set(expected) - set(mmproj.tensors), set(mmproj.tensors) - set(expected)
+        raise GgufError(f"mmproj tensors differ: missing {sorted(missing)}, unknown {sorted(extra)}")
+    for name, shape in expected.items():
+        tensor = mmproj.tensor(name)
+        if tensor.shape != shape:
+            raise GgufError(f"{name}: shape {tensor.shape}, expected {shape}")
+        wanted = "bf16" if name.endswith(".weight") and len(shape) == 2 and not name.startswith(
+            "v.position_embd") else "fp32"
+        if tensor.type.format != wanted:
+            raise GgufError(f"{name}: expected {wanted}, got {tensor.type.format}")
+    h, merger = config["hidden_size"], config["spatial_merge_size"] ** 2 * config["hidden_size"]
+    resources = {
+        "preprocessor_config.json": _json_bytes(PREPROCESSOR_CONFIG),
+        "video_preprocessor_config.json": _json_bytes(VIDEO_PREPROCESSOR_CONFIG),
+    }
+    references = {role: f"resource/vision/{role}" for role in resources}
+    model.components["vision"] = {"config": config, "target": "text", "resources": references}
+    for role, data in resources.items():
+        model.resources[references[role]] = data
+
+    def words(name: str) -> torch.Tensor:
+        tensor = mmproj.tensor(name)
+        values = tensor_source(mmproj, name, shape=tensor.shape).values().reshape(tensor.shape)
+        return narrow_exactly(name, values, "words")
+
+    def add(name: str, source, inputs=()) -> None:
+        model.add(Parameter(name, tuple(source.shape), source, inputs=inputs, residency="vision"))
+
+    slices = [words("v.patch_embd.weight" + (f".{t}" if t else "")) for t in range(config["temporal_patch_size"])]
+    patch = torch.stack(slices, dim=2).reshape(h, -1).contiguous()
+    add("vision/patch_embedding", array_source(patch, "v.patch_embd.weight[t]"), ("vision/patch_input",))
+    add("vision/patch_embedding_bias", array_source(words("v.patch_embd.bias"), "v.patch_embd.bias"))
+    add("vision/position_embedding", array_source(words("v.position_embd.weight"), "v.position_embd.weight"))
+    for layer in range(config["depth"]):
+        p, g = f"vision/layers/{layer}/", f"v.blk.{layer}."
+        for role, source in (("norm1", "ln1"), ("norm2", "ln2")):
+            for kind in ("weight", "bias"):
+                add(p + role + "_" + kind, array_source(words(g + source + "." + kind), g + source + "." + kind))
+        bias = words(g + "attn_qkv.bias")
+        for number, role in enumerate(("query", "key", "value")):
+            rows = (number * h, (number + 1) * h)
+            add(p + "attention/" + role, tensor_source(mmproj, g + "attn_qkv.weight", rows=rows),
+                (p + "attention_input",))
+            add(p + "attention/" + role + "_bias",
+                array_source(bias[rows[0]:rows[1]].clone(), f"{g}attn_qkv.bias[{rows[0]}:{rows[1]}]"))
+        model.packing_groups.append(tuple(p + "attention/" + r for r in ("query", "key", "value")))
+        model.packing_groups.append(tuple(p + "attention/" + r + "_bias" for r in ("query", "key", "value")))
+        add(p + "attention/output", tensor_source(mmproj, g + "attn_out.weight"), (p + "attention_output",))
+        add(p + "attention/output_bias", array_source(words(g + "attn_out.bias"), g + "attn_out.bias"))
+        add(p + "mlp/fc1", tensor_source(mmproj, g + "ffn_up.weight"), (p + "mlp_input",))
+        add(p + "mlp/fc1_bias", array_source(words(g + "ffn_up.bias"), g + "ffn_up.bias"))
+        add(p + "mlp/fc2", tensor_source(mmproj, g + "ffn_down.weight"), (p + "mlp_activation",))
+        add(p + "mlp/fc2_bias", array_source(words(g + "ffn_down.bias"), g + "ffn_down.bias"))
+    add("vision/merger/norm_weight", array_source(words("v.post_ln.weight"), "v.post_ln.weight"))
+    add("vision/merger/norm_bias", array_source(words("v.post_ln.bias"), "v.post_ln.bias"))
+    add("vision/merger/fc1", tensor_source(mmproj, "mm.0.weight"), ("vision/merger/input",))
+    add("vision/merger/fc1_bias", array_source(words("mm.0.bias"), "mm.0.bias"))
+    add("vision/merger/fc2", tensor_source(mmproj, "mm.2.weight"), ("vision/merger/activation",))
+    add("vision/merger/fc2_bias", array_source(words("mm.2.bias"), "mm.2.bias"))
+    if model.parameters["vision/merger/fc1"].shape != (merger, merger):
+        raise GgufError("mmproj merger fc1 does not span the 2x2 merged patch")
 
 
 def encoded_format(parameter: Parameter) -> str | None:

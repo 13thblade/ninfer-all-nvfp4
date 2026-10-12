@@ -228,3 +228,79 @@ def mtp_tensors(drop=()) -> list[tuple[str, int, tuple[int, ...], bytes]]:
 def write_mtp(path: Path, *, architecture="qwen4exp-mtp", drop=()) -> Path:
     items = [("general.architecture", 8, architecture), ("strata.mtp.expert_format", 8, "q2_0")]
     return write_gguf(path, items, mtp_tensors(drop))
+
+
+# The tiny vision tower: llama.cpp's qwen3vl_merger mmproj layout at width VH (two heads of 16),
+# MLP VI, the real patch geometry (16 x 16, two frames, 2 x 2 merge), a 4 x 4 position table and a
+# merger projecting to the text width H.
+VH, VI, VDEPTH, VPOS = 32, 48, 2, 16
+
+
+def mmproj_metadata(**changes) -> list[tuple[str, int, object]]:
+    c = "clip.vision."
+    items = {
+        "general.architecture": (8, "clip"),
+        "general.type": (8, "mmproj"),
+        "clip.has_vision_encoder": (7, True),
+        "clip.projector_type": (8, "qwen3vl_merger"),
+        "clip.use_gelu": (7, True),
+        c + "projection_dim": (4, H),
+        c + "image_size": (4, 64),
+        c + "patch_size": (4, 16),
+        c + "embedding_length": (4, VH),
+        c + "feed_forward_length": (4, VI),
+        c + "block_count": (4, VDEPTH),
+        c + "attention.head_count": (4, 2),
+        c + "attention.layer_norm_epsilon": (6, 1e-6),
+        c + "image_mean": (9, (6, [0.5, 0.5, 0.5])),
+        c + "image_std": (9, (6, [0.5, 0.5, 0.5])),
+        c + "spatial_merge_size": (4, 2),
+        c + "is_deepstack_layers": (9, (7, [False] * VDEPTH)),
+    }
+    items.update(changes)
+    return [(key, kind, value) for key, (kind, value) in items.items() if kind is not None]
+
+
+def mmproj_tensors(drop=(), unexact=()) -> list[tuple[str, int, tuple[int, ...], bytes]]:
+    """GGML dimensions (innermost first). F32 tensors hold BF16 words, as the real mmproj's do,
+    except those named in *unexact* (one low bit set)."""
+    merger = 4 * VH
+    specs = [
+        ("v.patch_embd.weight", F32, (16, 16, 3, VH)),
+        ("v.patch_embd.weight.1", F32, (16, 16, 3, VH)),
+        ("v.patch_embd.bias", F32, (VH,)),
+        ("v.position_embd.weight", F32, (VH, VPOS)),
+        ("v.post_ln.weight", F32, (VH,)),
+        ("v.post_ln.bias", F32, (VH,)),
+        ("mm.0.weight", BF16, (merger, merger)),
+        ("mm.0.bias", F32, (merger,)),
+        ("mm.2.weight", BF16, (merger, H)),
+        ("mm.2.bias", F32, (H,)),
+    ]
+    for layer in range(VDEPTH):
+        p = f"v.blk.{layer}."
+        specs += [
+            (p + "ln1.weight", F32, (VH,)), (p + "ln1.bias", F32, (VH,)),
+            (p + "ln2.weight", F32, (VH,)), (p + "ln2.bias", F32, (VH,)),
+            (p + "attn_qkv.weight", BF16, (VH, 3 * VH)), (p + "attn_qkv.bias", F32, (3 * VH,)),
+            (p + "attn_out.weight", BF16, (VH, VH)), (p + "attn_out.bias", F32, (VH,)),
+            (p + "ffn_up.weight", BF16, (VH, VI)), (p + "ffn_up.bias", F32, (VI,)),
+            (p + "ffn_down.weight", BF16, (VI, VH)), (p + "ffn_down.bias", F32, (VH,)),
+        ]
+    out = []
+    for index, (name, kind, ne) in enumerate(spec for spec in specs if spec[0] not in drop):
+        if kind == F32:
+            rng = np.random.default_rng(2000 + index)
+            words = rng.uniform(-1.0, 1.0, prod(ne)).astype(np.float32)
+            words = ((words.view(np.uint32) >> 16) << 16).view(np.float32)
+            if name in unexact:
+                words = (words.view(np.uint32) | 1).view(np.float32)
+            data = words.astype("<f4").tobytes()
+        else:
+            data = tensor_bytes(kind, ne, seed=2000 + index)
+        out.append((name, kind, ne, data))
+    return out
+
+
+def write_mmproj(path: Path, *, metadata_changes=None, drop=(), unexact=()) -> Path:
+    return write_gguf(path, mmproj_metadata(**(metadata_changes or {})), mmproj_tensors(drop, unexact))
