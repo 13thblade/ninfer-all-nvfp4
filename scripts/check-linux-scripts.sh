@@ -248,6 +248,13 @@ expect_exit 2 'NINFER_NGRAM=on on the 35B' clear_env "${serve_env[@]}" NINFER_NG
 expect_exit 2 'unknown NINFER_NGRAM on the 35B' clear_env "${serve_env[@]}" NINFER_NGRAM=yes "$root/run.sh" qwen36-35b-a3b
 expect_exit 2 'unknown NINFER_REASONING_LOOP' clear_env "${serve_env[@]}" NINFER_REASONING_LOOP=on \
   "$root/run.sh" qwen38-27b
+# The Flash-Next n-gram volume override belongs to run.bat; these models have no volume to point at.
+touch "$tmp/volume.ngram"
+expect_exit 2 'NINFER_NGRAM_VOLUME on the 27B' clear_env "${serve_env[@]}" NINFER_NGRAM_VOLUME="$tmp/volume.ngram" \
+  "$root/run.sh" qwen38-27b
+expect_exit 2 'NINFER_NGRAM_VOLUME on the 35B' clear_env "${serve_env[@]}" NINFER_NGRAM_VOLUME="$tmp/volume.ngram" \
+  "$root/run.sh" qwen36-35b-a3b
+refuse_flag '27B default' "$(record no_volume -- qwen38-27b)" '--ngram-volume'
 expect_exit 0 '--help' clear_env "${serve_env[@]}" "$root/run.sh" --help
 
 # A desktop holding VRAM can leave too little for the default context, and the tuned profile is

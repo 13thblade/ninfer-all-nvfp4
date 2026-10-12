@@ -103,7 +103,30 @@ What is different from the Qwen3.5 models:
   the GPU runs the current one; a prompt's first call waits for its own rows, so the volume's disk
   speed shows in time to first token.
 - **The n-gram volume** `<model>.ngram` (29 GB) is read unbuffered per token, with a 2^20-row host
-  cache; keep it on an SSD (an NVMe drive reads a prompt's rows several times faster than SATA).
+  cache, so its drive sets prefill speed; the 40 GB artifact is read only once, at load. Put the
+  volume on the fastest drive, even when the model cannot go there: `--ngram-volume FILE` (in the
+  launcher, `NINFER_NGRAM_VOLUME`) reads a copy anywhere, and the server refuses a volume that does
+  not belong to the model. The plain and `-mtp` artifacts converted with `--ngram-reuse` share one
+  volume, so one copy serves both. Measured 2026-10-12 on this RTX 3090 with the plain artifact
+  (no speculation) on a SATA SSD, moving only the volume to an NVMe drive (warm requests,
+  n = 12 / 12 / 6 per drive; prefill medians and the mean of the per-prompt ratios; prefill with
+  MTP on was not measured):
+
+  | Prompt | Volume on SATA | Volume on NVMe | NVMe / SATA, per prompt |
+  |---|---:|---:|---:|
+  | 4K | 1,825 tok/s | 2,345 tok/s | 1.37x |
+  | 32K | 2,332 tok/s | 2,422 tok/s | 1.11x |
+  | 128K | 2,135 tok/s | 2,372 tok/s | 1.13x |
+
+  Plain decode at 8K moved +0.8% (it reads few rows). The SATA arm also varies more from prompt to
+  prompt (4K: 1,334-2,128 tok/s against 2,320-2,393), and its first request in a process pays
+  0.86 s of reads where NVMe pays 0.07 s.
+
+  ```bat
+  set NINFER_MODEL_DIR=K:\ninfer-models\qwen4exp
+  set NINFER_NGRAM_VOLUME=C:\ninfer-models\qwen4exp\qwen4exp-iq2xs.ninfer.ngram
+  scripts\run.bat qwen38-flash-next
+  ```
 
 | Flash-Next option | Meaning | Default |
 |---|---|---|
