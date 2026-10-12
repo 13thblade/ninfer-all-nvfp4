@@ -142,6 +142,7 @@ struct Harness {
             state.qsa_tails.emplace_back(p, DType::BF16, std::initializer_list<std::int32_t>{di, r - 1});
             p += tail_bytes;
         }
+        state.ple_slot = Tensor(p, DType::I32, {1}); // in the zeroed slack
 
         // Int8Group64 K/V [256, 64, Hkv, pages] with FP16 scales [4, 64, Hkv, pages], and the pooled
         // index keys [Di / R, 64, 1, pages], through one identity block table.

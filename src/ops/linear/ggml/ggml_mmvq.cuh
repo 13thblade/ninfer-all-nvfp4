@@ -41,10 +41,13 @@ constexpr std::size_t mmvq_shared_bytes() {
 // t as two 16-byte halves at t K + 16 s and t K + K / 2 + 16 s, so the lanes of a row, which read
 // consecutive sub-blocks, hit distinct banks.
 // Out is BF16 (Linear, LinearAdd) or FP32 (projection_fp32's GGML head); Residual needs BF16.
+//
+// The body runs as CTA `cta` of `ctas` persistent CTAs over one matrix: ggml_mmvq_kernel gives it
+// the whole grid, ggml_mmvq_pair_kernel splits the grid between two matrices of one input. A row's
+// arithmetic does not depend on the CTA that computes it.
 template <QType F, int K, int T, bool Residual, class Out = __nv_bfloat16>
-__global__ void __launch_bounds__(kMmvqThreads)
-    ggml_mmvq_kernel(const std::uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ x,
-                     Out* __restrict__ out, int n) {
+__device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ x,
+                                          Out* __restrict__ out, int n, int cta, int ctas, unsigned char* smem) {
     static_assert(std::is_same_v<Out, __nv_bfloat16> || (std::is_same_v<Out, float> && !Residual));
     using Fmt                 = Format<F>;
     constexpr int kSubs       = K / kSubValues;
@@ -54,7 +57,6 @@ __global__ void __launch_bounds__(kMmvqThreads)
     constexpr int kRowBytes   = K / Fmt::kBlockValues * Fmt::kBlockBytes;
     static_assert(K % Fmt::kBlockValues == 0 && kSubs % kLanes == 0);
 
-    extern __shared__ __align__(16) unsigned char smem[];
     auto* xq_s   = reinterpret_cast<std::int8_t*>(smem);
     auto* xd_s   = reinterpret_cast<float*>(smem + static_cast<std::size_t>(T) * K);
     auto* grid_s = reinterpret_cast<std::uint32_t*>(smem + static_cast<std::size_t>(T) * K +
@@ -64,8 +66,8 @@ __global__ void __launch_bounds__(kMmvqThreads)
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
     const int sub_lane = lane % kLanes;
     const int groups   = n / kRowsWarp;
-    const int stride   = static_cast<int>(gridDim.x) * kMmvqWarps;
-    int rg             = static_cast<int>(blockIdx.x) * kMmvqWarps + warp;
+    const int stride   = ctas * kMmvqWarps;
+    int rg             = cta * kMmvqWarps + warp;
 
     Tables tables;
     load_tables<F>(tables, grid_s);
@@ -148,6 +150,30 @@ __global__ void __launch_bounds__(kMmvqThreads)
     }
 }
 
+template <QType F, int K, int T, bool Residual, class Out = __nv_bfloat16>
+__global__ void __launch_bounds__(kMmvqThreads)
+    ggml_mmvq_kernel(const std::uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ x,
+                     Out* __restrict__ out, int n) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    mmvq_body<F, K, T, Residual, Out>(w, x, out, n, static_cast<int>(blockIdx.x), static_cast<int>(gridDim.x), smem);
+}
+
+// Two matrices of one input in one launch (linear_pair): CTAs [0, first_ctas) compute the first,
+// the rest the second, each with the single kernel's body.
+template <QType F1, QType F2, int K, int T>
+__global__ void __launch_bounds__(kMmvqThreads)
+    ggml_mmvq_pair_kernel(const std::uint8_t* __restrict__ w1, const std::uint8_t* __restrict__ w2,
+                          const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out1,
+                          __nv_bfloat16* __restrict__ out2, int n, int first_ctas) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    const int cta = static_cast<int>(blockIdx.x);
+    if (cta < first_ctas) {
+        mmvq_body<F1, K, T, false>(w1, x, out1, n, cta, first_ctas, smem);
+    } else {
+        mmvq_body<F2, K, T, false>(w2, x, out2, n, cta - first_ctas, static_cast<int>(gridDim.x) - first_ctas, smem);
+    }
+}
+
 inline void mmvq_check(cudaError_t error, const char* what) {
     if (error != cudaSuccess) {
         throw std::runtime_error(std::string("ggml mmvq: ") + what + ": " +
@@ -183,6 +209,39 @@ void launch_mmvq_instance(const std::uint8_t* w, const __nv_bfloat16* x, Out* ou
     const int grid        = ctas_needed < resident ? ctas_needed : resident;
     ggml_mmvq_kernel<F, K, T, Residual, Out><<<grid, kMmvqThreads, kShared, stream>>>(w, x, out, n);
     mmvq_check(cudaGetLastError(), "launch");
+}
+
+// The pair: as many CTAs as fit at once, split evenly between the two matrices (same rows and K),
+// never more than a matrix has row groups.
+template <QType F1, QType F2, int K, int T>
+void launch_mmvq_pair_instance(const std::uint8_t* w1, const std::uint8_t* w2, const __nv_bfloat16* x,
+                               __nv_bfloat16* out1, __nv_bfloat16* out2, int n, cudaStream_t stream) {
+    constexpr std::size_t kShared = mmvq_shared_bytes<F1, K, T>() > mmvq_shared_bytes<F2, K, T>()
+                                        ? mmvq_shared_bytes<F1, K, T>()
+                                        : mmvq_shared_bytes<F2, K, T>();
+    constexpr int kRowsCta = kMmvqWarps * (32 / mmvq_lanes_per_row(K / kSubValues));
+    static const int resident = [] {
+        auto kernel = ggml_mmvq_pair_kernel<F1, F2, K, T>;
+        if (kShared > 48 * 1024) {
+            mmvq_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            static_cast<int>(kShared)),
+                       "shared memory opt-in");
+        }
+        int device = 0;
+        int sms    = 0;
+        int per_sm = 0;
+        mmvq_check(cudaGetDevice(&device), "device");
+        mmvq_check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device), "SMs");
+        mmvq_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, kMmvqThreads,
+                                                                 kShared),
+                   "occupancy");
+        return sms * (per_sm > 0 ? per_sm : 1);
+    }();
+    const int ctas_needed = (n + kRowsCta - 1) / kRowsCta;
+    const int half        = resident / 2 > 0 ? resident / 2 : 1;
+    const int each        = ctas_needed < half ? ctas_needed : half;
+    ggml_mmvq_pair_kernel<F1, F2, K, T><<<2 * each, kMmvqThreads, kShared, stream>>>(w1, w2, x, out1, out2, n, each);
+    mmvq_check(cudaGetLastError(), "pair launch");
 }
 
 template <QType F, int K, bool Residual, class Out = __nv_bfloat16>

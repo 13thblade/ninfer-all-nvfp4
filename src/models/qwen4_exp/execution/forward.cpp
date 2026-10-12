@@ -16,6 +16,7 @@
 #include "ninfer/ops/hyper_connection.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/ple.h"
 #include "ninfer/ops/projection_fp32.h"
@@ -38,6 +39,20 @@ std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
 
 void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s) {
     ops::linear(x, p.weight, out, p.policy, work, s);
+}
+
+// Two projections of one input: one linear_pair launch for decode-width calls over GGML weights
+// (the same outputs as two linears, bit for bit) when both policies admit A8 (the only GGML profile;
+// linear() rejects A16Only for them, so the pair must not bypass that), else two linears.
+void project_pair(const Tensor& x, const LinearParameters& a, const LinearParameters& b, Tensor& out_a, Tensor& out_b,
+                  WorkspaceArena& work, cudaStream_t s) {
+    if (x.ne[1] <= 8 && a.weight.layout == QuantLayout::GgmlBlocks && b.weight.layout == QuantLayout::GgmlBlocks &&
+        ops::allows_a8(a.policy) && ops::allows_a8(b.policy)) {
+        ops::linear_pair(x, a.weight, b.weight, out_a, out_b, s);
+        return;
+    }
+    project(x, a, out_a, work, s);
+    project(x, b, out_b, work, s);
 }
 
 void copy_tap(std::vector<Tensor>* targets, std::uint32_t layer, const Tensor& source, cudaStream_t s) {
@@ -77,6 +92,7 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
     : parameters_(parameters), config_(parameters.model.config()), device_(device), work_(&work),
       state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)) {
     if (state_.gdn_conv.size() != config_.gdn_layers || state_.gdn_recurrent.size() != config_.gdn_layers ||
+        state_.ple_slot.dtype != DType::I32 || state_.ple_slot.numel() != 1 ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
         kv_.pooled.size() != config_.attention_layers || experts_.frames.size() != config_.num_hidden_layers) {
         throw std::invalid_argument("Qwen4Exp forward: state, KV or expert residency is incomplete");
@@ -117,30 +133,60 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
 }
 
 void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap) {
+    if (logits.dtype != DType::FP32 || logits.ne[0] != dim(config_.vocab_size) ||
+        logits.ne[1] != batch.logit_columns.ne[0]) {
+        throw std::invalid_argument("Qwen4Exp forward: batch geometry is invalid");
+    }
+    run_front(batch, 0, tap);
+    run_back(batch, 0, logits, tap);
+}
+
+std::uint32_t Forward::rows_layer() const noexcept {
+    for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) {
+        if (parameters_.layers[l].ple) { return l; }
+    }
+    return config_.num_hidden_layers;
+}
+
+void Forward::run_front(const ForwardBatch& batch, std::uint32_t end, const ForwardTap* tap) {
     const cudaStream_t s = device_.stream;
     const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size), W = dim(config_.residual_width());
     if (T <= 0 || batch.positions.ne[0] != T || batch.rope_positions.ne[0] != T || batch.rope_positions.ne[1] != 3 ||
-        batch.block_start_rope.ne[0] != 3 || logits.dtype != DType::FP32 ||
-        logits.ne[0] != dim(config_.vocab_size) || logits.ne[1] != batch.logit_columns.ne[0]) {
+        batch.block_start_rope.ne[0] != 3 || end > rows_layer()) {
         throw std::invalid_argument("Qwen4Exp forward: batch geometry is invalid");
     }
     work_->reset();
-    Tensor residual = work_->alloc(DType::BF16, {W, T});
+    residual_ = work_->alloc(DType::BF16, {W, T});
     {
         auto scope = work_->scope();
         Tensor x0  = work_->alloc(DType::BF16, {H, T});
         ops::embedding(batch.ids, parameters_.token_embedding, x0, s);
-        ops::hyper_connection_expand(x0, dim(config_.hc.streams), residual, s);
+        ops::hyper_connection_expand(x0, dim(config_.hc.streams), residual_, s);
     }
-    for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) {
+    layers(0, end, batch, tap);
+}
+
+void Forward::layers(std::uint32_t begin, std::uint32_t end, const ForwardBatch& batch, const ForwardTap* tap) {
+    for (std::uint32_t l = begin; l < end; ++l) {
         try {
-            layer(l, batch, residual, tap);
+            layer(l, batch, residual_, tap);
         } catch (const std::exception& error) {
             throw std::runtime_error("qwen4_exp/layers/" + std::to_string(l) + ": " + error.what());
         }
     }
-    auto scope     = work_->scope();
-    Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
+}
+
+void Forward::run_back(const ForwardBatch& batch, std::uint32_t begin, Tensor& logits, const ForwardTap* tap) {
+    const cudaStream_t s = device_.stream;
+    const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size);
+    if (residual_.data == nullptr || residual_.ne[1] != T || logits.dtype != DType::FP32 ||
+        logits.ne[0] != dim(config_.vocab_size) || logits.ne[1] != batch.logit_columns.ne[0]) {
+        throw std::invalid_argument("Qwen4Exp forward: the back part needs its front's batch and FP32 logits");
+    }
+    layers(begin, config_.num_hidden_layers, batch, tap);
+    Tensor& residual = residual_;
+    auto scope       = work_->scope();
+    Tensor final_x   = mix(parameters_.final_mixer, residual, nullptr);
     Tensor last    = work_->alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
     ops::gather_columns(final_x, batch.logit_columns, last, s);
     ops::projection_fp32(last, parameters_.output_head, logits, s);
@@ -198,11 +244,10 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
     Tensor normalized = work_->alloc(DType::BF16, {W, T});
     ops::ple_gate(key, value, residual, p.key_norm, p.query_norm, p.conv_norm, dim(config_.hc.streams),
                   config_.rms_norm_eps, gated, normalized, s);
-    // One sequence in state slot 0, updated in place.
-    Tensor slot = work_->alloc(DType::I32, {1});
-    CUDA_CHECK(cudaMemsetAsync(slot.data, 0, sizeof(std::int32_t), s));
-    ops::ple_conv_inject(gated, normalized, p.convolution, dim(config_.ple.conv_dilation), state_.ple_conv, slot,
-                         slot, residual, s);
+    // One sequence in state slot 0, updated in place. The slot index is state (no per-call memset:
+    // a memset node splits the decode graph's kernel chain).
+    ops::ple_conv_inject(gated, normalized, p.convolution, dim(config_.ple.conv_dilation), state_.ple_conv,
+                         state_.ple_slot, state_.ple_slot, residual, s);
 }
 
 Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index) {
@@ -271,8 +316,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     Tensor v = work_->alloc(DType::BF16, {D, KVH, T});
     {
         Tensor kf = k.view({D * KVH, T}), vf = v.view({D * KVH, T});
-        project(x, p.key, kf, *work_, s);
-        project(x, p.value, vf, *work_, s);
+        project_pair(x, p.key, p.value, kf, vf, *work_, s);
     }
     // The indexer's BF16 rows in FP32, then rounded once to BF16 (Linear's BF16 output boundary).
     Tensor indexed = work_->alloc(DType::FP32, {IH * ID + ID, T});
@@ -374,8 +418,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const std::int32_t I = dim(m.shared_intermediate);
     Tensor g = work_->alloc(DType::BF16, {I, T});
     Tensor u = work_->alloc(DType::BF16, {I, T});
-    project(x, p.shared_gate, g, *work_, s);
-    project(x, p.shared_up, u, *work_, s);
+    project_pair(x, p.shared_gate, p.shared_up, g, u, *work_, s);
     Tensor product = work_->alloc(DType::BF16, {I, T});
     ops::silu_mul(g, u, product, s);
     Tensor shared = work_->alloc(DType::BF16, {H, T});
