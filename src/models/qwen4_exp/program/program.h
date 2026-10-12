@@ -211,6 +211,9 @@ struct PrefillProgress {
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
+    // The Engine records Main KV restored under the first prefill pass. This Program keeps no Host
+    // KV to restore (prefix reuse is off), so the list stays empty.
+    std::vector<runtime::ContextTransferObservation> landed_transfers;
 };
 
 struct CommitRowResult {
