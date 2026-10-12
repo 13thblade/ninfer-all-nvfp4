@@ -468,6 +468,8 @@ ProgramImpl::~ProgramImpl() noexcept {
         for (const auto event : landing.events) { (void)cudaEventDestroy(event); }
     }
     for (const auto event : spare_restore_events_) { (void)cudaEventDestroy(event); }
+    // Held source histories release into stores that are still alive here.
+    landing_restores_.clear();
     for (std::size_t rank = 0; rank < compute_streams.size(); ++rank) {
         const cudaStream_t stream = compute_streams[rank];
         if (stream != nullptr) { (void)cudaStreamSynchronize(stream); }

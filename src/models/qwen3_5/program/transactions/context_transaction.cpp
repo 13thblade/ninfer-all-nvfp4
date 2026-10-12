@@ -157,6 +157,7 @@ void ProgramImpl::enqueue_layered_restore(ContextTransaction& tx) {
     auto& landing               = landing_restores_.emplace_back(
         LandingRestore{.lane = tx.lane, .timer = CudaEventTimer(device, transfer_streams[0])});
     landing.page_count = tx.layered_pages;
+    if (tx.source_history) { landing.sources.push_back(tx.source_history); }
     landing.events.reserve(layers);
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         if (spare_restore_events_.empty()) {
@@ -288,7 +289,11 @@ void ProgramImpl::complete_landing(std::uint32_t lane) {
         spare_restore_events_.insert(spare_restore_events_.end(), it->events.begin(),
                                      it->events.end());
         if (it->descriptors) { spare_descriptor_buffers_.push_back(std::move(*it->descriptors)); }
+        // The copies have landed: the source history may now be released (and its Host pages
+        // reclaimed) after the landing is out of the list, so the release fence finds nothing to wait for.
+        auto sources = std::move(it->sources);
         landing_restores_.erase(it);
+        sources.clear();
         return;
     }
 }
@@ -310,7 +315,9 @@ void ProgramImpl::retire_landing(std::uint32_t lane) noexcept {
         } catch (...) {
             for (const auto event : it->events) { (void)cudaEventDestroy(event); }
         }
-        it = landing_restores_.erase(it);
+        auto sources = std::move(it->sources);
+        it           = landing_restores_.erase(it);
+        sources.clear(); // landed: release the source history now (see complete_landing)
     }
 }
 

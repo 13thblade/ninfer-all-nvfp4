@@ -587,6 +587,10 @@ public:
         bool ordered             = false;
         // The layers' gather descriptors, read by the kernels until the restore has landed.
         std::optional<PinnedHostBuffer> descriptors;
+        // The history a consuming Bind restored from. Its Host pages are the gather kernels'
+        // source, so it outlives the binding transaction and is released only after the landing
+        // has landed (the binding then never waits for the restore to reclaim it).
+        std::vector<std::shared_ptr<KVHistory>> sources;
     };
     std::vector<LandingRestore> landing_restores_;
     std::vector<cudaEvent_t> spare_restore_events_;
