@@ -819,7 +819,7 @@ PublishedOutput OutputSession::commit_preview() {
             impl_->state.in_reasoning && model_ended ? std::string_view(impl_->open_reasoning)
                                                      : std::string_view{};
         fi::ToolCallOutputDecoder::Terminal terminal =
-            impl_->tool_call_output.finish(impl_->preview_finish_reason, open_reasoning);
+            impl_->tool_call_output.finish(impl_->preview_finish_reason, open_reasoning, model_ended);
         impl_->tool_calls      = std::move(terminal.tool_calls);
         impl_->tool_call_parse = terminal.diagnostics;
         if (!terminal.content.empty()) {

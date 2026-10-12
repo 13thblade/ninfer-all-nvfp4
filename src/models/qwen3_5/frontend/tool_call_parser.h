@@ -92,9 +92,11 @@ public:
     void initialize_continuation(std::string_view prefix);
     // `open_reasoning` is the thinking of a turn that ended without closing it. For free tool
     // output, when the turn ended on its stop token and no content was fed, complete declared
-    // calls that end that thinking become the structured turn.
+    // calls that end that thinking become the structured turn. `model_ended` is false when a
+    // stop-token end came from a caller-listed id rather than the checkpoint's own end of turn;
+    // such an end may have cut a call between parameters, so it repairs like a cut turn.
     [[nodiscard]] Terminal finish(FinishReason reason             = FinishReason::StopToken,
-                                  std::string_view open_reasoning = {});
+                                  std::string_view open_reasoning = {}, bool model_ended = true);
 
 private:
     std::shared_ptr<const ToolCallOutputContract> contract_;

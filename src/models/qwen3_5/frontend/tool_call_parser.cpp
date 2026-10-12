@@ -1202,7 +1202,8 @@ void ToolCallOutputDecoder::initialize_continuation(std::string_view prefix) {
 }
 
 ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reason,
-                                                              std::string_view open_reasoning) {
+                                                              std::string_view open_reasoning,
+                                                              bool model_ended) {
     if (finished_) { throw std::logic_error("tool-call output decoder is already finished"); }
     finished_ = true;
     if (!contract_) { return {}; }
@@ -1244,9 +1245,14 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reaso
         throw std::logic_error("required tool grammar ended without a call");
     if (contract_->constrained && contract_->required) return {};
 
+    // A caller-listed stop id may have cut a call between parameters, as a stop string would.
+    ToolCallRepair repair = tool_call_repair(tolerant_, reason);
+    if (!model_ended && repair == ToolCallRepair::UnclosedFinalCall) {
+        repair = ToolCallRepair::CompleteCalls;
+    }
     ParsedToolCallOutput parsed =
         parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_, region_code_,
-                                    tool_call_repair(tolerant_, reason));
+                                    repair);
     if (saw_tool_marker_ && parsed.is_tool_call_response) {
         // The content is the held text before the accepted region: the bytes after an earlier
         // quoted marker, less those a continuation prefix already holds.

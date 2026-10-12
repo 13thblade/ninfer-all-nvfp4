@@ -1492,6 +1492,16 @@ int test_tolerant_unclosed_final_call() {
             "strict parsing kept a call with " + label);
     }
 
+    // A stop id the caller listed is the client's end, not the model's: it repairs like a cut.
+    for (const auto& [text, label] : unclosed) {
+        fi::ToolCallOutputDecoder decoder(contract, 64, true);
+        std::string content = decoder.feed(text);
+        const auto terminal = decoder.finish(FinishReason::StopToken, {}, false);
+        failures += check(terminal.tool_calls.empty() && !terminal.diagnostics.tolerant_recovered &&
+                              content + terminal.content == text,
+                          "a call with " + label + " was kept at a caller-supplied stop token");
+    }
+
     // After complete calls, the unclosed one joins them only at the stop token.
     const std::string first = tool_call("delete_file", {{"filePath", "/tmp/a"}});
     const std::string both  = first +
