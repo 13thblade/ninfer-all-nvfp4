@@ -61,6 +61,9 @@ public:
     void after_experts(std::uint32_t layer, cudaStream_t compute);
     // After the chunk's last layer (every copy was waited for by `compute`).
     void end() noexcept { active_ = false; }
+    // Blocks until the copy stream is idle. After an aborted chunk, copies of layers the compute
+    // stream never consumed can still be writing the ring, which the lender is about to reclaim.
+    void drain();
 
     struct Stats {
         std::uint64_t streamed = 0; // records copied

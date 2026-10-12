@@ -60,9 +60,9 @@ Check them with `ldd` on the new binaries and update the guide if they change.
 watch the Windows zip if more DLLs are added.
 
 **Smoke-test the launcher default on the real card.** A busy desktop holding 2-3 GiB of the 3090 refuses
-the default DFlash2 profile on the engine's runtime reservation. `run.{sh,bat}` therefore steps down by
-itself when startup is refused for lack of GPU memory or fails to pin the Host context budget; see `docs/maintainer/launcher-profiles.md`. `--kv-capacity
-auto` does not avoid this, because the engine still reserves room for one full `--max-context` sequence.
+the default DFlash2 profile's full context. `run.{sh,bat}` therefore pass `--fit-context 32768`, so the
+server starts at the largest context that fits and logs `context lowered to ...`, and the launcher retries
+with a smaller Host context budget if pinning it fails; see `docs/maintainer/launcher-profiles.md`.
 Start the launcher with nothing overridden and confirm it serves a request.
 
 ### Building on WSL

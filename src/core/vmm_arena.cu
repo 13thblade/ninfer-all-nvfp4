@@ -39,18 +39,18 @@ bool VmmArena::map_chunk() {
     const CUmemAllocationProp prop = vmm::device_prop(device_);
     CUmemGenericAllocationHandle handle{};
     const CUresult created = cuMemCreate(&handle, chunk_, &prop, 0);
-    if (created == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
+    if (vmm::grow_refused(created)) { return false; }
     vmm::check(created, "cuMemCreate");
     const CUdeviceptr va = base_ + mapped_bytes();
     if (const CUresult mapped = cuMemMap(va, chunk_, 0, handle, 0); mapped != CUDA_SUCCESS) {
         (void)cuMemRelease(handle);
-        if (mapped == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
+        if (vmm::grow_refused(mapped)) { return false; }
         vmm::check(mapped, "cuMemMap");
     }
     if (const CUresult access = vmm::try_set_access(va, chunk_, device_); access != CUDA_SUCCESS) {
         (void)cuMemUnmap(va, chunk_);
         (void)cuMemRelease(handle);
-        if (vmm::access_refused(access)) { return false; }
+        if (vmm::grow_refused(access)) { return false; }
         vmm::check(access, "cuMemSetAccess");
     }
     chunks_.push_back(handle);
@@ -85,18 +85,18 @@ bool VmmRange::map(std::size_t chunk) {
     const CUmemAllocationProp prop = vmm::device_prop(device_);
     CUmemGenericAllocationHandle handle{};
     const CUresult created = cuMemCreate(&handle, chunk_, &prop, 0);
-    if (created == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
+    if (vmm::grow_refused(created)) { return false; }
     vmm::check(created, "cuMemCreate");
     const CUdeviceptr va = base_ + chunk * chunk_;
     if (const CUresult mapped = cuMemMap(va, chunk_, 0, handle, 0); mapped != CUDA_SUCCESS) {
         (void)cuMemRelease(handle);
-        if (mapped == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
+        if (vmm::grow_refused(mapped)) { return false; }
         vmm::check(mapped, "cuMemMap");
     }
     if (const CUresult access = vmm::try_set_access(va, chunk_, device_); access != CUDA_SUCCESS) {
         (void)cuMemUnmap(va, chunk_);
         (void)cuMemRelease(handle);
-        if (vmm::access_refused(access)) { return false; }
+        if (vmm::grow_refused(access)) { return false; }
         vmm::check(access, "cuMemSetAccess");
     }
     handles_[chunk] = handle;

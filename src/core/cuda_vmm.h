@@ -57,6 +57,15 @@ inline std::size_t granularity(int device) {
     return bytes;
 }
 
+// A result that means "no memory or residency right now": a refused grow, not a fatal error. Under
+// Windows WDDM, mapping past this process's video-memory budget makes the OS evict other
+// allocations; when a device-memory query (cudaMemGetInfo) runs on another thread meanwhile, the
+// driver returns CUDA_ERROR_NOT_READY from cuMemSetAccess instead of waiting (reproduced on an RTX
+// 3090, driver 616.64). The caller treats it as an out-of-memory refusal.
+inline bool grow_refused(CUresult result) {
+    return result == CUDA_ERROR_OUT_OF_MEMORY || result == CUDA_ERROR_NOT_READY;
+}
+
 // The raw result, so a caller can treat a refusal for lack of memory as a failed grow.
 inline CUresult try_set_access(CUdeviceptr va, std::size_t bytes, int device) {
     CUmemAccessDesc access{};
@@ -68,15 +77,6 @@ inline CUresult try_set_access(CUdeviceptr va, std::size_t bytes, int device) {
 
 inline void set_access(CUdeviceptr va, std::size_t bytes, int device) {
     check(try_set_access(va, bytes, device), "cuMemSetAccess");
-}
-
-// Whether a cuMemSetAccess result means the device could not make the mapping resident now. Under
-// Windows WDDM, mapping past this process's video-memory budget makes the OS evict other
-// allocations; when a device-memory query (cudaMemGetInfo) runs on another thread meanwhile, the
-// driver returns CUDA_ERROR_NOT_READY instead of waiting (reproduced on an RTX 3090, driver
-// 616.64). The caller treats it as an out-of-memory refusal.
-inline bool access_refused(CUresult result) noexcept {
-    return result == CUDA_ERROR_NOT_READY || result == CUDA_ERROR_OUT_OF_MEMORY;
 }
 
 } // namespace ninfer::vmm
