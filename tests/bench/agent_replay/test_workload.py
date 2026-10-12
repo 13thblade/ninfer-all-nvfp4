@@ -130,11 +130,26 @@ def test_timing_counters_keep_counts_and_durations_not_rates():
 def test_requested_request_log_must_cover_every_measured_turn():
     from tools.bench.agent_replay.run import unjoined_turns
 
-    samples = [{"session": 0, "turn": 0, "response_id": "a", "error": None},
-               {"session": 0, "turn": 1, "response_id": "b", "error": None},
-               {"session": 0, "turn": 2, "response_id": None, "error": "timeout"}]
-    assert unjoined_turns(samples, {"a": {}, "b": {}}) == []
-    assert unjoined_turns(samples, {"a": {}}) == ["b"]
+    samples = [{"session": 0, "turn": 0, "response_id": "a", "error": None, "output_tokens": 2},
+               {"session": 0, "turn": 1, "response_id": "b", "error": None, "output_tokens": 3},
+               {"session": 0, "turn": 2, "response_id": None, "error": "timeout",
+                "output_tokens": 0}]
+    complete = {"a": {"result": {"generated_token_ids": [1, 2]}},
+                "b": {"result": {"generated_token_ids": [4, 5, 6]}}}
+    assert unjoined_turns(samples, complete) == []
+    assert unjoined_turns(samples, {"a": complete["a"]}) == ["b"]
+
+
+def test_request_log_ids_must_account_for_every_completion_token():
+    from tools.bench.agent_replay.run import logged_token_ids, unjoined_turns
+
+    sample = {"session": 0, "turn": 0, "response_id": "a", "error": None, "output_tokens": 3}
+    short = {"result": {"generated_token_ids": [1, 2]}}
+    assert logged_token_ids(sample, short) is None
+    assert logged_token_ids(sample, {}) is None
+    assert logged_token_ids(sample, None) is None
+    assert logged_token_ids(sample, {"result": {"generated_token_ids": [1, 2, 3]}}) == [1, 2, 3]
+    assert unjoined_turns([sample], {"a": short}) == ["a"]
 
 
 def test_run_rejects_settings_that_measure_nothing(tmp_path):
