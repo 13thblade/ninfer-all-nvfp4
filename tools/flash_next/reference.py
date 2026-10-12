@@ -280,8 +280,8 @@ class Reference:
         q, gate = qg[..., :d], qg[..., d:].reshape(T, nh * d)
         k = self.ggml_linear(x, p + "key", (nkv * d, H)).reshape(T, nkv, d)
         v = self.ggml_linear(x, p + "value", (nkv * d, H)).reshape(T, nkv, d)
-        q = rope(self.round(rmsnorm(q, 1.0 + self.p(p + "query_norm", (d,)), self.eps)), positions, self.theta, self.rotary)
-        k = rope(self.round(rmsnorm(k, 1.0 + self.p(p + "key_norm", (d,)), self.eps)), positions, self.theta, self.rotary)
+        q = self.round(rope(self.round(rmsnorm(q, 1.0 + self.p(p + "query_norm", (d,)), self.eps)), positions, self.theta, self.rotary))
+        k = self.round(rope(self.round(rmsnorm(k, 1.0 + self.p(p + "key_norm", (d,)), self.eps)), positions, self.theta, self.rotary))
         selected = self.qsa_select(layer, x, positions)
         rep = nh // nkv
         out = torch.zeros(T, nh, d, dtype=F64)
@@ -304,7 +304,7 @@ class Reference:
         T, H = x.shape[0], self.H
         q = self.bf16_linear(x, p + "query", (nh * d, H)).reshape(T, nh, d)
         raw = self.bf16_linear(x, p + "key", (d, H))  # [T, d], cached in BF16
-        q = rope(rmsnorm(q, 1.0 + self.p(p + "query_norm", (d,)), self.eps), positions, self.theta, self.rotary)
+        q = self.round(rope(rmsnorm(q, 1.0 + self.p(p + "query_norm", (d,)), self.eps), positions, self.theta, self.rotary))
         key_norm = 1.0 + self.p(p + "key_norm", (d,))
         out = []
         for t in range(T):
@@ -315,7 +315,7 @@ class Reference:
                 pooled = self.round(raw[: blocks * ratio].reshape(blocks, ratio, d).mean(1))
                 pooled = rmsnorm(pooled, key_norm, self.eps)
                 starts = positions[torch.arange(blocks) * ratio]
-                pooled = rope(pooled[:, None, :], starts, self.theta, self.rotary)[:, 0]
+                pooled = self.round(rope(pooled[:, None, :], starts, self.theta, self.rotary))[:, 0]
                 scores = torch.relu(q[t] @ pooled.T).sum(0) / math.sqrt(d)
                 count = min(budget, blocks)
                 order = sorted(range(blocks), key=lambda b: (-float(scores[b]), b))[:count]
