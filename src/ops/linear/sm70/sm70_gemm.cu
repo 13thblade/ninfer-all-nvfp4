@@ -22,7 +22,9 @@ void check_blas(cublasStatus_t status, const char* what) {
 }
 
 // One handle per device, created on first use and kept for the process; the stream is set per call
-// because the handle is shared.
+// because the handle is shared. The first use can be inside a CUDA graph capture (a verify graph of
+// several requests reaches the cuBLAS widths before any prefill has run); cublasCreate allocates,
+// which relaxed capture mode lets this thread do without invalidating the capture.
 cublasHandle_t handle_for_current_device() {
     static constexpr int kMaxDevices = 8;
     static cublasHandle_t handles[kMaxDevices]{};
@@ -32,7 +34,11 @@ cublasHandle_t handle_for_current_device() {
         throw std::runtime_error("sm70 GEMM: device index out of range");
     }
     if (!handles[device]) {
-        check_blas(cublasCreate(&handles[device]), "cublasCreate");
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+        const cublasStatus_t created = cublasCreate(&handles[device]);
+        CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+        check_blas(created, "cublasCreate");
         check_blas(cublasSetMathMode(handles[device], CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
     }
     return handles[device];

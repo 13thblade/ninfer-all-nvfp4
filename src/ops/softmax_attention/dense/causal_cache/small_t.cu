@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace ninfer::ops::detail {
 
@@ -158,6 +159,19 @@ std::int32_t causal_small_t_launch_capacity(CausalAttentionExecutionEnvelope env
 // tier when it routes one.
 template <typename Geometry>
 int i8_partial_ctas_per_sm(std::int32_t tokens, std::int32_t window, KvCacheStorage storage) {
+#if defined(NINFER_SM70)
+    // Volta's kernel (small_t_sm70.cuh) holds its own count, from its registers and shared memory.
+    (void)window;
+    (void)storage;
+    int ctas = 1;
+    [&]<int... T>(std::integer_sequence<int, T...>) {
+        ((tokens == T + 1
+              ? (ctas = sm70_attention::i8_resident_ctas<T + 1, (T + 1) * Geometry::GroupSize>())
+              : 0),
+         ...);
+    }(std::make_integer_sequence<int, 8>{});
+    return ctas;
+#endif
     if (const int routed = small_t_i8_routed_ctas_per_sm(Geometry::QHeads, storage, tokens, window);
         routed > 0) {
         return routed;

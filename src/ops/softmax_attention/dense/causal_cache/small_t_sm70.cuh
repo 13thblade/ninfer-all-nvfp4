@@ -96,6 +96,26 @@ struct Shape {
 inline constexpr int kQStride = kCausalHeadDim + 8; // halves; pads rows apart by 16 bytes
 inline constexpr int kPStride = 32 + 8;             // halves
 
+// The shared memory of causal_attention_small_t_sm70_i8_kernel for TokenTile tokens (its appending
+// form, the larger), and the CTAs of it an SM holds: the kernel is bounded to that many, which keeps
+// it within 128 registers a thread at four warps, and sm_70 has 96 KiB of shared memory an SM. The
+// host sizes its whole-wave split counts from the same number (i8_partial_ctas_per_sm).
+template <int TokenTile, int Rows>
+constexpr int i8_shared_bytes() {
+    using S = Shape<Rows>;
+    return S::kRowGroups * 8 * kQStride * 2 + S::kWarps * 8 * kPStride * 2 + 64 * 4 +
+           2 * S::kWarps * 8 * 4 + (S::kKeyWarps > 1 ? S::kRowGroups * 8 * kCausalHeadDim * 4 : 4) +
+           TokenTile * kCausalHeadDim * 4;
+}
+
+template <int TokenTile, int Rows>
+constexpr int i8_resident_ctas() {
+    const int by_registers = 16 / Shape<Rows>::kWarps;
+    const int by_shared    = 96 * 1024 / i8_shared_bytes<TokenTile, Rows>();
+    const int ctas         = by_registers < by_shared ? by_registers : by_shared;
+    return ctas > 0 ? ctas : 1;
+}
+
 // K and V of a BF16 cache: the current step's rows from the append input, the rest from the pages.
 template <typename Geometry, typename CacheInput>
 struct Bf16Rows {
@@ -836,8 +856,9 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
 // included), fused append and partial outputs, with this file's products.
 template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput,
           bool PackedValues, KvKeyCoding Keys>
-__launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::kWarps) __global__
-    void causal_attention_small_t_sm70_i8_kernel(
+__launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::kWarps,
+                  sm70_attention::i8_resident_ctas<TokenTile, TokenTile * Geometry::GroupSize>())
+    __global__ void causal_attention_small_t_sm70_i8_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
         std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
         const std::int32_t* block_tables, const std::int32_t* valid_columns,

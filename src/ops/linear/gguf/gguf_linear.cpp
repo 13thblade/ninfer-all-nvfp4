@@ -231,7 +231,7 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
         for (std::size_t i = 0; i < activations; ++i) {
             (void)layout.alloc_bytes(gguf::vector_activation_bytes(k, t));
         }
-        widest = layout.peak_bytes(1);
+        widest = std::max(widest, layout.peak_bytes(1));
     }
     if (max_tokens > gguf::kMaxVectorColumns) {
         const std::int32_t t = max_tokens;
