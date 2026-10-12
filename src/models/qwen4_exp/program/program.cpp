@@ -1522,16 +1522,17 @@ private:
                                                      residency_->frame_stride()) >> 20) +
                                      " MiB the images need now (a long context holds the rest): send a smaller image");
         }
-        const auto start    = Clock::now();
-        lane_.vision_lease  = residency_->lend(handoff_frames, device_.stream);
-        auto window         = residency_->lend(window_frames, device_.stream);
-        lane_.vision_handoff = Tensor(lane_.vision_lease.memory.data, DType::BF16,
-                                      {plan.out, static_cast<std::int32_t>(plan.tokens)});
+        // Everything that can throw without a lease is done first, so no lent frame is held across it.
         std::vector<execution::VisionEncodeItem> items;
         for (std::size_t k = 0; k < base.vision->items.size(); ++k) {
             items.push_back({base.payloads.at(k)->span(), &base.vision->items[k]});
         }
+        const auto start    = Clock::now();
+        lane_.vision_lease  = residency_->lend(handoff_frames, device_.stream); // release_lane returns it
+        auto window         = residency_->lend(window_frames, device_.stream);
         try {
+            lane_.vision_handoff = Tensor(lane_.vision_lease.memory.data, DType::BF16,
+                                          {plan.out, static_cast<std::int32_t>(plan.tokens)});
             lane_.vision_uploaded = execution::encode_vision(device_, *model.vision_config(), *parameters_.vision,
                                                              *model.vision_layout(), model.pinned_weights(), items, plan,
                                                              window.memory, lane_.vision_handoff, device_.stream);
@@ -2349,7 +2350,9 @@ private:
     // At a boundary (no round in flight; `idle`: no request active): resizes the expert cache to
     // the VRAM control law's decision.
     void apply_vram_target(bool idle) {
-        if (!control_ || !monitor_ || lease_.valid()) { return; } // the pool does not resize while lent
+        // The pool does not resize while lent: the wide-call lease, or the image handoff that
+        // stays lent across the prompt's prefill calls (resize would move or free its frames).
+        if (!control_ || !monitor_ || lease_.valid() || lane_.vision_lease.valid()) { return; }
         const double now = std::chrono::duration<double>(Clock::now() - vram_epoch_).count();
         const auto d     = control_->decide(monitor_->latest(), pool_now_, frames_now_, now, idle);
         if (d.frames == frames_now_) { return; }
