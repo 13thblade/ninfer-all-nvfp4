@@ -24,6 +24,18 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("offloaded_sparse_moe: ") + message); }
 }
 
+// CUDA grid limits: x takes up to 2^31-1 blocks, y and z up to 65535.
+constexpr std::int64_t kGridMaxX = 2147483647;
+constexpr std::int64_t kGridMaxY = 65535;
+
+// ceil(n / per_block) blocks, computed in 64 bits and checked against the dimension's limit, so a
+// launch extent never wraps as a signed int and never exceeds what the hardware accepts.
+unsigned grid_blocks(std::int64_t n, std::int64_t per_block, std::int64_t limit, const char* message) {
+    const std::int64_t blocks = n > 0 ? (n + per_block - 1) / per_block : 0;
+    require(blocks >= 1 && blocks <= limit, message);
+    return static_cast<unsigned>(blocks);
+}
+
 void check_launch(const char* what) {
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
@@ -247,7 +259,8 @@ void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cu
     require(routing.ids.ne[0] == top_k && routing.ids.ne[1] == columns && routing.weights.ne[0] == top_k &&
                 routing.weights.ne[1] == columns && routing.shared_gate.numel() == columns,
             "route output shapes disagree");
-    route_kernel<<<(columns + kWarps - 1) / kWarps, kThreads, 0, stream>>>(
+    route_kernel<<<grid_blocks(columns, kWarps, kGridMaxX, "route columns exceed the launch grid"), kThreads, 0,
+                   stream>>>(
         static_cast<const float*>(logits.data), experts, columns, top_k, static_cast<std::int32_t*>(routing.ids.data),
         static_cast<float*>(routing.weights.data), static_cast<float*>(routing.shared_gate.data));
     check_launch("route");
@@ -286,14 +299,13 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
     }
     require(cudaMemsetAsync(dispatch.counts, 0, sizeof(std::int32_t) * experts, stream) == cudaSuccess,
             "dispatch could not clear its counts");
-    count_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(ids, entries, experts, dispatch.counts,
-                                                                             route_log);
+    const unsigned entry_blocks = grid_blocks(entries, kThreads, kGridMaxX, "dispatch entries exceed the launch grid");
+    count_kernel<<<entry_blocks, kThreads, 0, stream>>>(ids, entries, experts, dispatch.counts, route_log);
     check_launch("count");
     scan_kernel<<<1, kDispatchThreads, 0, stream>>>(dispatch.counts, experts, dispatch.offsets, dispatch.cursor,
                                                     dispatch.jobs, dispatch.job_count);
     check_launch("scan");
-    scatter_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(ids, entries, experts,
-                                                                                 dispatch.cursor, dispatch.entries);
+    scatter_kernel<<<entry_blocks, kThreads, 0, stream>>>(ids, entries, experts, dispatch.cursor, dispatch.entries);
     check_launch("scatter");
 }
 
@@ -313,7 +325,9 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
                 shared.ne[1] == columns && routing.weights.ne[1] == columns &&
                 routing.shared_gate.numel() == columns,
             "combine shapes disagree");
-    combine_kernel<<<dim3(columns, (hidden + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
+    const dim3 grid(grid_blocks(columns, 1, kGridMaxX, "combine columns exceed the launch grid"),
+                    grid_blocks(hidden, kThreads, kGridMaxY, "combine hidden extent exceeds the launch grid"));
+    combine_kernel<<<grid, kThreads, 0, stream>>>(
         static_cast<const bf16*>(outputs.data), static_cast<const float*>(routing.weights.data),
         static_cast<const float*>(routing.shared_gate.data), static_cast<const bf16*>(shared.data), hidden, top_k,
         columns, static_cast<bf16*>(y.data));
