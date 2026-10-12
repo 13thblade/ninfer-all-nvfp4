@@ -412,8 +412,9 @@ public:
             demand.frame_bytes = plan_.frame_stride;
             demand.max_frames  = residency_->frame_limit();
             if (options_.expert_cache_bytes) {
-                demand.max_frames = std::min<std::uint32_t>(
-                    demand.max_frames, static_cast<std::uint32_t>(*options_.expert_cache_bytes / plan_.frame_stride));
+                // Bounded before the narrowing so a huge byte budget cannot truncate to a small count.
+                demand.max_frames = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(*options_.expert_cache_bytes / plan_.frame_stride, demand.max_frames));
             }
             // The KV above the base comes out of the frames: keep room for the request's whole extent.
             const std::uint64_t kv_growth = plan_.vmm ? plan_.kv.mapped_bytes(plan_.pages) - kv_vmm_->mapped_bytes() : 0;
@@ -617,6 +618,7 @@ public:
         out.complete = true;
         if (cancellation.requested()) {
             lane_ = Lane{.epoch = lane_.epoch};
+            settle_idle(); // the same idle reconciliation a finished request gets
             return out; // not published: the Engine completes the request as cancelled
         }
         // A fresh sequence: zero recurrent state (the KV is written before it is read).
@@ -846,8 +848,10 @@ public:
         out.row_count = ContractAccess::rows(pending).size();
         ContractAccess::consume(pending);
         pending_  = 0;
-        deferred_ = false;
+        // The round ran on the device: settle its cache update before the lane goes, as a commit would.
+        try { settle_round(); } catch (...) { deferred_ = false; }
         release_lane();
+        settle_idle();
         out.status = runtime::ConsumeStatus::Consumed;
         return out;
     }
@@ -878,6 +882,14 @@ public:
             out.status = runtime::ConsumeStatus::Consumed;
         } catch (...) {}
         return out;
+    }
+
+    // Between requests, after the lane is gone: the idle VRAM target and the periodic expert state.
+    void settle_idle() noexcept {
+        try {
+            apply_vram_target(true);
+            maintain_expert_state();
+        } catch (...) {}
     }
 
     void fail_all_cleanup() noexcept {
@@ -1212,11 +1224,24 @@ private:
             const std::uint32_t frames = residency_->frames();
             const auto give = static_cast<std::uint32_t>(
                 std::min<std::uint64_t>(frames, (added + ExpertResidency::kChunkBytes + stride - 1) / stride));
-            if (!map_kv(target)) {
-                (void)residency_->resize(frames - give, device_.stream, *vram_);
+            // Growth is all or nothing: a failure unmaps what this attempt mapped and refreshes the
+            // frame accounting the resize changed, so the next request starts from a consistent pool.
+            try {
                 if (!map_kv(target)) {
-                    throw std::runtime_error("Qwen3.8-Flash-Next: no VRAM left for this request's KV");
+                    (void)residency_->resize(frames - give, device_.stream, *vram_);
+                    if (!map_kv(target)) {
+                        throw std::runtime_error("Qwen3.8-Flash-Next: no VRAM left for this request's KV");
+                    }
                 }
+            } catch (...) {
+                (void)device_.synchronize_status();
+                const auto keep = plan_.kv.chunks(backed_pages_);
+                for (std::size_t c = 0; c < keep.size(); ++c) {
+                    if (!keep[c] && kv_vmm_->mapped(c)) { kv_vmm_->unmap(c); }
+                }
+                frames_now_ = residency_->frames();
+                pool_now_   = residency_->pool_bytes();
+                throw;
             }
             if (control_) { control_->account_fixed(static_cast<std::int64_t>(added)); }
             diagnostic("KV pool grew to " + std::to_string(target) + " pages (" +
