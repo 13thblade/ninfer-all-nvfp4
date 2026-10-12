@@ -57,6 +57,10 @@ struct HostMemoryLedger {
     std::uint64_t full_need = 0;
     // The commit limit, not physical memory, bounded expert_ram (a small page file).
     bool commit_limited = false;
+    // Every pinned byte (banks, other and later pins), compared with the Linux memory-lock limit.
+    std::uint64_t pinned_total = 0;
+    // The Linux RLIMIT_MEMLOCK is below pinned_total, so pinning would fail whatever is free.
+    bool lock_limited = false;
     // Every expert fits in RAM. Without the SSD tier (not ported) startup refuses otherwise.
     bool fits = false;
 

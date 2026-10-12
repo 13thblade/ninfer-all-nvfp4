@@ -289,7 +289,8 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
                           std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream);
 
 /// y = bf16(sum_slot w * outputs + shared_gate * shared), BF16 [H, T]; FP32 fma chain in slot
-/// order, then the shared term.
+/// order, then the shared term. H is limited to 65535 * 256 (one grid-y tile per 256 values) and
+/// top_k * T to INT_MAX; larger extents are refused before launch.
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
                  cudaStream_t stream);
 

@@ -106,6 +106,20 @@ void test_commit_limit() {
     require(enough.fits && !enough.commit_limited, "enough commit holds every expert");
 }
 
+void test_lock_limit() {
+    const HostMemoryDemand d = flash_next();
+    const std::uint64_t need = need_for_full(d);
+    HostMemorySnapshot s     = snapshot(need + 10 * kGiB, need + 10 * kGiB);
+    s.lock_limit             = 8 * kGiB;
+    const HostMemoryLedger low = plan_host_memory(s, d);
+    require(!low.fits && low.lock_limited, "a memory-lock limit below the pinned total refuses");
+    require(low.summary().find("memory-lock limit") != std::string::npos, "the refusal names the lock limit");
+    s.lock_limit = 64 * kGiB;
+    require(plan_host_memory(s, d).fits, "a lock limit above the pinned total fits");
+    s.lock_limit.reset();
+    require(plan_host_memory(s, d).fits, "no lock limit fits");
+}
+
 void test_starved_and_describe() {
     const HostMemoryDemand d     = flash_next();
     const HostMemoryLedger empty = plan_host_memory(snapshot(kGiB, kGiB), d);
@@ -362,6 +376,7 @@ int main() {
         test_reserve_applied_once();
         test_planned_terms();
         test_commit_limit();
+        test_lock_limit();
         test_starved_and_describe();
         test_graph_bound();
         test_display_headroom();

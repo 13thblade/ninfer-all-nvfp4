@@ -43,14 +43,15 @@ bool VmmArena::map_chunk() {
     const CUdeviceptr va = base_ + mapped_bytes();
     if (const CUresult mapped = cuMemMap(va, chunk_, 0, handle, 0); mapped != CUDA_SUCCESS) {
         (void)cuMemRelease(handle);
+        if (mapped == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
         vmm::check(mapped, "cuMemMap");
     }
-    try {
-        vmm::set_access(va, chunk_, device_);
-    } catch (...) {
+    // A mapping the OS cannot make resident is a refused grow, not a fatal error.
+    if (const CUresult access = vmm::try_set_access(va, chunk_, device_); access != CUDA_SUCCESS) {
         (void)cuMemUnmap(va, chunk_);
         (void)cuMemRelease(handle);
-        throw;
+        if (access == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
+        vmm::check(access, "cuMemSetAccess");
     }
     chunks_.push_back(handle);
     return true;
@@ -89,14 +90,15 @@ bool VmmRange::map(std::size_t chunk) {
     const CUdeviceptr va = base_ + chunk * chunk_;
     if (const CUresult mapped = cuMemMap(va, chunk_, 0, handle, 0); mapped != CUDA_SUCCESS) {
         (void)cuMemRelease(handle);
+        if (mapped == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
         vmm::check(mapped, "cuMemMap");
     }
-    try {
-        vmm::set_access(va, chunk_, device_);
-    } catch (...) {
+    // A mapping the OS cannot make resident is a refused grow, not a fatal error.
+    if (const CUresult access = vmm::try_set_access(va, chunk_, device_); access != CUDA_SUCCESS) {
         (void)cuMemUnmap(va, chunk_);
         (void)cuMemRelease(handle);
-        throw;
+        if (access == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
+        vmm::check(access, "cuMemSetAccess");
     }
     handles_[chunk] = handle;
     ++mapped_;
