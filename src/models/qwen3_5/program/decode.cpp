@@ -10,6 +10,7 @@
 #include "ninfer/ops/scatter.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -86,6 +87,40 @@ namespace ninfer::models::qwen3_5::detail {
 
 namespace {} // namespace
 
+const GdnReplayRecords* ProgramImpl::round_replay_records(std::uint32_t verify_drafts) const {
+    if (!replay_records) { return nullptr; }
+    if (verify_drafts == max_verify_drafts) { return &*replay_records; }
+    for (const NarrowReplayView& view : narrow_replay_views) {
+        if (view.records.spec.width == static_cast<std::int32_t>(verify_drafts + 1U)) {
+            return &view.records;
+        }
+    }
+    return nullptr;
+}
+
+const ops::GdnReplayFoldPlan& ProgramImpl::round_replay_fold(std::uint32_t verify_drafts) const {
+    if (!replay_fold) { throw std::logic_error("speculative round has no ReplaySSM fold"); }
+    if (verify_drafts == max_verify_drafts) { return *replay_fold; }
+    for (const NarrowReplayView& view : narrow_replay_views) {
+        if (view.records.spec.width == static_cast<std::int32_t>(verify_drafts + 1U)) {
+            return view.fold;
+        }
+    }
+    throw std::logic_error("speculative round width has no ReplaySSM fold");
+}
+
+SpeculativeRoundFamily& ProgramImpl::round_family(SpeculativeRoundKind kind, std::uint32_t drafts) {
+    SpeculativeRoundFamily* best = nullptr;
+    for (SpeculativeRoundFamily& family : round_families) {
+        if (family.shape.kind != kind || family.shape.verify_drafts < drafts) { continue; }
+        if (best == nullptr || family.shape.verify_drafts < best->shape.verify_drafts) {
+            best = &family;
+        }
+    }
+    if (best == nullptr) { throw std::logic_error("no speculative round family holds the round"); }
+    return *best;
+}
+
 void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& request,
                                    const ops::SamplingConfig& config) {
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
@@ -96,6 +131,7 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
         .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        .ngram_draft_tokens    = ngram_draft_tokens,
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
@@ -137,12 +173,15 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         throw std::logic_error("DFlash context append has invalid membership");
     }
 
-    std::uint32_t minimum_count = draft_window + 1U;
-    std::uint32_t maximum_count = 0;
-    *dflash_host_ingress        = {};
+    // A terminal round appends at most its own verified columns; pending features and append
+    // positions are allocated at the widest family.
+    const std::uint32_t append_width = max_verify_drafts + 1U;
+    std::uint32_t minimum_count      = append_width;
+    std::uint32_t maximum_count      = 0;
+    *dflash_host_ingress             = {};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
-        if (lane >= max_concurrency || counts[row] == 0 || counts[row] > draft_window + 1U ||
+        if (lane >= max_concurrency || counts[row] == 0 || counts[row] > append_width ||
             std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
                 lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
             throw std::logic_error("DFlash context append contains an invalid row");
@@ -180,7 +219,7 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
 
     qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
     CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, dflash_host_ingress,
-                               sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
+                               qwen3_5::kDFlashDecodeIngressNeuralBytes, cudaMemcpyHostToDevice,
                                device.stream));
     const auto batch                = static_cast<std::int32_t>(lanes.size());
     Tensor active_lane_tensor       = frame.active_lanes.slice(0, 0, batch);
@@ -194,7 +233,7 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
     work.reset();
     Tensor features =
         work.alloc(DType::BF16, {dimension(parameters.draft->feature_projection.weight.k),
-                                 static_cast<std::int32_t>(draft_window + 1U), batch});
+                                 static_cast<std::int32_t>(append_width), batch});
     ops::prepare_ragged_prefix(dflash->pending_features, active_lane_tensor, device_starts,
                                device_ends, features, positions, device_counts, device.stream);
 
@@ -399,11 +438,14 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         execution::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
         if (use_cuda_graph) {
+            // An MTP round verifies its own proposal: the neural family at the draft window.
+            SpeculativeRoundFamily& family =
+                round_family(SpeculativeRoundKind::Neural, draft_window);
             const auto batch = static_cast<std::uint32_t>(lanes.size());
-            auto& profile    = speculative_forward_graphs.select(batch, maximum_frontier);
-            forward          = &speculative_forward_graphs.install(profile);
-            finish           = &speculative_finish_graphs.install(
-                speculative_finish_graphs.select(batch, maximum_frontier));
+            auto& profile    = family.forward.select(batch, maximum_frontier);
+            auto& completion = family.finish.select(batch, maximum_frontier);
+            forward          = &family.forward.install(profile);
+            finish           = &family.finish.install(completion);
             envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, draft_window,
                                                        capacity);
         }
@@ -517,6 +559,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                 .base_S        = base_S,
                 .prompt_tokens = 0,
                 .produced      = static_cast<std::uint32_t>(count_i),
+                .verify_drafts = draft_window,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
@@ -555,9 +598,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         throw std::invalid_argument("DFlash batch membership is invalid");
     }
 
-    const std::uint32_t width           = draft_window + 1U;
-    std::uint32_t maximum_frontier      = 0;
-    std::uint32_t maximum_target_tokens = 1;
+    std::uint32_t maximum_frontier = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency ||
@@ -575,21 +616,16 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             sequence.execution_frontier >= capacity ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             sequence.dflash_context_frontier > sequence.execution_frontier ||
-            sequence.execution_frontier - sequence.dflash_context_frontier > width ||
+            // Catch-up covers the previous round's verified columns, from any family.
+            sequence.execution_frontier - sequence.dflash_context_frontier >
+                max_verify_drafts + 1U ||
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
             sequence.prefix_identity.size() != sequence.ledger_frontier ||
             sequence.prefix_digests.size() != sequence.ledger_frontier) {
             throw std::logic_error("DFlash batch row is not decode-ready");
         }
-        const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
-                                                ? budgets[row].generated_tokens_remaining - 1U
-                                                : 0U;
-        const std::uint32_t extent =
-            std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
-        maximum_target_tokens =
-            std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
     }
 
     const auto started = Clock::now();
@@ -597,6 +633,57 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         std::optional<nvtx::ScopedRange> submit_range;
         submit_range.emplace(nvtx::Name::DecodeDFlashSubmit, nvtx::Category::DFlash,
                              static_cast<std::uint64_t>(lanes.size()));
+        // N-gram copies: a row whose committed tail already occurred in its request proposes what
+        // followed it there. A round with a copy verifies it at the copy family's width without
+        // running the draft model (batch one only); otherwise the round is the neural family's.
+        // A copy is sized by its window and the context room, never by the output budget, so a
+        // budget-limited round runs the same family, and therefore the same arithmetic, as an
+        // unlimited one (Infernix 53489da2).
+        std::array<NgramMatch, kMaximumConcurrency> copies{};
+        bool copy_round = false;
+        if (ngram_draft_tokens != 0) {
+            const TokenId domain = dimension(parameters.model.resources().public_token_count);
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                RequestControl& request = requests[lanes[row]];
+                if (!request.ngram) { continue; }
+                copies[row] = request.ngram->propose_for_round(
+                    active_sequence(lanes[row]).ledger, ngram_draft_tokens, draft_window,
+                    ngram_min_match);
+                // Sources are tokenized text, so a copy stays in the public token domain; one that
+                // leaves it ends there.
+                std::vector<TokenId>& tokens = copies[row].tokens;
+                tokens.erase(std::find_if(tokens.begin(), tokens.end(),
+                                          [domain](TokenId token) {
+                                              return token < 0 || token >= domain;
+                                          }),
+                             tokens.end());
+                copy_round = copy_round || !tokens.empty();
+            }
+            if (copy_round && lanes.size() != 1) {
+                throw std::logic_error("a batched n-gram copy round is not built");
+            }
+        }
+        // Every row of a round verifies at its family's width; the frame, egress and ReplaySSM
+        // records are viewed at it.
+        SpeculativeRoundFamily& family =
+            copy_round ? round_family(SpeculativeRoundKind::Copy, ngram_draft_tokens)
+                       : round_family(SpeculativeRoundKind::Neural, draft_window);
+        const std::uint32_t verify_drafts = family.shape.verify_drafts;
+        const std::uint32_t width         = verify_drafts + 1U;
+        const auto row_extent             = [&](std::size_t row) {
+            const std::uint32_t remaining     = budgets[row].generated_tokens_remaining;
+            const std::uint32_t max_by_budget = remaining > 1 ? remaining - 1U : 0U;
+            const std::uint32_t proposed =
+                copy_round ? static_cast<std::uint32_t>(copies[row].tokens.size()) : verify_drafts;
+            return std::min({proposed, max_by_budget,
+                             capacity - active_sequence(lanes[row]).execution_frontier - 1U});
+        };
+        std::uint32_t maximum_target_tokens = 1;
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            maximum_target_tokens =
+                std::max(maximum_target_tokens,
+                         active_sequence(lanes[row]).execution_frontier + row_extent(row) + 1U);
+        }
         bool constrained = false;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             grammar_dead_positions[row] = 0;
@@ -604,30 +691,27 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         }
         DecodeGraphExecutable* forward       = nullptr;
         DecodeGraphExecutable* finish        = nullptr;
-        execution::DFlashEnvelopes envelopes = dflash_envelopes(maximum_frontier, draft_window);
+        execution::DFlashEnvelopes envelopes =
+            dflash_envelopes(maximum_frontier, max_verify_drafts);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
             const auto batch = static_cast<std::uint32_t>(lanes.size());
-            auto& profile    = speculative_forward_graphs.select(batch, maximum_frontier);
-            forward          = &speculative_forward_graphs.install(profile);
-            finish           = &speculative_finish_graphs.install(
-                speculative_finish_graphs.select(batch, maximum_frontier));
-            envelopes       = dflash_envelopes(profile.max_execution_frontier, draft_window);
+            auto& profile    = family.forward.select(batch, maximum_frontier);
+            auto& completion = family.finish.select(batch, maximum_frontier);
+            forward          = &family.forward.install(profile);
+            finish           = &family.finish.install(completion);
+            envelopes       = dflash_envelopes(profile.max_execution_frontier, max_verify_drafts);
             target_envelope = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
-                                     draft_window + 1ULL))};
+                                     verify_drafts + 1ULL))};
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = active_sequence(lanes[row]);
             const RequestControl& request     = requests[lanes[row]];
             const std::uint32_t frontier      = sequence.execution_frontier;
-            const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
-                                                    ? budgets[row].generated_tokens_remaining - 1U
-                                                    : 0U;
-            const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+            const std::uint32_t extent        = row_extent(row);
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -651,14 +735,23 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
             dflash_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
+            if (copy_round) {
+                // The copy at the round's [k, B] layout; columns past it hold the anchor, which
+                // verification never reads.
+                const std::vector<TokenId>& copy    = copies[row].tokens;
+                dflash_host_ingress->copy_rows[row] = copy.empty() ? 0 : 1;
+                for (std::uint32_t step = 0; step < verify_drafts; ++step) {
+                    dflash_host_ingress->copy_drafts[row * verify_drafts + step] =
+                        step < copy.size() ? copy[step] : sequence.ledger.back();
+                }
+            }
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
                                       backend_kv_cache() ? frontier : 0U);
         }
 
         execution::DFlashBatchContext schedule_state{
-            {device, parameters, work, state_images->linear(0),
-             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, stage_runtime.get()},
+            {device, parameters, work, state_images->linear(0), round_replay_records(verify_drafts),
+             io, prefill_hidden, prefill_chunk, proposal_head, stage_runtime.get()},
             decoder->text_kv,
             *dflash,
             *io.dflash_decode,
@@ -666,15 +759,17 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             *dflash_host_egress,
             state_images->continuation_hidden_store(),
             dflash_draft_handoff->tokens(),
-            dflash_draft_handoff->ready};
+            dflash_draft_handoff->ready,
+            copy_round};
 
         mark_workspace_usage(workspace_plan.dflash_round);
         const auto batch = static_cast<std::int32_t>(lanes.size());
-        execution::dflash_decode_batch(schedule_state, batch, draft_window, envelopes,
+        execution::dflash_decode_batch(schedule_state, batch, verify_drafts, envelopes,
                                        target_envelope, forward,
                                        execution::SpeculativePhase::Forward);
         if (constrained) {
-            // The forward graph signals draft readiness before running the target model.
+            // The forward graph signals draft readiness before running the target model. A copy
+            // round hands off its copies the same way, so masks follow whatever is verified.
             timing.begin_constraint_wait();
             dflash_draft_handoff->ready.synchronize();
             timing.end_constraint_wait();
@@ -683,10 +778,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 const auto extent =
                     static_cast<std::size_t>(dflash_host_ingress->proposal_extents[row]);
                 (void)fill_grammar_mask(
-                    masks, row, schedule_state.host_drafts.subspan(row * draft_window, extent));
+                    masks, row, schedule_state.host_drafts.subspan(row * verify_drafts, extent));
             }
         }
-        execution::dflash_decode_batch(schedule_state, batch, draft_window, envelopes,
+        execution::dflash_decode_batch(schedule_state, batch, verify_drafts, envelopes,
                                        target_envelope, finish,
                                        execution::SpeculativePhase::Finish);
         submit_range.reset();
@@ -725,9 +820,16 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 request.speculative_stats.rounds += 1;
                 request.speculative_stats.drafted_tokens += extent;
                 request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
-                for (std::int32_t i = 0; i < accepted_i; ++i) {
-                    request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
-                        1;
+                if (copy_round) {
+                    request.speculative_stats.ngram_rounds += 1;
+                    request.speculative_stats.ngram_drafted_tokens += extent;
+                    request.speculative_stats.ngram_accepted_tokens +=
+                        static_cast<std::uint32_t>(accepted_i);
+                } else {
+                    for (std::int32_t i = 0; i < accepted_i; ++i) {
+                        request.speculative_stats
+                            .accepted_per_position[static_cast<std::size_t>(i)] += 1;
+                    }
                 }
             }
             sequence.dflash_context_frontier = base_E;
@@ -737,6 +839,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                  .base_S        = base_S,
                                  .prompt_tokens = 0,
                                  .produced      = static_cast<std::uint32_t>(count_i),
+                                 .verify_drafts = verify_drafts,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
