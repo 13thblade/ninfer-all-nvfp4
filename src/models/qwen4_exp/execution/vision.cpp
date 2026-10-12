@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace ninfer::models::qwen4_exp::execution {
@@ -66,29 +67,41 @@ std::size_t encode_vision(DeviceContext& device, const qwen3_5::VisionConfig& co
     }
     auto* const base = static_cast<std::byte*>(window.data);
     const DeviceSpan backing{base + plan.staging_bytes, window.bytes - plan.staging_bytes};
-    // The tower's prelude and merger upload at construction, its layers one slot ahead of compute.
-    qwen3_5::execution::VisionWeightStream weights(device, layout, pinned_block, base);
-    const qwen3_5::execution::VisionParameters staged = weights.window_parameters(parameters);
-    const qwen3_5::execution::VisionContext context(device, config, staged, stream);
-    std::size_t column = 0;
-    for (const VisionEncodeItem& item : items) {
-        if (item.control == nullptr) { throw std::invalid_argument("Qwen4Exp vision item has no control"); }
-        const std::size_t merged = item.control->merged_count;
-        if (column + merged > plan.tokens) { throw std::invalid_argument("Qwen4Exp vision items exceed the plan"); }
-        weights.reset(stream);
-        Tensor output = qwen3_5::execution::VisionContext::bind_output(backing, plan.workspace, merged);
-        context.encode(qwen3_5::execution::VisionItemView{item.patches, item.control}, output, backing, plan.workspace,
-                       &weights);
-        const std::size_t column_bytes = 2ULL * static_cast<std::size_t>(plan.out);
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(handoff.data) + column_bytes * column, output.data,
-                                   output.bytes(), cudaMemcpyDeviceToDevice, stream));
-        column += merged;
+    // Declared outside the try so a failure drains both streams before the weight stream's events
+    // are destroyed and before the caller can reuse the window: the uploads, encode kernels and
+    // handoff copies already enqueued still read and write it. (VisionWeightStream's constructor
+    // leaves the transfer-stream drain to its caller, which the catch below also covers.)
+    std::optional<qwen3_5::execution::VisionWeightStream> weights;
+    try {
+        // The tower's prelude and merger upload at construction, its layers one slot ahead of compute.
+        weights.emplace(device, layout, pinned_block, base);
+        const qwen3_5::execution::VisionParameters staged = weights->window_parameters(parameters);
+        const qwen3_5::execution::VisionContext context(device, config, staged, stream);
+        std::size_t column = 0;
+        for (const VisionEncodeItem& item : items) {
+            if (item.control == nullptr) { throw std::invalid_argument("Qwen4Exp vision item has no control"); }
+            const std::size_t merged = item.control->merged_count;
+            if (column + merged > plan.tokens) { throw std::invalid_argument("Qwen4Exp vision items exceed the plan"); }
+            weights->reset(stream);
+            Tensor output = qwen3_5::execution::VisionContext::bind_output(backing, plan.workspace, merged);
+            context.encode(qwen3_5::execution::VisionItemView{item.patches, item.control}, output, backing,
+                           plan.workspace, &*weights);
+            const std::size_t column_bytes = 2ULL * static_cast<std::size_t>(plan.out);
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(handoff.data) + column_bytes * column, output.data,
+                                       output.bytes(), cudaMemcpyDeviceToDevice, stream));
+            column += merged;
+        }
+        if (column != plan.tokens) { throw std::invalid_argument("Qwen4Exp vision items do not fill the handoff"); }
+        // Every upload into the window was awaited by `stream` before its use, so once `stream` passes
+        // here nothing else writes the window; the stream's events are idle before they are destroyed.
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    } catch (...) {
+        // Best effort, never replacing the original exception (the overlay session's abandon() does the same).
+        (void)cudaStreamSynchronize(stream);
+        (void)cudaStreamSynchronize(device.transfer_stream);
+        throw;
     }
-    if (column != plan.tokens) { throw std::invalid_argument("Qwen4Exp vision items do not fill the handoff"); }
-    // Every upload into the window was awaited by `stream` before its use, so once `stream` passes
-    // here nothing else writes the window; the stream's events are idle before they are destroyed.
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-    return weights.uploaded_bytes();
+    return weights->uploaded_bytes();
 }
 
 } // namespace ninfer::models::qwen4_exp::execution
