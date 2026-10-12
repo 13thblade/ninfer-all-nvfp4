@@ -41,6 +41,17 @@ bool contiguous(const Tensor& t, DType dtype) {
     return t.data != nullptr && t.dtype == dtype && t.is_contiguous();
 }
 
+// A contiguous tensor with no extra planes: ne[2] and ne[3] are 1, so a kernel flattening it as
+// [rows][C] reads exactly its elements.
+bool flat2d(const Tensor& t, DType dtype) {
+    return contiguous(t, dtype) && t.ne[2] == 1 && t.ne[3] == 1;
+}
+
+// Conv state / commit input: [C, span-or-width, slots/rows], rank 3 with a positive extent.
+bool flat3d(const Tensor& t, DType dtype) {
+    return contiguous(t, dtype) && t.ne[2] > 0 && t.ne[3] == 1;
+}
+
 __device__ __forceinline__ float sigmoidf(float x) { return 1.0F / (1.0F + expf(-x)); }
 
 __device__ __forceinline__ float block_sum(float value, float* scratch) {
@@ -220,7 +231,7 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
               cudaStream_t stream) {
     for (const Tensor* t : {&key, &value, &residual, static_cast<const Tensor*>(&gated),
                             static_cast<const Tensor*>(&normalized)}) {
-        require(contiguous(*t, DType::BF16), "gate requires contiguous BF16 activations");
+        require(flat2d(*t, DType::BF16), "gate requires contiguous 2-D BF16 activations");
     }
     for (const Tensor* t : {&key_norm, &query_norm, &conv_norm}) {
         require(contiguous(*t, DType::FP32), "gate requires contiguous FP32 norm weights");
@@ -245,11 +256,11 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
 void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor& weight,
                      std::int32_t dilation, Tensor& states, const Tensor& source_slots,
                      const Tensor& destination_slots, Tensor& residual, cudaStream_t stream) {
-    require(contiguous(gated, DType::BF16) && contiguous(normalized, DType::BF16) &&
-                contiguous(weight, DType::FP32) && contiguous(states, DType::BF16) &&
-                contiguous(residual, DType::BF16) && contiguous(source_slots, DType::I32) &&
-                (destination_slots.data == nullptr || contiguous(destination_slots, DType::I32)),
-            "conv requires contiguous tensors");
+    require(flat2d(gated, DType::BF16) && flat2d(normalized, DType::BF16) &&
+                flat2d(weight, DType::FP32) && flat3d(states, DType::BF16) &&
+                flat2d(residual, DType::BF16) && flat2d(source_slots, DType::I32) &&
+                (destination_slots.data == nullptr || flat2d(destination_slots, DType::I32)),
+            "conv requires contiguous tensors of the documented rank and a non-empty state");
     const int channels = gated.ne[0], columns = gated.ne[1], taps = weight.ne[0];
     const int sequences = source_slots.ne[0];
     const bool update   = destination_slots.data != nullptr;
@@ -278,9 +289,9 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
 
 void ple_conv_commit(const Tensor& normalized, const Tensor& commit_columns, Tensor& states,
                      const Tensor& slots, cudaStream_t stream) {
-    require(contiguous(normalized, DType::BF16) && contiguous(commit_columns, DType::I32) &&
-                contiguous(states, DType::BF16) && contiguous(slots, DType::I32),
-            "commit requires contiguous tensors");
+    require(flat3d(normalized, DType::BF16) && flat2d(commit_columns, DType::I32) &&
+                flat3d(states, DType::BF16) && flat2d(slots, DType::I32),
+            "commit requires contiguous tensors of the documented rank and a non-empty state");
     const int channels = normalized.ne[0], width = normalized.ne[1], rows = normalized.ne[2];
     require(rows > 0 && width > 0 && commit_columns.ne[0] == rows && slots.ne[0] == rows &&
                 states.ne[0] == channels && states.ne[1] > 0,
