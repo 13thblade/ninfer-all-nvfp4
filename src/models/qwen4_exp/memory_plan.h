@@ -114,7 +114,9 @@ struct VramSizing {
 
 // CUDA graph executables a Program instantiates at most: one decode graph per batch size, and with
 // speculation a verification graph per batch size and width, and the MTP drafter's catch-up (per
-// batch size and width) and draft graphs (per batch size and step).
+// batch size and width) and draft graphs (per batch size and step). The count is per decode forward:
+// a caller that splits one decode into several graphs (the front/back split) multiplies it by the
+// number of parts, as the qwen4_exp Program's sizing does (2 * graph_bound(1, 1, 0)).
 [[nodiscard]] std::uint32_t graph_bound(std::uint32_t lanes, std::uint32_t max_width, std::uint32_t mtp_draft_tokens);
 // The headroom left for the display and other programs: the requested one, else 256 MiB without a
 // display and, with one (or when unknown), 512 MiB for an elastic pool or 1 GiB for a fixed one.
