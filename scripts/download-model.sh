@@ -23,6 +23,14 @@ set -euo pipefail
 #                    artifact revision: its artifact-manifest.json lists the text, vision, mtp and
 #                    dflash components, and the DFlash bundle (from z-lab/Qwen3.6-35B-A3B-DFlash) is
 #                    what --spec dflash needs.
+#   qwen38-flash-next  Qwen3.8-Flash-Next (preview; the server runs it on Windows only), this fork's
+#                    exact conversion of the ISTA DASLab GSQ-RCO IQ2_XS GGUF with Strata's MTP drafter
+#                    and the vision tower (WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090). Three files: the
+#                    model, its .part-0001 continuation (both read once, at load) and the 27.1 GiB
+#                    n-gram volume, read on every prompt. NINFER_NGRAM_DIR, or the answer to a question
+#                    on a terminal, puts the volume in another folder (default: beside the model): a
+#                    faster drive, since prefill from NVMe measured 1.1-1.4x that from a SATA SSD.
+#                    The launcher is then told with NINFER_NGRAM_VOLUME, which the script prints.
 #
 # To repin a model, edit its block below: take the size and sha256 from what HuggingFace reports for
 # the new revision (X-Linked-Size and X-Linked-ETag on the resolve URL, or the revision's
@@ -38,9 +46,12 @@ set -euo pipefail
 # otherwise. `apt-get install aria2` / `brew install aria2` to opt in.
 
 usage() {
-  printf 'usage: %s <model>\n\n  qwen38-27b (recommended)\n  qwen36-27b\n  qwen36-35b-a3b\n' "${0##*/}" >&2
+  printf 'usage: %s <model>\n\n  qwen38-27b (recommended)\n  qwen36-27b\n  qwen36-35b-a3b\n  qwen38-flash-next (preview)\n' \
+    "${0##*/}" >&2
 }
 
+# Only qwen38-flash-next has continuation parts and an n-gram volume.
+part_sizes=() part_sha256s=() ngram_name=''
 case "${1:-}" in
   qwen38-27b)
     artifact='qwen3_8_27b.ninfer'
@@ -72,6 +83,24 @@ case "${1:-}" in
     label='the RTX 3090-compatible Qwen3.6-35B-A3B vision model (21.2 GiB)'
     tests_variable='NINFER_QWEN3_6_35B_A3B_WEIGHTS'
     ;;
+  # The n-gram volume is pinned to the commit that uploaded it; the model file and its part are pinned
+  # to the revision that published the model card with them. The volume is unchanged in that revision.
+  qwen38-flash-next)
+    artifact='qwen4exp-iq2xs-mtp-vision.ninfer'
+    owner='WarlaxZ'
+    repo='Qwen3.8-Flash-Next-NInfer-3090'
+    revision='c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa'
+    expected_size=32000000000
+    expected_sha256='87c871e6cc1b6392e387104e8dfb159283a8a64247f669fbf33355b19b769ef4'
+    part_sizes=(9012140032)
+    part_sha256s=('1798c63c2f74a05cac71a609701f34368f0ba1e1eeebbf1b7641e83d0dd8d811')
+    ngram_name='qwen4exp-iq2xs-mtp-vision.ninfer.ngram'
+    ngram_revision='95b1b0169bd25db96ceb772a8a67cc6e87088a1f'
+    ngram_size=29127258112
+    ngram_sha256='7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051'
+    label='the Qwen3.8-Flash-Next model (38.2 GiB in two files)'
+    tests_variable='NINFER_TEST_QWEN4EXP_ARTIFACT'
+    ;;
   -h|--help) usage; exit 0 ;;
   *) usage; exit 2 ;;
 esac
@@ -79,14 +108,6 @@ esac
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 model_dir="${NINFER_MODEL_DIR:-$root/models}"
 model="$model_dir/$artifact"
-
-# Staged under a revision-scoped name so that curl -C - can only ever resume the same artifact.
-# curl -C - resumes by appending at the current file length, without checking what wrote those
-# bytes, so a leftover partial from a different revision -- for instance the previous pin's, on any
-# machine that ran an older script -- would be spliced onto the head of this one: a file of entirely
-# plausible size that is corrupt throughout. A name that carries the revision means a resume can only
-# ever continue the same artifact, and the checks below are what promote it to the final name.
-part="$model.$revision.part"
 
 file_size() { wc -c < "$1" | tr -d '[:space:]'; }
 
@@ -101,10 +122,12 @@ verify() {
   [ "$(file_size "$1")" = "$expected_size" ] || return 1
   [ "${NINFER_SKIP_SHA256:-0}" = '1' ] && return 0
   local actual
+  # Hashed from stdin: given a name with a backslash (a Windows path under Git Bash), sha256sum
+  # escapes its output line with a leading "\", which would make every hash a mismatch.
   if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum -- "$1" | cut -d' ' -f1)"
+    actual="$(sha256sum < "$1" | cut -d' ' -f1)"
   elif command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 256 -- "$1" | cut -d' ' -f1)"
+    actual="$(shasum -a 256 < "$1" | cut -d' ' -f1)"
   else
     printf 'No sha256sum or shasum found; cannot verify %s. Set NINFER_SKIP_SHA256=1 to accept it unverified.\n' "$1" >&2
     return 1
@@ -201,44 +224,103 @@ graft_sha_ok() {
   [ "$actual" = "$2" ]
 }
 
+# Fetches one pinned file: folder, name, size, sha256, revision, description, and kind (model, part or
+# volume). Returns non-zero unless the file ends at its final name, verified. A file already there that
+# verifies is kept without any download.
+#
+# The download is staged under a revision-scoped name so that curl -C - can only ever resume the same
+# file. curl -C - resumes by appending at the current file length, without checking what wrote those
+# bytes, so a leftover partial from a different revision -- for instance the previous pin's, on any
+# machine that ran an older script -- would be spliced onto the head of this one: a file of entirely
+# plausible size that is corrupt throughout. A name that carries the revision means a resume can only
+# ever continue the same file, and the checks below are what promote it to the final name.
+fetch_file() {
+  local dir="$1" name="$2" expected_size="$3" expected_sha256="$4" rev="$5" what="$6" kind="$7"
+  local path="$dir/$name" part="$dir/$name.$rev.part" url status=0
+  if [ -f "$path" ]; then
+    if verify "$path"; then
+      if [ "$kind" = model ]; then printf 'Model already present: %s\n' "$path"
+      else printf 'Already present: %s\n' "$path"; fi
+      return 0
+    fi
+    printf '%s\n' "Existing $path did not verify against revision $rev; fetching the pinned one." >&2
+    # A v2 file from an earlier release does not load any more, but it does not need to be fetched
+    # again either: tools/upgrade_ninfer_v2_to_v3.py rewrites it locally in a couple of minutes.
+    if [ "$kind" = model ] && [ -z "$ngram_name" ]; then
+      printf '%s\n' "If it is the v2 file from an earlier release, you can upgrade it instead of downloading:" \
+        "  python tools/upgrade_ninfer_v2_to_v3.py $path $path.v3 && mv $path.v3 $path" >&2
+    fi
+  fi
+
+  printf '%s\n' "Downloading $what..."
+  url="https://huggingface.co/$owner/$repo/resolve/$rev/$name"
+  if command -v aria2c >/dev/null 2>&1; then
+    # 16 parallel ranges over one file, not single-stream curl. On the Vast rental boxes this repo
+    # downloads at ~98 MB/s over aria2c against the same throttled-to-~1MB/s (and once outright
+    # stalled at 11 of 21 GiB) single-stream curl -- see scripts/multi-gpu-testing/README.md. -c
+    # resumes into the same .part name curl would use, and HuggingFace serves ranges fine.
+    aria2c -x16 -s16 -c --file-allocation=none -d "$dir" -o "$(basename -- "$part")" "$url" || status=$?
+  else
+    curl -L -C - --fail --output "$part" "$url" || status=$?
+  fi
+  if [ "$status" -ne 0 ]; then
+    printf '%s\n' 'Download failed. Run this script again to resume.' >&2
+    return 1
+  fi
+
+  if ! verify "$part"; then
+    printf 'Downloaded file at %s failed verification against revision %s. Delete it and run this script again.\n' \
+      "$part" "$rev" >&2
+    return 1
+  fi
+  mv -f -- "$part" "$path"
+}
+
+# The folder for the n-gram volume: NINFER_NGRAM_DIR, else the answer to a question when there is a
+# terminal to ask on, else the model folder.
+choose_ngram_dir() {
+  local answer=''
+  ngram_dir="${NINFER_NGRAM_DIR:-$model_dir}"
+  if [ -z "${NINFER_NGRAM_DIR:-}" ] && [ -t 0 ]; then
+    printf '\n%s\n%s\n%s\n\n  Model folder: %s\n\n' \
+      'Qwen3.8-Flash-Next reads its 27.1 GiB n-gram volume on every prompt, and the model only once,' \
+      'at load. Prompts were processed 1.1-1.4x faster with the volume on an NVMe drive than on a' \
+      'SATA SSD, so put it on your fastest drive (28 GiB free). The model can stay where it is.' \
+      "$model_dir"
+    read -r -p 'Folder for the n-gram volume (Enter = the model folder): ' answer || answer=''
+    [ -n "$answer" ] && ngram_dir="$answer"
+  fi
+  if ! mkdir -p -- "$ngram_dir" 2>/dev/null; then
+    printf 'Cannot create the folder %s for the n-gram volume.\n' "$ngram_dir" >&2
+    return 1
+  fi
+  printf 'N-gram volume folder: %s\n' "$ngram_dir"
+}
+
 mkdir -p -- "$model_dir"
 
-if [ -f "$model" ]; then
-  if verify "$model"; then
-    printf 'Model already present: %s\n' "$model"
-    fetch_graft "$1"
-    exit 0
-  fi
-  printf '%s\n' "Existing $model did not verify against revision $revision; fetching the pinned one." >&2
-  # A v2 file from an earlier release does not load any more, but it does not need to be fetched
-  # again either: tools/upgrade_ninfer_v2_to_v3.py rewrites it locally in a couple of minutes.
-  printf '%s\n' "If it is the v2 file from an earlier release, you can upgrade it instead of downloading:" \
-    "  python tools/upgrade_ninfer_v2_to_v3.py $model $model.v3 && mv $model.v3 $model" >&2
+# Ask where the n-gram volume goes before anything is fetched, so the downloads can run unattended.
+if [ -n "$ngram_name" ]; then choose_ngram_dir || exit 1; fi
+
+fetch_file "$model_dir" "$artifact" "$expected_size" "$expected_sha256" "$revision" "$label" model || exit 1
+for i in "${!part_sizes[@]}"; do
+  fetch_file "$model_dir" "$artifact.part-$(printf '%04d' $((i + 1)))" "${part_sizes[i]}" "${part_sha256s[i]}" \
+    "$revision" "part $((i + 1)) of the model" part || exit 1
+done
+if [ -n "$ngram_name" ]; then
+  fetch_file "$ngram_dir" "$ngram_name" "$ngram_size" "$ngram_sha256" "$ngram_revision" \
+    'the n-gram volume (27.1 GiB)' volume || exit 1
 fi
 
-printf '%s\n' "Downloading $label..."
-url="https://huggingface.co/$owner/$repo/resolve/$revision/$artifact"
-if command -v aria2c >/dev/null 2>&1; then
-  # 16 parallel ranges over one file, not single-stream curl. On the Vast rental boxes this repo
-  # downloads at ~98 MB/s over aria2c against the same throttled-to-~1MB/s (and once outright
-  # stalled at 11 of 21 GiB) single-stream curl -- see scripts/multi-gpu-testing/README.md. -c
-  # resumes into the same .part name curl would use, and HuggingFace serves ranges fine.
-  aria2c -x16 -s16 -c --file-allocation=none -d "$model_dir" -o "$(basename -- "$part")" "$url"
-else
-  curl -L -C - --fail --output "$part" "$url"
-fi
-if [ $? -ne 0 ]; then
-  printf '%s\n' 'Download failed. Run this script again to resume.' >&2
-  exit 1
-fi
-
-if ! verify "$part"; then
-  printf 'Downloaded file at %s failed verification against revision %s. Delete it and run this script again.\n' \
-    "$part" "$revision" >&2
-  exit 1
-fi
-
-mv -f -- "$part" "$model"
 printf 'Model ready: %s\n' "$model"
+if [ -n "$ngram_name" ]; then
+  printf 'N-gram volume ready: %s\n' "$ngram_dir/$ngram_name"
+  # The server reads <model>.ngram beside the model unless --ngram-volume (in run.bat,
+  # NINFER_NGRAM_VOLUME) names another file. Flash-Next is served on Windows only.
+  if [ "$ngram_dir" != "$model_dir" ]; then
+    printf 'It is not beside the model, so serve with --ngram-volume "%s"\n' "$ngram_dir/$ngram_name"
+    printf '(run.bat on Windows: set NINFER_NGRAM_VOLUME to that file).\n'
+  fi
+fi
 printf 'Point the tests at it with:  export %s=%s\n' "$tests_variable" "$model"
 fetch_graft "$1"

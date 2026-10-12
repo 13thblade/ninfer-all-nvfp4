@@ -83,7 +83,7 @@ overriding the artifact's built-in template) work for every profile.
 |---|---|
 | `run.sh <model>` (`tuned`) | `NINFER_CONTEXT`, `NINFER_CONCURRENCY`, `NINFER_KV_CAPACITY`, `NINFER_KV_DTYPE`, `NINFER_SPEC` (27B: `dflash2`, `mtp`, `none`; 35B: `mtp`, `none`), `NINFER_VISION`, `NINFER_VISION_RESIDENCY`, `NINFER_DRAFT_TOKENS`, `NINFER_PREFILL_CHUNK`, `NINFER_HOST_CONTEXT_MIB` (pinned host RAM for the context cache, default 8192), `NINFER_FALLBACK` (`off` makes the profile's context exact instead of fitting it to free GPU memory) |
 | `run.sh qwen38-27b int8`, `run.sh qwen38-27b c8` | nothing further; every serving flag is fixed |
-| `download-model.sh <model>` | `NINFER_MODEL_DIR`, `NINFER_SKIP_SHA256` |
+| `download-model.sh <model>` | `NINFER_MODEL_DIR`, `NINFER_SKIP_SHA256`; `NINFER_NGRAM_DIR` (qwen38-flash-next: the folder for the n-gram volume) |
 
 > `NINFER_HOST=0.0.0.0` exposes the server to your network **unauthenticated**. The launchers bind
 > `127.0.0.1` for that reason. If you set it, put something in front of it.

@@ -1,0 +1,123 @@
+{
+  "schema": "ninfer.artifact-manifest",
+  "schema_version": 2,
+  "artifact": {
+    "filename": "qwen4exp-iq2xs-mtp-vision.ninfer",
+    "bytes": 32000000000,
+    "sha256": "87c871e6cc1b6392e387104e8dfb159283a8a64247f669fbf33355b19b769ef4",
+    "parts": [
+      {
+        "filename": "qwen4exp-iq2xs-mtp-vision.ninfer.part-0001",
+        "bytes": 9012140032,
+        "sha256": "1798c63c2f74a05cac71a609701f34368f0ba1e1eeebbf1b7641e83d0dd8d811"
+      }
+    ],
+    "container_version": 3,
+    "artifact_id": "a1b2f8c8de7744c1a723735051f7e47c",
+    "architecture": "Qwen4ExpForCausalLM",
+    "components": [
+      "text",
+      "mtp",
+      "vision"
+    ]
+  },
+  "ngram_volume": {
+    "filename": "qwen4exp-iq2xs-mtp-vision.ninfer.ngram",
+    "bytes": 29127258112,
+    "sha256": "7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051",
+    "format": "NINFERNG",
+    "format_version": 2,
+    "volume_id": "1604acb23af5cb05f001e2ce3a8c0f12",
+    "row_format": "ggml_iq4_nl",
+    "rows": 320001536,
+    "row_bytes": 90,
+    "rows_per_block": 45,
+    "block_bytes": 4096,
+    "blocks": 7111146
+  },
+  "source": {
+    "base_model": {
+      "repo_id": "Qwen/Qwen3.8-Flash-Next",
+      "license": "qwen-community-1.0"
+    },
+    "base": {
+      "repo_id": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+      "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+      "files": [
+        {
+          "filename": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+          "bytes": 39225954592,
+          "sha256": "92cee27ae5bbadcd732416a0f7a7f0acc092399dbbe8f5a5efa707c2ec0a49d7"
+        },
+        {
+          "filename": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+          "bytes": 28800138432,
+          "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"
+        }
+      ],
+      "declared_license": "apache-2.0"
+    },
+    "vision": {
+      "repo_id": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+      "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+      "filename": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+      "bytes": 907543008,
+      "sha256": "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0",
+      "declared_license": "qwen-community-1.0"
+    },
+    "mtp": {
+      "filename": "mtp-q2_0.gguf",
+      "obtained_from": "Strata 0.1.38 installation",
+      "bytes": 889017216,
+      "sha256": "a22206a4d74eafbf31063a84610292535fb3b49af9a339963817fd04aed81e4d",
+      "declared_license": null
+    }
+  },
+  "conversion": {
+    "recipe_id": "qwen4_exp_gguf",
+    "converter_repository": "https://github.com/ashalliants/ninfer-3090",
+    "converter_commit": "06d812b2687022093e95bd8775b9d745893f3098",
+    "converter_branch": "feat/qwen4exp-vision",
+    "command": "python -m tools.convert --model Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf --mtp-gguf mtp-q2_0.gguf --mmproj mmproj-Qwen3.8-Flash-Next-BF16.gguf --recipe qwen4_exp_gguf --device cpu --out qwen4exp-iq2xs-mtp-vision.ninfer --ngram-reuse qwen4exp-iq2xs.ninfer.ngram",
+    "report": {
+      "filename": "qwen4exp-iq2xs-mtp-vision.ninfer.conversion.json",
+      "bytes": 527509,
+      "sha256": "73a3525c4582f7459fa3b6684d5b45e15ce6663222908e73a49a278d3ad1c040"
+    },
+    "verification": "tests/convert/qwen4_exp_verify.py: 1,356 tensor objects and every n-gram volume row byte-exact against the source GGUFs"
+  },
+  "runtime": {
+    "repository": "https://github.com/ashalliants/ninfer-3090",
+    "cuda_architecture": "sm_86",
+    "platform": "windows",
+    "launcher": "scripts\\run.bat qwen38-flash-next",
+    "host_ram_gib": 64
+  },
+  "inventory": {
+    "objects": 1362,
+    "tensors": 1356,
+    "resources": 6,
+    "bindings": 1599,
+    "uses": 1020,
+    "formats": {
+      "bf16": 829,
+      "fp32": 176,
+      "ggml_iq3_s": 44,
+      "ggml_iq4_nl": 36,
+      "ggml_iq4_xs": 181,
+      "ggml_q2_0": 5,
+      "ggml_q6_k": 29,
+      "ggml_q8_0": 7,
+      "ggml_rec_iq1_m_q2_0": 3,
+      "ggml_rec_iq2_s_q2_0": 34,
+      "ggml_rec_iq2_xxs_q2_0": 11,
+      "ggml_rec_q2_0_q2_0": 1
+    },
+    "layouts": {
+      "contiguous_le_v1": 1005,
+      "ggml_blocks_v1": 302,
+      "ggml_expert_record_v1": 49
+    },
+    "payload_bytes": 41011718144
+  }
+}
