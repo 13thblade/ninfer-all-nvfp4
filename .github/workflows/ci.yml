@@ -48,7 +48,7 @@ jobs:
     outputs:
       changed: ${{ steps.compare.outputs.changed }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # A pull request's merge commit and the branch head it merges into.
           fetch-depth: 2
@@ -57,10 +57,10 @@ jobs:
 
   calculator:
     name: Config calculator arithmetic
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       # No dependencies and no build step: the test loads the page's own <script> into a vm
@@ -73,9 +73,9 @@ jobs:
 
   host-kv-clamp:
     name: Host KV clamp arithmetic
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build and run tests/host/test_host_kv_clamp.cpp
         run: |
           g++ -std=c++20 -Wall -Wextra -Isrc tests/host/test_host_kv_clamp.cpp \
@@ -86,7 +86,7 @@ jobs:
     name: C++20 text and resource contracts (libc++)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install libc++
         run: sudo apt-get update && sudo apt-get install -y clang libc++-dev libc++abi-dev
       - name: Compile text sources and test copy-on-write state
@@ -104,9 +104,9 @@ jobs:
 
   linux-scripts:
     name: Linux launcher and downloader guard
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # The checkout must not normalize line endings, or the CRLF check tests nothing. Git's
       # default is to write out whatever .gitattributes says, which is exactly what a release
       # archive would carry, so this is the honest input.
@@ -129,8 +129,8 @@ jobs:
     name: Python suites (CPU)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
           # The wheels (CPU PyTorch is most of them) come from the cache; the key follows this file,
@@ -153,8 +153,8 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -194,8 +194,8 @@ jobs:
           # Outside the workspace, and without '..': actions/cache refuses such a path and saves nothing.
           echo "CCACHE_HOST_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
           df -h /
-      - uses: actions/checkout@v5
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -207,7 +207,7 @@ jobs:
       - name: Toolchain image
         run: .github/scripts/toolchain-image.sh
       - name: Restore ccache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.CCACHE_HOST_DIR }}
           key: ccache-sm${{ matrix.arch }}-${{ github.sha }}
@@ -215,6 +215,7 @@ jobs:
       # A step timeout below the job's, so that a cold build which runs out of time still saves
       # its ccache and the next run continues from there.
       - name: Build every target
+        id: build
         timeout-minutes: 320
         env:
           GH_TOKEN: ${{ github.token }}
@@ -226,18 +227,17 @@ jobs:
             'ccache --zero-stats && scripts/build-native.sh configure && scripts/build-native.sh build && ccache --show-stats' \
             > build-ci.log 2>&1 &
           build=$!
-          context="build progress (sm_${{ matrix.arch }})"
-          .github/scripts/build-progress.sh "$build" build-ci.log "$context" &
+          .github/scripts/build-progress.sh watch "$build" build-ci.log "build progress (sm_${{ matrix.arch }})" &
           tail -n +1 -f build-ci.log --pid="$build" &
-          status=0
-          wait "$build" || status=$?
-          state=success; (( status == 0 )) || state=failure
-          gh api --silent -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=$state \
-            -f context="$context" -f description="finished, exit $status" || true
-          exit "$status"
+          wait "$build"
+      - name: Report the build status
+        if: always() && steps.build.outcome != 'skipped'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/build-progress.sh finish "build progress (sm_${{ matrix.arch }})" "${{ steps.build.outcome }}"
       - name: Save ccache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ env.CCACHE_HOST_DIR }}
           key: ccache-sm${{ matrix.arch }}-${{ github.sha }}
@@ -253,7 +253,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/src" -w /src ninfer-toolchain:ci \
             docker/stage-dist.sh build-ci ${{ matrix.arch }} dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-sm${{ matrix.arch }}
           path: dist/
