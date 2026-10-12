@@ -16,5 +16,7 @@ elseif(MSVC)
   set_source_files_properties(${ninfer_offloaded_moe_host_sources} PROPERTIES COMPILE_OPTIONS "/fp:precise")
 endif()
 
-# GPU: routing, dispatch, staging, the narrow expert route, the CPU channel and the combine.
-target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/moe_layer.cu")
+# GPU: routing, dispatch, staging, the narrow expert route, the CPU channel and the combine; the wide
+# expert route (experts with more than 8 columns in a call) on integer tensor cores.
+target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/moe_layer.cu"
+                                  "${CMAKE_CURRENT_LIST_DIR}/cuda/wide_expert.cu")
