@@ -328,7 +328,7 @@ public:
                 // edit served by a shallower shared prefix or the root) starts a new owner.
                 // That owner is the dialogue's live continuation: it inherits the abandoned
                 // branch's retention, and the abandoned branch is evicted first.
-                if (auto* parent = abandoned_branch(program, base, choice)) {
+                if (auto* parent = abandoned_branch(program, base, choice, publication_order)) {
                     if (parent->priority.reused && !priority.reused) {
                         priority        = {.reused = true, .last_demand = ++clock_};
                         proven_frontier = choice.source.reused_tokens;
@@ -974,15 +974,18 @@ private:
 
     // The inactive dialogue this new owner rewrites: the one sharing the most of the request
     // beyond the reused source, by at least kBranchLineageTokens. A named different session
-    // and the source's own donor (an independent Fork) are never a lineage.
+    // and the source's own donor (an independent Fork) are never a lineage. An owner published
+    // after this request is newer than it and is never superseded by it (see candidates()).
     [[nodiscard]] Owner* abandoned_branch(const Program& program, const Base& base,
-                                          const SourceChoice& choice) {
+                                          const SourceChoice& choice,
+                                          std::uint64_t publication_order) {
         const auto& advice        = base.context_cache();
         const auto minimum        = choice.source.reused_tokens + kBranchLineageTokens;
         Owner* best               = nullptr;
         std::uint32_t best_shared = 0;
         for (auto& owner : owners_) {
             if (owner.active || owner.token == choice.owner ||
+                owner.publication_order > publication_order ||
                 (owner.session && advice.session_key && *owner.session != *advice.session_key)) {
                 continue;
             }
@@ -1036,7 +1039,17 @@ private:
             chosen.push_back(handle);
             if (program.host_bytes_released(chosen) >= bytes) { break; }
         }
-        if (chosen.empty() || !program.host_bytes_released(chosen)) { return false; }
+        // Drop victims that add no Host release (keeps aliased blocks released as a union), so
+        // Device/KV-only superseded history is not erased for a Host allocation it cannot help.
+        auto released = program.host_bytes_released(chosen);
+        for (std::size_t i = chosen.size(); i-- > 0;) {
+            auto without = chosen;
+            without.erase(without.begin() + static_cast<std::ptrdiff_t>(i));
+            if (!without.empty() && program.host_bytes_released(without) >= released) {
+                chosen = std::move(without);
+            }
+        }
+        if (chosen.empty() || !released) { return false; }
         commit_release(program, chosen, cursor);
         return true;
     }
