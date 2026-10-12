@@ -142,7 +142,7 @@ PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& prefix)
     out.key_norm         = b.direct(p + "key_norm", {width}, QType::FP32);
     out.query_norm       = b.direct(p + "query_norm", {width}, QType::FP32);
     out.conv_norm        = b.direct(p + "conv_norm", {width}, QType::FP32);
-    out.convolution      = b.direct(p + "convolution", {c.ple.conv_kernel, width}, QType::FP32);
+    out.convolution      = b.direct(p + "convolution", {width, c.ple.conv_kernel}, QType::FP32);
     return out;
 }
 
