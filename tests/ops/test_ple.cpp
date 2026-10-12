@@ -378,6 +378,46 @@ void commit_case(cudaStream_t stream) {
           "ple_conv_commit equals the in-place ple_conv_inject update (n = 0 leaves the slot)");
 }
 
+// Higher-rank operands are not accepted as their lower-rank logical views (the kernels would
+// silently ignore the extra planes). Validation runs before any launch, so the buffers are minimal.
+void rank_refusals(cudaStream_t stream) {
+    Buffer<std::uint16_t> d_act(std::vector<std::uint16_t>(static_cast<std::size_t>(kC) * 2, 0));
+    Buffer<std::uint16_t> d_out(std::vector<std::uint16_t>(static_cast<std::size_t>(kC) * 2, 0));
+    Buffer<std::uint16_t> d_weight(std::vector<std::uint16_t>(static_cast<std::size_t>(kC) * kTaps, 0));
+    Buffer<std::uint16_t> d_states(std::vector<std::uint16_t>(static_cast<std::size_t>(kC) * kSpan * kSlots, 0));
+    Buffer<float> d_norm(std::vector<float>(kC, 1.0F));
+    Buffer<std::int32_t> d_slots(std::vector<std::int32_t>(2, 0));
+    const auto refuses = [](const auto& call) {
+        try {
+            call();
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    const Tensor act(d_act.p, DType::BF16, {kC, 1}), act3(d_act.p, DType::BF16, {kC, 1, 2});
+    const Tensor value(d_act.p, DType::BF16, {kH, 1}), norm(d_norm.p, DType::FP32, {kC});
+    Tensor gated(d_out.p, DType::BF16, {kC, 1}), normalized(d_out.p, DType::BF16, {kC, 1});
+    check(refuses([&] {
+              ninfer::ops::ple_gate(act3, value, act, norm, norm, norm, kS, kEps, gated, normalized,
+                                    stream);
+          }),
+          "ple_gate refuses a [C, T, 2] key");
+    Tensor states(d_states.p, DType::BF16, {kC, kSpan, kSlots});
+    Tensor residual3(d_out.p, DType::BF16, {kC, 1, 2});
+    const Tensor weight(d_weight.p, DType::FP16, {kTaps, kC});
+    const Tensor source(d_slots.p, DType::I32, {1});
+    check(refuses([&] {
+              ninfer::ops::ple_conv_inject(act, act, weight, kDilation, states, source, Tensor{},
+                                           residual3, stream);
+          }),
+          "ple_conv_inject refuses a [C, T, 2] residual");
+    check(refuses([&] {
+              ninfer::ops::ple_conv_commit(Tensor(d_act.p, DType::BF16, {kC, 1, 1}),
+                                           Tensor(d_slots.p, DType::I32, {1, 2}), states,
+                                           Tensor(d_slots.p, DType::I32, {1}), stream);
+          }),
+          "ple_conv_commit refuses [B, 2] commit columns");
+}
+
 } // namespace
 
 int main() {
@@ -399,6 +439,7 @@ int main() {
         conv_case(10, {1, 2}, {}, stream);    // verification: no state update
         conv_split_case(stream);
         commit_case(stream);
+        rank_refusals(stream);
         cudaStreamDestroy(stream);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
