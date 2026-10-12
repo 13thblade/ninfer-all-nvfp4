@@ -273,7 +273,17 @@ bool Program::has_context_transaction() const noexcept { return impl_->has_conte
 
 PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t,
                                          runtime::TokenMaskProvider* m) {
-    auto progress            = impl_->advance_prefill(h, t, m);
+    // Landings complete inside this call (each lane's first prefill pass), so the list is empty on
+    // entry. A call that throws after one completed must not leave its observations for the next
+    // request's progress.
+    auto progress = [&] {
+        try {
+            return impl_->advance_prefill(h, t, m);
+        } catch (...) {
+            impl_->landed_transfers_.clear();
+            throw;
+        }
+    }();
     progress.landed_transfers = std::move(impl_->landed_transfers_);
     impl_->landed_transfers_.clear();
     return progress;
