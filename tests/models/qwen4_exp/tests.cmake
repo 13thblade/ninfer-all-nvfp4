@@ -39,6 +39,15 @@ ninfer_add_test(ninfer_qwen4_exp_vision_real_test
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_ops ninfer_core)
 set_tests_properties(ninfer_qwen4_exp_vision_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# GPU, real artifact with the vision tower (skips otherwise): images through the public Engine
+# (placement of the image tokens and their M-RoPE positions, answers on the example images, MTP
+# exactness with images in context); --kv-cycle and --bench modes.
+ninfer_add_test(ninfer_qwen4_exp_vision_engine_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_engine_real.cpp"
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_model_loading ninfer_core)
+set_tests_properties(ninfer_qwen4_exp_vision_engine_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # Host only: the expert cache (LFRU against the replay tool's decisions, frames, the controller and
 # the warm-start state file) and the startup memory plans (RAM ledger, VRAM sizing, control law).
 ninfer_add_test(ninfer_qwen4_exp_expert_cache_test

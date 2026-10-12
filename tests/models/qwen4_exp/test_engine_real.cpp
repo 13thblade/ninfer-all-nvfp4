@@ -20,8 +20,10 @@
 // Program logs each request's expert-cache hit rate.
 //
 //   ninfer_qwen4_exp_engine_real_test --bench [--max-context N] [--generate N] [--no-graph]
-//       [--expert-cache-mib N] [--no-expert-state] [--split N] [--print-ids]
+//       [--expert-cache-mib N] [--no-expert-state] [--split N] [--print-ids] [--vision]
 //       [--mtp K [--mtp-fixed] [--width-cost X]] TOKENS...
+//
+// --vision loads the artifact's vision tower (an Engine started with --vision; the jobs stay text).
 //
 // --mtp K decodes with MTP speculation (the artifact must hold the drafter), verifying up to K
 // drafts per round (--mtp-fixed: always K); each job also prints its acceptance.
@@ -348,7 +350,7 @@ bool same(const char* label, const std::vector<TokenId>& reference, const std::v
 
 int bench(const std::string& artifact, const std::vector<std::string>& args) {
     std::uint32_t max_context = 33'792, tokens = 512, split = 0, mtp = 0;
-    bool graph = true, state = true, print_ids = false, mtp_fixed = false;
+    bool graph = true, state = true, print_ids = false, mtp_fixed = false, vision = false;
     double width_cost = -1.0;
     std::optional<std::uint64_t> cache;
     std::vector<std::string> jobs;
@@ -376,6 +378,8 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
             mtp = static_cast<std::uint32_t>(value());
         } else if (a == "--mtp-fixed") {
             mtp_fixed = true;
+        } else if (a == "--vision") {
+            vision = true;
         } else if (a == "--width-cost" && i + 1 < args.size()) {
             width_cost = std::stod(args[++i]);
         } else {
@@ -386,6 +390,8 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
     options.use_cuda_graph                 = graph;
     options.flash_next.expert_cache_bytes  = cache;
     options.flash_next.save_expert_state   = state;
+    // Image input enabled (the artifact's vision tower loaded): text jobs run as a --vision server's.
+    options.enable_vision = vision;
     if (mtp > 0) {
         options.speculative.backend         = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens    = mtp;

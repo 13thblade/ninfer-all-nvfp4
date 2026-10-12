@@ -4,8 +4,10 @@
 // Modified for NInfer-3090: implements NInfer's Engine execution contract (the one EngineCore,
 // Scheduler and ResourceManager drive for Qwen3.5) instead of Infernix's hybrid-cache contract:
 // prefix reuse is off (the Program reports no checkpoints, captures nothing and offers only root
-// sources), one lane, MTP speculation (Infernix's drafter, verification and commit), no n-gram
-// copy drafts, vision, CPU-served misses or SSD tier.
+// sources), one lane, MTP speculation (Infernix's drafter, verification and commit), image input
+// (Infernix's vision program: the tower encodes in frames lent by the expert cache at the prompt's
+// first prefill unit, the handoff stays lent until the prompt's last call), no n-gram copy drafts,
+// CPU-served misses or SSD tier.
 //
 // The Qwen4Exp Program: the Engine-facing execution of Qwen3.8-Flash-Next. It owns the lane, its
 // paged INT8 KV (an elastic VMM pool), recurrent state, sampling state and the one pending model
@@ -355,6 +357,9 @@ struct ProgramOptions {
     // (Infernix measured 0.38 on the RTX 5090), and a measurement mode that always drafts the most.
     double mtp_width_cost = 0.38;
     bool mtp_fixed_drafts = false;
+    // Image input: the model loaded its vision tower. Prompts with media encode it into frames lent
+    // by the expert cache (its io words are planned only when set).
+    bool vision = false;
 };
 
 class Program {
@@ -442,7 +447,8 @@ public:
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept { return false; }
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept { return false; }
-    // No Vision: every call is a no-op.
+    // A prompt's images encode inside its first prefill unit (one lane: nothing runs beside it), so
+    // the Engine's Vision window calls are no-ops.
     [[nodiscard]] runtime::ResourceReservation reserve_vision_window(SequenceHandle) { return {.reserved = true}; }
     [[nodiscard]] bool vision_pending(SequenceHandle) const noexcept { return false; }
     bool poll_vision() { return false; }

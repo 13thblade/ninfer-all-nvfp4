@@ -24,6 +24,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/rows.h"
+#include "ninfer/ops/scatter.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 
@@ -175,6 +176,9 @@ void Forward::run_front(const ForwardBatch& batch, std::uint32_t end, const Forw
         auto scope = work_->scope();
         Tensor x0  = work_->alloc(DType::BF16, {H, T});
         ops::embedding(batch.ids, parameters_.token_embedding, x0, s);
+        if (batch.vision != nullptr && batch.vision->columns.data != nullptr) {
+            ops::scatter(batch.vision->embeddings, batch.vision->columns, x0, s);
+        }
         ops::hyper_connection_expand(x0, dim(config_.hc.streams), residual_, s);
     }
     layers(0, end, batch, tap);
@@ -394,8 +398,10 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
         ops::rmsnorm(q.view({D, NH * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
         ops::rmsnorm(k.view({D, KVH * T}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
     }
-    // Text tokens: the three RoPE axes are equal, so interleaved MRoPE is the 1-D rotation.
-    ops::rope(batch.positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, device_.execution_view());
+    // Interleaved MRoPE over the three-axis RoPE positions (an image's tokens take the frontend's
+    // grid positions, later tokens their index plus the prompt's rope delta). A text token's equal
+    // axes give the 1-D rotation bit for bit (the kernel computes position[axis] * frequency).
+    ops::rope(batch.rope_positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, device_.execution_view());
 
     const PagedKVLayerView& cache = kv_.layers.at(index);
     ops::kv_cache_append(kn, v, batch.positions, cache, s);
@@ -537,7 +543,7 @@ Tensor Forward::mtp_attention(const MtpParameters& p, const Tensor& x, const Mtp
     const auto geometry = qsa_geometry(config_);
     Tensor tail         = call.tail;
     if (call.kv_only) {
-        ops::rope(call.positions, dim(config_.rope.rotary_dim), config_.rope.theta, kn, device_.execution_view());
+        ops::rope(call.rope_positions, dim(config_.rope.rotary_dim), config_.rope.theta, kn, device_.execution_view());
         ops::kv_cache_append(kn, v, call.positions, m.kv, s);
         ops::qsa_pool_keys(ik, call.positions, call.rope_positions, call.block_start_rope, p.index_key_norm, geometry,
                            kv_.block_table, tail, m.pooled, s);
@@ -556,7 +562,7 @@ Tensor Forward::mtp_attention(const MtpParameters& p, const Tensor& x, const Mtp
         Tensor qn_rows = qn.view({D, NH * T});
         ops::rmsnorm(q.view({D, NH * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
     }
-    ops::rope(call.positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, device_.execution_view());
+    ops::rope(call.rope_positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, device_.execution_view());
     ops::kv_cache_append(kn, v, call.positions, m.kv, s);
     ops::qsa_pool_keys(ik, call.positions, call.rope_positions, call.block_start_rope, p.index_key_norm, geometry,
                        kv_.block_table, tail, m.pooled, s);
@@ -617,7 +623,8 @@ void Forward::mtp_cells(const MtpChunk& chunk, const Tensor& residual) {
                      .rope_positions   = Tensor(chunk.rope_positions + 3 * static_cast<std::size_t>(begin), DType::I32, {n, 3}),
                      .block_start_rope = Tensor(chunk.block_start_rope + 3 * static_cast<std::size_t>(k), DType::I32, {3}),
                      .tail             = mtp_->tail,
-                     .kv_only          = true};
+                     .kv_only          = true,
+                     .vision           = chunk.vision != nullptr ? &chunk.vision[k] : nullptr};
         mtp_block(call);
     }
     CUDA_CHECK(cudaMemcpyAsync(chunk.saved.data, static_cast<const std::byte*>(residual.data) + column * (T - 1), column,
@@ -642,6 +649,9 @@ void Forward::mtp_block(const MtpCall& call) {
         // Input fusion: R = fc_hidden(each stream of RMSNorm_{S*H}(rows)) + fc_embedding(RMSNorm_H(embed(id))).
         Tensor x0 = work_->alloc(DType::BF16, {H, T});
         ops::embedding(call.ids, parameters_.token_embedding, x0, s);
+        if (call.vision != nullptr && call.vision->columns.data != nullptr) {
+            ops::scatter(call.vision->embeddings, call.vision->columns, x0, s);
+        }
         Tensor e = work_->alloc(DType::BF16, {H, T});
         ops::rmsnorm(x0, p.embedding_norm, config_.rms_norm_eps, true, e, s);
         Tensor ep = work_->alloc(DType::BF16, {H, T});

@@ -340,7 +340,9 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStrea
     const auto first = controller_->choose_run(count, {});
     if (!first) { throw std::logic_error("expert residency: no run of frames to lend"); }
     commands_.clear();
-    displaced_.clear();
+    // Several leases may be out at once (an image's handoff beside the wide calls' lease): the
+    // displaced experts of all of them come back as the last one returns.
+    if (controller_->loaned_frames() == 0) { displaced_.clear(); }
     controller_->lend(*first, count, commands_, &displaced_);
     auto* table = static_cast<std::int32_t*>(table_host_.data());
     for (const auto& command : commands_) {
@@ -366,7 +368,7 @@ std::uint32_t ExpertResidency::give_back(FrameLease& lease, cudaStream_t compute
     // own calls had just used (they score highest), and decode after the prompt hit 1.1-1.6 points
     // less (integration #256).
     const std::uint32_t loaded = refill(compute, displaced_);
-    displaced_.clear();
+    if (controller_->loaned_frames() == 0) { displaced_.clear(); }
     return loaded;
 }
 
