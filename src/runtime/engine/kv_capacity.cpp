@@ -101,6 +101,58 @@ std::uint32_t SequenceCapacityCurve::resolved_tokens(std::uint32_t main_page_gro
     return static_cast<std::uint32_t>(tokens);
 }
 
+std::size_t explicit_reservation_bytes(std::uint32_t tokens, const SequenceCapacityCurve& curve) {
+    validate_curve(curve);
+    return curve.reservation_bytes(
+        explicit_page_groups(KvCapacityPolicy::explicit_capacity(tokens), curve));
+}
+
+bool explicit_capacity_fits(std::uint32_t tokens, const SequenceCapacityCurve& curve,
+                            std::size_t available_runtime_bytes,
+                            std::span<const std::size_t> extra_rank_available_bytes) {
+    validate_curve(curve);
+    if (extra_rank_available_bytes.size() != curve.extra_ranks.size()) {
+        throw std::invalid_argument("free memory was not given for every device in the plan");
+    }
+    const std::uint32_t pages =
+        explicit_page_groups(KvCapacityPolicy::explicit_capacity(tokens), curve);
+    if (pages < curve.minimum_main_page_groups || pages > curve.maximum_main_page_groups) {
+        return false;
+    }
+    if (curve.reservation_bytes(pages) > available_runtime_bytes) { return false; }
+    for (std::size_t index = 0; index < curve.extra_ranks.size(); ++index) {
+        if (curve.extra_rank_reservation_bytes(index, pages) > extra_rank_available_bytes[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<std::uint32_t> fit_context(std::uint32_t floor, std::uint32_t ceiling,
+                                         std::uint32_t step,
+                                         const std::function<bool(std::uint32_t)>& fits) {
+    if (floor == 0 || floor > ceiling || step == 0) {
+        throw std::invalid_argument("context fit needs 0 < floor <= ceiling and a nonzero step");
+    }
+    if (fits(ceiling)) { return ceiling; }
+    if (floor == ceiling || !fits(floor)) { return std::nullopt; }
+    // Multiples of `step` strictly between the floor and the ceiling, as indices.
+    std::uint64_t low  = static_cast<std::uint64_t>(floor) / step + 1;
+    std::uint64_t high = (static_cast<std::uint64_t>(ceiling) - 1) / step;
+    std::uint32_t best = floor;
+    while (low <= high) {
+        const std::uint64_t middle = low + (high - low) / 2;
+        const auto candidate       = static_cast<std::uint32_t>(middle * step);
+        if (fits(candidate)) {
+            best = candidate;
+            low  = middle + 1;
+        } else {
+            high = middle - 1;
+        }
+    }
+    return best;
+}
+
 KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
                                          const SequenceCapacityCurve& curve,
                                          std::size_t available_runtime_bytes,

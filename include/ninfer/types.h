@@ -61,6 +61,11 @@ enum class KvCapacityMode : std::uint8_t {
 };
 
 inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
+// EngineOptions::fit_context_floor: the device memory a fitted context leaves free beyond its plan,
+// so a desktop that grows after startup (140-230 MB measured on a Windows desktop) does not push
+// the card into paging, and the step between fitted contexts.
+inline constexpr std::size_t kFitContextHeadroomBytes = 256ULL * 1024ULL * 1024ULL;
+inline constexpr std::uint32_t kFitContextStepTokens  = 1024;
 
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
@@ -288,6 +293,12 @@ struct EngineOptions {
     std::vector<std::uint32_t> stage_layers;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    // Nonzero makes max_context a ceiling (Generation only; kv_capacity must be explicit and equal
+    // to it): when the plan at max_context does not fit the device memory free after the weights
+    // less kFitContextHeadroomBytes, construction lowers max_context and kv_capacity together to
+    // the largest multiple of kFitContextStepTokens that does, never below this floor, and fails
+    // with the missing amount when not even the floor fits. The options then hold the result.
+    std::uint32_t fit_context_floor    = 0;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
@@ -1165,6 +1176,9 @@ struct VisionWorkspaceMemorySummary {
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
+    // The max_context the Engine was asked for; larger than max_context when fit_context_floor
+    // lowered it to what the device could hold.
+    std::uint32_t requested_max_context       = 0;
     KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
     std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
     std::uint32_t kv_capacity_page_groups     = 0;

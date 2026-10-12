@@ -20,12 +20,15 @@ struct ModelInstance {
     const models::qwen3_5::execution::Parameters parameters;
     models::qwen3_5::Frontend frontend;
     KvCapacityResolution kv_capacity_resolution;
-    const std::uint32_t capacity;
+    std::uint32_t capacity;
     std::unique_ptr<models::qwen3_5::Program> program;
     // One pinned checkpoint per direct (direct_kv or softprompt_kv) graft, in Frontend graft order.
     std::vector<models::qwen3_5::CheckpointHandle> external_checkpoints;
 
     ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options);
+    // Rebuilds what depends on options.max_context (the Frontend and `capacity`) after a context
+    // fit lowered it. Only before the Program exists.
+    void refit_context(const EngineOptions& options);
     // Installs every direct graft as a pinned checkpoint, or, once installed, reinstalls any the
     // Program no longer holds. Requires an idle Program.
     void install_external_checkpoints();

@@ -491,6 +491,15 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_count(memory.kv_capacity_max_page_groups),
                   product::format_pretty_bytes(memory.runtime_reservation_bytes),
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
+    if (memory.requested_max_context > engine.max_context) {
+        logger_->warn("context lowered to {} tokens (asked for {}): the GPU had {} free beside the "
+                      "model, {} MiB of it kept spare. Close other programs that use the GPU and "
+                      "restart for the full context",
+                      product::format_pretty_count(engine.max_context),
+                      product::format_pretty_count(memory.requested_max_context),
+                      product::format_pretty_bytes(memory.available_after_weights_bytes),
+                      ninfer::kFitContextHeadroomBytes / (1024U * 1024U));
+    }
     if (!memory.stage_runtime_reservation_bytes.empty()) {
         std::string reservations;
         for (const std::size_t bytes : memory.stage_runtime_reservation_bytes) {

@@ -39,20 +39,23 @@
 # rk4v4 KV (Lloyd-Max 4-bit keys) is 31% smaller than rk8v4 at the same decode speed, for +0.10%
 # perplexity over it. Measured beside a desktop on an RTX 3090 (2026-09-24), the DFlash2 set starts
 # at up to 180,224 tokens and needs about 1.45 GB more for 262,144 -- roughly what a headless card
-# gets back -- so the full context below is the headless extrapolation, and the step-down catches
-# a card that falls short. The mtp set starts at 262,144 with two lanes even beside a desktop.
+# gets back -- so the full context below is the headless extrapolation, and the server fits a card
+# that falls short (IF THE CARD IS BUSY). The mtp set starts at 262,144 with two lanes even beside a
+# desktop.
 # `none` is the mtp set without speculation.
 # The qwen3_8_27b.ninfer that download-model.sh fetches is the DFlash2 bundle and carries the MTP
 # weights too, so one file serves both.
 #
 # IF THE CARD IS BUSY. A desktop (or another job) holding VRAM can leave too little for the default
-# context. When the `tuned` profile is refused at startup for lack of GPU memory, this launcher steps
-# down on its own -- an eighth of the context at a time, up to five times, from the second step with a 2048 prefill chunk
-# and a smaller Host context budget -- and says what it did, so the first run starts instead of ending in an
-# error. It
-# only does that for the defaults: an explicit NINFER_CONTEXT, NINFER_PREFILL_CHUNK,
-# NINFER_HOST_CONTEXT_MIB or NINFER_KV_CAPACITY is honoured as given and fails loudly, and
-# NINFER_FALLBACK=off turns the step-down off.
+# context. The `tuned` profiles' context is therefore a ceiling: the server is started with
+# --fit-context 32768 and, when the profile's context does not fit the GPU memory free at startup
+# with a 256 MiB safety margin, it starts at the largest context that does (a multiple of 1,024
+# tokens, at least 32,768) and prints one line saying so. If not even 32,768 tokens fit, it stops
+# and says how much memory is missing. Separately, if pinning the Host context budget fails (a
+# machine short of RAM), the launcher retries with half the budget, down to none. Values the
+# caller sets are honoured as given and fail loudly: an explicit NINFER_CONTEXT or
+# NINFER_KV_CAPACITY turns the fit off, an explicit NINFER_HOST_CONTEXT_MIB (or
+# NINFER_AUTO_HOST_CACHE=on) the host retry, and NINFER_FALLBACK=off turns both off.
 #
 # OVERRIDES, from the environment. All profiles: NINFER_MODEL (artifact path), NINFER_MODEL_DIR,
 # NINFER_SERVER, NINFER_HOST, NINFER_PORT, NINFER_CHAT_TEMPLATE (path to a local Jinja file, passed
@@ -74,10 +77,8 @@
 #   NINFER_CONTEXT_STORE                --context-store DIR            keep the context cache across restarts
 #     NINFER_CONTEXT_STORE_MAX_GIB      --context-store-max-gib N      disk budget for the store
 #
-# Each spec's defaults (context, lanes, chunk)
-# are the ones that fit; the context figures below are extrapolated for a headless card, so treat
-# the first start as the confirmation and drop a rung if it refuses:
-# 229376 / 212992 / 196608 / 163840 / 131072 / 114688 / 98304 / 65536.
+# Each spec's defaults (context, lanes, chunk) are the ones that fit a headless card; beside a
+# desktop the server fits the context to what is free (see IF THE CARD IS BUSY above).
 # ------------------------------------------------------------------------------------------------
 set -euo pipefail
 
@@ -270,7 +271,7 @@ if [[ "$profile" == 'tuned' ]]; then
   )
   # --auto-host-cache sizes that budget from the RAM still free once the model has loaded, and
   # refuses --host-context-mib, so it is either/or: with it on, NINFER_HOST_CONTEXT_MIB (and the
-  # step-down ladder's smaller budget) is ignored.
+  # host retry's smaller budget) is ignored.
   AUTO_HOST_CACHE="${NINFER_AUTO_HOST_CACHE:-off}"
   case "$AUTO_HOST_CACHE" in
     on)
@@ -311,6 +312,15 @@ if [[ "$profile" == 'tuned' ]]; then
   PRESENCE_PENALTY="${NINFER_PRESENCE_PENALTY:-0.5}"
   [[ "$MIN_P" == 'default' ]] || profile_args+=(--min-p "$MIN_P")
   [[ "$PRESENCE_PENALTY" == 'default' ]] || profile_args+=(--presence-penalty "$PRESENCE_PENALTY")
+  # The profile's context is a ceiling unless the caller chose it: --fit-context lets the server
+  # start at the largest context that fits the GPU memory free right now (never below the floor),
+  # and say so. 32,768 tokens is the smallest context still worth serving; below it the server
+  # stops and says how much memory is missing.
+  FIT_FLOOR=32768
+  if [[ "${NINFER_FALLBACK:-on}" != 'off' && -z "${NINFER_CONTEXT:-}${NINFER_KV_CAPACITY:-}" ]]; then
+    profile_args+=(--fit-context "$FIT_FLOOR")
+    label="${label/context $CONTEXT/context up to $CONTEXT}"
+  fi
 fi
 
 if [[ -n "${NINFER_CHAT_TEMPLATE:-}" ]]; then
@@ -339,53 +349,42 @@ fi
 [[ -z "${hint:-}" ]] || printf '%s\n' "$hint"
 printf 'API: http://%s:%s/v1\n\n' "$HOST" "$PORT"
 
-# Step-down eligibility. Only the defaults of the tuned profile may be second-guessed; a value the
-# caller chose is theirs. A step-down pass is a re-run of this script with the overrides below set,
-# marked by NINFER_FALLBACK_RUNG, so the settings are rebuilt by the same code as a first run.
-ladder=0
-if [[ "$profile" == 'tuned' && "${NINFER_FALLBACK:-on}" != 'off' ]]; then
-  if [[ -n "${NINFER_FALLBACK_RUNG:-}" ]]; then
-    ladder=1
-  elif [[ -z "${NINFER_CONTEXT:-}${NINFER_PREFILL_CHUNK:-}${NINFER_HOST_CONTEXT_MIB:-}${NINFER_KV_CAPACITY:-}" ]]; then
-    ladder=1
-  fi
+# Host retry eligibility. Only the tuned profile's default Host context budget may be
+# second-guessed; a value the caller chose is theirs. A retry is a re-run of this script with a
+# halved NINFER_HOST_CONTEXT_MIB, marked by NINFER_HOST_RETRY, so the settings are rebuilt by the
+# same code as a first run.
+host_retry=0
+if [[ "$profile" == 'tuned' && "${NINFER_FALLBACK:-on}" != 'off' && "$AUTO_HOST_CACHE" == 'off' ]]; then
+  if [[ -n "${NINFER_HOST_RETRY:-}" || -z "${NINFER_HOST_CONTEXT_MIB:-}" ]]; then host_retry=1; fi
 fi
+memory_advice() {
+  printf '\n%s could not start: the graphics card does not have enough free memory, even for a\n' "$title"
+  printf 'reduced context. Close other programs that use the GPU (games, video, other AI tools)\n'
+  printf 'and run this again. `nvidia-smi` lists what is using it.\n'
+}
 
 # --host-context-mib 8192 really pins 8 GiB of host RAM, here and in run.bat alike (see
 # docs/maintainer/launcher-profiles.md).
-if (( ! ladder )); then
+if [[ "$profile" != 'tuned' ]]; then
   exec "$server" "$MODEL" --host "$HOST" --port "$PORT" "${profile_args[@]}"
 fi
 
-# Run the server with its output shown and kept, so a refusal for lack of memory can be told apart
-# from any other failure. Only that failure steps down; a crash or a bad artifact does not.
-rung="${NINFER_FALLBACK_RUNG:-0}"
-base_context="${NINFER_FALLBACK_BASE_CONTEXT:-$CONTEXT}"
-base_chunk="${NINFER_FALLBACK_BASE_CHUNK:-$PREFILL_CHUNK}"
-base_host_mib="${NINFER_FALLBACK_BASE_HOST_MIB:-$HOST_CONTEXT_MIB}"
+# Run the server with its output shown and kept, so a failure the launcher can explain or retry is
+# told apart from any other. Only a failed host pin retries; a crash or a bad artifact does not.
 server_log="$(mktemp)"
 trap 'rm -f -- "$server_log"' EXIT
 set +e
 "$server" "$MODEL" --host "$HOST" --port "$PORT" "${profile_args[@]}" 2>&1 | tee "$server_log"
 status="${PIPESTATUS[0]}"
 set -e
-if (( status != 0 && rung < 5 )) &&
-   grep -q -E 'runtime reservation requires|cudaMallocHost failed' "$server_log"; then
-  next=$((rung + 1))
-  next_context=$(( base_context * (8 - next) / 8 / 1024 * 1024 ))
-  # The first step trims context only: an eighth of it frees more than a card that just misses
-  # needs, and prefill speed and cached prefixes are worth keeping. Later steps also give up the
-  # wider prefill chunk and halve the Host context budget every other step (floor 0).
-  next_chunk=$base_chunk
-  (( next < 2 || base_chunk <= 2048 )) || next_chunk=2048
-  next_host_mib=$(( base_host_mib >> (next / 2) ))
-  (( next_host_mib >= 0 )) || next_host_mib=0
-  printf '\nNot enough free memory to start at context %s. Retrying at %s (prefill chunk %s, %s MiB host context).\n' \
-    "$CONTEXT" "$next_context" "$next_chunk" "$next_host_mib"
-  printf 'Set NINFER_CONTEXT to choose your own, or NINFER_FALLBACK=off to fail instead.\n\n'
-  exec env NINFER_CONTEXT="$next_context" NINFER_PREFILL_CHUNK="$next_chunk" \
-    NINFER_HOST_CONTEXT_MIB="$next_host_mib" NINFER_FALLBACK_RUNG="$next" \
-    NINFER_FALLBACK_BASE_CONTEXT="$base_context" NINFER_FALLBACK_BASE_CHUNK="$base_chunk" \
-    NINFER_FALLBACK_BASE_HOST_MIB="$base_host_mib" "$0" "$@"
+if (( status != 0 )) && grep -q 'not enough free GPU memory' "$server_log"; then
+  memory_advice
+elif (( status != 0 && host_retry && HOST_CONTEXT_MIB > 0 )) &&
+     grep -q 'cudaMallocHost failed' "$server_log"; then
+  next_host_mib=$(( HOST_CONTEXT_MIB > 2048 ? HOST_CONTEXT_MIB / 2 : 0 ))
+  printf '\nCould not pin %s MiB of host RAM for the context cache. Retrying with %s MiB.\n' \
+    "$HOST_CONTEXT_MIB" "$next_host_mib"
+  printf 'Set NINFER_HOST_CONTEXT_MIB to choose your own, or NINFER_FALLBACK=off to fail instead.\n\n'
+  exec env NINFER_HOST_CONTEXT_MIB="$next_host_mib" NINFER_HOST_RETRY=1 "$0" "$@"
 fi
 exit "$status"

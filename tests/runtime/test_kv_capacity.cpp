@@ -126,6 +126,43 @@ int main() {
                           "every device"),
                       "missing free memory for a device was accepted");
 
+    // Context fit. An explicit capacity fits when its whole reservation does, on every device.
+    failures += check(ninfer::runtime::explicit_capacity_fits(129, curve, 1128) &&
+                          !ninfer::runtime::explicit_capacity_fits(129, curve, 1127) &&
+                          ninfer::runtime::explicit_reservation_bytes(129, curve) == 1128,
+                      "explicit capacity fit disagrees with its reservation");
+    failures += check(!ninfer::runtime::explicit_capacity_fits(64 * 19, split, 100000, split_available),
+                      "an explicit capacity too large for a further device was said to fit");
+    failures += check(!ninfer::runtime::explicit_capacity_fits(64 * 7, curve, 100000),
+                      "an explicit capacity beyond the curve was said to fit");
+
+    // The fit returns the ceiling when it fits, otherwise the largest step multiple below it, the
+    // floor when only the floor fits, and nothing when not even the floor does -- in O(log) probes.
+    int probes      = 0;
+    const auto upto = [&](std::uint32_t limit) {
+        return [&probes, limit](std::uint32_t context) {
+            ++probes;
+            return context <= limit;
+        };
+    };
+    failures += check(ninfer::runtime::fit_context(32768, 188416, 1024, upto(188416)) == 188416,
+                      "a ceiling that fits was lowered");
+    probes = 0;
+    failures += check(ninfer::runtime::fit_context(32768, 188416, 1024, upto(175000)) == 174080,
+                      "the fit missed the largest step multiple that fits");
+    failures += check(probes <= 2 + 9, "the fit probed more than logarithmically");
+    failures += check(ninfer::runtime::fit_context(32768, 188416, 1024, upto(33000)) == 32768,
+                      "the fit did not fall back to the floor");
+    failures += check(!ninfer::runtime::fit_context(32768, 188416, 1024, upto(30000)).has_value(),
+                      "the fit started below its floor");
+    failures += check(ninfer::runtime::fit_context(1000, 1500, 1024, upto(1499)) == 1024,
+                      "the fit did not take the only step multiple between floor and ceiling");
+    bool bad_range_rejected = false;
+    try {
+        (void)ninfer::runtime::fit_context(4096, 2048, 1024, upto(0));
+    } catch (const std::invalid_argument&) { bad_range_rejected = true; }
+    failures += check(bad_range_rejected, "a floor above the ceiling was accepted");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
