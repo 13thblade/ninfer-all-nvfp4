@@ -24,7 +24,8 @@ references, `engine-architecture.md`).
 | 10 | Prefill: exact GPU wide expert route (int8 `mma.sync`, cp.async), prefill expert streaming into lent frames, 4,096-token calls, n-gram row prefetch | done (prefill gate missed by 3-5%, below) |
 | 11 | Decode (M2 gate): few misses zero-copy (11a), fewer decode-graph nodes and the GGML `linear_pair` (11b), the decode graph split around the n-gram row read and the startup frame retry (11c) | done (measurements below) |
 | 12 | 128K through the elastic KV: growth takes expert frames before it maps (12a, the crash and 128K prefill fix); prefill lending restores the experts it displaced and is sized to the prompt (12b, the decode fix) | done (measurements below) |
-| 13-14 | MTP, vision | not started |
+| 13 | MTP speculation: the drafter imported exactly from Strata's `mtp-q2_0.gguf` (13a, `--mtp-gguf`, `ggml_rec_q2_0_q2_0`); Infernix's chained drafts, exact W-column verification and record commit (13b); the draft ceiling and the launcher (13c) | done (spec gate missed, below) |
+| 14 | Vision | not started |
 
 The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
 the six dense formats (PR 3); offloaded_sparse_moe executes the three expert record formats (PR 7).
@@ -59,6 +60,15 @@ distinct weight copies (the per-call cost inside a decode graph).
 The 80% HC gate is not met: the fused mixer is latency-bound on sm_86, and above T = 2 it is
 slower than the composed route. See the PR 6 description.
 
+Rejected in PR 11 (same bench, ABBA against the two-kernel route, which measured 26.6-27.0 us):
+- **One kernel of persistent CTAs** (each claims an A item and a B item from ticket counters and
+  issues both weights' loads up front; B waits on a count of finished A items and runs unclaimed A
+  items itself, so it cannot deadlock without co-residency): **47-50 us**. Per-CTA timestamps show
+  the A partials finishing only once most of both weights have landed (W_down does not arrive ahead
+  of W_up), then ~10 us of B work after the wait. Without the wait (timing probe) it was still 44 us.
+- **Activations first** (R, the norm weights, partials and the residual slice copied to shared
+  memory with `cp.async` before the weight loads, T <= 2): 27.4 us, no gain.
+
 ## Files ported from Infernix
 
 Infernix (Apache-2.0) at commit `a3edb450`. Each file carries its own adaptation notice.
@@ -72,6 +82,7 @@ Infernix (Apache-2.0) at commit `a3edb450`. Each file carries its own adaptation
 | `include/ninfer/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | `include/infernix/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` |
 | `include/ninfer/ops/rows.h`, `src/ops/rows/rows.cu` | `include/infernix/ops/rows.h`, `src/ops/rows/rows.cu` |
 | `tests/ops/test_hyper_connection.cpp`, `test_projection_fp32.cpp`, `test_rows.cpp` | `tests/ops/test_hyper_connection.cpp`, `tests/ops/linear/test_projection_fp32.cpp`, `tests/ops/test_rows.cpp` |
+
 
 ## PR 7 measurements
 
@@ -92,8 +103,25 @@ synthetic and on the subset artifact's real IQ2_S, IQ2_XXS and IQ1_M banks.
 
 The narrow route stays at the speed of Strata's native MMVQ grouped kernels on the same records:
 both run two dependent kernels (gate/up, then down) over 15 MB, and neither reaches the read
-roofline at T = 1. A sweep of CTA geometry and grids in shared memory moved T = 1 by at most ~15%;
-reaching 70% needs a different structure (one persistent two-phase kernel), left open.
+roofline at T = 1. A sweep of CTA geometry and grids in shared memory moved T = 1 by at most ~15%.
+
+PR 11 tried the persistent two-phase kernel and found the route is not bandwidth-bound:
+- **Persistent kernel** (CTAs claim gate/up then down tiles in ticket order through a ring of
+  `cp.async` slots; down tiles wait on per-job counters; bit-identical outputs): 2 slots matched the
+  two-kernel route (IQ2_S / IQ2_XXS / IQ1_M T = 1: 55 / 47 / 48 us), 3 slots was slower, 4 slots
+  (one CTA per SM) 70-74 us. Zero-copy calls were 2.4x slower (fewer bytes in flight over PCIe).
+- **Weights in L2**: with every job reading the same frame (about 1.5 MB, L2-resident) the
+  two-kernel route still takes 43 / 41 / 42 us at T = 1, against 47 / 46 / 45 us from DRAM. At most
+  ~10% of the time is DRAM.
+- **Grid gathers**: forcing every IQ grid index to 0 (timing only): 54 → 48 us (IQ2_S), unchanged
+  (IQ2_XXS), 48 → 44 us (IQ1_M).
+- **Activation reads first** (x prefetched to registers, h copied ahead of the down weights): T = 1
+  unchanged, T = 4 / 8 5-12% slower.
+- Per-CTA timestamps (gate/up, IQ2_S, T = 1): the first wave's slices land at ~11 us, then a CTA
+  computes for ~12 us at three CTAs per SM, and the second wave follows; down adds ~12 us.
+
+So the bound is per-CTA arithmetic latency at low occupancy, not memory, phase overlap or grid
+gathers. Not yet attributed per instruction (Nsight Compute needs an elevated shell).
 
 ## PR 8 (M0) measurements
 
@@ -352,6 +380,37 @@ session (the cache holds the restored decode set instead of the warm-up prompt's
 
 Quality (#243's method): logit dumps byte-identical to the integration's on all six texts (the
 forward does not use the Program). Greedy ids equal the integration's for every prompt measured.
+
+## PR 13 measurements
+
+MTP speculation, 2026-10-12. RTX 3090, CUDA 12.8, desktop attached; s60's prompts, 512 greedy tokens;
+#258 plain brackets the MTP processes (18 measured requests each, n = 12 per cell). Strata (PR 0):
+MTP 105 / 112 / 107, plain 71 / 70 / 66.
+
+| Tier | #258 plain | MTP policy, ceiling 3 | MTP fixed 2 | fixed 2 / plain | / Strata MTP |
+|---|---:|---:|---:|---:|---:|
+| 1K | 81.4 [78.3-83.0] | 108.0 [104.5-111.3] | 110.5 [106.0-113.6] | 1.36 | 1.05 |
+| 8K | 80.2 [78.7-83.5] | 110.7 [102.4-116.0] | 112.6 [104.6-118.2] | 1.39 | 1.01 |
+| 32K | 78.2 [75.9-79.8] | 111.8 [106.3-116.3] | 111.9 [104.7-114.7] | 1.42 | 1.05 |
+
+- **Gate (spec: 8K >= 1.2x Strata MTP = 134 tok/s): missed** at 112.6. Decode after a 128K prompt:
+  102.6 [101.7-108.9] (policy, n = 3; PR 12 plain 74.0).
+- Greedy ids equal plain decoding on every request (108 of 108 above, and `--mtp-exact`).
+- Depth (fixed drafts 1-5 at 8K): 102.1, 112.0, 111.9, 96.0, 90.0 tok/s; acceptance 82 / 76 / 65 /
+  58 / 51% of drafts, 1.82 / 2.51 / 2.94 / 3.30 / 3.52 tokens per round. Two drafts is the optimum.
+- Cost model (nsys, 8K): a verification of W columns costs 17.0 / 20.0 / 23.8 ms at W = 2 / 3 / 4,
+  +3.4 ms per column against a ~12.5 ms plain step; 2.0 ms of each column is routed experts (more
+  distinct experts per layer, and their PCIe misses), 0.6 ms the mixers. A drafter step is 0.88 ms,
+  0.40 of it the IQ4_XS head. The round has no host gap to recover.
+- Plain decode and prefill unchanged against #258 (decode 1.003 / 1.000 / 0.993, prefill 0.999 /
+  1.000 at 4K / 32K; ids identical). With MTP on, prefill is 1-4% slower (the drafter's cells, and a
+  ~5% smaller expert cache).
+- 4K / 32K / 128K alternation with MTP: no crash, adapter at most 23.3 of 24 GiB, no demotion.
+- **Ceiling (13c).** The policy with ceiling 3 against ceiling 2 (P2 P3 P3 P2, n = 12): 0.996 /
+  1.005 / 1.026 +- 0.015 at 1K / 8K / 32K; ceiling 2 drafts two in fewer rounds (1K: 2.16 tokens
+  per round). Fixed 2 drafts is 1-2% faster than either at 1K / 8K, but a fixed depth is a
+  measurement switch, not a serving option. The launcher uses ceiling 3 with the `-mtp` artifact.
+
 ## Artifact decisions
 
 Taken in PR 1 and revised in PR 2b, which aligned the artifact with Infernix (the model code and
@@ -441,7 +500,9 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `src/models/qwen4_exp/program/expert_cache/expert_{cache,state}.{h,cpp}` | same paths | Verbatim but for `lend` reporting the keys it evicts (PR 12) |
 | `src/models/qwen4_exp/program/expert_residency.{h,cpp}` | same path | Per-layer record strides in one frame size; no SSD tier or landing; frame lending (PR 10) whose give-back restores the displaced experts first (PR 12); a grow refills its new frames by score |
 | `src/models/qwen4_exp/program/vram_monitor.{h,cpp}` | same path | Verbatim |
-| `src/models/qwen4_exp/program/program.{h,cpp}` | `program/program.{h,cpp}`, `program/program_impl.h` | NInfer's execution contract (prefix reuse off, one lane); device plan, elastic KV (PR 12: `grow_kv`'s order, frames released before the pool maps; the pool shrinks at the next admission that needs less instead of after 60 s idle, and a growth that does not fit fails the request), decode budget, warm start, VRAM control, link probe and decode graph from Infernix |
+| `src/models/qwen4_exp/program/program.{h,cpp}` | `program/program.{h,cpp}`, `program/program_impl.h` | NInfer's execution contract (prefix reuse off, one lane); device plan, elastic KV (PR 12: `grow_kv`'s order, frames released before the pool maps; the pool shrinks at the next admission that needs less instead of after 60 s idle, and a growth that does not fit fails the request), decode budget, warm start, VRAM control, link probe and decode graph from Infernix; PR 13: `mtp_draft`, `verify`, `commit_verified`, `mtp_catch_up` and `choose_draft_length` for one lane, the drafts read back for the n-gram rows, graphs per width |
+| `src/models/qwen4_exp/execution/forward.{h,cpp}` (PR 13) | same path (`run_mtp`, `mtp_block`, the verification records) | Drafter experts through `offloaded_sparse_moe` from a device bank, the text IQ4_XS head as the draft head; verification records for the single-sequence Ops; the PLE and GDN a/b projections column by column in verification |
+| `src/ops/qsa/prep.cu` `commit_tail_kernel` (PR 13) | `src/ops/qsa/qsa.cu` | One sequence; writes every committed slot in order (a commit across two blocks equals the one-column calls bit for bit) |
 | `src/runtime/engine/qwen4_exp_instance.{h,cpp}` | same path | NInfer's EngineCore and ResourceManager with the context cache off; refuses unsupported options |
 | `tests/models/qwen4_exp/test_{expert_cache,memory_plan}.cpp`, `tests/fixtures/expert_cache/lfru_conformance.txt` | same paths | The memory plan's RAM tests rewritten for full mode |
 

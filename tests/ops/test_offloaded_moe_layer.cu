@@ -487,6 +487,15 @@ void test_synthetic_banks() {
         const auto bank = make_bank(format, records, align256(om::record_geometry(format).bytes));
         check_bank(bank, kTopK, g_small ? std::vector<int>{1, 8} : std::vector<int>{1, 2, 7, 8, 16}, rng, true);
     }
+    // The MTP drafter's Q2_0 records: the narrow route only (the drafter's steps run one column),
+    // every placement against the CPU engine and the FP64 oracle.
+    {
+        const QType format = QType::GGML_REC_Q2_0_Q2_0;
+        std::vector<std::vector<std::uint8_t>> records;
+        for (int e = 0; e < kExperts; ++e) { records.push_back(random_record(format, rng)); }
+        const auto bank = make_bank(format, records, align256(om::record_geometry(format).bytes));
+        check_bank(bank, kTopK, g_small ? std::vector<int>{1} : std::vector<int>{1, 2, 4, 8}, rng, true);
+    }
 }
 
 // The host-silent path: a service request for a layer the service does not have makes its thread

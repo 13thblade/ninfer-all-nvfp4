@@ -4,7 +4,8 @@
 // Modified for NInfer-3090: implements NInfer's Engine execution contract (the one EngineCore,
 // Scheduler and ResourceManager drive for Qwen3.5) instead of Infernix's hybrid-cache contract:
 // prefix reuse is off (the Program reports no checkpoints, captures nothing and offers only root
-// sources), one lane, no speculation, vision, CPU-served misses, SSD tier or prefill streaming.
+// sources), one lane, MTP speculation (Infernix's drafter, verification and commit), no n-gram
+// copy drafts, vision, CPU-served misses or SSD tier.
 //
 // The Qwen4Exp Program: the Engine-facing execution of Qwen3.8-Flash-Next. It owns the lane, its
 // paged INT8 KV (an elastic VMM pool), recurrent state, sampling state and the one pending model
@@ -179,16 +180,20 @@ public:
         : owner_(std::exchange(other.owner_, nullptr)), transaction_(std::exchange(other.transaction_, 0)),
           rows_(other.rows_), row_count_(std::exchange(other.row_count_, 0)),
           tokens_(std::exchange(other.tokens_, {})), timing_(std::exchange(other.timing_, {})),
-          constraint_failed_(other.constraint_failed_) {}
+          constraint_failed_(other.constraint_failed_), counts_(other.counts_),
+          stride_(std::exchange(other.stride_, 1U)), speculative_(std::exchange(other.speculative_, false)) {}
     PendingBatch& operator=(PendingBatch&&)      = delete;
     PendingBatch(const PendingBatch&)            = delete;
     PendingBatch& operator=(const PendingBatch&) = delete;
 
     [[nodiscard]] std::size_t row_count() const noexcept { return row_count_; }
     [[nodiscard]] std::span<const TokenId> tokens() const noexcept { return tokens_; }
-    // Every row licenses one token (no speculation).
-    [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return {}; }
-    [[nodiscard]] std::uint32_t row_stride() const noexcept { return 1; }
+    // A verification round licenses each row's accepted drafts and its correction or bonus token
+    // (tokens row_stride apart); any other round one token per row.
+    [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept {
+        return speculative_ ? std::span<const std::int32_t>(counts_.data(), row_count_) : std::span<const std::int32_t>{};
+    }
+    [[nodiscard]] std::uint32_t row_stride() const noexcept { return stride_; }
     [[nodiscard]] bool constraint_failed(std::size_t row) const { return constraint_failed_.at(row); }
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
 
@@ -200,6 +205,9 @@ private:
     std::span<const TokenId> tokens_;
     runtime::ExecutionTiming timing_;
     std::array<bool, kMaximumConcurrency> constraint_failed_{};
+    std::array<std::int32_t, kMaximumConcurrency> counts_{};
+    std::uint32_t stride_ = 1;
+    bool speculative_     = false;
 
     friend struct detail::ContractAccess;
 };
@@ -303,12 +311,14 @@ struct ProgramDevicePlan {
     std::uint64_t state     = 0; // GDN, PLE and QSA tail state
     std::uint64_t io        = 0; // per-call inputs, logits and sampling arrays
     std::uint64_t residency = 0; // the expert frame tables and route log
+    // MTP speculation: verification records, tail copies, the drafter's residuals and round words.
+    std::uint64_t speculation = 0;
     std::uint64_t expert_record_stride = 0; // one expert frame
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
-    std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate
+    std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate (counts both halves of the split decode)
 
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
-        return kv + workspace + staging + state + io + residency;
+        return kv + workspace + staging + state + io + residency + speculation;
     }
 };
 
@@ -340,6 +350,14 @@ struct ProgramOptions {
     std::uint32_t kv_base_tokens = 0;
     // The host-to-device link rate in bytes per second; 0 measures it at startup.
     double link_bytes_per_second = 0.0;
+    // MTP speculative decoding: the most drafts one round verifies (1..7; 0 disables). The model
+    // must have loaded its MTP drafter. Each round drafts the count its acceptance estimate
+    // favours, up to this bound (Infernix's draft-length policy).
+    std::uint32_t mtp_draft_tokens = 0;
+    // The draft-length policy's cost of one more verified column, relative to a plain round
+    // (Infernix measured 0.38 on the RTX 5090), and a measurement mode that always drafts the most.
+    double mtp_width_cost = 0.38;
+    bool mtp_fixed_drafts = false;
 };
 
 class Program {

@@ -124,6 +124,23 @@ void qsa_pool_keys(const Tensor& raw_keys, const Tensor& positions, const Tensor
                          geometry, block_table, tail, pooled_pages, stream);
 }
 
+void qsa_commit_tails(const Tensor& raw_keys, const Tensor& positions, const Tensor& commit_columns,
+                      Tensor& tail0, std::int64_t tail_stride_bytes, cudaStream_t stream) {
+    require(contiguous(raw_keys, DType::BF16) && raw_keys.ne[0] == kQsaIndexDim && raw_keys.ne[1] >= 1 &&
+                raw_keys.ne[2] >= 1 && raw_keys.ne[3] == 1,
+            "raw_keys must be contiguous BF16 [128, W, layers]");
+    require_positions(positions, raw_keys.ne[1]);
+    require(contiguous(commit_columns, DType::I32) && commit_columns.numel() == 1,
+            "commit_columns must be contiguous I32 [1]");
+    require(contiguous(tail0, DType::BF16) && tail0.ne[0] == kQsaIndexDim &&
+                tail0.ne[1] == kQsaBlockTokens - 1 && tail0.ne[2] == 1 && tail0.ne[3] == 1,
+            "tail must be contiguous BF16 [128, R - 1]");
+    require(tail_stride_bytes % 2 == 0 &&
+                (raw_keys.ne[2] == 1 || tail_stride_bytes >= static_cast<std::int64_t>(tail0.bytes())),
+            "tail layers must not overlap");
+    qsa_commit_tails_launch(raw_keys, positions, commit_columns, tail0, tail_stride_bytes / 2, stream);
+}
+
 std::size_t qsa_select_blocks_workspace_capacity_bytes(const QsaIndexerGeometry& geometry,
                                                        QsaExecutionEnvelope envelope,
                                                        std::int32_t min_tokens,

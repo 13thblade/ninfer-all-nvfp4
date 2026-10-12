@@ -5,7 +5,12 @@
 
 #include <nlohmann/json.hpp>
 #include <iostream>
+#include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 namespace frontend = ninfer::models::qwen3_5::frontend;
@@ -311,12 +316,143 @@ void custom_tool_input(ninfer::text::GrammarCompiler& compiled) {
             "custom tool call admitted a renamed argument");
 }
 
+// The decoder's terminal for `text` streamed at every listed width, with the published bytes and
+// the terminal content joined. Each width must agree with the whole output.
+frontend::ToolCallOutputDecoder::Terminal
+decode_streamed(const std::shared_ptr<const frontend::ToolCallOutputContract>& contract,
+                const std::string& text,
+                ninfer::FinishReason reason = ninfer::FinishReason::StopToken) {
+    std::optional<frontend::ToolCallOutputDecoder::Terminal> whole;
+    for (const std::size_t width : {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{5},
+                                    std::size_t{7}, std::size_t{64}, text.size()}) {
+        frontend::ToolCallOutputDecoder decoder(contract, 64);
+        std::string content;
+        for (std::size_t at = 0; at < text.size(); at += width)
+            content += decoder.feed(std::string_view(text).substr(at, width));
+        auto terminal = decoder.finish(reason);
+        terminal.content = content + terminal.content;
+        if (!whole) {
+            whole = std::move(terminal);
+            continue;
+        }
+        require(terminal.content == whole->content &&
+                    terminal.tool_calls.size() == whole->tool_calls.size() &&
+                    terminal.diagnostics == whole->diagnostics,
+                "a streamed chunking disagreed with the whole constrained output");
+    }
+    return *whole;
+}
+
+// The grammar dispatches on `<tool_call>` wherever it appears, so a model that shows the call
+// format inside Markdown code is forced to complete a real, declared call. When calling was
+// optional (`auto`), such a region is a quoted example and must reach the client as text, byte for
+// byte, never as a call it would execute. A required or named choice must call, so its region
+// always stays structured.
+void fenced_calls(ninfer::text::GrammarCompiler& compiled) {
+    const auto canonical = call("rm -rf build");
+    const std::vector<std::string> quoted{
+        "Here is the format:\n```xml\n" + canonical,
+        "Here is the format:\n~~~\n" + canonical,
+        "```\n" + canonical,
+        "Use `" + canonical,
+        // An earlier closed fence does not hide a later open one.
+        "```\nx = 1\n```\nThen:\n```\n" + canonical,
+    };
+    // (output, content before the call): a call after a closed fence or after prose is real.
+    const std::vector<std::pair<std::string, std::string>> real{
+        {canonical, ""},
+        {"Let me run it.\n\n" + canonical, "Let me run it."},
+        {"```\nx = 1\n```\n" + canonical, "```\nx = 1\n```"},
+        {"`a` and `b` " + canonical, "`a` and `b`"},
+    };
+    const auto string_schema = schema({{"type", "string"}});
+    ninfer::ToolChoice single_call;
+    single_call.parallel = false;
+    ninfer::ToolChoice selected;
+    selected.allowed_names = std::vector<std::string>{"call"};
+    for (const auto& choice : {ninfer::ToolChoice{}, single_call, selected}) {
+        for (const bool strict : {false, true}) {
+            const auto bound = contract(string_schema, strict, choice);
+            require(bound->constrained && !bound->required,
+                    "an auto choice was not a constrained optional contract");
+            for (const auto& text : quoted) {
+                require(accepts(compiled, *bound, text),
+                        "the grammar no longer admits a call opened inside Markdown code");
+                const auto terminal = decode_streamed(bound, text);
+                require(terminal.content == text && terminal.tool_calls.empty(),
+                        "a constrained call opened inside Markdown code was published as a call");
+                require(terminal.diagnostics.marker_seen &&
+                            terminal.diagnostics.structured_call_count == 0 &&
+                            terminal.diagnostics.fallback_reason ==
+                                ninfer::ToolCallParseFallbackReason::QuotedInCode,
+                        "a demoted fenced call did not report quoted_in_code");
+                // A fenced call cut by the output budget or a cancellation is text too.
+                for (const auto reason :
+                     {ninfer::FinishReason::OutputLimit, ninfer::FinishReason::Cancelled}) {
+                    const auto cut = text.substr(0, text.size() - 12);
+                    const auto interrupted = decode_streamed(bound, cut, reason);
+                    require(interrupted.content == cut && interrupted.tool_calls.empty(),
+                            "an interrupted fenced call was not returned as text");
+                }
+            }
+            for (const auto& [text, content] : real) {
+                require(accepts(compiled, *bound, text), "the grammar rejected a real call");
+                const auto terminal = decode_streamed(bound, text);
+                require(terminal.content == content && terminal.tool_calls.size() == 1 &&
+                            Json::parse(terminal.tool_calls[0].arguments_json) ==
+                                Json{{"x", "rm -rf build"}} &&
+                            terminal.diagnostics.fallback_reason ==
+                                ninfer::ToolCallParseFallbackReason::None,
+                        "a constrained call outside Markdown code was not published as a call");
+            }
+        }
+    }
+
+    // A continuation prefix that opened the fence is withheld from the terminal content, as
+    // everywhere else, and the call it quotes is still text.
+    {
+        const auto bound  = contract(string_schema, false);
+        const auto prefix = std::string("Here is the format:\n```\n");
+        frontend::ToolCallOutputDecoder continuation(bound, 64);
+        continuation.initialize_continuation(prefix);
+        auto content  = continuation.feed(canonical);
+        auto terminal = continuation.finish();
+        content += terminal.content;
+        require(content == canonical && terminal.tool_calls.empty(),
+                "a continuation that opened a fence published the quoted call");
+    }
+
+    // Required and named choices must call: the grammar admits no text before the call, and the
+    // decoder never demotes their region, even when the text before it opens a fence.
+    ninfer::ToolChoice required;
+    required.mode = ninfer::ToolChoiceMode::Required;
+    ninfer::ToolChoice named = required;
+    named.allowed_names      = std::vector<std::string>{"call"};
+    named.parallel           = false;
+    for (const auto& choice : {required, named}) {
+        const auto bound = contract(string_schema, false, choice);
+        require(bound->constrained && bound->required, "a required choice was not required");
+        require(!accepts(compiled, *bound, "```\n" + canonical),
+                "a required choice admitted text before its call");
+        for (const auto& text : quoted) {
+            const auto terminal = decode_streamed(bound, text);
+            require(terminal.tool_calls.size() == 1 &&
+                        Json::parse(terminal.tool_calls[0].arguments_json) ==
+                            Json{{"x", "rm -rf build"}} &&
+                        terminal.diagnostics.fallback_reason ==
+                            ninfer::ToolCallParseFallbackReason::None,
+                    "a required or named choice demoted its call to text");
+        }
+    }
+}
+
 void run() {
     auto compiled = compiler();
     basic_contracts(compiled);
     selected_contracts(compiled);
     thinking_cannot_end_with_eos(compiled);
     custom_tool_input(compiled);
+    fenced_calls(compiled);
     ninfer::ToolChoice required;
     required.mode = ninfer::ToolChoiceMode::Required;
     auto fixed =

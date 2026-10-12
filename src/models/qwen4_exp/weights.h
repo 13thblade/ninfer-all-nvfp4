@@ -3,8 +3,8 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/weights.h (Apache-2.0).
 // Modified for NInfer-3090: parameters mirror the GGUF tensors (tools/convert/qwen4_exp.py), so
 // the attention projections and the GDN qkv projection are separate GGML-format parameters rather
-// than one packed parent; the expert bank is a ggml_expert_record_v1 parameter with no activation
-// scales; no MTP, proposal head or vision weights (later milestones).
+// than one packed parent; the expert banks are ggml_expert_record_v1 parameters with no activation
+// scales (the MTP drafter's Q2_0 records included); no proposal head or vision weights.
 
 #include "core/weight_view.h"
 #include "ninfer/ops/linear.h"
@@ -78,6 +78,18 @@ struct TextWeights {
     WeightId output_head;     // GGML IQ4_XS, device
     HyperConnectionWeights final_mixer;
     std::vector<BlockWeights> layers;
+};
+
+// The MTP drafter (component mtp, from Strata's mtp-q2_0.gguf): one QSA block plus a routed MoE of
+// device-resident Q2_0 experts over the text model's token embedding and LM head. Projections are
+// BF16; embedding_norm and hidden_norm are BF16 gamma (unit offset); the mixer norms are FP32
+// multipliers. The attention's indexer projections are BF16 rows, as the text blocks'.
+struct MtpWeights {
+    WeightId embedding_norm, hidden_norm;
+    WeightId embedding_projection, hidden_projection;
+    HyperConnectionWeights attn_hc, mlp_hc, final_mixer;
+    AttentionWeights attention;
+    MoeWeights moe; // experts: a ggml_rec_q2_0_q2_0 bank in device memory
 };
 
 } // namespace ninfer::models::qwen4_exp

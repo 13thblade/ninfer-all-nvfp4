@@ -297,6 +297,10 @@ struct FlashNextOptions {
     // Tokens of KV backed at startup; requests needing more borrow it from the expert cache (0:
     // 32,768). Measurement and tests.
     std::uint32_t kv_base_tokens = 0;
+    // MTP speculation (--spec mtp): the draft-length policy's cost of one more verified column
+    // relative to a plain round, and a measurement mode that always drafts --draft-tokens.
+    double mtp_width_cost = 0.38;
+    bool mtp_fixed_drafts = false;
 };
 
 struct EngineOptions {
@@ -593,6 +597,8 @@ enum class ToolCallParseFallbackReason : std::uint8_t {
     InvalidToolName,
     UndeclaredTool,
     TrailingContent,
+    // Constrained `auto` output opened its call inside Markdown code: a quoted example, kept as text.
+    QuotedInCode,
 };
 
 [[nodiscard]] inline constexpr const char*
@@ -608,6 +614,8 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "undeclared_tool";
     case ToolCallParseFallbackReason::TrailingContent:
         return "trailing_content";
+    case ToolCallParseFallbackReason::QuotedInCode:
+        return "quoted_in_code";
     }
     return "malformed_structure";
 }

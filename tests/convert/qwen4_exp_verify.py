@@ -65,7 +65,60 @@ def verify_volume(path, gguf: GgufModel, table: dict) -> int:
     return g.rows
 
 
-def verify(path, gguf: GgufModel, subset: qwen4_exp.Subset | None = None, volume=None) -> dict:
+def _mtp_sources() -> dict[str, tuple[str, object]]:
+    """Each MTP parameter's GGUF tensor and how it is stored (None: the tensor's bytes)."""
+    out = {name: (gguf_name, rule) for gguf_name, (name, rule) in qwen4_exp._MTP_NORMS.items()}
+    out.update({name: (gguf_name, None) for gguf_name, (name, _) in qwen4_exp._MTP_MATRICES.items()})
+    out["mtp/layers/0/indexer/query"] = (qwen4_exp._MTP_INDEX, "query rows")
+    out["mtp/layers/0/indexer/key"] = (qwen4_exp._MTP_INDEX, "key rows")
+    out[qwen4_exp.MTP_EXPERTS] = (qwen4_exp._MTP_GATE_UP, "records")
+    return out
+
+
+def _verify_mtp_object(artifact: Artifact, obj: TensorObject, bound, mtp: GgufModel, config: dict) -> str:
+    """One MTP object against the drafter GGUF; returns the summary key it counts under."""
+    sources = _mtp_sources()
+    if obj.layout == "ggml_expert_record_v1":
+        ((_, _, name),) = bound
+        assert name == qwen4_exp.MTP_EXPERTS, name
+        g = ggml_expert_record_geometry(obj.format, obj.shape)
+        gate_up, down = mtp.tensor(qwen4_exp._MTP_GATE_UP), mtp.tensor(qwen4_exp._MTP_DOWN)
+        for first in range(0, g.experts, _EXPERTS_PER_READ):
+            count = min(_EXPERTS_PER_READ, g.experts - first)
+            payload = artifact.read_range(obj.offset + first * g.record_stride, count * g.record_stride)
+            gate, up, dn = unpack_expert_records(payload, obj.format, (count, g.hidden, g.intermediate))
+            fused = mtp.read_rows(gate_up, first * 2 * g.intermediate, (first + count) * 2 * g.intermediate)
+            fused = fused.reshape(count, 2 * g.intermediate, -1)
+            assert np.array_equal(gate, fused[:, : g.intermediate]), f"{obj.id}: gate rows differ"
+            assert np.array_equal(up, fused[:, g.intermediate :]), f"{obj.id}: up rows differ"
+            source = mtp.read_rows(down, first * g.hidden, (first + count) * g.hidden)
+            assert np.array_equal(dn.reshape(-1, dn.shape[-1]), source), f"{obj.id}: down rows differ"
+        return "mtp_records"
+    chunks = []
+    for _, _, name in bound:
+        gguf_name, rule = sources[name]
+        tensor = mtp.tensor(gguf_name)
+        raw = mtp.read_range(tensor, 0, tensor.bytes)
+        if rule in ("query rows", "key rows"):
+            iq = config["indexer_n_heads"] * config["indexer_head_dim"]
+            rows = (0, iq) if rule == "query rows" else (iq, tensor.rows)
+            raw = raw[rows[0] * tensor.row_bytes : rows[1] * tensor.row_bytes]
+        elif rule is not None:
+            gamma = np.frombuffer(raw, dtype="<f4")
+            if rule == "words":
+                assert obj.format == "bf16", obj.id
+                raw = (gamma.view(np.uint32) >> 16).astype("<u2").tobytes()
+                assert ((gamma.view(np.uint32) & 0xFFFF) == 0).all(), obj.id
+            else:
+                assert obj.format == "fp32", obj.id
+                raw = (np.float32(1.0) + gamma).astype("<f4").tobytes()
+        chunks.append(raw)
+    assert artifact.read_object(obj.id) == b"".join(chunks), obj.id
+    return "mtp_identical"
+
+
+def verify(path, gguf: GgufModel, subset: qwen4_exp.Subset | None = None, volume=None,
+           mtp: GgufModel | None = None) -> dict:
     """Every tensor object equals its GGUF ranges; returns counts of what was compared.
 
     Plain objects are compared by SHA-256 over the GGUF bytes of their bound parameters in
@@ -92,6 +145,13 @@ def verify(path, gguf: GgufModel, subset: qwen4_exp.Subset | None = None, volume
                 continue
             bound = sorted(parts[obj.id])
             assert bound, f"{obj.id} has no binding"
+            if bound[0][2].startswith("mtp/"):
+                assert mtp is not None, f"{obj.id}: an MTP object needs the drafter GGUF"
+                assert all(name.startswith("mtp/") for _, _, name in bound), obj.id
+                summary[_verify_mtp_object(artifact, obj, bound, mtp, config)] += 1
+                summary["objects"] += 1
+                summary["bytes"] += obj.bytes
+                continue
             if obj.layout == "ggml_expert_record_v1":
                 ((_, _, name),) = bound
                 order = {"gate": 0, "up": 1, "down": 2}

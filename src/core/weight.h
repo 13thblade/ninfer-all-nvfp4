@@ -31,6 +31,8 @@ enum class QType : std::uint16_t {
     GGML_REC_IQ2_S_Q2_0   = 18,
     GGML_REC_IQ2_XXS_Q2_0 = 19,
     GGML_REC_IQ1_M_Q2_0   = 20,
+    // The MTP drafter's experts: Q2_0 gate, up and down.
+    GGML_REC_Q2_0_Q2_0    = 21,
 };
 
 // One GGML block: `values` consecutive K values encoded in `bytes` bytes, scales included.
@@ -84,6 +86,8 @@ struct GgmlRecordParts {
         return {QType::GGML_IQ2_XXS, QType::GGML_Q2_0};
     case QType::GGML_REC_IQ1_M_Q2_0:
         return {QType::GGML_IQ1_M, QType::GGML_Q2_0};
+    case QType::GGML_REC_Q2_0_Q2_0:
+        return {QType::GGML_Q2_0, QType::GGML_Q2_0};
     default:
         return {};
     }

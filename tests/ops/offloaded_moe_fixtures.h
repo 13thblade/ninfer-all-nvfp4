@@ -40,6 +40,7 @@ inline const char* format_name(QType format) {
     case QType::GGML_REC_IQ2_S_Q2_0: return "iq2_s+q2_0";
     case QType::GGML_REC_IQ2_XXS_Q2_0: return "iq2_xxs+q2_0";
     case QType::GGML_REC_IQ1_M_Q2_0: return "iq1_m+q2_0";
+    case QType::GGML_REC_Q2_0_Q2_0: return "q2_0+q2_0";
     default: return "?";
     }
 }

@@ -1,8 +1,9 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/load.cpp (Apache-2.0).
 // Modified for NInfer-3090: binds the converter's GGUF-mirroring parameters (GGML block-format
 // projections, BF16 gamma attention norms, FP32 multiplier hyper-connection and PLE norms) and
-// ggml_expert_record_v1 banks in pinned host memory; no expert scales, vision,
-// MTP, proposal head or SSD tier; the frontend resources are the Qwen3.5 frontend's.
+// ggml_expert_record_v1 banks in pinned host memory, and on request the MTP drafter (BF16
+// projections, its Q2_0 expert bank in device memory); no expert scales, vision, proposal head or
+// SSD tier; the frontend resources are the Qwen3.5 frontend's.
 
 #include "models/qwen4_exp/model.h"
 
@@ -120,17 +121,67 @@ GdnWeights bind_gdn(Bindings& b, const TextConfig& c, const std::string& prefix)
     return out;
 }
 
-MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix) {
+MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix, bool drafter = false) {
     const std::uint64_t h = c.hidden_size, e = c.moe.experts, s = c.moe.shared_intermediate;
     const std::string input = prefix + "ffn_input", p = prefix + "moe/";
+    // The drafter's shared expert is BF16 (projected in FP32 rows); the text model's is GGML.
+    const std::optional<QType> shared = drafter ? std::optional<QType>(QType::BF16) : std::nullopt;
     MoeWeights out;
     out.router       = b.parameter(p + "router", {e, h}, input, QType::BF16);
     out.shared_score = b.parameter(p + "shared_score", {1, h}, input, QType::BF16);
-    out.shared_gate  = b.parameter(p + "shared/gate", {s, h}, input);
-    out.shared_up    = b.parameter(p + "shared/up", {s, h}, input);
-    out.shared_down  = b.parameter(p + "shared/down", {h, s}, p + "shared/product");
-    out.experts      = b.parameter(p + "experts", {e, h, c.moe.intermediate}, input, {}, Residency::Pinned);
+    out.shared_gate  = b.parameter(p + "shared/gate", {s, h}, input, shared);
+    out.shared_up    = b.parameter(p + "shared/up", {s, h}, input, shared);
+    out.shared_down  = b.parameter(p + "shared/down", {h, s}, p + "shared/product", shared);
+    // Text banks stay in pinned host memory (the expert cache stages them); the drafter's 512
+    // experts are device-resident.
+    out.experts = b.parameter(p + "experts", {e, h, c.moe.intermediate}, input,
+                              drafter ? std::optional<QType>(QType::GGML_REC_Q2_0_Q2_0) : std::nullopt,
+                              drafter ? Residency::Device : Residency::Pinned);
     return out;
+}
+
+// The MTP drafter: every projection BF16 (the GGUF's words).
+MtpWeights bind_mtp(Bindings& b, const TextConfig& c) {
+    const std::uint64_t h = c.hidden_size, width = c.residual_width();
+    const std::uint64_t q = c.attention.query_width(), k = c.attention.key_width();
+    const std::uint64_t iq = std::uint64_t(c.qsa.index_heads) * c.qsa.index_head_dim;
+    MtpWeights out;
+    out.embedding_norm       = b.direct("mtp/embedding_norm", {h}, QType::BF16);
+    out.hidden_norm          = b.direct("mtp/hidden_norm", {width}, QType::BF16);
+    out.embedding_projection = b.parameter("mtp/embedding_projection", {h, h}, "mtp/embedding_input", QType::BF16);
+    out.hidden_projection    = b.parameter("mtp/hidden_projection", {h, h}, "mtp/hidden_input", QType::BF16);
+    out.final_mixer          = bind_hc(b, c, "mtp/final_mixer/", false);
+    const std::string prefix = "mtp/layers/0/";
+    out.attn_hc              = bind_hc(b, c, prefix + "attn_hc/", true);
+    out.mlp_hc               = bind_hc(b, c, prefix + "mlp_hc/", true);
+    const std::string input = prefix + "mixer_input", p = prefix + "attention/", x = prefix + "indexer/";
+    auto& a            = out.attention;
+    a.query_gate       = b.parameter(p + "query_gate", {2 * q, h}, input, QType::BF16);
+    a.key              = b.parameter(p + "key", {k, h}, input, QType::BF16);
+    a.value            = b.parameter(p + "value", {k, h}, input, QType::BF16);
+    a.output           = b.parameter(p + "output", {h, q}, p + "gated_output", QType::BF16);
+    a.query_norm       = b.direct(p + "query_norm", {c.attention.head_dim}, QType::BF16);
+    a.key_norm         = b.direct(p + "key_norm", {c.attention.head_dim}, QType::BF16);
+    a.index_query      = b.parameter(x + "query", {iq, h}, input, QType::BF16);
+    a.index_key        = b.parameter(x + "key", {c.qsa.index_head_dim, h}, input, QType::BF16);
+    a.index_query_norm = b.direct(x + "query_norm", {c.qsa.index_head_dim}, QType::BF16);
+    a.index_key_norm   = b.direct(x + "key_norm", {c.qsa.index_head_dim}, QType::BF16);
+    out.moe            = bind_moe(b, c, prefix, true);
+    return out;
+}
+
+// Whether the artifact holds the MTP drafter (component mtp, architecture Qwen4ExpMTP).
+bool has_mtp_component(const artifact::Directory& directory) {
+    const auto found = directory.components.find("mtp");
+    if (found == directory.components.end()) { return false; }
+    const auto& component = found->second;
+    if (component.target.value_or("") != "text") { throw ArtifactError("mtp: target must be text"); }
+    const auto architectures = component.config.find("architectures");
+    if (architectures == component.config.end() || !architectures->is_array() || architectures->size() != 1 ||
+        architectures->front() != "Qwen4ExpMTP") {
+        throw ArtifactError("mtp: the drafter's architecture must be Qwen4ExpMTP");
+    }
+    return true;
 }
 
 PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& prefix) {
@@ -169,7 +220,7 @@ TextWeights bind_text(Bindings& b, const TextConfig& c) {
     return out;
 }
 
-ExpertBank expert_bank(const BoundWeight& weight, const TextConfig& c) {
+ExpertBank expert_bank(const BoundWeight& weight, const TextConfig& c, bool on_device = false) {
     const auto& view = weight.view;
     if (view.parts.size() != 1 || !is_complete_weight(view)) {
         throw ArtifactError(weight.name + ": an expert bank must be one complete parent");
@@ -184,6 +235,11 @@ ExpertBank expert_bank(const BoundWeight& weight, const TextConfig& c) {
     bank.format        = g.format;
     bank.experts       = c.moe.experts;
     bank.record_stride = g.record_stride;
+    if (on_device) {
+        // The drafter's bank: device memory, no host copy.
+        bank.device_records = reinterpret_cast<const std::uint8_t*>(parent.data);
+        return bank;
+    }
     bank.host_records  = reinterpret_cast<const std::uint8_t*>(parent.data);
     void* device       = nullptr;
     if (cudaHostGetDevicePointer(&device, const_cast<std::byte*>(parent.data), 0) != cudaSuccess || device == nullptr) {
@@ -215,6 +271,7 @@ FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& con
 struct LoadPlan::Impl {
     TextConfig config;
     TextWeights weights;
+    std::optional<MtpWeights> mtp;
     std::vector<PendingWeight> pending;
     artifact::MaterializationPlan materialization;
     FrontendResources resources;
@@ -233,22 +290,30 @@ std::uint64_t LoadPlan::device_bytes() const { return impl_->materialization.dev
 std::uint64_t LoadPlan::pinned_bytes() const { return impl_->materialization.pinned_capacity_bytes; }
 const std::vector<std::uint64_t>& LoadPlan::expert_record_strides() const { return impl_->strides; }
 
-Model::Model(TextConfig config, TextWeights weights, std::vector<BoundWeight> bound, std::vector<ExpertBank> banks,
-             FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing)
-    : backing_(std::move(backing)), config_(std::move(config)), weights_(std::move(weights)),
-      bound_(std::move(bound)), banks_(std::move(banks)), resources_(std::move(resources)), info_(std::move(info)) {}
+Model::Model(TextConfig config, TextWeights weights, std::optional<MtpWeights> mtp, std::vector<BoundWeight> bound,
+             std::vector<ExpertBank> banks, std::optional<ExpertBank> mtp_bank, FrontendResources resources,
+             InstanceInfo info, artifact::MaterializedArtifact backing)
+    : backing_(std::move(backing)), config_(std::move(config)), weights_(std::move(weights)), mtp_(std::move(mtp)),
+      bound_(std::move(bound)), banks_(std::move(banks)), mtp_bank_(std::move(mtp_bank)),
+      resources_(std::move(resources)), info_(std::move(info)) {}
 
 Model::~Model() = default;
 
 bool is_qwen4_exp(const artifact::Reader& reader) { return is_qwen4_exp_config(reader.directory()); }
 
-LoadPlan plan_load(const artifact::Reader& reader) {
+bool has_mtp(const artifact::Reader& reader) { return has_mtp_component(reader.directory()); }
+
+LoadPlan plan_load(const artifact::Reader& reader, bool mtp) {
     auto out    = std::make_unique<LoadPlan::Impl>();
     out->config = parse_config(reader.directory());
+    if (mtp && !has_mtp_component(reader.directory())) {
+        throw ArtifactError("this artifact has no MTP drafter: convert it with --mtp-gguf to use --spec mtp");
+    }
     artifact::Binder binder(reader);
     out->resources = bind_resources(binder, out->config);
     Bindings bindings(binder);
     out->weights         = bind_text(bindings, out->config);
+    if (mtp) { out->mtp = bind_mtp(bindings, out->config); }
     out->pending         = std::move(bindings.weights);
     for (const auto& layer : out->weights.layers) {
         const auto& parts = out->pending.at(layer.moe.experts.index).reference.binding.parts;
@@ -271,12 +336,20 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     }
     std::vector<ExpertBank> banks;
     for (const auto& layer : p.weights.layers) { banks.push_back(expert_bank(bound.at(layer.moe.experts.index), p.config)); }
-    return std::unique_ptr<Model>(new Model(std::move(p.config), std::move(p.weights), std::move(bound), std::move(banks),
-                                            std::move(p.resources), std::move(p.info), std::move(backing)));
+    std::optional<ExpertBank> mtp_bank;
+    if (p.mtp) {
+        mtp_bank = expert_bank(bound.at(p.mtp->moe.experts.index), p.config, /*device=*/true);
+        if (mtp_bank->format != QType::GGML_REC_Q2_0_Q2_0) {
+            throw ArtifactError("mtp: the drafter's experts must be ggml_rec_q2_0_q2_0 records");
+        }
+    }
+    return std::unique_ptr<Model>(new Model(std::move(p.config), std::move(p.weights), std::move(p.mtp), std::move(bound),
+                                            std::move(banks), std::move(mtp_bank), std::move(p.resources),
+                                            std::move(p.info), std::move(backing)));
 }
 
-std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device) {
-    return materialize_model(plan_load(reader), device);
+std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device, bool mtp) {
+    return materialize_model(plan_load(reader, mtp), device);
 }
 
 } // namespace ninfer::models::qwen4_exp

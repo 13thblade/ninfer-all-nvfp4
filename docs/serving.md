@@ -55,18 +55,28 @@ selected for this process.
 The one command:
 
 ```bat
-set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs.ninfer
+set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs-mtp.ninfer
 scripts\run.bat qwen38-flash-next
 ```
 
 That launcher profile runs `ninfer-serve <model> --max-concurrency 1 --max-context 32768
 --kv-capacity 32768 --kv-dtype int8 --prefill-chunk 1024`, the only serving shape this release
-supports. `NINFER_CONTEXT` changes the context (up to the model's positions; KV above 32,768 tokens
-is borrowed from the expert cache). What is different from the Qwen3.5 models:
+supports, adding `--spec mtp --draft-tokens 3` when the model is `qwen4exp-iq2xs-mtp.ninfer` (the
+artifact with the MTP drafter). Without `NINFER_MODEL` the launcher prefers that artifact when it
+sits beside the plain one; `NINFER_SPEC=none` turns speculation off. `NINFER_CONTEXT` changes the
+context (up to the model's positions; KV above 32,768 tokens is borrowed from the expert cache).
+What is different from the Qwen3.5 models:
 
-- **One request at a time, text only, plain decode.** `--max-concurrency` above 1, `--kv-dtype`
-  other than `int8`, `--spec`, `--ngram-draft-tokens`, `--vision`, `--graft`, `--context-store` and the
-  load-time weight flags are refused at startup with the flag to change.
+- **One request at a time, text only.** `--max-concurrency` above 1, `--kv-dtype` other than
+  `int8`, `--spec dflash|dflash2`, `--ngram-draft-tokens`, `--vision`, `--graft`, `--context-store` and
+  the load-time weight flags are refused at startup with the flag to change.
+- **MTP speculation** (`--spec mtp --draft-tokens N`, N from 1 to 7) needs an artifact converted
+  with the drafter (`--mtp-gguf`, [weight-conversion.md](weight-conversion.md)); a plain artifact
+  refuses with that instruction. The output is the same as without it, token for token (greedy).
+  The drafter keeps its 512 experts in VRAM (about 0.9 GiB, taken from the expert cache). `N` is a
+  ceiling: each round drafts as many tokens as the recent acceptance pays for, mostly two on prose;
+  a ceiling of 3 measured best or tied against 2 and against deeper fixed drafts (the
+  [plan's PR 13 measurements](maintainer/flash-next-plan.md#pr-13-measurements)), about 1.4x plain decode.
 - **No prefix reuse yet.** The server's context cache is switched off for this model (one line at
   startup says so), so every request prefills its whole prompt and reports 0 cached prompt tokens.
 - **Host RAM.** All 33 GiB of routed experts are pinned in host RAM at startup. Before anything is
@@ -696,6 +706,11 @@ relabeled as client input errors.
 The request `model` must equal the public model ID: the artifact `metadata.name` by default
 (falling back to its architecture name when absent), or the explicit `--model-id` override.
 Reasoning is returned separately as `reasoning_content`; answer text remains in `content`.
+The thinking ends at a `</think>` followed by a line break (the model writes `\n</think>\n\n`) or by
+the end of the turn. A `</think>` that thinking quotes while it discusses the tag, followed by a
+space, a quote, a backtick or other text on the same line, stays reasoning, so the rest of the
+thinking is not published as the answer. Constrained output (tools under `basic`, JSON formats)
+still requires the exact `\n</think>\n\n` framing.
 
 For non-strict tools, a direct top-level tool-parameter
 `type`, or an `anyOf`/`oneOf` composed entirely of explicit primitive types, guides conversion of
@@ -830,7 +845,15 @@ representations. Unsupported schemas fail with HTTP 400 before generation.
 
 For `auto` without JSON output, text can precede the first call. Required/named choices start directly with calls
 (after thinking, if enabled). Once a constrained call starts, the suffix consists of complete calls
-and model EOS. Active tool constraints require model EOS, so they cannot coexist with custom stop
+and model EOS. The grammar starts a call at a `<tool_call>` wherever it appears, including inside
+Markdown code, so a model that shows the call format in a code fence (```` ``` ```` or `~~~`) or
+inline code is made to complete a real call there. Under `auto` (calling optional, including
+`allowed_tools` with `mode:"auto"` and `parallel_tool_calls:false`), a call region that opened
+inside Markdown code is therefore returned as ordinary content, byte for byte, with no tool calls
+as a plain text answer (`stop`, Anthropic `end_turn`, Responses `completed`), so an agent client never executes an example; the
+request log records `fallback_reason: quoted_in_code`. The same Markdown rules as on the free route
+decide (only the text before `<tool_call>` counts). Required and named choices must call, so their
+calls are always structured. Active tool constraints require model EOS, so they cannot coexist with custom stop
 strings or `ignore_eos`. Basic constraints are only a default: a request that sends stop strings
 or `ignore_eos` with ordinary non-strict `auto` tools and no `tool_constraints` field falls back to
 free tool-call generation instead of being refused, because many OpenAI-compatible agent clients
@@ -1683,7 +1706,9 @@ unspecified. `enable_thinking` records whether the response starts in thinking m
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
 preserved for consumer validation, repeated parameter names resolved to their last value
 (`duplicate_parameters_repaired`), and a stable text-fallback reason. Fallback reasons are `none`,
-`malformed_structure`, `invalid_tool_name`, `undeclared_tool`, and `trailing_content`.
+`malformed_structure`, `invalid_tool_name`, `undeclared_tool`, `trailing_content`, and
+`quoted_in_code` (a constrained `auto` call opened inside Markdown code; see
+[Tool constraints](#tool-constraints)).
 `recovered_from_reasoning` is true when the structured calls came from a turn that ended inside
 its unclosed thinking. `tolerant_recovered` is true when `--tolerant-tool-calls` repaired markup
 the strict parser returns as text to produce the structured calls (see
