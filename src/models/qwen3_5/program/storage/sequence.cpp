@@ -92,6 +92,9 @@ void ProgramImpl::release_sequence_state(SequenceState& sequence) noexcept {
 }
 
 void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {
+    // A layered restore may still be writing this lane's destination pages from the transfer
+    // stream; they must not return to the pool (or be reused) before it has landed.
+    retire_landing(sequence.lane);
     if (!sequence.kv) { return; }
     if (sequence.kv->backend && backend_kv_addresses->active(*sequence.kv->backend)) {
         backend_kv_addresses->deactivate(*sequence.kv->backend);

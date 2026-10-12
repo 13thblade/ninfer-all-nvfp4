@@ -596,6 +596,8 @@ public:
     [[nodiscard]] std::span<const cudaEvent_t> take_restore_layers(std::uint32_t lane);
     void order_after_restores();
     void land_restores();
+    // Waits for every in-flight landing, ignoring errors: the Host extent release fence.
+    void land_restores_quietly() noexcept;
     void complete_landing(std::uint32_t lane);
     void retire_landing(std::uint32_t lane) noexcept;
     void enqueue_layered_restore(ContextTransaction&);

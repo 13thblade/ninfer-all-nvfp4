@@ -254,6 +254,12 @@ void ProgramImpl::land_restores() {
     }
 }
 
+void ProgramImpl::land_restores_quietly() noexcept {
+    for (const auto& landing : landing_restores_) {
+        if (!landing.events.empty()) { (void)cudaEventSynchronize(landing.events.back()); }
+    }
+}
+
 void ProgramImpl::complete_landing(std::uint32_t lane) {
     for (auto it = landing_restores_.begin(); it != landing_restores_.end(); ++it) {
         if (it->lane != lane) { continue; }

@@ -550,6 +550,13 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             sequence.rope_delta};
         schedule_state.prefill_gpu_timer = &prefill_gpu_timer_;
         schedule_state.layer_ready       = take_restore_layers(sequence.lane);
+        if (staged.cursor >= staged.prompt_tokens) {
+            // An exact hit runs no prefill chunk, so nothing waits for the restored layers before
+            // the tail hidden state is sampled and later compute reads Main KV. Wait for the
+            // landing here and retire it, as the first chunk would have.
+            schedule_state.layer_ready = {};
+            complete_landing(sequence.lane);
+        }
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||

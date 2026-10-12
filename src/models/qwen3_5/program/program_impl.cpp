@@ -332,6 +332,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         const auto extents = checked_count(host_bytes / minimum_kv_stride);
         if (extents) {
             host_kv_extents = std::make_unique<HostKVExtentStore>(*host_kv_arena, extents);
+            // A layered restore's gather kernels read Host extents until it has landed.
+            host_kv_extents->set_release_fence(
+                [](void* program) noexcept { static_cast<ProgramImpl*>(program)->land_restores_quietly(); },
+                this);
         }
         phase.complete(host_bytes, host_bytes);
     }
@@ -458,6 +462,8 @@ void ProgramImpl::synchronize_transfer_streams() const noexcept {
 
 ProgramImpl::~ProgramImpl() noexcept {
     synchronize_transfer_streams();
+    // The landings' events are destroyed below; the Host extent store outlives this body.
+    if (host_kv_extents) { host_kv_extents->set_release_fence(nullptr, nullptr); }
     for (auto& landing : landing_restores_) {
         for (const auto event : landing.events) { (void)cudaEventDestroy(event); }
     }
