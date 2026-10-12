@@ -967,4 +967,11 @@ void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, 
                                 stream);
 }
 
+void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
+                     const std::int32_t* row_ids, int rows, __half* out,
+                     std::int64_t out_row_stride, cudaStream_t stream) {
+    detail::dispatch_dequantize(type, weight, row_bytes, k, row_ids, rows, out, out_row_stride,
+                                stream);
+}
+
 } // namespace ninfer::ops::gguf

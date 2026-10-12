@@ -6,6 +6,7 @@
 #include "core/decode_graph.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
+#include "ops/linear/sm70/sm70_project.h"
 
 #include <cuda_runtime.h>
 
@@ -403,8 +404,14 @@ int run_bf16_target() {
     constexpr std::int32_t kParentRows = 14336;
     DeviceWeight parent(make_patterned(kParentRows, kHidden, 313U));
     int failures = 0;
+    // sm_70's wide route is the one BF16 route that holds workspace (ops/linear/sm70).
+    const std::size_t expected_bf16 =
+        ops::detail::sm70::takes(1024)
+            ? ops::detail::sm70::workspace_bytes(kParentRows, kHidden, 1024)
+            : 0;
     if (ops::attn_input_proj_workspace_capacity_bytes(QType::BF16, kParentRows, kHidden,
-                                                      ops::LinearPolicy::A16Only, 1, 1024) != 0) {
+                                                      ops::LinearPolicy::A16Only, 1,
+                                                      1024) != expected_bf16) {
         std::cerr << "BF16 attention input workspace interval is not zero-capacity\n";
         ++failures;
     }
@@ -535,7 +542,11 @@ int run_fp8_target() {
         }
         const auto interval = ops::attn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, policy, 1, 128);
-        if (interval != peak || (policy == ops::LinearPolicy::A16Only && interval != 0)) {
+        const std::size_t a16_interval =
+            ops::detail::sm70::takes(128) ? ops::detail::sm70::workspace_bytes(kRows, kHidden, 128)
+                                          : 0;
+        if (interval != peak ||
+            (policy == ops::LinearPolicy::A16Only && interval != a16_interval)) {
             std::cerr << "FP8 attention projection workspace interval mismatch\n";
             ++failures;
         }

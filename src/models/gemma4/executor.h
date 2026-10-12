@@ -22,9 +22,16 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::models::gemma4 {
+
+// The device lacks the memory the options need (the caches, or the workspace and CUDA graphs
+// beside them); the message names the amounts.
+struct InsufficientMemory : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 struct ExecutorOptions {
     std::uint32_t max_context   = 32768;

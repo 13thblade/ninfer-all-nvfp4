@@ -1039,11 +1039,13 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     // 12.0 is admitted alongside the qualified capabilities: consumer Blackwell runs the same
     // warp-level mma.sync schedules this family is written against, with the same 100 KiB of shared
     // memory per SM. The occupancy and split-k choices are still the sm_86 ones, so the card is
-    // supported here in the sense of running correctly, not of being tuned for.
-    if (device.compute_capability() != 80 && device.compute_capability() != 86 &&
-        device.compute_capability() != 89 && device.compute_capability() != 120) {
+    // supported here in the sense of running correctly, not of being tuned for. 7.0 (Tesla V100)
+    // runs only a build for it, whose kernels emulate the Ampere warp primitives.
+    if (device.compute_capability() != 70 && device.compute_capability() != 80 &&
+        device.compute_capability() != 86 && device.compute_capability() != 89 &&
+        device.compute_capability() != 120) {
         throw std::invalid_argument(
-            "Qwen3.5 family runtime requires compute capability 8.0, 8.6, 8.9 or 12.0");
+            "Qwen3.5 family runtime requires compute capability 7.0, 8.0, 8.6, 8.9 or 12.0");
     }
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&

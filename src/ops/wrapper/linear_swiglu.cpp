@@ -1,5 +1,6 @@
 #include "core/layout.h"
 #include "core/weight.h"
+#include "core/weight_view.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/silu_mul.h"
@@ -7,6 +8,10 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/sm70/sm70_dequantize.h"
+#include "ops/linear/sm70/sm70_gemm.h"
+#include "ops/linear/sm70/sm70_integer.h"
+#include "ops/linear/sm70/sm70_project.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
@@ -44,11 +49,11 @@ void validate_policy(LinearPolicy policy) {
 
 } // namespace
 
-std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
-                                                   std::int32_t input_rows, LinearPolicy policy,
-                                                   std::int32_t min_tokens,
-                                                   std::int32_t max_tokens) {
-    validate_policy(policy);
+namespace {
+
+std::size_t linear_swiglu_route_workspace_bytes(QType qtype, std::int32_t gate_up_rows,
+                                                std::int32_t input_rows, LinearPolicy policy,
+                                                std::int32_t min_tokens, std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens || (gate_up_rows % 2) != 0) {
         throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
     }
@@ -117,6 +122,28 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }
 
+// The policy sm_70's routes read: the T2 gate/up pair stays on its A16 route at decode widths, as
+// it does on the other targets, unless the integer gate/up trade (AllowA8IntDecode,
+// --mlp-a8-decode) is asked for.
+LinearPolicy sm70_policy(LinearPolicy policy) {
+    return policy == LinearPolicy::AllowA8IntDecode ? policy : LinearPolicy::A16Only;
+}
+
+} // namespace
+
+std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
+                                                   std::int32_t input_rows, LinearPolicy policy,
+                                                   std::int32_t min_tokens,
+                                                   std::int32_t max_tokens) {
+    validate_policy(policy);
+    const auto routes = [&](std::int32_t lo, std::int32_t hi) {
+        return linear_swiglu_route_workspace_bytes(qtype, gate_up_rows, input_rows, policy, lo, hi);
+    };
+    // Every width of a dense format takes an sm_70 route there.
+    return detail::sm70::capacity(qtype, gate_up_rows, input_rows, min_tokens, max_tokens,
+                                  sm70_policy(policy), routes);
+}
+
 std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
                                                    std::int32_t input_rows, std::int32_t min_tokens,
                                                    std::int32_t max_tokens) {
@@ -152,10 +179,10 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         throw std::invalid_argument("linear_swiglu: x/out must be non-null and 16-byte aligned");
     }
 
+    // The panel layout is RowSplit's bytes permuted (sm_70 loads, read by its routes).
     const bool common_row_split =
-        gate_up_weight.layout == QuantLayout::RowSplit &&
-        gate_up_weight.scale_dtype == DType::FP16 && gate_up_weight.ndim == 2 &&
-        gate_up_weight.shape[0] == gate_up_weight.n &&
+        is_row_split(gate_up_weight.layout) && gate_up_weight.scale_dtype == DType::FP16 &&
+        gate_up_weight.ndim == 2 && gate_up_weight.shape[0] == gate_up_weight.n &&
         gate_up_weight.shape[1] == gate_up_weight.k && gate_up_weight.qdata != nullptr &&
         gate_up_weight.scales != nullptr;
     const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4_G64_FP16 &&
@@ -172,6 +199,15 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                               gate_up_weight.high_plane_bytes == 0 && common_row_split;
     if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight && !t2_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
+    }
+
+    if (detail::sm70::covers(gate_up_weight, t)) {
+        auto scope            = ws.scope();
+        const auto activation = detail::sm70::prepare_for(
+            x, gate_up_weight.n, ws, stream,
+            detail::sm70::integer_takes(gate_up_weight, t, sm70_policy(policy)));
+        detail::sm70::swiglu_for(activation, gate_up_weight, nullptr, out, stream);
+        return;
     }
 
     if (t2_weight) {

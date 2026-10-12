@@ -46,7 +46,8 @@ Gemma 4 26B-A4B (`Gemma4ForCausalLM`, the text component of `Gemma4ForConditiona
 `src/models/gemma4`, `runtime/engine/gemma4_core`) is a third explicit family converted from
 Google's QAT GGUF (or a mixed-format GGUF of the same model) with its ggml blocks kept as stored.
 It shares the Qwen3.5 frontend (tokenizer, chat template, output channels and Gemma's tool-call
-markup), runs one to eight sequences in prompt chunks of 2048 tokens with an F16 KV cache or any
+markup), runs one to eight sequences in prompt chunks of 2048 tokens (narrower where memory is
+short) with an F16 KV cache or any
 `--kv-dtype` format, drafts with the release's multi-token-prediction assistant (the artifact's
 `mtp` component, `--spec mtp`),
 encodes images and video with the release's vision tower (the artifact's `vision` component, from
@@ -60,11 +61,13 @@ page cache. An additional application-managed RAM cache of experts is excluded f
 by the user's decision. Keep the bounded transfer buffers and the device expert cache.
 This line builds for **`sm_86`** (the RTX 30 series; that build also runs the RTX 40 series),
 `sm_89`, and `120a` (the RTX 50 series and RTX PRO 6000 Blackwell, CUDA 13.1 or newer), with
-`sm_80` as an unmeasured compatibility target; the published Docker image carries the `86` and
-`120a` builds. It was tuned on the **NVIDIA GeForce RTX 3090** (24 GB) first, and each card's kernel
-routes now come from its measured device profile, built in for the RTX 3090, 4090, 5090 and the
-three RTX PRO 6000 editions. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090 with native
-routes that this line's `120a` build does not compile by default; its schedules, route tables and
+`sm_80` as an unmeasured compatibility target and `sm_70` (Tesla V100, CUDA 12.x only, its own
+small-T, attention and prompt routes over emulated Ampere warp primitives, built from source); the
+published Docker image carries the `86` and `120a` builds. It was tuned on the **NVIDIA GeForce
+RTX 3090** (24 GB) first, and each card's kernel routes now come from its measured device profile,
+built in for the RTX 3090, 4090, 5090 and the three RTX PRO 6000 editions. Upstream
+(`Neroued/ninfer`) targets `sm_120a` on RTX 5090 with native routes that this line's `120a` build
+does not compile by default; its schedules, route tables and
 published measurements are not authoritative here -- every route table this fork inherited and
 re-measured on sm_86 turned out to be wrong by 12-41%. Treat an upstream tuning constant as a
 hypothesis until measured on the card in question. Windows builds and their toolchain constraints

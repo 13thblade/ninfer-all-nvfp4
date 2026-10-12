@@ -9,6 +9,7 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "ops/common/math.h"
+#include "ops/common/sm70_emulation.cuh"
 
 #include <cub/block/block_scan.cuh>
 #include <cuda_bf16.h>
@@ -148,8 +149,14 @@ __global__ void __launch_bounds__(128)
     const int start = *first;
     const int blocks = min((start + min(t0 + 4, tokens)) / kBlock, capacity);
     if (blocks <= kTopBlocks || b0 >= blocks) { return; }
+#if defined(NINFER_SM70_DEVICE)
+    // Volta has no TF32 tensor cores: each lane sums its eight dots of the warp's 16 x 16 tile in
+    // FP32 directly, the full product the three TF32 terms approximate.
+    float sum[8] = {};
+#else
     wmma::fragment<wmma::accumulator, 16, 16, 8, float> sum;
     wmma::fill_fragment(sum, 0.0f);
+#endif
 #pragma unroll
     for (int base = 0; base < kHeadDim; base += 8) {
         const int row = tid / 8, d = tid % 8;
@@ -157,10 +164,31 @@ __global__ void __launch_bounds__(128)
         const bool scored = t < tokens && (start + t + 1) / kBlock > kTopBlocks;
         const float q = scored ? queries[(static_cast<std::int64_t>(t) * kHeads +
                                          row % kHeads) * kHeadDim + base + d] : 0.0f;
+#if defined(NINFER_SM70_DEVICE)
+        q_hi[tid] = q;
+#    pragma unroll
+        for (int i = lane; i < 16 * 8; i += 32) {
+            const int b = b0 + warp * 16 + i / 8;
+            k_hi[warp][i] =
+                b < blocks ? pooled[static_cast<std::int64_t>(b) * kHeadDim + base + i % 8] : 0.0f;
+        }
+        __syncthreads();
+#    pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int q_row = lane / 16 + 2 * i, key = lane % 16;
+#    pragma unroll
+            for (int dd = 0; dd < 8; ++dd) {
+                sum[i] = fmaf(q_hi[q_row * 8 + dd], k_hi[warp][key * 8 + dd], sum[i]);
+            }
+        }
+        __syncthreads();
+        (void)q_lo;
+        (void)k_lo;
+#else
         const float high = wmma::__float_to_tf32(q);
         q_hi[tid] = high;
         q_lo[tid] = wmma::__float_to_tf32(q - high);
-#pragma unroll
+#    pragma unroll
         for (int i = lane; i < 16 * 8; i += 32) {
             const int b = b0 + warp * 16 + i / 8;
             const float k = b < blocks ? pooled[static_cast<std::int64_t>(b) * kHeadDim +
@@ -180,8 +208,14 @@ __global__ void __launch_bounds__(128)
         wmma::mma_sync(sum, ah, bl, sum);
         wmma::mma_sync(sum, al, bh, sum);
         __syncthreads();
+#endif
     }
+#if defined(NINFER_SM70_DEVICE)
+#    pragma unroll
+    for (int i = 0; i < 8; ++i) { dots[warp][(lane / 16 + 2 * i) * 16 + lane % 16] = sum[i]; }
+#else
     wmma::store_matrix_sync(dots[warp], sum, 16, wmma::mem_row_major);
+#endif
     __syncwarp();
     const int column = lane % 16;
     const int b = b0 + warp * 16 + column;

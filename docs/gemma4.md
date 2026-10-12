@@ -37,7 +37,7 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   video frame into soft tokens in the prompt, on the GPU, streamed from pinned host memory, or on
   CPU threads (`--vision-residency`); see [below](#images-and-video).
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
-  tokens, prefix reuse across turns and requests with host-memory images
+  tokens (1024 or 512 on a card without room for them, [below](#memory-and-context)), prefix reuse across turns and requests with host-memory images
   ([below](#prefix-reuse)), structured output, tool calls in Gemma's
   `<|tool_call>call:NAME{...}<tool_call|>` form returned as OpenAI tool calls, streaming, reasoning
   in its own channel when thinking is on, and causal scoring (`ninfer-perplexity`).
@@ -200,7 +200,9 @@ the CUDA graphs captured while serving:
 
 The startup check counts everything that grows with the context or the sequences (the caches, the
 checkpoints, the prompt chunk's derived keys, F16 values and full-attention mask) and keeps 1.5 GiB
-for the rest of the workspace and the CUDA graphs.
+for the rest of the workspace and the CUDA graphs. A card without that room (a 16 GB one with the
+assistant or the vision tower) prefills in 1,024- or 512-token chunks instead: the check then keeps
+512 MiB, and the chunk's planned workspace with 320 MiB beside it must fit what the caches leave.
 
 ### Quality and speed
 

@@ -242,7 +242,9 @@ struct Executor::Impl {
             // The caches are sized up front for every sequence's whole context: refuse with the
             // numbers rather than fail inside an allocation. Counted here: what grows with the
             // context or the sequences; the reserve covers the rest of the workspace, the CUDA
-            // graphs (some captured while serving) and a margin.
+            // graphs (some captured while serving) and a margin. The narrower prompt chunks a card
+            // without that room falls back to (gemma4_core.cpp) keep less, and their planned
+            // workspace is checked against what is left once it is known (below).
             std::size_t needed = 0, staging = 0, chunk_bytes = 0;
             for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
                 const bool full         = config.full_attention[i];
@@ -265,14 +267,14 @@ struct Executor::Impl {
             needed += staging + chunk_bytes + std::size_t(options.prefill_chunk) * global_slots * 2;
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-            constexpr std::size_t kReserve = std::size_t(1536) << 20;
-            if (needed + kReserve > free_bytes) {
-                throw std::runtime_error(
+            const std::size_t reserve = start_reserve();
+            if (needed + reserve > free_bytes) {
+                throw InsufficientMemory(
                     "Gemma 4: the KV cache, checkpoints and prompt buffers of " +
                     std::to_string(sequences) + " sequence(s) of " +
                     std::to_string(options.max_context) + " tokens need " +
-                    std::to_string(needed >> 20) +
-                    " MiB beside 1.5 GiB for the workspace and CUDA graphs, and " +
+                    std::to_string(needed >> 20) + " MiB beside " + std::to_string(reserve >> 20) +
+                    " MiB for the workspace and CUDA graphs, and " +
                     std::to_string(free_bytes >> 20) +
                     " MiB are free after the weights; lower --max-concurrency or --max-context");
             }
@@ -467,7 +469,35 @@ struct Executor::Impl {
         staged      = std::make_unique<CudaCompletionEvent>(device);
         logits_bf16 = DeviceBuffer(std::size_t(vocab) * kMaxLogitRows * 2);
         workspace_bytes = plan_workspace();
-        workspace       = std::make_unique<WorkspaceArena>(workspace_bytes);
+        {
+            std::size_t free_bytes = 0, total_bytes = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+            if (options.prefill_chunk < kFullChunk &&
+                workspace_bytes + kGraphReserve > free_bytes) {
+                // The destructor does not run for a constructor that throws.
+                if (media_begin != nullptr) { cudaEventDestroy(media_begin); }
+                if (media_end != nullptr) { cudaEventDestroy(media_end); }
+                throw InsufficientMemory(
+                    "Gemma 4: the workspace of " + std::to_string(workspace_bytes >> 20) +
+                    " MiB and " + std::to_string(kGraphReserve >> 20) +
+                    " MiB for the CUDA graphs need more than the " +
+                    std::to_string(free_bytes >> 20) +
+                    " MiB free after the caches; lower --max-concurrency or --max-context");
+            }
+        }
+        workspace = std::make_unique<WorkspaceArena>(workspace_bytes);
+    }
+
+    // The startup check's room for the workspace and the CUDA graphs: 1.5 GiB at the full
+    // 2048-token chunk (measured to leave 0.35-0.46 GiB for the graphs captured while serving
+    // eight sequences); a narrower chunk keeps the least its workspace takes and then checks the
+    // planned workspace with kGraphReserve beside it.
+    static constexpr std::uint32_t kFullChunk  = 2048;
+    static constexpr std::size_t kGraphReserve = std::size_t(320) << 20;
+
+    std::size_t start_reserve() const {
+        return options.prefill_chunk >= kFullChunk ? std::size_t(1536) << 20
+                                                   : std::size_t(512) << 20;
     }
 
     ~Impl() {

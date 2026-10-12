@@ -1,6 +1,7 @@
 #include "artifact/materializer.h"
 
 #include "artifact/framing.h"
+#include "artifact/permute_row_split.h"
 #include "artifact/transcode.h"
 #include "artifact/reader.h"
 #include "core/startup.h"
@@ -139,12 +140,11 @@ struct UploadTotals {
 };
 
 // Writes every device object's bytes to `bases[placement.rank] + placement.offset`: transcoded
-// objects whole through the host, the rest through direct-I/O staging, one pass per rank. Loading
-// and a resume after a model suspend upload through here alike.
-UploadTotals upload_device_objects(const Reader& reader, std::span<const DevicePlacement> placements,
-                                   std::span<std::byte* const> bases, DeviceContext& device,
-                                   const StartupObserver& observer, StartupPhaseScope& phase,
-                                   std::uint64_t total) {
+// objects whole through the host, the rest through direct-I/O staging, one pass per rank.
+UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePlacement> placements,
+                                 std::span<std::byte* const> bases, DeviceContext& device,
+                                 const StartupObserver& observer, StartupPhaseScope& phase,
+                                 std::uint64_t total) {
     UploadTotals totals;
     const std::size_t rank_count = bases.size();
     std::vector<std::vector<CopyRange>> ranges_by_rank(rank_count);
@@ -295,6 +295,38 @@ UploadTotals upload_device_objects(const Reader& reader, std::span<const DeviceP
     totals.seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     phase.complete(totals.h2d_bytes, total);
+    return totals;
+}
+
+// The geometry a device placement's bytes take: the transcode target's, or the stored one.
+WeightGeometry placement_geometry(const Reader& reader, const DevicePlacement& placement) {
+    return placement.transcode ? weight_geometry(*placement.transcode, QuantLayout::RowSplit,
+                                                 reader.directory().tensor(placement.object).shape)
+                               : reader.geometry(placement.object);
+}
+
+// upload_device_bytes, then the panel permutation of the placements that ask for it. Loading and a
+// resume after a model suspend upload through here alike.
+UploadTotals upload_device_objects(const Reader& reader,
+                                   std::span<const DevicePlacement> placements,
+                                   std::span<std::byte* const> bases, DeviceContext& device,
+                                   const StartupObserver& observer, StartupPhaseScope& phase,
+                                   std::uint64_t total) {
+    const UploadTotals totals =
+        upload_device_bytes(reader, placements, bases, device, observer, phase, total);
+    std::vector<bool> permuted_rank(bases.size(), false);
+    for (const auto& placement : placements) {
+        if (!placement.panel) { continue; }
+        const ScopedRank bound(device, placement.rank);
+        permute_row_split_to_panel(placement_geometry(reader, placement),
+                                   bases[placement.rank] + placement.offset, nullptr);
+        permuted_rank[placement.rank] = true;
+    }
+    for (std::size_t rank = 0; rank < permuted_rank.size(); ++rank) {
+        if (!permuted_rank[rank]) { continue; }
+        const ScopedRank bound(device, rank);
+        check_cuda(cudaDeviceSynchronize(), "finish the panel permutation");
+    }
     return totals;
 }
 
@@ -464,11 +496,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     std::vector<std::uint64_t> previous_device_end(rank_count, 0);
     for (const auto& placement : plan.device_objects) {
         const auto& stored_geometry = reader.geometry(placement.object);
-        const auto geometry =
-            placement.transcode
-                ? weight_geometry(*placement.transcode, QuantLayout::RowSplit,
-                                  reader.directory().tensor(placement.object).shape)
-                : stored_geometry;
+        auto geometry               = placement_geometry(reader, placement);
+        if (placement.panel) {
+            if (!row_split_panel_supported(geometry)) {
+                throw ArtifactError("a panel placement names an object without the layout");
+            }
+            geometry.layout = QuantLayout::RowSplitPanel;
+        }
         auto& object = out.objects_.at(placement.object.index);
         if (placement.rank >= rank_count) {
             throw ArtifactError("device placement names a rank the plan has no arena for");

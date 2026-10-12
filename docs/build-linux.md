@@ -9,8 +9,10 @@ This guide runs NInfer on Linux from the published container image, or builds it
 | `89` | RTX 40 series only | CUDA 12.8 or newer |
 | `120a` | RTX 50 series and RTX PRO 6000 Blackwell | CUDA 13.1 or newer (configure refuses 12.8 and 12.9, which miscompile `sm_120a` kernels) |
 | `80` | A100 class (GA100), an unmeasured compatibility target | CUDA 12.8 or newer |
+| `70` | Tesla V100 (Volta) | CUDA 12.8 or 12.9 (CUDA 13 no longer compiles `sm_70`) |
 
-An `89` or `120a` build does not run on an RTX 3090.
+An `89` or `120a` build does not run on an RTX 3090, and only a `70` build runs on a V100. See
+[Tesla V100](#tesla-v100-sm_70) for what that build changes.
 
 ## Container image
 
@@ -85,6 +87,54 @@ build-sm86/apps/ninfer-serve
 build-sm86/apps/ninfer-calibrate
 build-sm86/apps/ninfer-perplexity
 ```
+
+## Tesla V100 (sm_70)
+
+A `70` build runs on Tesla V100 (16 or 32 GB). It needs CUDA 12.8 or 12.9: CUDA 13 no longer
+compiles `sm_70`, and configure refuses that combination. Configure it like any other build, with
+`-DCMAKE_CUDA_ARCHITECTURES=70` and the 12.x `nvcc`:
+
+```bash
+cmake -S . -B build-sm70 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc \
+  -DCMAKE_CUDA_HOST_COMPILER="$CUDAHOSTCXX" \
+  -DCMAKE_CUDA_ARCHITECTURES=70 \
+  -DNINFER_BUILD_APPS=ON
+
+cmake --build build-sm70 --parallel 2
+```
+
+Volta's tensor cores multiply FP16 only (`mma.m8n8k4`): there are no BF16 or integer tensor cores,
+no `cp.async` and no `ldmatrix`. A `70` build therefore runs its own routes where they decide the
+speed, and the kernels written for Ampere everywhere else, on emulated warp primitives
+(`src/ops/common/sm70_emulation.cuh`), which are correct but slower:
+
+- **Dense projections** of every native format (T2, Q2, Q4, Q5, Q6, Q8, BF16, FP8, NVFP4) up to 64
+  columns: a lane decodes the weights of its row straight into FP16 tensor-core fragments, and a
+  row-split group's FP32 products are scaled when the group ends. Up to eight columns read the BF16
+  activations directly; wider calls convert them to FP16 once. From 65 columns
+  (`NINFER_SM70_CUBLAS_MIN`) the weights are dequantized to FP16 32 MiB at a time and multiplied by
+  cuBLAS with FP32 accumulation. Activations beyond +-65504 saturate there.
+- **Weight layout**: the row-split projection weights of the text and MTP layers (T2, Q2, Q4, Q5,
+  Q6) load in the panel layout, four rows' records of a group per 128-byte line, which the
+  decode reads stream at a larger share of the card's bandwidth.
+- **GGUF projections** keep NInfer's DP4A vector kernel up to eight columns and ggml's DP4A matrix
+  kernel above (as llama.cpp does on Volta); GGUF dense projections from 65 columns take the cuBLAS
+  route.
+- **Attention** of every KV format runs on Volta's tensor cores. Decode and verification use a
+  Volta kernel that decodes each format's keys and values to FP16 as it loads them, with the same
+  fused append, splits and reducers as the other targets. Prompt attention decodes the visible
+  pages into FP16 planes and runs ggml's Volta flash attention over them, 512 query rows at a
+  time; the planes and the mask take about 5 KiB of workspace per context token with four KV
+  heads.
+- FP8 A8 and NVFP4 W4A4 activations are not available, as on `sm_86`; those weights run their A16
+  routes.
+
+The device route profile of a V100 is calibrated at first start (see
+[device profiles](device-profiles.md)). Measurements are in
+[Tesla V100 measurements](performance/tesla-v100-2026-10.md).
 
 ## Optional vcpkg dependencies
 

@@ -104,7 +104,10 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens, bool replay 
 
     Tensor x(device_activation.p, DType::BF16, {hidden, tokens});
     Tensor output(guarded_output.data(), fp32 ? DType::FP32 : DType::BF16, {rows, tokens});
-    DeviceArena workspace(256);
+    // The A16 routes hold no workspace except sm_70's wide route (ops/linear/sm70).
+    DeviceArena workspace(std::max<std::size_t>(
+        256, ops::linear_workspace_capacity_bytes(QType::BF16, rows, hidden,
+                                                  ops::LinearPolicy::A16Only, tokens, tokens)));
     ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, workspace, nullptr);
     cuda_synchronize();
 

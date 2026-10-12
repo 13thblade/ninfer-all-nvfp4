@@ -1,6 +1,7 @@
 #include "ops/linear/gguf/gguf_linear.h"
 
 #include "core/layout.h"
+#include "ops/linear/sm70/sm70_gemm.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -83,6 +84,76 @@ std::size_t fixup_bound() {
     return std::size_t(gguf::multiprocessor_count()) * kFixupTileBytes;
 }
 
+// Workspace of sm70_project for `products` products of up to `rows` rows over `t` columns.
+std::size_t sm70_project_bytes(std::size_t products, std::int32_t rows, std::int32_t k,
+                               std::int32_t t) {
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc_bytes(std::size_t(rows) * t * sizeof(float));
+    (void)layout.alloc_bytes(std::size_t(detail::sm70::slab_rows(rows, k)) * k * sizeof(__half));
+    for (std::size_t i = 0; i < products; ++i) {
+        (void)layout.alloc_bytes(std::size_t(k) * t * 2);
+        (void)layout.alloc_bytes(detail::sm70::activation_bytes(k, t));
+    }
+    return layout.peak_bytes(1);
+}
+
+// sm_70 (ops/linear/sm70): every product converts its activation to FP16 once per input gather,
+// dequantizes its weight to FP16 a slab of rows at a time and multiplies each slab through cuBLAS
+// into the FP32 plane the other routes write.
+void sm70_project(const Tensor& x, std::span<const GgufProduct> products, WorkspaceArena& workspace,
+                  cudaStream_t stream) {
+    const std::int32_t k    = x.ne[0];
+    const std::int32_t t    = x.ne[1];
+    const auto* xb          = static_cast<const __nv_bfloat16*>(x.data);
+    std::int32_t plane_rows = 0;
+    for (const auto& p : products) { plane_rows = std::max(plane_rows, p.weight->n); }
+    auto* plane = static_cast<float*>(
+        workspace.alloc_bytes(std::size_t(plane_rows) * t * sizeof(float)).data);
+    auto* weights = static_cast<__half*>(
+        workspace
+            .alloc_bytes(std::size_t(detail::sm70::slab_rows(plane_rows, k)) * k * sizeof(__half))
+            .data);
+
+    struct Activation {
+        const std::int32_t* columns;
+        const __half* data;
+    };
+
+    std::vector<Activation> activations;
+    for (const auto& p : products) {
+        const Weight& w = *p.weight;
+        auto found = std::find_if(activations.begin(), activations.end(), [&](const Activation& a) {
+            return a.columns == w.input_columns;
+        });
+        if (found == activations.end()) {
+            const __nv_bfloat16* source = xb;
+            if (w.input_columns != nullptr) {
+                auto* gathered =
+                    static_cast<__nv_bfloat16*>(workspace.alloc_bytes(std::size_t(k) * t * 2).data);
+                gguf::gather_columns(xb, k, t, w.input_columns, gathered, stream);
+                source = gathered;
+            }
+            auto* converted = static_cast<__half*>(
+                workspace.alloc_bytes(detail::sm70::activation_bytes(k, t)).data);
+            detail::sm70::convert_activation(source, k, t, converted, stream);
+            activations.push_back({w.input_columns, converted});
+            found = activations.end() - 1;
+        }
+        const auto type           = gguf_type(w.qtype);
+        const bool direct         = p.f32 != nullptr && p.epilogue == GgufEpilogue::Store;
+        float* out                = direct ? p.f32 + p.row : plane;
+        const std::int64_t stride = direct ? p.f32_rows : w.n;
+        const std::int32_t slab   = detail::sm70::slab_rows(w.n, k);
+        for (std::int32_t first = 0; first < w.n; first += slab) {
+            const std::int32_t count = std::min(slab, w.n - first);
+            gguf::dequantize_rows(type, static_cast<const char*>(w.qdata) + first * row_bytes(w),
+                                  row_bytes(w), k, nullptr, count, weights, k, stream);
+            detail::sm70::gemm(weights, count, k, found->data, t, out + first, stride, stream);
+        }
+        if (!direct) { gguf::store_plane(plane, w.n, w.n, t, output(p, 0), stream); }
+    }
+}
+
 } // namespace
 
 gguf::GgmlType gguf_type(QType format) {
@@ -151,6 +222,9 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
     // Every product may carry its own input gather, so each may quantize its own activation.
     const std::size_t activations = shapes.size();
     std::size_t widest            = 0;
+    if (detail::sm70::takes(max_tokens)) {
+        widest = sm70_project_bytes(activations, static_cast<std::int32_t>(rows), k, max_tokens);
+    }
     if (min_tokens <= gguf::kMaxVectorColumns) {
         const std::int32_t t = std::min(max_tokens, gguf::kMaxVectorColumns);
         WorkspaceLayoutBuilder layout;
@@ -186,6 +260,11 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
     const std::int32_t t = x.ne[1];
     const auto* xb       = static_cast<const __nv_bfloat16*>(x.data);
     auto scope           = workspace.scope();
+
+    if (detail::sm70::takes(t)) {
+        sm70_project(x, products, workspace, stream);
+        return;
+    }
 
     if (t <= gguf::kMaxVectorColumns) {
         struct Activation {

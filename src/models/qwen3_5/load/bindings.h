@@ -100,6 +100,8 @@ void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& 
 // the load-time transcodes on the selected parameters.
 void apply_storage_trades(Bindings& bindings, const Config& config, const ModelWeights& weights,
                           const LoadOptions& options);
+// sm_70: the panel layout for the projection weights its routes read (storage_trades.cpp).
+void apply_device_layouts(Bindings& bindings, const ModelWeights& weights);
 // --vision-residency overlay: rank the device weights an exclusive Vision window may borrow.
 // `mtp_parameters` and `draft_parameters` are the half-open WeightId index ranges registered by
 // bind_mtp and bind_draft.

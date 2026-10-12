@@ -5,47 +5,87 @@
 namespace ninfer::ops {
 
 __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
+#if defined(NINFER_SM70_DEVICE)
+    unsigned r[2];
+    sm70::ldmatrix<2>(r, addr);
+    r0 = r[0];
+    r1 = r[1];
+#else
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1)
                  : "r"(addr));
+#endif
 }
 
 __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
                                             unsigned addr) {
+#if defined(NINFER_SM70_DEVICE)
+    unsigned r[4];
+    sm70::ldmatrix<4>(r, addr);
+    r0 = r[0];
+    r1 = r[1];
+    r2 = r[2];
+    r3 = r[3];
+#else
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                  : "r"(addr));
+#endif
 }
 
 __device__ __forceinline__ void ldmatrix_x2_t(unsigned& r0, unsigned& r1, unsigned addr) {
+#if defined(NINFER_SM70_DEVICE)
+    unsigned r[2];
+    sm70::ldmatrix_trans<2>(r, addr);
+    r0 = r[0];
+    r1 = r[1];
+#else
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1)
                  : "r"(addr));
+#endif
 }
 
 __device__ __forceinline__ void ldmatrix_x4_t(unsigned& r0, unsigned& r1, unsigned& r2,
                                               unsigned& r3, unsigned addr) {
+#if defined(NINFER_SM70_DEVICE)
+    unsigned r[4];
+    sm70::ldmatrix_trans<4>(r, addr);
+    r0 = r[0];
+    r1 = r[1];
+    r2 = r[2];
+    r3 = r[3];
+#else
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                  : "r"(addr));
+#endif
 }
 
 __device__ __forceinline__ void mma_bf16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
                                          unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                          unsigned b1) {
+#if defined(NINFER_SM70_DEVICE)
+    sm70::mma_m16n8k16<sm70::Bf16Operands>(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
                                         unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                         unsigned b1) {
+#if defined(NINFER_SM70_DEVICE)
+    sm70::mma_m16n8k16<sm70::F16Operands>(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 // FP16 accumulation: twice the FP32-accumulator rate on GeForce parts. d0 holds the row-gid pair
@@ -53,18 +93,26 @@ __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& 
 __device__ __forceinline__ void mma_f16_f16acc(unsigned& d0, unsigned& d1, unsigned a0,
                                                unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                                unsigned b1) {
+#if defined(NINFER_SM70_DEVICE)
+    sm70::mma_m16n8k16_f16acc(d0, d1, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
                  "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                  : "+r"(d0), "+r"(d1)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
                                        unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+#if defined(NINFER_SM70_DEVICE)
+    sm70::mma_m16n8k32_s8(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 // On RTX 5090, block-scaled FP8 avoids the plain form's half-rate FP32 accumulation.
@@ -89,10 +137,14 @@ __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, fl
 __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, float& c3,
                                               unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                               unsigned b0, unsigned b1) {
+#if defined(NINFER_SM70_DEVICE)
+    sm70::mma_m16n8k8_tf32(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ void mma_tf32(float& c0, float& c1, float& c2, float& c3, float a0,

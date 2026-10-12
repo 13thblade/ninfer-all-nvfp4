@@ -93,12 +93,12 @@ struct Grid {
 };
 
 template <int D>
-Grid grid_for(const Launch& launch, int tokens, int kv_heads, int slots) {
+Grid grid_for(const Launch& launch, int tokens, int kv_heads, int z_gqa, int slots) {
     constexpr int ncols1 = Shape<D>::ncols1;
     const auto& facts = device_facts();
     Grid g;
     g.ntiles_x   = (tokens + ncols1 - 1) / ncols1;
-    g.ntiles_dst = g.ntiles_x * kv_heads;
+    g.ntiles_dst         = g.ntiles_x * z_gqa * kv_heads;
     g.ntiles_kv  = (slots + launch.nbatch_fa - 1) / launch.nbatch_fa;
     const int max_blocks = launch.blocks_per_sm * facts.sm_count;
     const int waves      = (g.ntiles_dst + max_blocks - 1) / max_blocks;
@@ -134,11 +134,13 @@ void run(const FlashAttentionArgs& a, void* workspace, std::size_t workspace_byt
     constexpr int ncols1 = Shape<D>::ncols1;
     constexpr int ncols2 = Shape<D>::ncols2;
     constexpr int ncols  = ncols1 * ncols2;
-    if (a.query_heads != a.kv_heads * ncols2) {
+    if (a.query_heads % (a.kv_heads * ncols2) != 0) {
         throw std::invalid_argument("gguf flash attention: unsupported grouping for this width");
     }
+    // Query heads per key/value head come in groups of ncols2, one tile column each.
+    const int z_gqa      = a.query_heads / (a.kv_heads * ncols2);
     const Launch& launch = launch_for<D>();
-    const Grid g         = grid_for<D>(launch, a.tokens, a.kv_heads, a.slots);
+    const Grid g         = grid_for<D>(launch, a.tokens, a.kv_heads, z_gqa, a.slots);
     float2* meta         = nullptr;
     if (g.fixup) {
         const std::size_t need = std::size_t(g.blocks) * ncols * (2 + D / 2) * sizeof(float2);
@@ -155,7 +157,7 @@ void run(const FlashAttentionArgs& a, void* workspace, std::size_t workspace_byt
     const dim3 block(WARP_SIZE, launch.threads / WARP_SIZE, 1);
     launch.kernel<<<dim3(g.blocks, 1, 1), block, launch.shared, stream>>>(
         reinterpret_cast<const char*>(a.q), static_cast<const char*>(a.k),
-        static_cast<const char*>(a.v), static_cast<const char*>(a.mask), nullptr, nullptr, a.out,
+        static_cast<const char*>(a.v), static_cast<const char*>(a.mask), nullptr, a.kv_max, a.out,
         meta, a.scale, 0.0f, 1.0f, 1.0f, 1u, 0.0f, D, ne01, a.query_heads, 1, nb01, nb02, nb03, D,
         a.slots, a.kv_heads, 1, static_cast<std::int32_t>(a.row_bytes),
         static_cast<std::int32_t>(a.head_bytes), a.head_bytes * a.kv_heads,
@@ -167,8 +169,8 @@ void run(const FlashAttentionArgs& a, void* workspace, std::size_t workspace_byt
     const int gqa = a.query_heads / a.kv_heads;
     if (g.blocks % g.ntiles_dst == 0 && g.blocks > g.ntiles_dst) {
         const int per_tile = g.blocks / g.ntiles_dst;
-        const uint3 fd0    = init_fastdiv_values(g.ntiles_x * a.kv_heads);
-        const uint3 fd1    = init_fastdiv_values(g.ntiles_x);
+        const uint3 fd0    = init_fastdiv_values(g.ntiles_x * z_gqa * a.kv_heads);
+        const uint3 fd1    = init_fastdiv_values(g.ntiles_x * z_gqa);
         const uint3 fd2    = init_fastdiv_values(g.ntiles_x);
         flash_attn_stream_k_fixup_uniform<D, ncols1, ncols2>
             <<<dim3(g.ntiles_dst, ncols1, ncols2), dim3(D, 1, 1), 0, stream>>>(
@@ -176,8 +178,8 @@ void run(const FlashAttentionArgs& a, void* workspace, std::size_t workspace_byt
                 fd2);
     } else {
         const int total = g.ntiles_kv * g.ntiles_dst;
-        const uint3 fd0 = init_fastdiv_values(g.ntiles_kv * g.ntiles_x * a.kv_heads);
-        const uint3 fd1 = init_fastdiv_values(g.ntiles_kv * g.ntiles_x);
+        const uint3 fd0 = init_fastdiv_values(g.ntiles_kv * g.ntiles_x * z_gqa * a.kv_heads);
+        const uint3 fd1 = init_fastdiv_values(g.ntiles_kv * g.ntiles_x * z_gqa);
         const uint3 fd2 = init_fastdiv_values(g.ntiles_kv * g.ntiles_x);
         const uint3 fd3 = init_fastdiv_values(g.ntiles_kv);
         flash_attn_stream_k_fixup_general<D, ncols1, ncols2>
@@ -195,6 +197,18 @@ std::size_t flash_attention_workspace_bytes(int head_dim, int query_heads, int k
     case 256: return workspace_for<256>(query_heads, kv_heads, max_tokens);
     case 512: return workspace_for<512>(query_heads, kv_heads, max_tokens);
     default: break;
+    }
+    throw std::invalid_argument("gguf flash attention: head width must be 256 or 512");
+}
+
+int flash_attention_tile_rows(int head_dim) {
+    switch (head_dim) {
+    case 256:
+        return Shape<256>::ncols1;
+    case 512:
+        return Shape<512>::ncols1;
+    default:
+        break;
     }
     throw std::invalid_argument("gguf flash attention: head width must be 256 or 512");
 }

@@ -58,6 +58,10 @@ public:
     // object must already have a device demand and be a row-split Q8_G32_FP16 tensor, and every
     // consumer must accept the target format; a repeated request must name the same target.
     void transcode_device(ObjectHandle object, QType target);
+    // Materialize a device row-split object in the panel layout (artifact/permute_row_split.h).
+    // The object must already have a device demand and admit the layout, and every consumer must
+    // read QuantLayout::RowSplitPanel.
+    void panel_device(ObjectHandle object);
     // Moves a device object into the arena's evictable tail. Ranked objects follow every resident
     // object; ascending rank places the highest rank at the arena end, which an eviction pool
     // borrows first. A repeated request keeps the highest rank.
@@ -86,6 +90,7 @@ private:
         bool registered         = false;
         std::uint64_t alignment = 256;
         std::optional<QType> transcode;
+        bool panel               = false;
         std::uint32_t evict_rank = 0;
         std::uint64_t tail       = 0;
         std::optional<std::size_t> device_rank;
