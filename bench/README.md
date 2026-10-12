@@ -135,7 +135,8 @@ It has two independent suites:
   vary bytes and operation count to represent StateImage components and identify device bandwidth.
   It uses synthetic non-compressible buffers and never inspects an artifact or loads a model.
 - `prefill` loads one artifact through the public Engine and measures its Text/Vision recomputation
-  cost under the canonical BF16/no-spec configuration. Its result is keyed only by hardware class
+  cost without speculation, under the prefill configuration it is given: `--kv-dtype` (default bf16),
+  `--prefill-cublas`, `--gdn-state-fp16` and `--prefill-chunk`. Its result is keyed only by hardware class
   and the actual Text/Vision `prefill_signature`.
 
 The runtime models are:
@@ -175,9 +176,15 @@ Measure prefill separately when the GPU has room for the artifact:
   --suite prefill \
   --artifact out/qwen3_6_27b.ninfer \
   --corpus bench/fixtures/bench_corpus.ids \
+  --kv-dtype rk4v4 --prefill-cublas --gdn-state-fp16 --prefill-chunk 4096 --max-context 32768 \
   --json profiles/bench/qwen3_6_27b_prefill_cost.json \
   --preset-out profiles/bench/context_cost_presets.json
 ```
+
+The runtime keys a prefill price by hardware class and prefill signature only, not by KV dtype or
+GEMM route, although both change prefill time severalfold, so calibrate the configuration the
+machine serves with. The RTX 3090 compiled defaults use the launcher's prefill flags shown above
+(the grid then reaches 6.5 chunks, 26,624 tokens).
 
 `--suite all` performs transfer first, releases its fixtures, then loads the artifact for prefill.
 The JSON report retains every repetition, median/MAD, floating and quantized coefficients, and
@@ -206,9 +213,11 @@ and is not a runtime input.
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
-Q8, registered BF16 weights, the registered NVFP4 problems, and the registered FP8 problems.
-Existing formats use `--policy a16`; NVFP4 additionally supports `--policy a4`, and
-FP8 supports `--policy a8`. Each permission lets the production resolver select the qualified
+Q8, registered BF16 weights, the registered NVFP4 problems, the registered FP8 problems, and the
+registered GGML block-format problems (`--qtype ggml_iq4_xs|ggml_iq3_s|ggml_q6_k|ggml_iq4_nl|
+ggml_q8_0|ggml_q2_0`, random valid blocks; `--suite qwen3_8_flash_next` runs all of them).
+Existing formats use `--policy a16`; NVFP4 additionally supports `--policy a4`,
+FP8 supports `--policy a8`, and the GGML formats require `--policy a8` (their only profile). Each permission lets the production resolver select the qualified
 route for the exact geometry and T. LinearAdd, LinearSwiGLU,
 LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops and are not
 benchmark modes here.
@@ -324,6 +333,24 @@ cmake --build build -j --target ninfer_benches
 ./build/bench/ninfer_benches ninfer_linear_topk_bench --columns 1,7,16,24,64,120 --repeat 25
 ./build/bench/ninfer_benches ninfer_linear_topk_bench --profile fp8-full --columns 120
 ./build/bench/ninfer_benches ninfer_linear_topk_bench --profile q4-optimized --columns 129 --repeat 60
+```
+
+## QSA Op benchmark
+
+`ninfer_qsa_bench` measures the four public QSA Ops of `include/ninfer/ops/qsa.h` at the registered
+geometry (4 x 128 indexer, R=4, budget 2048, D256/Q24/KV2 Int8Group64 cache): `index_query`,
+`pool_keys`, `select` and `attention` for one call of `T` columns ending at the last position of a
+context `L`, each captured alone, and `all` (the four in one graph). Pooled keys, queries and cache
+codes are random, so the selection picks scattered blocks; the page table is shuffled. The
+attention stage reads the selection the select stage produced. Each sample replays a CUDA Graph,
+after a 256 MiB L2 eviction read by default (`--cache warm` skips it). Defaults: `T=1,2048`,
+`L=8192,32768,131072`, 5 warmups, 30 samples. Output is CSV
+`stage,T,context,cache,median_us,min_us,p95_us,graph_nodes`. These are Op measurements.
+
+```bash
+cmake --build build -j --target ninfer_benches
+./build/bench/ninfer_benches ninfer_qsa_bench
+./build/bench/ninfer_benches ninfer_qsa_bench --tokens 1 --contexts 32768 --repeat 100
 ```
 
 ## CandidateSelectorPath Op benchmark
