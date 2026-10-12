@@ -71,8 +71,10 @@ public:
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
     [[nodiscard]] const qwen3_5::PreparedContextCache& context_cache() const noexcept;
-    // Prefix reuse is off: no capture frontier and no shortlist key.
+    // Prefix reuse is off: no capture frontier, no shared-prefix checkpoint a sibling could wait
+    // for, and no shortlist key.
     [[nodiscard]] std::vector<std::uint32_t> capture_frontiers() const { return {}; }
+    [[nodiscard]] std::vector<std::uint32_t> shared_prefix_frontiers() const { return {}; }
     [[nodiscard]] std::optional<qwen3_5::PrefixShortlistKey> prefix_shortlist_key(std::uint32_t) const noexcept {
         return std::nullopt;
     }
@@ -221,6 +223,10 @@ struct CommitRowResult {
         std::uint64_t drafted_tokens  = 0;
         std::uint64_t accepted_tokens = 0;
         std::uint64_t fallback_steps  = 0;
+        // The Engine's n-gram copy counters; Flash-Next drafts no n-gram copies, so they stay 0.
+        std::uint64_t ngram_rounds          = 0;
+        std::uint64_t ngram_drafted_tokens  = 0;
+        std::uint64_t ngram_accepted_tokens = 0;
     } speculative_counters;
 };
 
@@ -370,6 +376,12 @@ public:
     [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle checkpoint) const;
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle checkpoint) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle checkpoint, const RequestBasePlan& base) const;
+    // The Engine prices a sibling's remaining prefill only to wait for one of its shared-prefix
+    // checkpoints; this Program publishes none, so the call is never reached. Counts tokens only.
+    [[nodiscard]] runtime::PrefillWork prefill_work(const RequestBasePlan&, std::uint32_t begin,
+                                                    std::uint32_t end) const {
+        return runtime::PrefillWork{.tokens = end > begin ? end - begin : 0U};
+    }
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle retained, const RequestBasePlan& base,
                                                              std::uint32_t target) const;
     [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
