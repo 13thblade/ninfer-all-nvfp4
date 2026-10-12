@@ -9,6 +9,7 @@
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
+#include "core/vmm_arena.h"
 #include "core/vram_budget.h"
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
@@ -55,8 +56,17 @@ void validate(const EngineOptions& options) {
     }
     if (options.max_concurrency != 1) { refuse("serves one request at a time in this release: use --max-concurrency 1"); }
     if (options.kv_cache != KvCacheStorage::Int8Group64) { refuse("its attention cache is INT8: use --kv-dtype int8"); }
-    if (options.speculative.backend != SpeculativeBackend::None || options.speculative.ngram_draft_tokens != 0) {
-        refuse("has no speculative decoding in this release: remove --spec and --ngram-draft-tokens");
+    // Every speculative field, not just the backend and n-gram window: a direct EngineOptions caller
+    // can set draft_tokens or proposal_head with the backend off, and the Program would run plain
+    // decode without saying so.
+    const SpeculativeOptions no_speculation{};
+    const auto& spec = options.speculative;
+    if (spec.backend != no_speculation.backend || spec.draft_tokens != no_speculation.draft_tokens ||
+        spec.proposal_head != no_speculation.proposal_head ||
+        spec.ngram_draft_tokens != no_speculation.ngram_draft_tokens ||
+        spec.ngram_min_match != no_speculation.ngram_min_match) {
+        refuse("has no speculative decoding in this release: remove --spec, --ngram-draft-tokens and the other "
+               "speculative flags");
     }
     if (options.kv_capacity.mode == KvCapacityMode::Automatic) {
         refuse("sizes its KV pool itself from free VRAM (it grows and shrinks per request): remove "
@@ -187,6 +197,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     {
         models::qwen4_exp::VramDemand check_demand;
         check_demand.headroom    = next.vram_headroom_bytes;
+        // The same condition the Program sizes with (program.cpp: residency_->elastic() && vram_monitor;
+        // the expert arena exists exactly when the VMM path is supported), so the display headroom
+        // here is the 512 MiB elastic default and not the 1 GiB fixed one.
+        check_demand.elastic     = VmmArena::supported(device.device) && program_options.vram_monitor;
         check_demand.graphs      = device_plan.graph_bound;
         check_demand.fixed       = dense + device_plan.fixed_bytes();
         check_demand.frame_bytes = device_plan.expert_record_stride;
