@@ -231,7 +231,8 @@ void gate_case(int T, cudaStream_t stream) {
 
 struct ConvInputs {
     std::vector<std::uint16_t> gated, normalized, residual, states;
-    std::vector<std::uint16_t> weight; // FP16 bits [K, C] (the GGUF's words): channel c's taps at c*K + j
+    std::vector<float> weight; // FP32 [K, C]: channel c's taps at c*K + j (FP16 values, as the
+                               // converter widens the GGUF's F16 taps)
 };
 
 ConvInputs conv_inputs(int T, std::uint32_t seed) {
@@ -248,8 +249,9 @@ ConvInputs conv_inputs(int T, std::uint32_t seed) {
         const float v  = u(rng);
         const int e    = v == 0.0F ? -25 : static_cast<int>(std::floor(std::log2(std::fabs(v))));
         const int m    = static_cast<int>(std::ldexp(std::fabs(v), 10 - e)) - 1024;
-        w = e < -14 ? static_cast<std::uint16_t>(v < 0 ? 0x8000 : 0)
-                    : static_cast<std::uint16_t>((v < 0 ? 0x8000 : 0) | ((e + 15) << 10) | (m & 0x3FF));
+        w = half_value(e < -14 ? static_cast<std::uint16_t>(v < 0 ? 0x8000 : 0)
+                               : static_cast<std::uint16_t>((v < 0 ? 0x8000 : 0) | ((e + 15) << 10) |
+                                                            (m & 0x3FF)));
     }
     return in;
 }
@@ -271,10 +273,7 @@ ConvResult run_conv(const ConvInputs& in, int T, const std::vector<std::int32_t>
     Buffer<std::uint16_t> d_gated(slice(in.gated)), d_norm(slice(in.normalized)),
         d_res(residual_override ? slice(*residual_override) : slice(in.residual)),
         d_states(states_override ? *states_override : in.states);
-    // The Op takes the FP32 widening the converter stores (exact for every FP16 word).
-    std::vector<float> weight32(in.weight.size());
-    for (std::size_t i = 0; i < weight32.size(); ++i) { weight32[i] = half_value(in.weight[i]); }
-    Buffer<float> d_weight(weight32);
+    Buffer<float> d_weight(in.weight);
     Buffer<std::int32_t> d_src(source), d_dst(destination.empty() ? std::vector<std::int32_t>{0} : destination);
     Tensor residual(d_res.p, DType::BF16, {kC, T}), states(d_states.p, DType::BF16, {kC, kSpan, kSlots});
     const Tensor dst = destination.empty() ? Tensor{} : Tensor(d_dst.p, DType::I32, {sequences});
@@ -302,7 +301,7 @@ void conv_oracle(const ConvInputs& in, int T, const std::vector<std::int32_t>& s
             for (int c = 0; c < kC; ++c) {
                 double a = 0;
                 for (int j = 0; j < kTaps; ++j) {
-                    a += static_cast<double>(half_value(in.weight[static_cast<std::size_t>(c) * kTaps + j])) *
+                    a += static_cast<double>(in.weight[static_cast<std::size_t>(c) * kTaps + j]) *
                          t::bf16_to_f32(src_value(c, u - (kTaps - 1 - j) * kDilation));
                 }
                 const std::size_t at = static_cast<std::size_t>(i * width + u) * kC + c;

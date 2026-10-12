@@ -3,8 +3,8 @@
 // Adapted from Infernix a3edb450 include/infernix/ops/ple.h (Apache-2.0).
 // Modified for NInfer-3090: n-gram rows are GGML IQ4_NL blocks (Infernix: FP8 E4M3 with one
 // per-tensor scale), the three norm weights are stored FP32 multipliers instead of BF16 unit-offset
-// weights, the convolution weight is FP32 (the GGUF's F16 words widened exactly by the converter)
-// with each channel's taps contiguous, and the contract follows op-development §3.
+// weights, the convolution weight is FP32 with each channel's taps contiguous, and the contract
+// follows op-development §3.
 
 #include "core/tensor.h"
 #include "core/weight.h"

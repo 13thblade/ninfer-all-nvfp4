@@ -1,8 +1,8 @@
 // Adapted from Infernix a3edb450 src/ops/ple/ple.cu (Apache-2.0).
 // Modified for NInfer-3090: ple_embed decodes GGML IQ4_NL rows (Infernix: FP8 E4M3 rows times one
 // scale), the norm weights are stored FP32 multipliers, the convolution weight is FP32 [K, C]
-// (each channel's taps contiguous; the GGUF's F16 words widened exactly by the converter), and the
-// namespaces and includes are NInfer's.
+// (each channel's taps contiguous; the GGUF's F16 taps widened exactly), and the namespaces and
+// includes are NInfer's.
 
 #include "ninfer/ops/ple.h"
 
