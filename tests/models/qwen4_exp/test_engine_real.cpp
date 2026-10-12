@@ -20,7 +20,17 @@
 // Program logs each request's expert-cache hit rate.
 //
 //   ninfer_qwen4_exp_engine_real_test --bench [--max-context N] [--generate N] [--no-graph]
-//       [--expert-cache-mib N] [--no-expert-state] [--split N] [--print-ids] TOKENS...
+//       [--expert-cache-mib N] [--no-expert-state] [--split N] [--print-ids]
+//       [--mtp K [--mtp-fixed] [--width-cost X]] TOKENS...
+//
+// --mtp K decodes with MTP speculation (the artifact must hold the drafter), verifying up to K
+// drafts per round (--mtp-fixed: always K); each job also prints its acceptance.
+//
+// MTP exactness mode: greedy output with MTP speculation must equal plain greedy output. One plain
+// Engine decodes every job, then one MTP Engine per depth K; the ids must be identical.
+//
+//   ninfer_qwen4_exp_engine_real_test --mtp-exact K[,K...] [--max-context N] [--generate N]
+//       [--mtp-fixed] TOKENS...
 //
 // --split N streams each request with live timings and also reports decode tok/s over generated
 // tokens 2..N and N+1..end (decode right after a prefill, while the expert cache refills).
@@ -119,6 +129,7 @@ EngineOptions base_options(const std::string& artifact, std::uint32_t max_contex
 struct Run {
     std::vector<TokenId> ids;
     GenerationTimings timings;
+    SpeculativeStats speculative;
     double wall = 0;
     // With a split: the time from the first generated token to token `split` and to the last one.
     std::uint32_t split = 0;
@@ -164,10 +175,28 @@ Run generate(Engine& engine, const std::vector<TokenId>& prompt, std::uint32_t t
     out.split    = split;
     out.to_split = sink.to_split;
     out.to_last  = sink.to_last;
-    out.ids     = std::move(result.generated_token_ids);
-    out.timings = result.timings;
+    out.ids         = std::move(result.generated_token_ids);
+    out.timings     = result.timings;
+    out.speculative = result.speculative;
     out.wall    = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     return out;
+}
+
+void print_speculation(const char* label, const SpeculativeStats& s) {
+    if (!s.enabled) { return; }
+    std::string per;
+    for (std::size_t j = 0; j < s.accepted_per_position.size(); ++j) {
+        char item[48];
+        std::snprintf(item, sizeof(item), "%s%.3f", j ? " " : "",
+                      s.rounds ? static_cast<double>(s.accepted_per_position[j]) / static_cast<double>(s.rounds) : 0.0);
+        per += item;
+    }
+    std::printf("%s: mtp rounds %llu, plain %llu, drafted %llu, accepted %llu (%.1f%%), %.3f tokens per round; "
+                "accepted at position 1.. [%s]\n",
+                label, static_cast<unsigned long long>(s.rounds), static_cast<unsigned long long>(s.fallback_steps),
+                static_cast<unsigned long long>(s.drafted_tokens), static_cast<unsigned long long>(s.accepted_tokens),
+                s.drafted_tokens ? 100.0 * static_cast<double>(s.accepted_tokens) / static_cast<double>(s.drafted_tokens) : 0.0,
+                s.rounds ? 1.0 + static_cast<double>(s.accepted_tokens) / static_cast<double>(s.rounds) : 0.0, per.c_str());
 }
 
 void print_run(const char* label, const Run& run, std::size_t prompt) {
@@ -301,8 +330,9 @@ bool same(const char* label, const std::vector<TokenId>& reference, const std::v
 }
 
 int bench(const std::string& artifact, const std::vector<std::string>& args) {
-    std::uint32_t max_context = 33'792, tokens = 512, split = 0;
-    bool graph = true, state = true, print_ids = false;
+    std::uint32_t max_context = 33'792, tokens = 512, split = 0, mtp = 0;
+    bool graph = true, state = true, print_ids = false, mtp_fixed = false;
+    double width_cost = -1.0;
     std::optional<std::uint64_t> cache;
     std::vector<std::string> jobs;
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -325,6 +355,12 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
             state = false;
         } else if (a == "--print-ids") {
             print_ids = true;
+        } else if (a == "--mtp") {
+            mtp = static_cast<std::uint32_t>(value());
+        } else if (a == "--mtp-fixed") {
+            mtp_fixed = true;
+        } else if (a == "--width-cost" && i + 1 < args.size()) {
+            width_cost = std::stod(args[++i]);
         } else {
             jobs.push_back(a);
         }
@@ -333,6 +369,12 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
     options.use_cuda_graph                 = graph;
     options.flash_next.expert_cache_bytes  = cache;
     options.flash_next.save_expert_state   = state;
+    if (mtp > 0) {
+        options.speculative.backend         = SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens    = mtp;
+        options.flash_next.mtp_fixed_drafts = mtp_fixed;
+        if (width_cost >= 0.0) { options.flash_next.mtp_width_cost = width_cost; }
+    }
     const auto load = std::chrono::steady_clock::now();
     Engine engine(options);
     std::printf("engine loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - load).count());
@@ -340,6 +382,7 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
         const auto prompt = parse_tokens(job);
         const Run run     = generate(engine, prompt, tokens, split);
         print_run(job.c_str(), run, prompt.size());
+        print_speculation(job.c_str(), run.speculative);
         if (print_ids) {
             std::string ids;
             for (const TokenId id : run.ids) { ids += (ids.empty() ? "" : ",") + std::to_string(id); }
@@ -347,6 +390,70 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
         }
     }
     return 0;
+}
+
+// Greedy MTP output equals plain greedy output: speculation is lossless. Plain first (one Engine),
+// then one Engine per depth; every job's ids must be identical, and each MTP run must have
+// verified drafts (so acceptance, rejection and the commit paths all ran).
+int mtp_exact(const std::string& artifact, const std::vector<std::string>& args) {
+    std::uint32_t max_context = 33'792, tokens = 256;
+    bool fixed = false;
+    std::vector<std::uint32_t> depths;
+    std::vector<std::string> jobs;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--max-context" && i + 1 < args.size()) {
+            max_context = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a == "--generate" && i + 1 < args.size()) {
+            tokens = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a == "--mtp-fixed") {
+            fixed = true;
+        } else if (depths.empty() && a.find_first_not_of("0123456789,") == std::string::npos) {
+            std::stringstream list(a);
+            std::string item;
+            while (std::getline(list, item, ',')) { depths.push_back(static_cast<std::uint32_t>(std::stoul(item))); }
+        } else {
+            jobs.push_back(a);
+        }
+    }
+    if (depths.empty() || jobs.empty()) { throw std::invalid_argument("--mtp-exact needs depths and token files"); }
+    std::vector<std::vector<TokenId>> plain;
+    const double ram_before = available_ram_gib();
+    {
+        EngineOptions options                = base_options(artifact, max_context);
+        options.flash_next.save_expert_state = false;
+        Engine engine(options);
+        for (const std::string& job : jobs) {
+            const auto prompt = parse_tokens(job);
+            const Run run     = generate(engine, prompt, tokens);
+            print_run(("plain " + job).c_str(), run, prompt.size());
+            plain.push_back(run.ids);
+        }
+    }
+    bool ok = true;
+    for (const std::uint32_t depth : depths) {
+        wait_for_ram(ram_before);
+        EngineOptions options                = base_options(artifact, max_context);
+        options.flash_next.save_expert_state = false;
+        options.speculative.backend          = SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens     = depth;
+        options.flash_next.mtp_fixed_drafts  = fixed;
+        Engine engine(options);
+        for (std::size_t j = 0; j < jobs.size(); ++j) {
+            const auto prompt       = parse_tokens(jobs[j]);
+            const Run run           = generate(engine, prompt, tokens);
+            const std::string label = "mtp K=" + std::to_string(depth) + " " + jobs[j];
+            print_run(label.c_str(), run, prompt.size());
+            print_speculation(label.c_str(), run.speculative);
+            ok = same(label.c_str(), plain[j], run.ids) && ok;
+            if (run.speculative.rounds == 0 || run.speculative.accepted_tokens == run.speculative.drafted_tokens) {
+                std::printf("FAIL: %s did not exercise both acceptance and rejection\n", label.c_str());
+                ok = false;
+            }
+        }
+    }
+    std::printf(ok ? "qwen4_exp mtp exactness passed\n" : "FAIL: qwen4_exp mtp exactness\n");
+    return ok ? 0 : 1;
 }
 
 } // namespace
@@ -363,6 +470,9 @@ int main(int argc, char** argv) {
         std::vector<std::string> args(argv + 1, argv + argc);
         if (!args.empty() && args.front() == "--bench") {
             return bench(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--mtp-exact") {
+            return mtp_exact(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         std::string tokens_arg = "@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/ppl_tokens-chat.ids";
         std::uint32_t generate_tokens = 48, max_context = 8192, prompt_tokens = 300;

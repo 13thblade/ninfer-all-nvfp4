@@ -3,6 +3,9 @@
 // index_query_kernel, pool_kernel and tail_kernel. Modified for NInfer: one warp per vector, the
 // norm output is not rounded before the rotation, the gain may be plain or unit-offset, and the
 // rotation angle is formed and range-reduced in FP64.
+// commit_tail_kernel: adapted from Infernix a3edb450 src/ops/qsa/qsa.cu (Apache-2.0); modified for
+// NInfer-3090: one sequence, and it writes every committed slot in order (the tail of n one-column
+// calls, bit for bit) instead of only the last block's.
 
 #include "ops/qsa/launch.h"
 
@@ -140,7 +143,43 @@ __global__ void __launch_bounds__(32) tail_kernel(const bf16* __restrict__ raw,
     }
 }
 
+// One warp per layer: the tail after the first commit[0] of the recorded columns (Infernix
+// a3edb450 src/ops/qsa/qsa.cu commit_tail_kernel, one sequence).
+__global__ void __launch_bounds__(32) commit_tail_kernel(const bf16* __restrict__ raw,
+                                                         const std::int32_t* __restrict__ positions,
+                                                         const std::int32_t* __restrict__ commit,
+                                                         int width, bf16* __restrict__ tails,
+                                                         std::int64_t layer_stride) {
+    const int lane = threadIdx.x, layer = blockIdx.x;
+    const int n    = commit[0];
+    if (n <= 0) { return; }
+    const int start = positions[0];
+    const int last  = start + n - 1;
+    const bf16* layer_raw = raw + static_cast<std::int64_t>(layer) * width * kDi;
+    bf16* tail            = tails + static_cast<std::int64_t>(layer) * layer_stride;
+    // Every committed position that does not complete a block, in order: the tail n one-column
+    // calls leave, including the slots a commit spanning two blocks fills from the earlier block
+    // (pooling never reads them, but the committed state equals the decoded state bit for bit).
+    for (int q = start; q <= last; ++q) {
+        if (q % kR == kR - 1) { continue; }
+        const bf16* source = layer_raw + static_cast<std::int64_t>(q - start) * kDi;
+        bf16* target       = tail + static_cast<std::int64_t>(q % kR) * kDi;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { target[lane + 32 * e] = source[lane + 32 * e]; }
+    }
+}
+
 } // namespace
+
+void qsa_commit_tails_launch(const Tensor& raw_keys, const Tensor& positions,
+                             const Tensor& commit_columns, Tensor& tail0,
+                             std::int64_t tail_stride_elements, cudaStream_t stream) {
+    commit_tail_kernel<<<raw_keys.ne[2], 32, 0, stream>>>(
+        static_cast<const bf16*>(raw_keys.data), static_cast<const std::int32_t*>(positions.data),
+        static_cast<const std::int32_t*>(commit_columns.data), raw_keys.ne[1],
+        static_cast<bf16*>(tail0.data), tail_stride_elements);
+    check_launch("commit tails");
+}
 
 QsaRopeTable qsa_rope_table(const QsaIndexerGeometry& geometry) {
     QsaRopeTable table{};

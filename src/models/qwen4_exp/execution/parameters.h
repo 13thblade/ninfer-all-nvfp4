@@ -3,7 +3,8 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/execution/parameters.h (Apache-2.0).
 // Modified for NInfer-3090: one Linear per GGUF tensor (the GGML formats of one input's
 // projections differ, so they cannot share a parent as Infernix's do); GDN decay and FP32 PLE
-// convolution; BF16 projection rows for the indexer; no MTP, proposal head or vision.
+// convolution; BF16 projection rows for the indexer; the MTP drafter's BF16 parameters; no
+// proposal head or vision.
 
 #include "core/tensor.h"
 #include "core/weight.h"
@@ -68,6 +69,26 @@ struct BlockParameters {
     std::optional<PleParameters> ple;
 };
 
+// The MTP drafter. Its projections are BF16; those over K <= 3072 run as FP32 projection rows
+// (projection_fp32, then one BF16 rounding), the attention output and the two fusion projections
+// as BF16 Linears. Drafter precision changes acceptance, never output.
+struct MtpParameters {
+    Tensor embedding_norm, hidden_norm;                 // BF16 gamma (unit offset): [H], [S*H]
+    LinearParameters embedding_projection;              // BF16 [H, H]
+    LinearParameters hidden_projection;                 // BF16 [H, H], applied to each stream
+    HyperConnectionParameters attn_hc, mlp_hc, final_mixer;
+    Tensor query_gate;                                  // BF16 rows [H, 2 * heads * D]
+    Tensor key, value;                                  // BF16 rows [H, kv_heads * D]
+    LinearParameters output;                            // BF16 [H, heads * D]
+    Tensor query_norm, key_norm;                        // BF16 [D], gamma
+    Tensor index_query, index_key;                      // BF16 rows [H, index_heads * Di], [H, Di]
+    Tensor index_query_norm, index_key_norm;            // BF16 [Di], gamma
+    Tensor router, shared_score;                        // BF16 rows [H, E], [H, 1]
+    Tensor shared_gate, shared_up;                      // BF16 rows [H, I_shared]
+    Tensor shared_down;                                 // BF16 rows [I_shared, H]
+    const ExpertBank* bank = nullptr;                   // ggml_rec_q2_0_q2_0, device memory
+};
+
 class Parameters {
 public:
     explicit Parameters(const Model& model);
@@ -77,6 +98,7 @@ public:
     Weight output_head;     // GGML IQ4_XS [V, H], FP32 logits
     HyperConnectionParameters final_mixer;
     std::vector<BlockParameters> layers;
+    std::optional<MtpParameters> mtp; // when the model loaded the drafter
 };
 
 } // namespace ninfer::models::qwen4_exp::execution

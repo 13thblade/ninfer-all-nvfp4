@@ -1,8 +1,14 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/program/program.cpp and program_impl.h
 // (Apache-2.0).
 // Modified for NInfer-3090: the execution contract is NInfer's (see program.h); one lane over the
-// single-sequence forward of PR 8; prefix reuse, MTP, n-gram drafts, vision, the CPU miss service,
+// single-sequence forward of PR 8; prefix reuse, n-gram drafts, vision, the CPU miss service,
 // the SSD tier, landing frames, the layer walk and /v1/decide are not ported.
+// MTP speculation (PR 13) follows Infernix's mtp_draft / verify / commit_verified / mtp_catch_up and
+// choose_draft_length for one lane: chained drafter steps, a W-column verification whose records
+// commit through the GDN replay fold, qsa_commit_tails and ple_conv_commit, then the drafter's
+// committed cells. Modified: the round's tokens come back to the host twice (the drafts, for the
+// n-gram rows the verification reads, and the licensed tokens), each graph is captured per width,
+// and --mtp-fixed bypasses the draft-length policy (measurement).
 // Kept from Infernix: the device plan and its spill checks, the elastic VMM KV pool that borrows
 // from the expert frames (grow_kv's order: the frames release memory before the pool maps it), the
 // expert cache (LFRU, decode promotion budget and cadence, warm-start state), the VRAM control law
@@ -17,6 +23,9 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/gdn_replay_records.h"
+#include "core/layout.h"
+#include "core/linear_attention_state.h"
 #include "core/link_probe.h"
 #include "core/nvtx.h"
 #include "core/paged_kv_cache.h"
@@ -33,8 +42,13 @@
 #include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/vram_monitor.h"
+#include "ninfer/ops/argmax.h"
 #include "ninfer/ops/cast.h"
+#include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/ple.h"
+#include "ninfer/ops/qsa.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_round.h"
 
 #include <cuda_runtime.h>
 
@@ -43,8 +57,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -89,6 +105,16 @@ struct ContractAccess {
         out.constraint_failed_[0] = constraint_failed;
         return out;
     }
+    // A verification round's batch: the row licenses `count` tokens of `tokens` (stride wide).
+    static PendingBatch make_speculative(const void* owner, std::uint64_t transaction, SequenceHandle row,
+                                         std::span<const TokenId> tokens, std::int32_t count, std::uint32_t stride,
+                                         runtime::ExecutionTiming timing) {
+        PendingBatch out = make_pending(owner, transaction, row, tokens, timing, false);
+        out.counts_[0]   = count;
+        out.stride_      = stride;
+        out.speculative_ = true;
+        return out;
+    }
     static const void* owner(const PendingBatch& p) noexcept { return p.owner_; }
     static std::uint64_t transaction(const PendingBatch& p) noexcept { return p.transaction_; }
     static std::span<const SequenceHandle> rows(const PendingBatch& p) noexcept { return {p.rows_.data(), p.row_count_}; }
@@ -97,6 +123,8 @@ struct ContractAccess {
         p.transaction_ = 0;
         p.row_count_   = 0;
         p.tokens_      = {};
+        p.speculative_ = false;
+        p.stride_      = 1;
     }
 };
 
@@ -175,7 +203,8 @@ struct KvLayout {
     std::size_t table  = 0;
     std::size_t bytes  = 0;
 
-    static KvLayout plan(const TextConfig& c, std::uint32_t pages) {
+    // `layers` attention layers: the text model's, plus the MTP drafter's when it runs.
+    static KvLayout plan(const TextConfig& c, std::uint32_t pages, std::uint32_t layers) {
         KvLayout out;
         out.pages = pages;
         const std::size_t D = c.attention.head_dim, Hkv = c.attention.kv_heads;
@@ -185,7 +214,7 @@ struct KvLayout {
         const std::size_t keys   = pooled * kPagedKVPageSize * 2;
         std::size_t at           = align(static_cast<std::size_t>(pages) * 4, kKvChunkBytes);
         out.table                = 0;
-        for (std::uint32_t l = 0; l < c.attention_layers; ++l) {
+        for (std::uint32_t l = 0; l < layers; ++l) {
             std::array<Plane, 5> planes{};
             const std::size_t per_page[5] = {codes, codes, scales, scales, keys};
             for (int p = 0; p < 5; ++p) {
@@ -219,18 +248,107 @@ struct KvLayout {
 };
 
 // Per-call inputs: one pinned host block uploaded by the SMs (upload_pinned) before each call.
+// With MTP it also holds the drafter's cells of a prefill call (ids, cells, RoPE words per
+// sub-chunk) and of a round (draft-step cells, their RoPE words and block starts); the n-gram rows
+// come last, so a call's inputs and its rows upload separately.
 struct IoLayout {
-    std::size_t ids = 0, positions = 0, rope = 0, block_rope = 0, logit_columns = 0, ngram = 0, bytes = 0;
+    std::size_t ids = 0, positions = 0, rope = 0, block_rope = 0, logit_columns = 0;
+    std::size_t mtp_ids = 0, mtp_cells = 0, mtp_rope = 0, mtp_block_rope = 0;
+    std::size_t draft_cells = 0, draft_rope = 0, draft_block_rope = 0, draft_anchor = 0;
+    std::size_t ngram = 0, bytes = 0;
 
-    static IoLayout plan(std::size_t columns, std::size_t row_bytes) {
+    static IoLayout plan(std::size_t columns, std::size_t row_bytes, std::size_t logits, std::size_t drafts) {
         IoLayout out;
         out.positions     = align(4 * columns);
         out.rope          = align(out.positions + 4 * columns);
         out.block_rope    = align(out.rope + 12 * columns);
         out.logit_columns = align(out.block_rope + 12);
-        out.ngram         = align(out.logit_columns + 4);
-        out.bytes         = align(out.ngram + row_bytes * columns);
+        std::size_t at    = align(out.logit_columns + 4 * logits);
+        if (drafts > 0) {
+            const std::size_t cells     = columns + 1;
+            const std::size_t subchunks = (cells + execution::kMtpChunkColumns - 1) / execution::kMtpChunkColumns;
+            out.mtp_ids          = at;
+            out.mtp_cells        = align(out.mtp_ids + 4 * cells);
+            out.mtp_rope         = align(out.mtp_cells + 4 * cells);
+            out.mtp_block_rope   = align(out.mtp_rope + 12 * cells);
+            out.draft_cells      = align(out.mtp_block_rope + 12 * subchunks);
+            out.draft_rope       = align(out.draft_cells + 4 * drafts);
+            out.draft_block_rope = align(out.draft_rope + 12 * drafts);
+            out.draft_anchor     = align(out.draft_block_rope + 12 * drafts);
+            at                   = align(out.draft_anchor + 4);
+        }
+        out.ngram = at;
+        out.bytes = align(out.ngram + row_bytes * columns);
         return out;
+    }
+};
+
+// MTP speculation's device memory (one allocation): the verification records (GDN replay
+// records, PLE convolution inputs, the text layers' raw index keys and the drafter's), copies of the
+// QSA tails a verification or draft pools from, the convolution's discarded window, the drafter's
+// residuals (a round's W columns, the saved one, the draft chain), its ones and the round's words.
+struct SpecLayout {
+    std::int32_t width = 0, drafts = 0;
+    GdnReplayRecordLayout gdn;
+    std::size_t gdn_bytes = 0;
+    std::size_t ple = 0, qsa_keys = 0, mtp_keys = 0, tails = 0, mtp_tail = 0, conv = 0, slot = 0;
+    std::size_t residuals = 0, saved = 0, chain = 0, ones = 0, words = 0, bytes = 0;
+    // Round words (I32): the drafts, verification targets, licensed tokens, then one word each.
+    std::size_t w_drafts = 0, w_target = 0, w_licensed = 0, w_counts = 0, w_accepted = 0, w_extents = 0,
+                w_lengths = 0, w_anchors = 0, w_commit = 0, w_mtp_ids = 0, w_count = 0;
+
+    static SpecLayout plan(const TextConfig& c, std::int32_t drafts, std::size_t tail_bytes, std::size_t conv_bytes) {
+        SpecLayout out;
+        out.drafts = drafts;
+        out.width  = drafts + 1;
+        const std::size_t W = static_cast<std::size_t>(out.width), w = c.residual_width();
+        const std::size_t di = c.qsa.index_head_dim;
+        LayoutBuilder builder;
+        out.gdn = plan_gdn_replay_records(builder, records_spec(c, out.width));
+        out.gdn_bytes = align(out.gdn.payload_bytes());
+        std::size_t at = out.gdn_bytes;
+        const auto take = [&](std::size_t bytes) {
+            const std::size_t here = at;
+            at                     = align(at + bytes);
+            return here;
+        };
+        out.ple       = take(w * W * 2);
+        out.qsa_keys  = take(di * W * c.attention_layers * 2);
+        out.mtp_keys  = take(di * W * 2);
+        out.tails     = take(align(tail_bytes) * c.attention_layers);
+        out.mtp_tail  = take(tail_bytes);
+        out.conv      = take(conv_bytes);
+        out.slot      = take(4);
+        out.residuals = take(w * W * 2);
+        out.saved     = take(w * 2);
+        out.chain     = take(w * 2);
+        out.ones      = take(static_cast<std::size_t>(c.hc.streams) * execution::kMtpChunkColumns * 4);
+        // Round words.
+        out.w_drafts   = 0;
+        out.w_target   = out.w_drafts + static_cast<std::size_t>(drafts);
+        out.w_licensed = out.w_target + W;
+        out.w_counts   = out.w_licensed + W;
+        out.w_accepted = out.w_counts + 1;
+        out.w_extents  = out.w_accepted + 1;
+        out.w_lengths  = out.w_extents + 1;
+        out.w_anchors  = out.w_lengths + 1;
+        out.w_commit   = out.w_anchors + 1;
+        out.w_mtp_ids  = out.w_commit + 1;
+        out.w_count    = out.w_mtp_ids + W;
+        out.words      = take(4 * out.w_count);
+        out.bytes      = at;
+        return out;
+    }
+
+    static GdnReplayRecordSpec records_spec(const TextConfig& c, std::int32_t width) {
+        return {.layers          = static_cast<std::int32_t>(c.gdn_layers),
+                .record_capacity = 1,
+                .width           = width,
+                .conv_channels   = static_cast<std::int32_t>(c.gdn.conv_channels()),
+                .qk_heads        = static_cast<std::int32_t>(c.gdn.value_heads), // tiled: one per value head
+                .value_heads     = static_cast<std::int32_t>(c.gdn.value_heads),
+                .key_dim         = static_cast<std::int32_t>(c.gdn.key_head_dim),
+                .value_dim       = static_cast<std::int32_t>(c.gdn.value_head_dim)};
     }
 };
 
@@ -245,6 +363,9 @@ struct Layout {
     std::uint64_t frame_stride = 0;
     int sms                    = 0;
     bool vmm                   = false;
+    // MTP speculation: the most drafts a round verifies (0: off) and the widest round, 1 + drafts.
+    std::int32_t drafts = 0, max_width = 1;
+    SpecLayout spec;
     ProgramDevicePlan bytes;
 };
 
@@ -265,23 +386,32 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     if (public_tokens == 0 || public_tokens > c.vocab_size) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: the tokenizer's domain exceeds the vocabulary");
     }
+    if (o.mtp_draft_tokens > 7) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next verifies at most 7 MTP drafts per round: use --draft-tokens 1..7");
+    }
     Layout d;
+    d.drafts       = static_cast<std::int32_t>(o.mtp_draft_tokens);
+    d.max_width    = 1 + d.drafts;
     d.chunk        = static_cast<std::int32_t>(std::min(o.prefill_chunk, o.max_context));
     d.wide_chunk   = std::max(d.chunk, std::min(kWideChunk, static_cast<std::int32_t>(o.max_context)));
     d.token_domain = static_cast<std::int32_t>(public_tokens);
     d.pages        = (o.max_context + kPagedKVPageSize - 1) / kPagedKVPageSize;
     const std::uint32_t base_tokens = o.kv_base_tokens != 0 ? o.kv_base_tokens : kKvBaseTokens;
     d.base_pages = std::min(d.pages, std::max(1U, base_tokens / kPagedKVPageSize));
-    d.kv         = KvLayout::plan(c, d.pages);
+    // The drafter's KV is one more attention layer through the same block table.
+    d.kv         = KvLayout::plan(c, d.pages, c.attention_layers + (d.drafts > 0 ? 1U : 0U));
     const NgramHash hash(c.ple.ngram, 0);
     d.io = IoLayout::plan(static_cast<std::size_t>(d.wide_chunk),
-                          static_cast<std::size_t>(c.ple.table.row_bytes) * hash.heads());
+                          static_cast<std::size_t>(c.ple.table.row_bytes) * hash.heads(),
+                          static_cast<std::size_t>(d.max_width), static_cast<std::size_t>(d.drafts));
     d.gdn_conv      = std::size_t(c.gdn.conv_channels()) * (c.gdn.conv_kernel - 1) * 2;
     d.gdn_recurrent = std::size_t(c.gdn.key_head_dim) * c.gdn.value_head_dim * c.gdn.value_heads * 4;
     d.ple           = std::size_t(c.residual_width()) * c.ple.conv_span() * 2;
     d.tail          = std::size_t(c.qsa.index_head_dim) * (c.qsa.compress_ratio - 1) * 2;
+    // GDN, PLE and QSA tail state, the PLE slot word, then (with MTP) the drafter's tail.
     d.state = align(c.gdn_layers * (align(d.gdn_conv) + align(d.gdn_recurrent)) + align(d.ple) +
-                    c.attention_layers * align(d.tail) + align(sizeof(std::int32_t)));
+                    c.attention_layers * align(d.tail) + align(sizeof(std::int32_t)) + (d.drafts > 0 ? align(d.tail) : 0));
+    if (d.drafts > 0) { d.spec = SpecLayout::plan(c, d.drafts, d.tail, d.gdn_conv); }
     for (const std::uint64_t stride : strides) { d.frame_stride = std::max(d.frame_stride, stride); }
     if (d.frame_stride == 0) { throw std::invalid_argument("Qwen3.8-Flash-Next: no expert banks"); }
     d.staging    = static_cast<std::size_t>(kStagingSlots) * d.frame_stride;
@@ -295,6 +425,14 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.work = execution::Forward::workspace_bytes(c, d.chunk, d.pages * kPagedKVPageSize,
                                                  DeviceExecutionView{nullptr, sms}) +
              ops::sampling_workspace_capacity_bytes(d.token_domain, 1, 1);
+    if (d.drafts > 0) {
+        // A drafter step (one column and the head's logits), and a prefill call's drafter cells: a
+        // sub-chunk's residual rows beside the call's residual. Acceptance's workspace.
+        const std::size_t step = execution::Forward::mtp_workspace_bytes(c, 1, d.pages * kPagedKVPageSize,
+                                                                         DeviceExecutionView{nullptr, sms});
+        d.work = std::max(d.work, step) + std::size_t(c.residual_width()) * execution::kMtpChunkColumns * 2 * 3 +
+                 ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, d.drafts, 1, 1);
+    }
     d.sms       = sms;
     d.wide_work = d.wide_chunk > d.chunk ? execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
                                                                                DeviceExecutionView{nullptr, sms})
@@ -308,12 +446,17 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.workspace = d.work;
     b.staging   = d.staging;
     b.state     = d.state;
-    b.io        = d.io.bytes + sizeof(float) * c.vocab_size + 2ULL * c.vocab_size + 256 * 4 +
+    // Logits of the widest round (FP32 and BF16), then the sampling words.
+    b.io        = d.io.bytes + (sizeof(float) + 2ULL) * c.vocab_size * d.max_width + 256 * 4 +
                   sizeof(ops::SamplingConfig) + 4ULL * public_tokens + 4 * d.mask_words + 4096;
     b.residency            = ExpertResidency::table_bytes(c, d.wide_chunk);
+    b.speculation          = d.drafts > 0 ? d.spec.bytes : 0;
     b.expert_record_stride = d.frame_stride;
     b.max_frames           = ExpertResidency::max_frames(c);
-    b.graph_bound          = 2 * graph_bound(1, 1, 0); // the decode forward in two parts
+    // The decode forward in two parts; with MTP a verification forward in two parts per width, a
+    // draft graph per step count, a drafter catch-up per committed count and the pending cell's.
+    b.graph_bound = 2 * graph_bound(1, 1, 0) +
+                    (d.drafts > 0 ? static_cast<std::uint32_t>(2 * d.drafts + d.drafts + d.max_width + 1) : 0U);
     return d;
 }
 
@@ -341,6 +484,16 @@ public:
         ExpertResidency::Stats cache_at_decode; // at the first token's commit: the decode phase's base
         NgramVolume::Counters ngram_at_decode;
         NgramVolume::Counters ngram_at_admission;
+        // MTP (Infernix's Lane fields): drafter cells [0, mtp_cells) are written; the pending cell
+        // is state_tokens - 1 (its residual is the saved one). mtp_accept is the running estimate
+        // of each draft position's acceptance given the earlier ones were accepted.
+        std::uint32_t mtp_cells = 0;
+        bool mtp_live           = false;
+        std::array<double, 8> mtp_accept{};
+        std::uint64_t mtp_policy_rounds = 0;
+        // Per draft position: rounds that drafted it, and rounds that accepted it.
+        std::array<std::uint64_t, 8> mtp_offered{}, mtp_taken{};
+        SpeculativeStats speculative;
     };
 
     ProgramImpl(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
@@ -382,10 +535,11 @@ public:
         config_host_ = PinnedHostBuffer(sizeof(ops::SamplingConfig) + 64);
         auto* io = static_cast<std::byte*>(io_device_.p);
         std::size_t at = align(plan_.io.bytes);
+        // One column's logits; a verification round reads the widest round's columns from here on.
         logits32_ = Tensor(io + at, DType::FP32, {vocab_, 1});
-        at = align(at + sizeof(float) * c_.vocab_size);
+        at = align(at + sizeof(float) * c_.vocab_size * plan_.max_width);
         logits16_ = Tensor(io + at, DType::BF16, {vocab_, 1});
-        at = align(at + 2ULL * c_.vocab_size);
+        at = align(at + 2ULL * c_.vocab_size * plan_.max_width);
         sampled_ = Tensor(io + at, DType::I32, {1});
         at = align(at + 4);
         sample_position_ = Tensor(io + at, DType::I32, {1});
@@ -402,6 +556,12 @@ public:
         allocated += plan_.work;
         staging_ = DeviceBuffer(plan_.staging);
         allocated += plan_.staging;
+        if (plan_.drafts > 0) {
+            spec_backing_ = DeviceBuffer(plan_.spec.bytes);
+            spec_backing_.fill(0);
+            allocated += plan_.spec.bytes;
+            spec_host_ = PinnedHostBuffer(4 * plan_.spec.w_count + 64);
+        }
 
         std::vector<const std::uint8_t*> banks;
         std::vector<std::uint64_t> bank_strides;
@@ -492,6 +652,16 @@ public:
             p += align(plan_.tail);
         }
         state.ple_slot = Tensor(p, DType::I32, {1}); // 0 with the rest of the state at binding
+        p += align(sizeof(std::int32_t));
+        tails_base_ = state.qsa_tails.empty() ? nullptr : state.qsa_tails.front().data;
+        ple_state_  = state.ple_conv;
+        ple_slot_   = state.ple_slot;
+        if (plan_.drafts > 0) {
+            mtp_tail_ = Tensor(p, DType::BF16, {di, r - 1});
+            if (parameters_.mtp == std::nullopt) {
+                throw std::invalid_argument("Qwen3.8-Flash-Next: MTP speculation needs the model's drafter loaded");
+            }
+        }
 
         const std::int32_t P = dim(plan_.pages), D = dim(c_.attention.head_dim), Hkv = dim(c_.attention.kv_heads);
         execution::ForwardKV kv;
@@ -503,6 +673,7 @@ public:
             for (std::int32_t i = 0; i < P; ++i) { table[static_cast<std::size_t>(i)] = i; }
             CUDA_CHECK(cudaMemcpy(kv.block_table.data, table.data(), table.size() * 4, cudaMemcpyHostToDevice));
         }
+        std::optional<execution::ForwardMtp> drafter;
         for (const auto& planes : plan_.kv.layers) {
             PagedKVLayerView view;
             view.k_pages       = Tensor(kv_base_ + planes[0].offset, DType::I8, {D, kPagedKVPageSize, Hkv, P});
@@ -513,10 +684,22 @@ public:
             view.head_dim      = D;
             view.num_kv_heads  = Hkv;
             view.storage       = KvCacheStorage::Int8Group64;
-            kv.layers.push_back(view);
-            kv.pooled.emplace_back(kv_base_ + planes[4].offset, DType::BF16,
-                                   std::initializer_list<std::int32_t>{di / r, kPagedKVPageSize, 1, P});
+            const Tensor pooled(kv_base_ + planes[4].offset, DType::BF16, {di / r, kPagedKVPageSize, 1, P});
+            if (kv.layers.size() < c_.attention_layers) {
+                kv.layers.push_back(view);
+                kv.pooled.push_back(pooled);
+                continue;
+            }
+            // The drafter's layer, after the text model's.
+            const auto& s = plan_.spec;
+            auto* spec    = static_cast<std::byte*>(spec_backing_.p);
+            drafter.emplace(execution::ForwardMtp{
+                .kv     = view,
+                .pooled = pooled,
+                .tail   = mtp_tail_,
+                .ones   = Tensor(spec + s.ones, DType::FP32, {dim(c_.hc.streams), execution::kMtpChunkColumns})});
         }
+        if (plan_.drafts > 0) { bind_speculation(); }
         execution::ForwardExperts experts;
         experts.frame_base    = residency_->frame_base();
         experts.frame_stride  = residency_->frame_stride();
@@ -538,7 +721,7 @@ public:
         }
         ngram_next_ = PinnedHostBuffer(plan_.io.bytes - plan_.io.ngram);
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
-                                                        std::move(experts));
+                                                        std::move(experts), std::move(drafter));
         warm_start_experts();
         device_.synchronize();
         report_startup();
@@ -660,6 +843,8 @@ public:
         lane_.begin        = {.prompt_tokens = lane_.prompt_tokens, .reused_prompt_tokens = 0,
                               .prefix_reuse_path = PrefixReusePath::Root};
         install_sampling(base.sampling);
+        lane_.mtp_accept.fill(kAcceptancePrior);
+        lane_.mtp_live = plan_.drafts > 0;
         lane_.cache_at_admission = residency_->stats();
         lane_.ngram_at_admission = volume_.counters();
         lane_.phase              = Phase::Prefill;
@@ -759,6 +944,15 @@ public:
         }
         const nvtx::ScopedRange range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode);
         try {
+            // With the MTP drafter, a verification round when the policy drafts.
+            if (auto speculative = try_speculate(sequences[0], budgets[0], masks, start)) { return std::move(*speculative); }
+            if (plan_.drafts > 0) {
+                // A plain round keeps the drafter current: its pending cell first, the round's cell at
+                // commit.
+                mtp_write_pending();
+                plain_round_ = lane_.mtp_live;
+                ++lane_.speculative.fallback_steps;
+            }
             const std::int32_t position = static_cast<std::int32_t>(lane_.state_tokens);
             // The layers before the PLE layer run while the host reads the round's n-gram rows from
             // the volume; the rest of the forward follows their upload.
@@ -857,6 +1051,14 @@ public:
         const bool constraint_failed = pending.constraint_failed(0);
         ContractAccess::consume(pending);
         pending_ = 0;
+        if (round_width_ > 1) {
+            CommitResult out        = commit_verified(d, constraint_failed);
+            lane_.permit            = false;
+            out.timing.post_host_ns = elapsed_ns(start);
+            return out;
+        }
+        const bool catch_up = plain_round_;
+        plain_round_        = false;
         CommitResult out;
         out.row_count = 1;
         if (d.cancelled || d.failed) {
@@ -866,6 +1068,7 @@ public:
                 throw std::logic_error("Qwen3.8-Flash-Next: pending decision is invalid");
             }
             out.rows[0].timings     = timings();
+            out.rows[0].speculative = speculative_stats();
             out.rows[0].disposition = d.failed ? runtime::CommitDisposition::FailedReleased
                                                : runtime::CommitDisposition::CancelledReleased;
             settle_round();
@@ -881,9 +1084,13 @@ public:
                 lane_.ngram_at_decode     = volume_.counters();
             }
             lane_.history.push_back(pending_token_);
+            // The drafter's cell of the round's position, from its exported residual.
+            if (catch_up) { mtp_catch_up(static_cast<std::int32_t>(lane_.state_tokens) - 1, 1); }
             lane_.phase = d.terminal ? Phase::Finishable : Phase::Decode;
             out.rows[0].disposition = d.terminal ? runtime::CommitDisposition::Finishable : runtime::CommitDisposition::Active;
             out.rows[0].timings     = timings();
+            out.rows[0].speculative = speculative_stats();
+            out.rows[0].speculative_counters = speculative_counters();
             settle_round();
         }
         lane_.permit           = false;
@@ -896,8 +1103,10 @@ public:
         if (ContractAccess::owner(pending) != this || ContractAccess::transaction(pending) != pending_) { return out; }
         out.row_count = ContractAccess::rows(pending).size();
         ContractAccess::consume(pending);
-        pending_  = 0;
-        deferred_ = false;
+        pending_     = 0;
+        deferred_    = false;
+        round_width_ = 1;
+        plain_round_ = false;
         release_lane();
         out.status = runtime::ConsumeStatus::Consumed;
         return out;
@@ -907,7 +1116,8 @@ public:
         FinishResult out;
         try {
             if (!valid(sequence) || lane_.phase != Phase::Finishable || pending_ != 0) { return out; }
-            out.timings = timings();
+            out.timings     = timings();
+            out.speculative = speculative_stats();
             report_request();
             release_lane();
             apply_vram_target(true);
@@ -921,7 +1131,8 @@ public:
         AbortResult out;
         try {
             if (!valid(sequence) || pending_ != 0) { return out; }
-            out.timings = timings();
+            out.timings     = timings();
+            out.speculative = speculative_stats();
             device_.synchronize();
             release_lane();
             out.status = runtime::ConsumeStatus::Consumed;
@@ -931,9 +1142,11 @@ public:
 
     void fail_all_cleanup() noexcept {
         (void)device_.synchronize_status();
-        binding_  = false;
-        pending_  = 0;
-        deferred_ = false;
+        binding_     = false;
+        pending_     = 0;
+        deferred_    = false;
+        round_width_ = 1;
+        plain_round_ = false;
         release_lane();
     }
 
@@ -1025,6 +1238,7 @@ private:
     // write_inputs' words, then the n-gram rows.
     void stage(std::int32_t begin, std::int32_t width) {
         write_inputs(begin, width);
+        write_mtp_chunk(begin, width);
         const std::size_t rows = read_rows(begin, width);
         upload_pinned(io_device_.p, io_host_.data(), plan_.io.ngram + rows, device_.stream);
     }
@@ -1148,7 +1362,11 @@ private:
         frames_now_ = residency_->frames();
     }
 
-    execution::ForwardBatch batch(std::int32_t width) const {
+    // A call's inputs at their fixed addresses. A decode or verification round (`round`, width
+    // columns of logits) also exports its final residuals for the drafter; a verification round
+    // passes its records.
+    execution::ForwardBatch batch(std::int32_t width, bool round = false,
+                                  const execution::ForwardVerify* verify = nullptr) const {
         const auto& io = plan_.io;
         auto* base     = static_cast<std::byte*>(io_device_.p);
         execution::ForwardBatch b;
@@ -1156,24 +1374,32 @@ private:
         b.positions        = Tensor(base + io.positions, DType::I32, {width});
         b.rope_positions   = Tensor(base + io.rope, DType::I32, {width, 3});
         b.block_start_rope = Tensor(base + io.block_rope, DType::I32, {3});
-        b.logit_columns    = Tensor(base + io.logit_columns, DType::I32, {1});
+        b.logit_columns    = Tensor(base + io.logit_columns, DType::I32, {round ? width : 1});
         b.ngram_rows       = Tensor(base + io.ngram, DType::U8,
                                     {dim(c_.ple.table.row_bytes), dim(hash_.heads()), width});
+        b.verify           = verify;
+        if (round && plan_.drafts > 0) {
+            b.residual_out = Tensor(static_cast<std::byte*>(spec_backing_.p) + plan_.spec.residuals, DType::BF16,
+                                    {dim(c_.residual_width()), width});
+        }
         return b;
     }
 
     // One eager call over positions [begin, begin + width): stage, table, forward. Not synchronized.
-    // A wide call allocates from the lent workspace and streams its non-resident experts.
+    // A wide call allocates from the lent workspace and streams its non-resident experts. With MTP
+    // the call also writes the drafter's cells of its positions.
     void run_call(std::int32_t begin, std::int32_t width, bool wide) {
         stage(begin, width);
         residency_->before_round(device_.stream);
+        auto b = batch(width);
+        if (mtp_chunk_) { b.mtp_chunk = &*mtp_chunk_; }
         if (!wide) {
-            forward_->run(batch(width), logits32_);
+            forward_->run(b, logits32_);
         } else {
             forward_->use_workspace(*wide_work_);
             stream_->begin(residency_->host_table(), stream_tables_, ring_first_, ring_frames_, device_.stream);
             try {
-                forward_->run(batch(width), logits32_);
+                forward_->run(b, logits32_);
             } catch (...) {
                 stream_->end();
                 forward_->use_workspace(*work_);
@@ -1193,10 +1419,10 @@ private:
         const std::uint32_t split = forward_->rows_layer();
         const auto body = [this, part, split] {
             if (part == Part::Front) {
-                forward_->run_front(batch(1), split);
+                forward_->run_front(batch(1, true), split);
                 return;
             }
-            forward_->run_back(batch(1), split, logits32_);
+            forward_->run_back(batch(1, true), split, logits32_);
             ops::cast_fp32_to_bf16(logits32_, logits16_, device_.stream);
         };
         if (!options_.use_cuda_graph || decode_rounds_ == 0) {
@@ -1252,6 +1478,539 @@ private:
         return token;
     }
 
+    // ---------------------------------------------------------------- MTP speculation
+    // Adapted from Infernix a3edb450 src/models/qwen4_exp/program/program_impl.h:1662-1796 (decode's
+    // draft-length choice), 3143-3410 (verify, commit_verified) and 3413-3710 (the drafter: cells,
+    // drafts, catch-up). Modified for NInfer-3090: one lane; the round's n-gram rows are read while
+    // the verification's first layer runs (the decode round's front/back split) instead of behind a
+    // device gate; the drafter's catch-up runs over the committed cells only (one lane needs no
+    // padded batch), so its index-key tail advances directly; QSA tails are pooled from copies and
+    // committed with qsa_commit_tails; no n-gram copy proposals, proposal head or confidence cut.
+
+    // Policy constants (Infernix program_impl.h:4259-4262): the acceptance prior and its update
+    // weight, the cost of one more verified column relative to a plain round (to be re-measured on
+    // this card), and how often a row drafts one more than its choice to keep the estimate current.
+    static constexpr double kAcceptancePrior     = 0.75;
+    static constexpr double kAcceptanceWeight    = 0.1;
+    static constexpr std::uint64_t kProbeInterval = 8;
+
+    double width_cost() const noexcept { return options_.mtp_width_cost; }
+
+    std::byte* spec_base() const noexcept { return static_cast<std::byte*>(spec_backing_.p); }
+    std::int32_t* spec_words_host() const noexcept { return static_cast<std::int32_t*>(spec_host_.data()); }
+    std::int32_t* spec_words_device() const noexcept {
+        return reinterpret_cast<std::int32_t*>(spec_base() + plan_.spec.words);
+    }
+    Tensor spec_word(std::size_t offset, std::int32_t count) const {
+        return Tensor(spec_words_device() + offset, DType::I32, {count});
+    }
+    Tensor saved_residual() const {
+        return Tensor(spec_base() + plan_.spec.saved, DType::BF16, {dim(c_.residual_width()), 1});
+    }
+    Tensor round_residuals(std::int32_t columns) const {
+        return Tensor(spec_base() + plan_.spec.residuals, DType::BF16, {dim(c_.residual_width()), columns});
+    }
+    Tensor mtp_scratch_tail() const {
+        return Tensor(spec_base() + plan_.spec.tails + align(plan_.tail) * c_.attention_layers, DType::BF16,
+                      {dim(c_.qsa.index_head_dim), dim(c_.qsa.compress_ratio) - 1});
+    }
+
+    // One-time setup of the speculation buffers: the drafter's ones and per-width views.
+    void bind_speculation() {
+        const auto& s = plan_.spec;
+        std::vector<float> ones(static_cast<std::size_t>(c_.hc.streams) * execution::kMtpChunkColumns, 1.0F);
+        CUDA_CHECK(cudaMemcpy(spec_base() + s.ones, ones.data(), ones.size() * sizeof(float), cudaMemcpyHostToDevice));
+        records_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+        folds_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+        verify_front_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+        verify_back_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+        verify_front_exec_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+        verify_back_exec_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+        verify_runs_.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
+        verify_back_runs_.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
+        draft_graphs_.resize(static_cast<std::size_t>(plan_.drafts) + 1);
+        draft_execs_.resize(static_cast<std::size_t>(plan_.drafts) + 1);
+        draft_runs_.assign(static_cast<std::size_t>(plan_.drafts) + 1, 0);
+        catch_graphs_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+        catch_execs_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+        catch_runs_.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
+        pending_tokens_.assign(static_cast<std::size_t>(plan_.max_width), 0);
+    }
+
+    // The verification records of a W-column round: the GDN records planned at width W over the
+    // one backing (a narrower width's planes fit in the widest's), the PLE inputs, the raw index
+    // keys and the copies of the QSA tails.
+    execution::ForwardVerify verify_view(std::int32_t W) {
+        auto& records = records_.at(static_cast<std::size_t>(W));
+        if (!records) {
+            LayoutBuilder builder;
+            const auto layout = plan_gdn_replay_records(builder, SpecLayout::records_spec(c_, W));
+            records.emplace(DeviceSpan{spec_base(), plan_.spec.gdn_bytes}, layout);
+        }
+        const auto& s = plan_.spec;
+        execution::ForwardVerify v;
+        v.gdn        = *records;
+        v.ple_inputs = Tensor(spec_base() + s.ple, DType::BF16, {dim(c_.residual_width()), W});
+        v.qsa_keys   = Tensor(spec_base() + s.qsa_keys, DType::BF16,
+                              {dim(c_.qsa.index_head_dim), W, dim(c_.attention_layers)});
+        const std::int32_t di = dim(c_.qsa.index_head_dim), r = dim(c_.qsa.compress_ratio);
+        for (std::uint32_t l = 0; l < c_.attention_layers; ++l) {
+            v.qsa_tails.emplace_back(spec_base() + s.tails + align(plan_.tail) * l, DType::BF16,
+                                     std::initializer_list<std::int32_t>{di, r - 1});
+        }
+        v.conv_scratch = Tensor(spec_base() + s.conv, DType::BF16,
+                                {dim(c_.gdn.conv_channels()), dim(c_.gdn.conv_kernel - 1)});
+        v.initial_slot = Tensor(spec_base() + s.slot, DType::I32, {1});
+        return v;
+    }
+
+    const ops::GdnReplayFoldPlan& fold(std::int32_t W) {
+        auto& plan = folds_.at(static_cast<std::size_t>(W));
+        if (!plan) {
+            (void)verify_view(W);
+            const auto* state = static_cast<std::byte*>(state_backing_.p);
+            const auto stride = static_cast<std::int64_t>(align(plan_.gdn_conv) + align(plan_.gdn_recurrent));
+            LinearAttentionStateAllLayersView view;
+            view.conv_layer0      = Tensor(const_cast<std::byte*>(state), DType::BF16,
+                                           {dim(c_.gdn.conv_channels()), dim(c_.gdn.conv_kernel - 1), 1});
+            view.recurrent_layer0 = Tensor(const_cast<std::byte*>(state) + align(plan_.gdn_conv), DType::FP32,
+                                           {dim(c_.gdn.key_head_dim), dim(c_.gdn.value_head_dim),
+                                            dim(c_.gdn.value_heads), 1});
+            view.conv_layer_stride_bytes      = stride;
+            view.recurrent_layer_stride_bytes = stride;
+            view.spec = LinearAttentionStatePoolSpec{.layers         = c_.gdn_layers,
+                                                     .conv_channels  = dim(c_.gdn.conv_channels()),
+                                                     .conv_width     = dim(c_.gdn.conv_kernel - 1),
+                                                     .value_heads    = dim(c_.gdn.value_heads),
+                                                     .value_head_dim = dim(c_.gdn.value_head_dim),
+                                                     .key_head_dim   = dim(c_.gdn.key_head_dim),
+                                                     .slot_count     = 1};
+            plan.emplace(*records_.at(static_cast<std::size_t>(W)), view);
+        }
+        return *plan;
+    }
+
+    // Runs `body` eagerly on its first use (the kernels' one-time setup runs outside a capture),
+    // then captures it once and replays it.
+    void replay(DecodeGraphDefinition& graph, DecodeGraphExecutable& exec, std::uint64_t& runs,
+                const std::function<void()>& body) {
+        if (!options_.use_cuda_graph || runs++ == 0) {
+            body();
+            return;
+        }
+        if (!exec.ready()) {
+            graph.capture(device_.stream, body);
+            exec.instantiate(graph);
+            exec.upload(device_.stream);
+        }
+        exec.launch(device_.stream);
+    }
+
+    // The drafter's cells of a prefill or forced-token call [begin, begin + width) (Infernix
+    // stage_mtp_chunk): the pending cell begin - 1 when it is unwritten, then every column whose
+    // next token is known. Writes the cells' words into the io block (uploaded with the call).
+    void write_mtp_chunk(std::int32_t begin, std::int32_t width) {
+        mtp_chunk_.reset();
+        if (plan_.drafts == 0) { return; }
+        const bool prepend = begin > 0 && lane_.mtp_cells < static_cast<std::uint32_t>(begin);
+        const bool known   = lane_.history.size() > static_cast<std::size_t>(begin + width);
+        const std::int32_t columns = known ? width : width - 1;
+        const std::int32_t first   = prepend ? begin - 1 : begin;
+        const std::int32_t cells   = (prepend ? 1 : 0) + columns;
+        const auto& io = plan_.io;
+        auto* host     = static_cast<std::byte*>(io_host_.data());
+        auto* ids      = reinterpret_cast<std::int32_t*>(host + io.mtp_ids);
+        auto* positions = reinterpret_cast<std::int32_t*>(host + io.mtp_cells);
+        auto* rope     = reinterpret_cast<std::int32_t*>(host + io.mtp_rope);
+        auto* block    = reinterpret_cast<std::int32_t*>(host + io.mtp_block_rope);
+        const std::int32_t r = dim(c_.qsa.compress_ratio), K = execution::kMtpChunkColumns;
+        for (std::int32_t i = 0; i < cells; ++i) {
+            positions[i] = first + i;
+            ids[i]       = lane_.history[static_cast<std::size_t>(first + i + 1)];
+            // Sub-chunk k's [n_k, 3] axis-major block (text: every axis is the position).
+            const std::int32_t k = i / K, j = i % K, n = std::min(K, cells - k * K);
+            for (int a = 0; a < 3; ++a) { rope[3 * K * k + a * n + j] = first + i; }
+            if (j == 0) {
+                for (int a = 0; a < 3; ++a) { block[3 * k + a] = (first + i) / r * r; }
+            }
+        }
+        lane_.mtp_cells = static_cast<std::uint32_t>(begin + columns);
+        lane_.mtp_live  = true;
+        execution::MtpChunk chunk;
+        chunk.saved   = saved_residual().view({dim(c_.residual_width())});
+        chunk.prepend = prepend;
+        chunk.columns = columns;
+        if (cells > 0) {
+            auto* base             = static_cast<std::byte*>(io_device_.p);
+            chunk.ids              = Tensor(base + io.mtp_ids, DType::I32, {cells});
+            chunk.positions        = Tensor(base + io.mtp_cells, DType::I32, {cells});
+            chunk.rope_positions   = reinterpret_cast<std::int32_t*>(base + io.mtp_rope);
+            chunk.block_start_rope = reinterpret_cast<std::int32_t*>(base + io.mtp_block_rope);
+        }
+        mtp_chunk_ = chunk;
+    }
+
+    // Writes the drafter's round words: the anchor, and for step j the cell S - 1 + j, its RoPE
+    // words and pooled-block start. Uploaded at once.
+    void stage_draft_words(std::int32_t steps) {
+        const auto& io = plan_.io;
+        auto* host     = static_cast<std::byte*>(io_host_.data());
+        const std::int32_t S = static_cast<std::int32_t>(lane_.state_tokens), r = dim(c_.qsa.compress_ratio);
+        *reinterpret_cast<std::int32_t*>(host + io.draft_anchor) = lane_.history.back();
+        auto* cells = reinterpret_cast<std::int32_t*>(host + io.draft_cells);
+        auto* rope  = reinterpret_cast<std::int32_t*>(host + io.draft_rope);
+        auto* block = reinterpret_cast<std::int32_t*>(host + io.draft_block_rope);
+        for (std::int32_t j = 0; j < std::max(steps, 1); ++j) {
+            const std::int32_t cell = S - 1 + j;
+            cells[j] = cell;
+            for (int a = 0; a < 3; ++a) {
+                rope[3 * j + a]  = cell;
+                block[3 * j + a] = cell / r * r;
+            }
+        }
+        upload_pinned(static_cast<std::byte*>(io_device_.p) + io.draft_cells, host + io.draft_cells,
+                      io.draft_anchor + 4 - io.draft_cells, device_.stream);
+    }
+
+    execution::MtpCall draft_call(std::int32_t step) const {
+        const auto& io = plan_.io;
+        auto* base     = static_cast<std::byte*>(io_device_.p);
+        execution::MtpCall call;
+        call.positions        = Tensor(base + io.draft_cells + 4 * step, DType::I32, {1});
+        call.rope_positions   = Tensor(base + io.draft_rope + 12 * step, DType::I32, {1, 3});
+        call.block_start_rope = Tensor(base + io.draft_block_rope + 12 * step, DType::I32, {3});
+        return call;
+    }
+
+    // The pending cell (state_tokens - 1, its residual saved, its next token the anchor) when the
+    // drafter has not written it: after a prompt, whose last cell waits for the first token.
+    void mtp_write_pending() {
+        if (!lane_.mtp_live || lane_.mtp_cells >= lane_.state_tokens) { return; }
+        stage_draft_words(0);
+        auto call      = draft_call(0);
+        call.residuals = saved_residual();
+        call.ids       = Tensor(static_cast<std::byte*>(io_device_.p) + plan_.io.draft_anchor, DType::I32, {1});
+        call.tail      = mtp_tail_;
+        call.kv_only   = true;
+        forward_->run_mtp(call);
+        lane_.mtp_cells = lane_.state_tokens;
+    }
+
+    // `steps` chained drafter steps from the saved residual and the anchor (Infernix mtp_draft):
+    // step j writes the cell S - 1 + j and drafts the token at S + 1 + j. The steps pool from a copy
+    // of the drafter's tail. Returns the drafts on the host.
+    std::span<const TokenId> mtp_draft(std::int32_t steps) {
+        const cudaStream_t s = device_.stream;
+        const nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Decode);
+        mtp_write_pending();
+        stage_draft_words(steps);
+        const std::size_t column = 2ULL * c_.residual_width();
+        auto* chain = spec_base() + plan_.spec.chain;
+        replay(draft_graphs_.at(static_cast<std::size_t>(steps)), draft_execs_.at(static_cast<std::size_t>(steps)),
+               draft_runs_.at(static_cast<std::size_t>(steps)), [&] {
+                   CUDA_CHECK(cudaMemcpyAsync(chain, spec_base() + plan_.spec.saved, column, cudaMemcpyDeviceToDevice, s));
+                   const Tensor scratch = mtp_scratch_tail();
+                   CUDA_CHECK(cudaMemcpyAsync(scratch.data, mtp_tail_.data, mtp_tail_.bytes(), cudaMemcpyDeviceToDevice, s));
+                   const Tensor chain_tensor(chain, DType::BF16, {dim(c_.residual_width()), 1});
+                   for (std::int32_t j = 0; j < steps; ++j) {
+                       auto call         = draft_call(j);
+                       call.residuals    = chain_tensor;
+                       call.ids          = j == 0 ? Tensor(static_cast<std::byte*>(io_device_.p) + plan_.io.draft_anchor,
+                                                           DType::I32, {1})
+                                                  : spec_word(plan_.spec.w_drafts + static_cast<std::size_t>(j - 1), 1);
+                       call.tail         = scratch;
+                       call.kv_only      = false;
+                       call.residual_out = chain_tensor;
+                       call.drafts       = spec_word(plan_.spec.w_drafts + static_cast<std::size_t>(j), 1);
+                       forward_->run_mtp(call);
+                   }
+               });
+        CUDA_CHECK(cudaMemcpyAsync(spec_words_host() + plan_.spec.w_drafts, spec_words_device() + plan_.spec.w_drafts,
+                                   4ULL * steps, cudaMemcpyDeviceToHost, s));
+        {
+            const nvtx::ScopedRange wait(nvtx::Name::DecodeMtpWait, nvtx::Category::Decode);
+            device_.synchronize();
+        }
+        drafts_.assign(spec_words_host() + plan_.spec.w_drafts, spec_words_host() + plan_.spec.w_drafts + steps);
+        return drafts_;
+    }
+
+    // Infernix choose_draft_length: the K in [0, limit] maximizing expected tokens per round time,
+    // where a round of K drafts costs 1 + width_cost * K plain rounds; every kProbeInterval rounds
+    // one draft more than the choice keeps the next position's estimate current.
+    std::int32_t choose_draft_length(std::int32_t limit) {
+        std::int32_t best = 0;
+        double best_score = 1.0, reach = 1.0, tokens = 1.0;
+        for (std::int32_t k = 1; k <= limit; ++k) {
+            reach *= lane_.mtp_accept[static_cast<std::size_t>(k - 1)];
+            tokens += reach;
+            const double score = tokens / (1.0 + width_cost() * k);
+            if (score > best_score) {
+                best_score = score;
+                best       = k;
+            }
+        }
+        if (++lane_.mtp_policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, limit); }
+        if (options_.mtp_fixed_drafts) { best = limit; }
+        return best;
+    }
+
+    // The round's speculative verification, or nullopt for a plain round (no drafter, a
+    // constrained row, too little budget or context, or the policy chose no drafts).
+    std::optional<PendingBatch> try_speculate(SequenceHandle row, const runtime::RoundBudget& budget,
+                                              runtime::TokenMaskProvider* masks, Clock::time_point start) {
+        if (plan_.drafts == 0 || !lane_.mtp_live || (masks != nullptr && masks->constrained(0))) { return std::nullopt; }
+        // A row drafts at most one token fewer than it may still emit, and every verified position
+        // lies within the request's reserved extent.
+        const std::int64_t room = std::min<std::int64_t>(static_cast<std::int64_t>(budget.generated_tokens_remaining) - 1,
+                                                         static_cast<std::int64_t>(lane_.extent) - lane_.state_tokens - 1);
+        const std::int32_t limit = static_cast<std::int32_t>(std::clamp<std::int64_t>(room, 0, plan_.drafts));
+        if (limit <= 0) { return std::nullopt; }
+        const std::int32_t steps = choose_draft_length(limit);
+        if (steps == 0) { return std::nullopt; }
+        const auto drafts = mtp_draft(steps);
+        return verify(row, drafts, start);
+    }
+
+    // One verification round (Infernix verify): the anchor and the drafts as W consecutive
+    // columns, one forward that leaves the recurrent state in place, then acceptance on the device.
+    PendingBatch verify(SequenceHandle row, std::span<const TokenId> drafts, Clock::time_point start) {
+        const cudaStream_t s  = device_.stream;
+        const std::int32_t K  = static_cast<std::int32_t>(drafts.size()), W = K + 1;
+        const std::int32_t S  = static_cast<std::int32_t>(lane_.state_tokens);
+        const auto& sp        = plan_.spec;
+        const nvtx::ScopedRange range(nvtx::Name::DecodeMtpRound, nvtx::Category::Decode);
+        // The columns' tokens: the history's anchor, then the drafts (appended while staging).
+        const std::size_t history = lane_.history.size();
+        lane_.history.insert(lane_.history.end(), drafts.begin(), drafts.end());
+        write_inputs(S, W);
+        auto* columns = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(io_host_.data()) + plan_.io.logit_columns);
+        for (std::int32_t j = 0; j < W; ++j) { columns[j] = j; }
+        upload_pinned(io_device_.p, io_host_.data(), plan_.io.ngram, s);
+        // Acceptance's inputs: the drafts, their count, the length (sampling positions) and anchor.
+        auto* words = spec_words_host();
+        for (std::int32_t j = 0; j < K; ++j) { words[sp.w_drafts + j] = drafts[static_cast<std::size_t>(j)]; }
+        words[sp.w_extents] = K;
+        words[sp.w_lengths] = S;
+        words[sp.w_anchors] = lane_.history[history - 1];
+        upload_pinned(spec_words_device(), words, 4 * sp.w_mtp_ids, s);
+        residency_->before_round(s);
+        const execution::ForwardVerify view = verify_view(W);
+        const std::uint32_t split          = forward_->rows_layer();
+        const auto tails_bytes             = align(plan_.tail) * c_.attention_layers;
+        const Tensor wide32(logits32_.data, DType::FP32, {vocab_, W});
+        Tensor wide16(logits16_.data, DType::BF16, {vocab_, W});
+        const auto w = static_cast<std::size_t>(W);
+        replay(verify_front_.at(w), verify_front_exec_.at(w), verify_runs_.at(w), [&] {
+            // The verification pools from copies of the live tails.
+            CUDA_CHECK(cudaMemcpyAsync(spec_base() + sp.tails, tails_base_, tails_bytes, cudaMemcpyDeviceToDevice, s));
+            forward_->run_front(batch(W, true, &view), split);
+        });
+        {
+            const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
+            upload_rows(S, W);
+        }
+        lane_.history.resize(history);
+        replay(verify_back_.at(w), verify_back_exec_.at(w), verify_back_runs_.at(w), [&] {
+            Tensor logits = wide32;
+            forward_->run_back(batch(W, true, &view), split, logits);
+            ops::cast_fp32_to_bf16(wide32, wide16, s);
+        });
+        residency_->enqueue_route_download(s, W);
+        // Acceptance from BF16 logits, as plain decode samples them.
+        Tensor target = spec_word(sp.w_target, W);
+        ops::argmax(wide16, target, plan_.token_domain, s);
+        install_round_config();
+        {
+            auto scope = work_->scope();
+            Tensor licensed = spec_word(sp.w_licensed, W).view({W, 1});
+            Tensor counts   = spec_word(sp.w_counts, 1);
+            Tensor accepted = spec_word(sp.w_accepted, 1);
+            Tensor lengths  = spec_word(sp.w_lengths, 1);
+            Tensor anchors  = spec_word(sp.w_anchors, 1);
+            ops::speculative_accept_greedy_drafts(target.view({W, 1}), wide16.view({vocab_, W, 1}),
+                                                  spec_word(sp.w_drafts, K).view({K, 1}), spec_word(sp.w_extents, 1),
+                                                  lengths, anchors, licensed, counts, accepted, plan_.token_domain,
+                                                  configs_, *work_, s);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(words + sp.w_licensed, spec_words_device() + sp.w_licensed,
+                                   4ULL * (sp.w_accepted + 1 - sp.w_licensed), cudaMemcpyDeviceToHost, s));
+        const auto wait = Clock::now();
+        {
+            const nvtx::ScopedRange waiting(nvtx::Name::DecodeMtpWait, nvtx::Category::Decode);
+            device_.synchronize();
+        }
+        runtime::ExecutionTiming timing;
+        timing.device_wait_ns = elapsed_ns(wait);
+        const std::int32_t L = words[sp.w_counts], A = words[sp.w_accepted];
+        if (L < 1 || L > W || A != L - 1) {
+            release_lane();
+            throw std::logic_error("Qwen3.8-Flash-Next: acceptance returned an invalid extent");
+        }
+        for (std::int32_t j = 0; j < L; ++j) {
+            const TokenId token = words[sp.w_licensed + j];
+            if (token < 0 || token >= plan_.token_domain) {
+                release_lane();
+                throw std::runtime_error("Qwen3.8-Flash-Next: the verification produced non-finite logits");
+            }
+            pending_tokens_[static_cast<std::size_t>(j)] = token;
+        }
+        // Statistics, and the acceptance estimate (positions 1..A accepted, A + 1 the first rejected).
+        auto& stats = lane_.speculative;
+        ++stats.rounds;
+        stats.drafted_tokens += static_cast<std::uint64_t>(K);
+        stats.accepted_tokens += static_cast<std::uint64_t>(A);
+        if (stats.accepted_per_position.size() < static_cast<std::size_t>(plan_.drafts)) {
+            stats.accepted_per_position.resize(static_cast<std::size_t>(plan_.drafts), 0);
+        }
+        for (std::int32_t j = 0; j < A; ++j) { ++stats.accepted_per_position[static_cast<std::size_t>(j)]; }
+        for (std::int32_t j = 0; j < K; ++j) {
+            ++lane_.mtp_offered[static_cast<std::size_t>(j)];
+            if (j < A) { ++lane_.mtp_taken[static_cast<std::size_t>(j)]; }
+        }
+        for (std::int32_t j = 0; j < K && j <= A; ++j) {
+            double& a = lane_.mtp_accept[static_cast<std::size_t>(j)];
+            a         = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * (j < A ? 1.0 : 0.0);
+        }
+        ++verify_rounds_[static_cast<std::size_t>(W)];
+        pending_count_ = L;
+        round_width_   = W;
+        deferred_      = true; // the round's cache update runs at commit
+        pending_       = ++transaction_;
+        lane_.phase    = Phase::Pending;
+        timing.submit_host_ns = elapsed_ns(start) - timing.device_wait_ns;
+        lane_.decode_ns += elapsed_ns(start);
+        ++decode_rounds_;
+        return ContractAccess::make_speculative(this, pending_, row,
+                                                {pending_tokens_.data(), static_cast<std::size_t>(W)}, L,
+                                                static_cast<std::uint32_t>(W), timing);
+    }
+
+    // The row's sampling config on the device (acceptance reads it), without a grammar mask.
+    void install_round_config() {
+        auto* host_config = static_cast<ops::SamplingConfig*>(config_host_.data());
+        *host_config      = lane_.sampling;
+        upload_pinned(configs_, host_config, sizeof(ops::SamplingConfig), device_.stream);
+    }
+
+    // The drafter's cells of `k` committed positions from S (Infernix mtp_catch_up, the committed
+    // cells only): cell S + j pairs the round's residual j with committed token j; the tail advances
+    // and the last residual becomes the saved one.
+    void mtp_catch_up(std::int32_t S, std::int32_t k) {
+        const cudaStream_t s = device_.stream;
+        const nvtx::ScopedRange range(nvtx::Name::MtpForward, nvtx::Category::Decode);
+        const auto& sp       = plan_.spec;
+        auto* words          = spec_words_host();
+        for (std::int32_t j = 0; j < k; ++j) {
+            words[sp.w_mtp_ids + j] = lane_.history[static_cast<std::size_t>(S + j + 1)];
+        }
+        upload_pinned(spec_words_device() + sp.w_mtp_ids, words + sp.w_mtp_ids, 4ULL * k, s);
+        const auto& io = plan_.io;
+        auto* base     = static_cast<std::byte*>(io_device_.p);
+        const auto w   = static_cast<std::size_t>(k);
+        replay(catch_graphs_.at(w), catch_execs_.at(w), catch_runs_.at(w), [&] {
+            // The round's positions and RoPE words are the call's own (positions S..S+W-1); a
+            // k-column view of them is valid for k <= W.
+            execution::MtpCall call;
+            call.residuals        = round_residuals(k);
+            call.ids              = spec_word(sp.w_mtp_ids, k);
+            call.positions        = Tensor(base + io.positions, DType::I32, {k});
+            call.rope_positions   = Tensor(base + io.rope, DType::I32, {k, 3});
+            call.block_start_rope = Tensor(base + io.block_rope, DType::I32, {3});
+            call.tail             = mtp_tail_;
+            call.kv_only          = true;
+            forward_->run_mtp(call);
+            CUDA_CHECK(cudaMemcpyAsync(spec_base() + sp.saved,
+                                       spec_base() + sp.residuals + 2ULL * c_.residual_width() * (k - 1),
+                                       2ULL * c_.residual_width(), cudaMemcpyDeviceToDevice, s));
+        });
+        lane_.mtp_cells = static_cast<std::uint32_t>(S + k);
+    }
+
+
+    // Commits a verification round (Infernix commit_verified): the row keeps its first
+    // accepted_tokens licensed tokens, so the state advances by that many columns; the GDN fold,
+    // the QSA tails and the PLE history take those columns' records, then the drafter catches up.
+    CommitResult commit_verified(const runtime::CommitDecision& d, bool constraint_failed) {
+        const cudaStream_t s = device_.stream;
+        const auto& sp       = plan_.spec;
+        const std::int32_t W = round_width_, S = static_cast<std::int32_t>(lane_.state_tokens);
+        CommitResult out;
+        out.row_count = 1;
+        round_width_  = 1;
+        if (d.cancelled || d.failed) {
+            if ((d.cancelled && d.failed) || (!d.cancelled && d.failed != constraint_failed) || d.accepted_tokens != 0 ||
+                !d.terminal) {
+                release_lane();
+                throw std::logic_error("Qwen3.8-Flash-Next: pending decision is invalid");
+            }
+            out.rows[0].timings     = timings();
+            out.rows[0].speculative = speculative_stats();
+            out.rows[0].disposition = d.failed ? runtime::CommitDisposition::FailedReleased
+                                               : runtime::CommitDisposition::CancelledReleased;
+            settle_round(W, 0);
+            release_lane();
+            return out;
+        }
+        const auto k = static_cast<std::int32_t>(d.accepted_tokens);
+        if (k < 1 || k > pending_count_ || (!d.terminal && k != pending_count_)) {
+            release_lane();
+            throw std::logic_error("Qwen3.8-Flash-Next: commit exceeds the licensed tokens");
+        }
+        if (lane_.history.size() == lane_.prompt_tokens) {
+            lane_.first_token_seconds = std::chrono::duration<double>(Clock::now() - lane_.admitted).count();
+            lane_.cache_at_decode     = residency_->stats();
+            lane_.ngram_at_decode     = volume_.counters();
+        }
+        for (std::int32_t j = 0; j < k; ++j) { lane_.history.push_back(pending_tokens_[static_cast<std::size_t>(j)]); }
+        lane_.state_tokens += static_cast<std::uint32_t>(k);
+        auto* words         = spec_words_host();
+        words[sp.w_commit]  = k;
+        upload_pinned(spec_words_device() + sp.w_commit, words + sp.w_commit, 4, s);
+        const ops::GdnReplayFoldRow row{0, 0, k};
+        fold(W).execute(std::span<const ops::GdnReplayFoldRow>(&row, 1), s);
+        auto* base = static_cast<std::byte*>(io_device_.p);
+        const Tensor positions(base + plan_.io.positions, DType::I32, {W});
+        const Tensor commit = spec_word(sp.w_commit, 1);
+        Tensor tail0(tails_base_, DType::BF16, {dim(c_.qsa.index_head_dim), dim(c_.qsa.compress_ratio) - 1});
+        ops::qsa_commit_tails(Tensor(spec_base() + sp.qsa_keys, DType::BF16,
+                                     {dim(c_.qsa.index_head_dim), W, dim(c_.attention_layers)}),
+                              positions, commit, tail0, static_cast<std::int64_t>(align(plan_.tail)), s);
+        ops::ple_conv_commit(Tensor(spec_base() + sp.ple, DType::BF16, {dim(c_.residual_width()), W, 1}), commit,
+                             ple_state_, ple_slot_, s);
+        // The catch-up's RoPE words: the committed cells' positions, [k, 3] axis-major over the
+        // round's (a k-column prefix of the round's [W, 3] words is not one); the next round stages
+        // its own.
+        auto* host = static_cast<std::byte*>(io_host_.data());
+        auto* rope = reinterpret_cast<std::int32_t*>(host + plan_.io.rope);
+        for (std::int32_t j = 0; j < k; ++j) {
+            for (int a = 0; a < 3; ++a) { rope[a * k + j] = S + j; }
+        }
+        upload_pinned(base + plan_.io.rope, rope, 12ULL * k, s);
+        mtp_catch_up(S, k);
+        lane_.phase = d.terminal ? Phase::Finishable : Phase::Decode;
+        out.rows[0].disposition = d.terminal ? runtime::CommitDisposition::Finishable : runtime::CommitDisposition::Active;
+        out.rows[0].timings     = timings();
+        out.rows[0].speculative = speculative_stats();
+        out.rows[0].speculative_counters = speculative_counters();
+        settle_round(W, k);
+        return out;
+    }
+
+    SpeculativeStats speculative_stats() const {
+        SpeculativeStats out = lane_.speculative;
+        out.backend          = plan_.drafts > 0 ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
+        out.enabled          = plan_.drafts > 0;
+        out.draft_window     = static_cast<std::uint32_t>(plan_.drafts);
+        return out;
+    }
+
+    CommitRowResult::SpeculativeCounters speculative_counters() const {
+        if (plan_.drafts == 0) { return {}; }
+        const auto& s = lane_.speculative;
+        return {s.rounds, s.drafted_tokens, s.accepted_tokens, s.fallback_steps};
+    }
+
     // ---------------------------------------------------------------- expert cache
     // Promotions follow the tokens a round advances. The fill phase (fewer promotions than frames
     // so far) promotes every round; afterwards every promotion_interval-th.
@@ -1270,10 +2029,13 @@ private:
         return static_cast<std::uint64_t>(std::clamp<long>(std::lround(scaled), 1L, 8L));
     }
 
-    void settle_round() {
+    // A decode or verification round's cache update: `columns` routed columns, promotions for the
+    // `tokens` it advanced.
+    void settle_round(std::int32_t columns = 1, std::int32_t tokens = 1) {
         if (!deferred_) { return; }
         deferred_ = false;
-        residency_->after_round(device_.stream, 1, decode_budget(1));
+        residency_->after_round(device_.stream, columns,
+                                tokens > 0 ? decode_budget(static_cast<std::uint32_t>(tokens)) : 0);
         apply_vram_target(false);
     }
 
@@ -1489,6 +2251,36 @@ private:
     // The expert cache and n-gram traffic of the finished request: one line per request.
     void report_request() const noexcept {
         try {
+            if (plan_.drafts > 0) {
+                // The request's speculation: rounds, acceptance, and acceptance at each draft position.
+                const auto& sp = lane_.speculative;
+                std::string per;
+                for (std::size_t j = 0; j < static_cast<std::size_t>(plan_.drafts); ++j) {
+                    // Of the rounds that drafted position j + 1: offered, and the share accepted.
+                    char item[64];
+                    std::snprintf(item, sizeof(item), "%s%llu:%.1f%%", j ? " " : "",
+                                  static_cast<unsigned long long>(lane_.mtp_offered[j]),
+                                  lane_.mtp_offered[j] ? 100.0 * static_cast<double>(lane_.mtp_taken[j]) /
+                                                             static_cast<double>(lane_.mtp_offered[j])
+                                                       : 0.0);
+                    per += item;
+                }
+                char line[400];
+                std::snprintf(line, sizeof(line),
+                              "mtp: %llu verification rounds, %llu plain; %llu drafted, %llu accepted (%.1f%%); "
+                              "%.2f tokens per verification round; draft position 1.. offered:accepted [%s]",
+                              static_cast<unsigned long long>(sp.rounds),
+                              static_cast<unsigned long long>(sp.fallback_steps),
+                              static_cast<unsigned long long>(sp.drafted_tokens),
+                              static_cast<unsigned long long>(sp.accepted_tokens),
+                              sp.drafted_tokens ? 100.0 * static_cast<double>(sp.accepted_tokens) /
+                                                      static_cast<double>(sp.drafted_tokens)
+                                                : 0.0,
+                              sp.rounds ? 1.0 + static_cast<double>(sp.accepted_tokens) / static_cast<double>(sp.rounds)
+                                        : 0.0,
+                              per.c_str());
+                diagnostic(line);
+            }
             const auto& s = residency_->stats();
             const auto& a = lane_.cache_at_admission;
             const auto n  = volume_.counters();
@@ -1586,6 +2378,21 @@ private:
     std::int32_t next_begin_ = -1, next_width_ = 0;
     DecodeGraphDefinition front_graph_, back_graph_;
     DecodeGraphExecutable front_exec_, back_exec_;
+    // MTP speculation (see the MTP section).
+    DeviceBuffer spec_backing_;
+    PinnedHostBuffer spec_host_{1};
+    Tensor mtp_tail_, ple_state_, ple_slot_;
+    void* tails_base_ = nullptr;
+    std::optional<execution::MtpChunk> mtp_chunk_;
+    std::vector<std::optional<GdnReplayRecords>> records_;
+    std::vector<std::optional<ops::GdnReplayFoldPlan>> folds_;
+    std::vector<DecodeGraphDefinition> verify_front_, verify_back_, draft_graphs_, catch_graphs_;
+    std::vector<DecodeGraphExecutable> verify_front_exec_, verify_back_exec_, draft_execs_, catch_execs_;
+    std::vector<std::uint64_t> verify_runs_, verify_back_runs_, draft_runs_, catch_runs_;
+    std::vector<TokenId> pending_tokens_, drafts_;
+    std::int32_t pending_count_ = 0, round_width_ = 1;
+    bool plain_round_           = false;
+    std::array<std::uint64_t, 9> verify_rounds_{};
 
     Lane lane_;
     std::uint64_t epoch_       = 0;

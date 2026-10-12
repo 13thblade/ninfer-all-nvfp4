@@ -289,6 +289,10 @@ struct FlashNextOptions {
     // Tokens of KV backed at startup; requests needing more borrow it from the expert cache (0:
     // 32,768). Measurement and tests.
     std::uint32_t kv_base_tokens = 0;
+    // MTP speculation (--spec mtp): the draft-length policy's cost of one more verified column
+    // relative to a plain round, and a measurement mode that always drafts --draft-tokens.
+    double mtp_width_cost = 0.38;
+    bool mtp_fixed_drafts = false;
 };
 
 struct EngineOptions {

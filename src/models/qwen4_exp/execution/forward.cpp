@@ -7,6 +7,7 @@
 
 #include "models/qwen4_exp/execution/forward.h"
 
+#include "ninfer/ops/argmax.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
@@ -28,6 +29,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -86,14 +88,26 @@ ops::QsaIndexerGeometry qsa_geometry(const TextConfig& c) {
 }
 
 Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, ForwardState state,
-                 ForwardKV kv, ForwardExperts experts)
+                 ForwardKV kv, ForwardExperts experts, std::optional<ForwardMtp> mtp)
     : parameters_(parameters), config_(parameters.model.config()), device_(device), work_(&work),
-      state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)) {
+      state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)), mtp_(std::move(mtp)) {
     if (state_.gdn_conv.size() != config_.gdn_layers || state_.gdn_recurrent.size() != config_.gdn_layers ||
         state_.ple_slot.dtype != DType::I32 || state_.ple_slot.numel() != 1 ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
         kv_.pooled.size() != config_.attention_layers || experts_.frames.size() != config_.num_hidden_layers) {
         throw std::invalid_argument("Qwen4Exp forward: state, KV or expert residency is incomplete");
+    }
+    if (mtp_.has_value() != parameters_.mtp.has_value()) {
+        throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
+    }
+    if (mtp_) {
+        // Every drafter expert is resident: expert e's record is frame e of its device bank.
+        const auto E = static_cast<std::int32_t>(config_.moe.experts);
+        std::vector<std::int32_t> identity(static_cast<std::size_t>(E));
+        for (std::int32_t e = 0; e < E; ++e) { identity[static_cast<std::size_t>(e)] = e; }
+        mtp_frames_backing_ = DeviceBuffer(identity.size() * sizeof(std::int32_t));
+        mtp_frames_backing_.copy_from_host(identity.data(), mtp_frames_backing_.bytes);
+        mtp_frames_ = Tensor(mtp_frames_backing_.p, DType::I32, {E});
     }
 }
 
@@ -183,6 +197,13 @@ void Forward::run_back(const ForwardBatch& batch, std::uint32_t begin, Tensor& l
     }
     layers(begin, config_.num_hidden_layers, batch, tap);
     Tensor& residual = residual_;
+    if (batch.residual_out.data != nullptr) {
+        if (batch.residual_out.bytes() != residual.bytes()) {
+            throw std::invalid_argument("Qwen4Exp forward: residual_out must be BF16 [S*H, T]");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(batch.residual_out.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s));
+    }
+    if (batch.mtp_chunk != nullptr) { mtp_cells(*batch.mtp_chunk, residual); }
     auto scope       = work_->scope();
     Tensor final_x   = mix(parameters_.final_mixer, residual, nullptr);
     Tensor last    = work_->alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
@@ -200,7 +221,7 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
     Tensor xa     = mix(block.attn_hc, residual, &inject);
     const std::uint32_t compact = config_.compact_layer_indices[layer];
     Tensor y = config_.layer_types[layer] == MixerKind::Gdn
-                   ? gdn(std::get<GdnParameters>(block.mixer), xa, compact)
+                   ? gdn(std::get<GdnParameters>(block.mixer), xa, compact, batch)
                    : attention(std::get<AttentionParameters>(block.mixer), xa, compact, batch);
     ops::hyper_connection_inject(y, inject, residual, s);
     Tensor xm = mix(block.mlp_hc, residual, &inject);
@@ -231,36 +252,52 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
     Tensor e   = work_->alloc(DType::BF16, {dim(config_.ple.embed_dim), T});
     ops::ple_embed(batch.ngram_rows, config_.ple.table.format, e, s);
     Tensor kv = work_->alloc(DType::BF16, {W + H, T});
-    project(e, p.projection, kv, *work_, s);
+    project_verify(e, p.projection, kv, batch.verify != nullptr);
     Tensor key   = work_->alloc(DType::BF16, {W, T});
     Tensor value = work_->alloc(DType::BF16, {H, T});
     {
         Tensor* parts[] = {&key, &value};
         ops::split_rows(kv, parts, s);
     }
-    Tensor gated      = work_->alloc(DType::BF16, {W, T});
-    Tensor normalized = work_->alloc(DType::BF16, {W, T});
+    Tensor gated = work_->alloc(DType::BF16, {W, T});
+    // A verification call records the convolution inputs for its commit and leaves the history.
+    Tensor normalized = batch.verify != nullptr ? batch.verify->ple_inputs : work_->alloc(DType::BF16, {W, T});
     ops::ple_gate(key, value, residual, p.key_norm, p.query_norm, p.conv_norm, dim(config_.hc.streams),
                   config_.rms_norm_eps, gated, normalized, s);
     // One sequence in state slot 0, updated in place. The slot index is state (no per-call memset:
     // a memset node splits the decode graph's kernel chain).
     ops::ple_conv_inject(gated, normalized, p.convolution, dim(config_.ple.conv_dilation), state_.ple_conv,
-                         state_.ple_slot, state_.ple_slot, residual, s);
+                         state_.ple_slot, batch.verify != nullptr ? Tensor{} : state_.ple_slot, residual, s);
 }
 
-Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index) {
+void Forward::project_verify(const Tensor& x, const LinearParameters& p, Tensor& out, bool columnwise) {
+    const cudaStream_t s = device_.stream;
+    if (!columnwise || x.ne[1] == 1) {
+        project(x, p, out, *work_, s);
+        return;
+    }
+    for (std::int32_t t = 0; t < x.ne[1]; ++t) {
+        Tensor column = out.slice(1, t, 1);
+        project(x.slice(1, t, 1), p, column, *work_, s);
+    }
+}
+
+Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch) {
     const cudaStream_t s = device_.stream;
     const auto& g        = config_.gdn;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size);
     const std::int32_t C = dim(g.conv_channels()), KW = dim(g.key_width()), VW = dim(g.value_width());
     const std::int32_t NV = dim(g.value_heads), NK = dim(g.key_heads), DK = dim(g.key_head_dim),
                        DV = dim(g.value_head_dim);
-    Tensor qkv = work_->alloc(DType::BF16, {C, T});
+    // A verification call projects its convolution inputs straight into the replay records.
+    GdnReplayRecordLayer records;
+    if (batch.verify != nullptr) { records = batch.verify->gdn.layer(static_cast<std::int32_t>(index), 1); }
+    Tensor qkv = batch.verify != nullptr ? records.conv.view({C, T}) : work_->alloc(DType::BF16, {C, T});
     project(x, p.qkv, qkv, *work_, s);
     Tensor z = work_->alloc(DType::BF16, {VW, T});
     project(x, p.z, z, *work_, s);
     Tensor ab = work_->alloc(DType::BF16, {2 * NV, T});
-    project(x, p.control, ab, *work_, s);
+    project_verify(x, p.control, ab, batch.verify != nullptr);
     Tensor a = work_->alloc(DType::BF16, {NV, T});
     Tensor b = work_->alloc(DType::BF16, {NV, T});
     {
@@ -275,15 +312,29 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     Tensor k = work_->alloc(DType::BF16, {KW, T});
     Tensor v = work_->alloc(DType::BF16, {VW, T});
     Tensor& conv_state = state_.gdn_conv.at(index);
-    ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state, conv_state, q, k, v, s);
+    // Verification reads the live convolution window and discards the advanced one.
+    Tensor conv_out = batch.verify != nullptr ? batch.verify->conv_scratch : conv_state;
+    ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state, conv_out, q, k, v, s);
     Tensor qt = work_->alloc(DType::BF16, {DK, NV, T});
     Tensor kt = work_->alloc(DType::BF16, {DK, NV, T});
     tile_heads(q.view({DK, NK, T}), qt, s);
     tile_heads(k.view({DK, NK, T}), kt, s);
     Tensor o = work_->alloc(DType::BF16, {DV, NV, T});
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(DK)));
-    ops::gated_delta_net(qt, kt, v.view({DV, NV, T}), gate, beta, scale, /*normalize_qk=*/true, *work_,
-                         state_.gdn_recurrent.at(index), o, device_.execution_view());
+    if (batch.verify != nullptr) {
+        // The recurrence from the live state, which it leaves unchanged; the tiled q/k (one key
+        // head per value head), v and {g, beta} go to the records the commit folds.
+        Tensor& recurrent = state_.gdn_recurrent.at(index);
+        const Tensor states = recurrent.view({DK, DV, NV, 1});
+        Tensor out          = o.view({DV, NV, T, 1});
+        ops::gated_delta_net_replay_record(qt.view({DK, NV, T, 1}), kt.view({DK, NV, T, 1}), v.view({DV, NV, T, 1}),
+                                           gate.view({NV, T, 1}), beta.view({NV, T, 1}), scale, states, Tensor{},
+                                           batch.verify->initial_slot, records.key, records.value, records.gate,
+                                           out, s);
+    } else {
+        ops::gated_delta_net(qt, kt, v.view({DV, NV, T}), gate, beta, scale, /*normalize_qk=*/true, *work_,
+                             state_.gdn_recurrent.at(index), o, device_.execution_view());
+    }
     Tensor normed = work_->alloc(DType::BF16, {DV, NV * T});
     ops::gated_rmsnorm(o.view({DV, NV * T}), p.norm, z.view({DV, NV * T}),
                        g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu,
@@ -325,7 +376,10 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     Tensor index_rows = work_->alloc(DType::BF16, {IH * ID + ID, T});
     ops::cast_fp32_to_bf16(indexed, index_rows, s);
     Tensor iq = work_->alloc(DType::BF16, {ID, IH, T});
-    Tensor ik = work_->alloc(DType::BF16, {ID, T});
+    // A verification call records the raw index keys for the tail commit.
+    Tensor ik = batch.verify != nullptr
+                    ? batch.verify->qsa_keys.slice(2, static_cast<std::int32_t>(index), 1).view({ID, T})
+                    : work_->alloc(DType::BF16, {ID, T});
     {
         Tensor iqf      = iq.view({IH * ID, T});
         Tensor* parts[] = {&iqf, &ik};
@@ -344,8 +398,10 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     const PagedKVLayerView& cache = kv_.layers.at(index);
     ops::kv_cache_append(kn, v, batch.positions, cache, s);
     const auto geometry = qsa_geometry(config_);
+    // Verification pools from a copy of the live tail (and advances the copy).
+    Tensor tail = batch.verify != nullptr ? batch.verify->qsa_tails.at(index) : state_.qsa_tails.at(index);
     ops::qsa_pool_keys(ik, batch.positions, batch.rope_positions, batch.block_start_rope, p.index_key_norm, geometry,
-                       kv_.block_table, state_.qsa_tails.at(index), kv_.pooled.at(index), s);
+                       kv_.block_table, tail, kv_.pooled.at(index), s);
     ops::qsa_index_query(batch.rope_positions, p.index_query_norm, geometry, iq, s);
     const std::int32_t top = dim(config_.qsa.budget / config_.qsa.compress_ratio);
     Tensor selected = work_->alloc(DType::I32, {top, T});
@@ -425,6 +481,266 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     Tensor y = work_->alloc(DType::BF16, {H, T});
     ops::moe_combine(outputs, routing, shared, y, s);
     return y;
+}
+
+// ------------------------------------------------------------------------------- MTP drafter
+// Adapted from Infernix a3edb450 src/models/qwen4_exp/execution/forward.cpp:666-785 (run_mtp,
+// mtp_block). Modified for NInfer-3090: one sequence; BF16 projections in FP32 rows
+// (projection_fp32) where K <= 3072, BF16 Linears for the fusion and attention-output
+// projections; the routed experts are Q2_0 records served by offloaded_sparse_moe's narrow route
+// from the device bank (every expert resident) instead of resident_moe; the draft head is the
+// text model's IQ4_XS head over the public tokens (no proposal head, no draft log-probability).
+
+namespace {
+
+// FP32 rows of a BF16 projection, then one BF16 rounding (the drafter's projections).
+Tensor project_rows(const Tensor& x, std::initializer_list<const Tensor*> rows, std::int32_t n, WorkspaceArena& work,
+                    cudaStream_t s) {
+    Tensor wide = work.alloc(DType::FP32, {n, x.ne[1]});
+    ops::projection_fp32(x, std::span<const Tensor* const>(rows.begin(), rows.size()), wide, s);
+    Tensor out = work.alloc(DType::BF16, {n, x.ne[1]});
+    ops::cast_fp32_to_bf16(wide, out, s);
+    return out;
+}
+
+} // namespace
+
+Tensor Forward::mtp_attention(const MtpParameters& p, const Tensor& x, const MtpCall& call) {
+    const cudaStream_t s = device_.stream;
+    const auto& a        = config_.attention;
+    const std::int32_t T = x.ne[1], H = dim(config_.hidden_size);
+    const std::int32_t D = dim(a.head_dim), NH = dim(a.heads), KVH = dim(a.kv_heads), QW = dim(a.query_width());
+    const std::int32_t IH = dim(config_.qsa.index_heads), ID = dim(config_.qsa.index_head_dim);
+    ForwardMtp& m         = *mtp_;
+    Tensor kv = project_rows(x, {&p.key, &p.value}, 2 * D * KVH, *work_, s);
+    Tensor k  = work_->alloc(DType::BF16, {D, KVH, T});
+    Tensor v  = work_->alloc(DType::BF16, {D, KVH, T});
+    {
+        Tensor kf = k.view({D * KVH, T}), vf = v.view({D * KVH, T});
+        Tensor* parts[] = {&kf, &vf};
+        ops::split_rows(kv, parts, s);
+    }
+    Tensor index_rows = project_rows(x, {&p.index_query, &p.index_key}, IH * ID + ID, *work_, s);
+    Tensor iq         = work_->alloc(DType::BF16, {ID, IH, T});
+    Tensor ik         = call.key_records.data != nullptr ? call.key_records.view({ID, T}) : work_->alloc(DType::BF16, {ID, T});
+    {
+        Tensor iqf      = iq.view({IH * ID, T});
+        Tensor* parts[] = {&iqf, &ik};
+        ops::split_rows(index_rows, parts, s);
+    }
+    Tensor kn = work_->alloc(DType::BF16, {D, KVH, T});
+    {
+        Tensor kn_rows = kn.view({D, KVH * T});
+        ops::rmsnorm(k.view({D, KVH * T}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
+    }
+    const auto geometry = qsa_geometry(config_);
+    Tensor tail         = call.tail;
+    if (call.kv_only) {
+        ops::rope(call.positions, dim(config_.rope.rotary_dim), config_.rope.theta, kn, device_.execution_view());
+        ops::kv_cache_append(kn, v, call.positions, m.kv, s);
+        ops::qsa_pool_keys(ik, call.positions, call.rope_positions, call.block_start_rope, p.index_key_norm, geometry,
+                           kv_.block_table, tail, m.pooled, s);
+        return Tensor{};
+    }
+    Tensor qg   = project_rows(x, {&p.query_gate}, 2 * QW, *work_, s);
+    Tensor q    = work_->alloc(DType::BF16, {D, NH, T});
+    Tensor gate = work_->alloc(DType::BF16, {D, NH, T});
+    {
+        Tensor qf = q.view({D, NH * T}), gf = gate.view({D, NH * T});
+        Tensor* parts[] = {&qf, &gf};
+        ops::split_rows(qg.view({2 * D, NH * T}), parts, s);
+    }
+    Tensor qn = work_->alloc(DType::BF16, {D, NH, T});
+    {
+        Tensor qn_rows = qn.view({D, NH * T});
+        ops::rmsnorm(q.view({D, NH * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
+    }
+    ops::rope(call.positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, device_.execution_view());
+    ops::kv_cache_append(kn, v, call.positions, m.kv, s);
+    ops::qsa_pool_keys(ik, call.positions, call.rope_positions, call.block_start_rope, p.index_key_norm, geometry,
+                       kv_.block_table, tail, m.pooled, s);
+    ops::qsa_index_query(call.rope_positions, p.index_query_norm, geometry, iq, s);
+    const std::int32_t top = dim(config_.qsa.budget / config_.qsa.compress_ratio);
+    Tensor selected = work_->alloc(DType::I32, {top, T});
+    Tensor counts   = work_->alloc(DType::I32, {T});
+    ops::qsa_select_blocks(iq, call.positions, kv_.block_table, m.pooled, geometry, {kv_.max_visible_keys}, *work_,
+                           selected, counts, device_.execution_view());
+    Tensor out = work_->alloc(DType::BF16, {D, NH, T});
+    ops::qsa_attention(qn, call.positions, selected, counts, {D, NH, KVH}, geometry,
+                       static_cast<float>(1.0 / std::sqrt(static_cast<double>(D))), m.kv, *work_, out,
+                       device_.execution_view());
+    ops::sigmoid_mul(gate, out, s);
+    Tensor y = work_->alloc(DType::BF16, {H, T});
+    project(out.view({QW, T}), p.output, y, *work_, s);
+    return y;
+}
+
+void Forward::run_mtp(const MtpCall& call) {
+    work_->reset();
+    mtp_block(call);
+}
+
+void Forward::mtp_cells(const MtpChunk& chunk, const Tensor& residual) {
+    if (!mtp_) { throw std::logic_error("Qwen4Exp forward: MTP cells without the drafter"); }
+    const cudaStream_t s = device_.stream;
+    const std::int32_t T = residual.ne[1], W = dim(config_.residual_width());
+    const std::int32_t cells = (chunk.prepend ? 1 : 0) + chunk.columns;
+    const std::size_t column = static_cast<std::size_t>(W) * 2;
+    if (chunk.columns < 0 || chunk.columns > T || chunk.saved.bytes() != column ||
+        (cells > 0 && (chunk.ids.ne[0] != cells || chunk.positions.ne[0] != cells || chunk.rope_positions == nullptr ||
+                       chunk.block_start_rope == nullptr))) {
+        throw std::invalid_argument("Qwen4Exp forward: MTP chunk does not match the call");
+    }
+    // Cell v is `saved` (v = 0 when prepending) or call column v - prepend.
+    const std::int32_t first_column = chunk.prepend ? -1 : 0;
+    for (std::int32_t begin = 0; begin < cells; begin += kMtpChunkColumns) {
+        const std::int32_t n = std::min(kMtpChunkColumns, cells - begin);
+        auto scope  = work_->scope();
+        Tensor rows = work_->alloc(DType::BF16, {W, n});
+        auto* out   = static_cast<std::byte*>(rows.data);
+        std::int32_t from = first_column + begin;
+        if (from < 0) {
+            CUDA_CHECK(cudaMemcpyAsync(out, chunk.saved.data, column, cudaMemcpyDeviceToDevice, s));
+            out += column;
+            from = 0;
+        }
+        const std::int32_t rest = first_column + begin + n - from;
+        if (rest > 0) {
+            CUDA_CHECK(cudaMemcpyAsync(out, static_cast<const std::byte*>(residual.data) + column * from, column * rest,
+                                       cudaMemcpyDeviceToDevice, s));
+        }
+        const std::int32_t k = begin / kMtpChunkColumns;
+        MtpCall call{.residuals        = rows,
+                     .ids              = chunk.ids.slice(0, begin, n),
+                     .positions        = chunk.positions.slice(0, begin, n),
+                     .rope_positions   = Tensor(chunk.rope_positions + 3 * static_cast<std::size_t>(begin), DType::I32, {n, 3}),
+                     .block_start_rope = Tensor(chunk.block_start_rope + 3 * static_cast<std::size_t>(k), DType::I32, {3}),
+                     .tail             = mtp_->tail,
+                     .kv_only          = true};
+        mtp_block(call);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(chunk.saved.data, static_cast<const std::byte*>(residual.data) + column * (T - 1), column,
+                               cudaMemcpyDeviceToDevice, s));
+}
+
+void Forward::mtp_block(const MtpCall& call) {
+    if (!mtp_ || !parameters_.mtp) { throw std::logic_error("Qwen4Exp forward: the MTP drafter is not loaded"); }
+    const cudaStream_t s = device_.stream;
+    const auto& p        = *parameters_.mtp;
+    const std::int32_t T = call.ids.ne[0], H = dim(config_.hidden_size), W = dim(config_.residual_width());
+    const std::int32_t S = dim(config_.hc.streams);
+    if (T <= 0 || call.residuals.ne[0] != W || call.residuals.ne[1] != T || call.positions.ne[0] != T ||
+        call.rope_positions.ne[0] != T || call.rope_positions.ne[1] != 3 || call.block_start_rope.ne[0] != 3 ||
+        call.tail.data == nullptr || (!call.kv_only && (T != 1 || call.residual_out.data == nullptr ||
+                                                        call.drafts.data == nullptr)) ||
+        T > mtp_->ones.ne[1]) {
+        throw std::invalid_argument("Qwen4Exp forward: MTP call geometry is invalid");
+    }
+    auto scope = work_->scope();
+    try {
+        // Input fusion: R = fc_hidden(each stream of RMSNorm_{S*H}(rows)) + fc_embedding(RMSNorm_H(embed(id))).
+        Tensor x0 = work_->alloc(DType::BF16, {H, T});
+        ops::embedding(call.ids, parameters_.token_embedding, x0, s);
+        Tensor e = work_->alloc(DType::BF16, {H, T});
+        ops::rmsnorm(x0, p.embedding_norm, config_.rms_norm_eps, true, e, s);
+        Tensor ep = work_->alloc(DType::BF16, {H, T});
+        project(e, p.embedding_projection, ep, *work_, s);
+        Tensor hn = work_->alloc(DType::BF16, {W, T});
+        ops::rmsnorm(call.residuals, p.hidden_norm, config_.rms_norm_eps, true, hn, s);
+        Tensor residual = work_->alloc(DType::BF16, {W, T});
+        {
+            Tensor per_stream = residual.view({H, S * T});
+            project(hn.view({H, S * T}), p.hidden_projection, per_stream, *work_, s);
+        }
+        ops::hyper_connection_inject(ep, mtp_->ones.slice(1, 0, T), residual, s);
+        const auto tap = [&](const Tensor& target, const Tensor& source) {
+            if (call.tap == nullptr || target.data == nullptr) { return; }
+            if (target.bytes() != source.bytes()) { throw std::invalid_argument("Qwen4Exp forward: MTP tap shape"); }
+            CUDA_CHECK(cudaMemcpyAsync(target.data, source.data, source.bytes(), cudaMemcpyDeviceToDevice, s));
+        };
+        if (call.tap != nullptr) { tap(call.tap->fused, residual); }
+
+        Tensor inject = work_->alloc(DType::FP32, {S, T});
+        Tensor xa     = mix(p.attn_hc, residual, &inject);
+        Tensor y      = mtp_attention(p, xa, call);
+        if (call.kv_only) { return; }
+        if (call.tap != nullptr) {
+            tap(call.tap->mixer_in, xa);
+            tap(call.tap->attention, y);
+        }
+        ops::hyper_connection_inject(y, inject, residual, s);
+
+        // MoE over the device-resident Q2_0 experts, with the shared expert.
+        Tensor xm            = mix(p.mlp_hc, residual, &inject);
+        const auto& mc       = config_.moe;
+        const std::int32_t E = dim(mc.experts), K = dim(mc.top_k), SI = dim(mc.shared_intermediate);
+        Tensor logits        = work_->alloc(DType::FP32, {E + 1, T});
+        {
+            const Tensor* rows[] = {&p.router, &p.shared_score};
+            ops::projection_fp32(xm, rows, logits, s);
+        }
+        ops::MoeRouting routing{work_->alloc(DType::I32, {K, T}), work_->alloc(DType::FP32, {K, T}),
+                                work_->alloc(DType::FP32, {T})};
+        ops::moe_route(logits, K, routing, s);
+        const DeviceSpan dispatch_bytes = work_->alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
+        ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
+        ops::moe_dispatch(routing, E, dispatch, nullptr, s);
+        const ops::MoeExpertSource source{.format        = p.bank->format,
+                                          .frame_base    = p.bank->device_records,
+                                          .frames        = static_cast<const std::int32_t*>(mtp_frames_.data),
+                                          .host_records  = p.bank->device_records,
+                                          .record_stride = p.bank->record_stride,
+                                          .frame_stride  = p.bank->record_stride};
+        Tensor outputs              = work_->alloc(DType::BF16, {H, K * T});
+        const std::int32_t max_jobs = std::min(E, K * T);
+        const DeviceSpan expert_ws  = work_->alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T));
+        ops::moe_experts(xm, dispatch, source, K, max_jobs, expert_ws.data, outputs, s);
+        Tensor gu = project_rows(xm, {&p.shared_gate, &p.shared_up}, 2 * SI, *work_, s);
+        Tensor g  = work_->alloc(DType::BF16, {SI, T});
+        Tensor u  = work_->alloc(DType::BF16, {SI, T});
+        {
+            Tensor* parts[] = {&g, &u};
+            ops::split_rows(gu, parts, s);
+        }
+        Tensor product = work_->alloc(DType::BF16, {SI, T});
+        ops::silu_mul(g, u, product, s);
+        Tensor shared = project_rows(product, {&p.shared_down}, H, *work_, s);
+        Tensor ym     = work_->alloc(DType::BF16, {H, T});
+        ops::moe_combine(outputs, routing, shared, ym, s);
+        if (call.tap != nullptr) {
+            tap(call.tap->moe_in, xm);
+            tap(call.tap->routes, routing.ids);
+            tap(call.tap->moe_out, ym);
+        }
+        ops::hyper_connection_inject(ym, inject, residual, s);
+        CUDA_CHECK(cudaMemcpyAsync(call.residual_out.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s));
+
+        // The draft: argmax of the text head over the public tokens, from BF16 logits.
+        Tensor final_x = mix(p.final_mixer, residual, nullptr);
+        Tensor head    = work_->alloc(DType::FP32, {dim(config_.vocab_size), T});
+        ops::projection_fp32(final_x, parameters_.output_head, head, s);
+        if (call.tap != nullptr) {
+            tap(call.tap->final_x, final_x);
+            tap(call.tap->logits, head);
+        }
+        Tensor narrow = work_->alloc(DType::BF16, {dim(config_.vocab_size), T});
+        ops::cast_fp32_to_bf16(head, narrow, s);
+        Tensor drafts = call.drafts;
+        ops::argmax(narrow, drafts, dim(parameters_.model.resources().public_token_count), s);
+    } catch (const std::exception& error) {
+        throw std::runtime_error(std::string("qwen4_exp/mtp: ") + error.what());
+    }
+}
+
+std::size_t Forward::mtp_workspace_bytes(const TextConfig& c, std::int32_t columns, std::uint32_t max_visible_keys,
+                                         DeviceExecutionView execution) {
+    const std::size_t t = static_cast<std::size_t>(columns), bf = 2, f = 4;
+    const std::size_t h = c.hidden_size, w = c.residual_width(), v = c.vocab_size;
+    // A block at `columns` columns (as the text forward sizes one), the fusion's tensors, the
+    // FP32 projection rows and the head's logits of one column.
+    return workspace_bytes(c, columns, max_visible_keys, execution) + (h * 4 + w * 2) * t * bf +
+           (2 * std::size_t(c.attention.query_width()) + 2 * std::size_t(c.attention.key_width()) + 1024) * t * f +
+           v * (f + bf) + (8ULL << 20);
 }
 
 } // namespace ninfer::models::qwen4_exp::execution

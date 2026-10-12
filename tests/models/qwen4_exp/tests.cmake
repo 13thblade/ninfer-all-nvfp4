@@ -16,6 +16,15 @@ ninfer_add_test(ninfer_qwen4_exp_forward_real_test
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
 set_tests_properties(ninfer_qwen4_exp_forward_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# GPU, real artifact with the MTP drafter (skips otherwise): verification reproduces one-column
+# decode bit for bit and its commit leaves the decode's state; the drafter's fusion, MoE and head
+# against FP64 oracles on its tapped inputs.
+ninfer_add_test(ninfer_qwen4_exp_mtp_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_real.cpp"
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_ops ninfer_core)
+set_tests_properties(ninfer_qwen4_exp_mtp_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # Host only: the expert cache (LFRU against the replay tool's decisions, frames, the controller and
 # the warm-start state file) and the startup memory plans (RAM ledger, VRAM sizing, control law).
 ninfer_add_test(ninfer_qwen4_exp_expert_cache_test

@@ -129,6 +129,35 @@ Parameters::Parameters(const Model& source) : model(source) {
         }
         layers.push_back(std::move(out));
     }
+    if (const auto& m = source.mtp()) {
+        MtpParameters p;
+        p.embedding_norm       = prepare.tensor(m->embedding_norm);
+        p.hidden_norm          = prepare.tensor(m->hidden_norm);
+        p.embedding_projection = prepare.linear({m->embedding_projection});
+        p.hidden_projection    = prepare.linear({m->hidden_projection});
+        p.attn_hc              = prepare.hc(m->attn_hc);
+        p.mlp_hc               = prepare.hc(m->mlp_hc);
+        p.final_mixer          = prepare.hc(m->final_mixer);
+        const auto& a          = m->attention;
+        p.query_gate           = prepare.tensor(a.query_gate);
+        p.key                  = prepare.tensor(a.key);
+        p.value                = prepare.tensor(a.value);
+        p.output               = prepare.linear({a.output});
+        p.query_norm           = prepare.tensor(a.query_norm);
+        p.key_norm             = prepare.tensor(a.key_norm);
+        p.index_query          = prepare.tensor(a.index_query);
+        p.index_key            = prepare.tensor(a.index_key);
+        p.index_query_norm     = prepare.tensor(a.index_query_norm);
+        p.index_key_norm       = prepare.tensor(a.index_key_norm);
+        p.router               = prepare.tensor(m->moe.router);
+        p.shared_score         = prepare.tensor(m->moe.shared_score);
+        p.shared_gate          = prepare.tensor(m->moe.shared_gate);
+        p.shared_up            = prepare.tensor(m->moe.shared_up);
+        p.shared_down          = prepare.tensor(m->moe.shared_down);
+        p.bank                 = source.mtp_bank();
+        if (p.bank == nullptr) { throw std::logic_error("Qwen4Exp: the MTP drafter has no expert bank"); }
+        mtp = std::move(p);
+    }
 }
 
 } // namespace ninfer::models::qwen4_exp::execution

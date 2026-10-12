@@ -1,6 +1,6 @@
 // Adapted from Infernix a3edb450 src/runtime/engine/qwen4_exp_instance.cpp (Apache-2.0).
 // Modified for NInfer-3090: full RAM mode only (no SSD tier: a ledger that cannot hold every expert
-// refuses); no prefix cache, MTP, n-gram drafts or vision; the options NInfer's serving can set
+// refuses); MTP speculation through the artifact's drafter (--spec mtp); no prefix cache, n-gram drafts or vision; the options NInfer's serving can set
 // that this model does not support are refused with the flag to change; NInfer's startup phases.
 
 #include "runtime/engine/qwen4_exp_instance.h"
@@ -49,8 +49,13 @@ void validate(const EngineOptions& options) {
     }
     if (options.max_concurrency != 1) { refuse("serves one request at a time in this release: use --max-concurrency 1"); }
     if (options.kv_cache != KvCacheStorage::Int8Group64) { refuse("its attention cache is INT8: use --kv-dtype int8"); }
-    if (options.speculative.backend != SpeculativeBackend::None || options.speculative.lookup_ngram != 0) {
-        refuse("has no speculative decoding in this release: remove --spec and --lookup-ngram");
+    if (options.speculative.backend != SpeculativeBackend::None && options.speculative.backend != SpeculativeBackend::Mtp) {
+        refuse("drafts with its MTP drafter only: use --spec mtp");
+    }
+    if (options.speculative.lookup_ngram != 0) { refuse("has no context-lookup drafts: remove --lookup-ngram"); }
+    if (options.speculative.backend == SpeculativeBackend::Mtp &&
+        (options.speculative.draft_tokens < 1 || options.speculative.draft_tokens > 7)) {
+        refuse("verifies at most 7 MTP drafts per round: use --draft-tokens 1..7");
     }
     if (options.enable_vision) { refuse("serves text only in this release: remove --vision"); }
     if (!options.grafts.empty()) { refuse("has no prompt grafts: remove --graft"); }
@@ -95,7 +100,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     if (!models::qwen4_exp::is_qwen4_exp(reader)) { throw std::invalid_argument("artifact is not Qwen4ExpForCausalLM"); }
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
-    auto plan = models::qwen4_exp::plan_load(reader);
+    // The drafter (its own QSA layer and 512 device-resident Q2_0 experts, ~0.86 GiB) loads only for
+    // --spec mtp; the proposal-head choice is moot: it drafts with the text head.
+    const bool mtp = options.speculative.backend == SpeculativeBackend::Mtp;
+    auto plan      = models::qwen4_exp::plan_load(reader, mtp);
     binding.complete();
     const auto& config = plan.config();
 
@@ -127,6 +135,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.vram_headroom   = next.vram_headroom_bytes;
     program_options.expert_cache_bytes = next.expert_cache_bytes;
     program_options.kv_base_tokens  = next.kv_base_tokens;
+    program_options.mtp_draft_tokens = mtp ? options.speculative.draft_tokens : 0;
+    program_options.mtp_width_cost   = next.mtp_width_cost;
+    program_options.mtp_fixed_drafts = next.mtp_fixed_drafts;
     program_options.ngram_volume    = next.ngram_volume_path.empty()
                                           ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                           : next.ngram_volume_path;

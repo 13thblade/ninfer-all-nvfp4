@@ -125,6 +125,23 @@ void qsa_pool_keys(const Tensor& raw_keys, const Tensor& positions, const Tensor
                    Tensor& pooled_pages, cudaStream_t stream);
 
 /**
+ * Op: QSA tail commit (speculative verification: Infernix a3edb450 qsa_commit_tails, one sequence).
+ *
+ * Inputs: raw_keys BF16 [Di, W, L], the raw index keys of W consecutive positions p_t =
+ * positions[0] + t of L layers, recorded by a verification call that pooled from a copy of the
+ * tails and left them unchanged; positions I32 [W]; commit_columns device I32 [1] holding n in
+ * [0, W]. Tails: layer l's BF16 [Di, R - 1] at tail0 + l * tail_stride_bytes.
+ *
+ * Effect: each layer's tail becomes what n one-column qsa_pool_keys calls at p_0 .. p_0 + n - 1
+ * would have left: for q in that order with q mod R != R - 1, column q mod R takes raw key q; no
+ * other column is written. This includes slots a commit spanning two blocks fills from the earlier
+ * block, which pooling never reads, so the committed state equals the decoded state bit for bit.
+ * n = 0 changes nothing. Exact copies. Execution: stream-ordered, graph-capturable.
+ */
+void qsa_commit_tails(const Tensor& raw_keys, const Tensor& positions, const Tensor& commit_columns,
+                      Tensor& tail0, std::int64_t tail_stride_bytes, cudaStream_t stream);
+
+/**
  * Op: QSA block selection.
  *
  * Inputs: index_q BF16 [Di, index_heads, T] (prepared by qsa_index_query), positions I32 [T]
@@ -187,7 +204,9 @@ void qsa_select_blocks(const Tensor& index_q, const Tensor& positions, const Ten
  * prepared query with their group scales applied in FP32; P x V takes one FP16 rounding of either
  * the probability times the value scale or the value code times its scale; accumulation, softmax
  * and merges are FP32; the output is stored as BF16. These are private implementation profiles;
- * the suite's named criterion qualifies every route against the FP64 oracle.
+ * the suite's named criterion qualifies every route against the FP64 oracle. In a call of at most
+ * eight columns a column's output bits do not depend on T or on the other columns (each column is
+ * split as a one-column call is), so a speculative verification reproduces one-column decode.
  *
  * Effects: out BF16 [256, 24, T] contiguous is completely overwritten; the cache and every input
  * are unchanged; out, inputs, cache and workspace are pairwise non-overlapping.

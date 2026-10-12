@@ -496,9 +496,12 @@ constexpr int kStages = 2;
 
 QsaAttentionPlan qsa_attention_plan(std::int32_t tokens, std::int32_t multiprocessor_count) {
     // Columns x KV heads that already fill the SMs run unsplit; otherwise split the key list so
-    // that about two CTAs land on every SM, keeping at least one tile per warp.
+    // that about two CTAs land on every SM, keeping at least one tile per warp. Calls of at most
+    // kQsaColumnInvariantTokens columns take the one-column split, so a column's splits, and with
+    // them its bits, are those of a one-column decode call (a speculative verification of a few
+    // columns reproduces plain decode exactly).
     QsaAttentionPlan plan;
-    const std::int32_t ctas = tokens * kHkv;
+    const std::int32_t ctas = (tokens <= kQsaColumnInvariantTokens ? 1 : tokens) * kHkv;
     const std::int32_t max_splits = (kMaxTiles + kWarps - 1) / kWarps;
     if (ctas >= multiprocessor_count) {
         plan.splits = 1;

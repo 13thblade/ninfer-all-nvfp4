@@ -478,6 +478,9 @@ struct FoldGeometry {
 
 using FoldGeometry16x48 = FoldGeometry<16, 48, 10240>;
 using FoldGeometry16x32 = FoldGeometry<16, 32, 8192>;
+// Qwen3.8-Flash-Next: the GGUF's tiled value heads (value head h reads key head h % 16) reach the
+// recurrence as 48 key heads, one per value head.
+using FoldGeometry48x48 = FoldGeometry<48, 48, 10240>;
 
 template <class Geometry, class StateT = float>
 struct FoldAccess {
