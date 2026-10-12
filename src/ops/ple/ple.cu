@@ -256,7 +256,7 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
                      std::int32_t dilation, Tensor& states, const Tensor& source_slots,
                      const Tensor& destination_slots, Tensor& residual, cudaStream_t stream) {
     require(contiguous(gated, DType::BF16) && contiguous(normalized, DType::BF16) &&
-                contiguous(weight, DType::FP16) && contiguous(states, DType::BF16) &&
+                contiguous(weight, DType::FP32) && contiguous(states, DType::BF16) &&
                 contiguous(residual, DType::BF16) && contiguous(source_slots, DType::I32) &&
                 (destination_slots.data == nullptr || contiguous(destination_slots, DType::I32)),
             "conv requires contiguous tensors");
@@ -264,7 +264,7 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
                 rank_at_most(weight, 2) && rank_at_most(states, 3) &&
                 rank_at_most(source_slots, 1) &&
                 (destination_slots.data == nullptr || rank_at_most(destination_slots, 1)),
-            "conv requires [C, T] activations, an FP16 [K, C] weight, [C, span, slots] state and "
+            "conv requires [C, T] activations, an FP32 [K, C] weight, [C, span, slots] state and "
             "[sequences] slot vectors");
     const int channels = gated.ne[0], columns = gated.ne[1], taps = weight.ne[0];
     const int sequences = source_slots.ne[0];
