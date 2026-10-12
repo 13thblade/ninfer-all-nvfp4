@@ -640,7 +640,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         prepare_graphs();
         device.synchronize();
         const std::size_t free_after = device.free_bytes();
-        graph_measured_bytes         = free_before > free_after ? free_before - free_after : 0;
+        graph_measured_bytes =
+            free_after == 0 ? std::nullopt
+                            : std::optional<std::size_t>(
+                                  free_before > free_after ? free_before - free_after : 0);
         graph_phase.complete();
     }
     work.reset();

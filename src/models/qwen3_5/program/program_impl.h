@@ -301,6 +301,8 @@ struct CapturePressureCandidateImpl : ResourceCandidateState {};
 struct HybridQuoteImpl {
     runtime::RequestPlanSummary summary;
     ops::SamplingConfig sampling;
+    std::shared_ptr<text::GrammarState> grammar;
+    bool logprobs                             = false;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
@@ -581,11 +583,16 @@ struct RequestControl {
 
     std::optional<Prefill> prefill;
 
-    // Returns the request slot to Empty once its lane's resources have been released.
+    // Returns the request slot to Empty once its lane's resources have been released. Nothing of
+    // the request survives into the lane's next one: its grammar and its logprob switch belong to
+    // the request, whichever admission path installs the next.
     void retire() noexcept {
         prefill.reset();
         lifecycle            = Lifecycle::Empty;
         pending              = {};
+        mask_cost            = {};
+        next_mask_frontier   = 0;
+        logprobs             = false;
         active_resources     = {};
         optional_resources   = {};
         publish_continuation = true;
@@ -593,6 +600,8 @@ struct RequestControl {
         lease_space_limited  = false;
         lease_minimum_target = {};
         lease_ceiling        = 0;
+        grammar.reset();
+        next_mask.reset();
     }
 };
 
@@ -862,8 +871,9 @@ public:
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     // Free device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
-    // launch of every executable), for comparison with graph_allowance_bytes.
-    std::size_t graph_measured_bytes = 0;
+    // launch of every executable), for comparison with graph_allowance_bytes; empty when no free
+    // memory was left to measure it by.
+    std::optional<std::size_t> graph_measured_bytes = 0;
     const WorkspacePlan workspace_plan;
 
     // Overlay Vision residency only: the persistent arena is VMM-backed so free KV granules can be

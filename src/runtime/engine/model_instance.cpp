@@ -69,8 +69,8 @@ void validate_options(const EngineOptions& options) {
     if (options.suspend.enabled) {
         if (options.wddm_evictable_budget) {
             throw std::invalid_argument(
-                "model suspend cannot be combined with the WDDM evictable budget: its arenas come "
-                "from a D3D12 heap rather than releasable virtual memory");
+                "model suspend cannot be combined with the WDDM evictable budget: the budget "
+                "commits the device arenas at startup, and a suspend releases them");
         }
         const std::vector<int> ids =
             options.devices.empty() ? std::vector<int>{options.device} : options.devices;
@@ -648,7 +648,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         options.stage_layers = models::qwen3_5::default_stage_layers(
             reader, models::load_options(options), sizing, free_bytes);
     }
-    core::set_wddm_residency_lock_enabled(options.wddm_evictable_budget);
+    core::set_wddm_evictable_budget(options.wddm_evictable_budget);
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));
     binding.complete();

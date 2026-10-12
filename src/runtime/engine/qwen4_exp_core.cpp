@@ -70,6 +70,9 @@ bool request_error(const std::exception_ptr& error) {
         std::rethrow_exception(error);
     } catch (const RequestError&) { return true; } catch (const std::invalid_argument&) {
         return true;
+    } catch (const text::GrammarViolation&) {
+        // Raised by the output policy before anything of the round is committed.
+        return true;
     } catch (...) {}
     return false;
 }

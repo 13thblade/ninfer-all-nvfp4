@@ -888,7 +888,9 @@ std::string format_server_start_json(
              {"kv_capacity_headroom_bytes", memory.kv_capacity_headroom_bytes},
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
-             {"cuda_graph_measured_bytes", memory.cuda_graph_measured_bytes},
+             {"cuda_graph_measured_bytes", memory.cuda_graph_measured_bytes
+                                               ? Json(*memory.cuda_graph_measured_bytes)
+                                               : Json(nullptr)},
              {"kv_payload_bytes", memory.kv_payload_bytes},
              {"host_state_capacity_slots", memory.host_state_capacity_slots},
              {"host_state_occupied_slots", memory.host_state_occupied_slots},

@@ -228,7 +228,10 @@ without it: the row keeps its logits and samples once the mask is ready, while t
 go on. The Qwen3.5 family computes such a request's next mask after each of its tokens and leaves
 the request out of decode rounds until the mask is ready. A mask over 5 s fails its request with
 an explicit error, and so does a Gemma 4 or Flash-Next decoding request without a token for 120 s
-([Gemma 4](gemma4.md#structured-output)).
+([Gemma 4](gemma4.md#structured-output)). A generated token the grammar does not admit, which the
+masks should have excluded, fails its own request with an internal error (HTTP 500) and leaves
+the others running; in the Qwen3.5 family it still fails the whole engine when it arrives while
+another request's admission or prompt-state capture holds the context cache.
 
 It is opt-in: start the server with `--structured-output` (the CLI's `--json` and `--json-schema`
 enable it for their run). That reserves one grammar mask plane per draft position and lane; a
@@ -1873,7 +1876,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision-max-merged N` | merged-token budget of one media item, `[64, 16384]`; larger images and video frame pairs are downscaled at preprocessing instead of being rejected, and the overlay window is sized for it. Gemma 4 (at least 70): the most soft tokens an image or video frame takes, rounded down to its budgets 70, 140, 280, 560, 1120; an image takes 280 (70 at `detail: low`, this bound at `detail: high`), a video frame 70 | 16384 |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--cuda-graph-allowance-mib N` | total CUDA Graph driver-state allowance in MiB, subtracted from the KV sizing budget | computed |
-| `--wddm-evictable-budget` | Windows builds with `-DNINFER_D3D12_RESIDENCY=ON`: budget against dedicated memory, holding the device arenas resident | off |
+| `--wddm-evictable-budget` | Windows builds: budget the KV cache against dedicated memory less the weights and a 512 MiB desktop floor, committing the device arenas at startup; another process taking memory can then slow generation | off |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--use-alt-prefix-caching` | select the hybrid prefix cache ([spec](maintainer/hybrid-prefix-cache-spec.md)): content-addressed 64-token KV blocks shared across requests plus sparse state snapshots. It configures itself: `--kv-capacity` defaults to `auto` (free VRAM becomes Device block cache) and `--host-cache-mib` sizes the one pinned Host pool that blocks and snapshots share. The checkpoint-catalog flags are rejected with it: its capacities, `--auto-long-anchors`, `--auto-prefix-grid`, `--derive-session-keys`, `--context-cache-policy`, `--release-diverged-checkpoints`, `--thorough-admission-search`, `--recency-eviction`, `--value-aware-demote` and the disk tier, as are pipeline `--devices`. Requests that share a new prefix with one still prefilling wait for its snapshot instead of prefilling the prefix again, which needs `--concurrent-prefill` to admit them meanwhile. | off |
 | `--use-original-prefix-caching` | select the checkpoint catalog explicitly; it is already the default, and the flag is accepted for command lines written for builds where the hybrid cache is. Rejected together with `--use-alt-prefix-caching` | default |
@@ -2104,7 +2107,8 @@ that same allocation; these bytes must not be added to `workspace.capacity_bytes
 `null` when Vision is disabled.
 `cuda_graph_allowance_bytes` is the CUDA Graph memory the KV sizing reserved, and
 `cuda_graph_measured_bytes` the Device memory graph preparation actually took at startup (`0`
-without CUDA Graphs); the startup log warns when the second exceeds the first.
+without CUDA Graphs, `null` when no free Device memory was left to measure it by, as under WDDM
+with the card full); the startup log warns when the second exceeds the first.
 
 `server_start.engine` records `ngram_draft_window` and `ngram_min_match` (`--ngram-draft-tokens`,
 `0` when n-gram drafting is off, and `--ngram-min-match`), the draft-archive budgets

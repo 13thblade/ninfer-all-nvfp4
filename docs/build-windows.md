@@ -63,11 +63,14 @@ repository root: `nvcc` writes `.exp` and `.lib` files next to the output.
 Windows builds differ from Linux builds in three places: they decode PNG images natively (a
 prebuilt FFmpeg tree may have no PNG decoder), they pass the NVFP4 TMA descriptors through device
 memory, since MSVC cannot pass them by value, and WDDM charges pinned host memory against the
-card's memory. The Windows-only options, both untested:
+card's memory. Every Windows build offers `--wddm-evictable-budget`, which sizes the KV cache against
+the card's memory less the weights and a 512 MiB desktop floor instead of what is free at startup,
+and commits the device arenas at startup. Another process that later takes memory makes WDDM page
+some of this process's memory out, which slows generation until it comes back. The Windows-only
+build option, untested:
 
 | option | effect |
 |---|---|
-| `NINFER_D3D12_RESIDENCY=ON` | `--wddm-evictable-budget`: device arenas from a D3D12 heap held resident at maximum priority |
 | `NINFER_DIRECTSTORAGE=ON` | fetches the DirectStorage 1.3 runtime and offers `--disk-kv-directstorage` for disk-tier restores |
 
 The other build options are in the [Linux guide](build-linux.md#build-options).

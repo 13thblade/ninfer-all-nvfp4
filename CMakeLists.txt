@@ -107,12 +107,6 @@ option(NINFER_BF16_RESIDUAL_ADD
 if(NINFER_BF16_RESIDUAL_ADD)
   add_compile_definitions(NINFER_BF16_RESIDUAL_ADD=1)
 endif()
-# Windows only: device arenas from a D3D12 heap held resident, for --wddm-evictable-budget.
-option(NINFER_D3D12_RESIDENCY
-       "On Windows, offer --wddm-evictable-budget: D3D12-resident device arenas" OFF)
-if(WIN32 AND NINFER_D3D12_RESIDENCY)
-  add_compile_definitions(NINFER_D3D12_RESIDENCY=1)
-endif()
 # Windows only: disk-tier restores through Microsoft DirectStorage, for --disk-kv-directstorage.
 # dstorage.dll is delay-loaded, so a binary that never asks for DirectStorage runs without it.
 option(NINFER_DIRECTSTORAGE

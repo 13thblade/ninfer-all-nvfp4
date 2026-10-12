@@ -15,6 +15,7 @@
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/worker_fault.h"
+#include "text/structured_output.h"
 
 #include <algorithm>
 #include <array>
@@ -1701,10 +1702,13 @@ private:
         std::array<ContinuationAction, kMaximumConcurrency> continuations{};
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
         std::array<bool, kMaximumConcurrency> cancelled{};
+        // A row whose tokens its request's grammar rejects ends with this error instead.
+        std::array<std::exception_ptr, kMaximumConcurrency> row_errors{};
         bool generated_staged = false;
         std::array<std::shared_ptr<Request>, kMaximumConcurrency> terminal_requests{};
         std::array<std::uint32_t, kMaximumConcurrency> terminal_lanes{};
         std::array<FinishReason, kMaximumConcurrency> terminal_reasons{};
+        std::array<std::exception_ptr, kMaximumConcurrency> terminal_errors{};
         std::size_t terminal_count = 0;
         for (std::size_t row = 0; row < row_count; ++row) {
             lanes[row] = LaneId{lane_indices[row]};
@@ -1755,9 +1759,31 @@ private:
                     row_logprobs = pending.logprobs().subspan(
                         static_cast<std::size_t>(row) * pending.row_stride(), count);
                 }
-                const OutputDecision decision = request->output.preview_model(
-                    row_tokens, request->budget->remaining(), request->budget->limit_reason(),
-                    row_logprobs);
+                OutputDecision decision;
+                try {
+                    decision = request->output.preview_model(
+                        row_tokens, request->budget->remaining(), request->budget->limit_reason(),
+                        row_logprobs);
+                } catch (const text::GrammarViolation& violation) {
+                    // The round is consistent and only this request's output is wrong: it ends
+                    // with the error, its sequence released as a cancelled one's, and every other
+                    // row commits. A release waits for a global context transaction, as a
+                    // cancellation does, so during one the failure stays engine-wide.
+                    if (instance_.program->has_context_transaction()) { throw; }
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                       "lane %u structured output failed: %s", lane,
+                                       violation.what());
+                    row_errors[row] = std::current_exception();
+                    (void)request->output.preview_terminal(FinishReason::Cancelled);
+                    cancelled[row] = true;
+                    decisions[row] = CommitDecision{
+                        .accepted_tokens = 0,
+                        .terminal        = true,
+                        .cancelled       = true,
+                    };
+                    finish_reasons[row] = FinishReason::Cancelled;
+                    continue;
+                }
                 if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                     (!decision.finished() && decision.accepted_tokens != count) ||
                     (decision.finished() && decision.continuation != ContinuationAction::Decode) ||
@@ -1882,6 +1908,7 @@ private:
                         terminal_requests[terminal_count] = request;
                         terminal_lanes[terminal_count]    = lane;
                         terminal_reasons[terminal_count]  = finish_reasons[row];
+                        terminal_errors[terminal_count]   = row_errors[row];
                         ++terminal_count;
                     } else {
                         request->model_state     = EngineRequestState::ModelFinished;
@@ -1926,9 +1953,8 @@ private:
                     publish_runtime_stats();
                 } catch (...) {}
             }
-            for (std::size_t index = 0; index < terminal_count; ++index) {
-                complete_success(terminal_requests[index], terminal_reasons[index]);
-            }
+            complete_terminal_rows(terminal_requests, terminal_reasons, terminal_errors,
+                                   terminal_count);
             throw;
         }
         phase.finish();
@@ -1939,8 +1965,20 @@ private:
             remove_completed_slot(terminal_lanes[index]);
         }
         if (terminal_count != 0) { publish_runtime_stats(); }
-        for (std::size_t index = 0; index < terminal_count; ++index) {
-            complete_success(terminal_requests[index], terminal_reasons[index]);
+        complete_terminal_rows(terminal_requests, terminal_reasons, terminal_errors,
+                               terminal_count);
+    }
+
+    void complete_terminal_rows(
+        const std::array<std::shared_ptr<Request>, kMaximumConcurrency>& requests,
+        const std::array<FinishReason, kMaximumConcurrency>& reasons,
+        const std::array<std::exception_ptr, kMaximumConcurrency>& errors, std::size_t count) {
+        for (std::size_t index = 0; index < count; ++index) {
+            if (errors[index]) {
+                complete_error(requests[index], errors[index]);
+            } else {
+                complete_success(requests[index], reasons[index]);
+            }
         }
     }
 
