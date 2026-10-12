@@ -33,6 +33,8 @@ void projection_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
     require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous() && x.ne[2] == 1 &&
                 x.ne[3] == 1,
             "x must be contiguous BF16 [K, T]");
+    // The Q8_1 cast reads each 32-value group of x with uint4 loads.
+    require(reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0, "x must be 16-byte aligned");
     require(out.data != nullptr && out.dtype == DType::FP32 && out.is_contiguous() &&
                 out.ne[2] == 1 && out.ne[3] == 1,
             "out must be contiguous FP32 [N, T]");

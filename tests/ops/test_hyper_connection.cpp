@@ -436,6 +436,22 @@ int main() {
             } catch (const std::invalid_argument&) { threw = true; }
             check(threw, "an invalid LinearPolicy is refused by the capacity query");
         }
+        // A residual view off the 16-byte grid is refused (the fused route reads it with uint4).
+        {
+            Problem p = make_problem(false);
+            ninfer::WorkspaceArena ws(1 << 20);
+            Device rd(static_cast<std::size_t>(kW) * 2 + 16), xd(kH * 2);
+            const Tensor R(static_cast<std::uint16_t*>(rd.p) + 1, DType::BF16, {kW, 1});
+            const Tensor w(p.norm_device->p, DType::FP32, {kW});
+            Tensor x(xd.p, DType::BF16, {kH, 1});
+            bool threw = false;
+            try {
+                ninfer::ops::hyper_connection_mix(R, w, p.down_w, p.up_w,
+                                                  ninfer::ops::LinearPolicy::A16Only, kS, kRank,
+                                                  kEps, x, nullptr, ws, stream);
+            } catch (const std::invalid_argument&) { threw = true; }
+            check(threw, "a misaligned residual is refused");
+        }
         inject_and_expand(stream);
         cudaStreamDestroy(stream);
     } catch (const std::exception& error) {
