@@ -248,6 +248,13 @@ int main() {
               "Vision workspace layout missing");
     failures += check(server.at("memory").at("cuda_graph_measured_bytes") == 450,
                       "server_start memory does not report the measured CUDA Graph bytes");
+    ninfer::MemorySummary saturated = memory;
+    saturated.cuda_graph_measured_bytes.reset();
+    const Json saturated_server = Json::parse(format_server_start_json(
+        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias", load,
+        saturated, environment, std::uint64_t{123456}));
+    failures += check(saturated_server.at("memory").at("cuda_graph_measured_bytes").is_null(),
+                      "CUDA Graph bytes measured with no free memory left are not reported null");
     failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
                       "CUDA Graph allowance missing");
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&

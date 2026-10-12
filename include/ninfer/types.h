@@ -599,11 +599,12 @@ struct EngineOptions {
     // materializing requests and keeps serving the queue, as an out-of-memory failure does, instead
     // of failing the Engine. Eight consecutive recoveries without a completed unit still fail it.
     bool recover_invariant_failures = false;
-    // Windows builds with NINFER_D3D12_RESIDENCY only: allocate the device arenas from a D3D12
-    // heap held resident at maximum priority and budget the runtime against the adapter's
-    // dedicated memory less the weights and a 512 MiB desktop floor, not against what is free now,
-    // on the grounds that WDDM will evict other allocations. Not for a GPU that drives the
-    // desktop, whose allocations are often not evictable.
+    // Windows builds only: budget the runtime against the adapter's dedicated memory less the
+    // weights and a 512 MiB desktop floor, not against what is free now, on the grounds that WDDM
+    // will page other allocations out, and commit every owning device arena at startup. Under
+    // pressure from another process WDDM may page this process's memory out as well, which slows
+    // generation until the memory comes back. Not for a GPU that drives the desktop, whose
+    // allocations are often not evictable.
     bool wddm_evictable_budget         = false;
     ModelSuspendOptions suspend;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
@@ -1590,7 +1591,9 @@ struct MemorySummary {
     std::size_t cuda_graph_allowance_bytes        = 0;
     // Device memory CUDA Graph preparation actually took at startup (free memory before minus
     // after instantiating, uploading and launching every executable); 0 without CUDA Graphs.
-    std::size_t cuda_graph_measured_bytes         = 0;
+    // Empty when the device had no free memory left after preparation (WDDM can hand out more
+    // than the card holds), which leaves the difference only a lower bound.
+    std::optional<std::size_t> cuda_graph_measured_bytes = 0;
     std::size_t kv_payload_bytes                  = 0;
     std::uint32_t host_state_capacity_slots       = 0;
     std::uint32_t host_state_occupied_slots       = 0;

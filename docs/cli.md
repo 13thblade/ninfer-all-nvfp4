@@ -290,7 +290,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--vision-cpu` | `--vision` with `--vision-residency cpu` | off |
 | `--vision-max-merged N` | merged-token budget of one media item; larger media downscales at preprocessing. Gemma 4: the most soft tokens an image or video frame may take, rounded down to its budgets 70, 140, 280, 560, 1120 (an image takes 280, 70 with `detail: low` and this bound with `detail: high`; a video frame 70) | 16384 |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
-| `--wddm-evictable-budget` | Windows builds with `-DNINFER_D3D12_RESIDENCY=ON`: budget against dedicated memory, holding the device arenas resident | off |
+| `--wddm-evictable-budget` | Windows builds: budget the KV cache against dedicated memory less the weights and a 512 MiB desktop floor, committing the device arenas at startup; another process taking memory can then slow generation | off |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
