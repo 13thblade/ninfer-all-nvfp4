@@ -76,6 +76,7 @@ void split_rows(const Tensor& in, std::span<Tensor* const> outs, cudaStream_t st
     targets.count    = static_cast<int>(outs.size());
     targets.begin[0] = 0;
     for (std::size_t i = 0; i < outs.size(); ++i) {
+        require(outs[i] != nullptr, "split outputs must not be null");
         require(contiguous_bf16(*outs[i]) && outs[i]->ne[1] == in.ne[1],
                 "split outputs must be BF16 [r_i, T]");
         targets.data[i]      = static_cast<__nv_bfloat16*>(outs[i]->data);
@@ -105,8 +106,10 @@ void split_rows(const Tensor& in, std::span<Tensor* const> outs, cudaStream_t st
 }
 
 void gather_columns(const Tensor& in, const Tensor& columns, Tensor& out, cudaStream_t stream) {
-    require(contiguous_bf16(in) && contiguous_bf16(out) && columns.dtype == DType::I32 &&
-                columns.is_contiguous() && out.ne[0] == in.ne[0] && columns.numel() == out.ne[1],
+    require(contiguous_bf16(in) && contiguous_bf16(out) && columns.data != nullptr &&
+                columns.dtype == DType::I32 && columns.is_contiguous() && columns.ne[1] == 1 &&
+                columns.ne[2] == 1 && columns.ne[3] == 1 && out.ne[0] == in.ne[0] &&
+                columns.ne[0] == out.ne[1],
             "gather needs BF16 [R, T] in, BF16 [R, N] out and I32 [N] columns");
     gather_kernel<<<dim3((in.ne[0] + kThreads - 1) / kThreads, out.ne[1]), kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(in.data), in.ne[0],
