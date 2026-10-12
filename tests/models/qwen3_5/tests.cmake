@@ -15,6 +15,11 @@ ninfer_add_test(ninfer_qwen3_5_graft_loader_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_graft_loader.cpp"
   LIBRARIES ninfer_engine ninfer_core ninfer::json)
 
+# The reasoning-loop guard's repeated-passage measure (CPU only).
+ninfer_add_test(ninfer_qwen3_5_reasoning_loop_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reasoning_loop.cpp"
+  LIBRARIES ninfer_model_runtime)
+
 ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
   LIBRARIES ninfer_engine ninfer_core)
@@ -80,6 +85,13 @@ ninfer_add_test(ninfer_qwen3_5_dflash2_real_test
   LIBRARIES ninfer_engine
   TEST_ARGS 7 1 1 2 int8 0 1)
 
+# N-gram copy rounds beside DFlash2: copy exactness against non-speculative greedy, lifecycle,
+# context-store restore, a constrained copy, a copying lane beside a drafting lane and preemption
+# of copying lanes.
+ninfer_add_test(ninfer_qwen3_5_ngram_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_ngram_real.cpp"
+  LIBRARIES ninfer_engine ninfer::json)
+
 ninfer_add_test(ninfer_qwen3_5_dflash_prefill_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_prefill_real.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
@@ -111,6 +123,20 @@ ninfer_add_test(ninfer_qwen3_5_visual_scatter_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_visual_scatter.cpp"
   LIBRARIES ninfer_engine ninfer_core)
 
+# The context store under the launchers' DFlash2 profile (K=7, draft head, rk4v4, FP16 GDN state),
+# without and with n-gram copy drafting: the stored StateImages carry the draft's local rings, and
+# every restored continuation must match the warm control's output and speculation exactly.
+ninfer_bundle_command(ninfer_qwen3_5_context_store_real_command ninfer_tests
+  ninfer_qwen3_5_context_store_real_test)
+add_test(NAME ninfer_qwen3_5_context_store_dflash2_real_test
+  COMMAND ${ninfer_qwen3_5_context_store_real_command})
+set_tests_properties(ninfer_qwen3_5_context_store_dflash2_real_test PROPERTIES
+  ENVIRONMENT "NINFER_STORE_REAL_SPEC=dflash2")
+add_test(NAME ninfer_qwen3_5_context_store_ngram_real_test
+  COMMAND ${ninfer_qwen3_5_context_store_real_command})
+set_tests_properties(ninfer_qwen3_5_context_store_ngram_real_test PROPERTIES
+  ENVIRONMENT "NINFER_STORE_REAL_SPEC=dflash2-ngram")
+
 ninfer_bundle_command(ninfer_qwen3_5_prefix_real_command ninfer_tests
   ninfer_qwen3_5_prefix_real_test)
 add_test(NAME ninfer_qwen3_5_agent_continuation_real_test
@@ -125,6 +151,8 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_prefix_real_test
   ninfer_qwen3_5_agent_continuation_real_test
   ninfer_qwen3_5_context_store_real_test
+  ninfer_qwen3_5_context_store_dflash2_real_test
+  ninfer_qwen3_5_context_store_ngram_real_test
   ninfer_qwen3_5_preemption_real_test
   ninfer_qwen3_5_recovery_real_test
   ninfer_qwen3_5_grammar_real_test
@@ -133,6 +161,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_vision_workspace_test
   ninfer_qwen3_5_vision_overlay_real_test
   ninfer_qwen3_5_dflash2_real_test
+  ninfer_qwen3_5_ngram_real_test
   ninfer_qwen3_5_dflash_prefill_real_test
   ninfer_qwen3_5_moe_real_test
   ninfer_qwen3_5_dflash_real_test
@@ -153,12 +182,16 @@ ninfer_add_test(ninfer_qwen3_5_mtp_graph_profiles_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_graph_profiles.cpp"
   LIBRARIES ninfer_model_runtime ninfer_ops)
 
+ninfer_add_test(ninfer_qwen3_5_speculative_round_shapes_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_round_shapes.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_core)
+
 ninfer_add_test(ninfer_qwen3_5_mlp_a8_decode_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mlp_a8_decode_wiring.cpp"
   LIBRARIES ninfer_model_runtime ninfer_ops)
 
-ninfer_add_test(ninfer_qwen3_5_lookup_draft_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lookup_draft.cpp"
+ninfer_add_test(ninfer_qwen3_5_ngram_proposer_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp"
   LIBRARIES ninfer_core)
 # STANDALONE: the Python schema oracle drives this probe by executable path.
 ninfer_add_test(ninfer_qwen3_5_tool_constraints_test

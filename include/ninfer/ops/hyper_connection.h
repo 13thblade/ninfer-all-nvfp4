@@ -39,7 +39,7 @@ namespace ninfer::ops {
  * Supported domain:
  *   down and up are contiguous BF16 weights registered with Linear for their [N, K]; every T. The
  *   geometry S = 4, H = 2560, rank a multiple of 8 up to 512 is the one served without Linear at
- *   T <= 16. eps > 0.
+ *   T <= 16. residual is 16-byte aligned; eps > 0.
  *
  * Numeric:
  *   Arithmetic is FP32 from the represented inputs. Two profiles: at T <= 16 with the S = 4,

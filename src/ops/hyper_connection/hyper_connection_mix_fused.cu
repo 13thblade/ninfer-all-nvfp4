@@ -404,7 +404,8 @@ std::size_t hc_mix_fused_workspace_bytes(std::int32_t down_rows, std::int32_t st
 void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
                   const Weight& up, std::int32_t streams, std::int32_t rank, float eps, Tensor& x,
                   Tensor* inject, void* partials, cudaStream_t stream) {
-    if (!hc_mix_fused_supported(down, up, x.ne[0], streams, rank, residual.ne[1])) {
+    if (!hc_mix_fused_supported(down, up, x.ne[0], streams, rank, residual.ne[1]) ||
+        reinterpret_cast<std::uintptr_t>(residual.data) % 16 != 0) {
         throw std::invalid_argument("hyper_connection_mix: the fused route does not serve this problem");
     }
     if (inject != nullptr && down.n != rank + streams) {

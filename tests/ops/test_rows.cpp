@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -108,6 +109,30 @@ int gather_case(std::int32_t rows, std::int32_t tokens, const std::vector<std::i
     return failures;
 }
 
+// gather_columns refuses a column vector that is not rank one or has no data, before any launch.
+int gather_refusals() {
+    constexpr std::int32_t rows = 64, tokens = 4, n = 4;
+    GuardedDeviceBuffer device_input(static_cast<std::size_t>(rows) * tokens * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_columns(n * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_output(static_cast<std::size_t>(rows) * n * sizeof(std::uint16_t));
+    const Tensor in(device_input.data(), DType::BF16, {rows, tokens});
+    Tensor out(device_output.data(), DType::BF16, {rows, n});
+    int failures = 0;
+    for (const auto& [columns, what] :
+         {std::pair{Tensor(device_columns.data(), DType::I32, {n / 2, 2}), "I32 [N/2, 2] columns"},
+          std::pair{Tensor(nullptr, DType::I32, {n}), "null columns"}}) {
+        bool threw = false;
+        try {
+            ops::gather_columns(in, columns, out, nullptr);
+        } catch (const std::invalid_argument&) { threw = true; }
+        if (!threw) {
+            std::cerr << "FAIL gather_columns accepts " << what << "\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -133,6 +158,7 @@ int main() {
     failures += gather_case(2560, 1, {0});
     failures += gather_case(2560, 64, {63});
     failures += gather_case(2560, 17, {16, 0, 5, 5, 9});
+    failures += gather_refusals();
     std::cout << (failures ? "FAIL" : "OK") << " rows\n";
     return failures ? 1 : 0;
 }

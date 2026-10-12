@@ -52,19 +52,27 @@ void validate(const EngineOptions& options) {
     if (options.speculative.backend != SpeculativeBackend::None && options.speculative.backend != SpeculativeBackend::Mtp) {
         refuse("drafts with its MTP drafter only: use --spec mtp");
     }
-    if (options.speculative.lookup_ngram != 0) { refuse("has no context-lookup drafts: remove --lookup-ngram"); }
+    if (options.speculative.ngram_draft_tokens != 0) {
+        refuse("has no context-lookup drafts: remove --ngram-draft-tokens");
+    }
     if (options.speculative.backend == SpeculativeBackend::Mtp &&
         (options.speculative.draft_tokens < 1 || options.speculative.draft_tokens > 7)) {
         refuse("verifies at most 7 MTP drafts per round: use --draft-tokens 1..7");
+    }
+    if (options.kv_capacity.mode == KvCapacityMode::Automatic) {
+        refuse("sizes its KV pool itself from free VRAM (it grows and shrinks per request): remove "
+               "--kv-capacity auto");
     }
     if (options.enable_vision) { refuse("serves text only in this release: remove --vision"); }
     if (!options.grafts.empty()) { refuse("has no prompt grafts: remove --graft"); }
     if (options.devices.size() > 1) { refuse("runs on one GPU: remove --devices"); }
     if (options.context_store.enabled()) { refuse("has no context store (prefix reuse is off): remove --context-store"); }
     if (options.lm_head_q4 || options.lm_head_q6 || options.embedding_q4 || options.embedding_q6 ||
-        options.mtp_experts_q4 || options.mlp_a8_decode || options.prefill_cublas || options.gdn_state_fp16) {
+        options.mtp_experts_q4 || options.mlp_a8_decode || options.prefill_cublas || options.gdn_state_fp16 || !options.prefill_a8 ||
+        !options.prefill_cublas_projections) {
         refuse("its weights are the GGUF's, stored exactly: remove the load-time weight flags (--lm-head-q4/q6, "
-               "--embedding-q4/q6, --mtp-experts-q4, --mlp-a8-decode, --prefill-cublas, --gdn-state-fp16)");
+               "--embedding-q4/q6, --mtp-experts-q4, --mlp-a8-decode, --prefill-cublas, --gdn-state-fp16, "
+               "--no-prefill-a8, --no-prefill-cublas-projections)");
     }
 }
 

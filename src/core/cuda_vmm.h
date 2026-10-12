@@ -57,6 +57,7 @@ inline std::size_t granularity(int device) {
     return bytes;
 }
 
+// The raw result, so a caller can treat a refusal for lack of memory as a failed grow.
 inline CUresult try_set_access(CUdeviceptr va, std::size_t bytes, int device) {
     CUmemAccessDesc access{};
     access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;

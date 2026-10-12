@@ -136,6 +136,25 @@ int test_cli_contract() {
         expect(parsed.output == qb::OutputFormat::Json && parsed.output_file == "report.json",
                "output settings");
 
+    const auto ngram =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "dflash2",
+                        "--draft-tokens", "7", "--ngram-draft-tokens", "15", "--ngram-min-match",
+                        "8"});
+    failures += expect(ngram.speculative.ngram_draft_tokens == 15 &&
+                           ngram.speculative.ngram_min_match == 8,
+                       "benchmark n-gram copy controls");
+    const auto ngram_lanes =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "dflash2",
+                        "--draft-tokens", "7", "--ngram-draft-tokens", "15", "--concurrency", "2"});
+    failures +=
+        expect(ngram_lanes.speculative.ngram_draft_tokens == 15 && ngram_lanes.concurrency == 2,
+               "n-gram copy drafting above one lane");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "dflash2",
+                                  "--draft-tokens", "7", "--ngram-draft-tokens", "8"});
+        },
+        "n-gram copy window other than 15");
     for (const auto k : {1U, 7U, 15U}) {
         const auto dflash2 =
             parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "dflash2",
@@ -190,21 +209,28 @@ int test_cli_contract() {
                        "benchmark help omits new KV modes");
     const qb::BenchOptions route_defaults =
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer"});
-    failures += expect(!route_defaults.prefill_cublas && route_defaults.prefill_cublas_projections &&
-                           route_defaults.speculative.lookup_ngram == 0,
-                       "cuBLAS prefill or context lookup on by default");
+    failures += expect(!route_defaults.prefill_cublas && route_defaults.prefill_cublas_projections,
+                       "cuBLAS prefill on by default");
     const qb::BenchOptions route =
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "mtp",
-                        "--draft-tokens", "3", "--lookup-ngram", "5", "--prefill-cublas",
+                        "--draft-tokens", "3", "--prefill-cublas",
                         "--no-prefill-cublas-projections"});
     failures += expect(route.prefill_cublas && !route.prefill_cublas_projections &&
-                           route.speculative.lookup_ngram == 5 &&
                            route.speculative.backend == ninfer::SpeculativeBackend::Mtp,
-                       "benchmark cuBLAS prefill and context-lookup controls");
-    for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections", "--lookup-ngram"}) {
+                       "benchmark cuBLAS prefill and drafting controls");
+    for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections"}) {
         failures += expect(qb::usage_text("ninfer_bench").find(flag) != std::string::npos,
                            std::string("benchmark help omits ") + flag);
     }
+    // The MTP-only context lookup was removed with no alias; n-gram copy drafting replaces it.
+    failures += expect(qb::usage_text("ninfer_bench").find("--lookup-ngram") == std::string::npos,
+                       "benchmark help still advertises the removed --lookup-ngram");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test(
+                {"ninfer_bench", "--weights", "model.ninfer", "--lookup-ngram", "5"});
+        },
+        "removed --lookup-ngram");
     failures += expect_string(qb::kv_cache_name(ninfer::KvCacheStorage::Nvfp4Group16), "nvfp4",
                               "NVFP4 report name");
     failures += expect_string(qb::kv_cache_name(ninfer::KvCacheStorage::Fp8KeyNvfp4Value), "k8v4",
@@ -409,6 +435,10 @@ int test_report_contract() {
                             "decode engine throughput");
     failures += expect(tg.at("speculative").at("rounds") == 1, "speculative rounds");
     failures += expect(tg.at("speculative").at("fallback_steps") == 3, "speculative fallbacks");
+    failures += expect(tg.at("speculative").at("ngram_rounds") == 0 &&
+                           tg.at("speculative").at("ngram_accepted_tokens") == 0 &&
+                           report.at("config").at("ngram_draft_tokens") == 0,
+                       "n-gram copy counters in the JSON report");
     failures += expect_near(tg.at("speculative").at("acceptance_rate").get<double>(), 1.0,
                             "speculative acceptance");
     failures += expect(tg.at("speculative").at("accepted_per_position").size() == 5,

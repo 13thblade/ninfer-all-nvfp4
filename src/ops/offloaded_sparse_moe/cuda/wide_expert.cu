@@ -69,7 +69,7 @@ std::size_t round256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 // ------------------------------------------------------------------------------------- planning
 
 // One CTA: the call's wide tiles, (job, first column) for each 64-column slice of every job with at
-// least min_columns columns, in job order; for each pass of pass_jobs jobs the index of its first
+// least min_columns columns that the CPU does not serve, in job order; for each pass of pass_jobs jobs the index of its first
 // tile; and the narrow kernels' skip flag of every job (CPU-served or wide).
 __global__ void __launch_bounds__(kPlanThreads)
     plan_kernel(MoeDispatch dispatch, int max_jobs, int pass_jobs, int passes, int min_columns,
@@ -87,9 +87,11 @@ __global__ void __launch_bounds__(kPlanThreads)
         if (job < jobs) {
             const int expert  = dispatch.jobs[job];
             const int columns = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
-            const bool wide   = columns >= min_columns;
+            const bool cpu    = cpu_flags != nullptr && cpu_flags[job] != 0;
+            // A CPU-served job has no staged record (job_records unset), so it never gets wide tiles.
+            const bool wide   = !cpu && columns >= min_columns;
             if (wide) { n = (columns + kTileColumns - 1) / kTileColumns; }
-            skip[job] = wide || (cpu_flags != nullptr && cpu_flags[job] != 0) ? 1 : 0;
+            skip[job] = wide || cpu ? 1 : 0;
         } else if (job < max_jobs) {
             skip[job] = 0;
         }

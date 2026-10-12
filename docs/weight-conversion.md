@@ -358,9 +358,9 @@ The text config uses Infernix's Qwen4Exp keys. The GGUF stores the n-gram hash t
 tables differ from that derivation.
 
 The full conversion writes a 39.2 GB artifact (two files) and a 29.1 GB volume; on this fork's
-host it took 802 s plus 346 s for the volume, at a peak working set of 0.62 GiB. The model runs from
-it through `ninfer_qwen4_exp_forward_real_test` (M0, see `docs/maintainer/qwen4-exp-model.md`); the
-Engine, CLI and server do not load it yet. `--subset dev` writes a
+host it took 802 s plus 346 s for the volume, at a peak working set of 0.62 GiB. Nothing loads
+the artifact yet: the model loader and its tests arrive in a later change, so the Engine, CLI and
+server cannot run it. `--subset dev` writes a
 2.9 GB development subset instead: one real tensor of each GGML type, the direct tensors of layers
 0, 1 and 3, the expert banks of layers 0, 1 and 8 (one of each record format) and a volume of the
 first 4,500 n-gram rows. The reader ([`sources/gguf.py`](../tools/convert/sources/gguf.py)) admits

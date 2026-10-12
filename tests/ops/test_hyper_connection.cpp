@@ -419,6 +419,38 @@ int main() {
                                                   kEps, x, nullptr, ws, stream);
             } catch (const std::invalid_argument&) { threw = true; }
             check(threw, "a BF16 norm weight is refused");
+            // An invalid policy is refused on a fused shape (1 column) and by the capacity query.
+            const auto bad_policy = static_cast<ninfer::ops::LinearPolicy>(0xFF);
+            Device id(static_cast<std::size_t>(kS) * 4);
+            Tensor inject(id.p, DType::FP32, {kS, 1});
+            threw = false;
+            try {
+                ninfer::ops::hyper_connection_mix(R, w, p.down_w, p.up_w, bad_policy, kS, kRank, kEps, x,
+                                                  &inject, ws, stream);
+            } catch (const std::invalid_argument&) { threw = true; }
+            check(threw, "an invalid LinearPolicy is refused on the fused route");
+            threw = false;
+            try {
+                (void)ninfer::ops::hyper_connection_mix_workspace_capacity_bytes(p.down_w, p.up_w, bad_policy,
+                                                                                 kS, kRank, 1);
+            } catch (const std::invalid_argument&) { threw = true; }
+            check(threw, "an invalid LinearPolicy is refused by the capacity query");
+        }
+        // A residual view off the 16-byte grid is refused (the fused route reads it with uint4).
+        {
+            Problem p = make_problem(false);
+            ninfer::WorkspaceArena ws(1 << 20);
+            Device rd(static_cast<std::size_t>(kW) * 2 + 16), xd(kH * 2);
+            const Tensor R(static_cast<std::uint16_t*>(rd.p) + 1, DType::BF16, {kW, 1});
+            const Tensor w(p.norm_device->p, DType::FP32, {kW});
+            Tensor x(xd.p, DType::BF16, {kH, 1});
+            bool threw = false;
+            try {
+                ninfer::ops::hyper_connection_mix(R, w, p.down_w, p.up_w,
+                                                  ninfer::ops::LinearPolicy::A16Only, kS, kRank,
+                                                  kEps, x, nullptr, ws, stream);
+            } catch (const std::invalid_argument&) { threw = true; }
+            check(threw, "a misaligned residual is refused");
         }
         inject_and_expand(stream);
         cudaStreamDestroy(stream);

@@ -135,7 +135,8 @@ It has two independent suites:
   vary bytes and operation count to represent StateImage components and identify device bandwidth.
   It uses synthetic non-compressible buffers and never inspects an artifact or loads a model.
 - `prefill` loads one artifact through the public Engine and measures its Text/Vision recomputation
-  cost under the canonical BF16/no-spec configuration. Its result is keyed only by hardware class
+  cost without speculation, under the prefill configuration it is given: `--kv-dtype` (default bf16),
+  `--prefill-cublas`, `--gdn-state-fp16` and `--prefill-chunk`. Its result is keyed only by hardware class
   and the actual Text/Vision `prefill_signature`.
 
 The runtime models are:
@@ -175,9 +176,15 @@ Measure prefill separately when the GPU has room for the artifact:
   --suite prefill \
   --artifact out/qwen3_6_27b.ninfer \
   --corpus bench/fixtures/bench_corpus.ids \
+  --kv-dtype rk4v4 --prefill-cublas --gdn-state-fp16 --prefill-chunk 4096 --max-context 32768 \
   --json profiles/bench/qwen3_6_27b_prefill_cost.json \
   --preset-out profiles/bench/context_cost_presets.json
 ```
+
+The runtime keys a prefill price by hardware class and prefill signature only, not by KV dtype or
+GEMM route, although both change prefill time severalfold, so calibrate the configuration the
+machine serves with. The RTX 3090 compiled defaults use the launcher's prefill flags shown above
+(the grid then reaches 6.5 chunks, 26,624 tokens).
 
 `--suite all` performs transfer first, releases its fixtures, then loads the artifact for prefill.
 The JSON report retains every repetition, median/MAD, floating and quantized coefficients, and
@@ -1087,6 +1094,19 @@ cmake --build build --parallel \
 Run separate invocations for `K=1..15`, `full|optimized`, representative contexts, and
 `--no-cuda-graph`. This complete-round benchmark measures the DFlash model's actual greedy
 acceptance. Transaction correctness is covered by the state and Engine tests.
+
+For n-gram copy rounds (DFlash2, `--corpus` for a realistic prompt):
+
+- `--copy-width W [--copy-lanes N]` records the request's own greedy continuation and hands it to
+  the first `N` lanes (default: all of `--batch`, which must be 1 or 2 because copy rounds run at
+  most two lanes) as a proposal-only source, so their copy rounds
+  verify a full `W-1` drafts; the other lanes decode the same prompt without copies. It times the
+  rounds in which every copying lane accepts all of its drafts: the cost of a `W`-column copy round,
+  and with `--batch 2 --copy-lanes 1` the cost a copying lane imposes on a drafting one.
+- `--ngram-idle W` runs ordinary rounds with `W`-column copy rounds configured but no copy index,
+  the cost n-gram drafting adds to output that never copies.
+- `--prefill-tail N` times a final `N`-token prefill chunk at the context depth, a proxy for verify
+  widths the round Ops do not reach.
 
 ## Token-decision Op benchmarks
 
