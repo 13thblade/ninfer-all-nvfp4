@@ -63,12 +63,13 @@ formats (Section 3.6):
 | `ggml_rec_iq1_m_q2_0` | `ggml_iq1_m` | `ggml_q2_0` |
 
 The C++ registry accepts the GGML block and expert record formats and materializes them to Device,
-Host or Pinned memory unchanged. Linear and LinearAdd consume `ggml_iq4_xs`, `ggml_iq3_s`,
-`ggml_q6_k`, `ggml_iq4_nl`, `ggml_q8_0` and `ggml_q2_0` at the registered problems in
+Host or Pinned memory unchanged. Linear and LinearAdd consume `ggml_iq4_xs`, `ggml_iq3_s`, `ggml_q6_k`,
+`ggml_iq4_nl`, `ggml_q8_0` and `ggml_q2_0` at the registered problems in
 [`linear.h`](../../include/ninfer/ops/linear.h) and
-[`linear_add.h`](../../include/ninfer/ops/linear_add.h), through their Q8_1 activation profile;
-the other three block formats and the expert record formats have no consuming Op yet. An Op that
-consumes a format declares its own support.
+[`linear_add.h`](../../include/ninfer/ops/linear_add.h), through their Q8_1 activation profile.
+offloaded_sparse_moe consumes the three expert record formats through its canonical A8 arithmetic
+([`offloaded_sparse_moe.h`](../../include/ninfer/ops/offloaded_sparse_moe.h)). An Op that consumes
+a format declares its own support.
 
 Each name fixes a code and scale contract. The format registry is implemented in
 [`tools/artifact/formats.py`](../../tools/artifact/formats.py) and
