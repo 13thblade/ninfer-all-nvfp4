@@ -116,7 +116,8 @@ speed, and the kernels written for Ampere everywhere else, on emulated warp prim
   row-split group's FP32 products are scaled when the group ends. Up to eight columns read the BF16
   activations directly; wider calls convert them to FP16 once. From 65 columns
   (`NINFER_SM70_CUBLAS_MIN`) the weights are dequantized to FP16 32 MiB at a time and multiplied by
-  cuBLAS with FP32 accumulation. Activations beyond +-65504 saturate there.
+  cuBLAS with FP32 accumulation; a call of more than 8,192 columns (a Vision item's patches) passes
+  over them 8,192 at a time. Activations beyond +-65504 saturate there.
 - **T2 projections at one to eight columns** (decode, two requests, an MTP or DFlash2 verify round)
   take an integer route where the projection's policy admits integer activations, as the other
   targets' T2 A8 route does: the activations are quantized to int8 with one scale per 64 values,
@@ -132,16 +133,16 @@ speed, and the kernels written for Ampere everywhere else, on emulated warp prim
   route.
 - **Attention** of every KV format runs on Volta's tensor cores with FP32 accumulation. Decode and
   verification use a Volta kernel that decodes each format's keys and values to FP16 as it loads
-  them, with the same fused append, splits and reducers as the other targets. Prompt attention
-  gives a CTA 64 query rows of one KV head and decodes each 32-key tile of the visible pages into
-  shared memory once for all of them; it reads the pages where they are and needs no workspace.
+  them (32 dimensions of a quantized row a load), with the same fused append, splits and reducers
+  as the other targets. Prompt attention gives a CTA 64 query rows of one KV head and decodes each
+  32-key tile of the visible pages into shared memory once for all of them; it reads the pages
+  where they are and needs no workspace.
 - FP8 A8 and NVFP4 W4A4 activations are not available, as on `sm_86`; those weights run their A16
   routes.
 
 On a 16 GB card the official Qwen3.8-27B artifact loads with `--embedding-q4 --lm-head-q4` (its
-Q8 embedding and output head stored as Q4 while loading, 14.7 GiB of weights), and the GSQ-RCO
-IQ3_S with DFlash2 needs `--prefill-chunk 512`. What else fits is in the
-[measurements](performance/tesla-v100-2026-10.md#models-on-a-16-gb-card).
+Q8 embedding and output head stored as Q4 while loading, 14.7 GiB of weights). What else fits is in
+the [measurements](performance/tesla-v100-2026-10.md#models-on-a-16-gb-card).
 
 The V100-SXM2-16GB's device route profile is built in; another V100 part calibrates at first start,
 in about nine seconds (see [device profiles](device-profiles.md)).
