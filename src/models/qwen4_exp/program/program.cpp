@@ -232,7 +232,7 @@ struct IoLayout {
 };
 
 struct Layout {
-    std::int32_t chunk = 0, wide_chunk = 0, token_domain = 0;
+    std::int32_t chunk = 0, wide_chunk = 0, columns = 0, token_domain = 0;
     std::size_t wide_work = 0; // workspace of a wide call (in the lent frames)
     std::uint32_t pages = 0, base_pages = 0;
     KvLayout kv;
@@ -263,14 +263,17 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     }
     Layout d;
     d.chunk        = static_cast<std::int32_t>(std::min(o.prefill_chunk, o.max_context));
-    d.wide_chunk   = std::max(d.chunk, std::min(kWideChunk, static_cast<std::int32_t>(o.max_context)));
+    // The wide route is a fixed kWideChunk columns whatever --prefill-chunk is; the IO and residency
+    // tables are sized for the wider of the two routes.
+    d.wide_chunk   = std::min(kWideChunk, static_cast<std::int32_t>(o.max_context));
+    d.columns      = std::max(d.chunk, d.wide_chunk);
     d.token_domain = static_cast<std::int32_t>(public_tokens);
     d.pages        = (o.max_context + kPagedKVPageSize - 1) / kPagedKVPageSize;
     const std::uint32_t base_tokens = o.kv_base_tokens != 0 ? o.kv_base_tokens : kKvBaseTokens;
     d.base_pages = std::min(d.pages, std::max(1U, base_tokens / kPagedKVPageSize));
     d.kv         = KvLayout::plan(c, d.pages);
     const NgramHash hash(c.ple.ngram, 0);
-    d.io = IoLayout::plan(static_cast<std::size_t>(d.wide_chunk),
+    d.io = IoLayout::plan(static_cast<std::size_t>(d.columns),
                           static_cast<std::size_t>(c.ple.table.row_bytes) * hash.heads());
     d.gdn_conv      = std::size_t(c.gdn.conv_channels()) * (c.gdn.conv_kernel - 1) * 2;
     d.gdn_recurrent = std::size_t(c.gdn.key_head_dim) * c.gdn.value_head_dim * c.gdn.value_heads * 4;
@@ -291,9 +294,8 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.work = execution::Forward::workspace_bytes(c, d.chunk, d.pages * kPagedKVPageSize,
                                                  DeviceExecutionView{nullptr, sms}) +
              ops::sampling_workspace_capacity_bytes(d.token_domain, 1, 1);
-    d.wide_work = d.wide_chunk > d.chunk ? execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
-                                                                               DeviceExecutionView{nullptr, sms})
-                                         : 0;
+    d.wide_work = execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
+                                                      DeviceExecutionView{nullptr, sms});
     d.vmm = VmmArena::supported(o.device);
 
     auto& b     = d.bytes;
@@ -305,7 +307,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.state     = d.state;
     b.io        = d.io.bytes + sizeof(float) * c.vocab_size + 2ULL * c.vocab_size + 256 * 4 +
                   sizeof(ops::SamplingConfig) + 4ULL * public_tokens + 4 * d.mask_words + 4096;
-    b.residency            = ExpertResidency::table_bytes(c, d.wide_chunk);
+    b.residency            = ExpertResidency::table_bytes(c, d.columns);
     b.expert_record_stride = d.frame_stride;
     b.max_frames           = ExpertResidency::max_frames(c);
     b.graph_bound          = 2 * graph_bound(1, 1, 0); // the decode forward in two parts
@@ -404,7 +406,7 @@ public:
             banks.push_back(bank.host_records);
             bank_strides.push_back(bank.record_stride);
         }
-        residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), std::move(bank_strides), plan_.wide_chunk,
+        residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), std::move(bank_strides), plan_.columns,
                                                        device_.device);
         allocated += plan_.bytes.residency;
         if (allocated != plan_.bytes.fixed_bytes()) {
@@ -1124,8 +1126,14 @@ private:
         lease_          = residency_->lend(work_frames + ring, device_.stream);
         auto* base      = static_cast<std::byte*>(lease_.memory.data);
         stream_tables_  = reinterpret_cast<std::int32_t*>(base);
-        wide_work_      = std::make_unique<WorkspaceArena>(
-            DeviceSpan{base + tables, static_cast<std::size_t>(work_frames) * stride - tables});
+        try {
+            wide_work_ = std::make_unique<WorkspaceArena>(
+                DeviceSpan{base + tables, static_cast<std::size_t>(work_frames) * stride - tables});
+        } catch (...) {
+            // No half-built lease: run_call dereferences wide_work_ whenever the lease is held.
+            return_lease();
+            throw;
+        }
         ring_first_  = lease_.first + work_frames;
         ring_frames_ = ring;
         ++leases_;
@@ -1144,6 +1152,8 @@ private:
     void return_lease() {
         if (!lease_.valid()) { return; }
         wide_peak_ = std::max(wide_peak_, wide_work_ ? wide_work_->peak_used() : 0);
+        // The forward must never keep pointing at the lent arena destroyed below.
+        if (forward_) { forward_->use_workspace(*work_); }
         wide_work_.reset();
         refilled_ += residency_->give_back(lease_, device_.stream);
         frames_now_ = residency_->frames();
@@ -1172,8 +1182,8 @@ private:
             forward_->run(batch(width), logits32_);
         } else {
             forward_->use_workspace(*wide_work_);
-            stream_->begin(residency_->host_table(), stream_tables_, ring_first_, ring_frames_, device_.stream);
             try {
+                stream_->begin(residency_->host_table(), stream_tables_, ring_first_, ring_frames_, device_.stream);
                 forward_->run(batch(width), logits32_);
             } catch (...) {
                 stream_->end();
