@@ -117,8 +117,72 @@ def _verify_mtp_object(artifact: Artifact, obj: TensorObject, bound, mtp: GgufMo
     return "mtp_identical"
 
 
+def _vision_source(name: str, depth: int) -> tuple[str, str, int]:
+    """The mmproj tensor of one vision parameter, how its bytes are formed, and the third of a
+    fused QKV tensor it takes (-1: all). Rules: ``bf16`` the tensor's words; ``words`` the high
+    halves of F32 BF16 words; ``patch`` the temporal slices interleaved per output channel."""
+    fixed = {
+        "vision/patch_embedding": ("v.patch_embd.weight", "patch", -1),
+        "vision/patch_embedding_bias": ("v.patch_embd.bias", "words", -1),
+        "vision/position_embedding": ("v.position_embd.weight", "words", -1),
+        "vision/merger/norm_weight": ("v.post_ln.weight", "words", -1),
+        "vision/merger/norm_bias": ("v.post_ln.bias", "words", -1),
+        "vision/merger/fc1": ("mm.0.weight", "bf16", -1),
+        "vision/merger/fc1_bias": ("mm.0.bias", "words", -1),
+        "vision/merger/fc2": ("mm.2.weight", "bf16", -1),
+        "vision/merger/fc2_bias": ("mm.2.bias", "words", -1),
+    }
+    if name in fixed:
+        return fixed[name]
+    layer, role = name.removeprefix("vision/layers/").split("/", 1)
+    assert int(layer) < depth, name
+    g = f"v.blk.{layer}."
+    table = {
+        "norm1_weight": ("ln1.weight", "words"), "norm1_bias": ("ln1.bias", "words"),
+        "norm2_weight": ("ln2.weight", "words"), "norm2_bias": ("ln2.bias", "words"),
+        "attention/output": ("attn_out.weight", "bf16"), "attention/output_bias": ("attn_out.bias", "words"),
+        "mlp/fc1": ("ffn_up.weight", "bf16"), "mlp/fc1_bias": ("ffn_up.bias", "words"),
+        "mlp/fc2": ("ffn_down.weight", "bf16"), "mlp/fc2_bias": ("ffn_down.bias", "words"),
+    }
+    for third, part in enumerate(("query", "key", "value")):
+        table[f"attention/{part}"] = ("attn_qkv.weight", "bf16", third)
+        table[f"attention/{part}_bias"] = ("attn_qkv.bias", "words", third)
+    tensor, rule, *third = table[role]
+    return g + tensor, rule, third[0] if third else -1
+
+
+def _vision_bytes(mmproj: GgufModel, name: str, depth: int) -> bytes:
+    gguf_name, rule, third = _vision_source(name, depth)
+    tensor = mmproj.tensor(gguf_name)
+    raw = mmproj.read_range(tensor, 0, tensor.bytes)
+    if rule == "patch":
+        slices = [np.frombuffer(raw, "<f4")]
+        extra = gguf_name + ".1"
+        if extra in mmproj.tensors:
+            more = mmproj.tensor(extra)
+            slices.append(np.frombuffer(mmproj.read_range(more, 0, more.bytes), "<f4"))
+        out = tensor.shape[0]
+        # [out, 3, t, ps, ps]: per output channel and colour channel, every frame's ps x ps block.
+        blocks = [s.reshape(out, 3, -1) for s in slices]
+        values = np.stack(blocks, axis=2).reshape(-1)
+    elif rule == "words":
+        values = np.frombuffer(raw, "<f4")
+    else:
+        words = np.frombuffer(raw, "<u2")
+        if third >= 0:
+            rows = tensor.shape[0] // 3
+            words = words.reshape(tensor.shape[0], -1)[third * rows : (third + 1) * rows].reshape(-1)
+        return words.tobytes()
+    bits = values.view(np.uint32)
+    assert ((bits & 0xFFFF) == 0).all(), f"{gguf_name}: an F32 value is not a BF16 word"
+    words = (bits >> 16).astype("<u2")
+    if third >= 0:
+        words = words[third * (words.size // 3) : (third + 1) * (words.size // 3)]
+    return words.tobytes()
+
+
 def verify(path, gguf: GgufModel, subset: qwen4_exp.Subset | None = None, volume=None,
-           mtp: GgufModel | None = None) -> dict:
+           mtp: GgufModel | None = None, vision: GgufModel | None = None) -> dict:
     """Every tensor object equals its GGUF ranges; returns counts of what was compared.
 
     Plain objects are compared by SHA-256 over the GGUF bytes of their bound parameters in
@@ -149,6 +213,17 @@ def verify(path, gguf: GgufModel, subset: qwen4_exp.Subset | None = None, volume
                 assert mtp is not None, f"{obj.id}: an MTP object needs the drafter GGUF"
                 assert all(name.startswith("mtp/") for _, _, name in bound), obj.id
                 summary[_verify_mtp_object(artifact, obj, bound, mtp, config)] += 1
+                summary["objects"] += 1
+                summary["bytes"] += obj.bytes
+                continue
+            if bound[0][2].startswith("vision/"):
+                assert vision is not None, f"{obj.id}: a vision object needs the mmproj GGUF"
+                assert all(name.startswith("vision/") for _, _, name in bound), obj.id
+                assert obj.format == "bf16", obj.id
+                depth = directory.components["vision"]["config"]["depth"]
+                expected = b"".join(_vision_bytes(vision, name, depth) for _, _, name in bound)
+                assert artifact.read_object(obj.id) == expected, obj.id
+                summary["vision_identical"] += 1
                 summary["objects"] += 1
                 summary["bytes"] += obj.bytes
                 continue
@@ -195,7 +270,15 @@ def verify(path, gguf: GgufModel, subset: qwen4_exp.Subset | None = None, volume
                 assert json.loads(data) == json.loads(synthesized[role]), role
             else:
                 assert data == synthesized[role], role
-    rows = gguf.tensor(qwen4_exp.PLE_TABLE).rows if subset is None else subset.ple_rows
+        if vision is not None:
+            component = directory.components["vision"]
+            assert component["config"] == qwen4_exp.vision_config(vision, config), "vision config"
+            for role, expected in (("preprocessor_config.json", qwen4_exp.PREPROCESSOR_CONFIG),
+                                   ("video_preprocessor_config.json", qwen4_exp.VIDEO_PREPROCESSOR_CONFIG)):
+                assert json.loads(artifact.read_object(component["resources"][role])) == expected, role
+        else:
+            assert "vision" not in directory.components, "a vision component needs the mmproj GGUF"
+    rows =gguf.tensor(qwen4_exp.PLE_TABLE).rows if subset is None else subset.ple_rows
     assert text["ngram_table"]["rows"] == rows
     if volume is not None:
         summary["volume_rows"] = verify_volume(volume, gguf, text["ngram_table"])

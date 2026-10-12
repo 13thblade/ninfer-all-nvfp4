@@ -352,6 +352,29 @@ python -m tools.convert \
   --recipe qwen4_exp_gguf --device cpu --out out/qwen4exp-mtp.ninfer --ngram-reuse out/qwen4exp.ninfer.ngram
 ```
 
+`--mmproj PATH` adds the vision tower (component `vision`) from the model's
+`mmproj-Qwen3.8-Flash-Next-BF16.gguf` (llama.cpp's `qwen3vl_merger` export, GGUF architecture
+`clip`). The tower is Qwen3.5's vision encoder (27 blocks of width 1152, a 2 x 2 merger to the text
+width 2560, no deepstack), so the component takes Qwen3.5's vision config and parameter names and
+the runtime binds it through the same Vision contract. The converter undoes llama.cpp's split of
+the temporal patch convolution (`v.patch_embd.weight` and `.weight.1` stack back into
+`[1152, 3, 2, 16, 16]`), splits `attn_qkv` into its query, key and value rows, and maps `v.post_ln`
+to the merger's LayerNorm and `mm.0` / `mm.2` to its two projections. Every value is stored as BF16
+without rounding: the BF16 matrices keep their words, and the F32 tensors (patch convolution, biases,
+LayerNorms, the position table), which hold widened BF16 words, are narrowed after a check that
+refuses any value that would round. The mmproj carries no resize bounds, so the vision resources
+(`preprocessor_config.json`, `video_preprocessor_config.json`) are the official Qwen3.5/3.8 processor
+settings; the converter refuses an mmproj whose patch size, frames, merge size or 0.5/0.5
+normalization differ from them. The tower adds 0.86 GB; the Engine loads it only for `--vision`.
+
+```bash
+python -m tools.convert \
+  --model /models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+  --mtp-gguf /models/mtp-q2_0.gguf --mmproj /models/mmproj-Qwen3.8-Flash-Next-BF16.gguf \
+  --recipe qwen4_exp_gguf --device cpu --out out/qwen4exp-mtp-vision.ninfer \
+  --ngram-reuse out/qwen4exp.ninfer.ngram
+```
+
 The text config uses Infernix's Qwen4Exp keys. The GGUF stores the n-gram hash tables literally
 (multipliers, head sizes and offsets); the config records Infernix's derivation parameters (seed
 1234, prime base 20,000,000, padding to 128 rows), and the converter refuses a GGUF whose literal

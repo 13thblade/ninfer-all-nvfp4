@@ -153,6 +153,11 @@ def main(argv=None):
         type=Path,
         help="GGUF: add the MTP drafter from this GGUF (Strata's mtp-q2_0.gguf), component mtp",
     )
+    parser.add_argument(
+        "--mmproj",
+        type=Path,
+        help="GGUF: add the vision tower from this mmproj GGUF (image input), component vision",
+    )
     args = parser.parse_args(argv)
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):
@@ -166,8 +171,8 @@ def main(argv=None):
         raise ValueError("--subset applies to a GGUF model")
     if gguf and (components != ("text",) or paths or args.proposal):
         raise ValueError("a GGUF model supplies only the text component and takes no --source")
-    if not gguf and (args.ngram_out or args.ngram_reuse or args.mtp_gguf):
-        raise ValueError("--ngram-out, --ngram-reuse and --mtp-gguf apply to a GGUF model")
+    if not gguf and (args.ngram_out or args.ngram_reuse or args.mtp_gguf or args.mmproj):
+        raise ValueError("--ngram-out, --ngram-reuse, --mtp-gguf and --mmproj apply to a GGUF model")
     if args.ngram_out and args.ngram_reuse:
         raise ValueError("--ngram-reuse and --ngram-out are exclusive")
     ngram_out = None
@@ -176,11 +181,13 @@ def main(argv=None):
             base = stack.enter_context(GgufModel(args.model))
             sources = {"base": base}
             mtp = stack.enter_context(GgufModel(args.mtp_gguf)) if args.mtp_gguf else None
+            mmproj = stack.enter_context(GgufModel(args.mmproj)) if args.mmproj else None
             model = qwen4_exp.build_model(
                 base,
                 subset=qwen4_exp.SUBSETS[args.subset] if args.subset else None,
                 resource_overrides=overrides,
                 mtp=mtp,
+                vision=mmproj,
             )
             # The volume id ties the separately placed n-gram volume to this artifact.
             if args.ngram_reuse is not None:
@@ -226,6 +233,7 @@ def main(argv=None):
                 {
                     "base": {"paths": [str(file.path) for file in base.files]},
                     **({"mtp": {"paths": [str(file.path) for file in mtp.files]}} if mtp is not None else {}),
+                    **({"vision": {"paths": [str(file.path) for file in mmproj.files]}} if mmproj is not None else {}),
                 }
                 if gguf
                 else sources.provenance()

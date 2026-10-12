@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 
+import numpy as np
 import pytest
 import torch
 
@@ -319,6 +320,79 @@ def test_mtp_gguf_is_checked(tmp_path):
         with GgufModel(fixture.write_mtp(tmp_path / "b.gguf", drop=(dropped,))) as mtp:
             with pytest.raises(GgufError, match="missing"):
                 qwen4_exp.build_model(gguf, mtp=mtp)
+
+
+def test_vision_tower_is_stored_exactly(tmp_path):
+    from tools.artifact.reader import Artifact
+
+    path = _record_gguf(tmp_path)
+    mmproj_path = fixture.write_mmproj(tmp_path / "mmproj.gguf")
+    out = tmp_path / "vision.ninfer"
+    with GgufModel(path) as gguf, GgufModel(mmproj_path) as mmproj:
+        model = qwen4_exp.build_model(gguf, vision=mmproj)
+        # The patch convolution's two frames, stacked back per output and colour channel.
+        frames = [
+            torch.from_numpy(
+                np.frombuffer(mmproj.read_range(mmproj.tensor(name), 0, mmproj.tensor(name).bytes), "<f4").copy()
+            ).reshape(fixture.VH, 3, 16, 16)
+            for name in ("v.patch_embd.weight", "v.patch_embd.weight.1")
+        ]
+        patch = model.parameters["vision/patch_embedding"].source.values().reshape(fixture.VH, -1)
+        assert torch.equal(patch.float(), torch.stack(frames, dim=2).reshape(fixture.VH, -1))
+        qwen4_exp.bind_ngram_volume(model, os.urandom(16))
+        recipe = Recipe(model)
+        qwen4_exp_gguf(model, recipe, {"base": gguf})
+        report = convert(model, recipe, out, device="cpu")
+        summary = verify(out, gguf, vision=mmproj)
+    # Every vision parameter in its own BF16 object, except each layer's packed Q/K/V and biases.
+    vision = [name for name in model.parameters if name.startswith("vision/")]
+    assert len(vision) == 9 + 16 * fixture.VDEPTH
+    assert summary["vision_identical"] == len(vision) - 4 * fixture.VDEPTH
+    qkv = [m for m in report["methods"] if "vision/layers/1/attention/key" in m["parameters"]]
+    assert [tuple(m["parameters"]) for m in qkv] == [tuple(
+        f"vision/layers/1/attention/{role}" for role in ("query", "key", "value"))]
+    assert {m["format"] for m in report["methods"] if m["parameters"][0].startswith("vision/")} == {"bf16"}
+    with Artifact(out) as artifact:
+        component = artifact.directory.components["vision"]
+    assert component["config"] == {
+        "model_type": "qwen3_5_vision", "depth": fixture.VDEPTH, "hidden_size": fixture.VH,
+        "intermediate_size": fixture.VI, "num_heads": 2, "patch_size": 16, "temporal_patch_size": 2,
+        "spatial_merge_size": 2, "num_position_embeddings": fixture.VPOS,
+    }
+    assert component["target"] == "text"
+    assert set(component["resources"]) == {"preprocessor_config.json", "video_preprocessor_config.json"}
+    # The check reads every vision byte: one changed bit of the patch convolution's second half
+    # (frame 1 of the last output channel) fails it.
+    (object_id,) = [m["object"] for m in report["methods"] if m["parameters"] == ("vision/patch_embedding",)]
+    with Artifact(out) as artifact:
+        obj = artifact.by_id[object_id]
+        at = artifact.payload_offset + obj.offset + obj.bytes - 3
+    data = bytearray(out.read_bytes())
+    data[at] ^= 0x01
+    out.write_bytes(data)
+    with GgufModel(path) as gguf, GgufModel(mmproj_path) as mmproj, pytest.raises(AssertionError):
+        verify(out, gguf, vision=mmproj)
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"metadata_changes": {"clip.projector_type": (8, "qwen25vl_merger")}}, "projector_type"),
+        ({"metadata_changes": {"clip.vision.is_deepstack_layers": (9, (7, [True, False]))}},
+         "is_deepstack_layers"),
+        ({"metadata_changes": {"clip.vision.projection_dim": (4, 64)}}, "projection_dim"),
+        ({"metadata_changes": {"clip.vision.image_std": (9, (6, [0.25, 0.25, 0.25]))}}, "image_std"),
+        ({"metadata_changes": {"clip.vision.patch_size": (4, 14)}}, "patch_size"),
+        ({"drop": ("v.blk.1.ln2.bias",)}, "missing"),
+        ({"drop": ("v.patch_embd.weight.1",)}, "temporal_patch_size"),
+        ({"unexact": ("v.blk.0.attn_qkv.bias",)}, "no exact BF16"),
+    ],
+)
+def test_mmproj_is_checked(tmp_path, kwargs, message):
+    path = _record_gguf(tmp_path)
+    with GgufModel(path) as gguf, GgufModel(fixture.write_mmproj(tmp_path / "m.gguf", **kwargs)) as mmproj:
+        with pytest.raises(GgufError, match=message):
+            qwen4_exp.build_model(gguf, vision=mmproj)
 
 
 def test_unit_offset_multiplier_is_the_fp32_sum():
