@@ -43,6 +43,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -1465,16 +1466,24 @@ private:
             kv_taken_ += frames - residency_->frames();
             kv_added_ += added;
             if (control_) { control_->account_fixed(static_cast<std::int64_t>(added)); }
-            const VramSnapshot after = vram_->query();
+            // The growth is final: commit the pool state before the telemetry below, which queries the
+            // device and must not be able to leave backed_pages_ behind the mapped chunks.
+            backed_pages_ = target;
+            frames_now_   = residency_->frames();
+            pool_now_     = residency_->pool_bytes();
             char line[320];
-            std::snprintf(line, sizeof(line),
-                          "KV pool grew to %u pages (%zu MiB, +%zu); expert cache %u -> %u frames (%llu MiB spare); "
-                          "VRAM free %zu MiB, OS budget %llu, used %llu",
+            std::snprintf(line, sizeof(line), "KV pool grew to %u pages (%zu MiB, +%zu); expert cache %u -> %u frames (%llu MiB spare)",
                           target, kv_vmm_->mapped_bytes() >> 20, added >> 20, frames, residency_->frames(),
-                          static_cast<unsigned long long>(spare >> 20), after.device_free >> 20,
-                          static_cast<unsigned long long>(after.local_budget >> 20),
-                          static_cast<unsigned long long>(after.local_usage >> 20));
-            diagnostic(line);
+                          static_cast<unsigned long long>(spare >> 20));
+            std::string text = line;
+            try {
+                const VramSnapshot after = vram_->query();
+                std::snprintf(line, sizeof(line), "; VRAM free %zu MiB, OS budget %llu, used %llu", after.device_free >> 20,
+                              static_cast<unsigned long long>(after.local_budget >> 20),
+                              static_cast<unsigned long long>(after.local_usage >> 20));
+                text += line;
+            } catch (...) {} // telemetry only: the line goes out without the VRAM numbers
+            diagnostic(text);
         } else {
             const std::size_t freed = unmap_kv(target);
             if (control_) { control_->account_fixed(-static_cast<std::int64_t>(freed)); }
@@ -1491,11 +1500,21 @@ private:
             kv_added_ -= std::min<std::uint64_t>(kv_added_, freed);
             const std::uint32_t regrow = std::min(frames + back, demand_.max_frames);
             if (regrow > frames) {
-                (void)residency_->resize(regrow, device_.stream, *vram_);
+                std::exception_ptr failure;
+                try {
+                    (void)residency_->resize(regrow, device_.stream, *vram_);
+                } catch (...) { failure = std::current_exception(); }
                 // A refused mapping leaves the cache short of `regrow`: keep what was not restored as
                 // debt, so a later shrink (or the next growth's accounting) still owes it.
                 const std::uint32_t restored = residency_->frames() > frames ? residency_->frames() - frames : 0;
                 kv_taken_ += (regrow - frames) - std::min(restored, regrow - frames);
+                if (failure) {
+                    // The chunks are already unmapped: commit the pool state before propagating.
+                    backed_pages_ = target;
+                    frames_now_   = residency_->frames();
+                    pool_now_     = residency_->pool_bytes();
+                    std::rethrow_exception(failure);
+                }
             }
             diagnostic("KV pool shrank to " + std::to_string(target) + " pages; expert cache " + std::to_string(frames) +
                        " -> " + std::to_string(residency_->frames()) + " frames");
