@@ -138,11 +138,16 @@ expect_flags '27B default' "$recorded" \
 refuse_flag '27B default' "$recorded" '--lm-head-q6'
 refuse_flag '27B default' "$recorded" '--embedding-q4'
 
-# N-gram copies: on with DFlash2 at one lane, off at two unless asked for, never without DFlash2.
+# N-gram copies: on with DFlash2 at one and two lanes, off at three unless asked for, never without
+# DFlash2.
 refuse_flag '27B NINFER_NGRAM=off' "$(record ngram_off NINFER_NGRAM=off -- qwen38-27b)" '--ngram-draft-tokens'
-refuse_flag '27B DFlash2 two lanes' "$(record ngram_c2 NINFER_CONCURRENCY=2 -- qwen38-27b)" '--ngram-draft-tokens'
-expect_flags '27B DFlash2 two lanes, NINFER_NGRAM=on' \
-  "$(record ngram_c2_on NINFER_CONCURRENCY=2 NINFER_NGRAM=on -- qwen38-27b)" '--ngram-draft-tokens 15'
+expect_flags '27B DFlash2 two lanes' \
+  "$(record ngram_c2 NINFER_CONCURRENCY=2 -- qwen38-27b)" '--ngram-draft-tokens 15'
+refuse_flag '27B DFlash2 two lanes, NINFER_NGRAM=off' \
+  "$(record ngram_c2_off NINFER_CONCURRENCY=2 NINFER_NGRAM=off -- qwen38-27b)" '--ngram-draft-tokens'
+refuse_flag '27B DFlash2 three lanes' "$(record ngram_c3 NINFER_CONCURRENCY=3 -- qwen38-27b)" '--ngram-draft-tokens'
+expect_flags '27B DFlash2 three lanes, NINFER_NGRAM=on' \
+  "$(record ngram_c3_on NINFER_CONCURRENCY=3 NINFER_NGRAM=on -- qwen38-27b)" '--ngram-draft-tokens 15'
 refuse_flag '27B NINFER_SPEC=mtp' "$(record ngram_mtp NINFER_SPEC=mtp -- qwen38-27b)" '--ngram-draft-tokens'
 
 recorded="$(record mtp NINFER_SPEC=mtp -- qwen38-27b tuned)"

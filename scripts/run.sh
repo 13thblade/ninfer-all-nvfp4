@@ -62,7 +62,7 @@
 # straight to --chat-template; overrides the artifact's built-in template). `tuned` also:
 # NINFER_CONTEXT, NINFER_CONCURRENCY,
 # NINFER_KV_CAPACITY, NINFER_KV_DTYPE, NINFER_SPEC, NINFER_DRAFT_TOKENS, NINFER_PREFILL_CHUNK,
-# NINFER_NGRAM (on|off; n-gram copy drafting, on with DFlash2 at one lane), NINFER_VISION (on|off), NINFER_VISION_RESIDENCY, NINFER_HOST_CONTEXT_MIB (8192), NINFER_MIN_P (0.03) and
+# NINFER_NGRAM (on|off; n-gram copy drafting, on with DFlash2 at one or two lanes), NINFER_VISION (on|off), NINFER_VISION_RESIDENCY, NINFER_HOST_CONTEXT_MIB (8192), NINFER_MIN_P (0.03) and
 # NINFER_PRESENCE_PENALTY (0.5), the loop guard ("default" keeps the registered preset).
 #
 # SERVING KNOBS, `tuned` only. Each is passed to ninfer-serve only when set, so leaving them all
@@ -168,11 +168,14 @@ case "$model_key/$profile" in
     KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
     KV_DTYPE="${NINFER_KV_DTYPE:-rk4v4}"
     PREFILL_CHUNK="${NINFER_PREFILL_CHUNK:-$default_chunk}"
-    # N-gram copy drafting rides on DFlash2. At one lane it is on: +42% decode on agent traffic that
-    # writes back files it has read, -0.7% on output that never copies, 170 MiB of VRAM. At two
-    # lanes a copying request slows the other one by up to 19%, so it stays off unless NINFER_NGRAM=on.
+    # N-gram copy drafting rides on DFlash2 and is on at one and two lanes: +42% decode at one lane on
+    # agent traffic that writes back files it has read, +15% batch throughput at two, where a lane
+    # without a copy is widened only as far as its own balance allows (about 3% of its round time).
+    # Three or more lanes never copy, so it stays off there unless NINFER_NGRAM=on.
     default_ngram=off
-    [[ "$SPEC" != 'dflash2' || "$CONCURRENCY" != '1' ]] || default_ngram=on
+    if [[ "$SPEC" == 'dflash2' && ( "$CONCURRENCY" == '1' || "$CONCURRENCY" == '2' ) ]]; then
+      default_ngram=on
+    fi
     NGRAM="${NINFER_NGRAM:-$default_ngram}"
     case "$NGRAM" in
       on)

@@ -45,12 +45,16 @@ defaults) and the second is the full context with a second lane, still fast. The
 Windows.
 
 N-GRAM COPIES, 2026-10-10. The `dflash2` variant passes `--ngram-draft-tokens 15` when it runs one
-lane, which is its default; `NINFER_NGRAM=off` drops it. On the agent replay
+lane, which is its default, or two; `NINFER_NGRAM=off` drops it. On the agent replay
 (`tools/bench/agent_replay`) it decodes 42% faster overall and 53-76% faster on turns that write back
 a file the conversation has read. Output that never copies is 0.7% slower, and it plans 170 MiB more
 runtime memory: the Windows 188,416-token start still had 991 MiB free. With
-`NINFER_CONCURRENCY=2` it stays off unless `NINFER_NGRAM=on`. There, aggregate throughput rises 15%,
-but a request sharing rounds with a copying one decodes up to 19% slower. `NINFER_NGRAM=on` with
+`NINFER_CONCURRENCY=2` it is on as well (since 2026-10-12): a lane without a copy is widened only
+while its partner balance covers it, so the batch gains 15% while turns that barely copy stay within
+1% of off (they were up to 19% slower without the balance). It costs context there: the copy family
+is captured at batches one and two, and on the Windows desktop (0.9 GiB already in use) the two-lane
+start lowered the shared KV to 137,216 tokens against 156,672 without it (2026-10-12). From three lanes no round copies, so it
+is off there unless `NINFER_NGRAM=on`. `NINFER_NGRAM=on` with
 `mtp` or `none`, or on the 35B-A3B profile (which has no DFlash2), is refused, because copy rounds ride on DFlash2. Tables are in
 [performance](../performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b).
 

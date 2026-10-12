@@ -222,8 +222,9 @@ The default is the fast profile — about 1.7x the previous prefill and 1.39x th
 ```
 
 `--ngram-draft-tokens 15` copies text the conversation already contains (a file it read, a tool
-result) instead of drafting it: agent turns that write back a file decode 53-76% faster. Set
-`NINFER_NGRAM=off` to turn it off.
+result) instead of drafting it: agent turns that write back a file decode 53-76% faster. It stays on
+with `NINFER_CONCURRENCY=2`, where the other lane is slowed by at most about 3% when it isn't
+copying. Set `NINFER_NGRAM=off` to turn it off.
 
 `NINFER_SPEC=mtp` swaps to `--spec mtp --draft-tokens 3` and `--prefill-chunk 2048`, which runs
 the full 262,144 tokens with two lanes sharing the pool:

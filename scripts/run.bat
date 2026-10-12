@@ -74,7 +74,7 @@ rem apply the loaded graft to every request that names none), NINFER_CHAT_TEMPLA
 rem Jinja file, passed straight to --chat-template; overrides the artifact's built-in template).
 rem `tuned` also: NINFER_CONTEXT,
 rem NINFER_CONCURRENCY, NINFER_KV_DTYPE, NINFER_SPEC, NINFER_DRAFT_TOKENS, NINFER_PREFILL_CHUNK,
-rem NINFER_NGRAM (on^|off; n-gram copy drafting, on with DFlash2 at one lane), NINFER_VISION (on^|off), NINFER_VISION_RESIDENCY, NINFER_HOST_CONTEXT_MIB (8192), NINFER_MIN_P (0.03) and
+rem NINFER_NGRAM (on^|off; n-gram copy drafting, on with DFlash2 at one or two lanes), NINFER_VISION (on^|off), NINFER_VISION_RESIDENCY, NINFER_HOST_CONTEXT_MIB (8192), NINFER_MIN_P (0.03) and
 rem NINFER_PRESENCE_PENALTY (0.5), the loop guard ("default" keeps the registered preset).
 rem
 rem SERVING KNOBS, `tuned` only. Each is passed to ninfer-serve only when set, so leaving them all
@@ -276,11 +276,13 @@ if not "%NINFER_CONTEXT%"=="" set "CONTEXT=%NINFER_CONTEXT%"
 if not "%NINFER_CONCURRENCY%"=="" set "CONCURRENCY=%NINFER_CONCURRENCY%"
 if not "%NINFER_KV_DTYPE%"=="" set "KV_DTYPE=%NINFER_KV_DTYPE%"
 if not "%NINFER_PREFILL_CHUNK%"=="" set "PREFILL_CHUNK=%NINFER_PREFILL_CHUNK%"
-rem N-gram copy drafting rides on DFlash2. At one lane it is on: +42%% decode on agent traffic that
-rem writes back files it has read, -0.7%% on output that never copies, 170 MiB of VRAM. At two lanes
-rem a copying request slows the other one by up to 19%%, so it stays off unless NINFER_NGRAM=on.
+rem N-gram copy drafting rides on DFlash2 and is on at one and two lanes: +42%% decode at one lane on
+rem agent traffic that writes back files it has read, +15%% batch throughput at two, where a lane
+rem without a copy is widened only as far as its own balance allows (about 3%% of its round time).
+rem Three or more lanes never copy, so it stays off there unless NINFER_NGRAM=on.
 set "NGRAM=off"
 if /i "%SPEC%"=="dflash2" if "%CONCURRENCY%"=="1" set "NGRAM=on"
+if /i "%SPEC%"=="dflash2" if "%CONCURRENCY%"=="2" set "NGRAM=on"
 if not "%NINFER_NGRAM%"=="" set "NGRAM=%NINFER_NGRAM%"
 if /i not "%NGRAM%"=="on" if /i not "%NGRAM%"=="off" (
   echo NINFER_NGRAM must be on or off, got %NGRAM% 1>&2

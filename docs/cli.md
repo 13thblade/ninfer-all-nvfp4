@@ -345,8 +345,8 @@ therefore slowed by at most about 3% of its decode-round time; with three or mor
 nothing is copied. The counters are in
 the request log and `/metrics` (see [serving](serving.md)). On an agent replay at one lane it
 decoded 42% faster overall and up to 76% faster on turns that return a file, at about 0.7% on
-output that never copies. At two lanes the replay finished 12% sooner, but a request sharing rounds
-with a copying one decoded up to a fifth slower; see
+output that never copies. At two lanes the replay's batch throughput rose 15%, and turns that copy
+little stayed within 1% of their speed without copies; see
 [performance](performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b).
 
 ## CUDA synchronization
