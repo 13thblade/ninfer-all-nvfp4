@@ -1,7 +1,9 @@
 // Adapted from Infernix a3edb450 src/runtime/engine/qwen4_exp_instance.cpp (Apache-2.0).
 // Modified for NInfer-3090: full RAM mode only (no SSD tier: a ledger that cannot hold every expert
-// refuses); MTP speculation through the artifact's drafter (--spec mtp); no prefix cache, n-gram drafts or vision; the options NInfer's serving can set
-// that this model does not support are refused with the flag to change; NInfer's startup phases.
+// refuses); MTP speculation through the artifact's drafter (--spec mtp); image input through the
+// artifact's vision tower (--vision: host-pinned, streamed per encode into lent expert frames); no
+// prefix cache or n-gram drafts; the options NInfer's serving can set that this model does not
+// support are refused with the flag to change; NInfer's startup phases.
 
 #include "runtime/engine/qwen4_exp_instance.h"
 
@@ -11,6 +13,7 @@
 #include "core/startup.h"
 #include "core/vmm_arena.h"
 #include "core/vram_budget.h"
+#include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/registry.h"
@@ -44,8 +47,9 @@ void report(const std::string& text) {
     std::fflush(stderr);
 }
 
-// What this release of the model serves: one text request at a time, plain decode, INT8 KV, no
-// prefix reuse. Every option a user can set otherwise is refused with what to change.
+// What this release of the model serves: one request at a time (text, or text and images with
+// --vision), plain or MTP decode, INT8 KV, no prefix reuse. Every option a user can set otherwise is
+// refused with what to change.
 void validate(const EngineOptions& options) {
     const auto refuse = [](const std::string& why) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: " + why);
@@ -96,7 +100,9 @@ void validate(const EngineOptions& options) {
         refuse("a memory option is out of range: --vram-headroom-mib, --ram-headroom-mib and "
                "--expert-cache-mib are at most 1048576");
     }
-    if (options.enable_vision) { refuse("serves text only in this release: remove --vision"); }
+    if (options.enable_vision && options.media_live_bytes == 0) {
+        refuse("images need room for their decoded pixels: set a nonzero media live-byte budget");
+    }
     if (!options.grafts.empty()) { refuse("has no prompt grafts: remove --graft"); }
     // A single --devices entry selects the card (Engine builds its DeviceContext from it), so it is
     // honored; more than one entry, or per-stage layer counts, would need pipeline stages.
@@ -126,11 +132,15 @@ bool artifact_is_qwen4_exp(const std::filesystem::path& artifact) noexcept {
 Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source, const EngineOptions& options)
     : model(std::move(source)), parameters(*model),
       frontend(models::qwen3_5::make_frontend(model->resources(),
-                                              {.chat_template_path  = options.chat_template_path,
-                                               .grammar_cache_bytes = options.grammar_cache_bytes,
-                                               .architecture        = models::Architecture::Qwen4Exp,
-                                               .vision_enabled      = false,
-                                               .max_context         = options.max_context})),
+                                              {.chat_template_path       = options.chat_template_path,
+                                               .grammar_cache_bytes      = options.grammar_cache_bytes,
+                                               .architecture             = models::Architecture::Qwen4Exp,
+                                               .vision_enabled           = model->vision().has_value(),
+                                               .max_context              = options.max_context,
+                                               .media_cache_bytes        = options.media_cache_bytes,
+                                               .media_live_bytes         = options.media_live_bytes,
+                                               .media_preprocess_threads = options.media_preprocess_threads,
+                                               .vision_max_merged_tokens = options.vision_max_merged_tokens})),
       capacity(options.max_context) {}
 
 Qwen4ExpInstance::~Qwen4ExpInstance() = default;
@@ -147,17 +157,31 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The drafter (its own QSA layer and 512 device-resident Q2_0 experts, ~0.86 GiB) loads only for
     // --spec mtp; the proposal-head choice is moot: it drafts with the text head.
     const bool mtp = options.speculative.backend == SpeculativeBackend::Mtp;
-    auto plan      = models::qwen4_exp::plan_load(reader, mtp);
+    // The vision tower (0.84 GiB, pinned beside the experts) loads only for --vision.
+    const bool vision = options.enable_vision;
+    if (vision && !models::qwen4_exp::has_vision(reader)) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: this artifact has no vision tower: convert it with --mmproj "
+                                    "to use --vision, or remove --vision");
+    }
+    auto plan      = models::qwen4_exp::plan_load(reader, mtp, vision);
     binding.complete();
     const auto& config = plan.config();
 
-    // The RAM ledger: every expert is pinned, beside a reserve for Windows and every other planned
-    // allocation, before anything is pinned or read.
+    // The RAM ledger: every expert (and the vision tower) is pinned, beside a reserve for Windows and
+    // every other planned allocation, before anything is pinned or read.
     models::qwen4_exp::HostMemoryDemand demand;
     demand.reserve      = next.ram_headroom_bytes;
     demand.expert_banks = plan.pinned_bytes();
     demand.later_pinned = kProgramPinnedAllowance;
     demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(config.ple.table);
+    // Decoded media: the frontend's cache up to its budget, and in flight at most one prompt's patches
+    // (one lane; the prompt's vision tokens are bounded by the context).
+    if (vision) {
+        const std::uint64_t prompt_patches =
+            std::min<std::uint64_t>(options.max_context, models::qwen3_5::kMaximumPromptVisionTokens) *
+            models::qwen3_5::kRawPatchesPerVisionToken * models::qwen3_5::kPreparedVisionPatchFeatures * 2;
+        demand.pageable += options.media_cache_bytes + std::min<std::uint64_t>(options.media_live_bytes, prompt_patches);
+    }
     demand.load_staging = kLoadStagingBytes;
     const auto ledger   = models::qwen4_exp::plan_host_memory(host_memory_snapshot(), demand);
     report(ledger.summary());
@@ -182,6 +206,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_draft_tokens = mtp ? options.speculative.draft_tokens : 0;
     program_options.mtp_width_cost   = next.mtp_width_cost;
     program_options.mtp_fixed_drafts = next.mtp_fixed_drafts;
+    program_options.vision           = vision;
     program_options.ngram_volume    = next.ngram_volume_path.empty()
                                           ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                           : next.ngram_volume_path;

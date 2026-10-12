@@ -1,8 +1,13 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/program/program.cpp and program_impl.h
 // (Apache-2.0).
 // Modified for NInfer-3090: the execution contract is NInfer's (see program.h); one lane over the
-// single-sequence forward of PR 8; prefix reuse, n-gram drafts, vision, the CPU miss service,
-// the SSD tier, landing frames, the layer walk and /v1/decide are not ported.
+// single-sequence forward of PR 8; prefix reuse, n-gram drafts, the CPU miss service, the SSD tier,
+// landing frames, the layer walk and /v1/decide are not ported.
+// Image input (PR 14) follows Infernix's vision_program.cpp and rope_positions: M-RoPE positions
+// staged per call, the encode in frames lent by the expert cache, the handoff scattered over the
+// image tokens of each prefill call and of the drafter's cells. Modified: the whole encode runs in
+// the prompt's first prefill unit (one lane: Infernix's stepped placement L is not needed), item by
+// item through Qwen3.5's streamed tower (execution/vision.h).
 // MTP speculation (PR 13) follows Infernix's mtp_draft / verify / commit_verified / mtp_catch_up and
 // choose_draft_length for one lane: chained drafter steps, a W-column verification whose records
 // commit through the GDN replay fold, qsa_commit_tails and ple_conv_commit, then the drafter's
@@ -34,13 +39,16 @@
 #include "core/tensor.h"
 #include "core/vmm_arena.h"
 #include "core/vram_budget.h"
+#include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/execution/parameters.h"
+#include "models/qwen4_exp/execution/vision.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "models/qwen4_exp/program/rope_positions.h"
 #include "models/qwen4_exp/program/vram_monitor.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/cast.h"
@@ -75,6 +83,15 @@ struct BasePlanImpl {
     qwen3_5::PreparedContextCache context_cache;
     ops::SamplingConfig sampling;
     std::shared_ptr<const std::vector<TokenId>> prompt;
+    // A prompt with media: its M-RoPE positions ([3, prompt tokens] axis-major) and rope delta, the
+    // control of every item (prompt order), their patches, the image tokens' positions (ascending;
+    // handoff column c is token visual[c]) and the encode's plan.
+    std::vector<std::int32_t> rope_positions;
+    std::int32_t rope_delta = 0;
+    std::shared_ptr<const qwen3_5::VisionControl> vision;
+    std::vector<std::shared_ptr<const qwen3_5::PreparedMediaPayload>> payloads;
+    std::vector<std::uint32_t> visual;
+    execution::VisionPassPlan vision_plan;
 };
 
 struct ResumeStateImpl {
@@ -250,21 +267,32 @@ struct KvLayout {
 
 // Per-call inputs: one pinned host block uploaded by the SMs (upload_pinned) before each call.
 // With MTP it also holds the drafter's cells of a prefill call (ids, cells, RoPE words per
-// sub-chunk) and of a round (draft-step cells, their RoPE words and block starts); the n-gram rows
-// come last, so a call's inputs and its rows upload separately.
+// sub-chunk) and of a round (draft-step cells, their RoPE words and block starts); with vision the
+// call's image columns and the drafter cells' image columns; the n-gram rows come last, so a call's
+// inputs and its rows upload separately.
 struct IoLayout {
     std::size_t ids = 0, positions = 0, rope = 0, block_rope = 0, logit_columns = 0;
     std::size_t mtp_ids = 0, mtp_cells = 0, mtp_rope = 0, mtp_block_rope = 0;
     std::size_t draft_cells = 0, draft_rope = 0, draft_block_rope = 0, draft_anchor = 0;
+    std::size_t vision_columns = 0, mtp_vision_columns = 0;
     std::size_t ngram = 0, bytes = 0;
 
-    static IoLayout plan(std::size_t columns, std::size_t row_bytes, std::size_t logits, std::size_t drafts) {
+    static IoLayout plan(std::size_t columns, std::size_t row_bytes, std::size_t logits, std::size_t drafts,
+                         bool vision) {
         IoLayout out;
         out.positions     = align(4 * columns);
         out.rope          = align(out.positions + 4 * columns);
         out.block_rope    = align(out.rope + 12 * columns);
         out.logit_columns = align(out.block_rope + 12);
         std::size_t at    = align(out.logit_columns + 4 * logits);
+        if (vision) {
+            out.vision_columns = at;
+            at                 = align(at + 4 * columns);
+            if (drafts > 0) {
+                out.mtp_vision_columns = at;
+                at                     = align(at + 4 * (columns + 1));
+            }
+        }
         if (drafts > 0) {
             const std::size_t cells     = columns + 1;
             const std::size_t subchunks = (cells + execution::kMtpChunkColumns - 1) / execution::kMtpChunkColumns;
@@ -407,7 +435,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     const NgramHash hash(c.ple.ngram, 0);
     d.io = IoLayout::plan(static_cast<std::size_t>(d.columns),
                           static_cast<std::size_t>(c.ple.table.row_bytes) * hash.heads(),
-                          static_cast<std::size_t>(d.max_width), static_cast<std::size_t>(d.drafts));
+                          static_cast<std::size_t>(d.max_width), static_cast<std::size_t>(d.drafts), o.vision);
     d.gdn_conv      = std::size_t(c.gdn.conv_channels()) * (c.gdn.conv_kernel - 1) * 2;
     d.gdn_recurrent = std::size_t(c.gdn.key_head_dim) * c.gdn.value_head_dim * c.gdn.value_heads * 4;
     d.ple           = std::size_t(c.residual_width()) * c.ple.conv_span() * 2;
@@ -497,6 +525,14 @@ public:
         // Per draft position: rounds that drafted it, and rounds that accepted it.
         std::array<std::uint64_t, 8> mtp_offered{}, mtp_taken{};
         SpeculativeStats speculative;
+        // Image input: the lane's RoPE positions; the handoff of its encoded images (lent frames,
+        // given back once the prompt's last call ran) and the encode's measurements.
+        LaneRope rope;
+        ExpertResidency::FrameLease vision_lease;
+        Tensor vision_handoff;
+        bool vision_encoded         = false;
+        double vision_seconds       = 0;
+        std::size_t vision_uploaded = 0;
     };
 
     ProgramImpl(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
@@ -726,6 +762,7 @@ public:
         ngram_next_ = PinnedHostBuffer(plan_.io.bytes - plan_.io.ngram);
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
                                                         std::move(experts), std::move(drafter));
+        warm_vision();
         warm_start_experts();
         device_.synchronize();
         report_startup();
@@ -763,9 +800,8 @@ public:
         if (data.token_ids.size() > options_.max_context) {
             throw std::invalid_argument("prompt exceeds configured context capacity");
         }
-        if (data.has_media()) {
-            throw std::invalid_argument("Qwen3.8-Flash-Next serves text only in this release (no images or video)");
-        }
+        auto base = std::make_shared<BasePlanImpl>();
+        if (data.has_media()) { plan_vision(data, *base); }
         if (data.external_prefix_tokens != 0) {
             throw std::invalid_argument("Qwen3.8-Flash-Next has no prompt grafts (they need the context cache)");
         }
@@ -774,7 +810,6 @@ public:
                 throw std::invalid_argument("prompt contains token outside the public token domain");
             }
         }
-        auto base                            = std::make_shared<BasePlanImpl>();
         base->summary.prompt_tokens          = static_cast<std::uint32_t>(data.token_ids.size());
         base->summary.requested_output_tokens = options.requested_output_tokens;
         const std::uint32_t capacity_output  = options_.max_context - base->summary.prompt_tokens + 1U;
@@ -845,6 +880,7 @@ public:
         const auto& base   = *lane_.base;
         lane_.history      = *base.prompt;
         lane_.prompt_tokens = base.summary.prompt_tokens;
+        lane_.rope         = LaneRope{base.rope_positions, lane_.prompt_tokens, base.rope_delta};
         lane_.begin        = {.prompt_tokens = lane_.prompt_tokens, .reused_prompt_tokens = 0,
                               .prefix_reuse_path = PrefixReusePath::Root};
         install_sampling(base.sampling);
@@ -886,14 +922,16 @@ public:
         const nvtx::ScopedRange range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         const std::int32_t begin     = static_cast<std::int32_t>(lane_.state_tokens);
         const std::int32_t remaining = static_cast<std::int32_t>(lane_.prompt_tokens) - begin;
-        const bool wide              = wide_ready(remaining);
-        const std::int32_t width     = std::min(call_width(wide), remaining);
-        const bool last              = width == remaining;
         PrefillProgress out;
-        out.summary                 = lane_.begin;
-        out.processed_prompt_tokens = static_cast<std::uint32_t>(width);
-        out.complete                = last;
+        out.summary = lane_.begin;
         try {
+            // The prompt's images first: their frames are lent before the wide calls' lease.
+            encode_lane_vision();
+            const bool wide          = wide_ready(remaining);
+            const std::int32_t width = std::min(call_width(wide), remaining);
+            const bool last          = width == remaining;
+            out.processed_prompt_tokens = static_cast<std::uint32_t>(width);
+            out.complete                = last;
             run_call(begin, width, wide);
             if (!last) {
                 // The next call's n-gram rows, read from the volume while the device runs this one.
@@ -914,6 +952,7 @@ public:
                 const TokenId token = sampled_token();
                 residency_->after_round(device_.stream, width, promotions);
                 return_lease();
+                return_vision();
                 apply_vram_target(false);
                 pending_token_ = token;
                 pending_       = ++transaction_;
@@ -1217,12 +1256,17 @@ private:
     }
 
     void release_lane() noexcept {
-        if (lease_.valid()) {
+        if (lease_.valid() || lane_.vision_lease.valid()) {
+            // Each step runs whatever the earlier ones did: a failed sync or lease return must not
+            // leave the other lease lent (lane_ is reset below, which would drop its only owner).
+            auto sync   = [&] { device_.synchronize(); };
+            auto lease  = [&] { return_lease(); };
+            auto vision = [&] { return_vision(); };
             try {
-                device_.synchronize();
-                return_lease();
+                run_all(sync, lease, vision);
             } catch (...) {}
         }
+        call_vision_ = nullptr;
         next_begin_               = -1;
         const std::uint64_t epoch = lane_.epoch;
         lane_       = Lane{};
@@ -1235,6 +1279,14 @@ private:
         out.prefill_seconds     = seconds(lane_.prefill_ns);
         out.decode_seconds      = seconds(lane_.decode_ns);
         out.first_token_seconds = lane_.first_token_seconds;
+        // The image encode (inside the first prefill unit, so also counted in prefill_seconds) and
+        // its one lent window, reported in the overlay fields.
+        out.vision_seconds = lane_.vision_seconds;
+        if (lane_.vision_encoded) {
+            out.overlay_windows        = 1;
+            out.overlay_window_seconds = lane_.vision_seconds;
+            out.overlay_staged_bytes   = lane_.vision_uploaded;
+        }
         return out;
     }
 
@@ -1261,6 +1313,7 @@ private:
     void stage(std::int32_t begin, std::int32_t width) {
         write_inputs(begin, width);
         write_mtp_chunk(begin, width);
+        call_vision_ = stage_vision(begin, width);
         const std::size_t rows = read_rows(begin, width);
         upload_pinned(io_device_.p, io_host_.data(), plan_.io.ngram + rows, device_.stream);
     }
@@ -1276,8 +1329,9 @@ private:
                       static_cast<std::byte*>(io_host_.data()) + plan_.io.ngram, rows, device_.stream);
     }
 
-    // Writes the input words of the call to the pinned block: ids, positions, RoPE positions (text:
-    // every axis equals the position), the pooled-block start and the logit column.
+    // Writes the input words of the call to the pinned block: ids, positions, RoPE positions (the
+    // lane's: a text token's every axis is its index plus the prompt's rope delta, an image token's
+    // its grid position), the pooled-block start and the logit column.
     void write_inputs(std::int32_t begin, std::int32_t width) {
         const auto& io = plan_.io;
         auto* host     = static_cast<std::byte*>(io_host_.data());
@@ -1289,10 +1343,10 @@ private:
         for (std::int32_t t = 0; t < width; ++t) {
             ids[t] = lane_.history[static_cast<std::size_t>(begin + t)];
             pos[t] = begin + t;
-            for (int a = 0; a < 3; ++a) { rope[a * width + t] = begin + t; }
         }
-        const std::int32_t r = dim(c_.qsa.compress_ratio);
-        for (int a = 0; a < 3; ++a) { block[a] = begin / r * r; }
+        const auto first = static_cast<std::uint32_t>(begin);
+        stage_rope(lane_.rope, first, width, std::span<std::int32_t>(rope, 3ULL * width), width, 0);
+        stage_rope_value(block_start_rope(lane_.rope, first, c_.qsa.compress_ratio), std::span<std::int32_t>(block, 3), 1, 0);
         columns[0] = width - 1;
     }
 
@@ -1383,7 +1437,28 @@ private:
         return true;
     }
 
-    // Returns the lease (the device has finished with it) and refills its frames.
+    // Runs every step even when an earlier one threw, then rethrows the first failure. Used where a
+    // wait (a device sync, a stream drain) precedes handing a lent run back: a failed wait must not
+    // skip the give-back, or the frames stay lent for good. The give-back itself orders its copies
+    // behind the compute stream, so returning after a failed wait is safe on a device that still
+    // accepts work, and on one that does not nothing more can be corrupted.
+    template <class... Steps>
+    static void run_all(Steps&&... steps) {
+        std::exception_ptr first;
+        const auto one = [&first](auto& step) {
+            try {
+                step();
+            } catch (...) {
+                if (!first) { first = std::current_exception(); }
+            }
+        };
+        (one(steps), ...);
+        if (first) { std::rethrow_exception(first); }
+    }
+
+    // Returns the lease (the device has finished with it) and refills its frames. The frames go back
+    // even when draining the expert stream fails; the lease stays valid only while the controller
+    // still has them lent.
     void return_lease() {
         if (!lease_.valid()) { return; }
         wide_peak_ = std::max(wide_peak_, wide_work_ ? wide_work_->peak_used() : 0);
@@ -1392,9 +1467,239 @@ private:
         wide_work_.reset();
         // device_.synchronize() does not cover the expert copy stream: an aborted wide call can leave
         // its copies running into the ring frames give_back is about to hand to the cache.
-        if (stream_) { stream_->drain(); }
-        refilled_ += residency_->give_back(lease_, device_.stream);
-        frames_now_ = residency_->frames();
+        auto drain  = [&] { if (stream_) { stream_->drain(); } };
+        auto give   = [&] { refilled_ += residency_->give_back(lease_, device_.stream); };
+        auto frames = [&] { frames_now_ = residency_->frames(); };
+        run_all(drain, give, frames);
+    }
+
+    // ---------------------------------------------------------------- image input
+    // Adapted from Infernix a3edb450 src/models/qwen4_exp/program/vision_program.cpp (plan_vision,
+    // vision_reserve, vision_step, vision_release, stage_vision, stage_mtp_vision). Modified for
+    // NInfer-3090: every item encodes in the prompt's first prefill unit in one lent window, which
+    // goes back right after; the handoff's frames stay lent until the prompt's last call ran.
+
+    // A lent run that goes back on every exit: when the scope unwinds (a failed encode, a later
+    // lend() that throws) the device is drained and the frames returned, and a throw from that is
+    // swallowed so it cannot replace the failure that unwound. `give_back()` is the success path.
+    class ScopedLease {
+    public:
+        ScopedLease(ExpertResidency& residency, DeviceContext& device, ExpertResidency::FrameLease lease)
+            : residency_(residency), device_(device), lease_(lease) {}
+        ScopedLease(const ScopedLease&)            = delete;
+        ScopedLease& operator=(const ScopedLease&) = delete;
+        ~ScopedLease() {
+            if (!lease_.valid()) { return; }
+            // The give-back runs even when the sync failed: the lease must not outlive this scope
+            // lent. ExpertResidency::give_back hands the frames to the controller before anything
+            // else can throw, so a failure here leaves them returned.
+            auto sync = [&] { device_.synchronize(); };
+            auto give = [&] { (void)residency_.give_back(lease_, device_.stream); };
+            try {
+                run_all(sync, give);
+            } catch (...) {}
+        }
+        [[nodiscard]] const ExpertResidency::FrameLease& lease() const noexcept { return lease_; }
+        std::uint32_t give_back() { return residency_.give_back(lease_, device_.stream); }
+
+    private:
+        ExpertResidency& residency_;
+        DeviceContext& device_;
+        ExpertResidency::FrameLease lease_;
+    };
+
+    std::uint32_t frames_for(std::size_t bytes) const {
+        const std::uint64_t stride = residency_->frame_stride();
+        return static_cast<std::uint32_t>((bytes + stride - 1) / stride);
+    }
+
+    // Admission of a prompt with media: its items' control, the image tokens and the encode's
+    // memory, refused when the expert cache could never lend that memory.
+    void plan_vision(const qwen3_5::PreparedPromptData& data, BasePlanImpl& base) const {
+        const auto& model = parameters_.model;
+        if (!parameters_.vision || !model.vision_config() || !model.vision_layout() || plan_.io.vision_columns == 0) {
+            throw std::invalid_argument("Qwen3.8-Flash-Next: images need an Engine started with --vision on an artifact "
+                                        "converted with --mmproj");
+        }
+        const auto& config  = *model.vision_config();
+        const std::size_t n = data.token_ids.size();
+        if (data.positions.size() != 3 * n) {
+            throw std::invalid_argument("Qwen3.8-Flash-Next: a prompt with media needs its M-RoPE positions");
+        }
+        const auto control_plan = qwen3_5::plan_vision_control(data, config);
+        auto control = std::make_shared<qwen3_5::VisionControl>(qwen3_5::build_vision_control(data, control_plan, 0));
+        std::vector<std::size_t> merged;
+        for (std::size_t k = 0; k < control->items.size(); ++k) {
+            const auto& item    = control->items[k];
+            const auto& payload = data.media_payloads.at(k);
+            if (!payload || payload->patch_elements != item.patch_count * config.patch_width()) {
+                throw std::invalid_argument("Qwen3.8-Flash-Next: an image's patches do not match its grid");
+            }
+            merged.push_back(item.merged_count);
+            for (const std::int32_t token : item.scatter_indices) { base.visual.push_back(static_cast<std::uint32_t>(token)); }
+        }
+        if (!std::is_sorted(base.visual.begin(), base.visual.end())) {
+            throw std::logic_error("Qwen3.8-Flash-Next: the image tokens are not in prompt order");
+        }
+        base.vision_plan = execution::plan_vision_pass(config, *parameters_.vision, *model.vision_layout(), merged);
+        if (base.vision_plan.tokens != base.visual.size()) {
+            throw std::logic_error("Qwen3.8-Flash-Next: the encode plan disagrees with the image tokens");
+        }
+        const std::uint32_t need = frames_for(base.vision_plan.window_bytes) + frames_for(base.vision_plan.handoff_bytes);
+        const std::uint32_t most = residency_->frames() - residency_->frames() / 4;
+        if (need > most) {
+            throw std::invalid_argument(
+                "Qwen3.8-Flash-Next: the images need " +
+                std::to_string((static_cast<std::uint64_t>(need) * residency_->frame_stride()) >> 20) +
+                " MiB of device memory to encode, more than the expert cache can lend (" +
+                std::to_string((static_cast<std::uint64_t>(most) * residency_->frame_stride()) >> 20) +
+                " MiB): send fewer or smaller images");
+        }
+        base.rope_positions = data.positions;
+        base.rope_delta     = data.rope_delta;
+        base.vision         = std::move(control);
+        base.payloads       = data.media_payloads;
+    }
+
+    // The prompt's images through the tower, before its first prefill call: the handoff and the
+    // window are lent by the expert cache, the window goes back once the encode completes.
+    void encode_lane_vision() {
+        const auto& base = *lane_.base;
+        if (!base.vision || lane_.vision_encoded) { return; }
+        const auto& plan  = base.vision_plan;
+        const auto& model = parameters_.model;
+        const nvtx::ScopedRange range(nvtx::Name::VisionEncode, nvtx::Category::Vision);
+        const std::uint32_t handoff_frames = frames_for(plan.handoff_bytes), window_frames = frames_for(plan.window_bytes);
+        if (handoff_frames + window_frames > residency_->lendable()) {
+            throw std::runtime_error("Qwen3.8-Flash-Next: the expert cache cannot lend the " +
+                                     std::to_string((static_cast<std::uint64_t>(handoff_frames + window_frames) *
+                                                     residency_->frame_stride()) >> 20) +
+                                     " MiB the images need now (a long context holds the rest): send a smaller image");
+        }
+        // Everything that can throw without a lease is done first, so no lent frame is held across it.
+        std::vector<execution::VisionEncodeItem> items;
+        for (std::size_t k = 0; k < base.vision->items.size(); ++k) {
+            items.push_back({base.payloads.at(k)->span(), &base.vision->items[k]});
+        }
+        const auto start    = Clock::now();
+        lane_.vision_lease = residency_->lend(handoff_frames, device_.stream); // release_lane returns it
+        // The window goes back on every exit, including a throw from the encode or the sync.
+        ScopedLease window(*residency_, device_, residency_->lend(window_frames, device_.stream));
+        lane_.vision_handoff = Tensor(lane_.vision_lease.memory.data, DType::BF16,
+                                      {plan.out, static_cast<std::int32_t>(plan.tokens)});
+        lane_.vision_uploaded = execution::encode_vision(device_, *model.vision_config(), *parameters_.vision,
+                                                         *model.vision_layout(), model.pinned_weights(), items, plan,
+                                                         window.lease().memory, lane_.vision_handoff, device_.stream);
+        device_.synchronize();
+        lane_.vision_seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        refilled_ += window.give_back();
+        frames_now_          = residency_->frames();
+        lane_.vision_encoded = true;
+        char line[240];
+        std::snprintf(line, sizeof(line),
+                      "vision: %zu image(s), %u tokens encoded in %.1f ms (window %.0f MiB and handoff %.1f MiB lent "
+                      "from %u expert frames, %.0f MiB of the tower streamed)",
+                      items.size(), plan.tokens, lane_.vision_seconds * 1e3,
+                      static_cast<double>(plan.window_bytes) / (1 << 20), static_cast<double>(plan.handoff_bytes) / (1 << 20),
+                      handoff_frames + window_frames, static_cast<double>(lane_.vision_uploaded) / (1 << 20));
+        diagnostic(line);
+    }
+
+    // One encode of a blank image of the processor's smallest size (16 x 16 patches) at startup, in
+    // lent frames like a request's: the tower's kernels and Linear routes set themselves up here
+    // (2-7 s measured on the first image of a process) instead of in the first request.
+    void warm_vision() {
+        if (!parameters_.vision || residency_->frames() == 0) { return; }
+        const auto& model  = parameters_.model;
+        const auto& config = *model.vision_config();
+        const std::int32_t side = 16;
+        qwen3_5::PreparedPromptData prompt;
+        const std::size_t patches = static_cast<std::size_t>(side) * side, merged = patches / 4;
+        prompt.token_types.assign(merged + 2, 0);
+        std::fill(prompt.token_types.begin() + 1, prompt.token_types.begin() + 1 + static_cast<std::ptrdiff_t>(merged),
+                  static_cast<std::uint8_t>(qwen3_5::PromptModality::Image));
+        prompt.token_ids.assign(prompt.token_types.size(), 0);
+        prompt.vision_items.push_back(qwen3_5::VisionItem{.modality    = qwen3_5::PromptModality::Image,
+                                                          .grid        = {.temporal = 1, .height = side, .width = side},
+                                                          .patch_begin = 0,
+                                                          .patch_count = patches,
+                                                          .token_spans = {{1, merged}}});
+        prompt.prepare.media_items   = 1;
+        prompt.prepare.raw_patches   = patches;
+        prompt.prepare.vision_tokens = merged;
+        const auto control = qwen3_5::build_vision_control(prompt, qwen3_5::plan_vision_control(prompt, config), 0);
+        const std::vector<std::uint16_t> blank(patches * config.patch_width(), 0);
+        const std::size_t counts[] = {merged};
+        const auto plan = execution::plan_vision_pass(config, *parameters_.vision, *model.vision_layout(), counts);
+        const std::uint32_t handoff_frames = frames_for(plan.handoff_bytes), window_frames = frames_for(plan.window_bytes);
+        if (handoff_frames + window_frames > residency_->lendable()) { return; }
+        const auto start = Clock::now();
+        ScopedLease handoff_lease(*residency_, device_, residency_->lend(handoff_frames, device_.stream));
+        ScopedLease window(*residency_, device_, residency_->lend(window_frames, device_.stream));
+        Tensor handoff(handoff_lease.lease().memory.data, DType::BF16, {plan.out, static_cast<std::int32_t>(plan.tokens)});
+        const execution::VisionEncodeItem item{blank, &control.items.front()};
+        (void)execution::encode_vision(device_, config, *parameters_.vision, *model.vision_layout(), model.pinned_weights(),
+                                       std::span<const execution::VisionEncodeItem>(&item, 1), plan, window.lease().memory,
+                                       handoff, device_.stream);
+        device_.synchronize();
+        (void)window.give_back();
+        (void)handoff_lease.give_back();
+        char line[120];
+        std::snprintf(line, sizeof(line), "vision: tower warmed up in %.1f s",
+                      std::chrono::duration<double>(Clock::now() - start).count());
+        diagnostic(line);
+    }
+
+    // Returns the handoff's frames once the device has run the prompt's calls.
+    void return_vision() {
+        if (!lane_.vision_lease.valid()) { return; }
+        refilled_ += residency_->give_back(lane_.vision_lease, device_.stream);
+        frames_now_          = residency_->frames();
+        lane_.vision_handoff = Tensor{};
+    }
+
+    // The image columns of call [begin, begin + width): their handoff slice and call-local columns
+    // (written to the io block the call uploads), or null when the call holds no image token.
+    const execution::VisionInput* stage_vision(std::int32_t begin, std::int32_t width) {
+        if (!lane_.vision_lease.valid() || lane_.base->visual.empty()) { return nullptr; }
+        auto* words = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(io_host_.data()) + plan_.io.vision_columns);
+        const auto a = static_cast<std::uint32_t>(begin), b = static_cast<std::uint32_t>(begin + width);
+        const VisualSlice slice =
+            visual_slice(lane_.base->visual, a, b, a, std::span<std::int32_t>(words, static_cast<std::size_t>(width)));
+        if (slice.count == 0) { return nullptr; }
+        const std::int32_t out = lane_.vision_handoff.ne[0];
+        auto* base             = static_cast<std::byte*>(io_device_.p);
+        vision_input_ = {Tensor(static_cast<std::byte*>(lane_.vision_handoff.data) + 2ULL * out * slice.first,
+                                DType::BF16, {out, static_cast<std::int32_t>(slice.count)}),
+                         Tensor(base + plan_.io.vision_columns, DType::I32, {static_cast<std::int32_t>(slice.count)})};
+        return &vision_input_;
+    }
+
+    // The drafter cells' image columns: cell c of sub-chunk k (cells first + K k ...) takes the
+    // token after it, so its columns are the image tokens in [first + K k + 1, + n_k + 1). Null when
+    // no cell's next token is an image token.
+    const execution::VisionInput* stage_mtp_vision(std::int32_t first, std::int32_t cells) {
+        if (!lane_.vision_lease.valid() || lane_.base->visual.empty() || cells <= 0) { return nullptr; }
+        const std::int32_t K   = execution::kMtpChunkColumns, subchunks = (cells + K - 1) / K;
+        const std::int32_t out = lane_.vision_handoff.ne[0];
+        auto* words = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(io_host_.data()) + plan_.io.mtp_vision_columns);
+        auto* base  = static_cast<std::byte*>(io_device_.p);
+        mtp_vision_inputs_.assign(static_cast<std::size_t>(subchunks), execution::VisionInput{});
+        bool any = false;
+        for (std::int32_t k = 0; k < subchunks; ++k) {
+            const std::int32_t n   = std::min(K, cells - k * K);
+            const auto lo          = static_cast<std::uint32_t>(first + k * K + 1);
+            const std::size_t at   = static_cast<std::size_t>(k) * K;
+            const VisualSlice slice = visual_slice(lane_.base->visual, lo, lo + static_cast<std::uint32_t>(n), lo,
+                                                   std::span<std::int32_t>(words + at, static_cast<std::size_t>(n)));
+            if (slice.count == 0) { continue; }
+            any = true;
+            mtp_vision_inputs_[static_cast<std::size_t>(k)] = {
+                Tensor(static_cast<std::byte*>(lane_.vision_handoff.data) + 2ULL * out * slice.first, DType::BF16,
+                       {out, static_cast<std::int32_t>(slice.count)}),
+                Tensor(base + plan_.io.mtp_vision_columns + 4 * at, DType::I32, {static_cast<std::int32_t>(slice.count)})};
+        }
+        return any ? mtp_vision_inputs_.data() : nullptr;
     }
 
     // A call's inputs at their fixed addresses. A decode or verification round (`round`, width
@@ -1428,6 +1733,7 @@ private:
         residency_->before_round(device_.stream);
         auto b = batch(width);
         if (mtp_chunk_) { b.mtp_chunk = &*mtp_chunk_; }
+        b.vision = call_vision_;
         if (!wide) {
             forward_->run(b, logits32_);
         } else {
@@ -1658,16 +1964,17 @@ private:
         auto* positions = reinterpret_cast<std::int32_t*>(host + io.mtp_cells);
         auto* rope     = reinterpret_cast<std::int32_t*>(host + io.mtp_rope);
         auto* block    = reinterpret_cast<std::int32_t*>(host + io.mtp_block_rope);
-        const std::int32_t r = dim(c_.qsa.compress_ratio), K = execution::kMtpChunkColumns;
+        const std::int32_t K = execution::kMtpChunkColumns;
         for (std::int32_t i = 0; i < cells; ++i) {
             positions[i] = first + i;
             ids[i]       = lane_.history[static_cast<std::size_t>(first + i + 1)];
-            // Sub-chunk k's [n_k, 3] axis-major block (text: every axis is the position).
-            const std::int32_t k = i / K, j = i % K, n = std::min(K, cells - k * K);
-            for (int a = 0; a < 3; ++a) { rope[3 * K * k + a * n + j] = first + i; }
-            if (j == 0) {
-                for (int a = 0; a < 3; ++a) { block[3 * k + a] = (first + i) / r * r; }
-            }
+        }
+        if (cells > 0) {
+            // Sub-chunk k's [n_k, 3] axis-major block and its pooled-block start (the lane's RoPE
+            // positions of the cells: the target's).
+            const std::int32_t subchunks = (cells + K - 1) / K;
+            stage_mtp_chunk_rope(lane_.rope, static_cast<std::uint32_t>(first), cells, K, c_.qsa.compress_ratio,
+                                 std::span<std::int32_t>(rope, 3ULL * cells), std::span<std::int32_t>(block, 3ULL * subchunks));
         }
         lane_.mtp_cells = static_cast<std::uint32_t>(begin + columns);
         lane_.mtp_live  = true;
@@ -1681,6 +1988,7 @@ private:
             chunk.positions        = Tensor(base + io.mtp_cells, DType::I32, {cells});
             chunk.rope_positions   = reinterpret_cast<std::int32_t*>(base + io.mtp_rope);
             chunk.block_start_rope = reinterpret_cast<std::int32_t*>(base + io.mtp_block_rope);
+            chunk.vision           = stage_mtp_vision(first, cells);
         }
         mtp_chunk_ = chunk;
     }
@@ -1690,18 +1998,18 @@ private:
     void stage_draft_words(std::int32_t steps) {
         const auto& io = plan_.io;
         auto* host     = static_cast<std::byte*>(io_host_.data());
-        const std::int32_t S = static_cast<std::int32_t>(lane_.state_tokens), r = dim(c_.qsa.compress_ratio);
+        const std::int32_t S = static_cast<std::int32_t>(lane_.state_tokens);
         *reinterpret_cast<std::int32_t*>(host + io.draft_anchor) = lane_.history.back();
         auto* cells = reinterpret_cast<std::int32_t*>(host + io.draft_cells);
         auto* rope  = reinterpret_cast<std::int32_t*>(host + io.draft_rope);
         auto* block = reinterpret_cast<std::int32_t*>(host + io.draft_block_rope);
         for (std::int32_t j = 0; j < std::max(steps, 1); ++j) {
             const std::int32_t cell = S - 1 + j;
-            cells[j] = cell;
-            for (int a = 0; a < 3; ++a) {
-                rope[3 * j + a]  = cell;
-                block[3 * j + a] = cell / r * r;
-            }
+            const auto at           = static_cast<std::size_t>(3 * j);
+            cells[j]                = cell;
+            stage_rope_value(rope_of(lane_.rope, static_cast<std::uint32_t>(cell)), std::span<std::int32_t>(rope + at, 3), 1, 0);
+            stage_rope_value(block_start_rope(lane_.rope, static_cast<std::uint32_t>(cell), c_.qsa.compress_ratio),
+                             std::span<std::int32_t>(block + at, 3), 1, 0);
         }
         upload_pinned(static_cast<std::byte*>(io_device_.p) + io.draft_cells, host + io.draft_cells,
                       io.draft_anchor + 4 - io.draft_cells, device_.stream);
@@ -2018,9 +2326,7 @@ private:
         // its own.
         auto* host = static_cast<std::byte*>(io_host_.data());
         auto* rope = reinterpret_cast<std::int32_t*>(host + plan_.io.rope);
-        for (std::int32_t j = 0; j < k; ++j) {
-            for (int a = 0; a < 3; ++a) { rope[a * k + j] = S + j; }
-        }
+        stage_rope(lane_.rope, static_cast<std::uint32_t>(S), k, std::span<std::int32_t>(rope, 3ULL * k), k, 0);
         upload_pinned(base + plan_.io.rope, rope, 12ULL * k, s);
         mtp_catch_up(S, k);
         lane_.phase = d.terminal ? Phase::Finishable : Phase::Decode;
@@ -2093,7 +2399,9 @@ private:
     // At a boundary (no round in flight; `idle`: no request active): resizes the expert cache to
     // the VRAM control law's decision.
     void apply_vram_target(bool idle) {
-        if (!control_ || !monitor_ || lease_.valid()) { return; } // the pool does not resize while lent
+        // The pool does not resize while lent: the wide-call lease, or the image handoff that
+        // stays lent across the prompt's prefill calls (resize would move or free its frames).
+        if (!control_ || !monitor_ || lease_.valid() || lane_.vision_lease.valid()) { return; }
         const double now = std::chrono::duration<double>(Clock::now() - vram_epoch_).count();
         const auto d     = control_->decide(monitor_->latest(), pool_now_, frames_now_, now, idle);
         if (d.frames == frames_now_) { return; }
@@ -2463,6 +2771,10 @@ private:
     Tensor mtp_tail_, ple_state_, ple_slot_;
     void* tails_base_ = nullptr;
     std::optional<execution::MtpChunk> mtp_chunk_;
+    // The staged call's image columns and its drafter cells' (per sub-chunk).
+    execution::VisionInput vision_input_;
+    const execution::VisionInput* call_vision_ = nullptr;
+    std::vector<execution::VisionInput> mtp_vision_inputs_;
     std::vector<std::optional<GdnReplayRecords>> records_;
     std::vector<std::optional<ops::GdnReplayFoldPlan>> folds_;
     std::vector<DecodeGraphDefinition> verify_front_, verify_back_, draft_graphs_, catch_graphs_;

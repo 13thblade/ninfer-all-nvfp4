@@ -5,7 +5,8 @@
 // decode); NInfer's single-sequence QSA Ops and paged INT8 KV; the PLE rows come from the caller
 // already read; experts are served by the GPU narrow route from device frames, staging slots or the
 // pinned bank, or for a wide prefill call from the expert stream's ring (no CPU miss service,
-// overlap streams, landing frames, vision or prefix-cache events). Speculative verification and the
+// overlap streams, landing frames or prefix-cache events). Image columns take their visual
+// embeddings after the token embedding, in the text model and the drafter (Infernix's VisionInput). Speculative verification and the
 // MTP drafter follow Infernix's ForwardVerify and mtp_block; QSA tails are pooled from scratch
 // copies (this repo's qsa_pool_keys always advances the tail it is given) and committed with
 // qsa_commit_tails.
@@ -84,6 +85,14 @@ struct ForwardVerify {
 // Cells of one drafter call inside a prefill chunk (bounds the drafter's share of the workspace).
 inline constexpr std::int32_t kMtpChunkColumns = 512;
 
+// Adapted from Infernix a3edb450 src/models/qwen4_exp/execution/forward.h (VisionInput).
+// Visual embeddings of a call's image columns: they replace those columns' token embeddings before
+// the stream expansion (transformers' masked_scatter precedes the repeat).
+struct VisionInput {
+    Tensor embeddings; // BF16 [H, m]: the columns' embeddings, in column order
+    Tensor columns;    // I32 [m]: call-local columns, ascending
+};
+
 // The MTP drafter's cells of a prefill or forced-token call (Infernix MtpChunk, one sequence),
 // written from the call's own residuals while they are live: cell c pairs the residual at position
 // c with the token at c + 1. The cells are `saved` (the residual of the position before the call)
@@ -99,6 +108,9 @@ struct MtpChunk {
     Tensor positions;    // I32 [prepend + columns]: the cells
     std::int32_t* rope_positions   = nullptr;
     std::int32_t* block_start_rope = nullptr;
+    // Per sub-chunk: the visual embeddings of cells whose next token is an image token; null for a
+    // prompt without media (an entry with no columns has none).
+    const VisionInput* vision = nullptr;
 };
 
 // One call: T consecutive positions of the sequence.
@@ -112,6 +124,7 @@ struct ForwardBatch {
     const ForwardVerify* verify = nullptr; // set for a speculative verification call (T = W >= 2)
     Tensor residual_out;     // when set: BF16 [S*H, T] copy of the final residual (the drafter's input)
     const MtpChunk* mtp_chunk = nullptr; // when set: the call's drafter cells (run_back writes them)
+    const VisionInput* vision = nullptr; // when set: the image columns of a prefill call
 };
 
 // The MTP drafter's own QSA layer (a 13th attention layer through the same block table) and state.
@@ -141,6 +154,7 @@ struct MtpCall {
     bool kv_only = true;
     Tensor residual_out;     // BF16 [S*H, 1]
     Tensor drafts;           // I32 [1]
+    const VisionInput* vision = nullptr; // when set: cells whose next token is an image token
     // Optional observation of a full step (reference checks): each set tensor receives a copy.
     struct Tap {
         Tensor fused;    // BF16 [S*H, 1]: the residual after the input fusion

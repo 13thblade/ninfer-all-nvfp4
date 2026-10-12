@@ -141,6 +141,10 @@ public:
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
 private:
+    // After the controller took a run back (commands_ holds the loads that gave back queued): reloads
+    // displaced_[displaced_from..] and issues every queued load. The frames are already returned when
+    // this runs, so a throw from it leaves them returned.
+    std::uint32_t settle_return(cudaStream_t compute, std::size_t displaced_from);
     void upload_table(cudaStream_t compute);
     // Publishes the promotions whose copies have completed.
     void publish_landed();
