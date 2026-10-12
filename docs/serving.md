@@ -642,6 +642,11 @@ relabeled as client input errors.
 The request `model` must equal the public model ID: the artifact `metadata.name` by default
 (falling back to its architecture name when absent), or the explicit `--model-id` override.
 Reasoning is returned separately as `reasoning_content`; answer text remains in `content`.
+The thinking ends at a `</think>` followed by a line break (the model writes `\n</think>\n\n`) or by
+the end of the turn. A `</think>` that thinking quotes while it discusses the tag, followed by a
+space, a quote, a backtick or other text on the same line, stays reasoning, so the rest of the
+thinking is not published as the answer. Constrained output (tools under `basic`, JSON formats)
+still requires the exact `\n</think>\n\n` framing.
 
 For non-strict tools, a direct top-level tool-parameter
 `type`, or an `anyOf`/`oneOf` composed entirely of explicit primitive types, guides conversion of
