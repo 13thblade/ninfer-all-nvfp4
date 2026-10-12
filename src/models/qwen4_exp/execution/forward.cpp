@@ -356,7 +356,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                 .frame_stride  = experts_.frame_stride,
                                 .error         = experts_.error,
                                 .staging_base  = experts_.staging_base,
-                                .staging_slots = experts_.staging_slots};
+                                .staging_slots = experts_.staging_slots,
+                                .zero_copy_misses = experts_.zero_copy_misses};
     ExpertStream* stream = experts_.stream != nullptr && experts_.stream->active() ? experts_.stream : nullptr;
     if (stream != nullptr) {
         source.frames = stream->table(layer);

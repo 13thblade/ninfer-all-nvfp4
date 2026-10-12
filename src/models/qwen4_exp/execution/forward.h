@@ -52,6 +52,9 @@ struct ForwardExperts {
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     std::uint32_t* error        = nullptr; // optional mapped word (ops::MoeExpertSource::error)
+    // A staged call with at most this many misses reads them zero-copy instead
+    // (ops::MoeExpertSource::zero_copy_misses).
+    std::int32_t zero_copy_misses = 0;
     // Optional prefill expert stream: while it is active the MoE reads its per-layer frame tables
     // (streamed experts resident in the ring) and orders itself with the stream's copies.
     ExpertStream* stream = nullptr;

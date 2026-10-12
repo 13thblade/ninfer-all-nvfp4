@@ -124,6 +124,10 @@ constexpr std::int32_t kStreamMinColumns = 512;
 // Ring frames per half: a layer's every expert, so every non-resident one streams and a wide call
 // needs no staging pass (resident counts vary widely by layer: a 320-frame half left 29% of the
 // misses to the staging kernel, 1.5 s of a 32K prompt).
+// A layer call with at most this many misses reads them zero-copy instead of staging them: one or
+// two misses stream over PCIe beside the resident experts' compute faster than a stage copy that
+// precedes it (PR 11 measurements in flash-next-plan.md).
+constexpr std::int32_t kZeroCopyMisses = 2;
 // Promotions per layer call of a decode round (Infernix design section 19.2: one measured fastest).
 constexpr std::size_t kDecodePromotionsPerLayer = 1;
 // Once the frames are full, decode promotes only every interval-th round on the reference link.
@@ -516,6 +520,7 @@ public:
         experts.route_stride  = residency_->route_stride();
         experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
         experts.staging_slots = kStagingSlots;
+        experts.zero_copy_misses = kZeroCopyMisses;
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames.push_back(residency_->table(l)); }
         if (residency_->frames() > 0 && plan_.wide_work > 0) {
             std::vector<execution::ExpertStream::Bank> stream_banks;

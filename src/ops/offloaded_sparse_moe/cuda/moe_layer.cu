@@ -181,6 +181,17 @@ __global__ void __launch_bounds__(kThreads)
         }
         __syncthreads();
     }
+    if (misses <= source.zero_copy_misses) {
+        // Few misses: the expert kernels read them from the host bank (NInfer-3090; a stage copy
+        // that precedes the compute costs more than their slices streamed beside it).
+        if (blockIdx.x == 0) {
+            for (int m = threadIdx.x; m < misses; m += blockDim.x) {
+                const int job    = miss_jobs[m];
+                job_records[job] = source.host_records + static_cast<std::uint64_t>(dispatch.jobs[job]) * source.record_stride;
+            }
+        }
+        return;
+    }
     const int chunks = static_cast<int>((record_bytes + kStageChunk - 1) / kStageChunk);
     constexpr int kVec = kStageChunk / 16;
     const int total    = misses * chunks;
@@ -1077,13 +1088,19 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         narrow_flags = wide_ws.skip;
     }
     const moe::wide::Geometry wide_geometry{g.up_offset, g.down_offset, g.gate_up_row_bytes, g.down_row_bytes};
+    // The zero-copy rule for a few misses was measured on single-column decode only. A wider call
+    // (prefill: a miss owns many columns) keeps the bulk staging copy, so the rule is switched off
+    // for it here rather than changing an unmeasured path.
+    MoeExpertSource stage_source = source;
+    if (x.ne[1] != 1) { stage_source.zero_copy_misses = 0; }
     for (int base = 0; base < max_jobs; base += pass_jobs) {
         const int jobs = std::min(pass_jobs, max_jobs - base);
         // Without staging the expert kernels resolve their records themselves.
         const std::uint8_t* const* records = nullptr;
         if (source.staging_slots > 0) {
-            stage_kernel<<<kStageCtas, kThreads, 0, stream>>>(dispatch, source, static_cast<std::uint32_t>(geometry.bytes),
-                                                              base, jobs, flags, layout.job_records);
+            stage_kernel<<<kStageCtas, kThreads, 0, stream>>>(dispatch, stage_source,
+                                                              static_cast<std::uint32_t>(geometry.bytes), base, jobs,
+                                                              flags, layout.job_records);
             check_launch("stage");
             records = layout.job_records;
         }

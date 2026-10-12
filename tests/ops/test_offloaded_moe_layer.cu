@@ -4,12 +4,14 @@
 //     logits drawn from FP64 values; a column whose FP64 gap between ranks 10 and 11 is inside the
 //     FP32 rounding bound is counted, not required to agree. Weights and the shared gate against
 //     FP64.
-//   - moe_dispatch: counts, offsets, jobs and entries exactly, on the one-CTA and three-kernel routes.
+//   - moe_dispatch: counts, offsets, jobs, entries and the route log exactly, on the one-CTA and
+//     three-kernel routes.
 //   - moe_experts: every routed (column, expert) output equals the CPU engine's (expert_forward_cpu,
 //     scalar) bit for bit, for each record format at T in {1, 2, 7, 8, 16}, with the records in
 //     device frames (record-stride apart, or wider: frame_stride), read zero-copy, staged through
 //     1, 3 or 64 slots, mixed, and served by the CPU
-//     miss service at 1 and 6 workers.
+//     miss service at 1 and 6 workers; and staged calls whose passes with few misses read them
+//     zero-copy (MoeExpertSource::zero_copy_misses), alone, mixed and beside the CPU service.
 //   - The whole layer against FP64: route weights, the routed experts (FP64 over the decoded
 //     records and A8-cast activations), a shared expert composed of GGML linears and silu_mul (its
 //     Op outputs rounded to BF16, their observable boundaries), and moe_combine.
@@ -137,7 +139,7 @@ RouteRef route_oracle(const double* logits, int experts, int k) {
 }
 
 struct DeviceRouting {
-    DeviceBuffer logits, ids, weights, shared_gate, dispatch;
+    DeviceBuffer logits, ids, weights, shared_gate, dispatch, route_log;
     ops::MoeRouting routing;
     ops::MoeDispatch view;
     int experts = 0, k = 0, columns = 0;
@@ -145,7 +147,8 @@ struct DeviceRouting {
     DeviceRouting(const std::vector<float>& host_logits, int e, int top_k, int t)
         : logits(host_logits.size() * 4), ids(static_cast<std::size_t>(top_k) * t * 4),
           weights(static_cast<std::size_t>(top_k) * t * 4), shared_gate(static_cast<std::size_t>(t) * 4),
-          dispatch(ops::moe_dispatch_bytes(e, top_k * t)), experts(e), k(top_k), columns(t) {
+          dispatch(ops::moe_dispatch_bytes(e, top_k * t)), route_log(static_cast<std::size_t>(top_k) * t * 4),
+          experts(e), k(top_k), columns(t) {
         logits.copy_from_host(host_logits.data(), host_logits.size() * 4);
         routing.ids         = Tensor(ids.p, DType::I32, {top_k, t});
         routing.weights     = Tensor(weights.p, DType::FP32, {top_k, t});
@@ -153,7 +156,8 @@ struct DeviceRouting {
         view                = ops::carve_moe_dispatch(dispatch.p, e, top_k * t);
         const Tensor l(logits.p, DType::FP32, {e + 1, t});
         ops::moe_route(l, top_k, routing, nullptr);
-        ops::moe_dispatch(routing, e, view, nullptr, nullptr);
+        cuda_ok(cudaMemset(route_log.p, 0xFF, route_log.bytes), "poison the route log");
+        ops::moe_dispatch(routing, e, view, static_cast<std::int32_t*>(route_log.p), nullptr);
         cuda_ok(cudaDeviceSynchronize(), "route/dispatch");
     }
 };
@@ -243,6 +247,7 @@ void test_route_and_dispatch() {
             at += want_counts[e];
         }
         check(offsets[kExperts] == entries && job_count == used, "dispatch totals");
+        check(download<std::int32_t>(r.route_log.p, entries) == ids, "the route log holds the routed ids");
         std::printf("route+dispatch T=%d: exact; %d column(s) inside the FP64 tie bound\n", columns, boundary);
     }
 }
@@ -298,6 +303,7 @@ struct Config {
     // Device frames frame_stride apart, wider than the record (a frame pool shared by layers whose
     // record formats differ in size): MoeExpertSource::frame_stride.
     bool wide_frames = false;
+    int zero_copy_misses = 0; // MoeExpertSource::zero_copy_misses
 };
 
 std::vector<Config> configs() {
@@ -311,8 +317,12 @@ std::vector<Config> configs() {
         {"mixed-staged-4", 3, 4},
         {"cpu-1w-all", 3, 0, 1, 64, 0},
         {"cpu-6w-div3", 0, 4, 6, 4, 3, 2},
+        {"staged-zc-all", 0, 64, 0, 0, 3, om::kMaxColumns, false, 64},
+        {"mixed-zc-8", 3, 64, 0, 0, 3, om::kMaxColumns, false, 8},
+        {"mixed-staged-4-zc-2", 3, 4, 0, 0, 3, om::kMaxColumns, false, 2},
+        {"cpu-6w-zc-1", 3, 4, 6, 4, 3, 2, false, 1},
     };
-    if (g_small) { c = {c[0], c[1], c[2], c[4], c[7]}; }
+    if (g_small) { c = {c[0], c[1], c[2], c[4], c[7], c[10], c[11]}; }
     return c;
 }
 
@@ -379,6 +389,7 @@ std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const
     source.error         = reinterpret_cast<std::uint32_t*>(error.device);
     source.staging_base  = staging ? static_cast<std::uint8_t*>(staging->p) : nullptr;
     source.staging_slots = cfg.staging_slots;
+    source.zero_copy_misses = cfg.zero_copy_misses;
     std::unique_ptr<om::CpuMissService> owned;
     om::CpuMissService* service = external;
     if (service == nullptr && cfg.cpu_workers > 0) {

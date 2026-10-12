@@ -1,7 +1,10 @@
 // offloaded_sparse_moe over GGML expert records: the public Op at decode widths.
 //
 //   gpu   moe_experts with E experts each routed every one of T columns (top_k = E): records in
-//         device frames (resident), staged from the pinned host bank, or read zero-copy. Cold L2
+//         device frames (resident), staged from the pinned host bank, or read zero-copy; and the
+//         decode case of --misses misses among resident experts: staged (m-staged), staged with
+//         MoeExpertSource::zero_copy_misses covering them (m-zc-rule: the stage kernel runs and
+//         copies nothing), and read zero-copy without staging (m-zerocopy). Cold L2
 //         (a 256 MiB read before every rep), CUDA events around the call replayed from a CUDA graph
 //         (as decode issues it) and launched eagerly, median of --reps. Rate = record bytes read /
 //         graph time.
@@ -11,7 +14,7 @@
 // Records are random blocks with finite scales (each format's bytes per record are fixed, so the
 // rate does not depend on their values).
 //
-//   ninfer_benches ninfer_offloaded_moe_bench [--mode gpu|cpu|all] [--experts 10] [--reps 30]
+//   ninfer_benches ninfer_offloaded_moe_bench [--mode gpu|cpu|all] [--experts 10] [--reps 30] [--misses 1]
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -105,7 +108,7 @@ double median(std::vector<double> v) {
     return v[v.size() / 2];
 }
 
-void bench_gpu(int experts, int reps) {
+void bench_gpu(int experts, int reps, int misses) {
     std::mt19937 rng(5);
     cudaStream_t stream = nullptr;
     cuda_ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
@@ -115,6 +118,9 @@ void bench_gpu(int experts, int reps) {
         flush_kernel<<<328, 512, 0, stream>>>(static_cast<const uint4*>(flush.p), flush.bytes / 16,
                                               static_cast<uint4*>(sink.p));
     };
+    // Raise the clocks of an idle GPU before the first measurement (~0.3 s of reads).
+    for (int i = 0; i < 400; ++i) { flush_l2(); }
+    cuda_ok(cudaStreamSynchronize(stream), "warm-up");
     cudaEvent_t a, b;
     cuda_ok(cudaEventCreate(&a), "event");
     cuda_ok(cudaEventCreate(&b), "event");
@@ -157,10 +163,14 @@ void bench_gpu(int experts, int reps) {
             DeviceBuffer x(xh.size() * 2), out(static_cast<std::size_t>(experts) * t * om::kHidden * 2),
                 workspace(ops::moe_experts_workspace_bytes(experts, experts * t, t));
             x.copy_from_host(xh.data(), xh.size() * 2);
-            for (int placement = 0; placement < 3; ++placement) {
+            for (int placement = 0; placement < 6; ++placement) {
                 if (placement > 0 && t > 1) { continue; } // misses at T = 1 only
-                std::vector<std::int32_t> f(experts, placement == 0 ? 0 : -1);
-                for (int e = 0; e < experts && placement == 0; ++e) { f[e] = e; }
+                // 0 resident, 1 staged, 2 zero-copy; 3-5 experts [0, misses) missing and the rest
+                // resident: staged, staged under the zero-copy rule, read zero-copy.
+                std::vector<std::int32_t> f(experts, -1);
+                for (int e = 0; e < experts; ++e) {
+                    if (placement == 0 || (placement >= 3 && e >= misses)) { f[e] = e; }
+                }
                 DeviceBuffer d_frames(f.size() * 4);
                 d_frames.copy_from_host(f.data(), f.size() * 4);
                 ops::MoeExpertSource source;
@@ -170,7 +180,8 @@ void bench_gpu(int experts, int reps) {
                 source.host_records  = host_dev;
                 source.record_stride = stride;
                 source.staging_base  = static_cast<std::uint8_t*>(staging.p);
-                source.staging_slots = placement == 1 ? experts : 0;
+                source.staging_slots    = placement == 1 || placement == 3 || placement == 4 ? experts : 0;
+                source.zero_copy_misses = placement == 4 ? misses : 0;
                 const Tensor xt(x.p, DType::BF16, {om::kHidden, t});
                 Tensor ot(out.p, DType::BF16, {om::kHidden, experts * t});
                 // The call as decode issues it, replayed from a CUDA graph, and launched eagerly.
@@ -201,7 +212,7 @@ void bench_gpu(int experts, int reps) {
                 const double g = time(true), e = time(false);
                 cuda_ok(cudaGraphExecDestroy(exec), "destroy");
                 cuda_ok(cudaGraphDestroy(graph), "destroy");
-                static const char* kPlacement[] = {"resident", "staged", "zero-copy"};
+                static const char* kPlacement[] = {"resident", "staged", "zero-copy", "m-staged", "m-zc-rule", "m-zerocopy"};
                 std::printf("%-8s %-10s %3d %8.2f %9.1f %8.1f %9.1f %5.0f%%\n", name(format), kPlacement[placement], t,
                             record_mb, g, e, record_mb * 1e3 / g, 100.0 * record_mb * 1e3 / g / 936.0);
             }
@@ -253,22 +264,23 @@ void bench_cpu(int reps) {
 
 int main(int argc, char** argv) {
     std::string mode = "all";
-    int experts = 10, reps = 30;
+    int experts = 10, reps = 30, misses = 1;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string k = argv[i];
         if (k == "--mode") { mode = argv[i + 1]; }
         else if (k == "--experts") { experts = std::atoi(argv[i + 1]); }
         else if (k == "--reps") { reps = std::atoi(argv[i + 1]); }
+        else if (k == "--misses") { misses = std::atoi(argv[i + 1]); }
         else {
-            std::fprintf(stderr, "usage: %s [--mode gpu|cpu|all] [--experts N] [--reps N]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--mode gpu|cpu|all] [--experts 10] [--reps 30] [--misses 1]\n", argv[0]);
             return 2;
         }
     }
-    if (experts < 1 || experts > 16 || reps < 1) {
-        std::fprintf(stderr, "--experts must be in [1, 16] and --reps positive\n");
+    if (experts < 1 || experts > 16 || reps < 1 || misses < 1 || misses > experts) {
+        std::fprintf(stderr, "--experts must be in [1, 16], --reps positive and --misses in [1, experts]\n");
         return 2;
     }
-    if (mode == "gpu" || mode == "all") { bench_gpu(experts, reps); }
+    if (mode == "gpu" || mode == "all") { bench_gpu(experts, reps, misses); }
     if (mode == "cpu" || mode == "all") { bench_cpu(reps); }
     return 0;
 }
