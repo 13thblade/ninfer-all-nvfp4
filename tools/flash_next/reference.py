@@ -384,7 +384,8 @@ class Reference:
         span = (taps - 1) * dilation
         padded_in = torch.cat((torch.zeros(span, W, dtype=F64), normed), dim=0)
         conv = sum(kernel[:, j][None, :] * padded_in[j * dilation : j * dilation + T] for j in range(taps))
-        return self.round(self.round(gated) + silu(conv)), rows
+        # The contribution keeps the gated operand's BF16 boundary; the caller's residual add rounds once.
+        return self.round(gated) + silu(conv), rows
 
     # -- embedding and head
     def embed(self, ids: list[int]) -> torch.Tensor:
