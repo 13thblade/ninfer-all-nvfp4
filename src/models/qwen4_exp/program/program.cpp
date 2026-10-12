@@ -244,6 +244,7 @@ struct Layout {
     std::size_t state = 0, gdn_conv = 0, gdn_recurrent = 0, ple = 0, tail = 0;
     std::size_t work = 0, staging = 0, mask_words = 0;
     std::uint64_t frame_stride = 0;
+    int sms                    = 0;
     bool vmm                   = false;
     ProgramDevicePlan bytes;
 };
@@ -298,6 +299,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.work = execution::Forward::workspace_bytes(c, d.chunk, d.pages * kPagedKVPageSize,
                                                  DeviceExecutionView{nullptr, sms}) +
              ops::sampling_workspace_capacity_bytes(d.token_domain, 1, 1);
+    d.sms       = sms;
     d.wide_work = execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
                                                       DeviceExecutionView{nullptr, sms});
     d.vmm = VmmArena::supported(o.device);
@@ -714,7 +716,10 @@ public:
                 prefetch_rows(next, std::min(call_width(wide), remaining - width));
             }
             lane_.state_tokens += static_cast<std::uint32_t>(width);
-            const std::size_t promotions = width <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(width)) : 0;
+            // No promotion while the lease is held, whatever the call's width: a trailing short call
+            // would evict residents after lend() recorded the displaced set, which give_back restores.
+            const std::size_t promotions =
+                !lease_.valid() && width <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(width)) : 0;
             if (last) {
                 const bool failed_constraint = sample(begin + width - 1, masks);
                 residency_->enqueue_route_download(device_.stream, width);
@@ -1123,9 +1128,17 @@ private:
     bool wide_ready(std::int32_t remaining) {
         if (lease_.valid()) { return true; }
         if (!stream_ || plan_.wide_work == 0 || remaining < kStreamMinColumns) { return false; }
+        // The workspace of this prompt's widest call (not the planned wide_chunk columns). The keys
+        // stay the planned envelope: Forward::attention runs the QSA selection at
+        // kv_.max_visible_keys, whose scratch grows with it, so a smaller figure here would
+        // under-allocate the lent arena.
+        const std::int32_t widest   = std::min(plan_.wide_chunk, remaining);
+        const std::uint32_t keys    = plan_.pages * kPagedKVPageSize;
+        const std::size_t work      = std::min<std::size_t>(
+            plan_.wide_work, execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms}));
         const std::uint64_t stride  = residency_->frame_stride();
         const std::size_t tables    = align(stream_->table_bytes());
-        const auto work_frames      = static_cast<std::uint32_t>((tables + plan_.wide_work + stride - 1) / stride);
+        const auto work_frames      = static_cast<std::uint32_t>((tables + work + stride - 1) / stride);
         const std::uint32_t can     = residency_->lendable();
         if (can < work_frames + 2) { return false; } // a small cache: static calls through staging
         const std::uint32_t ring    = std::min(2 * c_.moe.experts, (can - work_frames) & ~1U);
@@ -1143,12 +1156,13 @@ private:
         ring_first_  = lease_.first + work_frames;
         ring_frames_ = ring;
         ++leases_;
-        if (leases_ == 1) {
+        if (lease_.count != last_lease_) { // its size follows the prompt: say when it changes
+            last_lease_ = lease_.count;
             char line[200];
             std::snprintf(line, sizeof(line),
                           "prefill lends %u expert frames (%.2f GiB: %u for %d-token calls, a ring of %u for streamed experts)",
-                          lease_.count, static_cast<double>(lease_.memory.bytes) / (1ULL << 30), work_frames,
-                          plan_.wide_chunk, ring);
+                          lease_.count, static_cast<double>(lease_.memory.bytes) / (1ULL << 30), work_frames, widest,
+                          ring);
             diagnostic(line);
         }
         return true;
@@ -1644,6 +1658,7 @@ private:
     std::uint32_t ring_first_ = 0, ring_frames_ = 0;
     std::size_t wide_peak_ = 0;
     std::uint64_t leases_ = 0, refilled_ = 0;
+    std::uint32_t last_lease_ = 0;
     // The next prefill call's n-gram rows, read while the device runs the current one.
     PinnedHostBuffer ngram_next_{1};
     std::int32_t next_begin_ = -1, next_width_ = 0;

@@ -3,8 +3,8 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/program/expert_residency.h (Apache-2.0).
 // Modified for NInfer-3090: frames hold ggml_expert_record_v1 records of each layer's bank (the
 // stride is the largest bank's); no SSD tier or landing frames (their Op and Program paths are not
-// ported); frame lending for prefill, with a refill of the returned frames; uploads use
-// core/pinned_upload.h.
+// ported); frame lending for prefill, whose give-back restores the displaced experts; a grow
+// refills its new frames by score; uploads use core/pinned_upload.h.
 //
 // The VRAM expert cache of the Qwen4Exp Program: a pool of device frames, each holding one routed
 // expert's record, the per-layer frame tables the MoE kernels read (frame or -1: stage the record
@@ -77,6 +77,7 @@ public:
         std::uint32_t frames  = 0;     // frames backed afterwards
         std::uint64_t spilled = 0;     // bytes of a chunk the driver placed in system memory (given back)
         bool refused          = false; // the device had no memory for the next chunk
+        std::uint32_t refilled = 0;     // a grow: experts loaded into the new frames
         VramSnapshot at_spill;         // the reading after a spilled chunk (diagnostics)
     };
     // Backs `frames` frames (clamped to frame_limit()). Call only between rounds, with nothing in
@@ -131,8 +132,9 @@ public:
     // experts of the cheapest run of `count` frames and uploads the table on `compute`.
     FrameLease lend(std::uint32_t count, cudaStream_t compute);
     // Returns a lease once `compute` has finished every access to it, then refills the free frames
-    // with the highest-score experts that are not resident (the prompt's routes updated their
-    // scores), on the copy stream behind `compute`. Returns the number of refill loads.
+    // on the copy stream behind `compute`: first with the experts the lease displaced (the set
+    // before the prompt), then with the highest-score experts that are not resident. Returns the
+    // number of refill loads.
     std::uint32_t give_back(FrameLease& lease, cudaStream_t compute);
     [[nodiscard]] std::uint32_t lent_frames() const noexcept;
 
@@ -144,6 +146,9 @@ private:
     void publish_landed();
     // Issues commands_' promotion copies on the copy stream, after the table update on `compute`.
     void issue_loads(cudaStream_t compute);
+    // Loads non-resident experts into the free frames: those of `first`, then the others with
+    // uses, each group highest LFRU score first. Returns the number loaded.
+    std::uint32_t refill(cudaStream_t compute, std::span<const std::uint32_t> first);
 
     const TextConfig& c_;
     std::vector<const std::uint8_t*> banks_;
@@ -165,6 +170,7 @@ private:
     std::unique_ptr<expert_cache::CacheController> controller_;
     std::vector<expert_cache::CacheController::Command> commands_;
     std::vector<std::uint32_t> group_;
+    std::vector<std::uint32_t> displaced_; // the experts the current lease evicted
     std::vector<std::uint8_t> seen_;
     std::uint64_t round_ = 0;
 
