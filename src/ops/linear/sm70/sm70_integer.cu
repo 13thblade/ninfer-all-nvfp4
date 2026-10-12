@@ -19,7 +19,7 @@ namespace ninfer::ops::detail::sm70 {
 namespace {
 
 constexpr int kGroup   = 64;  // values per activation scale
-constexpr int kWarps   = 8;   // a warp per four-row panel, so a CTA owns 32 rows
+constexpr int kWarps   = 8;   // two warps per four-row panel, so a CTA owns 16 rows
 constexpr int kT2Group = 128; // values per T2 weight scale (a 32-byte record)
 
 // Element e of a 64-value group in the stored order: within each sixteen-value block, word s holds
@@ -148,23 +148,83 @@ __device__ __forceinline__ float row_sum(float value) {
     return value;
 }
 
+// A lane's record of one step: half p.half of row `row`'s record for group 4 step + p.group_offset
+// and that group's weight scale (nothing past the row's groups).
+struct Record {
+    uint4 codes;
+    float scale;
+    int group;
+};
+
+__device__ __forceinline__ Record load_record(const RowSplitView& view, std::int32_t row,
+                                              const PanelLane& p, int step, int t2_groups) {
+    Record r{make_uint4(0u, 0u, 0u, 0u), 0.0F, 4 * step + p.group_offset};
+    if (r.group < t2_groups) {
+        r.codes = __ldg(reinterpret_cast<const uint4*>(
+                            view.record(view.base, kT2Group / 4, row, r.group)) +
+                        p.half);
+        r.scale = view.scale(row, r.group);
+    }
+    return r;
+}
+
 template <int Cols>
-__device__ __forceinline__ void
-accumulate_row(const RowSplitView& view, std::int32_t row, const PanelLane& p, int step,
-               int t2_groups, const StagedActivations<Cols>& x, int cols, float (&acc)[Cols]) {
-    const int group = 4 * step + p.group_offset;
-    if (group >= t2_groups) { return; }
-    const uint4 record = __ldg(
-        reinterpret_cast<const uint4*>(view.record(view.base, kT2Group / 4, row, group)) + p.half);
-    const float weight_scale = view.scale(row, group);
+__device__ __forceinline__ void accumulate(const Record& r, const PanelLane& p, int t2_groups,
+                                           const StagedActivations<Cols>& x, int cols,
+                                           float (&acc)[Cols]) {
+    if (r.group >= t2_groups) { return; }
     unsigned b[16];
-    offset_codes(record, b);
-    const int x_group = 2 * group + p.half;
+    offset_codes(r.codes, b);
+    const int x_group = 2 * r.group + p.half;
 #pragma unroll
     for (int c = 0; c < Cols; ++c) {
         if (c >= cols) { break; }
         acc[c] = fmaf(static_cast<float>(integer_dot(b, x, c, x_group)),
-                      weight_scale * x.scales[c * x.groups + x_group], acc[c]);
+                      r.scale * x.scales[c * x.groups + x_group], acc[c]);
+    }
+}
+
+// The warps of a panel split its steps (kSplit warps, kUnroll steps of records in flight per
+// warp): a narrow parent such as a 5120-row down projection otherwise runs too few warps per SM to
+// keep the weight stream busy.
+constexpr int kSplit  = 2;
+constexpr int kUnroll = 2;
+constexpr int kPanels = kWarps / kSplit; // four-row panels per CTA
+
+// The partial sums of a warp's steps, over the lanes of each row.
+template <int Cols, int Parts>
+__device__ __forceinline__ void panel_sums(const RowSplitView (&views)[Parts],
+                                           const std::int32_t (&rows)[Parts], const PanelLane& p,
+                                           int split, int t2_groups,
+                                           const StagedActivations<Cols>& x, int cols,
+                                           float (&acc)[Parts][Cols]) {
+#pragma unroll
+    for (int part = 0; part < Parts; ++part) {
+#pragma unroll
+        for (int c = 0; c < Cols; ++c) { acc[part][c] = 0.0F; }
+    }
+    const int steps = (t2_groups + 3) / 4;
+    for (int step0 = split * kUnroll; step0 < steps; step0 += kSplit * kUnroll) {
+        Record r[Parts][kUnroll];
+#pragma unroll
+        for (int part = 0; part < Parts; ++part) {
+#pragma unroll
+            for (int u = 0; u < kUnroll; ++u) {
+                r[part][u] = load_record(views[part], rows[part], p, step0 + u, t2_groups);
+            }
+        }
+#pragma unroll
+        for (int part = 0; part < Parts; ++part) {
+#pragma unroll
+            for (int u = 0; u < kUnroll; ++u) {
+                accumulate<Cols>(r[part][u], p, t2_groups, x, cols, acc[part]);
+            }
+        }
+    }
+#pragma unroll
+    for (int part = 0; part < Parts; ++part) {
+#pragma unroll
+        for (int c = 0; c < Cols; ++c) { acc[part][c] = row_sum(acc[part][c]); }
     }
 }
 
@@ -175,24 +235,35 @@ __launch_bounds__(kWarps * 32) __global__
                                 const float* __restrict__ scales,
                                 const std::int32_t* __restrict__ sums, std::int32_t cols,
                                 DestinationEpilogue epilogue) {
+    __shared__ float split_sums[kWarps][Cols][4];
     const StagedActivations<Cols> x = stage_activations<Cols>(codes, scales, sums, k, cols);
     const int lane                  = static_cast<int>(threadIdx.x) & 31;
+    const int warp                  = static_cast<int>(threadIdx.x) >> 5;
+    const int split                 = warp % kSplit;
     const std::int32_t row0 =
-        (static_cast<std::int32_t>(blockIdx.x) * kWarps + (static_cast<int>(threadIdx.x) >> 5)) * 4;
-    if (row0 >= rows) { return; }
+        (static_cast<std::int32_t>(blockIdx.x) * kPanels + warp / kSplit) * 4;
     const PanelLane p      = panel_lane(lane);
     const std::int32_t row = row0 + p.row_in_panel;
-    const int t2_groups    = k / kT2Group;
-    float acc[Cols];
+    const bool live        = row0 < rows;
+    float acc[1][Cols];
+    if (live) {
+        const RowSplitView views[1]   = {view};
+        const std::int32_t panel_rows[1] = {row};
+        panel_sums<Cols, 1>(views, panel_rows, p, split, k / kT2Group, x, cols, acc);
+        if ((lane & 0x19) == 0) {
 #pragma unroll
-    for (int c = 0; c < Cols; ++c) { acc[c] = 0.0F; }
-    for (int step = 0; 4 * step < t2_groups; ++step) {
-        accumulate_row<Cols>(view, row, p, step, t2_groups, x, cols, acc);
+            for (int c = 0; c < Cols; ++c) { split_sums[warp][c][p.row_in_panel] = acc[0][c]; }
+        }
     }
+    __syncthreads();
+    if (!live || split != 0 || (lane & 0x19) != 0) { return; }
 #pragma unroll
     for (int c = 0; c < Cols; ++c) {
-        const float value = row_sum(acc[c]);
-        if ((lane & 0x19) == 0 && c < cols) { epilogue(row, c, value); }
+        if (c >= cols) { break; }
+        float value = 0.0F;
+#pragma unroll
+        for (int s = 0; s < kSplit; ++s) { value += split_sums[warp + s][c][p.row_in_panel]; }
+        epilogue(row, c, value);
     }
 }
 
@@ -206,33 +277,42 @@ __launch_bounds__(kWarps * 32) __global__
                                const std::int32_t* __restrict__ sums, std::int32_t cols,
                                RowFactor gate_factor, RowFactor up_factor,
                                __nv_bfloat16* __restrict__ out) {
+    __shared__ float split_sums[kWarps][2][Cols][4];
     const StagedActivations<Cols> x = stage_activations<Cols>(codes, scales, sums, k, cols);
     const int lane                  = static_cast<int>(threadIdx.x) & 31;
-    const std::int32_t i0 =
-        (static_cast<std::int32_t>(blockIdx.x) * kWarps + (static_cast<int>(threadIdx.x) >> 5)) * 4;
-    if (i0 >= rows) { return; }
-    const PanelLane p    = panel_lane(lane);
-    const std::int32_t i = i0 + p.row_in_panel;
-    const int t2_groups  = k / kT2Group;
-    float g[Cols];
-    float u[Cols];
+    const int warp                  = static_cast<int>(threadIdx.x) >> 5;
+    const int split                 = warp % kSplit;
+    const std::int32_t i0 = (static_cast<std::int32_t>(blockIdx.x) * kPanels + warp / kSplit) * 4;
+    const PanelLane p     = panel_lane(lane);
+    const std::int32_t i  = i0 + p.row_in_panel;
+    const bool live       = i0 < rows;
+    float acc[2][Cols];
+    if (live) {
+        const RowSplitView views[2]   = {gate, up};
+        const std::int32_t panel_rows[2] = {i, up_first + i};
+        panel_sums<Cols, 2>(views, panel_rows, p, split, k / kT2Group, x, cols, acc);
+        if ((lane & 0x19) == 0) {
 #pragma unroll
-    for (int c = 0; c < Cols; ++c) {
-        g[c] = 0.0F;
-        u[c] = 0.0F;
-    }
-    for (int step = 0; 4 * step < t2_groups; ++step) {
-        accumulate_row<Cols>(gate, i, p, step, t2_groups, x, cols, g);
-        accumulate_row<Cols>(up, up_first + i, p, step, t2_groups, x, cols, u);
-    }
-#pragma unroll
-    for (int c = 0; c < Cols; ++c) {
-        const float gate_value = row_sum(g[c]) * gate_factor(i);
-        const float up_value   = row_sum(u[c]) * up_factor(up_first + i);
-        if ((lane & 0x19) == 0 && c < cols) {
-            out[static_cast<std::size_t>(c) * rows + i] =
-                __float2bfloat16_rn(silu(gate_value) * up_value);
+            for (int c = 0; c < Cols; ++c) {
+                split_sums[warp][0][c][p.row_in_panel] = acc[0][c];
+                split_sums[warp][1][c][p.row_in_panel] = acc[1][c];
+            }
         }
+    }
+    __syncthreads();
+    if (!live || split != 0 || (lane & 0x19) != 0) { return; }
+#pragma unroll
+    for (int c = 0; c < Cols; ++c) {
+        if (c >= cols) { break; }
+        float g = 0.0F;
+        float u = 0.0F;
+#pragma unroll
+        for (int s = 0; s < kSplit; ++s) {
+            g += split_sums[warp + s][0][c][p.row_in_panel];
+            u += split_sums[warp + s][1][c][p.row_in_panel];
+        }
+        out[static_cast<std::size_t>(c) * rows + i] =
+            __float2bfloat16_rn(silu(g * gate_factor(i)) * (u * up_factor(up_first + i)));
     }
 }
 
@@ -338,7 +418,7 @@ void integer_project(const Activation& x, const Weight& w,
     DestinationEpilogue epilogue;
     for (const Destination& d : destinations) { epilogue.set[epilogue.count++] = d; }
     epilogue.factor = row_factor(w);
-    const dim3 grid(static_cast<unsigned>((w.n / 4 + kWarps - 1) / kWarps));
+    const dim3 grid(static_cast<unsigned>((w.n / 4 + kPanels - 1) / kPanels));
     with_cols(x.tokens, [&]<int Cols>() {
         const std::size_t shared = shared_bytes(x.k, Cols);
         integer_project_kernel<Cols><<<grid, kWarps * 32, shared, stream>>>(
@@ -363,7 +443,7 @@ void integer_swiglu(const Activation& x, const Weight& gate, const Weight* up, T
         throw std::invalid_argument("sm70 integer swiglu: unsupported weights or output");
     }
 #if defined(NINFER_SM70)
-    const dim3 grid(static_cast<unsigned>((rows / 4 + kWarps - 1) / kWarps));
+    const dim3 grid(static_cast<unsigned>((rows / 4 + kPanels - 1) / kPanels));
     with_cols(x.tokens, [&]<int Cols>() {
         const std::size_t shared = shared_bytes(x.k, Cols);
         integer_swiglu_kernel<Cols><<<grid, kWarps * 32, shared, stream>>>(

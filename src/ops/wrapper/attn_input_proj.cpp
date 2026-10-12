@@ -145,6 +145,23 @@ void sm70_split(const Tensor& x, const Weight& first, std::initializer_list<Tens
     }
 }
 
+// sm_70 without a workspace: up to the small-T route's direct widths, each parent row range into
+// its plane straight from the BF16 activations. False where the width needs a workspace.
+bool sm70_direct_split(const Tensor& x, const Weight& weight, std::initializer_list<Tensor*> planes,
+                       cudaStream_t stream) {
+    if (!detail::sm70::direct_tokens(x.ne[1]) || !detail::sm70::covers(weight, x.ne[1])) {
+        return false;
+    }
+    std::vector<detail::sm70::Destination> destinations;
+    std::int32_t row = 0;
+    for (Tensor* t : planes) {
+        destinations.push_back({plane(*t), t->ne[0], 0, row, t->ne[0], false});
+        row += t->ne[0];
+    }
+    detail::sm70::project_for(detail::sm70::prepare_direct(x), weight, destinations, stream);
+    return true;
+}
+
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                             cudaStream_t stream) {
@@ -225,6 +242,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
     require_q8_rowsplit(weight, kRows, kHidden, "query/key/gate/value weight");
+    if (sm70_direct_split(x, weight, {&q, &k, &gate, &v}, stream)) { return; }
     detail::q8_attn_input_dispatch(x, weight, q, gate, k, v, stream);
 }
 
@@ -552,7 +570,7 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
     require_q8_rowsplit(query_key_value_weight, kRows, hidden, "query/key/value weight");
-
+    if (sm70_direct_split(x, query_key_value_weight, {&q, &k, &v}, stream)) { return; }
     detail::q8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
 }
 
