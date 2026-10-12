@@ -1795,6 +1795,62 @@ int exercise_concurrent_resource_settlement(const char* artifact) {
     return 0;
 }
 
+// Two requests that share a new marked tools prefix arrive together on two lanes. The second waits
+// for the first to publish the prefix checkpoint instead of prefilling the same tokens itself.
+int exercise_sibling_single_flight(const char* artifact) {
+    auto options                 = concurrent_engine_options(artifact);
+    options.max_concurrency      = 2;
+    options.max_pending_requests = 4;
+    options.max_context          = 4096;
+    options.kv_capacity          = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+    options.enable_vision        = false;
+    ninfer::Engine engine(std::move(options));
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 2;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+    request.tool_choice.constraints           = ninfer::ToolConstraintMode::Automatic;
+
+    std::string description;
+    for (std::uint32_t index = 0; index < 600; ++index) { description += "stable-schema "; }
+    const std::string tool =
+        std::string(R"({"type":"function","function":{"name":"lookup","description":")") +
+        description +
+        R"(","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})";
+    const auto input = [&](std::string question) {
+        ninfer::PromptInput prompt;
+        prompt.options.enable_thinking = false;
+        prompt.options.tool_jsons.push_back(tool);
+        prompt.context_cache.allow_engine_automatic_shared_prefixes = false;
+        prompt.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence         = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
+            .after_tool_count = 1,
+        });
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(question), .media = {}});
+        prompt.messages.push_back(std::move(user));
+        return prompt;
+    };
+    auto first  = engine.submit(engine.prepare(input("Use lookup for alpha.")), request);
+    auto second = engine.submit(engine.prepare(input("Use lookup for bravo.")), request);
+    const ninfer::GenerationResult a = first.wait();
+    const ninfer::GenerationResult b = second.wait();
+    if (a.generated_token_ids.size() != 2 || b.generated_token_ids.size() != 2 ||
+        a.reused_prompt_tokens != 0 || b.reused_prompt_tokens < 1024 ||
+        b.reused_prompt_tokens >= b.prompt.prompt_tokens) {
+        std::cerr << "concurrent sibling prefilled a shared prefix twice: first reused="
+                  << a.reused_prompt_tokens << " second reused=" << b.reused_prompt_tokens << " of "
+                  << b.prompt.prompt_tokens << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 int verify_loaded_product(const ninfer::Engine& engine) {
     const ninfer::LoadSummary load = engine.load_summary();
     if (load.architecture != "Qwen3_5ForCausalLM" || load.model_name.empty() ||
@@ -1857,6 +1913,7 @@ int exercise_artifact(const char* artifact) {
     if (const int result = exercise_concurrent_resource_settlement(artifact); result != 0) {
         return result;
     }
+    if (const int result = exercise_sibling_single_flight(artifact); result != 0) { return result; }
     return 0;
 }
 
@@ -1991,6 +2048,8 @@ int main() {
         result = exercise_artifact(artifact);
     } else if (scenario == "concurrent") {
         result = exercise_concurrent_resource_settlement(artifact);
+    } else if (scenario == "sibling-single-flight") {
+        result = exercise_sibling_single_flight(artifact);
     } else if (scenario == "anthropic-prefix-regression") {
         result = exercise_anthropic_prefix_regression(artifact);
     } else if (scenario == "nested-tool-markers") {

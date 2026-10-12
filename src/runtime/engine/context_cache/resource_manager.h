@@ -80,6 +80,10 @@ public:
     explicit ResourceManager(bool enabled, ContextMachineCostModel costs)
         : enabled_(enabled), costs_(std::move(costs)) {}
 
+    [[nodiscard]] std::uint64_t prefill_ns(PrefillWork work) const noexcept {
+        return costs_.prefill_ns(work);
+    }
+
     [[nodiscard]] std::vector<SourceChoice>
     candidates(Program& program, const Base& base, std::uint32_t maximum_frontier = UINT32_MAX,
                std::optional<OwnerToken> own_resume = std::nullopt, std::uint64_t request = 0,

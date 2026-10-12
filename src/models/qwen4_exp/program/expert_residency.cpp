@@ -1,7 +1,7 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/program/expert_residency.cpp (Apache-2.0).
-// Modified for NInfer-3090: per-layer record strides in one frame size; no SSD tier, landing frames
-// or frame lending; table uploads through core/pinned_upload.h; drain() for the warm start and
-// shutdown.
+// Modified for NInfer-3090: per-layer record strides in one frame size; no SSD tier or landing
+// frames; frame lending without the SSD tier's holds and with a refill of the returned frames; table
+// uploads through core/pinned_upload.h; drain() for the warm start and shutdown.
 
 #include "models/qwen4_exp/program/expert_residency.h"
 
@@ -298,6 +298,63 @@ std::uint32_t ExpertResidency::warm_start(const SavedState& state, std::uint32_t
     stats_.promotions -= loaded; // issue_loads counted them; they are seeds, not promotions
     stats_.seeded += loaded;
     drain(compute);
+    return loaded;
+}
+
+std::uint32_t ExpertResidency::lendable() const noexcept {
+    if (!controller_) { return 0; }
+    const std::uint32_t lent = controller_->loaned_frames(), floor = frames_ / 4;
+    return frames_ > lent + floor ? frames_ - lent - floor : 0;
+}
+
+std::uint32_t ExpertResidency::lent_frames() const noexcept { return controller_ ? controller_->loaned_frames() : 0; }
+
+ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStream_t compute) {
+    if (count == 0 || count > lendable()) { throw std::logic_error("expert residency: cannot lend that many frames"); }
+    // Promotions still landing could target the run: let them finish first (a lease is taken once
+    // per prompt, so the wait is rare and short).
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    publish_landed();
+    const auto first = controller_->choose_run(count, {});
+    if (!first) { throw std::logic_error("expert residency: no run of frames to lend"); }
+    commands_.clear();
+    controller_->lend(*first, count, commands_);
+    auto* table = static_cast<std::int32_t*>(table_host_.data());
+    for (const auto& command : commands_) {
+        if (command.kind == CacheController::Command::Kind::kWriteEntry &&
+            ResidencyEntry::decode(command.word).state != ResidencyState::kReady && table[command.key] >= 0) {
+            table[command.key] = -1;
+            table_dirty_       = true;
+        }
+    }
+    if (table_dirty_) { upload_table(compute); }
+    auto* base = const_cast<std::uint8_t*>(frame_base());
+    return {*first, count,
+            DeviceSpan{base + static_cast<std::size_t>(*first) * stride_, static_cast<std::size_t>(count) * stride_}};
+}
+
+std::uint32_t ExpertResidency::give_back(FrameLease& lease, cudaStream_t compute) {
+    if (!lease.valid()) { return 0; }
+    commands_.clear();
+    controller_->give_back(lease.first, lease.count, commands_);
+    lease = {};
+    // The best experts that are not resident, by LFRU score (ties to the lower key), into the free
+    // frames: without it the returned run would fill only at the decode promotion rate.
+    const auto& policy = controller_->policy();
+    std::vector<std::pair<double, std::uint32_t>> ranked;
+    ranked.reserve(policy.num_keys());
+    for (std::uint32_t key = 0; key < policy.num_keys(); ++key) {
+        if (!policy.resident(key) && policy.count(key) > 0) { ranked.emplace_back(policy.score(key), key); }
+    }
+    const std::size_t room = controller_->free_frames();
+    const std::size_t take = std::min(room, ranked.size());
+    std::partial_sort(ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(take), ranked.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+    std::vector<std::uint32_t> keys;
+    keys.reserve(take);
+    for (std::size_t i = 0; i < take; ++i) { keys.push_back(ranked[i].second); }
+    const std::uint32_t loaded = controller_->seed(keys, {}, commands_);
+    issue_loads(compute);
     return loaded;
 }
 

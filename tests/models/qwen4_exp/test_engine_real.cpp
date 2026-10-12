@@ -136,11 +136,14 @@ void print_run(const char* label, const Run& run, std::size_t prompt) {
     const double wall_decode   = run.ids.size() > 1 && after_prefill > 0
                                      ? static_cast<double>(run.ids.size() - 1) / after_prefill
                                      : 0.0;
-    // FNV-1a of the generated ids: greedy runs of two builds compare by this word.
+    // FNV-1a over the generated ids: equal hashes across runs of one prompt mean equal outputs.
     std::uint64_t hash = 1469598103934665603ULL;
-    for (const TokenId id : run.ids) { hash = (hash ^ static_cast<std::uint32_t>(id)) * 1099511628211ULL; }
+    for (const TokenId id : run.ids) {
+        hash ^= static_cast<std::uint32_t>(id);
+        hash *= 1099511628211ULL;
+    }
     std::printf("%s: %zu prompt tokens, %zu generated; prefill %.2f s (%.1f tok/s), decode %.2f s (%.2f tok/s), "
-                "after prefill %.2f s (%.2f tok/s), wall %.2f s; ids %016llx\n",
+                "after prefill %.2f s (%.2f tok/s), wall %.2f s, ids %016llx\n",
                 label, prompt, run.ids.size(), run.timings.prefill_seconds,
                 run.timings.prefill_seconds > 0 ? static_cast<double>(prompt) / run.timings.prefill_seconds : 0.0,
                 run.timings.decode_seconds, decode, after_prefill, wall_decode, run.wall,

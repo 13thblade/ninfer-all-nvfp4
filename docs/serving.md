@@ -80,8 +80,17 @@ is borrowed from the expert cache). What is different from the Qwen3.5 models:
   between requests, and loaded at the next start, so the second start is warm. A cold cache fills
   at one promotion per layer per decoded token; decode speeds up as it fills. Each finished
   request logs one line with its expert hit rate, promotions and decode speed.
+- **Prefill.** A prompt of 512 tokens or more prefills in calls of 4,096 tokens (independent of
+  `--prefill-chunk`, which sizes shorter prompts and forced tokens). For the prompt, the expert cache
+  lends about 2,250 of its frames (3.2 GiB): the calls' workspace, and a ring into which each layer's
+  non-resident experts are copied two layers ahead while the GPU computes. When the prompt is done
+  the frames come back and are refilled with the experts the prompt used most, so the first decode
+  tokens find them resident. A cache too small to lend that many frames prefills in
+  `--prefill-chunk` calls instead (slower, same output). The next call's n-gram rows are read while
+  the GPU runs the current one; a prompt's first call waits for its own rows, so the volume's disk
+  speed shows in time to first token.
 - **The n-gram volume** `<model>.ngram` (29 GB) is read unbuffered per token, with a 2^20-row host
-  cache; keep it on an SSD.
+  cache; keep it on an SSD (an NVMe drive reads a prompt's rows several times faster than SATA).
 
 | Flash-Next option | Meaning | Default |
 |---|---|---|

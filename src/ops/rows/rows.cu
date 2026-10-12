@@ -1,5 +1,6 @@
 // Adapted from Infernix a3edb450 src/ops/rows/rows.cu (Apache-2.0).
-// Modified for NInfer-3090: namespaces and includes only.
+// Modified for NInfer-3090: namespaces and includes; columns stride over gridDim.y (prefill calls
+// split 24 heads x 4,096 tokens, more than the 65,535 a grid dimension holds).
 
 #include "ninfer/ops/rows.h"
 
@@ -30,42 +31,46 @@ bool contiguous_bf16(const Tensor& t) {
            t.ne[3] == 1;
 }
 
-__global__ void split_kernel(const __nv_bfloat16* __restrict__ in, int rows, SplitTargets targets) {
+// Columns stride over gridDim.y (at most 65,535): a call may have more (24 heads x 4,096 tokens).
+__global__ void split_kernel(const __nv_bfloat16* __restrict__ in, int rows, int columns, SplitTargets targets) {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
     if (r >= rows) { return; }
     int i = 0;
     while (r >= targets.begin[i + 1]) { ++i; }
     const int width = targets.begin[i + 1] - targets.begin[i];
-    targets.data[i][static_cast<std::size_t>(t) * width + (r - targets.begin[i])] =
-        in[static_cast<std::size_t>(t) * rows + r];
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) {
+        targets.data[i][static_cast<std::size_t>(t) * width + (r - targets.begin[i])] =
+            in[static_cast<std::size_t>(t) * rows + r];
+    }
 }
 
 // Eight rows (16 bytes) per thread: every output boundary, the row count and every pointer are
 // multiples of eight elements, so a thread's rows lie in one output and both accesses are aligned.
-__global__ void split_vector_kernel(const uint4* __restrict__ in, int rows8, SplitTargets targets) {
+__global__ void split_vector_kernel(const uint4* __restrict__ in, int rows8, int columns, SplitTargets targets) {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
     if (r >= rows8) { return; }
     const int row = r * 8;
     int i         = 0;
     while (row >= targets.begin[i + 1]) { ++i; }
     const int width = targets.begin[i + 1] - targets.begin[i];
     auto* out       = reinterpret_cast<uint4*>(targets.data[i]);
-    out[(static_cast<std::size_t>(t) * width + (row - targets.begin[i])) / 8] =
-        in[static_cast<std::size_t>(t) * rows8 + r];
+    for (int t = blockIdx.y; t < columns; t += gridDim.y) {
+        out[(static_cast<std::size_t>(t) * width + (row - targets.begin[i])) / 8] =
+            in[static_cast<std::size_t>(t) * rows8 + r];
+    }
 }
 
 __global__ void gather_kernel(const __nv_bfloat16* __restrict__ in, int rows,
                               const std::int32_t* __restrict__ columns,
-                              __nv_bfloat16* __restrict__ out) {
+                              int count, __nv_bfloat16* __restrict__ out) {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    const int i = blockIdx.y;
-    if (r < rows) {
-        out[static_cast<std::size_t>(i) * rows + r] =
-            in[static_cast<std::size_t>(columns[i]) * rows + r];
+    if (r >= rows) { return; }
+    for (int i = blockIdx.y; i < count; i += gridDim.y) {
+        out[static_cast<std::size_t>(i) * rows + r] = in[static_cast<std::size_t>(columns[i]) * rows + r];
     }
 }
+
+unsigned grid_columns(int columns) { return static_cast<unsigned>(columns < 65535 ? columns : 65535); }
 
 } // namespace
 
@@ -93,11 +98,11 @@ void split_rows(const Tensor& in, std::span<Tensor* const> outs, cudaStream_t st
     }
     if (vector) {
         const int rows8 = in.ne[0] / 8;
-        split_vector_kernel<<<dim3((rows8 + kThreads - 1) / kThreads, in.ne[1]), kThreads, 0,
-                              stream>>>(static_cast<const uint4*>(in.data), rows8, targets);
+        split_vector_kernel<<<dim3((rows8 + kThreads - 1) / kThreads, grid_columns(in.ne[1])), kThreads, 0,
+                              stream>>>(static_cast<const uint4*>(in.data), rows8, in.ne[1], targets);
     } else {
-        split_kernel<<<dim3((in.ne[0] + kThreads - 1) / kThreads, in.ne[1]), kThreads, 0,
-                       stream>>>(static_cast<const __nv_bfloat16*>(in.data), in.ne[0], targets);
+        split_kernel<<<dim3((in.ne[0] + kThreads - 1) / kThreads, grid_columns(in.ne[1])), kThreads, 0,
+                       stream>>>(static_cast<const __nv_bfloat16*>(in.data), in.ne[0], in.ne[1], targets);
     }
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
@@ -111,9 +116,9 @@ void gather_columns(const Tensor& in, const Tensor& columns, Tensor& out, cudaSt
                 columns.ne[2] == 1 && columns.ne[3] == 1 && out.ne[0] == in.ne[0] &&
                 columns.ne[0] == out.ne[1],
             "gather needs BF16 [R, T] in, BF16 [R, N] out and I32 [N] columns");
-    gather_kernel<<<dim3((in.ne[0] + kThreads - 1) / kThreads, out.ne[1]), kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(in.data), in.ne[0],
-        static_cast<const std::int32_t*>(columns.data), static_cast<__nv_bfloat16*>(out.data));
+    gather_kernel<<<dim3((in.ne[0] + kThreads - 1) / kThreads, grid_columns(out.ne[1])), kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(in.data), in.ne[0], static_cast<const std::int32_t*>(columns.data),
+        out.ne[1], static_cast<__nv_bfloat16*>(out.data));
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
         throw std::runtime_error(std::string("gather_columns: ") + cudaGetErrorString(error));
