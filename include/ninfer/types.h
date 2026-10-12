@@ -99,8 +99,8 @@ struct SpeculativeOptions {
     // request (its prompt, a tool result or its own output), a round verifies what followed it,
     // up to this many drafts, instead of the draft model's proposal. Verification licenses every
     // token, so a wrong copy costs throughput and never changes output. 0 disables it. The product
-    // flags accept only 15; the Engine accepts 1..15 above draft_tokens so benchmarks can measure
-    // other verify widths. Requires DFlash2 and, for now, max_concurrency 1.
+    // flags accept only 15; the Engine accepts 1..15 at least draft_tokens so benchmarks can measure
+    // other verify widths. Requires DFlash2.
     std::uint32_t ngram_draft_tokens = 0;
     // Tail tokens a copy must match before it is proposed, 4..64.
     std::uint32_t ngram_min_match = 12;
