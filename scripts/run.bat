@@ -74,7 +74,11 @@ rem     NINFER_HOST_CACHE_RESERVE_MIB     --host-cache-reserve-mib N     RAM to 
 rem     NINFER_HOST_CACHE_MAX_MIB         --host-cache-max-mib N         hard cap on pinned RAM
 rem   NINFER_MAX_OUTPUT_TOKENS            --max-output-tokens N          cap every request's output budget
 rem   NINFER_MLP_A8_DECODE=on             --mlp-a8-decode                INT8-activation MLP decode
-rem   NINFER_CONTEXT_STORE                --context-store DIR            keep the context cache across restarts
+rem   NINFER_REASONING_LOOP=stop^|conclude --reasoning-loop MODE         end (stop) or close the thinking
+rem                                                                      (conclude) when it keeps repeating
+rem                                                                      whole passages; off (the default)
+rem                                                                      leaves thinking unguarded
+rem   NINFER_CONTEXT_STORE               --context-store DIR            keep the context cache across restarts
 rem                                                                      and crashes (dflash2, mtp, none)
 rem     NINFER_CONTEXT_STORE_MAX_GIB      --context-store-max-gib N      disk budget for the store
 rem
@@ -437,6 +441,31 @@ if not "%NINFER_MLP_A8_DECODE%"=="" if /i not "%NINFER_MLP_A8_DECODE%"=="on" if 
   echo NINFER_MLP_A8_DECODE must be on or off, got %NINFER_MLP_A8_DECODE% 1>&2
   exit /b 2
 )
+rem Reasoning-loop guard (--reasoning-loop): off unless asked for. It has never fired on the 27B in
+rem the measurements behind it (#217: 21 requests, including one written to make the model loop),
+rem and its thresholds come from other models, so turning it on by default would trade an unmeasured
+rem false-positive risk for no observed benefit. `off` is the server's own default and passes nothing.
+set "REASONING_LOOP="
+set "LOOP_NOTE="
+if "%NINFER_REASONING_LOOP%"=="" goto :loop_done
+if /i "%NINFER_REASONING_LOOP%"=="off" (
+  set "LOOP_NOTE=Reasoning-loop guard: off  (NINFER_REASONING_LOOP)"
+  goto :loop_done
+)
+if /i "%NINFER_REASONING_LOOP%"=="stop" (
+  set "REASONING_LOOP=stop"
+  set "LOOP_NOTE=Reasoning-loop guard: stop - a reply whose thinking keeps repeating itself ends early  (NINFER_REASONING_LOOP)"
+  goto :loop_done
+)
+if /i "%NINFER_REASONING_LOOP%"=="conclude" (
+  set "REASONING_LOOP=conclude"
+  set "LOOP_NOTE=Reasoning-loop guard: conclude - thinking that keeps repeating itself is closed and the model answers  (NINFER_REASONING_LOOP)"
+  goto :loop_done
+)
+echo NINFER_REASONING_LOOP must be off, stop or conclude, got %NINFER_REASONING_LOOP% 1>&2
+exit /b 2
+:loop_done
+if defined REASONING_LOOP set "KNOB_ARGS=%KNOB_ARGS% --reasoning-loop %REASONING_LOOP%"
 rem The store directory is an arbitrary path: the unquoted `set NAME=value` form puts the quotes
 rem around the expansion, as for CHAT_TEMPLATE_ARGS below, so metacharacters stay inert.
 set "STORE_ARGS="
@@ -492,6 +521,7 @@ echo %TITLE%  ^|  %LABEL%
 if not "%PREFILL_NOTE%"=="" echo %PREFILL_NOTE%
 if /i "%PROFILE%"=="tuned" echo %CACHE_NOTE%
 if /i "%PROFILE%"=="tuned" echo Sampling guard: min-p %MIN_P%, presence penalty %PRESENCE%  (NINFER_MIN_P, NINFER_PRESENCE_PENALTY; "default" = registered preset)
+if /i "%PROFILE%"=="tuned" if defined LOOP_NOTE echo %LOOP_NOTE%
 rem GRAFT_ARGS carries literal embedded quotes (--graft "godmode=<path>"), so re-quoting it for a
 rem string comparison here garbles the quoting and breaks the if statement. `defined` sidesteps
 rem that: it tests the variable directly, with no substitution.
