@@ -902,6 +902,8 @@ public:
             out.timings = timings();
             device_.synchronize();
             release_lane();
+            apply_vram_target(true);
+            maintain_expert_state();
             out.status = runtime::ConsumeStatus::Consumed;
         } catch (...) {}
         return out;
@@ -1278,8 +1280,13 @@ private:
         try {
             const std::string error = expert_cache::save_expert_state(options_.expert_state, options_.expert_state_identity,
                                                                       residency_->saved_state());
-            if (!error.empty()) { diagnostic("expert state not saved: " + error); }
-            expert_state_saved_  = Clock::now();
+            // The interval restarts either way so a failing save is retried at most every
+            // kExpertStateInterval; the routed count only advances when the state reached disk.
+            expert_state_saved_ = Clock::now();
+            if (!error.empty()) {
+                diagnostic("expert state not saved: " + error);
+                return;
+            }
             expert_state_routed_ = residency_->stats().routed;
         } catch (...) {}
     }

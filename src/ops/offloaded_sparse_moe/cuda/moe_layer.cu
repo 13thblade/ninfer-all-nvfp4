@@ -893,8 +893,9 @@ __global__ void __launch_bounds__(kThreads)
 __global__ void combine_kernel(const bf16* __restrict__ outputs, const float* __restrict__ weights,
                                const float* __restrict__ shared_gate, const bf16* __restrict__ shared, int hidden,
                                int top_k, int columns, bf16* __restrict__ y) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
+    // Columns ride gridDim.x (2^31-1 limit); hidden tiles ride gridDim.y (65535 limit, never reached).
+    const int d = blockIdx.y * blockDim.x + threadIdx.x;
+    const int t = blockIdx.x;
     if (d >= hidden || t >= columns) { return; }
     float sum = 0.0F;
     for (int k = 0; k < top_k; ++k) { // fixed slot order
@@ -1092,12 +1093,18 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
     require(contiguous(outputs, DType::BF16) && contiguous(shared, DType::BF16) && contiguous(y, DType::BF16) &&
                 contiguous(routing.weights, DType::FP32) && contiguous(routing.shared_gate, DType::FP32),
             "combine requires contiguous BF16 tensors and FP32 routing");
-    const int hidden = y.ne[0], columns = y.ne[1], top_k = routing.weights.ne[0];
+    const std::int64_t hidden64 = y.ne[0], columns64 = y.ne[1], top_k64 = routing.weights.ne[0];
+    require(top_k64 >= 1 && top_k64 <= 16, "combine supports top_k in [1, 16]");
+    require(hidden64 > 0 && hidden64 <= std::numeric_limits<int>::max() && columns64 > 0 &&
+                columns64 * top_k64 <= std::numeric_limits<int>::max(),
+            "combine dimensions out of range");
+    const int hidden = static_cast<int>(hidden64), columns = static_cast<int>(columns64),
+              top_k = static_cast<int>(top_k64);
     require(outputs.ne[0] == hidden && outputs.ne[1] == columns * top_k && shared.ne[0] == hidden &&
                 shared.ne[1] == columns && routing.weights.ne[1] == columns &&
                 routing.shared_gate.numel() == columns,
             "combine shapes disagree");
-    combine_kernel<<<dim3((hidden + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
+    combine_kernel<<<dim3(columns, (hidden + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
         static_cast<const bf16*>(outputs.data), static_cast<const float*>(routing.weights.data),
         static_cast<const float*>(routing.shared_gate.data), static_cast<const bf16*>(shared.data), hidden, top_k,
         columns, static_cast<bf16*>(y.data));
