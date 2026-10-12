@@ -2348,6 +2348,15 @@ int test_open_reasoning_tool_recovery() {
         failures += rejected(run(planning + call, true, true, caller_eos),
                              "a caller stop id equal to a disabled checkpoint default across rounds");
     }
+    // With the defaults enabled, a caller id that is also a checkpoint default is still the caller's.
+    {
+        ninfer::StopPolicy caller_eos;
+        caller_eos.token_ids.push_back(eos);
+        failures += rejected(run(planning + call, true, false, caller_eos),
+                             "a caller stop id equal to an enabled checkpoint default");
+        failures += rejected(run(planning + call, true, true, caller_eos),
+                             "a caller stop id equal to an enabled checkpoint default across rounds");
+    }
     return failures;
 }
 

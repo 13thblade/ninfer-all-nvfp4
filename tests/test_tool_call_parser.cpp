@@ -1014,6 +1014,14 @@ int test_mismatched_closing_tags_rejected() {
         "Value\n</parameter>\n</invoke>\n</tool_call>",
         contract, Reason::MalformedStructure,
         "invoke opener without a token boundary was accepted");
+    failures += check_rejected(
+        "<tool_call>\n<function name=\"TaskCreate>\n<parameter name=\"description\">\n"
+        "Value\n</parameter>\n</function>\n</tool_call>",
+        contract, Reason::InvalidToolName, "unterminated quoted function name was accepted");
+    failures += check_rejected(
+        "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description>\n"
+        "Value\n</parameter>\n</function>\n</tool_call>",
+        contract, Reason::MalformedStructure, "unterminated quoted parameter name was accepted");
     {
         // A value quoting a balanced pair of the other parameter tag family stays one value.
         const std::string quoted_short = "run <param name=\"x\">v</param> done";
@@ -1119,7 +1127,9 @@ int test_markdown_quoted_calls() {
         "Use `" + call + "` like this.", "Use `x`, then `\n" + call + "`", "```\n" + call,
         "Text\n\n```python\nx = 1\n```\n```\n" + call,
         // A line that starts with the fence character but carries info text does not close it.
-        "~~~\n~~~shell\n" + call, "```\n```cpp\n" + call, "~~~\n~~~~x\n" + call};
+        "~~~\n~~~shell\n" + call, "```\n```cpp\n" + call, "~~~\n~~~~x\n" + call,
+        // A closing fence must be at least as long as the opener, and a long run still opens one.
+        "~~~~\nx\n~~~\n" + call, "``````\nx\n```\n" + call, "``````\n" + call};
     // (output, content before the call)
     const std::vector<std::pair<std::string, std::string>> real{
         {call, ""},

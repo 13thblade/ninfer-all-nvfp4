@@ -418,6 +418,9 @@ struct StopPolicy {
     std::vector<StopString> strings;
     bool include_model_defaults = true;
     bool publish_stop_token     = false;
+    // Set by the frontend's merge: the stop ids in token_ids that only the checkpoint defaults
+    // supplied (not also listed by the caller). Empty on a caller-built policy.
+    std::vector<TokenId> model_default_token_ids;
 };
 
 // What the reasoning-loop guard does when the open thinking keeps repeating whole passages (every
