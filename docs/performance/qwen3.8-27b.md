@@ -298,6 +298,76 @@ The remapping itself is cheap on both paths: 192 MiB left the arena in 3.9–31 
 12–32 ms. The KV path pays more of it because it remaps 2 MiB granules where the weight path
 remaps 16 MiB chunks.
 
+## v0.15.1 against master on RTX 3090 (2026-10-13)
+
+Measured by this fork. A regression check of the launcher's DFlash2 profile since v0.15.1 (the
+context-engine swap, FA2 prompt kernels, the cuBLAS width gate, n-gram copy drafting). Desktop
+RTX 3090, driver 616.64, CUDA 12.8 build, GPU lock held for each run set, `qwen3_8_27b.ninfer`.
+Baseline: `ninfer_bench` built here from tag `v0.15.1-rtx3090` (`d2dd8e70`); new: master
+`04901788`. Flags, identical for every arm: `--spec dflash2 --draft-tokens 7 --lm-head-draft
+--prefill-cublas --prefill-chunk 4096 --kv-dtype rk4v4 --max-ctx 73728 -r 3 --warmup 1` (neither
+bench takes `--gdn-state-fp16`, so BF16 state in both); the third arm adds `--ngram-draft-tokens
+15`, the launcher default at one lane. One session, order v0.15.1, master, master + n-gram,
+master + n-gram, master, v0.15.1; each cell is the mean of its two runs, and the two runs of a
+cell agree within 1.5%. An earlier set against the v0.15.0 release binary gave the same rounds
+and the same numbers within 1.5%, so v0.15.0 and v0.15.1 are interchangeable as a baseline here.
+
+| test | v0.15.1 | master | change | master + n-gram | change |
+|---|---:|---:|---:|---:|---:|
+| prefill 512 | 1,985 | 2,011 | +1.4% | 2,007 | +1.1% |
+| prefill 4,096 | 3,000 | 3,044 | +1.5% | 3,041 | +1.4% |
+| prefill 16,384 | 2,651 | 2,815 | +6.2% | 2,813 | +6.1% |
+| prefill 65,536 | 1,823 | 2,172 | **+19.1%** | 2,173 | +19.1% |
+| prefill 2,048 (before 128 decoded) | 2,787 | 2,825 | +1.4% | 2,827 | +1.4% |
+| prefill 32,768 (before 128 decoded) | 2,290 | 2,557 | **+11.6%** | 2,558 | +11.7% |
+| decode 128 after 2,048 (copyable text), tok/s | 242.9 | 241.9 | -0.4% | 454.1 | +87% |
+| decode 128 after 32,768 (copyable text), tok/s | 253.6 | 253.1 | -0.2% | 403.2 | +59% |
+| **decode 512 from a one-token seed, tok/s** | 62.95 | 60.10 | **-4.5%** | 60.5 | **-3.9%** |
+
+Memory at 73,728 tokens: weights and workspace are byte-identical; the sequence reservation is
+1,789,305,344 B (v0.15.0 binary, from the earlier set; the two releases are interchangeable as a baseline here), 1,789,306,112 B (master) and 1,808,323,072 B with n-gram (+18.1 MiB).
+
+**The one drop, `tg512`, is a different token stream, not a slower round.** Rounds cost the same
+(v0.15.1 846 rounds at 62.95 tok/s is 34.6 rounds/s; master 882 rounds at 60.10 is 34.5), and the
+drop is exactly the fall in tokens accepted per round, 1.816 to 1.738. Bisected by building and
+running each point in one lock hold, forward then reversed: 846 rounds at v0.15.1, v0.15.0 and
+through `50999da3` (#237) and `5d7b8521` (#229), 882 from `46ba361b` (#240, "re-tune sm_86
+prompt/small-T boundaries for the FA2 kernel") on, with n-gram on or off.
+
+**Why #240 changes the stream, and why it is not a regression.** For rk4v4 on the 27B, an
+8-column verify round (DFlash2 K=7) used to run the small-T kernel at any key count; #240 sends it
+to the FA2 prompt kernel while it sees at most 128 keys (`kH24PromptKeysRk4v4`). That kernel
+accumulates PxV in FP16, so the verify logits differ in the last bits over that range, near-ties
+flip, and a greedy generation continues differently. It follows from the route table, and the
+data bear it out: the five prompts of 116-310 tokens have bit-identical rounds before and after #240, and
+58 of 60 prompts of 59-76 tokens do not.
+
+Two measurements decide whether the different stream is a loss:
+
+- **Round cost is unchanged.** Over 12 real chat prompts of 54-310 tokens (chat template
+  applied, 384 tokens decoded) the round takes 14.3 ms before and after (ratio 1.001, range
+  0.996-1.010). So #240's route retuning bought nothing end to end at short contexts.
+- **Acceptance is symmetric.** 60 real chat prompts of 59-76 tokens (twelve subjects by ten task
+  shapes, 320 tokens decoded, thinking on, ABBA order alternated per prompt), master just before
+  #240 against #240: 58 differ, 27 take more rounds, 31 fewer; total rounds 6,269 against 6,237
+  (-0.5%); mean per-prompt ratio 1.010 (bootstrap 95% CI 0.975-1.046); sign test p = 0.69. A single
+  prompt moves by up to a third in either direction (one went from 167 rounds to 109, another
+  from 62 to 96), which is why one stream cannot be read as a regression or a gain.
+
+An earlier, smaller set of twelve prompts read -7% in mean tok/s (before 119.8 against 111.2).
+That was the noise of those streams, not an effect: it did not repeat at n = 60. The
+`tg512` figure above is a single stream and the same kind of noise; the bench's corpus and
+one-token seed happen to land in a continuation that #240 makes 4% less draftable. Also not a
+clean bill in one respect: v0.15.1 against master just before #240 differ by up to half per
+prompt in either direction (mean +0.8%), from the engine swap and other numerics, so any single
+prompt's speed is not a fixed property of a build.
+
+Copy rounds (n-gram arm) cost nothing on text that does not copy: `tg512` is 60.5 against 60.1
+without the flag, with identical rounds and acceptance, and the idle-cost question in
+[performance.md](../performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b) is not visible in
+this run set. Not measured here: agent replay on master (documented separately), the serving
+layer (TTFT, restore overlap), two lanes, perplexity, and short prompts on rk8v4 or INT8 KV.
+
 ## Reproduction and reports
 
 Reports are local under `profiles/bench/qwen3_8_27b_fp8kv_20260928/`.
