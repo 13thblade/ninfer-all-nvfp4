@@ -12,6 +12,7 @@ and builds and are not read against each other.
 | [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
 | [Quality trades](maintainer/quality-trade-experiments.md) | what each precision option costs in perplexity and buys in memory or speed | RTX 3090 |
 | [Configuration calculator](config-calculator.html) | which context, KV format and speculation fit an RTX 3090, from measured sizes | RTX 3090 |
+| [TITAN RTX](performance/titan-rtx.md) | the `75` build: built-in profile against compiled routes, MTP and DFlash2 draft counts, the Turing Q8 path, kernel time, perplexity against `86` | TITAN RTX |
 
 The tools behind them: [`tools/bench/refbench.py`](../tools/bench/README.md#reference-measurements-refbenchpy)
 for the reference tables, the [serving corpus runner](../tools/bench/README.md#serving-corpus-benchmark),

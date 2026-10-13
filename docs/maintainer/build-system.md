@@ -1,9 +1,66 @@
 # Build system
 
 NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
-`CMAKE_CUDA_ARCHITECTURES` is `80`, `86` (the default), `89` or `120a`, one per build tree; configure
-refuses anything else. CUDA 12.8 builds the `sm_8x` targets, and a `120a` build needs CUDA 13.1 or
-newer.
+`CMAKE_CUDA_ARCHITECTURES` is `70`, `75`, `80`, `86` (the default), `89` or `120a`, one per build
+tree; configure refuses anything else. CUDA 12.8 builds `75` and the `sm_8x` targets, a `70` build
+needs CUDA 12.x ([Tesla V100](../build-linux.md#tesla-v100-sm_70)), and a `120a` build needs CUDA
+13.1 or newer.
+
+## Turing tier (`75`)
+
+A `75` build (TITAN RTX, RTX 20 series) compiles the `mma.sync` compatibility path with
+`NINFER_SM75=1` defined for host and device code. Turing lacks instructions the path is written
+with, and the device helpers replace them without changing any Op's arithmetic contract (BF16-cache
+attention, below, is the one exception):
+
+- `cp_async*` in `src/ops/common/memory.cuh` copy synchronously through registers with the same
+  cache policy and zero-fill contract; `cp_commit`/`cp_wait` are empty.
+- `src/ops/common/mma.cuh` runs FP16 m16n8k16 as two m16n8k8 and INT8 m16n8k32 as four m8n8k16.
+  BF16 and TF32 products run on FP16 m16n8k8 with FP32 accumulation, and in FP32 from the same
+  operands where an operand is not exactly an FP16 value; no value is narrowed. The choice is made
+  per output element, from its own row of A and column of B, so a result does not depend on which
+  rows and columns happen to share its tile -- the batch-invariant replay contracts rely on that.
+  `ninfer_mma_fragments_test` qualifies every helper against an FP64 oracle through the PTX
+  fragment layouts, including that independence.
+- Packed conversions (`cvt.rn.satfinite.f16x2`, `cvt.rna.tf32`, `cvt.rn.bf16x2`) and
+  `__reduce_max_sync` have scalar or shuffle forms that give the same bits.
+- A `70` build emulates more (no ldmatrix, no m16n8 shapes) in `ops/common/sm70_emulation.cuh`,
+  whose `NINFER_SM70_DEVICE` stops below `sm_75`: Turing keeps the native ldmatrix and FP16 MMA and
+  shares only Volta's scalar forms where both lack an instruction (the QSA indexer's FP32 dots, the
+  GDN conversions).
+
+`ops/common/device_limits.h` holds the 64 KiB per-block shared-memory limit kernel shapes assert
+against, and `pipeline_stages()` caps cp.async rings at two stages; the rowsplit A8 GEMM runs one,
+since a synchronous copy has nothing to overlap. Kernels that cannot fit take Turing shapes: the
+BF16 prompt attention stages K and V through one buffer, the INT8-family prompt attention always
+runs the fast kernel with one K/V stage (the standard INT8 prompt kernel is not built), small-T
+INT8 attention has no 64-key arena tier, context-KV materialization uses 64-key blocks, and the
+cooperative GDN gating projection launches the CTAs per SM a Turing SM can hold. The FP8, NVFP4
+and K8V4 KV kernels widen K and V into one shared tile, V overwriting K once QK is done, wherever
+two tiles would pass 64 KiB: the FP8 prompt kernel and the small-T shapes of two and three 16-row
+tiles (`kCausalSmallTCompactKV`).
+BF16-cache attention would spend most of its time in the BF16 emulation, so a `75` build rounds
+the softmax probabilities to FP16, as the INT8-family kernels do on every architecture, and
+multiplies Q, K and V as their FP16 roundings: values from 2^-17 to below 2^16 unchanged, a smaller
+one moved by at most 2^-25 (`ops/softmax_attention/common/bf16_attention.cuh`). Tiles stage as FP16
+and run on FP16 MMA; a tile with a value of 2^16 or more takes an emulation that forms the same
+products for every other operand, so an output still depends on its own row and column alone.
+The prompt and small-T BF16 kernels have Turing versions of their own (`prompt_bf16_sm75.cuh`,
+`small_t_bf16_sm75.cuh`): a CTA sweeps its keys on FP16 MMA and, only when a tile does not fit
+FP16, sweeps them again in an out-of-line function on the emulation; in one loop body with the fast
+path, the emulation's code made it spill and slowed it several times over. The small-T kernel keeps
+its probabilities in registers and its page IDs in the block table: 32 KiB per CTA, two CTAs per
+SM.
+A `75` build selects the legacy Linear route table only
+(`kUnifiedLinearRoutes`); the unified templates compile but are never chosen, and their
+calibration keys are absent from the route catalog.
+The Q8 G32 A16 K-split contraction (`ops/linear/q8/q8_ksplit_mma.cuh`) forms its codes as FP16
+pairs and issues FP16 MMA directly on tiles whose live activations are FP16 values, the operands
+and order the emulation would use, so its outputs are the same bits at a fraction of the cost. It
+loads the next K group's codes and scales, and an activation tile of up to eight columns, into
+registers during the current group's MMAs, and `Q8KSplitDeviceSchedule`
+(`ops/linear/q8/q8_ksplit_config.h`) runs the 8-column tiles of matrices with at least 6144 rows
+with four K warps ([TITAN RTX measurements](../performance/titan-rtx.md)).
 Product commands and prerequisites are in the README's [Running](../../README.md#running) and
 [Building](../../README.md#building) sections; test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).

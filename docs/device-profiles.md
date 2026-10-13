@@ -19,9 +19,11 @@ Up to three layers answer, per route key:
    else `~/.cache/ninfer/device-profiles.json` (`%LOCALAPPDATA%\ninfer\device-profiles.json` on
    Windows). `--device-profile-path` names another file.
 2. **The built-in table.** Profiles measured on the RTX 3090, RTX 4090, RTX 5090, the RTX PRO 6000
-   Blackwell and the Tesla V100-SXM2-16GB ship inside the binary
+   Blackwell, the Tesla V100-SXM2-16GB and the TITAN RTX ship inside the binary
    (`src/runtime/engine/device_profiles.json`). The PRO 6000's Workstation (600 W), Max-Q (300 W)
-   and Server editions report different names, so each has its own entry.
+   and Server editions report different names, so each has its own entry. The TITAN RTX entry is
+   measured by a `75` build, the only build that runs on it; its route catalog lacks the keys a
+   Turing build never selects.
 3. **The compiled route** of each operation, for a key neither names.
 
 For a key both the file and the built-in table name, the file's bands answer up to their last width

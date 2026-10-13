@@ -17,8 +17,8 @@ run.
 ## Requirements
 
 - Windows 11 x64 and a recent NVIDIA driver;
-- Visual Studio 2022 (MSVC v143) with CUDA 12.8 or newer for `86` and `89`, or Visual Studio 2026
-  with CUDA 13.1 or newer for `120a`;
+- Visual Studio 2022 (MSVC v143) with CUDA 12.8 or newer for `75`, `86` and `89`, or Visual Studio
+  2026 with CUDA 13.1 or newer for `120a`;
 - CMake, Ninja and [vcpkg](https://github.com/microsoft/vcpkg), which provides FFmpeg and curl
   through `vcpkg.json`;
 - the Microsoft Visual C++ runtime to run the executables, and a `.ninfer` artifact.
@@ -38,7 +38,7 @@ Ninja generator, and builds into `build-ninja`:
 .\scripts\build.ps1                       # configure and build
 .\scripts\build.ps1 -Test                 # then run the test suite
 .\scripts\build.ps1 -Target ninfer-serve  # one target
-.\scripts\build.ps1 -Arch 89              # another architecture (80, 86 or 89)
+.\scripts\build.ps1 -Arch 89              # another architecture (75, 80, 86 or 89)
 ```
 
 The same build by hand:

@@ -10,9 +10,10 @@ This guide runs NInfer on Linux from the published container image, or builds it
 | `120a` | RTX 50 series and RTX PRO 6000 Blackwell | CUDA 13.1 or newer (configure refuses 12.8 and 12.9, which miscompile `sm_120a` kernels) |
 | `80` | A100 class (GA100), an unmeasured compatibility target | CUDA 12.8 or newer |
 | `70` | Tesla V100 (Volta) | CUDA 12.8 or 12.9 (CUDA 13 no longer compiles `sm_70`) |
+| `75` | TITAN RTX and RTX 20 series (Turing), through the [Turing tier](maintainer/build-system.md#turing-tier-75) | CUDA 12.8 or newer |
 
-An `89` or `120a` build does not run on an RTX 3090, and only a `70` build runs on a V100. See
-[Tesla V100](#tesla-v100-sm_70) for what that build changes.
+An `89` or `120a` build does not run on an RTX 3090, only a `70` build runs on a V100, and only
+a `75` build on a Turing card. See [Tesla V100](#tesla-v100-sm_70) for what that build changes.
 
 ## Container image
 

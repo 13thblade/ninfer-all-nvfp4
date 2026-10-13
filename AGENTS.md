@@ -60,13 +60,15 @@ reuse published weights and the published IQ4 table when adding MTP. Disk reside
 page cache. An additional application-managed RAM cache of experts is excluded from this delivery
 by the user's decision. Keep the bounded transfer buffers and the device expert cache.
 This line builds for **`sm_86`** (the RTX 30 series; that build also runs the RTX 40 series),
-`sm_89`, and `120a` (the RTX 50 series and RTX PRO 6000 Blackwell, CUDA 13.1 or newer), with
-`sm_80` as an unmeasured compatibility target and `sm_70` (Tesla V100, CUDA 12.x only, its own
-small-T, attention and prompt routes over emulated Ampere warp primitives, built from source); the
-published Docker image carries the `86` and `120a` builds. It was tuned on the **NVIDIA GeForce
-RTX 3090** (24 GB) first, and each card's kernel routes now come from its measured device profile,
-built in for the RTX 3090, 4090, 5090, the three RTX PRO 6000 editions and the Tesla
-V100-SXM2-16GB. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090 with native routes that
+`sm_89`, `120a` (the RTX 50 series and RTX PRO 6000 Blackwell, CUDA 13.1 or newer) and Turing
+`sm_75` (TITAN RTX, RTX 20 series) through its tier of the compatibility path
+(`docs/maintainer/build-system.md`), with `sm_80` as an unmeasured compatibility target and
+`sm_70` (Tesla V100, CUDA 12.x only, its own small-T, attention and prompt routes over emulated
+Ampere warp primitives, built from source); the published Docker image carries the `86` and
+`120a` builds. It was tuned on the **NVIDIA GeForce RTX 3090** (24 GB) first, and each card's
+kernel routes now come from its measured device profile, built in for the RTX 3090, 4090, 5090,
+the three RTX PRO 6000 editions, the Tesla V100-SXM2-16GB and the TITAN RTX. Upstream
+(`Neroued/ninfer`) targets `sm_120a` on RTX 5090 with native routes that
 this line's `120a` build does not compile by default; its schedules, route tables and
 published measurements are not authoritative here -- every route table this fork inherited and
 re-measured on sm_86 turned out to be wrong by 12-41%. Treat an upstream tuning constant as a

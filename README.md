@@ -174,8 +174,8 @@ of the file.
 
 - **Device route profiles.** Each card's measured profile picks the kernel route for every
   operation and width. Profiles are built in for the RTX 3090, 4090, 5090, the three RTX PRO
-  6000 editions and the Tesla V100-SXM2-16GB; any other GPU is measured once at first start, and
-  `ninfer-calibrate` re-measures ([device profiles](docs/device-profiles.md)).
+  6000 editions, the Tesla V100-SXM2-16GB and the TITAN RTX; any other GPU is measured once at
+  first start, and `ninfer-calibrate` re-measures ([device profiles](docs/device-profiles.md)).
 - **Pipeline stages.** `--devices 0,1,...` splits the layers over up to eight GPUs on Linux, each
   stage owning its weights, KV and state ([pipeline stages](docs/maintainer/pipeline-stages.md)).
 - FP8 A8 and NVFP4 W4A4 tensor-core routes on every `120a` build, an FP4 tensor-core prompt kernel
@@ -460,12 +460,13 @@ cmake --build build --target ninfer-serve ninfer-calibrate
 ```
 
 `CMAKE_CUDA_ARCHITECTURES` is `86` for the RTX 30 series (that build also runs the RTX 40 series),
-`89` for the RTX 40 series and `120a` for the RTX 50 series and the RTX PRO 6000 Blackwell (on the
-`mma.sync` compatibility path, which the ternary route needs). CUDA 12.8 or newer builds `86` and
-`89`; a `120a` build needs CUDA 13.1 or newer, since 12.8 and 12.9 miscompile sm_120a kernels and
-configure refuses them. The [Linux](docs/build-linux.md) and [Windows](docs/build-windows.md)
-guides cover dependencies, the opt-in build options and the launcher scripts;
-[tests](tests/README.md) and [benchmarks](bench/README.md) have their own guides.
+`89` for the RTX 40 series, `120a` for the RTX 50 series and the RTX PRO 6000 Blackwell (on the
+`mma.sync` compatibility path, which the ternary route needs) and `75` for the TITAN RTX and RTX 20
+series ([Turing tier](docs/maintainer/build-system.md#turing-tier-75)). CUDA 12.8 or newer builds
+`75`, `86` and `89`; a `120a` build needs CUDA 13.1 or newer, since 12.8 and 12.9 miscompile
+sm_120a kernels and configure refuses them. The [Linux](docs/build-linux.md) and
+[Windows](docs/build-windows.md) guides cover dependencies, the opt-in build options and the
+launcher scripts; [tests](tests/README.md) and [benchmarks](bench/README.md) have their own guides.
 
 ## License
 
