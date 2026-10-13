@@ -497,7 +497,6 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
     return failures;
 }
 
-#if defined(NINFER_SM75)
 // Both sides of every width where this device's plan changes schedule, with the interval's ends.
 std::vector<std::int32_t> plan_endpoints(const Geometry& geometry, std::int32_t sm_count,
                                          std::int32_t last) {
@@ -515,12 +514,11 @@ std::vector<std::int32_t> plan_endpoints(const Geometry& geometry, std::int32_t 
     }
     return endpoints;
 }
-#endif
 
 // Which schedule the projection gets on devices with different SM counts. The route table was
 // tuned on 82 SMs and its cooperative schedules need their whole grid resident, so a smaller device
-// (a 48-SM RTX A4000) must fall through to a less-split schedule while the tuned device keeps its
-// routes exactly.
+// (a 48-SM RTX A4000), or one whose SMs hold fewer CTAs, must fall through to a less-split schedule
+// while a route that fits is kept exactly.
 namespace sm_count_routes {
 
 using ninfer::ops::detail::Bf16GdnGatingPlan;
@@ -574,18 +572,12 @@ std::int32_t split_of(Id schedule) {
     }
 }
 
-// Resident CTAs per SM of each cooperative schedule, as measured on the sm_86 build; a Turing SM
-// holds one 27B CTA and two 35B ones of any split (bf16_gdn_gating_proj_plan.cpp).
+// Resident CTAs per SM of each cooperative schedule on this device: the compiled kernels'
+// occupancy, which the plan reads too (two 27B CTAs and two to four 35B ones on sm_86, fewer on a
+// Turing SM's 64 KiB of shared memory).
 std::int32_t ctas_per_sm(const Geometry& g, Id schedule) {
-#if defined(NINFER_SM75)
-    static_cast<void>(schedule);
-    return g.heads == 48 ? 1 : 2;
-#else
-    if (g.heads == 48) { return 2; }
-    if (schedule == Id::MmaCooperativeSplit32) { return 2; }
-    if (schedule == Id::MmaCooperativeSplit16) { return 4; }
-    return 3;
-#endif
+    return ninfer::ops::detail::bf16_gdn_gating_proj_mma_resident_ctas_per_sm(g.heads == 32,
+                                                                              split_of(schedule));
 }
 
 bool grid_fits(const Geometry& g, Id schedule, std::int32_t cols, std::int32_t sms) {
@@ -598,24 +590,28 @@ bool grid_fits(const Geometry& g, Id schedule, std::int32_t cols, std::int32_t s
 
 int verify_plan_across_sm_counts() {
     constexpr std::int32_t kWidths = 6000;
-#if defined(NINFER_SM75)
-    // No SM count holds the whole tuned table at Turing's residency, so every count, the TITAN
-    // RTX's 72 among them, falls back as a smaller sm_86 device does.
+    // 82 SMs is the device the table was tuned on: where this device's occupancy holds a tuned
+    // route there (every width on sm_86), the plan must keep it.
     constexpr std::int32_t kSmCounts[] = {84, 82, 72, 68, 48, 40, 30};
-#else
-    constexpr std::int32_t kSmCounts[] = {84, 68, 48, 40, 30};
-#endif
-    for (const Geometry& g : {k27, k35}) {
-#if !defined(NINFER_SM75)
-        // The tuned device keeps its tuned routes at every width.
-        for (std::int32_t cols = 1; cols <= kWidths; ++cols) {
-            const Bf16GdnGatingPlan plan =
-                ninfer::ops::detail::bf16_gdn_gating_resolve_plan({g.heads, g.rows, cols}, 82);
-            check(plan.schedule == tuned(g, cols),
-                  std::string(g.label) + ": 82 SMs changed the tuned route at " +
-                      std::to_string(cols) + " columns");
+    // The tuned occupancy, restated from the tuning notes: on an sm_86 part the compiled kernels
+    // must still hold it, or the tuned table no longer fits the device it was tuned on.
+    int device = 0, major = 0, minor = 0;
+    if (cudaGetDevice(&device) == cudaSuccess &&
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
+        major == 8 && minor == 6) {
+        for (const Id schedule :
+             {Id::MmaCooperativeSplit8, Id::MmaCooperativeSplit4, Id::MmaCooperativeSplit2}) {
+            check(ctas_per_sm(k27, schedule) == 2, "27B: sm_86 occupancy of a cooperative split");
         }
-#endif
+        check(ctas_per_sm(k35, Id::MmaCooperativeSplit32) == 2, "35B: sm_86 split-32 occupancy");
+        check(ctas_per_sm(k35, Id::MmaCooperativeSplit16) == 4, "35B: sm_86 split-16 occupancy");
+        for (const Id schedule :
+             {Id::MmaCooperativeSplit8, Id::MmaCooperativeSplit4, Id::MmaCooperativeSplit2}) {
+            check(ctas_per_sm(k35, schedule) == 3, "35B: sm_86 occupancy of a cooperative split");
+        }
+    }
+    for (const Geometry& g : {k27, k35}) {
         // A device with fewer SMs never gets a grid it cannot hold, and only leaves the tuned route
         // when that route does not fit, moving to a schedule that splits K no more.
         for (const std::int32_t sms : kSmCounts) {
@@ -737,18 +733,12 @@ int main() {
     const DeviceExecutionView execution{nullptr, device.multiprocessor_count()};
     const DeviceExecutionView norm_execution{device.stream, device.multiprocessor_count()};
     int failures = sm_count_routes::verify_plan_across_sm_counts();
-#if defined(NINFER_SM75)
-    // Turing's residency moves the route endpoints with the SM count; this device's come from the
-    // plan.
+    // Both sides of each route boundary of this device's plan (768/769, 1664/1665 and 3456/3457 on
+    // an 82-SM sm_86 part; residency moves them with the SM count and the SM's occupancy).
     failures += verify_workspace_capacity_contract(
         kQwen27, plan_endpoints(kQwen27, device.multiprocessor_count(), 3457));
     failures += verify_workspace_capacity_contract(
         kQwen35, plan_endpoints(kQwen35, device.multiprocessor_count(), 3905));
-#else
-    failures +=
-        verify_workspace_capacity_contract(kQwen27, {1, 8, 768, 769, 1664, 1665, 3456, 3457});
-    failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 960, 1920, 3904, 3905});
-#endif
 
     // Every registered 27B projection route, including predicated and full token tiles, and both
     // sides of each sm_86 residency boundary (768/769, 1664/1665, 3456/3457).
