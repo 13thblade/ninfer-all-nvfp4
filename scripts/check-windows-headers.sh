@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Syntax-checks every host C++ source against the Windows headers, with MinGW-w64 standing in for
-# MSVC, so a Windows build break shows up on a Linux or macOS machine. It catches what the Windows
-# headers do to portable code: <windows.h>, which nvtx3 brings into most translation units, defines
-# `near`, `far` and other common words as macros, and a strict C++20 <cmath> declares no `M_PI`
-# (issue #44). MinGW is GCC, so it does not see MSVC's own gaps (GCC builtins, `sincosf`, scalar
-# F16C intrinsics); review covers those.
+# Syntax-checks every .cpp source against the Windows headers, with MinGW-w64 standing in for MSVC,
+# so a Windows build break shows up on a Linux or macOS machine. It catches what the Windows headers
+# do to portable code: <windows.h>, which nvtx3 brings into most translation units, defines `near`,
+# `far` and other common words as macros, and a strict C++20 <cmath> declares no `M_PI` (issue #44).
+# MinGW is GCC, so it does not see MSVC's own gaps (GCC builtins, `sincosf`, scalar F16C
+# intrinsics), and it never compiles a .cu file, whose host code only nvcc's MSVC front end on
+# Windows sees (an enclosing lambda's constexpr kernel pointer named in a nested lambda, issue #62).
+# Review covers those.
 #
 # usage: CUDA_INCLUDE_DIRS=DIR[:DIR...] scripts/check-windows-headers.sh [INCLUDE_DIR...]
 #
