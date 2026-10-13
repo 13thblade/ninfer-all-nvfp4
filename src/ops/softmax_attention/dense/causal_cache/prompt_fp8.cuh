@@ -11,6 +11,7 @@
 // separately before it runs), so there is no quantize-on-write path to preserve here, unlike the
 // small_t (decode) kernel.
 
+#include "ops/common/device_limits.h"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
@@ -36,6 +37,13 @@ inline constexpr int kCausalPromptFp8Bc            = 32;
 inline constexpr int kCausalPromptFp8RowTiles      = kCausalPromptFp8Br / 16;
 inline constexpr int kCausalPromptFp8ProducerWarps = 2 * kCausalPromptFp8RowTiles;
 inline constexpr int kCausalPromptFp8DConsumers = kCausalPromptFp8Warps / kCausalPromptFp8RowTiles;
+// Turing's 64 KiB per block holds this tile only with K and V widened into one shared tile, V
+// overwriting K once QK is done; elsewhere the non-QK warps widen V into its own tile during QK.
+#if defined(NINFER_SM75)
+inline constexpr bool kCausalPromptFp8CompactKV = true;
+#else
+inline constexpr bool kCausalPromptFp8CompactKV = false;
+#endif
 
 inline constexpr int kCausalPromptFp8QBytes =
     kCausalPromptFp8Br * kCausalPromptHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
@@ -44,7 +52,9 @@ inline constexpr int kCausalPromptFp8KBytes =
     kCausalPromptFp8Bc * kCausalPromptHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
 inline constexpr int kCausalPromptFp8VBytes = kCausalPromptFp8Bc * kCausalPromptHeadDim;
 inline constexpr int kCausalPromptFp8VStageBytes =
-    kCausalPromptFp8Bc * kCausalPromptHeadDim * static_cast<int>(sizeof(__half));
+    kCausalPromptFp8CompactKV
+        ? 0
+        : kCausalPromptFp8Bc * kCausalPromptHeadDim * static_cast<int>(sizeof(__half));
 inline constexpr int kCausalPromptFp8PBytes =
     kCausalPromptFp8Br * kCausalPromptFp8Bc * static_cast<int>(sizeof(__half));
 inline constexpr int kCausalPromptFp8ScaleBytes =
@@ -57,6 +67,7 @@ inline constexpr int kCausalPromptFp8SmemBytes =
     kCausalPromptFp8ScaleBytes + kCausalPromptFp8StatsBytes;
 
 static_assert(kCausalPromptFp8DConsumers == 8);
+static_assert(kCausalPromptFp8SmemBytes <= kMaxSharedBytesPerBlock);
 
 template <typename Geometry, typename Metadata>
 __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
@@ -88,9 +99,12 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
         reinterpret_cast<__nv_bfloat16*>(k_fp8 + kCausalPromptFp8KRawBytes);
     std::uint8_t* v_fp8 = reinterpret_cast<std::uint8_t*>(
         reinterpret_cast<unsigned char*>(k_b16) + kCausalPromptFp8KBytes);
-    __half* v_f16        = reinterpret_cast<__half*>(v_fp8 + kCausalPromptFp8VBytes);
-    __half* p_s          = reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(v_f16) +
-                                                     kCausalPromptFp8VStageBytes);
+    // A compact stage widens V into the K tile's bytes once QK is done.
+    __half* v_f16 = reinterpret_cast<__half*>(kCausalPromptFp8CompactKV
+                                                  ? reinterpret_cast<unsigned char*>(k_b16)
+                                                  : v_fp8 + kCausalPromptFp8VBytes);
+    __half* p_s   = reinterpret_cast<__half*>(v_fp8 + kCausalPromptFp8VBytes +
+                                              kCausalPromptFp8VStageBytes);
     __half* k_scale_s =
         reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(p_s) + kCausalPromptFp8PBytes);
     __half* v_scale_s  = k_scale_s + Bc;
@@ -343,7 +357,7 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
                 alpha_s[row0]       = alpha0;
                 alpha_s[row1]       = alpha1;
             }
-        } else if (warp < ProducerWarps + VWorkerWarps) {
+        } else if (!kCausalPromptFp8CompactKV && warp < ProducerWarps + VWorkerWarps) {
             const int worker_tid = tid - ProducerWarps * 32;
 #pragma unroll 1
             for (int chunk = worker_tid; chunk < Bc * (D / 8); chunk += WorkerThreads) {
@@ -361,6 +375,25 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
             }
         }
         __syncthreads();
+
+        if constexpr (kCausalPromptFp8CompactKV) {
+            // Every producer warp is done with K: V overwrites the widened K tile.
+#pragma unroll 1
+            for (int chunk = tid; chunk < Bc * (D / 8); chunk += kCausalPromptFp8Threads) {
+                const int key_l = chunk / (D / 8);
+                const int dc    = chunk - key_l * (D / 8);
+                const int d     = dc * 8;
+                const int key   = k0 + key_l;
+                __half* dst     = &v_f16[key_l * D + causal_prompt_swz(key_l, d)];
+                if (key <= max_query_abs) {
+                    store_vec(dst, kv_cache_fp8_dequant_f16x8(&v_fp8[key_l * D + d],
+                                                              v_scale_s[key_l]));
+                } else {
+                    store_vec(dst, make_int4(0, 0, 0, 0));
+                }
+            }
+            __syncthreads();
+        }
 
         const bool has_next = kb + 1 < key_blocks;
         if (has_next) issue_kv_tile((kb + 1) * Bc, tid, kCausalPromptFp8Threads);

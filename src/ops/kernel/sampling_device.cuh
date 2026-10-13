@@ -21,11 +21,20 @@
 
 namespace ninfer::ops {
 
-// The candidate merges reduce over the first kSamplingTileWarps lanes; redux.sync is sm_80.
+// The candidate merges reduce over the first kSamplingTileWarps lanes; redux.sync is sm_80, and
+// sm_75 takes the same maximum with a butterfly over those lanes.
 template <int Width>
 __device__ __forceinline__ unsigned int sampling_lane_max(unsigned int mask, unsigned int value) {
 #if defined(NINFER_SM70_DEVICE)
     return ops::sm70::reduce_max<Width>(mask, value);
+#elif defined(NINFER_SM75)
+    static_assert((Width & (Width - 1)) == 0);
+#pragma unroll
+    for (int offset = Width / 2; offset > 0; offset /= 2) {
+        const unsigned int other = __shfl_xor_sync(mask, value, offset);
+        value                    = other > value ? other : value;
+    }
+    return value;
 #else
     return __reduce_max_sync(mask, value);
 #endif

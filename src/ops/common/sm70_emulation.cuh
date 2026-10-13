@@ -12,7 +12,9 @@
 
 #include <cstdint>
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+// Volta only: Turing (sm_75) has ldmatrix and the m16n8k8 FP16 shape, and a 75 build takes its own
+// helpers under NINFER_SM75 (docs/maintainer/build-system.md).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
 #    define NINFER_SM70_DEVICE 1
 #endif
 

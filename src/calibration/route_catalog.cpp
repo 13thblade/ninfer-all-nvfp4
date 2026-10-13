@@ -54,11 +54,14 @@ std::vector<RouteCatalogEntry> build_catalog() {
     add("q4_linear_swiglu/34816x17408x5120",
         {"gemv_pair", "small_t_tiled", "split_half_pair_c40", "split_half_pair_c48",
          "split_half_pair_c128", "split_half_pair_c128_tail"});
+    // A Turing build never selects the unified table (ops/linear/common/route_table.h).
+#if !defined(NINFER_SM75)
     for (const char* key : {"unified/q4_q5_attn_input", "unified/q4_q5_gdn_input",
                             "unified/q5_linear_add/5120x6144", "unified/q5_linear_add/5120x17408",
                             "unified/q4_linear_swiglu", "unified/q4_linear_add"}) {
         add(key, {"unified"});
     }
+#endif
 
 #endif
 
@@ -67,10 +70,13 @@ std::vector<RouteCatalogEntry> build_catalog() {
     add("gdn_two_stage/h32", {"on"});
 
 #if !defined(NINFER_SM70)
-    // Prompt attention switches, measured on rk8v4.
+    // Prompt attention switches, measured on rk8v4. A Turing build has no standard INT8 prompt
+    // kernel to pack or to compare the fast one against: its INT8-family prompts are all fast.
     add("attn_pv_f16", {"on"});
+#if !defined(NINFER_SM75)
     add("attn_pack_gqa", {"on"});
     add("attn_prompt_fast", {"on"});
+#endif
     // Parallel query tiles for single-row chunked small-T widths, measured on rk8v4.
     add("attn_parallel_tiles", {"on"});
 
@@ -90,6 +96,10 @@ std::vector<RouteCatalogEntry> build_catalog() {
             } else {
                 tiers = {"6x2x32",   "12x1x32", "12x1x64d", "24x1x32",  "6x2x32q",
                          "12x1x32q", "6x2x32e", "12x1x32e", "6x2x32qe", "12x1x32qe"};
+#if defined(NINFER_SM75)
+                // The 64-key dynamic arena does not fit Turing's 64 KiB per block.
+                std::erase(tiers, "12x1x64d");
+#endif
             }
             add(std::string("attn_i8_small/h24/") + coding + "/w" + std::to_string(width),
                 std::move(tiers));

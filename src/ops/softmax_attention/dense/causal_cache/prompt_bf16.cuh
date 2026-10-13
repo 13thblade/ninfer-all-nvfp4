@@ -61,6 +61,14 @@ causal_prompt_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* cache, int kv_he
     }
 }
 
+#if defined(NINFER_SM75)
+} // namespace ninfer::ops
+
+// A Turing build takes its own kernel of the same name and contract.
+#include "ops/softmax_attention/dense/causal_cache/prompt_bf16_sm75.cuh"
+#else
+inline constexpr int kCausalPromptBf16SmemBytes = kCausalPromptSmemBytes;
+
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
@@ -420,3 +428,4 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
 }
 
 } // namespace ninfer::ops
+#endif

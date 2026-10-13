@@ -613,7 +613,13 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
          view(residual, hidden),
          reset_residual},
     };
+#if defined(NINFER_SM75)
+    // The unified table is not selectable on Turing (kUnifiedLinearRoutes).
+    for (const auto* set : {&families}) {
+        static_cast<void>(unified_families);
+#else
     for (const auto* set : {&families, &unified_families}) {
+#endif
         for (const Family& family : *set) {
             auto bands = sweep(family, timer, options);
             if (!bands.empty()) {
@@ -805,8 +811,10 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
             profile.routes[family.key] = std::move(bands);
             ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
         }
+#if !defined(NINFER_SM75)
         // The standard prompt kernel with each KV head's query heads packed into its tiles, as the
-        // PV choice above left it: one 1024-token chunk at 32K and one at 131K of context.
+        // PV choice above left it: one 1024-token chunk at 32K and one at 131K of context. (A
+        // Turing build has no standard INT8 prompt kernel; its prompts all take the fast one.)
         const Family pack{"attn_pack_gqa",
                           {1},
                           [&](std::int32_t, cudaStream_t stream) {
@@ -842,6 +850,7 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
             profile.routes[fast.key] = std::move(fast_bands);
             ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
         }
+#endif
         // Parallel query tiles against the serial chunks for single-row verification: 16 and 32
         // columns (two and four 8-column tiles) at 32K and 131K of context. The serial and the
         // tiled workspaces differ, so the arena takes the larger of the two.

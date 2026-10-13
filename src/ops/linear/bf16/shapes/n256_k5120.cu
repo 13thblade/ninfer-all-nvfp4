@@ -35,7 +35,12 @@ void launch_grid(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
 } // namespace
 
 Bf16Launch select_bf16_n256_k5120(std::int32_t tokens) {
+#if defined(NINFER_SM75)
+    // Sixteen K warps stage 96 KiB, past Turing's 64 KiB a block: narrow widths split K eight ways.
+    if (tokens <= 76) return launch_grid<Bf16N256K5120MmaSchedule<8, 8>>;
+#else
     if (tokens <= 76) return launch_grid<Bf16N256K5120MmaSchedule<16, 8>>;
+#endif
     return launch_grid<Bf16N256K5120MmaSchedule<8, 16>>;
 }
 

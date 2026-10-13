@@ -38,8 +38,10 @@ void launch_fp8_partial(const Tensor& q, CacheInput input, const Tensor& positio
     // fits comfortably (~78KiB total) at the cost of more, smaller key-tile iterations.
     constexpr int KeyBlock             = 32;
     constexpr int MinBlocks            = TokenTile == 1 ? 2 : 1;
-    // k_fp8(Bc*D) + k_b16(2*Bc*D) + v_fp8(Bc*D) + v_f16(2*Bc*D) = 6*Bc*D bytes.
-    constexpr std::size_t DynamicBytes = 6u * KeyBlock * kCausalHeadDim;
+    // k_fp8(Bc*D) + k_b16(2*Bc*D) + v_fp8(Bc*D) + v_f16(2*Bc*D) = 6*Bc*D bytes; a compact stage
+    // widens V into k_b16 (kCausalSmallTCompactKV), 4*Bc*D bytes.
+    constexpr std::size_t DynamicBytes =
+        (kCausalSmallTCompactKV<RowTiles> ? 4u : 6u) * KeyBlock * kCausalHeadDim;
     using KernelInput                  = CacheInput;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     const auto launch = [&]() {

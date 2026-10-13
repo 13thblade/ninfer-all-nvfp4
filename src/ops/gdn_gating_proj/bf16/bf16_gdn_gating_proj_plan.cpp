@@ -80,15 +80,28 @@ static_assert(catalog_is_closed(k35Routes, kAnyCols));
 // -- multiply by the runtime SM count for the residency predicate, and by the minimum supported SM
 // count for the compile-time guard.
 constexpr std::int32_t ctas_per_sm_27(Bf16GdnGatingScheduleId) noexcept {
+#if defined(NINFER_SM75)
+    // sm_75 build (ptxas -v): 122-124 registers, and the 40 KiB allocation against Turing's 64 KiB
+    // of shared memory per SM admits one CTA per SM.
+    return 1;
+#else
     // Uniform across split8/4/2: all three are 8-warp, 65-register CTAs bounded by the same 40 KiB
     // shared-memory allocation, so all three admit two CTAs per SM.
     return 2;
+#endif
 }
 
 constexpr std::int32_t ctas_per_sm_35(Bf16GdnGatingScheduleId schedule) noexcept {
+#if defined(NINFER_SM75)
+    // sm_75 build (ptxas -v): 72-127 registers; the 24 KiB allocation against 64 KiB per SM admits
+    // two CTAs per SM for every split, and no split's registers admit fewer.
+    static_cast<void>(schedule);
+    return 2;
+#else
     if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32) { return 2; }
     if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit16) { return 4; }
     return 3;
+#endif
 }
 
 // Fewest SMs of any device this build supports. The RTX 3090 is the smallest sm_86 part the fork
@@ -163,6 +176,11 @@ constexpr bool catalog_is_resident(const std::array<RouteSpec, N>& routes, std::
     return true;
 }
 
+// The route table is the sm_86 one. Turing parts hold one or two of these CTAs per SM on 30 to 72
+// SMs, so its widest cooperative routes are never resident there; resolve_from_routes hands each
+// such width to the next route that is (candidate_is_legal checks the actual device), which is the
+// behavior the guard below exists to make unnecessary on sm_86.
+#if !defined(NINFER_SM75)
 static_assert(catalog_is_resident(k27Routes, 128, 3,
                                   [](Bf16GdnGatingScheduleId schedule) constexpr noexcept {
                                       return ctas_per_sm_27(schedule) * kMinSupportedSmCount;
@@ -175,6 +193,7 @@ static_assert(catalog_is_resident(k35Routes, 64, 2,
                                   }),
               "a 35B cooperative route exceeds the sm_86 resident-CTA budget at its upper bound "
               "on the smallest supported device");
+#endif
 
 bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;

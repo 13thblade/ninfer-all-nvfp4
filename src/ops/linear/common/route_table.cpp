@@ -165,6 +165,7 @@ std::optional<LinearRouteTable> forced_route_table() {
 } // namespace
 
 LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t) {
+    if constexpr (!kUnifiedLinearRoutes) return LinearRouteTable::Legacy;
     if (const auto forced = forced_route_table()) return *forced;
     for (const WidthBand band : family_bands(bands_for(current_device_class()), family)) {
         if (t >= band.first && t <= band.last) return LinearRouteTable::Unified;
@@ -173,6 +174,7 @@ LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t) {
 }
 
 LinearRouteTable fused_route_table(std::string_view key, std::int32_t width) {
+    if constexpr (!kUnifiedLinearRoutes) return LinearRouteTable::Legacy;
     if (const auto forced = forced_route_table()) return *forced;
     return device_route_schedule(key, width) == "unified" ? LinearRouteTable::Unified
                                                           : LinearRouteTable::Legacy;

@@ -26,6 +26,18 @@ inline constexpr int kCausalHeadDim = 256;
 // split count, reads its pages from the block table instead.
 inline constexpr int kCausalSmallTSplitKeyLimit = 3968;
 
+// Whether a quantized-cache (FP8, NVFP4, K8V4) small-T tile of `RowTiles` 16-row tiles widens K
+// and V into one shared tile, V overwriting K once QK is done, instead of widening V into its own
+// tile during QK. Turing's 64 KiB per block holds the two- and three-row-tile shapes only this way;
+// the NVFP4 kernel stages its one- and two-row-tile shapes so on every architecture.
+template <int RowTiles>
+inline constexpr bool kCausalSmallTCompactKV =
+#if defined(NINFER_SM75)
+    RowTiles >= 2;
+#else
+    false;
+#endif
+
 struct CausalAppendInput {
     static constexpr bool writes_cache = true;
     const __nv_bfloat16* k;

@@ -262,13 +262,24 @@ constexpr std::int32_t cooperative_resident_ctas_per_sm() noexcept {
     static_assert(SplitK > 1);
     if constexpr (std::is_same_v<Geometry, Bf16Gdn27Geometry>) {
         static_assert(SplitK == 8 || SplitK == 4 || SplitK == 2);
+#if defined(NINFER_SM75)
+        // Measured on the sm_75 build (ptxas -v): 122-124 registers, and the 40-KiB shared-memory
+        // allocation admits one resident CTA per SM of Turing's 64 KiB.
+        return 1;
+#else
         // Measured on the sm_86 build (cuobjdump -res-usage): BN128 split-8/4/2 are all run at
         // 8 warps (256 threads) here, at 65 registers; registers and the 40-KiB shared-memory
         // allocation both admit two resident CTAs per SM uniformly across the three.
         return 2;
+#endif
     } else {
         static_assert(std::is_same_v<Geometry, Bf16Gdn35Geometry>);
         static_assert(SplitK == 32 || SplitK == 16 || SplitK == 8 || SplitK == 4 || SplitK == 2);
+#if defined(NINFER_SM75)
+        // Measured on the sm_75 build (ptxas -v): 72-127 registers; the 24-KiB allocation admits
+        // two resident CTAs per SM of Turing's 64 KiB at every split.
+        return 2;
+#else
         // Measured on the sm_86 build (cuobjdump -res-usage): split-32 uses 122-126 registers
         // with 256 threads and is register-bound to two resident CTAs per SM; split-16 uses 56
         // registers and reaches the 4-CTA shared-memory bound; split-8/4/2 use 74 registers and
@@ -276,6 +287,7 @@ constexpr std::int32_t cooperative_resident_ctas_per_sm() noexcept {
         if (SplitK == 32) { return 2; }
         if (SplitK == 16) { return 4; }
         return 3;
+#endif
     }
 }
 

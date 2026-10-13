@@ -30,6 +30,7 @@
 //     FP32 row and its (max, sum) statistics; causal_attention_prompt_rotated_fast_merge_kernel
 //     combines the splits.
 
+#include "ops/common/device_limits.h"
 #include "ops/common/math.cuh"
 #include "ops/common/math.h"
 #include "ops/common/mma.cuh"
@@ -79,7 +80,7 @@ struct CausalPromptRotatedShape {
     static constexpr int QBytes      = Br * kCausalPromptHeadDim;
     static constexpr int QScaleBytes = 2 * Br * kKVCacheNvfp4Groups;
     static constexpr int SmemBytes   = QBytes + QScaleBytes + 2 * Stage::Bytes;
-    static_assert(SmemBytes <= 101376);
+    static_assert(SmemBytes <= kMaxSharedBytesPerBlock);
 };
 
 // A 64-key FP16 partial is bounded by 64 * 6 * max_scale (every probability is at most one).

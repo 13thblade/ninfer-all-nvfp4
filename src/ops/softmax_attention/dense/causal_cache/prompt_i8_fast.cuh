@@ -34,7 +34,7 @@
 #include <cuda_fp16.h>
 #include <math_constants.h>
 
-#include "ops/common/sm70_emulation.cuh"
+#include "ops/common/device_limits.h"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
 
@@ -63,6 +63,15 @@ struct CausalPromptI8FastStage {
 };
 inline constexpr int kCausalPromptI8FastStageBytes = CausalPromptI8FastStage<false>::Bytes;
 
+// K/V tiles are double-buffered so the next tile's cp.async overlaps this tile's math. Turing has
+// no cp.async and copies synchronously, so a second stage would overlap nothing; one stage keeps
+// the kernel inside its 64 KiB of shared memory.
+#if defined(NINFER_SM75)
+inline constexpr int kCausalPromptI8FastStages = 1;
+#else
+inline constexpr int kCausalPromptI8FastStages = 2;
+#endif
+
 // Each warp owns 16 query rows. Eight warps fill an SM's register file; four warps serve
 // launches too narrow to occupy every SM with 128-row CTAs.
 template <int Warps, bool PackedValues = false>
@@ -71,7 +80,11 @@ struct CausalPromptI8FastShape {
     static constexpr int Threads   = Warps * 32;
     static constexpr int Br        = Warps * 16;
     static constexpr int QBytes    = Br * kCausalPromptHeadDim;
-    static constexpr int SmemBytes = QBytes + 2 * CausalPromptI8FastStage<PackedValues>::Bytes;
+    static constexpr int SmemBytes =
+        QBytes + kCausalPromptI8FastStages * CausalPromptI8FastStage<PackedValues>::Bytes;
+    // Whether this shape can launch on the build's architecture (8 warps with INT8 values cannot
+    // on Turing: 66,560 bytes).
+    static constexpr bool Launchable = SmemBytes <= kMaxSharedBytesPerBlock;
 };
 
 // A 64-key FP16 partial is bounded by 64 * 127 * max_scale (every probability is at most one).
@@ -82,20 +95,18 @@ inline constexpr float kCausalPromptI8FastPackedF16PartialScaleLimit = 64.0f;
 
 static_assert(kCausalPromptI8FastBc == kPagedKVPageSize);
 static_assert(kCausalPromptI8FastGroups == 4);
+#if !defined(NINFER_SM75)
 static_assert(CausalPromptI8FastShape<8>::SmemBytes == 100352);
+#endif
+static_assert(CausalPromptI8FastShape<4>::Launchable &&
+              CausalPromptI8FastShape<4, true>::Launchable &&
+              CausalPromptI8FastShape<8, true>::Launchable);
 
 __device__ __forceinline__ void causal_prompt_i8_fast_mma_f16_acc(unsigned& c0, unsigned& c1,
                                                                   unsigned a0, unsigned a1,
                                                                   unsigned a2, unsigned a3,
                                                                   unsigned b0, unsigned b1) {
-#if defined(NINFER_SM70_DEVICE)
-    sm70::mma_m16n8k16_f16acc(c0, c1, a0, a1, a2, a3, b0, b1);
-#else
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
-                 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-                 : "+r"(c0), "+r"(c1)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-#endif
+    mma_f16_f16acc(c0, c1, a0, a1, a2, a3, b0, b1);
 }
 
 // One ldmatrix.trans b16 lane of an INT8 [key][d] tile holds the codes
@@ -258,7 +269,8 @@ __global__ __launch_bounds__(
     // zero-filled and their scores masked.
     const auto commit_keys = [&](int kb) {
         if constexpr (PackedKeys) {
-            std::int8_t* k_s = reinterpret_cast<std::int8_t*>(stage_base(kb & 1));
+            std::int8_t* k_s =
+                reinterpret_cast<std::int8_t*>(stage_base(kb % kCausalPromptI8FastStages));
 #pragma unroll
             for (int i = 0; i < KChunksPerThread; ++i) {
                 const int chunk = tid + i * Threads;
@@ -274,7 +286,7 @@ __global__ __launch_bounds__(
     // packed) and their scales, all contiguous in the cache. Keys past the CTA's last visible key
     // are zero-filled so masked columns stay finite.
     const auto issue_tile = [&](int kb) {
-        unsigned char* base = stage_base(kb & 1);
+        unsigned char* base = stage_base(kb % kCausalPromptI8FastStages);
         std::int8_t* k_s    = reinterpret_cast<std::int8_t*>(base);
         std::int8_t* v_s    = k_s + kCausalPromptI8FastTileBytes;
         __half* ks_s        = reinterpret_cast<__half*>(base + Stage::KScaleOffset);
@@ -393,7 +405,7 @@ __global__ __launch_bounds__(
         tile_live    = false;
         const int k0 = kb * Bc;
         if (!warp_active || k0 > warp_max_qabs) { return; }
-        const unsigned char* base  = stage_base(kb & 1);
+        const unsigned char* base  = stage_base(kb % kCausalPromptI8FastStages);
         const __nv_bfloat16* k_b16 = reinterpret_cast<const __nv_bfloat16*>(base);
         const __half* ks_s = reinterpret_cast<const __half*>(base + Stage::KScaleOffset);
         const __half* vs_s = ks_s + Bc * Groups;
@@ -514,7 +526,7 @@ __global__ __launch_bounds__(
     };
 
     const auto pv_packed = [&](int kb) {
-        const unsigned char* base = stage_base(kb & 1);
+        const unsigned char* base = stage_base(kb % kCausalPromptI8FastStages);
         const std::int8_t* v_s =
             reinterpret_cast<const std::int8_t*>(base) + kCausalPromptI8FastTileBytes;
         const __half* vs_s =
@@ -577,7 +589,8 @@ __global__ __launch_bounds__(
             return;
         }
         const std::int8_t* v_s =
-            reinterpret_cast<const std::int8_t*>(stage_base(kb & 1)) + kCausalPromptI8FastTileBytes;
+            reinterpret_cast<const std::int8_t*>(stage_base(kb % kCausalPromptI8FastStages)) +
+            kCausalPromptI8FastTileBytes;
         const __half* vs_s =
             reinterpret_cast<const __half*>(v_s + kCausalPromptI8FastTileBytes) + Bc * Groups;
         const __half2 mul   = __float2half2_rn(ldexpf(1.0f, -tile_shift));
@@ -659,6 +672,19 @@ __global__ __launch_bounds__(
         }
     };
 
+#if defined(NINFER_SM75)
+    // One stage: a tile is staged once every warp is done with the previous one, then published.
+#pragma unroll 1
+    for (int kb = 0; kb < key_blocks; ++kb) {
+        if (kb > 0) { __syncthreads(); }
+        issue_tile(kb);
+        commit_keys(kb);
+        cp_wait<0>();
+        __syncthreads();
+        qk_softmax(kb);
+        pv(kb);
+    }
+#else
     // Every warp publishes one tile per barrier; the next tile's copy overlaps this tile's math.
     issue_tile(0);
     commit_keys(0);
@@ -671,6 +697,7 @@ __global__ __launch_bounds__(
         pv(kb);
         if (kb + 1 < key_blocks) { commit_keys(kb + 1); }
     }
+#endif
 
     running_l0         = warp_sum<4>(running_l0, FullMask);
     running_l1         = warp_sum<4>(running_l1, FullMask);

@@ -34,6 +34,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -196,6 +197,29 @@ int main() {
                           })},
                          {"linear_swiglu.q8.dflash2.mma.r32.c64.k128"}));
 
+    std::vector<std::string> q5_add_unrouted = {
+        "linear_add.q5.mma.r64.c16.cta_collective_residual",
+        "linear_add.q5.mma.r64.c24.cta_collective_residual",
+        "linear_add.q5.mma.r64.c32.cta_collective_residual"};
+#if defined(NINFER_SM75)
+    // A Turing build never selects the unified table (kUnifiedLinearRoutes in
+    // ops/linear/common/route_table.h), so forcing it resolves the legacy routes.
+    q5_add_unrouted.insert(
+        q5_add_unrouted.end(),
+        {"linear_add.q5.unified.direct_simt.split2.exact.residual",
+         "linear_add.q5.unified.sliced.r16.t8.w4.s2.residual",
+         "linear_add.q5.unified.sliced.r16.t16.w4.s2.residual",
+         "linear_add.q5.unified.sliced.r16.t24.w4.s2.residual",
+         "linear_add.q5.unified.sliced.r32.t32.w4.s2.residual",
+         "linear_add.q5.unified.sliced.r32.t24.w4.s2.pairwise.residual",
+         "linear_add.q5.unified.sliced.r32.t32.w4.s1.residual",
+         "linear_add.q5.unified.sliced.r32.t32.w2.s2.residual",
+         "linear_add.q5.unified.sliced.r32.t64.w2.s1.residual",
+         "linear_add.q5.unified.mma.r32.t32.k128.residual",
+         "linear_add.q5.unified.mma.r32.t128.residual",
+         "linear_add.q5.unified.mma.r64.t128.cta_collective_residual",
+         "linear_add.q5.unified.mma.r64.t128.cta_collective_residual.narrow_tail"});
+#endif
     using AddFn = std::function<detail::Q5LinearAddScheduleId(std::int32_t)>;
     reports.push_back(
         survey<detail::Q5LinearAddScheduleId, decltype(detail::q5_linear_add_schedule_name), AddFn>(
@@ -217,9 +241,7 @@ int main() {
                      return detail::q5_linear_add_resolve_plan({5120, 17408, 17408, cols}).schedule;
                  });
              })},
-            {"linear_add.q5.mma.r64.c16.cta_collective_residual",
-             "linear_add.q5.mma.r64.c24.cta_collective_residual",
-             "linear_add.q5.mma.r64.c32.cta_collective_residual"}));
+            std::move(q5_add_unrouted)));
 
     using Q4Q5Fn = std::function<detail::Q4Q5AttnInputScheduleId(std::int32_t)>;
     reports.push_back(
@@ -299,9 +321,13 @@ int main() {
     //                          2026-09-24 catch-up, upstream's 13..32 band on a native sm_120 build,
     //                          and MixedR32C32K128S2, the native build's T=32 route.
     //
+    // A Turing build adds q5_linear_add's 13 unified schedules, whose table it never selects.
+    //
     // All of them are kept on purpose: deleting an upstream schedule costs merge effort at every
     // future catch-up for no measured gain here. The point is that the set is written down.
-#if defined(NINFER_SM8X_COMPAT)
+#if defined(NINFER_SM75)
+    constexpr std::size_t kExpectedUnrouted = 45;
+#elif defined(NINFER_SM8X_COMPAT)
     constexpr std::size_t kExpectedUnrouted = 32;
 #else
     constexpr std::size_t kExpectedUnrouted = 28;

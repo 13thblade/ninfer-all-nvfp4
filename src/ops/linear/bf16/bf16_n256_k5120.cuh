@@ -4,6 +4,7 @@
 // 16-row by 8/16-token tile. Sixteen/eight warps split K, double-buffer global-to-shared staging,
 // and reduce FP32 fragments in shared memory before the final BF16 store.
 
+#include "ops/common/device_limits.h"
 #include "ops/common/math.h"
 #include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
@@ -37,7 +38,7 @@ struct Bf16N256K5120MmaSchedule {
     static constexpr int kSharedBytes = kStagingBytes;
 
     static_assert((5120 % kGroupK) == 0);
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= kMaxSharedBytesPerBlock);
 };
 
 __device__ __forceinline__ int bf16_n256_k5120_swizzle(int row, int col) {

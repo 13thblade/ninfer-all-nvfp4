@@ -13,6 +13,10 @@
 
 #include <cstdint>
 
+#if defined(NINFER_SM75)
+// A Turing build takes its own kernel of the same name and contract.
+#include "ops/softmax_attention/dense/causal_cache/small_t_bf16_sm75.cuh"
+#else
 namespace ninfer::ops {
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
@@ -428,3 +432,4 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
 }
 
 } // namespace ninfer::ops
+#endif

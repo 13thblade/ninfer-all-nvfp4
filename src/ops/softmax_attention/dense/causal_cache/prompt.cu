@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 static_assert(kPromptWaveRows == CausalPromptI8FastShape<8>::Br);
@@ -68,12 +69,16 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
                                                 float scale, const CacheView& cache,
                                                 Metadata metadata, Tensor& out,
                                                 cudaStream_t stream) {
-    configure_cuda_device_once([] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 8, PackedValues, Keys>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            CausalPromptI8FastShape<8, PackedValues>::SmemBytes);
-    });
+    // Eight warps with INT8 values do not fit Turing's shared memory; those launches take four.
+    constexpr bool kWide = CausalPromptI8FastShape<8, PackedValues>::Launchable;
+    if constexpr (kWide) {
+        configure_cuda_device_once([] {
+            return cudaFuncSetAttribute(
+                causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 8, PackedValues, Keys>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                CausalPromptI8FastShape<8, PackedValues>::SmemBytes);
+        });
+    }
     configure_cuda_device_once([] {
         return cudaFuncSetAttribute(
             causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 4, PackedValues, Keys>,
@@ -96,10 +101,14 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
     };
-    if (causal_attention_prompt_i8_fast_prefers_narrow(tokens, Geometry::QHeads)) {
-        launch.template operator()<4>();
+    if constexpr (kWide) {
+        if (causal_attention_prompt_i8_fast_prefers_narrow(tokens, Geometry::QHeads)) {
+            launch.template operator()<4>();
+        } else {
+            launch.template operator()<8>();
+        }
     } else {
-        launch.template operator()<8>();
+        launch.template operator()<4>();
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -142,6 +151,10 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
     const Tensor& cache_v = cache.v_pages;
     const auto tokens     = static_cast<std::int32_t>(q.ne[2]);
     if (kv_cache_is_int8_family(cache.storage)) {
+#if defined(NINFER_SM75)
+        // Every INT8-family coding took the fast kernel above, causal_attention_prompt_fast_kernel.
+        throw std::logic_error("INT8-family prompt attention reached the standard kernel on sm_75");
+#else
         // The INT8 family is the one place that deliberately does not take its plane types from
         // ops/kv_cache/plane_types.h. One kernel serves both codings, so its value parameter is
         // std::int8_t* for int8-g64 and for rk8v4 alike, and the packed-int4 path re-casts to
@@ -221,17 +234,18 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
             launch_i8.template operator()<false, KvKeyCoding::Int8, false>();
         }
 #endif
+#endif
     } else {
         // The kernel exceeds the default 48 KiB dynamic-smem ceiling.
         configure_cuda_device_once([&] {
             return cudaFuncSetAttribute(causal_attention_prompt_bf16_kernel<Geometry, Metadata>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        kCausalPromptSmemBytes);
+                                        kCausalPromptBf16SmemBytes);
         });
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         causal_attention_prompt_bf16_kernel<Geometry, Metadata>
-            <<<attention_grid, kCausalPromptThreads, kCausalPromptSmemBytes, stream>>>(
+            <<<attention_grid, kCausalPromptThreads, kCausalPromptBf16SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const __nv_bfloat16*>(cache_k.data),
                 static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
@@ -256,6 +270,11 @@ bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested)
                            storage == KvCacheStorage::RotatedE8RootKeyInt4Value ||
                            storage == KvCacheStorage::Nvfp4Group16;
     if (!supported) { return false; }
+#if defined(NINFER_SM75)
+    // The standard INT8 prompt kernel needs 91 KiB of shared memory and is not built for Turing:
+    // every INT8-family prompt takes the fast kernel there.
+    if (storage != KvCacheStorage::Nvfp4Group16) { return true; }
+#endif
     if (requested) { return true; }
     static const int forced = [] {
         const char* value = std::getenv("NINFER_PROMPT_FAST");

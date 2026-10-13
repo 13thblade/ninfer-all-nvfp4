@@ -8,6 +8,7 @@
 // K vector per token, which is the column-major B representation consumed by the
 // row.col MMA atom. M and K come from a compiled geometry; N remains runtime.
 
+#include "ops/common/device_limits.h"
 #include "ops/common/mma.cuh"
 
 #include <cuda_bf16.h>
@@ -43,7 +44,7 @@ struct Bf16MmaSchedule {
     static constexpr int kBlockK                               = BlockK;
     static constexpr int kWarpRows                             = WarpRows;
     static constexpr int kWarpCols                             = WarpCols;
-    static constexpr int kPipelineStages                       = PipelineStages;
+    static constexpr int kPipelineStages                       = pipeline_stages(PipelineStages);
     static constexpr int kMinBlocks                            = MinBlocks;
     static constexpr Cache kWeightCache                        = WeightCache;
     static constexpr Cache kActivationCache                    = ActivationCache;
@@ -69,7 +70,7 @@ struct Bf16MmaSchedule {
     static_assert(kPipelineStages >= 2 && kPipelineStages <= 8);
     static_assert(kMinBlocks >= 1);
     static_assert(kWarps >= 1 && kThreads <= 1024);
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= kMaxSharedBytesPerBlock);
     static_assert(kRaster != Bf16MmaRaster::Grouped || kRasterGroupRows > 0);
 };
 

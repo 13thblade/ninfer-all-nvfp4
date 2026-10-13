@@ -467,7 +467,7 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
 }
 
 int verify_workspace_capacity_contract(const Geometry& geometry,
-                                       std::initializer_list<std::int32_t> route_endpoints) {
+                                       const std::vector<std::int32_t>& route_endpoints) {
     const std::int32_t last = *std::max_element(route_endpoints.begin(), route_endpoints.end());
     const std::size_t interval =
         ops::gdn_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, last);
@@ -496,6 +496,26 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
     }
     return failures;
 }
+
+#if defined(NINFER_SM75)
+// Both sides of every width where this device's plan changes schedule, with the interval's ends.
+std::vector<std::int32_t> plan_endpoints(const Geometry& geometry, std::int32_t sm_count,
+                                         std::int32_t last) {
+    const auto schedule = [&](std::int32_t cols) {
+        return ninfer::ops::detail::bf16_gdn_gating_resolve_plan(
+                   {geometry.heads, geometry.hidden, cols}, sm_count)
+            .schedule;
+    };
+    std::vector<std::int32_t> endpoints{1, last};
+    for (std::int32_t cols = 2; cols <= last; ++cols) {
+        if (schedule(cols) != schedule(cols - 1)) {
+            endpoints.push_back(cols - 1);
+            endpoints.push_back(cols);
+        }
+    }
+    return endpoints;
+}
+#endif
 
 // Which schedule the projection gets on devices with different SM counts. The route table was
 // tuned on 82 SMs and its cooperative schedules need their whole grid resident, so a smaller device
@@ -554,12 +574,18 @@ std::int32_t split_of(Id schedule) {
     }
 }
 
-// Resident CTAs per SM of each cooperative schedule, as measured on the sm_86 build.
+// Resident CTAs per SM of each cooperative schedule, as measured on the sm_86 build; a Turing SM
+// holds one 27B CTA and two 35B ones of any split (bf16_gdn_gating_proj_plan.cpp).
 std::int32_t ctas_per_sm(const Geometry& g, Id schedule) {
+#if defined(NINFER_SM75)
+    static_cast<void>(schedule);
+    return g.heads == 48 ? 1 : 2;
+#else
     if (g.heads == 48) { return 2; }
     if (schedule == Id::MmaCooperativeSplit32) { return 2; }
     if (schedule == Id::MmaCooperativeSplit16) { return 4; }
     return 3;
+#endif
 }
 
 bool grid_fits(const Geometry& g, Id schedule, std::int32_t cols, std::int32_t sms) {
@@ -572,7 +598,15 @@ bool grid_fits(const Geometry& g, Id schedule, std::int32_t cols, std::int32_t s
 
 int verify_plan_across_sm_counts() {
     constexpr std::int32_t kWidths = 6000;
+#if defined(NINFER_SM75)
+    // No SM count holds the whole tuned table at Turing's residency, so every count, the TITAN
+    // RTX's 72 among them, falls back as a smaller sm_86 device does.
+    constexpr std::int32_t kSmCounts[] = {84, 82, 72, 68, 48, 40, 30};
+#else
+    constexpr std::int32_t kSmCounts[] = {84, 68, 48, 40, 30};
+#endif
     for (const Geometry& g : {k27, k35}) {
+#if !defined(NINFER_SM75)
         // The tuned device keeps its tuned routes at every width.
         for (std::int32_t cols = 1; cols <= kWidths; ++cols) {
             const Bf16GdnGatingPlan plan =
@@ -581,9 +615,10 @@ int verify_plan_across_sm_counts() {
                   std::string(g.label) + ": 82 SMs changed the tuned route at " +
                       std::to_string(cols) + " columns");
         }
+#endif
         // A device with fewer SMs never gets a grid it cannot hold, and only leaves the tuned route
         // when that route does not fit, moving to a schedule that splits K no more.
-        for (const std::int32_t sms : {84, 68, 48, 40, 30}) {
+        for (const std::int32_t sms : kSmCounts) {
             for (std::int32_t cols = 1; cols <= kWidths; ++cols) {
                 const Bf16GdnGatingPlan plan = ninfer::ops::detail::bf16_gdn_gating_resolve_plan(
                     {g.heads, g.rows, cols}, sms);
@@ -702,9 +737,18 @@ int main() {
     const DeviceExecutionView execution{nullptr, device.multiprocessor_count()};
     const DeviceExecutionView norm_execution{device.stream, device.multiprocessor_count()};
     int failures = sm_count_routes::verify_plan_across_sm_counts();
+#if defined(NINFER_SM75)
+    // Turing's residency moves the route endpoints with the SM count; this device's come from the
+    // plan.
+    failures += verify_workspace_capacity_contract(
+        kQwen27, plan_endpoints(kQwen27, device.multiprocessor_count(), 3457));
+    failures += verify_workspace_capacity_contract(
+        kQwen35, plan_endpoints(kQwen35, device.multiprocessor_count(), 3905));
+#else
     failures +=
         verify_workspace_capacity_contract(kQwen27, {1, 8, 768, 769, 1664, 1665, 3456, 3457});
     failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 960, 1920, 3904, 3905});
+#endif
 
     // Every registered 27B projection route, including predicated and full token tiles, and both
     // sides of each sm_86 residency boundary (768/769, 1664/1665, 3456/3457).

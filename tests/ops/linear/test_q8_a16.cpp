@@ -137,3 +137,6 @@ int main() {
         return 1;
     }
 }
+            if (table == LinearRouteTable::Unified && !ninfer::ops::detail::kUnifiedLinearRoutes) {
+                continue;
+            }
