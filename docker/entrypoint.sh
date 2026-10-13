@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Container entrypoint. Picks the build that matches the GPU -- sm86 for compute capability 8.6
-# and 8.9 (sm_86 cubins run on Ada), sm120a for 12.0 -- and runs one of:
+# Container entrypoint. Picks the build that matches the GPU -- sm75 for compute capability 7.5,
+# sm86 for 8.6 and 8.9 (sm_86 cubins run on Ada), sm120a for 12.0 -- and runs one of:
 #
 #   run <model> [profile]     scripts/run.sh: the measured serving profiles (default: run qwen38-27b)
 #   download <model>          scripts/download-model.sh into /models
@@ -8,7 +8,7 @@
 #                             listens on NINFER_HOST:NINFER_PORT unless --host/--port are given
 #   anything else             executed as given
 #
-# NINFER_IMAGE_ARCH=sm86|sm120a skips detection.
+# NINFER_IMAGE_ARCH=sm75|sm86|sm120a skips detection.
 set -euo pipefail
 home=/opt/ninfer
 : "${NINFER_HOST:=0.0.0.0}" "${NINFER_PORT:=8080}"
@@ -26,11 +26,13 @@ select_arch() {
     exit 1
   fi
   case "${capability// /}" in
+    7.5) printf 'sm75' ;;
     8.6|8.7|8.9) printf 'sm86' ;;
     12.0) printf 'sm120a' ;;
     *)
-      printf 'Compute capability %s is not supported: NInfer runs on 8.6 (RTX 30), 8.9 (RTX 40)\n' "$capability" >&2
-      printf 'and 12.0 (RTX 50). NINFER_IMAGE_ARCH=sm86|sm120a overrides the detection.\n' >&2
+      printf 'Compute capability %s is not supported: NInfer runs on 7.5 (RTX 20, TITAN RTX), 8.6\n' "$capability" >&2
+      printf '(RTX 30), 8.9 (RTX 40) and 12.0 (RTX 50). NINFER_IMAGE_ARCH=sm75|sm86|sm120a overrides\n' >&2
+      printf 'the detection.\n' >&2
       exit 1 ;;
   esac
 }

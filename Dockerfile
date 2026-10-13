@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1.7
 #
 # NInfer server image. ninfer, ninfer-serve, ninfer-perplexity, ninfer-calibrate and
-# ninfer-ngram-profile are built once per architecture -- sm_86 (Ampere; the same cubins run on Ada
-# sm_89) and sm_120a (consumer Blackwell), since a NInfer build targets exactly one -- as one
-# multi-call executable each (NINFER_MULTICALL), next to the launcher and the downloader. The
-# entrypoint runs the build that matches the GPU it is given (docker/entrypoint.sh).
+# ninfer-ngram-profile are built once per architecture -- sm_75 (Turing), sm_86 (Ampere; the same
+# cubins run on Ada sm_89) and sm_120a (consumer Blackwell), since a NInfer build targets exactly
+# one -- as one multi-call executable each (NINFER_MULTICALL), next to the launcher and the
+# downloader. The entrypoint runs the build that matches the GPU it is given (docker/entrypoint.sh).
 #
-#   docker build -t ninfer .                               both architectures, from source
+#   docker build -t ninfer .                               every architecture, from source
 #   docker build --build-arg ARCHS=86 -t ninfer .          one architecture
 #   docker build --build-context dist=<dir> -t ninfer .    package prebuilt binaries (what CI does)
 #
@@ -40,7 +40,7 @@ RUN apt-get update \
 
 # --- build -----------------------------------------------------------------------------------------
 FROM toolchain AS build
-ARG ARCHS="86 120a"
+ARG ARCHS="75 86 120a"
 ARG JOBS=""
 WORKDIR /src
 COPY . .

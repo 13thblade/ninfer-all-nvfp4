@@ -12,9 +12,9 @@
 #     saw it.
 #
 #   * scripts/check-host-compile.py on Windows -- the host code of every translation unit of the
-#     sm_70, sm_80, sm_86, sm_89 and sm_120a configurations compiled by MSVC and by nvcc's MSVC
-#     front end, without device code. CI builds no Windows binary, and MSVC broke the Windows build
-#     three times (issues #44 and #62) on code that GCC accepts.
+#     sm_70, sm_75, sm_80, sm_86, sm_89 and sm_120a configurations compiled by MSVC and by nvcc's
+#     MSVC front end, without device code. CI builds no Windows binary, and MSVC broke the Windows
+#     build three times (issues #44 and #62) on code that GCC accepts.
 #
 #   * tests/host/test_host_kv_clamp.cpp -- pins the pinned-host-KV-cache clamp arithmetic
 #     (src/core/host_kv_clamp.h) used by the Windows startup path in program_impl.h.
@@ -23,10 +23,10 @@
 #
 #   * tests/test_docker_build_cache.sh -- the Dockerfile's incremental build cache.
 #
-#   * the CUDA build of every target for sm_86 and sm_120a in the Dockerfile's toolchain stage,
-#     then CTest. The toolchain stage is published as ghcr.io/<owner>/<repo>-toolchain once per
-#     change of its definition (.github/scripts/toolchain-image.sh); ccache carries over between
-#     runs; the binaries go to the image.
+#   * the CUDA build of every target for sm_75, sm_86 and sm_120a in the Dockerfile's toolchain
+#     stage, then CTest. The toolchain stage is published as ghcr.io/<owner>/<repo>-toolchain once
+#     per change of its definition (.github/scripts/toolchain-image.sh); ccache carries over
+#     between runs; the binaries go to the image.
 #
 # The last two run only when a file they build, test or ship from differs from the base: the
 # branch a pull request merges into, or on master the commit the published image was built from
@@ -129,8 +129,8 @@ jobs:
             packages: nvcc cudart cublas_dev nvtx thrust cuda_profiler_api
           # Their commands differ only in the architecture numbers, which check-host-compile.py
           # compiles once; a definition or source of one of them alone is compiled for it.
-          - label: sm_80, sm_86, sm_89
-            archs: '80 86 89'
+          - label: sm_75, sm_80, sm_86, sm_89
+            archs: '75 80 86 89'
             cuda: 13.4.2
             installer: cuda_13.4.2_windows_x86_64_network.exe
             packages: nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api
@@ -306,7 +306,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: ['86', '120a']
+        arch: ['75', '86', '120a']
     steps:
       # The runner's disk (about 80 GB free) holds the toolchain, a build tree and ccache with room
       # to spare, so nothing is deleted to make space; the free space is logged.
