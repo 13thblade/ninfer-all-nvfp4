@@ -60,7 +60,7 @@ constexpr int kStages = 1;
 #else
 constexpr int kStages = 2;
 #endif
-constexpr int kRingGroups = 8;  // 16 bytes of one row's scales, the widest cp.async
+constexpr int kRingGroups = 8; // 16 bytes of one row's scales, the widest cp.async
 constexpr int kRingBufs   = 2;
 
 __device__ __forceinline__ uint4 lds128(const void* p) {
@@ -409,15 +409,11 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
         if (g + kStages - 1 < kGroups) { issue(g + kStages - 1, (g + kStages - 1) % kStages); }
         const int issued  = (g + kStages < kGroups) ? (g + kStages) : kGroups;
         const int allowed = issued - (g + 1);
-#if !defined(NINFER_SM70_DEVICE)
         if (allowed >= 1) {
             cp_wait<1>();
         } else {
             cp_wait<0>();
         }
-#else
-        (void)allowed;
-#endif
         __syncthreads();
 
         const char* const sa    = s_base + buf * kStage;

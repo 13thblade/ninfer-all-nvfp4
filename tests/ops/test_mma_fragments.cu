@@ -40,10 +40,12 @@ constexpr int kN = 8;
 __device__ unsigned pack16(const std::uint16_t* m, int stride, int row, int col) {
     return unsigned(m[row * stride + col]) | (unsigned(m[row * stride + col + 1]) << 16);
 }
+
 __device__ unsigned frag_a_k16(const std::uint16_t* a, int lane, int r) {
     const int g = lane / 4, t = lane % 4;
     return pack16(a, 16, g + 8 * (r & 1), 2 * t + 8 * (r >> 1));
 }
+
 // bt is B transposed, [n][k].
 __device__ unsigned frag_b_k16(const std::uint16_t* bt, int lane, int r) {
     const int g = lane / 4, t = lane % 4;
@@ -59,10 +61,12 @@ __device__ unsigned pack8(const std::int8_t* m, int stride, int row, int col) {
     }
     return v;
 }
+
 __device__ unsigned frag_a_s8(const std::int8_t* a, int lane, int r) {
     const int g = lane / 4, t = lane % 4;
     return pack8(a, 32, g + 8 * (r & 1), 4 * t + 16 * (r >> 1));
 }
+
 __device__ unsigned frag_b_s8(const std::int8_t* bt, int lane, int r) {
     const int g = lane / 4, t = lane % 4;
     return pack8(bt, 32, g, 4 * t + 16 * r);
@@ -74,6 +78,7 @@ __device__ unsigned frag_a_tf32(const std::uint32_t* a, int lane, int r) {
     const int g = lane / 4, t = lane % 4;
     return a[(g + 8 * (r & 1)) * 8 + t + 4 * (r >> 1)];
 }
+
 __device__ unsigned frag_b_tf32(const std::uint32_t* bt, int lane, int r) {
     const int g = lane / 4, t = lane % 4;
     return bt[g * 8 + t + 4 * r];
@@ -123,10 +128,10 @@ __global__ void run(Kind kind, int tiles, const std::uint16_t* a16, const std::u
             ninfer::ops::mma_f16_f16acc(h0, h1, a0, a1, a2, a3, b0, b1);
             const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&h0));
             const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&h1));
-            d[0] = f0.x;
-            d[1] = f0.y;
-            d[2] = f1.x;
-            d[3] = f1.y;
+            d[0]            = f0.x;
+            d[1]            = f0.y;
+            d[2]            = f1.x;
+            d[3]            = f1.y;
         }
     } else if (kind == Kind::tf32) {
         const std::uint32_t* a = a32 + tile * 16 * 8;
@@ -154,7 +159,9 @@ __global__ void run(Kind kind, int tiles, const std::uint16_t* a16, const std::u
 // ---- Host values -------------------------------------------------------------------------------
 
 float bf16_value(std::uint16_t bits) { return std::bit_cast<float>(std::uint32_t(bits) << 16); }
+
 float f16_value(std::uint16_t bits) { return __half2float(std::bit_cast<__half>(bits)); }
+
 // The value a TF32 operand represents: its low 13 mantissa bits are not part of it.
 float tf32_value(std::uint32_t bits) { return std::bit_cast<float>(bits & 0xffffe000u); }
 
@@ -211,7 +218,7 @@ int check_case(const Case& test, int tiles, std::mt19937& rng) {
     for (int tile = 0; tile < tiles; ++tile) { test.fill(rng, tile, t, std::size_t(tile)); }
 
     auto upload = [](const auto& host) {
-        using T = typename std::decay_t<decltype(host)>::value_type;
+        using T   = typename std::decay_t<decltype(host)>::value_type;
         T* device = nullptr;
         cuda_check(cudaMalloc(&device, host.size() * sizeof(T)), "cudaMalloc");
         cuda_check(cudaMemcpy(device, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice),
@@ -281,8 +288,8 @@ int check_case(const Case& test, int tiles, std::mt19937& rng) {
                 // Exact products summed in FP32 (FP16 for the FP16-accumulating form): the error of
                 // a correct tile is bounded by its absolute sum times a few ulps per addition. A
                 // wrong fragment layout misplaces whole products, orders of magnitude above this.
-                const double unit  = test.kind == Kind::f16_f16acc ? std::ldexp(1.0, -8)
-                                                                   : std::ldexp(1.0, -18);
+                const double unit =
+                    test.kind == Kind::f16_f16acc ? std::ldexp(1.0, -8) : std::ldexp(1.0, -18);
                 const double bound = unit * magnitude +
                                      (test.kind == Kind::f16_f16acc ? std::ldexp(1.0, -24) : 1e-38);
                 const double error = std::fabs(got - expected);
@@ -323,12 +330,14 @@ void fill_c(std::mt19937& rng, Tiles& t, std::size_t tile, float scale) {
 }
 
 // Operand of one 16-bit tile: `pick(rng, index)` returns its bits.
-template <class Pick> void fill16(Tiles& t, std::size_t tile, std::mt19937& rng, Pick pick) {
+template <class Pick>
+void fill16(Tiles& t, std::size_t tile, std::mt19937& rng, Pick pick) {
     for (int i = 0; i < 16 * 16; ++i) { t.a16[tile * 256 + i] = pick(rng, i); }
     for (int i = 0; i < 8 * 16; ++i) { t.b16t[tile * 128 + i] = pick(rng, 256 + i); }
 }
 
-template <class Pick> void fill32(Tiles& t, std::size_t tile, std::mt19937& rng, Pick pick) {
+template <class Pick>
+void fill32(Tiles& t, std::size_t tile, std::mt19937& rng, Pick pick) {
     for (int i = 0; i < 16 * 8; ++i) { t.a32[tile * 128 + i] = pick(rng, i); }
     for (int i = 0; i < 8 * 8; ++i) { t.b32t[tile * 64 + i] = pick(rng, 128 + i); }
 }
@@ -347,9 +356,8 @@ std::vector<Case> cases() {
         fill_c(rng, t, s, 4.0F);
     });
     add("bf16 window edges", Kind::bf16, [](Rng& rng, int, Tiles& t, std::size_t s) {
-        fill16(t, s, rng, [](Rng& r, int i) {
-            return random_bf16(r, i % 2 ? 15 : -17, i % 2 ? 15 : -17);
-        });
+        fill16(t, s, rng,
+               [](Rng& r, int i) { return random_bf16(r, i % 2 ? 15 : -17, i % 2 ? 15 : -17); });
         fill_c(rng, t, s, 1.0F);
     });
     add("bf16 past the window", Kind::bf16, [](Rng& rng, int, Tiles& t, std::size_t s) {
@@ -357,17 +365,19 @@ std::vector<Case> cases() {
         fill_c(rng, t, s, 1.0F);
     });
     add("bf16 just past the window", Kind::bf16, [](Rng& rng, int, Tiles& t, std::size_t s) {
-        fill16(t, s, rng, [](Rng& r, int i) {
-            return random_bf16(r, i % 2 ? 16 : -18, i % 2 ? 16 : -18);
-        });
+        fill16(t, s, rng,
+               [](Rng& r, int i) { return random_bf16(r, i % 2 ? 16 : -18, i % 2 ? 16 : -18); });
         fill_c(rng, t, s, 1.0F);
     });
     add("bf16 subnormals and zeros", Kind::bf16, [](Rng& rng, int, Tiles& t, std::size_t s) {
         fill16(t, s, rng, [](Rng& r, int i) -> std::uint16_t {
             switch (r() % 4) {
-            case 0: return std::uint16_t((r() & 0x8000u) | (r() & 0x7fu)); // subnormal
-            case 1: return std::uint16_t(r() & 0x8000u);                     // +-0
-            default: return random_bf16(r, -5, 5);
+            case 0:
+                return std::uint16_t((r() & 0x8000u) | (r() & 0x7fu)); // subnormal
+            case 1:
+                return std::uint16_t(r() & 0x8000u); // +-0
+            default:
+                return random_bf16(r, -5, 5);
             }
         });
         fill_c(rng, t, s, 1.0F);
@@ -414,15 +424,13 @@ std::vector<Case> cases() {
         fill_c(rng, t, s, 4.0F);
     });
     add("tf32 window edges", Kind::tf32, [](Rng& rng, int, Tiles& t, std::size_t s) {
-        fill32(t, s, rng, [](Rng& r, int i) {
-            return random_tf32(r, i % 2 ? 15 : -14, i % 2 ? 15 : -14);
-        });
+        fill32(t, s, rng,
+               [](Rng& r, int i) { return random_tf32(r, i % 2 ? 15 : -14, i % 2 ? 15 : -14); });
         fill_c(rng, t, s, 1.0F);
     });
     add("tf32 just past the window", Kind::tf32, [](Rng& rng, int, Tiles& t, std::size_t s) {
-        fill32(t, s, rng, [](Rng& r, int i) {
-            return random_tf32(r, i % 2 ? 16 : -15, i % 2 ? 16 : -15);
-        });
+        fill32(t, s, rng,
+               [](Rng& r, int i) { return random_tf32(r, i % 2 ? 16 : -15, i % 2 ? 16 : -15); });
         fill_c(rng, t, s, 1.0F);
     });
     add("tf32 past the window", Kind::tf32, [](Rng& rng, int, Tiles& t, std::size_t s) {
@@ -444,9 +452,12 @@ std::vector<Case> cases() {
     add("tf32 zeros and subnormals", Kind::tf32, [](Rng& rng, int, Tiles& t, std::size_t s) {
         fill32(t, s, rng, [](Rng& r, int) -> std::uint32_t {
             switch (r() % 4) {
-            case 0: return (r() & 0x80000000u) | (r() & 0x7fffffu); // subnormal
-            case 1: return r() & 0x80000000u;                        // +-0
-            default: return random_tf32(r, -5, 5);
+            case 0:
+                return (r() & 0x80000000u) | (r() & 0x7fffffu); // subnormal
+            case 1:
+                return r() & 0x80000000u; // +-0
+            default:
+                return random_tf32(r, -5, 5);
             }
         });
         fill_c(rng, t, s, 1.0F);
@@ -461,9 +472,7 @@ std::vector<Case> cases() {
     add("s8", Kind::s8, [](Rng& rng, int, Tiles& t, std::size_t s) {
         for (int i = 0; i < 16 * 32; ++i) { t.a8[s * 512 + i] = std::int8_t(rng()); }
         for (int i = 0; i < 8 * 32; ++i) { t.b8t[s * 256 + i] = std::int8_t(rng()); }
-        for (int i = 0; i < kM * kN; ++i) {
-            t.ci[s * kM * kN + i] = int(rng() % 200001u) - 100000;
-        }
+        for (int i = 0; i < kM * kN; ++i) { t.ci[s * kM * kN + i] = int(rng() % 200001u) - 100000; }
     });
     return all;
 }
@@ -492,38 +501,38 @@ int check_neighbor_independence(Kind kind, std::mt19937& rng) {
             fill16(t, clean, rng, [](std::mt19937& r, int) { return random_bf16(r, -6, 4); });
             std::copy_n(t.a16.begin() + clean * 256, 256, t.a16.begin() + mixed * 256);
             std::copy_n(t.b16t.begin() + clean * 128, 128, t.b16t.begin() + mixed * 128);
-            t.a16[mixed * 256 + kRow * 16 + p % 16] = random_bf16(rng, 20, 20);
+            t.a16[mixed * 256 + kRow * 16 + p % 16]        = random_bf16(rng, 20, 20);
             t.b16t[mixed * 128 + kCol * 16 + (p * 7) % 16] = random_bf16(rng, -30, -30);
         } else {
             fill32(t, clean, rng, [](std::mt19937& r, int) { return random_tf32(r, -6, 4); });
             std::copy_n(t.a32.begin() + clean * 128, 128, t.a32.begin() + mixed * 128);
             std::copy_n(t.b32t.begin() + clean * 64, 64, t.b32t.begin() + mixed * 64);
-            t.a32[mixed * 128 + kRow * 8 + p % 8] = random_tf32(rng, 20, 20);
+            t.a32[mixed * 128 + kRow * 8 + p % 8]       = random_tf32(rng, 20, 20);
             t.b32t[mixed * 64 + kCol * 8 + (p * 3) % 8] = random_tf32(rng, -30, -30);
         }
     }
     auto upload = [](const auto& host) {
-        using T = typename std::decay_t<decltype(host)>::value_type;
+        using T   = typename std::decay_t<decltype(host)>::value_type;
         T* device = nullptr;
         cuda_check(cudaMalloc(&device, host.size() * sizeof(T)), "cudaMalloc");
         cuda_check(cudaMemcpy(device, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice),
                    "upload");
         return device;
     };
-    auto* da16 = upload(t.a16);
-    auto* db16 = upload(t.b16t);
-    auto* da32 = upload(t.a32);
-    auto* db32 = upload(t.b32t);
-    auto* da8  = upload(t.a8);
-    auto* db8  = upload(t.b8t);
-    auto* dc   = upload(t.c);
-    auto* dci  = upload(t.ci);
+    auto* da16  = upload(t.a16);
+    auto* db16  = upload(t.b16t);
+    auto* da32  = upload(t.a32);
+    auto* db32  = upload(t.b32t);
+    auto* da8   = upload(t.a8);
+    auto* db8   = upload(t.b8t);
+    auto* dc    = upload(t.c);
+    auto* dci   = upload(t.ci);
     float* dout = nullptr;
     int* dciout = nullptr;
     cuda_check(cudaMalloc(&dout, t.c.size() * sizeof(float)), "cudaMalloc out");
     cuda_check(cudaMalloc(&dciout, t.ci.size() * sizeof(int)), "cudaMalloc int out");
     run<<<2 * kPairs, 32>>>(kind, 2 * kPairs, da16, db16, da32, db32, da8, db8, dc, dci, dout,
-                             dciout);
+                            dciout);
     cuda_check_last_launch("neighbor independence");
     std::vector<float> out(t.c.size());
     cuda_check(cudaMemcpy(out.data(), dout, out.size() * sizeof(float), cudaMemcpyDeviceToHost),
