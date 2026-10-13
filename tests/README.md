@@ -61,6 +61,14 @@ On a machine without a usable CUDA device -- no GPU, an old driver, or only the 
 skipped and the host tests still run. A test asks `tests/cuda_availability.h`; one that fails on its
 first CUDA call with the runtime's no-device message is skipped by CTest the same way.
 
+`scripts/check-host-compile.py BUILD_DIR...` compiles the host code of every translation unit of
+configured builds (`-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`) for syntax only, without device code: each
+`.cpp`, and each `.cu` through nvcc's host preprocessing, cudafe++ and the host compiler. A source
+whose command differs between the builds only in the architecture numbers is compiled once, and
+`--shard I/N` checks the I-th of N parts. CI runs it on Windows with MSVC for every architecture,
+since nothing else there compiles Windows code; one Linux configuration takes about 80 s on 28
+cores.
+
 Alternatively, `cmake --preset dev` enables products, tests and benchmarks together.
 After building, `ctest --preset dev` runs the same CTest suite. See
 [Build system](../docs/maintainer/build-system.md) for local interpreter presets.
