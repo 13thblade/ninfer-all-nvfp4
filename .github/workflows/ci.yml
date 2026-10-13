@@ -11,9 +11,10 @@
 #     Windows box called the tree clean because Git Bash strips CR on read. Only real Linux bash
 #     saw it.
 #
-#   * scripts/check-windows-headers.sh -- every host C++ source compiled for syntax by MinGW-w64
-#     against the Windows headers, the nearest thing to the MSVC build this CI has: <windows.h>
-#     defining `near` and `far` and a strict <cmath> without M_PI broke that build twice.
+#   * scripts/check-host-compile.py on Windows -- the host code of every translation unit of the
+#     sm_70, sm_80, sm_86, sm_89 and sm_120a configurations compiled by MSVC and by nvcc's MSVC
+#     front end, without device code. CI builds no Windows binary, and MSVC broke the Windows build
+#     three times (issues #44 and #62) on code that GCC accepts.
 #
 #   * tests/host/test_host_kv_clamp.cpp -- pins the pinned-host-KV-cache clamp arithmetic
 #     (src/core/host_kv_clamp.h) used by the Windows startup path in program_impl.h.
@@ -106,43 +107,121 @@ jobs:
             tests/host/test_checkpoint_recovery_impact.cpp -o checkpoint_recovery_impact_test
           ./checkpoint_recovery_impact_test
 
-  windows-headers:
-    name: Host sources against the Windows headers (MinGW-w64)
-    runs-on: ubuntu-24.04
-    # The toolchain image's distribution, so the MinGW-w64 GCC and its libstdc++ match the Linux
-    # build's own.
-    container: ubuntu:26.04
+  windows-msvc:
+    name: Host code under MSVC (${{ matrix.build.label }}, part ${{ matrix.shard }}/3)
+    needs: build-inputs
+    if: needs.build-inputs.outputs.changed == 'true'
+    # Visual Studio 2022 (MSVC 14.44): CUDA 12.9 refuses Visual Studio 2026's MSVC 14.5x.
+    runs-on: windows-2022
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # A configuration's check takes 13-18 minutes on one 4-core runner; three runners take a
+        # third each.
+        shard: [1, 2, 3]
+        build:
+          # CUDA 13 dropped Volta, so sm_70 builds with 12.9.
+          - label: sm_70
+            archs: '70'
+            cuda: 12.9.1
+            installer: cuda_12.9.1_windows_network.exe
+            packages: nvcc cudart cublas_dev nvtx thrust cuda_profiler_api
+          # Their commands differ only in the architecture numbers, which check-host-compile.py
+          # compiles once; a definition or source of one of them alone is compiled for it.
+          - label: sm_80, sm_86, sm_89
+            archs: '80 86 89'
+            cuda: 13.4.2
+            installer: cuda_13.4.2_windows_x86_64_network.exe
+            packages: nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api
+          - label: sm_120a
+            archs: '120a'
+            cuda: 13.4.2
+            installer: cuda_13.4.2_windows_x86_64_network.exe
+            packages: nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api
     steps:
-      - name: Install MinGW-w64, git, CMake and the media libraries' headers
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-            ca-certificates cmake g++-mingw-w64-x86-64-posix git libavcodec-dev libavformat-dev \
-            libavutil-dev libcurl4-openssl-dev libswscale-dev python3-venv zlib1g-dev
       - uses: actions/checkout@v7
-      # Headers only, from NVIDIA's wheels: no CUDA toolkit is installed or needed.
-      - name: CUDA headers
+      # The compiler, runtime, cuBLAS import library and the NVTX and CCCL headers: a configure and
+      # a host-only compile need nothing else.
+      - name: Install CUDA ${{ matrix.build.cuda }}
+        shell: pwsh
         run: |
-          python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/pip" install --quiet --target "$RUNNER_TEMP/cuda" \
-            'nvidia-cuda-runtime-cu12==12.8.*' 'nvidia-cuda-cccl-cu12==12.8.*' \
-            'nvidia-cuda-nvcc-cu12==12.8.*' 'nvidia-nvtx-cu12==12.8.*' \
-            'nvidia-cuda-profiler-api-cu12==12.8.*'
-      - name: Run scripts/check-windows-headers.sh
+          $version = '${{ matrix.build.cuda }}'
+          $short = ($version -split '\.')[0..1] -join '.'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
+          Invoke-WebRequest -Uri "https://developer.download.nvidia.com/compute/cuda/$version/network_installers/${{ matrix.build.installer }}" -OutFile $installer
+          $packages = '${{ matrix.build.packages }}'.Split(' ') | ForEach-Object { "${_}_$short" }
+          $process = Start-Process -FilePath $installer -ArgumentList (@('-s') + $packages) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "CUDA installer exited with $($process.ExitCode)" }
+          $cuda = "${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA\v$short"
+          foreach ($file in 'bin\nvcc.exe', 'include\cuda_runtime.h', 'include\crt\host_config.h', 'lib\x64\cublas.lib') {
+            if (-not (Test-Path -LiteralPath (Join-Path $cuda $file))) { throw "the CUDA install lacks $file" }
+          }
+          "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$cuda\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      # Headers and import libraries are all a host-only compile reads: FFmpeg from BtbN's builds,
+      # laid out as the vcpkg triplet tree cmake/FindFFMPEG.cmake reads, zlib for the native PNG
+      # decoder from the runner's vcpkg, and libcurl from curl.se.
+      - name: FFmpeg, zlib and libcurl headers
+        shell: pwsh
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          # Only the media libraries' own directories: the rest of the Linux include tree would
-          # hide headers that Windows lacks.
-          media="$RUNNER_TEMP/media"
-          mkdir -p "$media"
-          for dir in libavcodec libavformat libavutil libswscale curl; do
-            ln -s "$(dirname "$(find /usr/include -path "*/$dir/*.h" -print -quit)")" "$media/$dir"
-          done
-          ln -s /usr/include/zlib.h "$media/zlib.h"
-          ln -s "$(find /usr/include -name zconf.h -print -quit)" "$media/zconf.h"
-          cuda="$RUNNER_TEMP/cuda/nvidia"
-          CUDA_INCLUDE_DIRS="$cuda/cuda_runtime/include:$cuda/cuda_cccl/include:$cuda/cuda_nvcc/include:$cuda/nvtx/include:$cuda/cuda_profiler_api/include" \
-            bash scripts/check-windows-headers.sh "$media"
+          $deps = Join-Path $env:RUNNER_TEMP 'deps'
+          $tree = Join-Path $deps 'installed\x64-windows'
+          New-Item -ItemType Directory -Force -Path $tree | Out-Null
+          Invoke-WebRequest -Uri 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip' -OutFile "$deps\ffmpeg.zip"
+          Expand-Archive -Path "$deps\ffmpeg.zip" -DestinationPath $deps
+          $ffmpeg = Get-ChildItem -Path $deps -Directory -Filter 'ffmpeg-*' | Select-Object -First 1
+          Copy-Item -Recurse -Path "$($ffmpeg.FullName)\include", "$($ffmpeg.FullName)\lib" -Destination $tree
+          foreach ($lib in 'avformat', 'avcodec', 'avutil', 'swscale') {
+            if (-not (Test-Path -LiteralPath "$tree\lib\$lib.lib")) { New-Item -ItemType File -Path "$tree\lib\$lib.lib" | Out-Null }
+          }
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --classic zlib:x64-windows
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg could not install zlib' }
+          $zlib = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          Copy-Item -Path "$zlib\include\zlib.h", "$zlib\include\zconf.h" -Destination "$tree\include"
+          # Nothing links: the library only has to exist where src/media/CMakeLists.txt names it.
+          New-Item -ItemType File -Force -Path "$tree\lib\z.lib" | Out-Null
+          Invoke-WebRequest -Uri 'https://curl.se/windows/latest.cgi?p=win64-mingw.zip' -OutFile "$deps\curl.zip"
+          Expand-Archive -Path "$deps\curl.zip" -DestinationPath $deps
+          $curl = Get-ChildItem -Path $deps -Directory -Filter 'curl-*' | Select-Object -First 1
+          "VCPKG_ROOT=$deps" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_TARGET_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CURL_ROOT_DIR=$($curl.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      # vcvars64 writes its environment into its own cmd process only: carry it into the later steps.
+      - name: Visual Studio 2022 environment
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'no Visual Studio 2022 with the x64 toolset' }
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul 2>&1 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $Matches[1] -notin 'VCPKG_ROOT', 'CUDA_PATH') {
+              "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+          python -m pip install --quiet ninja
+      # The benchmarks too: the Windows release archive ships ninfer_bench.exe.
+      - name: Configure ${{ matrix.build.label }}
+        shell: pwsh
+        run: |
+          cl 2>&1 | Select-Object -First 1
+          nvcc --version | Select-Object -Last 2
+          $curl = $env:CURL_ROOT_DIR
+          foreach ($arch in '${{ matrix.build.archs }}'.Split(' ')) {
+            cmake -S . -B "build-$arch" -G Ninja -DCMAKE_BUILD_TYPE=Release `
+              "-DCMAKE_CUDA_ARCHITECTURES=$arch" "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH\bin\nvcc.exe" `
+              -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
+              -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_INCLUDES=OFF -DCMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES=OFF `
+              -DBUILD_TESTING=ON -DNINFER_BUILD_APPS=ON -DNINFER_BUILD_BENCHMARKS=ON `
+              "-DCMAKE_PREFIX_PATH=$env:VCPKG_ROOT\installed\x64-windows" `
+              "-DCURL_INCLUDE_DIR=$curl\include" "-DCURL_LIBRARY=$curl\lib\libcurl.dll.a"
+            if ($LASTEXITCODE -ne 0) { throw "configure for sm_$arch failed ($LASTEXITCODE)" }
+          }
+      - name: Run scripts/check-host-compile.py
+        shell: pwsh
+        run: |
+          $builds = @('${{ matrix.build.archs }}'.Split(' ') | ForEach-Object { "build-$_" })
+          python -u scripts/check-host-compile.py $builds --shard ${{ matrix.shard }}/3 --jobs 4
 
   linux-scripts:
     name: Linux launcher and downloader guard

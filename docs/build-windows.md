@@ -8,9 +8,11 @@ this guide is for a checkout.
 
 **Status.** The last full native build and test run was in September 2026: all targets built on
 an RTX 3090 host with Visual Studio 2022 BuildTools (MSVC v143) and CUDA 12.8, and the test suite
-passed. This repository has no Windows test host and CI does not build Windows, so later changes
-are verified on Linux only; the Windows-only build options below compile against Windows headers
-and have not been run.
+passed. This repository has no Windows test host. CI compiles the host code of every translation
+unit with MSVC 14.44 for `70` (CUDA 12.9), `80`, `86`, `89` and `120a` (CUDA 13.4) on each change
+to the build inputs (`scripts/check-host-compile.py`), but builds no device code and runs nothing
+on Windows; the Windows-only build option below compiles against Windows headers and has not been
+run.
 
 ## Requirements
 
