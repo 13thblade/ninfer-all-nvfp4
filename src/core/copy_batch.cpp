@@ -34,9 +34,17 @@ void CopyBatch::flush() {
     std::size_t failed        = 0;
     std::vector<void*> sources(sources_.size());
     for (std::size_t i = 0; i < sources_.size(); ++i) { sources[i] = const_cast<void*>(sources_[i]); }
+#if CUDART_VERSION >= 13000
+    // CUDA 13 dropped the failure index from the batched copy.
+    (void)failed;
+    if (!batch_refused_ &&
+        cudaMemcpyBatchAsync(destinations_.data(), sources.data(), sizes_.data(), sizes_.size(), &attributes, &first, 1,
+                             stream_) != cudaSuccess) {
+#else
     if (!batch_refused_ &&
         cudaMemcpyBatchAsync(destinations_.data(), sources.data(), sizes_.data(), sizes_.size(), &attributes, &first, 1,
                              &failed, stream_) != cudaSuccess) {
+#endif
         (void)cudaGetLastError();
         batch_refused_ = true;
     }
