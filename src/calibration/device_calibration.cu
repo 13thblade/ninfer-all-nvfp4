@@ -14,10 +14,12 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
+#include "ops/linear/common/route_table.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include <cuda_runtime.h>
 
@@ -613,13 +615,9 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
          view(residual, hidden),
          reset_residual},
     };
-#if defined(NINFER_SM75)
-    // The unified table is not selectable on Turing (kUnifiedLinearRoutes).
-    for (const auto* set : {&families}) {
-        static_cast<void>(unified_families);
-#else
     for (const auto* set : {&families, &unified_families}) {
-#endif
+        // A build that cannot select the unified table has no switch onto it to measure.
+        if (set == &unified_families && !ops::detail::kUnifiedLinearRoutes) { continue; }
         for (const Family& family : *set) {
             auto bands = sweep(family, timer, options);
             if (!bands.empty()) {
@@ -627,6 +625,47 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
                 ops::install_device_route_profile(
                     std::make_shared<const ops::DeviceRouteProfile>(profile));
             }
+        }
+    }
+}
+
+// The Q8 G32 K-split contractions' 8-column tiles on their four-K-warp form, at every registered
+// geometry and decode width, through the Linear Op an MTP head, a DFlash2 drafter or an official
+// artifact's head runs. One synthetic weight at a time bounds the memory this takes.
+void calibrate_q8_ksplit(ops::DeviceRouteProfile& profile, Timer& timer,
+                         const CalibrationOptions& options) {
+    constexpr std::int32_t max_tokens      = 8;
+    const std::vector<std::int32_t> widths = {1, 2, 3, 4, 5, 6, 7, 8};
+    for (const auto& shape :
+         {std::pair{6144, 5120}, std::pair{14336, 5120}, std::pair{17408, 5120},
+          std::pair{34816, 5120}, std::pair{248320, 5120}, std::pair{5120, 6144},
+          std::pair{5120, 10240}, std::pair{5120, 17408}, std::pair{5120, 25600},
+          std::pair{2048, 4096}, std::pair{2048, 16384}}) {
+        const std::int32_t rows = shape.first;
+        const std::int32_t k    = shape.second;
+        const std::string key   = "q8_ksplit/" + std::to_string(rows) + "x" + std::to_string(k);
+        if (!options.only.empty() && key.rfind(options.only, 0) != 0) { continue; }
+        SyntheticWeight weight = row_split_weight(QType::Q8_G32_FP16, rows, k);
+        DeviceBuffer x         = bf16_buffer(static_cast<std::size_t>(k) * max_tokens);
+        DeviceBuffer out       = bf16_buffer(static_cast<std::size_t>(rows) * max_tokens);
+        const Family family{key,
+                            widths,
+                            [&](std::int32_t cols, cudaStream_t stream) {
+                                const Tensor input(x.p, DType::BF16, {k, cols});
+                                Tensor output(out.p, DType::BF16, {rows, cols});
+                                ops::linear(input, weight.weight, output, stream);
+                            },
+                            [&](std::int32_t cols) {
+                                return std::pair<const void*, std::size_t>{
+                                    out.p, static_cast<std::size_t>(rows) *
+                                               static_cast<std::size_t>(cols)};
+                            },
+                            {}};
+        auto bands = sweep(family, timer, options);
+        if (!bands.empty()) {
+            profile.routes[family.key] = std::move(bands);
+            ops::install_device_route_profile(
+                std::make_shared<const ops::DeviceRouteProfile>(profile));
         }
     }
 }
@@ -811,46 +850,48 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
             profile.routes[family.key] = std::move(bands);
             ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
         }
-#if !defined(NINFER_SM75)
-        // The standard prompt kernel with each KV head's query heads packed into its tiles, as the
-        // PV choice above left it: one 1024-token chunk at 32K and one at 131K of context. (A
-        // Turing build has no standard INT8 prompt kernel; its prompts all take the fast one.)
-        const Family pack{"attn_pack_gqa",
-                          {1},
-                          [&](std::int32_t, cudaStream_t stream) {
-                              run(chunk, 32768, stream);
-                              run(chunk, 131072, stream);
-                          },
-                          [&](std::int32_t) {
-                              return std::pair<const void*, std::size_t>{
-                                  prompt_out.p, static_cast<std::size_t>(head_dim) * q_heads};
-                          },
-                          {}};
-        auto pack_bands = sweep(pack, timer, options);
-        if (!pack_bands.empty()) {
-            profile.routes[pack.key] = std::move(pack_bands);
-            ops::install_device_route_profile(
-                std::make_shared<const ops::DeviceRouteProfile>(profile));
+        // A build without the standard INT8 prompt kernel (kCausalPromptI8Standard) runs every
+        // INT8-family prompt on the fast one and has neither switch.
+        if (ops::detail::kCausalPromptI8Standard) {
+            // The standard prompt kernel with each KV head's query heads packed into its tiles, as
+            // the PV choice above left it: one 1024-token chunk at 32K and one at 131K of context.
+            const Family pack{"attn_pack_gqa",
+                              {1},
+                              [&](std::int32_t, cudaStream_t stream) {
+                                  run(chunk, 32768, stream);
+                                  run(chunk, 131072, stream);
+                              },
+                              [&](std::int32_t) {
+                                  return std::pair<const void*, std::size_t>{
+                                      prompt_out.p, static_cast<std::size_t>(head_dim) * q_heads};
+                              },
+                              {}};
+            auto pack_bands = sweep(pack, timer, options);
+            if (!pack_bands.empty()) {
+                profile.routes[pack.key] = std::move(pack_bands);
+                ops::install_device_route_profile(
+                    std::make_shared<const ops::DeviceRouteProfile>(profile));
+            }
+            // The fast prompt kernel against the standard one (as the PV and packing choices above
+            // left it): one wave-aligned chunk at 32K and one at 131K of context.
+            const Family fast{"attn_prompt_fast",
+                              {1},
+                              [&](std::int32_t, cudaStream_t stream) {
+                                  run(wave_chunk, 32768, stream);
+                                  run(wave_chunk, 131072, stream);
+                              },
+                              [&](std::int32_t) {
+                                  return std::pair<const void*, std::size_t>{
+                                      prompt_out.p, static_cast<std::size_t>(head_dim) * q_heads};
+                              },
+                              {}};
+            auto fast_bands = sweep(fast, timer, options);
+            if (!fast_bands.empty()) {
+                profile.routes[fast.key] = std::move(fast_bands);
+                ops::install_device_route_profile(
+                    std::make_shared<const ops::DeviceRouteProfile>(profile));
+            }
         }
-        // The fast prompt kernel against the standard one (as the PV and packing choices above
-        // left it): one wave-aligned chunk at 32K and one at 131K of context.
-        const Family fast{"attn_prompt_fast",
-                          {1},
-                          [&](std::int32_t, cudaStream_t stream) {
-                              run(wave_chunk, 32768, stream);
-                              run(wave_chunk, 131072, stream);
-                          },
-                          [&](std::int32_t) {
-                              return std::pair<const void*, std::size_t>{
-                                  prompt_out.p, static_cast<std::size_t>(head_dim) * q_heads};
-                          },
-                          {}};
-        auto fast_bands = sweep(fast, timer, options);
-        if (!fast_bands.empty()) {
-            profile.routes[fast.key] = std::move(fast_bands);
-            ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
-        }
-#endif
         // Parallel query tiles against the serial chunks for single-row verification: 16 and 32
         // columns (two and four 8-column tiles) at 32K and 131K of context. The serial and the
         // tiled workspaces differ, so the arena takes the larger of the two.
@@ -974,7 +1015,10 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
     const bool attention   = options.attention;
 #endif
     if (projections && options.ternary) { calibrate_ternary(profile, timer, options); }
-    if (projections && options.groupwise) { calibrate_groupwise(profile, timer, options); }
+    if (projections && options.groupwise) {
+        calibrate_groupwise(profile, timer, options);
+        calibrate_q8_ksplit(profile, timer, options);
+    }
     if (options.linear_attention) { calibrate_linear_attention(profile, timer, options); }
     if (attention) {
         calibrate_attention(profile, timer, options, KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,

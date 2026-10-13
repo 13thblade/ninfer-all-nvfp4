@@ -227,10 +227,9 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
     // activation tile is staged at that barrier as before: holding it in registers costs more
     // occupancy than the latency it hides.
     constexpr bool kSharedScales = Schedule::kScaleAccess == Q8KSplitScaleAccess::Shared;
-    constexpr bool kPaddedStage =
-        Schedule::kActivationStage == Q8KSplitActivationStage::PaddedZero;
-    constexpr int kCodeChunks        = kGroupK / 16;
-    constexpr int kCodeLoads         = (kCodeChunks + 31) / 32;
+    constexpr bool kPaddedStage = Schedule::kActivationStage == Q8KSplitActivationStage::PaddedZero;
+    constexpr int kCodeChunks   = kGroupK / 16;
+    constexpr int kCodeLoads    = (kCodeChunks + 31) / 32;
     constexpr int kScaleChunksPerRow = Schedule::kScaleBytesPerRow / 16;
     constexpr int kScaleChunks       = kMmaRows * kScaleChunksPerRow;
     constexpr int kScaleLoads =
@@ -253,8 +252,8 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
     };
     // Activation item `item` of this warp's slice as stage_x copies it: its column and 8-element
     // K offset, and whether that column is read from x (zero-filled otherwise).
-    const int x_items = (kRuntimeActive ? live_columns : (kPaddedStage ? kTileCols : ActiveCols)) *
-                        (kTileK / 8);
+    const int x_items =
+        (kRuntimeActive ? live_columns : (kPaddedStage ? kTileCols : ActiveCols)) * (kTileK / 8);
     const auto x_item = [&](int item, int& col, int& k8) {
         col = item / (kTileK / 8);
         k8  = item - col * (kTileK / 8);
@@ -267,29 +266,29 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
         }
     };
     const auto load_next = [&](int group_k0) {
-#pragma unroll
+#    pragma unroll
         for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
             const int weight_row =
                 row_policy.weight_row(cta_row0, warp * Schedule::kRowsPerLoaderWarp + row_item);
-#pragma unroll
+#    pragma unroll
             for (int load = 0; load < kCodeLoads; ++load) {
                 const int chunk = lane + 32 * load;
                 if (chunk < kCodeChunks) {
-                    next_codes[row_item][load] = sm75_global_load<uint4, Schedule::kWeightCache>(
+                    next_codes[row_item][load] = load_global<uint4, Schedule::kWeightCache>(
                         codes + static_cast<std::int64_t>(weight_row) * kHidden + group_k0 +
                         chunk * 16);
                 }
             }
         }
         if constexpr (kPrefetchX) {
-#pragma unroll
+#    pragma unroll
             for (int load = 0; load < kXLoads; ++load) {
                 const int item = lane + 32 * load;
                 int col, k8;
                 if (item < x_items) {
                     next_x[load] =
                         x_item(item, col, k8)
-                            ? sm75_global_load<uint4, Schedule::kActivationCache>(
+                            ? load_global<uint4, Schedule::kActivationCache>(
                                   &x[static_cast<std::int64_t>(column_policy(column_offset + col)) *
                                          kHidden +
                                      group_k0 + warp * kTileK + k8 * 8])
@@ -298,14 +297,14 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
             }
         }
         if constexpr (kSharedScales) {
-#pragma unroll
+#    pragma unroll
             for (int load = 0; load < kScaleLoads; ++load) {
                 const int item = tid + load * kWarps * 32;
                 if (item < kScaleChunks) {
                     const int row        = item / kScaleChunksPerRow;
                     const int chunk      = item - row * kScaleChunksPerRow;
                     const int weight_row = row_policy.weight_row(cta_row0, row);
-                    next_scales[load]    = sm75_global_load<uint4, Schedule::kWeightCache>(
+                    next_scales[load]    = load_global<uint4, Schedule::kWeightCache>(
                         scales + (static_cast<std::int64_t>(weight_row) * Geometry::kGroupsPerRow +
                                   group_k0 / 32 + chunk * 8) *
                                      2);
@@ -316,10 +315,10 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
         }
     };
     const auto store_next = [&](int group_k0) {
-#pragma unroll
+#    pragma unroll
         for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
             const int row = warp * Schedule::kRowsPerLoaderWarp + row_item;
-#pragma unroll
+#    pragma unroll
             for (int load = 0; load < kCodeLoads; ++load) {
                 const int chunk = lane + 32 * load;
                 if (chunk < kCodeChunks) {
@@ -329,7 +328,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
             }
         }
         if constexpr (kPrefetchX) {
-#pragma unroll
+#    pragma unroll
             for (int load = 0; load < kXLoads; ++load) {
                 const int item = lane + 32 * load;
                 int col, k8;
@@ -344,7 +343,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
             stage_x(group_k0);
         }
         if constexpr (kSharedScales) {
-#pragma unroll
+#    pragma unroll
             for (int load = 0; load < kScaleLoads; ++load) {
                 const int item = tid + load * kWarps * 32;
                 if (item < kScaleChunks) {
@@ -427,7 +426,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
                 const unsigned hf1   = q8_ksplit_f16_pair_from_s8(code1);
                 const unsigned hf2   = q8_ksplit_f16_pair_from_s8(code2);
                 const unsigned hf3   = q8_ksplit_f16_pair_from_s8(code3);
-#pragma unroll
+#    pragma unroll
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
                     const int br = ni * 8 + b_rin;
@@ -455,7 +454,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
                 const unsigned af2 = q8_ksplit_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
                 const unsigned af3 =
                     q8_ksplit_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
-#pragma unroll
+#    pragma unroll
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
                     const int br = ni * 8 + b_rin;
