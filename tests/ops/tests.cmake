@@ -48,6 +48,10 @@ ninfer_add_op_test(ninfer_gguf_moe_geglu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_moe_geglu.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_gguf_flash_attention_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_flash_attention.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)
@@ -264,14 +268,10 @@ set_tests_properties(ninfer_gdn_state_fp16_two_stage_test
 
 add_test(NAME ninfer_gdn_replay_fold_wide_test
   COMMAND ninfer_tests ninfer_gdn_replay_fold_test --wide-only)
-# About 300 cases with an FP64 oracle each: 11 minutes on the Tesla V100 host (Xeon E5-2683 v4),
-# about 35 on a TITAN RTX (sm_75) with six host cores for its oracles.
-set(ninfer_gdn_replay_fold_wide_timeout 1200)
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "75")
-  set(ninfer_gdn_replay_fold_wide_timeout 3600)
-endif()
+# About 300 cases with an FP64 oracle each, on the host's cores: 11 minutes on the Tesla V100 host
+# (Xeon E5-2683 v4), about 35 on a six-core host.
 set_tests_properties(ninfer_gdn_replay_fold_wide_test
-  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT ${ninfer_gdn_replay_fold_wide_timeout} RUN_SERIAL TRUE)
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 RUN_SERIAL TRUE)
 
 # A Turing build has no selectable unified table (src/ops/linear/common/route_table.h), so its
 # route-table variants run the legacy table only.
