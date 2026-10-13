@@ -72,4 +72,33 @@ using Q8KSplitSm8xFourWarpSchedule =
                      ActivationStage>;
 #endif
 
+// The schedule a route's K-split launch runs on this build. On Turing (sm_75) an 8-column tile of
+// a matrix with at least 6144 rows streams its codes at 420-600 GB/s with four K warps on the
+// TITAN RTX and at 230-330 GB/s with eight or sixteen, so a `75` build runs those tiles with four.
+// Wider tiles keep the route's schedule (four K warps need 190 registers for a 16-column tile and
+// run it at half the speed of eight), and so do smaller matrices: at 5120 rows four K warps are
+// 15-25 % slower than eight. A four-K-warp 8-column tile is bounded to 128 registers, four CTAs
+// an SM: the register prefetch of q8_ksplit_mma would otherwise take the fused SwiGLU tile to 160
+// and three CTAs, 2-5 % slower with FP16 activations and 11-13 % when some tiles fall back to the
+// BF16 emulation (docs/performance/titan-rtx.md). Other builds run the route's schedule as written.
+#if defined(NINFER_SM75)
+template <class Geometry, class Schedule>
+struct Q8KSplitTuringSchedule {
+    static constexpr bool kNarrow = Schedule::kTileTokens == 8;
+    static constexpr int kKWarps =
+        kNarrow && Schedule::kKWarps > 4 && Geometry::kOutputRows >= 6144 ? 4 : Schedule::kKWarps;
+    static constexpr int kMinBlocksPerSm =
+        kNarrow && kKWarps == 4 && Schedule::kMinBlocksPerSm < 4 ? 4 : Schedule::kMinBlocksPerSm;
+    using type = Q8KSplitSchedule<kKWarps, Schedule::kTileTokens, kMinBlocksPerSm,
+                                  Schedule::kScaleAccess, Schedule::kActivationCache,
+                                  Schedule::kWeightCache, Schedule::kActivationStage>;
+};
+
+template <class Geometry, class Schedule>
+using Q8KSplitDeviceSchedule = typename Q8KSplitTuringSchedule<Geometry, Schedule>::type;
+#else
+template <class Geometry, class Schedule>
+using Q8KSplitDeviceSchedule = Schedule;
+#endif
+
 } // namespace ninfer::ops::detail

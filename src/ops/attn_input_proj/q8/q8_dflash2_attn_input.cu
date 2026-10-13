@@ -38,7 +38,8 @@ void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, T
     constexpr auto Scales  = Columns <= 4 || (Columns > 8 && Columns <= 16)
                                  ? Q8KSplitScaleAccess::Direct
                                  : Q8KSplitScaleAccess::Shared;
-    using Schedule         = Q8KSplitSchedule<Warps, Capacity, 2, Scales>;
+    using RouteSchedule    = Q8KSplitSchedule<Warps, Capacity, 2, Scales>;
+    using Schedule         = Q8KSplitDeviceSchedule<Geometry, RouteSchedule>;
     static_assert((kQueryRows % Schedule::kRowsPerCta) == 0);
     static_assert((kKvRows % Schedule::kRowsPerCta) == 0);
     static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);

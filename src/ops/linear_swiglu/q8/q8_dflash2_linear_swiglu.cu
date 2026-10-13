@@ -27,8 +27,9 @@ using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 template <int Capacity>
 void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    using Schedule =
+    using RouteSchedule =
         Q8KSplitSchedule<Capacity == 24 ? 8 : 4, Capacity, 2, Q8KSplitScaleAccess::Shared>;
+    using Schedule = Q8KSplitDeviceSchedule<Geometry, RouteSchedule>;
     using RowPolicy = Q8SwiGluPairedRows<kIntermediate>;
     static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
     static_assert((kIntermediate % RowPolicy::kOutputRowsPerCta) == 0);

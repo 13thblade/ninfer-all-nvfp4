@@ -10,9 +10,10 @@ namespace ninfer::ops::detail {
 
 // Shape files select the capacity and physical schedule. The launcher supplies the live T,
 // so every T in the selected interval reuses this compiled instance.
-template <class Geometry, int ColumnCapacity, class Schedule,
+template <class Geometry, int ColumnCapacity, class RouteSchedule,
           class Epilogue = Q8KSplitStoreEpilogue>
 void launch_q8_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    using Schedule = Q8KSplitDeviceSchedule<Geometry, RouteSchedule>;
     static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
     static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
     if (weight.padded_shape[1] != Geometry::kInputRows) {
