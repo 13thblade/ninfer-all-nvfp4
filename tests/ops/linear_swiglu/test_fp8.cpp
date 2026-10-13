@@ -25,6 +25,8 @@ struct UnifiedTable {
 
 int check_negative_gate() {
     using namespace ninfer;
+    // A build that cannot select the unified table (kUnifiedLinearRoutes) has no such route.
+    if constexpr (!ops::detail::kUnifiedLinearRoutes) { return 0; }
     const UnifiedTable unified;
     namespace qw = test::quantized_weight;
     if (test::cuda_unavailable()) return 0;

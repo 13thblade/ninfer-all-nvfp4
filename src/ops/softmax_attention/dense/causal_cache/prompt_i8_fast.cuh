@@ -63,14 +63,13 @@ struct CausalPromptI8FastStage {
 };
 inline constexpr int kCausalPromptI8FastStageBytes = CausalPromptI8FastStage<false>::Bytes;
 
-// K/V tiles are double-buffered so the next tile's cp.async overlaps this tile's math. Turing has
-// no cp.async and copies synchronously, so a second stage would overlap nothing; one stage keeps
-// the kernel inside its 64 KiB of shared memory.
-#if defined(NINFER_SM75)
-inline constexpr int kCausalPromptI8FastStages = 1;
-#else
-inline constexpr int kCausalPromptI8FastStages = 2;
-#endif
+// K/V tiles are double-buffered so the next tile's cp.async overlaps this tile's math, where two
+// stages beside the four-warp shape's Q tile fit a block. Turing's 64 KiB holds one stage, and its
+// copies are synchronous, so a second stage would overlap nothing there.
+inline constexpr int kCausalPromptI8FastStages =
+    4 * 16 * kCausalPromptHeadDim + 2 * kCausalPromptI8FastStageBytes <= kMaxSharedBytesPerBlock
+        ? 2
+        : 1;
 
 // Each warp owns 16 query rows. Eight warps fill an SM's register file; four warps serve
 // launches too narrow to occupy every SM with 128-row CTAs.
@@ -95,9 +94,7 @@ inline constexpr float kCausalPromptI8FastPackedF16PartialScaleLimit = 64.0f;
 
 static_assert(kCausalPromptI8FastBc == kPagedKVPageSize);
 static_assert(kCausalPromptI8FastGroups == 4);
-#if !defined(NINFER_SM75)
-static_assert(CausalPromptI8FastShape<8>::SmemBytes == 100352);
-#endif
+static_assert(kCausalPromptI8FastStages == 1 || CausalPromptI8FastShape<8>::SmemBytes == 100352);
 static_assert(CausalPromptI8FastShape<4>::Launchable &&
               CausalPromptI8FastShape<4, true>::Launchable &&
               CausalPromptI8FastShape<8, true>::Launchable);
@@ -672,32 +669,34 @@ __global__ __launch_bounds__(
         }
     };
 
-#if defined(NINFER_SM75)
-    // One stage: a tile is staged once every warp is done with the previous one, then published.
+    if constexpr (kCausalPromptI8FastStages == 1) {
+        // One stage: a tile is staged once every warp is done with the previous one, then
+        // published.
 #pragma unroll 1
-    for (int kb = 0; kb < key_blocks; ++kb) {
-        if (kb > 0) { __syncthreads(); }
-        issue_tile(kb);
-        commit_keys(kb);
-        cp_wait<0>();
-        __syncthreads();
-        qk_softmax(kb);
-        pv(kb);
-    }
-#else
-    // Every warp publishes one tile per barrier; the next tile's copy overlaps this tile's math.
-    issue_tile(0);
-    commit_keys(0);
+        for (int kb = 0; kb < key_blocks; ++kb) {
+            if (kb > 0) { __syncthreads(); }
+            issue_tile(kb);
+            commit_keys(kb);
+            cp_wait<0>();
+            __syncthreads();
+            qk_softmax(kb);
+            pv(kb);
+        }
+    } else {
+        // Every warp publishes one tile per barrier; the next tile's copy overlaps this tile's
+        // math.
+        issue_tile(0);
+        commit_keys(0);
 #pragma unroll 1
-    for (int kb = 0; kb < key_blocks; ++kb) {
-        cp_wait<0>();
-        __syncthreads();
-        if (kb + 1 < key_blocks) { issue_tile(kb + 1); }
-        qk_softmax(kb);
-        pv(kb);
-        if (kb + 1 < key_blocks) { commit_keys(kb + 1); }
+        for (int kb = 0; kb < key_blocks; ++kb) {
+            cp_wait<0>();
+            __syncthreads();
+            if (kb + 1 < key_blocks) { issue_tile(kb + 1); }
+            qk_softmax(kb);
+            pv(kb);
+            if (kb + 1 < key_blocks) { commit_keys(kb + 1); }
+        }
     }
-#endif
 
     running_l0         = warp_sum<4>(running_l0, FullMask);
     running_l1         = warp_sum<4>(running_l1, FullMask);

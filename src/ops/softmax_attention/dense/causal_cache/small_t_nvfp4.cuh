@@ -49,7 +49,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int ProducerWarps        = RowTiles;
     constexpr int VWorkerWarps         = Wc - ProducerWarps;
     constexpr int VWorkerThreads       = VWorkerWarps * 32;
-    constexpr bool CompactKVStage      = RowTiles <= 2 || kCausalSmallTCompactKV<RowTiles>;
+    constexpr bool CompactKVStage =
+        RowTiles <= 2 || kCausalSmallTCompactKV<RowTiles, Bc, 5 * Bc * D>;
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
     constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
     constexpr int PVKs                 = Bc / 16;

@@ -52,7 +52,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int PageIds              = 64;
     constexpr int ProducerThreads      = RowTiles * 32;
     constexpr int VLoaderThreads       = Threads - ProducerThreads;
-    constexpr bool CompactKVStage      = kCausalSmallTCompactKV<RowTiles>;
+    constexpr bool CompactKVStage      = kCausalSmallTCompactKV<RowTiles, Bc, 6 * Bc * D>;
     constexpr float Log2E              = 1.4426950408889634074F;
     constexpr unsigned FullMask        = 0xffffffffU;
 
@@ -71,8 +71,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     __nv_bfloat16* k_b16 = reinterpret_cast<__nv_bfloat16*>(arena + Bc * D);
     std::uint8_t* v_fp8  = arena + 3 * Bc * D;
     // A compact stage widens V into the K tile's bytes once QK is done (kCausalSmallTCompactKV).
-    __half* v_f16 =
-        reinterpret_cast<__half*>(CompactKVStage ? arena + Bc * D : arena + 4 * Bc * D);
+    __half* v_f16 = reinterpret_cast<__half*>(CompactKVStage ? arena + Bc * D : arena + 4 * Bc * D);
     __nv_bfloat16* q_b16 = q_s;
     __shared__ __align__(16) __half p_s[Br * PStride];
     __shared__ float alpha_s[Br];
@@ -490,8 +489,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + causal_small_t_tc_swz(key_l, d)];
                 if (key >= split_start && key < split_end) {
-                    store_vec(dst, kv_cache_fp8_dequant_f16x8(&v_fp8[key_l * D + d],
-                                                                    v_scale_s[key_l]));
+                    store_vec(dst,
+                              kv_cache_fp8_dequant_f16x8(&v_fp8[key_l * D + d], v_scale_s[key_l]));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }

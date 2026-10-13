@@ -6,6 +6,7 @@
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ops/common/device_limits.h"
 
 #include <cuda_runtime.h>
 
@@ -18,6 +19,13 @@ enum class CausalAttentionRoute { SmallT, ChunkedSmallT, Prompt };
 // The widest prompt-route row block (the eight-warp fast INT8 kernel); every prompt kernel's row
 // block divides it.
 inline constexpr std::int32_t kPromptWaveRows = 128;
+
+// Shared memory of the standard INT8-family prompt kernel's tile (prompt_i8.cuh), and whether this
+// build's blocks hold it. A Turing build's 64 KiB do not: there every INT8-family prompt runs on
+// the fast kernel, and the "attn_pack_gqa" and "attn_prompt_fast" switches have nothing to choose.
+inline constexpr int kCausalPromptI8StandardSmemBytes = 93184;
+inline constexpr bool kCausalPromptI8Standard =
+    kCausalPromptI8StandardSmemBytes <= kMaxSharedBytesPerBlock;
 
 // Whether a prompt call on this storage takes the fast kernel (register-resident rows, FP16 PV per
 // 64-key tile): when the caller asks for it (--fast-prefill-kernel), else as NINFER_PROMPT_FAST=0|1

@@ -3659,8 +3659,7 @@ int run_bf16_range_cases() {
                                 MappingPattern::Fragmented);
         failures += run_a3_case(geometry, storage, {4, 300, 304, 952u, false, false, kBeyondFp16},
                                 MappingPattern::Identity);
-        failures += run_a1_case(geometry, storage,
-                                {300, 200, 500, 953u, false, false, kBeyondFp16},
+        failures += run_a1_case(geometry, storage, {300, 200, 500, 953u, false, false, kBeyondFp16},
                                 MappingPattern::Offset);
         failures +=
             run_a1_case(geometry, storage, key_case(4, 700, 954u), MappingPattern::Fragmented);
@@ -4150,13 +4149,9 @@ int run_softmax_attention_wide_tests() {
         return only == nullptr || std::string_view(only) == cache_name(storage);
     };
     int failures = only == nullptr ? verify_workspace_capacity_contract() : 0;
-    for (const auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64}) {
+    for (const auto storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256}) {
         if (selected(storage)) { failures += run_wide_copy_cases(storage); }
-    }
-    if (selected(KvCacheStorage::Fp8E4M3Row256)) {
-        failures += run_case_allowing_arch_skip("causal_softmax_attention wide copy (FP8)", [] {
-            return run_wide_copy_cases(KvCacheStorage::Fp8E4M3Row256);
-        });
     }
     for (const auto storage : {KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
         if (!selected(storage)) { continue; }
@@ -4267,10 +4262,7 @@ int run_dflash2_cases() {
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value,
           KvCacheStorage::RotatedInt4KeyInt4ValueE8, KvCacheStorage::RotatedE8RootKeyInt4Value}) {
-        // Per storage, so a storage this build refuses (FP8 and NVFP4 on sm_75) skips alone.
-        failures += run_case_allowing_arch_skip(
-            std::string("causal_softmax_attention DFlash2 verification, ") + cache_name(storage),
-            [&] { return sweep(storage); });
+        failures += sweep(storage);
     }
     failures += sweep(kPlanRk8v4);
     failures += sweep(kPlanRk4v4);

@@ -56,7 +56,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int PageIds              = 64;
     constexpr int ProducerThreads      = RowTiles * 32;
     constexpr int VLoaderThreads       = Threads - ProducerThreads;
-    constexpr bool CompactKVStage      = kCausalSmallTCompactKV<RowTiles>;
+    constexpr bool CompactKVStage      = kCausalSmallTCompactKV<RowTiles, Bc, 11 * Bc * D / 2>;
     constexpr float Log2E              = 1.4426950408889634074F;
     constexpr unsigned FullMask        = 0xffffffffU;
 

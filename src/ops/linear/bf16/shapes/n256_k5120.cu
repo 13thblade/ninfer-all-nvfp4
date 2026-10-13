@@ -34,13 +34,13 @@ void launch_grid(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
 }
 } // namespace
 
+// Narrow widths split K sixteen ways where those warps' 96 KiB of staging fit a block, and eight
+// ways on Turing (64 KiB).
+constexpr int kNarrowKWarps =
+    bf16_n256_k5120_staging_bytes(16, 8) <= kMaxSharedBytesPerBlock ? 16 : 8;
+
 Bf16Launch select_bf16_n256_k5120(std::int32_t tokens) {
-#if defined(NINFER_SM75)
-    // Sixteen K warps stage 96 KiB, past Turing's 64 KiB a block: narrow widths split K eight ways.
-    if (tokens <= 76) return launch_grid<Bf16N256K5120MmaSchedule<8, 8>>;
-#else
-    if (tokens <= 76) return launch_grid<Bf16N256K5120MmaSchedule<16, 8>>;
-#endif
+    if (tokens <= 76) return launch_grid<Bf16N256K5120MmaSchedule<kNarrowKWarps, 8>>;
     return launch_grid<Bf16N256K5120MmaSchedule<8, 16>>;
 }
 

@@ -19,15 +19,6 @@
 namespace ninfer::ops::detail {
 namespace small_t_i8 {
 
-// The 64-key dynamic arena (64 KiB) plus the kernel's static tiles exceeds Turing's 64 KiB of
-// shared memory per block, so a Turing build has no "12x1x64d" tier and its 2K-8K windows take
-// 12x1x32.
-#if defined(NINFER_SM75)
-inline constexpr bool kSmallTI8KeyBlock64 = false;
-#else
-inline constexpr bool kSmallTI8KeyBlock64 = true;
-#endif
-
 // Sums each key tile's PV products in FP16 where the device profile's "attn_pv_f16" says "on"
 // (GeForce parts accumulate FP16 at twice their FP32-accumulator rate); NINFER_SMALLT_PV_F16=0|1
 // overrides the profile.

@@ -37,13 +37,6 @@ inline constexpr int kCausalPromptFp8Bc            = 32;
 inline constexpr int kCausalPromptFp8RowTiles      = kCausalPromptFp8Br / 16;
 inline constexpr int kCausalPromptFp8ProducerWarps = 2 * kCausalPromptFp8RowTiles;
 inline constexpr int kCausalPromptFp8DConsumers = kCausalPromptFp8Warps / kCausalPromptFp8RowTiles;
-// Turing's 64 KiB per block holds this tile only with K and V widened into one shared tile, V
-// overwriting K once QK is done; elsewhere the non-QK warps widen V into its own tile during QK.
-#if defined(NINFER_SM75)
-inline constexpr bool kCausalPromptFp8CompactKV = true;
-#else
-inline constexpr bool kCausalPromptFp8CompactKV = false;
-#endif
 
 inline constexpr int kCausalPromptFp8QBytes =
     kCausalPromptFp8Br * kCausalPromptHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
@@ -51,16 +44,24 @@ inline constexpr int kCausalPromptFp8KRawBytes = kCausalPromptFp8Bc * kCausalPro
 inline constexpr int kCausalPromptFp8KBytes =
     kCausalPromptFp8Bc * kCausalPromptHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
 inline constexpr int kCausalPromptFp8VBytes = kCausalPromptFp8Bc * kCausalPromptHeadDim;
-inline constexpr int kCausalPromptFp8VStageBytes =
-    kCausalPromptFp8CompactKV
-        ? 0
-        : kCausalPromptFp8Bc * kCausalPromptHeadDim * static_cast<int>(sizeof(__half));
 inline constexpr int kCausalPromptFp8PBytes =
     kCausalPromptFp8Br * kCausalPromptFp8Bc * static_cast<int>(sizeof(__half));
 inline constexpr int kCausalPromptFp8ScaleBytes =
     2 * kCausalPromptFp8Bc * static_cast<int>(sizeof(__half));
 inline constexpr int kCausalPromptFp8StatsBytes =
     7 * kCausalPromptFp8Br * static_cast<int>(sizeof(float));
+// The non-QK warps widen V into its own tile during QK where a block holds it beside the K tile;
+// on Turing's 64 KiB it does not, and K and V are widened into one shared tile, V overwriting K
+// once QK is done.
+inline constexpr int kCausalPromptFp8SplitVStageBytes =
+    kCausalPromptFp8Bc * kCausalPromptHeadDim * static_cast<int>(sizeof(__half));
+inline constexpr bool kCausalPromptFp8CompactKV =
+    kCausalPromptFp8QBytes + kCausalPromptFp8KRawBytes + kCausalPromptFp8KBytes +
+        kCausalPromptFp8VBytes + kCausalPromptFp8SplitVStageBytes + kCausalPromptFp8PBytes +
+        kCausalPromptFp8ScaleBytes + kCausalPromptFp8StatsBytes >
+    kMaxSharedBytesPerBlock;
+inline constexpr int kCausalPromptFp8VStageBytes =
+    kCausalPromptFp8CompactKV ? 0 : kCausalPromptFp8SplitVStageBytes;
 inline constexpr int kCausalPromptFp8SmemBytes =
     kCausalPromptFp8QBytes + kCausalPromptFp8KRawBytes + kCausalPromptFp8KBytes +
     kCausalPromptFp8VBytes + kCausalPromptFp8VStageBytes + kCausalPromptFp8PBytes +
@@ -103,8 +104,8 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
     __half* v_f16 = reinterpret_cast<__half*>(kCausalPromptFp8CompactKV
                                                   ? reinterpret_cast<unsigned char*>(k_b16)
                                                   : v_fp8 + kCausalPromptFp8VBytes);
-    __half* p_s   = reinterpret_cast<__half*>(v_fp8 + kCausalPromptFp8VBytes +
-                                              kCausalPromptFp8VStageBytes);
+    __half* p_s =
+        reinterpret_cast<__half*>(v_fp8 + kCausalPromptFp8VBytes + kCausalPromptFp8VStageBytes);
     __half* k_scale_s =
         reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(p_s) + kCausalPromptFp8PBytes);
     __half* v_scale_s  = k_scale_s + Bc;
@@ -386,8 +387,8 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + causal_prompt_swz(key_l, d)];
                 if (key <= max_query_abs) {
-                    store_vec(dst, kv_cache_fp8_dequant_f16x8(&v_fp8[key_l * D + d],
-                                                              v_scale_s[key_l]));
+                    store_vec(dst,
+                              kv_cache_fp8_dequant_f16x8(&v_fp8[key_l * D + d], v_scale_s[key_l]));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }

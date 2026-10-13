@@ -5,6 +5,7 @@
 
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
+#include "ops/common/device_limits.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include <cuda_runtime.h>
@@ -13,6 +14,11 @@
 #include <string>
 
 namespace ninfer::ops::detail {
+
+// Whether this build has the partial kernel's "12x1x64d" tier: its 64-key dynamic arena of 64 KiB
+// beside the kernel's static tiles needs more than 64 KiB of shared memory per block, which Turing
+// does not have; there 2K-8K windows take 12x1x32 and the tier is no calibration candidate.
+inline constexpr bool kSmallTI8KeyBlock64 = kMaxSharedBytesPerBlock > 64 * 1024;
 
 // Device-profile key of the INT8-family partial kernel's launch tier:
 // "attn_i8_small/h24/rk8v4/w8". The axis is the launch's implementation window.

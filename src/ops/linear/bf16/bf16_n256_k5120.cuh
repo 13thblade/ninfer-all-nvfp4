@@ -17,6 +17,11 @@
 
 namespace ninfer::ops::detail {
 
+// The two staging stages of a schedule: 16 weight rows and the token tile, 64 K a warp each.
+[[nodiscard]] constexpr int bf16_n256_k5120_staging_bytes(int k_warps, int tile_tokens) {
+    return 2 * (16 + tile_tokens) * k_warps * 64 * static_cast<int>(sizeof(__nv_bfloat16));
+}
+
 template <int KWarps, int TileTokens>
 struct Bf16N256K5120MmaSchedule {
     static constexpr int kOutputRowsPerCta  = 16;
@@ -32,6 +37,7 @@ struct Bf16N256K5120MmaSchedule {
     static constexpr int kStageElements     = (16 + kTileTokens) * kGroupK;
     static constexpr int kStagingBytes =
         kPipelineStages * kStageElements * static_cast<int>(sizeof(__nv_bfloat16));
+    static_assert(kStagingBytes == bf16_n256_k5120_staging_bytes(kKWarps, kTileTokens));
     static constexpr int kPartialBytes =
         kKWarps * kTokenMmas * 32 * 4 * static_cast<int>(sizeof(float));
     static_assert(kStagingBytes >= kPartialBytes);

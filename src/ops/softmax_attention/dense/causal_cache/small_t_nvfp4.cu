@@ -33,8 +33,11 @@ void launch_nvfp4_partial(const Tensor& q, CacheInput input, const Tensor& posit
     constexpr int Warps                = RowTiles == 3 ? 12 : 8;
     constexpr int KeyBlock             = 32;
     constexpr int MinBlocks            = RowTiles <= 2 ? 2 : 1;
-    constexpr bool Compact             = RowTiles <= 2 || kCausalSmallTCompactKV<RowTiles>;
+    constexpr bool Compact =
+        RowTiles <= 2 || kCausalSmallTCompactKV<RowTiles, KeyBlock, 5 * KeyBlock * kCausalHeadDim>;
     constexpr std::size_t DynamicBytes = (Compact ? 3u : 5u) * KeyBlock * kCausalHeadDim;
+    static_assert(kCausalSmallTQuantizedFixedBytes<RowTiles, KeyBlock> + DynamicBytes <=
+                  kMaxSharedBytesPerBlock);
     using KernelInput                  = CacheInput;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     const auto launch = [&]() {

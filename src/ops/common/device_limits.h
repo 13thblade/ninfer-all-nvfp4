@@ -12,6 +12,22 @@ inline constexpr int kMaxSharedBytesPerBlock = 64 * 1024;
 inline constexpr int kMaxSharedBytesPerBlock = 99 * 1024;
 #endif
 
+// The most threads one SM holds resident on the build's architecture: 1,024 on Turing, 1,536 on
+// sm_86, sm_89 and sm_120 (a 70 or 80 build's parts hold 2,048, and their kernels ask for at most
+// the sm_86 figure).
+#if defined(NINFER_SM75)
+inline constexpr int kMaxThreadsPerSm = 1024;
+#else
+inline constexpr int kMaxThreadsPerSm = 1536;
+#endif
+
+// The minimum resident CTAs a __launch_bounds__ of `threads` a CTA asks for: `requested`, or as
+// many as an SM of the build's architecture holds where that is fewer. ptxas ignores a minimum it
+// cannot meet, which leaves the kernel's registers unbounded instead of sized for full occupancy.
+[[nodiscard]] constexpr int resident_ctas_bound(int threads, int requested) {
+    return requested * threads <= kMaxThreadsPerSm ? requested : kMaxThreadsPerSm / threads;
+}
+
 // The sm_8x bound, for the unified-template Linear schedules (namespace detail::unified) and the
 // Q8 schedule templates they share with the legacy table. A Turing build compiles the unified table
 // but never selects it (kUnifiedLinearRoutes in ops/linear/common/route_table.h), so those
