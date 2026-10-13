@@ -249,6 +249,7 @@ int run_tests() {
                                         "--frequency-penalty",
                                         "--full-draft-head",
                                         "--gdn-state-fp16",
+                                        "--gpu-clock-floor",
                                         "--greedy",
                                         "--json",
                                         "--json-schema",

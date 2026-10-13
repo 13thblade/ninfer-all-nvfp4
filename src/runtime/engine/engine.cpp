@@ -2,6 +2,7 @@
 #include "text/structured_output.h"
 
 #include "core/device.h"
+#include "core/gpu_clock_floor.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
 #include "runtime/contract/sampling.h"
@@ -58,6 +59,20 @@ DeviceContext initialize_device(const EngineOptions& options) {
     DeviceContext device{std::span<const int>(options.devices)};
     phase.complete();
     return device;
+}
+
+// EngineOptions::gpu_clock_floor_mhz over every device the Engine runs on, with one diagnostic line
+// per device.
+GpuClockFloor hold_gpu_clock_floor(const EngineOptions& options, const DeviceContext& device) {
+    if (options.gpu_clock_floor_mhz == 0) { return {}; }
+    GpuClockFloor floor(device.device_ids(), options.gpu_clock_floor_mhz);
+    for (const std::string& line : floor.report()) {
+        runtime::publish_diagnostic(
+            options.diagnostic_observer,
+            floor.complete() ? DiagnosticLevel::Info : DiagnosticLevel::Warning,
+            "gpu clock floor: %s", line.c_str());
+    }
+    return floor;
 }
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
@@ -266,7 +281,7 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(std::move(engine_options))),
-          device(initialize_device(options)) {
+          device(initialize_device(options)), clock_floor(hold_gpu_clock_floor(options, device)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (runtime::is_gemma4_artifact(options.artifact_path)) {
             auto constructed    = runtime::construct_gemma4(options, device);
@@ -449,6 +464,8 @@ public:
 
     EngineOptions options;
     DeviceContext device;
+    // After the device, before the model: the clocks go back once the model has been torn down.
+    GpuClockFloor clock_floor;
     std::unique_ptr<runtime::ModelInstance> active;
     std::unique_ptr<runtime::Qwen4ExpInstance> flash;
     std::unique_ptr<runtime::Gemma4Instance> gemma;

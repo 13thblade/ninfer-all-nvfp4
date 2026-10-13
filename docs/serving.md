@@ -1875,6 +1875,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision-cpu` | `--vision` with `--vision-residency cpu` | off |
 | `--vision-max-merged N` | merged-token budget of one media item, `[64, 16384]`; larger images and video frame pairs are downscaled at preprocessing instead of being rejected, and the overlay window is sized for it. Gemma 4 (at least 70): the most soft tokens an image or video frame takes, rounded down to its budgets 70, 140, 280, 560, 1120; an image takes 280 (70 at `detail: low`, this bound at `detail: high`), a video frame 70 | 16384 |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
+| `--gpu-clock-floor MHZ` | hold the graphics clock of the model's GPUs at MHZ or more while it is loaded (NVML locked clocks, given back at exit; a killed process leaves them until `nvidia-smi -rgc`), so the stages of a layer pipeline do not wait at idle clocks; needs administrator rights on Windows and root on Linux, without which the start reports it and keeps the driver's clocks | off |
 | `--cuda-graph-allowance-mib N` | total CUDA Graph driver-state allowance in MiB, subtracted from the KV sizing budget | computed |
 | `--wddm-evictable-budget` | Windows builds: budget the KV cache against dedicated memory less the weights and a 512 MiB desktop floor, committing the device arenas at startup; another process taking memory can then slow generation | off |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
