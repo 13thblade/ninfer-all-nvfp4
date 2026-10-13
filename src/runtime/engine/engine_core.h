@@ -334,6 +334,7 @@ public:
         if (store_.store && !hydration_reader_.joinable()) {
             hydration_reader_ = std::thread([this] { hydration_reader_loop(); });
         }
+        publish_store_read_rate();
     }
 
     // Host context bytes free now, for choosing which stored images to restore at start-up.
@@ -345,11 +346,14 @@ public:
 
     // Restores one stored image into the empty cache at start-up as a Host-resident continuation.
     // Never evicts anything. False when it does not fit now or does not belong to this Engine.
-    bool restore_image(std::span<const std::uint8_t> image) {
+    // `read_ns`, when known, is how long the store took to read it: with the import time it is one
+    // observation of the store's read rate.
+    bool restore_image(std::span<const std::uint8_t> image, std::uint64_t read_ns = 0) {
         std::scoped_lock lock(execution_mutex_);
         device_.bind_to_current_thread();
         auto& program = *instance_.program;
         if (program.has_context_transaction()) { return false; }
+        const auto started = Clock::now();
         try {
             const auto needed = program.checkpoint_image_host_bytes(image, store_.binding);
             const auto usage  = program.physical_usage();
@@ -362,6 +366,13 @@ public:
             owner_marks_[token] = {.persisted = fingerprint(imported->points),
                                    .last_used = Clock::now()};
         } catch (const std::invalid_argument&) { return false; }
+        if (read_ns) {
+            observe_store_read(image.size(),
+                               read_ns + static_cast<std::uint64_t>(
+                                             std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 Clock::now() - started)
+                                                 .count()));
+        }
         publish_runtime_stats();
         return true;
     }
@@ -2884,21 +2895,23 @@ private:
         } catch (...) { next_persist_scan_ = now + std::chrono::seconds(4); }
     }
 
-    // A stored session must add at least this many prompt tokens beyond what the cache already
-    // offers before reading it back is worth it: a few thousand tokens prefill faster than a deep
-    // image comes off a slow disk.
-    static constexpr std::uint32_t kMinimumHydrationGain = 4096;
+    // Extra reclaim rounds a hydration import may take when free Host bytes are split too finely
+    // for the image (each round frees as much again as the image needs).
+    static constexpr int kHydrationImportRounds = 3;
 
     struct HydrationTask {
         std::shared_ptr<Request> request;
         std::string id;
         std::optional<std::vector<std::uint8_t>> bytes;
+        // Wall time of the store read, for the cost model's read rate.
+        std::uint64_t read_ns = 0;
     };
 
     // Before admission: when the store holds a checkpoint of this very prompt deeper than anything
-    // the cache offers, read it back on the host reader while the request waits, instead of
-    // prefilling the difference. True when a read was started; the request is then not offered
-    // for admission until the read settles or its deadline passes.
+    // the cache offers, and reading it back, copying it to the device and prefilling the rest is
+    // cheaper than the best source the cache offers (the cost model prices all three), read it
+    // back on the host reader while the request waits. True when a read was started; the request
+    // is then not offered for admission until the read settles or its deadline passes.
     bool start_hydration(const std::shared_ptr<Request>& request,
                          std::span<const typename ResourceManagement::SourceChoice> sources) {
         if (store_.store == nullptr || request->store_probed || !request->base_plan ||
@@ -2908,23 +2921,36 @@ private:
         }
         request->store_probed = true;
         std::uint32_t resident = 0;
+        // Sources are ranked cheapest first; the root is always among them.
+        std::uint64_t best_cost = UINT64_MAX;
         for (const auto& choice : sources) {
-            resident = std::max(resident, choice.source.reused_tokens);
+            resident  = std::max(resident, choice.source.reused_tokens);
+            best_cost = std::min(best_cost, resources_.source_cost_ns(choice.source));
         }
+        const auto& base         = *request->base_plan;
+        const auto prompt_tokens = base.summary().prompt_tokens;
         std::string best_id;
-        std::uint32_t best_frontier = resident + kMinimumHydrationGain - 1U;
+        std::uint32_t best_frontier = resident;
         try {
             for (const ContextStore::Info& info : store_.store->list()) {
                 // The binding does not include the context length: an image deeper than this
                 // Engine's context could never be restored, and reading it would only cost time.
                 if (info.binding != store_.binding || info.tokens > max_context_) { continue; }
+                const auto restore = resources_.store_restore_ns(info.image_bytes);
+                if (restore >= best_cost) { continue; }
                 for (const ContextStore::CheckpointKey& key : info.checkpoints) {
-                    if (key.frontier <= best_frontier) { continue; }
-                    const auto mine = request->base_plan->prefix_shortlist_key(key.frontier);
+                    if (key.frontier <= resident || key.frontier > prompt_tokens) { continue; }
+                    const auto prefill = resources_.prefill_ns(
+                        instance_.program->prefill_work(base, key.frontier, prompt_tokens));
+                    const auto cost = prefill > UINT64_MAX - restore ? UINT64_MAX
+                                                                     : restore + prefill;
+                    if (cost >= best_cost) { continue; }
+                    const auto mine = base.prefix_shortlist_key(key.frontier);
                     if (mine && mine->digests == key.digests &&
                         mine->identity_tag == key.identity_tag) {
                         best_id       = info.id;
                         best_frontier = key.frontier;
+                        best_cost     = cost;
                     }
                 }
             }
@@ -2955,10 +2981,13 @@ private:
                 task = std::move(hydration_queue_.front());
                 hydration_queue_.pop_front();
             }
-            if (Clock::now() < task.request->hydration_deadline) {
+            if (const auto started = Clock::now(); started < task.request->hydration_deadline) {
                 try {
                     task.bytes = store_.store->load(task.id, false);
                 } catch (...) { task.bytes.reset(); }
+                task.read_ns = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started)
+                        .count());
             }
             {
                 std::lock_guard lock(hydration_mutex_);
@@ -2975,6 +3004,25 @@ private:
         }
         hydration_cv_.notify_all();
         if (hydration_reader_.joinable()) { hydration_reader_.join(); }
+    }
+
+    void observe_store_read(std::uint64_t image_bytes, std::uint64_t nanoseconds) noexcept {
+        resources_.observe_store_read(image_bytes, nanoseconds);
+        publish_store_read_rate();
+    }
+
+    void publish_store_read_rate() noexcept {
+        const auto per_byte_q32 = resources_.costs().store_read.ns_per_byte_q32;
+        cumulative_stats_.context_store_read_bytes_per_second =
+            per_byte_q32 == 0 ? 0.0
+                              : 1e9 * static_cast<double>(kContextCostQ32One) /
+                                    static_cast<double>(per_byte_q32);
+        // The rate may change while no request runs (store set up, a start-up restore), when
+        // nothing else republishes: update the published copy too. execution_mutex_ (held by the
+        // callers) before stats_mutex_ is the existing order.
+        std::lock_guard lock(stats_mutex_);
+        published_stats_.context_store_read_bytes_per_second =
+            cumulative_stats_.context_store_read_bytes_per_second;
     }
 
     void finish_hydration(const std::shared_ptr<Request>& request, bool failed) {
@@ -2999,9 +3047,9 @@ private:
             (void)program.release_redundant_host({});
             usage = program.physical_usage();
         }
+        auto cursor = resources_.begin_reclaim(
+            program, std::nullopt, ReclaimRights{ReclaimPurpose::OptionalWrite, request->id});
         if (needed > usage.capacity.host_bytes - usage.occupied.host_bytes) {
-            auto cursor = resources_.begin_reclaim(
-                program, std::nullopt, ReclaimRights{ReclaimPurpose::OptionalWrite, request->id});
             const auto victims = resources_.host_victims(program, needed, std::nullopt, {}, {},
                                                          std::nullopt, &cursor);
             if (!victims) { return false; }
@@ -3009,6 +3057,18 @@ private:
             if (!victims->empty()) { scheduler_.capacity_released(); }
         }
         auto imported = program.import_checkpoints(image, store_.binding);
+        // Free bytes are not free geometry: each StateImage needs one contiguous Host extent, and
+        // under pressure the free space is often split below that. Give up the next-ranked Host
+        // contents (the same optional-write rights, never another request's waiting source) a
+        // round at a time until the image fits or nothing more may go.
+        for (int round = 0; !imported && round < kHydrationImportRounds; ++round) {
+            if (resources_.reclaim(program, ContextResourceUsage{.host_bytes = needed}, {},
+                                   cursor) != ReclaimProgress::Changed) {
+                break;
+            }
+            scheduler_.capacity_released();
+            imported = program.import_checkpoints(image, store_.binding);
+        }
         if (!imported) { return false; }
         const auto token = resources_.adopt_restored(program, imported->points, imported->session);
         if (!token) { return false; }
@@ -3065,9 +3125,18 @@ private:
             }
             bool imported = false;
             if (task.bytes) {
+                const auto started = Clock::now();
                 try {
                     imported = import_for_request(request, *task.bytes, task.id);
                 } catch (const std::invalid_argument&) { imported = false; }
+                if (imported) {
+                    observe_store_read(task.bytes->size(),
+                                       task.read_ns +
+                                           static_cast<std::uint64_t>(
+                                               std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   Clock::now() - started)
+                                                   .count()));
+                }
             }
             finish_hydration(request, !imported);
         }
