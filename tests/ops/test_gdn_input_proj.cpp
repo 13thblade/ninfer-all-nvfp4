@@ -4,6 +4,7 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "ops/input_projection_test_common.h"
+#include "ops/linear/common/route_table.h"
 
 #include <cuda_runtime.h>
 
@@ -32,6 +33,8 @@ constexpr ReductionCriterion kGdnInputProjA16Tolerance{3.0e-3, 4.0e-3, kBf16Gros
 constexpr ReductionCriterion kFp8GdnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 constexpr ReductionCriterion kFp8GdnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 constexpr ReductionCriterion kGdnInputProjA4Tolerance{0.16, 4.0e-3, 0.16};
+// The int8-grouped route integer-quantizes both operands, the structure the A8 allowance covers.
+constexpr ReductionCriterion kGdnInputProjInt8Tolerance{0.04, 1.0 / 256.0, 0.06};
 constexpr std::int32_t kA8SampleRows = 31;
 
 int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
@@ -342,9 +345,12 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     cuda_synchronize();
 
     const bool a4                       = policy == ops::LinearPolicy::AllowA4;
-    const ReductionCriterion& criterion = a4 ? kGdnInputProjA4Tolerance : kGdnInputProjA16Tolerance;
-    const std::string suffix =
-        std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
+    const bool int8                     = policy == ops::LinearPolicy::AllowNvfp4Int8;
+    const ReductionCriterion& criterion = a4   ? kGdnInputProjA4Tolerance
+                                          : int8 ? kGdnInputProjInt8Tolerance
+                                                 : kGdnInputProjA16Tolerance;
+    const std::string suffix            = std::string(" NVFP4 ") + (a4 ? "A4" : int8 ? "Int8" : "A16") +
+                                          " T=" + std::to_string(tokens);
     int failures = qkv.verify_guards("gdn qkv" + suffix);
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
@@ -387,6 +393,16 @@ int run_nvfp4() {
             "gdn_input_proj NVFP4 A4 T=" + std::to_string(tokens),
             [&] { return run_nvfp4_case(parent, tokens, ops::LinearPolicy::AllowA4); });
     }
+    // Whole 128-token tiles take the int8-grouped route (one quantisation of x, identity rows).
+    // This binary installs no device profile, so force the unified table the engine's profile
+    // selects at these widths; otherwise the route silently falls back to A16.
+    ops::detail::force_linear_route_table(ops::detail::LinearRouteTable::Unified);
+    for (const std::int32_t tokens : {128, 256}) {
+        failures += run_case_allowing_arch_skip(
+            "gdn_input_proj NVFP4 Int8 T=" + std::to_string(tokens),
+            [&] { return run_nvfp4_case(parent, tokens, ops::LinearPolicy::AllowNvfp4Int8); });
+    }
+    ops::detail::force_linear_route_table(std::nullopt);
     return failures;
 }
 

@@ -2,9 +2,11 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan_unified.h"
 
 #include "core/layout.h"
+#include "ops/linear/nvfp4/nvfp4_int8_grouped_host.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4_tma_launch.h"
+#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_int8_grouped.cuh"
 
 #include <algorithm>
 #include <cstddef>
@@ -16,6 +18,8 @@ namespace {
 enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
+    FusedA16Mma,
+    Int8Grouped,
     FusedA4,
     TmaFusedA4,
 };
@@ -25,10 +29,30 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (!valid_linear_policy(policy)) {
         throw std::invalid_argument("nvfp4 linear_swiglu: invalid compute policy");
     }
+    if (policy == LinearPolicy::AllowNvfp4Int8) {
+        // A named int8 route outranks the narrow-width A16 preferences below. They are speed
+        // judgements the default cascade makes for one and sixteen tokens; leaving them in front of
+        // the admission makes the plan and the launch disagree about which route ran, and since the
+        // int8 launch pads its token tile up to 128 while the A16 route needs no transient storage
+        // at all, that disagreement is a buffer overrun and not merely an accounting error. The
+        // swiglu exact-workspace high-water check is what caught it.
+        if (nvfp4_gemm_route_forces_int8()) { return Nvfp4LinearSwiGluRoute::Int8Grouped; }
+        if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
+        if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
+        // Whole 128-token tiles take the integer tensor cores; ragged and intermediate widths
+        // keep the fused A16 MMA. The integer route is the
+        // gate-to-FP32-plane + GateProduct two-GEMM assembly over the stored [gate; up] plane.
+        if (nvfp4_int8_route_admits(tokens)) {
+            return Nvfp4LinearSwiGluRoute::Int8Grouped;
+        }
+        return Nvfp4LinearSwiGluRoute::FusedA16Mma;
+    }
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-        throw std::invalid_argument("nvfp4 linear_swiglu A16 is registered only through T=16");
+        // Above the SIMT band the A16-only card needs the fused wide MMA; see
+        // nvfp4_linear_swiglu_a16_mma.cu. There is no NVFP4 tensor-core route here to prefer.
+        return Nvfp4LinearSwiGluRoute::FusedA16Mma;
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
@@ -59,8 +83,21 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     }
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
-    if ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) || max_tokens <= 4) {
+    // The `max_tokens <= 4` short-circuit is the same narrow-width A16 preference resolve_route
+    // carries, restated in bytes: at those widths the A16 routes need no transient storage. A named
+    // int8 route must not be answered with "zero bytes" while its launch pads up to a whole
+    // 128-token tile, so the preference is skipped there for exactly the reason it is skipped in
+    // resolve_route -- and the two have to agree, which is what the high-water check proves.
+    const bool forced_int8 =
+        policy == LinearPolicy::AllowNvfp4Int8 && nvfp4_gemm_route_forces_int8();
+    if (!forced_int8 &&
+        ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) || max_tokens <= 4)) {
         return 0;
+    }
+    if (policy == LinearPolicy::AllowNvfp4Int8) {
+        // The route's capacity function reports exact bytes for a single T (padded to whole tiles,
+        // which is what a launch addresses) and the widest reach of an interval otherwise.
+        return nvfp4_linear_swiglu_int8_workspace_capacity_bytes(min_tokens, max_tokens);
     }
 
     return fused_workspace_bytes(max_tokens);
@@ -75,6 +112,12 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         return;
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
+        return;
+    case Nvfp4LinearSwiGluRoute::FusedA16Mma:
+        nvfp4_linear_swiglu_a16_mma_launch(x, weight, out, stream);
+        return;
+    case Nvfp4LinearSwiGluRoute::Int8Grouped:
+        nvfp4_linear_swiglu_int8_grouped_launch(x, weight, out, workspace, stream);
         return;
     case Nvfp4LinearSwiGluRoute::FusedA4:
         nvfp4_linear_swiglu_a4_launch(x, weight, out, workspace, stream);

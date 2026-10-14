@@ -45,6 +45,11 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
         return {kBf16UnitRoundoff, kBf16UnitRoundoff, 2.0 * kBf16UnitRoundoff};
     case ActivationCompute::A8:
         return {kA8QuantizationAllowance, kBf16UnitRoundoff, 1.5 * kA8QuantizationAllowance};
+    case ActivationCompute::Int8Grouped:
+        // Both operands are integer-quantized (s8 activations at one scale per (token, 32)
+        // block, e2m1 weights at one E4M3 scale per 16 columns), the same structure the A8
+        // allowance was sized for, so the same criterion applies.
+        return {kA8QuantizationAllowance, kBf16UnitRoundoff, 1.5 * kA8QuantizationAllowance};
     case ActivationCompute::A4:
         return {kA4QuantizationAllowance, kBf16UnitRoundoff, kA4QuantizationAllowance};
     }
@@ -315,6 +320,15 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
               WeightGenerator generator, const ShapeCase& shape) {
     if (shape.invocations.empty()) {
         throw std::invalid_argument("linear test: shape has no invocations");
+    }
+    // Same reasoning as the linear_swiglu harness: an Int8Grouped shape claims the integer mainloop,
+    // the route that decides it is named in the environment, and unset now means A16. Without this
+    // pin an Int8Grouped case would score the A16 composition of the same weights against the
+    // quantisation allowance and pass without the kernel under test ever launching.
+    std::optional<test::ScopedNvfp4GemmRoute> route_pin;
+    if (activation_compute == ActivationCompute::Int8Grouped &&
+        ops::detail::nvfp4_gemm_route() == ops::detail::Nvfp4GemmRoute::A16) {
+        route_pin.emplace(ops::detail::Nvfp4GemmRoute::Grouped);
     }
     const auto maximum = std::max_element(
         shape.invocations.begin(), shape.invocations.end(),

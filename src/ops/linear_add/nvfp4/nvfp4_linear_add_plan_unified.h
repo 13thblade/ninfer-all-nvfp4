@@ -31,6 +31,15 @@ void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tens
 void nvfp4_linear_add_a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                 Nvfp4A4Workspace workspace, cudaStream_t stream);
 
+// The integer-activation route on the s8 tensor cores (sm_86): whole 128-token tiles only, the
+// projection added into the residual in the epilogue. Requires the exact int8-grouped workspace
+// capacity for the call's token count.
+void nvfp4_linear_add_int8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                  WorkspaceArena& workspace, cudaStream_t stream);
+
+[[nodiscard]] bool nvfp4_linear_add_int8_tokens_supported(std::int32_t min_tokens,
+                                                          std::int32_t max_tokens);
+
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
 

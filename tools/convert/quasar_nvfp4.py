@@ -193,8 +193,9 @@ def main() -> None:
     parser.add_argument("--model", required=True, help="QUASAR safetensors directory")
     parser.add_argument(
         "--dflash2",
-        required=True,
-        help="reference v3 artifact to graft the dflash2 draft from",
+        required=False,
+        default=None,
+        help="reference v3 artifact to graft the dflash2 draft from (optional; omit for an artifact without dflash2)",
     )
     parser.add_argument("--out", required=True, help="output .ninfer path")
     parser.add_argument(
@@ -237,18 +238,23 @@ def main() -> None:
     if args.proposal:
         add_official_proposal(
             recipe, ranking=args.ranking, rows=args.proposal_rows)
-    _add_dflash2_head_uses(recipe, model.parameters)
+    if args.dflash2:
+        _add_dflash2_head_uses(recipe, model.parameters)
     prepared = recipe.prepare(device=args.device, rows_per_chunk=args.rows_per_chunk)
 
     # Read the grafted dflash2 payload while the reference is still open.
     dflash2_artifact_id = None
-    with Artifact(args.dflash2) as official:
-        dflash2_artifact_id = official.artifact_id.hex()
-        graft = _collect_dflash2(official)
-        dflash2_data = {
-            graft["id_map"][old_id]: official.read_object(old_id)
-            for old_id in graft["old_ids"]
-        }
+    if args.dflash2:
+        with Artifact(args.dflash2) as official:
+            dflash2_artifact_id = official.artifact_id.hex()
+            graft = _collect_dflash2(official)
+            dflash2_data = {
+                graft["id_map"][old_id]: official.read_object(old_id)
+                for old_id in graft["old_ids"]
+            }
+    else:
+        graft = {"specs": [], "bindings": {}, "uses": [], "component": None}
+        dflash2_data = {}
 
     resources = [
         ResourceSpec(key, len(value)) for key, value in model.resources.items()
@@ -260,21 +266,25 @@ def main() -> None:
         + graft["specs"]
     )
     components = dict(model.components)
-    components["dflash2"] = graft["component"]
+    if graft["component"] is not None:
+        components["dflash2"] = graft["component"]
     bindings = dict(prepared.bindings)
     bindings.update(graft["bindings"])
     uses = list(prepared.uses) + graft["uses"]
+    method = (
+        "import_encoded (nvfp4, bit-exact) for quantised Linear projections; "
+        "grouped_absmax q8_g32_fp16 for MTP head (scope=%s) + shared lm_head; "
+        "cast_direct bf16 for GDN a/b (48-row, upcast); source-format otherwise"
+        % args.q8_scope
+    )
+    if args.dflash2:
+        method += "; dflash2 grafted verbatim"
     provenance = {
         "model": "QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 (compressed-tensors nvfp4-pack-quantized)",
-        "dflash2_source": str(args.dflash2),
+        "dflash2_source": str(args.dflash2) if args.dflash2 else None,
         "dflash2_artifact_id": dflash2_artifact_id,
         "q8_scope": args.q8_scope,
-        "method": (
-            "import_encoded (nvfp4, bit-exact) for quantised Linear projections; "
-            "grouped_absmax q8_g32_fp16 for MTP head (scope=%s) + shared lm_head; "
-            "cast_direct bf16 for GDN a/b (48-row, upcast); source-format otherwise; "
-            "dflash2 grafted verbatim" % args.q8_scope
-        ),
+        "method": method,
     }
     if args.proposal:
         provenance["proposal"] = {

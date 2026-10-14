@@ -6,6 +6,7 @@
 #include "core/decode_graph.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
+#include "ops/linear/common/route_table.h"
 #include "ops/linear/sm70/sm70_project.h"
 
 #include <cuda_runtime.h>
@@ -33,6 +34,8 @@ constexpr ReductionCriterion kAttnInputProjA16Tolerance{2.9e-3, 4.0e-3, kBf16Gro
 constexpr ReductionCriterion kFp8AttnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 constexpr ReductionCriterion kAttnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 constexpr ReductionCriterion kAttnInputProjA4Tolerance{0.16, 1.0 / 256.0, 0.16};
+// The int8-grouped route integer-quantizes both operands, the structure the A8 allowance covers.
+constexpr ReductionCriterion kAttnInputProjInt8Tolerance{0.04, 1.0 / 256.0, 0.06};
 // Retain the original seven grid points while stabilizing the distribution-level A4 criterion.
 constexpr std::int32_t kA4SampleRows = 31;
 
@@ -522,6 +525,88 @@ int run_nvfp4_target() {
     return failures;
 }
 
+// The int8-grouped route the fused single parent takes on whole 128-token tiles: prepared at
+// A16Only the way the model's route table reaches it, then patched to AllowNvfp4Int8. Every
+// segment (query/key/gate/value) is checked, so a row-order mistake in the segmented output
+// adapter cannot pass.
+int run_nvfp4_int8_case(DevicePackedWeight& parent, std::int32_t tokens) {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 1024;
+    const std::vector<float> activation =
+        make_bf16_activation(kHidden, tokens, 421U + static_cast<std::uint32_t>(tokens));
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+
+    GuardedBf16Tensor query(kQRows, tokens);
+    GuardedBf16Tensor gate(kQRows, tokens);
+    GuardedBf16Tensor key(kKvRows, tokens);
+    GuardedBf16Tensor value(kKvRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor q                   = query.tensor();
+    Tensor g                   = gate.tensor();
+    Tensor k                   = key.tensor();
+    Tensor v                   = value.tensor();
+    const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::NVFP4, 14336, kHidden, ops::LinearPolicy::AllowNvfp4Int8, tokens, tokens);
+    DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+    const auto physical = physical_parent(parent.view());
+    const auto qw = rows(physical, 0, 6144), kw = rows(physical, 6144, 1024);
+    const auto gw      = rows(physical, 7168, 6144), vw = rows(physical, 13312, 1024);
+    auto prepared      = std::get<ops::SingleProjectionWeight>(ops::prepare_attn_input_proj_weights(
+        {qw, ops::LinearPolicy::A16Only}, {kw, ops::LinearPolicy::A16Only},
+        {gw, ops::LinearPolicy::A16Only}, {vw, ops::LinearPolicy::A16Only}));
+    if (prepared.policy != ops::LinearPolicy::A16Only) {
+        throw std::runtime_error("NVFP4 int8 case: preparation did not settle at A16Only");
+    }
+    prepared.policy = ops::LinearPolicy::AllowNvfp4Int8;
+    ops::attn_input_proj(x, prepared.weight, q, g, k, v, prepared.policy, workspace, nullptr);
+    cuda_synchronize();
+
+    constexpr std::int32_t kKeyBegin   = kQRows;
+    constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
+    constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
+    const std::string suffix = " NVFP4 Int8 T=" + std::to_string(tokens);
+    int failures             = 0;
+    failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
+                              tokens, kAttnInputProjInt8Tolerance, 31);
+    failures += verify_output("attn k" + suffix, key, parent.host, kKeyBegin, kKvRows, activation,
+                              kHidden, tokens, kAttnInputProjInt8Tolerance, 31);
+    failures += verify_output("attn gate" + suffix, gate, parent.host, kGateBegin, kQRows,
+                              activation, kHidden, tokens, kAttnInputProjInt8Tolerance, 31);
+    failures += verify_output("attn value" + suffix, value, parent.host, kValueBegin, kKvRows,
+                              activation, kHidden, tokens, kAttnInputProjInt8Tolerance, 31);
+    failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
+    failures += parent.verify_preserved("attn parent" + suffix);
+    if (workspace.used() != 0) {
+        std::cerr << "attention int8 projection leaks a workspace scope\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int run_nvfp4_int8_target() {
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kParentRows = 14336;
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 3.5F;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::NVFP4, kParentRows, kHidden, 331U, options));
+    // This binary installs no device profile, so the fused Op's own table reads Legacy and the
+    // int8 route would silently fall back to A16. Force the unified table the engine's profile
+    // selects at these widths, and verify under it.
+    ops::detail::force_linear_route_table(ops::detail::LinearRouteTable::Unified);
+    int failures = 0;
+    for (const std::int32_t tokens : {128, 256}) {
+        failures += run_case_allowing_arch_skip(
+            "attn_input_proj NVFP4 Int8 T=" + std::to_string(tokens),
+            [&] { return run_nvfp4_int8_case(parent, tokens); });
+    }
+    ops::detail::force_linear_route_table(std::nullopt);
+    return failures;
+}
+
 int run_fp8_target() {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 14336;
@@ -743,8 +828,9 @@ int main(int argc, char** argv) {
         failures += run_q4_q5();
         failures += run_t2();
         failures += run_bf16_target();
-        failures += run_nvfp4_target();
-        failures += run_fp8_target();
+    failures += run_nvfp4_target();
+    failures += run_nvfp4_int8_target();
+    failures += run_fp8_target();
         failures += run_q8_target();
         failures += run_q8_companion();
     }

@@ -1,0 +1,98 @@
+// The LinearAdd int8-grouped route: identity rows over the down/o_proj geometries, the projection
+// added into the residual in the epilogue. The token tile is padded to 128 and its surplus columns
+// never stored -- which matters here more than elsewhere, because this store reads the residual
+// back before writing it, so an unpredicated padding column would be an out-of-bounds read too. Shares the
+// mainloop with the other NVFP4 int8 routes via nvfp4_int8_grouped_mma.cuh.
+
+#include "core/arena.h"
+#include "core/device.h"
+#include "core/weight.h"
+#include "ops/linear/common/output.cuh"
+#include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/nvfp4/nvfp4_int8_grouped_mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_mmq_launch.cuh"
+
+#include <cuda_bf16.h>
+
+#include <stdexcept>
+
+namespace ninfer::ops::detail::unified {
+namespace {
+
+// The epilogue adds the scaled projection into the residual tile before the single BF16 rounding,
+// which is exactly linear_add's contract (A16 routes fuse the same addition).
+struct Nvfp4LinearAddInt8Output {
+    __nv_bfloat16* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(int row, int token, float value) const {
+        __nv_bfloat16* slot = data + static_cast<std::int64_t>(token) * rows + row;
+        *slot = __float2bfloat16_rn(__bfloat162float(*slot) + value);
+    }
+};
+
+} // namespace
+
+bool nvfp4_linear_add_int8_tokens_supported(std::int32_t min_tokens, std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) { return false; }
+    if (min_tokens == max_tokens) { return nvfp4_int8_route_admits(min_tokens); }
+    return nvfp4_int8_route_interval_admits(min_tokens, max_tokens);
+}
+
+void nvfp4_linear_add_int8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                  WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    const std::int32_t padded = nvfp4_int8_padded_tokens(tokens);
+    if (weight.qtype != QType::NVFP4 || weight.layout != QuantLayout::BlockScaleK16M128x4 ||
+        weight.group != 16 || weight.n != 5120 || (weight.k != 6144 && weight.k != 17408) ||
+        weight.qdata == nullptr || weight.scales == nullptr ||
+        !nvfp4_int8_route_admits(tokens)) {
+        throw std::invalid_argument("nvfp4 linear_add int8: unsupported profile");
+    }
+    (void)validate_nvfp4_weight(weight, "nvfp4 linear_add int8");
+
+    auto scope = workspace.scope();
+    // The interleaved plane the MMQ mainloop reads and the two separated planes the grouped
+    // mainloop reads cost the same bytes per token; only the quantiser that fills them differs.
+    const bool mmq_route = mmq::select(weight.k, tokens);
+    DeviceSpan codes;
+    DeviceSpan scales;
+    if (mmq_route) {
+        codes = workspace.alloc_bytes(mmq::activation_bytes(tokens, weight.k));
+    } else {
+        codes  = workspace.alloc_bytes(static_cast<std::size_t>(padded) * weight.k);
+        scales = workspace.alloc_bytes(static_cast<std::size_t>(padded) * (weight.k / 32) *
+                                       sizeof(float));
+    }
+    if (mmq_route) {
+        mmq::quantize_activations(x.data, tokens, weight.k, codes.data, stream);
+    } else {
+        quantize_nvfp4_int8_grouped<<<padded, 128, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data), tokens, weight.k,
+            reinterpret_cast<std::int8_t*>(codes.data), reinterpret_cast<float*>(scales.data));
+    }
+
+    const Nvfp4LinearAddInt8Output output{static_cast<__nv_bfloat16*>(residual.data), weight.n};
+    if (mmq_route) {
+        mmq::launch<128, Nvfp4LinearAddInt8Output>(
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales),
+            reinterpret_cast<const std::int8_t*>(codes.data),
+            1.0F / weight.weight_scale_divisor, output, weight.k, tokens, weight.n, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    const dim3 grid(weight.n / 128, padded / 128);
+    // alpha = 1/weight_scale_divisor: the E2M1 1/2 already folded into the E4M3 scale decode,
+    // where llama.cpp folds it too, so the half factor appears once and the store rounds once.
+    nvfp4_int8_grouped_kernel<Nvfp4LinearAddInt8Output>
+        <<<grid, detail::kInt8Threads, nvfp4_int8_grouped_smem_bytes(), stream>>>(
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales),
+            reinterpret_cast<const std::int8_t*>(codes.data),
+            reinterpret_cast<const float*>(scales.data), 1.0F / weight.weight_scale_divisor,
+            output, weight.k, tokens);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace ninfer::ops::detail::unified

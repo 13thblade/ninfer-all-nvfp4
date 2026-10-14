@@ -1,6 +1,7 @@
 #include "ops/linear/common/route_table.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan_unified.h"
 #include "core/weight.h"
+#include "ops/linear/nvfp4/nvfp4_int8_grouped_host.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include "core/layout.h"
@@ -19,6 +20,7 @@ namespace {
 enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
+    FusedA16Mma,
     FusedW4A4,
     LinearW4A4Post,
     TmaFusedW4A4,
@@ -47,13 +49,10 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (!allows_a4(policy)) { // A16Only, AllowA8 and the integer-A8 policies
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-        // Deliberately verbose. This throw fires during *runtime planning*, before a token
-        // is processed, so on sm_86 it is the entire user-visible symptom of an artifact
-        // that cannot be loaded at all -- and "registered only through T=16" gives an
-        // operator nothing to act on. It took a full-suite run and a bisect of two
-        // deliberate decisions to work out why; the message now carries that.
-        throw std::invalid_argument(
-            "nvfp4 linear_swiglu: the A16 route is registered only through T=16, and on sm_80/86/89 A16 is the only policy available for NVFP4 weights (no NVFP4 tensor-core path), so this artifact cannot serve a prefill chunk wider than 16 columns on this architecture. Use a groupwise-int artifact here; an sm_120a build runs NVFP4 through AllowA4 at any width.");
+        // Widest reachable band on a card without a native FP4 tensor core. A16 is the only
+        // policy NVFP4 weights have there, so the wide fused A16 MMA owns everything above the
+        // SIMT small-T band instead of refusing it; see nvfp4_linear_swiglu_a16_mma.cu.
+        return Nvfp4LinearSwiGluRoute::FusedA16Mma;
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
@@ -170,6 +169,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
         return;
+    case Nvfp4LinearSwiGluRoute::FusedA16Mma:
+        unified::nvfp4_linear_swiglu_a16_mma_launch(x, weight, out, stream);
+        return;
     case Nvfp4LinearSwiGluRoute::FusedW4A4:
         nvfp4_linear_swiglu_w4a4_launch(x, weight, out, workspace, stream);
         return;
@@ -195,6 +197,16 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     constexpr std::int32_t kIntermediate = Nvfp4N34816K5120::kOutputRows / 2;
     silu_mul(scratch.projected.slice(0, 0, kIntermediate),
              scratch.projected.slice(0, kIntermediate, kIntermediate), out, stream);
+}
+
+bool nvfp4_linear_swiglu_int8_route_active(LinearPolicy policy, std::int32_t tokens) {
+    // The three conditions dispatch stacks: the policy arrives at the unified plan intact
+    // (unified_policy() passes AllowNvfp4Int8 through, since allows_a8_int() is false for it),
+    // the route table names the unified plan, and the unified plan's own admission rule holds.
+    // Anything else lands on the workspace-free A16 routes -- exactly what this query reports.
+    return policy == LinearPolicy::AllowNvfp4Int8 && tokens > 0 &&
+           fused_route_table("unified/nvfp4_linear_swiglu", tokens) == LinearRouteTable::Unified &&
+           unified::nvfp4_int8_route_admits(tokens);
 }
 
 } // namespace ninfer::ops::detail

@@ -17,6 +17,7 @@
 #include "core/arena.h"
 #include "core/tensor.h" // ninfer::DType, ninfer::Tensor (for op call sites)
 #include "cuda_availability.h"
+#include "ops/linear/nvfp4/nvfp4_int8_route.h"
 #include "ops/op_check.h"
 
 #include <cuda_runtime.h>
@@ -24,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <optional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -414,5 +416,22 @@ inline int verify_reduction(std::string_view label, std::span<const double> got,
               << " reference=" << stats.reference_at_maximum << '\n';
     return 1;
 }
+
+// Pin the NVFP4 GEMM route a case is actually testing. Which mainloop runs is named in the
+// environment and an unset environment names A16, so a profile that claims an integer-quantized
+// activation path has to ask for that route itself -- otherwise the harness measures the A16
+// composition of the same weights, sits inside the quantization tolerance, and reports green for a
+// kernel that never ran. Nesting-safe: whatever was in force is restored on scope exit.
+class ScopedNvfp4GemmRoute {
+public:
+    explicit ScopedNvfp4GemmRoute(ops::detail::Nvfp4GemmRoute route)
+        : previous_(ops::detail::force_nvfp4_gemm_route(route)) {}
+    ~ScopedNvfp4GemmRoute() { ops::detail::force_nvfp4_gemm_route(previous_); }
+    ScopedNvfp4GemmRoute(const ScopedNvfp4GemmRoute&)            = delete;
+    ScopedNvfp4GemmRoute& operator=(const ScopedNvfp4GemmRoute&) = delete;
+
+private:
+    std::optional<ops::detail::Nvfp4GemmRoute> previous_;
+};
 
 } // namespace ninfer::test

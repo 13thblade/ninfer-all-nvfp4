@@ -30,6 +30,15 @@ void nvfp4_attn_input_a4_launch(const Tensor& x, const Weight& weight, Tensor& q
                                 Tensor& k, Tensor& v, Nvfp4A4Workspace workspace,
                                 cudaStream_t stream);
 
+// The integer-activation route on the s8 tensor cores (sm_86): whole 128-token tiles only, the
+// per-(token,64) quantised activation planes in the caller workspace.
+void nvfp4_attn_input_int8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                  Tensor& k, Tensor& v, WorkspaceArena& workspace,
+                                  cudaStream_t stream);
+
+[[nodiscard]] bool nvfp4_attn_input_int8_tokens_supported(std::int32_t min_tokens,
+                                                          std::int32_t max_tokens);
+
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                                cudaStream_t stream);

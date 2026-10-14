@@ -1,0 +1,89 @@
+// The GDN input-projection int8-grouped route: identity rows over the fused 16384-row NVFP4
+// weight (qkv and z segments), whole 128-token tiles only. Shares the mainloop with the other
+// NVFP4 int8 routes via nvfp4_int8_grouped_mma.cuh; the segmented output adapter maps global
+// rows to the two output tensors.
+
+#include "core/arena.h"
+#include "core/device.h"
+#include "core/weight.h"
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output_unified.cuh"
+#include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/nvfp4/nvfp4_int8_grouped_mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_mmq_launch.cuh"
+
+#include <cuda_bf16.h>
+
+#include <stdexcept>
+
+namespace ninfer::ops::detail::unified {
+namespace {
+
+constexpr std::int32_t kRows = 16384; // qkv [0,10240) then z [10240,16384)
+constexpr std::int32_t kCols = 5120;
+
+} // namespace
+
+bool nvfp4_gdn_input_int8_tokens_supported(std::int32_t min_tokens, std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) { return false; }
+    if (min_tokens == max_tokens) { return nvfp4_int8_route_admits(min_tokens); }
+    return nvfp4_int8_route_interval_admits(min_tokens, max_tokens);
+}
+
+void nvfp4_gdn_input_int8_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                 WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    const std::int32_t padded = nvfp4_int8_padded_tokens(tokens);
+    if (weight.qtype != QType::NVFP4 || weight.layout != QuantLayout::BlockScaleK16M128x4 ||
+        weight.group != 16 || weight.n != kRows || weight.k != kCols ||
+        weight.qdata == nullptr || weight.scales == nullptr ||
+        !nvfp4_int8_route_admits(tokens)) {
+        throw std::invalid_argument("nvfp4 gdn_input_proj int8: unsupported profile");
+    }
+    (void)validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj int8");
+
+    auto scope = workspace.scope();
+    // The interleaved plane the MMQ mainloop reads and the two separated planes the grouped
+    // mainloop reads cost the same bytes per token; only the quantiser that fills them differs.
+    const bool mmq_route = mmq::select(kCols, tokens);
+    DeviceSpan codes;
+    DeviceSpan scales;
+    if (mmq_route) {
+        codes = workspace.alloc_bytes(mmq::activation_bytes(tokens, kCols));
+    } else {
+        codes  = workspace.alloc_bytes(static_cast<std::size_t>(padded) * kCols);
+        scales = workspace.alloc_bytes(static_cast<std::size_t>(padded) * (kCols / 32) *
+                                       sizeof(float));
+    }
+    if (mmq_route) {
+        mmq::quantize_activations(x.data, tokens, kCols, codes.data, stream);
+    } else {
+        quantize_nvfp4_int8_grouped<<<padded, 128, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data), tokens, kCols,
+            reinterpret_cast<std::int8_t*>(codes.data), reinterpret_cast<float*>(scales.data));
+    }
+
+    const Nvfp4GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
+                                     static_cast<__nv_bfloat16*>(z.data)};
+    const dim3 grid(kRows / 128, padded / 128);
+    // alpha = 1/weight_scale_divisor: the E2M1 1/2 already folded into the E4M3 scale decode,
+    // where llama.cpp folds it too, so the half factor appears once and the store rounds once.
+    if (mmq_route) {
+        mmq::launch<128, Nvfp4GdnInputOutput>(
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales),
+            reinterpret_cast<const std::int8_t*>(codes.data),
+            1.0F / weight.weight_scale_divisor, output, kCols, tokens, kRows, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    nvfp4_int8_grouped_kernel<Nvfp4GdnInputOutput>
+        <<<grid, detail::kInt8Threads, nvfp4_int8_grouped_smem_bytes(), stream>>>(
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales),
+            reinterpret_cast<const std::int8_t*>(codes.data),
+            reinterpret_cast<const float*>(scales.data), 1.0F / weight.weight_scale_divisor,
+            output, kCols, tokens);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace ninfer::ops::detail::unified

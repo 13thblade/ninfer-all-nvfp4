@@ -2,6 +2,7 @@
 #include "ninfer/ops/linear_add.h"
 #include "core/device.h"
 
+#include "ops/linear/common/route_table.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -28,6 +29,9 @@ constexpr ReductionCriterion kA16Tolerance{
     2.0 * kBf16UnitRoundoff,
 };
 constexpr ReductionCriterion kA4Tolerance{0.16, kBf16UnitRoundoff, 0.16};
+// Both operands integer-quantized (s8 activations at one scale per (token, 32) block, e2m1
+// weights at one E4M3 scale per 16 columns): the same structure the A8 allowance was sized for.
+constexpr ReductionCriterion kInt8Tolerance{0.04, kBf16UnitRoundoff, 0.06};
 
 struct Invocation {
     std::int32_t tokens;
@@ -123,6 +127,11 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{1023, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
         Invocation{1025, ops::LinearPolicy::AllowA4},
+        // Whole 128-token tiles take the int8-grouped route: one quantisation of x, the
+        // projection added into the residual in the epilogue.
+        Invocation{128, ops::LinearPolicy::AllowNvfp4Int8},
+        Invocation{256, ops::LinearPolicy::AllowNvfp4Int8},
+        Invocation{384, ops::LinearPolicy::AllowNvfp4Int8},
     };
     // The invocation list is what drives the host buffers, so take the bound from it rather than
     // from a literal that silently caps it.
@@ -150,6 +159,10 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
     int failures = 0;
     for (const Invocation invocation : invocations) {
+        // The int8 route lives on the unified table only; this binary installs no device profile,
+        // so force the table the engine's profile selects at these widths while it runs.
+        const bool int8 = invocation.policy == ops::LinearPolicy::AllowNvfp4Int8;
+        if (int8) { ops::detail::force_linear_route_table(ops::detail::LinearRouteTable::Unified); }
         const std::size_t output_words = static_cast<std::size_t>(n) * invocation.tokens;
         GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
         output.copy_from_host(initial_residual.data(), output.bytes());
@@ -190,7 +203,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
         const bool a4           = invocation.policy == ops::LinearPolicy::AllowA4;
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +
-                                  std::to_string(k) + "] " + (a4 ? "A4" : "A16") +
+                                  std::to_string(k) + "] " +
+                                  (a4 ? "A4" : int8 ? "Int8" : "A16") +
                                   " T=" + std::to_string(invocation.tokens);
         if (workspace.peak_used() != capacity) {
             std::cerr << label << ": workspace query/execution high-water mismatch\n";
@@ -222,7 +236,11 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
                 expected.push_back(sum + static_cast<double>(bf16_to_f32(initial_residual[index])));
             }
         }
-        failures += verify_reduction(label, actual, expected, a4 ? kA4Tolerance : kA16Tolerance);
+        failures += verify_reduction(label, actual, expected,
+                                     a4   ? kA4Tolerance
+                                          : int8 ? kInt8Tolerance
+                                                 : kA16Tolerance);
+        if (int8) { ops::detail::force_linear_route_table(std::nullopt); }
     }
 
     failures += device_activation.verify_guards("NVFP4 linear_add activation");
