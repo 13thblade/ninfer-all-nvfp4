@@ -4,8 +4,9 @@ cmake_minimum_required(VERSION 3.28)
 # CMP 170HX) as an unmeasured compatibility target: it shares the sm_86 instruction set the
 # kernels use, but none of its route tables have been swept. sm_70 (Tesla V100) builds the same
 # compatibility path with the Ampere warp primitives it lacks (cp.async, ldmatrix, the m16n8
-# mma.sync shapes) emulated in src/ops/common, and its own prefill and attention routes. Set and
-# validate the architecture before CUDA compiler detection so CMake never injects a generic
+# mma.sync shapes) emulated in src/ops/common, and its own prefill and attention routes. Turing
+# sm_75 (TITAN RTX, RTX 20 series) runs the same mma.sync path through the Turing tier below. Set
+# and validate the architecture before CUDA compiler detection so CMake never injects a generic
 # host-toolchain default or accepts an unsupported target.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures to build")
@@ -13,9 +14,9 @@ endif()
 # 120a is admitted locally as an unqualified target. Consumer Blackwell is Ada-like at the warp
 # level - mma.sync, ldmatrix and cp.async recompile natively, and there is no tcgen05 or tensor
 # memory at all - so the compatibility path below is what actually runs there.
-if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|80|86|89|120a)$")
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|75|80|86|89|120a)$")
   message(FATAL_ERROR
-    "NInfer supports CMAKE_CUDA_ARCHITECTURES=70, 80, 86, 89 or 120a; got "
+    "NInfer supports CMAKE_CUDA_ARCHITECTURES=70, 75, 80, 86, 89 or 120a; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
@@ -50,7 +51,7 @@ endif()
 # NINFER_SM120_NATIVE=ON to build the native routes instead.
 option(NINFER_SM120_NATIVE
        "On a 120a build, compile upstream's native routes instead of the mma.sync path" OFF)
-if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|80|86|89)$" OR NOT NINFER_SM120_NATIVE)
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|75|80|86|89)$" OR NOT NINFER_SM120_NATIVE)
   set(NINFER_COMPAT_PATH ON)
   add_compile_definitions(NINFER_SM8X_COMPAT=1)
 else()
@@ -60,6 +61,13 @@ endif()
 # __CUDA_ARCH__ is not defined.
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   add_compile_definitions(NINFER_SM70=1)
+endif()
+# NINFER_SM75 is the Turing tier of that path, for host and device code alike: the device helpers
+# replace the sm_80+ instructions (cp.async, BF16/TF32 and m16n8k16/k32 MMA, packed conversions,
+# warp reductions) with exact Turing forms (src/ops/common/memory.cuh, mma.cuh), kernels fit the
+# 64 KiB per-block shared memory, and the host knows which routes this binary carries.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "75")
+  add_compile_definitions(NINFER_SM75=1)
 endif()
 # Programmatic dependent launch lets a captured decode-graph kernel stage its weights while the
 # kernel before it finishes (src/core/pdl.cuh). It needs sm_90 or newer, so the compatibility path

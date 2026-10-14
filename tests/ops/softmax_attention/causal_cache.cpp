@@ -225,6 +225,8 @@ struct AttentionCase {
     bool fast_prompt_kernel = false;
     bool wide_verification  = false;
     bool small_prefill      = false;
+    // Sets one key element of the new tokens to 2^17, beyond FP16's range (KvCacheStorage cases).
+    bool key_beyond_fp16 = false;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -2659,6 +2661,9 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u,
                                             -test_case.value_scale, test_case.value_scale);
     inject_codec_edges(geometry, test_case.tokens, k, v);
+    if (test_case.key_beyond_fp16) {
+        k[kv_input_index(geometry, 0, 5, test_case.tokens / 2)] = 131072.0f;
+    }
     std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
@@ -3636,6 +3641,34 @@ int run_int8_prompt_cases(bool fast) {
     return failures;
 }
 
+// BF16 values beyond FP16's range. Turing builds run BF16-cache attention on FP16 MMA and stage a
+// tile that holds such a value as BF16 for the exact emulation (common/bf16_attention.cuh): values
+// of up to 2^17 send every tile there, one key of 2^17 its own tile only. Decode, verification and
+// prompt widths.
+int run_bf16_range_cases() {
+    constexpr KvCacheStorage storage = KvCacheStorage::BFloat16;
+    constexpr float kBeyondFp16      = 131072.0f;
+    const auto key_case = [](std::int32_t tokens, std::int32_t base, std::uint32_t seed) {
+        AttentionCase test_case{tokens, base, static_cast<std::uint32_t>(base + tokens), seed};
+        test_case.key_beyond_fp16 = true;
+        return test_case;
+    };
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(geometry, storage, {1, 700, 701, 951u, false, false, kBeyondFp16},
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, storage, {4, 300, 304, 952u, false, false, kBeyondFp16},
+                                MappingPattern::Identity);
+        failures += run_a1_case(geometry, storage, {300, 200, 500, 953u, false, false, kBeyondFp16},
+                                MappingPattern::Offset);
+        failures +=
+            run_a1_case(geometry, storage, key_case(4, 700, 954u), MappingPattern::Fragmented);
+        failures +=
+            run_a1_case(geometry, storage, key_case(300, 200, 955u), MappingPattern::Identity);
+    }
+    return failures;
+}
+
 int run_geometry(const Geometry& geometry) {
     int failures = 0;
     for (const CachePlan& plan : {kPlanBf16, kPlanInt8, kPlanRk8v4}) {
@@ -3954,6 +3987,9 @@ int run_k8v4_decode_cases() {
                             {1, 64, 65, 808u, false, true}, MappingPattern::Fragmented);
     failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {5, 17, 22, 809u},
                             MappingPattern::Identity);
+    // Two 16-row tiles (18 query rows): Turing's compact K/V stage (kCausalSmallTCompactKV).
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value, {3, 61, 192, 815u},
+                            MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {1, 8191, 8192, 812u},
                             MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value,
@@ -4355,6 +4391,7 @@ int run_softmax_attention_causal_cache_tests() {
     failures += run_case_allowing_arch_skip("causal_softmax_attention k8v4 KV cache (prompt)",
                                             [] { return run_k8v4_prompt_cases(); });
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
+    failures += run_bf16_range_cases();
     failures += run_int8_prompt_cases(false);
     failures += run_int8_prompt_cases(true);
     failures += run_case_allowing_arch_skip("causal_softmax_attention FP8 KV cache (decode)",

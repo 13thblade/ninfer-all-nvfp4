@@ -1,9 +1,84 @@
 # Build system
 
 NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
-`CMAKE_CUDA_ARCHITECTURES` is `80`, `86` (the default), `89` or `120a`, one per build tree; configure
-refuses anything else. CUDA 12.8 builds the `sm_8x` targets, and a `120a` build needs CUDA 13.1 or
-newer.
+`CMAKE_CUDA_ARCHITECTURES` is `70`, `75`, `80`, `86` (the default), `89` or `120a`, one per build
+tree; configure refuses anything else. CUDA 12.8 or newer builds `75` and the `sm_8x` targets, a
+`70` build needs CUDA 12.x ([Tesla V100](../build-linux.md#tesla-v100-sm_70)), and a `120a` build
+needs CUDA 13.1 or newer.
+
+## Turing tier (`75`)
+
+A `75` build runs on Turing (`sm_75`: the TITAN RTX and the RTX 20 series; it is measured on a
+TITAN RTX). It compiles the `mma.sync` compatibility path with `NINFER_SM75=1` for host and device
+code. Turing lacks some instructions that the path uses, and the device helpers replace them:
+
+- `ops/common/pre_sm80.cuh` holds the forms that Volta and Turing share, under
+  `NINFER_PRE_SM80_DEVICE` (device code below `sm_80`): `cp.async` as a plain copy with the same
+  cache policy and zero fill (`cp_commit` and `cp_wait` are empty), `redux.sync` as a shuffle
+  butterfly, the packed conversions in software, and the FP32 products of BF16, FP16 and TF32
+  `m16n8` fragments in a fixed summation order.
+- `ops/common/sm75_mma.cuh` holds the Turing tensor-core forms. FP16 `m16n8k16` runs as two
+  `m16n8k8`, and INT8 `m16n8k32` as four `m8n8k16`. BF16 and TF32 products run on FP16 `m16n8k8`
+  with FP32 accumulation for each output whose row of A and column of B hold only FP16 values, and
+  as the FP32 product of the same operands for the other outputs. No value is narrowed, and an
+  output's route depends on its own row and column only, so every tiling of a product gives the
+  same bits. `ninfer_mma_fragments_test` qualifies each helper against an FP64 oracle through the
+  PTX fragment layouts.
+- A `70` build keeps the Volta forms in `ops/common/sm70_emulation.cuh` (no `ldmatrix`, no `m16n8`
+  shapes); a `75` build keeps the native `ldmatrix` and FP16/INT8 shapes.
+
+`ops/common/device_limits.h` holds the 64 KiB of shared memory that a Turing block can use and
+the 1,024 threads that a Turing SM holds. Kernel shapes assert against the first or derive from it,
+`pipeline_stages()` limits `cp.async` rings to two stages, and `resident_ctas_bound()` lowers a
+`__launch_bounds__` minimum of resident CTAs that a Turing SM cannot hold to the number it can
+(ptxas ignores such a minimum, which leaves the registers unbounded). A kernel that does not fit
+takes a Turing shape:
+
+- The standard INT8-family prompt kernel needs 93,184 bytes, so a Turing build does not have it
+  (`kCausalPromptI8Standard`): every INT8-family prompt runs on the fast kernel with one K/V stage,
+  and the `attn_pack_gqa` and `attn_prompt_fast` switches do not exist.
+- Small-T INT8 attention has no 64-key arena tier (`kSmallTI8KeyBlock64`).
+- The FP8, NVFP4 and K8V4 KV kernels widen K and V into one shared tile where two tiles do not fit
+  (the FP8 prompt kernel and the small-T shapes of two and three 16-row tiles,
+  `kCausalSmallTCompactKV`). V overwrites K after QK.
+- The BF16 prompt attention stages K and V through one buffer, context-KV materialization uses
+  64-key blocks, the rowsplit A8 GEMM runs one stage, and the BF16 `n256_k5120` GEMV splits K
+  eight ways at narrow widths.
+- The GGUF flash attention of Gemma 4 (`ops/linear/gguf/ggml_fattn.cu`) takes the most query rows
+  per tile that the build's device code has, computes without a race and its shared memory fits.
+  llama.cpp's Turing kernel has no tile wider than 32 columns, so width 256 takes 16 rows instead
+  of 32. At width 512 its tiles of 16 and 32 columns, which keep Q in shared memory, race
+  (compute-sanitizer racecheck reports errors, and Gemma 4's prompts gave run-to-run different
+  caches), so width 512 takes 1 row (8 columns) instead of 8.
+- The cooperative GDN gating projection reads the occupancy of its compiled kernels on the device
+  (`bf16_gdn_gating_proj_mma_resident_ctas_per_sm`). A Turing SM holds fewer of these CTAs than an
+  `sm_86` SM, so the widest cooperative routes go to the next route that is resident.
+
+Some Ops round private operands differently on Turing. The Op contracts and the oracle criteria
+are the same on every build:
+
+- BF16-cache attention multiplies Q, K and V as their FP16 roundings: a value from 2^-17 to below
+  2^16 is unchanged, and a smaller value changes by at most 2^-25. A tile that holds a value of
+  2^16 or more is swept again on the per-output FP32 route (`prompt_bf16_sm75.cuh`,
+  `small_t_bf16_sm75.cuh`, `ops/softmax_attention/common/bf16_attention.cuh`). The fast sweep and
+  the FP32 sweep are separate functions, because in one loop body the FP32 route made the fast
+  route spill.
+- Every attention PV product with BF16 values rounds the softmax probabilities to FP16, as the
+  INT8-family kernels do on every architecture: BF16-cache causal attention, the packed attention
+  of the vision towers, and the context and sliding-window attention of the drafters
+  (`pack_attention_p`).
+- An FP16-accumulated product (`mma_f16_f16acc`) rounds its partial sum to FP16 once more per
+  16-value step, because it runs as two 8-value steps.
+
+A `75` build selects the legacy Linear route table only (`kUnifiedLinearRoutes`). Most unified
+schedules need more than 64 KiB, and the build refuses `NINFER_LINEAR_ROUTES=unified`. The Q8 G32
+K-split contraction (`ops/linear/q8/q8_ksplit_mma.cuh`) forms its codes as FP16 pairs and runs FP16
+MMA on tiles whose live activations are FP16 values, with the operands and order of the BF16 route,
+so the outputs are the same bits. It loads the next K group into registers during the current
+group's MMAs. A device profile can run any 8-column K-split tile on four K warps at four CTAs an SM
+(`q8_ksplit/<rows>x<k>` -> `kw4`, `ops/linear/q8/q8_ksplit_config.h`); the TITAN RTX profile does
+so where `ninfer-calibrate` measured it faster ([TITAN RTX measurements](../performance/titan-rtx-2026-10.md)).
+
 Product commands and prerequisites are in the README's [Running](../../README.md#running) and
 [Building](../../README.md#building) sections; test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).

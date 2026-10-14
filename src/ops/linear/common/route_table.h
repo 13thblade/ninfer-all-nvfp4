@@ -18,6 +18,16 @@ enum class LinearRouteTable : std::uint8_t {
     Unified,
 };
 
+// Whether the unified table can be selected in this build. A Turing (sm_75) build takes the legacy
+// table for every width, and refuses NINFER_LINEAR_ROUTES=unified and forcing it: most unified
+// schedules were sized for 99 KiB of shared memory per block against Turing's 64 KiB. Their
+// translation units still compile; nothing launches them.
+#if defined(NINFER_SM75)
+inline constexpr bool kUnifiedLinearRoutes = false;
+#else
+inline constexpr bool kUnifiedLinearRoutes = true;
+#endif
+
 enum class LinearRouteFamily : std::uint8_t {
     Q4,
     Q5,

@@ -6,6 +6,7 @@
 // shared body) so each KV format can be optimized independently. This header owns
 // only what both share: layout constants, device helpers, and the split reducer.
 
+#include "ops/common/device_limits.h"
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
@@ -25,6 +26,24 @@ inline constexpr int kCausalHeadDim = 256;
 // pages go to key-tile rounding and page alignment. A split that must cover more, past the maximum
 // split count, reads its pages from the block table instead.
 inline constexpr int kCausalSmallTSplitKeyLimit = 3968;
+
+// The shared memory of a quantized-cache (FP8, NVFP4, K8V4) small-T CTA besides its key/value
+// stage: Q and the probabilities of `RowTiles` 16-row tiles, their row rescales, the key and value
+// scales of `KeyBlock` keys (at most 16 bytes a key each) and 64 staged page IDs.
+template <int RowTiles, int KeyBlock>
+inline constexpr int kCausalSmallTQuantizedFixedBytes =
+    RowTiles * 16 * (kCausalHeadDim * 2 + (KeyBlock < 64 ? 64 : KeyBlock) * 2 + 4) +
+    2 * KeyBlock * 16 + 64 * 4;
+
+// Whether a quantized-cache small-T tile widens K and V into one shared tile, V overwriting K once
+// QK is done, instead of widening V into its own tile during QK: where the stage with both tiles
+// (`SeparateStageBytes`) does not fit a block beside the rest. On Turing (64 KiB) that is every
+// shape of two and three 16-row tiles. The NVFP4 kernel also stages its one- and two-row-tile
+// shapes so on every architecture.
+template <int RowTiles, int KeyBlock, int SeparateStageBytes>
+inline constexpr bool kCausalSmallTCompactKV =
+    kCausalSmallTQuantizedFixedBytes<RowTiles, KeyBlock> + SeparateStageBytes >
+    kMaxSharedBytesPerBlock;
 
 struct CausalAppendInput {
     static constexpr bool writes_cache = true;

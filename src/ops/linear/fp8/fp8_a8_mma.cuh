@@ -6,6 +6,7 @@
 // contiguous axis the public output-row axis. The epilogue stages BF16 pairs and emits aligned
 // output vectors, while the output policy remains replaceable by a fused semantic Op.
 
+#include "ops/common/device_limits.h"
 #include "ops/common/math.cuh"
 #include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
@@ -70,7 +71,7 @@ struct Fp8MmaSchedule {
     static_assert(kStages >= 2 && kStages <= 8);
     static_assert(kMinBlocksPerSm >= 1);
     static_assert(kWarps >= 1 && kThreads <= 1024);
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= kMaxSharedBytesPerBlock);
     static_assert(kRaster != Fp8MmaRaster::Grouped || kRasterGroupRows > 0);
 };
 

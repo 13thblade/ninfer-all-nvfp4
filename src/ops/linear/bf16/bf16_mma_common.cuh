@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "ops/common/device_limits.h"
 #include "ops/common/mma.cuh"
 #include "ops/linear/bf16/bf16_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
@@ -8,7 +9,7 @@ namespace ninfer::ops::detail::unified {
 
 template <int Bytes, auto Kernel>
 int bf16_prepare_shared() {
-    static_assert(Bytes <= 99 * 1024);
+    static_assert(Bytes <= kMaxSharedBytesPerBlockSm8x);
     if constexpr (Bytes > 48 * 1024) {
         configure_cuda_device_once([] {
             return cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);

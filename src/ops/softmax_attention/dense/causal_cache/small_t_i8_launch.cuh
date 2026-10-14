@@ -199,8 +199,10 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 launch.template operator()<6, 2, 32, false>();
             } else if (routed == "12x1x32") {
                 launch.template operator()<12, 1, 32, false>();
-            } else if (routed == "12x1x64d") {
-                launch.template operator()<12, 1, 64, true>();
+            } else if (routed == "12x1x64d" && kSmallTI8KeyBlock64) {
+                if constexpr (kSmallTI8KeyBlock64) {
+                    launch.template operator()<12, 1, 64, true>();
+                }
             } else if (routed == "24x1x32") {
                 launch.template operator()<24, 1, 32, false>();
             } else if (routed == "6x2x32q") {
@@ -232,7 +234,11 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         } else if (implementation_window <= 2054) {
             launch.template operator()<12, 1, 32, false>();
         } else if (implementation_window <= 8198) {
-            launch.template operator()<12, 1, 64, true>();
+            if constexpr (kSmallTI8KeyBlock64) {
+                launch.template operator()<12, 1, 64, true>();
+            } else {
+                launch.template operator()<12, 1, 32, false>();
+            }
         } else {
             launch.template operator()<6, 2, 32, false>();
         }

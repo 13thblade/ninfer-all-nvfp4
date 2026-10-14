@@ -56,6 +56,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int PageIds              = 64;
     constexpr int ProducerThreads      = RowTiles * 32;
     constexpr int VLoaderThreads       = Threads - ProducerThreads;
+    constexpr bool CompactKVStage      = kCausalSmallTCompactKV<RowTiles, Bc, 11 * Bc * D / 2>;
     constexpr float Log2E              = 1.4426950408889634074F;
     constexpr unsigned FullMask        = 0xffffffffU;
 
@@ -66,13 +67,16 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     static_assert(PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
     static_assert(QKKs == 16);
     __shared__ __align__(16) __nv_bfloat16 q_s[Br * D];
-    __shared__ __align__(16) std::uint8_t static_arena[DynamicArena ? 16 : 11 * Bc * D / 2];
+    __shared__ __align__(16)
+        std::uint8_t static_arena[DynamicArena ? 16 : (CompactKVStage ? 7 : 11) * Bc * D / 2];
     extern __shared__ __align__(16) std::uint8_t dynamic_arena[];
     std::uint8_t* arena   = DynamicArena ? dynamic_arena : static_arena;
     std::uint8_t* k_fp8   = arena;
     __nv_bfloat16* k_b16  = reinterpret_cast<__nv_bfloat16*>(arena + Bc * D);
     std::uint8_t* v_nvfp4 = arena + 3 * Bc * D;
-    __half* v_f16         = reinterpret_cast<__half*>(arena + 3 * Bc * D + Bc * D / 2);
+    // A compact stage widens V into the K tile's bytes once QK is done (kCausalSmallTCompactKV).
+    __half* v_f16 = reinterpret_cast<__half*>(CompactKVStage ? arena + Bc * D
+                                                             : arena + 3 * Bc * D + Bc * D / 2);
     __nv_bfloat16* q_b16  = q_s;
     __shared__ __align__(16) __half p_s[Br * PStride];
     __shared__ float alpha_s[Br];
@@ -464,7 +468,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 alpha_s[row0] = alpha0;
                 alpha_s[row1] = alpha1;
             }
-        } else {
+        } else if constexpr (!CompactKVStage) {
             const int loader_tid = tid - ProducerThreads;
 #pragma unroll 1
             for (int chunk = loader_tid; chunk < Bc * (D / 8); chunk += VLoaderThreads) {
@@ -484,6 +488,27 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             }
         }
         __syncthreads();
+
+        if constexpr (CompactKVStage) {
+            // Every producer warp is done with K: V overwrites the widened K tile.
+#pragma unroll 1
+            for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
+                const int key_l = chunk / (D / 8);
+                const int dc    = chunk - key_l * (D / 8);
+                const int d     = dc * 8;
+                const int key   = k0 + key_l;
+                __half* dst     = &v_f16[key_l * D + causal_small_t_tc_swz(key_l, d)];
+                if (key >= split_start && key < split_end) {
+                    store_vec(dst,
+                              kv_cache_nvfp4_dequant_f16x8(
+                                  &v_nvfp4[key_l * (D / 2) + d / 2],
+                                  v_scale_s[key_l * kKVCacheNvfp4Groups + d / kKVCacheNvfp4Group]));
+                } else {
+                    store_vec(dst, make_int4(0, 0, 0, 0));
+                }
+            }
+            __syncthreads();
+        }
 
         const bool has_next = kb + 1 < key_blocks;
         if (has_next) {

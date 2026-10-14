@@ -6,10 +6,11 @@ APIs. Pipeline stages over several GPUs (`--devices` with distinct ids) are Linu
 README inside a release archive is [`release-archive-windows.md`](release-archive-windows.md);
 this guide is for a checkout.
 
-**Status.** The last full native build and test run was in September 2026: all targets built on
-an RTX 3090 host with Visual Studio 2022 BuildTools (MSVC v143) and CUDA 12.8, and the test suite
-passed. This repository has no Windows test host. CI compiles the host code of every translation
-unit with MSVC 14.44 for `70` (CUDA 12.9), `80`, `86`, `89` and `120a` (CUDA 13.4) on each change
+**Status.** The last full native build and test run was in October 2026: every target of a `75`
+build and of an `86` build with Visual Studio 2022 (MSVC 14.44) and CUDA 12.8, the test suite on a
+TITAN RTX (TCC, and WDDM for the virtual-memory tests) and an RTX 3060 (WDDM), run by a contributor.
+This repository has no Windows test host. CI compiles the host code of every translation unit with
+MSVC 14.44 for `70` (CUDA 12.9), `75`, `80`, `86`, `89` and `120a` (CUDA 13.4) on each change
 to the build inputs (`scripts/check-host-compile.py`), but builds no device code and runs nothing
 on Windows; the Windows-only build option below compiles against Windows headers and has not been
 run.
@@ -17,8 +18,8 @@ run.
 ## Requirements
 
 - Windows 11 x64 and a recent NVIDIA driver;
-- Visual Studio 2022 (MSVC v143) with CUDA 12.8 or newer for `86` and `89`, or Visual Studio 2026
-  with CUDA 13.1 or newer for `120a`;
+- Visual Studio 2022 (MSVC v143) with CUDA 12.8 or newer for `75`, `86` and `89`, or Visual Studio
+  2026 with CUDA 13.1 or newer for `120a`;
 - CMake, Ninja and [vcpkg](https://github.com/microsoft/vcpkg), which provides FFmpeg and curl
   through `vcpkg.json`;
 - the Microsoft Visual C++ runtime to run the executables, and a `.ninfer` artifact.
@@ -38,7 +39,7 @@ Ninja generator, and builds into `build-ninja`:
 .\scripts\build.ps1                       # configure and build
 .\scripts\build.ps1 -Test                 # then run the test suite
 .\scripts\build.ps1 -Target ninfer-serve  # one target
-.\scripts\build.ps1 -Arch 89              # another architecture (80, 86 or 89)
+.\scripts\build.ps1 -Arch 89              # another architecture (75, 80, 86 or 89)
 ```
 
 The same build by hand:

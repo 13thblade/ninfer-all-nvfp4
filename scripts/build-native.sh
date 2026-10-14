@@ -10,7 +10,7 @@
 #   scripts/build-native.sh test        ctest; a test that needs a GPU skips without one
 #
 #   NINFER_CUDA_PATH   CUDA toolkit root            (default /usr/local/cuda)
-#   NINFER_CUDA_ARCH   80, 86, 89 or 120a           (default 86)
+#   NINFER_CUDA_ARCH   70, 75, 80, 86, 89 or 120a   (default 86)
 #   NINFER_BUILD_DIR   build tree                   (default build-native)
 #   NINFER_TESTS       ON or OFF: build the tests   (default ON)
 #   NINFER_MULTICALL   ON or OFF: the programs as one multi-call executable, ninfer-multicall,
@@ -26,7 +26,7 @@ tests="${NINFER_TESTS:-ON}"
 multicall="${NINFER_MULTICALL:-OFF}"
 jobs="${NINFER_JOBS:-$(nproc)}"
 
-case "$arch" in 80|86|89|120a) ;; *) printf 'NINFER_CUDA_ARCH must be 80, 86, 89 or 120a, got %s\n' "$arch" >&2; exit 2 ;; esac
+case "$arch" in 70|75|80|86|89|120a) ;; *) printf 'NINFER_CUDA_ARCH must be 70, 75, 80, 86, 89 or 120a, got %s\n' "$arch" >&2; exit 2 ;; esac
 case "$tests" in ON|OFF) ;; *) printf 'NINFER_TESTS must be ON or OFF, got %s\n' "$tests" >&2; exit 2 ;; esac
 case "$multicall" in ON|OFF) ;; *) printf 'NINFER_MULTICALL must be ON or OFF, got %s\n' "$multicall" >&2; exit 2 ;; esac
 

@@ -8,7 +8,7 @@ spelling and defaults.
 
 | Document | Purpose |
 |---|---|
-| [Linux build](build-linux.md) | the container image, native Ubuntu builds for `86`, `89` and `120a`, build options and the Bash launchers |
+| [Linux build](build-linux.md) | the container image, native Ubuntu builds for every target (`70`, `75`, `80`, `86`, `89`, `120a`), build options and the Bash launchers |
 | [Windows build](build-windows.md) | native Windows builds, their toolchain constraints and the launcher scripts |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, speculative decoding, and the runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, llama.cpp endpoints, the router, model suspend, state, streaming, token counting, authentication, tool calls, and the server options |
@@ -19,7 +19,7 @@ spelling and defaults.
 | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md) | converting the GSQ-RCO GGUF releases and their n-gram table; experts on one or several GPUs, in host memory or on disk; measurements |
 | [Gemma 4 26B-A4B](gemma4.md) | converting Google's QAT GGUF release with its MTP assistant and vision tower, what runs, speculative decoding, images and video, the defaults, measurements against llama.cpp and the numerical checks |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
-| [Device profiles](device-profiles.md) | per-GPU route profiles: the built-in RTX 3090/4090/5090/PRO 6000 table, calibration at first start, `ninfer-calibrate` |
+| [Device profiles](device-profiles.md) | per-GPU route profiles: the built-in RTX 3090/4090/5090/PRO 6000/TITAN RTX table, calibration at first start, `ninfer-calibrate` |
 | [Configuration calculator](config-calculator.html) | which context, KV format and speculation fit an RTX 3090 with Qwen3.8-27B or Qwen3.6-35B-A3B, from measurements |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 | [Release archives](release-archive-linux.md) ([Windows](release-archive-windows.md)) | the README that `scripts/package-release.sh` and `.ps1` put in a release archive |

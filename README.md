@@ -2,7 +2,8 @@
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
 their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next and Gemma 4 26B-A4B, on the RTX 3090,
-RTX 4090, RTX 5090 and RTX PRO 6000 Blackwell, and on the Tesla V100 from a
+RTX 4090, RTX 5090 and RTX PRO 6000 Blackwell, on the TITAN RTX and RTX 20 series
+([Turing](docs/build-linux.md#turing-sm_75)), and on the Tesla V100 from a
 [source build](docs/build-linux.md#tesla-v100-sm_70). It serves the OpenAI, Anthropic and llama.cpp
 APIs from one GPU, or from up to eight as pipeline stages on Linux.
 
@@ -174,8 +175,8 @@ of the file.
 
 - **Device route profiles.** Each card's measured profile picks the kernel route for every
   operation and width. Profiles are built in for the RTX 3090, 4090, 5090, the three RTX PRO
-  6000 editions and the Tesla V100-SXM2-16GB; any other GPU is measured once at first start, and
-  `ninfer-calibrate` re-measures ([device profiles](docs/device-profiles.md)).
+  6000 editions, the Tesla V100-SXM2-16GB and the TITAN RTX; any other GPU is measured once at
+  first start, and `ninfer-calibrate` re-measures ([device profiles](docs/device-profiles.md)).
 - **Pipeline stages.** `--devices 0,1,...` splits the layers over up to eight GPUs on Linux, each
   stage owning its weights, KV and state ([pipeline stages](docs/maintainer/pipeline-stages.md)).
 - FP8 A8 and NVFP4 W4A4 tensor-core routes on every `120a` build, an FP4 tensor-core prompt kernel
@@ -420,8 +421,9 @@ conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b
 
 `ghcr.io/iamwavecut/ninfer-all:latest` is built from the newest `master` commit that passes CI, on
 CUDA 13.4 and Ubuntu 26.04; a commit that changes only documentation or tooling the image does not
-carry keeps the image before it. It carries two builds and starts the one that matches the GPU: `sm_86` for
-the RTX 30 and RTX 40 series, `sm_120a` for the RTX 50 series and the RTX PRO 6000 Blackwell.
+carry keeps the image before it. It carries three builds and starts the one that matches the GPU:
+`sm_75` for the TITAN RTX and RTX 20 series, `sm_86` for the RTX 30 and RTX 40 series, `sm_120a` for
+the RTX 50 series and the RTX PRO 6000 Blackwell.
 
 - **Host.** An NVIDIA driver of the CUDA 13 branch (580 or newer) and the
   [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
@@ -449,8 +451,8 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
 
 [compose.yaml](compose.yaml) wires the GPU, the port and the volumes for the same:
 `docker compose run --rm ninfer download qwen38-27b`, then `docker compose up -d`.
-`NINFER_IMAGE_ARCH=sm86|sm120a` overrides the GPU detection, and `docker build -t ninfer .` builds
-the image from source (`--build-arg ARCHS=86` for one architecture).
+`NINFER_IMAGE_ARCH=sm75|sm86|sm120a` overrides the GPU detection, and `docker build -t ninfer .`
+builds the image from source (`--build-arg ARCHS=86` for one architecture).
 
 ## Building
 
@@ -460,12 +462,13 @@ cmake --build build --target ninfer-serve ninfer-calibrate
 ```
 
 `CMAKE_CUDA_ARCHITECTURES` is `86` for the RTX 30 series (that build also runs the RTX 40 series),
-`89` for the RTX 40 series and `120a` for the RTX 50 series and the RTX PRO 6000 Blackwell (on the
-`mma.sync` compatibility path, which the ternary route needs). CUDA 12.8 or newer builds `86` and
-`89`; a `120a` build needs CUDA 13.1 or newer, since 12.8 and 12.9 miscompile sm_120a kernels and
-configure refuses them. The [Linux](docs/build-linux.md) and [Windows](docs/build-windows.md)
-guides cover dependencies, the opt-in build options and the launcher scripts;
-[tests](tests/README.md) and [benchmarks](bench/README.md) have their own guides.
+`89` for the RTX 40 series, `120a` for the RTX 50 series and the RTX PRO 6000 Blackwell (on the
+`mma.sync` compatibility path, which the ternary route needs) and `75` for the TITAN RTX and RTX 20
+series ([Turing tier](docs/maintainer/build-system.md#turing-tier-75)). CUDA 12.8 or newer builds
+`75`, `86` and `89`; a `120a` build needs CUDA 13.1 or newer, since 12.8 and 12.9 miscompile
+sm_120a kernels and configure refuses them. The [Linux](docs/build-linux.md) and
+[Windows](docs/build-windows.md) guides cover dependencies, the opt-in build options and the
+launcher scripts; [tests](tests/README.md) and [benchmarks](bench/README.md) have their own guides.
 
 ## License
 

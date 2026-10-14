@@ -36,8 +36,14 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
     // constraint as small_t_fp8.cu; see its comment). KeyBlock=32 fits comfortably (~75KiB).
     constexpr int KeyBlock             = 32;
     constexpr int MinBlocks            = TokenTile == 1 ? 2 : 1;
-    // k_fp8(Bc*D) + k_b16(2*Bc*D) + v_nvfp4(Bc*D/2) + v_f16(2*Bc*D) = 5.5*Bc*D bytes.
-    constexpr std::size_t DynamicBytes = 11u * KeyBlock * kCausalHeadDim / 2u;
+    // k_fp8(Bc*D) + k_b16(2*Bc*D) + v_nvfp4(Bc*D/2) + v_f16(2*Bc*D) = 5.5*Bc*D bytes; a compact
+    // stage widens V into k_b16 (kCausalSmallTCompactKV), 3.5*Bc*D bytes.
+    constexpr std::size_t DynamicBytes =
+        (kCausalSmallTCompactKV<RowTiles, KeyBlock, 11 * KeyBlock * kCausalHeadDim / 2> ? 7u
+                                                                                        : 11u) *
+        KeyBlock * kCausalHeadDim / 2u;
+    static_assert(kCausalSmallTQuantizedFixedBytes<RowTiles, KeyBlock> + DynamicBytes <=
+                  kMaxSharedBytesPerBlock);
     using KernelInput                  = CacheInput;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     const auto launch = [&]() {

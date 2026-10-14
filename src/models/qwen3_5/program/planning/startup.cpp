@@ -1044,12 +1044,23 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     // warp-level mma.sync schedules this family is written against, with the same 100 KiB of shared
     // memory per SM. The occupancy and split-k choices are still the sm_86 ones, so the card is
     // supported here in the sense of running correctly, not of being tuned for. 7.0 (Tesla V100)
-    // runs only a build for it, whose kernels emulate the Ampere warp primitives.
-    if (device.compute_capability() != 70 && device.compute_capability() != 80 &&
-        device.compute_capability() != 86 && device.compute_capability() != 89 &&
-        device.compute_capability() != 120) {
+    // runs only a build for it, whose kernels emulate the Ampere warp primitives. 7.5 needs the
+    // Turing tier of a 75 build (NINFER_SM75), whose kernels avoid the sm_80 instructions and fit
+    // its 64 KiB of shared memory.
+    const int capability = device.compute_capability();
+#if defined(NINFER_SM75)
+    constexpr bool kTuringBuild = true;
+#else
+    constexpr bool kTuringBuild = false;
+#endif
+    if (!(capability == 70 || capability == 80 || capability == 86 || capability == 89 ||
+          capability == 120 || (capability == 75 && kTuringBuild))) {
         throw std::invalid_argument(
-            "Qwen3.5 family runtime requires compute capability 7.0, 8.0, 8.6, 8.9 or 12.0");
+            kTuringBuild
+                ? "Qwen3.5 family runtime requires compute capability 7.0, 7.5, 8.0, 8.6, 8.9 or "
+                  "12.0"
+                : "Qwen3.5 family runtime requires compute capability 7.0, 8.0, 8.6, 8.9 or 12.0 "
+                  "(7.5 needs a CMAKE_CUDA_ARCHITECTURES=75 build)");
     }
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&

@@ -11,6 +11,7 @@
 #include <math_constants.h>
 
 #include "ops/kv_cache/int8_g64_codec.cuh"
+#include "ops/softmax_attention/dense/causal_cache/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
 
 #include <cstdint>
@@ -119,7 +120,7 @@ inline constexpr int kCausalPromptI8SmemBytes =
 
 static_assert(kCausalPromptI8Groups == 4);
 static_assert(kCausalPromptI8DConsumers == 4);
-static_assert(kCausalPromptI8SmemBytes == 93184);
+static_assert(kCausalPromptI8SmemBytes == detail::kCausalPromptI8StandardSmemBytes);
 
 // The f16 value loaders this kernel needs now live in ops/kv_cache/int8_g64_codec.cuh, beside their
 // bf16 counterparts: kv_cache_int8_dequant_f16x8_from and kv_cache_int4_dequant_f16x8_from. They

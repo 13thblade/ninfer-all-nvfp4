@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 static_assert(kPromptWaveRows == CausalPromptI8FastShape<8>::Br);
@@ -68,12 +69,16 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
                                                 float scale, const CacheView& cache,
                                                 Metadata metadata, Tensor& out,
                                                 cudaStream_t stream) {
-    configure_cuda_device_once([] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 8, PackedValues, Keys>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            CausalPromptI8FastShape<8, PackedValues>::SmemBytes);
-    });
+    // Eight warps with INT8 values do not fit Turing's shared memory; those launches take four.
+    constexpr bool kWide = CausalPromptI8FastShape<8, PackedValues>::Launchable;
+    if constexpr (kWide) {
+        configure_cuda_device_once([] {
+            return cudaFuncSetAttribute(
+                causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 8, PackedValues, Keys>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                CausalPromptI8FastShape<8, PackedValues>::SmemBytes);
+        });
+    }
     configure_cuda_device_once([] {
         return cudaFuncSetAttribute(
             causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 4, PackedValues, Keys>,
@@ -96,10 +101,14 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
     };
-    if (causal_attention_prompt_i8_fast_prefers_narrow(tokens, Geometry::QHeads)) {
-        launch.template operator()<4>();
+    if constexpr (kWide) {
+        if (causal_attention_prompt_i8_fast_prefers_narrow(tokens, Geometry::QHeads)) {
+            launch.template operator()<4>();
+        } else {
+            launch.template operator()<8>();
+        }
     } else {
-        launch.template operator()<8>();
+        launch.template operator()<4>();
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -142,96 +151,105 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
     const Tensor& cache_v = cache.v_pages;
     const auto tokens     = static_cast<std::int32_t>(q.ne[2]);
     if (kv_cache_is_int8_family(cache.storage)) {
-        // The INT8 family is the one place that deliberately does not take its plane types from
-        // ops/kv_cache/plane_types.h. One kernel serves both codings, so its value parameter is
-        // std::int8_t* for int8-g64 and for rk8v4 alike, and the packed-int4 path re-casts to
-        // std::uint8_t where it unpacks (causal_prompt_i4_dequant_f16x8). Substituting
-        // KvValueCodeT<RotatedInt8KeyInt4ValueGroup64>, which is U8 because the profile describes
-        // the plane's storage rather than this kernel's signature, would not be a cleanup. Leave
-        // it; the dtype check below is the guard that matters here.
-        const bool pack_gqa  = Geometry::GroupSize > 1 && prompt_pack_gqa();
-        const auto launch_i8 = [&]<bool PackedValues, KvKeyCoding Keys, bool PvF16>() {
-            const auto launch = [&]<bool PackGqa>() {
-                const auto kernel =
-                    causal_attention_prompt_i8_kernel<Geometry, Metadata, PackedValues, Keys, PvF16,
-                                                      PackGqa>;
-                // The kernel exceeds the default 48 KiB dynamic-smem ceiling.
-                configure_cuda_device_once([&] {
-                    return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                kCausalPromptI8SmemBytes);
-                });
-                const dim3 grid =
-                    PackGqa ? dim3(static_cast<unsigned>(
-                                       div_up(tokens * Geometry::GroupSize, kCausalPromptI8Br)),
-                                   static_cast<unsigned>(Geometry::KVHeads), 1u)
-                            : dim3(static_cast<unsigned>(div_up(tokens, kCausalPromptI8Br)),
-                                   static_cast<unsigned>(Geometry::QHeads), 1u);
-                kernel<<<grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::int8_t*>(cache_k.data),
-                    static_cast<const std::int8_t*>(cache_v.data),
-                    static_cast<const __half*>(cache.k_scale_pages.data),
-                    static_cast<const __half*>(cache.v_scale_pages.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
-            };
+        if constexpr (!kCausalPromptI8Standard) {
+            // Every INT8-family coding took the fast kernel above
+            // (causal_attention_prompt_fast_kernel).
+            throw std::logic_error(
+                "INT8-family prompt attention reached the standard kernel, which this build lacks");
+        } else {
+            // The INT8 family is the one place that deliberately does not take its plane types from
+            // ops/kv_cache/plane_types.h. One kernel serves both codings, so its value parameter is
+            // std::int8_t* for int8-g64 and for rk8v4 alike, and the packed-int4 path re-casts to
+            // std::uint8_t where it unpacks (causal_prompt_i4_dequant_f16x8). Substituting
+            // KvValueCodeT<RotatedInt8KeyInt4ValueGroup64>, which is U8 because the profile
+            // describes the plane's storage rather than this kernel's signature, would not be a
+            // cleanup. Leave it; the dtype check below is the guard that matters here.
+            const bool pack_gqa  = Geometry::GroupSize > 1 && prompt_pack_gqa();
+            const auto launch_i8 = [&]<bool PackedValues, KvKeyCoding Keys, bool PvF16>() {
+                const auto launch = [&]<bool PackGqa>() {
+                    const auto kernel =
+                        causal_attention_prompt_i8_kernel<Geometry, Metadata, PackedValues, Keys,
+                                                          PvF16, PackGqa>;
+                    // The kernel exceeds the default 48 KiB dynamic-smem ceiling.
+                    configure_cuda_device_once([&] {
+                        return cudaFuncSetAttribute(kernel,
+                                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                    kCausalPromptI8SmemBytes);
+                    });
+                    const dim3 grid =
+                        PackGqa ? dim3(static_cast<unsigned>(
+                                           div_up(tokens * Geometry::GroupSize, kCausalPromptI8Br)),
+                                       static_cast<unsigned>(Geometry::KVHeads), 1u)
+                                : dim3(static_cast<unsigned>(div_up(tokens, kCausalPromptI8Br)),
+                                       static_cast<unsigned>(Geometry::QHeads), 1u);
+                    kernel<<<grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
+                        static_cast<const __nv_bfloat16*>(q.data),
+                        static_cast<const std::int8_t*>(cache_k.data),
+                        static_cast<const std::int8_t*>(cache_v.data),
+                        static_cast<const __half*>(cache.k_scale_pages.data),
+                        static_cast<const __half*>(cache.v_scale_pages.data), metadata,
+                        static_cast<const std::int32_t*>(positions.data), scale,
+                        static_cast<__nv_bfloat16*>(out.data), tokens);
+                };
 #if defined(NINFER_SM70)
-            // A 70 build emulates these tiles; one variant per coding keeps ptxas within bounds.
-            (void)pack_gqa;
-            launch.template operator()<false>();
-#else
-            if (pack_gqa) {
-                launch.template operator()<true>();
-            } else {
+                // A 70 build emulates these tiles; one variant per coding keeps ptxas within
+                // bounds.
+                (void)pack_gqa;
                 launch.template operator()<false>();
+#else
+                if (pack_gqa) {
+                    launch.template operator()<true>();
+                } else {
+                    launch.template operator()<false>();
+                }
+#endif
+            };
+            // A U8 key plane is a packed key coding (rk4v4, rk4v4-e8 or rk2v4-e8), told apart by
+            // storage; a U8 value plane is the packed signed int4 coding they share with rk8v4.
+#if defined(NINFER_SM70)
+            if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+                launch_i8.template operator()<true, KvKeyCoding::Lloyd4, false>();
+            } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
+                launch_i8.template operator()<true, KvKeyCoding::Int4E8, false>();
+            } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
+                launch_i8.template operator()<true, KvKeyCoding::RootE8, false>();
+            } else if (cache_v.dtype == DType::U8) {
+                launch_i8.template operator()<true, KvKeyCoding::Int8, false>();
+            } else {
+                launch_i8.template operator()<false, KvKeyCoding::Int8, false>();
+            }
+#else
+            const bool pv_f16 = prompt_pv_f16();
+            if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value && pv_f16) {
+                launch_i8.template operator()<true, KvKeyCoding::Lloyd4, true>();
+            } else if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+                launch_i8.template operator()<true, KvKeyCoding::Lloyd4, false>();
+            } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8 && pv_f16) {
+                launch_i8.template operator()<true, KvKeyCoding::Int4E8, true>();
+            } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
+                launch_i8.template operator()<true, KvKeyCoding::Int4E8, false>();
+            } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
+                launch_i8.template operator()<true, KvKeyCoding::RootE8, false>();
+            } else if (cache_v.dtype == DType::U8 && pv_f16) {
+                launch_i8.template operator()<true, KvKeyCoding::Int8, true>();
+            } else if (cache_v.dtype == DType::U8) {
+                launch_i8.template operator()<true, KvKeyCoding::Int8, false>();
+            } else {
+                launch_i8.template operator()<false, KvKeyCoding::Int8, false>();
             }
 #endif
-        };
-        // A U8 key plane is a packed key coding (rk4v4, rk4v4-e8 or rk2v4-e8), told apart by
-        // storage; a U8 value plane is the packed signed int4 coding they share with rk8v4.
-#if defined(NINFER_SM70)
-        if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
-            launch_i8.template operator()<true, KvKeyCoding::Lloyd4, false>();
-        } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
-            launch_i8.template operator()<true, KvKeyCoding::Int4E8, false>();
-        } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
-            launch_i8.template operator()<true, KvKeyCoding::RootE8, false>();
-        } else if (cache_v.dtype == DType::U8) {
-            launch_i8.template operator()<true, KvKeyCoding::Int8, false>();
-        } else {
-            launch_i8.template operator()<false, KvKeyCoding::Int8, false>();
         }
-#else
-        const bool pv_f16 = prompt_pv_f16();
-        if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value && pv_f16) {
-            launch_i8.template operator()<true, KvKeyCoding::Lloyd4, true>();
-        } else if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
-            launch_i8.template operator()<true, KvKeyCoding::Lloyd4, false>();
-        } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8 && pv_f16) {
-            launch_i8.template operator()<true, KvKeyCoding::Int4E8, true>();
-        } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
-            launch_i8.template operator()<true, KvKeyCoding::Int4E8, false>();
-        } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
-            launch_i8.template operator()<true, KvKeyCoding::RootE8, false>();
-        } else if (cache_v.dtype == DType::U8 && pv_f16) {
-            launch_i8.template operator()<true, KvKeyCoding::Int8, true>();
-        } else if (cache_v.dtype == DType::U8) {
-            launch_i8.template operator()<true, KvKeyCoding::Int8, false>();
-        } else {
-            launch_i8.template operator()<false, KvKeyCoding::Int8, false>();
-        }
-#endif
     } else {
         // The kernel exceeds the default 48 KiB dynamic-smem ceiling.
         configure_cuda_device_once([&] {
             return cudaFuncSetAttribute(causal_attention_prompt_bf16_kernel<Geometry, Metadata>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        kCausalPromptSmemBytes);
+                                        kCausalPromptBf16SmemBytes);
         });
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         causal_attention_prompt_bf16_kernel<Geometry, Metadata>
-            <<<attention_grid, kCausalPromptThreads, kCausalPromptSmemBytes, stream>>>(
+            <<<attention_grid, kCausalPromptThreads, kCausalPromptBf16SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const __nv_bfloat16*>(cache_k.data),
                 static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
@@ -256,6 +274,9 @@ bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested)
                            storage == KvCacheStorage::RotatedE8RootKeyInt4Value ||
                            storage == KvCacheStorage::Nvfp4Group16;
     if (!supported) { return false; }
+    // A build without the standard INT8-family prompt kernel (kCausalPromptI8Standard) takes the
+    // fast one for every INT8-family coding.
+    if (!kCausalPromptI8Standard && storage != KvCacheStorage::Nvfp4Group16) { return true; }
     if (requested) { return true; }
     static const int forced = [] {
         const char* value = std::getenv("NINFER_PROMPT_FAST");

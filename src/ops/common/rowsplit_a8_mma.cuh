@@ -38,7 +38,8 @@
 // Nothing in the prefetch path waits on a synchronous global read.
 
 #include "core/tensor.h"
-#include "ops/common/sm70_emulation.cuh"
+#include "ops/common/device_limits.h"
+#include "ops/common/mma.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -52,21 +53,15 @@ constexpr int kWarpsM  = 4;
 constexpr int kWarpsN  = 4;
 constexpr int kGroup   = 64; // k per iteration: exactly one scale group
 constexpr int kWRow    = 48; // padded shared stride for a row's 32 packed bytes, 16-byte aligned
-constexpr int kStages  = 2;
-constexpr int kRingGroups = 8;  // 16 bytes of one row's scales, the widest cp.async
-constexpr int kRingBufs   = 2;
-
-__device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
-                                       unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
-#if defined(NINFER_SM70_DEVICE)
-    sm70::mma_m16n8k32_s8(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+// Turing's copies are synchronous (ops/common/memory.cuh), so a second stage has nothing to overlap
+// there, and the 512-token tile's two stages would need 75 KiB of the 64 KiB a Turing block has.
+#if defined(NINFER_SM75)
+constexpr int kStages = 1;
 #else
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+constexpr int kStages = 2;
 #endif
-}
+constexpr int kRingGroups = 8; // 16 bytes of one row's scales, the widest cp.async
+constexpr int kRingBufs   = 2;
 
 __device__ __forceinline__ uint4 lds128(const void* p) {
     uint4 r;
@@ -91,19 +86,10 @@ __device__ __forceinline__ unsigned lds8(const void* p) {
     return r;
 }
 
+// 16-byte copies bypass L1 (.cg); narrower ones may only use .ca.
 template <int kBytes>
 __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
-#if defined(NINFER_SM70_DEVICE)
-    sm70::copy_to_shared<kBytes, kBytes == 16>(smem, gmem);
-#else
-    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-    if constexpr (kBytes == 16) {
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(addr), "l"(gmem));
-    } else {
-        asm volatile("cp.async.ca.shared.global [%0], [%1], %2;" ::"r"(addr), "l"(gmem),
-                     "n"(kBytes));
-    }
-#endif
+    ::ninfer::ops::cp_async<kBytes, kBytes == 16 ? Cache::cg : Cache::ca>(smem, gmem);
 }
 
 // Two packed bytes hold four consecutive k as (low,high) nibble pairs; this spreads them to one
@@ -292,6 +278,8 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
     constexpr int kXsBytes = BN * 2;
     constexpr int kStage   = kWBytes + kHBytes + kXBytes + kXsBytes;
     constexpr int kRingBytes = BM * kRingGroups * 2;
+    static_assert(kStages * kStage + kRingBufs * kRingBytes <= kMaxSharedBytesPerBlock,
+                  "rowsplit A8 tile exceeds the per-block shared memory limit");
 
     extern __shared__ char smem[];
     char* const s_base = smem;
@@ -400,9 +388,7 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
                                                   sizeof(__half));
             }
         }
-#if !defined(NINFER_SM70_DEVICE)
-        asm volatile("cp.async.commit_group;");
-#endif
+        cp_commit();
     };
 
     float acc[MT][NT][4];
@@ -423,15 +409,11 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
         if (g + kStages - 1 < kGroups) { issue(g + kStages - 1, (g + kStages - 1) % kStages); }
         const int issued  = (g + kStages < kGroups) ? (g + kStages) : kGroups;
         const int allowed = issued - (g + 1);
-#if !defined(NINFER_SM70_DEVICE)
         if (allowed >= 1) {
-            asm volatile("cp.async.wait_group 1;");
+            cp_wait<1>();
         } else {
-            asm volatile("cp.async.wait_group 0;");
+            cp_wait<0>();
         }
-#else
-        (void)allowed;
-#endif
         __syncthreads();
 
         const char* const sa    = s_base + buf * kStage;
@@ -569,6 +551,39 @@ template <class Codec, int MT, int NT, class RowMap>
         if (tokens % bn == 0) { return bn; }
     }
     return 0;
+}
+
+// The padded width a ragged T runs at: the GEMM's grid covers it, while the quantizer and the
+// epilogues cover T alone. Every column tile streams the whole weight, and a wider tile costs less
+// per column: on the RTX 3090 one 128-, 256- and 512-column tile of the text layers take
+// 1 : 1.4 : 2.2 (ninfer_linear_bench, 2026-09-22), so 300 tokens run as one 512-column tile (2.2)
+// rather than three of 128 (3.0), and 600 as three of 256 rather than five of 128. A prompt chunk
+// aligned to the attention grid (1,152 tokens on 72 SMs) runs as three 512-column tiles.
+[[nodiscard]] inline std::int32_t padded_tokens(std::int32_t tokens) {
+    struct Tile {
+        std::int32_t columns;
+        std::int32_t cost; // tenths of a 128-column tile
+    };
+
+    constexpr Tile kTiles[] = {{128, 10}, {256, 14}, {512, 22}};
+    std::int32_t best       = 0;
+    std::int32_t best_cost  = 0;
+    for (const Tile& tile : kTiles) {
+        const std::int32_t count = (tokens + tile.columns - 1) / tile.columns;
+        const std::int32_t cost  = count * tile.cost;
+        if (best == 0 || cost < best_cost) {
+            best      = count * tile.columns;
+            best_cost = cost;
+        }
+    }
+    return best;
+}
+
+// The activation planes for every T in [1, max_tokens] at its padded width: padded_tokens never
+// exceeds the next multiple of 512.
+[[nodiscard]] inline std::size_t padded_activation_workspace_bytes(std::int32_t input_rows,
+                                                                   std::int32_t max_tokens) {
+    return activation_workspace_bytes(input_rows, (max_tokens + 511) / 512 * 512);
 }
 
 [[nodiscard]] inline bool tokens_supported(std::int32_t tokens) {
