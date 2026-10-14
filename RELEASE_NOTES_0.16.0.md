@@ -176,11 +176,21 @@ GiB). Measured on the same RTX 3090 (README):
 
 ## Verification
 
-(Filled in after the smoke tests.)
+Checked on 2026-10-14 against the release commit, before publishing:
+
+- **Real-card smoke test (Windows, RTX 3090):** the extracted zip started `run.bat qwen38-27b` with only
+  Windows on `PATH`, was ready in 8.7 s, answered a chat completion, and `/health` reported
+  `0.16.0-rtx3090`. The context was lowered to 150,528 tokens (188,416 asked for) because the desktop
+  was using GPU memory, which is the launcher working as designed.
+- **Windows zip:** inner and outer checksums match; `ninfer-serve`, `ninfer` and `ninfer_bench` start
+  with only Windows on `PATH`.
+- **Linux archive:** inner and outer checksums match; a fresh unpack runs `./ninfer-serve --version`,
+  `./ninfer-serve --help` and `./run.sh --help`; `scripts/check-linux-scripts.sh` passes. The Linux
+  build was not run against a model.
 
 ## Install and upgrade
 
-Windows: unzip `NInfer-3090-v0.16.0-rtx3090-windows-x64.zip` next to your `models` folder and run
+Windows: unzip `ninfer-rtx3090-windows-x64-0.16.0-rtx3090.zip` next to your `models` folder and run
 `run.bat <profile>`. Linux: see `docs/release-archive-linux.md` for the glibc, CUDA 12.8, cuBLAS,
 FFmpeg 6 and libcurl requirements. Check the SHA256SUMS file for each archive. If you keep your own
 launch script, go through the breaking-changes list at the top first.
