@@ -553,6 +553,39 @@ template <class Codec, int MT, int NT, class RowMap>
     return 0;
 }
 
+// The padded width a ragged T runs at: the GEMM's grid covers it, while the quantizer and the
+// epilogues cover T alone. Every column tile streams the whole weight, and a wider tile costs less
+// per column: on the RTX 3090 one 128-, 256- and 512-column tile of the text layers take
+// 1 : 1.4 : 2.2 (ninfer_linear_bench, 2026-09-22), so 300 tokens run as one 512-column tile (2.2)
+// rather than three of 128 (3.0), and 600 as three of 256 rather than five of 128. A prompt chunk
+// aligned to the attention grid (1,152 tokens on 72 SMs) runs as three 512-column tiles.
+[[nodiscard]] inline std::int32_t padded_tokens(std::int32_t tokens) {
+    struct Tile {
+        std::int32_t columns;
+        std::int32_t cost; // tenths of a 128-column tile
+    };
+
+    constexpr Tile kTiles[] = {{128, 10}, {256, 14}, {512, 22}};
+    std::int32_t best       = 0;
+    std::int32_t best_cost  = 0;
+    for (const Tile& tile : kTiles) {
+        const std::int32_t count = (tokens + tile.columns - 1) / tile.columns;
+        const std::int32_t cost  = count * tile.cost;
+        if (best == 0 || cost < best_cost) {
+            best      = count * tile.columns;
+            best_cost = cost;
+        }
+    }
+    return best;
+}
+
+// The activation planes for every T in [1, max_tokens] at its padded width: padded_tokens never
+// exceeds the next multiple of 512.
+[[nodiscard]] inline std::size_t padded_activation_workspace_bytes(std::int32_t input_rows,
+                                                                   std::int32_t max_tokens) {
+    return activation_workspace_bytes(input_rows, (max_tokens + 511) / 512 * 512);
+}
+
 [[nodiscard]] inline bool tokens_supported(std::int32_t tokens) {
     return tokens >= 128 && tokens % 128 == 0;
 }
