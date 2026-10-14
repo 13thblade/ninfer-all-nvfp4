@@ -33,8 +33,9 @@ an RTX 3090, 4090 or 5090 replaces the keys calibration measures and keeps every
 the compiled route best is stored with an empty schedule, which overrides a built-in choice for it.
 
 A GPU with neither a file entry nor a built-in one is calibrated once when the engine starts, before
-the weights are loaded. This takes 20 to 40 seconds, and the result is written to the profile file
-for later starts. A `70` build runs its own projection and attention routes, which no profile key
+the weights are loaded. This takes 20 to 40 seconds on cards of the RTX 3090's class and longer on
+smaller ones (startup took 82 to 107 seconds on an RTX 3060, 3060 Ti and 2080 Ti), and the result
+is written to the profile file for later starts. A `70` build runs its own projection and attention routes, which no profile key
 steers, so it calibrates the two-stage GDN switch alone, in about nine seconds on a V100.
 
 An entry applies only to the same hardware class (the GPU name and compute capability) and the same
