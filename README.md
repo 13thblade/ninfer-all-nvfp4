@@ -1,15 +1,41 @@
 # NInfer-all
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
-their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next and Gemma 4 26B-A4B, on the RTX 3090,
-RTX 4090, RTX 5090 and RTX PRO 6000 Blackwell, on the TITAN RTX and RTX 20 series
-([Turing](docs/build-linux.md#turing-sm_75)), and on the Tesla V100 from a
-[source build](docs/build-linux.md#tesla-v100-sm_70). It serves the OpenAI, Anthropic and llama.cpp
-APIs from one GPU, or from up to eight as pipeline stages on Linux.
+their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next and Gemma 4 26B-A4B, on NVIDIA GPUs from
+Volta to consumer Blackwell ([supported GPUs](#supported-gpus)). It serves the OpenAI, Anthropic and
+llama.cpp APIs from one GPU, or from up to eight as pipeline stages on Linux.
 
 NInfer-all continues [NInfer](https://github.com/Neroued/ninfer) through the NInfer-3090 line and
 carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits each of them.
 The [documentation map](docs/README.md) lists the guides and references.
+
+## Supported GPUs
+
+A build targets one architecture (`CMAKE_CUDA_ARCHITECTURES`). The [Docker image](#docker) carries
+the `75`, `86` and `120a` builds and starts the one that matches the GPU.
+
+| Architecture | Compute capability | Build | Measured on | Built-in device profile | In the image |
+|---|---|---|---|---|---|
+| Blackwell (consumer) | 12.0 | `120a` (CUDA 13.1 or newer) | RTX 5090, RTX PRO 6000 Blackwell Workstation Edition | RTX 5090; RTX PRO 6000 Workstation, Max-Q and Server editions | yes |
+| Ada Lovelace | 8.9 | `89`, or the `86` build | RTX 4090, NVIDIA L40S | RTX 4090 | `86` build |
+| Ampere | 8.6 | `86` (the default) | RTX 3090; RTX 3060 (Windows tests, by a contributor) | RTX 3090 | yes |
+| Ampere, A100 class | 8.0 | `80` | not measured: a compatibility target | none | no |
+| Turing | 7.5 | `75` | TITAN RTX; the RTX 20 series is not measured | TITAN RTX | yes |
+| Volta | 7.0 | `70` (CUDA 12.8 or 12.9) | Tesla V100-SXM2-16GB | Tesla V100-SXM2-16GB | no: [source build](docs/build-linux.md#tesla-v100-sm_70) |
+
+- **Device profiles.** A profile picks the kernel route of every operation and width. A built-in
+  profile applies to the same GPU name, compute capability and SM count. Any other GPU of these
+  architectures (an RTX 3080 or RTX 2080 Ti, for example) is measured once at first start, in 20 to
+  40 seconds, and the result is stored for later starts; `ninfer-calibrate` measures again after a
+  driver or clock change ([device profiles](docs/device-profiles.md)). The `70` build runs its own
+  routes, so the V100 profile holds only the GDN prefill switch.
+- **Architecture limits.** NVFP4 expert weights need a `120a` build. The Turing and Volta builds
+  replace instructions their GPUs lack and reshape kernels to their shared memory
+  ([Turing](docs/build-linux.md#turing-sm_75), [Tesla V100](docs/build-linux.md#tesla-v100-sm_70)).
+  Configure accepts no other target, so Pascal and older, Hopper and data-center Blackwell have no
+  build.
+- **Speed per card.** [Performance](docs/performance.md) lists the measurement pages: the RTX 3090,
+  4090, 5090 and PRO 6000, the Tesla V100 and the TITAN RTX.
 
 ## Highlights
 
@@ -174,9 +200,8 @@ of the file.
 **Kernels and devices**
 
 - **Device route profiles.** Each card's measured profile picks the kernel route for every
-  operation and width. Profiles are built in for the RTX 3090, 4090, 5090, the three RTX PRO
-  6000 editions, the Tesla V100-SXM2-16GB and the TITAN RTX; any other GPU is measured once at
-  first start, and `ninfer-calibrate` re-measures ([device profiles](docs/device-profiles.md)).
+  operation and width: built in for the cards in [supported GPUs](#supported-gpus), measured once
+  at first start on any other ([device profiles](docs/device-profiles.md)).
 - **Pipeline stages.** `--devices 0,1,...` splits the layers over up to eight GPUs on Linux, each
   stage owning its weights, KV and state ([pipeline stages](docs/maintainer/pipeline-stages.md)).
 - FP8 A8 and NVFP4 W4A4 tensor-core routes on every `120a` build, an FP4 tensor-core prompt kernel
@@ -461,12 +486,10 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTUR
 cmake --build build --target ninfer-serve ninfer-calibrate
 ```
 
-`CMAKE_CUDA_ARCHITECTURES` is `86` for the RTX 30 series (that build also runs the RTX 40 series),
-`89` for the RTX 40 series, `120a` for the RTX 50 series and the RTX PRO 6000 Blackwell (on the
-`mma.sync` compatibility path, which the ternary route needs) and `75` for the TITAN RTX and RTX 20
-series ([Turing tier](docs/maintainer/build-system.md#turing-tier-75)). CUDA 12.8 or newer builds
-`75`, `86` and `89`; a `120a` build needs CUDA 13.1 or newer, since 12.8 and 12.9 miscompile
-sm_120a kernels and configure refuses them. The [Linux](docs/build-linux.md) and
+`CMAKE_CUDA_ARCHITECTURES` takes one build from [supported GPUs](#supported-gpus); `120a` runs the
+`mma.sync` compatibility path, which the ternary route needs. CUDA 12.8 or newer builds `75`, `80`,
+`86` and `89`, and `70` needs CUDA 12.8 or 12.9. A `120a` build needs CUDA 13.1 or newer, since 12.8
+and 12.9 miscompile sm_120a kernels and configure refuses them. The [Linux](docs/build-linux.md) and
 [Windows](docs/build-windows.md) guides cover dependencies, the opt-in build options and the
 launcher scripts; [tests](tests/README.md) and [benchmarks](bench/README.md) have their own guides.
 
