@@ -53,7 +53,8 @@ struct ToolCallOutputContract {
     // Function whose call opener the rendered prompt already carries, empty when the model chooses
     // freely. It lives here because the prompt that carries the opener is the only thing that knows
     // it: a second, independently supplied copy could name a different tool and the continuation
-    // would be attributed to that one.
+    // would be attributed to that one. The Qwen decoder and, for a Gemma 4 request, the Gemma
+    // decoder both start inside that call; the syntax of the opener is the model's own.
     std::string forced_tool_name;
 };
 
