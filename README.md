@@ -2,7 +2,8 @@
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
 their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next and Gemma 4 26B-A4B, on the RTX 3090,
-RTX 4090, RTX 5090 and RTX PRO 6000 Blackwell, and on the Tesla V100 from a
+RTX 4090, RTX 5090 and RTX PRO 6000 Blackwell, on the TITAN RTX and RTX 20 series
+([Turing](docs/build-linux.md#turing-sm_75)), and on the Tesla V100 from a
 [source build](docs/build-linux.md#tesla-v100-sm_70). It serves the OpenAI, Anthropic and llama.cpp
 APIs from one GPU, or from up to eight as pipeline stages on Linux.
 
@@ -420,8 +421,9 @@ conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b
 
 `ghcr.io/iamwavecut/ninfer-all:latest` is built from the newest `master` commit that passes CI, on
 CUDA 13.4 and Ubuntu 26.04; a commit that changes only documentation or tooling the image does not
-carry keeps the image before it. It carries two builds and starts the one that matches the GPU: `sm_86` for
-the RTX 30 and RTX 40 series, `sm_120a` for the RTX 50 series and the RTX PRO 6000 Blackwell.
+carry keeps the image before it. It carries three builds and starts the one that matches the GPU:
+`sm_75` for the TITAN RTX and RTX 20 series, `sm_86` for the RTX 30 and RTX 40 series, `sm_120a` for
+the RTX 50 series and the RTX PRO 6000 Blackwell.
 
 - **Host.** An NVIDIA driver of the CUDA 13 branch (580 or newer) and the
   [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
@@ -449,8 +451,8 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
 
 [compose.yaml](compose.yaml) wires the GPU, the port and the volumes for the same:
 `docker compose run --rm ninfer download qwen38-27b`, then `docker compose up -d`.
-`NINFER_IMAGE_ARCH=sm86|sm120a` overrides the GPU detection, and `docker build -t ninfer .` builds
-the image from source (`--build-arg ARCHS=86` for one architecture).
+`NINFER_IMAGE_ARCH=sm75|sm86|sm120a` overrides the GPU detection, and `docker build -t ninfer .`
+builds the image from source (`--build-arg ARCHS=86` for one architecture).
 
 ## Building
 

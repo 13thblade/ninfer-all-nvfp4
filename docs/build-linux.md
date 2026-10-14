@@ -13,13 +13,15 @@ This guide runs NInfer on Linux from the published container image, or builds it
 | `75` | TITAN RTX and RTX 20 series (Turing), through the [Turing tier](maintainer/build-system.md#turing-tier-75) | CUDA 12.8 or newer |
 
 An `89` or `120a` build does not run on an RTX 3090, only a `70` build runs on a V100, and only
-a `75` build on a Turing card. See [Tesla V100](#tesla-v100-sm_70) for what that build changes.
+a `75` build on a Turing card. See [Turing](#turing-sm_75) and [Tesla V100](#tesla-v100-sm_70) for
+what those builds change.
 
 ## Container image
 
 The published image, `ghcr.io/iamwavecut/ninfer-all:latest`, is the shortest path on any Linux
-distribution: CUDA 13.4 on Ubuntu 26.04, with an `sm_86` build for the RTX 30 and 40
-series and an `sm_120a` build for Blackwell, and it starts the one that matches the GPU. It needs a
+distribution: CUDA 13.4 on Ubuntu 26.04, with an `sm_75` build for Turing, an `sm_86` build for the
+RTX 30 and 40 series and an `sm_120a` build for Blackwell, and it starts the one that matches the
+GPU. It needs a
 driver of the CUDA 13 branch (580 or newer) and the NVIDIA Container Toolkit; make sure that Docker
 can access the GPU first:
 
@@ -88,6 +90,40 @@ build-sm86/apps/ninfer-serve
 build-sm86/apps/ninfer-calibrate
 build-sm86/apps/ninfer-perplexity
 ```
+
+## Turing (sm_75)
+
+A `75` build runs on the TITAN RTX and the RTX 20 series. The container image carries one; a native
+build needs CUDA 12.8 or newer and `-DCMAKE_CUDA_ARCHITECTURES=75`:
+
+```bash
+cmake -S . -B build-sm75 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+  -DCMAKE_CUDA_HOST_COMPILER="$CUDAHOSTCXX" \
+  -DCMAKE_CUDA_ARCHITECTURES=75 \
+  -DNINFER_BUILD_APPS=ON
+
+cmake --build build-sm75 --parallel
+```
+
+Turing's tensor cores multiply FP16 and INT8 but not BF16 or TF32, it has no `cp.async`, and a
+block has 64 KiB of shared memory. A `75` build runs the kernels of the other targets with Turing
+forms of those instructions and Turing shapes of the kernels that do not fit
+([Turing tier](maintainer/build-system.md#turing-tier-75)):
+
+- Integer routes (the T2 ternary projections, A8 activations, INT8-family attention, GGUF `dp4a`
+  and MMQ kernels) and FP16 routes run on the native tensor cores.
+- BF16 products run on FP16 tensor cores for every output whose operands are FP16 values, and in
+  FP32 for the others; no value is narrowed. BF16-cache attention multiplies Q, K and V as their
+  FP16 roundings, and every attention PV product with BF16 values rounds the probabilities to
+  FP16.
+- Every model, KV format and drafter runs. The Linear routes come from the legacy table only, and
+  `NINFER_LINEAR_ROUTES=unified` is refused.
+
+The TITAN RTX's device route profile is built in; another Turing part calibrates at first start
+(see [device profiles](device-profiles.md)). What runs and how fast is in the
+[TITAN RTX measurements](performance/titan-rtx-2026-10.md).
 
 ## Tesla V100 (sm_70)
 

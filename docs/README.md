@@ -8,7 +8,7 @@ spelling and defaults.
 
 | Document | Purpose |
 |---|---|
-| [Linux build](build-linux.md) | the container image, native Ubuntu builds for `86`, `89` and `120a`, build options and the Bash launchers |
+| [Linux build](build-linux.md) | the container image, native Ubuntu builds for every target (`70`, `75`, `80`, `86`, `89`, `120a`), build options and the Bash launchers |
 | [Windows build](build-windows.md) | native Windows builds, their toolchain constraints and the launcher scripts |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, speculative decoding, and the runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, llama.cpp endpoints, the router, model suspend, state, streaming, token counting, authentication, tool calls, and the server options |
