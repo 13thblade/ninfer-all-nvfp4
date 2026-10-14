@@ -631,7 +631,10 @@ and disk rows of one card use its free memory as the expert cache. A range is tw
 | RTX 3090 | IQ3_S | disk, the page cache holding part of the file | 22.1 GiB | | 19.0 | 21.6 | 209 |
 | RTX 3090 | IQ3_S | disk, pages evicted every second | 22.1 GiB | | 10.7 | 5.4 | 47 |
 | RTX 3090 | Q2_0 | pinned host memory | 22.1 GiB | 34.0 GB | 50.2 | 43.7 | 847 |
+| L40S (48 GB) | Coder IQ1_M | pinned host memory | | | 35 | | 1,648 |
+| L40S (48 GB) | Coder IQ1_M | disk, in the page cache | | | 42 | | 1,938 |
 
+The Coder IQ1_M rows are the 28.4 GiB model beside the shared n-gram table on one NVIDIA L40S (48 GB).
 The two RTX 3090 Q2_0 host-memory rows come from two hosts (an earlier build with 512-token prompt
 chunks, and the IQ3_S sitting). The host link carries host and disk experts: PCIe 5.0 x16 on the
 RTX 5090 host, 4.0 x16 on the RTX PRO 6000, RTX 4090 and RTX 3090 hosts. The RTX 4090 rows ran pinned to the GPU's NUMA node; left

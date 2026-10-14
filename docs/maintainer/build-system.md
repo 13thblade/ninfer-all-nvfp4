@@ -79,7 +79,7 @@ group's MMAs. A device profile can run any 8-column K-split tile on four K warps
 (`q8_ksplit/<rows>x<k>` -> `kw4`, `ops/linear/q8/q8_ksplit_config.h`); the TITAN RTX profile does
 so where `ninfer-calibrate` measured it faster ([TITAN RTX measurements](../performance/titan-rtx-2026-10.md)).
 
-Product commands and prerequisites are in the README's [Running](../../README.md#running) and
+Product commands and prerequisites are in the README's [Quick start](../../README.md#quick-start) and
 [Building](../../README.md#building) sections; test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).
 
