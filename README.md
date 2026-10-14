@@ -95,6 +95,6 @@ Takeaways (sm_86, QUASAR-NVFP4, 4K prompt / 64K ctx):
 2. **Improve int8-path prefill performance.** Further optimise the grouped/MMQ prefill
    mainloop (e.g. better tile/streaming of the per-(token, 32-col) activation quantiser,
    pack/dequant overlap, larger K-blocking) to push the current ~1.7–1.8× lead over A16 wider.
-3. **Implement a stronger A16-path kernel (separate).** Replace the current reference A16 MMA
+3. **Implement a higher performance A16-path kernel (separate).** Replace the current reference A16 MMA
    route with a higher-performance A16 implementation so the wiring-gap fill is no longer just
    a slow reference — keeping it viable where the int8 path is not selected.
