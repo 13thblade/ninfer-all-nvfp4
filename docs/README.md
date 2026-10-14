@@ -13,13 +13,14 @@ spelling and defaults.
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, speculative decoding, and the runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, llama.cpp endpoints, the router, model suspend, state, streaming, token counting, authentication, tool calls, and the server options |
 | [Ngram copy proposals](ngram.md) | copy acceleration alongside MTP, DFlash or DFlash2, on by default with a drafter |
-| [Performance](performance.md) | where the measurements live, and the measured comparisons of KV formats, drafters and draft counts |
+| [Supported GPUs](gpus.md) | architectures and their builds, every card of 8 GB and more with what has run on it, and what fits in a given amount of GPU memory |
+| [Performance](performance.md) | every measured result card by card: largest context, decode and prompt rates by model, KV format, depth and drafter, several requests at once, Flash-Next's expert placements, quality; and the measurement pages |
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
 | [GGUF block formats](gguf.md) | GGUF releases with a ggml type per tensor: the eighteen block formats, their products, serving and measurements |
 | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md) | converting the GSQ-RCO GGUF releases and their n-gram table; experts on one or several GPUs, in host memory or on disk; measurements |
 | [Gemma 4 26B-A4B](gemma4.md) | converting Google's QAT GGUF release with its MTP assistant and vision tower, what runs, speculative decoding, images and video, the defaults, measurements against llama.cpp and the numerical checks |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
-| [Device profiles](device-profiles.md) | per-GPU route profiles: the built-in RTX 3090/4090/5090/PRO 6000/TITAN RTX table, calibration at first start, `ninfer-calibrate` |
+| [Device profiles](device-profiles.md) | per-GPU route profiles: the built-in RTX 3090/4090/5090/PRO 6000/TITAN RTX/Tesla V100 table, calibration at first start, `ninfer-calibrate` |
 | [Configuration calculator](config-calculator.html) | which context, KV format and speculation fit an RTX 3090 with Qwen3.8-27B or Qwen3.6-35B-A3B, from measurements |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 | [Release archives](release-archive-linux.md) ([Windows](release-archive-windows.md)) | the README that `scripts/package-release.sh` and `.ps1` put in a release archive |
