@@ -70,8 +70,8 @@ model's positions; KV above 32,768 tokens is borrowed from the expert cache). Wh
 the Qwen3.5 models:
 
 - **One request at a time.** `--max-concurrency` above 1, `--kv-dtype` other than `int8`,
-  `--spec dflash|dflash2`, `--ngram-draft-tokens`, `--graft`, `--context-store`, `--auto-host-cache`
-  and the load-time weight flags are refused at startup with the flag to change.
+  `--spec dflash|dflash2`, `--ngram-draft-tokens`, `--graft`, `--auto-host-cache` and the load-time
+  weight flags are refused at startup with the flag to change.
 - **Images** (`--vision`, an artifact converted with `--mmproj`; otherwise startup refuses with that
   instruction): OpenAI `image_url` parts (data URIs, local files) and Anthropic image blocks, through
   the same media handling and processor as the Qwen3.5 models. The vision tower (0.84 GiB) stays
@@ -88,8 +88,8 @@ the Qwen3.5 models:
   ceiling: each round drafts as many tokens as the recent acceptance pays for, mostly two on prose;
   a ceiling of 3 measured best or tied against 2 and against deeper fixed drafts (the
   [plan's PR 13 measurements](maintainer/flash-next-plan.md#pr-13-measurements)), about 1.4x plain decode.
-- **Prefix reuse** through the same context cache as the other models, with checkpoints held only
-  in pinned host RAM ([design](maintainer/flash-next-context-cache.md)). A conversation's next turn
+- **Prefix reuse** through the same context cache as the other models, with checkpoints in pinned
+  host RAM or on local disk ([design](maintainer/flash-next-context-cache.md)). A conversation's next turn
   (or an agent's next tool round) restores the previous turn's state and prefills only the new
   tokens; repeating a prompt exactly samples its first token from the stored logits. A checkpoint is
   about 111 MiB of recurrent state plus 0.89 MiB per 64 tokens of KV (a 32K-token one 567 MiB), and
@@ -99,8 +99,19 @@ the Qwen3.5 models:
   512 MiB. `--host-context-mib 0` or `--no-prefix-reuse` turn reuse off; in the launcher,
   `NINFER_PREFIX_CACHE=off` (and `NINFER_HOST_CONTEXT_MIB` for the size). Restores and captures are
   host-to-device copies of a few milliseconds; nothing is kept in VRAM, so the expert cache keeps
-  every frame. `--context-store` (keeping the cache across restarts) is not available for this
-  model yet.
+  every frame.
+- **Checkpoints on disk** (`--context-nvme-mib N`): a scratch file of up to N MiB holds the
+  checkpoints, in `--context-nvme-dir DIR` or beside the model (put it on NVMe). It is created at
+  startup, grows only with what is written, is capped at half the drive's free space, and is
+  deleted when the server exits (also when it is killed). A tier under 512 MiB, or on a drive whose
+  free space cannot be read, is not opened and checkpoints stay in RAM. The host tier above becomes its RAM cache:
+  recent checkpoints restore from RAM, older ones from the file. With `--host-context-mib 0` every
+  checkpoint lives on disk (disk-only reuse, for a machine with no RAM to spare). A full or failing
+  disk turns the affected checkpoints into cache misses, never into wrong output.
+- **Across restarts** (`--context-store DIR`): conversations are written to the context store when
+  idle and at shutdown and restored at startup (or when a request for them arrives), exactly as for
+  the other models; it needs the host tier or the disk tier. Images are tied to the model file, the
+  MTP setting and `--vision`; a session written under another configuration is not restored.
 - **Host RAM.** All 33 GiB of routed experts are pinned in host RAM at startup (with `--vision` also
   the 0.84 GiB tower, and the ledger counts up to 1.4 GiB of decoded media: about 2.2 GiB more in
   all). Before anything is pinned, a RAM ledger checks that the experts, every other planned allocation and a reserve for
@@ -393,8 +404,9 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
 ### Context store
 
 `--context-store DIR` makes the context cache survive a restart or a crash. It is off by default
-and needs a Host context cache (the default 8 GiB, `--host-context-mib` or `--auto-host-cache`),
-because stored sessions come back into the Host tier. What is stored is one retained conversation
+and needs somewhere to hold checkpoints: a Host context cache (the default 8 GiB,
+`--host-context-mib` or `--auto-host-cache`), or a disk tier (`--context-nvme-mib N`, which also
+works with `--host-context-mib 0`), because stored sessions come back into that tier. What is stored is one retained conversation
 (continuation) at a time: its recovery points (the endpoint of the last turn, the point where the
 next turn's input starts, any long anchors) with their KV pages and recurrent states, byte for byte
 what the Host tier would hold for them. Public shared prefixes are not stored. A conversation is
@@ -1689,10 +1701,12 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
 | `--host-context-mib N` | shared pinned Host budget for StateImages, KV and pause snapshots, including in-flight destinations; refused together with `--auto-host-cache` | `8192 MiB + 8 native StateImages` |
 | `--auto-host-cache` | size the Host context budget from the host memory still free once the model has loaded, for a machine that exists to serve; see [automatic host cache](#automatic-host-cache). Refuses an explicit `--host-context-mib` | off |
+| `--context-nvme-mib N` | Qwen3.8-Flash-Next: keep checkpoints in a scratch file of up to N MiB on local disk (removed at exit), with the Host context budget as its RAM cache; `--host-context-mib 0` makes it disk only. See [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) | off |
+| `--context-nvme-dir DIR` | with `--context-nvme-mib`, the directory for the scratch file; put it on NVMe | beside the model |
 | `--host-cache-reserve-mib N` | with `--auto-host-cache`, host memory left unpinned beneath what is available | `3072` |
 | `--host-cache-max-mib N` | with `--auto-host-cache`, the most it may pin, applied after the reserve; for machines whose memory other tenants share | no cap |
 | `--host-cache-percent N` | with `--auto-host-cache`, the most it may pin as a percentage (1-100) of the machine's total memory (or its container's limit), however much is free at startup; the smallest of this, the cap and the free memory less the reserve applies | no limit |
-| `--context-store DIR` | keep retained sessions on disk so a restart or crash does not lose the context cache; see [Context store](#context-store). Needs a nonzero Host context budget | off |
+| `--context-store DIR` | keep retained sessions on disk so a restart or crash does not lose the context cache; see [Context store](#context-store). Needs a nonzero Host context budget or a disk tier (`--context-nvme-mib`) | off |
 | `--context-store-max-gib N` | bound the store; the least recently used sessions are removed beyond it. Requires `--context-store` | half the volume's free space |
 | `--context-store-ttl-hours N` | remove sessions unused this long; `0` keeps them until space is needed | `168` |
 | `--context-store-idle-seconds N` | write a session unused this long, and changed since it was last written, in the background; `0` writes only at shutdown | `30` |

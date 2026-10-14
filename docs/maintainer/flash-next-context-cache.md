@@ -11,7 +11,7 @@ contract in the Flash-Next Program. The Engine, ResourceManager and Scheduler ar
 ## What a checkpoint is
 
 A Flash-Next checkpoint is the lane's complete execution position at one token frontier F, held
-only in pinned Host memory:
+in pinned Host memory or in the NVMe tier's file (Storage tiers):
 
 | Part | Size (INT8 KV, MTP on) | Source |
 |---|---|---|
@@ -21,8 +21,8 @@ only in pinned Host memory:
 | BF16 logits of position F - 1, when F is the end of a prefill call | ~0.5 MiB | the last call's logits |
 | Identity: tokens `[0, F)`, three-axis positions, media items, rolling digests; `mtp_cells`, `history[F]` | host vectors | the request |
 
-Nothing lives in VRAM: the expert cache keeps every frame it had. A restore copies Host to the
-lane's own KV pool and state, so the source checkpoint is never written.
+Nothing lives in VRAM: the expert cache keeps every frame it had. A restore copies Host (or disk,
+through Host) to the lane's own KV pool and state, so the source checkpoint is never written.
 
 ## Host tier
 
@@ -43,30 +43,66 @@ lane's own KV pool and state, so the source checkpoint is never written.
 Capture and restore never name the memory a checkpoint lives in. They describe their copies as
 `SlabCopy` entries (a slab index and offset, a device region, rows and pitches) and hand them to a
 `CheckpointTier` (`program/context_cache.h`); `HostCheckpointStore` keeps the slab bookkeeping
-(records, shared pages, release quotes) independent of the tier. `HostTier` (pinned RAM, gather
-kernel) is the only tier built.
+(records, shared pages, release quotes) independent of the tier, and tells the tier when a slab's
+last reference goes. A tier also moves whole slabs to and from host memory (`read`, `write`), which
+is what checkpoint images use. Two tiers are built:
 
-Order of the tiers, each a separate step:
+1. **RAM** (`HostTier`): one pinned allocation of the Host budget, copied by the gather kernel. This
+   is the tier when no NVMe tier is configured.
+2. **NVMe** (`NvmeTier`, `program/nvme_tier.h`, `--context-nvme-mib N`): every slab is an offset in a
+   scratch file (`core/scratch_file.h`: unbuffered overlapped I/O, sparse, created at startup in
+   `--context-nvme-dir` or beside the model, deleted on close and by Windows when the process dies).
+   The Host budget becomes its RAM cache of *frames*:
+   - a capture gathers into frames and a writer thread writes them to the file at once
+     (write-through; SSD wear is not a concern). A frame is evictable as soon as its write lands, so
+     RAM never holds the only copy for long; the least recently used clean frame goes first;
+   - a capture larger than half the frames (or with no frames) gathers into a pinned bounce buffer
+     (128 MiB from the RAM ledger, two halves) and writes the file directly, one half's write
+     overlapping the next half's gather;
+   - a restore gathers the slabs RAM holds from their frames and reads the rest through the bounce
+     halves (8 requests of 4 MiB in flight), one half's reads overlapping the other's copy to the
+     device;
+   - images import through the file and keep what fits in frames (a hydrated session then restores
+     from RAM).
+   The Engine sees the file's size as the Host capacity (`host_bytes`), so the ResourceManager evicts
+   only when the file is full. The file is capped at half the volume's free space at startup.
 
-1. **RAM** (this change). Sized by the RAM ledger beside the experts.
-2. **Persistence on NVMe through the Engine's context store** (`--context-store`): implement
-   `export_checkpoints` / `checkpoint_image_host_bytes` / `import_checkpoints` for this Program, with
-   the Qwen3.5 Program's image container (magic and version, a configuration section, KV pages once
-   in first-reached order so successive images of a conversation share bytes in the
-   content-addressed store, the state images, exact identities, a point table, a trailing checksum)
-   and a Flash-Next configuration section (page record and state image layout, drafter on or off,
-   vision). The Engine's store plumbing (idle and shutdown writes, start-up and on-demand hydration,
-   S3 copies) is then reused unchanged. It imports into the RAM tier, so it needs a nonzero one.
-3. **An NVMe tier for little or no RAM**: a `CheckpointTier` whose slabs are offsets in a file on
-   local NVMe, moved through a small pinned bounce buffer (tens to a few hundred MiB from the
-   ledger). A 32K-token checkpoint (567 MiB) then restores in roughly 0.2-0.3 s at NVMe speed
-   instead of 13 s of prefill. Its byte layout is the same slab layout, so step 2's images can be
-   written from it without a second format.
+**A 0 GiB (or too small) Host budget** without an NVMe tier degrades, deliberately, to *prefix
+reuse off*: startup does not refuse; one line says the ledger had no room (or that
+`--host-context-mib 0` asked for none), requests prefill their whole prompts, and everything else
+runs as before. With an NVMe tier the same case is *disk-only reuse*: no frames, every capture and
+restore goes through the bounce buffer.
 
-**A 0 GiB (or too small) Host budget** degrades, deliberately, to *prefix reuse off*: startup does
-not refuse; one line says the ledger had no room (or that `--host-context-mib 0` asked for none),
-requests prefill their whole prompts, and everything else runs as before. With step 3 the same case
-becomes disk-only reuse.
+**Failures degrade to misses.** A capture whose bytes the tier cannot store (an I/O error, a full
+disk) is skipped (`start_capture` returns false; the Engine skips the group). A frame whose write
+failed stays resident (`stuck`) with the only good copy until its slab is freed. A restore the tier
+cannot read leaves the lane at the root: the request prefills its whole prompt (its begin summary
+reports 0 reused tokens). An import that cannot be stored returns nullopt (a miss) and keeps nothing.
+
+## Persistence (`--context-store`)
+
+`export_checkpoints`, `checkpoint_image_host_bytes` and `import_checkpoints`
+(`program/checkpoint_image.h`) write and read the Qwen3.5 Program's image container
+(`qwen3_5/program/storage/checkpoint_image_codec.h`, shared by both Programs): magic, a version of
+its own (`0x464E0001`, so neither Program's parser accepts the other's image), the model binding,
+then a Flash-Next configuration section (the five plane sizes per attention layer, the state block,
+the drafter's residual and the logits sizes, vision, the identity tag), the session, each exact
+identity once, a point table (role, frontier, full pages, the drafter's cells and next token, the
+logits flag, rope delta, page indices, key), then the payload: every KV page once in the order the
+points (deepest first) first reach them, every state image once, and a trailing checksum. Pages and
+state images are stored *compact* (planes back to back, none of a slab's alignment padding; logits
+never captured as zeros), so an image does not depend on where its slabs were and successive images
+of one conversation share their leading pages byte for byte in the content-addressed store. A
+shared prefix is exported alone, without a session (the rule the shared engine uses).
+
+Import checks the binding, the configuration and the checksum before it takes a slab, then the
+table bounds and each point's key against its identity, and the drafter's position (cells at the
+frontier or one behind; none without the drafter); any mismatch is `std::invalid_argument`, which
+the Engine counts as a foreign or damaged image. It imports into whichever tier is configured, so
+with an NVMe tier a 0 GiB Host budget still restores stored sessions.
+
+The Engine's store plumbing is reused: idle and shutdown writes, start-up restore, request-time
+hydration and S3 copies (`engine.cpp` now attaches the store to either generation core).
 
 ## Sharing
 
@@ -180,8 +216,43 @@ Costs: chat prompts split prefill at the typed recovery frontier (just before th
 header), a few-token static call: +0.07 s on a 2.5K-token first turn (+6%) and +0.2-0.3 s on
 28K (+2%), in every configuration. The 4 GiB Host tier pins in about 1 s at startup.
 
+### NVMe tier and `--context-store` (2026-10-13, same machine and flags)
+
+Server sessions, one sitting, ABBA in the order master, RAM tier, RAM + NVMe tier, NVMe only | NVMe
+only, RAM + NVMe, RAM, master (master is the build before this branch; `--context-nvme-mib 16384`;
+`tools/bench/flash_next_store/bench.py`). A 24,144-token and a 7,283-token document; the repeat is an
+exact hit, so its TTFT is the restore plus the fixed ~0.08 s of a one-token request.
+
+| | master | RAM | RAM + NVMe | NVMe only (2nd arm) |
+|---|---:|---:|---:|---:|
+| cold 24K TTFT, s | 10.63 / 10.61 | 10.64 / 10.33 | 10.76 / 10.33 | 10.55 |
+| cold 7K TTFT, s | 3.33 / 3.32 | 3.33 / 3.24 | 3.38 / 3.26 | 3.31 |
+| repeat 24K TTFT, median of 5, s | 0.118 / 0.123 | 0.118 / 0.118 | 0.108 / 0.124 | 0.198 |
+| repeat 7K TTFT, median of 5, s | 0.097 / 0.075 | 0.082 / 0.092 | 0.076 / 0.078 | 0.127 |
+| decode, 512 tokens, median of 3, tok/s | 92.7 / 93.8 | 93.9 / 96.5 | 93.7 / 96.5 | 94.8 |
+
+The first NVMe-only arm ran while something else used the card (cold 24K 14.5 s, decode 80.7 tok/s,
+repeat 0.253 s) and is not used; it is in the raw data. The tier costs nothing measurable on cold
+prefill or decode. With RAM frames in front, a hit is served from RAM exactly as before; with no RAM
+tier a 24K-token restore costs about 80 ms more (7K: 45 ms) than from RAM. Micro-benchmark
+(`ninfer_qwen4_exp_nvme_tier_test --bench`): file only, 511 MiB restore 96.5 ms (5.6 GB/s), capture
+263 ms; with RAM frames, restore 21.4 ms.
+
+Restart (first conversation, server stopped with CTRL_BREAK, started again on the same store, n = 1
+per cell, the repeats after it n = 3): the 24K-token request, cold 10.79 s, after the restart 0.211 s
+with the RAM tier and 0.445 s with `--host-context-mib 0 --context-nvme-mib 16384`; the 7K-token
+one 3.27 s cold, 0.142 s / 0.281 s after. Start-up imports one session (283-289 MiB image) in
+0.17-0.77 s.
+
+Not measured: hit rate or TTFT under a working set larger than the RAM tier (the eviction gate with
+a 1 GiB tier proves correctness, not benefit), and a store on a different volume than the model.
+
 ## Status
 
 Done: the RAM tier, capture/restore/reclaim hooks, the launcher default (`NINFER_PREFIX_CACHE=off`
-opts out), real-model gates. Not built: `--context-store` and the NVMe tier (see Storage tiers),
-more than one lane (the handles, keys and mirror are per lane already).
+opts out), real-model gates; the NVMe tier and `--context-store` (Storage tiers, Persistence).
+The launcher keeps the NVMe tier opt-in (`NINFER_CONTEXT_NVME_MIB`): it costs nothing measurable, but
+it only pays once the working set exceeds the RAM tier, which was not measured, and it writes a
+scratch file beside the model (capped at half the volume's free space). Revisit with a hit-rate run.
+Not built: more than one lane (the handles, keys and mirror are per lane already); retrying a failed
+frame write (a frame whose write failed stays in RAM until its slab is freed).
