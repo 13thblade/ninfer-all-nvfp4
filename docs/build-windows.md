@@ -84,7 +84,7 @@ The other build options are in the [Linux guide](build-linux.md#build-options).
 its size and SHA-256 (`qwen36-27b` and `qwen36-35b-a3b` work the same way), and
 `scripts\run.bat qwen38-27b` serves it with the measured profile; the profiles and their overrides
 are in [launcher profiles](maintainer/launcher-profiles.md). Any other artifact starts with
-`ninfer-serve.exe` and the flags the [README](../README.md#running) gives for it, for example:
+`ninfer-serve.exe` and the flags the [launch recipes](recipes.md) give for it, for example:
 
 ```powershell
 .\build-ninja\apps\ninfer-serve.exe models\qwen3_8_27b.ninfer --model-id qwen3.8-27b `

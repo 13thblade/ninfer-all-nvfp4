@@ -195,7 +195,7 @@ table artifact whose digest or row format differs from the one the model names.
 
 A model converted with its table needs no `--ngram-table`. `ninfer` and `ninfer-perplexity` take
 the same options, and the Docker image's `serve` command takes them with the files under `/models`
-([Running](../README.md#running)).
+([launch recipes](recipes.md#qwen38-flash-next)).
 
 | Option | Meaning |
 |---|---|
