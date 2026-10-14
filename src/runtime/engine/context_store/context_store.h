@@ -94,6 +94,9 @@ public:
         // same conversation: this image contains everything it does, so once this one is durable
         // the older one is removed instead of being kept as a near-duplicate until it ages out.
         std::span<const std::array<std::uint64_t, 2>> prefix_digests;
+        // A prefix many conversations share (a system or tools prompt) rather than one
+        // conversation: restored before conversations when not everything fits.
+        bool shared = false;
     };
 
     struct Info {
@@ -105,7 +108,8 @@ public:
         std::int64_t last_used_ms   = 0;
         std::vector<CheckpointKey> checkpoints;
         // Every chunk of the image is in the directory, so load() does not touch the network.
-        bool local = true;
+        bool local  = true;
+        bool shared = false;
     };
 
     struct PutResult {
@@ -128,6 +132,7 @@ public:
         std::uint64_t evicted_for_space = 0;
         std::uint64_t expired           = 0;
         std::uint64_t superseded        = 0;
+        std::uint64_t remote_removed    = 0; // images a remote refresh found gone
         // With a remote: images only the remote holds, and the traffic to it.
         std::uint64_t remote_images          = 0;
         std::uint64_t remote_uploads         = 0; // objects uploaded (chunks and manifests)

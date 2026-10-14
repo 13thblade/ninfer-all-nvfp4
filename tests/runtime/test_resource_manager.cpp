@@ -543,9 +543,10 @@ struct Fixture {
     Cache cache;
     std::uint64_t next_order = 0;
 
-    explicit Fixture(std::size_t capacity)
+    explicit Fixture(std::size_t capacity, std::uint64_t token_ns = 1)
         : program{.host_capacity = capacity},
-          cache(true, {.prefill = {.token_ns_q32 = ninfer::runtime::kContextCostQ32One}}) {}
+          cache(true,
+                {.prefill = {.token_ns_q32 = token_ns * ninfer::runtime::kContextCostQ32One}}) {}
 
     Cache::SourceChoice source(const Base& base, std::optional<Handle> desired,
                                std::optional<Token> resume = {}) {
@@ -2233,8 +2234,139 @@ void test_candidate_memo_changes_no_decision() {
 
 } // namespace
 
+Key run(std::uint32_t first, std::uint32_t count) {
+    Key key(count);
+    for (std::uint32_t i = 0; i < count; ++i) { key[i] = first + i; }
+    return key;
+}
+
+// A continuation the durable store holds costs its read back, not its recomputation: with equal
+// recovery tokens it is evicted before one the store does not hold, even when that one is older.
+void test_stored_continuation_is_priced_as_a_disk_restore() {
+    // 1 ms per prefill token: 100 tokens cost 100 ms against a ~5 ms read of a small image.
+    const auto evicts_newer = [](bool newer_stored) {
+        Fixture f(48, 1'000'000);
+        const auto older =
+            f.program.add(run(1, 100), {f.program.host_block(16)}, Role::Continuation);
+        const auto newer =
+            f.program.add(run(201, 100), {f.program.host_block(16)}, Role::Continuation);
+        f.publish(older);
+        const auto newer_owner = f.publish(newer);
+        if (newer_stored) {
+            f.cache.set_durability(
+                {.stored_bytes = [=](Fixture::Token token) -> std::optional<std::uint64_t> {
+                    if (token == newer_owner) { return 16; }
+                    return std::nullopt;
+                }});
+        }
+        const auto victims = f.cache.host_victims(f.program, 32, std::nullopt);
+        require(victims && victims->size() == 1, "one 16-byte victim frees the shortage");
+        return victims->front() == newer;
+    };
+    require(!evicts_newer(false), "without a store the older continuation is evicted first");
+    require(evicts_newer(true), "a stored continuation was priced as a full recomputation");
+}
+
+// A store read slower than the prefill it replaces is no discount: the loss stays the recompute.
+void test_slow_store_read_is_not_a_discount() {
+    Fixture f(48, 1); // 1 ns per token: 100 tokens prefill far faster than a 5 ms read
+    const auto older = f.program.add(run(1, 100), {f.program.host_block(16)}, Role::Continuation);
+    const auto newer =
+        f.program.add(run(201, 100), {f.program.host_block(16)}, Role::Continuation);
+    f.publish(older);
+    const auto newer_owner = f.publish(newer);
+    f.cache.set_durability(
+        {.stored_bytes = [=](Fixture::Token token) -> std::optional<std::uint64_t> {
+            if (token == newer_owner) { return 16; }
+            return std::nullopt;
+        }});
+    const auto victims = f.cache.host_victims(f.program, 32, std::nullopt);
+    require(victims && *victims == std::vector<Handle>{older},
+            "a store slower than recomputation changed the eviction order");
+}
+
+// Write-on-evict: before a committed release takes a point, the store is shown every inactive,
+// live continuation that loses it, with all of its points still valid.
+void test_release_offers_live_continuations_before_their_points_go() {
+    Fixture f(32);
+    const auto cold       = f.program.add({1, 2}, {f.program.host_block(16)}, Role::Continuation);
+    const auto warm       = f.program.add({3, 4}, {f.program.host_block(16)}, Role::Continuation);
+    const auto cold_owner = f.publish(cold);
+    f.publish(warm);
+    std::vector<Fixture::Token> offered;
+    bool valid_when_offered = true;
+    f.cache.set_durability(
+        {.releasing = [&](std::span<const Fixture::Cache::RetainedOwner> owners) {
+            for (const auto& owner : owners) {
+                offered.push_back(owner.token);
+                for (const auto point : owner.points) {
+                    valid_when_offered = valid_when_offered && f.program.valid_checkpoint(point);
+                }
+            }
+        }});
+    auto cursor = f.cache.begin_reclaim(f.program);
+    require(f.cache.reclaim(f.program, {.host_bytes = 16}, {}, cursor) ==
+                ninfer::runtime::ReclaimProgress::Changed,
+            "fixture reclaim did not release history");
+    require(offered == std::vector<Fixture::Token>{cold_owner} && valid_when_offered &&
+                !f.program.valid_checkpoint(cold),
+            "the evicted continuation was not offered to the store before its release");
+}
+
+// Losing only a shallower point (an anchor or input point) leaves the conversation's resume point
+// in the cache: nothing is offered for writing.
+void test_release_of_a_shallower_point_is_not_offered() {
+    Fixture f(48);
+    const auto shallow = f.program.add({1, 2}, {f.program.host_block(16)}, Role::LongAnchor);
+    const auto deep = f.program.add({1, 2, 3, 4}, {f.program.host_block(16)}, Role::Continuation);
+    const Base base{.tokens = {1, 2, 3, 4}};
+    const auto owner = f.begin(base);
+    f.cache.publish(f.program, owner, shallow);
+    f.cache.publish(f.program, owner, deep);
+    f.cache.finish(f.program, owner, base, f.next_order);
+    std::vector<Fixture::Token> offered;
+    f.cache.set_durability(
+        {.releasing = [&](std::span<const Fixture::Cache::RetainedOwner> owners) {
+            for (const auto& entry : owners) { offered.push_back(entry.token); }
+        }});
+    auto cursor = f.cache.begin_reclaim(f.program);
+    f.cache.commit_host_victims(f.program, std::vector<Handle>{shallow}, cursor);
+    require(offered.empty() && !f.program.valid_checkpoint(shallow),
+            "losing a shallower point offered the whole conversation");
+    f.cache.commit_host_victims(f.program, std::vector<Handle>{deep}, cursor);
+    require(offered == std::vector<Fixture::Token>{owner},
+            "losing the resume point did not offer the conversation");
+}
+
+// A pause that frees Host by releasing a victim directly (not through a committed reclaim) still
+// shows the store the continuation that loses its resume point, with every point still valid.
+void test_direct_victim_release_offers_the_continuation_first() {
+    Fixture f(32);
+    const auto cold       = f.program.add({1, 2}, {f.program.host_block(16)}, Role::Continuation);
+    const auto stray      = f.program.add({7, 8}, {f.program.host_block(16)}, Role::Continuation);
+    const auto cold_owner = f.publish(cold);
+    std::vector<Fixture::Token> offered;
+    bool valid_when_offered = true;
+    f.cache.set_durability(
+        {.releasing = [&](std::span<const Fixture::Cache::RetainedOwner> owners) {
+            for (const auto& owner : owners) {
+                offered.push_back(owner.token);
+                for (const auto point : owner.points) {
+                    valid_when_offered = valid_when_offered && f.program.valid_checkpoint(point);
+                }
+            }
+        }});
+    require(!f.cache.release_victim(f.program, stray) && offered.empty(),
+            "an uncatalogued handle was released or offered");
+    require(f.cache.release_victim(f.program, cold), "the direct victim release did not happen");
+    require(offered == std::vector<Fixture::Token>{cold_owner} && valid_when_offered &&
+                !f.program.valid_checkpoint(cold),
+            "the directly released continuation was not offered before its release");
+}
+
 int main() {
     try {
+        test_direct_victim_release_offers_the_continuation_first();
         test_candidate_memo_cuts_victim_selection_work();
         test_candidate_memo_changes_no_decision();
         test_pinned_shared_prefix_survives_reclaim_and_cache_clear();
@@ -2293,6 +2425,10 @@ int main() {
         test_reclaim_cursor_keeps_host_writeback_permissions();
         test_failed_demotion_keeps_scanning_independent_history();
         test_failed_demotion_reports_prior_host_release();
+        test_stored_continuation_is_priced_as_a_disk_restore();
+        test_slow_store_read_is_not_a_discount();
+        test_release_offers_live_continuations_before_their_points_go();
+        test_release_of_a_shallower_point_is_not_offered();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -593,6 +594,17 @@ public:
         return true;
     }
 
+    // Releases one Host victim the way commit_release does: its continuation is offered to the
+    // durable store first, while every point is still valid. False, with nothing offered, when the
+    // handle is not a catalogued point or may not be released now.
+    bool release_victim(Program& program, Handle handle, ReclaimRights rights = {}) {
+        if (!references(handle) || pinned(handle) || !may_revoke({&handle, 1}, rights)) {
+            return false;
+        }
+        notify_releasing(program, {&handle, 1});
+        return erase(program, handle, rights);
+    }
+
     // Victim selection reuses each candidate's facts across the plans of one reclaim. The tests turn
     // this off to prove the answers are identical either way; production never does.
     void set_candidate_memo(bool enabled) noexcept { candidate_memo_ = enabled; }
@@ -782,6 +794,21 @@ public:
         std::vector<Handle> points;
     };
 
+    // The durable context store's view of retained continuations. `stored_bytes` names a
+    // continuation whose every current point the store holds (or has queued), with the size of
+    // that image: losing it from the cache costs reading it back, not recomputing it, and reclaim
+    // prices it so. `releasing` is told about the inactive, live continuations a committed release
+    // is about to take points from, while every point is still valid, so they can be written to
+    // the store first. Both are optional; without them every loss is a recomputation.
+    struct Durability {
+        std::function<std::optional<std::uint64_t>(OwnerToken)> stored_bytes;
+        // The same for a public shared prefix, stored as an image of its own.
+        std::function<std::optional<std::uint64_t>(Handle)> shared_stored_bytes;
+        std::function<void(std::span<const RetainedOwner>)> releasing;
+    };
+
+    void set_durability(Durability durability) { durability_ = std::move(durability); }
+
     [[nodiscard]] std::vector<RetainedOwner> retained_owners(Program& program) {
         prune(program);
         std::vector<RetainedOwner> out;
@@ -824,6 +851,35 @@ public:
         }
         prune(program);
         return token;
+    }
+
+    // Public shared prefixes the durable store may keep: installed (pinned) context is not cache
+    // contents and is never stored.
+    // Only entries with repeat demand (another request crossed or reused the prefix): the cache
+    // also publishes shared entries at points inside one conversation's history, which no other
+    // tenant will ask for and which are not worth an export.
+    [[nodiscard]] std::vector<Handle> retained_shared(Program& program) {
+        prune(program);
+        std::vector<Handle> out;
+        for (const auto& shared : shared_) {
+            if (!shared.pinned && shared.priority.reused) { out.push_back(shared.handle); }
+        }
+        return out;
+    }
+
+    // Catalogues a shared prefix Native rebuilt from a durable image, with no demand evidence:
+    // like any new shared entry it earns its retention by being used. False (and released) when
+    // the cache is off or the handle is not a shared prefix.
+    bool adopt_restored_shared(Program& program, Handle handle) {
+        if (!enabled_ || !program.valid_checkpoint(handle) ||
+            program.checkpoint_metadata(handle).role != CheckpointRole::SharedPrefix) {
+            release_unreferenced(program, handle);
+            return false;
+        }
+        shared_.push_back({.handle = handle, .ordinal = ++ordinal_, .priority = {},
+                           .retained_at = ++clock_});
+        index_.insert(program, handle, program.checkpoint_metadata(handle).frontier);
+        return true;
     }
 
     // Pinned shared prefixes are kept, with their index entries: they are installed context,
@@ -1390,11 +1446,72 @@ private:
         if (!facts.loss) {
             facts.loss = sources.empty()
                              ? 0
-                             : recovery_loss(program, sources,
-                                             action_survivors(program, sources, facts, evaluation),
-                                             evaluation);
+                             : stored_loss(sources,
+                                           recovery_loss(program, sources,
+                                                         action_survivors(program, sources, facts,
+                                                                          evaluation),
+                                                         evaluation));
         }
         return *facts.loss;
+    }
+
+    // The store's image size when every catalog holder of every source is a continuation or
+    // shared prefix the store holds in full; nullopt when any source would be recomputed (a
+    // waiting reader's only copy, or a holder the store does not hold as it is now).
+    [[nodiscard]] std::optional<std::uint64_t>
+    stored_image_bytes(std::span<const Handle> sources) const {
+        if (!durability_.stored_bytes || sources.empty()) { return std::nullopt; }
+        std::vector<OwnerToken> holders;
+        std::uint64_t shared_bytes = 0;
+        for (const auto handle : sources) {
+            bool held = false;
+            if (std::any_of(shared_.begin(), shared_.end(),
+                            [&](const auto& entry) { return entry.handle == handle; })) {
+                const auto stored = durability_.shared_stored_bytes
+                                        ? durability_.shared_stored_bytes(handle)
+                                        : std::nullopt;
+                if (!stored) { return std::nullopt; }
+                shared_bytes = *stored > UINT64_MAX - shared_bytes ? UINT64_MAX
+                                                                   : shared_bytes + *stored;
+                held = true;
+            }
+            for (const auto& owner : owners_) {
+                if (std::none_of(owner.points.begin(), owner.points.end(),
+                                 [&](const auto& point) { return point.handle == handle; })) {
+                    continue;
+                }
+                held = true;
+                if (std::find(holders.begin(), holders.end(), owner.token) == holders.end()) {
+                    holders.push_back(owner.token);
+                }
+            }
+            if (!held) { return std::nullopt; }
+        }
+        std::uint64_t bytes = shared_bytes;
+        for (const auto token : holders) {
+            const auto stored = durability_.stored_bytes(token);
+            if (!stored) { return std::nullopt; }
+            bytes = *stored > UINT64_MAX - bytes ? UINT64_MAX : bytes + *stored;
+        }
+        return bytes;
+    }
+
+    // Recovery loss is counted in prompt tokens to recompute. A loss the store can restore costs
+    // its read and upload instead: the same tokens, scaled by restore time over prefill time.
+    [[nodiscard]] std::uint64_t stored_loss(std::span<const Handle> sources,
+                                            std::uint64_t loss) const {
+        if (loss == 0) { return 0; }
+        const auto bytes = stored_image_bytes(sources);
+        if (!bytes) { return loss; }
+        const auto prefill = costs_.prefill_ns(make_prefill_work(0, loss, 0, 0, 0));
+        const auto restore = store_restore_ns(*bytes);
+        if (prefill == 0 || restore >= prefill) { return loss; }
+        // restore < prefill, so the result is below `loss`. At least one token: a restorable loss
+        // is still a loss, ranked after any release that loses nothing.
+        const auto scaled = static_cast<std::uint64_t>(static_cast<long double>(loss) *
+                                                       static_cast<long double>(restore) /
+                                                       static_cast<long double>(prefill));
+        return std::max<std::uint64_t>(1, scaled);
     }
 
     [[nodiscard]] CacheRetentionPriority action_priority(Program& program,
@@ -1585,11 +1702,13 @@ private:
         if (!may_revoke(handles, cursor.rights)) {
             throw std::logic_error("cache release lacks waiting-source revocation rights");
         }
+        notify_releasing(program, handles);
         const auto loss =
             cursor.gain_limit && !superseded_only(handles)
                 ? (quoted_loss
                        ? *quoted_loss
-                       : program.checkpoint_recovery_loss(handles, surviving(program, handles)))
+                       : stored_loss(handles, program.checkpoint_recovery_loss(
+                                                  handles, surviving(program, handles))))
                 : 0;
         for (const auto handle : handles) {
             if (!erase(program, handle, cursor.rights)) {
@@ -1707,6 +1826,41 @@ private:
         return selected;
     }
 
+    // Write-on-evict: the inactive, live continuations about to lose a point, while every point is
+    // still valid. Superseded branches are not offered: they are evict-first because nothing is
+    // expected to come back to them.
+    void notify_releasing(Program& program, std::span<const Handle> handles) {
+        if (!durability_.releasing) { return; }
+        std::vector<RetainedOwner> affected;
+        for (const auto& owner : owners_) {
+            if (owner.active || owner.superseded || owner.points.empty()) { continue; }
+            // Only when the release takes the point the conversation resumes from (its deepest):
+            // losing a shallower anchor or input point leaves the next turn served from the cache,
+            // and exporting the whole conversation for it would stall the worker for nothing.
+            const Point* deepest = nullptr;
+            std::uint32_t deepest_frontier = 0;
+            for (const auto& point : owner.points) {
+                if (!program.valid_checkpoint(point.handle)) { continue; }
+                const auto frontier = program.checkpoint_metadata(point.handle).frontier;
+                if (!deepest || frontier > deepest_frontier) {
+                    deepest          = &point;
+                    deepest_frontier = frontier;
+                }
+            }
+            if (!deepest || !contains(handles, deepest->handle)) { continue; }
+            auto points = this->points(owner.token);
+            if (!std::all_of(points.begin(), points.end(),
+                             [&](auto point) { return program.valid_checkpoint(point); })) {
+                continue;
+            }
+            affected.push_back({.token   = owner.token,
+                                .active  = false,
+                                .session = owner.session,
+                                .points  = std::move(points)});
+        }
+        if (!affected.empty()) { durability_.releasing(affected); }
+    }
+
     void balance_reused(Program& program) {
         const auto amounts = [](ContextResourceUsage r) {
             return std::array<std::uint64_t, 4>{r.state_slots, r.main_kv_pages, r.backend_kv_pages,
@@ -1783,6 +1937,7 @@ private:
 
     bool enabled_;
     ContextMachineCostModel costs_;
+    Durability durability_;
     PrefixIndex<Model> index_;
     bool candidate_memo_ = true;
     std::vector<Owner> owners_;
