@@ -353,7 +353,7 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
     return result;
 }
 
-fi::ChatRenderOptions render_options(const PromptOptions& options,
+fi::ChatRenderOptions render_options(const PromptOptions& options, fi::ToolCallSyntax syntax,
                                      std::span<const PromptCacheMarker> cache_markers = {}) {
     fi::ChatRenderOptions rendered{.continuation              = options.continuation,
                                    .enable_thinking           = options.enable_thinking,
@@ -362,7 +362,8 @@ fi::ChatRenderOptions render_options(const PromptOptions& options,
                                    .chat_template_kwargs_json = options.chat_template_kwargs_json,
                                    .add_vision_id             = options.add_vision_id,
                                    .tool_jsons                = options.tool_jsons,
-                                   .forced_tool_name          = options.forced_tool_name};
+                                   .forced_tool_name          = options.forced_tool_name,
+                                   .tool_call_syntax          = syntax};
     rendered.cache_markers.assign(cache_markers.begin(), cache_markers.end());
     return rendered;
 }
@@ -987,6 +988,11 @@ public:
         }
     }
 
+    // The syntax the model writes its calls in, which a forced call's opener has to match.
+    [[nodiscard]] fi::ToolCallSyntax tool_call_syntax() const noexcept {
+        return gemma ? fi::ToolCallSyntax::Gemma : fi::ToolCallSyntax::Qwen;
+    }
+
     // The graft a request names, or null for none.
     [[nodiscard]] const PromptGraft* find_graft(const std::string& name) const {
         if (name.empty()) { return nullptr; }
@@ -1207,9 +1213,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                 impl_->media_cache);
         fi::ProcessedInput processed;
         try {
-            processed =
-                processor.process(std::move(messages), render_options(options, rendered_markers),
-                                  control, prompt_context);
+            processed = processor.process(
+                std::move(messages),
+                render_options(options, impl_->tool_call_syntax(), rendered_markers), control,
+                prompt_context);
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
         result.starts_in_reasoning = processed.starts_in_reasoning;
@@ -1243,7 +1250,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         cache_boundaries   = std::move(processed.cache_boundaries);
     } else {
         const fi::RenderedChat rendered = impl_->chat_template.render(
-            messages, render_options(options, rendered_markers), control);
+            messages, render_options(options, impl_->tool_call_syntax(), rendered_markers),
+            control);
         result.starts_in_reasoning  = rendered.starts_in_reasoning;
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(
@@ -1362,8 +1370,8 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
     if (!has_media) {
-        const fi::RenderedChat rendered =
-            impl_->chat_template.render(messages, render_options(options), control);
+        const fi::RenderedChat rendered = impl_->chat_template.render(
+            messages, render_options(options, impl_->tool_call_syntax()), control);
         const std::uint32_t count = checked_token_count(
             graft_tokens + fi::encode_rendered_chat(*impl_->tokenizer, rendered).input_ids.size());
         fi::check_preparation_control(control, "tokenization");
@@ -1374,8 +1382,9 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
                             impl_->media_cache);
     try {
         return checked_token_count(
-            graft_tokens +
-            processor.count_tokens(std::move(messages), render_options(options), control));
+            graft_tokens + processor.count_tokens(
+                               std::move(messages),
+                               render_options(options, impl_->tool_call_syntax()), control));
     } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
 }
 

@@ -1425,22 +1425,22 @@ contains earlier calls.
 
 A forced selection names one function: `tool_choice` naming it directly, `required`, or
 `allowed_tools` with mode `required` over a single callable tool. NInfer executes it by ending the
-generation prompt with that call's opener, so the answer can only continue inside the call. It
+generation prompt with that call's opener in the model's own call syntax, so the answer can only
+continue inside the call: `<tool_call>\n<function=NAME>\n` for Qwen, `<|tool_call>call:NAME{` for
+Gemma 4, where `<|tool_call>` is the special token the chat template writes for an earlier call. It
 therefore requires a fresh answer position and a prompt without a thinking block: reasoning that
 the request itself enables is rejected with `tool_choice_not_supported`, while reasoning that only a
 default turns on, the server's or the chat template's, is switched off for that request. `required`
 over several callable tools is rejected too, because the function itself would still be sampled. The forced call is present and first in the output; a model that keeps writing may
-add further calls, exactly as under `auto` with parallel calls enabled.
+add further calls, exactly as under `auto` with parallel calls enabled. Output decoding starts
+inside the opened call, so no text can precede it, and a turn that ends after the call's last
+argument but before its closing tag (`</tool_call>`, `<tool_call|>` for Gemma 4) still returns the
+call, with `forced_call_closed` set.
 
 NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
 `strict:true`, hosted tools, remote MCP tools, and custom free-form tools are rejected. Deferred
 loading, output schemas, and caller restrictions that exclude direct invocation are also rejected
 because their semantics cannot be honored.
-
-NInfer does not execute functions or constrain tool arguments with JSON Schema, so
-`strict:true`, required or named tool choice, hosted tools, remote MCP tools, and custom free-form
-tools are rejected. Deferred loading, output schemas, and caller restrictions that exclude direct
-invocation are also rejected because their semantics cannot be honored.
 
 ### Response object and usage
 
@@ -2076,7 +2076,8 @@ call count, empty non-string arguments omitted during normalization, schema-mism
 preserved for consumer validation, `duplicate_parameters_repaired`, and a stable fallback reason. A
 parameter named more than once in one call keeps its last value, as in JSON object syntax, and
 counts once in `duplicate_parameters_repaired` for each repeat instead of demoting the call to text.
-`forced_call_closed` reports a forced call whose closing tag the decoder supplied. When the strict
+`forced_call_closed` reports a forced call whose closing tag (`</tool_call>`, or `<tool_call|>` for
+Gemma 4) the decoder supplied. When the strict
 pass rejects a region, `recovered` reports that a recovery pass still produced calls from it (with
 `recovered_call_count` the calls only that pass kept), `malformed_call_reported` that an unreadable
 call became a call to the reserved error tool, and `trailing_content_dropped` that text after the

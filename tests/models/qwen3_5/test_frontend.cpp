@@ -3328,6 +3328,21 @@ int test_forced_tool_call(const Frontend& frontend) {
     failures += check(prompt_text.find("<think>\n\n</think>") != std::string::npos,
                       "forced tool choice did not keep the reasoning block closed");
 
+    // The syntax picks the opener and nothing else: Gemma's call form replaces Qwen's at the end of
+    // the same prompt.
+    fi::ChatRenderOptions gemma_forced = forced;
+    gemma_forced.tool_call_syntax      = fi::ToolCallSyntax::Gemma;
+    const std::string gemma_prompt =
+        render_chat_text({chat_message(ninfer::ChatRole::User, "x")}, gemma_forced);
+    constexpr std::string_view kQwenOpener  = "<tool_call>\n<function=TaskUpdate>\n";
+    constexpr std::string_view kGemmaOpener = "<|tool_call>call:TaskUpdate{";
+    failures += check(gemma_prompt.ends_with(kGemmaOpener) && prompt_text.ends_with(kQwenOpener) &&
+                          std::string_view(gemma_prompt)
+                                  .substr(0, gemma_prompt.size() - kGemmaOpener.size()) ==
+                              std::string_view(prompt_text)
+                                  .substr(0, prompt_text.size() - kQwenOpener.size()),
+                      "the Gemma syntax did not change only the forced call's opener");
+
     fi::ChatRenderOptions thinking = forced;
     thinking.enable_thinking       = true;
     failures += check(throws_invalid_argument([&] {
@@ -3405,6 +3420,140 @@ int test_forced_tool_call(const Frontend& frontend) {
     return failures;
 }
 
+// A forced tool choice on Gemma 4 opens the call in Gemma's own syntax: the generation prompt ends
+// with the <|tool_call> token and `call:NAME{`, the decoder starts inside that call, and the model's
+// continuation (arguments, then `}<tool_call|>`) becomes one structured call with JSON arguments.
+int test_gemma_forced_tool_call() {
+    const GemmaFixture fixture = gemma_fixture();
+    const Frontend frontend    = make_gemma_frontend(fixture);
+    const fi::Tokenizer tokenizer(fi::TokenizerResources{
+        fixture.tokenizer_json, fixture.tokenizer_config_json, fixture.generation_config});
+    const auto input = [&](std::string_view forced_name) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+        ninfer::PromptInput prompt;
+        prompt.messages.push_back(std::move(message));
+        prompt.options.enable_thinking  = false;
+        prompt.options.forced_tool_name = std::string(forced_name);
+        prompt.options.tool_jsons.emplace_back(kForcedToolDefinition);
+        return prompt;
+    };
+    constexpr ninfer::TokenId kCallOpen = 42;
+
+    int failures = 0;
+    {
+        const auto forced       = frontend.prepare(input("TaskUpdate"));
+        const auto& ids         = FrontendFactory::inspect(forced).token_ids;
+        std::vector<int> opener = {kCallOpen};
+        const std::vector<int> head = tokenizer.encode("call:TaskUpdate{");
+        opener.insert(opener.end(), head.begin(), head.end());
+        failures += check(ids.size() > opener.size() &&
+                              std::equal(opener.begin(), opener.end(), ids.end() - opener.size()),
+                          "a forced Gemma prompt did not end with <|tool_call>call:NAME{");
+        failures += check(frontend.count_tokens(input("TaskUpdate")) == ids.size(),
+                          "token counting disagrees with a forced Gemma prompt");
+        const auto free = frontend.prepare(input(""));
+        const auto& free_ids = FrontendFactory::inspect(free).token_ids;
+        failures += check(std::find(free_ids.begin(), free_ids.end(), kCallOpen) == free_ids.end() &&
+                              ids.size() == free_ids.size() + opener.size() &&
+                              std::equal(free_ids.begin(), free_ids.end(), ids.begin()),
+                          "a forced Gemma prompt differs from the free one beyond its opener");
+    }
+
+    struct Outcome {
+        std::vector<ninfer::GeneratedToolCall> calls;
+        ninfer::ToolCallParseDiagnostics diagnostics;
+        std::string streamed;
+    };
+    // Each piece is one round of model tokens, committed as the engine would; the last one ends the
+    // turn, which is also where an unterminated call is judged.
+    const auto run = [&](std::string_view forced_name, const std::vector<std::string>& pieces) {
+        const auto prompt = frontend.prepare(input(forced_name));
+        auto session      = frontend.make_output_session(
+            prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+        Outcome outcome;
+        for (std::size_t i = 0; i < pieces.size(); ++i) {
+            const std::vector<ninfer::TokenId> tokens = tokenizer.encode(pieces[i]);
+            const bool last                           = i + 1 == pieces.size();
+            const auto size                           = static_cast<std::uint32_t>(tokens.size());
+            (void)session.preview_model(tokens, last ? size : size + 64U,
+                                        ninfer::FinishReason::OutputLimit);
+            outcome.streamed += channel_text(session.commit_preview(), ninfer::OutputChannel::Content);
+        }
+        outcome.calls       = session.take_tool_calls();
+        outcome.diagnostics = session.tool_call_parse_diagnostics();
+        return outcome;
+    };
+    const std::string q = "<|\"|>";
+
+    // Strings, numbers, booleans, a list and nested objects, across several rounds. Nothing
+    // reaches the content stream: the first bytes after the opener already belong to the call.
+    const Outcome complete =
+        run("TaskUpdate", {"caption:" + q + "a cat, in a hat" + q + ",count:3,", "ratio:0.25,ok:true,",
+                           "tags:[" + q + "x" + q + ",2],opts:{n:{k:null,s:" + q + "}" + q + "}}",
+                           "}<tool_call|>"});
+    failures += check(complete.calls.size() == 1 && complete.calls.front().name == "TaskUpdate" &&
+                          complete.streamed.empty() && complete.diagnostics.marker_seen &&
+                          complete.diagnostics.structured_call_count == 1 &&
+                          !complete.diagnostics.forced_call_closed &&
+                          complete.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None,
+                      "a forced Gemma call did not complete from the seeded opener");
+    if (!complete.calls.empty()) {
+        failures += check(
+            nlohmann::json::parse(complete.calls.front().arguments_json) ==
+                nlohmann::json::parse(
+                    R"({"caption":"a cat, in a hat","count":3,"ratio":0.25,"ok":true,)"
+                    R"("tags":["x",2],"opts":{"n":{"k":null,"s":"}"}}})"),
+            "a forced Gemma call's arguments were not read as typed JSON values");
+    }
+
+    // The turn ends after the closing brace: the decoder supplies <tool_call|> and nothing else.
+    const Outcome unclosed = run("TaskUpdate", {"caption:" + q + "x" + q + "}"});
+    failures += check(unclosed.calls.size() == 1 && unclosed.calls.front().name == "TaskUpdate" &&
+                          unclosed.diagnostics.forced_call_closed && unclosed.streamed.empty() &&
+                          nlohmann::json::parse(unclosed.calls.front().arguments_json) ==
+                              nlohmann::json{{"caption", "x"}},
+                      "a Gemma turn ending on the closed arguments did not become the forced call");
+
+    // A function without arguments closes at once.
+    const Outcome bare = run("TaskUpdate", {"}<tool_call|>"});
+    failures += check(bare.calls.size() == 1 && bare.calls.front().arguments_json == "{}" &&
+                          !bare.diagnostics.forced_call_closed,
+                      "a forced Gemma call without arguments was not read");
+
+    // Anything less complete stays text: only the model's own bytes, not the prompt's opener.
+    const Outcome truncated = run("TaskUpdate", {"caption:" + q + "x" + q + ",cou"});
+    failures += check(truncated.calls.empty() && !truncated.diagnostics.forced_call_closed &&
+                          truncated.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::MalformedStructure &&
+                          truncated.streamed == "caption:" + q + "x" + q + ",cou",
+                      "an unfinished forced Gemma call was completed or leaked the prompt's opener");
+    const Outcome unreadable = run("TaskUpdate", {"caption " + q + "x" + q + "}<tool_call|>"});
+    failures += check(unreadable.calls.empty() &&
+                          unreadable.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::MalformedStructure &&
+                          unreadable.streamed == "caption " + q + "x" + q + "}<tool_call|>",
+                      "an unreadable forced Gemma call was not returned as the model's text");
+
+    // The forced call comes first; a model that goes on may call again, and that call is the
+    // model's own, so a missing marker there is not a closed forced call.
+    const Outcome again = run("TaskUpdate", {"id:1}<tool_call|><|tool_call>call:TaskUpdate{id:2}"});
+    failures += check(again.calls.size() == 2 && !again.diagnostics.forced_call_closed &&
+                          again.streamed.empty(),
+                      "a second Gemma call after the forced one was lost or reported as closed");
+
+    // Without a forced choice the decoder is unchanged: text, then the model's own call.
+    const Outcome free_call = run("", {"Hi. <|tool_call>call:TaskUpdate{id:" + q + "7" + q +
+                                       "}<tool_call|>"});
+    failures += check(free_call.calls.size() == 1 && free_call.streamed == "Hi. " &&
+                          !free_call.diagnostics.forced_call_closed,
+                      "an unforced Gemma tool call changed");
+    return failures;
+}
+
 int main() {
     const FrontendResources owned = resources();
     const Frontend frontend       = make_frontend(owned);
@@ -3468,5 +3617,6 @@ int main() {
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
     failures += test_gemma_media_layout();
+    failures += test_gemma_forced_tool_call();
     return failures == 0 ? 0 : 1;
 }
