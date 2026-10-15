@@ -40,8 +40,11 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   tokens (1024 or 512 on a card without room for them, [below](#memory-and-context)), prefix
   reuse across turns and requests with host-memory images ([below](#prefix-reuse)), structured
   output, tool calls in Gemma's
-  `<|tool_call>call:NAME{...}<tool_call|>` form returned as OpenAI tool calls, streaming, reasoning
-  in its own channel when thinking is on, and causal scoring (`ninfer-perplexity`).
+  `<|tool_call>call:NAME{...}<tool_call|>` form returned as OpenAI tool calls (a forced
+  `tool_choice` ends the generation prompt with Gemma's own opener, `<|tool_call>call:NAME{`, so
+  the model continues with the arguments; see [forced selection](serving.md#function-tools)),
+  streaming, reasoning in its own channel when thinking is on, and causal scoring
+  (`ninfer-perplexity`).
 - **Thinking.** Off unless asked for, as the release's chat template has it: a request turns it on
   with `chat_template_kwargs: {"enable_thinking": true}`, and the reasoning arrives as
   `reasoning_content`.
@@ -453,8 +456,8 @@ dominate a small one. A follow-up turn over the same picture reuses it without e
   product of the decoded blocks (`ninfer_linear_gguf_test`, `ninfer_gguf_moe_geglu_test`); the
   decode attention (both head widths, stored and derived keys, several rows of one sequence at
   consecutive positions), its q8_1 output and the decode routing match FP64 oracles
-  (`ninfer_gemma4_kernels_test`); Gemma's tool-call markup parses as streamed
-  (`ninfer_gemma4_output_test`).
+  (`ninfer_gemma4_kernels_test`); Gemma's tool-call markup parses as streamed, a forced call
+  from its seeded opener included (`ninfer_gemma4_output_test`, `ninfer_qwen3_5_frontend_test`).
 - The KV-cache formats (`ninfer_gemma4_kv_test`), each of the eight quantized ones: the codes and
   scales a store writes, decoded on the host by the engine's codec oracles (and turned back in FP64
   for a rotated plane), stay within the coding's error of the rows stored; a ring's load and a prompt
