@@ -328,6 +328,7 @@ int main() {
                         blob.extents = {{blobs.size(), std::uint64_t(e * bank->expert_bytes), blob.bytes}};
                     } else {
                         blob.pinned = static_cast<const std::byte*>(bank->pinned->data()) + e * bank->expert_bytes;
+                        blob.pinned_region = reinterpret_cast<std::uintptr_t>(bank->pinned->data());
                     }
                     blobs.push_back(std::move(blob));
                 }

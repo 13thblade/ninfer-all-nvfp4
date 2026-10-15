@@ -78,6 +78,16 @@ struct Fixture {
         for (int l = 0; l < kLayers; ++l) {
             ExpertDeliveryLayer layer;
             layer.aliases = {{0, 0}, {0, kGu / 2}, {0, 0}, {1, 0}};
+            // Host blobs of one layer and blob index share an allocation, experts in order, as a
+            // model's pinned parent does: runs of them copy as one.
+            std::array<std::byte*, 2> host{};
+            if (!disk) {
+                for (int b = 0; b < 2; ++b) {
+                    pinned.push_back(std::make_unique<PinnedHostBuffer>(
+                        kExperts * (b ? kDown - std::uint64_t(l) * 256 : kGu)));
+                    host[b] = static_cast<std::byte*>(pinned.back()->data());
+                }
+            }
             for (int e = 0; e < kExperts; ++e) {
                 std::vector<ExpertBlob> expert;
                 for (int b = 0; b < 2; ++b) {
@@ -95,9 +105,10 @@ struct Fixture {
                         file_offsets[0] += split;
                         file_offsets[1] += blob.bytes - split;
                     } else {
-                        pinned.push_back(std::make_unique<PinnedHostBuffer>(blob.bytes));
-                        std::memcpy(pinned.back()->data(), data.data(), data.size());
-                        blob.pinned = pinned.back()->data();
+                        auto* target = host[b] + std::uint64_t(e) * blob.bytes;
+                        std::memcpy(target, data.data(), data.size());
+                        blob.pinned = target;
+                        blob.pinned_region = reinterpret_cast<std::uintptr_t>(host[b]);
                     }
                     expert.push_back(std::move(blob));
                 }
@@ -233,7 +244,7 @@ int admission_boundaries(DeviceContext& device) {
     PinnedHostBuffer source(256);
     std::memset(source.data(), 0, source.size());
     ExpertDeliveryLayer layer;
-    layer.experts = {{{source.data(), {}, 256, 0}}};
+    layer.experts = {{ExpertBlob{.pinned = source.data(), .bytes = 256}}};
     layer.aliases = {{0, 0}};
     for (const bool suspendable : {false, true}) {
         ExpertDeliveryOptions options;

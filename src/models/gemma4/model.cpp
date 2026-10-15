@@ -83,7 +83,9 @@ std::vector<ExpertBlob> expert_blobs(const artifact::Reader& reader,
         blob.zero_tail = kRowTail;
         const auto offset = start + e * blob.bytes;
         if (reference.residency == artifact::Residency::Pinned) {
-            blob.pinned = backing.pinned_parent(part.object).data + offset;
+            const auto* parent = backing.pinned_parent(part.object).data;
+            blob.pinned = parent + offset;
+            blob.pinned_region = reinterpret_cast<std::uintptr_t>(parent);
         } else {
             const auto logical = reader.directory().tensor(part.object).offset + offset;
             for (const auto& segment : reader.segments(logical, blob.bytes)) {

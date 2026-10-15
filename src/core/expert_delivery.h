@@ -19,6 +19,9 @@ struct ExpertExtent {
 };
 struct ExpertBlob {
     const void* pinned = nullptr;
+    // The base of the host allocation `pinned` lies in. Neighbouring pinned blobs of one nonzero
+    // region are copied together; a copy never spans two allocations.
+    std::uintptr_t pinned_region = 0;
     std::vector<ExpertExtent> extents;
     std::uint64_t bytes = 0;
     // Zero bytes a kernel may read past the blob's end (whole K steps past a row's end decode the

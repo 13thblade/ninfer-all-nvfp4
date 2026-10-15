@@ -164,6 +164,7 @@ struct ExpertDelivery::Impl {
     struct Piece {
         std::byte* target = nullptr;
         const std::byte* pinned = nullptr;
+        std::uintptr_t region = 0;
         std::vector<ExpertExtent> extents;
         std::uint64_t bytes = 0;
     };
@@ -498,7 +499,8 @@ struct ExpertDelivery::Impl {
         if (!pieces.empty()) {
             auto& last = pieces.back();
             const bool target_follows = last.target + last.bytes == target;
-            if (target_follows && blob.pinned && last.pinned &&
+            if (target_follows && blob.pinned && last.pinned && blob.pinned_region != 0 &&
+                blob.pinned_region == last.region &&
                 last.pinned + last.bytes == static_cast<const std::byte*>(blob.pinned)) {
                 last.bytes += blob.bytes;
                 return;
@@ -519,6 +521,7 @@ struct ExpertDelivery::Impl {
         Piece piece;
         piece.target = target;
         piece.pinned = static_cast<const std::byte*>(blob.pinned);
+        piece.region = blob.pinned_region;
         piece.extents = blob.extents;
         piece.bytes = blob.bytes;
         pieces.push_back(std::move(piece));
