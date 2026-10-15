@@ -36,7 +36,7 @@ constexpr double kFloor      = 0.5;
 // Victim choice samples this many cached slots instead of scanning every slot per miss.
 constexpr int kVictimSamples = 24;
 // A wide call promotes at most this many experts over colder cached ones (free slots are taken
-// without limit): its device copies run beside the layer's arithmetic.
+// without limit). Those device copies run while the next call is served.
 constexpr std::size_t kPromotionsOverVictims = 32;
 
 std::uint64_t aligned(std::uint64_t n) {
@@ -160,6 +160,12 @@ struct ExpertDelivery::Impl {
         std::size_t layer;
         std::int32_t expert, slot;
     };
+    // Experts of a wide call's bank left to replace colder cached experts.
+    struct Replacements {
+        std::size_t layer = 0;
+        int bank = -1;
+        std::vector<std::int32_t> experts;
+    };
     // A host-to-device copy of contiguous bytes from one pinned range or a run of file extents.
     struct Piece {
         std::byte* target = nullptr;
@@ -185,6 +191,7 @@ struct ExpertDelivery::Impl {
     std::vector<Slot> slots;
     std::vector<std::int32_t> free_slots;
     std::vector<Deferred> deferred;
+    Replacements replacements;
     std::uint64_t random_state = 0x9e3779b97f4a7c15ULL;
     CudaHostHandshake handshake;
     cudaStream_t copies = nullptr;
@@ -206,6 +213,9 @@ struct ExpertDelivery::Impl {
     ExpertDeliveryMemory allocation;
     bool released = false;
     // The call being served and its post work: layer, bank, whether wide, and its routed experts.
+    // Between a call's ready signal and the next request the GPU may read any layer's table (the
+    // next split, then that call's cached pairs), so post work writes only free slots. Cached
+    // experts are replaced only while a request is served, never one it routes.
     std::int64_t previous_layer = -1;
     std::size_t call_layer      = 0;
     int call_bank               = 0;
@@ -610,8 +620,8 @@ struct ExpertDelivery::Impl {
         ++delta.evictions;
     }
 
-    // A free slot, else the coldest of a sample of cached experts the call does not use, when the
-    // candidate is clearly hotter. -1: keep the candidate out of the cache.
+    // A free slot, else the coldest of a sample of cached experts the served call does not route,
+    // when the candidate (li, e) is clearly hotter. -1: keep the candidate out of the cache.
     std::int32_t choose_slot(std::size_t li, std::int32_t e, ExpertDeliveryStats& delta) {
         if (!free_slots.empty()) {
             const auto s = free_slots.back();
@@ -625,7 +635,9 @@ struct ExpertDelivery::Impl {
             const auto s = std::int32_t(next_random(random_state) % slots.size());
             const auto& slot = slots[std::size_t(s)];
             if (slot.layer < 0 || slot.pending) { continue; }
-            if (std::size_t(slot.layer) == li && call_routed[std::size_t(slot.expert)]) { continue; }
+            if (std::size_t(slot.layer) == call_layer && call_routed[std::size_t(slot.expert)]) {
+                continue;
+            }
             const double score = score_of(std::size_t(slot.layer), slot.expert);
             if (victim < 0 || score < coldest) { victim = s; coldest = score; }
         }
@@ -689,6 +701,39 @@ struct ExpertDelivery::Impl {
         }
     }
 
+    // Device copies of bank expert e into slot s.
+    void promote(std::int32_t s, std::size_t li, std::int32_t e, int bank, ExpertDeliveryStats& delta) {
+        for (std::size_t b = 0; b < layers[li].source.experts[std::size_t(e)].size(); ++b) {
+            const auto bytes = layers[li].source.experts[std::size_t(e)][b].bytes;
+            CUDA_CHECK(cudaMemcpyAsync(slot_base(s) + slot_offset[b], bank_blob(bank, li, e, b),
+                                       bytes, cudaMemcpyDeviceToDevice, copies));
+            slot_written(s, b, bytes);
+            delta.promoted_bytes += bytes;
+        }
+        ++delta.admissions;
+    }
+
+    // The replacements an earlier wide call left, while serving the call of layer `current`: its
+    // split has read its table, and choose_slot keeps the experts it routes. The promoting layer's
+    // call has ended, so its table changes at once. A repeat of that layer reuses its bank instead.
+    void replace_cached(std::size_t current, ExpertDeliveryStats& delta) {
+        auto r = std::move(replacements);
+        replacements = {};
+        if (r.bank < 0 || r.experts.empty() || r.layer == current) { return; }
+        const auto& bank = bank_state[std::size_t(r.bank)];
+        if (bank.layer != std::int64_t(r.layer)) { return; }
+        for (const auto e : r.experts) {
+            if (!bank.valid[std::size_t(e)] || layers[r.layer].slot_of[std::size_t(e)] >= 0) {
+                continue;
+            }
+            const auto s = choose_slot(r.layer, e, delta);
+            if (s < 0) { break; }
+            occupy(s, r.layer, e, false);
+            promote(s, r.layer, e, r.bank, delta);
+            point_slot(r.layer, e, s);
+        }
+    }
+
     void serve(const CudaHostHandshake::Request& request) {
         const auto started = std::chrono::steady_clock::now();
         ExpertDeliveryStats delta;
@@ -703,6 +748,7 @@ struct ExpertDelivery::Impl {
         deferred.clear();
         const std::size_t li = request.tag;
         auto& layer = layers.at(li);
+        call_layer = li;
         const auto* needed = static_cast<const std::uint32_t*>(needed_host->data());
         const int experts = int(layer.source.experts.size());
         const double tokens = std::max(1.0, double(request.width) / options.routes_per_token);
@@ -730,6 +776,7 @@ struct ExpertDelivery::Impl {
             layers[std::size_t(previous_layer)].successor_wide = wide;
         }
         previous_layer = std::int64_t(li);
+        replace_cached(li, delta);
         const int held = bank_holding(li);
         int k = held;
         std::vector<std::int32_t> to_bank;
@@ -765,7 +812,6 @@ struct ExpertDelivery::Impl {
         if (!to_bank.empty() && k < 0) { k = claim_bank(li, -1); }
         for (const auto e : to_bank) { point_bank(li, e, k); }
         if (k >= 0) { last_bank = k; }
-        call_layer = li;
         call_bank = k;
         call_wide = wide;
         if (!to_bank.empty()) { fill_bank(k, li, to_bank); }
@@ -777,8 +823,9 @@ struct ExpertDelivery::Impl {
         add(delta);
     }
 
-    // After the call's experts are ready: a wide call promotes its hottest bank experts into the
-    // cache by device copies and starts the bank of the layer that followed it last time.
+    // After the call's experts are ready: a wide call promotes its hottest bank experts into free
+    // cache slots by device copies, leaves the next ones to replace colder cached experts, and
+    // starts the bank of the layer that followed it last time.
     void post() {
         if (!call_wide) { return; }
         const auto started = std::chrono::steady_clock::now();
@@ -797,24 +844,18 @@ struct ExpertDelivery::Impl {
                 const double sa = score_of(li, a), sb = score_of(li, b);
                 return sa != sb ? sa > sb : a < b;
             });
-            std::size_t over_victims = 0;
-            for (const auto e : candidates) {
-                const bool free = !free_slots.empty();
-                if (!free && ++over_victims > kPromotionsOverVictims) { break; }
-                const auto s = choose_slot(li, e, delta);
-                if (s < 0) { break; }
+            std::size_t next = 0;
+            for (; next < candidates.size() && !free_slots.empty(); ++next) {
+                const auto e = candidates[next];
+                const auto s = free_slots.back();
+                free_slots.pop_back();
                 occupy(s, li, e, true);
-                for (std::size_t b = 0; b < layer.source.experts[std::size_t(e)].size(); ++b) {
-                    const auto bytes = layer.source.experts[std::size_t(e)][b].bytes;
-                    CUDA_CHECK(cudaMemcpyAsync(slot_base(s) + slot_offset[b],
-                                               bank_blob(call_bank, li, e, b), bytes,
-                                               cudaMemcpyDeviceToDevice, copies));
-                    slot_written(s, b, bytes);
-                    delta.promoted_bytes += bytes;
-                }
+                promote(s, li, e, call_bank, delta);
                 deferred.push_back({li, e, s});
-                ++delta.admissions;
             }
+            const auto end = std::min(candidates.size(), next + kPromotionsOverVictims);
+            replacements = {li, call_bank, {candidates.begin() + std::ptrdiff_t(next),
+                                            candidates.begin() + std::ptrdiff_t(end)}};
         }
         if (bank_state.size() == 2 && layer.successor >= 0 && layer.successor_wide) {
             const auto next = std::size_t(layer.successor);
@@ -831,8 +872,7 @@ struct ExpertDelivery::Impl {
                 ++delta.prefetched_layers;
             }
         }
-        flush_pieces(delta);
-        upload_tables();
+        flush_pieces(delta); // tables are unchanged: promoted entries are patched at the next request
         delta.service_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
         add(delta);

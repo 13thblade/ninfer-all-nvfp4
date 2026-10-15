@@ -119,7 +119,8 @@ struct Fixture {
     }
 };
 
-int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesystem::path& path) {
+int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesystem::path& path,
+        bool shifting = false) {
     Fixture fixture(disk, path);
     ExpertDeliveryOptions options;
     options.pair_capacity = kPairs;
@@ -155,7 +156,14 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
     constexpr int repeats = 12;
     for (int iteration = 0; iteration < repeats; ++iteration) {
         for (int p = 0; p < kPairs; ++p) {
-            routes[p] = iteration % 3 == 0 ? p % 5 : (p + iteration) % kExperts;
+            if (shifting) {
+                // Wide calls whose hot half moves every four replays: once the cache is full, a
+                // wide call's promotions replace cached experts of layers the GPU reads next.
+                const int hot = (iteration / 4) % 2 ? kExperts / 2 : 0;
+                routes[p] = (p % 8 == 7 ? kExperts / 2 - hot : hot) + (p / 8) % 8;
+            } else {
+                routes[p] = iteration % 3 == 0 ? p % 5 : (p + iteration) % kExperts;
+            }
         }
         ids.copy_from_host(routes.data(), ids.bytes);
         CUDA_CHECK(cudaGraphLaunch(executable, device.stream));
@@ -187,10 +195,11 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
                     (cache ? memory.cache_bytes != 0 : memory.cache_bytes == 0) &&
                     memory.banks == 2 &&
                     (cache ? stats.promoted_bytes != 0
-                           : stats.prefetched_layers != 0 && stats.bank_reuses != 0);
-    std::printf("%s cache=%llu bad=%llu pairs=%llu hits=%llu misses=%llu evictions=%llu "
+                           : stats.prefetched_layers != 0 && stats.bank_reuses != 0) &&
+                    (!shifting || stats.evictions != 0);
+    std::printf("%s%s cache=%llu bad=%llu pairs=%llu hits=%llu misses=%llu evictions=%llu "
                 "admissions=%llu bank_reuses=%llu prefetched=%llu read=%llu copied=%llu "
-                "promoted=%llu banks=%u %s\n", disk ? "disk" : "host",
+                "promoted=%llu banks=%u %s\n", disk ? "disk" : "host", shifting ? " shifting" : "",
                 (unsigned long long)cache, bad, count, (unsigned long long)stats.hits,
                 (unsigned long long)stats.misses, (unsigned long long)stats.evictions,
                 (unsigned long long)stats.admissions, (unsigned long long)stats.bank_reuses,
@@ -339,6 +348,7 @@ int main(int argc, char** argv) {
             for (auto cache : {0ULL, 6ULL << 20, 64ULL << 20}) {
                 failures += run(device, disk, cache, path);
             }
+            failures += run(device, disk, 6ULL << 20, path, true);
         }
         failures += failure_control(device, path, false);
         return failures ? 1 : 0;
