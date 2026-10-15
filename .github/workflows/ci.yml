@@ -23,7 +23,7 @@
 #
 #   * tests/test_docker_build_cache.sh -- the Dockerfile's incremental build cache.
 #
-#   * the CUDA build of every target for sm_75, sm_86 and sm_120a in the Dockerfile's toolchain
+#   * the CUDA build of every target for sm_75, sm_86, sm_89 and sm_120a in the Dockerfile's toolchain
 #     stage, then CTest. The toolchain stage is published as ghcr.io/<owner>/<repo>-toolchain once
 #     per change of its definition (.github/scripts/toolchain-image.sh); ccache carries over
 #     between runs; the binaries go to the image.
@@ -306,7 +306,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: ['75', '86', '120a']
+        arch: ['75', '86', '89', '120a']
     steps:
       # The runner's disk (about 80 GB free) holds the toolchain, a build tree and ccache with room
       # to spare, so nothing is deleted to make space; the free space is logged.

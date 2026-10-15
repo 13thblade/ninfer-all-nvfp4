@@ -7,13 +7,14 @@ each card are on the [performance](performance.md) page.
 ## Architectures
 
 A build targets one architecture (`CMAKE_CUDA_ARCHITECTURES`); configure refuses any other target.
-The Docker image (CUDA 13.4, NVIDIA driver 580 or newer) carries the `75`, `86` and `120a` builds and
-starts the one that matches the GPU.
+The Docker image (CUDA 13.4, NVIDIA driver 580 or newer) carries the `75`, `86`, `89` and `120a`
+builds and starts the one that matches the GPU -- which for 8.9 is still the `86` build, so the
+`89` one is there to be built and tested, and to be selected with `NINFER_IMAGE_ARCH=sm89`.
 
 | Architecture | Compute capability | Build | CUDA | In the image | Status |
 |---|---|---|---|---|---|
 | Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer | yes | measured; built-in device profiles |
-| Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | the `86` build | measured; built-in device profile |
+| Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | yes: both, started as the `86` build | measured; built-in device profile |
 | Ampere | 8.6 | `86` (the default) | 12.8 or newer | yes | measured; the reference card |
 | Ampere, A100 class | 8.0 | `80` | 12.8 or newer | no | builds; not measured |
 | Turing | 7.5 | `75` | 12.8 or newer | yes | measured; built-in device profile |

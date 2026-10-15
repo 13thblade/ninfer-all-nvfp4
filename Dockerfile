@@ -40,7 +40,7 @@ RUN apt-get update \
 
 # --- build -----------------------------------------------------------------------------------------
 FROM toolchain AS build
-ARG ARCHS="75 86 120a"
+ARG ARCHS="75 86 89 120a"
 ARG JOBS=""
 WORKDIR /src
 COPY . .
