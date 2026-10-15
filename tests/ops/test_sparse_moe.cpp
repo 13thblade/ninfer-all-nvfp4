@@ -5,7 +5,10 @@
 #include "models/qwen3_5/expert_layout.h"
 #include "ops/sparse_moe/streamed.h"
 
+#include "ops/common/device_route.h"
 #include "ops/op_tester.h"
+#include "ops/sparse_moe/laboratory.h"
+#include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 #include "ops/quantized_weight.h"
 
 #include <cuda_runtime.h>
@@ -824,9 +827,13 @@ public:
     }
 
     int run(std::int32_t tokens, int first_pattern, bool graph_replay,
-            bool streamed = false, std::uint64_t cache_bytes = 0) {
+            bool streamed = false, std::uint64_t cache_bytes = 0,
+            ops::detail::SparseMoeCandidate candidate = ops::detail::SparseMoeCandidate::Automatic) {
+        const bool forced = candidate != ops::detail::SparseMoeCandidate::Automatic;
         const std::string label = std::string(profile_.name) + " T=" + std::to_string(tokens) +
-            (streamed ? " streamed cache=" + std::to_string(cache_bytes) : " resident");
+            (streamed ? " streamed cache=" + std::to_string(cache_bytes) : " resident") +
+            (forced ? " candidate=" + std::string(ops::detail::sparse_moe_candidate_name(candidate))
+                    : std::string());
         std::vector<float> input(static_cast<std::size_t>(kHidden) * tokens);
         std::vector<float> residual(static_cast<std::size_t>(kHidden) * tokens);
         std::vector<double> reference(static_cast<std::size_t>(kHidden) * tokens);
@@ -858,8 +865,12 @@ public:
         };
         Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
         Tensor destination(destination_storage.data(), DType::BF16, {kHidden, tokens});
-        std::size_t workspace_bytes = ops::sparse_moe_workspace_capacity_bytes(
-            weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens);
+        std::size_t workspace_bytes =
+            forced ? ops::detail::sparse_moe_candidate_workspace_bytes(
+                         weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, candidate)
+                   : ops::sparse_moe_workspace_capacity_bytes(weights.routed_gate_up.qtype,
+                                                              weights.routed_down.qtype, tokens,
+                                                              tokens);
         if (streamed) {
             prepare_streaming(weights, cache_bytes);
             workspace_bytes = ops::detail::sparse_moe_stream_workspace_bytes(
@@ -867,12 +878,16 @@ public:
         }
         WorkspaceArena workspace(workspace_bytes);
         const auto execute = [&](cudaStream_t stream) {
-            if (!streamed) {
+            if (streamed) {
+                ops::detail::sparse_moe_stream(x, weights, destination, *delivery_, 0, workspace,
+                                               stream);
+            } else if (forced) {
+                ops::detail::sparse_moe_candidate(x, weights, ops::SparseMoeEpilogue::AddResidual,
+                                                  destination, candidate, workspace, stream);
+            } else {
                 ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination,
                                 workspace, stream);
-                return;
             }
-            ops::detail::sparse_moe_stream(x, weights, destination, *delivery_, 0, workspace, stream);
         };
 
         if (graph_replay) {
@@ -1090,13 +1105,46 @@ int run_profile(const CodecProfile& profile, bool streamed = false) {
     return failures;
 }
 
+// The laboratory candidates a device profile may select, held to the same oracle: Q4 prefill
+// tiles forced narrow and wide around the profile bands, Small-T across the Q8 frontier range a
+// profile may move (T20..T46), and the profile-driven Q8 frontier itself.
+int run_candidates(const CodecProfile& profile) {
+    using Candidate = ops::detail::SparseMoeCandidate;
+    SparseMoeFixture fixture(profile);
+    int failures = 0;
+    if (profile.routed_gate_up == QType::Q4_G64_FP16) {
+        for (const Candidate candidate : {Candidate::PrefillNarrow, Candidate::PrefillWide}) {
+            for (const std::int32_t tokens : {47, 64, 768, 1024}) {
+                failures += fixture.run(tokens, 0, tokens == 64, false, 0, candidate);
+            }
+        }
+    }
+    if (profile.routed_gate_up == QType::Q8_G32_FP16) {
+        for (const std::int32_t tokens : {20, 32, 33, 46}) {
+            failures += fixture.run(tokens, 0, tokens == 32, false, 0, Candidate::SmallT);
+        }
+        const ops::DeviceRouteForce frontier("sparse_moe/prefill/q8-q8", "33");
+        if (ops::detail::sparse_moe_uses_prefill(32, profile.routed_gate_up, profile.routed_down) ||
+            !ops::detail::sparse_moe_uses_prefill(33, profile.routed_gate_up, profile.routed_down)) {
+            std::cerr << profile.name << ": profile frontier 33 did not move the prefill route\n";
+            ++failures;
+        }
+        for (const std::int32_t tokens : {20, 32, 33}) {
+            failures += fixture.run(tokens, 0, tokens == 32);
+        }
+    }
+    failures += fixture.verify_persistent_inputs();
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     const bool wide_only = argc == 2 && std::string_view(argv[1]) == "--wide-only";
     const bool streamed = argc == 2 && std::string_view(argv[1]) == "--streaming";
-    if (argc != 1 && !wide_only && !streamed) {
-        std::cerr << "usage: " << argv[0] << " [--wide-only|--streaming]\n";
+    const bool candidates_only = argc == 2 && std::string_view(argv[1]) == "--candidates-only";
+    if (argc != 1 && !wide_only && !streamed && !candidates_only) {
+        std::cerr << "usage: " << argv[0] << " [--wide-only|--streaming|--candidates-only]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -1160,6 +1208,11 @@ int main(int argc, char** argv) {
         }
     }
     int failures = 0;
+    if (candidates_only) {
+        for (const CodecProfile& profile : profiles) { failures += run_candidates(profile); }
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe laboratory candidates\n";
+        return failures == 0 ? 0 : 1;
+    }
     for (const CodecProfile& profile : profiles) {
         if (wide_only && profile.routed_gate_up == QType::NVFP4 && !kNvfp4Prefill) { continue; }
         failures += run_profile(profile, streamed);

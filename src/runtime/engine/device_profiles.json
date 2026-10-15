@@ -127,8 +127,9 @@
         "unified/q8_linear_add": [[55, ""], [128, "unified"]],
         "unified/q8_linear_pair": [[24, "unified"]]
      }},
-    {"hardware_class": "nvidia-geforce-rtx-5090-sm120", "multiprocessors": 170, "origin": "built in: RTX 5090 at 575 W, 2026-09-25; unified routes and two-stage GDN at 450 W, 2026-09-27",
+    {"hardware_class": "nvidia-geforce-rtx-5090-sm120", "multiprocessors": 170, "origin": "built in: RTX 5090 at 575 W, 2026-09-25; unified routes and two-stage GDN at 450 W, 2026-09-27; Q4/Q5 MoE prefill tile at 450 W, 2026-10-15",
      "routes": {
+        "sparse_moe/prefill-tiles/q4-q5": [[1023, ""], [1024, "narrow"]],
         "attn_i8_small/h24/int8/w1": [[8192, "8x2x32e"], [65536, ""], [1048576, "4x2x32"]],
         "attn_i8_small/h24/int8/w3": [[8192, "16x1x32"], [1048576, "8x2x32q"]],
         "attn_i8_small/h24/int8/w5": [[8192, "16x1x32"], [1048576, ""]],
@@ -331,6 +332,12 @@
         "t2_i8_small/5120x17408": [[12, ""], [14, "r16c8s3"], [16, ""], [24, "r16c32"], [32, ""]],
         "t2_i8_small/5120x6144": [[16, ""], [20, "r16c32"], [32, ""]],
         "t2_i8_small/7168+7168x5120": [[1, "r32c8"], [4, "r16c8w1"], [6, "r32c8"], [7, "r16c8w1"], [8, "r32c8"], [16, "r32c16"], [32, ""]]
+     }},
+    {"hardware_class": "nvidia-tesla-v100-sxm2-32gb-sm70", "multiprocessors": 80, "origin": "built in: Tesla V100-SXM2-32GB at 300 W, 2026-10-15; GDN routes of the 16 GB card",
+     "routes": {
+        "gdn_two_stage/h32": [[48, ""], [2147483647, "on"]],
+        "gdn_two_stage/h48": [[48, ""], [2147483647, "on"]],
+        "sparse_moe/prefill/q8-q8": [[1, "33"]]
      }},
     {"hardware_class": "nvidia-tesla-v100-sxm2-16gb-sm70", "multiprocessors": 80, "origin": "built in: Tesla V100-SXM2-16GB at 300 W, 2026-10-12",
      "routes": {

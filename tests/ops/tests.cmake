@@ -148,6 +148,10 @@ add_test(NAME ninfer_sparse_moe_streaming_test
   COMMAND ninfer_tests ninfer_sparse_moe_test --streaming)
 set_tests_properties(ninfer_sparse_moe_streaming_test PROPERTIES SKIP_RETURN_CODE 77)
 
+ninfer_add_op_test(ninfer_sparse_moe_candidates_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_sparse_moe_candidates.cpp"
+  LIBRARIES ninfer_ops)
+
 # The routing sort on its own, exhaustively. The Op test above covers SparseMoe end to end and
 # would not localise a network that mis-sorts a minority of score permutations; this one runs the
 # device function over all 8! orderings and all 3^8 tie patterns.
@@ -259,6 +263,10 @@ set_tests_properties(ninfer_softmax_attention_parallel_tiles_test
 add_test(NAME ninfer_sparse_moe_wide_test
   COMMAND ninfer_tests ninfer_sparse_moe_test --wide-only)
 set_tests_properties(ninfer_sparse_moe_wide_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
+add_test(NAME ninfer_sparse_moe_candidates_op_test
+  COMMAND ninfer_tests ninfer_sparse_moe_test --candidates-only)
+set_tests_properties(ninfer_sparse_moe_candidates_op_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
 
 foreach(mode IN ITEMS ngram-only onehot-distribution mtp-onehot mtp-distribution ngram-negative-penalties wide-accept wide-distribution)

@@ -238,16 +238,18 @@ within one pinned allocation. Two banks let the next layer of a wide call (half 
 or more: a prompt slice, a wide verification) arrive while the current layer computes; one bank
 remains where memory is short.
 
-Calls below the codec's compiled prefill frontier (47 columns for Q4/Q5 and Q4/Q6, 20 for Q8, 13 for
-NVFP4) route, run the cached pairs and the shared expert while the rest arrive, then run the
-delivered pairs; both phases write per-rank FP32 products that one rank-order sum reduces, adds to
-the residual and rounds to BF16. This is the resident Small-T arithmetic; the Op test holds the
-streamed Q4/Q5, Q4/Q6 and Q8 outputs to the resident bits at every tested call width. Wider calls
-take the resident grouped prefill route with per-expert raw pointer addressing, after one delivery
-request per bounded native slice (up to 4096 token rows) covers every selected expert. NVFP4 keeps
-its admitted W4A4 path. Grouped streaming does not take the resident adaptive narrow-job shortcut;
-its planning uses the compiled codec frontiers, independently of device-profile frontiers measured
-for resident weights. No routes are dropped or renormalized, and no weights are re-encoded.
+Calls below the codec's prefill frontier (compiled at 47 columns for Q4/Q5 and Q4/Q6, 20 for Q8 and
+13 for NVFP4; a device profile may move it, see [SparseMoe policy
+keys](../device-profiles.md#sparsemoe-policy-keys)) route, run the cached pairs and the shared
+expert while the rest arrive, then run the delivered pairs; both phases write per-rank FP32 products
+that one rank-order sum reduces, adds to the residual and rounds to BF16. This is the resident
+Small-T arithmetic; the Op test holds the streamed Q4/Q5, Q4/Q6 and Q8 outputs to the resident bits
+at every tested call width. Wider calls take the resident grouped prefill route with per-expert raw
+pointer addressing, after one delivery request per bounded native slice (up to 4096 token rows)
+covers every selected expert. NVFP4 keeps its admitted W4A4 path. Grouped streaming does not take
+the resident adaptive narrow-job shortcut; it takes the same frontier and tile width as resident
+calls, so both run the same arithmetic. No routes are dropped or renormalized, and no weights are
+re-encoded.
 
 The persistent cache (`--expert-cache-mib`, default: what is free after startup) holds the experts
 that decode and verification used most recently: a narrow call's misses enter the cache over the
