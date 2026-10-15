@@ -22,16 +22,29 @@ namespace ninfer::ops::detail {
 // yields e2m1 * 2^-14 exactly and the trailing *2^14 below is a power-of-two rescale.
 // Enumerated over all 256 byte values and compared bit-for-bit against the vendor path
 // (including -0) by F:/temp_scripts/a16_dequant_probe/bitcheck.cu.
-__device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
+// E2M1 pair -> FP32, exact (see the _raw variant below for the bit-exactness argument).
+// Callers whose group coefficient is a free scalar prefer decode_nvfp4_e2m1x2_raw, which
+// skips the 2^14 rescale and lets the caller fold that power of two into the coefficient.
+__device__ __forceinline__ float2 decode_nvfp4_e2m1x2_raw(std::uint8_t storage) {
     const unsigned v = static_cast<unsigned>(storage) | (static_cast<unsigned>(storage) << 12);
     const unsigned r = ((v << 9) & 0x0E000E00u) | ((v & 0x00080008u) << 12);
     __half2 packed;
     packed.x = __ushort_as_half(static_cast<unsigned short>(r & 0xFFFFu));
     packed.y = __ushort_as_half(static_cast<unsigned short>(r >> 16));
-    const float2 scaled = __half22float2(packed);
+    return __half22float2(packed);
+}
+
+// The same expansion without the 2^14 rescale: returns e2m1 * 2^-14 exactly. The FP16 pattern
+// carries the e2m1 significand in [11:9] and the sign in [15]; FP16 subnormals line the
+// exp==0 codes up on a common 2^-14 factor, so the conversion is exact. 16384 is a power of
+// two, so folding it into the caller's coefficient is exact and the product is bit-identical
+// to the rescaled form. Enumerated over all 256 byte values against the vendor
+// __nv_fp4x2_e2m1 path by F:/temp_scripts/a16_dequant_probe/bitcheck.cu.
+__device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
+    const float2 raw = decode_nvfp4_e2m1x2_raw(storage);
     float2 result;
-    result.x = scaled.x * 16384.0F;
-    result.y = scaled.y * 16384.0F;
+    result.x = raw.x * 16384.0F;
+    result.y = raw.y * 16384.0F;
     return result;
 }
 

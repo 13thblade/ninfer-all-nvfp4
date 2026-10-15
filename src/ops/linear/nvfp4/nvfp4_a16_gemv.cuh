@@ -118,7 +118,7 @@ template <class Geometry, class Schedule>
 __device__ __forceinline__ void load_nvfp4_coefficients(
     const std::uint8_t* __restrict__ scales,
     const Nvfp4A16GemvSharedStorage<Geometry, Schedule>& shared, int parent_row, int local_row,
-    int phase, int lane, float inverse_weight_divisor,
+    int phase, int lane, float coefficient_gain,
     float (&coefficients)[Schedule::kValuesPerLane < 16 ? 1 : Schedule::kValuesPerLane / 16]) {
     constexpr int kGroupsPerLane =
         Schedule::kValuesPerLane < 16 ? 1 : Schedule::kValuesPerLane / 16;
@@ -136,14 +136,14 @@ __device__ __forceinline__ void load_nvfp4_coefficients(
 #pragma unroll
         for (int group = 0; group < kGroupsPerLane; ++group) {
             const auto scale    = static_cast<std::uint8_t>(word >> (8 * (first_byte + group)));
-            coefficients[group] = decode_nvfp4_e4m3(scale) * inverse_weight_divisor;
+            coefficients[group] = decode_nvfp4_e4m3(scale) * coefficient_gain;
         }
     } else {
 #pragma unroll
         for (int group = 0; group < kGroupsPerLane; ++group) {
             const std::uint8_t scale =
                 scales[nvfp4_scale_offset<Geometry>(parent_row, group_begin + group)];
-            coefficients[group] = decode_nvfp4_e4m3(scale) * inverse_weight_divisor;
+            coefficients[group] = decode_nvfp4_e4m3(scale) * coefficient_gain;
         }
     }
 }
@@ -153,7 +153,7 @@ __device__ __forceinline__ void
 compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                    const std::uint8_t* __restrict__ scales,
                    const Nvfp4A16GemvSharedStorage<Geometry, Schedule>& shared,
-                   float inverse_weight_divisor, const int (&parent_rows)[Schedule::kRowsPerWarp],
+                   float coefficient_gain, const int (&parent_rows)[Schedule::kRowsPerWarp],
                    int flat_row0, int lane,
                    float (&accumulators)[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains]) {
     constexpr int kValuesPerPhase = 32 * Schedule::kValuesPerLane;
@@ -171,7 +171,7 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
             load_nvfp4_coefficients<Geometry, Schedule>(
                 scales, shared, parent_rows[local_row], flat_row0 + local_row, phase, lane,
-                inverse_weight_divisor, coefficients[local_row]);
+                coefficient_gain, coefficients[local_row]);
             const std::int64_t code_offset =
                 static_cast<std::int64_t>(parent_rows[local_row]) * Geometry::kCodeBytesPerRow +
                 phase * (kValuesPerPhase / 2) + lane * (Schedule::kValuesPerLane / 2);
@@ -189,7 +189,7 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                 const std::uint32_t word  = row_codes[local_row].words[pair / 4];
                 const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                const float2 code         = decode_nvfp4_e2m1x2(packed);
+                const float2 code         = decode_nvfp4_e2m1x2_raw(packed);
                 const float coefficient   = coefficients[local_row][group];
                 constexpr int kChainMask  = Schedule::kAccumulatorChains - 1;
                 accumulators[local_row][(2 * pair) & kChainMask] =
@@ -264,8 +264,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
         parent[r] = nvfp4_a16_parent_row<Schedule>(block, local0 + r, rows, policy);
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
-    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, alpha, parent, local0, lane,
-                                           accumulators);
+    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, alpha * 16384.0F, parent,
+                                           local0, lane, accumulators);
     float totals[Schedule::kRowsPerWarp];
 #pragma unroll
     for (int r = 0; r < Schedule::kRowsPerWarp; ++r) {

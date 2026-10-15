@@ -14,25 +14,33 @@ namespace ninfer::ops::detail::unified {
 
 // E2M1 pair -> FP32 without the vendor conversion. The vendor __nv_fp4x2_e2m1 -> float2
 // conversion is outlined by ptxas on sm_86/sm_89 into a call with BSSY/BSYNC bookkeeping,
-// and the NVFP4 decode-phase GEMV is issue-bound on it (measured: 22368 SASS instructions
-// per kernel on sm_86, of which BSSY+BSYNC alone are 522). This form builds both halves as
-// FP16 bit patterns and converts, which costs a handful of integer ops and no branches.
+// and the NVFP4 decode-phase GEMV is issue-bound on it (measured: 11184 SASS instructions
+// per kernel on sm_86, of which BRA+BSSY+BSYNC alone are 2510). This form builds both halves
+// as FP16 bit patterns and converts, which costs a handful of integer ops and no branches.
 //
 // Bit-exactness: the FP16 pattern carries the e2m1 significand in [11:9] and the sign in
 // [15]; FP16 subnormals line the exp==0 codes up on a common 2^-14 factor, so the conversion
 // yields e2m1 * 2^-14 exactly and the trailing *2^14 below is a power-of-two rescale.
 // Enumerated over all 256 byte values and compared bit-for-bit against the vendor path
 // (including -0) by F:/temp_scripts/a16_dequant_probe/bitcheck.cu.
-__device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
+__device__ __forceinline__ float2 decode_nvfp4_e2m1x2_raw(std::uint8_t storage) {
     const unsigned v = static_cast<unsigned>(storage) | (static_cast<unsigned>(storage) << 12);
     const unsigned r = ((v << 9) & 0x0E000E00u) | ((v & 0x00080008u) << 12);
     __half2 packed;
     packed.x = __ushort_as_half(static_cast<unsigned short>(r & 0xFFFFu));
     packed.y = __ushort_as_half(static_cast<unsigned short>(r >> 16));
-    const float2 scaled = __half22float2(packed);
+    return __half22float2(packed);
+}
+
+// The same expansion without the 2^14 rescale: returns e2m1 * 2^-14 exactly. Callers whose
+// group coefficient is a free scalar fold that 2^14 into the coefficient instead of paying one
+// FMUL per code here -- the GEMV/SIMT inner loops do exactly that (16384 is a power of two, so
+// scaling the coefficient is exact and the product is bit-identical to the rescaled form).
+__device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
+    const float2 raw = decode_nvfp4_e2m1x2_raw(storage);
     float2 result;
-    result.x = scaled.x * 16384.0F;
-    result.y = scaled.y * 16384.0F;
+    result.x = raw.x * 16384.0F;
+    result.y = raw.y * 16384.0F;
     return result;
 }
 
