@@ -12,6 +12,7 @@
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
+#include "models/qwen3_5/execution/expert_runtime.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/graft_injection.h"
 
@@ -640,7 +641,8 @@ public:
     };
 
     ProgramImpl(const execution::Parameters& parameters, const SequencePlanImpl& plan,
-                DeviceContext& device, const StartupObserver& startup_observer);
+                DeviceContext& device, const StartupObserver& startup_observer,
+                std::unique_ptr<execution::NativeExpertRuntime> experts);
     ~ProgramImpl() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
@@ -958,6 +960,9 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
 
+    // Declared before Graphs so all graph users die before the delivery tables and service.
+    std::unique_ptr<execution::NativeExpertRuntime> experts;
+    ExpertDeliveryStats expert_startup_stats;
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;

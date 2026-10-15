@@ -1809,14 +1809,14 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device N` | CUDA device index | `0` |
 | `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see [pipeline stages](maintainer/pipeline-stages.md)); on the Qwen3.5 family MTP, DFlash, DFlash2 and resident or CPU Vision run across the stages (the Vision tower stays on the first device; `--vision-residency overlay` is refused); overrides `--device` | none |
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
-| `--expert-residency device\|host\|disk` | Flash-Next and Gemma 4 MoE: routed expert banks on GPU, in pinned host memory, or in artifact files. Gemma brings misses into whole-layer device banks (see [Gemma](gemma4.md#expert-residency)); Flash-Next supports its documented mapped/staged paths | `device` |
-| `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; `0` disables the persistent cache. Gemma then keeps only its layer banks; Flash-Next disk mode needs a cache | `auto` (what is free after startup) |
-| `--expert-misses staged\|mapped` | GGUF host experts: copy each missing expert into a device cache slot while the cached experts run (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
-| `--expert-dma-share F` | host or disk experts: the GPU's share of a call's cache misses, `0..1`; below `1` the CPU computes the rest, an experimental mode; prefill always uses the GPU | `1` |
-| `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers | automatic, at most 16 |
-| `--expert-cache-adaptive` | replace cold cached experts between calls; changes the CPU/GPU arithmetic partition | off |
-| `--expert-profile PATH` | fill the host expert cache from counts recorded for the same artifact and bank geometry | none |
-| `--expert-profile-out PATH` | record expert counts for this artifact after requests | none |
+| `--expert-residency device\|host\|disk` | routed MoE experts on GPU, in pinned host memory, or in artifact files: [native Qwen](maintainer/qwen3_5-model.md#routed-expert-residency), [Gemma 4](gemma4.md), and [Flash-Next](qwen3-8-flash-next.md#run). Native Qwen and Gemma copy misses to GPU transient slots | `device` |
+| `--expert-cache-mib N\|auto` | persistent device cache for host or disk experts; native Qwen and Gemma allow `0` and keep bounded transient slots. Flash-Next disk requires a nonzero cache. Automatic sizing follows each family's KV and workspace reservation | `auto` |
+| `--expert-misses staged\|mapped` | Qwen3.8-Flash-Next only, GGUF host experts: copy each missing expert into a device cache slot while the cached experts run (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
+| `--expert-dma-share F` | Qwen3.8-Flash-Next only: host or disk experts: the GPU's share of a call's cache misses, `0..1`; below `1` the CPU computes the rest, an experimental mode; prefill always uses the GPU | `1` |
+| `--expert-cpu-threads N` | Qwen3.8-Flash-Next only: host experts with a CPU share: `1..256` CPU workers | automatic, at most 16 |
+| `--expert-cache-adaptive` | Qwen3.8-Flash-Next only: replace cold cached experts between calls; changes the CPU/GPU arithmetic partition | off |
+| `--expert-profile PATH` | Qwen3.8-Flash-Next only: fill the host expert cache from counts recorded for the same artifact and bank geometry | none |
+| `--expert-profile-out PATH` | Qwen3.8-Flash-Next only: record expert counts for this artifact after requests | none |
 | `--ngram-table PATH` | Qwen3.8-Flash-Next: the n-gram table artifact of a model published without its table | the model's own table |
 | `--ngram-residency disk\|ram\|ram-hot` | Qwen3.8-Flash-Next: where the n-gram rows come from: the table's file, 16 rows per token; all of the table in RAM; or the rows a hot-row profile ranks first in RAM and the rest from the file (see [the n-gram rows](qwen3-8-flash-next.md#the-n-gram-rows)) | `disk` |
 | `--ngram-io buffered\|direct\|mmap` | Qwen3.8-Flash-Next: how rows are read from the file: through the OS page cache, past it, or out of a mapping | `buffered` |

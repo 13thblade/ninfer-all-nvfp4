@@ -213,6 +213,59 @@ The shared expert always executes and is outside top-k. Logical expert id e iden
 and the corresponding expert matrices. Physical bank ordering and fused dispatch preserve that
 relationship. Router loss coefficients and training-only outputs add no inference term.
 
+
+#### Routed expert residency
+
+`--expert-residency device` retains the fused resident SparseMoe path. `host` retains the native
+routed banks in pinned memory. `disk` leaves them in the artifact and records file extents for
+each expert plane. Both offload modes use the common `core/expert_delivery` byte transport.
+Shared experts and router weights remain resident and keep the same gated SwiGLU mathematics.
+Dense Qwen models reject host/disk expert residency.
+
+A Qwen slot has aliases for gate/up codes, high bits, scales and NVFP4 divisors, followed by the
+same down planes. RowSplit Q4/Q5/Q6 use group-64 FP16 scales; Q8 uses group-32 scales. Q5/Q6 high
+planes have independent strides. NVFP4 preserves whole 128-row swizzled scale tiles and each
+source matrix's divisor. Delivery copies stored bytes without re-encoding. Disk sources can span
+multiple objects and part files. Host sources currently require one contiguous span per plane;
+a fragmented host plane is rejected rather than assembled into a second RAM bank.
+
+Each Program owns one delivery service per pipeline rank, separate from the immutable Model
+sources. Narrow calls process at most eight token rows per wave. Routing partitions pairs into
+hits and misses. Hits and the shared expert execute while the copy engine serves misses; missing
+experts then execute. A final FP32 rank-order sum adds the residual and rounds to BF16.
+Grouped prefill retains the resident router, grouped arithmetic and intermediate formats, with
+per-expert raw pointer addressing. NVFP4 keeps its admitted W4A4 path. Each bounded native slice
+(up to 4096 token rows) delivers its selected experts once before grouped arithmetic. This avoids
+reloading an expert at each narrow wave. Grouped streaming does not take the resident adaptive
+narrow-job shortcut. Its planning and execution use the compiled codec frontiers, independently
+of device-profile frontiers measured for resident weights. No routes are dropped or renormalized,
+and no weights are re-encoded.
+
+Up to 256 transient expert slots are reserved independently of the persistent cache. This costs
+more device memory than narrow-only delivery, but bounds prefill traffic when the persistent cache
+cannot hold a layer. `--expert-cache-mib 0` is supported in native host and native disk mode.
+With explicit KV capacity, cache sizing reserves that runtime and KV shape plus a margin.
+With automatic KV and an explicit nonzero cache budget, the cache gets priority above the
+minimum legal runtime, then KV grows into the remaining memory. With automatic KV and automatic
+cache, KV gets priority and the persistent cache may be zero. Zero cache always retains the
+transient slots. An explicit cache that would consume the reserved runtime budget is rejected.
+Actual delivery allocations are made before final KV capacity selection.
+Public runtime expert counters exclude synchronized startup Graph warmup deliveries.
+
+MTP has its own MoE source and gets every selected expert through the same full delivery path.
+`--mtp-experts-q4` is an explicit exception: its existing load-time Q4/Q6 transcode keeps the MTP
+expert bank resident. It does not create a cache-only draft policy or discard missing draft
+experts. This combination retains that one layer's VRAM cost.
+
+Delivery tables and slots outlive all captured Graph users. The next wave starts after every
+consumer of the previous wave. Suspendable Programs use the core VMM allocation mechanism:
+suspend drains delivery and releases its physical backing, and restore remaps the same virtual
+addresses and invalidates the cache before replay. Immutable pinned sources remain alive.
+`RuntimeStats.experts` reports token–expert pairs, hits, admissions and transferred bytes. Transport
+diagnostics separately count distinct expert requests, misses, evictions, file reads and service
+time. Device cache bytes are reported separately; transient slots and table storage contribute
+to the workspace memory summary.
+
 ## Hadamard-rotated checkpoints
 
 Some checkpoints, such as the ternary Bonsai releases, store a projection as `W * diag(s) * H`

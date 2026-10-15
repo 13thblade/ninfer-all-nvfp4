@@ -1101,6 +1101,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->rope_yarn           = inputs.rope_yarn;
     impl->mtp_attention_window = inputs.mtp_attention_window;
     impl->features            = inputs.features;
+    impl->expert_cache_bytes  = inputs.expert_cache_bytes;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
     impl->structured_output   = inputs.structured_output;
@@ -1389,6 +1390,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .rope_yarn                  = planned_rope_yarn(parameters, options),
         .mtp_attention_window       = options.speculative.mtp_attention_window,
         .features                   = models::load_options(options),
+        .expert_cache_bytes         = options.expert_cache_bytes,
         .use_cuda_graph             = options.use_cuda_graph,
         .cuda_graph_allowance_bytes = options.cuda_graph_allowance_bytes,
         .causal_scoring             = options.purpose == EnginePurpose::CausalScoring,

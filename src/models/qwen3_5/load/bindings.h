@@ -2,6 +2,7 @@
 
 #include "artifact/binder.h"
 #include "models/qwen3_5/config.h"
+#include "models/qwen3_5/expert_sources.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
 
@@ -23,7 +24,9 @@ struct PendingWeight {
 
 class Bindings {
 public:
-    explicit Bindings(artifact::Binder& binder) : binder(binder) {}
+    explicit Bindings(artifact::Binder& binder, const LoadOptions& options = {})
+        : binder(binder), expert_residency(options.expert_residency),
+          resident_mtp_experts(options.mtp_experts_q4) {}
 
     [[nodiscard]] WeightId parameter(std::string name, artifact::Shape shape,
                                      std::vector<std::string> inputs   = {},
@@ -49,6 +52,8 @@ public:
     void place(WeightId id, std::size_t rank);
 
     artifact::Binder& binder;
+    ExpertResidency expert_residency;
+    bool resident_mtp_experts;
     std::vector<PendingWeight> weights;
 
 private:
@@ -115,5 +120,12 @@ void apply_vision_overlay_placement(Bindings& bindings, const ModelWeights& weig
 [[nodiscard]] std::vector<BoundWeight>
 resolve_weights(std::vector<PendingWeight>&& pending,
                 const artifact::MaterializedArtifact& materialized);
+
+[[nodiscard]] NativeExpertSources expert_sources(const artifact::Reader& reader,
+                                                  std::span<const PendingWeight> pending,
+                                                  ModelWeights& weights,
+                                                  const artifact::MaterializedArtifact& backing,
+                                                  const LoadOptions& options,
+                                                  const std::filesystem::path& artifact_path);
 
 } // namespace ninfer::models::qwen3_5::loading

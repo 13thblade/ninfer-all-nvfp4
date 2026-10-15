@@ -30,7 +30,10 @@ approval requirements beyond the user's instructions and the actual execution en
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU performance, with an
 optional layer pipeline across several GPUs on Linux. It implements
 `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
-use the same architecture, binding and execution path. Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`,
+use the same architecture, binding and execution path. Native MoE routed experts may reside
+on the GPU, in pinned host memory, or in the artifact's files, using a bounded device delivery
+window and optional persistent device cache (`--expert-residency host|disk`). Router and shared
+experts remain resident; all model arithmetic runs on the GPU, including the MTP MoE. Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`,
 `src/models/qwen4_exp`) is a second, explicit family with its own load, executor and Engine core
 (`runtime/engine/qwen4_exp_core`); it shares the Qwen3.5 frontend and Vision tower, runs up to
 eight requests at once (one batched decode step between prompt chunks), and may keep its routed
@@ -40,8 +43,8 @@ routes to them (`--expert-residency disk`). Its n-gram table is stored in the mo
 in a separate table artifact the model names by digest (`--ngram-table`); it stays in that file,
 read a row at a time, unless `--ngram-residency ram` loads it. A model with PLE requires its table
 unless `--no-ngram-table` overrides that; a qualification layer slice without PLE needs no table.
-Gemma MoE also supports these host/disk expert placements, with all expert arithmetic on the GPU
-and whole-layer device banks beside its optional persistent cache.
+Native Qwen MoE and Gemma MoE also support host/disk expert placements, with all expert arithmetic
+on the GPU and bounded transient device workspace beside the optional persistent cache.
 Gemma 4 26B-A4B (`Gemma4ForCausalLM`, the text component of `Gemma4ForConditionalGeneration`;
 `src/models/gemma4`, `runtime/engine/gemma4_core`) is a third explicit family converted from
 Google's QAT GGUF (or a mixed-format GGUF of the same model) with its ggml blocks kept as stored.
@@ -68,7 +71,8 @@ attention and prompt routes over emulated Ampere warp primitives, built from sou
 published Docker image carries the `75`, `86` and `120a` builds. It was tuned on the **NVIDIA
 GeForce RTX 3090** (24 GB) first, and each card's kernel routes now come from its measured device
 profile, built in for the RTX 3090, 4090, 5090, the three RTX PRO 6000 editions, the Tesla
-V100-SXM2-16GB and the TITAN RTX. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090 with
+V100-SXM2-16GB, the TITAN RTX, and a capacity-specific FP8 entry for the
+modified 22 GiB RTX 2080 Ti. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090 with
 native routes that this line's `120a` build does not compile by default; its schedules, route
 tables and published measurements are not authoritative here -- every route table this fork
 inherited and re-measured on sm_86 turned out to be wrong by 12-41%. Treat an upstream tuning

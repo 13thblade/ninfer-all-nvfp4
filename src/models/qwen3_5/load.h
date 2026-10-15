@@ -35,13 +35,14 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     explicit LoadPlan(std::unique_ptr<Impl> impl);
-    friend LoadPlan plan_load(const artifact::Reader&, LoadOptions);
+    friend LoadPlan plan_load(const artifact::Reader&, LoadOptions, std::filesystem::path);
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*,
                                                     const artifact::MaterializeOptions&);
 };
 
-[[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options = {});
+[[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options = {},
+                                 std::filesystem::path artifact_path = {});
 // How many layers each of `free_bytes.size()` pipeline stages should own so that the most KV cache
 // fits on every device at once, given the bytes free on each. Sized from the artifact's stored
 // layers; the head stage (rank 0) also carries the embedding, head and round buffers. The default

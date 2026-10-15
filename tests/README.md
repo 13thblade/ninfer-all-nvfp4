@@ -473,3 +473,54 @@ build/tests/ninfer_native_schema_probe < semantic-corpus.jsonl > semantic-native
 python3 tests/text/compare_schema_semantics.py --cases semantic-corpus.jsonl --results semantic-native.jsonl --report semantic-comparison.json
 ctest --test-dir build -R '^ninfer_(structured_output|unicode_scalar_output|unique_strings|structured_unique|unique_strings_masks)_test$' --output-on-failure
 ```
+
+Native Qwen MoE plane relocation and streaming arithmetic:
+
+```bash
+./build/tests/ninfer_tests ninfer_qwen_native_expert_layout_test
+./build/tests/ninfer_tests ninfer_sparse_moe_test --streaming
+```
+
+The first test runs on the CPU and checks exact RowSplit planes and NVFP4 scale/divisor relocation.
+The second needs a free GPU. It qualifies indirect host delivery against the independent FP64
+SparseMoe oracle at rows 1, 2, 8, 9, 13, 32, 47, 64, 257, 768 and 4097, with zero, small and
+larger persistent caches. It replays Graphs and retains output guards and input-preservation
+checks. Narrow NVFP4 reads represented BF16 input; grouped NVFP4 uses the existing admitted W4A4
+criterion and arithmetic. The ordinary SparseMoe test checks the resident route. These synthetic
+Op tests do not establish full-model quality or Engine lifecycle correctness.
+
+The real-artifact gate compares resident/host/disk causal scores, single-request MTP and each
+corresponding lane of a compact eight-request MTP batch. It also checks long prefill, active
+cancellation, worker recovery and suspend/Graph restore. Each selected artifact needs MTP:
+
+```bash
+NINFER_NATIVE_MOE_ARTIFACT=/absolute/path/to/model.ninfer \
+  ./build/tests/ninfer_tests ninfer_qwen_native_streaming_real_test
+```
+
+`NINFER_NATIVE_PREFILL_PROFILE=1` selects a bounded matched 2053-token request profile, with one
+output token, resident/host/disk placement and cache budgets 0/128 MiB. It prints two request
+samples per configuration, copied bytes and memory, excluding model startup from request timing.
+
+The native pipeline gate is a separate, short B=1 test without MTP. It compares resident, host
+and disk placement with CUDA Graphs enabled, two fresh 6-token requests per placement, four output
+tokens each, explicit KV capacity 512, prefill chunks of 128 and a 128 MiB total expert cache.
+It checks corresponding token IDs, both published rank device IDs and allocations, startup-free
+monotonic delivery counters, and repeated decode. No download or full model matrix is performed.
+
+```bash
+# Two logical ranks on one CUDA device (the default selection).
+NINFER_NATIVE_MOE_ARTIFACT=/absolute/path/to/groupwise-model.ninfer \
+NINFER_NATIVE_PIPELINE_CHECK=1 NINFER_NATIVE_PIPELINE_DEVICES=0,0 \
+  ./build/tests/ninfer_tests ninfer_qwen_native_streaming_real_test
+
+# Two physical CUDA devices. Requires both devices to be free and the groupwise artifact.
+NINFER_NATIVE_MOE_ARTIFACT=/absolute/path/to/groupwise-model.ninfer \
+NINFER_NATIVE_PIPELINE_CHECK=1 NINFER_NATIVE_PIPELINE_DEVICES=0,1 \
+  ./build/tests/ninfer_tests ninfer_qwen_native_streaming_real_test
+```
+
+The physical selection disables device-profile calibration (`device_profile=off`) for this
+correctness gate. It does not qualify device-profile performance. The runner must record distinct
+GPU UUIDs for CUDA devices 0 and 1. A `0,0` result does not qualify two physical GPUs. On `sm_75`,
+use the pinned groupwise Qwen3.6 artifact; NVFP4 expert banks are not supported.

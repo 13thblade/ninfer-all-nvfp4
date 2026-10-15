@@ -564,11 +564,12 @@ struct EngineOptions {
     // Layers per stage, one count per entry of `devices`. Empty lets the engine choose from each
     // device's free memory.
     std::vector<std::uint32_t> stage_layers;
-    // Qwen3.8-Flash-Next and Gemma 4 MoE.
+    // Native Qwen MoE, Qwen3.8-Flash-Next and Gemma 4 MoE.
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Host/disk experts: device memory lent to the persistent cache, split
-    // evenly over the devices. Empty takes what each device has free after startup less a margin;
-    // zero disables the cache. Gemma keeps separate bounded transient delivery slots.
+    // evenly over the devices. Automatic sizing follows each family's KV/workspace reservations.
+    // Zero disables the cache for native Qwen and Gemma, which retain bounded transient slots;
+    // Flash-Next disk residency requires a nonzero cache.
     std::optional<std::uint64_t> expert_cache_bytes;
     HybridExpertOptions hybrid_experts;
     // Qwen3.8-Flash-Next only.
@@ -1606,8 +1607,8 @@ struct MemorySummary {
     std::size_t host_kv_page_group_bytes = 0;
     // Engaged only when the single host RAM budget mode is active.
     std::size_t host_cache_budget_bytes = 0;
-    // Host or disk experts: device memory lent to the persistent expert cache, over every
-    // device.
+    // Host or disk routed experts: persistent device cache bytes, over every device. Native
+    // Qwen delivery windows are counted separately in workspace.
     std::size_t expert_cache_bytes = 0;
     // A pipeline over several devices: each device in stage order, the primary one (which the
     // single-device fields above describe) first. Empty on one device.
@@ -1920,7 +1921,7 @@ struct LoadSummary {
     std::uint64_t artifact_bytes_read  = 0;
     std::uint64_t host_to_device_bytes = 0;
     std::uint64_t peak_staging_bytes   = 0;
-    std::uint64_t pinned_weight_bytes  = 0; // host-pinned weights (overlay vision tower)
+    std::uint64_t pinned_weight_bytes  = 0; // host-pinned model weights (experts or overlay vision tower)
     std::uint64_t overlay_window_bytes = 0; // device bytes one overlay vision window borrows
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;

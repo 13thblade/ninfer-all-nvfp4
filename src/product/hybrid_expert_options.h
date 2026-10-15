@@ -11,6 +11,7 @@
 namespace ninfer::product {
 
 inline constexpr const char* kHybridExpertHelp =
+    "  Flash-Next-only expert options:\n"
     "  --expert-dma-share F          host or disk experts: GPU share of cache misses,\n"
     "                                0..1 (default 1); below 1 lets the CPU compute the rest\n"
     "                                prefill always uses the GPU\n"
