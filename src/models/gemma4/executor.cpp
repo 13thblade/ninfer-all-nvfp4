@@ -514,23 +514,24 @@ struct Executor::Impl {
                     }
                 }
             }
+            // One whole-layer bank at least (the transport adds a second where memory allows).
             std::uint64_t slot = 0;
             for (auto bytes : sizes) { slot += bytes; }
-            const auto transient = slot * config.num_experts;
+            const auto bank = slot * config.num_experts;
             const auto metadata = std::uint64_t(options.prefill_chunk) * config.top_k_experts * 8 +
                 std::uint64_t(config.num_hidden_layers) * config.num_experts * 4 * sizeof(void*) +
                 config.num_experts * 4;
             std::size_t free = 0, total = 0;
             CUDA_CHECK(cudaMemGetInfo(&free, &total));
             const auto cache = options.expert_cache_bytes.value_or(0);
-            if (transient + metadata + cache + kGraphReserve > free) {
+            if (bank + metadata + cache + kGraphReserve > free) {
                 throw InsufficientMemory("Gemma 4: expert delivery needs " +
-                    std::to_string((transient + metadata + cache) >> 20) +
+                    std::to_string((bank + metadata + cache) >> 20) +
                     " MiB plus the CUDA Graph reserve after workspace allocation");
             }
             ExpertDeliveryOptions transport;
             transport.pair_capacity = options.prefill_chunk * config.top_k_experts;
-            transport.active_capacity = config.num_experts;
+            transport.routes_per_token = config.top_k_experts;
             transport.cache_bytes = options.expert_cache_bytes;
             transport.keep_free_bytes = kGraphReserve;
             delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
@@ -1737,9 +1738,9 @@ struct Executor::Impl {
         std::fill(anchored.begin(), anchored.end(), 0);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         if (delivery) {
-            delivery->check();
-            // warm_up's stream completion also orders every request's service counters before
-            // this baseline. Runtime readers use the same mutex and report request work only.
+            // Drained, so warm-up deliveries and their asynchronous prefetches stay out of the
+            // request counters. Runtime readers use the same mutex and report request work only.
+            delivery->drain();
             std::lock_guard lock(expert_stats_mutex);
             expert_startup_stats = delivery->stats();
         }
@@ -1916,20 +1917,7 @@ void Executor::check_experts() const { if (impl_->delivery) { impl_->delivery->c
 ExpertDeliveryStats Executor::expert_stats() const {
     if (!impl_->delivery) { return {}; }
     std::lock_guard lock(impl_->expert_stats_mutex);
-    auto stats = impl_->delivery->stats();
-    const auto& startup = impl_->expert_startup_stats;
-    stats.requests -= startup.requests;
-    stats.routes -= startup.routes;
-    stats.hits -= startup.hits;
-    stats.misses -= startup.misses;
-    stats.evictions -= startup.evictions;
-    stats.pairs -= startup.pairs;
-    stats.pair_hits -= startup.pair_hits;
-    stats.admissions -= startup.admissions;
-    stats.read_bytes -= startup.read_bytes;
-    stats.copied_bytes -= startup.copied_bytes;
-    stats.service_seconds -= startup.service_seconds;
-    return stats;
+    return impl_->delivery->stats() - impl_->expert_startup_stats;
 }
 
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,

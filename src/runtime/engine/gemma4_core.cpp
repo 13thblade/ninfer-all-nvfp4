@@ -183,9 +183,12 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     // Prompt chunks of 2048 tokens whatever was requested: the routed experts' matrix kernel fills
     // its widest (128-column) tile only at 2048 x 8 / 128 tokens per expert, which prefills ~20%
     // faster than 1024-token chunks; larger chunks grow the sliding-window rings (window + chunk).
-    // A device without room for that chunk's workspace (a 16 GB card) takes the widest of 1024 and
-    // 512 that fits.
-    for (const std::uint32_t chunk : {2048u, 1024u, 512u}) {
+    // Host or disk experts start at 4096: every chunk past ~64 tokens routes to nearly all of a
+    // layer's experts, so each chunk carries the whole expert bank across the bus once. A device
+    // without room for a chunk's workspace (a 16 GB card) takes the widest of the rest that fits.
+    const bool streamed = options.expert_residency != ExpertResidency::Device;
+    for (const std::uint32_t chunk : {4096u, 2048u, 1024u, 512u}) {
+        if (chunk == 4096 && !streamed) { continue; }
         executor.prefill_chunk = chunk;
         try {
             instance->executor =
@@ -217,11 +220,11 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     if (options.expert_residency != ExpertResidency::Device) {
         const auto memory = instance->executor->memory().experts;
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-            "Gemma 4: experts in %s, cache %.0f MiB (%u slots), transient %.0f MiB, "
+            "Gemma 4: experts in %s, cache %.0f MiB (%u slots), %u layer bank(s) %.0f MiB, "
             "metadata %.1f MiB, pinned delivery %.1f MiB, pinned expert sources %.0f MiB",
             options.expert_residency == ExpertResidency::Host ? "pinned host memory" : "artifact files",
-            double(memory.cache_bytes) / 1048576, memory.cache_slots,
-            double(memory.transient_bytes) / 1048576, double(memory.metadata_bytes) / 1048576,
+            double(memory.cache_bytes) / 1048576, memory.cache_slots, memory.banks,
+            double(memory.bank_bytes) / 1048576, double(memory.metadata_bytes) / 1048576,
             double(memory.pinned_bytes) / 1048576, double(model->expert_pinned_bytes()) / 1048576);
     }
     if (options.enable_vision) {
@@ -2259,12 +2262,12 @@ MemorySummary Gemma4Core::memory_summary() const {
     }
     out.weights   = arena(stats.device_capacity_by_rank.empty() ? 0 : stats.device_capacity_by_rank[0]);
     out.sequence  = arena(memory.kv_bytes);
-    out.workspace = arena(memory.workspace_bytes + memory.experts.transient_bytes +
+    out.workspace = arena(memory.workspace_bytes + memory.experts.bank_bytes +
                           memory.experts.metadata_bytes);
     out.kv_payload_bytes              = memory.kv_bytes;
     out.expert_cache_bytes = memory.experts.cache_bytes;
     out.runtime_reservation_bytes = memory.kv_bytes + memory.workspace_bytes +
-        memory.experts.cache_bytes + memory.experts.transient_bytes + memory.experts.metadata_bytes;
+        memory.experts.cache_bytes + memory.experts.bank_bytes + memory.experts.metadata_bytes;
     out.available_after_weights_bytes = impl_->instance.free_after_weights;
     out.available_after_startup_bytes = impl_->instance.free_after_startup;
     if (impl_->instance.vision_budget > 0) {

@@ -44,8 +44,13 @@ __global__ void inspect(const void* const* table, const std::int32_t* ids, int p
             if (data[at] != signature(layer, expert, b, at)) { atomicAdd(failures, 1ull); }
         }
         if (data[bytes - 1] != signature(layer, expert, b, bytes - 1)) { atomicAdd(failures, 1ull); }
+        // A kernel may read kTail bytes past a blob: zeros, or in a layer bank the next expert of
+        // the same layer and blob, laid out as in a resident bank.
         for (int at = threadIdx.x; at < kTail; at += blockDim.x) {
-            if (data[bytes + at]) { atomicAdd(failures, 1ull); }
+            const unsigned char value = data[bytes + at];
+            if (value && (expert + 1 == kExperts || value != signature(layer, expert + 1, b, at))) {
+                atomicAdd(failures, 1ull);
+            }
         }
         if (!b && !threadIdx.x) {
             if (table[expert] != data || table[kExperts + expert] != data + kGu / 2) {
@@ -162,17 +167,25 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
     visited.copy_to_host(&count, 8);
     const auto stats = delivery.stats();
     const auto memory = delivery.memory();
+    // Two of three replays route all sixteen experts of every layer (wide calls): without a cache
+    // the next layer's bank is prefetched and reused; with one, wide calls promote by device copies.
     const bool ok = !bad && count == std::uint64_t(repeats + 1) * kLayers * kPairs &&
                     stats.routes == stats.hits + stats.misses && stats.misses &&
                     (cache ? stats.hits != 0 : stats.hits == 0) &&
                     (disk ? stats.read_bytes == stats.copied_bytes : stats.read_bytes == 0) &&
-                    (cache ? memory.cache_bytes != 0 : memory.cache_bytes == 0);
+                    (cache ? memory.cache_bytes != 0 : memory.cache_bytes == 0) &&
+                    memory.banks == 2 &&
+                    (cache ? stats.promoted_bytes != 0
+                           : stats.prefetched_layers != 0 && stats.bank_reuses != 0);
     std::printf("%s cache=%llu bad=%llu pairs=%llu hits=%llu misses=%llu evictions=%llu "
-                "read=%llu copied=%llu transient=%llu %s\n", disk ? "disk" : "host",
+                "admissions=%llu bank_reuses=%llu prefetched=%llu read=%llu copied=%llu "
+                "promoted=%llu banks=%u %s\n", disk ? "disk" : "host",
                 (unsigned long long)cache, bad, count, (unsigned long long)stats.hits,
                 (unsigned long long)stats.misses, (unsigned long long)stats.evictions,
-                (unsigned long long)stats.read_bytes, (unsigned long long)stats.copied_bytes,
-                (unsigned long long)memory.transient_bytes, ok ? "PASS" : "FAIL");
+                (unsigned long long)stats.admissions, (unsigned long long)stats.bank_reuses,
+                (unsigned long long)stats.prefetched_layers, (unsigned long long)stats.read_bytes,
+                (unsigned long long)stats.copied_bytes, (unsigned long long)stats.promoted_bytes,
+                memory.banks, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -226,32 +239,28 @@ int admission_boundaries(DeviceContext& device) {
         ExpertDeliveryOptions options;
         options.pair_capacity = 1;
         options.suspendable = suspendable;
-        // At zero available cache bytes, a nonzero explicit request must be refused before
-        // allocation. This is independent of the card's currently free memory.
+        options.banks = 1;
+        // Every miss needs a layer bank: with nothing available it is refused before allocation.
         options.keep_free_bytes = std::numeric_limits<std::uint64_t>::max();
-        options.cache_bytes = 256;
+        options.cache_bytes = 0;
         bool rejected = false;
         try { ExpertDelivery delivery(device.rank(0), {}, {layer}, options); }
         catch (const std::invalid_argument& error) {
-            rejected = std::string(error.what()).find("expert delivery: cache needs ") == 0;
+            rejected = std::string(error.what()).find("expert delivery: a layer bank needs ") == 0;
         }
-        if (!rejected) { throw std::runtime_error("explicit cache consumed the reserved budget"); }
+        if (!rejected) { throw std::runtime_error("a layer bank consumed the reserved budget"); }
         // The exact zero-cache boundary remains valid, both explicitly and automatically.
-        options.cache_bytes = 0;
+        options.keep_free_bytes = 0;
         std::uint64_t mandatory_backing = 0;
         {
             ExpertDelivery delivery(device.rank(0), {}, {layer}, options);
-            if (delivery.memory().cache_bytes) { throw std::runtime_error("zero cache allocated backing"); }
+            if (delivery.memory().cache_bytes || delivery.memory().banks != 1) {
+                throw std::runtime_error("zero cache allocated backing");
+            }
             mandatory_backing = delivery.state_backing_bytes();
         }
-        options.cache_bytes.reset();
-        {
-            ExpertDelivery delivery(device.rank(0), {}, {layer}, options);
-            if (delivery.memory().cache_bytes) { throw std::runtime_error("auto cache consumed the reserve"); }
-        }
         // With available room, report the physical size of a sub-granule slot, not its 256-byte
-        // logical size. The same rounded size is used by the rejection above.
-        options.keep_free_bytes = 0;
+        // logical size.
         options.cache_bytes = 256;
         {
             ExpertDelivery delivery(device.rank(0), {}, {layer}, options);
@@ -263,8 +272,8 @@ int admission_boundaries(DeviceContext& device) {
         }
 #ifndef _WIN32
         // Linux pinned buffers do not consume device backing. Use the observed mandatory
-        // footprint, without assuming its allocation layout, to leave 256 bytes at admission.
-        // The logical slot fits; its VMM granule must be refused.
+        // footprint, without assuming its allocation layout, to leave 256 bytes for the cache.
+        // The logical slot fits; its VMM granule must be refused, and auto must choose zero.
         if (suspendable) {
             const auto granule = vmm::granularity(device.device);
             if (granule > 256) {
@@ -281,8 +290,6 @@ int admission_boundaries(DeviceContext& device) {
                     if (!rejected) { throw std::runtime_error(error.what()); }
                 }
                 if (!rejected) { throw std::runtime_error("VMM cache rounding consumed the reserve"); }
-                // Auto must choose zero slots, rather than reject or allocate a granule beyond
-                // its remainder. A remainder one byte below the granule is the upper boundary.
                 CUDA_CHECK(cudaMemGetInfo(&free, &total));
                 options.keep_free_bytes = free - mandatory_backing - (granule - 1);
                 options.cache_bytes.reset();
@@ -293,7 +300,7 @@ int admission_boundaries(DeviceContext& device) {
             }
         }
 #endif
-        std::printf("cache admission suspendable=%d explicit reject, zero/auto accept, "
+        std::printf("cache admission suspendable=%d bank reject, zero/auto accept, "
                     "physical rounding PASS\n", int(suspendable));
     }
     return 0;
