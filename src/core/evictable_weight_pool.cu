@@ -54,12 +54,18 @@ struct EvictableWeightPool::Impl {
     // One handle per region piece: [0, tail_begin) in large pieces, the tail in kChunkBytes
     // chunks. Offsets are arena offsets; the vectors are parallel.
     std::vector<CUmemGenericAllocationHandle> handles;
+    // Parallel to `handles`: whether the piece is mapped at its home address. Tracked apart from
+    // the handle so a release that fails part way can be retried (or undone by restore_backing)
+    // without unmapping an unmapped range or dropping a handle that is still mapped.
+    std::vector<char> mapped;
     std::vector<std::size_t> offsets;
     std::vector<std::size_t> sizes;
     std::size_t evicted_pieces = 0; // pieces currently mapped at the overlay range
     std::unique_ptr<PinnedHostBuffer> mirror;
     bool mirror_captured = false;
     bool poisoned        = false;
+    bool backed          = true; // false between release_backing and restore_backing
+    CUmemAllocationProp prop{};
 
     explicit Impl(DeviceContext& context) : device(context) {}
 
@@ -111,6 +117,7 @@ EvictableWeightPool::EvictableWeightPool(DeviceContext& device, const Config& co
     prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id   = device.device;
+    impl.prop = prop;
     NINFER_CU_CHECK(cuMemGetAllocationGranularity(&impl.granularity, &prop,
                                                   CU_MEM_ALLOC_GRANULARITY_MINIMUM));
     if (kChunkBytes % impl.granularity != 0) {
@@ -141,9 +148,11 @@ EvictableWeightPool::EvictableWeightPool(DeviceContext& device, const Config& co
     }
 
     impl.handles.resize(impl.offsets.size());
+    impl.mapped.assign(impl.offsets.size(), 0);
     for (std::size_t piece = 0; piece < impl.offsets.size(); ++piece) {
         NINFER_CU_CHECK(cuMemCreate(&impl.handles[piece], impl.sizes[piece], &prop, 0));
         impl.map_home(piece);
+        impl.mapped[piece] = 1;
     }
 }
 
@@ -152,6 +161,7 @@ EvictableWeightPool::~EvictableWeightPool() {
     Impl& impl               = *impl_;
     const std::size_t pieces = impl.handles.size();
     for (std::size_t piece = 0; piece < pieces; ++piece) {
+        if (impl.handles[piece] == 0) { continue; } // released by a suspend: nothing is held
         const bool away = impl.evicted_pieces != 0 && piece >= pieces - impl.evicted_pieces;
         if (away) {
             const std::size_t rank = piece - (pieces - impl.evicted_pieces);
@@ -186,6 +196,86 @@ bool EvictableWeightPool::transaction_open() const noexcept {
 }
 
 bool EvictableWeightPool::poisoned() const noexcept { return impl_->poisoned; }
+
+bool EvictableWeightPool::backed() const noexcept { return impl_->backed; }
+
+std::size_t EvictableWeightPool::backing_bytes() const noexcept {
+    std::size_t bytes = 0;
+    for (const std::size_t size : impl_->sizes) { bytes += size; }
+    return bytes;
+}
+
+void EvictableWeightPool::release_backing() {
+    Impl& impl = *impl_;
+    const bool holds = std::any_of(impl.handles.begin(), impl.handles.end(),
+                                   [](CUmemGenericAllocationHandle handle) { return handle != 0; });
+    if (!holds) { return; }
+    if (impl.evicted_pieces != 0) {
+        throw std::logic_error("evictable pool cannot release its backing inside a transaction");
+    }
+    CUDA_CHECK(cudaStreamSynchronize(impl.device.stream));
+    CUDA_CHECK(cudaStreamSynchronize(impl.device.transfer_stream));
+    // Every piece is tried, so one refusal does not strand the rest. A piece whose unmap failed
+    // keeps its handle; one whose release failed keeps it too, unmapped. Nothing is cleared that
+    // the driver still holds, so a retry or restore_backing() repeats only what is left.
+    CUresult first = CUDA_SUCCESS;
+    for (std::size_t piece = 0; piece < impl.handles.size(); ++piece) {
+        if (impl.mapped[piece] != 0) {
+            const CUresult unmapped = cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+            if (unmapped != CUDA_SUCCESS) {
+                if (first == CUDA_SUCCESS) { first = unmapped; }
+                continue;
+            }
+            impl.mapped[piece] = 0;
+        }
+        if (impl.handles[piece] != 0) {
+            const CUresult released = cuMemRelease(impl.handles[piece]);
+            if (released != CUDA_SUCCESS) {
+                if (first == CUDA_SUCCESS) { first = released; }
+                continue;
+            }
+            impl.handles[piece] = 0;
+        }
+    }
+    impl.backed = false;
+    NINFER_CU_CHECK(first);
+}
+
+void EvictableWeightPool::restore_backing() {
+    Impl& impl = *impl_;
+    if (impl.backed) { return; }
+    try {
+        for (std::size_t piece = 0; piece < impl.handles.size(); ++piece) {
+            if (impl.mapped[piece] != 0) { continue; }
+            if (impl.handles[piece] == 0) {
+                NINFER_CU_CHECK(
+                    cuMemCreate(&impl.handles[piece], impl.sizes[piece], &impl.prop, 0));
+            }
+            try {
+                impl.map_home(piece);
+            } catch (...) {
+                (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+                throw;
+            }
+            impl.mapped[piece] = 1;
+        }
+    } catch (...) {
+        // Give back everything held so the retry starts from a released arena; a piece the
+        // driver will not release stays tracked for that retry.
+        for (std::size_t piece = 0; piece < impl.handles.size(); ++piece) {
+            if (impl.mapped[piece] != 0 &&
+                cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]) == CUDA_SUCCESS) {
+                impl.mapped[piece] = 0;
+            }
+            if (impl.mapped[piece] == 0 && impl.handles[piece] != 0 &&
+                cuMemRelease(impl.handles[piece]) == CUDA_SUCCESS) {
+                impl.handles[piece] = 0;
+            }
+        }
+        throw;
+    }
+    impl.backed = true;
+}
 
 void EvictableWeightPool::capture_window_mirror(std::size_t window_capacity_bytes,
                                                 cudaStream_t stream) {
