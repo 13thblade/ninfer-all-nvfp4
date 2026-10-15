@@ -39,8 +39,6 @@ struct ExpertDeliveryLayer {
 };
 struct ExpertDeliveryOptions {
     std::uint32_t pair_capacity = 0;
-    // Routed experts per token: the cache's route scores decay per token.
-    std::uint32_t routes_per_token = 8;
     // Persistent cache only; the layer banks are separate. Both explicit and automatic cache keep
     // keep_free_bytes free after physical allocation rounding.
     std::optional<std::uint64_t> cache_bytes;
@@ -107,12 +105,13 @@ struct ExpertDeliveryMemory {
 // One Program, rank and serial compute stream. Sources outlive this object. All device addresses
 // stay fixed until destruction. The caller drains graph users before destroying their graphs.
 //
-// Each call splits its routes into experts the persistent cache holds and the rest. A host worker
-// brings the rest into a layer bank, laid out like a resident bank (expert e of blob b at a fixed
-// stride), with one copy per run of consecutive experts. A wide call (half the layer's experts or
-// more) also starts the bank of the layer that followed it last time, and promotes its hottest
-// experts from the bank into the cache by device copies; narrower calls admit their misses into
-// the cache by decayed route counts, so a passing prompt does not push out the working set.
+// Each call splits its routes into experts the persistent cache holds and the rest. A narrow call
+// (decode, verification) admits its misses into the cache over the least recently used experts it
+// does not route. A wide call (half the layer's experts or more: a prompt chunk) brings its misses
+// into a layer bank, laid out like a resident bank (expert e of blob b at a fixed stride) with one
+// copy per run of consecutive experts, starts the bank of the layer that followed it last time,
+// and promotes its most routed experts from the bank into free cache slots by device copies, up
+// to the layer's share; it evicts nothing, so a prompt does not push out the decode working set.
 class ExpertDelivery {
 public:
     ExpertDelivery(const RankContext& rank, std::vector<std::filesystem::path> files,

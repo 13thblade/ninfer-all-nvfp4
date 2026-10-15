@@ -531,7 +531,6 @@ struct Executor::Impl {
             }
             ExpertDeliveryOptions transport;
             transport.pair_capacity = options.prefill_chunk * config.top_k_experts;
-            transport.routes_per_token = config.top_k_experts;
             transport.cache_bytes = options.expert_cache_bytes;
             transport.keep_free_bytes = kGraphReserve;
             delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),

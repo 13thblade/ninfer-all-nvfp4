@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -157,10 +158,10 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
     for (int iteration = 0; iteration < repeats; ++iteration) {
         for (int p = 0; p < kPairs; ++p) {
             if (shifting) {
-                // Wide calls whose hot half moves every four replays: once the cache is full, a
-                // wide call's promotions replace cached experts of layers the GPU reads next.
-                const int hot = (iteration / 4) % 2 ? kExperts / 2 : 0;
-                routes[p] = (p % 8 == 7 ? kExperts / 2 - hot : hot) + (p / 8) % 8;
+                // Narrow calls whose five experts move by three every replay, and a wide call every
+                // fourth: once the cache is full, admissions evict the least recently used experts
+                // of every layer while the GPU reads the next call's cached pairs.
+                routes[p] = iteration % 4 == 3 ? p % kExperts : (3 * iteration + p % 5) % kExperts;
             } else {
                 routes[p] = iteration % 3 == 0 ? p % 5 : (p + iteration) % kExperts;
             }
@@ -194,7 +195,7 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
                     (disk ? stats.read_bytes == stats.copied_bytes : stats.read_bytes == 0) &&
                     (cache ? memory.cache_bytes != 0 : memory.cache_bytes == 0) &&
                     memory.banks == 2 &&
-                    (cache ? stats.promoted_bytes != 0
+                    (cache ? shifting || stats.promoted_bytes != 0
                            : stats.prefetched_layers != 0 && stats.bank_reuses != 0) &&
                     (!shifting || stats.evictions != 0);
     std::printf("%s%s cache=%llu bad=%llu pairs=%llu hits=%llu misses=%llu evictions=%llu "
@@ -325,6 +326,70 @@ int admission_boundaries(DeviceContext& device) {
     }
     return 0;
 }
+
+// Narrow calls on one layer with a four-slot cache, against a host model of the policy: a call's
+// cached experts become the most recent in ascending order, then each miss in ascending order
+// takes a free slot or evicts the least recently used expert the call does not route.
+int recency_order(DeviceContext& device) {
+    constexpr int experts = 12, slots = 4, calls = 400;
+    std::vector<std::unique_ptr<PinnedHostBuffer>> sources;
+    ExpertDeliveryLayer layer;
+    layer.aliases = {{0, 0}};
+    sources.push_back(std::make_unique<PinnedHostBuffer>(std::size_t(experts) * 256));
+    std::memset(sources.back()->data(), 0, sources.back()->size());
+    for (int e = 0; e < experts; ++e) {
+        auto* data = static_cast<std::byte*>(sources.back()->data()) + std::size_t(e) * 256;
+        layer.experts.push_back({ExpertBlob{.pinned = data,
+            .pinned_region = reinterpret_cast<std::uintptr_t>(sources.back()->data()), .bytes = 256}});
+    }
+    ExpertDeliveryOptions options;
+    options.pair_capacity = 8;
+    options.cache_bytes = slots * 256;
+    ExpertDelivery delivery(device.rank(0), {}, {layer}, options);
+    if (delivery.memory().cache_slots != slots) { throw std::runtime_error("recency: slot count"); }
+    DeviceBuffer ids(8 * 4);
+    std::vector<int> order; // least recent first
+    std::uint64_t state = 12345, failures = 0;
+    for (int call = 0; call < calls; ++call) {
+        std::vector<std::int32_t> routed;
+        const int width = 1 + int((state = state * 6364136223846793005ULL + 1442695040888963407ULL) >> 62);
+        while (int(routed.size()) < width) {
+            const int e = int((state = state * 6364136223846793005ULL + 1442695040888963407ULL) >> 33) % 7 +
+                          (call / 100) % 2 * 5; // the hot set moves halfway through
+            if (std::find(routed.begin(), routed.end(), e) == routed.end()) { routed.push_back(e); }
+        }
+        std::sort(routed.begin(), routed.end());
+        std::uint64_t expected_hits = 0;
+        for (const int e : routed) {
+            const auto at = std::find(order.begin(), order.end(), e);
+            if (at != order.end()) { ++expected_hits; order.erase(at); order.push_back(e); }
+        }
+        for (const int e : routed) {
+            if (std::find(order.begin(), order.end(), e) != order.end()) { continue; }
+            if (int(order.size()) == slots) {
+                const auto victim = std::find_if(order.begin(), order.end(), [&](int v) {
+                    return std::find(routed.begin(), routed.end(), v) == routed.end();
+                });
+                order.erase(victim);
+            }
+            order.push_back(e);
+        }
+        ids.copy_from_host(routed.data(), routed.size() * 4);
+        const auto before = delivery.stats();
+        (void)delivery.begin(0, static_cast<const std::int32_t*>(ids.p), std::uint32_t(routed.size()),
+                             device.stream);
+        delivery.await(device.stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        delivery.drain();
+        if (delivery.stats().hits - before.hits != expected_hits) { ++failures; }
+    }
+    const auto stats = delivery.stats();
+    const bool ok = !failures && stats.evictions != 0;
+    std::printf("recency order calls=%d hits=%llu evictions=%llu mismatched=%llu %s\n", calls,
+                (unsigned long long)stats.hits, (unsigned long long)stats.evictions,
+                (unsigned long long)failures, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -344,6 +409,7 @@ int main(int argc, char** argv) {
             return failure_control(device, path, true);
         }
         int failures = admission_boundaries(device);
+        failures += recency_order(device);
         for (bool disk : {false, true}) {
             for (auto cache : {0ULL, 6ULL << 20, 64ULL << 20}) {
                 failures += run(device, disk, cache, path);

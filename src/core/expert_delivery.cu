@@ -27,18 +27,6 @@ constexpr std::uint32_t kCountMask = (1u << 30) - 1;
 constexpr std::uint32_t kHit       = 1u << 30;
 constexpr std::uint32_t kMiss      = 1u << 31;
 
-// The cache scores (layer, expert) by its route count with a per-token decay, a half-life of about
-// 700 tokens, and admits a miss over a cached expert only when it is clearly hotter, so near-ties
-// do not thrash: the constants Flash-Next's cache was measured with (models/qwen4_exp).
-constexpr double kDecay      = 0.999;
-constexpr double kHysteresis = 1.25;
-constexpr double kFloor      = 0.5;
-// Victim choice samples this many cached slots instead of scanning every slot per miss.
-constexpr int kVictimSamples = 24;
-// A wide call promotes at most this many experts over colder cached ones (free slots are taken
-// without limit). Those device copies run while the next call is served.
-constexpr std::size_t kPromotionsOverVictims = 32;
-
 std::uint64_t aligned(std::uint64_t n) {
     if (n > std::numeric_limits<std::uint64_t>::max() - 255) {
         throw std::invalid_argument("expert delivery: byte extent overflow");
@@ -117,13 +105,6 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
     }
 }
 
-std::uint64_t next_random(std::uint64_t& state) {
-    state ^= state << 13;
-    state ^= state >> 7;
-    state ^= state << 17;
-    return state;
-}
-
 } // namespace
 
 struct ExpertDelivery::Impl {
@@ -138,9 +119,7 @@ struct ExpertDelivery::Impl {
         int next_upload = 0;
         bool dirty      = false;
         std::vector<std::int32_t> slot_of;
-        // Decayed route count and the layer's token clock when it was last brought up to date.
-        std::vector<double> score, stamp;
-        double clock = 0;
+        std::uint32_t cached = 0; // slots holding this layer's experts
         // Bank stride of each blob: the blob's bytes when every expert's are equal (the resident
         // layout, one copy per run of experts), else its aligned maximum.
         std::vector<std::uint64_t> stride;
@@ -154,17 +133,14 @@ struct ExpertDelivery::Impl {
     struct Slot {
         std::int32_t layer = -1, expert = -1;
         bool pending       = false; // promoted; its table entry is patched at the next call
+        // Recency list of occupied slots: decode and verification hits move a slot to the newest
+        // end; misses take the oldest slot their call does not route.
+        std::int32_t newer = -1, older = -1;
         std::vector<std::uint64_t> written;
     };
     struct Deferred {
         std::size_t layer;
         std::int32_t expert, slot;
-    };
-    // Experts of a wide call's bank left to replace colder cached experts.
-    struct Replacements {
-        std::size_t layer = 0;
-        int bank = -1;
-        std::vector<std::int32_t> experts;
     };
     // A host-to-device copy of contiguous bytes from one pinned range or a run of file extents.
     struct Piece {
@@ -191,8 +167,7 @@ struct ExpertDelivery::Impl {
     std::vector<Slot> slots;
     std::vector<std::int32_t> free_slots;
     std::vector<Deferred> deferred;
-    Replacements replacements;
-    std::uint64_t random_state = 0x9e3779b97f4a7c15ULL;
+    std::int32_t newest = -1, oldest = -1;
     CudaHostHandshake handshake;
     cudaStream_t copies = nullptr;
     cudaEvent_t copied[2]{};
@@ -221,6 +196,7 @@ struct ExpertDelivery::Impl {
     int call_bank               = 0;
     bool call_wide              = false;
     std::vector<unsigned char> call_routed;
+    std::vector<std::uint32_t> call_count;
     std::vector<Piece> pieces;
     std::vector<std::pair<std::byte*, std::uint64_t>> zeroes;
 
@@ -233,9 +209,6 @@ struct ExpertDelivery::Impl {
         }
         if (options.banks < 1 || options.banks > 2) {
             throw std::invalid_argument("expert delivery: one or two layer banks");
-        }
-        if (options.routes_per_token == 0) {
-            throw std::invalid_argument("expert delivery: routes per token must be positive");
         }
         std::uint64_t expert_count = 0;
         bool disk = false;
@@ -308,8 +281,6 @@ struct ExpertDelivery::Impl {
                                         checked_add(checked_mul(count, layer.stride.back()), tail[b]));
             }
             layer.slot_of.assign(count, -1);
-            layer.score.assign(count, 0.0);
-            layer.stamp.assign(count, 0.0);
             const auto bytes = count * spec.aliases.size() * sizeof(void*);
             layer.mirror = std::make_unique<PinnedHostBuffer>(bytes);
             std::memset(layer.mirror->data(), 0, bytes);
@@ -411,6 +382,7 @@ struct ExpertDelivery::Impl {
         allocation.cache_bytes = cache.backing_bytes();
         allocation.cache_slots = std::uint32_t(slots.size());
         call_routed.assign(max_experts, 0);
+        call_count.assign(max_experts, 0);
         CUDA_CHECK(cudaFuncSetAttribute(split_routes, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         int(max_experts * 4)));
         CUDA_CHECK(cudaStreamCreateWithFlags(&copies, cudaStreamNonBlocking));
@@ -495,12 +467,6 @@ struct ExpertDelivery::Impl {
             CUDA_CHECK(cudaEventRecord(layer.uploaded[u], copies));
             layer.dirty = false;
         }
-    }
-
-    [[nodiscard]] double score_of(std::size_t li, std::int32_t e) const {
-        const auto& layer = layers[li];
-        return layer.score[std::size_t(e)] *
-               std::pow(kDecay, layer.clock - layer.stamp[std::size_t(e)]);
     }
 
     // Queue a host-to-device copy, extending the previous piece when both its source and its
@@ -610,40 +576,56 @@ struct ExpertDelivery::Impl {
         written = bytes;
     }
 
+    void unlink(std::int32_t s) {
+        auto& slot = slots[std::size_t(s)];
+        (slot.newer >= 0 ? slots[std::size_t(slot.newer)].older : newest) = slot.older;
+        (slot.older >= 0 ? slots[std::size_t(slot.older)].newer : oldest) = slot.newer;
+        slot.newer = slot.older = -1;
+    }
+    void link_newest(std::int32_t s) {
+        auto& slot = slots[std::size_t(s)];
+        slot.older = newest;
+        slot.newer = -1;
+        (newest >= 0 ? slots[std::size_t(newest)].newer : oldest) = s;
+        newest = s;
+    }
+    void link_oldest(std::int32_t s) {
+        auto& slot = slots[std::size_t(s)];
+        slot.newer = oldest;
+        slot.older = -1;
+        (oldest >= 0 ? slots[std::size_t(oldest)].older : newest) = s;
+        oldest = s;
+    }
+
     void evict(std::int32_t s, ExpertDeliveryStats& delta) {
         auto& slot = slots[std::size_t(s)];
-        if (slot.layer < 0) { return; }
-        layers[std::size_t(slot.layer)].slot_of[std::size_t(slot.expert)] = -1;
+        unlink(s);
+        auto& layer = layers[std::size_t(slot.layer)];
+        layer.slot_of[std::size_t(slot.expert)] = -1;
+        --layer.cached;
         point_nowhere(std::size_t(slot.layer), slot.expert);
         slot.layer = slot.expert = -1;
         slot.pending = false;
         ++delta.evictions;
     }
 
-    // A free slot, else the coldest of a sample of cached experts the served call does not route,
-    // when the candidate (li, e) is clearly hotter. -1: keep the candidate out of the cache.
-    std::int32_t choose_slot(std::size_t li, std::int32_t e, ExpertDeliveryStats& delta) {
+    // A free slot, else the least recently used one the served call does not route. -1: none.
+    std::int32_t choose_slot(ExpertDeliveryStats& delta) {
         if (!free_slots.empty()) {
             const auto s = free_slots.back();
             free_slots.pop_back();
             return s;
         }
-        if (slots.empty()) { return -1; }
-        std::int32_t victim = -1;
-        double coldest = 0;
-        for (int sample = 0; sample < kVictimSamples; ++sample) {
-            const auto s = std::int32_t(next_random(random_state) % slots.size());
+        for (auto s = oldest; s >= 0; s = slots[std::size_t(s)].newer) {
             const auto& slot = slots[std::size_t(s)];
-            if (slot.layer < 0 || slot.pending) { continue; }
+            if (slot.pending) { continue; }
             if (std::size_t(slot.layer) == call_layer && call_routed[std::size_t(slot.expert)]) {
                 continue;
             }
-            const double score = score_of(std::size_t(slot.layer), slot.expert);
-            if (victim < 0 || score < coldest) { victim = s; coldest = score; }
+            evict(s, delta);
+            return s;
         }
-        if (victim < 0 || !(score_of(li, e) > kHysteresis * coldest + kFloor)) { return -1; }
-        evict(victim, delta);
-        return victim;
+        return -1;
     }
 
     void occupy(std::int32_t s, std::size_t li, std::int32_t e, bool pending) {
@@ -652,6 +634,7 @@ struct ExpertDelivery::Impl {
         slot.expert = e;
         slot.pending = pending;
         layers[li].slot_of[std::size_t(e)] = s;
+        ++layers[li].cached;
     }
 
     [[nodiscard]] int bank_holding(std::size_t li) const {
@@ -713,27 +696,6 @@ struct ExpertDelivery::Impl {
         ++delta.admissions;
     }
 
-    // The replacements an earlier wide call left, while serving the call of layer `current`: its
-    // split has read its table, and choose_slot keeps the experts it routes. The promoting layer's
-    // call has ended, so its table changes at once. A repeat of that layer reuses its bank instead.
-    void replace_cached(std::size_t current, ExpertDeliveryStats& delta) {
-        auto r = std::move(replacements);
-        replacements = {};
-        if (r.bank < 0 || r.experts.empty() || r.layer == current) { return; }
-        const auto& bank = bank_state[std::size_t(r.bank)];
-        if (bank.layer != std::int64_t(r.layer)) { return; }
-        for (const auto e : r.experts) {
-            if (!bank.valid[std::size_t(e)] || layers[r.layer].slot_of[std::size_t(e)] >= 0) {
-                continue;
-            }
-            const auto s = choose_slot(r.layer, e, delta);
-            if (s < 0) { break; }
-            occupy(s, r.layer, e, false);
-            promote(s, r.layer, e, r.bank, delta);
-            point_slot(r.layer, e, s);
-        }
-    }
-
     void serve(const CudaHostHandshake::Request& request) {
         const auto started = std::chrono::steady_clock::now();
         ExpertDeliveryStats delta;
@@ -751,18 +713,15 @@ struct ExpertDelivery::Impl {
         call_layer = li;
         const auto* needed = static_cast<const std::uint32_t*>(needed_host->data());
         const int experts = int(layer.source.experts.size());
-        const double tokens = std::max(1.0, double(request.width) / options.routes_per_token);
-        layer.clock += tokens;
         delta.requests = 1;
         std::uint32_t routes = 0;
         std::fill(call_routed.begin(), call_routed.end(), 0);
         for (int e = 0; e < experts; ++e) {
             const std::uint32_t count = needed[e] & kCountMask;
+            call_count[std::size_t(e)] = count;
             if (!count) { continue; }
             ++routes;
             call_routed[std::size_t(e)] = 1;
-            layer.score[std::size_t(e)] = score_of(li, e) + double(count);
-            layer.stamp[std::size_t(e)] = layer.clock;
             delta.pairs += count;
             if (needed[e] & kHit) {
                 ++delta.hits;
@@ -771,12 +730,22 @@ struct ExpertDelivery::Impl {
         }
         delta.routes = routes;
         const bool wide = 2 * routes >= std::uint32_t(experts);
+        if (!wide) {
+            // Decode and verification keep their experts recent; a prompt chunk, which routes to
+            // nearly every expert, leaves the order alone.
+            for (int e = 0; e < experts; ++e) {
+                const auto s = layer.slot_of[std::size_t(e)];
+                if (call_routed[std::size_t(e)] && s >= 0 && !slots[std::size_t(s)].pending) {
+                    unlink(s);
+                    link_newest(s);
+                }
+            }
+        }
         if (previous_layer >= 0) {
             layers[std::size_t(previous_layer)].successor = std::int64_t(li);
             layers[std::size_t(previous_layer)].successor_wide = wide;
         }
         previous_layer = std::int64_t(li);
-        replace_cached(li, delta);
         const int held = bank_holding(li);
         int k = held;
         std::vector<std::int32_t> to_bank;
@@ -794,9 +763,10 @@ struct ExpertDelivery::Impl {
                 continue;
             }
             if (!wide) {
-                const auto s = choose_slot(li, e, delta);
+                const auto s = choose_slot(delta);
                 if (s >= 0) {
                     occupy(s, li, e, false);
+                    link_newest(s);
                     for (std::size_t b = 0; b < layer.source.experts[std::size_t(e)].size(); ++b) {
                         const auto& blob = layer.source.experts[std::size_t(e)][b];
                         add_piece(slot_base(s) + slot_offset[b], blob);
@@ -823,9 +793,10 @@ struct ExpertDelivery::Impl {
         add(delta);
     }
 
-    // After the call's experts are ready: a wide call promotes its hottest bank experts into free
-    // cache slots by device copies, leaves the next ones to replace colder cached experts, and
-    // starts the bank of the layer that followed it last time.
+    // After the call's experts are ready: a wide call promotes its most routed bank experts into
+    // free cache slots by device copies, up to the layer's share of the cache, so a first prompt
+    // fills the cache across every layer and evicts nothing. It also starts the bank of the layer
+    // that followed it last time.
     void post() {
         if (!call_wide) { return; }
         const auto started = std::chrono::steady_clock::now();
@@ -841,21 +812,19 @@ struct ExpertDelivery::Impl {
                 }
             }
             std::sort(candidates.begin(), candidates.end(), [&](std::int32_t a, std::int32_t b) {
-                const double sa = score_of(li, a), sb = score_of(li, b);
-                return sa != sb ? sa > sb : a < b;
+                const auto ca = call_count[std::size_t(a)], cb = call_count[std::size_t(b)];
+                return ca != cb ? ca > cb : a < b;
             });
-            std::size_t next = 0;
-            for (; next < candidates.size() && !free_slots.empty(); ++next) {
-                const auto e = candidates[next];
+            const auto share = std::max<std::size_t>(1, slots.size() / layers.size());
+            for (const auto e : candidates) {
+                if (free_slots.empty() || layer.cached >= share) { break; }
                 const auto s = free_slots.back();
                 free_slots.pop_back();
                 occupy(s, li, e, true);
+                link_oldest(s);
                 promote(s, li, e, call_bank, delta);
                 deferred.push_back({li, e, s});
             }
-            const auto end = std::min(candidates.size(), next + kPromotionsOverVictims);
-            replacements = {li, call_bank, {candidates.begin() + std::ptrdiff_t(next),
-                                            candidates.begin() + std::ptrdiff_t(end)}};
         }
         if (bank_state.size() == 2 && layer.successor >= 0 && layer.successor_wide) {
             const auto next = std::size_t(layer.successor);
@@ -985,6 +954,7 @@ void ExpertDelivery::invalidate() {
         layer.tables.fill();
         std::memset(layer.mirror->data(), 0, layer.mirror->size());
         std::fill(layer.slot_of.begin(), layer.slot_of.end(), -1);
+        layer.cached = 0;
         layer.dirty = false;
     }
     p.free_slots.clear();
@@ -992,8 +962,10 @@ void ExpertDelivery::invalidate() {
         auto& slot = p.slots[std::size_t(s)];
         slot.layer = slot.expert = -1;
         slot.pending = false;
+        slot.newer = slot.older = -1;
         p.free_slots.push_back(std::int32_t(s));
     }
+    p.newest = p.oldest = -1;
     for (auto& bank : p.bank_state) {
         bank.layer = -1;
         std::fill(bank.valid.begin(), bank.valid.end(), 0);

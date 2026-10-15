@@ -519,15 +519,17 @@ ninfer /models/gemma4.ninfer --expert-residency disk --expert-cache-mib 0
 
 Experts reach the GPU through the shared transport (`core/expert_delivery`):
 
-- **Layer banks.** An expert missing from the cache lands in a whole-layer bank laid out like the
-  resident bank, each expert at its index, so consecutive experts arrive in one copy. Two banks let
-  the next layer of a prompt chunk arrive while the current one computes (one bank where memory is
-  short). Each prompt chunk needs nearly every expert of every layer, so host and disk prompts start
-  at 4096-token chunks: the whole expert bank crosses the bus once per chunk.
-- **Cache.** `--expert-cache-mib` (default: what is free after startup) holds the experts with the
-  most decayed routes. Decode admits its misses over clearly colder cached experts; a prompt chunk
-  promotes its hottest experts from the bank by device copies and never evicts in bulk, so a long
-  prompt does not flush decode's working set. `0` keeps the banks only.
+- **Layer banks.** A prompt chunk's experts missing from the cache (and decode's, without a cache)
+  land in a whole-layer bank laid out like the resident bank, each expert at its index, so
+  consecutive experts arrive in one copy. Two banks let the next layer of a prompt chunk arrive
+  while the current one computes (one bank where memory is short). Each prompt chunk needs nearly
+  every expert of every layer, so host and disk prompts start at 4096-token chunks: the whole expert
+  bank crosses the bus once per chunk.
+- **Cache.** `--expert-cache-mib` (default: what is free after startup) holds the experts decode and
+  verification used most recently: their misses enter the cache over the least recently used experts
+  the call does not route. A prompt chunk evicts nothing; it promotes its most routed experts from
+  the bank into free slots by device copies, up to each layer's share of the cache, so a long prompt
+  does not flush decode's working set. `0` keeps the banks only.
 - **Calls.** Vector decode and verification run the cached pairs while the rest arrive, then the
   rest; both add to one fixed-point sum, so outputs equal resident execution bit for bit. Prompt
   chunks wait for their experts and run the existing matrix path.
