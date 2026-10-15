@@ -2,8 +2,7 @@
 
 // Device route profiles on disk and in the binary, and their installation at Engine startup.
 //
-// A profile file holds one entry per base hardware class (context_cost_hardware_class). A compiled
-// memory-capacity variant can supply additional defaults after lookup or calibration:
+// A profile file holds one entry per hardware class (context_cost_hardware_class of the GPU):
 //
 //   {"schema": "ninfer.device-route-profiles", "schema_version": 2,
 //    "devices": [{"hardware_class": "nvidia-geforce-rtx-3090-sm86", "multiprocessors": 82,
@@ -25,7 +24,6 @@
 
 #include "ops/common/device_route.h"
 
-#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -78,18 +76,6 @@ layer_device_route_profiles(const ops::DeviceRouteProfile& upper,
 // The compiled table's entry for this hardware class and SM count.
 [[nodiscard]] std::optional<ops::DeviceRouteProfile>
 compiled_device_route_profile(std::string_view hardware_class, int multiprocessors);
-
-// Prefer a compiled capacity-specific profile (for example a modified 22 GiB RTX 2080 Ti) without
-// assigning its measurements to the stock card. CUDA reserves part of VRAM, so round capacity up
-// to GiB. If that exact hardware/SM/capacity entry is absent, retain the base hardware class.
-[[nodiscard]] std::string device_profile_hardware_class(std::string_view hardware_class,
-                                                        int multiprocessors,
-                                                        std::uint64_t total_vram_bytes);
-
-// Add capacity-specific built-in defaults for keys the selected base profile does not name.
-// Preserve file overrides and the base card's normal auto-calibration of every other operation.
-void apply_device_capacity_defaults(ops::DeviceRouteProfile& profile, int multiprocessors,
-                                    std::uint64_t total_vram_bytes);
 
 // The profile for this hardware class and SM count: the file's calibrated entry layered over the
 // compiled table's, or whichever of the two exists. A file entry measured against another route

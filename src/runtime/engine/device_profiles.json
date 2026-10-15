@@ -337,9 +337,8 @@
         "gdn_two_stage/h32": [[48, ""], [2147483647, "on"]],
         "gdn_two_stage/h48": [[48, ""], [2147483647, "on"]]
      }},
-    {"hardware_class": "nvidia-titan-rtx-sm75", "multiprocessors": 72, "origin": "built in: TITAN RTX at 280 W (TCC), 2026-10-11; Q8 K-split routes at 280 W (Linux), 2026-10-13; Gemma FP16 attention at 180 W, 2026-10-15",
+    {"hardware_class": "nvidia-titan-rtx-sm75", "multiprocessors": 72, "origin": "built in: TITAN RTX at 280 W (TCC), 2026-10-11; Q8 K-split routes at 280 W (Linux), 2026-10-13",
      "routes": {
-        "ggml_fattn/d512": [[1, "rows4"]],
         "attn_i8_small/h24/int8/w1": [[65536, "16x1x32"], [1048576, "8x2x32e"]],
         "attn_i8_small/h24/int8/w2": [[8192, "16x1x32"], [1048576, "4x2x32e"]],
         "attn_i8_small/h24/int8/w3": [[8192, "16x1x32"], [1048576, "8x2x32qe"]],
@@ -405,10 +404,5 @@
         "t2_i8_small/5120x17408": [[8, "r32c8"], [16, "r32c16k8"], [32, ""]],
         "t2_i8_small/5120x6144": [[8, "r32c8k4"], [16, "r32c16"], [32, ""]],
         "t2_i8_small/7168+7168x5120": [[3, "r32c8k4"], [14, ""], [16, "r32c16"], [32, ""]]
-     }},
-    {"hardware_class": "nvidia-geforce-rtx-2080-ti-22gib-sm75", "multiprocessors": 68,
-     "origin": "built in: modified RTX 2080 Ti 22 GiB, FP8 prompt attention at 250 W, 2026-10-15",
-     "routes": {
-        "causal_fp8_prompt/d256": [[511, ""], [2048, "bc16"]]
      }}
 ]}

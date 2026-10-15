@@ -38,9 +38,7 @@ struct FlashAttentionArgs {
     const int* kv_max = nullptr;
 };
 
-// Query rows per tile of the launch (the granularity of FlashAttentionArgs::kv_max). On sm75,
-// the device profile's ggml_fattn/d512 width-1 band may select rows1/rows2/rows4. The choice must
-// stay fixed between workspace/mask preparation and execution, as Engine-installed profiles do.
+// Query rows per tile of the launch (the granularity of FlashAttentionArgs::kv_max).
 [[nodiscard]] int flash_attention_tile_rows(int head_dim);
 
 // Workspace the launch needs (the stream-k partial results), for any `tokens` up to the given count.

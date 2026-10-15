@@ -32,9 +32,8 @@ drafts with the tokens committed per verify round in brackets.
 | RTX 3090 | 24 GB | `86` | 300 to 420 W by campaign | every page |
 | RTX 3060 | 12 GB | `86`, the image | 170 W | [small cards](performance/small-cards-2026-10.md) |
 | RTX 3060 Ti | 8 GB | `86`, the image | 200 W | [small cards](performance/small-cards-2026-10.md) |
-| TITAN RTX | 24 GB | `75` | 280 W; correction comparison at 180 W | [TITAN RTX](performance/titan-rtx-2026-10.md) |
+| TITAN RTX | 24 GB | `75` | 280 W | [TITAN RTX](performance/titan-rtx-2026-10.md) |
 | RTX 2080 Ti | 11 GB | `75`, the image | 250 W | [small cards](performance/small-cards-2026-10.md) |
-| RTX 2080 Ti, modified | 22 GiB | `75` | 250 W; additional correctness checks at 170 W | [Turing follow-up](performance/titan-rtx-2026-10.md#corrected-gemma-prompt-attention-15-october) |
 | Tesla V100-SXM2-16GB | 16 GB | `70` | 300 W | [Tesla V100](performance/tesla-v100-2026-10.md) |
 
 ## Largest context

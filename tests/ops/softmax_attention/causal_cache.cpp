@@ -9,8 +9,6 @@
 #include "ops/kv_cache_lloyd4_oracle.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
-#include "runtime/engine/context_cache/context_cost.h"
-#include "runtime/engine/device_profile.h"
 
 #include <algorithm>
 #include <array>
@@ -4339,74 +4337,23 @@ int run_softmax_attention_int8_prompt_tests() {
     return failures ? 1 : 0;
 }
 
-int run_softmax_attention_fp8_default_tests() {
-#if !defined(NINFER_SM75)
-    std::cout << "SKIP FP8 default: requires an sm75 build\n";
-    return 77;
-#else
-    if (cuda_unavailable()) return 77;
-    int device = 0;
-    cudaDeviceProp props{};
-    CUDA_CHECK(cudaGetDevice(&device));
-    CUDA_CHECK(cudaGetDeviceProperties(&props, device));
-    ops::DeviceRouteProfile profile;
-    profile.hardware_class = runtime::context_cost_hardware_class(props.name, props.major, props.minor);
-    profile.multiprocessors = props.multiProcessorCount;
-    runtime::apply_device_capacity_defaults(profile, props.multiProcessorCount, props.totalGlobalMem);
-    if (!profile.routes.contains("causal_fp8_prompt/d256")) {
-        std::cout << "SKIP FP8 default: requires the measured 22 GiB RTX 2080 Ti\n";
-        return 77;
-    }
-    const auto previous = ops::installed_device_route_profile();
-    struct RestoreProfile {
-        int device;
-        std::shared_ptr<const ops::DeviceRouteProfile> previous;
-        ~RestoreProfile() { ops::install_device_route_profile(device, previous); }
-    } restore{device, previous};
-    ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
-    // No DeviceRouteForce: actual GPU properties select the default used by the public Ops.
-    if (ops::device_route_schedule("causal_fp8_prompt/d256", 512) != "bc16" ||
-        ops::device_route_schedule("causal_fp8_prompt/d256", 2048) != "bc16") {
-        throw std::runtime_error("the measured card did not select the Bc16 FP8 default");
-    }
-    std::cout << "FP8 automatic default: "
-              << ops::device_route_schedule("causal_fp8_prompt/d256", 512) << std::endl;
-    int failures = 0;
-    for (const Geometry& geometry : kGeometries) {
-        failures += run_a1_case(geometry, kPlanFp8, {512, 1536, 2048, 611u},
-                                MappingPattern::Fragmented);
-        failures += run_a3_case(geometry, kPlanFp8, {512, 1536, 2048, 612u},
-                                MappingPattern::Offset);
-    }
-    failures += run_a3_case(kGeometries[1], kPlanFp8, {2048, 0, 2048, 613u},
-                            MappingPattern::Fragmented);
-    std::cout << (failures ? "FAIL" : "PASS") << " FP8 automatic default public Ops\n";
-    return failures ? 1 : 0;
-#endif
-}
-
 int run_softmax_attention_fp8_prompt_tests() {
     if (cuda_unavailable()) return 77;
-    int failures = 0;
-#if defined(NINFER_SM75)
-    constexpr const char* routes[] = {"bc32", "bc16"};
-#else
-    constexpr const char* routes[] = {"bc32"};
-#endif
-    for (const char* route : routes) {
-        const ops::DeviceRouteForce force("causal_fp8_prompt/d256", route);
-        std::cout << "FP8 prompt route " << route << std::endl;
-        failures += run_fp8_prompt_cases();
-        // Multiple key tiles, partial query tiles and real long-cache extents. Packed inputs
-        // retain the existing independent code/scale decoder and FP64 softmax oracle.
-        for (const Geometry& geometry : kGeometries) {
-            failures += run_a1_case(geometry, kPlanFp8, {33, 511, 1024, 608u},
-                                    MappingPattern::Fragmented);
-            failures += run_a3_case(geometry, kPlanFp8, {65, 2047, 4096, 609u},
-                                    MappingPattern::Offset);
-            failures += run_a3_case(geometry, kPlanFp8, {7, 16377, 16384, 610u},
-                                    MappingPattern::Fragmented);
-        }
+    // Multiple 16- and 32-key tiles of the build's Bc (16 on Turing, 32 elsewhere).
+    int failures = run_fp8_prompt_cases();
+    // Multiple key tiles, partial query tiles and real long-cache extents. Packed inputs retain
+    // the existing independent code/scale decoder and FP64 softmax oracle.
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(geometry, kPlanFp8, {33, 511, 1024, 608u},
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, kPlanFp8, {65, 2047, 4096, 609u},
+                                MappingPattern::Offset);
+        failures += run_a3_case(geometry, kPlanFp8, {7, 16377, 16384, 610u},
+                                MappingPattern::Fragmented);
+        failures += run_a1_case(geometry, kPlanFp8, {512, 1536, 2048, 611u},
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, kPlanFp8, {511, 1537, 2048, 612u},
+                                MappingPattern::Offset);
     }
     std::cout << (failures ? "FAIL" : "PASS") << " FP8 prompt causal attention\n";
     return failures ? 1 : 0;

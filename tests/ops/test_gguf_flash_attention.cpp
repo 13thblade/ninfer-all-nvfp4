@@ -8,7 +8,6 @@
 // stream-k wave, and each launch is repeated and held to the first one's bits.
 
 #include "core/arena.h"
-#include "ops/common/device_route.h"
 #include "ops/linear/gguf/ggml_fattn.h"
 
 #include <cuda_fp16.h>
@@ -180,12 +179,10 @@ int main(int argc, char** argv) {
         return 77;
     }
     try {
-        bool racecheck = false, default_only = false;
+        bool racecheck = false;
         for (int i = 1; i < argc; ++i) {
             if (std::strcmp(argv[i], "--racecheck") == 0) racecheck = true;
-            else if (std::strcmp(argv[i], "--default-only") == 0) default_only = true;
-            else throw std::invalid_argument(
-                "usage: ninfer_gguf_flash_attention_test [--racecheck] [--default-only]");
+            else throw std::invalid_argument("usage: ninfer_gguf_flash_attention_test [--racecheck]");
         }
         const auto matrix = [&] {
             std::mt19937 rng(5120);
@@ -214,25 +211,6 @@ int main(int argc, char** argv) {
             std::cout << (failures == 0 ? "OK" : "FAIL") << " GGUF flash attention\n";
             return failures == 0 ? 0 : 1;
         };
-#if defined(NINFER_SM75)
-        if (!default_only) {
-            {
-                ninfer::ops::DeviceRouteForce unsupported("ggml_fattn/d512", "rows8");
-                if (gguf::flash_attention_tile_rows(512) != 1) {
-                    throw std::runtime_error("unsupported flash-attention route changed the default");
-                }
-            }
-            int failures = 0;
-            for (const char* route : {"rows1", "rows2", "rows4"}) {
-                std::cout << "GGUF flash attention route " << route << std::endl;
-                ninfer::ops::DeviceRouteForce force("ggml_fattn/d512", route);
-                failures += matrix();
-            }
-            return failures == 0 ? 0 : 1;
-        }
-#else
-        (void)default_only;
-#endif
         return matrix();
     } catch (const std::exception& error) {
         std::cerr << "GGUF flash attention: " << error.what() << '\n';

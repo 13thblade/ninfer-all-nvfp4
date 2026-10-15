@@ -264,37 +264,6 @@ std::optional<ops::DeviceRouteProfile> compiled_device_route_profile(std::string
     return std::nullopt;
 }
 
-std::string device_profile_hardware_class(std::string_view hardware_class, int multiprocessors,
-                                          std::uint64_t total_vram_bytes) {
-    const auto suffix = hardware_class.rfind("-sm");
-    if (suffix == std::string_view::npos || total_vram_bytes == 0) {
-        return std::string(hardware_class);
-    }
-    constexpr std::uint64_t gib = 1ULL << 30;
-    const auto capacity = total_vram_bytes / gib + (total_vram_bytes % gib != 0);
-    const std::string specific = std::string(hardware_class.substr(0, suffix)) + "-" +
-                                 std::to_string(capacity) + "gib" +
-                                 std::string(hardware_class.substr(suffix));
-    return compiled_device_route_profile(specific, multiprocessors) ? specific
-                                                                  : std::string(hardware_class);
-}
-
-void apply_device_capacity_defaults(ops::DeviceRouteProfile& profile, int multiprocessors,
-                                    std::uint64_t total_vram_bytes) {
-    const std::string specific =
-        device_profile_hardware_class(profile.hardware_class, multiprocessors, total_vram_bytes);
-    if (specific == profile.hardware_class) { return; }
-    const auto defaults = compiled_device_route_profile(specific, multiprocessors);
-    bool added = false;
-    for (const auto& [key, bands] : defaults->routes) {
-        added |= profile.routes.try_emplace(key, bands).second;
-    }
-    if (added) {
-        if (!profile.origin.empty()) { profile.origin += "; "; }
-        profile.origin += defaults->origin;
-    }
-}
-
 std::optional<ops::DeviceRouteProfile> find_device_route_profile(
     std::string_view hardware_class, int multiprocessors, const std::filesystem::path& path,
     std::string_view route_catalog, const std::function<void(const std::string&)>& log) {

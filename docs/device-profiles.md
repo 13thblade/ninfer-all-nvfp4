@@ -42,17 +42,6 @@ An entry applies only to the same hardware class (the GPU name and compute capab
 SM count, so a laptop part that shares a desktop part's name but not its SM count is calibrated on its
 own. With several GPUs (`--devices`), every distinct device gets its own profile.
 
-The TITAN RTX profile selects Gemma 4's corrected 32-column FP16 prompt-attention tile
-(`ggml_fattn/d512: rows4`). It was the fastest qualified tile in all four 180 W Op workloads;
-these measurements do not establish the whole-model gain or the gain at 280 W.
-
-The modified 22 GiB RTX 2080 Ti also receives an FP8 prompt default with separate expanded K/V
-(`causal_fp8_prompt/d256: bc16`, query widths 512 to 2048), measured at 250 W. A capacity-specific
-built-in entry supplies this key after normal base-profile lookup or calibration. CUDA-reported
-capacity rounds up to GiB to allow reserved VRAM. The ordinary 11 GiB card does not take that entry.
-Other calibrated keys and explicit profile-file overrides keep their choices. No FP8 result is
-assigned to the TITAN RTX by this entry.
-
 `--device-profile auto` (the default) follows the order above, `--device-profile calibrate` measures
 again and stores the result over the file's entry, and `--device-profile off` uses the compiled
 tables only.
