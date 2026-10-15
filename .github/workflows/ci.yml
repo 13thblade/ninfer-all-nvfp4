@@ -36,6 +36,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     # ci/** runs the whole workflow on a branch without a pull request; only master publishes.
     branches: [master, 'ci/**']
@@ -46,8 +47,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Draft PRs allocate no runners. Ready-for-review starts CI; converting back cancels the old run.
 jobs:
   build-inputs:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Build inputs changed
     runs-on: ubuntu-24.04
     outputs:
@@ -61,6 +64,7 @@ jobs:
         run: .github/scripts/build-inputs.sh >> "$GITHUB_OUTPUT"
 
   calculator:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Config calculator arithmetic
     runs-on: ubuntu-24.04
     steps:
@@ -77,6 +81,7 @@ jobs:
         run: node docs/config-calculator.render.test.mjs
 
   host-kv-clamp:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Host KV clamp arithmetic
     runs-on: ubuntu-24.04
     steps:
@@ -88,6 +93,7 @@ jobs:
           ./test_host_kv_clamp
 
   cxx20-libcxx:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: C++20 text and resource contracts (libc++)
     runs-on: ubuntu-24.04
     steps:
@@ -110,7 +116,7 @@ jobs:
   windows-msvc:
     name: Host code under MSVC (${{ matrix.build.label }}, part ${{ matrix.shard }}/3)
     needs: build-inputs
-    if: needs.build-inputs.outputs.changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.changed == 'true'
     # Visual Studio 2022 (MSVC 14.44): CUDA 12.9 refuses Visual Studio 2026's MSVC 14.5x.
     runs-on: windows-2022
     timeout-minutes: 60
@@ -224,6 +230,7 @@ jobs:
           python -u scripts/check-host-compile.py $builds --shard ${{ matrix.shard }}/3 --jobs 4
 
   linux-scripts:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Linux launcher and downloader guard
     runs-on: ubuntu-24.04
     steps:
@@ -247,6 +254,7 @@ jobs:
           exit $status
 
   python:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Python suites (CPU)
     runs-on: ubuntu-24.04
     steps:
@@ -268,7 +276,7 @@ jobs:
   docker-build-cache:
     name: Dockerfile build cache
     needs: build-inputs
-    if: needs.build-inputs.outputs.changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -296,7 +304,7 @@ jobs:
   cuda:
     name: CUDA build and tests (sm_${{ matrix.arch }}, no GPU)
     needs: build-inputs
-    if: needs.build-inputs.outputs.changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     permissions:
