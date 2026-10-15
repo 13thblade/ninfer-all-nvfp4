@@ -177,7 +177,7 @@ std::string usage_text(const char* argv0) {
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
            "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen\n"
-           "                                and Gemma allow 0 with transient delivery slots.\n"
+           "                                and Gemma allow 0 (layer banks only).\n"
            "                                Flash-Next disk requires a nonzero cache\n" +
            std::string(ninfer::product::kHybridExpertHelp) +
            std::string(ninfer::product::kNgramTableHelp) +

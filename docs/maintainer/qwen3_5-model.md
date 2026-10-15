@@ -229,42 +229,51 @@ source matrix's divisor. Delivery copies stored bytes without re-encoding. Disk 
 multiple objects and part files. Host sources currently require one contiguous span per plane;
 a fragmented host plane is rejected rather than assembled into a second RAM bank.
 
-Each Program owns one delivery service per pipeline rank, separate from the immutable Model
-sources. Narrow calls process at most eight token rows per wave. Routing partitions pairs into
-hits and misses. Hits and the shared expert execute while the copy engine serves misses; missing
-experts then execute. A final FP32 rank-order sum adds the residual and rounds to BF16.
-Grouped prefill retains the resident router, grouped arithmetic and intermediate formats, with
-per-expert raw pointer addressing. NVFP4 keeps its admitted W4A4 path. Each bounded native slice
-(up to 4096 token rows) delivers its selected experts once before grouped arithmetic. This avoids
-reloading an expert at each narrow wave. Grouped streaming does not take the resident adaptive
-narrow-job shortcut. Its planning and execution use the compiled codec frontiers, independently
-of device-profile frontiers measured for resident weights. No routes are dropped or renormalized,
-and no weights are re-encoded.
+Each Program owns one delivery service per pipeline rank, separate from the immutable Model sources.
+Every SparseMoe call makes one delivery request for its layer. The service splits the call's routes
+into experts the persistent cache holds and the rest. A host worker copies the rest of a narrow call
+into cache slots, and the rest of a wide call into a whole-layer bank laid out like the resident
+bank (expert e of each plane at a fixed stride), with one host copy per run of consecutive experts
+within one pinned allocation. Two banks let the next layer of a wide call (half the layer's experts
+or more: a prompt slice, a wide verification) arrive while the current layer computes; one bank
+remains where memory is short.
 
-Up to 256 transient expert slots are reserved independently of the persistent cache. This costs
-more device memory than narrow-only delivery, but bounds prefill traffic when the persistent cache
-cannot hold a layer. `--expert-cache-mib 0` is supported in native host and native disk mode.
-With explicit KV capacity, cache sizing reserves that runtime and KV shape plus a margin.
-With automatic KV and an explicit nonzero cache budget, the cache gets priority above the
-minimum legal runtime, then KV grows into the remaining memory. With automatic KV and automatic
-cache, KV gets priority and the persistent cache may be zero. Zero cache always retains the
-transient slots. An explicit cache that would consume the reserved runtime budget is rejected.
-Actual delivery allocations are made before final KV capacity selection.
-Public runtime expert counters exclude synchronized startup Graph warmup deliveries.
+Calls below the codec's compiled prefill frontier (47 columns for Q4/Q5 and Q4/Q6, 20 for Q8, 13 for
+NVFP4) route, run the cached pairs and the shared expert while the rest arrive, then run the
+delivered pairs; both phases write per-rank FP32 products that one rank-order sum reduces, adds to
+the residual and rounds to BF16. This is the resident Small-T arithmetic; the Op test holds the
+streamed Q4/Q5, Q4/Q6 and Q8 outputs to the resident bits at every tested call width. Wider calls
+take the resident grouped prefill route with per-expert raw pointer addressing, after one delivery
+request per bounded native slice (up to 4096 token rows) covers every selected expert. NVFP4 keeps
+its admitted W4A4 path. Grouped streaming does not take the resident adaptive narrow-job shortcut;
+its planning uses the compiled codec frontiers, independently of device-profile frontiers measured
+for resident weights. No routes are dropped or renormalized, and no weights are re-encoded.
+
+The persistent cache (`--expert-cache-mib`, default: what is free after startup) holds the experts
+that decode and verification used most recently: a narrow call's misses enter the cache over the
+least recently used experts the call does not route. A wide call evicts nothing; it promotes its
+most routed experts from the bank into free slots by device copies, up to each layer's share of the
+cache, so a prompt does not flush the decode working set. `--expert-cache-mib 0` keeps the banks
+only. With automatic KV, the cache has priority: KV takes the minimum legal runtime (one request's
+full context) and the cache takes the remaining memory, because each cached expert saves bus traffic
+on every token that routes to it. Explicit KV keeps its requested shape, and a cache that would
+consume that reserved runtime is rejected. Delivery allocations are made before final KV capacity
+selection. Host and disk prompts default to 4096-token chunks: each chunk needs nearly every expert
+of every layer, so a wider chunk moves the expert bank across the bus fewer times.
 
 MTP has its own MoE source and gets every selected expert through the same full delivery path.
 `--mtp-experts-q4` is an explicit exception: its existing load-time Q4/Q6 transcode keeps the MTP
 expert bank resident. It does not create a cache-only draft policy or discard missing draft
 experts. This combination retains that one layer's VRAM cost.
 
-Delivery tables and slots outlive all captured Graph users. The next wave starts after every
-consumer of the previous wave. Suspendable Programs use the core VMM allocation mechanism:
+Delivery tables, banks and cache outlive all captured Graph users. The next request starts after
+every consumer of the previous one. Suspendable Programs use the core VMM allocation mechanism:
 suspend drains delivery and releases its physical backing, and restore remaps the same virtual
 addresses and invalidates the cache before replay. Immutable pinned sources remain alive.
-`RuntimeStats.experts` reports token–expert pairs, hits, admissions and transferred bytes. Transport
-diagnostics separately count distinct expert requests, misses, evictions, file reads and service
-time. Device cache bytes are reported separately; transient slots and table storage contribute
-to the workspace memory summary.
+`RuntimeStats.experts` reports token-expert pairs, hits, admissions and transferred bytes, without
+startup Graph warm-up deliveries. Transport diagnostics separately count distinct expert requests,
+misses, bank reuses, prefetched layers, promotions, evictions, file reads and service time. The
+memory summary reports the cache, the banks and table storage.
 
 ## Hadamard-rotated checkpoints
 

@@ -482,11 +482,12 @@ Native Qwen MoE plane relocation and streaming arithmetic:
 ```
 
 The first test runs on the CPU and checks exact RowSplit planes and NVFP4 scale/divisor relocation.
-The second needs a free GPU. It qualifies indirect host delivery against the independent FP64
-SparseMoe oracle at rows 1, 2, 8, 9, 13, 32, 47, 64, 257, 768 and 4097, with zero, small and
-larger persistent caches. It replays Graphs and retains output guards and input-preservation
-checks. Narrow NVFP4 reads represented BF16 input; grouped NVFP4 uses the existing admitted W4A4
-criterion and arithmetic. The ordinary SparseMoe test checks the resident route. These synthetic
+The second needs a free GPU. It qualifies host delivery against the independent FP64 SparseMoe
+oracle at 1, 2, 8, 9, 13, 20, 32, 46, 47, 64, 257, 768 and 4097 columns (NVFP4 without a `120a`
+build: 1, 2, 8, 9 and 12), with persistent caches of 0, 16 and 128 MiB, and requires the Q4/Q5,
+Q4/Q6 and Q8 outputs to equal the resident route's bits at each width. It replays Graphs and
+retains output guards and input-preservation checks. Narrow NVFP4 reads represented BF16 input;
+grouped NVFP4 uses the existing admitted W4A4 criterion and arithmetic. The ordinary SparseMoe test checks the resident route. These synthetic
 Op tests do not establish full-model quality or Engine lifecycle correctness.
 
 The real-artifact gate compares resident/host/disk causal scores, single-request MTP and each

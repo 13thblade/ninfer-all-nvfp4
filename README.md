@@ -228,9 +228,9 @@ Prefill of a 4,463-token prompt, in tok/s:
 - **Qwen3.5 family.** Dense and MoE (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`) with MTP,
   DFlash (35B-A3B) and DFlash2 (Qwen3.8-27B) drafters, Vision for images and video, and
   `groupwise-int`, FP8, NVFP4 and ternary weights. Native MoE routed experts can stay in pinned
-  host memory or the artifact's files, with a bounded GPU delivery window and an optional device
-  cache ([expert residency](docs/maintainer/qwen3_5-model.md#routed-expert-residency)). NVFP4 expert banks prefill through W4A4 and need
-  a `120a` build.
+  host memory or the artifact's files, brought into whole-layer GPU banks with an optional device
+  cache ([expert residency](docs/maintainer/qwen3_5-model.md#routed-expert-residency)). NVFP4
+  expert banks prefill through W4A4 and need a `120a` build.
 - **GGUF block formats.** Releases that pick a ggml type per tensor, such as ISTA-DASLab's GSQ-RCO,
   convert without requantization and multiply their blocks in place. The 3.5-bit Qwen3.8-27B IQ3_S
   release holds 10.95 GiB of weights instead of 15.9, scores WikiText-2 perplexity 7.071 (the
