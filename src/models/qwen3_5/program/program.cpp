@@ -703,12 +703,11 @@ MemorySummary Program::memory_summary() const noexcept { return impl_->memory_su
 ExpertResidencyStats Program::expert_residency_stats() const {
     ExpertResidencyStats out;
     if (!impl_->experts) { return out; }
-    const auto stats = impl_->experts->stats();
-    const auto& startup = impl_->expert_startup_stats;
-    out.routes = stats.pairs - startup.pairs;
-    out.hits = stats.pair_hits - startup.pair_hits;
-    out.admitted = stats.admissions - startup.admissions;
-    out.transferred_bytes = stats.copied_bytes - startup.copied_bytes;
+    const auto stats = impl_->experts->stats() - impl_->expert_startup_stats;
+    out.routes = stats.pairs;
+    out.hits = stats.pair_hits;
+    out.admitted = stats.admissions;
+    out.transferred_bytes = stats.copied_bytes;
     for (std::size_t rank = 0; rank < impl_->device.size(); ++rank) {
         out.slots += impl_->experts->memory(rank).cache_slots;
     }

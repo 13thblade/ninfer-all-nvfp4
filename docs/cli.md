@@ -246,7 +246,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--rope-scaling-original-context N` | the interpolation threshold | the native window |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--kv-headroom-mib N` | device memory in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto`. `--vram-headroom-mib` is accepted as an alias | `1024` |
-| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
+| `--prefill-chunk N` | text-prefill chunk, in multiples of 128 | `1024`; `4096` for native MoE experts in host memory or files |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see [pipeline stages](maintainer/pipeline-stages.md)); on the Qwen3.5 family MTP, DFlash, DFlash2 and resident or CPU Vision run across the stages (the Vision tower stays on the first device; `--vision-residency overlay` is refused); overrides `--device` | none |

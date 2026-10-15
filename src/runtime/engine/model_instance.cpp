@@ -627,6 +627,9 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     // Every later stage of startup checks its options against the ones the model was loaded with, so
     // the stage split is decided once, here, and carried in the options from then on.
     EngineOptions options = requested;
+    if (options.prefill_chunk == 0) {
+        options.prefill_chunk = options.expert_residency == ExpertResidency::Device ? 1024 : 4096;
+    }
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     // Shared so a suspendable model can keep its files open and upload the weights again on resume.
     const auto retained_reader = std::make_shared<artifact::Reader>(options.artifact_path);
@@ -709,20 +712,23 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         std::span<const std::size_t>(free_by_rank).subspan(1));
     std::unique_ptr<models::qwen3_5::execution::NativeExpertRuntime> experts;
     if (!instance->model->expert_sources().layers.empty()) {
-        // Price startup with the real allocations before the KV plan is finalized. The first
-        // resolution reserves the requested runtime/KV shape while automatic cache sizing runs.
+        // Price startup with the real allocations before the KV plan is finalized: the delivery
+        // keeps free what the runtime reserves (expert_admission.h decides how much KV that is),
+        // and automatic KV then resolves on what the cache left.
         std::vector<std::uint64_t> reserved{resolution.runtime_reservation_bytes};
         reserved.insert(reserved.end(), resolution.extra_rank_reservation_bytes.begin(),
                          resolution.extra_rank_reservation_bytes.end());
         const bool automatic_kv = options.kv_capacity.mode == KvCapacityMode::Automatic;
+        const std::uint64_t headroom =
+            automatic_kv ? options.kv_capacity.automatic_headroom_bytes : 0;
         const auto& curve = planner.capacity_curve();
         reserved[0] = models::qwen3_5::native_expert_runtime_reservation(
             automatic_kv, options.expert_cache_bytes, reserved[0],
-            curve.minimum_device_reservation_bytes);
+            curve.minimum_device_reservation_bytes) + headroom;
         for (std::size_t rank = 1; rank < reserved.size(); ++rank) {
             reserved[rank] = models::qwen3_5::native_expert_runtime_reservation(
                 automatic_kv, options.expert_cache_bytes, reserved[rank],
-                curve.extra_ranks[rank - 1].minimum_device_reservation_bytes);
+                curve.extra_ranks[rank - 1].minimum_device_reservation_bytes) + headroom;
         }
         experts = std::make_unique<models::qwen3_5::execution::NativeExpertRuntime>(
             *instance->model, device, reserved, options.expert_cache_bytes);

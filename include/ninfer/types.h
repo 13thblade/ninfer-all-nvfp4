@@ -612,7 +612,10 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
+    // Prompt tokens per prefill chunk; 0 is automatic: 1024, or 4096 for a native Qwen3.5-family MoE
+    // whose routed experts live in host memory or files (each chunk carries the whole expert bank
+    // across the bus once). Gemma 4 chooses its own chunk.
+    std::uint32_t prefill_chunk        = 0;
     // Decode rounds that run before a prefill chunk while other requests generate, proportionally
     // fewer (at least one) before a shorter prefill unit and more before a longer one. A decode
     // round takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves

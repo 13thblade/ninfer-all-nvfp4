@@ -114,7 +114,8 @@ int main() {
                                  std::optional<std::uint64_t>{0},
                                  std::optional<std::uint64_t>{1024}}) {
             const auto reserved = native_expert_runtime_reservation(automatic_kv, cache, 8192, 2048);
-            const auto expected = automatic_kv && cache && *cache > 0 ? 2048 : 8192;
+            // The cache comes first unless KV is explicit or the cache is turned off.
+            const auto expected = automatic_kv && (!cache || *cache > 0) ? 2048 : 8192;
             expect(reserved == std::uint64_t(expected),
                    "automatic/explicit KV and cache priority differs");
         }

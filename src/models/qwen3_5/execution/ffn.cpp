@@ -71,16 +71,18 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
                                 std::int32_t last, bool mtp, bool verify, bool wide_verification) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
     if (const auto* streamed = std::get_if<StreamedMoeParameters>(&parameters)) {
-        const auto rows = std::min(last, ops::detail::kSparseMoeStreamRows);
-        WorkspaceLayoutBuilder layout;
-        (void)ops::detail::allocate_sparse_moe_small_t_workspace(layout, rows);
-        (void)layout.alloc(DType::FP32, {2048, 9 * rows});
-        std::size_t bytes = layout.peak_bytes();
-        if (ops::detail::sparse_moe_uses_prefill(last, streamed->weights.routed_gate_up.qtype,
-                                                    streamed->weights.routed_down.qtype)) {
-            bytes = std::max(bytes, ops::detail::resolve_sparse_moe_prefill_plan(
-                last, streamed->weights.routed_gate_up.qtype,
-                streamed->weights.routed_down.qtype).workspace_bytes);
+        std::size_t bytes = 0;
+        for (const std::int32_t tokens : {first, last}) {
+            bytes = std::max(bytes, ops::detail::sparse_moe_stream_workspace_bytes(
+                                        tokens, streamed->weights.routed_gate_up.qtype,
+                                        streamed->weights.routed_down.qtype));
+        }
+        // Small-T grows with the column count up to the prefill frontier.
+        for (std::int32_t tokens = first; tokens <= std::min(last, ops::detail::kSparseMoeSmallTMax);
+             ++tokens) {
+            bytes = std::max(bytes, ops::detail::sparse_moe_stream_workspace_bytes(
+                                        tokens, streamed->weights.routed_gate_up.qtype,
+                                        streamed->weights.routed_down.qtype));
         }
         return bytes;
     }
@@ -169,39 +171,9 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
             throw std::invalid_argument("streamed SparseMoe needs contiguous BF16 [2048,T]");
         }
         auto& delivery = experts->layer(moe->delivery_layer);
-        const auto layer = experts->local_layer(moe->delivery_layer);
         delivery.check();
-        if (ops::detail::sparse_moe_uses_prefill(columns, moe->weights.routed_gate_up.qtype,
-                                                         moe->weights.routed_down.qtype)) {
-            const auto plan = ops::detail::resolve_sparse_moe_prefill_plan(
-                columns, moe->weights.routed_gate_up.qtype, moe->weights.routed_down.qtype);
-            const auto views = ops::detail::allocate_sparse_moe_prefill_workspace(
-                workspace, plan.slice_tokens, plan.nvfp4);
-            ops::detail::sparse_moe_stream_prefill(hidden, moe->weights, residual, plan, views,
-                                                   delivery, layer, stream);
-            return;
-        }
-        for (std::int32_t offset = 0; offset < columns; offset += ops::detail::kSparseMoeStreamRows) {
-            auto call_scope = workspace.scope();
-            const auto rows = std::min(columns - offset, ops::detail::kSparseMoeStreamRows);
-            const Tensor input = hidden.slice(1, offset, rows);
-            Tensor output = residual.slice(1, offset, rows);
-            const auto views = ops::detail::allocate_sparse_moe_small_t_workspace(workspace, rows);
-            Tensor products = workspace.alloc(DType::FP32, {2048, 9 * rows});
-            ops::detail::sparse_moe_stream_route(input, moe->weights.router_shared_gate, views, stream);
-            const auto split = delivery.begin(layer, static_cast<const std::int32_t*>(views.token_ids.data),
-                                                8 * rows, stream);
-            const auto* alpha = static_cast<const float*>(views.token_alpha.data);
-            const auto* shared = static_cast<const float*>(views.shared_scale.data);
-            auto* activations = static_cast<float*>(views.scratch.data);
-            auto* values = static_cast<float*>(products.data);
-            ops::detail::sparse_moe_stream_experts(input, moe->weights, delivery.tables(layer),
-                split.cached_ids, alpha, shared, activations, values, true, stream);
-            delivery.await(stream);
-            ops::detail::sparse_moe_stream_experts(input, moe->weights, delivery.tables(layer),
-                split.missing_ids, alpha, shared, activations, values, false, stream);
-            ops::detail::sparse_moe_stream_merge(values, output, stream);
-        }
+        ops::detail::sparse_moe_stream(hidden, moe->weights, residual, delivery,
+                                       experts->local_layer(moe->delivery_layer), workspace, stream);
         return;
     }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {

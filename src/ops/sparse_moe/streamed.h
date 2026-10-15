@@ -7,11 +7,19 @@
 
 namespace ninfer::ops::detail {
 
-// Narrow calls overlap cached arithmetic with delivery in eight-row waves. Grouped prefill
-// resolves at most all 256 experts once per bounded native slice, through the same raw tables.
-// Tables hold [gate/up code, high, scale, divisor, down ...][256].
-inline constexpr std::int32_t kSparseMoeStreamRows = 8;
+// SparseMoe over delivered routed experts: tables hold [gate/up code, high, scale, divisor,
+// down ...][256] per layer. One delivery call per slice: below the prefill frontier the Small-T
+// arithmetic runs the cached pairs while the rest arrive, then the missing ones; at and above it
+// the grouped prefill waits for the whole slice's experts (one call per bounded native slice).
 inline constexpr std::int32_t kSparseMoeStreamPairs = 8 * kSparseMoePrefillSliceMax;
+
+// Workspace of one streamed call of `tokens` columns.
+[[nodiscard]] std::size_t sparse_moe_stream_workspace_bytes(std::int32_t tokens, QType routed_gate_up,
+                                                            QType routed_down);
+void sparse_moe_stream(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
+                       ExpertDelivery& delivery, std::size_t layer, WorkspaceArena& workspace,
+                       cudaStream_t stream);
+
 void sparse_moe_stream_prefill(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
                                const SparseMoePrefillWorkspace& workspace, ExpertDelivery& delivery,

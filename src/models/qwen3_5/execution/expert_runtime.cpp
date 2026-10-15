@@ -21,7 +21,6 @@ NativeExpertRuntime::NativeExpertRuntime(const Model& model, DeviceContext& devi
         if (layers[rank].empty()) { continue; }
         ExpertDeliveryOptions options;
         options.pair_capacity = ops::detail::kSparseMoeStreamPairs;
-        options.active_capacity = 256;
         options.suspendable = model.weights_suspendable();
         if (cache_bytes) { options.cache_bytes = *cache_bytes / device.size(); }
         options.keep_free_bytes = expert_add(keep_free_by_rank[rank], 512ULL << 20);
@@ -63,13 +62,7 @@ std::uint64_t NativeExpertRuntime::device_backing_bytes() const noexcept {
 ExpertDeliveryStats NativeExpertRuntime::stats() const {
     ExpertDeliveryStats out;
     for (const auto& rank : ranks_) {
-        if (!rank) { continue; }
-        const auto s = rank->stats();
-        out.requests += s.requests; out.routes += s.routes; out.hits += s.hits;
-        out.misses += s.misses; out.evictions += s.evictions;
-        out.pairs += s.pairs; out.pair_hits += s.pair_hits; out.admissions += s.admissions;
-        out.read_bytes += s.read_bytes; out.copied_bytes += s.copied_bytes;
-        out.service_seconds += s.service_seconds;
+        if (rank) { out = out + rank->stats(); }
     }
     return out;
 }

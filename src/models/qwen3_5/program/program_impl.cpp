@@ -916,7 +916,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
             out.expert_cache_bytes += experts->memory(rank).cache_bytes;
         }
         const auto m = experts->memory(0);
-        const auto overhead = m.transient_bytes + m.metadata_bytes;
+        const auto overhead = m.bank_bytes + m.metadata_bytes;
         out.workspace.capacity_bytes += overhead;
         out.workspace.used_bytes += overhead;
         out.workspace.peak_used_bytes += overhead;
@@ -962,7 +962,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
                 const auto m = experts->memory(rank);
                 out.devices[rank].expert_cache_bytes = m.cache_bytes;
                 if (rank == 0) { continue; }
-                const auto overhead = m.transient_bytes + m.metadata_bytes;
+                const auto overhead = m.bank_bytes + m.metadata_bytes;
                 auto& workspace = out.devices[rank].workspace;
                 workspace.capacity_bytes += overhead;
                 workspace.used_bytes += overhead;

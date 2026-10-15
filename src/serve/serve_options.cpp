@@ -92,7 +92,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                8192)\n"
            "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
-           "                                (default 1024)\n"
+           "                                (default 1024; 4096 for native MoE experts\n"
+           "                                in host memory or files)\n"
            "  --decode-rounds-per-prefill N decode rounds after each prefill chunk while\n"
            "                                others generate (0: chunk / 64; 1 alternates)\n"
            "  --default-max-tokens N        output limit of a request that sets none\n"
@@ -1651,8 +1652,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
     }
-    if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
-        throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    if (options.prefill_chunk % 128 != 0) {
+        throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     if (options.unconstrained_response_format && options.structured_output) {
         throw std::invalid_argument(

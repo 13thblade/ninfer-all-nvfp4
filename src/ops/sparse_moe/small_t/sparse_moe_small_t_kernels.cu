@@ -290,8 +290,8 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 
 void sparse_moe_stream_route(const Tensor& x, const Weight& router,
                               const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
-    if (x.ne[1] < 1 || x.ne[1] > kSparseMoeStreamRows) {
-        throw std::invalid_argument("streamed SparseMoe supports one to eight rows per call");
+    if (x.ne[1] < 1 || x.ne[1] > kSparseMoeSmallTMax) {
+        throw std::invalid_argument("streamed SparseMoe routes one to 46 columns per call");
     }
     if (x.ne[1] == 1) {
         sparse_moe_stream_decode_route(x, router, workspace, stream);

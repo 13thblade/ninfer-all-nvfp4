@@ -862,16 +862,8 @@ public:
             weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens);
         if (streamed) {
             prepare_streaming(weights, cache_bytes);
-            WorkspaceLayoutBuilder layout;
-            const auto rows = std::min(tokens, ops::detail::kSparseMoeStreamRows);
-            (void)ops::detail::allocate_sparse_moe_small_t_workspace(layout, rows);
-            (void)layout.alloc(DType::FP32, {kHidden, 9 * rows});
-            workspace_bytes = layout.peak_bytes();
-            if (ops::detail::sparse_moe_uses_prefill(tokens, weights.routed_gate_up.qtype,
-                                                            weights.routed_down.qtype)) {
-                workspace_bytes = ops::detail::resolve_sparse_moe_prefill_plan(
-                    tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype).workspace_bytes;
-            }
+            workspace_bytes = ops::detail::sparse_moe_stream_workspace_bytes(
+                tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
         }
         WorkspaceArena workspace(workspace_bytes);
         const auto execute = [&](cudaStream_t stream) {
@@ -880,38 +872,7 @@ public:
                                 workspace, stream);
                 return;
             }
-            if (ops::detail::sparse_moe_uses_prefill(tokens, weights.routed_gate_up.qtype,
-                                                            weights.routed_down.qtype)) {
-                auto scope = workspace.scope();
-                const auto plan = ops::detail::resolve_sparse_moe_prefill_plan(
-                    tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
-                const auto views = ops::detail::allocate_sparse_moe_prefill_workspace(
-                    workspace, plan.slice_tokens, plan.nvfp4);
-                ops::detail::sparse_moe_stream_prefill(x, weights, destination, plan, views,
-                                                       *delivery_, 0, stream);
-                return;
-            }
-            for (int offset = 0; offset < tokens; offset += ops::detail::kSparseMoeStreamRows) {
-                auto scope = workspace.scope();
-                const int rows = std::min(tokens - offset, ops::detail::kSparseMoeStreamRows);
-                const auto input = x.slice(1, offset, rows);
-                auto output = destination.slice(1, offset, rows);
-                const auto views = ops::detail::allocate_sparse_moe_small_t_workspace(workspace, rows);
-                auto products = workspace.alloc(DType::FP32, {kHidden, 9 * rows});
-                ops::detail::sparse_moe_stream_route(input, weights.router_shared_gate, views, stream);
-                const auto call = delivery_->begin(0, static_cast<const int*>(views.token_ids.data),
-                                                     rows * 8, stream);
-                auto* act = static_cast<float*>(views.scratch.data);
-                auto* values = static_cast<float*>(products.data);
-                const auto* alpha = static_cast<const float*>(views.token_alpha.data);
-                const auto* shared = static_cast<const float*>(views.shared_scale.data);
-                ops::detail::sparse_moe_stream_experts(input, weights, delivery_->tables(0),
-                    call.cached_ids, alpha, shared, act, values, true, stream);
-                delivery_->await(stream);
-                ops::detail::sparse_moe_stream_experts(input, weights, delivery_->tables(0),
-                    call.missing_ids, alpha, shared, act, values, false, stream);
-                ops::detail::sparse_moe_stream_merge(values, output, stream);
-            }
+            ops::detail::sparse_moe_stream(x, weights, destination, *delivery_, 0, workspace, stream);
         };
 
         if (graph_replay) {
@@ -1050,7 +1011,6 @@ private:
         }
         ExpertDeliveryOptions options;
         options.pair_capacity = ops::detail::kSparseMoeStreamPairs;
-        options.active_capacity = 256;
         options.cache_bytes = cache_bytes;
         delivery_ = std::make_unique<ExpertDelivery>(stream_device_->rank(0),
             std::vector<std::filesystem::path>{}, std::vector<ExpertDeliveryLayer>{std::move(layer)}, options);
