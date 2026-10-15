@@ -61,16 +61,16 @@ upstream wiring gap.
 **Perplexity** (`ninfer-perplexity`, `perplexity-1m` `--quick`, kv int8, ctx 4096,
 artifact `qwen3.8-27b-quasar`, full-precision reporting):
 
-| Route   | PPL          | scoring tok/s |
-|---------|--------------|---------------|
-| a16     | 4.315016269  | 386.0 – 393.9 |
-| grouped | 4.314882867  | 667.8         |
-| mmq     | 4.314882867  | 655.9         |
-| mmvq    | 4.314882867  | 657.9         |
+| Route   | PPL         |
+|---------|-------------|
+| a16     | 4.315016269 |
+| grouped | 4.314882867 |
+| mmq     | 4.314882867 |
+| mmvq    | 4.314882867 |
 
 `grouped`, `mmq` and `mmvq` agree bit for bit, and all three sit **0.000133 below**
 the A16 reference rather than above it: the int8 kernels introduce no quality
-regression. int8 scores **~1.7×** faster than the A16 reference.
+regression. Throughput is reported only in the decode/prefill table below.
 
 **Decode / prefill.** Same artifact, same 4202-token prompt, `unified` route table,
 greedy, `--max-new 512`. Every row below is this build.
