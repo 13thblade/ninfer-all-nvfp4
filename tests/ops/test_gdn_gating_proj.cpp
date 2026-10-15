@@ -592,7 +592,7 @@ int verify_plan_across_sm_counts() {
     constexpr std::int32_t kWidths = 6000;
     // 82 SMs is the device the table was tuned on: where this device's occupancy holds a tuned
     // route there (every width on sm_86), the plan must keep it.
-    constexpr std::int32_t kSmCounts[] = {84, 82, 72, 68, 48, 40, 30};
+    constexpr std::int32_t kSmCounts[] = {84, 82, 72, 68, 48, 40, 30, 28};
     // The tuned occupancy, restated from the tuning notes: on an sm_86 part the compiled kernels
     // must still hold it, or the tuned table no longer fits the device it was tuned on.
     int device = 0, major = 0, minor = 0;
@@ -639,6 +639,23 @@ int verify_plan_across_sm_counts() {
             threw = true;
         }
         check(threw, std::string(g.label) + ": an over-large candidate was accepted");
+    }
+    // The fused 35B norm + gating route launches split 32 only where its grid is resident (an RTX
+    // 3060's 28 SMs hold 56 of its 64 CTAs); otherwise the norm runs first and the gating keeps
+    // its resident plan.
+    using NormId = ninfer::ops::detail::Bf16GdnNormGatingScheduleId;
+    for (const std::int32_t sms : kSmCounts) {
+        for (std::int32_t cols = 1; cols <= 64; ++cols) {
+            const auto plan = ninfer::ops::detail::bf16_gdn_norm_gating_resolve_plan(
+                {k35.heads, k35.rows, cols}, sms);
+            const std::string where = "35B norm gating: " + std::to_string(sms) + " SMs, " +
+                                      std::to_string(cols) + " columns";
+            const bool fused = cols <= 16 && grid_fits(k35, Id::MmaCooperativeSplit32, cols, sms);
+            check(plan.schedule == (fused ? NormId::MmaCooperativeSplit32 : NormId::Composed),
+                  where + " chose the wrong route");
+            check(grid_fits(k35, plan.control.schedule, cols, sms),
+                  where + " got a control grid that is not resident");
+        }
     }
     if (failures != 0) { std::cerr << failures << " gating plan failures\n"; }
     return failures;
