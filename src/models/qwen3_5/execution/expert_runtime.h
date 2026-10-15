@@ -16,6 +16,8 @@ public:
     [[nodiscard]] ExpertDeliveryMemory memory(std::size_t rank) const noexcept;
     [[nodiscard]] ExpertDeliveryStats stats() const;
     void check() const;
+    // Waits for every rank's delivery work, prefetches included.
+    void drain();
     void release_device_backing();
     void restore_device_backing();
     [[nodiscard]] std::uint64_t device_backing_bytes() const noexcept;

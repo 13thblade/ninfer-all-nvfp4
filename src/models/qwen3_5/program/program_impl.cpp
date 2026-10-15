@@ -653,7 +653,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
     create_hybrid_prefix_cache(startup_observer);
-    if (experts) { expert_startup_stats = experts->stats(); }
+    // Warm-up deliveries, the transport's asynchronous prefetches included, stay out of the
+    // request counters.
+    if (experts) {
+        experts->drain();
+        expert_startup_stats = experts->stats();
+    }
 }
 
 void ProgramImpl::synchronize_transfer_streams() const {

@@ -41,6 +41,9 @@ ExpertDeliveryMemory NativeExpertRuntime::memory(std::size_t rank) const noexcep
 void NativeExpertRuntime::check() const {
     for (const auto& rank : ranks_) { if (rank) { rank->check(); } }
 }
+void NativeExpertRuntime::drain() {
+    for (const auto& rank : ranks_) { if (rank) { rank->drain(); } }
+}
 void NativeExpertRuntime::release_device_backing() {
     for (const auto& rank : ranks_) { if (rank) { rank->release_device_backing(); } }
 }
