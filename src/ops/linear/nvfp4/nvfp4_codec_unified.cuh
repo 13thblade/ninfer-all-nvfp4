@@ -3,6 +3,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
+#include "ops/linear/nvfp4/nvfp4_e4m3_scale.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
@@ -11,6 +12,16 @@
 #include <cstdint>
 
 namespace ninfer::ops::detail::unified {
+
+// The ue4m3 scale table for the A16 decode path: expanded from the same list the int8 routes
+// use (nvfp4_e4m3_scale.h) and read as a 1KB constant table.  Over the reachable domain
+// 0x00..0x7E every entry is exactly half the vendor __nv_fp8x2_e4m3 value; both users in this
+// file compensate with a power-of-two fold (2^15), so every product stays bit-identical.  The
+// domain gate is machine-checked: 0x7E is the maximum stored scale byte across all 256 weight
+// planes of the production artifact (scan_scale_plane.py), and both chains are enumerated
+// bit-for-bit by lut_bitcheck.cu (0 mismatches in 47,625 combinations).
+__device__ constexpr float kNvfp4E4M3ScaleA16[256] = {
+    NINFER_E4M3_SCALE_LIST(NINFER_E4M3_SCALE_VALUE)};
 
 // E2M1 pair -> FP32 without the vendor conversion. The vendor __nv_fp4x2_e2m1 -> float2
 // conversion is outlined by ptxas on sm_86/sm_89 into a call with BSSY/BSYNC bookkeeping,
@@ -67,8 +78,13 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
     asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(result) : "r"(values), "r"(multiplier));
     return result;
 #else
-    const float2 values    = decode_nvfp4_e2m1x2(code);
-    const float multiplier = decode_nvfp4_e4m3(scale);
+    // E2M1 * E4M3 scale to a BF16 pair without either vendor conversion: the code side is the
+    // raw bit-trick expansion (e2m1 * 2^-14), the scale side is the ue4m3 table (exactly
+    // e4m3fn / 2 over the reachable domain) raised back by 2^15.  Both factors are power-of-two
+    // rescalings of exact values, so the product rounds once to the same bits the vendor pair
+    // produced (lut_bitcheck.cu is bit-exact over the full domain).
+    const float2 values    = decode_nvfp4_e2m1x2_raw(code);
+    const float multiplier = kNvfp4E4M3ScaleA16[scale] * 32768.0F;
 
     union {
         __nv_bfloat162 pair;
