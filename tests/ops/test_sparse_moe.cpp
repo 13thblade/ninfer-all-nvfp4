@@ -929,8 +929,8 @@ public:
             cuda_check(cudaEventDestroy(start), "destroy native Op timer");
             cuda_check(cudaEventDestroy(stop), "destroy native Op timer");
         }
-        int failures = verify_reduction(label, destination_storage.values(), reference,
-                                        profile_.criterion(tokens));
+        last_output_ = destination_storage.values();
+        int failures = verify_reduction(label, last_output_, reference, profile_.criterion(tokens));
         failures += destination_storage.verify_guards(label);
         failures +=
             verify_exact((label + " input preservation").c_str(),
@@ -1032,6 +1032,10 @@ private:
     quantized_weight::PackedWeight shared_up_host_;
     quantized_weight::PackedWeight shared_down_host_;
     std::vector<std::vector<double>> references_;
+
+public:
+    // The output of the last run, for placement comparisons at the same input.
+    std::vector<double> last_output_;
     std::unique_ptr<DeviceContext> stream_device_;
     std::vector<std::unique_ptr<PinnedHostBuffer>> stream_sources_;
     std::vector<std::uint64_t> stream_plane_sizes_;
@@ -1053,12 +1057,20 @@ int run_profile(const CodecProfile& profile, bool streamed = false) {
         if (streamed) {
             // A same-workload resident comparator, except NVFP4 where the prefill route changes
             // activation precision and an sm_86 build cannot execute it.
+            std::vector<double> resident;
             if (profile.routed_gate_up != QType::NVFP4) {
                 failures += fixture.run(tokens, index == 0 ? 1 : 0, tokens == 8 || tokens == 32);
+                resident = fixture.last_output_;
             }
             for (const std::uint64_t cache : {0ULL, 16ULL << 20, 128ULL << 20}) {
                 failures += fixture.run(tokens, index == 0 ? 1 : 0, tokens == 8 || tokens == 32,
                                           true, cache);
+                // Delivered experts run the resident arithmetic: the same bits at the same T.
+                if (!resident.empty() && fixture.last_output_ != resident) {
+                    std::cerr << profile.name << " T=" << tokens << " cache=" << cache
+                              << ": streamed output differs from resident\n";
+                    ++failures;
+                }
             }
         } else {
             failures += fixture.run(tokens, index == 0 ? 1 : 0,
@@ -1131,7 +1143,9 @@ int main(int argc, char** argv) {
         for (CodecProfile& profile : profiles) { profile.token_cases = kWideTokens; }
     }
 
-    constexpr std::array<std::int32_t, 11> stream_tokens{1, 2, 8, 9, 13, 32, 47, 64, 257, 768, 4097};
+    // One delivery call covers each call's columns: Small-T through its widest call (T=46 below
+    // the Q4 frontier), the Q8 frontier at T=20, and grouped slices beyond.
+    constexpr std::array<std::int32_t, 13> stream_tokens{1, 2, 8, 9, 13, 20, 32, 46, 47, 64, 257, 768, 4097};
     constexpr std::array<std::int32_t, 5> stream_nvfp4_small_tokens{1, 2, 8, 9, 12};
     if (streamed) {
         for (auto& profile : profiles) {
