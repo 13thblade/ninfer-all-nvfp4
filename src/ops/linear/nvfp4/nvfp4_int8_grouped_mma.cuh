@@ -21,6 +21,7 @@
 // ~45% MFU (measured), ~50-55% after the staging optimisations; the real-world expectation is
 // 30-45% MFU, the same staging-bound conclusion the A8 integer routes already live with.
 
+#include "ops/common/mma.cuh"  // sm70:: and sm75:: mma emulations, and the NINFER_SM70_DEVICE guard
 #include "ops/linear/common/output.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec_unified.cuh"
 #include "ops/linear/nvfp4/nvfp4_e4m3_scale.h"
@@ -302,10 +303,19 @@ __device__ __forceinline__ uint2 int8_lds64(const void* pointer) {
 
 __device__ __forceinline__ void mma_s8_k16(int& c0, int& c1, int& c2, int& c3, unsigned a0,
                                            unsigned a1, unsigned b0) {
+#if defined(NINFER_SM70_DEVICE)
+    sm70::mma_m16n8k16_s8(c0, c1, c2, c3, a0, a1, b0);
+#elif defined(NINFER_SM75)
+    // m16n8k16 splits into two m8n8k16 over the row halves: a0 is row g, a1 is row g+8 (the same
+    // contract mma_s8 uses for its k32 form), so the four accumulators pair up without reordering.
+    sm75::mma_s8_k16(c0, c1, a0, b0);
+    sm75::mma_s8_k16(c2, c3, a1, b0);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
                  "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                  : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
                  : "r"(a0), "r"(a1), "r"(b0));
+#endif
 }
 
 } // namespace detail
