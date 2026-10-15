@@ -555,22 +555,25 @@ float decode_e4m3fn(std::uint8_t code) {
 }
 
 std::uint8_t encode_e4m3fn_rne_satfinite(float value) {
+    static const auto positive = [] {
+        std::array<float, 127> values{};
+        for (std::size_t code = 0; code < values.size(); ++code) {
+            values[code] = decode_e4m3fn_positive(static_cast<std::uint8_t>(code));
+        }
+        return values;
+    }();
     const bool negative   = std::signbit(value);
     const float magnitude = std::abs(value);
     std::uint8_t selected = 0x7eU;
     if (magnitude < 448.0f) {
-        for (std::uint8_t upper = 1; upper <= 0x7eU; ++upper) {
-            const float upper_value = decode_e4m3fn_positive(upper);
-            if (upper_value < magnitude) continue;
-            const std::uint8_t lower = static_cast<std::uint8_t>(upper - 1);
-            const float lower_value  = decode_e4m3fn_positive(lower);
-            const float lower_error  = magnitude - lower_value;
-            const float upper_error  = upper_value - magnitude;
-            selected                 = lower_error < upper_error   ? lower
-                                       : upper_error < lower_error ? upper
-                                                                   : ((lower & 1U) == 0U ? lower : upper);
-            break;
-        }
+        const auto found = std::lower_bound(positive.begin() + 1, positive.end(), magnitude);
+        const auto upper = static_cast<std::uint8_t>(found - positive.begin());
+        const auto lower = static_cast<std::uint8_t>(upper - 1);
+        const float lower_error = magnitude - positive[lower];
+        const float upper_error = positive[upper] - magnitude;
+        selected = lower_error < upper_error   ? lower
+                   : upper_error < lower_error ? upper
+                                               : ((lower & 1U) == 0U ? lower : upper);
     }
     return static_cast<std::uint8_t>(selected | (negative ? 0x80U : 0U));
 }
@@ -779,25 +782,6 @@ void encode_nvfp4_rotated_row(std::span<const float> source, std::size_t source_
     }
 }
 
-std::vector<float> represent_f16_rotated_queries(const std::vector<float>& q,
-                                                 const Geometry& geometry, std::int32_t tokens) {
-    std::vector<float> represented(q.size(), 0.0f);
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        for (std::int32_t head = 0; head < geometry.q_heads; ++head) {
-            std::array<float, kHeadDim> rotated{};
-            for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                rotated[static_cast<std::size_t>(d)] = q[q_index(geometry, head, d, token)];
-            }
-            normalized_hadamard_d256(rotated);
-            for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                represented[q_index(geometry, head, d, token)] =
-                    round_to_f16(rotated[static_cast<std::size_t>(d)]);
-            }
-        }
-    }
-    return represented;
-}
-
 void encode_fp8_row(const std::array<float, kHeadDim>& values, std::vector<std::uint8_t>& codes,
                     std::size_t code_base, std::vector<std::uint16_t>& scales,
                     std::size_t scale_offset) {
@@ -835,28 +819,6 @@ void encode_fp8_rotated_row(std::span<const float> source, std::size_t source_ba
         represented_rotated[represented_base + static_cast<std::size_t>(d)] =
             decode_e4m3fn(codes[code_base + static_cast<std::size_t>(d)]) * represented_scale;
     }
-}
-
-std::vector<float> quantize_fp8_rotated_queries(const std::vector<float>& q,
-                                                const Geometry& geometry, std::int32_t tokens) {
-    std::vector<float> represented(q.size(), 0.0f);
-    std::vector<std::uint8_t> codes(static_cast<std::size_t>(kHeadDim));
-    std::vector<std::uint16_t> scales(1);
-    std::vector<float> row(static_cast<std::size_t>(kHeadDim));
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        for (std::int32_t head = 0; head < geometry.q_heads; ++head) {
-            for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                row[static_cast<std::size_t>(d)] = q[q_index(geometry, head, d, token)];
-            }
-            std::vector<float> decoded(static_cast<std::size_t>(kHeadDim));
-            encode_fp8_rotated_row(row, 0, codes, 0, scales, 0, decoded, 0);
-            for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                represented[q_index(geometry, head, d, token)] =
-                    decoded[static_cast<std::size_t>(d)];
-            }
-        }
-    }
-    return represented;
 }
 
 void encode_rotated_fp8_key_row(std::span<const float> source, std::size_t source_base,
@@ -1529,28 +1491,68 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
     std::vector<double> output(static_cast<std::size_t>(kHeadDim) *
                                static_cast<std::size_t>(geometry.q_heads) *
                                static_cast<std::size_t>(tokens));
-    if (cache.storage == KvCacheStorage::Nvfp4Group16 ||
+    if (cache.storage == KvCacheStorage::Fp8E4M3Row256 ||
+        cache.storage == KvCacheStorage::Nvfp4Group16 ||
         cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
-        const std::vector<float> q_represented =
-            cache.storage == KvCacheStorage::Fp8KeyNvfp4Value
-                ? quantize_fp8_rotated_queries(q, geometry, tokens)
-                : represent_f16_rotated_queries(q, geometry, tokens);
+        const int key_tokens = positions.back() + 1;
+        const std::size_t plane = static_cast<std::size_t>(geometry.kv_heads) * key_tokens * kHeadDim;
+        std::vector<double> keys(plane);
+        std::vector<double> values(plane);
+        // Decode the stored codes and scales independently. Reconstruct original coordinates in
+        // FP64, without reproducing transient query quantization or the kernel's staging casts.
+        // Each stored element is decoded once. Dimension-major V preserves serial key reduction
+        // order and keeps the long-context reference from repeating codec work for every query.
+        for (int head = 0; head < geometry.kv_heads; ++head) {
+            for (int position = 0; position < key_tokens; ++position) {
+                std::array<double, kHeadDim> key{};
+                std::array<double, kHeadDim> value{};
+                const std::size_t fp8_code =
+                    cache_index(geometry, cache.logical_capacity, head, position, 0);
+                const std::size_t fp8_scale =
+                    fp8_scale_index(geometry, cache.logical_capacity, head, position);
+                const std::size_t packed_code = logical_plane_index(
+                    kNvfp4CodeBytes, geometry, cache.logical_capacity, head, position, 0);
+                const std::size_t packed_scale = logical_plane_index(
+                    kNvfp4QuantGroups, geometry, cache.logical_capacity, head, position, 0);
+                for (int d = 0; d < kHeadDim; ++d) {
+                    const int shift = (d & 1) * 4;
+                    if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+                        key[d] = decode_e2m1((cache.k_nvfp4[packed_code + d / 2] >> shift) & 15U) *
+                                 decode_e4m3fn(cache.k_nvfp4_scale[packed_scale + d / 16]);
+                    } else {
+                        key[d] = decode_e4m3fn(cache.k_fp8[fp8_code + d]) *
+                                 f16_bits_to_f32(cache.k_scale[fp8_scale]);
+                    }
+                    if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
+                        value[d] = decode_e4m3fn(cache.v_fp8[fp8_code + d]) *
+                                   f16_bits_to_f32(cache.v_scale[fp8_scale]);
+                    } else {
+                        value[d] = decode_e2m1((cache.v_nvfp4[packed_code + d / 2] >> shift) & 15U) *
+                                   decode_e4m3fn(cache.v_nvfp4_scale[packed_scale + d / 16]);
+                    }
+                }
+                normalized_hadamard_d256(key);
+                if (cache.storage != KvCacheStorage::Fp8E4M3Row256) {
+                    normalized_hadamard_d256(value);
+                }
+                for (int d = 0; d < kHeadDim; ++d) {
+                    keys[(static_cast<std::size_t>(head) * key_tokens + position) * kHeadDim + d] =
+                        key[d];
+                    values[(static_cast<std::size_t>(head) * kHeadDim + d) * key_tokens + position] =
+                        value[d];
+                }
+            }
+        }
         naive_dense_softmax_attention(
-            op_geometry(geometry), tokens, positions.back() + 1,
-            static_cast<double>(kAttentionScale),
+            op_geometry(geometry), tokens, key_tokens, static_cast<double>(kAttentionScale),
             [&](int d, int head, int token) {
-                return static_cast<double>(q_represented[q_index(geometry, head, d, token)]);
+                return static_cast<double>(q[q_index(geometry, head, d, token)]);
             },
             [&](int d, int head, int position) {
-                const float represented = cache.rotated_k_quantized[cache_index(
-                    geometry, cache.logical_capacity, head, position, d)];
-                return static_cast<double>(cache.storage == KvCacheStorage::Nvfp4Group16
-                                               ? round_to_f16(represented)
-                                               : represented);
+                return keys[(static_cast<std::size_t>(head) * key_tokens + position) * kHeadDim + d];
             },
             [&](int d, int head, int position) {
-                return static_cast<double>(round_to_f16(cache.rotated_v_quantized[cache_index(
-                    geometry, cache.logical_capacity, head, position, d)]));
+                return values[(static_cast<std::size_t>(head) * kHeadDim + d) * key_tokens + position];
             },
             [&](int token, int position) {
                 return position <= positions[static_cast<std::size_t>(token)];
@@ -1558,18 +1560,6 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
             [&](int d, int head, int token, double value) {
                 output[q_index(geometry, head, d, token)] = value;
             });
-        for (std::int32_t token = 0; token < tokens; ++token) {
-            for (std::int32_t head = 0; head < geometry.q_heads; ++head) {
-                std::array<double, kHeadDim> row{};
-                for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    row[static_cast<std::size_t>(d)] = output[q_index(geometry, head, d, token)];
-                }
-                normalized_hadamard_d256(row);
-                for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    output[q_index(geometry, head, d, token)] = row[static_cast<std::size_t>(d)];
-                }
-            }
-        }
         return output;
     }
 
@@ -4076,6 +4066,50 @@ int verify_workspace_capacity_contract() {
 }
 
 } // namespace
+
+// Decode and four-column verification after short and long histories. The reference decodes
+// each stored KV format independently, then evaluates attention in FP64. Fragmented pages,
+// fused append, cached-only access and graph replay keep the state contract in this regression.
+int run_softmax_attention_quantized_depth_tests() {
+    if (cuda_unavailable()) return 77;
+    int failures = 0;
+    unsigned seed = 5300u;
+    for (const Geometry& geometry : kGeometries) {
+        for (const auto storage : {KvCacheStorage::Fp8E4M3Row256,
+                                   KvCacheStorage::Nvfp4Group16,
+                                   KvCacheStorage::Fp8KeyNvfp4Value}) {
+            for (const int depth : {8192, 61440}) {
+                for (const int width : {1, 4}) {
+                    std::cout << "quantized depth: heads=" << geometry.q_heads
+                              << " storage=" << static_cast<int>(storage)
+                              << " T=" << width << " context=" << depth << std::endl;
+                    const AttentionCase profile{width, depth,
+                                                static_cast<std::uint32_t>(depth + width),
+                                                seed++, false, true};
+                    failures += run_a1_case(geometry, storage, profile,
+                                            MappingPattern::Fragmented);
+                    failures += run_a3_case(geometry, storage, profile,
+                                            MappingPattern::Fragmented);
+                }
+            }
+        }
+        // Keep a broad captured envelope while the actual positions straddle split tiers and
+        // the cached-only grid crossover. The public values, cache effects and output criterion
+        // remain the same on both sides.
+        for (const int base : {8194, 8195, 16386, 16387, 30716, 30717}) {
+            std::cout << "quantized boundary: heads=" << geometry.q_heads
+                      << " T=4 context=" << base << " envelope=65536" << std::endl;
+            const AttentionCase profile{
+                4, base, 65536, static_cast<unsigned>(7300 + base + geometry.q_heads), false, true};
+            failures += run_a1_case(geometry, KvCacheStorage::Nvfp4Group16, profile,
+                                    MappingPattern::Fragmented);
+            failures += run_a3_case(geometry, KvCacheStorage::Nvfp4Group16, profile,
+                                    MappingPattern::Fragmented);
+        }
+    }
+    std::cout << (failures ? "FAIL" : "PASS") << " quantized depth causal attention\n";
+    return failures ? 1 : 0;
+}
 
 int run_softmax_attention_nvfp4_tests() {
     if (cuda_unavailable()) {

@@ -73,6 +73,9 @@ add_test(NAME ninfer_softmax_attention_nvfp4_test
 add_test(NAME ninfer_softmax_attention_k8v4_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --k8v4-only)
 
+add_test(NAME ninfer_softmax_attention_quantized_depth_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --quantized-depth-only)
+
 add_test(NAME ninfer_softmax_attention_rk4v4_e8_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --rk4v4-e8-only)
 add_test(NAME ninfer_softmax_attention_rk2v4_e8_test
@@ -94,6 +97,7 @@ add_test(NAME ninfer_softmax_attention_pack_gqa_test
 set_tests_properties(
   ninfer_softmax_attention_nvfp4_test
   ninfer_softmax_attention_k8v4_test
+  ninfer_softmax_attention_quantized_depth_test
   ninfer_softmax_attention_rk4v4_e8_test
   ninfer_softmax_attention_rk2v4_e8_test
   ninfer_softmax_attention_dflash2_test

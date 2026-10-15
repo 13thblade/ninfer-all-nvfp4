@@ -125,6 +125,14 @@ The variable-width DFlash2 target-attention subset can be run with
 cache codecs, W=2..16, B=1..8, request-local prefixes, cache effects, and Graph metadata/input
 updates. The default executable also runs the existing attention geometries and prefill tests.
 
+`--quantized-depth-only` checks FP8, NVFP4 and K8V4 after 8,192 and 61,440 context tokens,
+at one query column and four verification columns, for both D256 geometries. It compares
+append-and-attend and cached-only Graph execution over fragmented pages with independently decoded
+KV and the FP64 attention oracle. The existing format-specific error criteria and cache, input,
+guard and workspace checks apply.
+NVFP4 verification also straddles the 8K/16K split tiers and the cached-only grid crossover with
+a 65,536-key execution envelope, so the captured capacity does not stand in for actual positions.
+
 Linear tests are independently runnable by weight and activation-compute profile:
 
 ```bash
