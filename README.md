@@ -27,7 +27,7 @@ concurrent cohorts through **C8**.
 33 GiB of experts pinned in host RAM: **1.15-1.18x Strata's plain decode** (81 / 80 / 78 tok/s after
 a 1K / 8K / 32K prompt against 71 / 70 / 66), **109-113 tok/s with MTP** (the launcher default, same
 tokens as plain decoding; 102.6 after a 128K prompt, in a separate run with the context raised above this release's 32K default) and **2,345 tok/s prefill** at 4K, 1.23x Strata's,
-when the n-gram volume sits on NVMe. One request at a time, 32K context in this release. Details
+when the n-gram volume sits on NVMe. One request at a time by default (two lanes opt-in with `NINFER_CONCURRENCY=2`), 32K context in this release. Details
 [below](#qwen38-flash-next-preview).
 
 Re-measured on the v0.16.0 release binaries through `ninfer-serve` (2026-10-14, launcher flags, real
@@ -355,7 +355,7 @@ starts answering in 0.1 s instead of 11.7 s, and the next turn of that conversat
 ([measurements](docs/maintainer/flash-next-context-cache.md#measurements)). Checkpoints can also
 live on local disk (`--context-nvme-mib`, with RAM as their cache, or alone with
 `--host-context-mib 0`) and survive a restart (`--context-store DIR`, `NINFER_CONTEXT_STORE` in the
-launcher). Not yet: more than one lane. Measured on this RTX 3090 with a warm expert cache: decode
+launcher). One lane is the default; `NINFER_CONCURRENCY=2` opts into two (three or more are refused). Measured on this RTX 3090 with a warm expert cache: decode
 after 1K / 8K / 32K prompts is 108-109 / 111 / 112-113 tok/s with MTP and 81 / 80 / 78 without
 (Strata with MTP 105 / 112 / 107, plain 71 / 70 / 66); prefill is 2,345 / 2,422 / 2,372 tok/s at
 4K / 32K / 128K with the volume on NVMe (Strata 1,912 / 2,397 / 2,184). Re-run on 2026-10-13 on this
@@ -506,7 +506,7 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 | **Qwen3.8-27B** | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-27B-NInfer-3090/tree/d47f2732d369acaec76dc44228f67c72b081df2f) | 17.68 GiB | **Recommended.** Validated at C1–C8 with ReplaySSM. This fork's [3090 conversion](model-cards/Qwen3.8-27B-NInfer-3090/README.md): imatrix-weighted encoder, 4-bit embedding, 6-bit head. Carries vision, MTP and the DFlash2 bundle for `--spec dflash2` |
 | Qwen3.6-35B-A3B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6) | 21.23 GiB | Carries the DFlash bundle for `--spec dflash` |
 | Qwen3.6-27B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/tree/3e3d9a3951c452c1ca80bd7a2860c7f3bfc5a829) | 16.29 GiB | Supported with more runtime headroom |
-| Qwen3.8-Flash-Next (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090/tree/c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa) | 38.20 GiB in two files + 27.13 GiB n-gram volume | Windows, one request at a time, 64 GB RAM. This fork's [exact conversion](model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) of the GSQ-RCO IQ2_XS GGUF with the MTP drafter and vision tower. Keep the n-gram volume on NVMe |
+| Qwen3.8-Flash-Next (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090/tree/c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa) | 38.20 GiB in two files + 27.13 GiB n-gram volume | Windows, one request at a time (two lanes opt-in), 64 GB RAM. This fork's [exact conversion](model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) of the GSQ-RCO IQ2_XS GGUF with the MTP drafter and vision tower. Keep the n-gram volume on NVMe |
 
 `download-model qwen38-27b`, `qwen36-35b-a3b` or `qwen36-27b` (`.bat` on Windows, `.sh` on Linux)
 fetches the pinned revision into `models/` and verifies it. `download-model qwen38-flash-next`
@@ -788,7 +788,8 @@ and the design are in `docs/maintainer/pipeline-parallel-plan.md`.
 - The shared KV pool is fixed at startup and is not divided statically among request lanes.
 - This is bounded small-scale batching, not preemptive large-scale continuous batching.
 - Tool calls are returned to the client but are not executed by NInfer.
-- Qwen3.8-Flash-Next (preview) serves one request at a time with INT8 KV. It has been built and
+- Qwen3.8-Flash-Next (preview) serves one request at a time by default (`NINFER_CONCURRENCY=2` opts into two
+  lanes, a small gain on a burst of agent requests) with INT8 KV. It has been built and
   run on Windows only (Linux is neither built nor tested; its disk tier reads and writes one
   request at a time there).
 - This fork targets `sm_86`. NVFP4 A4, FP8 A8 and TMA *weight and activation* kernels require

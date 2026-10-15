@@ -10,7 +10,7 @@ rem   qwen38-27b        tuned (default), int8, c8   <- recommended
 rem   qwen36-35b-a3b    tuned (default)
 rem   qwen38-flash-next tuned (default)      <- Qwen3.8-Flash-Next from the IQ2_XS GGUF (preview)
 rem
-rem QWEN3.8-FLASH-NEXT: one request at a time, 32,768 tokens of context, INT8 KV, prefix reuse from
+rem QWEN3.8-FLASH-NEXT: one request at a time (NINFER_CONCURRENCY=2: two), 32,768 tokens of context, INT8 KV, prefix reuse from
 rem a 4 GiB Host cache (a conversation's next turn prefills only what is new; NINFER_PREFIX_CACHE=off
 rem turns it off, NINFER_HOST_CONTEXT_MIB sizes it, NINFER_CONTEXT_NVME_MIB adds a disk tier,
 rem NINFER_CONTEXT_STORE keeps it across restarts). MTP speculation (up to 3 drafts, 1.4x decode) is
@@ -164,7 +164,7 @@ rem no console to read from; that must not silently pick a model.
 echo Which model?
 echo   1  Qwen3.8-27B  (recommended)
 echo   2  Qwen3.6-35B-A3B
-echo   3  Qwen3.8-Flash-Next  (preview: one request at a time, 32K context)
+echo   3  Qwen3.8-Flash-Next  (preview: one request at a time, 32K context; NINFER_CONCURRENCY=2 for two)
 choice /c 123 /n /m "Choose 1, 2 or 3: "
 if errorlevel 255 exit /b 2
 if errorlevel 3 (
@@ -359,9 +359,10 @@ set "LABEL=C%CONCURRENCY%  ^|  %CONTEXT_WORD% %CONTEXT%  ^|  %KV_DTYPE% KV  ^|  
 goto :profile_tuned_common
 
 :profile_flash_next
-rem The only serving shape this release supports: one lane, INT8 KV. The step-down ladder does not
-rem apply (its refusals are another model's); a refusal here says what to change. PROFILE is
-rem renamed so the tuned profiles' cache and sampling notes are not printed for it.
+rem The serving shape this release supports: INT8 KV and one lane, or two (NINFER_CONCURRENCY=2: two
+rem requests decode in the same rounds; docs\maintainer\flash-next-plan.md has the measurements). The
+rem step-down ladder does not apply (its refusals are another model's); a refusal here says what to
+rem change. PROFILE is renamed so the tuned profiles' cache and sampling notes are not printed for it.
 set "LADDER=0"
 set "PROFILE=flash-next"
 set "CONTEXT=32768"
@@ -426,8 +427,16 @@ rem cache off. The unquoted set form keeps metacharacters in the path inert (as 
 set "STORE_ARGS="
 if /i "%FN_CACHE%"=="on" if not "%NINFER_CONTEXT_STORE%"=="" set STORE_ARGS=--context-store "%NINFER_CONTEXT_STORE%"
 if /i "%FN_CACHE%"=="on" if not "%NINFER_CONTEXT_STORE%"=="" if not "%NINFER_CONTEXT_STORE_MAX_GIB%"=="" set STORE_ARGS=%STORE_ARGS% --context-store-max-gib %NINFER_CONTEXT_STORE_MAX_GIB%
-set "PROFILE_ARGS=--max-concurrency 1 --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype int8 --prefill-chunk 1024 --max-pending-requests 16 --pending-timeout-ms 600000 %SPEC_ARGS% %FN_VISION_ARGS% %FN_CACHE_ARGS%"
-set "LABEL=one request  ^|  context %CONTEXT%  ^|  INT8 KV  ^|  %FN_INPUT%, %SPEC_LABEL%  ^|  %FN_CACHE_LABEL%"
+set "FN_LANES=1"
+if not "%NINFER_CONCURRENCY%"=="" set "FN_LANES=%NINFER_CONCURRENCY%"
+if not "%FN_LANES%"=="1" if not "%FN_LANES%"=="2" (
+  echo NINFER_CONCURRENCY must be 1 or 2 for Qwen3.8-Flash-Next, got %FN_LANES% 1>&2
+  exit /b 2
+)
+set "FN_LANES_LABEL=one request"
+if "%FN_LANES%"=="2" set "FN_LANES_LABEL=two requests at once"
+set "PROFILE_ARGS=--max-concurrency %FN_LANES% --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype int8 --prefill-chunk 1024 --max-pending-requests 16 --pending-timeout-ms 600000 %SPEC_ARGS% %FN_VISION_ARGS% %FN_CACHE_ARGS%"
+set "LABEL=%FN_LANES_LABEL%  ^|  context %CONTEXT%  ^|  INT8 KV  ^|  %FN_INPUT%, %SPEC_LABEL%  ^|  %FN_CACHE_LABEL%"
 if /i "%FN_VISION%"=="off" if "%NINFER_VISION%"=="" set "HINT=Images: convert with --mtp-gguf and --mmproj to qwen4exp-iq2xs-mtp-vision.ninfer (docs\weight-conversion.md); this launcher then uses it."
 if /i "%FN_VISION%"=="off" if "%NINFER_VISION%"=="" if not "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%qwen4exp-iq2xs-mtp-vision.ninfer" set "HINT=Images: qwen4exp-iq2xs-mtp-vision.ninfer is beside this model; clear NINFER_MODEL to use it."
 if /i "%SPEC%"=="none" if exist "%MODEL%" for %%F in ("%MODEL%") do if /i not "%%~nF"=="qwen4exp-iq2xs-mtp" if /i not "%%~nF"=="qwen4exp-iq2xs-mtp-vision" set "HINT=Faster decode: convert with --mtp-gguf to qwen4exp-iq2xs-mtp.ninfer (docs\weight-conversion.md); this launcher then uses it."
