@@ -51,7 +51,12 @@ public:
     std::vector<PendingWeight> weights;
 
 private:
+    // One device weight per distinct sign binding, however many Uses name it.
+    WeightId hadamard_signs(const artifact::Binding& binding, std::uint64_t width,
+                            const std::string& use);
+
     std::map<std::string, WeightId, std::less<>> parameters_;
+    std::map<std::string, WeightId, std::less<>> signs_;
 };
 
 [[nodiscard]] AttentionWeights bind_attention(Bindings& bindings, const TextConfig& config,
@@ -89,9 +94,11 @@ void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& 
 void apply_storage_trades(Bindings& bindings, const Config& config, const ModelWeights& weights,
                           const LoadOptions& options);
 // --vision-residency overlay: rank the device weights an exclusive Vision window may borrow.
-// `mtp_parameters` is the half-open WeightId index range registered by bind_mtp.
+// `mtp_parameters` and `draft_parameters` are the half-open WeightId index ranges registered by
+// bind_mtp and bind_draft.
 void apply_vision_overlay_placement(Bindings& bindings, const ModelWeights& weights,
-                                    std::pair<std::size_t, std::size_t> mtp_parameters);
+                                    std::pair<std::size_t, std::size_t> mtp_parameters,
+                                    std::pair<std::size_t, std::size_t> draft_parameters);
 // Byte ranges of the Vision groups inside the materialized pinned block.
 [[nodiscard]] VisionOverlayLayout vision_overlay_layout(const VisionWeights& weights,
                                                         std::span<const BoundWeight> bound,

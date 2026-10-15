@@ -288,8 +288,8 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                                   dimension(config.mask_token_id), ids, positions, stream);
         Tensor residual = work.alloc(DType::BF16, {dimension(target.hidden_size), width, batch});
         Tensor flat_residual = residual.view({dimension(target.hidden_size), columns});
-        ops::embedding(ids.view({columns}), state.execution.parameters.text.token_embedding,
-                       flat_residual, stream);
+        embed_tokens(ids.view({columns}), state.execution.parameters.text.token_embedding,
+                     state.execution.parameters.text.token_embedding_signs, flat_residual, stream);
         for (std::size_t layer_index = 0; layer_index < weights.layers.size(); ++layer_index) {
             const auto& layer = weights.layers[layer_index];
             nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
@@ -355,19 +355,23 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
             candidates.view({dimension(config.dflash2->selector_top_k), mask_columns});
         Tensor scores =
             work.alloc(DType::FP32, {dimension(config.dflash2->selector_top_k), mask_columns});
+        // A rotated head reads its own copy: the selector projection below takes the primal hidden.
         if (state.execution.proposal_head == ProposalHead::Full) {
+            const auto& head        = state.execution.parameters.draft->output_head;
+            const Tensor head_input = rotated_input(hidden, head.hadamard_signs, work, stream);
             ops::linear_topk(
-                hidden, state.execution.parameters.draft->output_head.weight,
+                head_input, head.weight,
                 dimension(state.execution.parameters.model.resources().public_token_count),
                 ids_flat, scores, work, stream);
         } else {
-            const auto& head = *state.execution.parameters.proposal;
+            const auto& head        = *state.execution.parameters.proposal;
+            const Tensor head_input = rotated_input(hidden, head.head.hadamard_signs, work, stream);
             if (head.token_ids) {
-                ops::linear_topk(hidden, head.head.weight, *head.token_ids, ids_flat, scores, work,
-                                 stream);
+                ops::linear_topk(head_input, head.head.weight, *head.token_ids, ids_flat, scores,
+                                 work, stream);
             } else {
                 ops::linear_topk(
-                    hidden, head.head.weight,
+                    head_input, head.head.weight,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     ids_flat, scores, work, stream);
             }
@@ -414,8 +418,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                                   state.execution.device.stream);
         Tensor residual =
             state.execution.work.alloc(DType::BF16, {dimension(target.hidden_size), columns});
-        ops::embedding(ids.view({columns}), state.execution.parameters.text.token_embedding,
-                       residual, state.execution.device.stream);
+        embed_tokens(ids.view({columns}), state.execution.parameters.text.token_embedding,
+                     state.execution.parameters.text.token_embedding_signs, residual,
+                     state.execution.device.stream);
 
         for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
             nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,

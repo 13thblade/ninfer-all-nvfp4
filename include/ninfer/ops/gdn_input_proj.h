@@ -45,9 +45,10 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
 
 /**
  * Policy-bearing split form. AllowA8Int admits the integer-activation route for the registered
- * Q4 [4096,5120] plus Q5 [12288,5120] pair at full prefill tiles (T a positive multiple of 128);
- * every other width, shape or policy takes the A16 schedules and needs no transient bytes. The
- * transient storage is sized by gdn_input_proj_split_workspace_capacity_bytes().
+ * Q4 [4096,5120] plus Q5 [12288,5120] pair at full prefill tiles (T a positive multiple of 128) and
+ * for the T2 pair of the same shapes at 1..192 tokens (the small-T kernel) and above (padded
+ * inside); every other width, shape or policy takes the A16 schedules. The transient storage is
+ * sized by gdn_input_proj_split_workspace_capacity_bytes().
  */
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
@@ -107,6 +108,24 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /**
+ * Two-parent snapshot capacity keyed by the parents' formats. The Q4/Q5 pair answers as the
+ * row-count query above; a T2 pair (ternary checkpoints, both parents T2_G128_FP16) projects every
+ * part through the T2 linear routes, so it adds its private projection planes to the materialized
+ * convolution path at every batch size.
+ */
+[[nodiscard]] std::size_t gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(
+    QType qk_qtype, QType value_z_qtype, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width);
+
+/**
+ * Policy-bearing two-parent snapshot capacity: a T2 pair adds the integer-activation planes its
+ * projections take under AllowA8Int; the Q4/Q5 pair answers as the query above.
+ */
+[[nodiscard]] std::size_t gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(
+    QType qk_qtype, QType value_z_qtype, LinearPolicy policy, std::int32_t batch_size,
+    std::int32_t min_width, std::int32_t max_width);
+
+/**
  * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8 snapshot
  * profile. `batch_size` is exact and the query covers every W in the inclusive width interval.
  * B=1 preserves the format-specific fused/materialized resolver; B=2..8 covers its aggregate
@@ -159,6 +178,19 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   cudaStream_t stream);
 
 /**
+ * Policy-bearing two-parent snapshot. The policy reaches a T2 pair's projections, which take the
+ * integer-activation routes under AllowA8Int (see the split gdn_input_proj); the Q4/Q5 pair runs as
+ * the form above. Size the workspace with the policy-bearing capacity query.
+ */
+void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
+                                  const Weight& value_z_weight, const Tensor& conv_weight,
+                                  Tensor& conv_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
+                                  cudaStream_t stream);
+
+/**
  * Single-parent form of gdn_input_proj_conv_snapshot. Registered parents are Q8_G32_FP16 RowSplit
  * [12288,2048], NVFP4 BlockScaleK16M128x4 [16384,5120], and FP8_E4M3FN_ROW_BF16 RowScale
  * [16384,5120], all in q/k/value/z row order. All policies permit Q8 A16. NVFP4 uses A16
@@ -197,6 +229,21 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /**
+ * Two-parent record capacity keyed by the parents' formats: zero for the Q4/Q5 pair, the private
+ * projection planes of every recorded column for a T2 pair.
+ */
+[[nodiscard]] std::size_t gdn_input_proj_split_conv_record_workspace_capacity_bytes(
+    QType qk_qtype, QType value_z_qtype, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width);
+
+/**
+ * Policy-bearing two-parent record capacity, as the snapshot query of the same form.
+ */
+[[nodiscard]] std::size_t gdn_input_proj_split_conv_record_workspace_capacity_bytes(
+    QType qk_qtype, QType value_z_qtype, LinearPolicy policy, std::int32_t batch_size,
+    std::int32_t min_width, std::int32_t max_width);
+
+/**
  * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8
  * record-producing profile. Fused and materialized A16 routes require no storage. AllowA4/AllowA8
  * returns only the activation-quantization workspace selected by this complete-Op route;
@@ -231,6 +278,18 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 const Tensor& initial_state_slots, Tensor& conv_record,
                                 Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                 WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Policy-bearing two-parent record, as the snapshot of the same form: records stay bit-identical
+ * to a snapshot run under the same policy.
+ */
+void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
+                                const Weight& value_z_weight, const Tensor& conv_weight,
+                                const Tensor& conv_states, const Tensor& valid_columns,
+                                const Tensor& initial_state_slots, Tensor& conv_record,
+                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                LinearPolicy policy, WorkspaceArena& workspace,
+                                cudaStream_t stream);
 
 /**
  * Single-parent record-producing form. Registered parents are Q8_G32_FP16 [12288,2048], NVFP4

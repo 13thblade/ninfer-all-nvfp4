@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/execution/rotation.h"
 
 #include "core/weight_view.h"
 
@@ -83,6 +84,31 @@ public:
                             [&] { return ops::prepare_linear_weight(model_.input(id)); });
     }
 
+    // A ternary output or proposal head takes the integer route at decode, verify and draft widths
+    // like the text projections (any row count of whole 64-row blocks at the hidden width).
+    LinearParameters head(WeightUseId id) const {
+        LinearParameters out = rotated_linear(id);
+        integer_route(out, {QType::T2_G128_FP16}, out.weight.n, 5120);
+        return out;
+    }
+
+    LinearParameters head(WeightId id) const {
+        LinearParameters out = rotated_linear(id);
+        integer_route(out, {QType::T2_G128_FP16}, out.weight.n, 5120);
+        return out;
+    }
+
+    // Sites whose execution rotates the activation of a Hadamard-rotated matrix.
+    LinearParameters rotated_linear(WeightId id) const {
+        return with_context(model_.weight(id).name,
+                            [&] { return ops::prepare_linear_weight(model_.rotated_input(id)); });
+    }
+
+    LinearParameters rotated_linear(WeightUseId id) const {
+        return with_context(model_.weight(id.parameter).name,
+                            [&] { return ops::prepare_linear_weight(model_.rotated_input(id)); });
+    }
+
     Tensor tensor(WeightId id) const {
         const auto& bound = model_.weight(id);
         return with_context(bound.name, [&] {
@@ -106,11 +132,12 @@ public:
         DenseParameters out{with_context(model_.weight(w.gate).name,
                                          [&] {
                                              return ops::prepare_linear_swiglu_weight(
-                                                 model_.input(w.gate), model_.input(w.up));
+                                                 model_.rotated_input(w.gate),
+                                                 model_.rotated_input(w.up));
                                          }),
-                            linear(w.down)};
-        integer_route(out.gate_up, {QType::Q4_G64_FP16}, 34816, 5120);
-        integer_route(out.down, {QType::Q4_G64_FP16, QType::Q5_G64_FP16}, 5120, 17408);
+                            rotated_linear(w.down)};
+        integer_route(out.gate_up, {QType::Q4_G64_FP16, QType::T2_G128_FP16}, 34816, 5120);
+        integer_route(out.down, {QType::Q4_G64_FP16, QType::Q5_G64_FP16, QType::T2_G128_FP16}, 5120, 17408);
         // --mlp-a8-decode is a separate verify-phase trade from --prefill-a8: it must admit the
         // decode route by this profile's own format/shape, not by whether prefill promotion
         // already ran, so the two flags stay orthogonal as documented.
@@ -152,12 +179,14 @@ public:
         out.post_attention_norm = tensor(w.post_attention_norm);
         out.ffn                 = ffn(w);
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
-            LinearParameters attention_output = linear(a->output);
-            integer_route(attention_output, {QType::Q4_G64_FP16, QType::Q5_G64_FP16}, 5120, 6144);
+            LinearParameters attention_output = rotated_linear(a->output);
+            integer_route(attention_output, {QType::Q4_G64_FP16, QType::Q5_G64_FP16, QType::T2_G128_FP16}, 5120, 6144);
             ops::ProjectionWeights attention_projection = ops::prepare_attn_input_proj_weights(
-                model_.input(a->query), model_.input(a->key), model_.input(a->gate),
-                model_.input(a->value));
+                model_.rotated_input(a->query), model_.rotated_input(a->key),
+                model_.rotated_input(a->gate), model_.rotated_input(a->value));
             integer_route_pair(attention_projection, QType::Q4_G64_FP16, 7168, QType::Q5_G64_FP16,
+                               7168, 5120);
+            integer_route_pair(attention_projection, QType::T2_G128_FP16, 7168, QType::T2_G128_FP16,
                                7168, 5120);
             out.mixer = AttentionParameters{std::move(attention_projection), tensor(a->query_norm),
                                             tensor(a->key_norm), std::move(attention_output)};
@@ -165,13 +194,15 @@ public:
                 prefetch(std::get<AttentionParameters>(out.mixer).projection, a->query);
         } else {
             const auto& g              = std::get<GdnWeights>(w.mixer);
-            LinearParameters gdn_output = linear(g.output);
-            integer_route(gdn_output, {QType::Q4_G64_FP16, QType::Q5_G64_FP16}, 5120, 6144);
+            LinearParameters gdn_output = rotated_linear(g.output);
+            integer_route(gdn_output, {QType::Q4_G64_FP16, QType::Q5_G64_FP16, QType::T2_G128_FP16}, 5120, 6144);
             ops::ProjectionWeights gdn_projection = ops::prepare_gdn_input_proj_weights(
-                model_.input(g.query), model_.input(g.key), model_.input(g.value),
-                model_.input(g.z));
+                model_.rotated_input(g.query), model_.rotated_input(g.key),
+                model_.rotated_input(g.value), model_.rotated_input(g.z));
             integer_route_pair(gdn_projection, QType::Q4_G64_FP16, 4096, QType::Q5_G64_FP16, 12288,
                                5120);
+            integer_route_pair(gdn_projection, QType::T2_G128_FP16, 4096, QType::T2_G128_FP16,
+                               12288, 5120);
             out.mixer = GdnParameters{
                 std::move(gdn_projection),
                 ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
@@ -217,7 +248,7 @@ public:
         out.key_norm    = tensor(a.key_norm);
         out.output      = linear(a.output);
         out.ffn         = ffn(w.layer);
-        out.output_head = linear(w.output_head_use);
+        out.output_head = head(w.output_head_use);
         return out;
     }
 
@@ -290,7 +321,7 @@ public:
         out.feature_projection = linear(w.feature_projection);
         out.context_norm       = tensor(w.context_norm);
         out.final_norm         = tensor(w.final_norm);
-        out.output_head        = linear(w.output_head_use);
+        out.output_head        = head(w.output_head_use);
         out.layers.reserve(w.layers.size());
         for (std::size_t i = 0; i < w.layers.size(); ++i) {
             out.layers.push_back(with_context(
@@ -335,7 +366,17 @@ Parameters::Parameters(const Model& source) : model(source) {
     const Prepare prepare(model);
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
-    text.output_head     = prepare.linear(w.text.output_head_use);
+    text.output_head     = prepare.head(w.text.output_head_use);
+    if (text.token_embedding.qtype == QType::T2_G128_FP16) {
+        // A ternary checkpoint stores its token table rotated by the same hidden-width signs as
+        // every 5120-wide input, the output head's among them; the table has no Use of its own.
+        if (!rotated(text.output_head.hadamard_signs) ||
+            text.output_head.hadamard_signs.ne[0] != text.token_embedding.k) {
+            throw std::invalid_argument(
+                "a T2 token embedding needs a rotated output head carrying the hidden-width signs");
+        }
+        text.token_embedding_signs = text.output_head.hadamard_signs;
+    }
     text.final_norm      = prepare.tensor(w.text.final_norm);
     text.rank_count = w.text.stages.stages();
     text.stage_begin.clear();
@@ -360,7 +401,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     }
     if (w.proposal) {
         proposal =
-            ProposalParameters{prepare.linear(w.proposal->head), std::nullopt, w.proposal->rows};
+            ProposalParameters{prepare.head(w.proposal->head), std::nullopt, w.proposal->rows};
         if (w.proposal->token_ids) { proposal->token_ids = prepare.tensor(*w.proposal->token_ids); }
     }
 }

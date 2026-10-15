@@ -317,6 +317,7 @@ group size、scale 类型和解码规则直接由该 codec 定义。
 | q5_g64_fp16 | Signed 5-bit codes，G64，FP16 multiplier |
 | q6_g64_fp16 | Signed 6-bit codes，G64，FP16 multiplier |
 | q8_g32_fp16 | Codes `[-127,127]`，G32，FP16 multiplier |
+| t2_g128_fp16 | Ternary codes `[-1,1]`，2-bit two's complement，G128，FP16 multiplier |
 | nvfp4 | E2M1 codes、G16 E4M3FN block scale、FP32 weight divisor |
 | fp8_e4m3fn_row_bf16 | E4M3FN codes，每行一个 BF16 multiplier |
 
@@ -332,7 +333,7 @@ Code 范围、特殊浮点值、舍入与精确重建按[数值合同](tensor-fo
 | 名称 | 当前允许的 format / shape | 对象对齐 |
 |---|---|---:|
 | contiguous_le_v1 | bf16/fp32/int32，rank 0..16 | 256 |
-| row_split_k128_v1 | q4_g64_fp16、q5_g64_fp16、q6_g64_fp16、q8_g32_fp16，正 rank-2 `[N,K]` | 256 |
+| row_split_k128_v1 | q4_g64_fp16、q5_g64_fp16、q6_g64_fp16、q8_g32_fp16、t2_g128_fp16，正 rank-2 `[N,K]` | 256 |
 | block_scale_k16_m128x4_v1 | nvfp4，`N%128=0`、`K%64=0` | 256 |
 | row_scale_v1 | fp8_e4m3fn_row_bf16，正 rank-2 `[N,K]` | 256 |
 | raw_bytes_v1 | Resource，非空字节串 | 1 |
@@ -450,6 +451,21 @@ Writer 为需要许可的 projection 使用位置写出明确结果。某个 enc
 该例的辅助对象为 `format=fp32, layout=contiguous_le_v1, shape=[]`，其数值按 consumer 要求
 检查为正且有限。也可用 Part 引用一个 FP32 向量中的单个元素，保留相同 scalar 含义。
 Auxiliary Binding 的期望 shape、类型和作用由对应使用合同定义。
+
+`hadamard_signs` 标记 Hadamard 旋转的矩阵：Binding 为 `format=bf16, layout=contiguous_le_v1,
+shape=[K]`，K 为该 parameter 的输入宽度且是 1024 的倍数，元素为 +1 或 -1。该用途把存储的矩阵
+乘以 `hadamard_transform(input, signs)`（每个 1024 块先逐元素乘符号，再做归一化 Sylvester
+Walsh-Hadamard 变换）而不是原始输入。同一向量可被任意多个用途引用，loader 只绑定一次。
+执行层只在支持旋转的输入位置接受它；其余位置遇到该辅助输入时拒绝加载。
+
+```json
+{
+  "parameter": "text/layers/0/mlp/down",
+  "input": "text/layers/0/mlp/product",
+  "activation_policy": "A16Only",
+  "auxiliaries": {"hadamard_signs": {"object": "w.hadamard.signs_17408"}}
+}
+```
 
 DFlash/DFlash2 的 query K/V 使用 `attention/key`、`attention/value`，context K/V 使用
 `attention/context_key`、`attention/context_value`，各自建立 Binding 和 Use。

@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .methods import import_encoded
 from .model import Parameter
 from .recipe import Recipe
 from .sources.logical import array_source, gather_source
@@ -62,6 +63,8 @@ def add_proposal(
         total[: model.token_count], rows, model.special_token_ids
     )
     ids = torch.from_numpy(selected).to(torch.int32)
+    derived = source is None
+    encoded = None
     if source is None:
         selections = recipe.selections["text/output_head"]
         if len(selections) != 1:
@@ -69,6 +72,10 @@ def add_proposal(
                 "provide a proposal source when the main head uses split sources"
             )
         source = selections[0].source
+        # A head imported in its source's own encoding (a ternary checkpoint's T2 rows) lends the
+        # proposal those exact rows in the same encoding.
+        if selections[0].method is import_encoded:
+            encoded = selections[0].format
     head = gather_source(source, ids)
     inputs = tuple(
         component + "/final_hidden"
@@ -92,15 +99,35 @@ def add_proposal(
     )
     recipe.add_parameter("proposal/head")
     recipe.add_parameter("proposal/token_ids")
-    recipe.assign("proposal/head", format=format, method="grouped_absmax")
+    if encoded is not None:
+        recipe.assign("proposal/head", format=encoded, method=import_encoded)
+    else:
+        recipe.assign("proposal/head", format=format, method="grouped_absmax")
+    if derived:
+        # Rows gathered from a Hadamard-rotated head keep that head's input rotation.
+        signs = next(
+            (
+                value
+                for (parameter, _, role), value in recipe.auxiliary_overrides.items()
+                if parameter == "text/output_head" and role == "hadamard_signs"
+            ),
+            None,
+        )
+        if signs is not None:
+            for input_name in inputs:
+                recipe.use(
+                    "proposal/head", input_name, auxiliaries={"hadamard_signs": signs}
+                )
 
 
 def add_official_proposal(
     recipe: Recipe, *, ranking=DEFAULT_RANKING, rows=131072
 ) -> None:
-    add_proposal(
-        recipe,
-        ranking=ranking,
-        rows=rows,
-        source=recipe.model.parameters["text/output_head"].source,
-    )
+    # The rows the output head is converted from: the recipe's own source when it selected one (a
+    # ternary checkpoint's head), the base checkpoint's head otherwise.
+    base = recipe.model.parameters["text/output_head"].source
+    selections = recipe.selections["text/output_head"]
+    if len(selections) == 1 and selections[0].source is not base:
+        add_proposal(recipe, ranking=ranking, rows=rows)
+        return
+    add_proposal(recipe, ranking=ranking, rows=rows, source=base)
