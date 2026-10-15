@@ -136,14 +136,14 @@ __device__ __forceinline__ void load_nvfp4_coefficients(
 #pragma unroll
         for (int group = 0; group < kGroupsPerLane; ++group) {
             const auto scale    = static_cast<std::uint8_t>(word >> (8 * (first_byte + group)));
-            coefficients[group] = decode_nvfp4_e4m3(scale) * coefficient_gain;
+            coefficients[group] = kNvfp4E4M3ScaleA16[scale] * coefficient_gain;
         }
     } else {
 #pragma unroll
         for (int group = 0; group < kGroupsPerLane; ++group) {
             const std::uint8_t scale =
                 scales[nvfp4_scale_offset<Geometry>(parent_row, group_begin + group)];
-            coefficients[group] = decode_nvfp4_e4m3(scale) * coefficient_gain;
+            coefficients[group] = kNvfp4E4M3ScaleA16[scale] * coefficient_gain;
         }
     }
 }
@@ -264,7 +264,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
         parent[r] = nvfp4_a16_parent_row<Schedule>(block, local0 + r, rows, policy);
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
-    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, alpha * 16384.0F, parent,
+    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared,
+                                           alpha * 32768.0F,  // folds the decoder's 2^14 rescale and the table's half scale (bit-exact)
+                                           parent,
                                            local0, lane, accumulators);
     float totals[Schedule::kRowsPerWarp];
 #pragma unroll

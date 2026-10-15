@@ -47,7 +47,7 @@ __global__ __launch_bounds__(
 
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
     compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared,
-                                           inverse_weight_divisor * 16384.0F,  // folds the decoder's 2^14 rescale (bit-exact)
+                                           inverse_weight_divisor * 32768.0F,  // folds the decoder's 2^14 rescale and the table's half scale (bit-exact)
                                            parent_rows, warp * Schedule::kRowsPerWarp, lane,
                                            accumulators);
 
