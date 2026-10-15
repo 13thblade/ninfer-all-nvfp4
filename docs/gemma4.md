@@ -506,15 +506,34 @@ dominate a small one. A follow-up turn over the same picture reuses it without e
 
 ## Expert residency
 
-`--expert-residency device` keeps the routed GGUF banks on the GPU. `host` keeps those banks in pinned host memory. `disk` leaves them in the artifact files and reads selected experts through the OS page cache. Both offload modes execute all expert arithmetic on the GPU. They preserve top-8 GeGLU, the 704-wide middle, and the dense branch and sandwich norms.
+`--expert-residency device` keeps the routed GGUF banks on the GPU. `host` keeps them in pinned host
+memory and `disk` in the artifact's files, read through the OS page cache. Both run all expert
+arithmetic on the GPU with the resident kernels and outputs: top-8 GeGLU, the 704-wide middle, the
+dense branch and the sandwich norms. A 12 GB card runs the model this way; the GPU holds 1.7 GiB of
+other weights instead of 13.7 GiB.
 
 ```sh
-ninfer /models/gemma4.ninfer --expert-residency host --expert-cache-mib 1024
+ninfer /models/gemma4.ninfer --expert-residency host
 ninfer /models/gemma4.ninfer --expert-residency disk --expert-cache-mib 0
 ```
 
-The cache budget controls persistent device slots. A separate bounded transient workspace fits one layer's experts, including wide prefill. Cache `0` uses only that workspace. Each slot preserves the `gate`, `up`, `gate_up` and `down` aliases and a zero tail after each physical blob. The loader keeps the stored GGUF representation and does not repack it.
+Experts reach the GPU through the shared transport (`core/expert_delivery`):
 
-Vector decode and verification execute cached pairs while DMA serves misses. Both disjoint sets add to one fixed-point sum. Wide prefill waits for delivery before the existing matrix path. The assistant itself is dense; its target verification uses the same delivery path as ordinary decode. Intermediate prompt chunks keep the existing completion event for the pinned token buffer.
+- **Layer banks.** An expert missing from the cache lands in a whole-layer bank laid out like the
+  resident bank, each expert at its index, so consecutive experts arrive in one copy. Two banks let
+  the next layer of a prompt chunk arrive while the current one computes (one bank where memory is
+  short). Each prompt chunk needs nearly every expert of every layer, so host and disk prompts start
+  at 4096-token chunks: the whole expert bank crosses the bus once per chunk.
+- **Cache.** `--expert-cache-mib` (default: what is free after startup) holds the experts with the
+  most decayed routes. Decode admits its misses over clearly colder cached experts; a prompt chunk
+  promotes its hottest experts from the bank by device copies and never evicts in bulk, so a long
+  prompt does not flush decode's working set. `0` keeps the banks only.
+- **Calls.** Vector decode and verification run the cached pairs while the rest arrive, then the
+  rest; both add to one fixed-point sum, so outputs equal resident execution bit for bit. Prompt
+  chunks wait for their experts and run the existing matrix path.
 
-Startup diagnostics report persistent cache, transient workspace, metadata and pinned delivery buffers separately. Runtime expert counters start at zero after warmup and report token–expert pairs, cache hits, admissions and transferred bytes for requests. Disk uses two bounded pinned transfer halves and creates no additional application RAM cache. These modes trade GPU weight capacity for host/file reads and DMA. Their throughput depends on cache coverage, PCIe and storage. Flash-Next CPU/hybrid/profile flags do not apply. Gemma model suspend remains unsupported, as in the resident baseline.
+The loader keeps the stored GGUF blocks; nothing is repacked. Startup diagnostics report the cache,
+the layer banks, metadata and pinned buffers; runtime expert counters start at zero after warm-up.
+Disk residency uses two bounded pinned transfer halves and no application RAM cache. Flash-Next's
+CPU, hybrid and profile options do not apply. Gemma model suspend is unsupported, as with resident
+experts.
