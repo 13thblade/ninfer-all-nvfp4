@@ -118,7 +118,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void rmsnorm_nv
 
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
     compute_nvfp4_rows<Geometry, Schedule>(reinterpret_cast<const __nv_bfloat16*>(staged), codes,
-                                           scales, gemv_shared, inverse_weight_divisor, parent_rows,
+                                           scales, gemv_shared,
+                                           inverse_weight_divisor * 16384.0F,  // folds the decoder's 2^14 rescale (bit-exact)
+                                           parent_rows,
                                            flat_row0, lane, accumulators);
 
 #pragma unroll
