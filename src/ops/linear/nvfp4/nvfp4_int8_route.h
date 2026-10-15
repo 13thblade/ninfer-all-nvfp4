@@ -1,15 +1,27 @@
 #pragma once
 
-// The NVFP4 GEMM paths on hardware without native FP4 tensor cores (sm_86 / sm_89): three
-// standalone routes, named one at a time.
+// The NVFP4 GEMM paths on hardware without native FP4 tensor cores (sm_86 / sm_89): named one at a
+// time. `mmvq` is one route over two widths rather than one kernel: below llama.cpp's tensor-core
+// crossover it runs the MMVQ-shaped mainloop, above it the MMQ mainloop, exactly the division of
+// labour `ggml_cuda_should_use_mmvq` makes. It exists so the narrow half of the width ladder is
+// measurable as its own thing instead of being hidden inside whichever wide-kernel answers.
 //
 // There used to be a fourth answer, and it was not a route: the dispatcher compared the call's
 // token count against the int8 mainloop's whole-128-token-tile admission and fell through to the
 // A16 (BF16 MMA / SIMT) family for every other width, while the MMQ mainloop was a nested switch
-// *inside* that int8 branch. That hybrid cascade is gone. Each of the three paths is now selected
-// outright and served at every width, because a same-geometry A/B is impossible while one of them
-// is a function of the other's refusal -- and, in the other direction, a route that never got taken
-// reads as a route that made no difference.
+// *inside* that int8 branch. That hybrid cascade is gone. Each of the three paths is selected
+// outright and served above the crossover, because a same-geometry A/B is impossible while one of
+// them is a function of the other's refusal -- and, in the other direction, a route that never got
+// taken reads as a route that made no difference.
+//
+// The crossover itself is now a property of the int8 family rather than of the name `mmvq`:
+// `mmvq::applies` claims T <= 8 whichever route is named, so `grouped` and `mmq` differ only from
+// nine columns up. This is not the deleted cascade coming back -- nothing falls through to A16 on a
+// width, and every int8 route still answers every width. What it does cost is the ability to A/B the
+// two MMA mainloops against each other *at decode widths*: the §15.5 decode column (grouped 18.7 /
+// mmq 26.5 / mmvq 36.8 tok/s) is history, not a reproducible pair of arms. What it buys is that
+// decode has one implementation, and that the kernel reading each weight byte exactly once -- rather
+// than staging a J-token tile for a single column -- is what answers there, as it does upstream.
 //
 // Unset resolves to A16, the upstream implementation, which is the shipping default: the int8
 // mainloops pad their token tile up to 128 (nvfp4_int8_padded_tokens), so a forced int8 route at
@@ -29,8 +41,9 @@ namespace ninfer::ops::detail {
 
 enum class Nvfp4GemmRoute : std::int8_t {
     A16,     ///< The BF16 MMA / SIMT family. Resolved when the environment names nothing.
-    Grouped, ///< The int8-grouped mainloop, at every token count.
-    Mmq,     ///< The ggml-shaped MMQ mainloop, at every token count.
+    Grouped, ///< The int8-grouped mainloop above the crossover; T <= 8 goes to the row-form kernel.
+    Mmq,     ///< The ggml-shaped MMQ mainloop above the crossover; same narrow-band exception.
+    Mmvq,    ///< ggml's width ladder: MMVQ up to 8 columns, MMQ above it.
 };
 
 inline const char* to_string(Nvfp4GemmRoute route) {
@@ -38,6 +51,7 @@ inline const char* to_string(Nvfp4GemmRoute route) {
         case Nvfp4GemmRoute::A16: return "a16";
         case Nvfp4GemmRoute::Grouped: return "grouped";
         case Nvfp4GemmRoute::Mmq: return "mmq";
+        case Nvfp4GemmRoute::Mmvq: return "mmvq";
     }
     return "?";
 }
@@ -63,8 +77,8 @@ inline bool iequals(const char* lhs, const std::string& rhs) {
 [[noreturn]] inline void reject(const std::string& value) {
     throw std::invalid_argument(
         "NINFER_NVFP4_GEMM: unrecognised route '" + value +
-        "'; expected one of a16|grouped|mmq. Note that in cmd.exe a trailing space is part of the "
-        "value -- write set \"NINFER_NVFP4_GEMM=grouped\" or use PowerShell's $env:.");
+        "'; expected one of a16|grouped|mmq|mmvq. Note that in cmd.exe a trailing space is part of "
+        "the value -- write set \"NINFER_NVFP4_GEMM=grouped\" or use PowerShell's $env:.");
 }
 
 // -1: nothing forced; otherwise the forced route, plus one. Same shape as the route table's
@@ -121,6 +135,7 @@ inline Nvfp4GemmRoute nvfp4_gemm_route() {
         }
         if (route_detail::iequals("a16", value)) { return Nvfp4GemmRoute::A16; }
         if (route_detail::iequals("grouped", value)) { return Nvfp4GemmRoute::Grouped; }
+        if (route_detail::iequals("mmvq", value)) { return Nvfp4GemmRoute::Mmvq; }
         if (route_detail::iequals("mmq", value) || value == "1") {
             // "1" is the legacy spelling of the MMQ switch, kept so existing A/B scripts still work.
             return Nvfp4GemmRoute::Mmq;
@@ -141,7 +156,8 @@ inline void validate_nvfp4_gemm_env() {
     if (raw == nullptr || raw[0] == '\0') { return; }
     const std::string value(raw);
     if (route_detail::iequals("a16", value) || route_detail::iequals("grouped", value) ||
-        route_detail::iequals("mmq", value) || value == "1") {
+        route_detail::iequals("mmq", value) || route_detail::iequals("mmvq", value) ||
+        value == "1") {
         return;
     }
     if (route_detail::iequals("default", value) || route_detail::iequals("cascade", value)) {
@@ -158,7 +174,8 @@ inline void validate_nvfp4_gemm_env() {
 /// running the A16 family.
 inline bool nvfp4_gemm_route_forces_int8() {
     const Nvfp4GemmRoute route = nvfp4_gemm_route();
-    return route == Nvfp4GemmRoute::Grouped || route == Nvfp4GemmRoute::Mmq;
+    return route == Nvfp4GemmRoute::Grouped || route == Nvfp4GemmRoute::Mmq ||
+           route == Nvfp4GemmRoute::Mmvq;
 }
 
 } // namespace ninfer::ops::detail

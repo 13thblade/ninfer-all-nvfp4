@@ -6,6 +6,7 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_int8_grouped_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_mmq_launch.cuh"
+#include "ops/linear/nvfp4/nvfp4_mmvq_launch.cuh"
 
 #include <cuda_bf16.h>
 
@@ -93,7 +94,10 @@ void nvfp4_linear_swiglu_int8_grouped_launch(const Tensor& x, const Weight& weig
     // Two projections read the same activations, so the plane is quantised once: interleaved
     // (four FP32 scales then 128 s8 codes per token per 128-column window) for the MMQ mainloop,
     // two separated planes for the grouped one. Both cost K + K/8 bytes per token.
-    const bool mmq_route = mmq::select(kCols, tokens);
+    const bool mmq_route  = mmq::select(kCols, tokens);
+    // Below the crossover the MMVQ-shaped mainloop reads these same two planes, so it needs no
+    // second quantisation pass and none of the interleaved form's routing.
+    const bool mmvq_route = mmvq::select(tokens);
     DeviceSpan codes;
     DeviceSpan scales;
     if (mmq_route) {
@@ -123,31 +127,34 @@ void nvfp4_linear_swiglu_int8_grouped_launch(const Tensor& x, const Weight& weig
     const auto* weight_scales = static_cast<const std::uint8_t*>(weight.scales);
     const auto* x_codes       = reinterpret_cast<const std::int8_t*>(codes.data);
     const auto* x_scales      = reinterpret_cast<const float*>(scales.data);
-    const dim3 grid(kOut / 128, padded / 128);
 
     const LinearF32Output gate_output{reinterpret_cast<float*>(gate_plane.data), kOut};
-    if (mmq_route) {
-        mmq::launch<128, LinearF32Output>(weight_codes, weight_scales, x_codes, alpha, gate_output,
-                                          kCols, tokens, kOut, stream);
-        const LinearBf16GateSiluOutput up_output{static_cast<__nv_bfloat16*>(out.data), kOut,
-                                                reinterpret_cast<const float*>(gate_plane.data),
-                                                kOut};
-        mmq::launch<128, LinearBf16GateSiluOutput>(weight_codes + kHalfCodeBytes,
-                                                   weight_scales + kHalfScaleBytes, x_codes, alpha,
-                                                   up_output, kCols, tokens, kOut, stream);
+    const LinearBf16GateSiluOutput up_output{static_cast<__nv_bfloat16*>(out.data), kOut,
+                                            reinterpret_cast<const float*>(gate_plane.data), kOut};
+    if (mmvq_route) {
+        mmvq::launch<LinearF32Output>(weight_codes, weight_scales, x_codes, x_scales, alpha,
+                                      gate_output, kCols, tokens, kOut, stream);
+        mmvq::launch<LinearBf16GateSiluOutput>(weight_codes + kHalfCodeBytes,
+                                               weight_scales + kHalfScaleBytes, x_codes, x_scales,
+                                               alpha, up_output, kCols, tokens, kOut, stream);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    nvfp4_int8_grouped_kernel<LinearF32Output>
-        <<<grid, detail::kInt8Threads, nvfp4_int8_grouped_smem_bytes(), stream>>>(
-            weight_codes, weight_scales, x_codes, x_scales, alpha, gate_output, kCols, tokens);
-
-    const LinearBf16GateSiluOutput up_output{static_cast<__nv_bfloat16*>(out.data), kOut,
-                                            reinterpret_cast<const float*>(gate_plane.data), kOut};
-    nvfp4_int8_grouped_kernel<LinearBf16GateSiluOutput>
-        <<<grid, detail::kInt8Threads, nvfp4_int8_grouped_smem_bytes(), stream>>>(
-            weight_codes + kHalfCodeBytes, weight_scales + kHalfScaleBytes, x_codes, x_scales,
-            alpha, up_output, kCols, tokens);
+    if (mmq_route) {
+        mmq::launch<LinearF32Output>(weight_codes, weight_scales, x_codes, alpha, gate_output, kCols,
+                                     tokens, kOut, stream);
+        mmq::launch<LinearBf16GateSiluOutput>(weight_codes + kHalfCodeBytes,
+                                              weight_scales + kHalfScaleBytes, x_codes, alpha,
+                                              up_output, kCols, tokens, kOut, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    nvfp4_int8_grouped_launch<LinearF32Output>(weight_codes, weight_scales, x_codes, x_scales, alpha,
+                                               gate_output, kCols, tokens, kOut, stream);
+    nvfp4_int8_grouped_launch<LinearBf16GateSiluOutput>(weight_codes + kHalfCodeBytes,
+                                                        weight_scales + kHalfScaleBytes, x_codes,
+                                                        x_scales, alpha, up_output, kCols, tokens,
+                                                        kOut, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail::unified

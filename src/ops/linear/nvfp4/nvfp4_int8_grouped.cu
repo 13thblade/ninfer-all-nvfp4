@@ -10,6 +10,7 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_int8_grouped_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_mmq_launch.cuh"
+#include "ops/linear/nvfp4/nvfp4_mmvq_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_shapes_unified.h"
 
 #include <cuda_bf16.h>
@@ -42,7 +43,10 @@ void nvfp4_linear_int8_grouped_launch(const Tensor& x, const Weight& weight, Ten
     // 128-column window), the grouped mainloop the two separated planes. Both cost K + K/8 bytes
     // per token, so the workspace the plan declared covers either. The grouped planes are sized for
     // the padded width because that is the width the mainloop addresses.
-    const bool mmq_route = mmq::select(weight.k, tokens);
+    const bool mmq_route  = mmq::select(weight.k, tokens);
+    // Below the crossover the MMVQ-shaped mainloop reads these same two planes, so it needs no
+    // second quantisation pass and none of the interleaved form's routing.
+    const bool mmvq_route = mmvq::select(tokens);
     DeviceSpan codes;
     DeviceSpan scales;
     if (mmq_route) {
@@ -61,26 +65,29 @@ void nvfp4_linear_int8_grouped_launch(const Tensor& x, const Weight& weight, Ten
     }
 
     const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), weight.n};
-    if (mmq_route) {
-        mmq::launch<128, LinearBf16Output>(
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales),
-            reinterpret_cast<const std::int8_t*>(codes.data),
-            1.0F / weight.weight_scale_divisor, output, weight.k, tokens, weight.n, stream);
+    const auto* w_codes  = static_cast<const std::uint8_t*>(weight.qdata);
+    const auto* w_scales = static_cast<const std::uint8_t*>(weight.scales);
+    const auto* x_int8   = reinterpret_cast<const std::int8_t*>(codes.data);
+    const auto* x_scale  = reinterpret_cast<const float*>(scales.data);
+    const float alpha    = 1.0F / weight.weight_scale_divisor;
+    if (mmvq_route) {
+        mmvq::launch<LinearBf16Output>(w_codes, w_scales, x_int8, x_scale, alpha, output, weight.k,
+                                       tokens, weight.n, stream);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    const dim3 grid(weight.n / 128, padded / 128);
-    // alpha = 1/weight_scale_divisor: the E2M1 1/2 already folded into the E4M3 scale decode,
-    // where llama.cpp folds it too -- the same for every route on this mainloop. The kernel is given
-    // the real token count, not the padded one, and predicates its stores on it.
-    nvfp4_int8_grouped_kernel<LinearBf16Output>
-        <<<grid, detail::kInt8Threads, nvfp4_int8_grouped_smem_bytes(), stream>>>(
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales),
-            reinterpret_cast<const std::int8_t*>(codes.data),
-            reinterpret_cast<const float*>(scales.data), 1.0F / weight.weight_scale_divisor,
-            output, weight.k, tokens);
+    if (mmq_route) {
+        mmq::launch<LinearBf16Output>(w_codes, w_scales, x_int8, alpha, output, weight.k, tokens,
+                                      weight.n, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    // alpha = 1/weight_scale_divisor: the E2M1 1/2 already folded into the E4M3 scale decode, where
+    // llama.cpp folds it too -- the same for every route on this mainloop. Both int8 mainloops take
+    // the caller's real token count and predicate their stores on it, so the surplus columns a padded
+    // tile computes are dropped rather than written.
+    nvfp4_int8_grouped_launch<LinearBf16Output>(w_codes, w_scales, x_int8, x_scale, alpha, output,
+                                                weight.k, tokens, weight.n, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

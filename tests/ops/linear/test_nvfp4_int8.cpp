@@ -23,6 +23,8 @@ using namespace ninfer::test::linear;
 
 int run_generic_geometries();
 int run_forced_padded_widths();
+int run_mmvq_width_ladder();
+int verify_token_tile_ladder();
 int verify_geometry_diagnostics();
 
 // Two things have to be said for an int8 measurement to be real, and they are the same shape of
@@ -249,6 +251,8 @@ int run_nvfp4_int8() {
     }
     failures += run_generic_geometries();
     failures += run_forced_padded_widths();
+    failures += run_mmvq_width_ladder();
+    failures += verify_token_tile_ladder();
     failures += verify_ue4m3_scale_table();
     return failures;
 }
@@ -402,6 +406,92 @@ int run_forced_padded_widths() {
     failures += run_shape("NVFP4_Int8Mmq_PaddedAlignedOnly", ActivationCompute::Int8Grouped,
                           make_nvfp4_weight,
                           {4096, 2048, 927U, Comparison::SampledRows, true, mmq_alignment_only});
+    return failures;
+}
+
+// The width ladder: `mmvq` is one named route over two shapes, MMVQ up to eight columns and MMQ
+// above it, which is llama.cpp's own crossover. Both halves have to land on the FP64 oracle at the
+// widths they serve -- the narrow half is the one nothing else covers (a single column is where a
+// token tile wastes the most), and the wide half has to keep agreeing with `mmq` rather than quietly
+// drifting into a third arithmetic.
+int run_mmvq_width_ladder() {
+    int failures = 0;
+    const ForcedRoute mmvq_route(ops::detail::Nvfp4GemmRoute::Mmvq);
+
+    // Every width MMVQ serves, including both sides of each power-of-two column stage: NC is padded
+    // up to a power of two, so 3 and 5 retire four and eight columns respectively and must still
+    // store exactly the columns the caller asked for.
+    std::vector<Invocation> narrow;
+    for (int t : {1, 2, 3, 4, 5, 6, 7, 8}) {
+        narrow.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowNvfp4Int8});
+    }
+    failures += run_shape("NVFP4_Int8Mmvq_Narrow", ActivationCompute::Int8Grouped,
+                          make_nvfp4_weight,
+                          {8192, 4096, 931U, Comparison::SampledRows, true, narrow});
+
+    // Above the crossover the same named route is MMQ, at the J stage the width selects. The
+    // geometry pair is chosen so K % ITER_K == 0, which is the one condition MMQ still asks for.
+    std::vector<Invocation> wide;
+    for (int t : {9, 16, 31, 64, 128, 129, 256}) {
+        wide.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowNvfp4Int8});
+    }
+    failures += run_shape("NVFP4_Int8Mmvq_Wide", ActivationCompute::Int8Grouped, make_nvfp4_weight,
+                          {8192, 4096, 933U, Comparison::SampledRows, true, wide});
+
+    // [4096, 2048] has no table row and no A16 composition, so a green run here can only mean the
+    // ladder answered these widths itself.
+    std::vector<Invocation> alignment_only;
+    for (int t : {1, 3, 8, 37, 129}) {
+        alignment_only.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowNvfp4Int8});
+    }
+    failures += run_shape("NVFP4_Int8Mmvq_AlignedOnly", ActivationCompute::Int8Grouped,
+                          make_nvfp4_weight,
+                          {4096, 2048, 935U, Comparison::SampledRows, true, alignment_only});
+    return failures;
+}
+
+// The ladder's stage selection is arithmetic, not a table lookup, so it is cheap to state outright:
+// the tile is the smallest admitted stage covering the width, and the padded width is that stage
+// rounded up -- which together are what make a narrow call read each weight element exactly once.
+int verify_token_tile_ladder() {
+    int failures = 0;
+    struct Case {
+        std::int32_t tokens;
+        int j;
+        std::int32_t padded;
+    };
+    const Case cases[] = {
+        {1, 8, 8},     {7, 8, 8},      {8, 8, 8},      {9, 16, 16},    {16, 16, 16},
+        {17, 24, 24},  {48, 48, 48},   {49, 64, 64},   {64, 64, 64},   {65, 80, 80},
+        {100, 112, 112}, {127, 128, 128}, {128, 128, 128}, {129, 128, 256}, {256, 128, 256},
+        {300, 128, 384}, {1024, 128, 1024},
+    };
+    for (const Case& probe : cases) {
+        const int j = ops::detail::unified::nvfp4_int8_select_j(probe.tokens);
+        const std::int32_t padded = ops::detail::unified::nvfp4_int8_padded_tokens(probe.tokens);
+        if (j != probe.j || padded != probe.padded) {
+            std::cerr << "NVFP4 token tile T=" << probe.tokens << ": got J=" << j << " padded="
+                      << padded << ", expected J=" << probe.j << " padded=" << probe.padded << '\n';
+            ++failures;
+        }
+        if (!ops::detail::unified::nvfp4_int8_j_admitted(j)) {
+            std::cerr << "NVFP4 token tile T=" << probe.tokens << ": J=" << j
+                      << " is not an admitted stage\n";
+            ++failures;
+        }
+    }
+    // Every admitted stage has to divide the padded width it produces -- the grid is (rows/128,
+    // padded/J), so anything else is a partial tile column and a launch that drops columns.
+    for (int t = 1; t <= 1024; ++t) {
+        const int j = ops::detail::unified::nvfp4_int8_select_j(t);
+        const std::int32_t padded = ops::detail::unified::nvfp4_int8_padded_tokens(t);
+        if (padded % j != 0 || padded < t) {
+            std::cerr << "NVFP4 token tile T=" << t << ": padded=" << padded << " is not whole "
+                      << j << "-token tiles covering the width\n";
+            ++failures;
+            break;
+        }
+    }
     return failures;
 }
 

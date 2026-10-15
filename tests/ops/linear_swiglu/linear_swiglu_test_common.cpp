@@ -331,7 +331,7 @@ int run_profile(std::string_view label, const Profile& profile,
                                  ? ops::LinearPolicy::AllowA8IntDecode
                                  : (profile.activation_compute == ActivationCompute::Int8Grouped
                                         ? ops::LinearPolicy::AllowNvfp4Int8
-                                 : ops::LinearPolicy::A16Only)));
+                                        : ops::LinearPolicy::A16Only))));
     const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
         profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1, maximum_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));

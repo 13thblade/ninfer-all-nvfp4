@@ -29,6 +29,8 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
 
 namespace ninfer::ops::detail::unified {
@@ -229,20 +231,47 @@ static __global__ void quantize_nvfp4_int8_grouped(const __nv_bfloat16* __restri
 
 // ---------------------------------------------------------------------------
 // Row layout. A block stages 128 consecutive output rows and every thread's fragment tiles land
-// on rows that warp owns: the four wm warps take 32-row bands, each band's two m tiles 16 rows
-// apart.
+// on rows the warp owns. The block's J tokens are shared by NT token warps, each taking the NIT
+// eight-token tile_C columns its participation buys; the remaining 8/NT warps take consecutive
+// output-row bands of kWarpRows rows, held as MT fragment tiles 16 rows apart.
+//
+// J = 128 reproduces the layout this kernel shipped with: NT = 2 token warps of 64 tokens against
+// four row bands of 32 rows. Narrower tiles coalesce the token axis into one warp (NT = 1) and spend
+// the seven warps that frees on eight row bands of 16 rows -- same 128 output rows, same eight
+// warps, one MT fragment per warp instead of two. That is the whole point of the ladder: the row
+// tile, the staging and the weight traffic do not move, and the tensor-core work drops in
+// proportion to J because the activation side of every MMA is J tokens wide instead of 128.
 // ---------------------------------------------------------------------------
+template <int J>
 struct Nvfp4Int8RowPolicy {
-    static constexpr int kStagedRows   = 128;
-    static constexpr int kOutputRows   = 128;
-    static constexpr int kFragmentStep = 16;
-    static constexpr int kWarpRowStride = 32;
+    static_assert(nvfp4_int8_j_admitted(J), "J must be a stage of the token-tile ladder");
+
+    static constexpr int kNTiles   = J / 8;             // eight-token MMA columns in the tile
+    static constexpr int NT        = (kNTiles + 7) / 8; // token warps the tile keeps busy
+    static constexpr int NIT       = kNTiles / NT;      // tile_C columns per token warp
+    static constexpr int kRowWarps = detail::kInt8Threads / 32 / NT;
+    static constexpr int kWarpRows = detail::kInt8TileRows / kRowWarps;
+    static constexpr int MT        = kWarpRows / 16;
+
+    static_assert(NT > 0 && NT <= detail::kInt8Threads / 32, "warp budget must cover the warps");
+    static_assert(MT * 16 * kRowWarps == detail::kInt8TileRows, "row bands must tile the tile");
+    static_assert(NIT * NT * 8 == J, "token warps must tile the token tile");
+
+    static constexpr int kStagedRows    = detail::kInt8TileRows;
+    static constexpr int kOutputRows    = detail::kInt8TileRows;
+    static constexpr int kFragmentStep  = 16;
+    static constexpr int kWarpRowStride = kWarpRows;
 
     static __device__ int weight_row(int begin, int local) { return begin + local; }
 
     // Staged row of fragment tile (wm, m) for lane row `gid`.
     static __device__ int fragment_row(int wm, int m, int gid) {
         return wm * kWarpRowStride + gid + m * kFragmentStep;
+    }
+
+    // First token column of tile_C column index `n` for token warp `wt`.
+    static __device__ int token_column(int wt, int n, int tig) {
+        return wt * (NIT * 8) + n * 8 + tig * 2;
     }
 };
 
@@ -282,28 +311,36 @@ __device__ __forceinline__ void mma_s8_k16(int& c0, int& c1, int& c2, int& c3, u
 } // namespace detail
 
 // ---------------------------------------------------------------------------
-// Main kernel. One block covers kInt8TileRows output rows x kInt8TileTokens tokens x one k-tile
-// of kInt8TileK columns per iteration; T must be a whole 128-token tile (there is no predication).
+// Main kernel. One block covers kInt8TileRows output rows x J tokens x one k-tile
+// of kInt8TileK columns per iteration, where J is the stage of the token-tile ladder the caller's
+// width selects (nvfp4_int8_select_j) -- see Nvfp4Int8RowPolicy for how the block's eight warps are
+// spread over those two axes. There is no predicated tail inside the mainloop, so the surplus
+// columns of a padded tile are computed and dropped by the epilogue guard.
 // The output adapter owns the projection's epilogue -- a plain BF16 row store for the Linear and
 // LinearAdd routes, an FP32 plane for the gate half of gate_up, and silu(gate)*up read back from
 // that plane for its up half.
 //
-// The CTA is ggml-MMQ shaped: 256 threads / 8 warps in a 4x2 grid, each warp owning 32 rows x 64
-// tokens (MT=2, NT=8, acc[2][8][4] = 64 floats). The 128-register ceiling of the old 512-thread
-// CTA (512 threads * 128 = the SM's whole register file) is gone, so the kernel hoists the A
-// operands (weights) for the whole BK=64 tile with lds128 and streams the activations one n-tile
-// at a time. The measured shared-read census per warp and tile falls from ~40 LDS on the
-// 512-thread CTA (A 8 + B 8 + ws 8 + xs 16) to 24 lds128 (A 4 + ws 4 + xs 8 + B 8). The staging
-// pipeline runs two tiles deep, so a tile's LDG lands a whole extra tile of compute early.
+// The CTA is ggml-MMQ shaped: 256 threads / 8 warps, each warp owning kWarpRows x (J/NT) tokens
+// when J = 128 that is the 4x2 grid it has always used -- 32 rows x 64 tokens, MT=2, NT=2, NIT=8,
+// acc[2][8][4] = 64 floats. The 128-register ceiling of the old 512-thread CTA (512 threads * 128 =
+// the SM's whole register file) is gone, so the kernel hoists the A operands (weights) for the whole
+// BK=64 tile with lds128 and streams the activations one n-tile at a time. The measured shared-read
+// census per warp and tile falls from ~40 LDS on the 512-thread CTA (A 8 + B 8 + ws 8 + xs 16) to 24
+// lds128 (A 4 + ws 4 + xs 8 + B 8). The staging pipeline runs two tiles deep, so a tile's LDG lands
+// a whole extra tile of compute early.
 // ---------------------------------------------------------------------------
-template <class Output>
+template <int J, class Output>
 __global__ __launch_bounds__(detail::kInt8Threads) void nvfp4_int8_grouped_kernel(
     const std::uint8_t* __restrict__ weight_codes, const std::uint8_t* __restrict__ weight_scales,
     const std::int8_t* __restrict__ x_codes, const float* __restrict__ x_scales, float alpha_half,
     Output output, std::int32_t k, std::int32_t tokens) {
-    using Policy = Nvfp4Int8RowPolicy;
+    using Policy = Nvfp4Int8RowPolicy<J>;
     namespace d  = detail;
     constexpr int BM      = d::kInt8TileRows;
+    constexpr int BN      = J;
+    constexpr int MT      = Policy::MT;
+    constexpr int N_IT    = Policy::NIT;
+    constexpr int NT      = Policy::NT;
     constexpr int kSRow   = d::kInt8SRow;
     constexpr int kThreads = d::kInt8Threads;
     // A 128x64 tile is staged as BM x 4 k-quarters 16-byte slots; 256 threads sweep them in two
@@ -321,13 +358,13 @@ __global__ __launch_bounds__(detail::kInt8Threads) void nvfp4_int8_grouped_kerne
     const int tid  = static_cast<int>(threadIdx.x);
     const int lane = tid & 31;
     const int warp = tid >> 5;
+    const int wm   = warp / NT; // row band the warp owns
+    const int wt   = warp % NT; // token slice of the band the warp owns
     const int gid  = lane >> 2; // 0..7, row inside a 16-row tile
     const int tig  = lane & 3;  // 0..3, k quarter
-    const int wm   = warp >> 1; // 0..3, 32-row band the warp owns
-    const int wt   = warp & 1;  // 0..1, token half (64 tokens) the warp owns
 
     const int row_block = static_cast<int>(blockIdx.x) * Policy::kOutputRows;
-    const int col_block = static_cast<int>(blockIdx.y) * d::kInt8TileTokens;
+    const int col_block = static_cast<int>(blockIdx.y) * BN;
     const int groups    = k >> 6; // 64-column k-tiles == weight scale tiles
 
     // The block is a whole 128-row output tile, so a segmented adapter binds its segment once,
@@ -351,9 +388,16 @@ __global__ __launch_bounds__(detail::kInt8Threads) void nvfp4_int8_grouped_kerne
         stage.w          = *reinterpret_cast<const uint2*>(
             weight_codes + static_cast<std::size_t>(Policy::weight_row(row_block, ld_row)) * (k / 2) +
             static_cast<std::size_t>(tile) * (d::kInt8TileK / 2) + ld_q * 8);
-        stage.x = *reinterpret_cast<const uint4*>(
-            x_codes + static_cast<std::size_t>(col_block + ld_row) * k +
-            static_cast<std::size_t>(tile) * d::kInt8TileK + ld_q * 16);
+        // Only the first J rows of the activation tile exist -- the plane was allocated for the
+        // padded width, so a row past J would be a read past it. The weight side keeps all BM rows
+        // regardless: that is what the title of the loop is, and it is why the same (row, quarter)
+        // sweep stays unconditional while this half of it does not.
+        stage.x = make_uint4(0u, 0u, 0u, 0u);
+        if (ld_row < BN) {
+            stage.x = *reinterpret_cast<const uint4*>(
+                x_codes + static_cast<std::size_t>(col_block + ld_row) * k +
+                static_cast<std::size_t>(tile) * d::kInt8TileK + ld_q * 16);
+        }
         stage.ws = 0u;
         if (tidw < BM) {
             // group%4 == 0: one 4-byte load carries the k-tile's four group scales.
@@ -376,10 +420,12 @@ __global__ __launch_bounds__(detail::kInt8Threads) void nvfp4_int8_grouped_kerne
             *reinterpret_cast<unsigned*>(weight_row_smem + i * 16) = q[i];
         }
         const unsigned x_words[4] = {stage.x.x, stage.x.y, stage.x.z, stage.x.w};
-        auto* x_row_smem          = sb + ld_row * kSRow + ld_q * 4;
+        if (ld_row < BN) {
+            auto* x_row_smem = sb + ld_row * kSRow + ld_q * 4;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            *reinterpret_cast<unsigned*>(x_row_smem + i * 16) = x_words[i];
+            for (int i = 0; i < 4; ++i) {
+                *reinterpret_cast<unsigned*>(x_row_smem + i * 16) = x_words[i];
+            }
         }
         if (tidw < BM) {
             float4 decoded;
@@ -388,7 +434,7 @@ __global__ __launch_bounds__(detail::kInt8Threads) void nvfp4_int8_grouped_kerne
             decoded.z = kNvfp4E4M3ScaleLut[(stage.ws >> 16) & 0xFFu];
             decoded.w = kNvfp4E4M3ScaleLut[stage.ws >> 24];
             *reinterpret_cast<float4*>(sws + tidw * 4) = decoded;
-            if (tidw < d::kInt8TileTokens) {
+            if (tidw < BN) {
                 // One 8-byte load carries both 32-block scales of the tile (k%64==0 makes
                 // token*k/32 even, so the pair is 8-byte aligned).
                 const uint2 xs_pair_raw = *reinterpret_cast<const uint2*>(
@@ -398,11 +444,11 @@ __global__ __launch_bounds__(detail::kInt8Threads) void nvfp4_int8_grouped_kerne
         }
     };
 
-    float acc[2][8][4]; // m=0: rows [0,16) of the warp band, m=1: rows [16,32); n spans 64 tokens
+    float acc[MT][N_IT][4]; // m: rows of the warp band, n: eight-token columns of the band
 #pragma unroll
-    for (int m = 0; m < 2; ++m)
+    for (int m = 0; m < MT; ++m)
 #pragma unroll
-        for (int n = 0; n < 8; ++n)
+        for (int n = 0; n < N_IT; ++n)
 #pragma unroll
             for (int j = 0; j < 4; ++j) acc[m][n][j] = 0.0F;
 
@@ -430,10 +476,10 @@ __global__ __launch_bounds__(detail::kInt8Threads) void nvfp4_int8_grouped_kerne
     const auto compute_tile = [&]() {
         // The A operands and weight scales are hoisted for the whole BK=64 tile (four k-steps):
         // two lds128 per m row-group instead of an 8-byte pair per half-pass.
-        unsigned af[2][4][2];      // [m][k-step 0..3][lo/hi row]
-        float    ws_pair[2][2][4]; // [m][row 0/1][k-step 0..3]
+        unsigned af[MT][4][2];      // [m][k-step 0..3][lo/hi row]
+        float    ws_pair[MT][2][4]; // [m][row 0/1][k-step 0..3]
 #pragma unroll
-        for (int m = 0; m < 2; ++m) {
+        for (int m = 0; m < MT; ++m) {
             const int r0   = Policy::fragment_row(wm, m, gid);
             const uint4 lo = d::int8_lds128(sa + r0 * kSRow + tig * 16);
             const uint4 hi = d::int8_lds128(sa + (r0 + 8) * kSRow + tig * 16);
@@ -461,9 +507,9 @@ __global__ __launch_bounds__(detail::kInt8Threads) void nvfp4_int8_grouped_kerne
         // A operands stay hoisted for the whole tile, so the weights are still read once per
         // tile and reused across all 64 tokens the warp owns.
 #pragma unroll
-        for (int n = 0; n < 8; ++n) {
-            const uint4 b4 = d::int8_lds128(sb + (((wt * 8 + n) * 8) + gid) * kSRow + tig * 16);
-            const int c0   = (wt * 8 + n) * 8 + tig * 2;
+        for (int n = 0; n < N_IT; ++n) {
+            const uint4 b4 = d::int8_lds128(sb + ((wt * N_IT + n) * 8 + gid) * kSRow + tig * 16);
+            const int c0   = (wt * N_IT + n) * 8 + tig * 2;
             const uint4 x4 = d::int8_lds128(sxs + c0 * 2);
             // sxs is laid out [token][half]: token c0 half 0/1 then token c0+1 half 0/1.
             const float xa[2][2] = {{__uint_as_float(x4.x), __uint_as_float(x4.y)},
@@ -477,7 +523,7 @@ __global__ __launch_bounds__(detail::kInt8Threads) void nvfp4_int8_grouped_kerne
                     const int kk      = half * 2 + ks;
                     const unsigned bw = (&b4.x)[kk];
 #pragma unroll
-                    for (int m = 0; m < 2; ++m) {
+                    for (int m = 0; m < MT; ++m) {
                         const float w0 = ws_pair[m][0][kk];
                         const float w1 = ws_pair[m][1][kk];
                         int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
@@ -544,12 +590,12 @@ __global__ __launch_bounds__(detail::kInt8Threads) void nvfp4_int8_grouped_kerne
     // that already lands on a whole tile every guard passes and the stores are exactly what they
     // were before padding existed.
 #pragma unroll
-    for (int m = 0; m < 2; ++m) {
+    for (int m = 0; m < MT; ++m) {
         const int row0 = row_block + Policy::fragment_row(wm, m, gid);
         const int row1 = row0 + 8;
 #pragma unroll
-        for (int n = 0; n < 8; ++n) {
-            const int c0 = col_block + (wt * 8 + n) * 8 + tig * 2;
+        for (int n = 0; n < N_IT; ++n) {
+            const int c0 = col_block + Policy::token_column(wt, n, tig);
             if (c0 >= tokens) { break; }
             epilogue.store(row0, c0, acc[m][n][0] * alpha_half);
             epilogue.store(row1, c0, acc[m][n][2] * alpha_half);
@@ -559,6 +605,86 @@ __global__ __launch_bounds__(detail::kInt8Threads) void nvfp4_int8_grouped_kerne
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Launch front end for the token-tile ladder. It exists so no route hard-codes a tile stage the way
+// every one of them used to hard-code 128: the width picks the stage (nvfp4_int8_select_j), the grid
+// and the padding follow it, and adding a stage is one line here rather than a sweep of six routes.
+// A J that no width can select would be a compile-time error in every instantiation instead of a
+// runtime surprise, so the switch below is written over exactly the admitted stages.
+// ---------------------------------------------------------------------------
+template <int J, class Output>
+inline void nvfp4_int8_grouped_launch_j(const std::uint8_t* weight_codes,
+                                        const std::uint8_t* weight_scales,
+                                        const std::int8_t* x_codes, const float* x_scales,
+                                        float alpha_half, Output output, std::int32_t k,
+                                        std::int32_t tokens, std::int32_t rows,
+                                        cudaStream_t stream) {
+    static_assert(nvfp4_int8_j_admitted(J), "J must be a stage of the token-tile ladder");
+    const std::int32_t padded = nvfp4_int8_padded_tokens(tokens);
+    const dim3 grid(rows / detail::kInt8TileRows, padded / J);
+    nvfp4_int8_grouped_kernel<J, Output>
+        <<<grid, detail::kInt8Threads, nvfp4_int8_grouped_smem_bytes(), stream>>>(
+            weight_codes, weight_scales, x_codes, x_scales, alpha_half, output, k, tokens);
+}
+
+template <class Output>
+inline void nvfp4_int8_grouped_launch(const std::uint8_t* weight_codes,
+                                      const std::uint8_t* weight_scales,
+                                      const std::int8_t* x_codes, const float* x_scales,
+                                      float alpha_half, Output output, std::int32_t k,
+                                      std::int32_t tokens, std::int32_t rows, cudaStream_t stream) {
+    switch (nvfp4_int8_select_j(tokens)) {
+        case 8:
+            nvfp4_int8_grouped_launch_j<8, Output>(weight_codes, weight_scales, x_codes, x_scales,
+                                                   alpha_half, output, k, tokens, rows, stream);
+            return;
+        case 16:
+            nvfp4_int8_grouped_launch_j<16, Output>(weight_codes, weight_scales, x_codes, x_scales,
+                                                    alpha_half, output, k, tokens, rows, stream);
+            return;
+        case 24:
+            nvfp4_int8_grouped_launch_j<24, Output>(weight_codes, weight_scales, x_codes, x_scales,
+                                                    alpha_half, output, k, tokens, rows, stream);
+            return;
+        case 32:
+            nvfp4_int8_grouped_launch_j<32, Output>(weight_codes, weight_scales, x_codes, x_scales,
+                                                    alpha_half, output, k, tokens, rows, stream);
+            return;
+        case 40:
+            nvfp4_int8_grouped_launch_j<40, Output>(weight_codes, weight_scales, x_codes, x_scales,
+                                                    alpha_half, output, k, tokens, rows, stream);
+            return;
+        case 48:
+            nvfp4_int8_grouped_launch_j<48, Output>(weight_codes, weight_scales, x_codes, x_scales,
+                                                    alpha_half, output, k, tokens, rows, stream);
+            return;
+        case 64:
+            nvfp4_int8_grouped_launch_j<64, Output>(weight_codes, weight_scales, x_codes, x_scales,
+                                                    alpha_half, output, k, tokens, rows, stream);
+            return;
+        case 80:
+            nvfp4_int8_grouped_launch_j<80, Output>(weight_codes, weight_scales, x_codes, x_scales,
+                                                    alpha_half, output, k, tokens, rows, stream);
+            return;
+        case 96:
+            nvfp4_int8_grouped_launch_j<96, Output>(weight_codes, weight_scales, x_codes, x_scales,
+                                                    alpha_half, output, k, tokens, rows, stream);
+            return;
+        case 112:
+            nvfp4_int8_grouped_launch_j<112, Output>(weight_codes, weight_scales, x_codes, x_scales,
+                                                     alpha_half, output, k, tokens, rows, stream);
+            return;
+        case 128:
+            nvfp4_int8_grouped_launch_j<128, Output>(weight_codes, weight_scales, x_codes, x_scales,
+                                                     alpha_half, output, k, tokens, rows, stream);
+            return;
+        default:
+            break;
+    }
+    throw std::invalid_argument("nvfp4 int8 grouped: no admissible token tile for T=" +
+                                std::to_string(tokens));
 }
 
 } // namespace ninfer::ops::detail::unified

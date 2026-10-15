@@ -11,6 +11,7 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_int8_grouped_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_mmq_launch.cuh"
+#include "ops/linear/nvfp4/nvfp4_mmvq_launch.cuh"
 
 #include <cuda_bf16.h>
 
@@ -54,7 +55,10 @@ void nvfp4_linear_add_int8_launch(const Tensor& x, const Weight& weight, Tensor&
     auto scope = workspace.scope();
     // The interleaved plane the MMQ mainloop reads and the two separated planes the grouped
     // mainloop reads cost the same bytes per token; only the quantiser that fills them differs.
-    const bool mmq_route = mmq::select(weight.k, tokens);
+    const bool mmq_route  = mmq::select(weight.k, tokens);
+    // Below the crossover the MMVQ-shaped mainloop reads these same two planes, so it needs no
+    // second quantisation pass and none of the interleaved form's routing.
+    const bool mmvq_route = mmvq::select(tokens);
     DeviceSpan codes;
     DeviceSpan scales;
     if (mmq_route) {
@@ -73,25 +77,27 @@ void nvfp4_linear_add_int8_launch(const Tensor& x, const Weight& weight, Tensor&
     }
 
     const Nvfp4LinearAddInt8Output output{static_cast<__nv_bfloat16*>(residual.data), weight.n};
-    if (mmq_route) {
-        mmq::launch<128, Nvfp4LinearAddInt8Output>(
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales),
-            reinterpret_cast<const std::int8_t*>(codes.data),
-            1.0F / weight.weight_scale_divisor, output, weight.k, tokens, weight.n, stream);
+    const auto* w_codes  = static_cast<const std::uint8_t*>(weight.qdata);
+    const auto* w_scales = static_cast<const std::uint8_t*>(weight.scales);
+    const auto* x_int8   = reinterpret_cast<const std::int8_t*>(codes.data);
+    const auto* x_scale  = reinterpret_cast<const float*>(scales.data);
+    // alpha = 1/weight_scale_divisor: the E2M1 1/2 already folded into the E4M3 scale decode, where
+    // llama.cpp folds it too, so the half factor appears once and the store rounds once.
+    const float alpha = 1.0F / weight.weight_scale_divisor;
+    if (mmvq_route) {
+        mmvq::launch<Nvfp4LinearAddInt8Output>(w_codes, w_scales, x_int8, x_scale, alpha, output,
+                                               weight.k, tokens, weight.n, stream);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    const dim3 grid(weight.n / 128, padded / 128);
-    // alpha = 1/weight_scale_divisor: the E2M1 1/2 already folded into the E4M3 scale decode,
-    // where llama.cpp folds it too, so the half factor appears once and the store rounds once.
-    nvfp4_int8_grouped_kernel<Nvfp4LinearAddInt8Output>
-        <<<grid, detail::kInt8Threads, nvfp4_int8_grouped_smem_bytes(), stream>>>(
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales),
-            reinterpret_cast<const std::int8_t*>(codes.data),
-            reinterpret_cast<const float*>(scales.data), 1.0F / weight.weight_scale_divisor,
-            output, weight.k, tokens);
+    if (mmq_route) {
+        mmq::launch<Nvfp4LinearAddInt8Output>(w_codes, w_scales, x_int8, alpha, output, weight.k,
+                                              tokens, weight.n, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    nvfp4_int8_grouped_launch<Nvfp4LinearAddInt8Output>(w_codes, w_scales, x_int8, x_scale, alpha,
+                                                        output, weight.k, tokens, weight.n, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

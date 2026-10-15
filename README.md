@@ -1,100 +1,171 @@
-# Add NVFP4 int8 kernels and wide A16 SwiGLU route for sm_86/89 on Qwen3.8 27B
+# Add NVFP4 int8 kernels (wide + decode) and the A16 SwiGLU wiring gap fill for sm_86/89 on Qwen3.8 27B
 
 ## Summary
 
 On GPUs without an FP4 tensor core (RTX 3090/4090, A16, etc.) upstream NVFP4 only
 wires a SIMT `linear_swiglu` path for `T ≤ 16`; wider shapes throw. This PR adds
 int8 matmul kernels for the wide path so NVFP4 prefill at large `T` actually runs,
-plus an A16 reference route covering the same upstream wiring gap.
+a token-tile ladder so the same kernels stop paying 128 columns of tensor-core work
+at narrow widths, a llama.cpp-shaped MMVQ mainloop that owns the decode band
+(`T ≤ 8`) for every int8 route, plus an A16 reference route covering the same
+upstream wiring gap.
 
 ## What's included
 
-1. **NVFP4 int8-grouped mainloop + fused SwiGLU route** (primary delivery).
+1. **NVFP4 int8-grouped mainloop + SwiGLU route** (primary delivery).
    Self-implemented per-(token, 32-col) int8 activation quantiser against
-   groupwise e2m1 weights with per-16 E4M3 group scales; fused epilogue, no
-   workspace. Covers `Linear`, `LinearAdd`, `attn_input_proj`, `gdn_input_proj`,
-   and `linear_swiglu`.
-2. **NVFP4 int8 MMQ mainloop (llama.cpp port)** — bit-exact vs the grouped kernel,
-   staged at `J = 128`. Reference/experimental, default-off.
-3. **Wide A16 MMA route for `NVFP4 linear_swiglu`** — fills the upstream `T > 16`
+   groupwise e2m1 weights with per-16 E4M3 group scales, writing through the
+   caller's epilogue adapter (plain store, residual add, or gate product). Covers
+   `Linear`, `LinearAdd`, `attn_input_proj`, `gdn_input_proj`, and `linear_swiglu`.
+   `linear_swiglu` is two launches over one row range -- the gate half writes an
+   FP32 plane the up half reads back, which is what keeps "no BF16 rounding before
+   the SiLU" true -- so it does cost one FP32 plane of workspace (the other ops
+   need none).
+2. **NVFP4 int8 MMQ mainloop (llama.cpp shape)** — bit-exact vs the grouped kernel,
+   default-off reference. Now staged on the same 11-step token ladder as (1) rather
+   than `J = 128` only.
+3. **Token-tile ladder, shared by both int8 mainloops**:
+   `J ∈ {8,16,24,32,40,48,64,80,96,112,128}`. The stage is chosen as the smallest
+   tile covering the width and both the grid and the activation-plane stride follow
+   it, so every weight element is read exactly once at any width; surplus columns of
+   a padded tile are computed and dropped by the epilogue guard rather than launched.
+   (Earlier both loops padded to 128, which multiplied the tensor-core work per
+   decode step by up to 16×.)
+4. **MMVQ-shaped decode mainloop (llama.cpp port) + `mmvq` route**: one output row
+   per CTA, dp4a, four warps sharing the row's K, `NC` padded to a power of two
+   `{1,2,4,8}` so the accumulator stays in registers. Widths above 8 stay on the
+   route's own wide kernel.
+5. **The narrow band is now a property of the int8 family, not of the route name**:
+   `T ≤ 8` is answered by (4) under `grouped`, `mmq` *and* `mmvq`, so decode has one
+   implementation and the two MMA mainloops differ only from nine columns up. This is
+   not a fallback cascade -- no width ever drops to A16 -- but it does mean the two
+   MMA loops can no longer be A/B'd against each other at decode widths.
+6. **Wide A16 MMA route for `NVFP4 linear_swiglu`** — fills the upstream `T > 16`
    gap on A16-only cards. Reference path (see Limitations).
 
 ## Routing / enabling
 
-- `NINFER_NVFP4_GEMM = a16 | grouped | mmq`; unset → `a16`.
+- `NINFER_NVFP4_GEMM = a16 | grouped | mmq | mmvq`; unset → `a16`. An unrecognised
+  value throws and names the valid set (a trailing space in `cmd.exe` is part of the
+  value), because a silently-ignored route name has already been mistaken for a
+  measurement of "no difference".
+- `NINFER_LINEAR_ROUTES=unified` is still required for narrow widths: the shipping
+  device profile bands narrow widths away from the unified table, and the own table
+  registers no int8 route at all. Both switches are needed to measure decode; naming
+  only the first is a loud error, not a quiet A16 run.
 - `device_profiles.json`: 3090 Ti prefill defaults to the int8-grouped unified table.
 - `LinearPolicy::AllowNvfp4Int8` lands on sm_86 prefill shapes.
 
 ## Validation
 
-**Perplexity** (`ninfer-perplexity`, `perplexity-1m` `--quick`, kv int8, ctx 4096 / stride 2048,
-artifact `qwen3.8-27b-quasar`):
+**Perplexity** (`ninfer-perplexity`, `perplexity-1m` `--quick`, kv int8, ctx 4096,
+artifact `qwen3.8-27b-quasar`, full-precision reporting):
 
-| Route   | PPL       | scoring tok/s |
-|---------|-----------|---------------|
-| a16     | 4.315224  | 399.5         |
-| grouped | 4.315502  | 713.2         |
-| mmq     | 4.315502  | 667.2         |
+| Route   | PPL          | scoring tok/s |
+|---------|--------------|---------------|
+| a16     | 4.315016269  | 386.0 – 393.9 |
+| grouped | 4.314882867  | 667.8         |
+| mmq     | 4.314882867  | 655.9         |
+| mmvq    | 4.314882867  | 657.9         |
 
-`grouped` and `mmq` are bit-exact identical; all three within **+0.0003** of the A16
-reference ⇒ the int8 kernels introduce no measurable quality regression. int8 scores
-**~1.8×** faster than the A16 reference.
+`grouped`, `mmq` and `mmvq` agree bit for bit, and all three sit **0.000133 below**
+the A16 reference rather than above it: the int8 kernels introduce no quality
+regression (an earlier round of this table had int8 fractionally higher; the wider
+corpus reading supersedes it). int8 scores **~1.7×** faster than the A16 reference.
 
-**Decode / prefill** (4K prompt ≈ 4202 tok, `--prefill-chunk 1024`, `--max-context 65536`,
-greedy, kv int8):
+**Decode / prefill.** The rows below were taken on the same artifact and the same
+4202-token prompt. The published build (before (3)-(5)) padded every int8 call to a
+128-column tile, so `T = 1` decode lost to the A16 reference; the follow-up build
+ladder-ed the tiles and moved `T ≤ 8` onto the MMVQ mainloop:
 
-| Config                | Route  | Prefill tok/s | Decode tok/s | 64K free VRAM | Draft accept |
-|-----------------------|--------|---------------|--------------|---------------|--------------|
-| baseline (no spec)    | a16    | 735.8         | 16.1         | 4.00 GiB      | —            |
-| MTP=3 (SIMT path)     | a16    | 743.4         | 28.7         | 3.40 GiB      | 47.2%        |
-| MTP=3 + ngram-31 (MMA)| a16    | 735.9         | 27.6         | 3.36 GiB      | 43.9%        |
-| baseline (no spec)    | grouped| 1.28k         | 9.9          | 4.00 GiB      | —            |
-| MTP=3 + ngram-31 (MMA)| grouped| 1.26k         | 35.4         | 3.36 GiB      | 64.8%        |
-| baseline (no spec)    | mmq    | 1.19k         | 9.0          | 4.00 GiB      | —            |
-| MTP=3 + ngram-31 (MMA)| mmq    | 1.18k         | 32.5         | 3.36 GiB      | 64.8%        |
+| Build            | KV    | Route   | Prefill tok/s | Decode tok/s |
+|------------------|-------|---------|---------------|--------------|
+| published (no ladder) | int8 | a16     | 735.8         | 16.1         |
+| published        | int8  | grouped | 1.28k         | 9.9          |
+| published        | int8  | mmq     | 1.19k         | 9.0          |
+| ladder + MMVQ    | int8  | a16     | 738.7         | 16.2         |
+| ladder + MMVQ    | int8  | grouped | 1.19k         | **36.8**     |
+| ladder + MMVQ    | int8  | mmq     | 1.20k         | **36.9**     |
+| ladder + MMVQ    | bf16  | grouped | 1.37k         | 36.4         |
+| ladder + MMVQ    | bf16  | mmq     | 1.33k         | 36.4         |
+| ladder + MMVQ    | bf16  | mmvq    | 1.34k         | 36.4         |
+| ladder + MMVQ    | bf16  | a16     | 771 – 783     | 16.1         |
 
-Takeaways (sm_86, QUASAR-NVFP4, 4K prompt / 64K ctx):
-- **Prefill / throughput: int8 ≈ 1.7–1.8× the A16 reference** (1.28k vs 736 prefill; 713 vs 399 PPL
-  scoring). This is the regime the wide-`T` NVFP4 path exists for, and where int8 matters most.
-- **Decode:** at `T = 1` without speculation the A16 reference is still faster (16.1 vs 9.9 grouped);
-  under MTP+ngram the int8 routes win (grouped 35.4 / mmq 32.5 vs A16 27.6) once the per-step
-  quantisation overhead is amortised over the drafted batch. Pure `T = 1` decode remains an
-  optimisation target.
-
-  The `T = 1` gap is **not** a quality or algorithmic issue — it is simply that the
-  small-`J` (`J < 128`) kernels and the dedicated SIMT decode mainloop are **not implemented
-  yet** in this PR. At `T = 1` the int8 route currently falls back to an unoptimised/larger-`J`
-  path, so the per-step quantisation setup cost is not amortised and it loses to the straight
-  A16 reference; the MTP+ngram numbers show the kernel itself is fine once enough work is
-  batched per step. Closing this gap is the first item in *Next steps*.
-- Draft acceptance 64.8% (MTP+ngram, accept length 3.93) confirms the MMA-path logits track the
-  target with no systematic drift. 64K context starts and completes without OOM.
+Takeaways (sm_86, QUASAR-NVFP4):
+- **Prefill is unchanged by the narrow-band work**: 1.19k/1.20k vs 1.21k/1.19k before
+  (−2% … +1%), i.e. this is a decode-only change, as intended -- prefill widths never
+  enter the narrow band.
+- **`T = 1` decode is now ~2.3× the A16 reference** (36.4-36.9 vs 16.1-16.2), which
+  reverses the headline limitation of the published round. `grouped`, `mmq` and `mmvq`
+  agree to 0.1 tok/s at decode, which is itself the proof that the band is unified:
+  three names, one narrow-band kernel.
+- Prefill lead over A16 stands at ~1.7-1.8× (1.33-1.37k vs 0.77-0.78k at matched
+  bf16 KV), and remains the regime the wide-`T` path exists for.
+- KV tier matters and is now pinned: bf16 KV is the reporting tier from here on
+  (it costs ~1% at decode and gains ~13% at prefill versus int8 KV), so numbers from
+  the two tiers are not mixed inside one comparison.
+- Kernel-level routing was verified by profiling rather than inferred: under all three
+  int8 route names the decode phase launches the MMVQ kernel the same number of times
+  (4352 launches), the `grouped` kernel answers zero decode calls under `mmq`/`mmvq`
+  and the `mmq` kernel answers zero under `grouped`; and the grouped-form activation
+  quantiser runs 7584 times under `grouped` versus 7328 + 256 under the wide-route
+  names, i.e. the narrow band moved and the wide band did not.
+- Speculative numbers from the published round (MTP=3 + ngram, 64K context,
+  64.8% acceptance / length 3.93) are kept as published but should be read with care:
+  `--spec` turns `--ngram-draft-tokens 15` on by default, so an unlabelled "MTP" row is
+  really a mixed MTP+ngram round, and the per-position acceptance histogram is sized by
+  `max(draft_window, ngram_draft_window)`. Pure-MTP arms need `--ngram-draft-tokens 0`.
+- 64K context starts and completes without OOM.
 
 ## Known limitations
 
 - The **a16 route is slow** (no FP4 core on these cards) — it is included as a
   reference for the wiring gap, not as a performance path. This is also likely why
-  upstream left it unwired.
-- The **mmq route is J=128-only staged**; it is a bit-exact reference for the
-  grouped kernel and is default-off.
+  upstream left it unwired. It remains the shipping default.
+- **No stream-K in either int8 mainloop**: the grid is row-tile × column-tile and one
+  CTA walks the whole K, so at narrow widths a 136-CTA launch on 84 SMs leaves a
+  quarter-idle tail wave that stream-K would flatten (the GGUF path in this engine
+  does have it).
+- **`--prefill-cublas` is a no-op on NVFP4**: the int8 promotion helper checks only
+  `prefill_a8`, unlike the Q4/Q5 one, and no cuBLAS route is registered for NVFP4.
+- **The MMQ mainloop throws rather than degrading when `K % 256 != 0`** (a weight plane
+  cannot be padded the way an activation tile can), and it registers no MoE /
+  expert-table variant, no `input_columns` gather, and no `dequantize_rows` embedding
+  path -- all of which the GGUF route has.
+- There is **no decode-phase policy for NVFP4** (no `AllowA8IntDecode` counterpart):
+  decode reaches the int8 path through the narrow band above, not through a
+  width-admission flag.
+- `J = 8` in both MMA ladders is unreachable under `grouped`/`mmq` now that `T ≤ 8`
+  belongs to the MMVQ kernel; the ladder's bottom rung only matters to a build that
+  puts the narrow band back.
 - Validated on **sm_86 (RTX 3090 Ti)** with the QUASAR-NVFP4 artifact; broader
   sm_89/90 coverage is pending.
 
 ## Test plan
 
 - Real-artifact int8 route tests (`test_nvfp4*.cpp`) on registered + aligned geometries.
-- Op-level FP64-oracle tests: integer activation relative-L2 ≤ 0.04.
-- Four-route configs (env unset / a16 / grouped / mmq) all green; wrong values fail loudly.
+- Op-level FP64-oracle tests: integer activation relative-L2 ≤ 0.04, over the ladder
+  widths `{1,2,3,31..127}` and the MMVQ half `{1..8}`.
+- **Five-route replay of the whole NVFP4 op suite** (env unset / a16 / grouped / mmq /
+  mmvq × 8 binaries = 40 runs): 35 pass, 5 skip (the TMA staging-race case has no TMA
+  route in an sm_8x build), 0 failures. Wrong route values fail loudly.
+- Envelope checks that a declared `[min,max]` workspace interval covers every width its
+  route can reach, including the padded width each mainloop actually addresses.
 
 ## Next steps
 
-1. **Implement the `J < 128` kernels including the decode path.** Add the small-`J`
-   SIMT decode mainloop so that `T = 1` decode stops falling back to the unoptimised
-   large-`J` path. This is expected to close the pure-decode gap against the A16 reference
-   (16.1 vs 9.9 grouped) without changing PPL.
-2. **Improve int8-path prefill performance.** Further optimise the grouped/MMQ prefill
-   mainloop (e.g. better tile/streaming of the per-(token, 32-col) activation quantiser,
-   pack/dequant overlap, larger K-blocking) to push the current ~1.7–1.8× lead over A16 wider.
+1. ~~Implement the `J < 128` kernels including the decode path.~~ **Done** by (3)-(5):
+   the ladder, the MMVQ mainloop and the narrow-band unification took `T = 1` decode
+   from 9.9 to 36.8 tok/s without moving PPL. What is left in this direction is the
+   fused narrow-`T` GLU: the int8 `linear_swiglu` is still two launches over an FP32
+   gate plane at every width, where a single-launch `[gate;up]` form (as the GGUF
+   decode kernel has) would remove one launch and the plane round-trip.
+2. **Improve int8-path prefill performance.** Now that the ladder is in, the remaining
+   known costs are stream-K (flat tail waves at 9-128 columns), the per-(token,32-col)
+   quantiser's tile streaming, and a cuBLAS escape for very wide prefills.
 3. **Implement a higher performance A16-path kernel (separate).** Replace the current reference A16 MMA
    route with a higher-performance A16 implementation so the wiring-gap fill is no longer just
-   a slow reference — keeping it viable where the int8 path is not selected.
+   a slow reference -- keeping it viable where the int8 path is not selected.
+4. **Give the int8 route a decode-phase policy** (`AllowNvfp4Int8Decode`-shaped) instead
+   of relying on the narrow band, and register the expert-table variant so an NVFP4 MoE
+   artifact can use these kernels at all.
