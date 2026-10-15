@@ -1,0 +1,331 @@
+#include "core/arena.h"
+#include "core/device.h"
+#include "core/expert_delivery.h"
+#include "core/vmm.h"
+
+#include <cuda_runtime.h>
+
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using namespace ninfer;
+namespace {
+constexpr int kLayers = 4, kExperts = 16, kPairs = 2048, kTail = 512;
+constexpr std::uint64_t kGu = 131072, kDown = 98304;
+
+__host__ __device__ unsigned char signature(int layer, int expert, int blob, std::uint64_t at) {
+    auto x = std::uint32_t(at) * 0x27d4eb2du ^ std::uint32_t(layer + 1) * 0x9e3779b1u ^
+             std::uint32_t(expert + 1) * 0x85ebca77u ^ std::uint32_t(blob + 1) * 0xc2b2ae3du;
+    x ^= x >> 15;
+    return static_cast<unsigned char>(x);
+}
+
+__global__ void inspect(const void* const* table, const std::int32_t* ids, int pairs, int layer,
+                        unsigned long long* failures, unsigned long long* visited) {
+    const int p = blockIdx.x;
+    if (p >= pairs || ids[p] < 0) { return; }
+    const int expert = ids[p];
+    if (threadIdx.x == 0) { atomicAdd(visited, 1ull); }
+    for (int b = 0; b < 2; ++b) {
+        const auto* data = static_cast<const unsigned char*>(table[(b ? 3 : 2) * kExperts + expert]);
+        if (!data) { if (!threadIdx.x) { atomicAdd(failures, 1ull); } continue; }
+        const auto bytes = b ? kDown - std::uint64_t(layer) * 256 : kGu;
+        // Every represented byte, its last byte, and every tail byte.
+        for (std::uint64_t at = threadIdx.x; at < bytes; at += blockDim.x) {
+            if (data[at] != signature(layer, expert, b, at)) { atomicAdd(failures, 1ull); }
+        }
+        if (data[bytes - 1] != signature(layer, expert, b, bytes - 1)) { atomicAdd(failures, 1ull); }
+        for (int at = threadIdx.x; at < kTail; at += blockDim.x) {
+            if (data[bytes + at]) { atomicAdd(failures, 1ull); }
+        }
+        if (!b && !threadIdx.x) {
+            if (table[expert] != data || table[kExperts + expert] != data + kGu / 2) {
+                atomicAdd(failures, 1ull);
+            }
+            if (reinterpret_cast<std::uintptr_t>(data) % 256) { atomicAdd(failures, 1ull); }
+        }
+    }
+}
+
+struct Fixture {
+    std::vector<std::unique_ptr<PinnedHostBuffer>> pinned;
+    std::vector<ExpertDeliveryLayer> layers;
+    std::vector<std::filesystem::path> paths;
+    explicit Fixture(bool disk, const std::filesystem::path& directory) {
+        std::array<std::ofstream, 2> output;
+        if (disk) {
+            for (int i = 0; i < 2; ++i) {
+                paths.push_back(directory / ("part-" + std::to_string(i)));
+                output[i].open(paths[i], std::ios::binary);
+                if (!output[i]) { throw std::runtime_error("fixture open failed"); }
+            }
+        }
+        std::uint64_t file_offsets[2]{};
+        for (int l = 0; l < kLayers; ++l) {
+            ExpertDeliveryLayer layer;
+            layer.aliases = {{0, 0}, {0, kGu / 2}, {0, 0}, {1, 0}};
+            for (int e = 0; e < kExperts; ++e) {
+                std::vector<ExpertBlob> expert;
+                for (int b = 0; b < 2; ++b) {
+                    ExpertBlob blob;
+                    blob.bytes = b ? kDown - std::uint64_t(l) * 256 : kGu;
+                    blob.zero_tail = kTail;
+                    std::vector<unsigned char> data(blob.bytes);
+                    for (std::uint64_t i = 0; i < blob.bytes; ++i) { data[i] = signature(l, e, b, i); }
+                    if (disk) {
+                        const auto split = blob.bytes / 3;
+                        output[0].write(reinterpret_cast<const char*>(data.data()), split);
+                        output[1].write(reinterpret_cast<const char*>(data.data() + split), blob.bytes - split);
+                        blob.extents = {{0, file_offsets[0], split},
+                                        {1, file_offsets[1], blob.bytes - split}};
+                        file_offsets[0] += split;
+                        file_offsets[1] += blob.bytes - split;
+                    } else {
+                        pinned.push_back(std::make_unique<PinnedHostBuffer>(blob.bytes));
+                        std::memcpy(pinned.back()->data(), data.data(), data.size());
+                        blob.pinned = pinned.back()->data();
+                    }
+                    expert.push_back(std::move(blob));
+                }
+                layer.experts.push_back(std::move(expert));
+            }
+            layers.push_back(std::move(layer));
+        }
+    }
+};
+
+int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesystem::path& path) {
+    Fixture fixture(disk, path);
+    ExpertDeliveryOptions options;
+    options.pair_capacity = kPairs;
+    options.cache_bytes = cache;
+    options.staging_bytes = 4096; // exercise repeated DMA half reuse inside one blob
+    options.suspendable = true;
+    ExpertDelivery delivery(device.rank(0), fixture.paths, std::move(fixture.layers), options);
+    DeviceBuffer ids(kPairs * 4), failures(8), visited(8);
+    failures.fill();
+    visited.fill();
+    const auto pass = [&] {
+        for (int l = 0; l < kLayers; ++l) {
+            const auto call = delivery.begin(l, static_cast<const std::int32_t*>(ids.p), kPairs, device.stream);
+            inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.cached_ids, kPairs, l,
+                static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            delivery.await(device.stream);
+            inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.missing_ids, kPairs, l,
+                static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            CUDA_CHECK(cudaGetLastError());
+        }
+    };
+    std::vector<std::int32_t> routes(kPairs);
+    for (int i = 0; i < kPairs; ++i) { routes[i] = i % 5; }
+    ids.copy_from_host(routes.data(), ids.bytes);
+    pass(); // load all kernels before a captured GPU wait can run
+    delivery.drain();
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(device.stream, cudaStreamCaptureModeThreadLocal));
+    pass();
+    CUDA_CHECK(cudaStreamEndCapture(device.stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    constexpr int repeats = 12;
+    for (int iteration = 0; iteration < repeats; ++iteration) {
+        for (int p = 0; p < kPairs; ++p) {
+            routes[p] = iteration % 3 == 0 ? p % 5 : (p + iteration) % kExperts;
+        }
+        ids.copy_from_host(routes.data(), ids.bytes);
+        CUDA_CHECK(cudaGraphLaunch(executable, device.stream));
+        delivery.drain();
+        if (iteration == 5) {
+            const auto* addresses = delivery.tables(0);
+            const auto bytes = delivery.state_backing_bytes();
+            if (!bytes) { throw std::runtime_error("suspend did not account device backing"); }
+            delivery.release_device_backing();
+            delivery.restore_device_backing();
+            if (delivery.tables(0) != addresses) {
+                throw std::runtime_error("suspend changed graph table address");
+            }
+        }
+    }
+    CUDA_CHECK(cudaGraphExecDestroy(executable));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    unsigned long long bad = 0, count = 0;
+    failures.copy_to_host(&bad, 8);
+    visited.copy_to_host(&count, 8);
+    const auto stats = delivery.stats();
+    const auto memory = delivery.memory();
+    const bool ok = !bad && count == std::uint64_t(repeats + 1) * kLayers * kPairs &&
+                    stats.routes == stats.hits + stats.misses && stats.misses &&
+                    (cache ? stats.hits != 0 : stats.hits == 0) &&
+                    (disk ? stats.read_bytes == stats.copied_bytes : stats.read_bytes == 0) &&
+                    (cache ? memory.cache_bytes != 0 : memory.cache_bytes == 0);
+    std::printf("%s cache=%llu bad=%llu pairs=%llu hits=%llu misses=%llu evictions=%llu "
+                "read=%llu copied=%llu transient=%llu %s\n", disk ? "disk" : "host",
+                (unsigned long long)cache, bad, count, (unsigned long long)stats.hits,
+                (unsigned long long)stats.misses, (unsigned long long)stats.evictions,
+                (unsigned long long)stats.read_bytes, (unsigned long long)stats.copied_bytes,
+                (unsigned long long)memory.transient_bytes, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+int failure_control(DeviceContext& device, const std::filesystem::path& path, bool omit_wait) {
+    Fixture fixture(true, path);
+    ExpertDeliveryOptions options;
+    options.pair_capacity = kPairs;
+    options.cache_bytes = 0;
+    options.staging_bytes = 4096;
+    ExpertDelivery delivery(device.rank(0), fixture.paths, std::move(fixture.layers), options);
+    DeviceBuffer ids(kPairs * 4), failures(8), visited(8);
+    failures.fill();
+    visited.fill();
+    std::vector<std::int32_t> routes(kPairs, -1);
+    ids.copy_from_host(routes.data(), ids.bytes);
+    // Load inspect before an asynchronous transfer can start.
+    inspect<<<1, 32, 0, device.stream>>>(delivery.tables(0), static_cast<const std::int32_t*>(ids.p),
+        1, 0, static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    std::fill(routes.begin(), routes.end(), 0);
+    ids.copy_from_host(routes.data(), ids.bytes);
+    if (!omit_wait) { std::filesystem::resize_file(fixture.paths.front(), 0); }
+    const auto call = delivery.begin(0, static_cast<const std::int32_t*>(ids.p), kPairs, device.stream);
+    if (omit_wait) {
+        inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(0), call.missing_ids, kPairs, 0,
+            static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+        delivery.await(device.stream);
+        delivery.drain();
+        unsigned long long bad = 0;
+        failures.copy_to_host(&bad, 8);
+        std::printf("positive control without ready dependency: %llu mismatches\n", bad);
+        return bad ? 1 : 0; // this intentionally broken execution must fail
+    }
+    try { delivery.await(device.stream); }
+    catch (const std::exception&) {
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        std::puts("truncated source: error propagated and GPU wait released PASS");
+        return 0;
+    }
+    std::puts("FAIL truncated source was accepted");
+    return 1;
+}
+
+int admission_boundaries(DeviceContext& device) {
+    PinnedHostBuffer source(256);
+    std::memset(source.data(), 0, source.size());
+    ExpertDeliveryLayer layer;
+    layer.experts = {{{source.data(), {}, 256, 0}}};
+    layer.aliases = {{0, 0}};
+    for (const bool suspendable : {false, true}) {
+        ExpertDeliveryOptions options;
+        options.pair_capacity = 1;
+        options.suspendable = suspendable;
+        // At zero available cache bytes, a nonzero explicit request must be refused before
+        // allocation. This is independent of the card's currently free memory.
+        options.keep_free_bytes = std::numeric_limits<std::uint64_t>::max();
+        options.cache_bytes = 256;
+        bool rejected = false;
+        try { ExpertDelivery delivery(device.rank(0), {}, {layer}, options); }
+        catch (const std::invalid_argument& error) {
+            rejected = std::string(error.what()).find("expert delivery: cache needs ") == 0;
+        }
+        if (!rejected) { throw std::runtime_error("explicit cache consumed the reserved budget"); }
+        // The exact zero-cache boundary remains valid, both explicitly and automatically.
+        options.cache_bytes = 0;
+        std::uint64_t mandatory_backing = 0;
+        {
+            ExpertDelivery delivery(device.rank(0), {}, {layer}, options);
+            if (delivery.memory().cache_bytes) { throw std::runtime_error("zero cache allocated backing"); }
+            mandatory_backing = delivery.state_backing_bytes();
+        }
+        options.cache_bytes.reset();
+        {
+            ExpertDelivery delivery(device.rank(0), {}, {layer}, options);
+            if (delivery.memory().cache_bytes) { throw std::runtime_error("auto cache consumed the reserve"); }
+        }
+        // With available room, report the physical size of a sub-granule slot, not its 256-byte
+        // logical size. The same rounded size is used by the rejection above.
+        options.keep_free_bytes = 0;
+        options.cache_bytes = 256;
+        {
+            ExpertDelivery delivery(device.rank(0), {}, {layer}, options);
+            const auto granule = suspendable ? vmm::granularity(device.device) : 1;
+            const auto expected = (256 + granule - 1) / granule * granule;
+            if (delivery.memory().cache_bytes != expected || delivery.memory().cache_slots != 1) {
+                throw std::runtime_error("sub-granule cache did not report its physical backing");
+            }
+        }
+#ifndef _WIN32
+        // Linux pinned buffers do not consume device backing. Use the observed mandatory
+        // footprint, without assuming its allocation layout, to leave 256 bytes at admission.
+        // The logical slot fits; its VMM granule must be refused.
+        if (suspendable) {
+            const auto granule = vmm::granularity(device.device);
+            if (granule > 256) {
+                std::size_t free = 0, total = 0;
+                CUDA_CHECK(cudaMemGetInfo(&free, &total));
+                if (free <= mandatory_backing + granule) {
+                    throw std::runtime_error("insufficient free memory for cache admission boundary test");
+                }
+                options.keep_free_bytes = free - mandatory_backing - 256;
+                rejected = false;
+                try { ExpertDelivery delivery(device.rank(0), {}, {layer}, options); }
+                catch (const std::invalid_argument& error) {
+                    rejected = std::string(error.what()).find("but only 256 remain") != std::string::npos;
+                    if (!rejected) { throw std::runtime_error(error.what()); }
+                }
+                if (!rejected) { throw std::runtime_error("VMM cache rounding consumed the reserve"); }
+                // Auto must choose zero slots, rather than reject or allocate a granule beyond
+                // its remainder. A remainder one byte below the granule is the upper boundary.
+                CUDA_CHECK(cudaMemGetInfo(&free, &total));
+                options.keep_free_bytes = free - mandatory_backing - (granule - 1);
+                options.cache_bytes.reset();
+                ExpertDelivery delivery(device.rank(0), {}, {layer}, options);
+                if (delivery.memory().cache_bytes) {
+                    throw std::runtime_error("auto cache rounded past its physical remainder");
+                }
+            }
+        }
+#endif
+        std::printf("cache admission suspendable=%d explicit reject, zero/auto accept, "
+                    "physical rounding PASS\n", int(suspendable));
+    }
+    return 0;
+}
+} // namespace
+
+int main(int argc, char** argv) {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) { return 77; }
+    try {
+        DeviceContext device(0);
+        if (argc == 2 && std::string(argv[1]) == "--admission-only") {
+            return admission_boundaries(device);
+        }
+        const auto path = std::filesystem::temp_directory_path() /
+            ("ninfer-expert-delivery-" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(path);
+        struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{path};
+        if (argc == 2 && std::string(argv[1]) == "--no-ready-wait") {
+            return failure_control(device, path, true);
+        }
+        int failures = admission_boundaries(device);
+        for (bool disk : {false, true}) {
+            for (auto cache : {0ULL, 6ULL << 20, 64ULL << 20}) {
+                failures += run(device, disk, cache, path);
+            }
+        }
+        failures += failure_control(device, path, false);
+        return failures ? 1 : 0;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAIL %s\n", error.what());
+        return 1;
+    }
+}

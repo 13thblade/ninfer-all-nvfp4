@@ -476,7 +476,7 @@ struct ModelSuspendOptions {
     bool auto_resume = true;
 };
 
-// Qwen3.8-Flash-Next (Qwen4ExpForCausalLM): where the routed experts' banks live.
+// Where supported MoE families keep routed expert banks (see each family guide).
 enum class ExpertResidency : std::uint8_t {
     // In the weight arena of each layer's stage device.
     Device,
@@ -564,11 +564,11 @@ struct EngineOptions {
     // Layers per stage, one count per entry of `devices`. Empty lets the engine choose from each
     // device's free memory.
     std::vector<std::uint32_t> stage_layers;
-    // Qwen3.8-Flash-Next only.
+    // Qwen3.8-Flash-Next and Gemma 4 MoE.
     ExpertResidency expert_residency = ExpertResidency::Device;
-    // Host-resident experts: device memory lent to the cache of the most used experts, split
+    // Host/disk experts: device memory lent to the persistent cache, split
     // evenly over the devices. Empty takes what each device has free after startup less a margin;
-    // zero disables the cache.
+    // zero disables the cache. Gemma keeps separate bounded transient delivery slots.
     std::optional<std::uint64_t> expert_cache_bytes;
     HybridExpertOptions hybrid_experts;
     // Qwen3.8-Flash-Next only.
@@ -1606,7 +1606,7 @@ struct MemorySummary {
     std::size_t host_kv_page_group_bytes = 0;
     // Engaged only when the single host RAM budget mode is active.
     std::size_t host_cache_budget_bytes = 0;
-    // Qwen3.8-Flash-Next host or disk experts: device memory lent to the expert cache, over every
+    // Host or disk experts: device memory lent to the persistent expert cache, over every
     // device.
     std::size_t expert_cache_bytes = 0;
     // A pipeline over several devices: each device in stage order, the primary one (which the
@@ -1658,7 +1658,7 @@ struct NgramTableStats {
     double stall_seconds = 0.0;
 };
 
-// Qwen3.8-Flash-Next's routed experts with host or disk residency, monotonic. A route is one
+// Routed experts with host or disk residency, monotonic. A route is one
 // (token, expert) pair a pass took; a hit found its expert in a device slot. transferred_bytes
 // counts the expert bytes copied to the devices (misses and cache admissions); cpu_routes the
 // pairs computed by the CPU.

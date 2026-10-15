@@ -44,7 +44,7 @@ foreach(op IN LISTS ninfer_op_tests)
     LIBRARIES ninfer_ops)
 endforeach()
 
-ninfer_add_op_test(ninfer_gguf_moe_geglu_test
+ninfer_add_op_test(ninfer_gguf_moe_geglu_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_moe_geglu.cpp"
   LIBRARIES ninfer_ops)
 

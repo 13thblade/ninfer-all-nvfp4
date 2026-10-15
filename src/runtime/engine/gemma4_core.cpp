@@ -116,6 +116,12 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                  speculative.mtp_policy == MtpDraftPolicy::Adaptive)) {
         throw std::invalid_argument("--lookup-ngram and --adaptive-mtp require --spec mtp");
     }
+    const auto& hybrid = options.hybrid_experts;
+    if (hybrid.dma_share != 1 || hybrid.cpu_threads != 0 || hybrid.mapped_misses ||
+        hybrid.adaptive_cache || !hybrid.routing_profile.empty() || !hybrid.record_profile.empty()) {
+        throw std::invalid_argument("Gemma 4 expert residency uses GPU arithmetic and DMA only; "
+                                    "Flash-Next hybrid/profile options do not apply");
+    }
     if (device.size() != 1) { throw std::invalid_argument("Gemma 4 runs on one device"); }
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     const artifact::Reader reader(options.artifact_path);
@@ -131,7 +137,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                                     "(convert with --components text,vision)");
     }
     auto model = models::gemma4::load_model(
-        reader, {.artifact = options.artifact_path, .assistant = mtp, .vision = vision}, device,
+        reader, {.artifact = options.artifact_path, .assistant = mtp, .vision = vision,
+                 .experts = options.expert_residency}, device,
         &options.startup_observer);
     device.synchronize();
     materialize.complete();
@@ -166,6 +173,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     executor.cuda_graphs   = options.use_cuda_graph;
     executor.draft_tokens  = mtp ? speculative.draft_tokens : 0;
     executor.kv_cache      = options.kv_cache;
+    executor.expert_cache_bytes = options.expert_cache_bytes;
     // Causal scoring keeps no context between requests.
     executor.checkpoints   = options.context_cache.enabled &&
                            options.purpose == EnginePurpose::Generation;
@@ -206,6 +214,16 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                        executor.sequences, executor.prefill_chunk,
                        double(instance->executor->memory().kv_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0);
+    if (options.expert_residency != ExpertResidency::Device) {
+        const auto memory = instance->executor->memory().experts;
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+            "Gemma 4: experts in %s, cache %.0f MiB (%u slots), transient %.0f MiB, "
+            "metadata %.1f MiB, pinned delivery %.1f MiB, pinned expert sources %.0f MiB",
+            options.expert_residency == ExpertResidency::Host ? "pinned host memory" : "artifact files",
+            double(memory.cache_bytes) / 1048576, memory.cache_slots,
+            double(memory.transient_bytes) / 1048576, double(memory.metadata_bytes) / 1048576,
+            double(memory.pinned_bytes) / 1048576, double(model->expert_pinned_bytes()) / 1048576);
+    }
     if (options.enable_vision) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "Gemma 4: vision tower %s, up to %u soft tokens per image or video frame",
@@ -1209,6 +1227,7 @@ struct Gemma4Core::Impl {
         CUDA_CHECK(cudaMemcpyAsync(tokens, sample_out.p, n * sizeof(std::int32_t),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        instance.executor->check_experts();
         for (std::size_t b = 0; b < n; ++b) {
             const std::int32_t token = tokens[b];
             if (token == ops::kSamplerNonFiniteToken || token < 0 ||
@@ -1337,6 +1356,7 @@ struct Gemma4Core::Impl {
         }
         if (r.observation.prompt_progress) {
             CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
+            executor.check_experts();
             {
                 std::lock_guard lock(r.mutex);
                 r.stream_progress =
@@ -1349,6 +1369,7 @@ struct Gemma4Core::Impl {
         }
         if (r.prefilled < prompt_n) { return; }
         CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
+        executor.check_experts();
         r.prefill_end = Clock::now();
         {
             std::lock_guard lock(stats_mutex);
@@ -1838,6 +1859,7 @@ struct Gemma4Core::Impl {
         CUDA_CHECK(cudaMemcpyAsync(host + b * w + b, spec_accepted.p, b * 4, cudaMemcpyDeviceToHost,
                                    stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        instance.executor->check_experts();
 
         // The output policy takes its part of each licensed run; the executor then keeps the tokens
         // fed up to the last one taken.
@@ -1988,6 +2010,7 @@ struct Gemma4Core::Impl {
             CUDA_CHECK(cudaMemcpyAsync(host.data(), score_out.p, rows * 4, cudaMemcpyDeviceToHost,
                                        stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
+            instance.executor->check_experts();
             out.insert(out.end(), host.begin(), host.end());
         }
         return out;
@@ -2236,9 +2259,12 @@ MemorySummary Gemma4Core::memory_summary() const {
     }
     out.weights   = arena(stats.device_capacity_by_rank.empty() ? 0 : stats.device_capacity_by_rank[0]);
     out.sequence  = arena(memory.kv_bytes);
-    out.workspace = arena(memory.workspace_bytes);
+    out.workspace = arena(memory.workspace_bytes + memory.experts.transient_bytes +
+                          memory.experts.metadata_bytes);
     out.kv_payload_bytes              = memory.kv_bytes;
-    out.runtime_reservation_bytes     = memory.kv_bytes + memory.workspace_bytes;
+    out.expert_cache_bytes = memory.experts.cache_bytes;
+    out.runtime_reservation_bytes = memory.kv_bytes + memory.workspace_bytes +
+        memory.experts.cache_bytes + memory.experts.transient_bytes + memory.experts.metadata_bytes;
     out.available_after_weights_bytes = impl_->instance.free_after_weights;
     out.available_after_startup_bytes = impl_->instance.free_after_startup;
     if (impl_->instance.vision_budget > 0) {
@@ -2253,7 +2279,7 @@ MemorySummary Gemma4Core::memory_summary() const {
                              : VisionResidency::Resident};
         if (placement == models::gemma4::VisionPlacement::Pinned) {
             vision.window_capacity_bytes = memory.vision_owned_bytes;
-            vision.pinned_weight_bytes   = stats.pinned_bytes;
+            vision.pinned_weight_bytes   = stats.pinned_bytes - impl_->instance.model->expert_pinned_bytes();
         }
         out.vision_workspace = vision;
     }
@@ -2262,7 +2288,14 @@ MemorySummary Gemma4Core::memory_summary() const {
 
 RuntimeStats Gemma4Core::runtime_stats() const {
     std::lock_guard lock(impl_->stats_mutex);
-    return impl_->stats;
+    auto stats = impl_->stats;
+    const auto experts = impl_->instance.executor->expert_stats();
+    stats.experts.routes = experts.pairs;
+    stats.experts.hits = experts.pair_hits;
+    stats.experts.admitted = experts.admissions;
+    stats.experts.slots = impl_->instance.executor->memory().experts.cache_slots;
+    stats.experts.transferred_bytes = experts.copied_bytes;
+    return stats;
 }
 
 bool Gemma4Core::is_available() const {
