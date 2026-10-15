@@ -41,7 +41,7 @@ struct Nvfp4AttentionInputOutput {
 
 using DecodeGeometry = Nvfp4N14336K5120;
 using DecodeSchedule =
-    Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+    Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 4>;
 
 // Fused Offset-RMSNorm + GEMV for exactly one token. The norm prologue deliberately reuses the
 // D=5120 RMSNorm launcher's pair ownership (256 threads x 10 pairs), accumulation order,
