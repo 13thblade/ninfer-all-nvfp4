@@ -113,6 +113,15 @@ the 32-key tile at every width from 128 to 4,096 queries, at 16 and 24 query hea
 at their default power limits (250 W, 260 W); both tiles passed the FP64 oracles, racecheck and
 memcheck.
 
+Whole model on the Quadro RTX 6000, `ninfer_bench -r 3`, the previous tiles and these run one after
+the other: resident Gemma 4 26B-A4B with an F16 KV cache prefilled 512, 2,048 and 16,384 tokens at
+2,580, 3,802 and 3,251 tok/s instead of 2,465, 3,503 and 2,624 (4.7%, 8.5% and 23.9% faster) and
+decoded at 154.1 instead of 151.7. Resident Qwen3.6-35B-A3B with an FP8 KV cache prefilled 512,
+4,096 and 16,384 tokens at 570, 717 and 602 tok/s instead of 566, 708 and 582 (0.7%, 1.3% and 3.4%)
+and decoded at 131.3 instead of 131.0. In Nsight Systems the width-512 attention of a 2,048- and a
+16,384-token Gemma prompt took 1.89 s instead of 3.70 s, and the FP8 prompt attention of a
+16,384-token Qwen prompt 10.5 s instead of 12.2 s.
+
 ### Several requests at once
 
 `ninfer-serve` with Ternary Bonsai 2, `rk8v4` and eight lanes; 1, 2, 4 and 8 different chat
