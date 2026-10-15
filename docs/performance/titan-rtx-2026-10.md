@@ -78,8 +78,8 @@ Ternary Bonsai 2, a 16,384-token prompt, then 64 decoded tokens, one run each:
 | `k8v4` | 25,728 | 634 | 59.6 |
 
 The RTX 3090 runs the same prompt at 2,875 tok/s with `rk8v4` and 2,687 with `bf16`, and decodes at
-93.9 and 92.0. On Turing the FP8, NVFP4 and K8V4 prompt kernels widen K and V into one shared tile
-(64 KiB a block), and their prompts run at about half the rate of the INT8 family.
+93.9 and 92.0. The FP8, NVFP4 and K8V4 prompts ran at about half the rate of the INT8 family here;
+the FP8 prompt kernel has since moved to 16-key tiles ([below](#prompt-attention-tiles)).
 
 ### Depth
 
@@ -93,8 +93,25 @@ A 65,536-token prompt, then 64 decoded tokens, one run each:
 | Qwen3.8-27B IQ3_S | `rk8v4` | 598 | 33.4 | |
 
 At 16,384 tokens IQ3_S prompts at 701 tok/s and decodes at 33.1, Gemma 4 (F16 KV) at 2,660 and
-158.5; its full-attention blocks run llama.cpp's 8-column Turing tile, since the wider ones race
+158.5. That Gemma run predates the vendored combine-loop barrier: its full-attention blocks then
+took llama.cpp's 8-column tile, and they now take the 32-column one
 ([Turing tier](../maintainer/build-system.md#turing-tier-75)).
+
+### Prompt attention tiles
+
+Median time of one complete prompt-attention launch at each tile, five interleaved rounds:
+
+| Gemma 4 width-512 attention, query / KV tokens | RTX 2080 Ti, 8 / 32 columns, ms | Quadro RTX 6000, 8 / 32 columns, ms |
+|---|---:|---:|
+| 512 / 512 | 0.650 / 0.418 | 0.599 / 0.411 |
+| 2,048 / 2,048 | 10.18 / 5.54 | 9.55 / 5.19 |
+| 2,048 / 16,384 | 94.6 / 42.4 | 85.9 / 39.8 |
+| 16,384 / 16,384 | 1,025 / 326 | 815 / 305 |
+
+FP8 prompt attention takes 16-key tiles on Turing: on the RTX 2080 Ti they ran 13-15% faster than
+the 32-key tile at every width from 128 to 4,096 queries, at 16 and 24 query heads. Both cards ran
+at their default power limits (250 W, 260 W); both tiles passed the FP64 oracles, racecheck and
+memcheck.
 
 ### Several requests at once
 
