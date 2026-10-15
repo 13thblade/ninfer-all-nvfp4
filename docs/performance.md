@@ -18,6 +18,169 @@
 
 ## RTX 3090 (`sm_86`) findings — this fork
 
+### v0.16.0 release binaries, all three models (2026-10-14)
+
+Measured on the **published v0.16.0 Windows zip** (`ninfer-serve.exe` and `ninfer_bench.exe` from the
+release asset, checksum verified), RTX 3090 (`sm_86`), CUDA 12.8, driver 13.4, Windows 11, models from
+`models\`. The desktop was attached (1.1-1.9 GiB of VRAM in use) and each block held the GPU lock for
+its whole run. 64 GiB of RAM, about 50 GiB free.
+
+Two routes, which answer different questions and must not be read against each other:
+
+- **HTTP route** (`ninfer-serve`, streaming, greedy, thinking off, 512 new tokens, launcher flags, four
+  requests per prompt size, medians). Prompts are this repository's markdown, each request with a unique
+  first line so the prefix cache cannot answer. "Prefill" is prompt tokens over time to first token, so
+  it includes HTTP and scheduling. This is what a user sees.
+- **`ninfer_bench`** (Engine route). Decode starts from a **one-token seed on the bundled token corpus**,
+  not from a chat prompt, so speculative acceptance is far lower than on real text. These rows
+  compare builds and settings, and are not a statement of decode speed in use.
+
+**HTTP route, launcher settings**
+
+| Model and flags | Prompt tokens | Prefill tok/s | First word | Decode tok/s |
+|---|---:|---:|---:|---:|
+| **Qwen3.8-27B**, DFlash2 K=7 + n-gram copies, rk4v4 KV, cuBLAS prefill (chunk 4096) | 1,268 | 2,101 | 0.55 s | 126.3 |
+| | 8,751 | 2,798 | 3.14 s | 125.6 |
+| | 29,454 | 2,581 | 11.44 s | 110.2 |
+| **Qwen3.8-27B**, MTP3 + draft head, rk4v4 KV | 1,268 | 2,149 | 0.55 s | 115.9 |
+| | 8,751 | 2,871 | 3.05 s | 119.4 |
+| | 29,454 | 2,628 | 11.23 s | 114.2 |
+| **Qwen3.6-35B-A3B**, MTP3 + draft head + Q4 MTP experts, rk4v4 KV, cuBLAS prefill | 1,268 | 5,351 | 0.21 s | 286.2 |
+| | 8,751 | 7,481 | 1.17 s | 271.6 |
+| | 29,454 | 6,708 | 4.42 s | 281.9 |
+| **Qwen3.8-Flash-Next** (preview), MTP 3 drafts, INT8 KV, 32K context | 1,268 | 1,281 | 0.90 s | 112.0 |
+| | 8,751 | 2,057 | 4.27 s | 113.2 |
+| | 29,454 | 2,328 | 12.69 s | 103.7 |
+| **Qwen3.8-Flash-Next**, no speculation | 1,268 | 1,334 | 0.86 s | 83.6 |
+| | 8,751 | 2,098 | 4.18 s | 82.1 |
+| | 29,454 | 2,355 | 12.53 s | 82.6 |
+
+- The 27B ran with a 131,072-token context and the 35B with 65,536, because these runs were not meant
+  to find the largest context that fits.
+- **Flash-Next with MTP is 1.34x to 1.38x plain decode** at 1.3K and 8.8K tokens and 1.26x at 29K, with the same
+  prefill speed as plain (the drafter costs no measurable prefill here). MTP decode ranges over the four
+  requests of a size by about +-10%: 98.9-119.6 at 1.3K, 97.6-122.2 at 8.8K.
+- **An exact repeat of the 29K prompt answers its first word in 0.05-0.14 s** on all three models
+  (cache hit of 29,445 of 29,454 tokens).
+- **A first Flash-Next MTP run measured 584 / 740 / 776 tok/s prefill and 93 / 94 / 87 tok/s decode.
+  Do not quote it.** It was the first server started after the machine's RAM had been cleared, so the
+  model and n-gram volume files were read from disk; a repeat on a warm file cache gave the rows above.
+  The warm-up requests inside the run did not hide it. Measure Flash-Next only after the model and
+  `.ngram` volume have been read once.
+- Flash-Next prefill climbs with prompt length (1,281 to 2,328 tok/s) because short prompts are
+  dominated by loading experts into the cache, which a long prompt amortises.
+
+**Forking a conversation and continuing both branches (prefix reuse), HTTP route, one run.** Sections of
+9,000 characters of this repository's markdown (2,400-3,300 tokens each) form a conversation as user
+messages with a fixed assistant reply ("Noted.") between them, so branches share an exact token prefix.
+Steps run in this order against one fresh server, with `cached` read from the response's
+`prompt_tokens_details.cached_tokens` and 24 output tokens per request. Flash-Next ran with MTP and
+INT8 KV at 32K context, the 27B with DFlash2 + n-gram copies and rk4v4 at 64K. Both models tokenize
+the prompts identically, so the token counts are the same.
+
+| Step (sections sent) | Prompt tokens | Cached | New tokens | First word, 27B | First word, Flash-Next |
+|---|---:|---:|---:|---:|---:|
+| 1+2 (new conversation) | 5,161 | 0 | 5,161 | 2.05 s | 2.41 s |
+| 1+2+3 (continue) | 7,599 | 5,164 | 2,435 | 0.94 s | 1.32 s |
+| 1+2+4 (fork from 1+2) | 8,144 | 5,152 | 2,992 | 1.23 s | 1.53 s |
+| 1+2+3+5 (continue branch A) | 10,881 | 7,602 | 3,279 | 1.27 s | 1.61 s |
+| 1+2+4+6 (continue branch B) | 11,094 | 8,147 | 2,947 | 1.16 s | 1.48 s |
+| 1+2+3+5+7 (branch A again) | 14,051 | 10,884 | 3,167 | 1.30 s | 1.56 s |
+| 1+2+4+6+8 (branch B again) | 14,284 | 11,097 | 3,187 | 1.32 s | 1.56 s |
+| 1+2+3+5 (exact repeat) | 10,881 | 10,872 | 9 | 0.11 s | 0.11 s |
+| 1+2+3+9 (late fork from 1+2+3) | 10,746 | 7,590 | 3,156 | 1.32 s | 1.51 s |
+| control: the 14,052-token 1+2+3+5+7, different first line | 14,052 | 0 | 14,052 | 5.69 s | 6.47 s |
+| control: the 14,285-token 1+2+4+6+8, different first line | 14,285 | 0 | 14,285 | 5.76 s | 6.56 s |
+
+- **Every step reused its parent's prefix.** The cached count equals the parent's prompt (a few tokens
+  more or fewer at the reply boundary), and the new tokens are the new section plus a handful. Both
+  branches stayed cached side by side: branch A continued after branch B had been created, and a late
+  fork from 1+2+3 still found 7,590 tokens after the 1+2+4 branches existed.
+- **Cost of a branch step against a cold prompt of the same length:** about 1.3 s against 5.7 s on the
+  27B and 1.6 s against 6.5 s on Flash-Next, at 14K tokens, so 4.4x and 4.1x faster to the first word.
+- The "cached" percentage rises with depth (68% to 78%) only because the shared prefix grows while each
+  step adds one section of similar size.
+- **Limits:** one run, one request per step, no thinking, 24 output tokens, one server per model so
+  the cache never had to evict, 32K and 64K contexts, and a generated reply that is the same each turn.
+  A real agent's changing tool output, edits to earlier turns, and many concurrent conversations are not
+  covered here; the agent-rotation and hosted-workload benchmarks in `tools/bench` measure those.
+
+**KV format for the 27B with MTP3.** The launcher's `tuned` profile uses rk4v4 and the C8 profile INT8.
+An interleaved INT8 / rk4v4 / rk4v4 / INT8 run (identical flags otherwise) shows:
+
+| Route | INT8 | rk4v4 |
+|---|---:|---:|
+| HTTP, 1,268-token prompt, decode tok/s | 120.5, 119.5 | 113.1, 112.9 |
+| HTTP, 8,751-token prompt, decode tok/s | 118.5, 118.1 | 121.2, 121.1 |
+| `ninfer_bench` tg128 (one-token seed), decode tok/s | 107.1, 105.6 (acceptance 55.6%) | 71.5, 71.3 (acceptance 27.5%) |
+| `ninfer_bench` tg512, decode tok/s | 128.3, 127.0 (acceptance 74.2%) | 82.4, 82.2 (acceptance 36.4%) |
+
+On real text over HTTP the two formats decode within a few percent of each other (rk4v4 6% slower at
+1.3K tokens, 2% faster at 8.8K, with three requests per cell, so this is not a ranking); rk4v4's gain is
+memory, which is what lets the launcher offer a larger context. On the `ninfer_bench` corpus rk4v4
+is about 33% slower with MTP3, because acceptance halves: the rk4v4 numerics send that synthetic
+greedy stream somewhere the draft model predicts worse. Rounds cost the same. We did not look for the
+cause. Treat `ninfer_bench` MTP rows as comparable only between runs that use the same KV format.
+
+**`ninfer_bench`, Engine route** (mean of 5 repetitions after one warm-up; model flags as noted)
+
+| Model | Test | Setting | Result |
+|---|---|---|---|
+| Qwen3.8-27B | prefill 512 / 4,096 / 16,384 | rk4v4, cuBLAS prefill, chunk 4096 | 2,057 / 3,143 / 2,893 tok/s |
+| Qwen3.8-27B | decode 128 / 512 from a one-token seed | DFlash2 K=7 + draft head, rk4v4 | 52.9 / 61.3 tok/s (acceptance 7% / 11%) |
+| Qwen3.8-27B | decode 128, no speculation | rk4v4 | 49.0 tok/s |
+| Qwen3.8-27B | decode 128 / 512 | MTP3 + draft head, INT8 KV | 107.1 / 128.3 tok/s (the ABBA rows above) |
+| Qwen3.8-27B | decode 128, C1 / C8 aggregate | MTP3 + draft head, INT8 KV | 105.7 / 280.0 tok/s |
+| Qwen3.8-27B | prefill 4,096; decode 128 / 512 | MTP3 + draft head, rk4v4 | 3,190 tok/s; 73.1 / 84.2 tok/s |
+| Qwen3.6-35B-A3B | prefill 512 / 4,096 / 16,384 | rk8v4, cuBLAS prefill, chunk 4096 | 5,479 / 8,468 / 7,749 tok/s |
+| Qwen3.6-35B-A3B | decode 128 / 512 | MTP3 + draft head, rk8v4 | 266.3 / 312.7 tok/s |
+| Qwen3.6-35B-A3B | decode 512, no speculation | rk8v4 | 204.5 tok/s |
+| Qwen3.6-35B-A3B | decode 128, C2 / C4 / C6 aggregate | MTP3 + draft head, INT8, 4K context | 362.4 / 436.1 / 464.3 tok/s |
+
+- `ninfer_bench` has no `--mtp-experts-q4` or `--gdn-state-fp16`, so the 35B rows above run without
+  those two launcher flags; the HTTP table runs with them. Both flags are in the HTTP row.
+- 27B prefill at 4,096 tokens (3,143 tok/s) sits between the 3,044 of the v0.15.1 comparison
+  (master, 2026-10-13) and the 3,185 of the README headline table. Prefill at 16,384 (2,893) is 2.8%
+  above the 2,815 recorded for master on 2026-10-13.
+- 35B prefill at 4K is 8,468 tok/s here against 8,848 in the README headline table (4.3% lower); the
+  README's 35B section said no 3090 prefill figure had been measured.
+- `ninfer_bench` on **Flash-Next is not a good measure**: the expert cache is cold at the start, and
+  decode rose from 49 to 75 tok/s over three consecutive 128-token requests in a probe. The HTTP
+  table above, with warm-up requests, is the Flash-Next measurement.
+
+**Not measured:** Qwen3.8-27B or 35B at C2-C8 over HTTP, any model with thinking enabled, Flash-Next at
+128K context, and a comparison against Strata on the same GGUF (its tools are not on this machine; the
+Strata figures in the README are from the earlier campaign).
+
+**Test suite on the same commit** (`master` `50a337e1`, built with `NINFER_CUDA_RDC=OFF`, run with
+`tools/run-tests.ps1`, the 27B artifact as `NINFER_TEST_ARTIFACT` and the Flash-Next artifact as
+`NINFER_TEST_QWEN4EXP_ARTIFACT`): 207 tests, **197 passed, 6 failed, 4 skipped**, in 57 minutes.
+
+- Skipped: `s3_object_store` (needs a MinIO server), `artifact_ggml_real`, `qwen3_5_loading_real` and
+  `qwen4_exp_forward_real` (each needs its own artifact or an explicit argument).
+- `qwen3_5_dflash_real` failed first for the wrong artifact ("missing component dflash": it needs the
+  35B, which has DFlash v1). With the 35B it failed on "did not reuse its cache snapshot: reused=0"
+  because its fixture is a 17-token conversation, too short for the cost-priced cache to restore; with
+  a ~200-token prompt the whole test passes, and forked-conversation reuse with `--spec dflash` works
+  over HTTP exactly as with MTP. Fixed in #313.
+- `qwen3_5_dflash_prefill_real` ("linear_topk: unsupported head profile") needs a 27B whose output head
+  is Q8 or FP8; this fork's 27B conversion has a 6-bit head. With upstream's artifact
+  (`neroued/Qwen3.8-27B-NInfer` at `1cbd84e7`) it passes, and `ninfer-serve --spec dflash2` without
+  `--lm-head-draft` runs on the fork's 27B, so serving is not affected. Documented in #313.
+- `artifact_writer_interop` failed on a stale constant: the writer fixture gained a 13th GGML object
+  (the MTP drafter's record format, #262) and the C++ test still required 12. It is a test bug, not a
+  product one, and is fixed in #312.
+- `offloaded_moe_wide` crashed on the real Flash-Next artifact (exit `0xc0000409`) while checking the
+  last bank, weight 48, the MTP drafter's `q2_0+q2_0`. That format is narrow-route only by contract
+  (`offloaded_sparse_moe.h`), the wide route correctly throws `std::invalid_argument`, and the test
+  had no handler, so the throw ended the process without a message. The test sent a bank to a route
+  that does not support it; the engine is not at fault, and the drafter runs on the narrow route.
+  Fixed in #312 (the wide test now skips that bank, asserts the refusal, and reports exceptions).
+- `qwen3_5_moe_real` is environmental: its last stage reserves a 262,144-token context and the test
+  harness turns a device-memory shortfall into a skip, which is why ctest listed it as passed and
+  skipped. With `NINFER_REAL_TEST_MAX_CONTEXT=32768` and the 35B artifact it runs to `ok`; 65,536 still
+  lacks 94 MB beside the desktop.
+
 **DFlash2 measured on this fork (RTX 3090, Qwen3.8-27B groupwise-int, `--kv-dtype int8`,
 `--draft-tokens 7`, greedy, 96 new tokens).** Text: 20.0% acceptance, 2.38 tok/round.
 Vision (`--vision`, the committed `image_chart` fixture): 85.7% acceptance, 7.00 tok/round,
