@@ -9,9 +9,9 @@ namespace ninfer::ops::detail::unified {
 namespace {
 using Geometry = Nvfp4Geometry<8192, 4096>;
 using Gemv =
-    Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+    Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Streaming, 2>;
 using C2      = Nvfp4A16SimtSchedule<4, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::TokenPacked,
-                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Streaming, 1,
                                      Nvfp4SimtBlockOrder::RowsContiguous, 1>;
 using T32R64  = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
 using T32R128 = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
