@@ -93,8 +93,53 @@ A 65,536-token prompt, then 64 decoded tokens, one run each:
 | Qwen3.8-27B IQ3_S | `rk8v4` | 598 | 33.4 | |
 
 At 16,384 tokens IQ3_S prompts at 701 tok/s and decodes at 33.1, Gemma 4 (F16 KV) at 2,660 and
-158.5; its full-attention blocks run llama.cpp's 8-column Turing tile, since the wider ones race
+158.5. This measurement used llama.cpp's 8-column Turing tile: before the combine-loop barrier
+backport, the wider tiles raced. The current TITAN profile selects the corrected 32-column tile;
+these historical measurements remain results of the 8-column tile
 ([Turing tier](../maintainer/build-system.md#turing-tier-75)).
+
+### Corrected Gemma prompt attention, 15 October
+
+The current TITAN default uses the fastest qualified tile: 32 columns instead of 8.
+The combine-loop barrier fixes the race that previously prevented the wider tiles from being
+used. On a TITAN RTX limited by its provider to **180 W**, five interleaved rounds gave these
+median times for the complete attention launch, including fixup. D512, 16 query heads, two KV
+heads and F16 KV were identical between variants.
+
+| query / KV tokens | old 8 columns, ms | corrected 16, ms | selected 32, ms | selected time change |
+|---|---:|---:|---:|---:|
+| 512 / 512 | 0.57385 | 0.50607 | 0.39765 | -30.70% |
+| 2048 / 2048 | 10.78579 | 7.40151 | 5.50053 | -49.00% |
+| 2048 / 16384 | 101.47311 | 56.92293 | 43.00658 | -57.62% |
+| 16384 / 16384 | 831.75879 | 441.90732 | 331.94669 | -60.09% |
+
+Every sample of the selected tile was faster than every sample of either alternative in each
+workload. Reported Op workspace increased from 3,566,848 to 4,755,712 bytes. This is a
+**prompt-attention result**, not a measurement of whole-model speed, decode speed or operation
+at 280 W. The provider rejected an attempt to restore that power limit.
+
+All three corrected widths passed 31 independent FP64 cases and eight identical reruns per case;
+the selected kernels passed racecheck and memcheck. The old wider kernel produced 540 racecheck
+errors and inconsistent outputs. Keeping the corrected eight-column tile alone gave median
+changes from -1.53% to +0.29%, including an unexplained short-workload outlier; it was not selected.
+
+A separate modified RTX 2080 Ti with 22 GiB, at 250 W, selected `bc16` for FP8 prompt attention
+at query widths 512 to 2048. Its six cached-attention workloads were 13.39% to 14.55% faster
+than `bc32`; shared memory fell from 52,224 to 42,944 bytes. Reducing the query tile instead
+was 79.92% to 86.05% slower and was rejected. These are not TITAN measurements.
+
+Combined public Op tests and a full `sm_75` build passed on a second 22 GiB RTX 2080 Ti at
+170 W. Its automatic FP8 selection passed five oracle cases. Four short Gemma runs, plain/MTP
+and eager/Graph, returned identical 32-token outputs; API tracing confirmed Graph launches.
+These checks used that card's own profile. They do not establish whole-model performance for
+the TITAN's 32-column default. Public Ops also passed on `sm_86`; standalone RTX 3090 timing
+changes ranged from -0.2684% to +0.0721% by median, with an individual paired slowdown up to
+0.864%. All ten before/after timing ranges overlapped; zero regression is not claimed.
+
+GDN replacements were rejected: their ordinary-workload latency changes included slowdowns up
+to 40.49%. The existing GDN still fails one of 18 stress cases with near-collinear keys
+(output/state relative L2 about 0.084/0.118). The direct variants pass that case but were not
+selected because of their measured cost.
 
 ### Several requests at once
 

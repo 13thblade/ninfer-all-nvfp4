@@ -512,6 +512,7 @@ void install_device_route_profile_on(const EngineOptions& options, int device) {
         const auto compiled = compiled_device_route_profile(hardware_class, multiprocessors);
         profile = compiled ? layer_device_route_profiles(entry.profile, *compiled) : entry.profile;
     }
+    apply_device_capacity_defaults(*profile, multiprocessors, props.totalGlobalMem);
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "device profile %s: %zu routed keys (%s)", hardware_class.c_str(),
                        profile->routes.size(), profile->origin.c_str());

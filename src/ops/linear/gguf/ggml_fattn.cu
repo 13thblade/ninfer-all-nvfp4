@@ -8,6 +8,7 @@
 // This archive's include path holds only the bridge and ggml (sources.cmake); the limits header
 // includes nothing.
 #include "../../common/device_limits.h"
+#include "../../common/device_route.h"
 
 #include <algorithm>
 #include <mutex>
@@ -77,11 +78,8 @@ inline constexpr int kBuildMaxTileColumns = 32;
 #else
 inline constexpr int kBuildMaxTileColumns = 1 << 20;
 #endif
-// The widest tile that keeps Q in shared memory (Q_in_reg false) whose output this build's device
-// code computes without a shared-memory race. On Turing, tiles of 16 and 32 columns at width 512 do
-// race: compute-sanitizer's racecheck reports errors in them, their rows miss the FP64 softmax
-// under it, and Gemma 4's prompt attention gave run-to-run different caches. Its 8-column tile,
-// whose warps hold 8 columns each, reports none.
+// The vendored combine barrier protects all three qualified tiles. The TITAN RTX profile selects
+// 32 columns; the compiled fallback remains 8 for other Turing parts without a measured profile.
 #if defined(NINFER_SM75)
 inline constexpr int kBuildMaxSharedQTileColumns = 8;
 #else
@@ -127,6 +125,18 @@ static_assert(Shape<256>::ncols1 == 16 && Shape<512>::ncols1 == 1);
 static_assert(Shape<256>::ncols1 == 32 && Shape<512>::ncols1 == 8);
 #endif
 
+#if defined(NINFER_SM75)
+int selected_512_rows() {
+    // One startup-fixed tile per device, independent of token count: workspace queries, kv_max
+    // granularity and launches must agree. The profile's width-1 band names this fixed choice.
+    const auto route = ::ninfer::ops::device_route_schedule("ggml_fattn/d512", 1);
+    if (route == "rows1") return 1;
+    if (route == "rows2") return 2;
+    if (route == "rows4") return 4;
+    return Shape<512>::ncols1;
+}
+#endif
+
 struct Launch {
     fattn_kernel_t kernel = nullptr;
     int threads           = 0;
@@ -135,11 +145,14 @@ struct Launch {
     int blocks_per_sm     = 0;
 };
 
-template <int D>
+template <int D, int Rows = Shape<D>::ncols1>
 const Launch& launch_for() {
-    constexpr int ncols1 = Shape<D>::ncols1;
+    constexpr int ncols1 = Rows;
     constexpr int ncols2 = Shape<D>::ncols2;
     constexpr int ncols  = ncols1 * ncols2;
+    static_assert(ncols <= kBuildMaxTileColumns);
+    static_assert(tile_shared_bytes(build_config(D, ncols), D, ncols1, ncols2,
+                                    kBuildTuringMma, kBuildCpAsync) <= kMaxSharedBytesPerBlock);
     static Launch launches[16];
     static std::once_flag once[16];
     int device = 0;
@@ -176,9 +189,9 @@ struct Grid {
     bool fixup     = false;
 };
 
-template <int D>
+template <int D, int Rows = Shape<D>::ncols1>
 Grid grid_for(const Launch& launch, int tokens, int kv_heads, int z_gqa, int slots) {
-    constexpr int ncols1 = Shape<D>::ncols1;
+    constexpr int ncols1 = Rows;
     const auto& facts = device_facts();
     Grid g;
     g.ntiles_x   = (tokens + ncols1 - 1) / ncols1;
@@ -199,23 +212,23 @@ Grid grid_for(const Launch& launch, int tokens, int kv_heads, int z_gqa, int slo
     return g;
 }
 
-template <int D>
+template <int D, int Rows = Shape<D>::ncols1>
 std::size_t workspace_for(int query_heads, int kv_heads, int max_tokens) {
-    constexpr int ncols = Shape<D>::ncols1 * Shape<D>::ncols2;
+    constexpr int ncols = Rows * Shape<D>::ncols2;
     (void)query_heads;
     (void)kv_heads;
     (void)max_tokens;
     // Stream-k never launches more than a wave of blocks; each keeps its partial rows and their
     // (max, sum) pairs.
-    const Launch& launch = launch_for<D>();
+    const Launch& launch = launch_for<D, Rows>();
     const std::size_t blocks = std::size_t(launch.blocks_per_sm) * device_facts().sm_count;
     return blocks * ncols * (2 + D / 2) * sizeof(float2) + 256;
 }
 
-template <int D>
+template <int D, int Rows = Shape<D>::ncols1>
 void run(const FlashAttentionArgs& a, void* workspace, std::size_t workspace_bytes,
          cudaStream_t stream) {
-    constexpr int ncols1 = Shape<D>::ncols1;
+    constexpr int ncols1 = Rows;
     constexpr int ncols2 = Shape<D>::ncols2;
     constexpr int ncols  = ncols1 * ncols2;
     if (a.query_heads % (a.kv_heads * ncols2) != 0) {
@@ -223,8 +236,8 @@ void run(const FlashAttentionArgs& a, void* workspace, std::size_t workspace_byt
     }
     // Query heads per key/value head come in groups of ncols2, one tile column each.
     const int z_gqa      = a.query_heads / (a.kv_heads * ncols2);
-    const Launch& launch = launch_for<D>();
-    const Grid g         = grid_for<D>(launch, a.tokens, a.kv_heads, z_gqa, a.slots);
+    const Launch& launch = launch_for<D, Rows>();
+    const Grid g         = grid_for<D, Rows>(launch, a.tokens, a.kv_heads, z_gqa, a.slots);
     float2* meta         = nullptr;
     if (g.fixup) {
         const std::size_t need = std::size_t(g.blocks) * ncols * (2 + D / 2) * sizeof(float2);
@@ -279,7 +292,15 @@ std::size_t flash_attention_workspace_bytes(int head_dim, int query_heads, int k
                                             int max_tokens) {
     switch (head_dim) {
     case 256: return workspace_for<256>(query_heads, kv_heads, max_tokens);
-    case 512: return workspace_for<512>(query_heads, kv_heads, max_tokens);
+    case 512:
+#if defined(NINFER_SM75)
+        switch (selected_512_rows()) {
+        case 2: return workspace_for<512, 2>(query_heads, kv_heads, max_tokens);
+        case 4: return workspace_for<512, 4>(query_heads, kv_heads, max_tokens);
+        default: break;
+        }
+#endif
+        return workspace_for<512>(query_heads, kv_heads, max_tokens);
     default: break;
     }
     throw std::invalid_argument("gguf flash attention: head width must be 256 or 512");
@@ -290,7 +311,11 @@ int flash_attention_tile_rows(int head_dim) {
     case 256:
         return Shape<256>::ncols1;
     case 512:
+#if defined(NINFER_SM75)
+        return selected_512_rows();
+#else
         return Shape<512>::ncols1;
+#endif
     default:
         break;
     }
@@ -308,7 +333,15 @@ void flash_attention(const FlashAttentionArgs& args, void* workspace, std::size_
     }
     switch (args.head_dim) {
     case 256: return run<256>(args, workspace, workspace_bytes, stream);
-    case 512: return run<512>(args, workspace, workspace_bytes, stream);
+    case 512:
+#if defined(NINFER_SM75)
+        switch (selected_512_rows()) {
+        case 2: return run<512, 2>(args, workspace, workspace_bytes, stream);
+        case 4: return run<512, 4>(args, workspace, workspace_bytes, stream);
+        default: break;
+        }
+#endif
+        return run<512>(args, workspace, workspace_bytes, stream);
     default: break;
     }
     throw std::invalid_argument("gguf flash attention: head width must be 256 or 512");

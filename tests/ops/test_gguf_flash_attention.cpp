@@ -8,6 +8,7 @@
 // stream-k wave, and each launch is repeated and held to the first one's bits.
 
 #include "core/arena.h"
+#include "ops/common/device_route.h"
 #include "ops/linear/gguf/ggml_fattn.h"
 
 #include <cuda_fp16.h>
@@ -30,7 +31,6 @@ using namespace ninfer;
 namespace gguf = ops::gguf;
 
 constexpr int kQueryHeads = 16;
-constexpr int kSlots      = 512;
 
 // Normwise relative error of one output row and a gross pointwise cap against the row's largest
 // reference value: the kernel rounds the queries and the probabilities to FP16.
@@ -39,20 +39,21 @@ constexpr double kPointwise   = 2e-2;
 // Identical launches after the first, held to its bits.
 constexpr int kReruns = 8;
 
-int run(int head_dim, int kv_heads, int tokens, int base, std::mt19937& rng) {
+int run(int head_dim, int kv_heads, int tokens, int base, std::mt19937& rng,
+        int slots = 512, bool limit_kv = false) {
     const int group = kQueryHeads / kv_heads;
     std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
     std::vector<float> q(std::size_t(tokens) * kQueryHeads * head_dim);
     for (float& value : q) { value = unit(rng); }
-    std::vector<__half> k(std::size_t(kv_heads) * kSlots * head_dim);
+    std::vector<__half> k(std::size_t(kv_heads) * slots * head_dim);
     std::vector<__half> v(k.size());
     for (__half& value : k) { value = __float2half(unit(rng)); }
     for (__half& value : v) { value = __float2half(unit(rng)); }
     // Query row t sees slots 0 .. base + t.
-    std::vector<__half> mask(std::size_t(tokens) * kSlots);
+    std::vector<__half> mask(std::size_t(tokens) * slots);
     for (int t = 0; t < tokens; ++t) {
-        for (int s = 0; s < kSlots; ++s) {
-            mask[std::size_t(t) * kSlots + s] =
+        for (int s = 0; s < slots; ++s) {
+            mask[std::size_t(t) * slots + s] =
                 __float2half(s <= base + t ? 0.0f : -std::numeric_limits<float>::infinity());
         }
     }
@@ -67,6 +68,14 @@ int run(int head_dim, int kv_heads, int tokens, int base, std::mt19937& rng) {
     const std::size_t workspace_bytes =
         gguf::flash_attention_workspace_bytes(head_dim, kQueryHeads, kv_heads, tokens);
     DeviceBuffer workspace(std::max<std::size_t>(workspace_bytes, 256));
+    const int tile_rows = gguf::flash_attention_tile_rows(head_dim);
+    std::vector<int> kv_max((tokens + tile_rows - 1) / tile_rows);
+    for (int tile = 0; tile < static_cast<int>(kv_max.size()); ++tile) {
+        const int visible = std::min(slots, base + std::min(tokens, (tile + 1) * tile_rows));
+        kv_max[tile] = std::min(slots, ((visible + 255) / 256) * 256);
+    }
+    DeviceBuffer d_kv_max(kv_max.size() * sizeof(int));
+    d_kv_max.copy_from_host(kv_max.data(), kv_max.size() * sizeof(int));
 
     gguf::FlashAttentionArgs args;
     args.head_dim        = head_dim;
@@ -78,12 +87,13 @@ int run(int head_dim, int kv_heads, int tokens, int base, std::mt19937& rng) {
     args.k               = d_k.p;
     args.v               = d_v.p;
     args.row_bytes       = std::int64_t(head_dim) * 2;
-    args.head_bytes      = std::int64_t(kSlots) * head_dim * 2;
-    args.slots           = kSlots;
+    args.head_bytes      = std::int64_t(slots) * head_dim * 2;
+    args.slots           = slots;
     args.mask            = d_mask.p;
-    args.mask_row_halves = kSlots;
+    args.mask_row_halves = slots;
     args.out             = static_cast<float*>(d_out.p);
     args.scale           = scale;
+    args.kv_max          = limit_kv ? static_cast<const int*>(d_kv_max.p) : nullptr;
     gguf::flash_attention(args, workspace.p, workspace.bytes, nullptr);
     if (const cudaError_t status = cudaDeviceSynchronize(); status != cudaSuccess) {
         throw std::runtime_error(std::string("flash attention: ") + cudaGetErrorString(status));
@@ -107,15 +117,15 @@ int run(int head_dim, int kv_heads, int tokens, int base, std::mt19937& rng) {
 
     int failures          = 0;
     double worst_relative = 0.0, worst_point = 0.0;
-    std::vector<double> scores(kSlots), want(head_dim);
+    std::vector<double> scores(slots), want(head_dim);
     for (int t = 0; t < tokens; ++t) {
         for (int h = 0; h < kQueryHeads; ++h) {
             const int kv       = h / group;
             const float* q_row = q.data() + (std::size_t(t) * kQueryHeads + h) * head_dim;
-            const int visible  = std::min(kSlots, base + t + 1);
+            const int visible  = std::min(slots, base + t + 1);
             double peak        = -std::numeric_limits<double>::infinity();
             for (int s = 0; s < visible; ++s) {
-                const __half* k_row = k.data() + (std::size_t(kv) * kSlots + s) * head_dim;
+                const __half* k_row = k.data() + (std::size_t(kv) * slots + s) * head_dim;
                 double dot          = 0.0;
                 for (int d = 0; d < head_dim; ++d) {
                     dot += double(q_row[d]) * double(__half2float(k_row[d]));
@@ -127,7 +137,7 @@ int run(int head_dim, int kv_heads, int tokens, int base, std::mt19937& rng) {
             std::fill(want.begin(), want.end(), 0.0);
             for (int s = 0; s < visible; ++s) {
                 const double p      = std::exp(scores[s] - peak);
-                const __half* v_row = v.data() + (std::size_t(kv) * kSlots + s) * head_dim;
+                const __half* v_row = v.data() + (std::size_t(kv) * slots + s) * head_dim;
                 sum += p;
                 for (int d = 0; d < head_dim; ++d) {
                     want[d] += p * double(__half2float(v_row[d]));
@@ -153,7 +163,8 @@ int run(int head_dim, int kv_heads, int tokens, int base, std::mt19937& rng) {
     }
     const bool ok = failures == 0 && reruns_differing == 0;
     std::cout << (ok ? "OK" : "FAIL") << " width " << head_dim << ", " << kv_heads << " KV heads, "
-              << tokens << " queries after " << base << ": worst row error " << worst_relative
+              << tokens << " queries after " << base << ", " << slots << " slots, kv_max="
+              << limit_kv << ", tile_rows=" << tile_rows << ": worst row error " << worst_relative
               << ", worst point " << worst_point << " (" << failures << " rows over, "
               << reruns_differing << " of " << kReruns << " reruns differ)\n";
     return ok ? 0 : 1;
@@ -161,22 +172,68 @@ int run(int head_dim, int kv_heads, int tokens, int base, std::mt19937& rng) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    std::cout << std::unitbuf;
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
     try {
-        std::mt19937 rng(5120);
-        int failures = 0;
-        for (const int tokens : {1, 3, 4, 5, 9, 33, 130}) {
-            failures += run(256, 8, tokens, 300, rng);
-            failures += run(512, 2, tokens, 300, rng);
+        bool racecheck = false, default_only = false;
+        for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--racecheck") == 0) racecheck = true;
+            else if (std::strcmp(argv[i], "--default-only") == 0) default_only = true;
+            else throw std::invalid_argument(
+                "usage: ninfer_gguf_flash_attention_test [--racecheck] [--default-only]");
         }
-        failures += run(512, 2, 64, 0, rng);
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " GGUF flash attention\n";
-        return failures == 0 ? 0 : 1;
+        const auto matrix = [&] {
+            std::mt19937 rng(5120);
+            int failures = 0;
+            if (racecheck) {
+                for (const int tokens : {3, 5}) {
+                    failures += run(256, 8, tokens, 253, rng);
+                    failures += run(512, 2, tokens, 253, rng);
+                    failures += run(512, 2, tokens, 253, rng, 1024, true);
+                }
+                return failures == 0 ? 0 : 1;
+            }
+            for (const int tokens : {1, 3, 4, 5, 9, 33, 130}) {
+                failures += run(256, 8, tokens, 300, rng);
+                failures += run(512, 2, tokens, 300, rng);
+            }
+            failures += run(512, 2, 64, 0, rng);
+            // Cross the 256-slot mask boundary and exercise the combine loop at long contexts.
+            // Both the full scan and kv_max must match the independent softmax, including tile tails.
+            for (const int slots : {256, 1024, 4096, 16384}) {
+                for (const bool limit_kv : {false, true}) {
+                    failures += run(512, 2, 5, slots - 9, rng, slots, limit_kv);
+                    failures += run(512, 2, 3, 253, rng, slots, limit_kv);
+                }
+            }
+            std::cout << (failures == 0 ? "OK" : "FAIL") << " GGUF flash attention\n";
+            return failures == 0 ? 0 : 1;
+        };
+#if defined(NINFER_SM75)
+        if (!default_only) {
+            {
+                ninfer::ops::DeviceRouteForce unsupported("ggml_fattn/d512", "rows8");
+                if (gguf::flash_attention_tile_rows(512) != 1) {
+                    throw std::runtime_error("unsupported flash-attention route changed the default");
+                }
+            }
+            int failures = 0;
+            for (const char* route : {"rows1", "rows2", "rows4"}) {
+                std::cout << "GGUF flash attention route " << route << std::endl;
+                ninfer::ops::DeviceRouteForce force("ggml_fattn/d512", route);
+                failures += matrix();
+            }
+            return failures == 0 ? 0 : 1;
+        }
+#else
+        (void)default_only;
+#endif
+        return matrix();
     } catch (const std::exception& error) {
         std::cerr << "GGUF flash attention: " << error.what() << '\n';
         return 1;

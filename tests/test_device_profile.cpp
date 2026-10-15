@@ -175,6 +175,68 @@ void test_builtin_parts() {
     }
 }
 
+void test_turing_defaults() {
+    using ninfer::runtime::compiled_device_route_profile;
+    using ninfer::runtime::device_profile_hardware_class;
+    const auto titan = compiled_device_route_profile("nvidia-titan-rtx-sm75", 72);
+    expect(titan && same_bands(titan->routes.at("ggml_fattn/d512"), {{1, "rows4"}}),
+           "TITAN RTX selects the qualified 32-column Gemma attention tile");
+    expect(!compiled_device_route_profile("nvidia-titan-rtx-sm75", 68),
+           "another SM count cannot take the TITAN profile");
+    constexpr std::uint64_t gib = 1ULL << 30;
+    constexpr auto stock = "nvidia-geforce-rtx-2080-ti-sm75";
+    constexpr auto modified = "nvidia-geforce-rtx-2080-ti-22gib-sm75";
+    expect(device_profile_hardware_class(stock, 68, 22 * gib) == modified &&
+               device_profile_hardware_class(stock, 68, 22 * gib - (256ULL << 20)) == modified,
+           "the measured 22 GiB card is recognized with CUDA's reserved VRAM");
+    expect(device_profile_hardware_class(stock, 68, 11 * gib) == stock &&
+               device_profile_hardware_class(stock, 68, 24 * gib) == stock &&
+               device_profile_hardware_class(stock, 72, 22 * gib) == stock &&
+               device_profile_hardware_class(stock, 68, 0) == stock,
+           "stock, other-capacity, other-SM and unknown-memory cards keep their own profiles");
+    expect(device_profile_hardware_class("nvidia-titan-rtx-sm75", 72, 24 * gib) ==
+               "nvidia-titan-rtx-sm75",
+           "the FP8 measurements do not become a TITAN profile");
+    const auto fp8 = compiled_device_route_profile(modified, 68);
+    expect(fp8 && same_bands(fp8->routes.at("causal_fp8_prompt/d256"), {{511, ""}, {2048, "bc16"}}),
+           "the measured card selects separate K/V stages between the measured prompt widths");
+    ninfer::ops::DeviceRouteProfile calibrated;
+    calibrated.hardware_class = stock;
+    calibrated.multiprocessors = 68;
+    calibrated.routes["other/calibrated-op"] = {{2048, "measured"}};
+    ninfer::runtime::apply_device_capacity_defaults(calibrated, 68, 22 * gib);
+    expect(calibrated.hardware_class == stock && calibrated.routes.size() == 2 &&
+               calibrated.origin.find("250 W") != std::string::npos &&
+               same_bands(calibrated.routes.at("other/calibrated-op"), {{2048, "measured"}}) &&
+               same_bands(calibrated.routes.at("causal_fp8_prompt/d256"),
+                          {{511, ""}, {2048, "bc16"}}),
+           "capacity defaults retain the base calibration identity and other measured routes");
+    calibrated.routes["causal_fp8_prompt/d256"] = {{2048, ""}};
+    ninfer::runtime::apply_device_capacity_defaults(calibrated, 68, 22 * gib);
+    expect(same_bands(calibrated.routes.at("causal_fp8_prompt/d256"), {{2048, ""}}),
+           "an explicit file override still wins over a capacity default");
+    ninfer::ops::DeviceRouteProfile ordinary;
+    ordinary.hardware_class = stock;
+    ninfer::runtime::apply_device_capacity_defaults(ordinary, 68, 11 * gib);
+    expect(ordinary.routes.empty(), "the ordinary 11 GiB card receives no 22 GiB defaults");
+    if (titan) {
+        ninfer::ops::install_device_route_profile(
+            std::make_shared<const ninfer::ops::DeviceRouteProfile>(*titan));
+        expect(ninfer::ops::device_route_schedule("ggml_fattn/d512", 1) == "rows4",
+               "the installed TITAN default reaches the Op's startup-fixed selector");
+    }
+    if (fp8) {
+        ninfer::ops::install_device_route_profile(
+            std::make_shared<const ninfer::ops::DeviceRouteProfile>(*fp8));
+        expect(ninfer::ops::device_route_schedule("causal_fp8_prompt/d256", 511).empty() &&
+                   ninfer::ops::device_route_schedule("causal_fp8_prompt/d256", 512) == "bc16" &&
+                   ninfer::ops::device_route_schedule("causal_fp8_prompt/d256", 2048) == "bc16" &&
+                   ninfer::ops::device_route_schedule("causal_fp8_prompt/d256", 2049).empty(),
+               "the FP8 default applies only within the 512-to-2048 query band");
+    }
+    ninfer::ops::install_device_route_profile(nullptr);
+}
+
 void test_layering() {
     ninfer::ops::DeviceRouteProfile lower;
     lower.hardware_class = "test-gpu-sm86";
@@ -318,6 +380,7 @@ int main() {
     test_compiled_table_parses();
     test_compiled_table_names_catalog_schedules();
     test_builtin_parts();
+    test_turing_defaults();
     test_layering();
     test_file_lookup();
     test_file_layers_over_builtin();

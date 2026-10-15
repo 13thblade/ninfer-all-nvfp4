@@ -3,6 +3,7 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/common/device_route.h"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh"
 #include "ops/kv_cache/plane_types.h"
@@ -12,15 +13,15 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <typename Geometry, typename CacheView, typename Metadata>
+template <typename Geometry, int Bc, typename CacheView, typename Metadata>
 void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Tensor& positions,
                                                       float scale, const CacheView& cache,
                                                       Metadata metadata, Tensor& out,
                                                       cudaStream_t stream) {
     configure_cuda_device_once([&] {
         return cudaFuncSetAttribute(
-            causal_attention_prompt_fp8_kernel<Geometry, Metadata>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptFp8SmemBytes);
+            causal_attention_prompt_fp8_kernel<Geometry, Metadata, Bc>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, CausalPromptFp8Tile<Bc>::SmemBytes);
     });
 
     constexpr auto kStorage = KvCacheStorage::Fp8E4M3Row256;
@@ -33,12 +34,28 @@ void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Ten
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     const dim3 grid(static_cast<unsigned>(div_up(tokens, kCausalPromptFp8Br)),
                     static_cast<unsigned>(Geometry::QHeads), 1u);
-    causal_attention_prompt_fp8_kernel<Geometry, Metadata>
-        <<<grid, kCausalPromptFp8Threads, kCausalPromptFp8SmemBytes, stream>>>(
+    causal_attention_prompt_fp8_kernel<Geometry, Metadata, Bc>
+        <<<grid, kCausalPromptFp8Threads, CausalPromptFp8Tile<Bc>::SmemBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), cache_k_ptr, cache_v_ptr, k_scale_ptr,
             v_scale_ptr, metadata, static_cast<const std::int32_t*>(positions.data), scale,
             static_cast<__nv_bfloat16*>(out.data), tokens);
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename Geometry, typename CacheView, typename Metadata>
+void causal_attention_prompt_fp8_attention_launch_selected(const Tensor& q, const Tensor& positions,
+                                                           float scale, const CacheView& cache,
+                                                           Metadata metadata, Tensor& out,
+                                                           cudaStream_t stream) {
+#if defined(NINFER_SM75)
+    if (device_route_schedule("causal_fp8_prompt/d256", static_cast<std::int32_t>(q.ne[2])) ==
+        "bc16") {
+        return causal_attention_prompt_fp8_attention_launch_for<Geometry, 16>(
+            q, positions, scale, cache, metadata, out, stream);
+    }
+#endif
+    causal_attention_prompt_fp8_attention_launch_for<Geometry, 32>(
+        q, positions, scale, cache, metadata, out, stream);
 }
 
 template <typename CacheView, typename Metadata>
@@ -47,11 +64,11 @@ void causal_attention_prompt_fp8_attention_dispatch(const Tensor& q, const Tenso
                                                     Metadata metadata, Tensor& out,
                                                     cudaStream_t stream) {
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        causal_attention_prompt_fp8_attention_launch_for<CausalD256H24Kv4>(
+        causal_attention_prompt_fp8_attention_launch_selected<CausalD256H24Kv4>(
             q, positions, scale, cache, metadata, out, stream);
         return;
     }
-    causal_attention_prompt_fp8_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,
+    causal_attention_prompt_fp8_attention_launch_selected<CausalD256H16Kv2>(q, positions, scale, cache,
                                                                        metadata, out, stream);
 }
 
