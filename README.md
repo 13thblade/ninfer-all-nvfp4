@@ -70,35 +70,28 @@ artifact `qwen3.8-27b-quasar`, full-precision reporting):
 
 `grouped`, `mmq` and `mmvq` agree bit for bit, and all three sit **0.000133 below**
 the A16 reference rather than above it: the int8 kernels introduce no quality
-regression (an earlier round of this table had int8 fractionally higher; the wider
-corpus reading supersedes it). int8 scores **~1.7×** faster than the A16 reference.
+regression. int8 scores **~1.7×** faster than the A16 reference.
 
-**Decode / prefill.** The rows below were taken on the same artifact and the same
-4202-token prompt. The published build (before (3)-(5)) padded every int8 call to a
-128-column tile, so `T = 1` decode lost to the A16 reference; the follow-up build
-ladder-ed the tiles and moved `T ≤ 8` onto the MMVQ mainloop:
+**Decode / prefill.** Same artifact, same 4202-token prompt, `unified` route table,
+greedy, `--max-new 512`. Every row below is this build.
 
-| Build            | KV    | Route   | Prefill tok/s | Decode tok/s |
-|------------------|-------|---------|---------------|--------------|
-| published (no ladder) | int8 | a16     | 735.8         | 16.1         |
-| published        | int8  | grouped | 1.28k         | 9.9          |
-| published        | int8  | mmq     | 1.19k         | 9.0          |
-| ladder + MMVQ    | int8  | a16     | 738.7         | 16.2         |
-| ladder + MMVQ    | int8  | grouped | 1.19k         | **36.8**     |
-| ladder + MMVQ    | int8  | mmq     | 1.20k         | **36.9**     |
-| ladder + MMVQ    | bf16  | grouped | 1.37k         | 36.4         |
-| ladder + MMVQ    | bf16  | mmq     | 1.33k         | 36.4         |
-| ladder + MMVQ    | bf16  | mmvq    | 1.34k         | 36.4         |
-| ladder + MMVQ    | bf16  | a16     | 771 – 783     | 16.1         |
+| KV    | Route   | Prefill tok/s | Decode tok/s |
+|-------|---------|---------------|--------------|
+| int8  | a16     | 738.7         | 16.2         |
+| int8  | grouped | 1.19k         | **36.8**     |
+| int8  | mmq     | 1.20k         | **36.9**     |
+| bf16  | a16     | 771 – 783     | 16.1         |
+| bf16  | grouped | 1.37k         | 36.4         |
+| bf16  | mmq     | 1.33k         | 36.4         |
+| bf16  | mmvq    | 1.34k         | 36.4         |
 
 Takeaways (sm_86, QUASAR-NVFP4):
-- **Prefill is unchanged by the narrow-band work**: 1.19k/1.20k vs 1.21k/1.19k before
-  (−2% … +1%), i.e. this is a decode-only change, as intended -- prefill widths never
-  enter the narrow band.
-- **`T = 1` decode is now ~2.3× the A16 reference** (36.4-36.9 vs 16.1-16.2), which
-  reverses the headline limitation of the published round. `grouped`, `mmq` and `mmvq`
-  agree to 0.1 tok/s at decode, which is itself the proof that the band is unified:
-  three names, one narrow-band kernel.
+- **`T = 1` decode is ~2.3× the A16 reference** (36.4-36.9 vs 16.1-16.2). `grouped`,
+  `mmq` and `mmvq` agree to 0.1 tok/s at decode, which is itself the proof that the
+  band is unified: three route names, one narrow-band kernel.
+- **Prefill widths never enter the narrow band**: the band is `T <= 8` and prefill here
+  runs at `T >= 128`, so the ladder and the MMVQ mainloop are a decode-only change by
+  construction; the prefill column above runs the same wide mainloop as before.
 - Prefill lead over A16 stands at ~1.7-1.8× (1.33-1.37k vs 0.77-0.78k at matched
   bf16 KV), and remains the regime the wide-`T` path exists for.
 - KV tier matters and is now pinned: bf16 KV is the reporting tier from here on
@@ -110,9 +103,8 @@ Takeaways (sm_86, QUASAR-NVFP4):
   and the `mmq` kernel answers zero under `grouped`; and the grouped-form activation
   quantiser runs 7584 times under `grouped` versus 7328 + 256 under the wide-route
   names, i.e. the narrow band moved and the wide band did not.
-- Speculative numbers from the published round (MTP=3 + ngram, 64K context,
-  64.8% acceptance / length 3.93) are kept as published but should be read with care:
-  `--spec` turns `--ngram-draft-tokens 15` on by default, so an unlabelled "MTP" row is
+- Any speculative number needs the flag state read first: `--spec` turns
+  `--ngram-draft-tokens 15` on by default, so an unlabelled "MTP" row is
   really a mixed MTP+ngram round, and the per-position acceptance histogram is sized by
   `max(draft_window, ngram_draft_window)`. Pure-MTP arms need `--ngram-draft-tokens 0`.
 - 64K context starts and completes without OOM.
@@ -154,9 +146,9 @@ Takeaways (sm_86, QUASAR-NVFP4):
 
 ## Next steps
 
-1. ~~Implement the `J < 128` kernels including the decode path.~~ **Done** by (3)-(5):
-   the ladder, the MMVQ mainloop and the narrow-band unification took `T = 1` decode
-   from 9.9 to 36.8 tok/s without moving PPL. What is left in this direction is the
+1. `J < 128` and the decode path are **done** by (3)-(5): the ladder, the MMVQ mainloop
+   and the narrow-band unification give `T = 1` decode 36.4-36.9 tok/s with PPL unmoved.
+   What is left in this direction is the
    fused narrow-`T` GLU: the int8 `linear_swiglu` is still two launches over an FP32
    gate plane at every width, where a single-launch `[gate;up]` form (as the GGUF
    decode kernel has) would remove one launch and the plane round-trip.
