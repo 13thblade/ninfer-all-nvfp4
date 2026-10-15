@@ -181,8 +181,8 @@ On a 16 GB card the official Qwen3.8-27B artifact loads with `--embedding-q4 --l
 Q8 embedding and output head stored as Q4 while loading, 14.7 GiB of weights). What else fits is in
 the [measurements](performance/tesla-v100-2026-10.md#models-on-a-16-gb-card).
 
-The V100-SXM2-16GB's device route profile is built in; another V100 part calibrates at first start,
-in about nine seconds (see [device profiles](device-profiles.md)).
+The V100-SXM2-16GB and V100-SXM2-32GB device route profiles are built in; another V100 part
+calibrates at first start, in about nine seconds (see [device profiles](device-profiles.md)).
 
 ## Optional vcpkg dependencies
 
