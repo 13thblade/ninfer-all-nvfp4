@@ -81,7 +81,9 @@ ExpertBlob blob(const artifact::Reader& reader, const artifact::MaterializedArti
             throw artifact::ArtifactError(
                 "native host expert plane must be contiguous; disk residency accepts fragments");
         }
-        out.pinned = backing.pinned_parent(spans.front().object).data + spans.front().offset;
+        const auto* parent = backing.pinned_parent(spans.front().object).data;
+        out.pinned = parent + spans.front().offset;
+        out.pinned_region = reinterpret_cast<std::uintptr_t>(parent);
     } else {
         for (const auto& span : spans) {
             const auto offset = artifact::object_offset(reader.directory().object(span.object));

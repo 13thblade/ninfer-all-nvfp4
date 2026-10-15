@@ -1006,6 +1006,7 @@ private:
                 ExpertBlob blob;
                 blob.bytes = bytes;
                 blob.pinned = static_cast<const std::byte*>(stream_sources_[plane]->data()) + expert * bytes;
+                blob.pinned_region = reinterpret_cast<std::uintptr_t>(stream_sources_[plane]->data());
                 payload.push_back(std::move(blob));
             }
         }
