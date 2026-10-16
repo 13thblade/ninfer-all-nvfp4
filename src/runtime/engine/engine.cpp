@@ -61,19 +61,22 @@ DeviceContext initialize_device(const EngineOptions& options) {
     return device;
 }
 
-// EngineOptions::gpu_clock_floor_mhz over every device the Engine runs on, with one diagnostic line
-// per device.
-GpuClockFloor hold_gpu_clock_floor(const EngineOptions& options, const DeviceContext& device) {
-    if (options.gpu_clock_floor_mhz == 0) { return {}; }
-    GpuClockFloor floor(device.device_ids(), options.gpu_clock_floor_mhz);
+// One diagnostic line per device that EngineOptions::gpu_clock_floor_mhz was asked for.
+void report_gpu_clock_floor(const EngineOptions& options, const GpuClockFloor& floor) {
     for (const std::string& line : floor.report()) {
         runtime::publish_diagnostic(
             options.diagnostic_observer,
             floor.complete() ? DiagnosticLevel::Info : DiagnosticLevel::Warning,
             "gpu clock floor: %s", line.c_str());
     }
-    return floor;
 }
+
+// A generation's hold on the clock floor beside its reference to the Engine, both kept until its
+// handle ends; the hold ends first.
+struct HeldEngine {
+    std::shared_ptr<void> engine;
+    std::shared_ptr<void> clock_floor;
+};
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {
@@ -281,7 +284,9 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(std::move(engine_options))),
-          device(initialize_device(options)), clock_floor(hold_gpu_clock_floor(options, device)) {
+          device(initialize_device(options)),
+          clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
+        report_gpu_clock_floor(options, clock_floor);
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (runtime::is_gemma4_artifact(options.artifact_path)) {
             auto constructed    = runtime::construct_gemma4(options, device);
@@ -464,7 +469,7 @@ public:
 
     EngineOptions options;
     DeviceContext device;
-    // After the device, before the model: the clocks go back once the model has been torn down.
+    // Held by each generation and scoring call (GpuClockFloor::hold).
     GpuClockFloor clock_floor;
     std::unique_ptr<runtime::ModelInstance> active;
     std::unique_ptr<runtime::Qwen4ExpInstance> flash;
@@ -650,6 +655,7 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     }
     PreparedPrompt prompt      = prepare_tokens(std::move(tokens), false);
     const std::size_t expected = prompt.summary().prompt_tokens - first_target;
+    const std::shared_ptr<void> clock_floor = impl_->clock_floor.hold();
     std::vector<float> result  = std::visit(
         [&](auto& core) -> std::vector<float> {
             using CoreState = std::remove_cvref_t<decltype(core)>;
@@ -744,11 +750,17 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
+                // Held before the core can start the request, so its prompt runs at the floor.
+                std::shared_ptr<void> keep_alive = impl_;
+                if (auto clock_floor = impl_->clock_floor.hold()) {
+                    keep_alive = std::make_shared<HeldEngine>(
+                        HeldEngine{.engine = impl_, .clock_floor = std::move(clock_floor)});
+                }
                 auto submission = core->submit(std::move(prompt.impl_->value), prompt_summary,
                                                prepare_seconds, std::move(resolved_options),
                                                consumer_mode, observation, pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
-                    impl_, std::move(submission), resolved_sampling));
+                    std::move(keep_alive), std::move(submission), resolved_sampling));
             }
         },
         impl_->core);

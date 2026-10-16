@@ -683,10 +683,10 @@ struct EngineOptions {
     // ($NINFER_DEVICE_PROFILES, else $XDG_CACHE_HOME or ~/.cache, /ninfer/device-profiles.json).
     std::string device_profile = "auto";
     std::filesystem::path device_profile_path;
-    // Lowest graphics clock, in MHz, the Engine's GPUs are held at while it lives
-    // (core/gpu_clock_floor.h): a layer pipeline's stages otherwise wait at idle clocks. Zero leaves
-    // the clocks to the driver. Holding them needs administrator rights (root on Linux); without
-    // them the Engine reports it and runs at the driver's clocks.
+    // Lowest graphics clock, in MHz, the Engine's GPUs are held at while a generation or scoring
+    // call runs (core/gpu_clock_floor.h): a layer pipeline's stages otherwise wait at idle clocks.
+    // Zero leaves the clocks to the driver. Holding them needs administrator rights (root on
+    // Linux); without them the Engine reports it and runs at the driver's clocks.
     std::uint32_t gpu_clock_floor_mhz = 0;
     // Prompt grafts a request may select by name through PromptOptions::graft. Each is loaded and
     // validated against the resident model at construction.

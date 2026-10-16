@@ -33,6 +33,18 @@ int check(bool condition, const char* message) {
 
 int run_tests() {
     int failures = 0;
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--gpu-clock-floor",
+                             "1500"}).gpu_clock_floor_mhz == 1500 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
+                                  .gpu_clock_floor_mhz == 0,
+                      "--gpu-clock-floor was not parsed, or is not off by default");
+    for (const char* value : {"0", "5001", "fast"}) {
+        failures += check(rejects([&] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                           "--gpu-clock-floor", value});
+                          }),
+                          "--gpu-clock-floor accepted 0, 5001 or a word");
+    }
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
                           .speculative.draft_min_p == 0, "draft confidence must be opt-in");
     for (const auto* floor : {"0", "0.3", "1"}) {

@@ -184,7 +184,7 @@ std::string usage_text(const char* argv0) {
            std::string(ninfer::product::kNgramTableHelp) +
            "  --no-cuda-graph               decode without CUDA Graphs\n"
            "  --gpu-clock-floor MHZ         hold the GPUs' graphics clock at MHZ or more while\n"
-           "                                the model runs, so pipeline stages do not wait at\n"
+           "                                a request runs, so pipeline stages do not wait at\n"
            "                                idle clocks (needs administrator or root rights)\n"
            "\n"
            "KV CACHE\n"

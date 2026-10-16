@@ -3,7 +3,6 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
-#include <utility>
 
 #if defined(_WIN32)
 #    ifndef NOMINMAX
@@ -110,6 +109,7 @@ std::shared_ptr<GpuClockFloor::Nvml> GpuClockFloor::load_nvml(std::string& probl
 }
 
 GpuClockFloor::GpuClockFloor(std::span<const int> devices, std::uint32_t floor_mhz) {
+    if (floor_mhz == 0) { return; }
     std::vector<int> unique;
     for (const int device : devices) {
         if (std::find(unique.begin(), unique.end(), device) == unique.end()) {
@@ -139,7 +139,9 @@ GpuClockFloor::GpuClockFloor(std::span<const int> devices, std::uint32_t floor_m
             result = nvml_->max_clock(handle, kNvmlClockGraphics, &max_mhz);
         }
         const unsigned int low = std::min<unsigned int>(floor_mhz, max_mhz);
+        // A trial lock shows now, rather than at the first request, whether the rights suffice.
         if (result == kNvmlSuccess) { result = nvml_->lock(handle, low, max_mhz); }
+        if (result == kNvmlSuccess) { result = nvml_->unlock(handle); }
         if (result != kNvmlSuccess) {
             report_.push_back(line + "clocks left alone: " + nvml_->error(result) +
                               (result == kNvmlNoPermission
@@ -148,38 +150,70 @@ GpuClockFloor::GpuClockFloor(std::span<const int> devices, std::uint32_t floor_m
             complete_ = false;
             continue;
         }
-        held_.push_back(handle);
+        devices_.push_back(Device{.handle = handle, .low_mhz = low, .high_mhz = max_mhz});
         report_.push_back(line + "graphics clock held at " + std::to_string(low) + "-" +
-                          std::to_string(max_mhz) + " MHz");
+                          std::to_string(max_mhz) + " MHz while requests run");
     }
+    if (devices_.empty()) {
+        nvml_.reset();
+        return;
+    }
+    governor_ = std::thread([this] { govern(); });
 }
 
-GpuClockFloor::~GpuClockFloor() { release(); }
-
-GpuClockFloor::GpuClockFloor(GpuClockFloor&& other) noexcept
-    : nvml_(std::move(other.nvml_)), held_(std::move(other.held_)),
-      report_(std::move(other.report_)), complete_(other.complete_) {
-    other.held_.clear();
+GpuClockFloor::~GpuClockFloor() {
+    if (!governor_.joinable()) { return; }
+    {
+        std::lock_guard lock(mutex_);
+        stopping_ = true;
+    }
+    changed_.notify_one();
+    governor_.join();
 }
 
-GpuClockFloor& GpuClockFloor::operator=(GpuClockFloor&& other) noexcept {
-    if (this != &other) {
-        release();
-        nvml_     = std::move(other.nvml_);
-        held_     = std::move(other.held_);
-        report_   = std::move(other.report_);
-        complete_ = other.complete_;
-        other.held_.clear();
+std::shared_ptr<void> GpuClockFloor::hold() {
+    if (devices_.empty()) { return nullptr; }
+    {
+        std::lock_guard lock(mutex_);
+        ++holders_;
     }
-    return *this;
+    changed_.notify_one();
+    return std::shared_ptr<void>(this, [](void* floor) {
+        static_cast<GpuClockFloor*>(floor)->leave();
+    });
 }
 
-void GpuClockFloor::release() noexcept {
-    if (nvml_ != nullptr) {
-        for (void* handle : held_) { (void)nvml_->unlock(handle); }
+void GpuClockFloor::leave() noexcept {
+    {
+        std::lock_guard lock(mutex_);
+        --holders_;
     }
-    held_.clear();
-    nvml_.reset();
+    changed_.notify_one();
+}
+
+// Locks the devices when the first holder arrives and resets them once none has been left for
+// kRelease, or when this object ends.
+void GpuClockFloor::govern() {
+    std::unique_lock lock(mutex_);
+    while (true) {
+        changed_.wait(lock, [this] { return stopping_ || holders_ > 0; });
+        if (stopping_) { return; }
+        lock.unlock();
+        for (const Device& device : devices_) {
+            (void)nvml_->lock(device.handle, device.low_mhz, device.high_mhz);
+        }
+        lock.lock();
+        while (!stopping_) {
+            changed_.wait(lock, [this] { return stopping_ || holders_ == 0; });
+            if (stopping_ ||
+                !changed_.wait_for(lock, kRelease, [this] { return stopping_ || holders_ > 0; })) {
+                break;
+            }
+        }
+        lock.unlock();
+        for (const Device& device : devices_) { (void)nvml_->unlock(device.handle); }
+        lock.lock();
+    }
 }
 
 } // namespace ninfer
