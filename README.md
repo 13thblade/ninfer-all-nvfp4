@@ -103,6 +103,25 @@ histogram 143,102,67. No ngram row is published because ngram never fired here -
 MTP=3 alone, i.e. zero ngram-only rounds. Graph-off prefill, for reference: a16 1.10k,
 grouped 1.24k, mmq 1.23k.
 
+**The state this fork started from.** Two readings on the same harness, same artifact, same **KV
+bf16** tier and same 4202-token prompt as the table above, taken on the build that predates the
+schedule work in items 1-7: prefill **771-783** tok/s, decode at `T = 1` **16.1** tok/s. On the
+earliest build measured here, before the token-tile ladder existed at all, the `a16` row was 735.8 /
+16.1 -- the decode reading did not move (a repeat probe of the later build returned 16.2, 1.5%,
+within day-to-day drift), because that work touched the int8 arms and not the A16 one.
+
+Why the A16 path was the weak one, and it is not the mainloop's fault: 16.1 tok/s is 62.1 ms/token
+while a decode step moves the artifact's 16.1 GB, i.e. **259 GB/s effective = 26% of this card's
+1008 GB/s peak** `[derived from the two measured numbers]`. The route was dequantization-bound: the
+three costs removed later were the out-of-range outer adjustment conversion, the `ue4m3` scale read
+through the table, and the `2^14` bias folded per product instead of into the group coefficient.
+Taking those out is what moved `T = 1` to 48.0 (3.0x).
+
+And the part with no number at all: before any local wiring, the only NVFP4 A16 shape this tree
+could execute was the SIMT `linear_swiglu` at `T <= 16`; every wider prompt span threw. Wide NVFP4
+prefill on a card with no FP4 tensor core therefore has no baseline reading to report -- the absence
+is the measurement.
+
 Takeaways (sm_86, QUASAR-NVFP4):
 - **The int8 decode lead is now ~1.03×, not 2.3×** (49.4-49.3 vs 48.0). The reason is
   item (7): the A16 decode band was rewritten and `T = 1` went 16.1 → 48.0 (3.0×), with
