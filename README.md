@@ -7,6 +7,14 @@
 
 # NInfer-3090
 
+<p>
+  <a href="https://github.com/Don-Chad/ninfer-3090/releases/latest"><img src="https://img.shields.io/github/v/release/Don-Chad/ninfer-3090?style=flat-square&amp;label=Windows%20x64&amp;labelColor=101714&amp;color=74e39b" alt="Download the latest Windows x64 release"></a>
+  <a href="https://github.com/Don-Chad/ninfer-3090/actions/workflows/host-checks.yml"><img src="https://img.shields.io/github/actions/workflow/status/Don-Chad/ninfer-3090/host-checks.yml?branch=master&amp;style=flat-square&amp;label=host%20checks&amp;labelColor=101714" alt="Host checks status on master"></a>
+  <a href="#performance"><img src="https://img.shields.io/badge/DFlash2%20K%3D7-140%20tok%2Fs-74e39b?style=flat-square&amp;labelColor=101714" alt="DFlash2 K=7: 140 tokens per second; see benchmark conditions"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-74e39b?style=flat-square&amp;labelColor=101714" alt="Apache 2.0 license"></a>
+  <a href="https://github.com/Don-Chad/ninfer-3090/stargazers"><img src="https://img.shields.io/github/stars/Don-Chad/ninfer-3090?style=flat-square&amp;label=stars&amp;labelColor=101714&amp;color=74e39b" alt="GitHub stars"></a>
+</p>
+
 **Hyper-optimized Qwen inference for RTX 3090.**
 
 A native C++20/CUDA runtime with specialized **SM86 kernels**, quantized execution, CUDA Graphs,
