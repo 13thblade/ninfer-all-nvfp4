@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://github.com/ashalliants/ninfer-3090/releases/tag/v0.16.0-rtx3090">Download community build</a> ·
+  <a href="https://github.com/Don-Chad/ninfer-3090/releases/tag/v0.16.1-rtx3090">Download Windows build</a> ·
   <a href="#running-in-minutes">Quick start</a> ·
   <a href="#inference-in-action">Inference demo</a> ·
   <a href="docs/README.md">Documentation</a>
@@ -29,6 +29,30 @@ these are separate measurements, not a matched comparison. [Conditions and sourc
 | APIs | OpenAI Chat Completions/Responses and Anthropic Messages | Native streaming HTTP server |
 | Larger expert model | Qwen3.8-Flash-Next with expert offload | Windows preview; substantial host RAM and fast storage required |
 
+<!-- contributor-avatars:start -->
+<p>
+  <a href="https://github.com/Neroued"><img src="https://avatars.githubusercontent.com/u/142312170?v=4&amp;s=64" width="40" height="40" alt="Neroued" title="Neroued"></a>
+  <a href="https://github.com/WarlaxZ"><img src="https://avatars.githubusercontent.com/u/14543891?v=4&amp;s=64" width="40" height="40" alt="WarlaxZ" title="WarlaxZ"></a>
+  <a href="https://github.com/ashalliants"><img src="https://avatars.githubusercontent.com/u/31437978?v=4&amp;s=64" width="40" height="40" alt="ashalliants" title="ashalliants"></a>
+  <a href="https://github.com/Don-Chad"><img src="https://avatars.githubusercontent.com/u/123101559?v=4&amp;s=64" width="40" height="40" alt="Don-Chad" title="Don-Chad"></a>
+  <a href="https://github.com/mgscreativa"><img src="https://avatars.githubusercontent.com/u/1286632?v=4&amp;s=64" width="40" height="40" alt="mgscreativa" title="mgscreativa"></a>
+  <a href="https://github.com/ARVLab"><img src="https://avatars.githubusercontent.com/u/30734946?v=4&amp;s=64" width="40" height="40" alt="ARVLab" title="ARVLab"></a>
+  <a href="https://github.com/MOVIBALE"><img src="https://avatars.githubusercontent.com/u/58595746?v=4&amp;s=64" width="40" height="40" alt="MOVIBALE" title="MOVIBALE"></a>
+  <a href="https://github.com/MichaelDementii"><img src="https://avatars.githubusercontent.com/u/136074657?v=4&amp;s=64" width="40" height="40" alt="MichaelDementii" title="MichaelDementii"></a>
+  <a href="https://github.com/ColeWheatley"><img src="https://avatars.githubusercontent.com/u/90545660?v=4&amp;s=64" width="40" height="40" alt="ColeWheatley" title="ColeWheatley"></a>
+  <a href="https://github.com/sry9681"><img src="https://avatars.githubusercontent.com/u/1504943?v=4&amp;s=64" width="40" height="40" alt="sry9681" title="sry9681"></a>
+  <a href="https://github.com/airtonix"><img src="https://avatars.githubusercontent.com/u/61225?v=4&amp;s=64" width="40" height="40" alt="airtonix" title="airtonix"></a>
+  <a href="https://github.com/pinizhaninov"><img src="https://avatars.githubusercontent.com/u/3766087?v=4&amp;s=64" width="40" height="40" alt="pinizhaninov" title="pinizhaninov"></a>
+  <a href="https://github.com/Thireus"><img src="https://avatars.githubusercontent.com/u/721759?v=4&amp;s=64" width="40" height="40" alt="Thireus" title="Thireus"></a>
+  <a href="https://github.com/iamwavecut"><img src="https://avatars.githubusercontent.com/u/239034?v=4&amp;s=64" width="40" height="40" alt="iamwavecut" title="iamwavecut"></a>
+  <a href="https://github.com/adubkov"><img src="https://avatars.githubusercontent.com/u/4600857?v=4&amp;s=64" width="40" height="40" alt="adubkov" title="adubkov"></a>
+  <a href="https://github.com/justinlime"><img src="https://avatars.githubusercontent.com/u/119710965?v=4&amp;s=64" width="40" height="40" alt="justinlime" title="justinlime"></a>
+  <a href="https://github.com/kuhlsnu"><img src="https://avatars.githubusercontent.com/u/208541260?v=4&amp;s=64" width="40" height="40" alt="kuhlsnu" title="kuhlsnu"></a>
+</p>
+
+Contributors: [full credits](CONTRIBUTORS.md) · [GitHub contribution history](https://github.com/Don-Chad/ninfer-3090/graphs/contributors).
+<!-- contributor-avatars:end -->
+
 ## Inference in action
 
 [![Play a real NInfer response on one RTX 3090](docs/assets/ninfer-demo.gif)](docs/assets/ninfer-demo.mp4)
@@ -46,7 +70,7 @@ free for the model; other GPU applications reduce the context available.
 ### Windows
 
 1. Download and extract the **Windows x64 archive** from the
-   [community release maintained by ashalliants](https://github.com/ashalliants/ninfer-3090/releases/tag/v0.16.0-rtx3090).
+   [Windows release](https://github.com/Don-Chad/ninfer-3090/releases/tag/v0.16.1-rtx3090).
 2. Open a terminal in that extracted folder and run:
 
 ```powershell
@@ -59,7 +83,7 @@ Microsoft Visual C++ 2022 runtime. [Windows archive guide](docs/release-archive-
 
 ### Linux
 
-Extract the Linux x64 archive from the same community release, open its folder, and run:
+Linux binaries remain available from the [ashalliants community release](https://github.com/ashalliants/ninfer-3090/releases/tag/v0.16.0-rtx3090). They are a separate build; this Windows release does not include a newly qualified Linux archive. Extract that Linux archive, open its folder, and run:
 
 ```bash
 ./download-model.sh qwen38-27b
@@ -183,8 +207,8 @@ executable is approximately **577 MB**, plus dependency DLLs and separately down
   contacts that host; optional model download and S3 storage features also use the network.
 - Linux has a multi-GPU pipeline route, but distinct GPUs have not been requalified on the current
   context engine. Flash-Next is a Windows preview. Start with one supported GPU and model.
-- The community release downloads above are published by ashalliants. This repository's adoption
-  branch has additional build fixes and documentation; no new Don-Chad release is implied.
+- The Windows download is this repository's v0.16.1 build, with Windows/MSVC and CUDA 13 packaging
+  fixes. The Linux download is separately published by ashalliants; its validation is not ours.
 
 [Serving reference](docs/serving.md) · [CLI](docs/cli.md) ·
 [Performance](docs/performance.md) · [All documentation](docs/README.md)

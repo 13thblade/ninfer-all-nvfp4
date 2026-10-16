@@ -4,6 +4,12 @@ How a `vX.Y.Z-rtx3090` release is built, packaged, verified and published from t
 steps are short; the gotchas below are the reason to read the page, because each one cost real time
 or very nearly shipped a broken archive.
 
+Publish only qualified platforms. v0.16.1 is a Windows-only release built with CUDA 13.2;
+an existing community Linux archive must not be relabeled as a new Linux build. The Windows
+packager derives cuBLAS DLL names and locations from the linked toolkit recorded in CMakeCache,
+including CUDA 13's `bin/x64` layout. `NINFER_DIST_ROOT` can place packaging outputs on a disk
+with sufficient free space. Archive metadata and checksums include source identity and notices.
+
 ## The flow
 
 1. **Prepare.** Branch `release/vX.Y.Z` from `master`. Set `VERSION` to the full tag (for example
@@ -27,13 +33,13 @@ or very nearly shipped a broken archive.
    `SHA256SUMS-vX.Y.Z-{windows,linux}.txt` under `dist/`.
 4. **Smoke-test on the real machine** (below), not just the unit tests.
 5. **Publish.** Merge the release PR, tag the merge commit (annotated), push the tag, then
-   `gh release create vX.Y.Z-rtx3090 <zip> <tar.gz> <both SHA256SUMS files> -R ashalliants/ninfer-3090
+   `gh release create vX.Y.Z-rtx3090 <qualified archives> <checksum files> -R Don-Chad/ninfer-3090
    --notes-file RELEASE_NOTES_X.Y.Z.md --title "..." --latest`.
 
 ## Gotchas
 
-**Always pass `-R ashalliants/ninfer-3090` to `gh`.** With no `-R` it resolves to the `upstream` remote
-(`Don-Chad/ninfer-3090`) and silently reads or writes the wrong fork. The same applies to the babysit
+**Always pass `-R Don-Chad/ninfer-3090` to publishing commands.** With no `-R`, fork resolution can
+select the wrong repository. The same applies to the babysit
 helper (also set `GH_REPO`).
 
 **Windows executables import cuBLAS, and the archive must carry it.** The cuBLAS prefill route makes

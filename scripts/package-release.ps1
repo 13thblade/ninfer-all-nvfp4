@@ -24,7 +24,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot $ReleaseNotes))) {
 }
 
 $BuildRoot = if ($env:NINFER_BUILD_ROOT) { $env:NINFER_BUILD_ROOT } else { Join-Path $RepoRoot 'build-ninja' }
-$DistRoot = Join-Path $RepoRoot 'dist'
+$DistRoot = if ($env:NINFER_DIST_ROOT) { $env:NINFER_DIST_ROOT } else { Join-Path $RepoRoot 'dist' }
 $ProductName = "ninfer-rtx3090-windows-x64-$ReleaseTag"
 $ProductRoot = Join-Path $DistRoot $ProductName
 $ArchivePath = Join-Path $DistRoot "$ProductName.zip"
@@ -60,30 +60,59 @@ foreach ($product in $Products) {
 Get-ChildItem -LiteralPath (Join-Path $BuildRoot 'apps') -Filter '*.dll' | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $ProductRoot
 }
-# The executables import cublas64_12.dll (the cuBLAS prefill route), which imports cublasLt64_12.dll.
+# The executables import the build toolkit's cuBLAS DLLs through the cuBLAS prefill route.
 # Neither is in the vcpkg apps\ directory: they come from the CUDA Toolkit, which a typical Windows
-# machine does not have, so without them every executable here fails to start with "cublas64_12.dll
-# was not found" -- before --prefill-cublas is even asked for. NVIDIA lists both as redistributable in
+# machine does not have, so without them every executable here fails to start with a cuBLAS DLL
+# load error -- before --prefill-cublas is even asked for. NVIDIA lists both as redistributable in
 # the CUDA Toolkit EULA. Take them from the toolkit that built the binaries.
-$CudaBin = if ($env:CUDA_PATH) { Join-Path $env:CUDA_PATH 'bin' } else { $null }
-foreach ($name in 'cublas64_12.dll', 'cublasLt64_12.dll') {
-    $found = if ($CudaBin) { Join-Path $CudaBin $name } else { $null }
-    if (-not $found -or -not (Test-Path -LiteralPath $found)) {
-        throw "Missing ${name}: set CUDA_PATH to the CUDA 12.x Toolkit that built the release (looked in $CudaBin)"
-    }
+# Resolve the toolkit actually linked by this build, not the caller's CUDA_PATH.
+# CUDA 13 uses version-13 DLL names under bin/x64; CUDA 12 uses bin.
+$CachePath = Join-Path $BuildRoot 'CMakeCache.txt'
+$CublasEntry = Select-String -LiteralPath $CachePath -Pattern '^CUDA_cublas_LIBRARY:FILEPATH=(.+)$'
+if (-not $CublasEntry) { throw "Build cache does not identify the linked cuBLAS library: $CachePath" }
+$CublasLibrary = $CublasEntry.Matches[0].Groups[1].Value
+$CudaRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $CublasLibrary))
+$CudaVersion = (Get-Content -LiteralPath (Join-Path $CudaRoot 'version.json') -Raw | ConvertFrom-Json).cuda.version
+$CudaMajor = $CudaVersion.Split('.')[0]
+if ($CudaMajor -notmatch '^\d+$') { throw "Invalid toolkit version in $CudaRoot" }
+foreach ($name in "cublas64_$CudaMajor.dll", "cublasLt64_$CudaMajor.dll") {
+    $found = @((Join-Path $CudaRoot "bin\x64\$name"), (Join-Path $CudaRoot "bin\$name")) |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $found) { throw "Missing ${name} in the build's CUDA toolkit: $CudaRoot" }
     Copy-Item -LiteralPath $found -Destination $ProductRoot
 }
 # NVIDIA's grant to redistribute those two DLLs (Attachment A of the EULA: cublas.dll and cublasLt.dll,
 # including files whose names carry a version such as cublas64_12.dll) is conditional: the
 # distribution must be consistent with the EULA and protect NVIDIA's rights. Its text therefore ships
 # beside them, and the archive README says which files it covers.
-$Eula = if ($env:CUDA_PATH) { Join-Path $env:CUDA_PATH 'EULA.txt' } else { $null }
+$Eula = Join-Path $CudaRoot 'EULA.txt'
 if (-not $Eula -or -not (Test-Path -LiteralPath $Eula)) {
     throw "Missing the CUDA Toolkit EULA (looked for $Eula): it must ship with the cuBLAS DLLs"
 }
 Copy-Item -LiteralPath $Eula -Destination (Join-Path $ProductRoot 'NVIDIA-CUDA-EULA.txt')
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'VERSION') -Destination $ProductRoot
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'LICENSE') -Destination $ProductRoot
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'CONTRIBUTORS.md') -Destination $ProductRoot
+$sourceCommit = (git -C $RepoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Could not identify release source commit' }
+$buildInfo = [ordered]@{ version = $ReleaseTag; source_commit = $sourceCommit; platform = 'windows-x64'; cuda = $CudaVersion; gpu_architecture = 'sm_86' }
+[IO.File]::WriteAllText((Join-Path $ProductRoot 'BUILD_INFO.json'), ($buildInfo | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+# Preserve the notices for redistributed vcpkg DLLs and statically linked vendored libraries.
+$Notices = Join-Path $ProductRoot 'THIRD_PARTY_LICENSES'
+New-Item -ItemType Directory -Path $Notices -Force | Out-Null
+$InstalledEntry = Select-String -LiteralPath $CachePath -Pattern '^VCPKG_INSTALLED_DIR:PATH=(.+)$'
+if ($InstalledEntry) {
+    $share = Join-Path $InstalledEntry.Matches[0].Groups[1].Value 'x64-windows\share'
+    Get-ChildItem -LiteralPath $share -Directory | ForEach-Object {
+        $notice = Join-Path $_.FullName 'copyright'
+        if (Test-Path -LiteralPath $notice) { Copy-Item -LiteralPath $notice -Destination (Join-Path $Notices "$($_.Name).txt") }
+    }
+}
+Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'third_party') -Recurse -File |
+    Where-Object { $_.Name -match '(^|[-_])(LICENSE|COPYING|NOTICE)(\.|$)' } | ForEach-Object {
+        $relativeName = $_.FullName.Substring((Join-Path $RepoRoot 'third_party').Length + 1) -replace '[\\/]', '_'
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Notices $relativeName)
+    }
 # The archive README must describe the archive. docs\rtx-3090-windows.md is written for a checkout
 # -- it points at scripts\download-model.bat, and the packager copies that script to the archive
 # root -- so a user following it from inside the archive got a missing-file error.
@@ -110,9 +139,10 @@ foreach ($exe in ($Products | ForEach-Object { $_.Destination })) {
     }
 }
 
-$innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File | Sort-Object Name | ForEach-Object {
+$innerHashes = Get-ChildItem -LiteralPath $ProductRoot -Recurse -File | Sort-Object FullName | ForEach-Object {
     $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
-    "$($hash.Hash.ToLowerInvariant())  $($_.Name)"
+    $relative = $_.FullName.Substring($ProductRoot.Length + 1) -replace '\\', '/'
+    "$($hash.Hash.ToLowerInvariant())  $relative"
 }
 # LF, not CRLF. `Set-Content` writes CRLF on Windows, and `sha256sum -c` then looks for a file whose
 # name ends in a carriage return: "avcodec-62.dll: FAILED open or read" for every line. The Linux

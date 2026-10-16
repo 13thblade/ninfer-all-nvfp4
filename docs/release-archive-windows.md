@@ -3,7 +3,7 @@
 This is the README that ships **inside** the Windows release archive, where every file sits in one
 directory. If you are reading it in a checkout instead, the launchers and downloaders it names live
 under `scripts/`, and
-[docs/rtx-3090-windows.md](https://github.com/ashalliants/ninfer-3090/blob/master/docs/rtx-3090-windows.md)
+[docs/rtx-3090-windows.md](https://github.com/Don-Chad/ninfer-3090/blob/master/docs/rtx-3090-windows.md)
 is the fuller guide. Links here are absolute on purpose: the archive ships no `docs/` directory.
 
 Check `VERSION` for the release this archive was cut from, and `RELEASE_NOTES_*.md` for what
@@ -16,7 +16,9 @@ changed.
 - Microsoft Visual C++ 2022 runtime
 
 Everything else is in the archive: the FFmpeg and libcurl DLLs, and NVIDIA's cuBLAS runtime
-(`cublas64_12.dll`, `cublasLt64_12.dll`). You do **not** need the CUDA Toolkit installed.
+(`cublas64_13.dll`, `cublasLt64_13.dll` in v0.16.1, built with CUDA 13.2). You do **not** need the
+CUDA Toolkit installed. This build needs a driver compatible with CUDA 13.2; the qualification
+machine uses NVIDIA driver 610.88.
 
 **Licensing.** NInfer is Apache-2.0 (`LICENSE`). The two cuBLAS DLLs are NVIDIA's, not part of NInfer:
 they are redistributed under the terms of the NVIDIA CUDA Toolkit EULA (`NVIDIA-CUDA-EULA.txt`,
@@ -67,7 +69,9 @@ API key blank.
 | `ninfer_bench.exe` | throughput benchmark against the public Engine route |
 | `download-model.bat` | pinned, resumable artifact downloads with verification |
 | `run.bat` | serving profiles: `run.bat <model> [profile]`, or double-click it to pick a model |
-| `*.dll` | the FFmpeg and libcurl runtime dependencies, and NVIDIA's cuBLAS (`cublas64_12.dll`, `cublasLt64_12.dll`) |
+| `*.dll` | the FFmpeg and libcurl runtime dependencies, and NVIDIA's cuBLAS runtime |
+| `BUILD_INFO.json` | release source commit, CUDA version and GPU target |
+| `CONTRIBUTORS.md`, `THIRD_PARTY_LICENSES/` | contributor credits and dependency license notices |
 | `NVIDIA-CUDA-EULA.txt` | the licence under which the two cuBLAS DLLs are redistributed |
 | `SHA256SUMS.txt` | checksums for every file in this directory |
 
