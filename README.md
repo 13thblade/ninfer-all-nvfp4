@@ -103,24 +103,35 @@ histogram 143,102,67. No ngram row is published because ngram never fired here -
 MTP=3 alone, i.e. zero ngram-only rounds. Graph-off prefill, for reference: a16 1.10k,
 grouped 1.24k, mmq 1.23k.
 
-**The state this fork started from.** Two readings on the same harness, same artifact, same **KV
-bf16** tier and same 4202-token prompt as the table above, taken on the build that predates the
-schedule work in items 1-7: prefill **771-783** tok/s, decode at `T = 1` **16.1** tok/s. On the
-earliest build measured here, before the token-tile ladder existed at all, the `a16` row was 735.8 /
-16.1 -- the decode reading did not move (a repeat probe of the later build returned 16.2, 1.5%,
-within day-to-day drift), because that work touched the int8 arms and not the A16 one.
+**The two stages this fork came through.** Kept out of the table above because every row there is
+one executable; these rows are three different ones. Same artifact, same 4202-token prompt, same
+**KV bf16** tier, `a16` route, greedy.
 
-Why the A16 path was the weak one, and it is not the mainloop's fault: 16.1 tok/s is 62.1 ms/token
-while a decode step moves the artifact's 16.1 GB, i.e. **259 GB/s effective = 26% of this card's
-1008 GB/s peak** `[derived from the two measured numbers]`. The route was dequantization-bound: the
-three costs removed later were the out-of-range outer adjustment conversion, the `ue4m3` scale read
-through the table, and the `2^14` bias folded per product instead of into the group coefficient.
-Taking those out is what moved `T = 1` to 48.0 (3.0x).
+| Stage                                                        | Prefill tok/s | Decode tok/s (`T = 1`) |
+|--------------------------------------------------------------|---------------|------------------------|
+| upstream as shipped -- no local wiring, no local kernels      | **does not run** | 16.1, measured through stage 2 (see 2) |
+| wired, before the schedule work (`ba8e3d33…`)                | 771 – 783     | 16.1                   |
+| this build (`6633ecf1…`, remote `cd0f12f`)                   | 1.15k         | 48.0                   |
 
-And the part with no number at all: before any local wiring, the only NVFP4 A16 shape this tree
-could execute was the SIMT `linear_swiglu` at `T <= 16`; every wider prompt span threw. Wide NVFP4
-prefill on a card with no FP4 tensor core therefore has no baseline reading to report -- the absence
-is the measurement.
+1. **Why upstream can only run at narrow `T`, and why there is no prefill number for it.** Two
+   walls, both in the source: the fused NVFP4 SwiGLU route has instances only up to `T <= 16`, and
+   `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp:57-67` resolves the A16 domain as
+   `T <= 16 -> SmallTFusedA16`, `T <= 64 -> Materialized`, `T > 64 -> throw`. There is no wide-`T`
+   kernel to fall back to and no eager fallback, so a 4202-token prompt span does not produce a slow
+   prefill -- it produces a throw. The missing number is the measurement.
+2. **Why the narrow path is weak, not merely narrow.** At that stage the decode step was executing
+   upstream's own legacy forms (`ninfer::ops::detail::nvfp4_gemv_kernel` and
+   `nvfp4_linear_swiglu_decode_kernel`; the shipping device profile bands narrow widths away from
+   the unified table, which is why `16.1` is attributable to them rather than to this fork). An nsys
+   census of that build measured 63.5 ms of kernel time against 62.9 ms of wall clock per token --
+   all kernel time, no gaps left to overlap -- with those five NVFP4 kernels holding **94.9%** of
+   it. `16.1` tok/s against the 16.1 GB a step moves is 259 GB/s effective, **26% of this card's
+   1008 GB/s peak** `[derived from those two numbers]`, and the instruction count accounts for the
+   rest: about 35 warp instructions per FP4 code over 27e9 codes is roughly 47 ms of the 63 ms.
+   Issue-bound, not bandwidth-bound. The three costs the schedule work then removed were the
+   out-of-range outer adjustment conversion, the `ue4m3` scale read through the table, and the
+   `2^14` bias folded per product instead of into the group coefficient; taking those out is what
+   moved `T = 1` to 48.0 (3.0x) and 4.2K prefill from 771-783 to 1.15k (1.49x).
 
 Takeaways (sm_86, QUASAR-NVFP4):
 - **The int8 decode lead is now ~1.03×, not 2.3×** (49.4-49.3 vs 48.0). The reason is
