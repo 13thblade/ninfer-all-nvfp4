@@ -153,17 +153,6 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
     static_assert((Geometry::kInputRows % kValuesPerPhase) == 0);
     const auto* activation_pairs = reinterpret_cast<const std::uint32_t*>(x);
 
-    // Per-row code bases: loop-invariant except for the phase stride, so build
-    // them once and advance by one stride per phase (pure addressing
-    // arithmetic; the loaded values remain bit-identical).
-    std::int64_t code_offset[Schedule::kRowsPerWarp];
-#pragma unroll
-    for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-        code_offset[local_row] =
-            static_cast<std::int64_t>(parent_rows[local_row]) * Geometry::kCodeBytesPerRow +
-            lane * (Schedule::kValuesPerLane / 2);
-    }
-
 #pragma unroll
     for (int phase = 0; phase < kPhases; ++phase) {
         float coefficients[Schedule::kRowsPerWarp][kGroupsPerLane];
@@ -173,29 +162,18 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
             load_nvfp4_coefficients<Geometry, Schedule>(
                 scales, shared, parent_rows[local_row], flat_row0 + local_row, phase, lane,
                 inverse_weight_divisor, coefficients[local_row]);
+            const std::int64_t code_offset =
+                static_cast<std::int64_t>(parent_rows[local_row]) * Geometry::kCodeBytesPerRow +
+                phase * (kValuesPerPhase / 2) + lane * (Schedule::kValuesPerLane / 2);
             row_codes[local_row] = load_nvfp4_codes<Schedule::kCodeCache, Schedule::kValuesPerLane>(
-                codes + code_offset[local_row]);
-            code_offset[local_row] += kValuesPerPhase / 2;
+                codes + code_offset);
         }
 
-        // One lane reads kValuesPerLane bf16 per phase (16 B-aligned, and for
-        // the 16-wide schedules 32 B); kValuesPerLane/8 128-bit loads replace
-        // the per-pair 32-bit loads.  Same addresses, same order, bit-identical.
-        const auto* lane_activation = reinterpret_cast<const uint4*>(
-            activation_pairs + phase * (kValuesPerPhase / 2) +
-            lane * (Schedule::kValuesPerLane / 2));
-        std::uint32_t activation_words[Schedule::kPairsPerLane];
-#pragma unroll
-        for (int quad = 0; quad < Schedule::kPairsPerLane / 4; ++quad) {
-            const uint4 packed   = load_vec<uint4>(lane_activation + quad);
-            activation_words[quad * 4]     = packed.x;
-            activation_words[quad * 4 + 1] = packed.y;
-            activation_words[quad * 4 + 2] = packed.z;
-            activation_words[quad * 4 + 3] = packed.w;
-        }
 #pragma unroll
         for (int pair = 0; pair < Schedule::kPairsPerLane; ++pair) {
-            const float2 activation = bf16x2_bits_to_float2(activation_words[pair]);
+            const int activation_index =
+                phase * (kValuesPerPhase / 2) + lane * Schedule::kPairsPerLane + pair;
+            const float2 activation = bf16x2_bits_to_float2(activation_pairs[activation_index]);
             const int group         = ((lane * Schedule::kValuesPerLane & 15) + pair * 2) / 16;
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
