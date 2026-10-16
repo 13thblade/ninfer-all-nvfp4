@@ -182,6 +182,9 @@ std::string usage_text(const char* argv0) {
            std::string(ninfer::product::kHybridExpertHelp) +
            std::string(ninfer::product::kNgramTableHelp) +
            "  --no-cuda-graph               decode without CUDA Graphs\n"
+           "  --gpu-clock-floor MHZ         hold the GPUs' graphics clock at MHZ or more while\n"
+           "                                a request runs, so pipeline stages do not wait at\n"
+           "                                idle clocks (needs administrator or root rights)\n"
            "\n"
            "KV CACHE\n"
            "  --kv-capacity N|auto          KV capacity in tokens (default --max-context);\n"
@@ -505,6 +508,11 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--gpu-clock-floor") {
+            options.gpu_clock_floor_mhz = parse_u32(value(arg), "gpu-clock-floor");
+            if (options.gpu_clock_floor_mhz == 0 || options.gpu_clock_floor_mhz > 5000) {
+                throw std::invalid_argument("--gpu-clock-floor must be in [1, 5000] MHz");
+            }
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

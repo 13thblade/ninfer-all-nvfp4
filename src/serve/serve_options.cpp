@@ -119,6 +119,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --cuda-graph-allowance-mib N  CUDA Graph driver-state allowance taken from the\n"
            "                                KV sizing budget (default 0: computed per\n"
            "                                profile)\n"
+           "  --gpu-clock-floor MHZ         hold the GPUs' graphics clock at MHZ or more while\n"
+           "                                requests run, so pipeline stages do not wait at\n"
+           "                                idle clocks (needs administrator or root rights)\n"
            "  --device-profile auto|off|calibrate\n"
            "                                per-GPU route profile: auto uses the stored or\n"
            "                                built-in one and calibrates a device that has\n"
@@ -1183,6 +1186,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+            continue;
+        }
+        if (arg == "--gpu-clock-floor") {
+            const std::uint64_t mhz =
+                parse_u64(require_value("--gpu-clock-floor"), "gpu-clock-floor");
+            if (mhz == 0 || mhz > 5000) {
+                throw std::invalid_argument("--gpu-clock-floor must be in [1, 5000] MHz");
+            }
+            options.gpu_clock_floor_mhz = static_cast<std::uint32_t>(mhz);
             continue;
         }
         if (arg == "--cuda-graph-allowance-mib") {

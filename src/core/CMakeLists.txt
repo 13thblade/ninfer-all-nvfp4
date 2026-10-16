@@ -3,6 +3,7 @@ add_library(ninfer_core STATIC
   device.cu
   stage_link.cu
   dtype.cpp
+  gpu_clock_floor.cpp
   host_worker_pool.cpp
   gdn_replay_records.cpp
   cyclic_kv_cache.cpp
@@ -27,6 +28,8 @@ add_library(ninfer_core STATIC
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads CUDA::cuda_driver)
+# gpu_clock_floor.cpp loads NVML at run time.
+target_link_libraries(ninfer_core PRIVATE ${CMAKE_DL_LIBS})
 if(WIN32 AND NINFER_DIRECTSTORAGE)
   target_link_libraries(ninfer_core PUBLIC ninfer_directstorage)
 endif()

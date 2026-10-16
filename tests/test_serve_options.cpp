@@ -1044,6 +1044,7 @@ int main() {
                                         "--frequency-penalty",
                                         "--full-draft-head",
                                         "--gdn-state-fp16",
+                                        "--gpu-clock-floor",
                                         "--graft",
                                         "--greedy",
                                         "--host",
@@ -1253,6 +1254,18 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--fast-prefill-kernel") !=
                           std::string::npos,
                       "serve help omits --fast-prefill-kernel");
+
+    const ServeOptions clock_floor =
+        parse({"ninfer-serve", "model.ninfer", "--gpu-clock-floor", "1500"});
+    failures += check(clock_floor.gpu_clock_floor_mhz == 1500 && defaults.gpu_clock_floor_mhz == 0,
+                      "--gpu-clock-floor was not parsed, or is not off by default");
+    for (const char* value : {"0", "5001", "fast"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--gpu-clock-floor", value});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--gpu-clock-floor accepted 0, 5001 or a word");
+    }
 
     const ServeOptions graph_allowance =
         parse({"ninfer-serve", "model.ninfer", "--cuda-graph-allowance-mib", "512"});
