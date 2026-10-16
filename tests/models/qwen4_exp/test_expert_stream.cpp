@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -100,7 +101,9 @@ int run() {
     // Slots are sized for the widest projections and the zeros after the down: 3072 + 3072 + 1792
     // bytes, ten of them.
     const std::vector<std::uint64_t> budget = {10 * (3072 + 3072 + 1792)};
-    ExpertStream stream(device, paths, std::move(layers), budget);
+    // Owned so it closes its files before they are removed: Windows cannot delete an open file.
+    auto owner = std::make_unique<ExpertStream>(device, paths, std::move(layers), budget);
+    ExpertStream& stream = *owner;
     require(stream.stats().slots == 10, "ten slots");
 
     const auto check = [&](int layer, const std::vector<std::int32_t>& ids, const std::string& label) {
@@ -147,6 +150,7 @@ int run() {
         stream.prepare(1, too_many);
     } catch (const std::runtime_error&) { refused = true; }
     require(refused, "a call that needs more experts than slots is refused");
+    owner.reset();
     for (const auto& path : paths) { std::filesystem::remove(path); }
     return 0;
 }
