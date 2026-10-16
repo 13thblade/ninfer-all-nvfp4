@@ -1,4 +1,4 @@
-# Add NVFP4 int8 kernels (wide + decode) and the A16 SwiGLU wiring gap fill for sm_86/89 on Qwen3.8 27B
+# W4(NVFP4) A16(BF16) support for sm_86/89/100/120 and A8(int8) support for sm_70/75/86/89/100/120 on ninfer
 
 ## Summary
 
@@ -161,8 +161,11 @@ Takeaways (sm_86, QUASAR-NVFP4):
 - `J = 8` in both MMA ladders is unreachable under `grouped`/`mmq` now that `T ≤ 8`
   belongs to the MMVQ kernel; the ladder's bottom rung only matters to a build that
   puts the narrow band back.
-- Validated on **sm_86 (RTX 3090 Ti)** with the QUASAR-NVFP4 artifact; broader
-  sm_89/90 coverage is pending.
+- The title states kernel availability per architecture; the verification basis differs by
+  tier: model-level numbers are **sm_86 only** (RTX 3090 Ti, QUASAR-NVFP4 artifact), the
+  build + op-suite legs cover **sm_75 / 86 / 89 / 120a** (`arch: ['75','86','89','120a']`,
+  all green on this master), and **sm_70 / sm_100 have no leg here** -- for those two the
+  claim is that the routes resolve and the kernels are in the tree, not that they were run.
 
 ## Test plan
 
