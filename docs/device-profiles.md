@@ -18,12 +18,14 @@ Up to three layers answer, per route key:
 1. **Your profile file.** `$NINFER_DEVICE_PROFILES`, else `$XDG_CACHE_HOME/ninfer/device-profiles.json`,
    else `~/.cache/ninfer/device-profiles.json` (`%LOCALAPPDATA%\ninfer\device-profiles.json` on
    Windows). `--device-profile-path` names another file.
-2. **The built-in table.** Profiles measured on the RTX 3090, RTX 4090, RTX 5090, the RTX PRO 6000
-   Blackwell, the Tesla V100-SXM2-16GB and V100-SXM2-32GB, and the TITAN RTX ship inside the binary
-   (`src/runtime/engine/device_profiles.json`). The PRO 6000's Workstation (600 W), Max-Q (300 W)
-   and Server editions report different names, so each has its own entry. The TITAN RTX entry is
-   measured by a `75` build, the only build that runs on it; its route catalog lacks the keys a
-   Turing build never selects.
+2. **The built-in table.** Profiles measured on 45 GPU models ship inside the binary
+   (`src/runtime/engine/device_profiles.json`); the Profile column of the
+   [card tables](gpus.md#cards) shows which. Each entry was measured at the card's default power
+   limit by the build that serves it: the image's `75`, `86` and `120a` builds (an Ada card runs the
+   `86` build), and CUDA 12.8 `80` and `70` builds for the A100 and V100. Variants that report
+   different names have their own entries, such as the PRO 6000's Workstation (600 W), Max-Q
+   (300 W) and Server editions. The Turing entries come from a `75` build, the only build that runs
+   on them; its route catalog lacks the keys a Turing build never selects.
 3. **The compiled route** of each operation, for a key neither names.
 
 For a key both the file and the built-in table name, the file's bands answer up to their last width
@@ -33,9 +35,9 @@ an RTX 3090, 4090 or 5090 replaces the keys calibration measures and keeps every
 the compiled route best is stored with an empty schedule, which overrides a built-in choice for it.
 
 A GPU with neither a file entry nor a built-in one is calibrated once when the engine starts, before
-the weights are loaded. This takes 20 to 40 seconds on cards of the RTX 3090's class and longer on
-smaller ones (startup took 82 to 107 seconds on an RTX 3060, 3060 Ti and 2080 Ti), and the result
-is written to the profile file for later starts. A `70` build runs its own projection and attention routes, which no profile key
+the weights are loaded. For the built-in table this took 35 to 75 seconds on most Ampere, Ada and
+Blackwell cards with 46 or more SMs, 75 to 132 seconds on smaller ones and 94 to 204 seconds on
+Turing cards, and the result is written to the profile file for later starts. A `70` build runs its own projection and attention routes, which no profile key
 steers, so it calibrates the two-stage GDN switch alone, in about nine seconds on a V100.
 
 An entry applies only to the same hardware class (the GPU name and compute capability) and the same

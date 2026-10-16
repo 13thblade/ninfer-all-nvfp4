@@ -209,8 +209,8 @@ build (the image has one); `sm_86` and `sm_89` builds refuse the file. On an RTX
 ## Cards of 8 to 12 GB
 
 The windows the [small cards](performance/small-cards-2026-10.md) page measured: the server started
-with `--max-concurrency 1` and answered a request. None of these cards has a built-in device
-profile, so the first start calibrates (82 to 107 s there).
+with `--max-concurrency 1` and answered a request. These three cards carry built-in device profiles;
+another card of this size calibrates once at its first start, in one to three minutes.
 
 ```bash
 # 8 GB (RTX 3060 Ti): Ternary Bonsai 2 with 24,576 tokens of rk4v4 and no drafter. MTP does not fit.

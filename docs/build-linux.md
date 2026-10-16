@@ -121,8 +121,9 @@ forms of those instructions and Turing shapes of the kernels that do not fit
 - Every model, KV format and drafter runs. The Linear routes come from the legacy table only, and
   `NINFER_LINEAR_ROUTES=unified` is refused.
 
-The TITAN RTX's device route profile is built in; another Turing part calibrates at first start
-(see [device profiles](device-profiles.md)). What runs and how fast is in the
+Device route profiles of the TITAN RTX and the other Turing cards the
+[card table](gpus.md#turing-75-build-75) marks are built in; another Turing part calibrates at first
+start (see [device profiles](device-profiles.md)). What runs and how fast is in the
 [TITAN RTX measurements](performance/titan-rtx-2026-10.md).
 
 ## Tesla V100 (sm_70)
