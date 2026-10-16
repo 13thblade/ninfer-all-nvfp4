@@ -16,6 +16,7 @@ int run_softmax_attention_plain_and_packed_tests();
 int run_softmax_attention_context_tests();
 int run_softmax_attention_wide_tests();
 int run_softmax_attention_parallel_tile_tests();
+int run_softmax_attention_quantized_depth_tests();
 
 namespace {
 
@@ -39,6 +40,8 @@ int run_guarded(const char* what, int (*suite)()) {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--quantized-depth-only")
+        return run_guarded("quantized depth", run_softmax_attention_quantized_depth_tests);
     if (argc == 2 && std::string_view(argv[1]) == "--wide-only")
         return run_guarded("wide", run_softmax_attention_wide_tests);
     if (argc == 2 && std::string_view(argv[1]) == "--parallel-tiles-only")
@@ -76,7 +79,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage: ninfer_softmax_attention_test "
                      "[--dflash2-only|--nvfp4-only|--k8v4-only|--rk4v4-e8-only|--rk2v4-e8-only|"
                      "--int8-prompt-only|--fp8-prompt-only|--pack-gqa-only|"
-                     "--wide-only|--parallel-tiles-only]\n";
+                     "--wide-only|--parallel-tiles-only|--quantized-depth-only]\n";
         return 2;
     }
     const int causal = run_guarded("causal cache", run_softmax_attention_causal_cache_tests);

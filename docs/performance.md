@@ -35,6 +35,7 @@ drafts with the tokens committed per verify round in brackets.
 | TITAN RTX | 24 GB | `75` | 280 W | [TITAN RTX](performance/titan-rtx-2026-10.md) |
 | RTX 2080 Ti | 11 GB | `75`, the image | 250 W | [small cards](performance/small-cards-2026-10.md) |
 | Tesla V100-SXM2-16GB | 16 GB | `70` | 300 W | [Tesla V100](performance/tesla-v100-2026-10.md) |
+| Tesla V100-SXM2-32GB | 32 GB | `70` | 300 W | [32 GB follow-up](performance/tesla-v100-2026-10.md#follow-up-on-the-32-gb-and-16-gb-cards-15-16-october) |
 
 ## Largest context
 

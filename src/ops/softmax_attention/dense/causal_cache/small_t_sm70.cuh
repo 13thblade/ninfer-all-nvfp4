@@ -191,6 +191,7 @@ __device__ __forceinline__ uint2 key_codes8(uint2 w) {
 template <typename Geometry, KvKeyCoding Keys, bool PackedValues>
 struct Int8Rows {
     static constexpr bool kChunks = true;
+    static constexpr int kKeyChunksInFlight = 8;
     const std::uint8_t* cache_k;
     const std::uint8_t* cache_v;
     const __half* scale_k;
@@ -327,9 +328,10 @@ struct Int8Rows {
 // K and V of the FP8 (row-scaled E4M3) and NVFP4 (G16 E2M1 over E4M3 scales) caches: fp8, nvfp4,
 // and k8v4's FP8 keys with NVFP4 values. Keys are stored rotated in both codings, NVFP4 values too
 // (their reducer rotates the output back). Chunked as Int8Rows: 32 dimensions a load.
-template <typename Geometry, bool KeyFp8, bool ValueFp8>
+template <typename Geometry, bool KeyFp8, bool ValueFp8, int KeyChunksInFlight = 8>
 struct QuantRows {
     static constexpr bool kChunks = true;
+    static constexpr int kKeyChunksInFlight = KeyChunksInFlight;
     const std::uint8_t* cache_k;
     const std::uint8_t* cache_v;
     const void* scale_k;
@@ -479,6 +481,51 @@ struct QuantRows {
     }
 };
 
+// NVFP4's scalar row access for the one/two-tile H16 verification splits. Keep the same
+// represented FP16 operands, but read each MMA fragment separately and use its logical output
+// dimensions. The chunked provider still owns the common pages and stored-scale decoding.
+template <typename Geometry>
+struct Nvfp4ScalarRows {
+    static constexpr bool kChunks = false;
+    using PackedRows = QuantRows<Geometry, false, false>;
+    using KeyRow = typename PackedRows::KeyRow;
+    PackedRows packed;
+
+    struct ValueRow {
+        const std::uint8_t* codes;
+        uint4 scales;
+        int group0;
+    };
+
+    __device__ __forceinline__ KeyRow key(int k) const { return packed.key(k); }
+
+    __device__ __forceinline__ uint4 key8(const KeyRow& row, int d) const {
+        const unsigned codes = *reinterpret_cast<const unsigned*>(row.codes + d / 2);
+        const __half2 scale = PackedRows::e4m3_scale(row.scales, d / kKVCacheNvfp4Group);
+        return make_uint4(PackedRows::e2m1x2(codes, scale),
+                          PackedRows::e2m1x2(codes >> 8, scale),
+                          PackedRows::e2m1x2(codes >> 16, scale),
+                          PackedRows::e2m1x2(codes >> 24, scale));
+    }
+
+    __device__ __forceinline__ ValueRow value(int k, int dim0) const {
+        const int page = packed.page_of(k);
+        const int offset = k & kPagedKVPageMask;
+        const auto at = kv_cache_nvfp4_code_index<Geometry>(page, packed.kv_head, dim0, offset);
+        return {packed.cache_v + at,
+                PackedRows::template load_scales<false>(packed.scale_v, page, packed.kv_head,
+                                                        offset),
+                dim0 / kKVCacheNvfp4Group};
+    }
+
+    __device__ __forceinline__ uint2 value4(const ValueRow& row, int n) const {
+        const unsigned codes = *reinterpret_cast<const std::uint16_t*>(row.codes + 16 * n);
+        const __half2 scale = PackedRows::e4m3_scale(row.scales, row.group0 + 2 * n);
+        return make_uint2(PackedRows::e2m1x2(codes, scale),
+                          PackedRows::e2m1x2(codes >> 8, scale));
+    }
+};
+
 // Rows whose lanes read 32 dimensions of a row at a time (Int8Rows::kChunks).
 template <class Rows, class = void>
 struct chunked_rows : std::false_type {};
@@ -547,7 +594,7 @@ __device__ __forceinline__ void attend_tile(const Rows& rows, const __half* q_ro
         const bool live  = key >= key_lo && key < key_hi;
         const auto k_row = rows.key(live ? key : k0);
         if constexpr (Chunks) {
-#pragma unroll
+#pragma unroll (Rows::kKeyChunksInFlight)
             for (int d0 = 0; d0 < D; d0 += 32) {
                 const auto chunk = rows.key_chunk(k_row, d0);
 #pragma unroll
@@ -1474,6 +1521,32 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
     const sm70_attention::QuantRows<Geometry, KeyFp8, ValueFp8> rows{
         cache_k,     cache_v,    cache_k_scale, cache_v_scale, physical_pages_s,
         block_table, first_page, staged_pages,  kv_head};
+    if constexpr (!MultiBatch && !KeyFp8 && !ValueFp8 && TokenTile == 4) {
+        // These choices are measured over the complete Op on V100. Use the actual split work,
+        // not the host envelope: one captured graph serves every position inside that envelope.
+        if constexpr (Geometry::QHeads == 16) {
+            if (key_blocks <= 2) {
+                const sm70_attention::Nvfp4ScalarRows<Geometry> scalar{rows};
+                sm70_attention::attend<Geometry, TokenTile>(
+                    scalar, q_s, p_s, stat_m, stat_l, combined, TokenTile, RowCount, kv_head,
+                    split, split_start, split_end, first_tile, key_blocks, positions,
+                    attention_scale, partial_acc, partial_m, partial_l);
+                return;
+            }
+        }
+        // Fused append benefits from the shorter QK unroll. Cached-only H16 splits at 9K/12K/
+        // 24K keep eight chunks in flight; above 256 active CTAs, two chunks win again.
+        if (CacheInput::writes_cache || Geometry::KVHeads * active_split_count > 256) {
+            const sm70_attention::QuantRows<Geometry, false, false, 2> limited{
+                cache_k, cache_v, cache_k_scale, cache_v_scale, physical_pages_s,
+                block_table, first_page, staged_pages, kv_head};
+            sm70_attention::attend<Geometry, TokenTile>(
+                limited, q_s, p_s, stat_m, stat_l, combined, TokenTile, RowCount, kv_head,
+                split, split_start, split_end, first_tile, key_blocks, positions,
+                attention_scale, partial_acc, partial_m, partial_l);
+            return;
+        }
+    }
     sm70_attention::attend<Geometry, TokenTile>(rows, q_s, p_s, stat_m, stat_l, combined, TokenTile,
                                                 RowCount, kv_head, split, split_start, split_end,
                                                 first_tile, key_blocks, positions, attention_scale,
