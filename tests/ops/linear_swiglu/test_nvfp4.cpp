@@ -196,7 +196,12 @@ int main() {
         return 77;
     }
     try {
-        constexpr std::array<std::int32_t, 4> kA16Cases{1, 4, 8, 16};
+        // The A16 ladder stops at the width the fused wide MMA takes over from the SIMT
+        // small-T band: 16|17 is the band boundary, and 128/256/512/1024/1025 carry the
+        // wide route over whole tiles and the ragged width just past four of them. TODO.md
+        // section 1 asks for exactly this re-add (the committed ladder stopped at 16, which
+        // is how a route that cannot run on sm_86 at all once had a passing Op test).
+        constexpr std::array<std::int32_t, 10> kA16Cases{1, 4, 8, 16, 17, 128, 256, 512, 1024, 1025};
         // 511 and 513 straddle the ragged floor: the first still reaches the composition, the
         // second is the narrowest ragged width the fused route admits and leaves one real token
         // in a third M tile. 767 leaves that tile all but full, and 1025 leaves one after four
