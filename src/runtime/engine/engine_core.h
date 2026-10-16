@@ -837,6 +837,9 @@ private:
         detail_range.emplace(nvtx::Name::StatsPublication, nvtx::Category::Control);
         RuntimeStats snapshot = cumulative_stats_;
         resources_.populate_runtime_stats(*instance_.program, snapshot);
+        if constexpr (requires { instance_.program->expert_residency_stats(); }) {
+            snapshot.experts = instance_.program->expert_residency_stats();
+        }
         {
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());

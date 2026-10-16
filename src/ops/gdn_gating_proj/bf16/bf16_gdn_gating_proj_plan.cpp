@@ -539,14 +539,22 @@ std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::in
 }
 
 Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
-    Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
+    return bf16_gdn_norm_gating_resolve_plan(problem, device_sm_count());
+}
+
+Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem,
+                                                        std::int32_t sm_count) {
+    Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem, sm_count);
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
     std::int32_t norm_splits             = 0;
     if (is_27(problem) && problem.cols <= 42)
         return {Bf16GdnNormGatingScheduleId::FusedSimt27, control, 0};
-    if (is_35(problem) && problem.cols <= 16) {
+    // Split 32 launches 64 CTAs per 64 columns: fewer than 32 SMs at two CTAs each (an RTX 3060's
+    // 28) cannot hold it, and the composed route takes the resident gating plan.
+    if (is_35(problem) && problem.cols <= 16 &&
+        candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit32, problem, sm_count)) {
         control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
-                                                     problem);
+                                                     problem, sm_count);
         schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
         norm_splits = 32;
     }

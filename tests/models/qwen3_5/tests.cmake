@@ -22,6 +22,14 @@ endforeach()
 ninfer_add_test(ninfer_shared_slot_release_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_shared_slot_release.cpp")
 
+ninfer_add_test(ninfer_qwen_native_expert_layout_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_layout.cpp")
+
+ninfer_add_test(ninfer_qwen_native_streaming_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_native_streaming_real.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
+set_tests_properties(ninfer_qwen_native_streaming_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_qwen3_5_loading_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"
   LIBRARIES ninfer_model_loading)

@@ -92,7 +92,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                8192)\n"
            "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
-           "                                (default 1024)\n"
+           "                                (default 1024; 4096 for native MoE experts\n"
+           "                                in host memory or files)\n"
            "  --decode-rounds-per-prefill N decode rounds after each prefill chunk while\n"
            "                                others generate (0: chunk / 64; 1 alternates)\n"
            "  --default-max-tokens N        output limit of a request that sets none\n"
@@ -107,12 +108,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                (Linux); excludes --device\n"
            "  --stage-layers A,B,...        layers per stage in --devices order (default:\n"
            "                                split by free memory)\n"
-           "  --expert-residency device|host|disk  Flash-Next/Gemma MoE: expert banks in GPU\n"
-           "                                memory (default), pinned host memory, or files\n"
-           "                                (Gemma brings misses into whole-layer banks)\n"
-           "  --expert-cache-mib N|auto     persistent device cache (default auto); Gemma 0\n"
-           "                                keeps the layer banks only. Flash-Next disk\n"
-           "                                residency requires a nonzero cache\n" +
+           "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
+           "                                host memory, or in artifact files\n"
+           "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen\n"
+           "                                and Gemma allow 0 (layer banks only).\n"
+           "                                Flash-Next disk requires a nonzero cache\n" +
            std::string(ninfer::product::kHybridExpertHelp) +
            std::string(ninfer::product::kNgramTableHelp) +
            "  --no-cuda-graph               decode without CUDA Graphs (on by default)\n"
@@ -1652,8 +1652,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
     }
-    if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
-        throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    if (options.prefill_chunk % 128 != 0) {
+        throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     if (options.unconstrained_response_format && options.structured_output) {
         throw std::invalid_argument(

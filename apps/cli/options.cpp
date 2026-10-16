@@ -163,7 +163,8 @@ std::string usage_text(const char* argv0) {
            "CONTEXT\n"
            "  --max-context N               context ceiling in tokens (default 2048)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
-           "                                (default 1024)\n"
+           "                                (default 1024; 4096 for native MoE experts\n"
+           "                                in host memory or files)\n"
            "  --max-new N                   cap on generated tokens (default 128)\n"
            "  --device N                    CUDA device index (default 0)\n"
            "  --devices A,B,...             one pipeline stage per listed GPU, each owning\n"
@@ -173,12 +174,11 @@ std::string usage_text(const char* argv0) {
            "                                exercises the path on one GPU\n"
            "  --stage-layers A,B,...        layers per stage (default: split by each GPU's\n"
            "                                free memory)\n"
-           "  --expert-residency device|host|disk  Flash-Next/Gemma MoE: expert banks in GPU\n"
-           "                                memory (default), pinned host memory, or files\n"
-           "                                (Gemma brings misses into whole-layer banks)\n"
-           "  --expert-cache-mib N|auto     persistent device cache (default auto); Gemma 0\n"
-           "                                keeps the layer banks only. Flash-Next disk\n"
-           "                                residency requires a nonzero cache\n" +
+           "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
+           "                                host memory, or in artifact files\n"
+           "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen\n"
+           "                                and Gemma allow 0 (layer banks only).\n"
+           "                                Flash-Next disk requires a nonzero cache\n" +
            std::string(ninfer::product::kHybridExpertHelp) +
            std::string(ninfer::product::kNgramTableHelp) +
            "  --no-cuda-graph               decode without CUDA Graphs\n"

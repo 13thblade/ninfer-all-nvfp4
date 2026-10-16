@@ -144,6 +144,9 @@ ninfer_add_op_test(ninfer_prepare_masked_block_test
 ninfer_add_op_test(ninfer_sparse_moe_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_moe.cpp"
   LIBRARIES ninfer_ops)
+add_test(NAME ninfer_sparse_moe_streaming_test
+  COMMAND ninfer_tests ninfer_sparse_moe_test --streaming)
+set_tests_properties(ninfer_sparse_moe_streaming_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # The routing sort on its own, exhaustively. The Op test above covers SparseMoe end to end and
 # would not localise a network that mis-sorts a minority of score permutations; this one runs the

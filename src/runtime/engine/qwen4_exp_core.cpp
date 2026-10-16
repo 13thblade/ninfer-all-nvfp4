@@ -241,7 +241,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     executor.draft_tokens    = mtp ? speculative.draft_tokens : 0;
     executor.draft_min_p     = speculative.draft_min_p;
     // A chunk also holds a verification of every sequence at once.
-    executor.prefill_chunk   = std::max(std::clamp<std::uint32_t>(options.prefill_chunk, 64, 4096),
+    const std::uint32_t requested_chunk = options.prefill_chunk ? options.prefill_chunk : 1024;
+    executor.prefill_chunk   = std::max(std::clamp<std::uint32_t>(requested_chunk, 64, 4096),
                                         (executor.draft_tokens + 1) * executor.sequences);
     executor.ngram           = std::move(ngram);
     executor.ngram_read      = std::move(ngram_read);

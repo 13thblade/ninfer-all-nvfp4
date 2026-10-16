@@ -36,7 +36,8 @@ on 0.0.0.0:8080.
 | `--vision`, `--vision-residency`, `--vision-max-merged` | image and video input, where the tower lives (`overlay` borrows device memory per image), and the merged-token budget of one item |
 | `--max-concurrency` | requests admitted at once, 1 to 8 |
 | `--devices` | one pipeline stage per listed GPU (Linux) |
-| `--expert-residency`, `--ngram-table`, `--ngram-residency` | Qwen3.8-Flash-Next: where the experts and the n-gram rows live, and the table's file |
+| `--expert-residency`, `--expert-cache-mib` | native Qwen MoE, Gemma 4 and Qwen3.8-Flash-Next: where the routed experts live and their persistent device cache budget ([expert residency](cli.md#common-options)) |
+| `--ngram-table`, `--ngram-residency` | Qwen3.8-Flash-Next: where the n-gram rows live and the table's file |
 | `--disk-kv-path`, `--disk-kv-gib`, `--disk-kv-restore` | the disk tier of the context cache |
 
 ## Ternary Bonsai 2 27B

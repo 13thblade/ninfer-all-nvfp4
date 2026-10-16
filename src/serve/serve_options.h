@@ -48,7 +48,7 @@ struct ServeOptions {
     // at C1 on an RTX 3090, and a 6.5K-token one past 100 s; a 30 s deadline expired those
     // callers before they were ever admitted.
     std::uint32_t pending_timeout_ms   = 600000;
-    std::uint32_t prefill_chunk        = 1024;
+    std::uint32_t prefill_chunk        = 0; // 0: the Engine's automatic chunk
     std::uint32_t decode_rounds_per_prefill = 0;
     bool fast_prefill_kernel           = false;
     std::filesystem::path context_cost_presets;
