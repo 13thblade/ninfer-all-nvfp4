@@ -1,5 +1,4 @@
 from pathlib import Path
-import html
 import json
 import shutil
 import subprocess
@@ -38,46 +37,44 @@ Style: Main,Segoe UI,32,&H00F6F6F0,&H00000000,&H00000000,&H00000000,0,0,0,0,100,
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """]
 
-def label(text, x, y, size=32, color="F6F6F0", start=0, end=DURATION, bold=False):
+def label(text, x, y, size=32, color="F0F6F0", start=0, end=DURATION, bold=False):
     tags = f"{{\\pos({x},{y})\\fs{size}\\c&H{color}&\\b{int(bold)}}}"
     lines.append(f"Dialogue: 0,{stamp(start)},{stamp(end)},Main,,0,0,0,,{tags}{text}\n")
 
-label("NINFER / RTX 3090", 100, 83, 24, "AAFA75", bold=True)
-label("An assistant.\\NOn your desk.", 92, 190, 76, bold=True)
-label("A real Qwen3.8-27B response.\\NOne GPU. Native Windows.", 100, 406, 29, "D1BEAA")
-label("YOUR CONVERSATION, LOCAL", 100, 588, 19, "AAFA75", bold=True)
-label("Privacy. Offline use after setup.\\NControl over how you run it.", 100, 628, 29)
-label("No cloud inference account required.", 100, 735, 24, "D1BEAA")
-label("LOCAL MODEL  /  QWEN3.8-27B", 798, 110, 22, "AAFA75", bold=True)
-label("Why run an AI assistant locally?", 798, 172, 36, bold=True)
-label("A conversation on your own machine.", 800, 235, 20, "D1BEAA")
-label("MODEL READY", 800, 325, 19, "AAFA75", end=REPLAY_START)
-label("GENERATING", 800, 325, 19, "AAFA75", start=REPLAY_START, end=REPLAY_START + sample["wall_seconds"])
-label("COMPLETE", 800, 325, 19, "AAFA75", start=REPLAY_START + sample["wall_seconds"])
-label("155 output tokens", 800, 862, 29, bold=True)
-label("1.71 s request", 1220, 862, 29, bold=True)
-label("99.4 tokens/s decode", 800, 911, 23, "D1BEAA")
-label("159 ms first streamed text", 1220, 911, 23, "D1BEAA")
-label("Recorded output replayed at 1x  |  Model already loaded  |  DFlash2 K=7  |  16 October 2026", 100, 1000, 22, "D1BEAA")
+label("NINFER-3090 / RECORDED INFERENCE", 120, 64, 23, "99FF83", bold=True)
+label("Qwen3.8-27B", 115, 110, 58, bold=True)
+label("RTX 3090  /  DFlash2 K=7  /  rk4v4 KV  /  Native C++ / CUDA", 120, 191, 27, "A2B19C")
+label("READY", 120, 258, 20, "99FF83", end=REPLAY_START)
+label("GENERATING", 120, 258, 20, "99FF83", start=REPLAY_START, end=REPLAY_START + sample["wall_seconds"])
+label("COMPLETE", 120, 258, 20, "99FF83", start=REPLAY_START + sample["wall_seconds"])
+label("155", 120, 892, 42, "99FF83", bold=True)
+label("output tokens", 120, 950, 23, "A2B19C")
+label("1.71 s", 540, 892, 42, "99FF83", bold=True)
+label("request wall time", 540, 950, 23, "A2B19C")
+label("99.4 tok/s", 960, 892, 42, "99FF83", bold=True)
+label("decode in this recording", 960, 950, 23, "A2B19C")
+label("159 ms", 1430, 892, 42, "99FF83", bold=True)
+label("first streamed text", 1430, 950, 23, "A2B19C")
+label("1x recorded arrival times  |  Model already loaded  |  One illustrative request  |  16 October 2026", 120, 1020, 21, "A2B19C")
 
 text = ""
 for index, event in enumerate(events):
     text += event["text"]
     paragraphs = []
     for paragraph in text.splitlines():
-        paragraphs.extend(textwrap.wrap(paragraph, width=69) or [""])
+        paragraphs.extend(textwrap.wrap(paragraph, width=96) or [""])
     shown = "\\N".join(escape(line) for line in paragraphs)
     start = REPLAY_START + event["seconds"]
     end = REPLAY_START + events[index + 1]["seconds"] if index + 1 < len(events) else DURATION
     if end > start:
-        label(shown, 800, 380, 27, start=start, end=end)
+        label(shown, 120, 310, 30, start=start, end=end)
 
 (WORK / "demo.ass").write_text("".join(lines), encoding="utf-8-sig")
-filters = ("drawbox=x=740:y=70:w=1090:h=900:color=0x112738:t=fill,"
-           "drawbox=x=780:y=300:w=1000:h=2:color=0x294356:t=fill,"
-           "drawbox=x=780:y=825:w=1000:h=2:color=0x294356:t=fill,subtitles=demo.ass")
+filters = ("drawbox=x=70:y=35:w=1780:h=970:color=0x101612:t=fill,"
+           "drawbox=x=110:y=240:w=1700:h=2:color=0x25432e:t=fill,"
+           "drawbox=x=110:y=850:w=1700:h=2:color=0x25432e:t=fill,subtitles=demo.ass")
 subprocess.run([str(FFMPEG), "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
-                f"color=c=0x07162b:s=1920x1080:r={FPS}:d={DURATION}", "-vf", filters,
+                f"color=c=0x070a08:s=1920x1080:r={FPS}:d={DURATION}", "-vf", filters,
                 "-c:v", "libx264", "-preset", "fast", "-crf", "21", "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart", "demo.mp4"], cwd=WORK, check=True, timeout=180)
 subprocess.run([str(FFMPEG), "-hide_banner", "-loglevel", "error", "-y", "-i", "demo.mp4",
@@ -86,9 +83,7 @@ subprocess.run([str(FFMPEG), "-hide_banner", "-loglevel", "error", "-y", "-i", "
 for suffix in ("mp4", "gif"):
     shutil.copyfile(WORK / f"demo.{suffix}", assets / f"ninfer-demo.{suffix}")
 
-poster = f'''<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="Play a recorded NInfer response on RTX 3090">
-<rect width="1280" height="640" rx="24" fill="#07162b"/><rect x="650" y="65" width="560" height="510" rx="20" fill="#112738"/>
-<g font-family="Segoe UI,Arial,sans-serif"><text x="65" y="100" font-size="20" fill="#75faaa">NINFER / RTX 3090</text><text x="60" y="210" font-size="65" font-weight="700" fill="#f0f6f6">Watch it answer.</text><text x="65" y="280" font-size="27" fill="#aabed1">Qwen3.8-27B. One card.</text><circle cx="130" cy="410" r="50" fill="#75faaa"/><path d="M118 385l34 25-34 25z" fill="#07162b"/><text x="205" y="420" font-size="26" fill="#f0f6f6">Play the real-time replay</text><text x="70" y="545" font-size="20" fill="#aabed1">Real output · Recorded arrival times · 1x speed</text><text x="690" y="125" font-size="22" fill="#75faaa">LOCAL ASSISTANT</text><text x="690" y="200" font-size="28" fill="#f0f6f6">{html.escape(sample['text'].splitlines()[0][:36])}</text><text x="690" y="285" font-size="26" fill="#f0f6f6">Privacy. Offline use. Control.</text><text x="690" y="420" font-size="42" fill="#75faaa">155 tokens / 1.71 s</text><text x="690" y="475" font-size="22" fill="#aabed1">Model already loaded · Windows</text></g></svg>'''
+poster = '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="NInfer-3090 Qwen3.8-27B recorded inference, DFlash2 K=7, RTX 3090">\n<rect width="1280" height="640" rx="20" fill="#070a08"/><rect x="40" y="35" width="1200" height="565" rx="14" fill="#101612" stroke="#25432e"/>\n<g font-family="Segoe UI,Arial,sans-serif"><text x="80" y="95" font-size="20" fill="#83ff99">NINFER-3090 / RECORDED INFERENCE</text><text x="77" y="185" font-size="60" font-weight="700" fill="#f0f6f0">Qwen3.8-27B</text><text x="80" y="242" font-size="25" fill="#9cb1a2">RTX 3090 / DFlash2 K=7 / rk4v4 KV</text><path d="M80 280h1120" stroke="#25432e"/><circle cx="130" cy="375" r="43" fill="#83ff99"/><path d="M120 352l30 23-30 23z" fill="#070a08"/><text x="205" y="385" font-size="34" fill="#f0f6f0">Play recorded inference at 1x</text><text x="80" y="500" font-size="31" fill="#83ff99">155 tokens / 1.71 s / 99.4 tok/s decode</text><text x="80" y="555" font-size="20" fill="#9cb1a2">One illustrative request. Model already loaded. No speed-up.</text></g></svg>'
 (assets / "ninfer-demo-poster.svg").write_text(poster, encoding="utf-8")
 public_capture = {"prompt": data["prompt"], "sample": sample, "source_commit": "931bd49ba332f48fad4b5230eec5a95ec5701290", "presentation": {"response_replay_start_seconds": REPLAY_START, "speed": 1, "duration_seconds": DURATION}}
 (ROOT / "docs/assets/ninfer-demo-recording.json").write_text(json.dumps(public_capture, indent=2), encoding="utf-8")

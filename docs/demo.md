@@ -6,7 +6,7 @@ content chunk, at 1x speed. It is not a screen recording of an included chat app
 
 The framing holds for 2.5 seconds before replay begins and holds the completed output afterward.
 That reading time does not change the generated-text timing. The model was loaded before the
-request; its cold startup is not shown. The prompt title is shortened on screen. The exact prompt,
+request; its cold startup is not shown. The frame shows model and execution settings rather than a chat application. The exact prompt,
 full response, chunk timestamps and metrics are in [the recording data](assets/ninfer-demo-recording.json).
 
 ## This recording
@@ -24,7 +24,7 @@ use the network for remote image requests or optional storage when those feature
 ## How it is made
 
 The renderer uses Python's standard library and an installed FFmpeg with libass. It places the
-recorded text into an original navy-and-green layout, exports an H.264 MP4, and creates a smaller
+recorded text into an original black-and-green inference layout, exports an H.264 MP4, and creates a smaller
 animated GIF for GitHub's README. It does not borrow HyperQwen's video, artwork, timings or numbers.
 
 Run `uv run tools/docs/render_demo.py` from the checkout after setting the FFmpeg constant at the

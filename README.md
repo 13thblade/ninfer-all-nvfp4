@@ -1,36 +1,35 @@
 <p align="center">
-  <img src="docs/assets/ninfer-hero.svg" alt="NInfer-3090 — Your GPU. Your AI. Native Qwen inference on RTX 3090." width="100%">
-</p>
-
-<p align="center">
   <a href="https://github.com/ashalliants/ninfer-3090/releases/tag/v0.16.0-rtx3090">Download community build</a> ·
   <a href="#running-in-minutes">Quick start</a> ·
-  <a href="#watch-it-answer">Watch it answer</a> ·
+  <a href="#inference-in-action">Inference demo</a> ·
   <a href="docs/README.md">Documentation</a>
 </p>
 
 # NInfer-3090
 
-**Put a capable Qwen assistant on your own RTX 3090. Keep the conversation on your machine.**
+**Hyper-optimized Qwen inference for RTX 3090.**
 
-Write code, work through documents, and ask questions about images with a native local server.
-Connect the tools you already use through OpenAI- and Anthropic-compatible APIs. Once the model
-is downloaded, inference runs locally without a cloud inference account or per-token service fees.
+A native C++20/CUDA runtime with specialized **SM86 kernels**, quantized execution, CUDA Graphs,
+and **ReplaySSM** state management. Supports **Qwen3.8-27B**, Qwen3.6, and
+**Qwen3.8-Flash-Next as a Windows preview**. Built around the RTX 3090's compute and memory
+constraints, with no Python or PyTorch runtime needed for inference.
 
-The starting point is **Qwen3.8-27B on one 24 GB card**. Windows runs natively; Linux builds are
-available too. Download a prebuilt archive, fetch the model, and launch the server. No Python
-environment or Docker installation is needed to run the prebuilt applications.
+**116.7 tokens/s single-stream DFlash2 K=7**, measured on our desktop-attached RTX 3090.
+The imported fork also publishes a **140 tokens/s** result on its own recorded workload;
+these are separate measurements, not a matched comparison. [Conditions and sources](#performance).
 
-| What you want | What NInfer gives you |
-|---|---|
-| Answers that keep moving | DFlash2 accelerated generation; **116.7 tokens/s** in our local 3090 smoke benchmark |
-| Your existing AI tools, running locally | OpenAI Chat Completions, Responses and Anthropic Messages endpoints |
-| Room for longer conversations | Configurable context and conversation-prefix reuse; larger contexts depend on model, settings and free memory |
-| Help with images as well as text | Vision support in compatible Qwen artifacts |
-| Output your app can use | JSON Schema, grammar, choice and regex constraints; tool-call responses |
-| A straightforward desktop setup | Native executable and launch scripts for Windows, with Linux builds available |
+| Capability | Specification | Conditions |
+|---|---|---|
+| GPU execution | Specialized Ampere SM86 kernels; CUDA Graph capture/replay | Tuned for RTX 3090; Windows and Linux builds |
+| Speculative decoding | DFlash2 K=7; MTP available on compatible artifacts | Default 27B DFlash2 profile uses one lane |
+| Context capacity | 188,416-token Windows DFlash2 profile; 262,144-token MTP profile | Published profile ceilings; depends on free memory and settings |
+| Concurrent requests | Up to 8 configured execution lanes; compact decode batches rebuilt each round | Shared KV pool; new requests join when a lane is available |
+| Memory management | Paged KV, quantized KV formats, prefix reuse, ReplaySSM | Context, state and speculation share the GPU budget |
+| Output constraints | JSON Schema, GBNF, regex, choice and tool-call responses | Enforced generation constraints; tool execution stays with the client |
+| APIs | OpenAI Chat Completions/Responses and Anthropic Messages | Native streaming HTTP server |
+| Larger expert model | Qwen3.8-Flash-Next with expert offload | Windows preview; substantial host RAM and fast storage required |
 
-## Watch it answer
+## Inference in action
 
 [![Play a real NInfer response on one RTX 3090](docs/assets/ninfer-demo.gif)](docs/assets/ninfer-demo.mp4)
 
@@ -86,15 +85,15 @@ does not enable authentication. [Client examples and API reference](docs/serving
 The downloaders can also fetch an optional private graft using an existing Hugging Face login.
 Set `NINFER_GRAFTS=off` to skip that extra fetch; the public model works without it.
 
-## Pick your model
+## Supported models
 
-| Model | A good fit for | Status |
+| Model | Execution | Status |
 |---|---|---|
-| **Qwen3.8-27B** | The recommended starting point for local chat and coding tools | DFlash2, text and vision; independently smoke-tested here |
-| **Qwen3.6-35B-A3B** | Another option when you want several configured request lanes | MTP and compatible vision artifacts; see measured profiles |
-| **Qwen3.6-27B** | Existing Qwen3.6 workflows | Supported artifact and launcher |
-| **Qwen3.8-Flash-Next** | Trying a much larger expert model on one 3090 | **Windows preview**; needs substantial host RAM and fast storage |
-| **Ternary Bonsai 2 27B** | Exploring a smaller weight footprint | Experimental artifact; direct CLI/server use, no launcher profile yet |
+| **Qwen3.8-27B** | Dense model; DFlash2 or MTP; text and vision | Recommended launcher; independently smoke-tested here |
+| **Qwen3.6-35B-A3B** | MoE; MTP and compatible vision artifacts | Several configured lanes; see measured profiles |
+| **Qwen3.6-27B** | Dense model | Supported artifact and launcher |
+| **Qwen3.8-Flash-Next** | 512-expert MoE with host-memory expert offload | **Windows preview**; needs substantial host RAM and fast storage |
+| **Ternary Bonsai 2 27B** | Ternary weight artifact | Experimental; direct CLI/server use, no launcher profile yet |
 
 The default `qwen38-27b` launcher uses DFlash2. Other download choices are `qwen36-35b-a3b`,
 `qwen36-27b`, `qwen38-flash-next`, and `bonsai2-27b`.
@@ -104,7 +103,7 @@ inside 24 GB VRAM, and it was not part of our local smoke test.
 
 ### More context, or more simultaneous requests?
 
-The defaults favor a useful single-user experience. The maintained launch profiles document a
+The default 27B profile selects single-stream DFlash2. The maintained launch profiles document a
 Qwen3.8-27B DFlash2 ceiling of **188,416 tokens on Windows**, with a lower context selected if the
 GPU is busy. An MTP profile targets the model's **262,144-token** limit with two configured lanes.
 These are profile-dependent capacities, not results from our 16K-cap local smoke test.
@@ -117,7 +116,9 @@ of vLLM-style high-concurrency dynamic batching.
 [Choose a configuration visually](docs/config-calculator.html) ·
 [Profiles and memory tradeoffs](docs/maintainer/launcher-profiles.md)
 
-## Measured on our RTX 3090
+## Performance
+
+### Local source build: 116.7 tokens/s, single stream
 
 | Local qualification, 16 October 2026 | Result |
 |---|---:|
@@ -135,8 +136,20 @@ This is a small reproducible smoke benchmark, not a model-quality evaluation or 
 comparison against another engine. Speed changes with the prompt, context, output and settings.
 We have not reproduced a 180-token/s result on this workload.
 
-[Our method and results](docs/performance/local-qualification-20261016.md) ·
-[Broader measurements published by the fork](docs/performance.md)
+[Our method and results](docs/performance/local-qualification-20261016.md).
+
+### Published fork result: 140 tokens/s, single stream
+
+[ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090/tree/931bd49ba332f48fad4b5230eec5a95ec5701290)
+reports **140 tokens/s** for Qwen3.8-27B with DFlash2. Its published method uses eight thinking-off
+prompts, 1,024 output tokens, greedy sampling and INT8 KV. That figure comes from the fork's
+measurements; we have not independently reproduced that workload. Our 116.7 result uses a
+different prompt and `rk4v4` KV, so the two numbers do not establish a build-speed difference.
+
+The fork's later v0.16.0 Windows HTTP measurements report **126.3 / 125.6 / 110.2 tokens/s** after
+roughly 1.3K / 8.8K / 29K prompt tokens, with DFlash2 K=7, `rk4v4` KV and its launcher settings.
+Flash-Next MTP reports **112.0 / 113.2 / 103.7 tokens/s** on those prompt sizes. These are also
+contributor-reported results. [Full conditions and tables](docs/performance.md#v0160-release-binaries-all-three-models-2026-10-14).
 
 ## Build it yourself
 
