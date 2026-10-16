@@ -101,8 +101,8 @@ costs more was not measured.
   2080 Ti at 250 W (PCIe 3.0, x8 by `nvidia-smi`, 85 GiB) and an RTX 3060 at 170 W (EPYC 7452,
   PCIe 4.0 x16, 85 GiB). Drivers 595.71, 595.91 and 580.159.
 - **Software.** The `ghcr.io/iamwavecut/ninfer-all` image at `sha-e408e428ae86`, its `sm_86` and
-  `sm_75` builds. None of these cards has a built-in device profile: each calibrated its routes
-  at first start, and that start took 82 s (RTX 3060 Ti), 101 s (RTX 3060) and 107 s (RTX 2080 Ti).
+  `sm_75` builds. None of these cards had a built-in device profile at that commit: each calibrated
+  its routes at first start, and that start took 82 s (RTX 3060 Ti), 101 s (RTX 3060) and 107 s (RTX 2080 Ti).
 - **CLI rows.** One run each, greedy.
 - **Largest context.** `ninfer-serve <artifact> --max-context W --kv-capacity W --max-concurrency 1
   --gdn-state-fp16 --kv-dtype KV`, bisected in 4,096-token steps; a step passes when the server

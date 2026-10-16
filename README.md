@@ -63,11 +63,11 @@ and starts the one that matches the GPU. Every card by name, with what has run o
 | Architecture | Compute capability | Build | CUDA | In the image | Status |
 |---|---|---|---|---|---|
 | Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer | yes | measured; built-in device profiles |
-| Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | the `86` build | measured; built-in device profile |
-| Ampere | 8.6 | `86` (the default) | 12.8 or newer | yes | measured; the reference card |
-| Ampere, A100 class | 8.0 | `80` | 12.8 or newer | no | builds; not measured |
-| Turing | 7.5 | `75` | 12.8 or newer | yes | measured; built-in device profile |
-| Volta | 7.0 | `70` | 12.8 or 12.9 | no: [source build](docs/build-linux.md#tesla-v100-sm_70) | measured; built-in device profile |
+| Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | the `86` build | measured; built-in device profiles |
+| Ampere | 8.6 | `86` (the default) | 12.8 or newer | yes | measured (the reference card); built-in device profiles |
+| Ampere, A100 class | 8.0 | `80` | 12.8 or newer | no | built-in device profiles; not benchmarked |
+| Turing | 7.5 | `75` | 12.8 or newer | yes | measured; built-in device profiles |
+| Volta | 7.0 | `70` | 12.8 or 12.9 | no: [source build](docs/build-linux.md#tesla-v100-sm_70) | measured; built-in device profiles |
 | Hopper; data-center Blackwell; GB10; Pascal and older | | none | | | no build |
 
 </details>
@@ -90,12 +90,13 @@ and starts the one that matches the GPU. Every card by name, with what has run o
 <details>
 <summary><b>Device profiles and limits</b> — how a card gets its kernel routes</summary>
 
-- **Device profiles.** A profile picks the kernel route of every operation and width. A built-in
-  profile applies to the same GPU name, compute capability and SM count: the RTX 3090, 4090 and
-  5090, the three RTX PRO 6000 Blackwell editions, the Tesla V100-SXM2-16GB and -32GB and the TITAN
-  RTX. Any other card is calibrated once at first start, which took 82 to 107 seconds on the 8 to 12
-  GB cards, and the result is stored for later starts; `ninfer-calibrate` measures again after a
-  driver or clock change ([device profiles](docs/device-profiles.md)). The `70` build runs its own
+- **Device profiles.** A profile picks the kernel route of every operation and width. The binary
+  carries profiles measured on 45 GPU models, from the Tesla V100 and RTX 2060 Super to the RTX PRO
+  6000 (the Profile column of [supported GPUs](docs/gpus.md#cards)); a built-in profile applies to
+  the same GPU name, compute capability and SM count. Any other card is calibrated once at first
+  start, which takes about half a minute to three and a half minutes, and the result is stored for
+  later starts; `ninfer-calibrate` measures again after a driver or clock change
+  ([device profiles](docs/device-profiles.md)). The `70` build runs its own
   routes, so the V100 profiles hold only the GDN prefill switch and, for the 32 GB card, the Q8 MoE
   prefill frontier.
 - **Architecture limits.** NVFP4 expert weights need a `120a` build. The Turing and Volta builds
