@@ -86,6 +86,8 @@ add_test(NAME ninfer_softmax_attention_dflash2_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --dflash2-only)
 add_test(NAME ninfer_softmax_attention_int8_prompt_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --int8-prompt-only)
+add_test(NAME ninfer_softmax_attention_fp8_prompt_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --fp8-prompt-only)
 add_test(NAME ninfer_softmax_attention_pack_gqa_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --pack-gqa-only)
 
@@ -96,6 +98,7 @@ set_tests_properties(
   ninfer_softmax_attention_rk2v4_e8_test
   ninfer_softmax_attention_dflash2_test
   ninfer_softmax_attention_int8_prompt_test
+  ninfer_softmax_attention_fp8_prompt_test
   ninfer_softmax_attention_pack_gqa_test
   PROPERTIES SKIP_RETURN_CODE 77)
 

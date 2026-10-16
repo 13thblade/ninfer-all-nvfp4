@@ -77,21 +77,11 @@ inline constexpr int kBuildMaxTileColumns = 32;
 #else
 inline constexpr int kBuildMaxTileColumns = 1 << 20;
 #endif
-// The widest tile that keeps Q in shared memory (Q_in_reg false) whose output this build's device
-// code computes without a shared-memory race. On Turing, tiles of 16 and 32 columns at width 512 do
-// race: compute-sanitizer's racecheck reports errors in them, their rows miss the FP64 softmax
-// under it, and Gemma 4's prompt attention gave run-to-run different caches. Its 8-column tile,
-// whose warps hold 8 columns each, reports none.
-#if defined(NINFER_SM75)
-inline constexpr int kBuildMaxSharedQTileColumns = 8;
-#else
-inline constexpr int kBuildMaxSharedQTileColumns = 1 << 20;
-#endif
-
-// The most query rows per tile, up to `widest`, whose tile this build's device code has, computes
-// without a race and whose shared memory fits a block: ggml's prompt choices (32 rows at width 256,
-// 8 at width 512) where they do, and on Turing 16 rows at width 256 (its kernel has no tile wider
-// than 32 columns) and 1 at width 512 (kBuildMaxSharedQTileColumns).
+// The most query rows per tile, up to `widest`, whose tile this build's device code has and whose
+// shared memory fits a block: ggml's prompt choices (32 rows at width 256, 8 at width 512) where
+// they do, and on Turing 16 rows at width 256 and 4 at width 512 (its kernel has no tile wider than
+// 32 columns). The vendored combine barrier (third_party/ggml-quants/README.ninfer.md) keeps the
+// tiles that hold Q in shared memory free of the race the upstream kernel had at width 512.
 template <int D, int ncols2>
 constexpr int fitting_ncols1(int widest) {
     for (int ncols1 = widest; ncols1 >= 1; ncols1 /= 2) {
@@ -99,7 +89,6 @@ constexpr int fitting_ncols1(int widest) {
         if (ncols < kBuildMinTileColumns) { break; }
         const fattn_mma_config config = build_config(D, ncols);
         if (ncols <= kBuildMaxTileColumns && config.nbatch_fa > 0 &&
-            (config.Q_in_reg || ncols <= kBuildMaxSharedQTileColumns) &&
             tile_shared_bytes(config, D, ncols1, ncols2, kBuildTuringMma, kBuildCpAsync) <=
                 std::size_t(kMaxSharedBytesPerBlock)) {
             return ncols1;
@@ -122,7 +111,7 @@ template <> struct Shape<512> {
 static_assert(Shape<256>::ncols1 > 0 && Shape<512>::ncols1 > 0,
               "no flash-attention tile of this build fits Gemma 4's head widths");
 #if defined(NINFER_SM75)
-static_assert(Shape<256>::ncols1 == 16 && Shape<512>::ncols1 == 1);
+static_assert(Shape<256>::ncols1 == 16 && Shape<512>::ncols1 == 4);
 #elif !defined(NINFER_SM70)
 static_assert(Shape<256>::ncols1 == 32 && Shape<512>::ncols1 == 8);
 #endif

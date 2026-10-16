@@ -38,18 +38,19 @@ takes a Turing shape:
   (`kCausalPromptI8Standard`): every INT8-family prompt runs on the fast kernel with one K/V stage,
   and the `attn_pack_gqa` and `attn_prompt_fast` switches do not exist.
 - Small-T INT8 attention has no 64-key arena tier (`kSmallTI8KeyBlock64`).
-- The FP8, NVFP4 and K8V4 KV kernels widen K and V into one shared tile where two tiles do not fit
-  (the FP8 prompt kernel and the small-T shapes of two and three 16-row tiles,
-  `kCausalSmallTCompactKV`). V overwrites K after QK.
+- The FP8 prompt kernel takes 16-key tiles (`kCausalPromptFp8Bc`), whose separate widened K and V
+  stages fit 64 KiB, so V widens during QK. The small-T FP8, NVFP4 and K8V4 shapes of two and three
+  16-row tiles widen K and V into one shared tile (`kCausalSmallTCompactKV`); V overwrites K after
+  QK.
 - The BF16 prompt attention stages K and V through one buffer, context-KV materialization uses
   64-key blocks, the rowsplit A8 GEMM runs one stage, and the BF16 `n256_k5120` GEMV splits K
   eight ways at narrow widths.
 - The GGUF flash attention of Gemma 4 (`ops/linear/gguf/ggml_fattn.cu`) takes the most query rows
   per tile that the build's device code has, computes without a race and its shared memory fits.
   llama.cpp's Turing kernel has no tile wider than 32 columns, so width 256 takes 16 rows instead
-  of 32. At width 512 its tiles of 16 and 32 columns, which keep Q in shared memory, race
-  (compute-sanitizer racecheck reports errors, and Gemma 4's prompts gave run-to-run different
-  caches), so width 512 takes 1 row (8 columns) instead of 8.
+  of 32 and width 512 takes 4 rows (32 columns) instead of 8. The 512-wide tiles keep Q in shared
+  memory; they race without the combine-loop barrier that the vendored kernel carries
+  ([README.ninfer.md](../../third_party/ggml-quants/README.ninfer.md)).
 - The cooperative GDN gating projection reads the occupancy of its compiled kernels on the device
   (`bf16_gdn_gating_proj_mma_resident_ctas_per_sm`). A Turing SM holds fewer of these CTAs than an
   `sm_86` SM, so the widest cooperative routes go to the next route that is resident.

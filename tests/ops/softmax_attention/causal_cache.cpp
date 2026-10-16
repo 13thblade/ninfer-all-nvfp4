@@ -20,6 +20,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -4333,6 +4334,28 @@ int run_softmax_attention_int8_prompt_tests() {
     if (cuda_unavailable()) return 77;
     const int failures = run_int8_prompt_cases(false) + run_int8_prompt_cases(true);
     std::cout << (failures ? "FAIL" : "PASS") << " INT8 prompt-scale causal attention\n";
+    return failures ? 1 : 0;
+}
+
+int run_softmax_attention_fp8_prompt_tests() {
+    if (cuda_unavailable()) return 77;
+    // Multiple 16- and 32-key tiles of the build's Bc (16 on Turing, 32 elsewhere).
+    int failures = run_fp8_prompt_cases();
+    // Multiple key tiles, partial query tiles and real long-cache extents. Packed inputs retain
+    // the existing independent code/scale decoder and FP64 softmax oracle.
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(geometry, kPlanFp8, {33, 511, 1024, 608u},
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, kPlanFp8, {65, 2047, 4096, 609u},
+                                MappingPattern::Offset);
+        failures += run_a3_case(geometry, kPlanFp8, {7, 16377, 16384, 610u},
+                                MappingPattern::Fragmented);
+        failures += run_a1_case(geometry, kPlanFp8, {512, 1536, 2048, 611u},
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, kPlanFp8, {511, 1537, 2048, 612u},
+                                MappingPattern::Offset);
+    }
+    std::cout << (failures ? "FAIL" : "PASS") << " FP8 prompt causal attention\n";
     return failures ? 1 : 0;
 }
 

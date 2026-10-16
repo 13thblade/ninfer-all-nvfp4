@@ -25,7 +25,7 @@ if command -v ccache >/dev/null; then
     export CCACHE_DIR=${CCACHE_DIR:-/workspace/ccache} CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-40G}
     export CCACHE_COMPILERCHECK=content CCACHE_BASEDIR=${CCACHE_BASEDIR:-$(dirname "$PWD")}
     [ -d "$CCACHE_DIR" ] || /workspace/ninfer-work/py311/bin/python scripts/pods/ccache_sync.py pull \
-        --arch "$arch"
+        --arch "$arch" --dir "$CCACHE_DIR"
     ccache --zero-stats >/dev/null
     launcher=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
               -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
@@ -45,6 +45,7 @@ echo "build seconds: $((SECONDS - started))"
 if command -v ccache >/dev/null; then
     ccache --show-stats | grep -E "Hits|Misses|Cache size" || true
     [ "${NINFER_CCACHE_PUSH:-1}" = 0 ] || \
-        /workspace/ninfer-work/py311/bin/python scripts/pods/ccache_sync.py push --arch "$arch"
+        /workspace/ninfer-work/py311/bin/python scripts/pods/ccache_sync.py push --arch "$arch" \
+            --dir "$CCACHE_DIR"
 fi
 sha256sum "$build/apps/ninfer" "$build/apps/ninfer-serve" > ../jobs/build-binaries.sha256
