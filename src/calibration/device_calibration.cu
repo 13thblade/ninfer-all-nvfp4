@@ -12,9 +12,13 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 #include "ops/linear/common/route_table.h"
+#include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
+#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
@@ -44,6 +48,14 @@ __global__ void fill_u16_kernel(std::uint16_t* values, std::uint64_t count, std:
     for (std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          index < count; index += stride) {
         values[index] = bits;
+    }
+}
+
+__global__ void fill_u8_kernel(std::uint8_t* values, std::uint64_t count, std::uint8_t byte) {
+    const std::uint64_t stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    for (std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < count; index += stride) {
+        values[index] = byte;
     }
 }
 
@@ -162,6 +174,57 @@ SyntheticWeight row_split_weight(QType qtype, std::int32_t n, std::int32_t k) {
     w.group             = group;
     w.layout            = QuantLayout::RowSplit;
     w.scale_dtype       = DType::FP16;
+    return result;
+}
+
+// An NVFP4 weight in the layout the artifacts use: an E2M1 code plane, one E4M3 block scale per
+// 16 elements of a 128x4 tile, and one weight divisor past the scale plane. The field list is
+// exactly what ops::detail::validate_nvfp4_weight requires (ops/linear/nvfp4/nvfp4_format.cpp),
+// including N%128, K%64, the 16-byte plane alignment and the divisor row count.
+SyntheticWeight block_scale_nvfp4_weight(std::int32_t n, std::int32_t k) {
+    const auto align = [](std::uint64_t value) { return (value + 255) / 256 * 256; };
+    const std::uint64_t elements           = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(k);
+    const std::uint64_t code_plane_bytes   = elements / 2;
+    const std::uint64_t scale_plane_offset = align(code_plane_bytes);
+    const std::uint64_t scale_plane_bytes  = elements / 16;
+    const std::uint64_t divisor_offset     = scale_plane_offset + scale_plane_bytes;
+    const std::uint64_t total              = divisor_offset + sizeof(float);
+
+    SyntheticWeight result{DeviceBuffer(static_cast<std::size_t>(total)), {}};
+    auto* base = static_cast<std::uint8_t*>(result.storage.p);
+    fill_random(base, code_plane_bytes, 0x4e56u + static_cast<std::uint32_t>(n));
+    // E4M3 1.0 is 0x38. A finite scale of one keeps the two chains' products comparable: the
+    // output check compares them, and a NaN scale would reject every candidate.
+    fill_u8_kernel<<<fill_grid(scale_plane_bytes), 256>>>(base + scale_plane_offset,
+                                                          scale_plane_bytes, 0x38);
+    CUDA_CHECK(cudaGetLastError());
+    fill_f32_kernel<<<fill_grid(1), 256>>>(reinterpret_cast<float*>(base + divisor_offset), 1, 1.0f);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    Weight& w              = result.weight;
+    w.payload              = base;
+    w.payload_bytes        = total;
+    w.high_plane_bytes     = 0;
+    w.qtype                = QType::NVFP4;
+    w.group_size           = 16;
+    w.shape[0]             = n;
+    w.shape[1]             = k;
+    w.padded_shape[0]      = n;
+    w.padded_shape[1]      = k;
+    w.ndim                 = 2;
+    w.qdata                = base;
+    w.qhigh                = nullptr;
+    w.scales               = base + scale_plane_offset;
+    w.n                    = n;
+    w.k                    = k;
+    w.group                = 16;
+    w.layout               = QuantLayout::BlockScaleK16M128x4;
+    w.scale_dtype          = DType::FP8_E4M3FN;
+    w.weight_scale_divisor = 1.0F;
+    w.input_scale_divisor  = 1.0F;
+    w.weight_divisors      = base + divisor_offset;
+    w.weight_divisor_rows  = n;
     return result;
 }
 
@@ -670,6 +733,113 @@ void calibrate_q8_ksplit(ops::DeviceRouteProfile& profile, Timer& timer,
     }
 }
 
+// The QUASAR NVFP4 fused projections, and the switch of each onto the unified templates.
+//
+// Under LinearPolicy::A16Only both chains are registered at every width a fused launch serves, so
+// this switch is a W4A16 chain choice and nothing else: the own chain's kernels against the
+// unified chain's own. That is a 32-token tiling loop against a single launch at prefill widths,
+// and two distinct small-T kernel families below them (the own chain's per-width SIMT kernels
+// against the unified chain's SIMT and sliced-K MMA). Past 16 columns both chains resolve to the
+// same wide fused A16 MMA kernel, so the SwiGLU key stops there: above it there is no switch left
+// to measure.
+void calibrate_nvfp4_fused(ops::DeviceRouteProfile& profile, Timer& timer,
+                           const CalibrationOptions& options) {
+    // A build that cannot select the unified table has no switch onto it to measure.
+    if (!ops::detail::kUnifiedLinearRoutes) { return; }
+    constexpr std::int32_t hidden     = 5120;
+    constexpr std::int32_t max_tokens = 1024;
+    SyntheticWeight attn              = block_scale_nvfp4_weight(14336, hidden);
+    SyntheticWeight gdn               = block_scale_nvfp4_weight(16384, hidden);
+    SyntheticWeight out_proj          = block_scale_nvfp4_weight(hidden, 6144);
+    SyntheticWeight down              = block_scale_nvfp4_weight(hidden, 17408);
+    SyntheticWeight gate_up           = block_scale_nvfp4_weight(34816, hidden);
+    DeviceBuffer x_hidden            = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
+    DeviceBuffer x_mixer             = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
+    DeviceBuffer x_inter             = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
+    DeviceBuffer q                   = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
+    DeviceBuffer gate                = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
+    DeviceBuffer k_plane             = bf16_buffer(static_cast<std::size_t>(1024) * max_tokens);
+    DeviceBuffer v_plane             = bf16_buffer(static_cast<std::size_t>(1024) * max_tokens);
+    DeviceBuffer qkv                 = bf16_buffer(static_cast<std::size_t>(10240) * max_tokens);
+    DeviceBuffer z_plane             = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
+    DeviceBuffer residual            = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
+    DeviceBuffer swiglu_out          = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
+    WorkspaceArena workspace(256ULL << 20);
+
+    const auto tensor = [](DeviceBuffer& buffer, std::int32_t rows, std::int32_t cols) {
+        return Tensor(buffer.p, DType::BF16, {rows, cols});
+    };
+    const auto view = [](DeviceBuffer& buffer, std::size_t rows) {
+        return [&buffer, rows](std::int32_t cols) {
+            return std::pair<const void*, std::size_t>{buffer.p,
+                                                       rows * static_cast<std::size_t>(cols)};
+        };
+    };
+    DeviceBuffer residual_pristine = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
+    const auto reset_residual      = [&]() {
+        CUDA_CHECK(
+            cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+    };
+
+    const auto attn_run = [&](std::int32_t cols, cudaStream_t stream) {
+        auto scope        = workspace.scope();
+        Tensor x          = tensor(x_hidden, hidden, cols);
+        Tensor q_out      = tensor(q, 6144, cols);
+        Tensor gate_out   = tensor(gate, 6144, cols);
+        Tensor k_out      = tensor(k_plane, 1024, cols);
+        Tensor v_out      = tensor(v_plane, 1024, cols);
+        ops::detail::nvfp4_attn_input_dispatch(x, attn.weight, q_out, gate_out, k_out, v_out,
+                                               ops::LinearPolicy::A16Only, &workspace, stream);
+    };
+    const auto gdn_run = [&](std::int32_t cols, cudaStream_t stream) {
+        auto scope      = workspace.scope();
+        Tensor x        = tensor(x_hidden, hidden, cols);
+        Tensor qkv_out  = tensor(qkv, 10240, cols);
+        Tensor z_out    = tensor(z_plane, 6144, cols);
+        ops::detail::nvfp4_gdn_input_dispatch(x, gdn.weight, qkv_out, z_out,
+                                              ops::LinearPolicy::A16Only, &workspace, stream);
+    };
+    // One key steers both residual adds, so a run exercises the pair the way a layer does.
+    const auto add_run = [&](std::int32_t cols, cudaStream_t stream) {
+        auto scope   = workspace.scope();
+        Tensor x     = tensor(x_mixer, 6144, cols);
+        Tensor res   = tensor(residual, hidden, cols);
+        ops::detail::nvfp4_linear_add_dispatch(x, out_proj.weight, res, ops::LinearPolicy::A16Only,
+                                               workspace, stream);
+        Tensor x2    = tensor(x_inter, 17408, cols);
+        Tensor res2  = tensor(residual, hidden, cols);
+        ops::detail::nvfp4_linear_add_dispatch(x2, down.weight, res2, ops::LinearPolicy::A16Only,
+                                               workspace, stream);
+    };
+    const auto swiglu_run = [&](std::int32_t cols, cudaStream_t stream) {
+        auto scope = workspace.scope();
+        Tensor x   = tensor(x_hidden, hidden, cols);
+        Tensor o   = tensor(swiglu_out, 17408, cols);
+        ops::detail::nvfp4_linear_swiglu_dispatch(x, gate_up.weight, o, ops::LinearPolicy::A16Only,
+                                                  workspace, stream);
+    };
+
+    // The decode step, the speculative verify widths, the small-T band, and the prefill chunks a
+    // 27B serves: the bands a profile stores have to answer all of them.
+    const std::vector<std::int32_t> widths = {1,  2,  3,  4,  5,  6,  7,  8,  9,  10,  12, 14,
+                                              16, 20, 24, 28, 32, 48, 64, 96, 128, 256, 512, 1024};
+    const std::vector<std::int32_t> small_t_widths = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16};
+    const std::vector<Family> families = {
+        {"unified/nvfp4_attn_input", widths, attn_run, view(q, 6144), {}},
+        {"unified/nvfp4_gdn_input", widths, gdn_run, view(qkv, 10240), {}},
+        {"unified/nvfp4_linear_add", widths, add_run, view(residual, hidden), reset_residual},
+        {"unified/nvfp4_linear_swiglu", small_t_widths, swiglu_run, view(swiglu_out, 17408), {}},
+    };
+    for (const Family& family : families) {
+        auto bands = sweep(family, timer, options);
+        if (!bands.empty()) {
+            profile.routes[family.key] = std::move(bands);
+            ops::install_device_route_profile(
+                std::make_shared<const ops::DeviceRouteProfile>(profile));
+        }
+    }
+}
+
 // The INT8-family small-T partial kernel's tiers. A serving process captures its graphs over an
 // envelope as wide as the KV capacity, so the tier is chosen per envelope and has to serve every
 // depth below it: each envelope is timed at its full depth and at a sixteenth of it.
@@ -1019,6 +1189,7 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
         calibrate_groupwise(profile, timer, options);
         calibrate_q8_ksplit(profile, timer, options);
     }
+    if (projections && options.nvfp4) { calibrate_nvfp4_fused(profile, timer, options); }
     if (options.linear_attention) { calibrate_linear_attention(profile, timer, options); }
     if (attention) {
         calibrate_attention(profile, timer, options, KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,

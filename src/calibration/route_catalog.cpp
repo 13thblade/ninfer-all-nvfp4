@@ -67,6 +67,15 @@ std::vector<RouteCatalogEntry> build_catalog() {
               "unified/q4_linear_swiglu", "unified/q4_linear_add"}) {
             add(key, {"unified"});
         }
+        // QUASAR NVFP4 fused projections, and the switch of each onto the unified templates.
+        // Under the A16 policies both chains are registered at every width a fused launch serves,
+        // so this switch is a pure W4A16 chain choice: the own chain's per-width kernels against
+        // the unified chain's own (a 32-token tiling loop against one launch at prefill widths,
+        // two distinct small-T kernel families below them).
+        for (const char* key : {"unified/nvfp4_attn_input", "unified/nvfp4_gdn_input",
+                                "unified/nvfp4_linear_add", "unified/nvfp4_linear_swiglu"}) {
+            add(key, {"unified"});
+        }
     }
     // Q8 G32 K-split contractions (MTP heads, DFlash2 drafters, the official artifacts' heads):
     // the four-K-warp form of each 8-column tile (ops/linear/q8/q8_ksplit_config.h).
