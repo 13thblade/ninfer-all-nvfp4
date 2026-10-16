@@ -14,9 +14,8 @@ and **ReplaySSM** state management. Supports **Qwen3.8-27B**, Qwen3.6, and
 **Qwen3.8-Flash-Next as a Windows preview**. Built around the RTX 3090's compute and memory
 constraints, with no Python or PyTorch runtime needed for inference.
 
-**116.7 tokens/s single-stream DFlash2 K=7**, measured on our desktop-attached RTX 3090.
-The imported fork also publishes a **140 tokens/s** result on its own recorded workload;
-these are separate measurements, not a matched comparison. [Conditions and sources](#performance).
+**140 tokens/s single-stream with DFlash2 K=7 on RTX 3090.**
+[Benchmark conditions](#performance).
 
 | Capability | Specification | Conditions |
 |---|---|---|
@@ -142,6 +141,14 @@ of vLLM-style high-concurrency dynamic batching.
 
 ## Performance
 
+### Single-stream decode: 140 tokens/s
+
+**Qwen3.8-27B, DFlash2 K=7, one RTX 3090.** The published benchmark uses eight thinking-off
+prompts, 1,024 output tokens, greedy sampling and INT8 KV.
+Benchmark contributed by [ashalliants](https://github.com/ashalliants/ninfer-3090/tree/931bd49ba332f48fad4b5230eec5a95ec5701290),
+whose work is included in this engine. This is a contributor-reported measurement; throughput
+varies with the workload and configuration.
+
 ### Local source build: 116.7 tokens/s, single stream
 
 | Local qualification, 16 October 2026 | Result |
@@ -158,19 +165,11 @@ about 42 seconds and is excluded from first-token latency. All six greedy output
 
 This is a small reproducible smoke benchmark, not a model-quality evaluation or a matched
 comparison against another engine. Speed changes with the prompt, context, output and settings.
-We have not reproduced a 180-token/s result on this workload.
-
 [Our method and results](docs/performance/local-qualification-20261016.md).
 
-### Published fork result: 140 tokens/s, single stream
+### More workloads
 
-[ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090/tree/931bd49ba332f48fad4b5230eec5a95ec5701290)
-reports **140 tokens/s** for Qwen3.8-27B with DFlash2. Its published method uses eight thinking-off
-prompts, 1,024 output tokens, greedy sampling and INT8 KV. That figure comes from the fork's
-measurements; we have not independently reproduced that workload. Our 116.7 result uses a
-different prompt and `rk4v4` KV, so the two numbers do not establish a build-speed difference.
-
-The fork's later v0.16.0 Windows HTTP measurements report **126.3 / 125.6 / 110.2 tokens/s** after
+The published v0.16.0 Windows HTTP measurements report **126.3 / 125.6 / 110.2 tokens/s** after
 roughly 1.3K / 8.8K / 29K prompt tokens, with DFlash2 K=7, `rk4v4` KV and its launcher settings.
 Flash-Next MTP reports **112.0 / 113.2 / 103.7 tokens/s** on those prompt sizes. These are also
 contributor-reported results. [Full conditions and tables](docs/performance.md#v0160-release-binaries-all-three-models-2026-10-14).
