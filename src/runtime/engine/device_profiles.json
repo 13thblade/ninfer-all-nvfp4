@@ -59,11 +59,11 @@
         "unified/q8_attn_input": [[1, ""], [3, "unified"]],
         "unified/q8_linear_pair": [[4, "unified"]]
      }},
-    {"hardware_class": "nvidia-geforce-rtx-3090-ti-sm86", "multiprocessors": 84, "origin": "built in: RTX 3090 Ti NVFP4 int8-grouped prefill routes, 2026-10-13; swiglu unified-route crossover adopted from the RTX 3090 entry, 2026-10-16",
+    {"hardware_class": "nvidia-geforce-rtx-3090-ti-sm86", "multiprocessors": 84, "origin": "built in: RTX 3090 Ti NVFP4 unified-route crossovers adopted from the RTX 3090 entry (2026-09-25/27), 2026-10-16",
      "routes": {
-        "unified/nvfp4_attn_input": [[127, ""], [1048576, "unified"]],
-        "unified/nvfp4_gdn_input": [[127, ""], [1048576, "unified"]],
-        "unified/nvfp4_linear_add": [[127, ""], [1048576, "unified"]],
+        "unified/nvfp4_attn_input": [[13, ""], [1024, "unified"]],
+        "unified/nvfp4_gdn_input": [[27, ""], [1024, "unified"]],
+        "unified/nvfp4_linear_add": [[13, ""], [16, "unified"], [27, ""], [1024, "unified"]],
         "unified/nvfp4_linear_swiglu": [[13, ""], [16, "unified"]]
      }},
     {"hardware_class": "nvidia-geforce-rtx-4090-sm89", "multiprocessors": 128, "origin": "built in: RTX 4090 at 450 W, 2026-09-25; unified routes and two-stage GDN at 300 to 450 W, 2026-09-27",
