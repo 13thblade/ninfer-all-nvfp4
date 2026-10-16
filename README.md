@@ -1,10 +1,10 @@
-# W4(NVFP4) A16(BF16) support for sm_86/89/100/120 and A8(int8) support for sm_70/75/86/89/100/120 on ninfer
+# W4(NVFP4) A16(BF16) support for sm_86/89/100/120 and A8(int8) support for sm_70/75/86/89/100/120 on ninfer, delivered on the Qwen3.8 27B geometry
 
 ## Summary
 
 NVFP4 weights run on GPUs that have no FP4 tensor core, through two selectable activation routes
 covering all five NVFP4 op routes (`linear`, `linear_add`, `attn_input_proj`, `gdn_input_proj`,
-`linear_swiglu`):
+`linear_swiglu`) of the Qwen3.8 27B geometry:
 
 - **W4A16** -- BF16 activations, dequantising kernels instantiated from the decode band through
   prefill width, so a wide prompt span prefills instead of throwing.
