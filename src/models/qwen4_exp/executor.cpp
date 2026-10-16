@@ -467,6 +467,7 @@ struct RankState {
     std::unique_ptr<PinnedHostBuffer> staging;
     cudaEvent_t staged = nullptr;
     cudaEvent_t done   = nullptr;
+    cudaEvent_t copied = nullptr; // its stack has been copied in from the previous rank
     cudaEvent_t routes = nullptr; // the last pass's routes reached the host
     ops::GgufMoeSide side;        // the decode MoE's shared expert runs there concurrently
     // Activation planes (capacity: prefill_chunk tokens).
@@ -769,6 +770,7 @@ struct Executor::Impl {
             RankBinding bind(device, rank.rank);
             if (rank.staged != nullptr) { cudaEventDestroy(rank.staged); }
             if (rank.done != nullptr) { cudaEventDestroy(rank.done); }
+            if (rank.copied != nullptr) { cudaEventDestroy(rank.copied); }
             if (rank.routes != nullptr) { cudaEventDestroy(rank.routes); }
             if (rank.side.fork != nullptr) { cudaEventDestroy(rank.side.fork); }
             if (rank.side.join != nullptr) { cudaEventDestroy(rank.side.join); }
@@ -1068,6 +1070,7 @@ struct Executor::Impl {
                 round_up(t * 28) + round_up(std::uint64_t(config.ngram_heads()) * t * row_b));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.staged, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.done, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&rank.copied, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.routes, cudaEventDisableTiming));
             CUDA_CHECK(cudaStreamCreateWithFlags(&rank.side.stream, cudaStreamNonBlocking));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.side.fork, cudaEventDisableTiming));
@@ -1745,7 +1748,8 @@ struct Executor::Impl {
     }
 
     // Moves the stack's first `tokens` columns from one rank to another, ordered after the
-    // source's work.
+    // source's work. The source's next pass (the next prompt chunk, queued before the target gets
+    // to this copy) rewrites the source's stack, so it waits until the copy has read it.
     void cross(std::size_t from, std::size_t to, std::int32_t tokens) {
         RankState& source = ranks[from];
         RankState& target = ranks[to];
@@ -1753,12 +1757,17 @@ struct Executor::Impl {
             RankBinding bind(device, from);
             CUDA_CHECK(cudaEventRecord(source.done, source.stream));
         }
-        RankBinding bind(device, to);
-        CUDA_CHECK(cudaStreamWaitEvent(target.stream, source.done, 0));
-        const std::size_t bytes =
-            std::size_t(config.hc_count) * config.hidden_size * std::size_t(tokens) * 4;
-        CUDA_CHECK(cudaMemcpyPeerAsync(target.stack, device.rank(to).device, source.stack,
-                                       device.rank(from).device, bytes, target.stream));
+        {
+            RankBinding bind(device, to);
+            CUDA_CHECK(cudaStreamWaitEvent(target.stream, source.done, 0));
+            const std::size_t bytes =
+                std::size_t(config.hc_count) * config.hidden_size * std::size_t(tokens) * 4;
+            CUDA_CHECK(cudaMemcpyPeerAsync(target.stack, device.rank(to).device, source.stack,
+                                           device.rank(from).device, bytes, target.stream));
+            CUDA_CHECK(cudaEventRecord(target.copied, target.stream));
+        }
+        RankBinding bind(device, from);
+        CUDA_CHECK(cudaStreamWaitEvent(source.stream, target.copied, 0));
     }
 
     // A pass's Vision work: the runs of consecutive embedding columns its tokens take (each run's
