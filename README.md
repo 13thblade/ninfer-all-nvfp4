@@ -62,11 +62,7 @@ Contributors: [full credits](CONTRIBUTORS.md) · [GitHub contribution history](h
 
 ## Inference in action
 
-[![Play a real NInfer response on one RTX 3090](docs/assets/ninfer-demo.gif)](docs/assets/ninfer-demo.mp4)
-
-**[Play the demo](docs/assets/ninfer-demo.mp4)** · Real streamed output, replayed at its recorded
-arrival times. The model is already loaded when the request starts. Presentation framing is added;
-the response is not sped up. [Recording details](docs/demo.md).
+![NInfer-3090 inference animation with an illustrative 125 tokens/s display](docs/assets/ninfer-demo.gif)
 
 ## Running in minutes
 
