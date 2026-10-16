@@ -1,5 +1,6 @@
 #include "calibration/route_catalog.h"
 #include "ops/common/device_route.h"
+#include "ops/linear/common/route_table.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/device_profile.h"
 #include "runtime/engine/device_profiles_builtin.h"
@@ -347,6 +348,60 @@ void test_bands_and_force() {
     expect(device_route_schedule("attn_pv_f16", 1).empty(), "removing the profile restores the tables");
 }
 
+// Past the widths the route bands were measured at, a call takes the table its Op names for wide
+// calls unless a profile band reaches the width; FP8 A16 calls name the unified one.
+void test_wide_tables() {
+    using ninfer::ops::detail::fused_route_table;
+    using ninfer::ops::detail::kRouteBandsMeasuredTo;
+    using ninfer::ops::detail::LinearRouteFamily;
+    using ninfer::ops::detail::linear_route_table;
+    using ninfer::ops::detail::LinearRouteTable;
+    using ninfer::ops::detail::fp8_wide_route_table;
+    using ninfer::ops::LinearPolicy;
+    expect(fp8_wide_route_table(LinearPolicy::A16Only) == LinearRouteTable::Unified &&
+               fp8_wide_route_table(LinearPolicy::AllowA8Int) == LinearRouteTable::Unified &&
+               fp8_wide_route_table(LinearPolicy::AllowA8) == LinearRouteTable::Legacy,
+           "an FP8 A16 call names the unified table for wide calls, an A8 call the legacy one");
+    if constexpr (!ninfer::ops::detail::kUnifiedLinearRoutes) {
+        expect(linear_route_table(LinearRouteFamily::Fp8, 4096, LinearRouteTable::Unified) ==
+                   LinearRouteTable::Legacy,
+               "a build without the unified table takes the legacy one at every width");
+        return;
+    }
+    constexpr auto kUnified = LinearRouteTable::Unified;
+    constexpr auto kLegacy  = LinearRouteTable::Legacy;
+    const std::int32_t past = kRouteBandsMeasuredTo + 1;
+    expect(linear_route_table(LinearRouteFamily::Fp8, past, kUnified) == kUnified &&
+               linear_route_table(LinearRouteFamily::Fp8, 1 << 20, kUnified) == kUnified,
+           "a wide FP8 width takes the table named for wide calls");
+    expect(linear_route_table(LinearRouteFamily::Fp8, past) == kLegacy &&
+               linear_route_table(LinearRouteFamily::Q4, 4096) == kLegacy,
+           "a wide width takes the legacy table by default");
+
+    ninfer::ops::DeviceRouteProfile profile = sample_profile();
+    profile.routes["unified/fp8_linear_add"] = {{4, ""}, {1024, "unified"}};
+    profile.routes["unified/measured_wide"]  = {{8192, ""}};
+    ninfer::ops::install_device_route_profile(
+        std::make_shared<const ninfer::ops::DeviceRouteProfile>(profile));
+    expect(fused_route_table("unified/fp8_linear_add", 2, kUnified) == kLegacy &&
+               fused_route_table("unified/fp8_linear_add", 1024, kUnified) == kUnified,
+           "a width in a profile band takes the band's table");
+    expect(fused_route_table("unified/fp8_linear_add", past) == kLegacy &&
+               fused_route_table("unified/fp8_linear_add", past, kUnified) == kUnified,
+           "a width past the profile's bands takes the table named for wide calls");
+    expect(fused_route_table("unified/missing", 512, kUnified) == kLegacy &&
+               fused_route_table("unified/missing", 4096, kUnified) == kUnified,
+           "a key the profile lacks keeps the legacy table up to the measured widths only");
+    expect(fused_route_table("unified/measured_wide", 4096, kUnified) == kLegacy,
+           "a profile band that reaches a wide width answers for it");
+    {
+        const ninfer::ops::DeviceRouteForce force("unified/missing", "");
+        expect(fused_route_table("unified/missing", 4096, kUnified) == kLegacy,
+               "a forced route answers at any width");
+    }
+    ninfer::ops::install_device_route_profile(nullptr);
+}
+
 } // namespace
 
 int main() {
@@ -360,6 +415,7 @@ int main() {
     test_file_layers_over_builtin();
     test_schema_versions_on_disk();
     test_bands_and_force();
+    test_wide_tables();
     if (failures != 0) {
         std::cerr << failures << " device profile check(s) failed\n";
         return 1;
