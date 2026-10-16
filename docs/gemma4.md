@@ -523,8 +523,8 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   land in a whole-layer bank laid out like the resident bank, each expert at its index, so
   consecutive experts arrive in one copy. Two banks let the next layer of a prompt chunk arrive
   while the current one computes (one bank where memory is short). Each prompt chunk needs nearly
-  every expert of every layer, so host and disk prompts start at 4096-token chunks: the whole expert
-  bank crosses the bus once per chunk.
+  every expert of every layer, so the expert bank crosses the bus about once per chunk; prompts take
+  the resident chunks of up to 2048 tokens.
 - **Cache.** `--expert-cache-mib` (default: what is free after startup) holds the experts decode and
   verification used most recently: their misses enter the cache over the least recently used experts
   the call does not route. A prompt chunk evicts nothing; it promotes its most routed experts from

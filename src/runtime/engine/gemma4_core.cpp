@@ -183,12 +183,10 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     // Prompt chunks of 2048 tokens whatever was requested: the routed experts' matrix kernel fills
     // its widest (128-column) tile only at 2048 x 8 / 128 tokens per expert, which prefills ~20%
     // faster than 1024-token chunks; larger chunks grow the sliding-window rings (window + chunk).
-    // Host or disk experts start at 4096: every chunk past ~64 tokens routes to nearly all of a
-    // layer's experts, so each chunk carries the whole expert bank across the bus once. A device
-    // without room for a chunk's workspace (a 16 GB card) takes the widest of the rest that fits.
-    const bool streamed = options.expert_residency != ExpertResidency::Device;
-    for (const std::uint32_t chunk : {4096u, 2048u, 1024u, 512u}) {
-        if (chunk == 4096 && !streamed) { continue; }
+    // Host and disk experts take the same chunks: 4096-token chunks changed 64 of 256 causal scores
+    // of a 4,609-token prompt against resident execution. A device without room for that chunk's
+    // workspace (a 16 GB card) takes the widest of 1024 and 512 that fits.
+    for (const std::uint32_t chunk : {2048u, 1024u, 512u}) {
         executor.prefill_chunk = chunk;
         try {
             instance->executor =
