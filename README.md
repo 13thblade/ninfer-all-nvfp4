@@ -91,12 +91,13 @@ and starts the one that matches the GPU. Every card by name, with what has run o
 <summary><b>Device profiles and limits</b> — how a card gets its kernel routes</summary>
 
 - **Device profiles.** A profile picks the kernel route of every operation and width. A built-in
-  profile applies to the same GPU name, compute capability and SM count: the RTX 3090, 4090 and 5090,
-  the three RTX PRO 6000 Blackwell editions, the Tesla V100-SXM2-16GB and the TITAN RTX. Any other
-  card is calibrated once at first start, which took 82 to 107 seconds on the 8 to 12 GB cards, and
-  the result is stored for later starts; `ninfer-calibrate` measures again after a driver or clock
-  change ([device profiles](docs/device-profiles.md)). The `70` build runs its own routes, so the
-  V100 profile holds only the GDN prefill switch.
+  profile applies to the same GPU name, compute capability and SM count: the RTX 3090, 4090 and
+  5090, the three RTX PRO 6000 Blackwell editions, the Tesla V100-SXM2-16GB and -32GB and the TITAN
+  RTX. Any other card is calibrated once at first start, which took 82 to 107 seconds on the 8 to 12
+  GB cards, and the result is stored for later starts; `ninfer-calibrate` measures again after a
+  driver or clock change ([device profiles](docs/device-profiles.md)). The `70` build runs its own
+  routes, so the V100 profiles hold only the GDN prefill switch and, for the 32 GB card, the Q8 MoE
+  prefill frontier.
 - **Architecture limits.** NVFP4 expert weights need a `120a` build. The Turing and Volta builds
   replace instructions their GPUs lack and reshape kernels to their shared memory
   ([Turing](docs/build-linux.md#turing-sm_75), [Tesla V100](docs/build-linux.md#tesla-v100-sm_70)).

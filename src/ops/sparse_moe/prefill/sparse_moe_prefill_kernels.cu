@@ -1982,10 +1982,14 @@ void sparse_moe_prefill_launch_impl(const Tensor& x, const SparseMoeWeights& wei
             (tokens + kSparseMoeRouteTileTokens - 1) / kSparseMoeRouteTileTokens;
         const int assignments   = tokens * kTopK;
         const bool nvfp4        = weights.routed_gate_up.qtype == QType::NVFP4;
+        const auto candidate = sparse_moe_prefill_tile_candidate(
+            tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype, plan.candidate);
         const int adaptive_last = weights.routed_down.qtype == QType::Q5_G64_FP16   ? 51
                                   : weights.routed_down.qtype == QType::Q6_G64_FP16 ? 52
                                                                                     : 0;
-        const bool adaptive     = !Indirect && !nvfp4 && tokens >= 47 && tokens <= adaptive_last;
+        const bool adaptive = !Indirect && !nvfp4 && tokens >= 47 && tokens <= adaptive_last &&
+                              candidate != SparseMoeCandidate::PrefillNarrow &&
+                              candidate != SparseMoeCandidate::PrefillWide;
 
         // Only this profile: the small-token router folds the NVFP4 quantisation of the chunk
         // into its epilogue, and its reduction order differs from the MMA router's, so a
@@ -2019,7 +2023,9 @@ void sparse_moe_prefill_launch_impl(const Tensor& x, const SparseMoeWeights& wei
         }
         CUDA_CHECK(cudaGetLastError());
 
-        const bool wide_plan = tokens >= kSparseMoePrefillWideMin;
+        const bool wide_plan = candidate == SparseMoeCandidate::PrefillWide ||
+                               (candidate != SparseMoeCandidate::PrefillNarrow &&
+                                tokens >= kSparseMoePrefillWideMin);
         // The NVFP4 tile is 64 columns wide at every token count, so its jobs have to be too.
         const int route_job_bn = nvfp4 ? kNvfp4JobColumns : (wide_plan ? 64 : 32);
         // The scan emits one route job per nonempty column tile of an expert, so it cannot

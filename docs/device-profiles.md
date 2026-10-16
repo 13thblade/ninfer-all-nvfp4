@@ -19,7 +19,7 @@ Up to three layers answer, per route key:
    else `~/.cache/ninfer/device-profiles.json` (`%LOCALAPPDATA%\ninfer\device-profiles.json` on
    Windows). `--device-profile-path` names another file.
 2. **The built-in table.** Profiles measured on the RTX 3090, RTX 4090, RTX 5090, the RTX PRO 6000
-   Blackwell, the Tesla V100-SXM2-16GB and the TITAN RTX ship inside the binary
+   Blackwell, the Tesla V100-SXM2-16GB and V100-SXM2-32GB, and the TITAN RTX ship inside the binary
    (`src/runtime/engine/device_profiles.json`). The PRO 6000's Workstation (600 W), Max-Q (300 W)
    and Server editions report different names, so each has its own entry. The TITAN RTX entry is
    measured by a `75` build, the only build that runs on it; its route catalog lacks the keys a
@@ -140,3 +140,22 @@ Some launch sizes follow the device directly and need no profile:
 - **Wave counts.** The chunked GDN output kernel and the sparse-MoE prefill size their grids from the
   SM count and the kernel's occupancy, and the small-T attention holds its split count to whole waves
   of the device.
+
+## SparseMoe policy keys
+
+SparseMoe, with resident or streamed experts, reads two optional keys outside automatic
+calibration:
+
+- `sparse_moe/prefill/<codec>` (`q4-q5`, `q4-q6`, `q8-q8`, `nvfp4`): a band ending at 1 stores the
+  token count from which calls take the prefill route instead of Small-T. Accepted values are 2 to
+  47 (13 to 47 for NVFP4); anything else keeps the compiled frontier. The workspace query and the
+  launch read the same value.
+- `sparse_moe/prefill-tiles/q4-q5` and `/q4-q6`, with T as the axis: `narrow` or `wide` forces the
+  prefill tile width; an empty schedule keeps the automatic choice.
+
+The built-in profiles use two of them. The V100-SXM2-32GB takes Small-T up to T=32 for Q8 experts
+(frontier 33): eight Qwen3.6-35B-A3B requests with three MTP drafts and 512-token prompts produced
+2.2% more tokens per second with identical outputs. The RTX 5090 takes the narrow Q4+Q5 tile at
+T=1024 (the default prompt chunk): whole generation ran 0.5% faster with identical outputs.
+`ninfer_sparse_moe_bench --candidate` and `ninfer_sparse_moe_test --candidates-only` compare and
+qualify the candidates a profile may name.

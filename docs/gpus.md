@@ -23,9 +23,9 @@ starts the one that matches the GPU.
 
 - **Device profiles.** A profile picks the kernel route of every operation and width. The built-in
   table holds the RTX 3090, 4090 and 5090, the three RTX PRO 6000 Blackwell editions, the Tesla
-  V100-SXM2-16GB and the TITAN RTX; a built-in profile applies to the same GPU name, compute
-  capability and SM count. Any other card of these architectures calibrates once at first start
-  and stores the result ([device profiles](device-profiles.md)).
+  V100-SXM2-16GB and -32GB and the TITAN RTX; a built-in profile applies to the same GPU name,
+  compute capability and SM count. Any other card of these architectures calibrates once at first
+  start and stores the result ([device profiles](device-profiles.md)).
 - **Architecture limits.** NVFP4 expert weights (the Qwen3.6-35B-A3B NVFP4 artifact) need a `120a`
   build. The Turing and Volta builds replace the instructions their GPUs lack and shape kernels to
   their shared memory ([Turing](build-linux.md#turing-sm_75),

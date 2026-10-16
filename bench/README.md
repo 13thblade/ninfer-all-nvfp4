@@ -1005,10 +1005,14 @@ it is not a mode of Attention input projection. End-to-end target measurement us
 ## 35B sparse-MoE dFlash benchmark
 
 `ninfer_sparse_moe_bench` measures the complete routed-plus-shared post-mixer Op for the 35B Text
-Q4+Q5/Q6 profiles and the MTP Q8+Q8 profile. It is a long-lived public Op benchmark: fixture setup
-uses `sparse_moe_workspace_capacity_bytes()`, and every eager or captured measurement calls only
-`ninfer::ops::sparse_moe()`. Production dispatch exclusively owns decode, Small-T, prefill,
-workspace views, launch decomposition, and schedule selection.
+Q4+Q5/Q6 profiles and the MTP Q8+Q8 profile. The default `--candidate auto` uses the public
+workspace query and `ninfer::ops::sparse_moe()`; production dispatch owns its route and schedule.
+An explicit `--candidate` (`decode`, `small-t` for T=2..46, `prefill`, `prefill-narrow`,
+`prefill-wide`) runs the internal laboratory path with the same validation and complete Op, so a
+device profile's `sparse_moe/*` bands ([device profiles](../docs/device-profiles.md)) can be chosen
+by measurement. The two forced tile widths bypass the adaptive prefill dispatch; NVFP4 has one
+prefill tile. `ninfer_sparse_moe_test --candidates-only` holds the candidates a profile may name to
+the FP64 oracle.
 
 CUDA Graph replay is the default and authoritative execution mode. The benchmark eagerly
 materializes the public call, captures it with stable tensor and workspace addresses, instantiates
@@ -1031,8 +1035,8 @@ cmake --build build --parallel --target ninfer_benches
 Each cold sample flushes 256 MiB before the timed interval. `trace-like` is the primary
 single-sequence verification distribution; `independent` and `same` bound zero and complete expert
 overlap. `--execution eager|graph|both` and `--cache cold|warm|both` change only the harness around
-the same public call. The CSV `timed_scope` is `full_sparse_moe_device_body`; it contains no private
-route, candidate, grid, block, or launch-count fields.
+the same selected call. The CSV `timed_scope` is `full_sparse_moe_device_body`, and its `candidate`
+column records the requested route. These are Op measurements, not Engine speedups.
 
 `unique_weight_gbps` counts the router, shared weights, and each selected expert's encoded weights
 once, so it is a distribution-aware useful-traffic lower bound rather than measured DRAM traffic.
