@@ -40,6 +40,9 @@ EngineOptions options(const char* artifact, ExpertResidency residency, bool scor
     out.context_cache.enabled = false;
     out.enable_vision = false;
     out.max_concurrency = scoring ? 1 : 8;
+    // A correctness gate: with the 128 MiB cache, requests queued behind a disk-streamed batch can
+    // wait longer than the 30 s default admission timeout.
+    out.pending_timeout_ms = 600000;
     out.suspend.enabled = !scoring && residency != ExpertResidency::Device;
     out.recover_invariant_failures = true;
     return out;
