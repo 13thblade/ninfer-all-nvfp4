@@ -31,7 +31,40 @@ int check(bool condition, const char* message) {
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures      = 0;
+    const auto choice = parse({"ninfer", "model.ninfer", "--prompt", "hello", "--choice", "",
+                               "--choice", "a|b", "--choice", "你好"});
+    failures += check(choice.choices == std::vector<std::string>{"", "a|b", "你好"},
+                      "choice flags changed literal text or order");
+    failures +=
+        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex", ""}).regex == "",
+              "empty regex must be distinct from no regex");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex", "",
+                                       "--choice", "yes"});
+                      }),
+                      "regex and choice were accepted together");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex",
+                                       "a", "--json-object"});
+                      }),
+                      "regex and JSON were accepted together");
+    failures += check(
+        parse({"ninfer", "model.ninfer", "--prompt", "hello", "--grammar-file", "answer.gbnf"})
+                .grammar_path == "answer.gbnf",
+        "grammar file argument was lost");
+    failures +=
+        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--json-object"}).json_object,
+              "JSON object CLI option lost");
+    failures += check(
+        parse({"ninfer", "model.ninfer", "--prompt", "hello", "--json-schema-file", "answer.json"})
+                .json_schema_path == "answer.json",
+        "schema file CLI option lost");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello",
+                                       "--json-object", "--grammar-file", "a.gbnf"});
+                      }),
+                      "conflicting CLI constraints accepted");
     const ninfer::cli::Options configured =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
     failures += check(configured.thinking_budget == 37,
@@ -54,10 +87,171 @@ int main() {
                "--reasoning-effort", "medium"});
     failures += check(with_effort.thinking_budget == 8 && with_effort.reasoning_effort,
                       "thinking budget did not coexist with reasoning effort");
+    failures += check(configured.reasoning_loop == ninfer::ReasoningLoopAction::Off &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                 "--reasoning-loop", "conclude"})
+                                  .reasoning_loop == ninfer::ReasoningLoopAction::Conclude &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                 "--reasoning-loop", "stop"})
+                                  .reasoning_loop == ninfer::ReasoningLoopAction::Stop,
+                      "--reasoning-loop did not select its action (or was not off by default)");
+    failures +=
+        check(ninfer::cli::usage_text("ninfer-cli").find("--reasoning-loop") != std::string::npos,
+              "CLI help omits --reasoning-loop");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--reasoning-loop", "on"});
+                      }),
+                      "--reasoning-loop on was accepted");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--reasoning-loop", "stop", "--no-thinking"});
+                      }),
+                      "--reasoning-loop was accepted with --no-thinking");
+    const ninfer::cli::Options dflash_vision =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision", "--spec", "dflash",
+               "--draft-tokens", "7"});
+    failures += check(dflash_vision.enable_vision &&
+                          dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
+                          dflash_vision.speculative.draft_tokens == 7,
+                      "CLI did not preserve the combined DFlash and Vision startup features");
+    for (const char* backend : {"mtp", "dflash", "dflash2"}) {
+        const auto implied = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                    backend, "--draft-tokens", "3"});
+        failures += check(implied.speculative.proposal_head == ninfer::ProposalHead::Optimized,
+                          "CLI --spec did not imply the optimized proposal head");
+    }
+    for (const auto k : {1U, 2U, 7U, 15U}) {
+        const auto dflash2 = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                    "dflash2", "--draft-tokens", std::to_string(k)});
+        failures += check(dflash2.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                              dflash2.speculative.draft_tokens == k,
+                          "CLI did not preserve the DFlash2 draft count");
+    }
+    for (const auto k : {0U, 16U}) {
+        failures +=
+            check(rejects([&] {
+                      (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                   "dflash2", "--draft-tokens", std::to_string(k)});
+                  }),
+                  "CLI accepted an unsupported DFlash2 draft count");
+    }
+    const ninfer::cli::Options nvfp4 =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "nvfp4"});
+    failures += check(nvfp4.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16,
+                      "--kv-dtype nvfp4 did not select group-16 NVFP4 KV");
+    const ninfer::cli::Options k8v4 =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "k8v4"});
+    failures += check(k8v4.kv_cache == ninfer::KvCacheStorage::Fp8KeyNvfp4Value,
+                      "--kv-dtype k8v4 did not select asymmetric K8V4 KV");
+    const std::string help = ninfer::cli::usage_text("ninfer-cli");
+    failures +=
+        check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos,
+              "CLI help omits a production KV storage mode");
+    const ninfer::cli::Options route_defaults =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"});
+    failures += check(!route_defaults.prefill_cublas && route_defaults.prefill_cublas_projections,
+                      "the cuBLAS prefill route is on by default");
+    const ninfer::cli::Options route =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "mtp", "--draft-tokens",
+               "3", "--prefill-cublas", "--no-prefill-cublas-projections"});
+    failures += check(route.prefill_cublas && !route.prefill_cublas_projections &&
+                          route.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          route.speculative.draft_tokens == 3,
+                      "CLI did not parse the cuBLAS prefill and drafting controls");
+    for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections"}) {
+        failures += check(help.find(flag) != std::string::npos,
+                          "CLI help omits an accepted prefill control");
+    }
+    // The MTP-only context lookup was removed with no alias; n-gram copy drafting replaces it.
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--lookup-ngram", "5"});
+                      }) && help.find("--lookup-ngram") == std::string::npos,
+                      "CLI still accepts or advertises the removed --lookup-ngram");
+    // N-gram copy drafting: off by default, 15 is the only window, and it rides DFlash2.
+    failures += check(route_defaults.speculative.ngram_draft_tokens == 0 &&
+                          route_defaults.speculative.ngram_min_match == 12,
+                      "n-gram copy drafting is on by default or its minimum match moved");
+    const ninfer::cli::Options ngram =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dflash2",
+               "--draft-tokens", "7", "--ngram-draft-tokens", "15", "--ngram-min-match", "8"});
+    failures += check(ngram.speculative.ngram_draft_tokens == 15 &&
+                          ngram.speculative.ngram_min_match == 8,
+                      "CLI did not parse the n-gram copy controls");
+    for (const char* window : {"7", "16", "31", "63"}) {
+        failures += check(rejects([window] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                           "--spec", "dflash2", "--draft-tokens", "7",
+                                           "--ngram-draft-tokens", window});
+                          }),
+                          "CLI accepted an n-gram copy window other than 0 or 15");
+    }
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "mtp", "--draft-tokens", "3", "--ngram-draft-tokens",
+                                       "15"});
+                      }) && rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--ngram-draft-tokens", "15"});
+                      }),
+                      "CLI accepted n-gram copy drafting without DFlash2");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--ngram-min-match", "3"});
+                      }),
+                      "CLI accepted an n-gram minimum match below 4");
+    failures += check(help.find("--ngram-draft-tokens") != std::string::npos &&
+                          help.find("--ngram-min-match") != std::string::npos,
+                      "CLI help omits the n-gram copy controls");
+    const ninfer::cli::Options logging =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--log-level", "debug"});
+    failures += check(logging.log_level == ninfer::product::LogLevel::Debug,
+                      "CLI log level was not parsed");
+    failures += check(help.find("--log-level") != std::string::npos,
+                      "CLI help omits the log-level control");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--log-level", "verbose"});
+                      }),
+                      "CLI accepted an unknown log level");
     failures +=
         check(rejects([] {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--device",
+                                       "1", "--devices", "0,1"});
+                      }),
+                      "--device and --devices were accepted together");
+    failures +=
+        check(rejects([] {
+                  (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices",
+                               "4294967296"});
+              }),
+              "--devices silently narrowed an out-of-range id instead of rejecting it");
+    const ninfer::cli::Options same_card = parse(
+        {"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,0"});
+    failures += check(same_card.devices.size() == 2 && same_card.devices[0] == 0 &&
+                           same_card.devices[1] == 0,
+                      "--devices 0,0 was not accepted for single-card split coverage");
+    const ninfer::cli::Options three = parse(
+        {"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1,2"});
+    failures += check(three.devices.size() == 3, "--devices did not accept more than two stages");
+    const ninfer::cli::Options staged = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                               "--devices", "0,0", "--stage-layers", "20,44"});
+    failures += check(staged.stage_layers == std::vector<std::uint32_t>({20, 44}),
+                      "--stage-layers did not reach the options");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--stage-layers", "20,44"});
+                      }),
+                      "--stage-layers without a multi-device split was accepted");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--devices", "0,0", "--stage-layers", "0,64"});
+                      }),
+                      "a stage with no layers was accepted");
     return failures == 0 ? 0 : 1;
 }

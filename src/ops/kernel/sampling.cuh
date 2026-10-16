@@ -24,12 +24,11 @@ __launch_bounds__(kSamplerBlock) __global__
     __shared__ float red_val[kSamplerBlock];
     __shared__ int red_idx[kSamplerBlock];
 
-    // With penalties disabled this remains the exact raw-logit argmax route.
+    // Without penalties or a token mask this remains the exact raw-logit argmax route.
     if (!(cfg.temperature > 0.0f)) {
-        float bv             = -CUDART_INF_F;
-        int bi               = INT_MAX;
-        const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
-        if (!penalties) {
+        float bv = -CUDART_INF_F;
+        int bi   = INT_MAX;
+        if (sampling_uses_raw_logits(cfg)) {
             for (int v = tid; v < token_domain; v += blockDim.x) {
                 const float x = __bfloat162float(logits[base + v]);
                 if (sampling_better(x, v, bv, bi)) {
@@ -58,8 +57,14 @@ __launch_bounds__(kSamplerBlock) __global__
             __syncthreads();
         }
         if (tid == 0) {
-            out[row] = red_idx[0];
-            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[red_idx[0]], 1); }
+            const int picked = red_idx[0];
+            if (!sampling_selected_logit_is_finite(logits, base, picked) ||
+                !sampling_token_licensed(cfg, 0, picked)) {
+                out[row] = kSamplerNonFiniteToken;
+            } else {
+                out[row] = picked;
+                if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+            }
         }
         return;
     }
@@ -99,6 +104,11 @@ __launch_bounds__(kSamplerBlock) __global__
             break;
         }
     }
+    if (!sampling_selected_logit_is_finite(logits, base, picked) ||
+        !sampling_token_licensed(cfg, 0, picked)) {
+        out[row] = kSamplerNonFiniteToken;
+        return;
+    }
     out[row] = picked;
     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
@@ -117,7 +127,7 @@ __launch_bounds__(kSamplerBlock) __global__
     unsigned long long keys[kSamplerItemsPerThread];
 
     const bool greedy       = !(cfg.temperature > 0.0f);
-    const bool penalties    = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+    const bool adjusted     = !sampling_uses_raw_logits(cfg);
     const int cap           = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
     const int tile_start    = partial * kSamplerPartialTileItems;
@@ -126,7 +136,7 @@ __launch_bounds__(kSamplerBlock) __global__
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
             const float raw = __bfloat162float(logits[base + v]);
-            const float x   = penalties ? sampling_adjusted_logit(raw, v, cfg) : raw;
+            const float x   = adjusted ? sampling_adjusted_logit(raw, v, cfg) : raw;
             keys[item]      = sampling_sort_key(x, v);
         } else {
             keys[item] = 0ull;
@@ -209,8 +219,15 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
         best = sampling_block_max_key(best, greedy_warp_keys);
         if (tid == 0) {
             const int picked = sampling_key_index(best);
-            out[col]         = picked;
-            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+            // This kernel never sees the logits, so the winner's own ordered value carries the
+            // check. An empty key (0ull) decodes to NaN, which is the same rejection; a mask with
+            // no licensed token leaves a -inf winner and is rejected the same way.
+            if (picked == INT_MAX || !sampling_value_is_finite(sampling_key_float(best))) {
+                out[col] = kSamplerNonFiniteToken;
+            } else {
+                out[col] = picked;
+                if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+            }
             workspace.group_done[col] = 0;
         }
         return;
@@ -281,15 +298,23 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
         const float u     = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
         float acc         = 0.0f;
         int picked        = cand_idx[support - 1];
+        float picked_val  = cand_val[support - 1];
         for (int j = 0; j < support; ++j) {
             acc += prob[j];
             if (u < acc) {
-                picked = cand_idx[j];
+                picked     = cand_idx[j];
+                picked_val = cand_val[j];
                 break;
             }
         }
-        out[col] = picked;
-        if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+        // The candidate's own adjusted value stands in for the logit: this kernel is fed by the
+        // partial/group workspace and never receives the logits themselves.
+        if (!sampling_value_is_finite(picked_val)) {
+            out[col] = kSamplerNonFiniteToken;
+        } else {
+            out[col] = picked;
+            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+        }
         workspace.group_done[col] = 0;
     }
 }

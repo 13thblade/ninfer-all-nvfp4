@@ -1,331 +1,199 @@
+<p align="center">
+  <img src="docs/assets/ninfer-hero.svg" alt="NInfer-3090 — Your GPU. Your AI. Native Qwen inference on RTX 3090." width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/ashalliants/ninfer-3090/releases/tag/v0.16.0-rtx3090">Download community build</a> ·
+  <a href="#running-in-minutes">Quick start</a> ·
+  <a href="#watch-it-answer">Watch it answer</a> ·
+  <a href="docs/README.md">Documentation</a>
+</p>
+
 # NInfer-3090
 
-NInfer-3090 is a specialized C++20/CUDA inference engine for **Qwen3.8-27B** and Qwen3.6 on one
-24 GB NVIDIA GeForce RTX 3090. Qwen3.8-27B is a first-class, tested target: the native SM86
-runtime loads its official groupwise `.ninfer` artifact, serves OpenAI- and Anthropic-compatible
-APIs, and supports paged KV, compatible-prefix reuse, CUDA Graphs, MTP speculative decoding,
-reasoning-effort control, ReplaySSM state transactions, and concurrent cohorts through **C8**.
+**Put a capable Qwen assistant on your own RTX 3090. Keep the conversation on your machine.**
 
-Community project, maintained on a best-effort basis. Issues and PRs are very welcome, but support
-and feature requests are not guaranteed.
+Write code, work through documents, and ask questions about images with a native local server.
+Connect the tools you already use through OpenAI- and Anthropic-compatible APIs. Once the model
+is downloaded, inference runs locally without a cloud inference account or per-token service fees.
 
+The starting point is **Qwen3.8-27B on one 24 GB card**. Windows runs natively; Linux builds are
+available too. Download a prebuilt archive, fetch the model, and launch the server. No Python
+environment or Docker installation is needed to run the prebuilt applications.
 
+| What you want | What NInfer gives you |
+|---|---|
+| Answers that keep moving | DFlash2 accelerated generation; **116.7 tokens/s** in our local 3090 smoke benchmark |
+| Your existing AI tools, running locally | OpenAI Chat Completions, Responses and Anthropic Messages endpoints |
+| Room for longer conversations | Configurable context and conversation-prefix reuse; larger contexts depend on model, settings and free memory |
+| Help with images as well as text | Vision support in compatible Qwen artifacts |
+| Output your app can use | JSON Schema, grammar, choice and regex constraints; tool-call responses |
+| A straightforward desktop setup | Native executable and launch scripts for Windows, with Linux builds available |
 
-On an RTX 3090, Qwen3.8-27B supports a measured **171K-token INT8 context** with the standard
-1 GiB safety headroom.
+## Watch it answer
 
-> **RotorQuant `rk8v4` is temporarily unavailable.** Upstream moved KV quantization out of the
-> fused GQA attention kernels into a dedicated `kv_cache_append` Op whose contract defines K
-> rotation as H256 and V as unrotated BF16. The rk8v4 int4-V representation has not been ported
-> to that contract yet, so `--kv-dtype rk8v4` is rejected at startup. The previously published
-> 226K/248K RotorQuant context figures do not apply to this build. INT8 remains the default and
-> recommended quantized profile.
+[![Play a real NInfer response on one RTX 3090](docs/assets/ninfer-demo.gif)](docs/assets/ninfer-demo.mp4)
 
-This fork targets `sm_86`. Blackwell-only NVFP4/W4A4 and FP8 A8 tensor-core execution are
-unavailable. FP8 and NVFP4 *weights* are admitted through their A16 dequantizing routes, but the
-FP8 E4M3 *KV-cache* profile is not: its attention kernels have no SM86 implementation. 
+**[Play the demo](docs/assets/ninfer-demo.mp4)** · Real streamed output, replayed at its recorded
+arrival times. The model is already loaded when the request starts. Presentation framing is added;
+the response is not sped up. [Recording details](docs/demo.md).
 
-The goal is the make the utmost rippin Qwen inference stack for the 3000 series. Gladly taking PR's, all help much appreciated. 
+## Running in minutes
 
-Release notes for this branch: [v0.6.1](RELEASE_NOTES_0.6.1.md).
+You need an RTX 3090/3090 Ti with 24 GB VRAM, a recent NVIDIA driver, and enough disk space for the
+application and model. The recommended Qwen3.8-27B artifact is about **19 GB**. Leave GPU memory
+free for the model; other GPU applications reduce the context available.
 
-## Choose a platform
+### Windows
 
-| Platform | Delivery | Guide |
-|---|---|---|
-| Linux | Docker image or native source build | [Linux build guide](docs/rtx-3090-linux.md) |
-| Windows 11 | Prebuilt release archive | [Windows guide](docs/rtx-3090-windows.md) |
+1. Download and extract the **Windows x64 archive** from the
+   [community release maintained by ashalliants](https://github.com/ashalliants/ninfer-3090/releases/tag/v0.16.0-rtx3090).
+2. Open a terminal in that extracted folder and run:
+
+```powershell
+.\download-model.bat qwen38-27b
+.\run.bat qwen38-27b
+```
+
+The launcher selects the Qwen3.8-27B profile and starts a local server. Windows also needs the
+Microsoft Visual C++ 2022 runtime. [Windows archive guide](docs/release-archive-windows.md).
 
 ### Linux
 
-The Dockerfile gives the shortest build path on Bazzite and other Linux distributions:
+Extract the Linux x64 archive from the same community release, open its folder, and run:
 
 ```bash
-docker build --tag ninfer-3090:sm86 .
+./download-model.sh qwen38-27b
+./run.sh qwen38-27b
 ```
 
-The Linux guide contains the GPU check, native Ubuntu build, model mount, server command, and Bash
-launchers. The project does not publish a prebuilt Linux archive or qualified Linux performance
-results yet.
+[Linux archive guide](docs/release-archive-linux.md). Building from a checkout instead? Use the
+scripts under `scripts/`; [source-build instructions](#build-it-yourself) are below.
 
-### Windows 11
+### Connect your client
 
-1. Download and unzip the latest [Windows release](https://github.com/Don-Chad/ninfer-3090/releases/latest).
-2. Double-click `download-qwen38.bat` to download the model. Interrupted downloads resume.
-3. Double-click one launcher:
-
-| Launcher | Best for |
+| Client setting | Value |
 |---|---|
-| `run-qwen38-c1.bat` | One interactive user, lowest latency, up to 64K context |
-| `run-qwen38-c8.bat` | Multiple users or agents, highest aggregate throughput, 8K context |
-| `run-qwen38-vision.bat` | Qwen3.8 image understanding, one user, 32K context, MTP3 |
-| `run-qwen36-35b-vision.bat` | Image understanding with Qwen3.6-35B-A3B, one user, 32K context |
+| OpenAI-compatible base URL | `http://127.0.0.1:8080/v1` |
+| Anthropic-compatible base URL | `http://127.0.0.1:8080` |
+| Model | Use the model ID advertised by `GET /v1/models` |
+| API key | Not required by the default local launcher |
 
-The API is then available at `http://127.0.0.1:8080/v1`. The Windows archive includes the required
-applications and DLLs.
+The server binds to your own computer by default. For access from another machine, configure
+authentication with `--api-key` and your network deliberately; changing the bind address alone
+does not enable authentication. [Client examples and API reference](docs/serving.md).
 
-## Qwen3.8-27B support and RTX 3090 results
+The downloaders can also fetch an optional private graft using an existing Hugging Face login.
+Set `NINFER_GRAFTS=off` to skip that extra fetch; the public model works without it.
 
-Qwen3.8-27B is validated from one through eight simultaneous users. ReplaySSM cuts the memory cost
-of speculative decoding, allowing the faster MTP3 mode to remain enabled at C8. The table below is
-the new sustained test: every request generated 1,024 tokens with CUDA Graphs enabled.
+## Pick your model
 
-The prompts were **29-34 input tokens** and the server's maximum context window was **8,192 tokens
-per request**. Each measured sequence therefore reached roughly 1,053-1,058 tokens including its
-generated output. This is a long-output/decode benchmark, not an 8K-prompt or long-prefill test.
-C1-C4 used an 8,192-token shared KV pool; C8 used 16,384 tokens so all eight requested outputs
-could be admitted simultaneously.
+| Model | A good fit for | Status |
+|---|---|---|
+| **Qwen3.8-27B** | The recommended starting point for local chat and coding tools | DFlash2, text and vision; independently smoke-tested here |
+| **Qwen3.6-35B-A3B** | Another option when you want several configured request lanes | MTP and compatible vision artifacts; see measured profiles |
+| **Qwen3.6-27B** | Existing Qwen3.6 workflows | Supported artifact and launcher |
+| **Qwen3.8-Flash-Next** | Trying a much larger expert model on one 3090 | **Windows preview**; needs substantial host RAM and fast storage |
+| **Ternary Bonsai 2 27B** | Exploring a smaller weight footprint | Experimental artifact; direct CLI/server use, no launcher profile yet |
 
-| Cohort | Total output | End-to-end throughput | Decode throughput | MTP acceptance | Mean TTFT | Peak VRAM |
-|---:|---:|---:|---:|---:|---:|---:|
-| C1 | 1,024 tokens | **70.19 tok/s** | **71.00 tok/s** | 61.13% | 149 ms | 19,641 MiB |
-| C2 | 2,048 tokens | **89.43 tok/s** | **90.66 tok/s** | 59.66% | 262 ms | 20,022 MiB |
-| C4 | 4,096 tokens | **97.89 tok/s** | **100.28 tok/s** | 59.63% | 538 ms | 20,641 MiB |
-| C8 | 8,192 tokens | **161.28 tok/s** | **165.33 tok/s** | 56.84% | 1,215 ms | 22,138 MiB |
+The default `qwen38-27b` launcher uses DFlash2. Other download choices are `qwen36-35b-a3b`,
+`qwen36-27b`, `qwen38-flash-next`, and `bonsai2-27b`.
+See [model artifacts](docs/README.md#model-artifacts) and the linked model cards before choosing.
+Flash-Next uses host memory and storage for offloaded experts: it is not a model that fits wholly
+inside 24 GB VRAM, and it was not part of our local smoke test.
 
-C1 is the responsive choice for a single user. C8 delivers **2.3x the total throughput** when
-several requests are active. The C8 long-output test uses a 16K shared KV pool so all eight
-1,024-token responses can be admitted together.
+### More context, or more simultaneous requests?
 
-### Prompt-processing speed
+The defaults favor a useful single-user experience. The maintained launch profiles document a
+Qwen3.8-27B DFlash2 ceiling of **188,416 tokens on Windows**, with a lower context selected if the
+GPU is busy. An MTP profile targets the model's **262,144-token** limit with two configured lanes.
+These are profile-dependent capacities, not results from our 16K-cap local smoke test.
 
-Prompt processing was tested separately with **4,362 fresh input tokens per request**, an 8,192-token
-per-request context window, 512-token prefill chunks, INT8 KV, ReplaySSM/MTP3, CUDA Graphs, and
-prefix reuse disabled. Each request generated only 16 tokens so the run measures prefill rather
-than long decode.
+For several clients, the engine supports **up to eight configured execution lanes** on compatible
+models and settings. Lanes share the available context pool, so eight clients cannot each assume
+the whole context is reserved for them. This is bounded small-scale batching; it is not a promise
+of vLLM-style high-concurrency dynamic batching.
 
-| Cohort | Total fresh input | Aggregate prefill | Active-prefill speed | Mean TTFT | Peak VRAM |
-|---:|---:|---:|---:|---:|---:|
-| C1 | 4,362 tokens | **861.51 tok/s** | 893.98 tok/s | 4,893 ms | 19,114 MiB |
-| C2 | 8,724 tokens | **853.86 tok/s** | 883.95 tok/s | 7,478 ms | 19,697 MiB |
-| C4 | 17,448 tokens | **847.26 tok/s** | 874.49 tok/s | 12,692 ms | 20,894 MiB |
-| C8 | 34,896 tokens | **844.10 tok/s** | 870.94 tok/s | 23,028 ms | 23,207 MiB |
+[Choose a configuration visually](docs/config-calculator.html) ·
+[Profiles and memory tradeoffs](docs/maintainer/launcher-profiles.md)
 
-`Aggregate prefill` is total fresh input tokens divided by the complete request-wave time, so it is
-the user-facing throughput number. NInfer currently processes one long prefill at a time; cohort
-batching accelerates decode, but does not multiply prompt ingestion. Consequently C1-C8 remain near
-844-862 input tok/s while queued requests increase mean TTFT. `Active-prefill speed` excludes queue
-waiting and measures only the server's recorded prefill phase.
+## Measured on our RTX 3090
 
-### RotorQuant KV (`rk8v4`) — currently unavailable
+| Local qualification, 16 October 2026 | Result |
+|---|---:|
+| Decode speed, median | **116.7 tokens/s** |
+| First streamed text, median | **127 ms** |
+| Measured requests | **6**, after 3 warmups |
+| Output per request | **512 tokens** |
 
-`rk8v4` was an experimental, opt-in KV-cache mode for Qwen3.8-27B that applied a normalized
-transform to queries and keys, rotated values before four-bit storage, and reversed the value
-transform after attention.
+Qwen3.8-27B, Windows, RTX 3090, CUDA 13.2/MSVC 14.43, DFlash2 K=7, one lane, 16K context cap,
+`rk4v4` KV, thinking off and prefix reuse off. The fixed prompt was 52 tokens. Every measured
+request produced 512 tokens; decode ranged from 116.5 to 117.4 tokens/s. Cold model startup was
+about 42 seconds and is excluded from first-token latency. All six greedy outputs matched.
 
-It is **not available in this build**. Upstream now owns KV quantization in a dedicated
-`kv_cache_append` Op, whose published numerical contract rotates K with a normalized H256
-transform and stores V from unrotated BF16 source values. rk8v4's H64 rotation and int4-V
-representation have no implementation against that contract yet, so `--kv-dtype rk8v4` parses but
-is rejected during engine construction rather than silently degrading to INT8.
+This is a small reproducible smoke benchmark, not a model-quality evaluation or a matched
+comparison against another engine. Speed changes with the prompt, context, output and settings.
+We have not reproduced a 180-token/s result on this workload.
 
-Porting RotorQuant onto the new Op is tracked as follow-up work. Until then the previously
-published 226,560-token and 247,872-token RotorQuant context measurements do not describe this
-build. Use `--kv-dtype int8`, which reaches 171,648 tokens at the 1 GiB headroom boundary.
+[Our method and results](docs/performance/local-qualification-20261016.md) ·
+[Broader measurements published by the fork](docs/performance.md)
 
-### Qwen3.8 vision
+## Build it yourself
 
-The same Qwen3.8 artifact supports images. Start the server with `--vision`, MTP3, INT8 KV, and a
-32K maximum context. The Windows archive includes `run-qwen38-vision.bat` for this profile.
+The source is C++20/CUDA. Use **CMake 3.28+**, **CUDA 12.8+**, Ninja, and the documented native
+dependencies. The Windows helper selects VS 2022 Build Tools; Linux has its own build script.
 
-A 1,920×1,080 image expanded to 2,074 prompt tokens and was read correctly. Measured TTFT was
-3.29 seconds, decode reached 98.1 tok/s, MTP acceptance was 96.7%, and startup retained 2.16 GiB
-free VRAM. The artifact also declares multi-image and video support; this release test directly
-validated a single image.
-
-## Qwen3.6-35B-A3B RTX 3090 results
-
-Measured with the compact 20.84 GiB 35B-A3B artifact, a 4K shared INT8 group-64 paged KV pool,
-CUDA Graphs, MTP3, greedy decoding, and no competing GPU workload:
-
-| Concurrent requests | 128 output tokens each | Observed VRAM |
-|---:|---:|---:|
-| 1 | 162.7 aggregate tok/s | 22,427 MiB |
-| 2 | 267.9 aggregate tok/s | 22,743 MiB |
-| 4 | 366.2 aggregate tok/s | 23,377 MiB |
-| 6 | 383.4 aggregate tok/s | 24,038 MiB |
-| 8 | rejected at startup | about 503 MiB over the safe reservation limit |
-
-A longer 512-token-per-request check reached **286.8 tok/s at C1** and **399.1 aggregate tok/s at
-C2**. These short-prompt measurements include request-level timing and are not directly comparable
-to v0.3.1's 1,500-token adaptive prompt-lookup benchmark.
-
-Compatible-prefix reuse was validated end to end: a repeated 26-token prompt reused 24 tokens,
-reducing measured prefill from 371 ms to 10 ms.
-
-### Qwen3.6-35B vision
-
-The compact 35B artifact includes its vision encoder and accepts images through the same OpenAI-
-compatible API. Start the server with `--vision` and leave speculative decoding disabled. The
-Windows archive includes `run-qwen36-35b-vision.bat` for this profile.
-
-The safe RTX 3090 profile is **one request, 32K maximum context, INT8 KV, vision enabled, and MTP
-disabled**. A current v0.6 test processed three 1,920×1,080 images correctly. Each image expanded
-to a 2,081-token prompt; engine TTFT was 3.76–4.07 seconds, decode was about 159 tok/s, and peak
-VRAM was 23,944 MiB. This leaves little room for another GPU workload.
-
-MTP is intentionally off for this profile. At 32K, speculative recurrent state would exceed the
-3090 memory budget; KV compression alone does not recover enough memory. Text-only 35B profiles can
-still use MTP3 as documented above.
-
-## Capabilities
-
-- Native SM86 CLI and server applications for Linux and Windows.
-- A prebuilt Windows archive with tested launchers.
-- OpenAI Chat Completions, Responses, and Anthropic-compatible APIs.
-- ReplaySSM and MTP3 for higher throughput without exceeding 24 GB VRAM.
-- `low`, `medium`, and `xhigh` reasoning modes.
-- Qwen3.8 image understanding with ReplaySSM and MTP3.
-- Prefix reuse for faster repeated or shared prompts.
-- Qwen3.6-35B image understanding with a guarded 32K profile.
-- Windows one-user and eight-user launchers with safe tested defaults.
-
-## Supported artifacts
-
-| Model | Artifact | Size | Notes |
-|---|---|---:|---|
-| Qwen3.6-35B-A3B v1 | [pinned compact artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c) | 20.84 GiB | **Recommended for RTX 3090; text C1-C6 at 4K and vision C1 at 32K** |
-| Qwen3.6-35B-A3B v2 | [current upstream artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | 21.22 GiB | Reader supported by v0.5+; includes DFlash payload and is not the measured 3090 artifact |
-| Qwen3.6-27B | [groupwise artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | 16.29 GiB | Supported with more runtime headroom |
-| **Qwen3.8-27B** | [official NInfer groupwise artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 16.96 GiB | **Validated at C1, C2, C4 and C8/MTP3 with ReplaySSM** |
-
-NInfer-3090 v0.5 and newer recognize both v1 and v2 container magic. The current 21.22 GiB v2
-artifact contains additional DFlash weights and is not the artifact used for the published RTX
-3090 concurrency results. The pinned compact v1 artifact keeps the measured model payload and
-omits DFlash, providing the known 24 GB memory profile.
-
-## Models and platform support
-
-Linux users build the applications from source or use the Docker image. Windows users can use the
-prebuilt archive, which includes the applications and required DLLs. Both platforms require an
-RTX 3090 or RTX 3090 Ti and a recent NVIDIA driver.
-
-Download the [official Qwen3.8 artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) as
-`models/qwen3_8_27b.ninfer`. Windows users can run `download-qwen38.bat` instead.
-
-For Qwen3.6-35B-A3B, the smaller
-[pinned container-v1 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c)
-is recommended on a 24 GB card. Releases v0.5 and newer also read the larger container-v2 file.
-An `artifact magic is not NInfer version 1` message means the executable is outdated, not that the
-current model download is necessarily corrupt.
-
-Developers can build from source on Windows or Linux. Windows uses Visual Studio 2022 and vcpkg.
-Linux uses GCC 13 with system packages or the pinned vcpkg manifest. Both builds require CUDA 12.8
-or newer and CMake 3.28 or newer.
-
-See the [Windows build guide](docs/rtx-3090-windows.md) or the
-[Linux build guide](docs/rtx-3090-linux.md). Ordinary Windows release users do not need these tools.
-
-## Qwen3.8 reasoning effort
-
-Qwen3.8-27B supports distinct reasoning-effort modes. `medium` uses the model's normal thinking
-prompt. `xhigh` injects the checkpoint's extended deliberation instruction, asking it to validate
-assumptions and consider alternatives. This is a real prompt-template change, not a sampling alias.
-
-| Value | Qwen3.8 behavior |
-|---|---|
-| `none` | Disable thinking |
-| `low` | Keep reasoning brief and focused |
-| `medium` | Use normal Qwen3.8 thinking |
-| `xhigh` | Use extended deliberation and verification |
-
-OpenAI Chat Completions accepts a top-level `reasoning_effort` field:
-
-```json
-{
-  "model": "qwen3.8-27b",
-  "messages": [{"role": "user", "content": "Solve this carefully..."}],
-  "reasoning_effort": "xhigh",
-  "max_tokens": 4096
-}
+```powershell
+.\scripts\build.ps1
 ```
 
-OpenAI Responses uses `"reasoning": {"effort": "xhigh"}`. Anthropic Messages uses
-`"output_config": {"effort": "xhigh"}`. For the native CLI, pass
-`--reasoning-effort low|medium|xhigh`; use `--no-thinking` instead of an effort to disable
-reasoning. Chat Completions returns hidden reasoning separately as `message.reasoning_content`.
+```bash
+./scripts/build.sh
+```
 
-## Serving APIs
+Use all available CPU cores for compilation. See the [Windows](docs/rtx-3090-windows.md),
+[Linux](docs/rtx-3090-linux.md) and [build-system](docs/maintainer/build-system.md) guides for
+toolchains and dependencies. Our qualified Windows build uses CUDA 13.2 and includes the local
+compatibility fixes in this branch. Linux runtime was not independently tested in that run.
 
-The server supports:
+This is a native executable distribution, not a tiny single-file package: our Windows server
+executable is approximately **577 MB**, plus dependency DLLs and separately downloaded weights.
 
-- OpenAI Chat Completions;
-- OpenAI Responses Core with streaming and local continuation state;
-- Anthropic Messages;
-- compatible-prefix reuse;
-- prompt-rendered function tools and parsed tool calls;
-- bounded pending-request admission and JSONL request logs.
+## Know before you start
 
-See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli.md).
+- Models must use the **v3 `.ninfer` container**. Existing supported v2 artifacts can be
+  [upgraded without re-downloading their weights](docs/weight-conversion.md#upgrade-an-existing-v2-artifact).
+- One model is loaded per server process. Capabilities such as vision and speculation are selected
+  at startup; requests cannot enable a component that was not loaded.
+- Tool calls are returned to your client. Your client decides whether to execute them.
+- Local text inference needs no cloud service. Requesting a remote image URL intentionally
+  contacts that host; optional model download and S3 storage features also use the network.
+- Linux has a multi-GPU pipeline route, but distinct GPUs have not been requalified on the current
+  context engine. Flash-Next is a Windows preview. Start with one supported GPU and model.
+- The community release downloads above are published by ashalliants. This repository's adoption
+  branch has additional build fixes and documentation; no new Don-Chad release is implied.
 
-## How cohort batching works
+[Serving reference](docs/serving.md) · [CLI](docs/cli.md) ·
+[Performance](docs/performance.md) · [All documentation](docs/README.md)
 
-The C number is the maximum number of requests NInfer can run together. C1 favors one interactive
-user; C8 can combine up to eight active requests into each GPU step for much higher total output.
+## Built by a community
 
-Follow-up requests do not need to arrive at the same instant. When a running request finishes, the
-next waiting request can join at a safe generation boundary. Empty or finished lanes are skipped,
-so a C8 server also works normally with only one, two, or four active users.
+NInfer-3090 started as **Don-Chad's RTX 3090 adaptation** of
+[Neroued's original NInfer engine](https://github.com/Neroued/ninfer).
+This update brings back the substantial continued work in
+[ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090), including major contributions
+from **ashalliants**, **WarlaxZ**, **Neroued**, and others. **mgscreativa** proposed bringing that
+work back through [PR #30](https://github.com/Don-Chad/ninfer-3090/pull/30) and contributed fixes.
 
-This is deliberately more bounded than datacenter-style dynamic batching. The maximum number of
-users and GPU memory are chosen when the server starts. In return, memory use stays predictable on
-a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding work continuously.
+The Flash-Next implementation also adapts work from
+[wallawalla47's Infernix](https://github.com/wallawalla47/infernix); attribution is retained in the
+source files. Original history, license notices and the [contributor list](CONTRIBUTORS.md)
+remain part of the project. Thank you to everyone who made the 3090 implementation better.
 
-## Current limits
-
-- One process owns one model on one RTX 3090.
-- Concurrency is fixed at startup and limited to 1-8 by the API; compact 35B fits C1-C6 and
-  Qwen3.8-27B fits C8/8K with MTP3 through ReplaySSM.
-- The shared KV pool is fixed at startup and is not divided statically among request lanes.
-- This is bounded small-scale batching, not preemptive large-scale continuous batching.
-- No multi-GPU execution or CPU/GPU weight offload.
-- Tool calls are returned to the client but are not executed by NInfer.
-- NVFP4 A4, FP8 A8, and TMA kernels require Blackwell and are unavailable on SM86. FP8 and NVFP4
-  weights are admitted through their A16 dequantizing routes.
-- The paged runtime exposes BF16 and INT8 group-64 KV; INT8 remains the quality-default path.
-  Upstream's row-scaled FP8 E4M3 KV profile and `rk8v4` both parse but are rejected on SM86.
-
-## Validation
-
-The v0.6.0 Windows gate covered Qwen3.8 generation, materialization, request memory, admission,
-paged KV, prefix reuse, speculative rounds, and SM86 W8 Linear paths.
-
-The v0.6.1 Linux source gate completed all 245 Docker compile and link steps with CUDA 13.1 on
-Ubuntu 24.04. Both Linux applications returned their `--help` output with GPU access enabled.
-A real-artifact Linux generation and Linux performance qualification remain open.
-
-## Upstream
-
-NInfer-3090 is derived from [Neroued/ninfer](https://github.com/Neroued/ninfer). The upstream project
-targets RTX 5090/`sm_120a`; this fork carries the Windows and Linux SM86 compatibility layer,
-compact 35B artifact support, and RTX 3090-specific schedules and memory planning.
-
-## Contributors
-
-See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the complete, maintained credit list.
-
-- [airtonix](https://github.com/airtonix) added Linux and Docker build and release support in
-  [PR #1](https://github.com/Don-Chad/ninfer-3090/pull/1).
-- [ColeWheatley](https://github.com/ColeWheatley) contributed SM86 runtime-count/GDN residency
-  fixes, ECC diagnostics, and the GeForce-safe Docker fix in
-  [PR #7](https://github.com/Don-Chad/ninfer-3090/pull/7).
-- [justinlime](https://github.com/justinlime) added NixOS build support in
-  [PR #5](https://github.com/Don-Chad/ninfer-3090/pull/5).
-- [sry9681](https://github.com/sry9681) contributed the device-wide GPU-memory startup fix in
-  [PR #6](https://github.com/Don-Chad/ninfer-3090/pull/6).
-- [iamwavecut](https://github.com/iamwavecut) contributed the swscale destination-alignment
-  JPEG safety fix in [PR #11](https://github.com/Don-Chad/ninfer-3090/pull/11).
-- [nasedkinpv](https://github.com/nasedkinpv) contributed the tool-call parser crash fix in
-  [PR #12](https://github.com/Don-Chad/ninfer-3090/pull/12).
-- [wmehanna](https://github.com/wmehanna) contributed in-place system-turn rendering for
-  Claude Code prefix reuse in [PR #13](https://github.com/Don-Chad/ninfer-3090/pull/13).
-
-## Contributing
-
-Please read the [Pull Request Policy](PR_POLICY.md) before opening an issue or pull request.
-It explains how to keep changes focused and how to document correctness, performance, VRAM, and
-compatibility evidence.
+Found a problem or have a measured improvement? Read the [contribution policy](PR_POLICY.md).
+This is a community project maintained on a best-effort basis.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Code: [Apache-2.0](LICENSE). Model artifacts and bundled dependencies retain their own licenses;
+see their model cards and notices.

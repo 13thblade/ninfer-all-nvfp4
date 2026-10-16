@@ -4,8 +4,10 @@
 // HTTP transport live in separate translation units; only wire-independent GenerationRequest is
 // passed to GenerationService.
 
+#include "serve/openai_common.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request.h"
+#include "serve/request_json.h"
 
 #include <nlohmann/json.hpp>
 
@@ -23,6 +25,9 @@ struct GenerationOutcome;
 struct OpenAIResponsesFunctionIdentity {
     std::string name;
     std::optional<std::string> wire_namespace;
+    // A free-form `custom` tool: served to the model as a strict function with one string
+    // parameter, `input`, and returned on the wire as custom_tool_call Items carrying that text.
+    bool custom = false;
 
     bool operator==(const OpenAIResponsesFunctionIdentity&) const = default;
 };
@@ -30,14 +35,20 @@ struct OpenAIResponsesFunctionIdentity {
 struct OpenAIResponsesPromptRequest {
     std::string model;
     GenerationRequest generation;
+    OpenAIPromptCachePolicy cache_policy;
     std::vector<ChatTurn> input_turns;
     std::vector<nlohmann::json> input_items;
     std::optional<std::string> instructions;
     std::optional<std::string> previous_response_id;
+    // Client-supplied cache bucketing hint (OpenAI's prompt_cache_key). Independent of `store`:
+    // it identifies a client-managed conversation lineage for cache retention purposes even when
+    // the caller never wants a retrievable Response object.
+    std::optional<std::string> prompt_cache_key;
 };
 
 struct OpenAIResponsesCreateRequest {
     OpenAIResponsesPromptRequest prompt;
+    nlohmann::json text_format = {{"type", "text"}};
     nlohmann::json metadata    = nlohmann::json::object();
     nlohmann::json tools       = nlohmann::json::array();
     nlohmann::json tool_choice = "auto";
@@ -71,12 +82,11 @@ struct BuiltOpenAIResponse {
     std::vector<ChatTurn> output_history;
 };
 
-OpenAIResponsesCreateRequest parse_openai_responses_create_request(const nlohmann::json& body,
+OpenAIResponsesCreateRequest parse_openai_responses_create_request(const RequestJson& body,
                                                                    const RequestLimits& limits);
 
 OpenAIResponsesPromptRequest
-parse_openai_responses_input_tokens_request(const nlohmann::json& body,
-                                            const RequestLimits& limits);
+parse_openai_responses_input_tokens_request(const RequestJson& body, const RequestLimits& limits);
 
 OpenAIResponsesResolvedPrompt
 resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,

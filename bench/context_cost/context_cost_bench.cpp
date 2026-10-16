@@ -1,8 +1,8 @@
 #include "context_cost_measure.h"
-#include "qwen3_6_context_fixture.h"
+#include "model_context_fixture.h"
 
 #include "core/device.h"
-#include "runtime/engine/context_cost.h"
+#include "runtime/engine/context_cache/context_cost.h"
 
 #include <nlohmann/json.hpp>
 
@@ -46,6 +46,35 @@ const char* suite_name(Suite suite) noexcept {
         return "transfer";
     case Suite::Prefill:
         return "prefill";
+    }
+    return "unknown";
+}
+
+struct KvCacheName {
+    std::string_view name;
+    ninfer::KvCacheStorage storage;
+};
+
+constexpr std::array<KvCacheName, 7> kKvCacheNames{{
+    {"bf16", ninfer::KvCacheStorage::BFloat16},
+    {"int8", ninfer::KvCacheStorage::Int8Group64},
+    {"fp8", ninfer::KvCacheStorage::Fp8E4M3Row256},
+    {"rk8v4", ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64},
+    {"rk4v4", ninfer::KvCacheStorage::RotatedLloyd4KeyInt4Value},
+    {"nvfp4", ninfer::KvCacheStorage::Nvfp4Group16},
+    {"k8v4", ninfer::KvCacheStorage::Fp8KeyNvfp4Value},
+}};
+
+ninfer::KvCacheStorage parse_kv_cache(std::string_view value) {
+    for (const KvCacheName& entry : kKvCacheNames) {
+        if (entry.name == value) { return entry.storage; }
+    }
+    throw std::invalid_argument("--kv-dtype must be bf16, int8, fp8, rk8v4, rk4v4, nvfp4, or k8v4");
+}
+
+std::string kv_cache_name(ninfer::KvCacheStorage storage) {
+    for (const KvCacheName& entry : kKvCacheNames) {
+        if (entry.storage == storage) { return std::string(entry.name); }
     }
     return "unknown";
 }
@@ -99,6 +128,9 @@ std::string usage(const char* executable) {
         << "  --device <id>              CUDA device (default: 0)\n"
         << "  --max-context <tokens>     prefill measurement context (default: 8192)\n"
         << "  --prefill-chunk <tokens>   prefill measurement chunk (default: 1024)\n"
+        << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4>  prefill KV cache (default: bf16)\n"
+        << "  --prefill-cublas           prefill with the cuBLAS GEMM route\n"
+        << "  --gdn-state-fp16           prefill with FP16 GDN recurrent state\n"
         << "  --transfer-warmup <n>      warmups per transfer point (default: 2)\n"
         << "  --transfer-reps <n>        samples per transfer point (default: 9)\n"
         << "  --prefill-reps <n>         samples per prefill point (default: 5)\n"
@@ -141,6 +173,12 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--prefill-chunk") {
             options.measurement.prefill_chunk =
                 parse_u32(value("--prefill-chunk"), "--prefill-chunk");
+        } else if (argument == "--kv-dtype") {
+            options.measurement.kv_cache = parse_kv_cache(value("--kv-dtype"));
+        } else if (argument == "--prefill-cublas") {
+            options.measurement.prefill_cublas = true;
+        } else if (argument == "--gdn-state-fp16") {
+            options.measurement.gdn_state_fp16 = true;
         } else if (argument == "--transfer-warmup") {
             options.measurement.transfer_warmup =
                 parse_nonnegative_int(value("--transfer-warmup"), "--transfer-warmup");
@@ -379,7 +417,7 @@ int main(int argc, char** argv) {
         accepted      = accepted && (!prefill_fit || prefill_fit->accepted);
 
         Json report{
-            {"schema_version", 2},
+            {"schema_version", 3},
             {"artifact_type", "ninfer_context_cost_calibration"},
             {"accepted", accepted},
             {"hardware", Json{{"gpu", hardware.gpu},
@@ -400,13 +438,13 @@ int main(int argc, char** argv) {
                                 {"ordering_significance", kOrderingSignificance}}},
         };
         if (artifact) {
-            report["artifact"] = Json{{"path", artifact->path.string()},
-                                      {"model_id", artifact->model_id},
-                                      {"weights_id", artifact->weights_id},
-                                      {"target", artifact->target_key},
-                                      {"canonical_kv_cache", "bf16"},
-                                      {"canonical_speculative_backend", "none"},
-                                      {"corpus", options.measurement.corpus.string()}};
+            report["artifact"] = Json{
+                {"path", artifact->path.string()},
+                {"kv_cache", kv_cache_name(options.measurement.kv_cache)},
+                {"prefill_cublas", options.measurement.prefill_cublas},
+                {"gdn_state_fp16", options.measurement.gdn_state_fp16},
+                {"speculative_backend", "none"},
+                {"corpus", options.measurement.corpus.string()}};
         }
         if (transfer_samples && transfer_fits) {
             Json measurements = Json::array();
@@ -447,9 +485,9 @@ int main(int argc, char** argv) {
             report["prefill"] = Json{
                 {"measurements", std::move(measurements)},
                 {"fit", fit_json(*prefill_fit)},
-                {"load", Json{{"target", prefill_samples->load.target},
-                              {"model_id", prefill_samples->load.model_id},
-                              {"weights_id", prefill_samples->load.weights_id},
+                {"load", Json{{"architecture", prefill_samples->load.architecture},
+                              {"name", prefill_samples->load.model_name},
+                              {"prefill_signature", prefill_samples->load.prefill_signature},
                               {"load_seconds", prefill_samples->load.load_seconds}}},
             };
         }
@@ -482,16 +520,19 @@ int main(int argc, char** argv) {
                 Json provenance                   = base_provenance;
                 provenance["suite"]               = "prefill";
                 provenance["artifact_path"]       = artifact->path.string();
-                provenance["target"]              = artifact->target_key;
+                provenance["architecture"]        = prefill_samples->load.architecture;
                 provenance["corpus"]              = options.measurement.corpus.string();
                 provenance["prefill_chunk"]       = options.measurement.prefill_chunk;
+                provenance["kv_cache"]            = kv_cache_name(options.measurement.kv_cache);
+                provenance["prefill_cublas"]      = options.measurement.prefill_cublas;
+                provenance["gdn_state_fp16"]      = options.measurement.gdn_state_fp16;
                 provenance["max_context"]         = options.measurement.max_context;
                 provenance["prefill_repetitions"] = options.measurement.prefill_repetitions;
                 ninfer::runtime::upsert_context_prefill_cost_atomic(
                     options.preset_output,
-                    ninfer::runtime::ContextCostIdentity{.hardware_class = hardware_class,
-                                                         .model_id       = artifact->model_id,
-                                                         .weights_id     = artifact->weights_id},
+                    ninfer::runtime::ContextCostIdentity{
+                        .hardware_class    = hardware_class,
+                        .prefill_signature = prefill_samples->load.prefill_signature},
                     runtime_prefill_cost(*prefill_fit), provenance.dump());
             }
             std::cerr << "wrote preset " << options.preset_output.string() << '\n';

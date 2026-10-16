@@ -16,12 +16,70 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVER = Path(os.environ.get("NINFER_BENCH_SERVER", ROOT / "build-sm86-replayssm/apps/Release/ninfer-serve.exe"))
-MODEL = Path(os.environ.get("NINFER_BENCH_MODEL", ROOT.parent / "qwen3_8_27b.ninfer"))
+# DFlash2 needs the artifact that carries the draft model: 18.33 GiB of weights against 15.92 for
+# the dense one. The published download (download-model qwen38-27b) is that bundle, saved as
+# qwen3_8_27b.ninfer, and it carries the MTP weights too, so it runs every spec. A separate
+# qwen3_8_27b_dflash2.ninfer beside a dense qwen3_8_27b.ninfer is preferred for DFlash2 when present.
+_DFLASH2_COPY = ROOT.parent / "qwen3_8_27b_dflash2.ninfer"
+_DEFAULT_MODEL = (_DFLASH2_COPY if os.environ.get("NINFER_BENCH_SPEC", "mtp") == "dflash2"
+                  and _DFLASH2_COPY.exists() else ROOT.parent / "qwen3_8_27b.ninfer")
+MODEL = Path(os.environ.get("NINFER_BENCH_MODEL", _DEFAULT_MODEL))
 MAX_CONTEXT = int(os.environ.get("NINFER_BENCH_MAX_CONTEXT", "65536"))
 OUTPUT_TOKENS = int(os.environ.get("NINFER_BENCH_OUTPUT_TOKENS", "1024"))
 PREFILL_PROMPT_CHARACTERS = int(os.environ.get("NINFER_BENCH_PREFILL_CHARS", "28000"))
 COHORTS = tuple(int(value) for value in os.environ.get("NINFER_BENCH_COHORTS", "1,2,4,8").split(","))
 KV_DTYPE = os.environ.get("NINFER_BENCH_KV_DTYPE", "int8")
+# Speculative backend and draft window. **This sweep stays on MTP3, for memory rather than speed.**
+#
+# DFlash2 at K=7 is faster at every concurrency it can run. Aggregate decode tok/s through the serve
+# path, thinking off, decode time taken from the server's own request log:
+#
+#   C        MTP3   DFlash2 K=7   change
+#   1       135.0         187.1   +38.6%
+#   2       238.2         313.5   +31.6%
+#   4       387.4         406.2    +4.9%
+#   8       522.8   does not fit
+#
+# The lead shrinks with concurrency and the mechanism says why: speculation pays because a
+# multi-column round costs about one sweep of the weights, and batching already amortises that sweep
+# across lanes, so the baseline catches up. Acceptance itself does not degrade -- tokens per round
+# holds at ~3.5 for MTP3 and ~5.6 for DFlash2 across all levels.
+#
+# What stops it is memory. The draft model's weights are 18.3 GiB against 16.7, and at C8 the
+# runtime reservation needs 4.64 GB where 3.78 GB remains; dropping to a 4096-token KV still needs
+# 4.24 GB, and only a 2048-token KV fits, which is too little for eight streams to do useful work.
+# This sweep includes C8, so it stays on MTP3. A C1-C4 deployment should use DFlash2:
+# NINFER_BENCH_SPEC=dflash2.
+#
+# Swept on realistic generation (mean of a reasoning, a code and a summarisation prompt, greedy,
+# 400 tokens, one run per cell):
+#
+#   K        3      4      5      6      7      8      9     10     12
+#   mean   128.0  146.0  159.0  169.6  172.3  163.7  163.3  160.2  159.2
+#
+# The peak is at 7, with 6 close behind and a decline past 8. That matches the published shape --
+# E[tokens/round] = (1 - a^(K+1))/(1 - a), with the optimum rising with the acceptance rate a and
+# diminishing returns reported at 5-8 for EAGLE-class drafters -- and it matches the mechanism here,
+# where a round costs about one sweep of the weights so extra columns are nearly free until they
+# stop being accepted.
+#
+# **The optimum is per-workload, and the mean hides it.** The reasoning prompt keeps improving to
+# K=12 (204.5, the best single cell in the sweep) while the summarisation prompt collapses there
+# (119.6 against 158.1 at K=7). Predictable structured output sustains acceptance far out; prose
+# does not. 7 is the best compromise, not a constant of nature -- a deployment serving one kind of
+# work should sweep its own.
+#
+# The synthetic bench corpus is no guide at all here: it picks K=15 (326 tok/s against 249 for K=7)
+# because it continues itself and acceptance stays high fifteen tokens out.
+SPEC = os.environ.get("NINFER_BENCH_SPEC", "mtp")
+DRAFT_TOKENS = os.environ.get("NINFER_BENCH_DRAFT_TOKENS", "7" if SPEC == "dflash2" else "3")
+# The cuBLAS prefill route, and the chunk it needs to pay for itself. Its dequantise pass is
+# weight-sized, so it only amortises over the tokens in a call: at the 512-token chunk this sweep
+# otherwise uses it is a loss, and the two settings have to move together. It costs +0.156%
+# perplexity (4.343155 -> 4.349944 on the 1M corpus), so results taken with it on are not
+# quality-identical to results taken with it off -- command.json records which was used.
+PREFILL_CUBLAS = os.environ.get("NINFER_BENCH_PREFILL_CUBLAS", "1").lower() not in ("0", "false", "no")
+PREFILL_CHUNK = os.environ.get("NINFER_BENCH_PREFILL_CHUNK", "4096" if PREFILL_CUBLAS else "512")
 PORT = 8093
 STARTUP_TIMEOUT_SECONDS = 90
 REQUEST_TIMEOUT_SECONDS = 900
@@ -92,11 +150,13 @@ def run_round(name: str, prompt: str, max_tokens: int, cohort: int) -> dict:
         str(SERVER), str(MODEL), "--host", "127.0.0.1", "--port", str(PORT),
         "--max-context", str(context_per_request), "--kv-capacity", str(kv_capacity),
         "--max-concurrency", str(cohort), "--max-pending-requests", "8",
-        "--pending-timeout-ms", "900000", "--prefill-chunk", "512",
-        "--kv-dtype", KV_DTYPE, "--spec", "mtp", "--draft-tokens", "3",
+        "--pending-timeout-ms", "900000", "--prefill-chunk", PREFILL_CHUNK,
+        "--kv-dtype", KV_DTYPE, "--spec", SPEC, "--draft-tokens", DRAFT_TOKENS,
         "--lm-head-draft", "--greedy", "--no-prefix-reuse",
         "--request-log-jsonl", str(request_log),
     ]
+    if PREFILL_CUBLAS:
+        command.append("--prefill-cublas")
     (out / "command.json").write_text(json.dumps(command, indent=2), encoding="utf-8")
     with (out / "stdout.log").open("w", encoding="utf-8") as stdout, (out / "stderr.log").open("w", encoding="utf-8") as stderr:
         process = subprocess.Popen(command, stdout=stdout, stderr=stderr, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -182,7 +242,8 @@ def main() -> None:
     configuration = {
         "server": str(SERVER), "model": str(MODEL), "max_context": MAX_CONTEXT,
         "output_tokens": OUTPUT_TOKENS, "prefill_prompt_characters": PREFILL_PROMPT_CHARACTERS,
-        "mtp_draft_tokens": 3, "cohorts": COHORTS, "kv_dtype": KV_DTYPE,
+        "spec": SPEC, "draft_tokens": int(DRAFT_TOKENS), "prefill_cublas": PREFILL_CUBLAS,
+        "prefill_chunk": int(PREFILL_CHUNK), "cohorts": COHORTS, "kv_dtype": KV_DTYPE,
     }
     (OUTPUT_ROOT / "configuration.json").write_text(json.dumps(configuration, indent=2), encoding="utf-8")
     generation_prompt = "Write a detailed technical guide to reliable local GPU inference. Continue until the requested output limit."

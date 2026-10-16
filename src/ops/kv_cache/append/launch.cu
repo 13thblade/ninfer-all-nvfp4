@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/kernel.cuh"
+#include "ops/kv_cache/plane_types.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -18,7 +19,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
-    if (cache.dtype == DType::FP8_E4M3FN) {
+    if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
         if (tokens >= 128 && Geometry::KVHeads == 2) {
@@ -51,35 +52,51 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    if (cache.dtype == DType::I8) {
+    if (kv_cache_is_int8_family(cache.storage)) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
-        if (tokens >= 128 && Geometry::KVHeads == 2) {
-            constexpr int TokensPerTile = 8;
-            const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
-            const dim3 fill_grid(static_cast<unsigned>(max_tiles),
-                                 static_cast<unsigned>(Geometry::KVHeads));
-            kv_cache_append_full_i8_page_kernel<Geometry, Metadata>
-                <<<fill_grid, kBlock, 0, stream>>>(
-                    static_cast<const __nv_bfloat16*>(k.data),
-                    static_cast<const __nv_bfloat16*>(v.data),
-                    static_cast<const std::int32_t*>(positions.data), metadata,
-                    static_cast<std::int8_t*>(cache_k.data),
-                    static_cast<std::int8_t*>(cache_v.data),
-                    static_cast<__half*>(cache_k_scale.data),
-                    static_cast<__half*>(cache_v_scale.data), tokens);
+        // A U8 value plane is the packed signed int4 coding (rk8v4, rk4v4); a U8 key plane is the
+        // rk4v4 Lloyd-Max coding. Otherwise the plane is plain INT8.
+        const bool packed_values = cache.v_pages.dtype == DType::U8;
+        const bool packed_keys   = cache.k_pages.dtype == DType::U8;
+        const auto issue         = [&]<bool PackedValues, bool PackedKeys>() {
+            if (tokens >= 128 && Geometry::KVHeads == 2) {
+                constexpr int TokensPerTile = 8;
+                const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
+                const dim3 fill_grid(static_cast<unsigned>(max_tiles),
+                                     static_cast<unsigned>(Geometry::KVHeads));
+                kv_cache_append_full_i8_page_kernel<Geometry, Metadata, PackedValues, PackedKeys>
+                    <<<fill_grid, kBlock, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(k.data),
+                        static_cast<const __nv_bfloat16*>(v.data),
+                        static_cast<const std::int32_t*>(positions.data), metadata,
+                        static_cast<std::int8_t*>(cache_k.data),
+                        static_cast<std::int8_t*>(cache_v.data),
+                        static_cast<__half*>(cache_k_scale.data),
+                        static_cast<__half*>(cache_v_scale.data), tokens);
+            } else {
+                constexpr int FillWarps = kBlock / 32;
+                const std::int64_t fill_units =
+                    static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
+                const int fill_grid =
+                    static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
+                kv_cache_append_full_i8_kernel<Geometry, Metadata, PackedValues, PackedKeys>
+                    <<<fill_grid, kBlock, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(k.data),
+                        static_cast<const __nv_bfloat16*>(v.data),
+                        static_cast<const std::int32_t*>(positions.data), metadata,
+                        static_cast<std::int8_t*>(cache_k.data),
+                        static_cast<std::int8_t*>(cache_v.data),
+                        static_cast<__half*>(cache_k_scale.data),
+                        static_cast<__half*>(cache_v_scale.data), tokens);
+            }
+        };
+        if (packed_keys) {
+            issue.template operator()<true, true>();
+        } else if (packed_values) {
+            issue.template operator()<true, false>();
         } else {
-            constexpr int FillWarps       = kBlock / 32;
-            const std::int64_t fill_units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
-            const int fill_grid =
-                static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
-            kv_cache_append_full_i8_kernel<Geometry, Metadata><<<fill_grid, kBlock, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(k.data),
-                static_cast<const __nv_bfloat16*>(v.data),
-                static_cast<const std::int32_t*>(positions.data), metadata,
-                static_cast<std::int8_t*>(cache_k.data), static_cast<std::int8_t*>(cache_v.data),
-                static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data),
-                tokens);
+            issue.template operator()<false, false>();
         }
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -90,11 +107,13 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     const std::int64_t elements = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
                                   (kKVCacheAppendFullHeadDim / VecElems);
     const int fill_grid = static_cast<int>(div_up(elements, static_cast<std::int64_t>(Block)));
+    using CacheKey   = KvKeyCodeT<KvCacheStorage::BFloat16>;
+    using CacheValue = KvValueCodeT<KvCacheStorage::BFloat16>;
+    assert_kv_code_planes<KvCacheStorage::BFloat16, CacheKey, CacheValue>();
     kv_cache_append_full_bf16_kernel<Geometry, Metadata><<<fill_grid, Block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
         static_cast<const std::int32_t*>(positions.data), metadata,
-        static_cast<__nv_bfloat16*>(cache_k.data), static_cast<__nv_bfloat16*>(cache_v.data),
-        tokens);
+        static_cast<CacheKey*>(cache_k.data), static_cast<CacheValue*>(cache_v.data), tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -110,8 +129,10 @@ void launch_paged(const Tensor& k, const Tensor& v, const Tensor& positions, con
                   const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
     validate_plan(k, plan);
     if (plan.max_count == 0) return;
-    auto* cache_k       = static_cast<__nv_bfloat16*>(cache.k_pages.data);
-    auto* cache_v       = static_cast<__nv_bfloat16*>(cache.v_pages.data);
+    assert_kv_code_planes<KvCacheStorage::BFloat16, KvKeyCodeT<KvCacheStorage::BFloat16>,
+                          KvValueCodeT<KvCacheStorage::BFloat16>>();
+    auto* cache_k       = static_cast<KvKeyCodeT<KvCacheStorage::BFloat16>*>(cache.k_pages.data);
+    auto* cache_v       = static_cast<KvValueCodeT<KvCacheStorage::BFloat16>*>(cache.v_pages.data);
     const auto* input_k = static_cast<const __nv_bfloat16*>(k.data);
     const auto* input_v = static_cast<const __nv_bfloat16*>(v.data);
     const auto* pos     = static_cast<const std::int32_t*>(positions.data);
@@ -126,10 +147,10 @@ void launch_paged(const Tensor& k, const Tensor& v, const Tensor& positions, con
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
-                   const Tensor& lanes, CyclicKVCacheLayerView cache,
-                   const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
-    validate_plan(k, plan);
+template <int Capacity>
+void launch_cyclic_profile(const Tensor& k, const Tensor& v, const Tensor& positions,
+                           const Tensor& counts, const Tensor& lanes, CyclicKVCacheLayerView cache,
+                           const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
     if (plan.max_count == 0) return;
     auto* cache_k       = static_cast<__nv_bfloat16*>(cache.k.data);
     auto* cache_v       = static_cast<__nv_bfloat16*>(cache.v.data);
@@ -140,19 +161,51 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
     const auto* lane    = static_cast<const std::int32_t*>(lanes.data);
     const int padded    = static_cast<int>(cache.padded_capacity);
 
-    const dim3 grid(1 + (plan.max_count - 1) / 4, k.ne[3], 1);
-    kv_cache_append_prefix_cyclic_kernel<<<grid, kBlock, 0, stream>>>(
-        input_k, input_v, pos, count, lane, cache_k, cache_v, plan.min_count, plan.max_count,
-        plan.tokens, padded);
-    CUDA_CHECK(cudaGetLastError());
+    const auto launch = [&]<int Threads>() {
+        constexpr int UnitsPerToken = 128;
+        const dim3 grid((plan.max_count * UnitsPerToken + Threads - 1) / Threads, k.ne[3], 1);
+        kv_cache_append_prefix_cyclic_kernel<Capacity, Threads>
+            <<<grid, Threads, 0, stream>>>(input_k, input_v, pos, count, lane, cache_k, cache_v,
+                                           plan.min_count, plan.max_count, plan.tokens, padded);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    // A half-token per CTA exposes enough independent copies for decode prefixes. At
+    // larger envelopes, one token per CTA reduces scheduling cost without serializing copies.
+    if (plan.max_count * k.ne[3] <= 128)
+        launch.template operator()<64>();
+    else
+        launch.template operator()<128>();
+}
+
+void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
+                   const Tensor& lanes, CyclicKVCacheLayerView cache,
+                   const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
+    validate_plan(k, plan);
+    switch (cache.capacity) {
+    case 2048:
+        launch_cyclic_profile<2048>(k, v, positions, counts, lanes, cache, plan, stream);
+        return;
+    case 4096:
+        launch_cyclic_profile<4096>(k, v, positions, counts, lanes, cache, plan, stream);
+        return;
+    default:
+        throw std::invalid_argument("kv_cache_append_prefix: unsupported cyclic capacity");
+    }
 }
 
 } // namespace
 
 void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                             PagedKVLayerView cache, cudaStream_t stream) {
-    const KVCacheAppendDirectMetadata metadata{
-        static_cast<const std::int32_t*>(cache.block_table.data)};
+    if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        kv_cache_append_k8v4_launch(k, v, positions, cache, stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+        kv_cache_append_nvfp4_launch(k, v, positions, cache, stream);
+        return;
+    }
+    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
     if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
         launch_full<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
         return;
@@ -163,14 +216,66 @@ void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& posi
 void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                   const Tensor& valid_columns, const Tensor& table_rows,
                                   PagedKVBatchLayerView cache, cudaStream_t stream) {
+    if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        kv_cache_append_k8v4_batch_launch(k, v, positions, valid_columns, table_rows, cache,
+                                          stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+        kv_cache_append_nvfp4_batch_launch(k, v, positions, valid_columns, table_rows, cache,
+                                           stream);
+        return;
+    }
     const auto launch = [&]<bool Masked>() {
-        const KVCacheAppendBatchMetadata<Masked> metadata{
+        const PagedKVBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
             .valid_columns =
                 Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
         };
+        if (cache.storage == KvCacheStorage::Fp8E4M3Row256 && k.ne[3] > 1) {
+            const auto append = [&]<class Geometry>() {
+                const dim3 grid(div_up(k.ne[2] * Geometry::KVHeads, 8), 1, k.ne[3]);
+                kv_cache_append_full_fp8_batch_kernel<Geometry, Masked>
+                    <<<grid, kBlock, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(k.data),
+                        static_cast<const __nv_bfloat16*>(v.data),
+                        static_cast<const std::int32_t*>(positions.data), metadata,
+                        static_cast<std::uint8_t*>(cache.k_pages.data),
+                        static_cast<std::uint8_t*>(cache.v_pages.data),
+                        static_cast<__half*>(cache.k_scale_pages.data),
+                        static_cast<__half*>(cache.v_scale_pages.data), k.ne[2]);
+            };
+            if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads)
+                append.template operator()<KVCacheAppendD256Kv4>();
+            else
+                append.template operator()<KVCacheAppendD256Kv2>();
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        if (cache.storage == KvCacheStorage::Int8Group64 && k.ne[3] > 1) {
+            const auto append = [&]<class Geometry>() {
+                const dim3 grid(div_up(k.ne[2] * Geometry::KVHeads, 8), 1, k.ne[3]);
+                // Plain INT8 codes only (PackedValues = PackedKeys = false); MultiBatch = true.
+                kv_cache_append_full_i8_kernel<Geometry, PagedKVBatchMetadata<Masked>, false, false,
+                                               true>
+                    <<<grid, kBlock, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(k.data),
+                        static_cast<const __nv_bfloat16*>(v.data),
+                        static_cast<const std::int32_t*>(positions.data), metadata,
+                        static_cast<std::int8_t*>(cache.k_pages.data),
+                        static_cast<std::int8_t*>(cache.v_pages.data),
+                        static_cast<__half*>(cache.k_scale_pages.data),
+                        static_cast<__half*>(cache.v_scale_pages.data), k.ne[2]);
+            };
+            if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads)
+                append.template operator()<KVCacheAppendD256Kv4>();
+            else
+                append.template operator()<KVCacheAppendD256Kv2>();
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
             launch_full<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
             return;

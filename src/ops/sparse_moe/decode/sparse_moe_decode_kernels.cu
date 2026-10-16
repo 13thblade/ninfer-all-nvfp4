@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
 
 #include "core/device.h"
@@ -8,7 +9,7 @@
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
-#include "ops/linear/w8/w8_rowsplit_storage.cuh"
+#include "ops/linear/q8/q8_rowsplit_storage.cuh"
 #include "ops/sparse_moe/sparse_moe_route.cuh"
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
@@ -69,7 +70,9 @@ __device__ __forceinline__ float router_row_dot(const __nv_bfloat16* x, const __
 
 __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ router,
-                                     float* __restrict__ scores) {
+                                     float* __restrict__ scores,
+                                     const char* __restrict__ shared_down_codes,
+                                     unsigned long long shared_down_bytes) {
     __shared__ float partial[kD1Warps];
     const int row   = static_cast<int>(blockIdx.x);
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
@@ -81,6 +84,15 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
         float value = lane < kD1Warps ? partial[lane] : 0.0f;
         value       = warp_reduce_sum<kD1Warps>(value);
         if (lane == 0) { scores[row] = value; }
+    }
+    if (shared_down_codes != nullptr) {
+        // Warm L2 for the shared-expert down codes that D4's shared warp
+        // (the block's long pole) will stream at t~14.3us. Pure cache hint.
+        const unsigned long long offset =
+            (static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x) * 128ull;
+        if (offset < shared_down_bytes) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(shared_down_codes + offset));
+        }
     }
 }
 
@@ -131,25 +143,40 @@ struct Q6Codec {
     }
 };
 
-struct W8Codec {
-    static constexpr int kGroupK                = 32;
-    static constexpr bool kD3SingleValuePerLane = true;
-    static constexpr bool kD3PackedWord8        = false;
-    static constexpr bool kPackedWord8          = false;
+struct Q8Codec {
+    static constexpr int kGroupK         = 32;
+    // Was kD3SingleValuePerLane, which is no longer what the branch does -- it selects the Q8
+    // shared plane in d3, and that plane now takes eight values per lane like everything else.
+    static constexpr bool kD3Q8Plane     = true;
+    static constexpr bool kD3PackedWord8 = false;
+    // The shared expert takes the same eight-per-lane consume loop as the routed ones. It used to
+    // take `load_pair`, and in d4 that is not merely slower in isolation -- d4 reduces nine warps
+    // through one `__syncthreads()`, so warp 8 running a 4x narrower loop on half a warp
+    // (`lane < kGroupK / 2` is 16 of 32 lanes at kGroupK=32) made it the straggler the other eight
+    // waited for. See the d4 stall table in TODO section 2c.
+    static constexpr bool kPackedWord8          = true;
 
-    __device__ static __forceinline__ float load_one(const std::uint8_t* codes,
-                                                     const std::uint8_t* scales,
-                                                     std::int64_t group_index, int lane) {
+    // Eight contiguous int8 codes and the group's single FP16 scale. The codes are plain and
+    // contiguous (kCodeBytesPerGroup == kGroupK), so the eight bytes are one 64-bit load rather
+    // than the four two-byte loads `load_pair` issued for the same span.
+    __device__ static __forceinline__ void
+    load_eight(const std::uint8_t* codes, const std::uint8_t* /*high*/, const std::uint8_t* scales,
+               std::int64_t group_index, int lane_in_group, float (&weights)[8]) {
         const float scale = __half2float(
             __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scales + group_index * 2)));
-        return static_cast<float>(static_cast<std::int8_t>(codes[group_index * kGroupK + lane])) *
-               scale;
-    }
-
-    __device__ static __forceinline__ void
-    load_pair(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
-              std::int64_t group_index, int lane, float& w0, float& w1) {
-        W8ScalarDecodeAtom::load_pair(codes, high, scales, group_index, lane, w0, w1);
+        const std::uint8_t* packed = codes +
+                                     group_index * Q8RowSplitStorage::kCodeBytesPerGroup +
+                                     static_cast<std::int64_t>(lane_in_group) * 8;
+        // kCodeBytesPerGroup is 32 and lane_in_group * 8 is a multiple of 8, so this is 8-byte
+        // aligned whenever the plane is, which the loader guarantees. One LDG.64 for eight codes.
+        const uint2 raw = *reinterpret_cast<const uint2*>(packed);
+        const std::uint32_t words[2] = {raw.x, raw.y};
+#pragma unroll
+        for (int item = 0; item < 8; ++item) {
+            const std::int8_t code =
+                static_cast<std::int8_t>((words[item >> 2] >> ((item & 3) * 8)) & 0xFFu);
+            weights[item] = static_cast<float>(code) * scale;
+        }
     }
 };
 
@@ -196,15 +223,37 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
                 acc1 = fmaf(weights1[item], values[item], acc1);
             }
         }
-    } else if constexpr (Codec::kD3SingleValuePerLane) {
-        for (int group = first_group; group < last_group; ++group) {
+    } else if constexpr (Codec::kD3Q8Plane) {
+        // The shared expert's Q8 plane, on the same eight-per-lane ownership as the Q4 branch
+        // above. It used to take one value per lane per group: identical arithmetic in 8x the
+        // loop trips, each carrying its own dependent load. d3's dominant stall is exactly that
+        // latency (long_scoreboard 7.54 of a ~9.3 budget), and eight values per lane is the same
+        // fix that was worth +3.90% on the 27B's q5 GEMV.
+        constexpr int kLanesPerGroup = Codec::kGroupK / 8;
+        constexpr int kGroupsPerIter = 32 / kLanesPerGroup;
+        static_assert(kGroups % kGroupsPerIter == 0, "the consume loop must not leave a tail");
+        const int lane_group    = lane / kLanesPerGroup;
+        const int lane_in_group = lane % kLanesPerGroup;
+        for (int group_base = first_group; group_base < last_group;
+             group_base += kGroupsPerIter) {
+            const int group           = group_base + lane_group;
             const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
             const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
-            const float w0            = Codec::load_one(codes, scales, index0, lane);
-            const float w1            = Codec::load_one(codes, scales, index1, lane);
-            const float xv            = __bfloat162float(x[group * Codec::kGroupK + lane]);
-            acc0                      = fmaf(w0, xv, acc0);
-            acc1                      = fmaf(w1, xv, acc1);
+            float weights0[8];
+            float weights1[8];
+            Codec::load_eight(codes, nullptr, scales, index0, lane_in_group, weights0);
+            Codec::load_eight(codes, nullptr, scales, index1, lane_in_group, weights1);
+            const uint4 input     = load_vec<uint4>(x + group * Codec::kGroupK + lane_in_group * 8);
+            const float2 x0       = bf16x2_bits_to_float2(input.x);
+            const float2 x1       = bf16x2_bits_to_float2(input.y);
+            const float2 x2       = bf16x2_bits_to_float2(input.z);
+            const float2 x3       = bf16x2_bits_to_float2(input.w);
+            const float values[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
+#pragma unroll
+            for (int item = 0; item < 8; ++item) {
+                acc0 = fmaf(weights0[item], values[item], acc0);
+                acc1 = fmaf(weights1[item], values[item], acc1);
+            }
         }
     } else if (lane < Codec::kGroupK / 2) {
         for (int group = first_group; group < last_group; ++group) {
@@ -225,6 +274,69 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
     result1 = warp_reduce_sum(acc1);
 }
 
+// Nine warps: 0..7 take one routed expert each through RoutedCodec, warp 8 takes the shared expert
+// through Q8Codec -- kTopK + 1, so eight warps would have nowhere to put the shared path.
+//
+// The block cannot retire until all nine warps finish, and the shared Q8 path is heavier than a
+// routed Q4 one, so eight completed routed warps hold warp slots while warp 8 drains. ncu sees that
+// as no warp eligible to issue on 43-48% of cycles, and sparse_moe_d3_path_tiled_kernel below
+// exists to spread the same nine paths over three-warp blocks for exactly this reason.
+//
+// SPLITTING THE BLOCK WAS TRIED AT ONE TOKEN AND IT IS WORSE. Measured 2026-09-09, 35B / int8 /
+// decode, clocks locked at 1,500 MHz, ncu kernel replay, medians of 3 launches. The path-tiled
+// kernel at tokens == 1 writes an identical activation layout, so this was a pure geometry A/B:
+//
+//                            nine_warp (512x1, 288 thr)   paths3 (512x3, 96 thr)
+//   duration                          29.63 us                  30.75 us
+//   block limit registers / warps        5 / 5                    16 / 16
+//   theoretical warps per SM                45                        48
+//   theoretical occupancy                93.75%                      100%
+//   ACHIEVED occupancy                   67.65%                    52.60%
+//   no eligible warp                      43.2%                     53.4%
+//
+// So the split delivers the higher *theoretical* occupancy it was designed for and a materially
+// lower *achieved* one, and the scheduler stall it was meant to remove gets worse. The cause is the
+// wave tail: three-warp blocks need 1,536 blocks against a 16-per-SM capacity of 1,312, so two
+// waves at 58.5% efficiency, against 512 blocks over 410 slots at 62.4%. Removing a serialisation
+// inside the block does not pay for spreading a kernel that is only ~1.17 machine-fulls of work
+// over more waves. Do not retry this without first making the kernel bigger than the machine.
+//
+// One measurement note worth keeping: d4 was captured alongside as an unchanged control and moved
+// 6.1% between the two arms (DRAM 46.9% -> 52.4%), which is larger than the d3 effect. A downstream
+// kernel in the same fused pipeline is NOT a clean control -- d3's different access pattern leaves
+// different L2 state behind for d4. The occupancy counters above are what carry this result.
+
+// EIGHT WARPS WAS ALSO TRIED, IN THE OPPOSITE DIRECTION, AND IT WINS THE KERNEL AND LOSES THE
+// MODEL. Measured 2026-09-13. The split above failed by making *more, smaller* blocks and paying a
+// worse wave tail, so this went the other way: fold the shared expert's K range across the eight
+// routed warps (kHidden/8 = 256 each, one trip of the widened Q8 loop) and reduce it once, so the
+// block is 8 warps instead of 9. That is a strictly better launch on every counter --
+//
+//                          nine_warp          eight_warp
+//   warps per SM             45 of 48          48 of 48
+//   blocks per SM                   5                 6   (410 -> 492 slots)
+//   waves per SM                 1.25              1.04
+//   ACHIEVED occupancy         77.13%            87.08%
+//   eligible warps               1.58              1.85
+//   duration                  23.87 us          21.82 us   (-8.6%)
+//
+// -- and it is worth **nothing** end to end: -0.03% at C1 (paired median of 6, 3/6 positive) and
+// +0.11% with MTP3 (4/6), both crossing zero. Under ncu replay the four MoE kernels total 57.05 ->
+// 54.97 us, so the kernel time is genuinely there; it just does not convert. These kernels run in
+// a PDL pipeline and overlap, so d3 finishing 0.8 us earlier does not let d4 start 0.8 us earlier.
+//
+// The lesson is the sharper version of the one above: **a faster kernel in isolation is not a
+// faster model, and ncu replay cannot tell you which you have.** Only the end-to-end paired A/B
+// can. Reverted -- it also reordered the shared expert's FP32 accumulation, which is a real
+// numerical change to carry for zero gain. The occupancy lever on d3 is now spent: it works
+// exactly as designed and the design does not matter.
+//
+// What was left on this Op was not d3 but `sparse_moe_d2_warp_kernel`, on <<<1, 32>>> with d3 unable
+// to start until it has the ids. This comment used to call it "a parallel-selection problem, not a
+// memory one". Half right: not memory, but not parallelism either. It was branch resolution on a
+// single warp -- the merge's bitonic restores and the comparator were branches -- and making them
+// selects took d2 from 11.04 to 5.73 us for +2.39% end to end, with no extra warps. See the d2
+// entry in TODO and `sparse_moe_merge_ranked_runs` in sparse_moe_route.cuh.
 template <class RoutedCodec>
 __global__ void sparse_moe_d3_nine_warp_kernel(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ ids,
@@ -250,7 +362,7 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
                                            row_base + kIntermediate + j, x_shared, 0, kHidden, gate,
                                            up);
     } else {
-        dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
+        dot_two_rows<Q8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
                                        x_shared, 0, kHidden, gate, up);
     }
     if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = silu(gate) * up; }
@@ -264,7 +376,7 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
     const std::uint8_t* __restrict__ shared_scales, float* __restrict__ token_activations,
     int tokens, const int* __restrict__ adaptive_route_jobs) {
     // Three path CTAs per token/output row expose enough blocks for the 170-SM target and keep the
-    // heavier shared W8 path from holding eight completed routed warps resident.
+    // heavier shared Q8 path from holding eight completed routed warps resident.
     static_assert(PathsPerBlock > 0 && (kTopK + 1) % PathsPerBlock == 0);
     constexpr int kPathBlocks = (kTopK + 1) / PathsPerBlock;
     __shared__ __align__(16) __nv_bfloat16 x_shared[kHidden];
@@ -309,7 +421,7 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
                                                row_base + j, row_base + kIntermediate + j, x_shared,
                                                0, kHidden, gate, up);
         } else {
-            dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j,
+            dot_two_rows<Q8Codec, kHidden>(shared_codes, nullptr, shared_scales, j,
                                            kIntermediate + j, x_shared, 0, kHidden, gate, up);
         }
         if (lane == 0) {
@@ -334,9 +446,20 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
     if constexpr (Codec::kPackedWord8) {
         // Q5/Q6 use the same eight-value lane ownership as D3. The high plane and FP16 scale are
         // decoded exactly from their registered row-split codec before FP32 accumulation.
-        const int lane_group    = lane >> 3;
-        const int lane_in_group = lane & 7;
-        for (int group_base = first_group; group_base < last_group; group_base += 4) {
+        //
+        // Eight values per lane fixes the lane-to-group mapping: a group of kGroupK values needs
+        // kGroupK/8 lanes, so a 32-lane warp covers 32/(kGroupK/8) groups per iteration. Q5/Q6 at
+        // kGroupK=64 give 8 lanes per group and 4 groups per pass, which is what this loop was
+        // written as literally; Q8 at kGroupK=32 gives 4 and 8. Both divide kGroups exactly at
+        // kIntermediate 512, and the static_assert says so rather than leaving a silent tail.
+        constexpr int kLanesPerGroup = Codec::kGroupK / 8;
+        constexpr int kGroupsPerIter = 32 / kLanesPerGroup;
+        static_assert(Codec::kGroupK % 8 == 0, "eight values per lane needs kGroupK % 8 == 0");
+        static_assert(kGroups % kGroupsPerIter == 0, "the consume loop must not leave a tail");
+        const int lane_group    = lane / kLanesPerGroup;
+        const int lane_in_group = lane % kLanesPerGroup;
+        for (int group_base = first_group; group_base < last_group;
+             group_base += kGroupsPerIter) {
             const int group = group_base + lane_group;
             const float4 x0 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8);
             const float4 x1 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8 + 4);
@@ -378,7 +501,8 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
     const float* __restrict__ shared_scale, const float* __restrict__ act,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
-    const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination) {
+    const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination,
+    const char* __restrict__ prefetch_data, unsigned long long prefetch_bytes) {
     __shared__ float paths[kTopK + 1][Rows];
     pdl::wait_for_dependencies();
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
@@ -397,12 +521,22 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
         }
     } else {
         float dot[Rows];
-        dot_fp32_rows<W8Codec, Rows>(shared_codes, nullptr, shared_scales, row_base,
+        dot_fp32_rows<Q8Codec, Rows>(shared_codes, nullptr, shared_scales, row_base,
                                      act + static_cast<std::int64_t>(kTopK) * kIntermediate, 0,
-                                     kIntermediate / W8Codec::kGroupK, dot);
+                                     kIntermediate / Q8Codec::kGroupK, dot);
         if (lane == 0) {
 #pragma unroll
             for (int row = 0; row < Rows; ++row) { paths[kTopK][row] = *shared_scale * dot[row]; }
+        }
+    }
+    if (prefetch_data != nullptr) {
+        // Fire-and-forget L2 warmup of the next consumer's weight codes,
+        // issued BEFORE the block barrier so it hides behind the slowest warp instead
+        // of extending the grid tail. Pure cache hint; no values, no addition order.
+        const unsigned long long offset =
+            (static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x) * 128ull;
+        if (offset < prefetch_bytes) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(prefetch_data + offset));
         }
     }
     __syncthreads();
@@ -457,9 +591,9 @@ __global__ void sparse_moe_d4_token_kernel(
             }
         } else {
             float dot[Rows];
-            dot_fp32_rows<W8Codec, Rows>(shared_codes, nullptr, shared_scales, row_base,
+            dot_fp32_rows<Q8Codec, Rows>(shared_codes, nullptr, shared_scales, row_base,
                                          act + static_cast<std::int64_t>(kTopK) * kIntermediate, 0,
-                                         kIntermediate / W8Codec::kGroupK, dot);
+                                         kIntermediate / Q8Codec::kGroupK, dot);
             if (lane == 0) {
 #pragma unroll
                 for (int row = 0; row < Rows; ++row) {
@@ -480,12 +614,14 @@ __global__ void sparse_moe_d4_token_kernel(
     }
 }
 
-void launch_d1(const Tensor& x, const Weight& router_shared_gate,
+void launch_d1(const Tensor& x, const SparseMoeWeights& weights,
                const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
     sparse_moe_d1_kernel<<<kRouterRows, kD1Warps * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data),
-        static_cast<const __nv_bfloat16*>(router_shared_gate.qdata),
-        static_cast<float*>(workspace.scratch.data));
+        static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
+        static_cast<float*>(workspace.scratch.data),
+        static_cast<const char*>(weights.shared_down.qdata),
+        static_cast<unsigned long long>(kHidden) * kIntermediate);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -515,11 +651,11 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
     CUDA_CHECK(cudaGetLastError());
 
     switch (weights.routed_gate_up.qtype) {
-    case QType::Q4G64_F16S:
+    case QType::Q4_G64_FP16:
         launch_d3_dependent_codec<Q4Codec>(x, weights, workspace, stream);
         return;
-    case QType::W8G32_F16S:
-        launch_d3_dependent_codec<W8Codec>(x, weights, workspace, stream);
+    case QType::Q8_G32_FP16:
+        launch_d3_dependent_codec<Q8Codec>(x, weights, workspace, stream);
         return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported D3 codec");
@@ -528,7 +664,8 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
 
 template <class Codec>
 void launch_d4_dependent_codec(const SparseMoeWeights& weights, Tensor& destination,
-                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                               const void* prefetch_data, std::size_t prefetch_bytes) {
     const auto* ids           = static_cast<const int*>(workspace.ids.data);
     const auto* alpha         = static_cast<const float*>(workspace.alpha.data);
     const auto* shared_scale  = static_cast<const float*>(workspace.shared_scale.data);
@@ -539,23 +676,28 @@ void launch_d4_dependent_codec(const SparseMoeWeights& weights, Tensor& destinat
     const auto* shared_codes  = static_cast<const std::uint8_t*>(weights.shared_down.qdata);
     const auto* shared_scales = static_cast<const std::uint8_t*>(weights.shared_down.scales);
     auto* output              = static_cast<__nv_bfloat16*>(destination.data);
-    CUDA_CHECK(pdl::launch_dependent({dim3(kHidden), dim3(9 * 32), 0, stream},
-                                     sparse_moe_d4_nine_warp_kernel<Codec, 1>, ids, alpha,
-                                     shared_scale, act, routed_codes, routed_high, routed_scales,
-                                     shared_codes, shared_scales, output));
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kHidden), dim3(9 * 32), 0, stream}, sparse_moe_d4_nine_warp_kernel<Codec, 1>, ids,
+        alpha, shared_scale, act, routed_codes, routed_high, routed_scales, shared_codes,
+        shared_scales, output, static_cast<const char*>(prefetch_data),
+        static_cast<unsigned long long>(prefetch_bytes)));
 }
 
 void launch_d4_dependent(const SparseMoeWeights& weights, Tensor& destination,
-                         const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+                         const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                         const void* prefetch_data, std::size_t prefetch_bytes) {
     switch (weights.routed_down.qtype) {
-    case QType::Q5G64_F16S:
-        launch_d4_dependent_codec<Q5Codec>(weights, destination, workspace, stream);
+    case QType::Q5_G64_FP16:
+        launch_d4_dependent_codec<Q5Codec>(weights, destination, workspace, stream, prefetch_data,
+                                           prefetch_bytes);
         return;
-    case QType::Q6G64_F16S:
-        launch_d4_dependent_codec<Q6Codec>(weights, destination, workspace, stream);
+    case QType::Q6_G64_FP16:
+        launch_d4_dependent_codec<Q6Codec>(weights, destination, workspace, stream, prefetch_data,
+                                           prefetch_bytes);
         return;
-    case QType::W8G32_F16S:
-        launch_d4_dependent_codec<W8Codec>(weights, destination, workspace, stream);
+    case QType::Q8_G32_FP16:
+        launch_d4_dependent_codec<Q8Codec>(weights, destination, workspace, stream, prefetch_data,
+                                           prefetch_bytes);
         return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported D4 codec");
@@ -661,7 +803,7 @@ void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights
                                          std::int32_t tokens, SparseMoeSmallTD3Schedule schedule,
                                          cudaStream_t stream, const int* adaptive_route_jobs) {
     switch (weights.routed_gate_up.qtype) {
-    case QType::Q4G64_F16S:
+    case QType::Q4_G64_FP16:
         if (adaptive_route_jobs == nullptr) {
             launch_d3_small_t_codec<Q4Codec, false>(x, weights, token_ids, token_activations,
                                                     tokens, schedule, stream, nullptr);
@@ -670,8 +812,8 @@ void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights
                                                    schedule, stream, adaptive_route_jobs);
         }
         return;
-    case QType::W8G32_F16S:
-        launch_d3_small_t_codec<W8Codec, false>(x, weights, token_ids, token_activations, tokens,
+    case QType::Q8_G32_FP16:
+        launch_d3_small_t_codec<Q8Codec, false>(x, weights, token_ids, token_activations, tokens,
                                                 schedule, stream, nullptr);
         return;
     default:
@@ -685,7 +827,7 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
                                          std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
                                          cudaStream_t stream, const int* adaptive_route_jobs) {
     switch (weights.routed_down.qtype) {
-    case QType::Q5G64_F16S:
+    case QType::Q5_G64_FP16:
         if (adaptive_route_jobs == nullptr) {
             launch_d4_small_t_codec<Q5Codec, false>(weights, destination, token_ids, token_alpha,
                                                     shared_scale, token_activations, tokens,
@@ -696,7 +838,7 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
                                                    schedule, stream, adaptive_route_jobs);
         }
         return;
-    case QType::Q6G64_F16S:
+    case QType::Q6_G64_FP16:
         if (adaptive_route_jobs == nullptr) {
             launch_d4_small_t_codec<Q6Codec, false>(weights, destination, token_ids, token_alpha,
                                                     shared_scale, token_activations, tokens,
@@ -707,8 +849,8 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
                                                    schedule, stream, adaptive_route_jobs);
         }
         return;
-    case QType::W8G32_F16S:
-        launch_d4_small_t_codec<W8Codec, false>(weights, destination, token_ids, token_alpha,
+    case QType::Q8_G32_FP16:
+        launch_d4_small_t_codec<Q8Codec, false>(weights, destination, token_ids, token_alpha,
                                                 shared_scale, token_activations, tokens, schedule,
                                                 stream, nullptr);
         return;
@@ -718,10 +860,12 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
 }
 
 void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
+                              const SparseMoeDecodePlan& plan,
                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
-    launch_d1(x, weights.router_shared_gate, workspace, stream);
+    launch_d1(x, weights, workspace, stream);
     launch_d2_d3(x, weights, workspace, stream);
-    launch_d4_dependent(weights, destination, workspace, stream);
+    launch_d4_dependent(weights, destination, workspace, stream, plan.next_weight_prefetch,
+                        plan.next_weight_prefetch_bytes);
 }
 
 } // namespace ninfer::ops::detail

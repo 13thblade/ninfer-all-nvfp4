@@ -10,7 +10,8 @@ run the CLI or HTTP server.
 | [RTX 3090 Linux build](rtx-3090-linux.md) | Docker and native Ubuntu builds for the `sm_86` applications |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
-| [Performance](performance.md) | RTX 5090 single-request and concurrent-decode results, MTP/DFlash measurements, and reproduction commands |
+| [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |
+| [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 
@@ -22,15 +23,17 @@ The executable `--help` output is the exact source for command-line option spell
 |---|---|---|---|
 | Qwen3.6-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | [model card](../model-cards/Qwen3.6-27B-NInfer/README.md) |
 | Qwen3.6-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) |
-| Qwen3.8-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |
+| Qwen3.8-27B | `groupwise-int`, RTX 3090 recipe (default) | [Hugging Face](https://huggingface.co/WarlaxZ/Qwen3.8-27B-NInfer-3090) | [model card](../model-cards/Qwen3.8-27B-NInfer-3090/README.md) |
+| Qwen3.8-27B | `groupwise-int`, upstream | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |
 | Qwen3.8-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
 | Qwen3.6-35B-A3B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [model card](../model-cards/Qwen3.6-35B-A3B-NInfer/README.md) |
+| Qwen3.8-Flash-Next (preview) | GGUF blocks from the GSQ-RCO IQ2_XS GGUF, exact; n-gram volume beside it | [Hugging Face](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090/tree/c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa) | [model card](../model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) |
 
 ## Repository-local guides
 
 - [Benchmarks](../bench/README.md)
 - [Tests](../tests/README.md)
-- [Maintainer tools](../tools/README.md)
+- [Tools](../tools/README.md)
 - [Capability evaluation](../eval/README.md)
 
 ## Maintainer references
@@ -39,27 +42,31 @@ The active references under [`maintainer/`](maintainer/) record current architec
 artifact, and maintenance contracts. These files are not additional user workflows or installed
 API documentation.
 
-Runtime and Op references:
+[Engine architecture](maintainer/engine-architecture.md) is the single top-level reference. The
+other references own narrower contracts:
 
-- [Engine architecture, execution ownership, scheduling, and request lifecycles](maintainer/engine-architecture.md)
-- [Resource scheduling, continuation/checkpoint, and Device/Host context-cache contracts](maintainer/resource-scheduling-and-context-cache.md)
-- [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
-- [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
-- [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
-- [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
+| Document | Responsibility |
+|---|---|
+| [Engine architecture](maintainer/engine-architecture.md) | model/config/weight ownership, loading-to-execution flow, requests, scheduling, transactions and graphs |
+| [Build system](maintainer/build-system.md) | CMake targets, explicit source ownership, CUDA compilation boundaries, presets and developer configuration |
+| [Artifact container](maintainer/artifact-container.md) | v3 directory, objects, logical bindings, Uses, resources and file framing/sharding |
+| [Numeric formats](maintainer/tensor-formats.md) | represented values, codes/scales, conversion arithmetic and numerical interpretation |
+| [Storage layouts](maintainer/storage-layouts.md) | packing, plane offsets, padding, encoded sizes and view addressing |
+| [Qwen3.5 model](maintainer/qwen3_5-model.md) | Dense/MoE mathematics, instance config, logical parameters, MTP, Vision and state semantics |
+| [Qwen3.8-Flash-Next model](maintainer/qwen4-exp-model.md) | qwen4exp mathematics, logical parameters and the GGUF's stored conventions (M0: runs through the real-artifact test) |
+| [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
+| [Constrained decoding](maintainer/constrained-decoding.md) | GBNF/JSON/choice/regex, tool policies, masks, speculative transactions and observations |
+| [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | core design for continuation, retention, incremental resources, preemption and recovery |
+| [Paged KV context store](maintainer/paged-kv-cache.md) | typed pools, pages, replicas, address spaces, reservations and consumer views |
+| [ReplaySSM GDN](maintainer/replayssm-gdn.md) | raw transition records and faithful commitment of the verified state prefix |
+| [Op development](maintainer/op-development.md) | semantic boundaries, source ownership, numerical qualification and performance evidence |
+| [Operational logging](maintainer/logging.md) | log ownership, presentation, severity and data policy |
+| [Linear benchmark](maintainer/linear-benchmark.md) | pure Linear measurement, metrics and suites |
+| [Linear tuning and reports](maintainer/linear-tuning.md) | tuning ranges, priority points, dispatch tradeoffs and final performance report format |
+| [Cutting a release](maintainer/release-process.md) | the release flow, the packagers, smoke tests, and the gotchas that nearly shipped a broken archive |
+| [Launcher profiles](maintainer/launcher-profiles.md) | `run`, `download-model` and `package-release`, the serving profile per model, and the measurements behind each default |
 
-`engine-architecture.md` is the sole top-level Engine architecture reference.
-`resource-scheduling-and-context-cache.md` is its narrower authority for resource selection,
-materialization, checkpoint ownership, and replica policy. The remaining files define physical
-storage, model, artifact, Op, or measurement contracts rather than parallel architecture variants.
-
-Artifact and model references:
-
-- [NInfer artifact container](maintainer/artifact-container.md)
-- [Persistent tensor numeric formats](maintainer/tensor-formats.md)
-- [Persistent storage layouts](maintainer/storage-layouts.md)
-- [Qwen3.6-27B model semantics](maintainer/qwen3.6-27b-model.md)
-- [Qwen3.6-27B artifact contracts, including NVFP4](maintainer/qwen3.6-27b-artifact.md)
-- [Qwen3.8-27B artifact contracts, including the NVFP4 target](maintainer/qwen3.8-27b-artifact.md)
-- [Qwen3.6-35B-A3B model semantics](maintainer/qwen3.6-35b-a3b-model.md)
-- [Qwen3.6-35B-A3B artifact contracts](maintainer/qwen3.6-35b-a3b-artifact.md)
+Model cards contain official artifact facts and source provenance. The
+[conversion guide](weight-conversion.md) is the entry point for making an artifact. Exact config
+fields, parameter expansion and native supported domains are maintained by the code linked from
+these references.

@@ -1,0 +1,589 @@
+#include "models/qwen3_5/frontend/tool_contract.h"
+#include "models/qwen3_5/frontend/tool_grammar.h"
+#include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "text/grammar.h"
+
+#include <nlohmann/json.hpp>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+namespace frontend = ninfer::models::qwen3_5::frontend;
+using Json         = nlohmann::ordered_json;
+
+void require(bool value, const char* message) {
+    if (!value) throw std::runtime_error(message);
+}
+
+ninfer::text::GrammarCompiler compiler() {
+    std::vector<std::string> tokens;
+    for (int i = 0; i < 256; ++i) tokens.emplace_back(1, static_cast<char>(i));
+    tokens.emplace_back();
+    return {std::move(tokens), {256}, 32 * 1024 * 1024};
+}
+
+auto contract(const Json& schema, bool strict, ninfer::ToolChoice choice = {}) {
+    std::vector<std::string> definitions{
+        Json{{"type", "function"},
+             {"function", {{"name", "call"}, {"parameters", schema}, {"strict", strict}}}}
+            .dump()};
+    return frontend::select_tool_call_contract(
+        frontend::build_tool_call_output_contract(definitions), choice);
+}
+
+bool accepts(ninfer::text::GrammarCompiler& compiler,
+             const frontend::ToolCallOutputContract& contract, std::string_view value) {
+    auto matcher = frontend::compile_tool_grammar(compiler, contract, {}, {});
+    std::vector<std::uint32_t> words(matcher->mask_words());
+    for (unsigned char c : value) {
+        if (matcher->masks({}, words) || !(words[c / 32] & (1u << (c % 32)))) return false;
+        matcher->accept(c);
+        matcher->confirm();
+    }
+    return matcher->masks({}, words) == 0 && (words[256 / 32] & 1u);
+}
+
+std::string call(std::string_view value, std::string_view name = "call") {
+    return "<tool_call>\n<function=" + std::string(name) + ">\n<parameter=x>\n" +
+           std::string(value) + "\n</parameter>\n</function>\n</tool_call>";
+}
+
+Json schema(const Json& value) {
+    return {{"type", "object"},
+            {"properties", {{"x", value}}},
+            {"required", {"x"}},
+            {"additionalProperties", false}};
+}
+
+void basic_contracts(ninfer::text::GrammarCompiler& compiled) {
+    const Json source{
+        {"type", "object"},
+        {"properties", {{"a", {{"type", "string"}}}, {"b", {{"type", "integer"}, {"minimum", 5}}}}},
+        {"required", {"a", "b"}},
+        {"additionalProperties", true}};
+    const auto basic = contract(source, false);
+    require(basic->constrained, "ordinary tools did not enable basic constraints");
+    const std::string reordered =
+        "<tool_call>\n<function=call>\n<parameter=b>\n1\n</parameter>\n"
+        "<parameter=a>\n007\n</parameter>\n<parameter=extra-key.键>\ntrue\n</parameter>\n"
+        "</function>\n</tool_call>";
+    require(accepts(compiled, *basic, reordered),
+            "basic closed or reordered an open parameter list");
+    frontend::ToolCallOutputDecoder decoded(basic, 64);
+    (void)decoded.feed(reordered);
+    const auto arguments = Json::parse(decoded.finish().tool_calls.at(0).arguments_json);
+    require(arguments == Json{{"b", 1}, {"a", "007"}, {"extra-key.键", true}},
+            "non-strict value normalization changed");
+    require(accepts(compiled, *basic, "An ordinary answer."), "default auto forced a call");
+    require(
+        !accepts(compiled, *basic, "<tool_call>\n<function=missing>\n</function>\n</tool_call>"),
+        "default auto admitted an undeclared function");
+
+    for (const Json& complex :
+         {Json{{"anyOf", {{{"type", "object"}}, {{"type", "object"}, {"required", {"x"}}}}}},
+          Json{{"$ref", "https://example.test/schema"}},
+          Json{{"type", "object"}, {"patternProperties", {{".*", {{"type", "string"}}}}}},
+          schema({{"type", {"string", "null"}}, {"format", "uri"}})}) {
+        const auto bound = contract(complex, false);
+        require(accepts(compiled, *bound, call("hello")),
+                "non-strict schema reached strict validation or closed the parameter list");
+    }
+
+    const auto integer         = contract(schema({{"type", "integer"}}), false);
+    const std::string repeated = "<tool_call>\n<function=call>\n<parameter=x>\n1\n</parameter>\n"
+                                 "<parameter=x>\n2\n</parameter>\n</function>\n</tool_call>";
+    require(accepts(compiled, *integer, repeated),
+            "generic argument syntax rejected repeated keys");
+    frontend::ToolCallOutputDecoder duplicate(integer, 64);
+    (void)duplicate.feed(repeated);
+    const auto resolved = duplicate.finish();
+    require(resolved.tool_calls.at(0).arguments_json == R"({"x":2})",
+            "non-strict duplicate was not resolved to one final value");
+    // The repair is counted as on the free route, per repeated name across every call.
+    require(resolved.diagnostics.duplicate_parameters_repaired == 1 &&
+                resolved.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+            "constrained duplicate repair was not counted");
+    frontend::ToolCallOutputDecoder repeated_twice(integer, 64);
+    (void)repeated_twice.feed(repeated + "\n" + call("3"));
+    (void)repeated_twice.feed("\n" + repeated);
+    const auto twice = repeated_twice.finish();
+    require(twice.tool_calls.size() == 3 && twice.diagnostics.duplicate_parameters_repaired == 2,
+            "constrained duplicate repairs were not counted per repeat");
+    frontend::ToolCallOutputDecoder single(integer, 64);
+    (void)single.feed(call("3"));
+    require(single.finish().diagnostics.duplicate_parameters_repaired == 0,
+            "a call without repeats counted a duplicate repair");
+
+    // A repeat inside a call that never completes is discarded with that call, so it is not
+    // counted; the repeats of the calls that did complete still are.
+    const std::string unfinished = "<tool_call>\n<function=call>\n<parameter=x>\n1\n</parameter>\n"
+                                   "<parameter=x>\n2\n</parameter>\n";
+    frontend::ToolCallOutputDecoder cut_alone(integer, 64);
+    (void)cut_alone.feed(unfinished);
+    const auto alone = cut_alone.finish(ninfer::FinishReason::OutputLimit);
+    require(alone.tool_calls.empty() && alone.diagnostics.duplicate_parameters_repaired == 0,
+            "an unfinished call's duplicate repair was counted without a published call");
+    frontend::ToolCallOutputDecoder cut_after(integer, 64);
+    (void)cut_after.feed(repeated + "\n" + unfinished);
+    const auto after = cut_after.finish(ninfer::FinishReason::OutputLimit);
+    require(after.tool_calls.size() == 1 && after.diagnostics.duplicate_parameters_repaired == 1,
+            "a completed call's duplicate repair was lost or inflated by an unfinished one");
+
+    // These requests share the same compiled envelope but have different value normalization.
+    const auto string = contract(schema({{"type", "string"}}), false);
+    for (const auto& bound : {integer, string}) {
+        require(accepts(compiled, *bound, call("7")),
+                "shared basic grammar changed with value types");
+        frontend::ToolCallOutputDecoder decoder(bound, 64);
+        (void)decoder.feed(call("7"));
+        const auto args = Json::parse(decoder.finish().tool_calls.at(0).arguments_json);
+        require(args["x"] == (bound == string ? Json("7") : Json(7)),
+                "compiled grammar leaked another request's argument types");
+    }
+
+    const auto two = reordered + "\n" + call("later");
+    for (std::size_t cut = 0; cut < two.size(); ++cut) {
+        frontend::ToolCallOutputDecoder decoder(basic, 64);
+        (void)decoder.feed(std::string_view(two).substr(0, cut));
+        const auto result = decoder.finish(ninfer::FinishReason::OutputLimit);
+        require(result.tool_calls.size() == (cut >= reordered.size() ? 1 : 0),
+                "non-strict truncation lost a completed call");
+    }
+    ninfer::ToolChoice automatic;
+    automatic.constraints = ninfer::ToolConstraintMode::Automatic;
+    require(!contract(source, false, automatic)->constrained,
+            "explicit auto ignored the free route");
+    automatic.mode = ninfer::ToolChoiceMode::Required;
+    require(contract(source, false, automatic)->constrained, "auto relaxed a required choice");
+    require(contract(schema({{"type", "integer"}}), true, automatic)->constrained,
+            "auto relaxed strict arguments");
+}
+
+void selected_contracts(ninfer::text::GrammarCompiler& compiled) {
+    const auto parameters = schema({{"type", "integer"}, {"minimum", 2}, {"maximum", 3}});
+    std::vector<std::string> definitions;
+    for (const char* name : {"strict", "loose", "excluded"}) {
+        definitions.push_back(
+            Json{{"type", "function"},
+                 {"function",
+                  {{"name", name},
+                   {"parameters",
+                    std::string_view(name) == "excluded" ? Json{{"type", "object"}} : parameters},
+                   {"strict", std::string_view(name) != "loose"}}}}
+                .dump());
+    }
+    const auto declarations = frontend::build_tool_call_output_contract(definitions);
+    ninfer::ToolChoice choice;
+    choice.constraints   = ninfer::ToolConstraintMode::Automatic;
+    choice.allowed_names = std::vector<std::string>{"strict", "loose"};
+    const auto selected  = frontend::select_tool_call_contract(declarations, choice);
+    require(accepts(compiled, *selected, "ordinary answer"), "selection forced an auto call");
+    require(!accepts(compiled, *selected, call("wrong", "strict")),
+            "non-strict sibling relaxed strict values");
+    require(!accepts(compiled, *selected, call("2", "excluded")),
+            "selection admitted an excluded function");
+    const auto mixed = call("2", "strict") + "\n" + call("wrong", "loose");
+    require(accepts(compiled, *selected, mixed), "mixed strict/non-strict calls rejected");
+    frontend::ToolCallOutputDecoder decoder(selected, 64);
+    (void)decoder.feed(mixed);
+    const auto calls = decoder.finish().tool_calls;
+    require(calls.size() == 2 && Json::parse(calls[0].arguments_json)["x"] == 2 &&
+                Json::parse(calls[1].arguments_json)["x"] == "wrong",
+            "selected tools used another function's argument codec");
+
+    choice.allowed_names = std::vector<std::string>{"loose"};
+    choice.mode          = ninfer::ToolChoiceMode::Required;
+    choice.parallel      = false;
+    const auto single    = frontend::select_tool_call_contract(declarations, choice);
+    require(accepts(compiled, *single, call("wrong", "loose")) &&
+                !accepts(compiled, *single, call("2", "strict")) &&
+                !accepts(compiled, *single, "ordinary answer"),
+            "reselecting declarations lost the required function policy");
+    for (const auto& names : {std::vector<std::string>{}, std::vector<std::string>{"missing"}}) {
+        choice.allowed_names = names;
+        bool rejected        = false;
+        try {
+            (void)frontend::select_tool_call_contract(declarations, choice);
+        } catch (const ninfer::RequestError&) { rejected = true; }
+        require(rejected, "required selection accepted an empty or unknown function set");
+    }
+}
+
+// A constrained turn cannot end inside its thinking: the tool grammar admits EOS only after the
+// canonical close, even right after a complete call written in the thinking. The free parser's
+// recovery of calls stranded in unclosed thinking therefore never applies to constrained output.
+void thinking_cannot_end_with_eos(ninfer::text::GrammarCompiler& compiled) {
+    constexpr std::string_view close = "\n</think>\n\n";
+    ninfer::ToolChoice required;
+    required.mode = ninfer::ToolChoiceMode::Required;
+    for (const auto& bound :
+         {contract(schema({{"type", "integer"}}), false),
+          contract(schema({{"type", "integer"}}), true, required)}) {
+        require(bound->constrained, "thinking EOS check needs a constrained contract");
+        auto matcher = frontend::compile_tool_grammar(compiled, *bound, close, {});
+        std::vector<std::uint32_t> words(matcher->mask_words());
+        const auto eos_allowed = [&] {
+            require(matcher->masks({}, words) == 0, "tool grammar dead end inside thinking");
+            return (words[256 / 32] & 1u) != 0;
+        };
+        const auto feed = [&](std::string_view text) {
+            for (unsigned char c : text) {
+                require(!eos_allowed(), "tool grammar admitted EOS inside open thinking");
+                require((words[c / 32] & (1u << (c % 32))) != 0,
+                        "tool grammar rejected thinking text");
+                matcher->accept(c);
+                matcher->confirm();
+            }
+        };
+        feed("I will call it.\n" + call("2") + std::string(close.substr(0, close.size() - 1)));
+        require(!eos_allowed(), "tool grammar admitted EOS one byte before the thinking close");
+        matcher->accept(static_cast<unsigned char>(close.back()));
+        matcher->confirm();
+        for (unsigned char c : call("2")) {
+            require(matcher->masks({}, words) == 0 && (words[c / 32] & (1u << (c % 32))) != 0,
+                    "tool grammar rejected a call after the thinking close");
+            matcher->accept(c);
+            matcher->confirm();
+        }
+        require(eos_allowed(), "tool grammar did not admit EOS after a call in the answer");
+    }
+}
+
+// The serve layer lowers a free-form `custom` tool (Codex's apply_patch) to this strict schema.
+// Its top-level pure-string parameter must come back byte for byte, so a patch keeps its leading
+// spaces, blank lines and markers, and the grammar must make `input` the only, required argument.
+void custom_tool_input(ninfer::text::GrammarCompiler& compiled) {
+    const Json lowered{
+        {"type", "object"},
+        {"properties",
+         {{"input",
+           {{"type", "string"},
+            {"description", "The tool's complete free-form input, passed to it exactly as written "
+                            "(not JSON). It must match this lark grammar:\nstart: begin_patch "
+                            "hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF"}}}}},
+        {"required", {"input"}},
+        {"additionalProperties", false}};
+    const auto automatic = contract(lowered, true);
+    ninfer::ToolChoice required;
+    required.mode       = ninfer::ToolChoiceMode::Required;
+    const auto forced   = contract(lowered, true, required);
+    const auto custom_call = [](std::string_view input) {
+        return "<tool_call>\n<function=call>\n<parameter=input>\n" + std::string(input) +
+               "\n</parameter>\n</function>\n</tool_call>";
+    };
+    const std::string patch = "*** Begin Patch\n"
+                              "*** Update File: src/app.py\n"
+                              "@@ def main():\n"
+                              "-    print(\"hi\")\n"
+                              "+    print(\"hello\")\n"
+                              " \n"
+                              "+\n"
+                              "+    return 0\n"
+                              "\n"
+                              "*** Add File: notes/todo.md\n"
+                              "+  - indented item\t(tab)\n"
+                              "*** End Patch";
+    for (const std::string& input : {patch, patch + "\n", "\n  " + patch, std::string("  ")}) {
+        const std::string text = custom_call(input);
+        require(accepts(compiled, *automatic, text) && accepts(compiled, *forced, text),
+                "custom tool grammar rejected a free-form input");
+        for (const std::size_t width : {std::size_t{1}, std::size_t{7}, text.size()}) {
+            frontend::ToolCallOutputDecoder decoder(forced, 64);
+            for (std::size_t at = 0; at < text.size(); at += width)
+                require(decoder.feed(std::string_view(text).substr(at, width)).empty(),
+                        "custom tool bytes leaked as content");
+            const auto result = decoder.finish();
+            require(result.tool_calls.size() == 1 &&
+                        Json::parse(result.tool_calls[0].arguments_json) ==
+                            Json{{"input", input}},
+                    "custom tool input changed in the raw string encoding");
+        }
+    }
+    require(!accepts(compiled, *forced, "<tool_call>\n<function=call>\n</function>\n</tool_call>"),
+            "custom tool call admitted a missing input");
+    require(!accepts(compiled, *forced,
+                     "<tool_call>\n<function=call>\n<parameter=input>\nx\n</parameter>\n"
+                     "<parameter=extra>\ny\n</parameter>\n</function>\n</tool_call>"),
+            "custom tool call admitted a second argument");
+    require(!accepts(compiled, *forced,
+                     "<tool_call>\n<function=call>\n<parameter=patch>\nx\n</parameter>\n"
+                     "</function>\n</tool_call>"),
+            "custom tool call admitted a renamed argument");
+}
+
+// The decoder's terminal for `text` streamed at every listed width, with the published bytes and
+// the terminal content joined. Each width must agree with the whole output.
+frontend::ToolCallOutputDecoder::Terminal
+decode_streamed(const std::shared_ptr<const frontend::ToolCallOutputContract>& contract,
+                const std::string& text,
+                ninfer::FinishReason reason = ninfer::FinishReason::StopToken) {
+    std::optional<frontend::ToolCallOutputDecoder::Terminal> whole;
+    for (const std::size_t width : {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{5},
+                                    std::size_t{7}, std::size_t{64}, text.size()}) {
+        frontend::ToolCallOutputDecoder decoder(contract, 64);
+        std::string content;
+        for (std::size_t at = 0; at < text.size(); at += width)
+            content += decoder.feed(std::string_view(text).substr(at, width));
+        auto terminal = decoder.finish(reason);
+        terminal.content = content + terminal.content;
+        if (!whole) {
+            whole = std::move(terminal);
+            continue;
+        }
+        require(terminal.content == whole->content &&
+                    terminal.tool_calls.size() == whole->tool_calls.size() &&
+                    terminal.diagnostics == whole->diagnostics,
+                "a streamed chunking disagreed with the whole constrained output");
+    }
+    return *whole;
+}
+
+// The grammar dispatches on `<tool_call>` wherever it appears, so a model that shows the call
+// format inside Markdown code is forced to complete a real, declared call. When calling was
+// optional (`auto`), such a region is a quoted example and must reach the client as text, byte for
+// byte, never as a call it would execute. A required or named choice must call, so its region
+// always stays structured.
+void fenced_calls(ninfer::text::GrammarCompiler& compiled) {
+    const auto canonical = call("rm -rf build");
+    const std::vector<std::string> quoted{
+        "Here is the format:\n```xml\n" + canonical,
+        "Here is the format:\n~~~\n" + canonical,
+        "```\n" + canonical,
+        "Use `" + canonical,
+        // An earlier closed fence does not hide a later open one.
+        "```\nx = 1\n```\nThen:\n```\n" + canonical,
+    };
+    // (output, content before the call): a call after a closed fence or after prose is real.
+    const std::vector<std::pair<std::string, std::string>> real{
+        {canonical, ""},
+        {"Let me run it.\n\n" + canonical, "Let me run it."},
+        {"```\nx = 1\n```\n" + canonical, "```\nx = 1\n```"},
+        {"`a` and `b` " + canonical, "`a` and `b`"},
+    };
+    const auto string_schema = schema({{"type", "string"}});
+    ninfer::ToolChoice single_call;
+    single_call.parallel = false;
+    ninfer::ToolChoice selected;
+    selected.allowed_names = std::vector<std::string>{"call"};
+    for (const auto& choice : {ninfer::ToolChoice{}, single_call, selected}) {
+        for (const bool strict : {false, true}) {
+            const auto bound = contract(string_schema, strict, choice);
+            require(bound->constrained && !bound->required,
+                    "an auto choice was not a constrained optional contract");
+            for (const auto& text : quoted) {
+                require(accepts(compiled, *bound, text),
+                        "the grammar no longer admits a call opened inside Markdown code");
+                const auto terminal = decode_streamed(bound, text);
+                require(terminal.content == text && terminal.tool_calls.empty(),
+                        "a constrained call opened inside Markdown code was published as a call");
+                require(terminal.diagnostics.marker_seen &&
+                            terminal.diagnostics.structured_call_count == 0 &&
+                            terminal.diagnostics.fallback_reason ==
+                                ninfer::ToolCallParseFallbackReason::QuotedInCode,
+                        "a demoted fenced call did not report quoted_in_code");
+                // A fenced call cut by the output budget or a cancellation is text too.
+                for (const auto reason :
+                     {ninfer::FinishReason::OutputLimit, ninfer::FinishReason::Cancelled}) {
+                    const auto cut = text.substr(0, text.size() - 12);
+                    const auto interrupted = decode_streamed(bound, cut, reason);
+                    require(interrupted.content == cut && interrupted.tool_calls.empty(),
+                            "an interrupted fenced call was not returned as text");
+                }
+            }
+            for (const auto& [text, content] : real) {
+                require(accepts(compiled, *bound, text), "the grammar rejected a real call");
+                const auto terminal = decode_streamed(bound, text);
+                require(terminal.content == content && terminal.tool_calls.size() == 1 &&
+                            Json::parse(terminal.tool_calls[0].arguments_json) ==
+                                Json{{"x", "rm -rf build"}} &&
+                            terminal.diagnostics.fallback_reason ==
+                                ninfer::ToolCallParseFallbackReason::None,
+                        "a constrained call outside Markdown code was not published as a call");
+            }
+        }
+    }
+
+    // A continuation prefix that opened the fence is withheld from the terminal content, as
+    // everywhere else, and the call it quotes is still text.
+    {
+        const auto bound  = contract(string_schema, false);
+        const auto prefix = std::string("Here is the format:\n```\n");
+        frontend::ToolCallOutputDecoder continuation(bound, 64);
+        continuation.initialize_continuation(prefix);
+        auto content  = continuation.feed(canonical);
+        auto terminal = continuation.finish();
+        content += terminal.content;
+        require(content == canonical && terminal.tool_calls.empty(),
+                "a continuation that opened a fence published the quoted call");
+    }
+
+    // Required and named choices must call: the grammar admits no text before the call, and the
+    // decoder never demotes their region, even when the text before it opens a fence.
+    ninfer::ToolChoice required;
+    required.mode = ninfer::ToolChoiceMode::Required;
+    ninfer::ToolChoice named = required;
+    named.allowed_names      = std::vector<std::string>{"call"};
+    named.parallel           = false;
+    for (const auto& choice : {required, named}) {
+        const auto bound = contract(string_schema, false, choice);
+        require(bound->constrained && bound->required, "a required choice was not required");
+        require(!accepts(compiled, *bound, "```\n" + canonical),
+                "a required choice admitted text before its call");
+        for (const auto& text : quoted) {
+            const auto terminal = decode_streamed(bound, text);
+            require(terminal.tool_calls.size() == 1 &&
+                        Json::parse(terminal.tool_calls[0].arguments_json) ==
+                            Json{{"x", "rm -rf build"}} &&
+                        terminal.diagnostics.fallback_reason ==
+                            ninfer::ToolCallParseFallbackReason::None,
+                    "a required or named choice demoted its call to text");
+        }
+    }
+}
+
+void run() {
+    auto compiled = compiler();
+    basic_contracts(compiled);
+    selected_contracts(compiled);
+    thinking_cannot_end_with_eos(compiled);
+    custom_tool_input(compiled);
+    fenced_calls(compiled);
+    ninfer::ToolChoice required;
+    required.mode = ninfer::ToolChoiceMode::Required;
+    auto fixed =
+        contract(schema({{"type", "integer"}, {"minimum", 2}, {"maximum", 3}}), true, required);
+    require(accepts(compiled, *fixed, call("2")), "strict integer rejected");
+    require(!accepts(compiled, *fixed, call("4")), "integer range ignored");
+    require(!accepts(compiled, *fixed, call("\"2\"")), "integer coerced from string");
+    require(!accepts(compiled, *fixed, "ordinary answer"), "required choice admitted text");
+    require(accepts(compiled, *fixed, call("2") + "\n" + call("3")), "parallel calls rejected");
+    required.parallel = false;
+    auto single       = contract(schema({{"type", "integer"}}), true, required);
+    require(!accepts(compiled, *single, call("2") + "\n" + call("3")),
+            "single choice admitted second call");
+    auto automatic = contract(schema({{"type", "string"}}), true);
+    require(accepts(compiled, *automatic, "ordinary answer"), "auto rejected plain text");
+    require(accepts(compiled, *automatic, "Calling.\n\n" + call("你好")),
+            "auto rejected preface/call");
+    require(!accepts(compiled, *automatic,
+                     "<tool_call>\n<function=unknown>\n</function>\n</tool_call>"),
+            "auto escaped through free text");
+    auto disabled = required;
+    disabled.mode = ninfer::ToolChoiceMode::None;
+    auto no_tools = contract(schema({{"type", "string"}}), true, disabled);
+    require(accepts(compiled, *no_tools, "ordinary answer") &&
+                !accepts(compiled, *no_tools, call("a")),
+            "none allowed a tool marker");
+    ninfer::ToolChoice basic;
+    basic.constraints = ninfer::ToolConstraintMode::Basic;
+    auto structure    = contract(schema({{"type", "integer"}, {"minimum", 2}}), false, basic);
+    require(accepts(compiled, *structure, call("not an integer")),
+            "basic unexpectedly enforced argument types");
+    auto bounded =
+        contract(schema({{"type", "string"}, {"minLength", 1}, {"maxLength", 2}}), true, required);
+    require(accepts(compiled, *bounded, call("😀")), "Unicode length mismatch");
+    require(!accepts(compiled, *bounded, call("abc")), "length bound dropped");
+    auto patterned = contract(schema({{"type", "string"}, {"pattern", "p"}}), true, required);
+    require(accepts(compiled, *patterned, call("apple")), "raw pattern lost search semantics");
+    require(!accepts(compiled, *patterned, call("none")), "raw pattern ignored");
+    auto intersection = contract(
+        schema({{"type", "string"}, {"pattern", "你|😀"}, {"minLength", 2}, {"maxLength", 3}}),
+        true, required);
+    require(accepts(compiled, *intersection, call("你好")) &&
+                accepts(compiled, *intersection, call("😀ab")) &&
+                !accepts(compiled, *intersection, call("你")) &&
+                !accepts(compiled, *intersection, call("你abc")) &&
+                !accepts(compiled, *intersection, call("abc")),
+            "strict string conjunction lost pattern or Unicode length");
+    auto conjunction = contract(schema({{"allOf",
+                                         {Json{{"type", "string"}, {"pattern", "a"}},
+                                          Json{{"pattern", "b"}, {"maxLength", 3}}}}}),
+                                true, required);
+    require(accepts(compiled, *conjunction, call("ab")) &&
+                !accepts(compiled, *conjunction, call("aaaa")),
+            "strict parameter domain disagrees with normalized conjunction");
+    const auto value = std::string("  你好\n");
+    frontend::ToolCallOutputDecoder decoder(automatic, 64);
+    const auto text = call(value);
+    for (char c : text) require(decoder.feed(std::string_view(&c, 1)).empty(), "tool bytes leaked");
+    auto result = decoder.finish();
+    require(result.tool_calls.size() == 1 &&
+                Json::parse(result.tool_calls[0].arguments_json)["x"] == value,
+            "raw string changed");
+    auto nested           = contract(schema({{"type", "object"},
+                                             {"properties", {{"s", {{"type", "string"}}}}},
+                                             {"required", {"s"}},
+                                             {"additionalProperties", false}}),
+                                     true, required);
+    const auto json_value = std::string(R"({"s": "</parameter>"})");
+    require(accepts(compiled, *nested, call(json_value)), "nested marker rejected");
+    frontend::ToolCallOutputDecoder json_decoder(nested, 64);
+    (void)json_decoder.feed(call(json_value));
+    require(Json::parse(json_decoder.finish().tool_calls[0].arguments_json)["x"]["s"] ==
+                "</parameter>",
+            "nested marker broke parser");
+    const auto two = call("2") + "\n" + call("3");
+    for (auto reason : {ninfer::FinishReason::OutputLimit, ninfer::FinishReason::Cancelled})
+        for (std::size_t cut = 0; cut < two.size(); ++cut) {
+            frontend::ToolCallOutputDecoder truncated(fixed, 64);
+            (void)truncated.feed(std::string_view(two).substr(0, cut));
+            const auto output = truncated.finish(reason);
+            require(output.tool_calls.size() == (cut >= call("2").size() ? 1 : 0),
+                    "interruption lost a complete call");
+        }
+    const auto seed = call("你好").substr(0, call("你好").size() - 20);
+    frontend::ToolCallOutputDecoder continuation(automatic, 64);
+    continuation.initialize_continuation(seed);
+    auto match = frontend::compile_tool_grammar(compiled, *automatic, {}, seed);
+    (void)continuation.feed(std::string_view(call("你好")).substr(seed.size()));
+    require(continuation.finish().tool_calls.size() == 1, "continuation did not complete the call");
+    bool rejected = false;
+    try {
+        (void)contract(schema({{"type", {"string", "null"}}}), true, required);
+    } catch (const ninfer::RequestError&) { rejected = true; }
+    require(rejected, "ambiguous top-level representation accepted");
+}
+} // namespace
+
+int main(int argc, char** argv) {
+    try {
+        if (argc == 2 && std::string_view(argv[1]) == "--probe") {
+            auto compiled = compiler();
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                Json response;
+                try {
+                    const auto input = Json::parse(line);
+                    ninfer::ToolChoice choice;
+                    choice.mode           = ninfer::ToolChoiceMode::Required;
+                    auto bound            = contract(input.at("schema"), true, choice);
+                    response["accepted"]  = Json::array();
+                    response["arguments"] = Json::array();
+                    for (const auto& text : input.at("candidates")) {
+                        bool allowed = accepts(compiled, *bound, text.get<std::string>());
+                        response["accepted"].push_back(allowed);
+                        if (allowed) {
+                            frontend::ToolCallOutputDecoder decode(bound, 64);
+                            (void)decode.feed(text.get<std::string>());
+                            response["arguments"].push_back(
+                                Json::parse(decode.finish().tool_calls[0].arguments_json));
+                        } else
+                            response["arguments"].push_back(nullptr);
+                    }
+                } catch (const std::exception& error) { response = {{"error", error.what()}}; }
+                std::cout << response.dump() << '\n';
+            }
+        } else {
+            run();
+            std::cout << "tool constraints passed\n";
+        }
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}

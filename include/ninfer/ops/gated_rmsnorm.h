@@ -1,10 +1,17 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
+#include <cstdint>
 
 namespace ninfer::ops {
+
+/// The gate activation of gated_rmsnorm.
+enum class RmsGate : std::uint8_t {
+    Silu,    ///< SiLU(z) = z * sigmoid(z) (Qwen3.5 GDN)
+    Sigmoid, ///< sigmoid(z)
+};
 
 /**
  * Applies RMS normalization over ne[0] and an elementwise SiLU gate. For each logical row r:
@@ -18,9 +25,17 @@ namespace ninfer::ops {
  * inputs. The BF16 output is promoted and compared directly with that result; output storage
  * rounding belongs to the Op's numerical criterion, not the oracle. Kernel reduction, staging,
  * and accumulator precision are implementation choices. There is no workspace or persistent state
- * side effect.
+ * side effect. `execution` supplies the stream and the selected device's positive physical SM
+ * count for launch selection.
  */
 void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
-                   cudaStream_t stream);
+                   DeviceExecutionView execution);
+
+/**
+ * The same contract with the gate chosen by `gate`: ideal[d,r] = x[d,r] * inv_r * weight[d] *
+ * act(z[d,r]) with act = SiLU (the form above) or sigmoid. Oracle and criterion are the same.
+ */
+void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, RmsGate gate, float eps,
+                   Tensor& out, DeviceExecutionView execution);
 
 } // namespace ninfer::ops

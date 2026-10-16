@@ -4,7 +4,7 @@
 // Match: contiguous request-major state and BF16 verification logits.
 // Algorithm assumptions: small vocabularies use one cooperative block; the
 // registered full-vocabulary stochastic route uses the sampling partial/group
-// pipeline and caller-owned workspace, while greedy commit remains one thread.
+// pipeline and caller-owned workspace. Sparse acceptance and emission use one warp per request.
 
 #include "ops/kernel/sampling_device.cuh"
 
@@ -14,6 +14,8 @@
 #include <cstdint>
 
 namespace ninfer::ops {
+
+inline constexpr int kSparseSpeculativeCandidates = 16;
 
 __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anchors,
                                                          const std::int32_t* drafts,
@@ -36,6 +38,30 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
     }
 }
 
+// One block per row. A flagged row takes the copy as its drafts and, with sparse planes, the
+// one-hot law of each copied token over 16 distinct candidate ids.
+__global__ void speculative_overlay_copy_proposals_kernel(
+    const std::int32_t* copy_rows, const std::int32_t* copy_drafts, std::int32_t* drafts,
+    std::int32_t* candidates, float* proposal_q, std::int32_t k, std::int32_t token_domain) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (copy_rows[row] == 0) { return; }
+    const std::int32_t* source = copy_drafts + static_cast<std::size_t>(row) * k;
+    for (int j = static_cast<int>(threadIdx.x); j < k; j += static_cast<int>(blockDim.x)) {
+        drafts[static_cast<std::size_t>(row) * k + j] = source[j];
+    }
+    if (candidates == nullptr) { return; }
+    const int planes = k * kSparseSpeculativeCandidates;
+    for (int i = static_cast<int>(threadIdx.x); i < planes; i += static_cast<int>(blockDim.x)) {
+        const int step      = i / kSparseSpeculativeCandidates;
+        const int slot      = i - step * kSparseSpeculativeCandidates;
+        std::int32_t id     = source[step] + slot;
+        id                  = id >= token_domain ? id - token_domain : id;
+        const std::size_t o = static_cast<std::size_t>(row) * planes + i;
+        candidates[o]       = id;
+        proposal_q[o]       = slot == 0 ? 1.0F : 0.0F;
+    }
+}
+
 template <typename T>
 __device__ inline T* speculative_workspace_offset(T* ptr, std::size_t byte_offset) {
     return ptr == nullptr
@@ -54,6 +80,277 @@ speculative_workspace_row(SamplingWorkspace workspace, std::size_t row_stride, s
     workspace.speculative_finalize_count =
         speculative_workspace_offset(workspace.speculative_finalize_count, offset);
     return workspace;
+}
+
+// selection_is_finite has no default on purpose. A diverged forward pass gives the selected column
+// an all-NaN logit row, which makes the acceptance comparisons meaningless as well as the
+// correction token, and the round must fail rather than license plausible-looking garbage. The
+// check used to be open-coded at each call site, so upstream's refactor into this helper silently
+// dropped it from every one; making it a required argument means a new call site cannot compile
+// without stating what it checked. Callers with no numeric in scope must pass true explicitly and
+// say why.
+template <bool UpdateTokenCounts>
+__device__ __forceinline__ void
+speculative_store_accept_result(const std::int32_t* row_drafts, std::int32_t k, std::int32_t row,
+                                std::int32_t accepted_count, std::int32_t terminal_token,
+                                std::int32_t* lengths, std::int32_t* anchors,
+                                std::int32_t* row_tokens, std::int32_t* licensed_counts,
+                                std::int32_t* accepted, const SamplingConfig* config,
+                                bool selection_is_finite) {
+    if (!selection_is_finite) {
+        for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
+        row_tokens[0]        = kSamplerNonFiniteToken;
+        licensed_counts[row] = 1;
+        accepted[row]        = 0;
+        anchors[row]         = kSamplerNonFiniteToken;
+        lengths[row] += 1;
+        return;
+    }
+    for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
+    for (int i = 0; i < accepted_count; ++i) { row_tokens[i] = row_drafts[i]; }
+    row_tokens[accepted_count] = terminal_token;
+
+    const int produced   = accepted_count + 1;
+    licensed_counts[row] = produced;
+    accepted[row]        = accepted_count;
+    anchors[row]         = terminal_token;
+    lengths[row] += produced;
+    if constexpr (UpdateTokenCounts) {
+        if (config->token_counts != nullptr) {
+            for (int i = 0; i < produced; ++i) {
+                atomicAdd(&config->token_counts[row_tokens[i]], 1);
+            }
+        }
+    }
+}
+
+// Every column a greedy round commits from must be finite, not only the terminal.
+//
+// Columns before the divergence point are accepted *because* the target's argmax matched the
+// draft. If such a column's logits are all NaN, that argmax is arbitrary, so the match is
+// meaningless and the round licenses a token the target never actually endorsed -- and then
+// advances past it, because a finite terminal further along still passes a terminal-only check.
+// Testing the whole committed span [0, accepted_count] closes that: the span is exactly the set of
+// columns whose verdicts the round is about to act on.
+//
+// `column_token(i)` returns the token this round would license at column i, so the caller decides
+// where that comes from -- target ids for the target-token routes, workspace.dist_idx for the
+// sampling-workspace ones.
+template <typename ColumnToken>
+__device__ __forceinline__ bool
+speculative_commit_span_is_finite(const __nv_bfloat16* row_logits, std::int32_t accepted_count,
+                                  std::int32_t physical_rows, ColumnToken column_token,
+                                  const SamplingConfig* mask_config = nullptr) {
+    for (int column = 0; column <= accepted_count; ++column) {
+        const std::int32_t token = column_token(column);
+        if (!sampling_selected_logit_is_finite(
+                row_logits, static_cast<std::int64_t>(column) * physical_rows, token)) {
+            return false;
+        }
+        // A token mask that licensed nothing at this position leaves an unlicensed winner.
+        if (mask_config != nullptr && !sampling_token_licensed(*mask_config, column, token)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+__device__ __forceinline__ float speculative_sparse_probability(const std::int32_t* candidate_ids,
+                                                                const float* proposal_q,
+                                                                std::int32_t token) {
+    float probability = 0.0f;
+#pragma unroll
+    for (int candidate = 0; candidate < kSparseSpeculativeCandidates; ++candidate) {
+        if (candidate_ids[candidate] == token) {
+            probability = proposal_q[candidate];
+            break;
+        }
+    }
+    return probability;
+}
+
+// One warp owns a request. Each draft's acceptance event is independent given the provided
+// path and its conditional p/q distributions; the first failed event determines the prefix.
+// selection_is_finite has no default, for the same reason speculative_store_accept_result does not:
+// a diverged forward pass gives the selected column an all-NaN row, and a round that licenses a
+// plausible-looking token from it is worse than one that fails. Requiring the argument means a new
+// caller cannot compile without stating what it checked.
+__device__ __forceinline__ void speculative_sparse_warp_store(const int* drafts, int k, int row,
+                                                              int accepted_count, int terminal,
+                                                              int* lengths, int* anchors,
+                                                              int* licensed_tokens,
+                                                              int* licensed_counts, int* accepted,
+                                                              bool selection_is_finite) {
+    const int lane = threadIdx.x & 31;
+    if (!selection_is_finite) {
+        // Same sentinel shape as the dense path: one licensed token, nothing accepted, the length
+        // still advances by one so the caller's frontier stays consistent.
+        if (lane <= k) {
+            licensed_tokens[row * (k + 1) + lane] = lane == 0 ? kSamplerNonFiniteToken : 0;
+        }
+        if (lane == 0) {
+            licensed_counts[row] = 1;
+            accepted[row]        = 0;
+            anchors[row]         = kSamplerNonFiniteToken;
+            lengths[row] += 1;
+        }
+        return;
+    }
+    if (lane <= k)
+        licensed_tokens[row * (k + 1) + lane] = lane < accepted_count    ? drafts[row * k + lane]
+                                                : lane == accepted_count ? terminal
+                                                                         : 0;
+    if (lane == 0) {
+        licensed_counts[row] = accepted_count + 1;
+        accepted[row]        = accepted_count;
+        anchors[row]         = terminal;
+        lengths[row] += accepted_count + 1;
+    }
+}
+
+// `logits` is the same verify-logit block the dense greedy path checks, laid out
+// [row][column][physical_rows]; `physical_rows` is its innermost stride. It is read only to test
+// the committed span for finiteness, so the greedy routes all refuse a NaN column alike.
+__device__ __forceinline__ void speculative_sparse_warp_greedy(
+    const int* target_tokens, const __nv_bfloat16* logits, const int* drafts, int* lengths,
+    int* anchors, int* licensed_tokens, int* licensed_counts, int* accepted, int row, int extent,
+    int k, int physical_rows) {
+    const int lane = threadIdx.x & 31;
+    const bool reject =
+        lane < extent && target_tokens[row * (k + 1) + lane] != drafts[row * k + lane];
+    const unsigned mask = __ballot_sync(0xffffffffU, reject);
+    const int a         = mask ? __ffs(mask) - 1 : extent;
+    const int terminal  = target_tokens[row * (k + 1) + a];
+    // `a` and `terminal` are warp-uniform -- `a` comes from a ballot, `terminal` from a uniform
+    // load -- so every lane computes the same answer here. That is deliberate: the alternative is
+    // computing it on one lane and shuffling, which costs more than the redundant load.
+    const __nv_bfloat16* row_logits =
+        logits + static_cast<std::int64_t>(row) * (k + 1) * physical_rows;
+    // One lane per column of the committed span, so the whole span costs a single ballot rather
+    // than the sequential loop the single-threaded routes need. `a <= extent <= k <= 15`, so the
+    // span always fits inside the warp.
+    const bool lane_is_non_finite =
+        lane <= a && !sampling_selected_logit_is_finite(
+                         row_logits, static_cast<std::int64_t>(lane) * physical_rows,
+                         target_tokens[row * (k + 1) + lane]);
+    const bool span_is_finite = __ballot_sync(0xffffffffU, lane_is_non_finite) == 0u;
+    speculative_sparse_warp_store(drafts, k, row, a, terminal, lengths, anchors, licensed_tokens,
+                                  licensed_counts, accepted, span_is_finite);
+}
+
+__global__ __launch_bounds__(256) void speculative_accept_sparse_warp_greedy_kernel(
+    const int* target_tokens, const __nv_bfloat16* logits, const int* drafts,
+    const int* current_extents, int* lengths, int* anchors, int* licensed_tokens,
+    int* licensed_counts, int* accepted, int k, int physical_rows) {
+    const int row    = threadIdx.x / 32;
+    const int extent = min(k, max(0, current_extents[row]));
+    speculative_sparse_warp_greedy(target_tokens, logits, drafts, lengths, anchors, licensed_tokens,
+                                   licensed_counts, accepted, row, extent, k, physical_rows);
+}
+
+__device__ __forceinline__ void speculative_sparse_warp_accept(
+    SamplingWorkspace workspace, const __nv_bfloat16* logits, const int* drafts,
+    const int* candidate_ids, const float* proposal_q, const SamplingConfig& cfg, int k, int row,
+    int extent, bool greedy, int* lengths, int* anchors, int* licensed_tokens, int* licensed_counts,
+    int* accepted, int physical_rows) {
+    const int lane       = threadIdx.x & 31;
+    const int old_length = lengths[row];
+    bool reject          = false;
+    if (lane < extent) {
+        const int d = drafts[row * k + lane];
+        if (greedy)
+            reject = workspace.dist_idx[sampling_dist_offset(lane, 0)] != d;
+        else {
+            const int support = workspace.dist_support[lane];
+            float pd          = 0.0f;
+            for (int j = 0; j < support; ++j) {
+                const int at = sampling_dist_offset(lane, j);
+                if (workspace.dist_idx[at] == d) {
+                    pd = workspace.dist_prob[at];
+                    break;
+                }
+            }
+            const int at   = (row * k + lane) * kSparseSpeculativeCandidates;
+            const float qd = speculative_sparse_probability(candidate_ids + at, proposal_q + at, d);
+            const float u  = sampling_uniform(cfg.seed, old_length + lane + 1,
+                                              kSamplePurposeSpeculativeAccept, 0);
+            reject         = !(pd >= qd || u * qd < pd);
+        }
+    }
+    const unsigned failures = __ballot_sync(0xffffffffU, reject);
+    const int a             = failures ? __ffs(failures) - 1 : extent;
+    int terminal;
+    // Whether the commit is backed by a finite selection. Tracked as a bool, not as the weight
+    // itself, because the greedy branch has no weight to carry: its producer writes only
+    // dist_idx (see the greedy store in the SparseProposal finalize kernel), so dist_prob at
+    // this offset is caller-owned scratch that this round never wrote. Reading it would make the
+    // guard depend on stale memory and could reject a perfectly good terminal -- worse than the
+    // gap it closes. Per-row greedy inside a mixed batch is a supported route, not a corner.
+    //
+    // The greedy branch instead tests the raw verify logit of the token it is about to license,
+    // which is the same source every other greedy route uses. This route is reached with penalties
+    // applied to the selecting score; the underlying logit is unaffected by that and is still what
+    // says whether the forward pass diverged.
+    bool terminal_is_finite;
+    if (greedy) {
+        terminal = workspace.dist_idx[sampling_dist_offset(a, 0)];
+        const __nv_bfloat16* row_logits =
+            logits + static_cast<std::int64_t>(row) * (k + 1) * physical_rows;
+        // The whole committed span, one lane per column, for the reason given at
+        // speculative_commit_span_is_finite: a matched column whose logits are all NaN matched by
+        // accident. The tokens come from dist_idx here rather than from target ids, because that
+        // is what this route's acceptance comparison above reads.
+        // A token mask that licensed nothing leaves an unlicensed winner; it is refused the same
+        // way.
+        const int lane_token = lane <= a ? workspace.dist_idx[sampling_dist_offset(lane, 0)] : 0;
+        const bool lane_is_non_finite =
+            lane <= a && (!sampling_selected_logit_is_finite(
+                              row_logits, static_cast<std::int64_t>(lane) * physical_rows,
+                              lane_token) ||
+                          !sampling_token_licensed(cfg, lane, lane_token));
+        terminal_is_finite = __ballot_sync(0xffffffffU, lane_is_non_finite) == 0u;
+    } else {
+        const int n  = workspace.dist_support[a];
+        int token    = 0;
+        float weight = 0.0f;
+        if (lane < n) {
+            const int at = sampling_dist_offset(a, lane);
+            token        = workspace.dist_idx[at];
+            weight       = workspace.dist_prob[at];
+            if (a < extent) {
+                const int q_at = (row * k + a) * kSparseSpeculativeCandidates;
+                weight         = fmaxf(weight - speculative_sparse_probability(candidate_ids + q_at,
+                                                                               proposal_q + q_at, token),
+                                       0.0f);
+            }
+        }
+        float cdf = weight;
+#pragma unroll
+        for (int offset = 1; offset < 32; offset *= 2) {
+            const float earlier = __shfl_up_sync(0xffffffffU, cdf, offset);
+            if (lane >= offset) cdf += earlier;
+        }
+        const float mass = __shfl_sync(0xffffffffU, cdf, 31);
+        const int purpose =
+            a < extent ? kSamplePurposeSpeculativeCorrection : kSamplePurposeSpeculativeBonus;
+        const float u           = sampling_uniform(cfg.seed, old_length + a + 1, purpose, 0);
+        const float goal        = u * mass;
+        const unsigned positive = __ballot_sync(0xffffffffU, lane < n && weight > 0.0f);
+        const unsigned candidates =
+            __ballot_sync(0xffffffffU, lane < n && weight > 0.0f && goal < cdf);
+        const int selected = !(mass > 0.0f) ? 0
+                             : candidates   ? __ffs(candidates) - 1
+                             : positive     ? 31 - __clz(positive)
+                                            : 0;
+        terminal           = __shfl_sync(0xffffffffU, token, selected);
+        // mass is the residual probability the selection drew from, and the stochastic branch does
+        // write dist_prob, so this one is real. A NaN column makes mass NaN, and `!(mass > 0.0f)`
+        // above already forces `selected` to 0 -- committing lane 0's token would be exactly the
+        // arbitrary licence this guard exists to prevent.
+        terminal_is_finite = sampling_value_is_finite(mass);
+    }
+    speculative_sparse_warp_store(drafts, k, row, a, terminal, lengths, anchors, licensed_tokens,
+                                  licensed_counts, accepted, terminal_is_finite);
 }
 
 // Commits the round's accepted tokens plus one correction/bonus token, then
@@ -86,28 +383,18 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
     const __nv_bfloat16* row_logits =
         logits + static_cast<std::int64_t>(row) * cols * physical_rows;
-    const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
-    if (!(cfg.temperature > 0.0f) && !penalties) {
+    if (!(cfg.temperature > 0.0f) && sampling_uses_raw_logits(cfg)) {
         if (tid == 0) {
             int a = 0;
             while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
             const int t_star = row_targets[a];
 
-            for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
-            for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
-            row_tokens[a] = t_star;
-
-            const int produced   = a + 1;
-            licensed_counts[row] = produced;
-            accepted[row]        = a;
-            anchors[row]         = t_star;
-            lengths[row] += produced;
-            if (cfg.token_counts != nullptr) {
-                for (int i = 0; i < produced; ++i) {
-                    atomicAdd(&cfg.token_counts[row_tokens[i]], 1);
-                }
-            }
+            const std::int64_t t_star_base = static_cast<std::int64_t>(a) * physical_rows;
+            speculative_store_accept_result<true>(
+                row_drafts, k, row, a, t_star, lengths, anchors, row_tokens, licensed_counts,
+                accepted, &cfg,
+                sampling_selected_logit_is_finite(row_logits, t_star_base, t_star));
         }
         return;
     }
@@ -124,6 +411,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     __shared__ int done_sh;
     __shared__ int tstar_sh;
     __shared__ int L_sh;
+    // Set when any column of the committed span selected a non-finite logit -- see
+    // speculative_commit_span_is_finite. Accumulated as the greedy loop below walks the columns,
+    // which is cheaper than a second pass over the same logits.
+    __shared__ int span_non_finite_sh;
 
     const int partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const int group_count    = sampler_group_count(partial_blocks);
@@ -131,10 +422,11 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     if (sampler_multiblock_ok(token_domain, cols, partial_blocks, group_count)) { return; }
 
     if (tid == 0) {
-        a_sh     = 0;
-        done_sh  = 0;
-        tstar_sh = 0;
-        L_sh     = lengths[row];
+        a_sh               = 0;
+        done_sh            = 0;
+        tstar_sh           = 0;
+        L_sh               = lengths[row];
+        span_non_finite_sh = 0;
     }
     __syncthreads();
 
@@ -164,6 +456,14 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
             }
             if (tid == 0) {
                 const int selected = red_idx[0];
+                // Every column this loop visits is part of the committed span: the ones that match
+                // are accepted, and the one that does not becomes the terminal. A NaN column's
+                // argmax is arbitrary, so a match against it is meaningless -- record it here
+                // rather than testing only the terminal after the loop.
+                if (!sampling_selected_logit_is_finite(row_logits, base, selected) ||
+                    !sampling_token_licensed(cfg, i, selected)) {
+                    span_non_finite_sh = 1;
+                }
                 if (i < extent && selected == row_drafts[i]) {
                     a_sh = i + 1;
                 } else {
@@ -178,20 +478,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         if (tid == 0) {
             const int a     = a_sh;
             const int tstar = tstar_sh;
-            const int L     = L_sh;
-            for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
-            for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
-            row_tokens[a]        = tstar;
-            const int produced   = a + 1;
-            licensed_counts[row] = produced;
-            accepted[row]        = a;
-            anchors[row]         = tstar;
-            lengths[row]         = L + produced;
-            if (cfg.token_counts != nullptr) {
-                for (int i = 0; i < produced; ++i) {
-                    atomicAdd(&cfg.token_counts[row_tokens[i]], 1);
-                }
-            }
+            speculative_store_accept_result<true>(
+                row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts,
+                accepted, &cfg, span_non_finite_sh == 0);
         }
         return;
     }
@@ -244,20 +533,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     if (tid == 0) {
         const int a     = a_sh;
         const int tstar = tstar_sh;
-        const int L     = L_sh;
-
-        for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
-        for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
-        row_tokens[a] = tstar;
-
-        const int produced   = a + 1;
-        licensed_counts[row] = produced;
-        accepted[row]        = a;
-        anchors[row]         = tstar;
-        lengths[row]         = L + produced;
-        if (cfg.token_counts != nullptr) {
-            for (int i = 0; i < produced; ++i) { atomicAdd(&cfg.token_counts[row_tokens[i]], 1); }
-        }
+        const std::int64_t tstar_base = static_cast<std::int64_t>(a) * physical_rows;
+        speculative_store_accept_result<true>(
+            row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts, accepted,
+            &cfg, sampling_selected_logit_is_finite(row_logits, tstar_base, tstar));
     }
 }
 
@@ -274,32 +553,47 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     if (col > extent) { return; }
     const SamplingConfig cfg = configs[row];
     const bool greedy        = !(cfg.temperature > 0.0f);
-    const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
-    if ((greedy && !penalties) || token_domain <= kSamplerTileItems) { return; }
+    const bool raw_scores    = sampling_uses_raw_logits(cfg);
+    if ((greedy && raw_scores) || token_domain <= kSamplerTileItems) { return; }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
     if (partial == 0 && threadIdx.x == 0) {
         workspace.group_done[col] = 0;
         if (col == 0) { *workspace.speculative_finalize_count = 0; }
     }
 
-    __shared__ typename SamplingPartialSort::TempStorage sort_storage;
+    __shared__ SamplingPartialTopKStorage topk_storage;
     __shared__ unsigned long long greedy_warp_keys[kSamplerBlock / 32];
-    unsigned long long keys[kSamplerItemsPerThread];
 
     const int cap                  = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     const std::int64_t base        = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
     const std::int32_t* row_drafts = drafts + row * k;
     const int tile_start           = partial * kSamplerPartialTileItems;
-    // Column col's penalty overlay is the first `col` drafts (see accept loop);
-    // applying it before top-k selection lets it change the candidate set, not
-    // just the post-truncation probabilities.
+    if (raw_scores) {
+        unsigned int keys[kSamplerItemsPerThread];
+#pragma unroll
+        for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+            const int tile_index = item * blockDim.x + threadIdx.x;
+            const int v          = tile_start + tile_index;
+            // raw_scores: no token mask and no penalty, so the BF16 logits are the scores.
+            keys[item] =
+                v < token_domain ? sampling_bf16_tile_sort_key(logits[base + v], tile_index) : 0u;
+        }
+        sampling_store_bf16_tile_topk(keys, cap, tile_start, workspace, col, partial,
+                                      topk_storage.bf16);
+        return;
+    }
+
+    unsigned long long keys[kSamplerItemsPerThread];
+    // Column col's penalty overlay is the first `col` drafts (see accept loop), and its token mask
+    // is the col-th mask; applying both before top-k selection lets them change the candidate set,
+    // not just the post-truncation probabilities.
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
-            const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg,
-                                                    row_drafts, col);
-            keys[item]    = sampling_sort_key(x, v);
+            const __nv_bfloat16 raw = logits[base + v];
+            keys[item]              = sampling_sort_key(
+                sampling_adjusted_logit(__bfloat162float(raw), v, cfg, row_drafts, col), v);
         } else {
             keys[item] = 0ull;
         }
@@ -317,24 +611,17 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
         }
         return;
     }
-    SamplingPartialSort(sort_storage).Sort(keys, SamplingKeyGreater{});
-
-#pragma unroll
-    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
-        const int rank = threadIdx.x * kSamplerItemsPerThread + item;
-        if (rank < cap) {
-            const int off               = sampling_partial_offset(workspace, col, partial, rank);
-            workspace.partial_keys[off] = keys[item];
-        }
-    }
+    sampling_store_tile_topk(keys, cap, workspace, col, partial, topk_storage.fp32);
 }
 
+template <bool SparseProposal>
 __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(
-    const std::int32_t* target_tokens, const std::int32_t* drafts,
-    const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
-    std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
-    const SamplingConfig* configs, std::int32_t token_domain, std::int32_t cols,
-    std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace,
+    const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
+    const std::int32_t* candidate_ids, const float* proposal_q, const std::int32_t* current_extents,
+    std::int32_t* lengths, std::int32_t* anchors, std::int32_t* licensed_tokens,
+    std::int32_t* licensed_counts, std::int32_t* accepted, const SamplingConfig* configs,
+    std::int32_t token_domain, std::int32_t cols, std::int32_t partial_blocks,
+    std::int32_t group_count, std::int32_t physical_rows, SamplingWorkspace workspace,
     std::size_t workspace_row_stride) {
     const int row   = static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
@@ -349,34 +636,42 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     const std::int32_t* row_drafts  = drafts + row * k;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
     if (token_domain <= kSamplerTileItems) { return; }
-    const bool greedy    = !(cfg.temperature > 0.0f);
-    const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+    const bool greedy = !(cfg.temperature > 0.0f);
 
-    if (greedy && !penalties) {
-        if (tid == 0 && col == 0 && group == 0) {
-            int a = 0;
-            while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
-            const int t_star = row_targets[a];
-            for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
-            for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
-            row_tokens[a]        = t_star;
-            const int produced   = a + 1;
-            licensed_counts[row] = produced;
-            accepted[row]        = a;
-            anchors[row]         = t_star;
-            lengths[row] += produced;
-            if (cfg.token_counts != nullptr) {
-                for (int i = 0; i < produced; ++i) {
-                    atomicAdd(&cfg.token_counts[row_tokens[i]], 1);
-                }
+    if (greedy && sampling_uses_raw_logits(cfg)) {
+        if constexpr (SparseProposal) {
+            if (tid < 32 && col == 0 && group == 0)
+                speculative_sparse_warp_greedy(target_tokens, logits, drafts, lengths, anchors,
+                                               licensed_tokens, licensed_counts, accepted, row,
+                                               extent, k, physical_rows);
+        } else {
+
+            if (tid == 0 && col == 0 && group == 0) {
+                int a = 0;
+                while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
+                const int t_star = row_targets[a];
+                // Dense only: this statement lives in the else of `if constexpr (SparseProposal)`, so it
+                // is instantiated with SparseProposal == false and token counts are updated.
+                // Spelled `true` rather than `!SparseProposal` because the double negative
+                // reads as if it could disable the counts here, which it cannot.
+                static_assert(!SparseProposal, "dense finalize path only");
+                const __nv_bfloat16* row_logits =
+                    logits + static_cast<std::int64_t>(row) * cols * physical_rows;
+                speculative_store_accept_result<true>(
+                    row_drafts, k, row, a, t_star, lengths, anchors, row_tokens, licensed_counts,
+                    accepted, &cfg,
+                    speculative_commit_span_is_finite(
+                        row_logits, a, physical_rows,
+                        [&](std::int32_t column) { return row_targets[column]; }));
             }
         }
         return;
     }
 
+
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
 
-    __shared__ typename SamplingGroupSort::TempStorage sort_storage;
+    __shared__ SamplingTileTopKStorage topk_storage;
     __shared__ float cand_val[kSamplerCandidateCap];
     __shared__ int cand_idx[kSamplerCandidateCap];
     __shared__ float prob[kSamplerCandidateCap];
@@ -405,17 +700,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             keys[item] = 0ull;
         }
     }
-    SamplingGroupSort(sort_storage).Sort(keys, SamplingKeyGreater{});
-
-#pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
-        const int rank = tid * kSamplerGroupItemsPerThread + item;
-        if (rank < cap) {
-            const int out_off =
-                sampling_partial_offset(workspace, col, partial_blocks + group, rank);
-            workspace.partial_keys[out_off] = keys[item];
-        }
-    }
+    sampling_store_tile_topk(keys, cap, workspace, col, partial_blocks + group, topk_storage);
     __syncthreads();
 
     if (tid == 0) {
@@ -439,49 +724,160 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             keys[item] = 0ull;
         }
     }
-    SamplingGroupSort(sort_storage).Sort(keys, SamplingKeyGreater{});
+    sampling_store_tile_topk(keys, cap, workspace, col, partial_blocks + group, topk_storage);
+    __syncthreads();
 
-#pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
-        const int rank = tid * kSamplerGroupItemsPerThread + item;
-        if (rank < cap) {
-            cand_val[rank] = sampling_key_float(keys[item]);
-            cand_idx[rank] = sampling_key_index(keys[item]);
-        }
+    if (tid < cap) {
+        const int off = sampling_partial_offset(workspace, col, partial_blocks + group, tid);
+        const unsigned long long key = workspace.partial_keys[off];
+        cand_val[tid]                = sampling_key_float(key);
+        cand_idx[tid]                = sampling_key_index(key);
     }
     __syncthreads();
 
-    if (greedy) {
+    if constexpr (SparseProposal) {
+        __shared__ int last_column;
+        if (greedy) {
+            if (tid == 0) {
+                workspace.dist_idx[sampling_dist_offset(col, 0)] = cand_idx[0];
+                workspace.group_done[col]                        = 0;
+                __threadfence();
+                last_column = atomicAdd(workspace.speculative_finalize_count, 1) + 1 == extent + 1;
+            }
+            __syncthreads();
+            if (last_column && tid < 32)
+                speculative_sparse_warp_accept(workspace, logits, drafts, candidate_ids, proposal_q,
+                                               cfg, k, row, extent, true, lengths, anchors,
+                                               licensed_tokens, licensed_counts, accepted,
+                                               physical_rows);
+            if (last_column && tid == 0) *workspace.speculative_finalize_count = 0;
+            return;
+        }
+        sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
         if (tid == 0) {
-            workspace.dist_idx[sampling_dist_offset(col, 0)] = cand_idx[0];
-            workspace.group_done[col]                        = 0;
+            workspace.dist_support[col] = n_support;
+            for (int j = 0; j < n_support; ++j) {
+                const int at            = sampling_dist_offset(col, j);
+                workspace.dist_idx[at]  = cand_idx[j];
+                workspace.dist_prob[at] = prob[j];
+            }
+            workspace.group_done[col] = 0;
+            __threadfence();
+            last_column = atomicAdd(workspace.speculative_finalize_count, 1) + 1 == extent + 1;
+        }
+        __syncthreads();
+        if (last_column && tid < 32)
+            speculative_sparse_warp_accept(workspace, logits, drafts, candidate_ids, proposal_q, cfg,
+                                           k, row, extent, false, lengths, anchors, licensed_tokens,
+                                           licensed_counts, accepted, physical_rows);
+        if (last_column && tid == 0) *workspace.speculative_finalize_count = 0;
+        return;
+    } else {
+
+        if (greedy) {
+            if (tid == 0) {
+                workspace.dist_idx[sampling_dist_offset(col, 0)] = cand_idx[0];
+                workspace.group_done[col]                        = 0;
+                __threadfence();
+                const int done_cols = atomicAdd(workspace.speculative_finalize_count, 1) + 1;
+                if (done_cols == extent + 1) {
+                    int a     = 0;
+                    int tstar = 0;
+                    for (int i = 0; i <= extent; ++i) {
+                        const int selected = workspace.dist_idx[sampling_dist_offset(i, 0)];
+                        if (i < extent && selected == row_drafts[i]) {
+                            a = i + 1;
+                            continue;
+                        }
+                        tstar = selected;
+                        break;
+                    }
+                    // This is the penalized greedy route: presence/frequency penalties changed the
+                    // score that selected tstar, but the raw verify logit is still what says
+                    // whether the forward pass diverged, and a NaN row is NaN before any penalty is
+                    // applied. The greedy branch writes only dist_idx, so there is no probability
+                    // to test -- but the logits themselves are in scope, which is what the
+                    // no-penalty route above tests too.
+                    // Dense only: this statement lives in the else of `if constexpr (SparseProposal)`, so it
+                    // is instantiated with SparseProposal == false and token counts are updated.
+                    // Spelled `true` rather than `!SparseProposal` because the double negative
+                    // reads as if it could disable the counts here, which it cannot.
+                    static_assert(!SparseProposal, "dense finalize path only");
+                    const __nv_bfloat16* row_logits =
+                        logits + static_cast<std::int64_t>(row) * cols * physical_rows;
+                    speculative_store_accept_result<true>(
+                        row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts,
+                        accepted, &cfg,
+                        speculative_commit_span_is_finite(
+                            row_logits, a, physical_rows,
+                            [&](std::int32_t column) {
+                                return workspace.dist_idx[sampling_dist_offset(column, 0)];
+                            },
+                            &cfg));
+                    *workspace.speculative_finalize_count = 0;
+                }
+            }
+            return;
+        }
+
+        sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
+
+        if (tid == 0) {
+            workspace.dist_support[col] = n_support;
+            for (int j = 0; j < n_support; ++j) {
+                const int off            = sampling_dist_offset(col, j);
+                workspace.dist_idx[off]  = cand_idx[j];
+                workspace.dist_prob[off] = prob[j];
+            }
+            workspace.group_done[col] = 0;
             __threadfence();
             const int done_cols = atomicAdd(workspace.speculative_finalize_count, 1) + 1;
             if (done_cols == extent + 1) {
-                int a     = 0;
-                int tstar = 0;
+                const int L      = lengths[row];
+                int a            = 0;
+                int tstar        = 0;
+                float tstar_prob = 0.0f;
                 for (int i = 0; i <= extent; ++i) {
-                    const int selected = workspace.dist_idx[sampling_dist_offset(i, 0)];
-                    if (i < extent && selected == row_drafts[i]) {
-                        a = i + 1;
-                        continue;
+                    const int n            = workspace.dist_support[i];
+                    const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
+                    const float* dist_prob = workspace.dist_prob + sampling_dist_offset(i, 0);
+                    if (i < extent) {
+                        const int d = row_drafts[i];
+                        float pd    = 0.0f;
+                        for (int j = 0; j < n; ++j) {
+                            if (dist_idx[j] == d) {
+                                pd = dist_prob[j];
+                                break;
+                            }
+                        }
+                        const float u           = sampling_uniform(cfg.seed, L + i + 1,
+                                                                   kSamplePurposeSpeculativeAccept, 0u);
+                        const bool accept_draft = u < pd;
+                        if (accept_draft) {
+                            a = i + 1;
+                            continue;
+                        }
+                        const float ur = sampling_uniform(cfg.seed, L + i + 1,
+                                                          kSamplePurposeSpeculativeCorrection, 0u);
+
+                        tstar      = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
+                        tstar_prob = dist_prob[0];
+
+                        break;
                     }
-                    tstar = selected;
-                    break;
+                    const float u = sampling_uniform(cfg.seed, L + extent + 1,
+                                                     kSamplePurposeSpeculativeBonus, 0u);
+                    tstar         = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
+                    tstar_prob    = dist_prob[0];
                 }
-                for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
-                for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
-                row_tokens[a]        = tstar;
-                const int produced   = a + 1;
-                licensed_counts[row] = produced;
-                accepted[row]        = a;
-                anchors[row]         = tstar;
-                lengths[row] += produced;
-                if (cfg.token_counts != nullptr) {
-                    for (int i = 0; i < produced; ++i) {
-                        atomicAdd(&cfg.token_counts[row_tokens[i]], 1);
-                    }
-                }
+                // Dense only: this statement lives in the else of `if constexpr (SparseProposal)`, so it
+                // is instantiated with SparseProposal == false and token counts are updated.
+                // Spelled `true` rather than `!SparseProposal` because the double negative
+                // reads as if it could disable the counts here, which it cannot.
+                static_assert(!SparseProposal, "dense finalize path only");
+                speculative_store_accept_result<true>(
+                    row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts,
+                    accepted, &cfg, sampling_value_is_finite(tstar_prob));
                 *workspace.speculative_finalize_count = 0;
             }
         }
@@ -504,6 +900,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             const int L = lengths[row];
             int a       = 0;
             int tstar   = 0;
+            float tstar_prob = 0.0f;
             for (int i = 0; i <= extent; ++i) {
                 const int n            = workspace.dist_support[i];
                 const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
@@ -526,25 +923,17 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     const float ur = sampling_uniform(cfg.seed, L + i + 1,
                                                       kSamplePurposeSpeculativeCorrection, 0u);
                     tstar          = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
+                    tstar_prob     = dist_prob[0];
                     break;
                 }
                 const float u =
                     sampling_uniform(cfg.seed, L + extent + 1, kSamplePurposeSpeculativeBonus, 0u);
-                tstar = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
+                tstar      = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
+                tstar_prob = dist_prob[0];
             }
-            for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
-            for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
-            row_tokens[a]        = tstar;
-            const int produced   = a + 1;
-            licensed_counts[row] = produced;
-            accepted[row]        = a;
-            anchors[row]         = tstar;
-            lengths[row]         = L + produced;
-            if (cfg.token_counts != nullptr) {
-                for (int i = 0; i < produced; ++i) {
-                    atomicAdd(&cfg.token_counts[row_tokens[i]], 1);
-                }
-            }
+            speculative_store_accept_result<true>(row_drafts, k, row, a, tstar, lengths, anchors,
+                                                  row_tokens, licensed_counts, accepted, &cfg,
+                                                  sampling_value_is_finite(tstar_prob));
             *workspace.speculative_finalize_count = 0;
         }
     }

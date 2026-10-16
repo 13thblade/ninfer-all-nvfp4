@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 
@@ -20,8 +21,63 @@ namespace ninfer::ops {
 enum class LinearPolicy : std::uint8_t {
     A16Only, ///< Admit only A16 compute profiles.
     AllowA8, ///< Admit either A16 or A8 compute profiles.
-    AllowA4, ///< Admit either A16 or A4 compute profiles.
+    AllowA4, ///< Admit A16, A8 or A4 compute profiles.
+    /// Admit either A16 or integer-A8 compute profiles. Distinct from AllowA8, which selects the
+    /// FP8 activation path against FP8 weights; this one quantises activations to s8 with one
+    /// scale per weight group and feeds groupwise-int weights to the integer tensor cores. Held
+    /// to the same A8 activation allowance.
+    AllowA8Int,
+    /// AllowA8Int plus the integer small-T route for the 27B gate_up at decode and verify widths
+    /// (ops/linear/q4/q4_small_t_mma_i8.cuh). Separate because that route is a quality trade the
+    /// prefill one is not asked to carry: it applies s8 activation quantisation to every decode
+    /// step rather than to full prefill tiles only, so it is opt-in per engine.
+    AllowA8IntDecode,
+    /// AllowA8Int plus the cuBLAS prefill route at wide token counts: the weight is materialised as
+    /// int8 with one scale per row and the GEMM handed to cuBLAS, which runs it about twice as fast
+    /// as this fork's own integer mainloop can. It is a further quality trade -- per-row weight
+    /// scales and per-token activation scales, where the integer route carries per-group ones -- so
+    /// it is opt-in per engine, and it falls back to AllowA8Int below the width where it pays.
+    AllowPrefillCublas,
 };
+
+[[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+           policy == LinearPolicy::AllowA4 || policy == LinearPolicy::AllowA8Int ||
+           policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowPrefillCublas;
+}
+
+[[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowA8 || policy == LinearPolicy::AllowA4;
+}
+
+[[nodiscard]] constexpr bool allows_a4(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowA4;
+}
+
+/// Integer-A8 (s8 activation, groupwise-int weight) profiles. Never implies the FP8 A8 path.
+[[nodiscard]] constexpr bool allows_a8_int(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowA8Int || policy == LinearPolicy::AllowA8IntDecode ||
+           policy == LinearPolicy::AllowPrefillCublas;
+}
+
+/// The cuBLAS prefill route. Only ever admitted above `kCublasPrefillMinTokens`, because its
+/// dequantise pass is weight-sized and has to be amortised over the tokens in the call.
+[[nodiscard]] constexpr bool allows_cublas_prefill(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowPrefillCublas;
+}
+
+/// Below this width the route can lose to the route it replaces: the dequantise pass costs the same
+/// whatever the token count, so a narrow call pays for it without the GEMM to amortise it. Measured
+/// on the 27B shapes (RTX 3090, ninfer_w4_cublas_prefill_bench), the route it replaces below 512 is
+/// the A8 integer mainloop only at multiples of 128 and the A16 mainloop everywhere else. Against
+/// that, the cuBLAS route wins on every shape from 72 unaligned tokens (1.1-1.9x), and from 129 to
+/// 511 by 1.4-2.8x unaligned and 0.99-1.9x at the aligned 256 and 384. The one real loss above 64
+/// is an aligned 128, where it runs gate_up at 0.74x of the A8 route.
+///
+/// 129 is also the floor this gate may not go below: a decode or verify round runs up to
+/// kMaximumConcurrency lanes of draft window + 1 tokens, 8 x 16 = 128 columns, through these same
+/// Ops and policies, and those widths must stay off the route (startup.cpp asserts it).
+inline constexpr std::int32_t kCublasPrefillMinTokens = 129;
 
 /**
  * Returns the caller-owned transient capacity required by Linear for every T in the inclusive
@@ -55,16 +111,24 @@ enum class LinearPolicy : std::uint8_t {
  * no bias, activation, residual addition, or transpose mode.
  *
  * @par Supported execution domain
- * Registered execution uses RowSplit Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, or W8G32_F16S weights
- * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16S weights, plus
- * registered contiguous BF16_CTRL problems. Each format owns a finite registry of exact physical
+ * Registered execution uses RowSplit Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, or Q8_G32_FP16 weights
+ * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16 weights, plus
+ * registered contiguous BF16 problems. Each format owns a finite registry of exact physical
  * weight problems and selects its kernel internally; a valid encoding and alignment do not imply
  * arbitrary N/K support. FP8 currently registers `[N,K]` in `{[14336,5120], [16384,5120],
  * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4
- * problems register the five non-vocabulary FP8 geometries and accept every positive T. Text and
- * MTP packed-weight problems accept every positive column extent T. Registered Vision problems
- * accept raw-patch P in `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does
- * not inherently represent a text token. FP32_CTRL is unsupported.
+ * problems register the five non-vocabulary FP8 geometries and accept every positive T. Q8 and
+ * BF16 register the exact physical N/K problems in their format-owned shape registries. Text/MTP
+ * problems accept every positive column extent T. Registered Vision problems accept raw-patch P in
+ * `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does not inherently
+ * represent a text token. FP32 is unsupported.
+ *
+ * GGML block formats in layout `ggml_blocks_v1` (tensor-formats.md Section 3.5) register the dense
+ * projections of Qwen3.8-Flash-Next at every positive T: GGML_IQ4_XS and GGML_IQ3_S at `[N,K]` in
+ * `{[10240,2560], [6144,2560], [12288,2560], [512,2560], [2560,6144], [640,2560]}`, GGML_Q6_K at
+ * `{[6144,2560], [512,2560], [2560,6144], [640,2560]}`, and GGML_IQ4_NL, GGML_Q8_0 and GGML_Q2_0
+ * at `[2560,640]`. The weight view is the codes-only native form (no scale or high plane); IQ4_XS
+ * rows are 8-byte aligned, the others 2-byte aligned.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
@@ -76,18 +140,28 @@ enum class LinearPolicy : std::uint8_t {
  * activation-compute path; none is copied into the oracle. Kernel, schedule, template instance,
  * host launcher, and T region do not create separate criteria inside one path.
  *
+ * GGML block formats are the exception: their activation enters through the Q8_1 cast, a semantic
+ * boundary of these formats, so the ideal result replaces `FP32(x)` with its cast. For every column
+ * t and every group of 32 consecutive k (k = 32g..32g+31), with a = max |FP32(x_{k,t})| over the
+ * group, d = a / 127 and q_{k,t} = rint(FP32(x_{k,t}) * (127 / a)) -- FP32 divisions and product,
+ * rounding to nearest with ties to even, saturated to [-127, 127], q = 0 when a = 0; a group with
+ * a < 2^-100 (where 127 / a would overflow) first scales a and x by 2^100, which is exact -- the
+ * ideal is
+ * `sum_k FP32Dequant(w)_{n,k} * q_{k,t} * d_{g,t}` evaluated exactly. The oracle applies the same
+ * cast to the represented activation; FP32Dequant is ggml's reference `dequantize_row_*`.
+ * Non-finite activations give unspecified results.
+ *
  * @par Compute policy
  * `policy` specifies the permitted private activation-compute set. A permission does not require a
  * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
- * choice. BF16_CTRL admits only LinearPolicy::A16Only. Registered Q4/Q5/Q6/W8 formats admit
- * LinearPolicy::A16Only and LinearPolicy::AllowA8. The five non-vocabulary FP8 problems admit the
- * same two policies at every positive T. AllowA8 resolves `[14336,5120]` to A16 through T=11 and
- * A8 from T=12; `[16384,5120]` to A16 through T=10 and A8 from T=11; `[34816,5120]` to A8 at T=1,
- * A16 at T=2..4, and A8 from T=5; both `[5120,6144]` and `[5120,17408]` resolve T<25 to A16 and
- * T>=25 to A8. FP8 `[248320,5120]` admits A16Only, AllowA8, and AllowA4; every policy retains A16
- * compute at every positive T. NVFP4 admits A16Only and AllowA4; AllowA4 permits the private
- * resolver to select either a qualified A16 route or activation quantization to NVFP4 at every
- * positive T. The selected route depends only on the registered problem and T.
+ * choice. Every policy permits the existing A16 implementations of BF16 and Q4/Q5/Q6/Q8.
+ * FP8 accepts all three policies; AllowA8 and AllowA4 permit the private resolver to select a
+ * qualified A16 or A8 route for the registered problem and T. FP8 `[248320,5120]` retains A16
+ * compute under every policy at every positive T. NVFP4 uses A16 for A16Only and
+ * AllowA8; AllowA4 permits the private resolver to select either a qualified A16 route or
+ * activation quantization to NVFP4 at every positive T. GGML block formats register only the Q8_1
+ * (A8) profile above: AllowA8 and AllowA4 admit it, and A16Only, including the A16 convenience
+ * overload, is rejected for them. The selected route depends only on the registered problem and T.
  *
  * @par Workspace
  * `workspace` is caller-owned call-scoped transient storage sized by

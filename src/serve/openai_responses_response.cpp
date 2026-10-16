@@ -1,4 +1,5 @@
 #include "serve/openai_responses.h"
+#include "product/constraint_observation.h"
 
 #include "serve/generation_service.h"
 #include "serve/openai_common.h"
@@ -31,6 +32,42 @@ std::string response_status(ninfer::FinishReason reason) {
     return "failed";
 }
 
+Json output_text_part(const std::string& text) {
+    return Json{{"type", "output_text"},
+                {"annotations", Json::array()},
+                {"logprobs", Json::array()},
+                {"text", text}};
+}
+
+// Response.error.code is a closed enum on the wire; engine/runtime failure codes outside it are
+// reported as server_error and keep their detail in the message.
+std::string response_error_code(const std::string& code) {
+    static constexpr std::string_view known[] = {"server_error",
+                                                 "rate_limit_exceeded",
+                                                 "invalid_prompt",
+                                                 "data_residency_mismatch",
+                                                 "bio_policy",
+                                                 "misalignment_policy_violation",
+                                                 "vector_store_timeout",
+                                                 "invalid_image",
+                                                 "invalid_image_format",
+                                                 "invalid_base64_image",
+                                                 "invalid_image_url",
+                                                 "image_too_large",
+                                                 "image_too_small",
+                                                 "image_parse_error",
+                                                 "image_content_policy_violation",
+                                                 "invalid_image_mode",
+                                                 "image_file_too_large",
+                                                 "unsupported_image_media_type",
+                                                 "empty_image_file",
+                                                 "failed_to_download_image",
+                                                 "image_file_not_found"};
+    return std::find(std::begin(known), std::end(known), code) != std::end(known)
+               ? code
+               : "server_error";
+}
+
 struct ItemIds {
     std::string reasoning;
     std::string message;
@@ -49,6 +86,30 @@ void add_wire_function_identity(Json& object, const OpenAIResponsesCreateRequest
     if (position->second.wire_namespace) { object["namespace"] = *position->second.wire_namespace; }
 }
 
+bool is_custom_tool(const OpenAIResponsesCreateRequest& request, std::string_view engine_name) {
+    const auto position = request.tool_identities.find(std::string(engine_name));
+    return position != request.tool_identities.end() && position->second.custom;
+}
+
+// The output Item of one generated call: a function_call, or a custom_tool_call with its raw input.
+Json tool_call_item(const OpenAIResponsesCreateRequest& request,
+                    const ninfer::GeneratedToolCall& call, const std::string& id,
+                    const std::string& call_id, const char* status, bool empty) {
+    Json item = is_custom_tool(request, call.name)
+                    ? Json{{"id", id},
+                           {"type", "custom_tool_call"},
+                           {"status", status},
+                           {"call_id", call_id},
+                           {"input", empty ? std::string() : custom_tool_input(call)}}
+                    : Json{{"id", id},
+                           {"type", "function_call"},
+                           {"status", status},
+                           {"call_id", call_id},
+                           {"arguments", empty ? std::string() : call.arguments_json}};
+    add_wire_function_identity(item, request, call.name);
+    return item;
+}
+
 Json response_common(const std::string& id, std::int64_t created_at,
                      const OpenAIResponsesCreateRequest& request,
                      const OpenAIResponsesRuntimeValues& runtime) {
@@ -61,6 +122,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"id", id},
         {"object", "response"},
         {"created_at", created_at},
+        {"access_programs", nullptr},
         {"background", false},
         {"instructions",
          request.prompt.instructions ? Json(*request.prompt.instructions) : Json(nullptr)},
@@ -78,7 +140,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"service_tier", "default"},
         {"store", request.store},
         {"temperature", runtime.temperature},
-        {"text", Json{{"format", Json{{"type", "text"}}}}},
+        {"text", Json{{"format", request.text_format}}},
         {"tool_choice", request.tool_choice},
         {"tools", request.tools},
         {"top_logprobs", 0},
@@ -121,28 +183,22 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
                  {"type", "message"},
                  {"status", item_status},
                  {"role", "assistant"},
-                 {"content", Json::array({Json{{"type", "output_text"},
-                                               {"annotations", Json::array()},
-                                               {"text", outcome.text}}})}});
+                 {"content", Json::array({output_text_part(outcome.text)})}});
     }
 
     ids.function_calls.resize(outcome.tool_calls.size());
     ids.call_ids.resize(outcome.tool_calls.size());
     for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) {
+        const ninfer::GeneratedToolCall& call = outcome.tool_calls[index];
         if (ids.function_calls[index].empty()) {
-            ids.function_calls[index] = new_openai_response_item_id("fc");
+            ids.function_calls[index] =
+                new_openai_response_item_id(is_custom_tool(request, call.name) ? "ctc" : "fc");
         }
         if (ids.call_ids[index].empty()) {
             ids.call_ids[index] = new_openai_response_item_id("call");
         }
-        const ninfer::GeneratedToolCall& call = outcome.tool_calls[index];
-        Json item                             = {{"id", ids.function_calls[index]},
-                                                 {"type", "function_call"},
-                                                 {"status", "completed"},
-                                                 {"call_id", ids.call_ids[index]},
-                                                 {"arguments", call.arguments_json}};
-        add_wire_function_identity(item, request, call.name);
-        built.output_items.push_back(std::move(item));
+        built.output_items.push_back(tool_call_item(request, call, ids.function_calls[index],
+                                                    ids.call_ids[index], "completed", false));
     }
 
     if (!outcome.reasoning.empty() || !outcome.text.empty() || !outcome.tool_calls.empty() ||
@@ -153,9 +209,11 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
         history.tool_calls.reserve(outcome.tool_calls.size());
         for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) {
             const ninfer::GeneratedToolCall& call = outcome.tool_calls[index];
-            history.tool_calls.push_back(ToolCall{.id             = ids.call_ids[index],
-                                                  .name           = call.name,
-                                                  .arguments_json = call.arguments_json});
+            history.tool_calls.push_back(
+                ToolCall{.id             = ids.call_ids[index],
+                         .name           = call.name,
+                         .arguments_json = call.arguments_json,
+                         .custom         = is_custom_tool(request, call.name)});
         }
         if (!outcome.text.empty()) {
             ContentPart part;
@@ -179,11 +237,14 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
     const int cached_tokens   = std::clamp(observed_cached, 0, outcome.prompt_tokens);
     response["usage"] =
         Json{{"input_tokens", outcome.prompt_tokens},
-             {"input_tokens_details", Json{{"cached_tokens", cached_tokens}}},
+             {"input_tokens_details",
+              Json{{"cached_tokens", cached_tokens}, {"cache_write_tokens", 0}}},
              {"output_tokens", outcome.completion_tokens},
              {"output_tokens_details", Json{{"reasoning_tokens", outcome.reasoning_tokens}}},
              {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens}};
     built.body = std::move(response);
+    if (outcome.constraint)
+        built.body["constraint"] = product::constraint_observation_json(outcome.constraint);
     return built;
 }
 
@@ -283,7 +344,7 @@ public:
                            {"status", "in_progress"},
                            {"role", "assistant"},
                            {"content", Json::array()}};
-        const Json part = {{"type", "output_text"}, {"annotations", Json::array()}, {"text", ""}};
+        const Json part = output_text_part("");
         return {sse(event("response.output_item.added",
                           Json{{"output_index", message_index}, {"item", item}})),
                 sse(event("response.content_part.added", Json{{"item_id", ids.message},
@@ -297,8 +358,7 @@ public:
         if (!message_started || message_done) { return {}; }
         message_done    = true;
         content_text    = final_text;
-        const Json part = {
-            {"type", "output_text"}, {"annotations", Json::array()}, {"text", content_text}};
+        const Json part = output_text_part(content_text);
         const Json item = {{"id", ids.message},
                            {"type", "message"},
                            {"status", item_status},
@@ -443,20 +503,36 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
     impl_->ids.function_calls.reserve(outcome.tool_calls.size());
     impl_->ids.call_ids.reserve(outcome.tool_calls.size());
     for (const ninfer::GeneratedToolCall& call : outcome.tool_calls) {
-        const std::string item_id = new_openai_response_item_id("fc");
+        const bool custom         = is_custom_tool(impl_->request, call.name);
+        const std::string item_id = new_openai_response_item_id(custom ? "ctc" : "fc");
         const std::string call_id = new_openai_response_item_id("call");
         impl_->ids.function_calls.push_back(item_id);
         impl_->ids.call_ids.push_back(call_id);
         const int output_index = impl_->next_output_index++;
-        Json added_item        = {{"id", item_id},
-                                  {"type", "function_call"},
-                                  {"status", "in_progress"},
-                                  {"call_id", call_id},
-                                  {"arguments", ""}};
-        add_wire_function_identity(added_item, impl_->request, call.name);
-        finished.events_before_terminal.push_back(
-            sse(impl_->event("response.output_item.added",
-                             Json{{"output_index", output_index}, {"item", added_item}})));
+        finished.events_before_terminal.push_back(sse(impl_->event(
+            "response.output_item.added",
+            Json{{"output_index", output_index},
+                 {"item",
+                  tool_call_item(impl_->request, call, item_id, call_id, "in_progress", true)}})));
+        if (custom) {
+            // A custom tool's input streams through the custom_tool_call_input events, which
+            // carry the raw text rather than JSON arguments.
+            const std::string input = custom_tool_input(call);
+            if (!input.empty()) {
+                finished.events_before_terminal.push_back(sse(impl_->event(
+                    "response.custom_tool_call_input.delta",
+                    Json{{"item_id", item_id}, {"output_index", output_index}, {"delta", input}})));
+            }
+            finished.events_before_terminal.push_back(sse(impl_->event(
+                "response.custom_tool_call_input.done",
+                Json{{"item_id", item_id}, {"output_index", output_index}, {"input", input}})));
+            finished.events_before_terminal.push_back(sse(impl_->event(
+                "response.output_item.done",
+                Json{{"output_index", output_index},
+                     {"item",
+                      tool_call_item(impl_->request, call, item_id, call_id, "completed", false)}})));
+            continue;
+        }
         if (!call.arguments_json.empty()) {
             finished.events_before_terminal.push_back(sse(impl_->event(
                 "response.function_call_arguments.delta", Json{{"item_id", item_id},
@@ -506,8 +582,8 @@ std::string OpenAIResponsesEventStream::failed(const ApiError& error) {
         in_progress_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime);
     response["status"]       = "failed";
     response["completed_at"] = nullptr;
-    response["error"]        = Json{{"code", error.code.empty() ? Json(nullptr) : Json(error.code)},
-                                    {"message", error.message}};
+    response["error"] =
+        Json{{"code", response_error_code(error.code)}, {"message", error.message}};
     return sse(impl_->event("response.failed", Json{{"response", response}}));
 }
 

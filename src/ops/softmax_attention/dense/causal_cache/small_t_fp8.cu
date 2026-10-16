@@ -4,26 +4,13 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_fp8.cuh"
+#include "ops/kv_cache/plane_types.h"
 
 #include <cstdint>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
-
-PagedKVBatchLayerView fp8_single_row_batch_view(const PagedKVLayerView& cache) {
-    return {
-        .k_pages       = cache.k_pages,
-        .v_pages       = cache.v_pages,
-        .k_scale_pages = cache.k_scale_pages,
-        .v_scale_pages = cache.v_scale_pages,
-        .block_tables  = cache.block_table.view({cache.block_table.ne[0], 1}),
-        .head_dim      = cache.head_dim,
-        .num_kv_heads  = cache.num_kv_heads,
-        .dtype         = cache.dtype,
-        .quant_group   = cache.quant_group,
-    };
-}
 
 template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
 void launch_fp8_partial(const Tensor& q, CacheInput input, const Tensor& positions, float scale,
@@ -33,24 +20,35 @@ void launch_fp8_partial(const Tensor& q, CacheInput input, const Tensor& positio
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
     constexpr int Warps                = RowTiles == 3 ? 12 : 8;
-    constexpr int KeyBlock             = TokenTile == 1 ? 32 : 64;
+    // KeyBlock=64 (used for TokenTile>1 on this fork's other small_t kernels) would need
+    // 6*64*256 = 96KiB of dynamic shared memory here on top of ~30KiB static (q_s/p_s/etc), since
+    // unlike those kernels this one keeps a real dequantized BF16 copy of K (not just V) beside
+    // its raw FP8 staging buffer -- over sm_86/sm_89's ~99KiB-per-block budget. KeyBlock=32 (this
+    // fork's existing T=1 configuration) keeps everything else about the kernel unchanged and
+    // fits comfortably (~78KiB total) at the cost of more, smaller key-tile iterations.
+    constexpr int KeyBlock             = 32;
     constexpr int MinBlocks            = TokenTile == 1 ? 2 : 1;
-    constexpr std::size_t DynamicBytes = 4u * KeyBlock * kCausalHeadDim;
+    // k_fp8(Bc*D) + k_b16(2*Bc*D) + v_fp8(Bc*D) + v_f16(2*Bc*D) = 6*Bc*D bytes.
+    constexpr std::size_t DynamicBytes = 6u * KeyBlock * kCausalHeadDim;
     using KernelInput                  = CacheInput;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     const auto launch = [&]() {
         auto kernel = causal_attention_small_t_fp8_tiled_kernel<
             Geometry, TokenTile, Warps, MinBlocks, KeyBlock, true, MultiBatch, Masked, KernelInput>;
-        static const cudaError_t attr = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(DynamicBytes));
-        CUDA_CHECK(attr);
+        configure_cuda_device_once([&] {
+            return cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(DynamicBytes));
+        });
 
         const auto q_ptr         = static_cast<const __nv_bfloat16*>(q.data);
         const auto positions_ptr = static_cast<const std::int32_t*>(positions.data);
-        const auto cache_k_ptr   = static_cast<std::uint8_t*>(cache.k_pages.data);
-        const auto cache_v_ptr   = static_cast<std::uint8_t*>(cache.v_pages.data);
-        const auto k_scale_ptr   = static_cast<__half*>(cache.k_scale_pages.data);
-        const auto v_scale_ptr   = static_cast<__half*>(cache.v_scale_pages.data);
+        constexpr auto kStorage  = KvCacheStorage::Fp8E4M3Row256;
+        const auto cache_k_ptr   = static_cast<KvKeyCodeT<kStorage>*>(cache.k_pages.data);
+        const auto cache_v_ptr   = static_cast<KvValueCodeT<kStorage>*>(cache.v_pages.data);
+        const auto k_scale_ptr   = static_cast<KvKeyScaleT<kStorage>*>(cache.k_scale_pages.data);
+        const auto v_scale_ptr   = static_cast<KvValueScaleT<kStorage>*>(cache.v_scale_pages.data);
+        assert_kv_planes<kStorage, decltype(cache_k_ptr), decltype(cache_v_ptr),
+                         decltype(k_scale_ptr), decltype(v_scale_ptr)>();
         const auto tables_ptr    = static_cast<const std::int32_t*>(cache.block_tables.data);
         const auto valid_ptr =
             invocation.valid_columns == nullptr
@@ -77,27 +75,27 @@ template <typename Geometry, bool MultiBatch, bool Masked>
 void launch_fp8_reduce(const Tensor& positions, const CausalSmallTInvocation& invocation,
                        std::int32_t splits, const Tensor& partial_acc, const Tensor& partial_m,
                        const Tensor& partial_l, Tensor& out, cudaStream_t stream) {
-    constexpr int Block  = 256;
-    constexpr int DChunk = 64;
-    const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, DChunk),
-                    invocation.width * invocation.batch_size);
-    const auto launch = [&]<bool Offset>() {
+    constexpr int Block = 256;
+
+    constexpr int DChunk = Geometry::QHeads == 24 ? 256 : 64;
+    const auto launch    = [&]<bool Offset>() {
+        const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, DChunk),
+                           invocation.width * invocation.batch_size);
         causal_attention_small_t_fp8_reduce_output_kernel<Geometry, DChunk, MultiBatch, Masked,
-                                                          Offset><<<grid, Block, 0, stream>>>(
+                                                             Offset><<<grid, Block, 0, stream>>>(
             static_cast<const float*>(partial_acc.data), static_cast<const float*>(partial_m.data),
             static_cast<const float*>(partial_l.data),
             static_cast<const std::int32_t*>(positions.data),
             invocation.valid_columns == nullptr
-                ? nullptr
-                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                   ? nullptr
+                   : static_cast<const std::int32_t*>(invocation.valid_columns->data),
             invocation.width, invocation.full_width, invocation.column_begin, invocation.batch_size,
             splits, static_cast<__nv_bfloat16*>(out.data));
     };
-    if (invocation.column_begin == 0) {
+    if (invocation.column_begin == 0)
         launch.template operator()<false>();
-    } else {
+    else
         launch.template operator()<true>();
-    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -110,8 +108,8 @@ void causal_attention_small_t_fp8_launch_for(const Tensor& q, CacheInput input,
                                              Tensor& partial_acc, Tensor& partial_m,
                                              Tensor& partial_l, Tensor& out, cudaStream_t stream) {
     const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto splits =
-        causal_attention_split_capacity(Geometry::QHeads, invocation.width, cache.dtype, envelope);
+    const auto splits           = causal_attention_split_capacity(
+        Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
 
     const auto launch_partial = [&]<int Tokens, bool MultiBatch, bool Masked>() {
         launch_fp8_partial<Geometry, Tokens, MultiBatch, Masked>(
@@ -152,6 +150,18 @@ void causal_attention_small_t_fp8_launch_for(const Tensor& q, CacheInput input,
     case 6:
         dispatch_metadata.template operator()<6>();
         break;
+    case 7:
+        if constexpr (Geometry::QHeads == 24) {
+            dispatch_metadata.template operator()<7>();
+            break;
+        }
+        throw std::invalid_argument("unsupported query-row tile");
+    case 8:
+        if constexpr (Geometry::QHeads == 24) {
+            dispatch_metadata.template operator()<8>();
+            break;
+        }
+        throw std::invalid_argument("unsupported query-row tile");
     default:
         throw std::invalid_argument("causal_attention_small_t_fp8_launch: unsupported T");
     }
@@ -217,7 +227,7 @@ void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& p
         .width         = q.ne[2],
         .batch_size    = 1,
     };
-    PagedKVBatchLayerView batch_cache = fp8_single_row_batch_view(cache);
+    PagedKVBatchLayerView batch_cache = single_row_paged_kv_batch_view(cache);
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_fp8_launch_for<CausalD256H24Kv4>(
             q, input, positions, scale, batch_cache, invocation, envelope, partial_acc, partial_m,

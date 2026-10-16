@@ -1,14 +1,19 @@
 {
   "schema": "ninfer.artifact-manifest",
-  "schema_version": 1,
+  "schema_version": 2,
   "artifact": {
     "filename": "qwen3_8_27b.ninfer",
-    "bytes": 18210531328,
-    "sha256": "eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e",
-    "container_version": 2,
-    "model_id": "qwen3.8-27b",
-    "weights_id": "groupwise-int",
-    "target_key": "qwen3_8_27b"
+    "bytes": 20437521664,
+    "sha256": "81f924d440c27261d820c19a9f8d45794c5aee410f8a68bd358133fa8c0375da",
+    "container_version": 3,
+    "architecture": "Qwen3_5ForCausalLM",
+    "name": "qwen3.8-27b",
+    "components": [
+      "text",
+      "vision",
+      "mtp",
+      "dflash2"
+    ]
   },
   "source": {
     "base": {
@@ -16,12 +21,16 @@
       "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
       "download_source": "https://modelscope.cn/models/Qwen/Qwen3.8-27B",
       "license": "Apache-2.0"
+    },
+    "dflash2": {
+      "repo_id": "z-lab/Qwen3.8-27B-DFlash2",
+      "revision": "50307d4c4cde6860d4eee73e2547cd786fe8e8a4",
+      "license": "Apache-2.0"
     }
   },
   "conversion": {
-    "recipe_id": "qwen3_8_27b-v1",
+    "recipe_id": "qwen3_8_27b",
     "converter_repository": "https://github.com/Neroued/ninfer",
-    "converter_revision": "52320554b5e71a9da96bff809ddf67ac5773ed63",
     "ranking_input": {
       "path": "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64",
       "sha256": "c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5"
@@ -29,35 +38,42 @@
   },
   "runtime": {
     "repository": "https://github.com/Neroued/ninfer",
-    "minimum_revision": "52320554b5e71a9da96bff809ddf67ac5773ed63",
-    "cuda_architecture": "sm_120a"
+    "minimum_revision": "98dada0e03cb073fd07f905400b5904bc6e82759",
+    "cuda_architecture": "sm_120a",
+    "dflash2_draft_tokens": {
+      "recommended": 7,
+      "minimum": 1,
+      "maximum": 15
+    }
   },
   "inventory": {
-    "objects": 1124,
-    "tensors": 1118,
+    "objects": 1190,
+    "tensors": 1184,
     "resources": 6,
+    "bindings": 1513,
+    "uses": 844,
     "formats": {
-      "BF16": 582,
-      "FP32": 96,
-      "I32": 1,
-      "Q4G64_F16S": 183,
-      "Q5G64_F16S": 246,
-      "Q6G64_F16S": 1,
-      "W8G32_F16S": 9
+      "bf16": 627,
+      "fp32": 96,
+      "int32": 1,
+      "q4_g64_fp16": 183,
+      "q5_g64_fp16": 246,
+      "q6_g64_fp16": 1,
+      "q8_g32_fp16": 30
     },
     "layouts": {
-      "contiguous-le-v1": 679,
-      "row-split-k128-v1": 439
+      "contiguous_le_v1": 724,
+      "row_split_k128_v1": 460
     },
     "encodings": {
-      "raw-bytes-v1": 6
+      "raw_bytes_v1": 6
     },
     "bytes": {
-      "tensor": 18197503904,
-      "resource": 12837177,
-      "object": 18210341081,
-      "payload_span": 18210355200,
-      "alignment": 14119
+      "tensor": 20424296864,
+      "resource": 12837937,
+      "object": 20437134801,
+      "payload_span": 20437148928,
+      "alignment": 14127
     }
   }
 }

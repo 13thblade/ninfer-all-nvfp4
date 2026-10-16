@@ -1,7 +1,7 @@
 #pragma once
 
 // Shared causal-attention dimensions and leaf PTX helpers used by the independently tuned
-// BF16 and INT8 prompt kernels. This file deliberately owns no staging policy,
+// quantized-cache prompt kernels. This file deliberately owns no staging policy,
 // shared-memory arena, warp schedule, or kernel body.
 
 #include "ops/common/math.cuh"
@@ -17,41 +17,6 @@
 namespace ninfer::ops {
 
 inline constexpr int kCausalPromptHeadDim = 256;
-
-inline constexpr int kCausalPromptBr        = 64;
-inline constexpr int kCausalPromptBc        = 64;
-inline constexpr int kCausalPromptThreads   = 128;
-inline constexpr int kCausalPromptSmemBytes = (kCausalPromptBr + 2 * kCausalPromptBc) *
-                                              kCausalPromptHeadDim *
-                                              static_cast<int>(sizeof(__nv_bfloat16));
-
-struct CausalPromptDirectMetadata {
-    const std::int32_t* table;
-
-    __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
-
-    __device__ __forceinline__ const std::int32_t* block_table() const { return table; }
-};
-
-template <bool Masked>
-struct CausalPromptBatchMetadata {
-    const std::int32_t* tables;
-    const std::int32_t* valid_columns;
-    const std::int32_t* table_rows;
-    std::int32_t table_stride;
-
-    __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const {
-        if constexpr (Masked) {
-            const std::int32_t valid = valid_columns[0];
-            return valid <= 0 ? 0 : (valid < width ? valid : width);
-        }
-        return width;
-    }
-
-    __device__ __forceinline__ const std::int32_t* block_table() const {
-        return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
-    }
-};
 
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t causal_prompt_q_index(int q_head, int d, int token) {
@@ -79,9 +44,19 @@ __device__ __forceinline__ int causal_prompt_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
 
-__device__ __forceinline__ unsigned causal_prompt_swz_addr(unsigned lane_base, unsigned ck,
-                                                           unsigned as, unsigned r) {
-    return lane_base + ((ck | as) ^ r);
+template <typename Byte>
+__device__ __forceinline__ void causal_prompt_store_byte_swizzled(Byte* tile, int row, int d,
+                                                                  Byte code) {
+    const int col_b16 = d >> 1;
+    const int byte    = d & 1;
+    const int off = (row * (kCausalPromptHeadDim / 2) + causal_prompt_swz(row, col_b16)) * 2 + byte;
+    tile[off]     = code;
+}
+
+template <int Columns>
+__device__ __forceinline__ int causal_prompt_p_swz(int row, int col) {
+    if constexpr (Columns == 32) { return (((col >> 3) ^ (row & 3)) << 3) | (col & 7); }
+    return causal_prompt_swz(row, col);
 }
 
 } // namespace ninfer::ops

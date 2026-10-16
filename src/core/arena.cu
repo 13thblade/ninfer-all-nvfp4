@@ -6,6 +6,7 @@
 #include <limits>
 #include <new>
 #include <stdexcept>
+#include <utility>
 #include <string>
 
 namespace ninfer {
@@ -83,14 +84,44 @@ DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
     return *this;
 }
 
+// The same contract for a fill: CUDA documents `cudaMemset` on device memory as asynchronous with
+// respect to the host, and it completes on the legacy stream, which a non-blocking stream does not
+// wait for. Unlike `copy_from_host` below this one has *not* been observed to race on this box --
+// tests/test_device_buffer_visibility.cu exercises it 90 times per run and has never caught it, so
+// on this driver the memset appears to complete before the call returns. That is an implementation
+// detail rather than a guarantee, and the sync costs nothing on a path every caller uses at setup,
+// so make the contract explicit rather than depend on the observation.
 void DeviceBuffer::fill(int byte_value) {
     if (bytes == 0) { return; }
     const cudaError_t err = cudaMemset(p, byte_value, bytes);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemset failed", err));
     }
+    const cudaError_t sync = cudaStreamSynchronize(nullptr);
+    if (sync != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("fill completion sync failed", sync));
+    }
 }
 
+// `cudaMemcpy` does not finish the transfer before it returns. CUDA's documented
+// synchronization behaviour for a host-to-device copy out of *pageable* memory is that the call
+// returns once the source has been staged for DMA, "but the DMA to final destination may not have
+// completed". That trailing DMA rides the legacy stream, and a stream created with
+// `cudaStreamNonBlocking` -- which is every stream `DeviceContext` owns -- is exempt from the
+// legacy stream's implicit ordering. So work enqueued on one of those streams immediately after
+// this call can, and does, read the destination before the copy lands.
+//
+// Measured on this RTX 3090 with a faithful replica of the sequence
+// tests/ops/test_attn_input_proj.cpp runs at graph replay phase 1 -- a 1,146,880-byte pageable
+// H2D, three `cudaMemsetAsync` on a non-blocking stream, then a captured graph launched on it --
+// the reader saw stale bytes in 146 of 200 iterations, up to 17.8% of the buffer, on an
+// *otherwise idle* GPU. Copies at or below ~256 KiB never raced; every size above it did.
+// tests/test_device_buffer_visibility.cu is that experiment, reduced.
+//
+// Synchronizing the legacy stream here costs one round trip on a path that is load-time setup in
+// every caller, and makes the method mean what its name says: on return, the bytes are visible to
+// any stream. Callers wanting an overlapped copy should use an explicitly stream-ordered one
+// (`cudaMemcpy2DAsync`, as the paged-KV and state-image pools already do) rather than this.
 void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::size_t byte_offset) {
     require_range(byte_offset, count, "host-to-device copy");
     if (count == 0) { return; }
@@ -98,6 +129,11 @@ void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::si
     const cudaError_t err = cudaMemcpy(destination, source, count, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemcpy host-to-device failed", err));
+    }
+    const cudaError_t sync = cudaStreamSynchronize(nullptr);
+    if (sync != cudaSuccess) {
+        throw std::runtime_error(
+            cuda_error_message("host-to-device copy completion sync failed", sync));
     }
 }
 
@@ -120,14 +156,25 @@ void DeviceBuffer::require_range(std::size_t byte_offset, std::size_t count,
 }
 
 DeviceArena::Scope::Scope(DeviceArena& arena) noexcept
-    : arena_(&arena), saved_offset_(arena.off_) {}
+    : arena_(&arena), saved_offset_(arena.off_), saved_rank_(arena.active_rank_) {}
 
 DeviceArena::Scope::~Scope() noexcept {
-    if (arena_ != nullptr && saved_offset_ <= arena_->off_) { arena_->off_ = saved_offset_; }
+    if (arena_ == nullptr) { return; }
+    if (saved_rank_ == arena_->active_rank_) {
+        if (saved_offset_ <= arena_->off_) { arena_->off_ = saved_offset_; }
+        return;
+    }
+    // The arena moved to another rank while this scope was open. Roll back the rank the scope was
+    // actually taken on, not whichever one happens to be active now -- restoring a foreign bump
+    // pointer would hand out overlapping workspace on the next allocation.
+    if (saved_rank_ < arena_->ranks_.size()) {
+        RankBacking& backing = arena_->ranks_[saved_rank_];
+        if (saved_offset_ <= backing.off) { backing.off = saved_offset_; }
+    }
 }
 
 DeviceArena::Scope::Scope(Scope&& other) noexcept
-    : arena_(other.arena_), saved_offset_(other.saved_offset_) {
+    : arena_(other.arena_), saved_offset_(other.saved_offset_), saved_rank_(other.saved_rank_) {
     other.arena_ = nullptr;
 }
 
@@ -142,9 +189,10 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
 
-    base_ = ptr;
-    cap_  = capacity_bytes;
-    off_  = 0;
+    base_       = ptr;
+    owned_base_ = ptr;
+    cap_        = capacity_bytes;
+    off_        = 0;
 }
 
 DeviceArena::DeviceArena(DeviceSpan storage)
@@ -155,34 +203,45 @@ DeviceArena::DeviceArena(DeviceSpan storage)
 }
 
 DeviceArena::~DeviceArena() {
-    if (owns_) { free_device(base_); }
+    if (owns_) { free_device(owned_base_); }
 }
 
 DeviceArena::DeviceArena(DeviceArena&& other) noexcept
     : base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_),
-      owns_(other.owns_) {
-    other.base_ = nullptr;
-    other.cap_  = 0;
-    other.off_  = 0;
-    other.peak_ = 0;
-    other.owns_ = true;
+      owns_(other.owns_), owned_base_(other.owned_base_), ranks_(std::move(other.ranks_)),
+      active_rank_(other.active_rank_) {
+    other.base_        = nullptr;
+    other.cap_         = 0;
+    other.off_         = 0;
+    other.peak_        = 0;
+    other.owns_        = true;
+    other.owned_base_  = nullptr;
+    other.ranks_.clear();
+    other.active_rank_ = 0;
 }
 
 DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (owns_) { free_device(base_); }
-    base_ = other.base_;
-    cap_  = other.cap_;
-    off_  = other.off_;
-    peak_ = other.peak_;
-    owns_ = other.owns_;
+    if (owns_) { free_device(owned_base_); }
+    base_       = other.base_;
+    cap_        = other.cap_;
+    off_        = other.off_;
+    peak_       = other.peak_;
+    owns_       = other.owns_;
+    owned_base_ = other.owned_base_;
 
-    other.base_ = nullptr;
-    other.cap_  = 0;
-    other.off_  = 0;
-    other.peak_ = 0;
-    other.owns_ = true;
+    ranks_       = std::move(other.ranks_);
+    active_rank_ = other.active_rank_;
+
+    other.base_        = nullptr;
+    other.cap_         = 0;
+    other.off_         = 0;
+    other.peak_        = 0;
+    other.owns_        = true;
+    other.owned_base_  = nullptr;
+    other.ranks_.clear();
+    other.active_rank_ = 0;
     return *this;
 }
 
@@ -222,7 +281,10 @@ Tensor DeviceArena::alloc(DType dtype, std::initializer_list<std::int32_t> shape
 
 DeviceArena::Scope DeviceArena::scope() noexcept { return Scope(*this); }
 
-void DeviceArena::reset() noexcept { off_ = 0; }
+void DeviceArena::reset() noexcept {
+    off_ = 0;
+    for (RankBacking& backing : ranks_) { backing.off = 0; }
+}
 
 void* DeviceArena::base() const noexcept { return base_; }
 
@@ -234,13 +296,132 @@ std::size_t DeviceArena::peak_used() const noexcept { return peak_; }
 
 void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 
+void DeviceArena::store_active_rank() noexcept {
+    if (active_rank_ < ranks_.size()) {
+        RankBacking& backing = ranks_[active_rank_];
+        backing.base         = base_;
+        backing.cap          = cap_;
+        backing.off          = off_;
+        backing.peak         = peak_;
+    }
+}
+
+void DeviceArena::attach_rank_storage(DeviceSpan storage) {
+    if (storage.data == nullptr || storage.bytes == 0) {
+        throw std::invalid_argument("attached rank storage must be a nonempty device span");
+    }
+    if (ranks_.empty()) {
+        // First attach materializes rank 0 from the arena's own storage, so indices line up with
+        // pipeline ranks from here on.
+        ranks_.push_back(RankBacking{base_, cap_, off_, peak_});
+        active_rank_ = 0;
+    }
+    ranks_.push_back(RankBacking{storage.data, storage.bytes, 0, 0});
+}
+
+void DeviceArena::activate_rank(std::size_t rank) {
+    if (ranks_.empty()) {
+        // Single-rank arenas only ever have rank 0; anything else is a planning bug worth hearing
+        // about rather than silently ignoring.
+        if (rank != 0) { throw std::out_of_range("arena has no storage for that pipeline rank"); }
+        return;
+    }
+    if (rank >= ranks_.size()) {
+        throw std::out_of_range("arena has no storage for that pipeline rank");
+    }
+    if (rank == active_rank_) { return; }
+
+    store_active_rank();
+    const RankBacking& next = ranks_[rank];
+    base_                   = next.base;
+    cap_                    = next.cap;
+    off_                    = next.off;
+    peak_                   = next.peak;
+    active_rank_            = rank;
+}
+
+std::size_t DeviceArena::active_rank() const noexcept { return active_rank_; }
+
+std::size_t DeviceArena::rank_count() const noexcept {
+    return ranks_.empty() ? 1U : ranks_.size();
+}
+
+std::size_t DeviceArena::peak_used_for_rank(std::size_t rank) const {
+    if (ranks_.empty()) {
+        if (rank != 0) { throw std::out_of_range("arena has no storage for that pipeline rank"); }
+        return peak_;
+    }
+    if (rank >= ranks_.size()) {
+        throw std::out_of_range("arena has no storage for that pipeline rank");
+    }
+    // The active rank's live counters have not been written back yet.
+    return rank == active_rank_ ? peak_ : ranks_[rank].peak;
+}
+
+ScopedArenaRank::ScopedArenaRank(DeviceArena& arena, std::size_t rank)
+    : arena_(arena), previous_rank_(arena.active_rank()) {
+    arena_.activate_rank(rank);
+}
+
+ScopedArenaRank::~ScopedArenaRank() noexcept {
+    if (arena_.active_rank() != previous_rank_) { arena_.activate_rank(previous_rank_); }
+}
+
 PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
 
+    // A pending error from an earlier call is returned by whatever runs next, so read and clear it
+    // first. Without this, a failure here can be somebody else's error wearing this message.
+    const cudaError_t pending = cudaGetLastError();
+
+    // Portable, so the buffer counts as pinned in every device's context rather than only the one
+    // that was current when it was allocated. With several ranks, ingress frames are copied to each
+    // stage's device from one host buffer, and a copy that treats it as pageable is neither fast nor
+    // capturable. Mapped, so cudaHostGetDevicePointer is defined for every buffer (zero-copy
+    // consumers such as the qwen4_exp expert banks read it through the device alias); on a UVA
+    // platform the flag changes nothing but making that contract explicit. (The error text below keeps its `cudaMallocHost` wording: launcher docs and the
+    // test guard match on it.)
     void* ptr             = nullptr;
-    const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
+    const cudaError_t err = cudaHostAlloc(&ptr, size_bytes, cudaHostAllocPortable | cudaHostAllocMapped);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
+        // Say the size, and say which memory. `cudaErrorMemoryAllocation: out of memory` reads as
+        // a VRAM shortfall and sends people to nvidia-smi when the shortfall is pinned system RAM.
+        // But the converse also happens and used to be asserted away here: on Windows/WDDM this
+        // allocation is mapped into the GPU's address space and charged against the card, so a
+        // large pin fails once the device is nearly full even with tens of GiB of system RAM free
+        // -- measured on a 24 GiB RTX 3090, where resident-device plus pinned-host lands within a
+        // few hundred MiB of the card's capacity every time. `cudaErrorAlreadyMapped` is the
+        // failure that shape produces. Report free VRAM so the two are distinguishable rather than
+        // asserting which one it is.
+        std::size_t free_device = 0, total_device = 0;
+        const cudaError_t info = cudaMemGetInfo(&free_device, &total_device);
+        std::string prefix     = "cudaMallocHost failed to pin " +
+                             std::to_string((size_bytes + (1ULL << 20) - 1) >> 20) +
+                             " MiB of host memory";
+        if (info == cudaSuccess) {
+            prefix += " (device has " + std::to_string(free_device >> 20) + " MiB of " +
+                      std::to_string(total_device >> 20) + " MiB free; on Windows a pinned host "
+                      "allocation is mapped into the GPU address space and competes with it)";
+        } else {
+            prefix += " (system RAM, pinned)";
+        }
+        if (pending != cudaSuccess) {
+            prefix += ", after an unretrieved earlier error (";
+            prefix += cudaGetErrorName(pending);
+            prefix += ")";
+        }
+        throw std::runtime_error(cuda_error_message(prefix.c_str(), err));
+    }
+
+    // The pending error read above is now gone for good -- `cudaGetLastError()` clears it, and
+    // nothing else has seen it since. A successful pin does not mean it never mattered: it means
+    // an earlier, unrelated CUDA call failed and nobody checked. Report it rather than let it
+    // disappear silently.
+    if (pending != cudaSuccess) {
+        std::fprintf(stderr,
+                      "ninfer: pinning %zu bytes of host memory succeeded, but cleared an "
+                      "unretrieved earlier CUDA error: %s: %s\n",
+                      size_bytes, cudaGetErrorName(pending), cudaGetErrorString(pending));
     }
 
     data_ = ptr;

@@ -1,0 +1,270 @@
+{
+  "prompt": "Explain why someone might run an AI assistant on their own computer. Use three numbered points: privacy, offline use after setup, and control. Keep it under 110 words and avoid markdown formatting.",
+  "sample": {
+    "sample": 1,
+    "warmup": false,
+    "ttft_ms": 158.57070000492968,
+    "wall_seconds": 1.707882899994729,
+    "text": "1. Privacy is a major concern for many users who do not want their personal data, conversations, or files sent to external servers. Running an AI locally ensures that sensitive information never leaves the user's device, significantly reducing the risk of data breaches or unauthorized access by third parties.\n\n2. Once the model is downloaded and set up, the assistant can function without an internet connection. This allows for seamless usage in areas with poor connectivity or during travel, providing reliable assistance regardless of network availability.\n\n3. Users gain full control over the system, including the ability to customize settings, update models at will, and manage hardware resources directly. This autonomy eliminates reliance on external service providers, subscription fees, or potential service outages, offering a more stable and personalized experience.",
+    "events": [
+      {
+        "seconds": 0.1585717999987537,
+        "text": "1"
+      },
+      {
+        "seconds": 0.1849884999974165,
+        "text": ". Privacy is a"
+      },
+      {
+        "seconds": 0.21252849999291357,
+        "text": " major concern for"
+      },
+      {
+        "seconds": 0.23947349999798462,
+        "text": " many users who"
+      },
+      {
+        "seconds": 0.2669807999918703,
+        "text": " do"
+      },
+      {
+        "seconds": 0.29441380000207573,
+        "text": " not want their personal"
+      },
+      {
+        "seconds": 0.32256539999798406,
+        "text": " data,"
+      },
+      {
+        "seconds": 0.34982429999217857,
+        "text": " conversations, or files"
+      },
+      {
+        "seconds": 0.378518500001519,
+        "text": " sent to external"
+      },
+      {
+        "seconds": 0.4058980999980122,
+        "text": " servers. Running an"
+      },
+      {
+        "seconds": 0.43404089999967255,
+        "text": " AI locally ensures that sensitive"
+      },
+      {
+        "seconds": 0.4612747999926796,
+        "text": " information never"
+      },
+      {
+        "seconds": 0.48850819999643136,
+        "text": " leaves the user"
+      },
+      {
+        "seconds": 0.515810099997907,
+        "text": "'s device, significantly"
+      },
+      {
+        "seconds": 0.5434070999908727,
+        "text": " reducing the risk of data"
+      },
+      {
+        "seconds": 0.5715806999942288,
+        "text": " breaches or unauthorized access by"
+      },
+      {
+        "seconds": 0.5987597999919672,
+        "text": " third parties"
+      },
+      {
+        "seconds": 0.6262457999982871,
+        "text": ".\n\n2. Once"
+      },
+      {
+        "seconds": 0.6535493999981554,
+        "text": " the"
+      },
+      {
+        "seconds": 0.6809023999958299,
+        "text": " model is downloaded"
+      },
+      {
+        "seconds": 0.7082479999953648,
+        "text": " and"
+      },
+      {
+        "seconds": 0.7355763999948977,
+        "text": " set"
+      },
+      {
+        "seconds": 0.7631266999960644,
+        "text": " up, the"
+      },
+      {
+        "seconds": 0.7912688999931561,
+        "text": " assistant can function"
+      },
+      {
+        "seconds": 0.8187250999908429,
+        "text": " without an"
+      },
+      {
+        "seconds": 0.8464211999962572,
+        "text": " internet connection. This allows for"
+      },
+      {
+        "seconds": 0.8741046999930404,
+        "text": " seamless"
+      },
+      {
+        "seconds": 0.9033167000015965,
+        "text": " usage"
+      },
+      {
+        "seconds": 0.9326606999966316,
+        "text": " in areas"
+      },
+      {
+        "seconds": 0.9616097999969497,
+        "text": " with poor connectivity or"
+      },
+      {
+        "seconds": 0.9901018999953521,
+        "text": " during travel"
+      },
+      {
+        "seconds": 1.0191843999928096,
+        "text": ", providing reliable"
+      },
+      {
+        "seconds": 1.047124699995038,
+        "text": " assistance regardless"
+      },
+      {
+        "seconds": 1.0747096999984933,
+        "text": " of network"
+      },
+      {
+        "seconds": 1.1022437999927206,
+        "text": " availability"
+      },
+      {
+        "seconds": 1.1296094999997877,
+        "text": ".\n\n3. Users"
+      },
+      {
+        "seconds": 1.157035199998063,
+        "text": " gain full control over the system"
+      },
+      {
+        "seconds": 1.1845570000004955,
+        "text": ", including"
+      },
+      {
+        "seconds": 1.2119926000013947,
+        "text": " the ability to customize settings"
+      },
+      {
+        "seconds": 1.2393433999968693,
+        "text": ", update"
+      },
+      {
+        "seconds": 1.267458499991335,
+        "text": " models"
+      },
+      {
+        "seconds": 1.2946999999985565,
+        "text": " at"
+      },
+      {
+        "seconds": 1.3222396999917692,
+        "text": " will"
+      },
+      {
+        "seconds": 1.350477600004524,
+        "text": ", and manage"
+      },
+      {
+        "seconds": 1.378093399995123,
+        "text": " hardware resources"
+      },
+      {
+        "seconds": 1.4054751999938162,
+        "text": " directly"
+      },
+      {
+        "seconds": 1.432909800001653,
+        "text": ". This autonomy"
+      },
+      {
+        "seconds": 1.4603553999913856,
+        "text": " eliminates"
+      },
+      {
+        "seconds": 1.4882778000028338,
+        "text": " reliance"
+      },
+      {
+        "seconds": 1.515647899999749,
+        "text": " on external service"
+      },
+      {
+        "seconds": 1.543225799992797,
+        "text": " providers,"
+      },
+      {
+        "seconds": 1.570510399993509,
+        "text": " subscription"
+      },
+      {
+        "seconds": 1.5977940000011586,
+        "text": " fees, or potential"
+      },
+      {
+        "seconds": 1.6253015999973286,
+        "text": " service out"
+      },
+      {
+        "seconds": 1.6525838999950793,
+        "text": "ages, offering"
+      },
+      {
+        "seconds": 1.679902999996557,
+        "text": " a more stable"
+      },
+      {
+        "seconds": 1.7076971999922534,
+        "text": " and personalized experience."
+      }
+    ],
+    "usage": {
+      "completion_tokens": 155,
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      },
+      "prompt_tokens": 54,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "total_tokens": 209
+    },
+    "timings": {
+      "cache_n": 0,
+      "draft_n": 392,
+      "draft_n_accepted": 99,
+      "predicted_ms": 1549.173,
+      "predicted_n": 155,
+      "predicted_per_second": 99.40787762244759,
+      "predicted_per_token_ms": 10.059564935064936,
+      "prompt_ms": 147.1654,
+      "prompt_n": 54,
+      "prompt_per_second": 366.93407553677696,
+      "prompt_per_token_ms": 2.7252851851851854
+    }
+  },
+  "source_commit": "931bd49ba332f48fad4b5230eec5a95ec5701290",
+  "presentation": {
+    "response_replay_start_seconds": 2.5,
+    "speed": 1,
+    "duration_seconds": 13
+  }
+}

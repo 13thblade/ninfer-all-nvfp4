@@ -1,6 +1,8 @@
+#include "core/weight.h"
 #include "ops/linear_pair/linear_pair_test_common.h"
 
 #include "ninfer/ops/linear_pair.h"
+#include "ninfer/ops/weight_input.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -29,10 +31,27 @@ constexpr std::int32_t kDFlashSecondRow  = 5120;
 
 // Both observable projections use the same A16 arithmetic profile. T and the selected pair
 // launcher never select another correctness criterion.
+//
+// The third field, the gross limit relative to the largest reference value, was 3.8e-3, then
+// 4.5e-3, and now takes the shared kBf16GrossRelativeFloor. Neither raise was a concession to a
+// less accurate kernel; the bound was below the floor its own output dtype can represent. Outputs
+// are BF16, so correct rounding alone costs up to 2^-8 of the value and a limit under that demands
+// the single worst element in the tensor round the same way the FP32 oracle does.
+//
+// The 4.5e-3 step was derived from 330 cases here -- bulk at 0.33-0.87 of the limit, then two
+// outliers at 0.9997 and 1.0059 -- and it cleared that observed edge. It was still inside a single
+// rounding step, and the tree-wide audit shows why that was not enough: this criterion's worst case
+// sits at exactly 1.00 of a step, i.e. the kernel is as accurate as BF16 permits and the bound was
+// still measuring the dtype rather than the kernel. See op_check.h for the derivation and for the
+// measured distribution across every Op.
+//
+// The bound that actually constrains the kernel is the first field, the relative L2 error, and it
+// is untouched: every one of those 330 cases sits at 0.45-0.69 of it, including the case that
+// tripped the gross limit. A kernel that regressed would move that, not this.
 constexpr ReductionCriterion kLinearPairA16Tolerance{
     2.9e-3,
     4.0e-3,
-    3.8e-3,
+    kBf16GrossRelativeFloor,
 };
 
 struct PairFixture {
@@ -97,9 +116,9 @@ PairFixture make_pair_fixture(std::int32_t k, std::uint32_t seed) {
     if (k == 5120) {
         return {
             false,
-            quantized_weight::make_patterned_weight(QType::W8G32_F16S, kOutputRows, k, seed,
+            quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, kOutputRows, k, seed,
                                                     options),
-            quantized_weight::make_patterned_weight(QType::W8G32_F16S, kOutputRows, k, seed + 1U,
+            quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, kOutputRows, k, seed + 1U,
                                                     options),
             0,
             0,
@@ -108,7 +127,7 @@ PairFixture make_pair_fixture(std::int32_t k, std::uint32_t seed) {
     if (k == 2048) {
         return {
             true,
-            quantized_weight::make_patterned_weight(QType::W8G32_F16S, kDFlashParentRows, k, seed,
+            quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, kDFlashParentRows, k, seed,
                                                     options),
             {},
             kDFlashFirstRow,
@@ -233,7 +252,7 @@ int verify_preserved(const test::GuardedDeviceBuffer& device,
 
 bool cuda_available() { return !test::cuda_unavailable(); }
 
-int run_w8_a16_shape(std::string_view label, const ShapeCase& shape) {
+int run_q8_a16_shape(std::string_view label, const ShapeCase& shape) {
     const std::vector<std::int32_t> tokens = conformance_tokens(shape);
     if (tokens.empty()) { throw std::invalid_argument("linear_pair test: no token cases"); }
     const std::int32_t maximum_t = tokens.back();
@@ -267,10 +286,23 @@ int run_w8_a16_shape(std::string_view label, const ShapeCase& shape) {
 
     void* const second_payload =
         fixture.shared_payload ? first_device_weight.data() : second_device_weight.data();
-    const Weight first_weight = fixture.first_storage.device_row_view(
-        first_device_weight.data(), fixture.first_row, kOutputRows);
-    const Weight second_weight =
-        second_storage.device_row_view(second_payload, fixture.second_row, kOutputRows);
+    const auto parent = [](const quantized_weight::PackedWeight& source, const void* payload) {
+        const std::array shape{static_cast<std::uint64_t>(source.weight.n),
+                               static_cast<std::uint64_t>(source.weight.k)};
+        return WeightParent{weight_geometry(source.weight.qtype, source.weight.layout, shape),
+                            static_cast<const std::byte*>(payload)};
+    };
+    const auto first_parent  = parent(fixture.first_storage, first_device_weight.data());
+    const auto second_parent = parent(second_storage, second_payload);
+    const auto region        = [](const WeightParent& storage, std::uint64_t row) {
+        const auto k = storage.geometry.shape[1];
+        return WeightView{{kOutputRows, k}, {{&storage, row * k, (row + kOutputRows) * k}}};
+    };
+    const auto first_view = region(first_parent, fixture.first_row);
+    const auto second_view =
+        region(fixture.shared_payload ? first_parent : second_parent, fixture.second_row);
+    const Weight first_weight  = ops::prepare_linear_weight({first_view}).weight;
+    const Weight second_weight = ops::prepare_linear_weight({second_view}).weight;
 
     int failures = 0;
     for (const std::int32_t t : tokens) {

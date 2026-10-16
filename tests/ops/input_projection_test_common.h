@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/weight.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -94,6 +95,15 @@ public:
 
     int verify_guards(std::string_view label) const { return storage_.verify_guards(label); }
 
+    // Re-poison the payload so a replayed graph has to write every element again. Without this a
+    // second replay only overwrites the first result and cannot show that the executable still
+    // consumes the operand that lives at the captured address. The poison is issued on the caller's
+    // stream so it is ordered against the graph launch it precedes.
+    void repaint(cudaStream_t stream) {
+        cuda_check(cudaMemsetAsync(storage_.data(), kPoisonByte, payload_bytes_, stream),
+                   "guarded BF16 repaint");
+    }
+
     int verify_fully_written(std::string_view label) const {
         const std::vector<std::uint16_t> output = bits();
         for (std::size_t index = 0; index < output.size(); ++index) {
@@ -149,10 +159,18 @@ projection_oracle(const quantized_weight::PackedWeight& weight, std::int32_t wei
     const std::vector<std::int32_t> selected = sampled_rows(output_rows, sample_count);
     expected.reserve(selected.size() * static_cast<std::size_t>(tokens));
     for (const std::int32_t local_row : selected) {
+        // Decode each represented coefficient once; every token still evaluates the full
+        // naive FP64 dot product, without production staging or intermediate rounding.
+        std::vector<double> decoded(hidden);
+        for (std::int32_t column = 0; column < hidden; ++column)
+            decoded[column] = quantized_weight::logical_weight_fp64(
+                weight, weight_row_offset + local_row, column);
         for (std::int32_t token = 0; token < tokens; ++token) {
-            expected.push_back(quantized_weight::dot_fp64(
-                weight, weight_row_offset + local_row,
-                activation.data() + static_cast<std::size_t>(token) * hidden, hidden));
+            const float* input = activation.data() + static_cast<std::size_t>(token) * hidden;
+            double sum         = 0.0;
+            for (std::int32_t column = 0; column < hidden; ++column)
+                sum += decoded[column] * static_cast<double>(input[column]);
+            expected.push_back(sum);
         }
     }
     return expected;

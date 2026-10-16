@@ -17,9 +17,12 @@ inline constexpr std::int32_t kEmbedGatherQ6Group          = 64;
 inline constexpr std::int32_t kEmbedGatherQ6NibbleBpr      = 32;
 inline constexpr std::int32_t kEmbedGatherQ6HighBpr        = 16;
 inline constexpr std::int32_t kEmbedGatherQ6GroupsPerBlock = 2;
-inline constexpr std::int32_t kEmbedGatherW8Group          = 32;
-inline constexpr std::int32_t kEmbedGatherW8D              = 2048;
-inline constexpr std::int32_t kEmbedGatherW8Groups         = kEmbedGatherW8D / kEmbedGatherW8Group;
+inline constexpr std::int32_t kEmbedGatherQ4Group          = 64;
+inline constexpr std::int32_t kEmbedGatherQ4NibbleBpr      = 32;
+inline constexpr std::int32_t kEmbedGatherQ4GroupsPerBlock = 2;
+inline constexpr std::int32_t kEmbedGatherQ8Group          = 32;
+inline constexpr std::int32_t kEmbedGatherQ8D              = 2048;
+inline constexpr std::int32_t kEmbedGatherQ8Groups         = kEmbedGatherQ8D / kEmbedGatherQ8Group;
 inline constexpr std::int32_t kEmbedGatherFp8D             = 5120;
 
 template <int BlocksPerToken, int Threads>
@@ -31,15 +34,10 @@ __launch_bounds__(Threads) __global__
     static_assert(kValuesPerBlock % 4 == 0);
     constexpr int kWordsPerBlock = kValuesPerBlock / 4;
 
-    const int token = static_cast<int>(blockIdx.x) / BlocksPerToken;
-    const int split = static_cast<int>(blockIdx.x) - token * BlocksPerToken;
-    __shared__ int row;
-    __shared__ float scale;
-    if (threadIdx.x == 0) {
-        row   = ids[token];
-        scale = __bfloat162float(scales[row]);
-    }
-    __syncthreads();
+    const int token   = static_cast<int>(blockIdx.x) / BlocksPerToken;
+    const int split   = static_cast<int>(blockIdx.x) - token * BlocksPerToken;
+    const int row     = ids[token];
+    const float scale = __bfloat162float(scales[row]);
 
     const int split_offset = split * kValuesPerBlock;
     const auto* code_row   = codes + static_cast<std::int64_t>(row) * kEmbedGatherFp8D;
@@ -67,6 +65,66 @@ __device__ __forceinline__ int unpack_q6_code(const std::uint8_t* nibble, const 
     const std::uint32_t high_bits = (high[high_pos >> 3] >> (high_pos & 7)) & 0x03u;
     const std::uint32_t u         = low | (high_bits << 4);
     return (u & 0x20u) ? static_cast<int>(u) - 64 : static_cast<int>(u);
+}
+
+__device__ __forceinline__ int unpack_q4_code(const std::uint8_t* nibble, int index) {
+    const std::uint8_t byte = nibble[index >> 1];
+    const int value         = (index & 1) ? (byte >> 4) : (byte & 0x0f);
+    return (value ^ 0x08) - 0x08;
+}
+
+__global__ void embed_gather_q4_kernel(const std::int32_t* ids, const std::uint8_t* codes,
+                                       const std::uint8_t* scales, __nv_bfloat16* out,
+                                       std::int32_t d, std::int32_t T, std::int32_t padded_d) {
+    const std::int32_t kg     = padded_d / kEmbedGatherQ4Group;
+    const std::int64_t n      = static_cast<std::int64_t>(d) * T;
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+
+    for (std::int64_t i = start; i < n; i += stride) {
+        const std::int32_t t    = static_cast<std::int32_t>(i / d);
+        const std::int32_t k    = static_cast<std::int32_t>(i - static_cast<std::int64_t>(t) * d);
+        const std::int32_t row  = ids[t];
+        const std::int32_t g    = k / kEmbedGatherQ4Group;
+        const std::int32_t lane = k - g * kEmbedGatherQ4Group;
+        const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + g;
+        const std::uint16_t scale_bits =
+            static_cast<std::uint16_t>(scales[group_index * 2]) |
+            static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[group_index * 2 + 1])
+                                       << 8);
+        const float scale = __half2float(__ushort_as_half(scale_bits));
+        const int code    = unpack_q4_code(codes + group_index * kEmbedGatherQ4NibbleBpr, lane);
+        out[i]            = __float2bfloat16(static_cast<float>(code) * scale);
+    }
+}
+
+__launch_bounds__(kEmbedGatherQ4Group* kEmbedGatherQ4GroupsPerBlock) __global__
+    void embed_gather_q4_grouped_kernel(const std::int32_t* ids, const std::uint8_t* codes,
+                                        const std::uint8_t* scales, __nv_bfloat16* out,
+                                        std::int32_t d, std::int32_t T) {
+    const std::int32_t kg           = d / kEmbedGatherQ4Group;
+    const std::int32_t group_blocks = div_up(kg, kEmbedGatherQ4GroupsPerBlock);
+    const std::int32_t t            = static_cast<std::int32_t>(blockIdx.x) / group_blocks;
+    const std::int32_t block_group  = static_cast<std::int32_t>(blockIdx.x) - t * group_blocks;
+    const std::int32_t group_slot   = threadIdx.x / kEmbedGatherQ4Group;
+    const std::int32_t lane         = threadIdx.x - group_slot * kEmbedGatherQ4Group;
+    const std::int32_t g            = block_group * kEmbedGatherQ4GroupsPerBlock + group_slot;
+    if (g >= kg) { return; }
+
+    const std::int32_t row         = ids[t];
+    const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + g;
+
+    int scale_bits = 0;
+    if ((lane & 31) == 0) {
+        scale_bits = static_cast<int>(scales[group_index * 2]) |
+                     (static_cast<int>(scales[group_index * 2 + 1]) << 8);
+    }
+    scale_bits        = __shfl_sync(0xffffffffu, scale_bits, 0);
+    const float scale = __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits)));
+    const int code    = unpack_q4_code(codes + group_index * kEmbedGatherQ4NibbleBpr, lane);
+    const std::int64_t out_idx = static_cast<std::int64_t>(t) * d +
+                                 static_cast<std::int64_t>(g) * kEmbedGatherQ4Group + lane;
+    out[out_idx] = __float2bfloat16(static_cast<float>(code) * scale);
 }
 
 __global__ void embed_gather_dense_kernel(const std::int32_t* ids, const __nv_bfloat16* table,
@@ -138,10 +196,10 @@ __launch_bounds__(kEmbedGatherQ6Group* kEmbedGatherQ6GroupsPerBlock) __global__
     out[out_idx] = __float2bfloat16(static_cast<float>(code) * scale);
 }
 
-__global__ void embed_gather_w8_kernel(const std::int32_t* ids, const std::uint8_t* codes,
+__global__ void embed_gather_q8_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                        const std::uint8_t* scales, __nv_bfloat16* out,
                                        std::int32_t d, std::int32_t T, std::int32_t padded_d) {
-    const std::int32_t kg     = padded_d / kEmbedGatherW8Group;
+    const std::int32_t kg     = padded_d / kEmbedGatherQ8Group;
     const std::int64_t n      = static_cast<std::int64_t>(d) * T;
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
@@ -149,26 +207,61 @@ __global__ void embed_gather_w8_kernel(const std::int32_t* ids, const std::uint8
         const std::int32_t t    = static_cast<std::int32_t>(i / d);
         const std::int32_t k    = static_cast<std::int32_t>(i - static_cast<std::int64_t>(t) * d);
         const std::int32_t row  = ids[t];
-        const std::int32_t g    = k / kEmbedGatherW8Group;
-        const std::int32_t lane = k - g * kEmbedGatherW8Group;
+        const std::int32_t g           = k / kEmbedGatherQ8Group;
+        const std::int32_t lane        = k - g * kEmbedGatherQ8Group;
         const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + g;
         const std::uint16_t scale_bits =
             static_cast<std::uint16_t>(scales[group_index * 2]) |
             static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[group_index * 2 + 1])
                                        << 8);
         const float scale = __half2float(__ushort_as_half(scale_bits));
-        const auto code = static_cast<std::int8_t>(codes[group_index * kEmbedGatherW8Group + lane]);
+        const auto code = static_cast<std::int8_t>(codes[group_index * kEmbedGatherQ8Group + lane]);
         out[i]          = __float2bfloat16(static_cast<float>(code) * scale);
     }
 }
 
+template <int Blocks, int Threads, bool PairStore>
+__launch_bounds__(Threads) __global__
+    void embed_gather_q8_packed_5120_kernel(const std::int32_t* ids, const std::uint8_t* codes,
+                                            const std::uint8_t* scales, __nv_bfloat16* out) {
+    constexpr int D = 5120, Values = D / Blocks, Words = Values / 4;
+    static_assert(D % Blocks == 0 && Values % 32 == 0);
+    const int token      = static_cast<int>(blockIdx.x) / Blocks;
+    const int split      = static_cast<int>(blockIdx.x) % Blocks;
+    const int row        = ids[token];
+    const auto* code_row = codes + static_cast<std::int64_t>(row) * D;
+    auto* output         = out + static_cast<std::int64_t>(token) * D;
+#pragma unroll
+    for (int item = threadIdx.x; item < Words; item += Threads) {
+        const int d      = split * Values + item * 4;
+        const auto group = static_cast<std::int64_t>(row) * (D / 32) + d / 32;
+        const auto sb    = static_cast<std::uint16_t>(scales[group * 2]) |
+                        (static_cast<std::uint16_t>(scales[group * 2 + 1]) << 8);
+        const float scale = __half2float(__ushort_as_half(sb));
+        const auto word   = *reinterpret_cast<const std::uint32_t*>(code_row + d);
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            const auto q0    = static_cast<std::int8_t>((word >> (pair * 16)) & 255u);
+            const auto q1    = static_cast<std::int8_t>((word >> (pair * 16 + 8)) & 255u);
+            const auto value = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
+                                                     static_cast<float>(q1) * scale);
+            if constexpr (PairStore)
+                reinterpret_cast<__nv_bfloat162*>(output + d)[pair] = value;
+            else {
+                output[d + pair * 2]     = value.x;
+                output[d + pair * 2 + 1] = value.y;
+            }
+        }
+    }
+}
+
 __launch_bounds__(32) __global__
-    void embed_gather_w8_grouped_2048_kernel(const std::int32_t* ids, const std::uint8_t* codes,
+    void embed_gather_q8_grouped_2048_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                              const std::uint8_t* scales, __nv_bfloat16* out) {
-    const std::int32_t t   = static_cast<std::int32_t>(blockIdx.x) / kEmbedGatherW8Groups;
-    const std::int32_t g   = static_cast<std::int32_t>(blockIdx.x) - t * kEmbedGatherW8Groups;
+    const std::int32_t t   = static_cast<std::int32_t>(blockIdx.x) / kEmbedGatherQ8Groups;
+    const std::int32_t g   = static_cast<std::int32_t>(blockIdx.x) - t * kEmbedGatherQ8Groups;
     const std::int32_t row = ids[t];
-    const std::int64_t group_index = static_cast<std::int64_t>(row) * kEmbedGatherW8Groups + g;
+    const std::int64_t group_index = static_cast<std::int64_t>(row) * kEmbedGatherQ8Groups + g;
 
     int scale_bits = 0;
     if (threadIdx.x == 0) {
@@ -178,32 +271,32 @@ __launch_bounds__(32) __global__
     scale_bits        = __shfl_sync(0xffffffffu, scale_bits, 0);
     const float scale = __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits)));
     const auto code   = static_cast<std::int8_t>(
-        codes[group_index * kEmbedGatherW8Group + static_cast<std::int32_t>(threadIdx.x)]);
-    const std::int64_t out_idx = static_cast<std::int64_t>(t) * kEmbedGatherW8D +
-                                 static_cast<std::int64_t>(g) * kEmbedGatherW8Group + threadIdx.x;
+        codes[group_index * kEmbedGatherQ8Group + static_cast<std::int32_t>(threadIdx.x)]);
+    const std::int64_t out_idx = static_cast<std::int64_t>(t) * kEmbedGatherQ8D +
+                                 static_cast<std::int64_t>(g) * kEmbedGatherQ8Group + threadIdx.x;
     out[out_idx] = __float2bfloat16(static_cast<float>(code) * scale);
 }
 
 __launch_bounds__(256) __global__
-    void embed_gather_w8_row_2048_kernel(const std::int32_t* ids, const std::uint8_t* codes,
+    void embed_gather_q8_row_2048_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                          const std::uint8_t* scales, __nv_bfloat16* out) {
     const int tid = static_cast<int>(threadIdx.x);
     const int t   = static_cast<int>(blockIdx.x);
     const int row = ids[t];
 
-    constexpr int kValuesPerThread = kEmbedGatherW8D / 256;
+    constexpr int kValuesPerThread = kEmbedGatherQ8D / 256;
     static_assert(kValuesPerThread == 8);
     const int k = tid * kValuesPerThread;
     const std::int64_t group_index =
-        static_cast<std::int64_t>(row) * kEmbedGatherW8Groups + k / kEmbedGatherW8Group;
+        static_cast<std::int64_t>(row) * kEmbedGatherQ8Groups + k / kEmbedGatherQ8Group;
     const std::uint16_t scale_bits =
         static_cast<std::uint16_t>(scales[group_index * 2]) |
         static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
     const float scale    = __half2float(__ushort_as_half(scale_bits));
-    const auto* code_row = codes + static_cast<std::int64_t>(row) * kEmbedGatherW8D;
+    const auto* code_row = codes + static_cast<std::int64_t>(row) * kEmbedGatherQ8D;
     const uint2 packed   = *reinterpret_cast<const uint2*>(code_row + k);
     auto* out_pairs =
-        reinterpret_cast<__nv_bfloat162*>(out + static_cast<std::int64_t>(t) * kEmbedGatherW8D + k);
+        reinterpret_cast<__nv_bfloat162*>(out + static_cast<std::int64_t>(t) * kEmbedGatherQ8D + k);
 #pragma unroll
     for (int word_index = 0; word_index < 2; ++word_index) {
         const std::uint32_t word = word_index == 0 ? packed.x : packed.y;

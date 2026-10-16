@@ -1,7 +1,45 @@
 # tools/bench
 
-Maintainer orchestration for the public `ninfer_bench` throughput tool and the external Serve TTFT
-client. Correctness/parity tooling lives separately under [`tools/parity`](../parity).
+Maintainer orchestration for the public `ninfer_bench` throughput tool, serving corpus/concurrency
+runners, and the external Serve TTFT client. Correctness is owned by the affected suites under
+[`tests/`](../../tests/README.md).
+
+## Interleaved A/B between two builds
+
+`run_interleaved_ab.py` compares two executables by alternating them **inside** each repetition.
+Use it for any before/after claim on this hardware. The card drifts 3-5% between processes as it
+heats and the power cap clamps, which is larger than most effects worth measuring here, so
+"all of arm A, then all of arm B" cannot separate a real change from the ramp -- two comparisons
+in TODO's history came out with opposite-signed drift on code paths that had not changed.
+
+```bash
+python tools/bench/run_interleaved_ab.py \
+    --arm-a build-ninja/apps/ninfer.exe \
+    --arm-b build-ninja/apps/ninfer-newtile.exe \
+    --reps 6 \
+    --config 'k6:{exe} models/qwen3_8_27b_dflash2.ninfer --prompt "..." --max-new 256 --greedy --spec dflash2 --draft-tokens 6' \
+    --control 'k4:{exe} models/qwen3_8_27b_dflash2.ninfer --prompt "..." --max-new 256 --greedy --spec dflash2 --draft-tokens 4'
+```
+
+It reports the **paired median** -- the median of per-repetition ratios -- and how many pairs came
+out positive. That is deliberately not the ratio of the two medians: on this box the two statistics
+disagree by more than the effects being measured.
+
+`--control` names a configuration whose code path is **identical in both arms**, so any ratio it
+shows is pure drift; the tool divides it out per repetition and prints a `normalised` column. In the
+GDN-tile comparison that control is what made the result readable, because draft counts 4 and 5
+stay on an unchanged route.
+
+Two things it refuses rather than lets you get wrong:
+
+- **both arms must sit in the same directory**, in practice `build-ninja/apps/` under different
+  names. An executable copied elsewhere fails DLL resolution on Windows, exits 127 and writes an
+  empty log, which reads exactly like a model-loading failure.
+- a `--config` with no `{exe}` placeholder, which would run the same binary twice.
+
+`--metric-regex` selects what to compare; it defaults to the CLI's `decode speed ... tok/s` summary
+line and needs changing for `ninfer_bench`, which prints CSV. A run where any sample produced no
+number exits 1, because a comparison with a hole in it is not a comparison.
 
 ## External Serve TTFT
 
@@ -18,6 +56,170 @@ client, stages the NVFP4 artifact once in `/dev/shm`, stores raw/progress/Serve 
 `profiles/bench/ttft/`, records structured per-request Serve diagnostics, and writes Markdown,
 JSON, and CSV summaries. The case catalog, exact profiles, TTFT boundary, and fixture qualification
 are documented in the dedicated README.
+
+## Agent rotation (context-cache retention)
+
+`run_agent_rotation.py` drives an already-running `ninfer-serve` with N independent agent
+conversations visited round-robin, each growing by one long user turn per visit until it reaches
+`--target-tokens`. With more agents than `--max-concurrency`, most visits must restore their
+conversation from the Host tier or re-prefill it, and every `--edit-every`th visit rewrites the user
+turn two back, which only a long anchor below the edit can serve. The client reports TTFT from the
+stream and the weighted cache hit rate from the usage `cached_tokens`, split by first, append and
+edit visits; run the server with `--request-log-jsonl` for the reuse path and transfers.
+
+```bash
+python3 tools/bench/run_agent_rotation.py --agents 4 --target-tokens 200000 \
+    --out profiles/bench/agent-rotation/run.jsonl
+```
+
+## Hosted multi-tenant workload (context cache on a provider)
+
+`run_hosted_workload.py` drives an already-running `ninfer-serve` with what a provider serving many
+people sees: N tenants, each with one conversation at a time, all conversations opening with one of a
+few shared "product" prompts (system text plus a tool catalogue), then a private opening document,
+then growing turn by turn with appended tool output. One request is in flight per conversation (a
+client waits for its reply); a `429 server_overloaded` answer is retried every second, as a gateway
+would hold it, and counted. `hosted_analysis.py` turns one or more runs into the hit split, the
+tokens an ideal cache would have saved and why they were lost, TTFT and queue percentiles, lane
+utilisation and the store counters. The baseline that uses them is
+[`docs/maintainer/cache-provider-baseline.md`](../../docs/maintainer/cache-provider-baseline.md).
+
+```powershell
+# server: the tuned 27B MTP flag set plus --request-log-jsonl (and --context-store DIR if wanted)
+python tools/bench/run_hosted_workload.py --preset hosted-32 --duration-s 600 `
+    --request-log server-requests.jsonl --out runs/c8-h8
+python tools/bench/hosted_analysis.py runs/c4-h8 runs/c8-h8 --warmup-s 300 --markdown
+```
+
+Presets (token sizes are measured with the server's own `count_tokens`; filler is about 1.35
+tokens per word):
+
+| preset | tenants | products (shared prompt tokens) | opening | per turn | think time | other |
+|---|---:|---|---|---|---:|---|
+| `smoke` | 4 | about 1.2K, 2.3K | 1-4K | 0.3-1.5K | 2 s | 10% edit, 10% branch, ends at 16K |
+| `hosted-16` | 16 | 1,608 / 4,563 / 9,090 (measured) | 2-40K | 0.3-4K | 20 s | 5% edit, 5% branch |
+| `hosted-32` | 32 | same | 2-40K | 0.3-4K | 40 s | same |
+| `hosted-64` | 64 | same | 2-40K | 0.3-4K | 80 s | same |
+| `bursty-32` | 32 | same | 2-40K | 0.3-4K | groups | groups of 8 every 45 s; 15% fan-out of 3 over a new 4-16K document |
+
+- Sizes in ranges are log-uniform. Tenant `i` uses product `i mod products`. A conversation ends
+  past 100K prompt tokens (16K for `smoke`) and its tenant opens a new one.
+- **Turn kinds.** `first` opens a conversation; `append` adds tool output after the last reply;
+  `edit` replaces the latest tool output (the prompt continues from the previous reply, a point
+  the newer turn superseded); `branch` drops the last 2-6 exchanges and continues from there;
+  `fanout` sends 3 sub-agent requests at once, each the history plus one new shared document plus
+  its own task (siblings share a prefix that ends at no chat marker); `resume` is one append per
+  saved conversation after a restart (`--save-state`, then `--resume-state FILE --resume-once`).
+- **Arrivals.** `poisson`: each tenant waits an exponential think time (mean above) after each
+  reply, so the offered rate is about tenants / think time while the server keeps up. `bursty`:
+  tenants wait until their random group of 8 is released, every 45 s.
+- **Replies.** Temperature 0. Thinking off: up to 160 tokens, the reply is replayed verbatim.
+  `--thinking on`: up to 640 tokens with `thinking_budget` 384; the client sends back only the
+  answer, as most clients do, so the template drops the closed reasoning and the reusable point is
+  the prompt before the reply rather than its end.
+- `--tenants` and `--think-s` override a preset; `--duration-s` stops issuing turns (in-flight ones
+  finish).
+
+Each run directory holds `requests.jsonl` (one record per request: prompt, cached, output tokens,
+client TTFT, retries, and the ideal reuse estimates), `server_records.json` (the joined
+`request_done` records), `load.jsonl` (`/v1/load` once a second) and `summary.json` (with
+`/metrics` before and after). `hosted_analysis.py` documents its classification in its docstring;
+its eviction split replays the trace through an LRU of the run's Device + Host bytes and is a
+ceiling model, not the engine.
+
+## Raw disk speed (`disk_seq_io.py`)
+
+Sequential write and read with the OS file cache bypassed (`FILE_FLAG_NO_BUFFERING` on Windows,
+`O_DIRECT` on Linux), one block at a time, over a scratch file it always deletes, with an optional
+buffered read for comparison. It is the disk rate to use in a disk-tier cost model, as opposed to
+the context store's end-to-end read path.
+
+```powershell
+python tools/bench/disk_seq_io.py --dir $env:TEMP --size-gib 4 --block-mib 4 8 16 32 --buffered
+```
+
+## Copy-heavy agent replay
+
+`agent_replay/` is the copy-drafting workload: deterministic multi-turn coding-agent sessions whose
+tool results are real files of this repository, so a large share of the model's output reproduces
+text already in its prompt. `run_agent_rotation.py` above never copies (its turns are random words)
+and cannot show copy-drafting gains. The replay is stdlib-only and drives an already-running
+`ninfer-serve` through streaming `/v1/chat/completions` with five tools (`Read`, `Write`, `Edit`,
+`Grep`, `Bash`), greedy and thinking off.
+
+Each session starts from a seeded file of the pinned `--commit` (default `HEAD`, recorded as a
+hash) and grows turn by turn until its prompt reaches a seeded target in
+`[--min-context, --max-context]`. Every turn stages a scripted tool call and its result, then the
+model generates the assistant turn. Turns come in shuffled blocks of eight, half of them copies:
+
+| category | observation | the model is asked to |
+|---|---|---|
+| `explore` | `cat -n` Read slice, plain `sed -n` slice, Grep rows, or a `git show` diff | continue (no instruction) |
+| `explain` | `cat -n` Read slice | explain an identifier in prose, no code |
+| `rewrite_file` | whole file as a `cat -n` Read | Write the whole file with one identifier renamed |
+| `apply_change` | whole file as plain `cat` | return the whole file with one comment added |
+| `edit_function` | `cat -n` Read around a 20-60 line block | Edit: old_string and new_string both reproduce the block |
+| `diff_revert` | `git show <sha> -- <path>` | write each hunk's pre-change lines |
+
+Tool results, file choices and instructions depend only on the seed and the corpus commit; the
+assistant turns are free-running, so the number of turns before a session reaches its target can
+differ between builds. Compare decode tok/s over committed tokens and wall time, matched by
+`(session, turn)`, not output hashes. Model tool calls are answered with a short acknowledgement
+before the next scripted observation.
+
+```bash
+# start the server with a request log, then
+python -m tools.bench.agent_replay run --port 18120 --sessions 4 --concurrency 1 \
+    --min-context 30000 --max-context 120000 \
+    --request-log profiles/bench/agent-replay/request_log.jsonl --out profiles/bench/agent-replay/run1
+```
+
+`--request-log` names the server's `--request-log-jsonl` file. The runner reads the records written
+during its run and joins them to its turns by response id, which adds the request's `speculative`
+counters, the server's TTFT/total seconds and the committed output token IDs. Without it the
+runner takes decode time from the usage chunk's `timings` (`predicted_ms`; `prompt_ms` is kept as
+`prompt_s`, it is not TTFT) and TTFT from client-side stream timing.
+
+Outputs in `--out`:
+
+- `turns.jsonl`: one sample per turn: category, prompt/cached/output tokens, finish reason, TTFT,
+  decode seconds and `decode_tps` (output tokens / (total - TTFT)), the timing source, the copy
+  overlap, and `counters`, every numeric leaf of the request log's `speculative` object and of
+  the usage `timings` under dotted names. New server counters, such as `ngram_*`, are picked up
+  without changes here.
+- `summary.json`: per category, `copy`, `non_copy` and `all`: token-weighted decode tok/s, its
+  median and minimum per turn, TTFT median/mean/max, token sums, length-capped turns,
+  `short_turns` (under 128 output tokens: a copy turn this short called a tool instead), summed
+  counters, DFlash/MTP acceptance and tokens per round, and the share of output from any
+  `*ngram*accepted_tokens` counter.
+- `transcripts.jsonl`: the full message list of each session and the message count at each turn.
+- `output_token_ids.jsonl` (with `--request-log`): committed output token IDs per turn.
+
+**Copy overlap** is the fraction of the turn's output (content plus tool-call argument values) in
+8-unit windows that also occur in the session's prompt so far. Units are identifiers, numbers or
+single punctuation characters, whitespace is ignored, and `cat -n` prefixes are removed from both
+sides. It shows that copy turns actually copy and bounds what a copy proposer can harvest; it is a
+text proxy, not the proposer's token-level match.
+
+`export` writes the prompt and output token sequence of every turn for an offline proposer
+simulation (the copy-length distribution of the n-gram copy-drafting plan). The server logs output
+IDs but not prompt IDs and has no tokenize endpoint, so each prompt is re-rendered from
+`transcripts.jsonl` with the served artifact's own `chat_template.jinja` and `tokenizer.json`
+resources, with tool definitions shaped as the server passes them to the template and message text
+that spells a special token (a source file quoting `<|video_pad|>`) encoded as plain text, as the
+server does. Each prompt's length is checked against the server's `prompt_tokens`. This one step
+needs `jinja2` and `tokenizers`:
+
+```bash
+python -m tools.bench.agent_replay export --run profiles/bench/agent-replay/run1 \
+    --artifact models/qwen3_8_27b.ninfer
+```
+
+It writes `token_streams.jsonl` (`prompt_ids`, `output_ids`, `output_source`) and prints how many
+rendered prompts match the server's length exactly. Output IDs come from the request log; without
+one they are re-tokenized from the recorded text and marked `retokenized_text`.
+`--tokenizer-dir` takes a directory holding `tokenizer.json`, `tokenizer_config.json` and
+`chat_template.jinja` instead of an artifact.
 
 ## Corpus baker
 
@@ -125,8 +327,8 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
-Each raw report must be `ninfer_bench_report` schema v13. The flattened summary and schema-v3 matrix
-manifest carry native names from the report: selected target, canonical `weights_id`, artifact,
+Each raw report must be `ninfer_bench_report` schema v19. The flattened summary and schema-v4 matrix
+manifest carry native facts from the report: architecture, public name, actual formats, prefill signature, artifact,
 load/read/upload/staging values, Engine memory arenas including the non-additive Vision layout
 inside the unified workspace and CUDA Graph allowance, per-test planned logical and
 allocator-observed workspace peaks, KV capacity and
@@ -134,41 +336,91 @@ payload, configured proposal head and graph mode, phase timings and throughput, 
 rounds/drafts/acceptance/fallbacks. The matrix manifest is descriptive and records the commands and
 selected local inputs; it does not make repository state part of report validity.
 
-`run_serve_corpus.py` runs both registered targets and both published MTP0/MTP3 suites when both
-artifacts are supplied. Pass one `--artifact` to select a single target and `--mode mtp0` or
-`--mode mtp3` to run only that suite. The 35B-A3B-only `--mode dflash7` route runs the same
-decode corpus with DFlash block=8 (`k=7`) and the optimized proposal head. Add
-`--sampling greedy` to force exact argmax while retaining the same fixtures and repetition count.
-Its schema-v6 result and flattened summaries retain the canonical `weights_id`, request Host
-exposure, and decode Host/Device-wait time per round received from the schema-v18 serving records.
+## Serving corpus benchmark
+
+[Published coverage and model results](../../docs/performance.md) identify the recorded runs.
+The [serving methodology](../../docs/performance/methodology.md) owns workload definitions,
+metric boundaries, aggregation, comparison rules, and publication format. This section describes
+runner usage and output files.
+
+`run_serve_corpus.py` accepts explicit `--artifact LABEL=PATH` entries. Labels identify report groups;
+the selected artifact supplies the architecture, public name and weight bindings.
+Omitting `--mode` selects MTP0 and MTP3; repeat `--mode` to select a subset. Use `dflash7` for
+Qwen3.6-35B-A3B DFlash K=7 and `dflash2_7` for Qwen3.8-27B DFlash2 K=7, with companion weights
+in the selected artifact. `--sampling greedy` selects exact argmax; the default is stochastic.
+Run commands with a selected Python 3.11 interpreter, as in the model-page reproduction entries.
+Both serving runners accept `--kv-dtype bf16|int8|fp8|nvfp4|k8v4` (default: `int8`).
+Specify it explicitly when recording a new campaign; the Qwen3.8 performance profile uses
+`--kv-dtype fp8`. The runner verifies the loaded KV representation and records the selection in
+its results. A serial run cannot resume records collected with a different KV dtype.
+
+The serial runner writes `run.jsonl`, `summary.csv`, `summary.md`, and per-server logs under
+`server/`. JSONL contains the completed requests and responses; CSV/Markdown contain fixture and
+category summaries. The output directory is supplied explicitly with `--output`.
+
+Its schema-v8 result and flattened summaries retain the KV dtype, actual `prefill_signature`, request Host
+exposure, and decode Host/Device-wait time per round received from the schema-v25 serving records.
 Request exposure is a latency distribution value and is never summed across concurrent requests;
 worker aggregation uses the serving `throughput.host_work` interval deltas. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do
 not alter the measurement method.
 
+## Chat decode A/B (`run_chat_decode.py`)
+
+Decode rate on a chat prompt set through `ninfer-serve`'s OpenAI Chat Completions endpoint,
+reported as `concurrency x 1000 / mean TPOT` from the server's own request log -- the metric
+`vllm bench serve` prints, so results can be read against stacks that publish it. `output
+throughput` (generated tokens / wall clock) is printed alongside and includes prefill and the tail.
+
+Arms are interleaved, in order on even passes and reversed on odd, because between-process spread
+on one RTX 3090 is 3-5%; always A/B two binaries inside one sitting rather than across sessions.
+Each arm may drop or add server flags, so one binary can be compared against itself under different
+options, and may name its own artifact (`;model=PATH`), so two artifacts can be compared on one
+binary with the same prompts. `--spec` selects `mtp` (the default), `dflash2` or `none` and
+`--draft-tokens` the draft count; the `RESULT` line carries the decode rate, the draft acceptance
+and the tokens emitted per round, so one run answers both "faster?" and "does it still draft as
+well?". `--model-id` is the id the server publishes, which is the artifact's public name
+(`qwen3.8-27b` by default, `qwen3.6-35b-a3b` for the 35B-A3B).
+
+```bash
+# two binaries, one artifact
+python3 tools/bench/run_chat_decode.py \
+  --model models/qwen3_8_27b.ninfer --prompts prompts_real.jsonl \
+  --concurrency 1 --reps 2 --out profiles/bench/chat-decode \
+  --arm base=/path/to/baseline/ninfer-serve --arm new=./build/apps/ninfer-serve
+
+# one binary, two artifacts, DFlash2, drafting acceptance included
+python3 tools/bench/run_chat_decode.py --prompts bench/fixtures/chat_prompts.jsonl \
+  --spec dflash2 --draft-tokens 7 --kv-dtype rk4v4 --max-tokens 512 --out profiles/bench/chat-decode \
+  --arm old=./build/apps/ninfer-serve\;model=old.ninfer --arm new=./build/apps/ninfer-serve\;model=new.ninfer
+```
+
+The prompt file is one JSON object per line with a `prompt` string. The comparisons in
+[docs/performance.md](../../docs/performance.md#small-t-tensor-core-kernels-for-verify-and-cohort-decode)
+use the eight thinking-off prompts of syv-ai/qwen38-27b-rtx3090's `bench/prompts_real.jsonl`, which
+is that project's file and is not vendored here. `bench/fixtures/chat_prompts.jsonl` is this
+repository's own set of 24 mixed prompts (code in eight languages, prose, maths, translation and
+Chinese); the artifact comparisons of 2026-10 use it with greedy decoding and thinking off.
+
 ## Concurrent serving benchmark
 
-`run_serve_concurrency.py` measures two separate concurrency properties through real loopback
-Chat Completions requests:
+`run_serve_concurrency.py` selects `--suite decode-saturation` or `--suite corpus-makespan`.
+Their distinct time boundaries and workload dispatch are defined in the
+[serving methodology](../../docs/performance/methodology.md#workloads-and-measurement-boundaries).
+Repeat `--concurrency` to select C points; each point starts a fresh server. The point report
+records the actual Engine configuration, automatic KV capacity, shuffle seed where applicable,
+dispatch method, and per-request positions.
+Both serving runners disable prefix reuse and set extra Device state and Host context capacity to zero.
 
-- `decode-saturation` submits one long-decode wave and uses only complete one-second intervals in
-  which every decode round has exactly the configured batch size. Ramp-up, prefill, and drain
-  intervals are excluded.
-- `corpus-makespan` shuffles the existing mode-specific corpus once with the fixed seed `20260811`,
-  then runs that same order with exactly `N` persistent client workers. A worker submits the next
-  request only after its current response completes, and makespan ends when the final response has
-  been read. Request bodies are sent in shuffled-order sequence while response waits remain fully
-  concurrent, removing client-thread arrival races without serializing inference.
-
-Each concurrency point starts a fresh server because its execution graphs and memory plan are
-startup-fixed. Prefix reuse is disabled, startup and warmup are outside both measurements, and the
-runner writes per-point JSON, raw serving JSONL, and combined JSON/CSV/Markdown summaries.
-The point report records the shuffle seed, dispatch method, shuffled position, and canonical corpus
-position for every request.
+Schema-v4 outputs include `points/*.json`, `server/*.jsonl`, and combined `summary.json`, `summary.csv`, and
+`summary.md`. C=1 corpus runs also write complete responses in `corpus/<point>/results.jsonl` and
+per-request phase summaries in that directory; older campaigns may have only point reports and
+server logs. Historical model pages identify the report directory associated with each table.
 
 ```bash
 python3 tools/bench/run_serve_concurrency.py \
   --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --kv-dtype int8 \
   --mode mtp3 --suite decode-saturation \
   --concurrency 1 --concurrency 2 --concurrency 4 \
   --decode-tokens 8192 \
@@ -176,6 +428,7 @@ python3 tools/bench/run_serve_concurrency.py \
 
 python3 tools/bench/run_serve_concurrency.py \
   --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --kv-dtype int8 \
   --mode mtp3 --suite corpus-makespan \
   --concurrency 1 --concurrency 2 \
   --output profiles/bench/concurrent-corpus
@@ -184,3 +437,44 @@ python3 tools/bench/run_serve_concurrency.py \
 Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the default 262,144-token
 pool. A point is intentionally not resumable: combining fragments from separate server processes
 would not preserve either a steady interval or one continuous makespan.
+
+## Host arena allocation replay (`replay_host_arena.py`)
+
+When the Host context tier is full, an allocation can fail because too few bytes are free or because
+enough bytes are free in total but no single run is large enough. `ninfer_host_context_geometry_failures_total`
+and `ninfer_host_context_shortage_failures_total` count the two on a live server. This tool asks a
+different question offline: **given the exact allocate / release / split sequence of a real run, how many
+refusals would another placement policy have had?** It needs no GPU and no new server run.
+
+It reads a trace printed by a *measurement build*. The shipped server does not print one. To make one, add
+these lines to `HostContextArena` (`src/core/host_context_arena.cpp`) and keep them out of the commit; kind is
+`S` for a state image allocation and `K` for a KV run (the arena does not know the kind, so pass it from every
+call site that reaches `HostContextArena::allocate`: `HostStatePool::allocate` and
+`ProgramImpl::reserve_capture_destination` (`capture.cpp`, a direct state image allocation) for `S`, and
+`HostKVArena::allocate` for `K`. Re-check with `rg "arena.*allocate\("` that no other caller exists, because a
+missing one leaves real `A`/`F` events out and the replay still runs on the incomplete sequence):
+
+```cpp
+// allocate(), on success:  std::fprintf(stderr, "[trace] A t=%lld off=%zu bytes=%zu kind=%c\n", now_ms(), offset, rounded, kind);
+// allocate(), on failure:  std::fprintf(stderr, "[trace] F t=%lld bytes=%zu kind=%c free=%zu largest=%zu extents=%zu %s\n",
+//                                        now_ms(), rounded, kind, free_bytes(), largest, free_extents_.size(),
+//                                        free_bytes() >= rounded ? "geometry" : "shortage");
+// release():               std::fprintf(stderr, "[trace] R t=%lld off=%zu bytes=%zu\n", now_ms(), offset, bytes);
+// split():                 std::fprintf(stderr, "[trace] P t=%lld off=%zu left=%zu right=%zu\n", now_ms(), left_offset, left_bytes, right_bytes);
+```
+
+```powershell
+# a hosted run with the trace build (see "Concurrent serving benchmark" and the hosted workload), then:
+python tools/bench/replay_host_arena.py runs/c8-h8/server.err --capacity-mib 8192
+python tools/bench/replay_host_arena.py runs/c8-h8/server.err --capacity-mib 8192 --policies legacy,bestfit,twoended_best
+```
+
+The first thing it prints is a validation: replaying the trace under `legacy` (first-fit by address, what
+the arena does today) must reproduce the real run exactly. If it does not, the script exits without
+reporting any other policy; `--force` overrides that for a trace taken under another placement.
+
+Read the result as a hypothesis, not a measurement. An F event is replayed as a probe (would the policy
+have placed it right now?) and the live set stays the real run's, so the engine's reaction to a successful
+placement, which would change every later event, is not modelled. A live A/B of plain two-ended placement did
+not show what the replay predicted for it. `python -I tools/bench/test_replay_host_arena.py` checks the tool
+itself and runs as `ninfer_host_arena_replay_test`.

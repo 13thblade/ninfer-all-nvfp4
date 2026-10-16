@@ -48,6 +48,18 @@ __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& 
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// FP16 x FP16 with an FP16 accumulator: full rate on GA10x GeForce parts, where the FP32-accumulate
+// form above runs at half rate. c0 holds the accumulator pair (row g, cols 2t..2t+1) and c1 the pair
+// (row g+8, cols 2t..2t+1) as packed __half2 bits; every product and partial sum rounds to FP16, so
+// callers bound the partial range themselves.
+__device__ __forceinline__ void mma_f16_acc16(unsigned& c0, unsigned& c1, unsigned a0, unsigned a1,
+                                              unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                 : "+r"(c0), "+r"(c1)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
 __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
                                        unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -56,13 +68,32 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// The k16 int8 shape: A is {a0,a1} (rows g and g+8, k = 4 (lane % 4) + 0..3), B is {b0}.
+__device__ __forceinline__ void mma_s8_k16(int& c0, int& c1, int& c2, int& c3, unsigned a0,
+                                           unsigned a1, unsigned b0) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                 : "r"(a0), "r"(a1), "r"(b0));
+}
+
+// On RTX 5090, block-scaled FP8 avoids the plain form's half-rate FP32 accumulation.
+// UE8M0 0x7f is exactly 1: preserve the raw E4M3 dot product and keep the callers'
+// existing row scales in FP32 after the MMA. No operand repacking is needed.
 __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
                                              unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                              unsigned b0, unsigned b1) {
-    asm volatile("mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+    constexpr unsigned kUnitScale8          = 0x7Fu;
+    constexpr unsigned short kScaleBlockId  = 0;
+    constexpr unsigned short kScaleThreadId = 0;
+    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X."
+                 "m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, "
+                 "{%10}, {%11,%12}, {%13}, {%14,%15};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(kUnitScale8),
+                   "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(kUnitScale8), "h"(kScaleBlockId),
+                   "h"(kScaleThreadId));
 }
 
 __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, float& c3,
@@ -72,12 +103,6 @@ __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, f
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
-
-__device__ __forceinline__ void mma_tf32(float& c0, float& c1, float& c2, float& c3, float a0,
-                                         float a1, float a2, float a3, float b0, float b1) {
-    mma_tf32_bits(c0, c1, c2, c3, __float_as_uint(a0), __float_as_uint(a1), __float_as_uint(a2),
-                  __float_as_uint(a3), __float_as_uint(b0), __float_as_uint(b1));
 }
 
 __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, float& c3,

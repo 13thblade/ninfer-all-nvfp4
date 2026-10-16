@@ -2,6 +2,7 @@
 
 // ninfer::ops - fused residual += W @ x.
 
+#include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
@@ -36,11 +37,14 @@ namespace ninfer::ops {
  *   ideal[:,t] = residual[:,t] + Linear(x,w)[:,t].
  *
  * Logical shapes:
- *   Contiguous BF16 x [K,T] and residual [N,T]. Registered weights are Q5G64_F16S RowSplit
- *   [5120,17408] or [5120,6144], W8G32_F16S RowSplit [2048,4096] or [2048,6144], NVFP4
+ *   Contiguous BF16 x [K,T] and residual [N,T]. Registered weights are Q4_G64_FP16 RowSplit
+ *   [5120,6144], Q5_G64_FP16 RowSplit [5120,17408] or [5120,6144], Q8_G32_FP16 RowSplit
+ *   [2048,4096], [2048,6144], [5120,6144] or [5120,17408], NVFP4
  *   BlockScaleK16M128x4 [5120,6144] or [5120,17408], row-scaled
- *   FP8_E4M3FN_ROW_BF16S [5120,6144] or [5120,17408], or BF16_CTRL Contiguous [5120,6144]. T may
- *   be any positive value.
+ *   FP8_E4M3FN_ROW_BF16 [5120,6144] or [5120,17408], BF16 Contiguous [5120,6144], GGML_IQ4_XS,
+ *   GGML_IQ3_S or GGML_Q6_K ggml_blocks_v1 [2560,6144], or GGML_IQ4_NL, GGML_Q8_0 or GGML_Q2_0
+ *   ggml_blocks_v1 [2560,640] (the codes-only native view of linear.h). T may be any positive
+ *   value.
  *
  * Numeric:
  *   The oracle reads a registered BF16 weight directly or exact-decodes a registered packed
@@ -49,13 +53,15 @@ namespace ninfer::ops {
  *   to LinearAdd's selected A16, A8, or A4 criterion, not the oracle. Production routes may fuse
  *   or materialize the projection and may choose their natural accumulator, activation
  *   quantization, staging, and workspace precision; those private choices are not semantic
- *   rounding boundaries.
+ *   rounding boundaries. GGML block formats are the exception: Linear(x,w) is linear.h's GGML
+ *   form, whose Q8_1 activation cast is a semantic boundary that the oracle applies too.
  *
  * Compute policy:
- *   Q5, W8, and BF16_CTRL admit only A16Only. NVFP4 admits A16Only and AllowA4. Row-scaled FP8
- *   admits A16Only and AllowA8. Its two semantic registrations own independent production plans:
- *   [5120,6144] resolves T<22 to A16 and T>=22 to A8, while [5120,17408] resolves T<25 to A16 and
- *   T>=25 to A8. A permissive policy allows the private resolver to select either qualified
+ *   All policies permit the A16 implementations of Q4, Q5, Q8 and BF16. NVFP4 uses A16 for
+ *   A16Only/AllowA8 and may use A4 under AllowA4. FP8 may use A8 under AllowA8/AllowA4. GGML
+ *   formats register only the Q8_1 (A8) profile, which every policy except A16Only admits.
+ *   Each registration owns its production plan. A permissive policy
+ *   allows the private resolver to select either qualified
  *   arithmetic profile; it does not itself prescribe a kernel.
  *
  * Effects:

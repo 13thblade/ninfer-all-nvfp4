@@ -3,6 +3,7 @@
 // Test-owned packed-weight fixtures for every registered quantized Weight format. Physical
 // row-split and block-scale codecs remain format-specific beneath one logical fixture interface.
 
+#include "core/weight.h"
 #include "core/tensor.h"
 
 #include <algorithm>
@@ -150,21 +151,36 @@ struct QuantSpec {
 
 inline QuantSpec quant_spec(QType qtype) {
     switch (qtype) {
-    case QType::Q4G64_F16S:
+    case QType::Q4_G64_FP16:
         return {4, 64, 7, -8};
-    case QType::Q5G64_F16S:
+    case QType::Q5_G64_FP16:
         return {5, 64, 15, -16};
-    case QType::Q6G64_F16S:
+    case QType::Q6_G64_FP16:
         return {6, 64, 31, -32};
-    case QType::W8G32_F16S:
+    case QType::Q8_G32_FP16:
         return {8, 32, 127, -127};
+    case QType::T2_G128_FP16:
+        return {2, 128, 1, -1};
     default:
         throw std::invalid_argument("row-split test packer: unsupported qtype");
     }
 }
 
+// T2 admits only the codes {00, 01, 11}; a random byte may carry the illegal field 0b10, which
+// the fixture rewrites to 0b11 (-1) so every generated group is a valid artifact word.
+inline std::uint8_t legalize_t2_byte(std::uint8_t value) {
+    std::uint8_t out = 0;
+    for (int field = 0; field < 4; ++field) {
+        std::uint8_t code = static_cast<std::uint8_t>((value >> (field * 2)) & 0x03u);
+        if (code == 0x02u) { code = 0x03u; }
+        out |= static_cast<std::uint8_t>(code << (field * 2));
+    }
+    return out;
+}
+
 inline int nibble_bytes_per_group(const QuantSpec& spec) {
-    return spec.bits == 8 ? spec.group_size : spec.group_size / 2;
+    if (spec.bits == 8) { return spec.group_size; }
+    return spec.bits == 2 ? spec.group_size / 4 : spec.group_size / 2;
 }
 
 inline int high_bytes_per_group(const QuantSpec& spec) {
@@ -181,6 +197,13 @@ inline void pack_lowbit_group(const std::int8_t* codes, const QuantSpec& spec,
     if (spec.bits == 8) {
         for (int i = 0; i < spec.group_size; ++i) {
             nibble_out[i] = static_cast<std::uint8_t>(codes[i]);
+        }
+        return;
+    }
+    if (spec.bits == 2) {
+        for (int i = 0; i < spec.group_size; ++i) {
+            const std::uint32_t u = static_cast<std::uint32_t>(codes[i]) & 0x03u;
+            nibble_out[i >> 2] |= static_cast<std::uint8_t>(u << ((i & 3) * 2));
         }
         return;
     }
@@ -208,6 +231,10 @@ inline void pack_lowbit_group(const std::int8_t* codes, const QuantSpec& spec,
 inline int unpack_lowbit_code(const std::uint8_t* nibble, const std::uint8_t* high,
                               const QuantSpec& spec, int index) {
     if (spec.bits == 8) { return static_cast<std::int8_t>(nibble[index]); }
+    if (spec.bits == 2) {
+        const std::uint32_t u = (nibble[index >> 2] >> ((index & 3) * 2)) & 0x03u;
+        return (u & 0x2u) ? static_cast<int>(u) - 4 : static_cast<int>(u);
+    }
     const std::uint8_t low_byte = nibble[index >> 1];
     const std::uint32_t low     = (index & 1) ? (low_byte >> 4) : (low_byte & 0x0fu);
     std::uint32_t hi            = 0;
@@ -245,7 +272,9 @@ struct PackedWeight {
             w.qhigh  = high_plane_bytes == 0
                            ? nullptr
                            : static_cast<std::uint8_t*>(device_payload) + high_plane_offset;
-            w.scales = static_cast<std::uint8_t*>(device_payload) + scale_plane_offset;
+            w.scales = w.qtype == QType::BF16
+                           ? nullptr
+                           : static_cast<std::uint8_t*>(device_payload) + scale_plane_offset;
         } else {
             w.qdata  = nullptr;
             w.qhigh  = nullptr;
@@ -321,7 +350,7 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
     if (n <= 0 || k <= 0) {
         throw std::invalid_argument("quantized-weight fixture: shape must be positive");
     }
-    if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
         if (options.weight_scale_divisor != 0.0F || options.input_scale_divisor != 0.0F) {
             throw std::invalid_argument(
                 "quantized-weight fixture: divisors do not belong to FP8 weights");
@@ -355,7 +384,7 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                                  kScales[(static_cast<std::uint32_t>(row) + seed) & 3U]);
         }
 
-        packed.weight.qtype            = QType::FP8_E4M3FN_ROW_BF16S;
+        packed.weight.qtype            = QType::FP8_E4M3FN_ROW_BF16;
         packed.weight.layout           = QuantLayout::RowScale;
         packed.weight.scale_dtype      = DType::BF16;
         packed.weight.payload          = packed.payload.data();
@@ -520,7 +549,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             for (std::uint64_t byte = 0; byte < code_bytes_per_group; ++byte) {
                 std::uint8_t code = static_cast<std::uint8_t>(
                     (row_mix * 37u + group * 29u + byte * 17u + seed) & 0xffu);
-                if (qtype == QType::W8G32_F16S && code == 0x80u) { code = 0x81u; }
+                if (qtype == QType::Q8_G32_FP16 && code == 0x80u) { code = 0x81u; }
+                if (qtype == QType::T2_G128_FP16) { code = detail::legalize_t2_byte(code); }
                 packed
                     .payload[static_cast<std::size_t>(group_index * code_bytes_per_group + byte)] =
                     code;
@@ -540,7 +570,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             for (std::size_t byte = 0; byte < code_bytes_per_group; ++byte) {
                 state              = detail::mix64(state + byte);
                 std::uint8_t value = static_cast<std::uint8_t>(state >> 56);
-                if (qtype == QType::W8G32_F16S && value == 0x80U) { value = 0x81U; }
+                if (qtype == QType::Q8_G32_FP16 && value == 0x80U) { value = 0x81U; }
+                if (qtype == QType::T2_G128_FP16) { value = detail::legalize_t2_byte(value); }
                 code_patterns[pattern][byte] = value;
             }
             for (std::size_t byte = 0; byte < high_bytes_per_group; ++byte) {
@@ -563,9 +594,10 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             }
         }
     }
+    // Sized from the format's own group (T2 has 128 lanes, the others 32 or 64).
+    std::vector<std::int8_t> codes(static_cast<std::size_t>(spec.group_size));
     const std::int32_t partial_group_lanes = k % spec.group_size;
     if (partial_group_lanes != 0) {
-        std::int8_t codes[64]{};
         const std::int32_t group = logical_groups - 1;
         for (std::int32_t row = 0; row < n; ++row) {
             const std::size_t group_index = static_cast<std::size_t>(row) * kg + group;
@@ -578,9 +610,9 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                 codes[lane] =
                     static_cast<std::int8_t>(detail::unpack_lowbit_code(nibble, high, spec, lane));
             }
-            std::fill(codes + partial_group_lanes, codes + spec.group_size,
+            std::fill(codes.begin() + partial_group_lanes, codes.end(),
                       static_cast<std::int8_t>(0));
-            detail::pack_lowbit_group(codes, spec, nibble, high);
+            detail::pack_lowbit_group(codes.data(), spec, nibble, high);
         }
     }
     constexpr std::uint16_t kUnitScales[]  = {0x3800u, 0x3a00u, 0x3c00u, 0x3d00u};
@@ -606,9 +638,27 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             options.row_split_codes == RowSplitCodePattern::Hashed
                 ? (detail::mix64(i ^ (static_cast<std::uint64_t>(seed) << 17)) >> 8) & 3U
                 : (row ^ (row >> 8) ^ group ^ seed) & 3U;
+        std::uint16_t scale = scales[scale_index];
+        // Store about half the groups as (-scale, -codes): the represented weights stay those of
+        // the positive pattern, so every calibrated criterion sees the same matrix statistics,
+        // while each route must apply the stored scale as a signed multiplier (tensor-formats
+        // section 6.1). -qmin is not a legal code, so a qmin lane stores qmax: one step off its
+        // positive-pattern value, and the oracle decodes the stored words either way.
+        if ((detail::mix64(i ^ 0x5bd1e995ULL) & 1U) != 0) {
+            std::uint8_t* nibble = packed.payload.data() + i * code_bytes_per_group;
+            std::uint8_t* high   = high_bytes_per_group == 0
+                                       ? nullptr
+                                       : packed.payload.data() + packed.high_plane_offset +
+                                           i * high_bytes_per_group;
+            for (std::int32_t lane = 0; lane < spec.group_size; ++lane) {
+                const int code = detail::unpack_lowbit_code(nibble, high, spec, lane);
+                codes[lane]    = static_cast<std::int8_t>(code == spec.qmin ? spec.qmax : -code);
+            }
+            detail::pack_lowbit_group(codes.data(), spec, nibble, high);
+            scale = static_cast<std::uint16_t>(scale | 0x8000u);
+        }
         detail::store_u16_le(packed.payload,
-                             static_cast<std::size_t>(packed.scale_plane_offset + i * 2),
-                             scales[scale_index]);
+                             static_cast<std::size_t>(packed.scale_plane_offset + i * 2), scale);
     }
 
     packed.weight.qtype            = qtype;
@@ -646,7 +696,16 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
         throw std::out_of_range("quantized-weight fixture: logical index out of range");
     }
 
-    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+    if (weight.qtype == QType::BF16) {
+        if (weight.layout != QuantLayout::Contiguous || weight.padded_shape[0] != weight.n ||
+            weight.padded_shape[1] != weight.k)
+            throw std::invalid_argument("linear-weight fixture: invalid contiguous BF16 metadata");
+        const auto offset = (static_cast<std::size_t>(row) * weight.k + column) * 2;
+        return static_cast<double>(
+            detail::bf16_to_f32(detail::load_u16_le(packed.payload, offset)));
+    }
+
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
         if (weight.layout != QuantLayout::RowScale || weight.scale_dtype != DType::BF16 ||
             weight.group != weight.k || weight.group_size != static_cast<std::uint32_t>(weight.k)) {
             throw std::invalid_argument("quantized-weight fixture: invalid FP8 metadata");
@@ -805,8 +864,8 @@ inline PackedWeight pack_row_split_lowbit(const std::vector<float>& source, std:
     out.scale_plane_bytes = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg) * 2ULL;
     out.payload.assign(static_cast<std::size_t>(out.scale_plane_offset + out.scale_plane_bytes), 0);
 
-    std::int8_t codes[64];
-    float vals[64];
+    std::vector<std::int8_t> codes(static_cast<std::size_t>(spec.group_size));
+    std::vector<float> vals(static_cast<std::size_t>(spec.group_size));
     for (std::int32_t row = 0; row < n; ++row) {
         for (std::int32_t g = 0; g < kg; ++g) {
             float maxabs = 0.0f;
@@ -828,7 +887,7 @@ inline PackedWeight pack_row_split_lowbit(const std::vector<float>& source, std:
             }
 
             const std::size_t group_index = static_cast<std::size_t>(row) * kg + g;
-            detail::pack_lowbit_group(codes, spec, out.payload.data() + group_index * nib,
+            detail::pack_lowbit_group(codes.data(), spec, out.payload.data() + group_index * nib,
                                       high_bpr == 0 ? nullptr
                                                     : out.payload.data() + out.high_plane_offset +
                                                           group_index * high_bpr);
@@ -864,24 +923,9 @@ inline PackedWeight pack_row_split_lowbit(const std::vector<float>& source, std:
     return out;
 }
 
-inline PackedWeight pack_q4_row_split(const std::vector<float>& source, std::int32_t n,
-                                      std::int32_t k) {
-    return pack_row_split_lowbit(source, n, k, QType::Q4G64_F16S);
-}
-
-inline PackedWeight pack_q5_row_split(const std::vector<float>& source, std::int32_t n,
-                                      std::int32_t k) {
-    return pack_row_split_lowbit(source, n, k, QType::Q5G64_F16S);
-}
-
-inline PackedWeight pack_q6_row_split(const std::vector<float>& source, std::int32_t n,
-                                      std::int32_t k) {
-    return pack_row_split_lowbit(source, n, k, QType::Q6G64_F16S);
-}
-
-inline PackedWeight pack_w8g32_row_split(const std::vector<float>& source, std::int32_t n,
-                                         std::int32_t k) {
-    return pack_row_split_lowbit(source, n, k, QType::W8G32_F16S);
+inline PackedWeight pack_q8_g32_row_split(const std::vector<float>& source, std::int32_t n,
+                                          std::int32_t k) {
+    return pack_row_split_lowbit(source, n, k, QType::Q8_G32_FP16);
 }
 
 } // namespace ninfer::test::quantized_weight

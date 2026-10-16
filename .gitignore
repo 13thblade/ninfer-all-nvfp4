@@ -19,6 +19,7 @@ CMakeUserPresets.json
 # Python tooling
 __pycache__/
 *.pyc
+.pytest_cache/
 .venv/
 .venv-*/
 venv/
@@ -29,10 +30,26 @@ venv/
 *.bin
 *.safetensors
 *.gguf
+# Phantom-KV grafts are tracked via LFS
+!artifacts/grafts/*.bin
+*.ninfer
+*.ninfer.conversion.json
+/models/
 out/
-models/
 vcpkg_installed/
+
+# Local workspace and transient runtime output
+/.local/
+/temp/
+/temp-*/
+/tmp/
+/tmp-*/
+/AGENTS.override.md
+/logs/
 *.log
+*.tmp
+/core
+/core.*
 
 # Measurement raw corpora & intermediates (large; produced by offline tooling).
 # The small final frequency stats under fixtures/ranking/ ARE tracked; the rest is ignored.
@@ -54,3 +71,8 @@ dist/*
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# Captured request payloads kept for reproducing a specific investigation locally. Deliberately not
+# committed: they are whole real prompts, so they carry third-party system-prompt text and are
+# large (100 KB+ each) for something only the person who captured them can act on.
+repro/

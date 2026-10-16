@@ -17,7 +17,7 @@
 namespace ninfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+using Json = RequestJson;
 
 constexpr std::size_t kMaxToolNameLength = 128;
 
@@ -28,12 +28,6 @@ enum class ParsePurpose {
 
 [[noreturn]] void invalid_tool_history(std::string message) {
     bad_request(std::move(message), "messages", "invalid_tool_history");
-}
-
-[[noreturn]] void invalid_thinking_signature() {
-    bad_request("assistant Thinking blocks must include the signature returned by NInfer and be "
-                "passed back unmodified",
-                "messages", "invalid_thinking_signature");
 }
 
 const Json& require_object(const Json& body) {
@@ -56,14 +50,35 @@ std::string require_block_type(const Json& block, const char* param) {
     return block.at("type").get<std::string>();
 }
 
-bool cache_boundary(const Json& value) {
+std::optional<CacheBoundary::Ttl> cache_boundary(const Json& value, const char* param) {
     if (!value.is_object() || !value.contains("cache_control") ||
-        !value.at("cache_control").is_object()) {
-        return false;
+        value.at("cache_control").is_null()) {
+        return std::nullopt;
     }
     const Json& control = value.at("cache_control");
-    return control.contains("type") && control.at("type").is_string() &&
-           control.at("type").get<std::string>() == "ephemeral";
+    if (!control.is_object()) {
+        bad_request("cache_control must be an object", param, "invalid_cache_control");
+    }
+    if (!control.contains("type") || !control.at("type").is_string() ||
+        control.at("type").get<std::string>() != "ephemeral") {
+        bad_request("cache_control.type must be 'ephemeral'", param, "invalid_cache_control");
+    }
+    if (!control.contains("ttl") || control.at("ttl").is_null()) {
+        return CacheBoundary::Ttl::FiveMinutes;
+    }
+    if (!control.at("ttl").is_string()) {
+        bad_request("cache_control.ttl must be '5m' or '1h'", param, "invalid_cache_control");
+    }
+    const std::string ttl = control.at("ttl").get<std::string>();
+    if (ttl == "5m") { return CacheBoundary::Ttl::FiveMinutes; }
+    if (ttl == "1h") { return CacheBoundary::Ttl::OneHour; }
+    bad_request("cache_control.ttl must be '5m' or '1h'", param, "invalid_cache_control");
+}
+
+CacheBoundary explicit_cache_boundary(CacheBoundary::Ttl ttl) {
+    return CacheBoundary{.kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                         .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                         .ttl      = ttl};
 }
 
 std::string require_tool_name(const Json& object, const char* param) {
@@ -113,8 +128,8 @@ ContentPart parse_image(const Json& block) {
     result.kind     = ContentKind::Image;
     result.type_raw = "image";
     result.source   = parse_image_source(block);
-    if (cache_boundary(block)) {
-        result.cache_boundary_after = ninfer::PromptCacheMarkerKind::PrivateLongAnchor;
+    if (const auto ttl = cache_boundary(block, "messages")) {
+        result.cache_boundary_after = explicit_cache_boundary(*ttl);
     }
     if (!block.contains("transformations") || block.at("transformations").is_null()) {
         return result;
@@ -139,12 +154,13 @@ ContentPart parse_image(const Json& block) {
     bad_request("transformations.oversized_image must be 'downsize' or 'error'", "messages");
 }
 
-ContentPart text_part(std::string value, bool boundary = false) {
+ContentPart text_part(std::string value,
+                      std::optional<CacheBoundary::Ttl> boundary = std::nullopt) {
     ContentPart part;
     part.kind     = ContentKind::Text;
     part.type_raw = "text";
     part.text     = std::move(value);
-    if (boundary) { part.cache_boundary_after = ninfer::PromptCacheMarkerKind::PrivateLongAnchor; }
+    if (boundary) { part.cache_boundary_after = explicit_cache_boundary(*boundary); }
     return part;
 }
 
@@ -181,8 +197,8 @@ void merge_turn(GenerationRequest& request, ChatTurn turn) {
 struct ParsedToolResult {
     std::string tool_use_id;
     std::vector<ContentPart> content;
-    bool is_error             = false;
-    bool cache_boundary_after = false;
+    bool is_error = false;
+    std::optional<CacheBoundary::Ttl> cache_boundary_after;
 };
 
 using ParsedUserBlock = std::variant<ContentPart, ParsedToolResult>;
@@ -214,7 +230,7 @@ std::vector<ContentPart> parse_tool_result_content(const Json& block) {
         const std::string type = require_block_type(part, "messages");
         if (type == "text") {
             result.push_back(text_part(require_string(part, "text", "messages", "text block"),
-                                       cache_boundary(part)));
+                                       cache_boundary(part, "messages")));
         } else if (type == "image") {
             result.push_back(parse_image(part));
         } else {
@@ -247,7 +263,7 @@ ParsedToolResult parse_tool_result(const Json& block) {
         }
         result.is_error = block.at("is_error").get<bool>();
     }
-    result.cache_boundary_after = cache_boundary(block);
+    result.cache_boundary_after = cache_boundary(block, "messages");
     return result;
 }
 
@@ -258,7 +274,7 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
         const std::string type = require_block_type(block, "messages");
         if (type == "text") {
             result.emplace_back(text_part(require_string(block, "text", "messages", "text block"),
-                                          cache_boundary(block)));
+                                          cache_boundary(block, "messages")));
         } else if (type == "image") {
             result.emplace_back(parse_image(block));
         } else if (type == "tool_result") {
@@ -283,7 +299,7 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
     return result;
 }
 
-ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSigner& signer) {
+ChatTurn parse_assistant_blocks(const Json& content) {
     ChatTurn assistant;
     assistant.role = ChatRole::Assistant;
     for (std::size_t index = 0; index < content.size(); ++index) {
@@ -291,22 +307,33 @@ ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSign
         const std::string type = require_block_type(block, "messages");
         if (type == "text") {
             assistant.content.push_back(
-                text_part(require_string(block, "text", "messages", "text block")));
+                text_part(require_string(block, "text", "messages", "text block"),
+                          cache_boundary(block, "messages")));
         } else if (type == "thinking") {
+            if (cache_boundary(block, "messages")) {
+                bad_request("cache_control is not valid on thinking blocks", "messages",
+                            "invalid_cache_control");
+            }
             const std::string thinking =
                 require_string(block, "thinking", "messages", "thinking block");
-            if (!block.contains("signature") || !block.at("signature").is_string()) {
-                invalid_thinking_signature();
-            }
-            const std::string signature = block.at("signature").get<std::string>();
-            if (signature.empty() || !signer.verify(thinking, index, signature)) {
-                invalid_thinking_signature();
-            }
+            // NInfer has no encrypted reasoning state to restore. The wire signature is therefore
+            // intentionally outside the lowered request; only visible Thinking reaches the model.
             assistant.reasoning_content += thinking;
         } else if (type == "redacted_thinking") {
+            if (cache_boundary(block, "messages")) {
+                bad_request("cache_control is not valid on redacted_thinking blocks", "messages",
+                            "invalid_cache_control");
+            }
             // Claude-encrypted reasoning is intentionally opaque to the local model.
         } else if (type == "tool_use") {
             assistant.tool_calls.push_back(parse_tool_use(block));
+            if (const auto ttl = cache_boundary(block, "messages")) {
+                if (index + 1U == content.size()) {
+                    assistant.cache_boundary_after = explicit_cache_boundary(*ttl);
+                }
+                // A valid non-terminal tool_use breakpoint cannot be represented by the Qwen
+                // flattened assistant turn. It is advisory, so execution continues without it.
+            }
         } else if (is_server_tool_block(type)) {
             bad_request("server tool content blocks require an executor that NInfer does not "
                         "provide",
@@ -319,30 +346,47 @@ ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSign
     return assistant;
 }
 
-ChatTurn parse_system_value(const Json& value, const char* param) {
+ChatTurn parse_system_value(const Json& value, const char* param, std::size_t first_block = 0) {
     ChatTurn system;
     system.role = ChatRole::System;
     if (value.is_string()) {
+        if (first_block != 0) { throw std::logic_error("string system value has a block offset"); }
         system.content.push_back(text_part(value.get<std::string>()));
         return system;
     }
     if (!value.is_array()) {
         bad_request("system content must be a string or an array of text blocks", param);
     }
-    for (const Json& block : value) {
+    if (first_block > value.size()) { throw std::logic_error("system block offset is invalid"); }
+    for (std::size_t index = first_block; index < value.size(); ++index) {
+        const Json& block = value[index];
         if (require_block_type(block, param) != "text") {
             bad_request("only text system blocks are supported", param,
                         "content_block_not_supported");
         }
-        system.content.push_back(text_part(
-            require_string(block, "text", param, "system text block"), cache_boundary(block)));
+        system.content.push_back(
+            text_part(require_string(block, "text", param, "system text block"),
+                      cache_boundary(block, param)));
     }
     return system;
 }
 
 void parse_system(const Json& body, GenerationRequest& request) {
     if (!body.contains("system") || body.at("system").is_null()) { return; }
-    request.messages.push_back(parse_system_value(body.at("system"), "system"));
+    const Json& value                             = body.at("system");
+    constexpr std::string_view kAttributionPrefix = "x-anthropic-billing-header:";
+    std::size_t first_block                       = 0;
+    if (value.is_array() && !value.empty()) {
+        const Json& first = value.front();
+        if (first.is_object() && first.contains("type") && first.at("type").is_string() &&
+            first.at("type").get_ref<const std::string&>() == "text" && first.contains("text") &&
+            first.at("text").is_string() &&
+            first.at("text").get_ref<const std::string&>().starts_with(kAttributionPrefix)) {
+            first_block = 1;
+        }
+    }
+    ChatTurn system = parse_system_value(value, "system", first_block);
+    if (!system.content.empty()) { request.messages.push_back(std::move(system)); }
 }
 
 std::vector<ParsedMessage> normalize_same_role_messages(std::vector<ParsedMessage> messages) {
@@ -462,9 +506,13 @@ void normalize_tool_history(std::vector<ParsedMessage>& messages) {
         paired_result_turn[index + 1U] = true;
     }
 
+    // A history whose opening turn was trimmed may start with the results of calls it no longer
+    // shows. Only System messages can precede that opening User turn.
+    std::size_t opening = 0;
+    while (opening < messages.size() && messages[opening].role == ChatRole::System) { ++opening; }
     for (std::size_t index = 0; index < messages.size(); ++index) {
         if (result_counts[index] == 0 || paired_result_turn[index]) { continue; }
-        if (index == 0 && messages[index].role == ChatRole::User) { continue; }
+        if (index == opening && messages[index].role == ChatRole::User) { continue; }
         const ParsedToolResult& result =
             std::get<ParsedToolResult>(messages[index].user_blocks.front());
         invalid_tool_history("tool_result id '" + result.tool_use_id +
@@ -493,7 +541,7 @@ void lower_messages(std::vector<ParsedMessage> messages, GenerationRequest& requ
             tool.content              = std::move(result.content);
             tool.tool_result_is_error = result.is_error;
             if (result.cache_boundary_after) {
-                tool.cache_boundary_after = ninfer::PromptCacheMarkerKind::PrivateLongAnchor;
+                tool.cache_boundary_after = explicit_cache_boundary(*result.cache_boundary_after);
             }
             request.messages.push_back(std::move(tool));
         }
@@ -503,8 +551,7 @@ void lower_messages(std::vector<ParsedMessage> messages, GenerationRequest& requ
     }
 }
 
-void parse_messages(const Json& body, GenerationRequest& request,
-                    const AnthropicThinkingSigner& signer) {
+void parse_messages(const Json& body, GenerationRequest& request) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
     if (!messages.is_array() || messages.empty()) {
@@ -534,21 +581,9 @@ void parse_messages(const Json& body, GenerationRequest& request,
         }
     }
 
-    for (std::size_t index = 0; index < roles.size();) {
-        if (roles[index] != ChatRole::System) {
-            ++index;
-            continue;
-        }
-        const std::size_t begin = index;
-        while (index < roles.size() && roles[index] == ChatRole::System) { ++index; }
-        if (begin == 0 || roles[begin - 1U] != ChatRole::User ||
-            (index < roles.size() && roles[index] != ChatRole::Assistant)) {
-            bad_request("system messages must follow a user message and be final or precede an "
-                        "assistant message",
-                        "messages", "invalid_message_order");
-        }
-    }
-
+    // A System message may sit anywhere in the history and renders as its own turn at that
+    // position, so an appended one leaves the rendered prefix intact for reuse. The one position it
+    // cannot take is between a tool_use and its tool_result; normalize_tool_history() rejects that.
     std::vector<ParsedMessage> parsed;
     parsed.reserve(messages.size());
     for (std::size_t index = 0; index < messages.size(); ++index) {
@@ -575,7 +610,7 @@ void parse_messages(const Json& body, GenerationRequest& request,
             bad_request("message content must be a string or an array", "messages");
         }
         if (role == ChatRole::Assistant) {
-            message.turn = parse_assistant_blocks(content, signer);
+            message.turn = parse_assistant_blocks(content);
         } else {
             message.user_blocks = parse_user_blocks(content);
         }
@@ -646,7 +681,6 @@ struct ParsedTool {
     ToolDefinition definition;
     ToolSource source = ToolSource::UserDefined;
     std::string source_type;
-    bool strict        = false;
     bool defer_loading = false;
     std::optional<std::vector<std::string>> allowed_callers;
 };
@@ -656,9 +690,12 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
     if (!body.contains("tools") || body.at("tools").is_null()) { return result; }
     if (!body.at("tools").is_array()) { bad_request("tools must be an array", "tools"); }
     std::unordered_set<std::string> names;
+    std::size_t source_index = 0;
     for (const Json& item : body.at("tools")) {
         if (!item.is_object()) { bad_request("tools entries must be objects", "tools"); }
         ParsedTool parsed;
+        parsed.definition.schema_param =
+            "tools/" + std::to_string(source_index++) + "/input_schema";
         if (item.contains("type") && !item.at("type").is_null()) {
             if (!item.at("type").is_string()) {
                 bad_request("tool type must be a string or null", "tools");
@@ -694,7 +731,9 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
                 }
                 parsed.definition.input_examples_json = item.at("input_examples").dump();
             }
-            parsed.definition.shared_cache_boundary_after = cache_boundary(item);
+            if (const auto ttl = cache_boundary(item, "tools")) {
+                parsed.definition.cache_boundary_after = explicit_cache_boundary(*ttl);
+            }
         } else if (item.contains("name") && item.at("name").is_string()) {
             parsed.definition.name = item.at("name").get<std::string>();
         }
@@ -703,7 +742,7 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
             if (!item.at("strict").is_boolean()) {
                 bad_request("tool strict must be a boolean", "tools");
             }
-            parsed.strict = item.at("strict").get<bool>();
+            parsed.definition.strict = item.at("strict").get<bool>();
         }
         if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
             if (!item.at("defer_loading").is_boolean()) {
@@ -743,19 +782,17 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         if (std::none_of(definitions.begin(), definitions.end(), named)) {
             bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
         }
-        bad_request("tool_choice.type='tool' requires that exact tool to be called, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "tool_choice_not_supported");
+        request.tool_choice.allowed_names = std::vector<std::string>{selection.name};
     }
     if (selection.kind == ToolSelectionKind::Any) {
         if (definitions.empty()) { bad_request("tool_choice requires tools", "tool_choice"); }
-        bad_request("tool_choice.type='any' requires at least one tool call, which NInfer cannot "
-                    "guarantee",
-                    "tool_choice", "tool_choice_not_supported");
     }
 
-    request.tool_choice.mode =
-        selection.kind == ToolSelectionKind::None ? ToolChoiceMode::None : ToolChoiceMode::Auto;
+    request.tool_choice.mode     = selection.kind == ToolSelectionKind::None ? ToolChoiceMode::None
+                                   : selection.kind == ToolSelectionKind::Auto
+                                       ? ToolChoiceMode::Auto
+                                       : ToolChoiceMode::Required;
+    request.tool_choice.parallel = !selection.disable_parallel;
     if (selection.kind == ToolSelectionKind::None) {
         for (ParsedTool& tool : definitions) {
             if (tool.source == ToolSource::UserDefined) {
@@ -776,11 +813,6 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                             "NInfer does not provide",
                         "tools", "anthropic_tools_not_supported");
         }
-        if (tool.strict) {
-            bad_request("strict=true requires generated tool input to satisfy the declared JSON "
-                        "Schema, which NInfer cannot guarantee",
-                        "tools", "strict_tools_not_supported");
-        }
         if (tool.defer_loading) {
             bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
                         "provide",
@@ -794,11 +826,6 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                         "tools", "tool_caller_not_supported");
         }
         request.tools.push_back(std::move(tool.definition));
-    }
-    if (selection.disable_parallel && !request.tools.empty()) {
-        bad_request("disable_parallel_tool_use=true requires at most one tool call, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "parallel_tool_use_not_supported");
     }
 }
 
@@ -824,6 +851,11 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
             bad_request("thinking.budget_tokens must be less than max_tokens", "thinking");
         }
         request.thinking_budget = static_cast<std::uint32_t>(*budget);
+    } else if (type == "between_tools") {
+        bad_request("thinking.type='between_tools' requests thinking only between tool calls, "
+                    "which the loaded chat template cannot schedule; use 'disabled', 'adaptive', "
+                    "or 'enabled'",
+                    "thinking", "thinking_type_not_supported");
     } else {
         bad_request("thinking.type must be 'disabled', 'adaptive', or 'enabled'", "thinking");
     }
@@ -852,11 +884,11 @@ void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose pur
     if (!body.contains("output_config") || body.at("output_config").is_null()) { return; }
     const Json& config = body.at("output_config");
     if (!config.is_object()) { bad_request("output_config must be an object", "output_config"); }
+    // count_tokens counts the prompt only; the output format does not change it.
     if (purpose == ParsePurpose::Messages && config.contains("format") &&
         !config.at("format").is_null()) {
-        bad_request("output_config.format requires constrained decoding, which NInfer does not "
-                    "provide",
-                    "output_config.format", "output_config_format_not_supported");
+        parse_json_output_format(config["format"], request, "output_config.format",
+                                 JsonFormatProtocol::Anthropic);
     }
     if (!config.contains("effort") || config.at("effort").is_null()) { return; }
     if (!config.at("effort").is_string()) {
@@ -908,18 +940,85 @@ std::string parse_model(const Json& body) {
     return body.at("model").get<std::string>();
 }
 
+void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& request) {
+    std::vector<std::optional<CacheBoundary>*> explicit_boundaries;
+    for (ToolDefinition& tool : request.tools) {
+        if (tool.cache_boundary_after) {
+            explicit_boundaries.push_back(&tool.cache_boundary_after);
+        }
+    }
+    for (ChatTurn& turn : request.messages) {
+        for (ContentPart& part : turn.content) {
+            if (part.cache_boundary_after) {
+                explicit_boundaries.push_back(&part.cache_boundary_after);
+            }
+        }
+        if (turn.cache_boundary_after) {
+            explicit_boundaries.push_back(&turn.cache_boundary_after);
+        }
+    }
+    if (explicit_boundaries.size() > kMaximumExplicitPromptCacheMarkers) {
+        bad_request("at most four block-level cache_control breakpoints are supported per request",
+                    "cache_control", "too_many_cache_breakpoints");
+    }
+
+    const std::optional<CacheBoundary::Ttl> automatic_ttl = cache_boundary(body, "cache_control");
+    if (!automatic_ttl) { return; }
+    request.allow_engine_automatic_shared_prefixes = false;
+
+    std::optional<CacheBoundary>* automatic_target = nullptr;
+    for (auto turn = request.messages.rbegin(); turn != request.messages.rend(); ++turn) {
+        if (!turn->tool_calls.empty()) {
+            automatic_target = &turn->cache_boundary_after;
+            break;
+        }
+        if (!turn->content.empty()) {
+            automatic_target = &turn->content.back().cache_boundary_after;
+            break;
+        }
+    }
+    if (automatic_target == nullptr && !request.tools.empty()) {
+        automatic_target = &request.tools.back().cache_boundary_after;
+    }
+    if (automatic_target == nullptr) { return; }
+
+    if (*automatic_target) {
+        if (automatic_target->value().ttl != *automatic_ttl) {
+            bad_request("request-level cache_control and the final block-level cache_control "
+                        "target the same boundary with different ttl values",
+                        "cache_control", "conflicting_cache_ttl");
+        }
+        automatic_target->value().evidence |= ninfer::SharedCandidateEvidence::RequestedAutomatic;
+        return;
+    }
+    if (explicit_boundaries.size() == kMaximumExplicitPromptCacheMarkers) {
+        bad_request("request-level cache_control needs a fifth distinct cache write after four "
+                    "block-level breakpoints",
+                    "cache_control", "too_many_cache_breakpoints");
+    }
+    *automatic_target =
+        CacheBoundary{.kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                      .evidence = ninfer::SharedCandidateEvidence::RequestedAutomatic,
+                      .ttl      = *automatic_ttl};
+}
+
 void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                         int effective_max_tokens, const AnthropicThinkingSigner& signer) {
+                         int effective_max_tokens) {
     lower_tools(body, request);
     parse_system(body, request);
-    parse_messages(body, request, signer);
+    parse_messages(body, request);
     parse_thinking(body, request, purpose, effective_max_tokens);
     parse_effort(body, request, purpose);
-    request.private_cache_boundary_at_prompt_end = cache_boundary(body);
+    apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
         bad_request("container requires an external execution environment that NInfer does not "
                     "provide",
                     "container", "container_not_supported");
+    }
+    if (body.contains("chat_template_kwargs") && !body.at("chat_template_kwargs").is_null()) {
+        if (!body.at("chat_template_kwargs").is_object())
+            bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
+        request.chat_template_kwargs_json = body.at("chat_template_kwargs").dump();
     }
     if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
         if (!body.at("preserve_thinking").is_boolean()) {
@@ -927,13 +1026,13 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
         }
         request.preserve_thinking = body.at("preserve_thinking").get<bool>();
     }
+    request.graft = parse_graft_field(body);
 }
 
 } // namespace
 
 AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
-                                                          const RequestLimits& limits,
-                                                          const AnthropicThinkingSigner& signer) {
+                                                          const RequestLimits& limits) {
     require_object(body);
     AnthropicMessagesRequest result;
     result.model                           = parse_model(body);
@@ -951,23 +1050,23 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
         if (*max_tokens < 0) { bad_request("max_tokens must be positive", "max_tokens"); }
         result.generation.max_tokens = *max_tokens;
     } else {
-        result.generation.max_tokens = limits.default_max_tokens;
+        apply_default_output_limit(result.generation, limits);
     }
 
     parse_common_prompt(body, result.generation, ParsePurpose::Messages,
-                        result.generation.max_tokens, signer);
+                        result.generation.max_tokens);
     parse_generation_fields(body, result.generation);
+    parse_structured_outputs(body, result.generation);
     return result;
 }
 
-AnthropicCountTokensRequest
-parse_anthropic_count_tokens_request(const Json& body, const AnthropicThinkingSigner& signer) {
+AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const Json& body) {
     require_object(body);
     AnthropicCountTokensRequest result;
     result.model                           = parse_model(body);
     result.generation.tool_name_max_length = kMaxToolNameLength;
     parse_common_prompt(body, result.generation, ParsePurpose::CountTokens,
-                        std::numeric_limits<int>::max(), signer);
+                        std::numeric_limits<int>::max());
     return result;
 }
 

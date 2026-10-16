@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ninfer/ops/linear_swiglu.h"
 
 #include "core/device.h"
@@ -78,7 +79,7 @@ Options parse_options(int argc, char** argv) {
                 options.t_sweep = {1, 4, 8, 16};
             } else if (value == "a4") {
                 options.policy  = ops::LinearPolicy::AllowA4;
-                options.t_sweep = {17, 128, 1024};
+                options.t_sweep = {5, 48, 49, 56, 64, 65, 96, 97, 128, 256, 1024};
             } else {
                 throw std::invalid_argument("--policy must be a16 or a4");
             }
@@ -147,8 +148,8 @@ int main(int argc, char** argv) {
             *std::min_element(options.t_sweep.begin(), options.t_sweep.end());
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        DeviceBuffer flush(kFlushBytes);
-        DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
+        bench::L2FlushBuffer flush(kFlushBytes);
+        DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t, 101U);
         DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
         bench::PackedQuantizedWeight packed  = bench::make_nvfp4_weight(kGateUpRows, kHidden);
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(

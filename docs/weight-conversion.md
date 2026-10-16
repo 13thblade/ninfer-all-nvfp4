@@ -1,0 +1,539 @@
+# Weight conversion
+
+NInfer's converter creates `.ninfer` artifacts from local weights and a Python recipe. A recipe
+can reuse an official conversion, change selected layers or projections, combine sources, or call
+your own conversion method. The artifact contains the resulting configuration, encoded weights,
+logical bindings and frontend resources.
+
+Run the commands below from the repository root.
+
+## Upgrade an existing v2 artifact
+
+The offline upgrade tool supports the official Qwen3.6/3.8-27B groupwise-int and NVFP4 artifacts,
+and Qwen3.6-35B-A3B groupwise-int. Update your checkout to the current `master` and
+[rebuild NInfer](../README.md#quick-start), then run with Python 3.11:
+
+```bash
+python3 tools/upgrade_ninfer_v2_to_v3.py \
+  models/qwen3_8_27b_nvfp4.ninfer \
+  models/qwen3_8_27b_nvfp4.v3.ninfer
+```
+
+The output must use a new path. After upgrading, use it directly or rename it to replace the
+original file. Stored weight values and formats are preserved. The upgrade also installs the
+matching template from `tools/chat_templates/`. Published SHA-256 checksums apply only to
+downloaded files.
+
+## Start with an official recipe
+
+Source-weight conversion requires a Python 3.11 environment with PyTorch and NumPy. It uses CUDA
+by default; `--device cpu` selects CPU conversion. The input paths below are placeholders for your
+local checkpoint directories.
+
+For Qwen3.6-27B floating-point source weights:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.6-27B \
+  --recipe qwen3_6_27b \
+  --components text,vision,mtp \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_6.jinja \
+  --proposal \
+  --name qwen3.6-27b \
+  --out models/qwen3_6_27b.ninfer
+```
+
+The default Qwen3.8-27B artifact (`download-model qwen38-27b`) is built with the `qwen3_8_27b`
+recipe, which needs an importance matrix (see `grouped_search` below; the published artifact used
+Unsloth's `imatrix_unsloth.gguf` for this model):
+
+```bash
+python3 -m tools.convert   --model /path/to/Qwen3.8-27B   --recipe qwen3_8_27b   --source imatrix=qwen3_8_27b.imatrix.safetensors   --source dflash2=/path/to/Qwen3.8-27B-DFlash2   --components text,vision,mtp,dflash2   --proposal   --name qwen3.8-27b   --out models/qwen3_8_27b.ninfer
+```
+
+`--components` defaults to `text`. Include only the optional components you want to distribute.
+`--proposal` adds the indexed proposal head used by speculative decoding; it uses the repository's
+token ranking and defaults to 131,072 rows. The ordinary full-vocabulary output head is retained.
+
+The built-in recipes are ordinary Python functions in
+[`official_recipes.py`](../tools/convert/official_recipes.py):
+
+| Recipe | Main representation choices | Additional source |
+|---|---|---|
+| `qwen3_6_27b` | Q4/Q5 projections, Q6 vocabulary weights | None |
+| `qwen3_8_27b` | `grouped_search` with signed scales; Q4/Q5 projections, Q4 mixer outputs and MLP down in layers 36–63, Q4 embedding, Q6 head | `imatrix` |
+| `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
+| `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
+| `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
+| `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses; the embedding is T2 too, stored inverse-rotated and restored to the primal basis by the runtime on gather | `ternary` (GGUF) |
+
+These names select conversion choices. Runtime execution is selected from the architecture,
+configuration and actual bindings stored in the artifact. `--name` sets the public model name;
+it does not select kernels.
+
+For a Qwen3.8-27B NVFP4/FP8 artifact with DFlash2:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B \
+  --recipe qwen3_8_27b_nvfp4 \
+  --source quantized=/path/to/Qwen3.8-27B-NVFP4 \
+  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 \
+  --components text,vision,mtp,dflash2 \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --proposal \
+  --name qwen3.8-27b \
+  --out models/qwen3_8_27b_nvfp4.ninfer
+```
+
+Vision uses the main source, and so does MTP unless `--source mtp=PATH` supplies a separately trained
+head under the checkpoint's `mtp.*` tensor names. DFlash and DFlash2 use the corresponding named
+source, supplied as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain several optional
+components; the Engine loads only the ones selected at startup, including at most one speculative
+backend. Component availability and startup selection are independent.
+
+### Ternary Bonsai 2 27B
+
+`bonsai2_27b_ternary` ([`ternary.py`](../tools/convert/ternary.py)) builds a Qwen3.8-27B artifact
+whose text tower comes from PrismML's `Ternary-Bonsai-2-27B-PQ2_0.gguf`. Every text projection
+except the GDN A/B controls, the output head and the token-embedding table are stored as
+`t2_g128_fp16`: the ternary codes and their per-128 scales are imported without rounding. Those
+matrices are Hadamard-rotated in the checkpoint, so each projection's Uses carry the
+`hadamard_signs` auxiliary of its input width (three shared vectors in total), and the runtime
+rotates the matching activations. The token table has no Use of its own: the runtime restores each
+gathered row to the primal basis with the hidden-width signs that the output head carries. The
+recipe also undoes llama.cpp's exporter conventions: GDN value heads return from the tiled to the
+grouped order, norms from `1 + w` to `w`, and `ssm_a` to `A_log`. Vision and the frontend
+resources come from the vanilla Qwen3.8-27B checkpoint, which shares the geometry. The published
+artifact's MTP head and DFlash2 adapter are the ones trained against Bonsai 2 itself
+(`ProCreations/Ternary-Bonsai-2-27B-MTP` and `-DFlash2`), so both `--source mtp=` and
+`--source dflash2=` are required to reproduce it: without `--source mtp`, MTP falls back to the
+vanilla checkpoint's head, and a vanilla DFlash2 adapter is not the one the artifact carries. The
+exact revisions are in the model card's `artifact-manifest.json`.
+A `--proposal` head gathered from the rotated output head inherits its rotation.
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B \
+  --recipe bonsai2_27b_ternary \
+  --source ternary=/path/to/Ternary-Bonsai-2-27B-PQ2_0.gguf \
+  --source mtp=/path/to/Ternary-Bonsai-2-27B-MTP/model_mtp.safetensors \
+  --source dflash2=/path/to/Ternary-Bonsai-2-27B-DFlash2 \
+  --components text,vision,mtp,dflash2 \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --proposal \
+  --name bonsai2-27b \
+  --out models/bonsai2_27b.ninfer
+```
+
+A named source whose path ends in `.gguf` opens as a GGUF file; the recipe validates its header,
+tensor set and Hadamard metadata before reading anything.
+
+## Change part of a recipe
+
+Save the following as `my_recipe.py`:
+
+```python
+from tools.convert.official_recipes import qwen3_6_27b
+
+
+def configure(model, recipe, sources):
+    qwen3_6_27b(model, recipe, sources)
+    recipe.assign(
+        "text/layers/0/mlp/down",
+        format="q6_g64_fp16",
+        method="grouped_absmax",
+    )
+```
+
+Run it with the same source and component selection:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.6-27B \
+  --recipe my_recipe.py \
+  --components text,vision,mtp \
+  --proposal \
+  --out models/my_qwen.ninfer
+```
+
+The default entry function is `configure`; `--recipe my_recipe.py:customize` selects another
+function. Alternatively, use an official `--recipe` and put only the changes in an `--override`
+file. Overrides run after the base recipe and optional proposal-head setup.
+
+`model.parameters` maps logical names to their shape, source and mathematical inputs. To see the
+available names for your selected components, a recipe can print them:
+
+```python
+for name, parameter in model.parameters.items():
+    print(name, parameter.shape, parameter.inputs)
+```
+
+`recipe.assign` accepts one name, a list of names, or shell-style patterns such as
+`text/layers/*/mlp/down`. A selector that matches nothing fails. Assignments run in Python order;
+later assignments replace only the explicitly supplied choices. Changing `format` does not
+automatically change `method`. Use `layout="auto"` to select the registered layout for the format
+when overriding an earlier explicit layout choice.
+
+The principal choices are:
+
+| Argument | Meaning |
+|---|---|
+| `format` | Persistent numeric format |
+| `layout` | Physical encoding; inferred from format unless explicitly set |
+| `method` | Built-in method name or Python callable |
+| `source` | Logical values or encoded rows from the selected source |
+| `parameters` | JSON-serializable numerical parameters passed to the method |
+| `rows=(begin, end)` | Override complete leading-axis rows in a half-open range |
+| `activation_policy` | Permission for activation precision at the parameter's mathematical inputs |
+
+For example, `rows=(0, 128)` can give the first 128 rows a different format. This creates multiple
+physical parts when necessary. The container can represent that result; the intended Op must also
+support consuming those parts. Current native projections generally require a contiguous parent
+region, so arbitrary splits of one projection are not automatically executable.
+
+## Formats, methods and activation precision
+
+The converter currently writes these formats:
+
+| Format | Built-in method for floating-point input | Import of already encoded input |
+|---|---|---|
+| `bf16`, `fp32`, `int32` | `cast_direct` | Direct words through the source reader |
+| `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax`, `grouped_search` | Supply a custom method/source if needed |
+| `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
+| `nvfp4` | Supply a custom quantizer | `import_encoded` |
+| `ggml_q8_0`, `ggml_q6_k`, `ggml_iq2_xxs`, `ggml_iq4_nl`, `ggml_iq3_s`, `ggml_iq2_s`, `ggml_iq4_xs`, `ggml_iq1_m`, `ggml_q2_0` | None | `import_encoded` from a GGUF |
+| `ggml_rec_iq2_s_q2_0`, `ggml_rec_iq2_xxs_q2_0`, `ggml_rec_iq1_m_q2_0`, `ggml_rec_q2_0_q2_0` | None | `import_expert_records` from a GGUF expert layer (the last: the MTP drafter's fused gate/up) |
+
+`grouped_absmax` stores one FP16 scale per group and signed integer codes. `grouped_search` stores
+the same words but chooses each group's scale by minimizing rounding error weighted by an activation
+importance matrix. Its parameters are `imatrix` (a file from `tools.convert.imatrix`) and
+`negative_scales`:
+
+```bash
+python -m tools.convert.imatrix --gguf imatrix.gguf --config /path/to/Qwen3.8-27B/config.json \
+  --out qwen3_8_27b.imatrix.safetensors
+```
+
+```python
+recipe.assign(name, format="q4_g64_fp16", method="grouped_search",
+              parameters={"imatrix": "qwen3_8_27b.imatrix.safetensors", "negative_scales": True})
+```
+
+The importance file comes from a llama.cpp `llama-imatrix` run on calibration text; parameters it
+does not cover (the embedding and output head) are searched without weights. `fp8_row_maxabs` first
+rounds input values to BF16, then produces E4M3FN codes and one BF16 multiplier per row.
+`import_encoded` preserves compatible code and scale words, including NVFP4's matrix weight divisor.
+It does not dequantize and requantize them.
+
+The exact numeric and packing rules are in [numeric formats](maintainer/tensor-formats.md) and
+[storage layouts](maintainer/storage-layouts.md). Source format names alone do not establish
+compatibility: scale direction, granularity, code meaning and axis order must also match.
+
+Activation permissions are independent of the stored weight format:
+
+| Policy | Permitted activation paths |
+|---|---|
+| `A16Only` | A16 |
+| `AllowA8` | A16, A8 |
+| `AllowA4` | A16, A8, A4 |
+
+They permit choices; they do not force a kernel to use the lowest precision. A fused operation that
+shares one activation across several projections must respect the intersection of their
+permissions. `recipe.use(parameter, input_name, ...)` can set one mathematical input independently;
+the names are available in `parameter.inputs`.
+
+An NVFP4 A4 input requires a positive finite activation divisor. `import_encoded` obtains it from
+the selected source, or a recipe supplies it through
+`recipe.use(..., auxiliaries={"activation_input_divisor": value})`. Shared weights retain separate
+Use records; sharing weights does not share calibration implicitly.
+
+## Fused parents and logical projections
+
+The Qwen adapter exposes Q, K, gate and V separately, even when they came from fused source tensors.
+It also supplies finite packing groups for attention, GDN, MLP and MoE. Compatible selections are
+packed into a shared parent automatically by the built-in methods.
+
+For the Dense groupwise recipe, attention Q/K form one Q4 parent and gate/V form one Q5 parent.
+The native fused Op receives two weights. To use the supported single-parent FP8 form, an override
+can assign all four projections together:
+
+```python
+def configure(model, recipe, sources):
+    for layer, kind in enumerate(model.config["layer_types"]):
+        if kind != "full_attention":
+            continue
+        prefix = f"text/layers/{layer}/attention/"
+        recipe.assign(
+            [prefix + role for role in ("query", "key", "gate", "value")],
+            format="fp8_e4m3fn_row_bf16",
+            layout="auto",
+            method="fp8_row_maxabs",
+            activation_policy="AllowA8",
+        )
+```
+
+Use this file as `--override` after `qwen3_6_27b` or `qwen3_8_27b`. It leaves the other parameters
+under that recipe. The adapter handles source Q/gate row order; the override works with logical
+projections. Changing their representation can change numerical results and the physical kernels.
+
+For explicit organization, `recipe.group([names...])` concatenates compatible selections in the
+given order, `recipe.separate(names)` disables automatic grouping for those parameters, and
+`recipe.share(parameter, target)` binds equal-shaped parameters to the same physical data.
+Explicit groups must be disjoint and use unsplit selections with matching format, layout, method
+and method parameters. NVFP4 parents also require a common weight divisor. Automatic grouping is
+limited to built-in methods; custom methods can request explicit groups.
+
+Grouping chooses storage. Model execution code chooses the supported fused implementation. The
+loader uploads the stored representation, without repacking an inconvenient arrangement.
+
+## Read another source
+
+`--model` supplies the main config, default resources and the source named `base`. Add other
+Safetensors sources with repeated `--source NAME=PATH`; they are opened when used. Single-file
+Safetensors and indexed shards are supported. Additional tensor-only sources can omit model config;
+sources carrying config are checked against the relevant model geometry.
+
+To replace a logical parameter from another compatible checkpoint in a recipe:
+
+```python
+name = "text/layers/0/mlp/down"
+recipe.assign(
+    name,
+    source=model.source(name, sources["alternate"]),
+    format="q6_g64_fp16",
+    method="grouped_absmax",
+)
+```
+
+Supply `--source alternate=/path/to/alternate-checkpoint`. `model.source` applies the architecture's
+source-name and axis mapping, including Q/gate extraction. The built-in compressed-tensors reader
+understands the implemented per-row FP8 and NVFP4 code/scale conventions. It can expose decoded
+values for another quantizer or encoded rows for exact import.
+
+For another file format or quantization convention, provide a `LogicalSource`. Its value reader
+accepts flat C-order element bounds and returns exactly that range. For example, a recipe can read
+a logical matrix from a NumPy file stored beside the recipe:
+
+```python
+from pathlib import Path
+import numpy as np
+import torch
+from tools.convert.sources.logical import LogicalSource
+
+
+def configure(model, recipe, sources):
+    name = "text/layers/0/mlp/down"
+    path = Path(__file__).with_name("mlp-down.npy")
+    data = np.load(path, mmap_mode="r")
+    if tuple(data.shape) != model.parameters[name].shape or not data.flags.c_contiguous:
+        raise ValueError("mlp-down.npy must have the logical shape and C-order storage")
+
+    def read_values(begin, end):
+        values = data.reshape(-1)[begin:end].astype(np.float32, copy=True)
+        return torch.from_numpy(values)
+
+    source = LogicalSource(tuple(data.shape), str(path), read_values)
+    recipe.assign(name, source=source, format="q6_g64_fp16", method="grouped_absmax")
+```
+
+Use this as an override. The NumPy file must already follow the logical row/column order. For an
+unfamiliar quantized source, its reader performs the corresponding decoding before returning
+values. To preserve existing compatible encoded words, also provide `read_encoded` returning
+`EncodedRows`, and the format's required divisor accessors. Their definitions are in
+[`sources/logical.py`](../tools/convert/sources/logical.py).
+
+## Convert a GGUF
+
+A `--model` path ending in `.gguf` selects the GGUF route. It supports Qwen3.8-Flash-Next
+(GGUF architecture `qwen4exp`) with the `qwen4_exp_gguf` recipe, which stores every value exactly:
+block tensors keep their GGML blocks, BF16 and FP32 keep their words, and the one F16 tensor widens
+exactly to FP32. A few direct tensors take the representation their Op reads, still without
+rounding: the attention and indexer q/k norms are stored as the BF16 `gamma` of the GGUF's
+`1 + gamma` (the converter forms `v - 1` exactly and refuses any value without an exact BF16 gamma
+that reproduces `v`), `ssm_norm` and `ssm_conv1d` (F32 words that are BF16 words) as BF16, and
+`ssm_conv1d` transposed to `[K, C]`; BF16 projections over one input are packed into one parent
+(each hyper-connection mixer's down and inject rows, the GDN a and b rows, the PLE key and value
+rows). Each layer's routed experts become one expert bank in
+`ggml_expert_record_v1`: one record per expert holding its gate, up and down blocks, the unit the
+expert cache moves. Name the first file of a split GGUF; the reader finds the others by their
+`-0000N-of-0000M` names and checks the split metadata.
+
+```bash
+python -m tools.convert \
+  --model /models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+  --recipe qwen4_exp_gguf --device cpu --out out/qwen4exp.ninfer
+```
+
+The PLE n-gram table is not stored in the artifact. The converter writes it after the artifact as
+a separate n-gram volume (storage layouts Section 11), by default `OUT.ngram`; `--ngram-out PATH`
+places it elsewhere, for example on another NVMe drive, and refuses to replace an existing file.
+The artifact records the volume's geometry and a random 16-byte volume id in its text config
+(`ngram_table`). To convert again without rewriting the 29 GB volume, pass `--ngram-reuse PATH`:
+the converter adopts that volume's id only if its header matches this table's geometry and 512
+rows spread over the table (the first and last included) equal the GGUF's rows byte for byte.
+
+`--mtp-gguf PATH` adds the MTP drafter (component `mtp`, architecture `Qwen4ExpMTP`) from Strata's
+`mtp-q2_0.gguf` (GGUF architecture `qwen4exp-mtp`, the checkpoint's `mtp.*` tensors). Its BF16
+matrices keep their words; its 512 routed experts keep their Q2_0 blocks as one
+`ggml_rec_q2_0_q2_0` bank (the fused `gate_up_proj` holds each expert's gate rows, then its up rows);
+the indexer's fused `index_qk_proj` splits into its query and key row blocks. Its norms hold the
+checkpoint's raw BF16 gamma widened to F32: the embedding, hidden and attention norms are stored as
+those BF16 words (unit-offset RMSNorms), and the three hyper-connection mixer norms as
+`fl32(1 + gamma)`, the multiplier the mixer Op takes and the same FP32 sum the text GGUF stores for
+every text mixer norm. With the drafter the artifact is 40.1 GB (905 s on this host, n-gram volume
+reused); the Engine loads the drafter only for `--spec mtp`.
+
+```bash
+python -m tools.convert \
+  --model /models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+  --mtp-gguf /models/mtp-q2_0.gguf \
+  --recipe qwen4_exp_gguf --device cpu --out out/qwen4exp-mtp.ninfer --ngram-reuse out/qwen4exp.ninfer.ngram
+```
+
+`--mmproj PATH` adds the vision tower (component `vision`) from the model's
+`mmproj-Qwen3.8-Flash-Next-BF16.gguf` (llama.cpp's `qwen3vl_merger` export, GGUF architecture
+`clip`). The tower is Qwen3.5's vision encoder (27 blocks of width 1152, a 2 x 2 merger to the text
+width 2560, no deepstack), so the component takes Qwen3.5's vision config and parameter names and
+it is laid out to bind through the same Vision contract (the artifact is conversion-only here; see below). The converter undoes llama.cpp's split of
+the temporal patch convolution (`v.patch_embd.weight` and `.weight.1` stack back into
+`[1152, 3, 2, 16, 16]`), splits `attn_qkv` into its query, key and value rows, and maps `v.post_ln`
+to the merger's LayerNorm and `mm.0` / `mm.2` to its two projections. Every value is stored as BF16
+without rounding: the BF16 matrices keep their words, and the F32 tensors (patch convolution, biases,
+LayerNorms, the position table), which hold widened BF16 words, are narrowed after a check that
+refuses any value that would round. The mmproj carries no resize bounds, so the vision resources
+(`preprocessor_config.json`, `video_preprocessor_config.json`) are the Qwen3.5-family processor
+settings, copied from the Qwen3.6 checkpoints' files (the Qwen3.8 checkpoint's own were not available
+to compare, so the bounds are assumed to carry over); the converter refuses an mmproj whose patch size, frames, merge size or 0.5/0.5
+normalization differ from them. The tower adds 0.86 GB. This is an artifact-only change: the runtime does not load the vision
+component yet, and `--vision` support arrives in the stacked changes (#271, #272).
+
+```bash
+python -m tools.convert \
+  --model /models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+  --mtp-gguf /models/mtp-q2_0.gguf --mmproj /models/mmproj-Qwen3.8-Flash-Next-BF16.gguf \
+  --recipe qwen4_exp_gguf --device cpu --out out/qwen4exp-mtp-vision.ninfer \
+  --ngram-reuse out/qwen4exp.ninfer.ngram
+```
+
+The text config uses Infernix's Qwen4Exp keys. The GGUF stores the n-gram hash tables literally
+(multipliers, head sizes and offsets); the config records Infernix's derivation parameters (seed
+1234, prime base 20,000,000, padding to 128 rows), and the converter refuses a GGUF whose literal
+tables differ from that derivation.
+
+The full conversion writes a 39.2 GB artifact (two files) and a 29.1 GB volume; on this fork's
+host it took 802 s plus 346 s for the volume, at a peak working set of 0.62 GiB. Nothing loads
+the artifact yet: the model loader and its tests arrive in a later change, so the Engine, CLI and
+server cannot run it. `--subset dev` writes a
+2.9 GB development subset instead: one real tensor of each GGML type, the direct tensors of layers
+0, 1 and 3, the expert banks of layers 0, 1 and 8 (one of each record format) and a volume of the
+first 4,500 n-gram rows. The reader ([`sources/gguf.py`](../tools/convert/sources/gguf.py)) admits
+only F32, F16, BF16 and the registered GGML block types, and reads with bounded positional reads;
+the measured peak working set was 0.62 GiB for the subset conversion and 0.60 GiB for a pass of the
+whole 29.1 GB n-gram volume through the writer.
+
+The tokenizer resources are synthesized from the GGUF vocabulary and merges. A GGUF cannot record
+that a `<|...|>` added token is not special (llama.cpp's converter marks those as control tokens), so
+the synthesized `tokenizer.json` marks the FIM and repository tokens special. To keep the
+Hugging Face flags, pass the original file with `--resource tokenizer.json=PATH`; the converter
+accepts it only if its vocabulary, merges and added tokens equal the GGUF's.
+
+## Write a conversion method
+
+A method receives a `PrepareRequest` and returns `request.job(produce=...)`. Preparation validates
+the target and determines auxiliary values. The `produce` function reads bounded source regions
+and writes values or codes/scales through `TensorOutput`; the writer owns placement and file I/O.
+
+This example adds explicit clipping before the existing grouped quantizer. It demonstrates the
+method interface; the clipping threshold is a numerical choice made by the recipe author.
+
+```python
+import math
+import torch
+from tools.artifact.formats import QuantFormat, get_format
+from tools.convert.quantization.groupwise import quantize_matrix
+
+
+def clipped_grouped(request):
+    if len(request.target.shape) != 2 or not isinstance(
+        get_format(request.target.format), QuantFormat
+    ):
+        raise ValueError("clipped_grouped requires a grouped-integer matrix")
+    limit = float(request.parameters["clip"])
+    if not math.isfinite(limit) or limit <= 0 or request.rows_per_chunk <= 0:
+        raise ValueError("clip and rows_per_chunk must be positive")
+    n, k = request.target.shape
+
+    def produce(output):
+        for begin in range(0, n, request.rows_per_chunk):
+            end = min(n, begin + request.rows_per_chunk)
+            values = request.values(begin * k, end * k).reshape(end - begin, k)
+            if not bool(torch.isfinite(values).all()):
+                raise ValueError("source contains non-finite values")
+            encoded = quantize_matrix(
+                values.clamp(-limit, limit),
+                request.target.format,
+                device=request.device,
+            )
+            output.write_codes(begin, encoded.codes, encoded.scales)
+
+    return request.job(produce=produce)
+
+
+def configure(model, recipe, sources):
+    recipe.assign(
+        "text/layers/0/mlp/down",
+        format="q6_g64_fp16",
+        method=clipped_grouped,
+        parameters={"clip": 1.0},
+    )
+```
+
+Use this as an override. `request.values` traverses the prepared logical inputs in parent order,
+including explicit groups. `output.write_codes` performs the registered packing and validates
+codes/scales; the method should not duplicate that byte-layout logic. Direct output uses
+`output.write_values`. Keep source blocks and temporary device tensors bounded to the method's
+working set. `--rows-per-chunk` defaults to 512; custom methods own how they use it.
+
+## Resources, files and inspection
+
+Text includes `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and
+`generation_config.json`. Vision adds its image and video processor configs. Resources come from
+`--model`; `--resource ROLE=PATH` replaces a selected resource:
+
+```text
+--resource chat_template.jinja=/path/to/chat_template.jinja
+```
+
+The official conversion examples select these maintained templates:
+
+| Model | Template | Defaults |
+|---|---|---|
+| Qwen3.6 Dense/MoE | [qwen3_6.jinja](../tools/chat_templates/qwen3_6.jinja) | thinking on; closed-turn reasoning omitted |
+| Qwen3.8 | [qwen3_8.jinja](../tools/chat_templates/qwen3_8.jinja) | thinking on; effort `xhigh`; closed-turn reasoning retained |
+
+Use your own Jinja file to change the artifact's default template. A startup
+[`--chat-template FILE`](cli.md#text-input) overrides the stored template.
+`generation_config.json` is preserved; sampling presets remain determined by the architecture
+and explicit application/request settings.
+
+The default maximum file size is 32,000,000,000 bytes, including framing. Smaller artifacts remain
+one file. Larger artifacts use an entry such as `models/my_qwen.ninfer` plus
+`my_qwen.ninfer.part-0001`, `my_qwen.ninfer.part-0002`, and so on in the same directory. Pass only the
+entry path to NInfer and keep all its recorded parts together. `--max-file-bytes` changes the limit.
+
+Conversion writes `models/my_qwen.ninfer.conversion.json` alongside the artifact, recording sources,
+methods, formats, component configs, files and timing. Existing output files are not overwritten.
+The report is useful for reproducing a recipe; the Engine reads the artifact itself.
+
+```bash
+python3 -m tools.artifact.inspect models/my_qwen.ninfer --objects --bindings
+python3 -m tools.artifact.inspect models/my_qwen.ninfer --json
+```
+
+Inspection reads directory facts without running inference. Conversion rejects missing logical
+coverage, invalid source geometry, unsupported encodings and invalid method output. Actual Op
+support is checked by consumers during preparation, resource queries, warmup or execution. A
+valid file may need additional Op support before its chosen combination can run. Exercise the
+phases and optional components you intend to use through the normal [CLI](cli.md) or
+[serving](serving.md) route.

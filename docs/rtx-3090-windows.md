@@ -1,4 +1,9 @@
-# NInfer-3090 v0.6.1 for Windows
+# NInfer-3090 for Windows
+
+> Not the archive README. This is the checkout-side Windows guide, so the scripts it names live
+> under `scripts/`. The README shipped inside the release archive is
+> [`release-archive-windows.md`](release-archive-windows.md), and `VERSION` in the archive says
+> which release you have.
 
 This native Windows release supports Qwen3.8-27B, Qwen3.6-27B, and the compact, text-only
 Qwen3.6-35B-A3B v0.3.1 artifact. The runtime provides paged KV, concurrent request execution,
@@ -15,29 +20,43 @@ OpenAI/Anthropic serving APIs.
 The bundled applications and dependency DLLs are native Windows executables. Model artifacts are
 not included in the release archive.
 
+## Recommended model: Qwen3.8-27B
+
+`scripts\download-model.bat qwen38-27b` fetches the pinned Qwen3.8-27B artifact and
+`scripts\run.bat qwen38-27b` serves it with the tuned profile (see the
+[README](../README.md#quick-start)). The rest of this guide documents the Qwen3.6-35B-A3B MoE, which
+serves more lanes.
+
 ## Download the compatible Qwen3.6-35B artifact
 
-The published RTX 3090 measurements use the compact 20.84 GiB container-v1 artifact. Pin its
-revision because the Hugging Face repository's unpinned `main` file is now the larger 21.22 GiB
-container-v2 artifact with DFlash weights:
+`scripts/download-model.bat qwen36-35b-a3b` fetches this pinned revision and is the simplest way to
+get it. Pin the revision explicitly because the Hugging Face repository's unpinned `main` file can
+move:
 
 ```powershell
 hf download neroued/Qwen3.6-35B-A3B-NInfer `
   qwen3_6_35b_a3b.ninfer `
-  --revision c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c `
+  --revision ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6 `
   --local-dir models
 
 Get-FileHash .\models\qwen3_6_35b_a3b.ninfer -Algorithm SHA256
 ```
 
 Expected SHA-256:
-`9e8378398d2b789a77224b5110c7590adbbc6fd4accd139b918157b2b9da7163`.
+`3e33297645dc33557751be1a3c407a74ed7c00f34909b5d4e8cfdce91b3dbe84`.
 
-The v0.5 runtime reader accepts both v1 and v2 containers. An error that says only
-`artifact magic is not NInfer version 1` comes from an older executable; replace it with the
-[v0.5.0 Windows release](https://github.com/Don-Chad/ninfer-3090/releases/tag/v0.5.0-rtx3090).
-Although v2 is readable, its DFlash-bearing payload is not the artifact used to qualify the 24 GB
-3090 cohort profiles, so pinned v1 remains the recommended download.
+This is the v3 container artifact, carrying the DFlash bundle needed for `--spec dflash`. The
+runtime reads only v3. A v2 file from an earlier release (for example the `560f227e` pin) is refused
+at load; upgrade it locally instead of downloading again:
+
+```powershell
+python tools\upgrade_ninfer_v2_to_v3.py models\qwen3_6_35b_a3b.ninfer models\qwen3_6_35b_a3b.v3.ninfer
+```
+
+**The DFlash bundle costs nothing in VRAM unless you ask for DFlash.** The published RTX 3090
+concurrency measurements were taken against the smaller v2 `c8b8c1c0` artifact; loading with
+`--spec` unset binds the same resident weights, and only `--spec dflash` maps the additional
+bundle. The concurrency table below therefore still applies.
 
 ## Run the concurrent server
 
@@ -48,7 +67,7 @@ headroom and may reject an otherwise viable compact-35B configuration.
 .\ninfer-serve.exe models\qwen3_6_35b_a3b.ninfer `
   --host 127.0.0.1 --port 8080 `
   --max-context 4096 --kv-capacity 4096 `
-  --max-concurrency 4 --max-pending-requests 32 `
+  --max-concurrency 4 --max-pending-requests 32 --pending-timeout-ms 600000 `
   --prefill-chunk 512 --kv-dtype int8 `
   --spec mtp --draft-tokens 3 --lm-head-draft
 ```
@@ -57,8 +76,8 @@ Prefix reuse is enabled by default; `--no-prefix-reuse` disables it. The server 
 Responses, OpenAI Chat Completions, and Anthropic Messages-compatible endpoints. Run
 `.\ninfer-serve.exe --help` for the complete option list.
 
-The compact 35B artifact does not contain DFlash weights. Do not select `--spec dflash`; the
-runtime reports the missing optional weights explicitly.
+`--spec dflash` needs an artifact with the DFlash bundle, such as the pinned v3 artifact above;
+without it startup refuses the selection explicitly.
 
 ## Qwen3.8-27B C8/8K profile
 
@@ -69,8 +88,8 @@ to use MTP3:
 .\ninfer-serve.exe models\qwen3_8_27b.ninfer `
   --host 127.0.0.1 --port 8080 `
   --max-context 8192 --kv-capacity 8192 `
-  --max-concurrency 8 --max-pending-requests 32 `
-  --prefill-chunk 1024 --kv-dtype int8 `
+  --max-concurrency 8 --max-pending-requests 32 --pending-timeout-ms 600000 `
+  --prefill-chunk 512 --kv-dtype int8 `
   --spec mtp --draft-tokens 3 --lm-head-draft
 ```
 
@@ -90,10 +109,26 @@ top-level field `"reasoning_effort": "xhigh"`; Responses uses
 `"reasoning": {"effort": "xhigh"}`. The CLI accepts
 `--reasoning-effort low|medium|xhigh`.
 
-The paged cache supports BF16, INT8, and experimental opt-in `rk8v4` storage. INT8 remains the
-recommended default. On the development RTX 3090, `rk8v4` raised the measured C1 automatic-sizing
-boundary from 171,648 to 226,560 tokens with MTP and CUDA Graphs disabled and 1 GiB headroom, but a
-matched hard-output test was not quality-equivalent. Use it only after validating your workload.
+The paged cache supports seven KV formats — `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `k8v4` and `nvfp4`.
+INT8 remains the
+recommended default. On the development RTX 3090, `rk8v4` raises the measured automatic-sizing
+boundary from 171,648 to 226,560 tokens at 1 GiB headroom, for 5.51 GiB of KV against INT8's
+5.40 GiB.
+
+Since the port onto the `kv_cache_append` Op, that context gain has a measured quality cost of
+**+0.092% perplexity** (`ninfer-perplexity`, `ninfer-ppl-1m-v1` quick, 261,167 scored tokens:
+4.342425 on INT8 against 4.346413 on rk8v4; both re-measured September 2026 and both
+bit-reproducible run to run). Values are not rotated, so there is no
+inverse-rotation pass over the attention output. Values do use a finer group than keys, 32 against
+64, which halved that penalty from +0.146% at no cost in context.
+
+Decode cost depends on speculation. Without it the packed value plane is within about 1% of INT8,
+because halved value traffic and the added unpack nearly cancel. With MTP3, C1 decode falls about
+5%, from a mean 81.61 tok/s across three runs to 77.39, because the lower value precision reduces
+draft acceptance from 71.27% to 65.86%. The finer value group does not fix that: it recovers 44% of
+the perplexity penalty but only about 15% of the acceptance loss, because acceptance turns on exact
+token agreement rather than on mean error. Prefer `rk8v4` when context is the binding constraint,
+and INT8 when decode throughput under speculation matters more.
 
 ## Measured 35B capacity
 

@@ -1,19 +1,22 @@
 #pragma once
 
+#include "core/nvtx.h"
 #include "ninfer/types.h"
-#include "runtime/contract/types.h"
-#include "runtime/engine/admission_policy.h"
-#include "runtime/generation/generation_budget.h"
+#include "runtime/contract/execution.h"
+#include "runtime/engine/generation_budget.h"
+#include "runtime/engine/context_cache/types.h"
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace ninfer::runtime {
@@ -32,6 +35,7 @@ struct RequestHostTiming {
     std::uint64_t engine_commit_output_exposed_ns = 0;
     std::uint64_t engine_maintenance_exposed_ns   = 0;
     std::uint64_t device_wait_exposed_ns          = 0;
+    std::uint64_t constraint_draft_wait_exposed_ns = 0;
     std::uint64_t decode_host_exposed_ns          = 0;
     std::uint64_t decode_device_wait_exposed_ns   = 0;
     std::uint64_t prefill_units                   = 0;
@@ -58,6 +62,7 @@ struct RequestHostTiming {
         program_submit_exposed_ns += timing.submit_host_ns;
         program_post_exposed_ns += timing.post_host_ns;
         device_wait_exposed_ns += timing.device_wait_ns;
+        constraint_draft_wait_exposed_ns += timing.constraint_draft_wait_ns;
         if (decode_member) {
             decode_host_exposed_ns += timing.host_ns();
             decode_device_wait_exposed_ns += timing.device_wait_ns;
@@ -80,6 +85,8 @@ struct RequestHostTiming {
                 static_cast<double>(engine_maintenance_exposed_ns) * kNanosecondsToSeconds,
             .device_wait_exposed_seconds =
                 static_cast<double>(device_wait_exposed_ns) * kNanosecondsToSeconds,
+            .constraint_draft_wait_exposed_seconds =
+                static_cast<double>(constraint_draft_wait_exposed_ns) * kNanosecondsToSeconds,
             .decode_host_exposed_seconds =
                 static_cast<double>(decode_host_exposed_ns) * kNanosecondsToSeconds,
             .decode_device_wait_exposed_seconds =
@@ -95,38 +102,46 @@ enum class EngineRequestState : std::uint8_t {
     Waiting,
     Materializing,
     Prefill,
+    Replay,
+    Pausing,
+    Paused,
     DecodeReady,
     ControlReady,
     ModelFinished,
 };
 
-template <class Package>
+template <class ModelContract>
 struct RequestRecord {
     using Clock          = std::chrono::steady_clock;
-    using PreparedPrompt = typename Package::PreparedPrompt;
-    using OutputSession  = typename Package::OutputSession;
-    using BasePlan       = typename Package::RequestBasePlan;
-    using SequenceHandle = typename Package::SequenceHandle;
+    using PreparedPrompt = typename ModelContract::PreparedPrompt;
+    using OutputSession  = typename ModelContract::OutputSession;
+    using BasePlan       = typename ModelContract::RequestBasePlan;
+    using SequenceHandle = typename ModelContract::SequenceHandle;
+    using ResumeState    = typename ModelContract::ResumeState;
+    using StreamEvent = std::variant<GenerationTimingObservation, GenerationFirstTokenObservation,
+                                     OutputDelta, std::unique_ptr<GenerationSchedulingObservation>>;
 
     RequestRecord(std::uint64_t request_identity, std::uint64_t publication_sequence,
                   PreparedPrompt input, OutputSession output_session, PromptSummary summary,
                   double frontend_seconds, ResolvedRequestOptions request_options,
-                  OutputConsumerMode output_consumer, Clock::time_point limit,
-                  Clock::time_point submit_time)
-        : id(request_identity), publication_order(publication_sequence), prompt(std::move(input)),
+                  OutputConsumerMode output_consumer, GenerationObservationOptions observation,
+                  Clock::time_point limit, Clock::time_point submit_time)
+        : generation_range(nvtx::Name::Generate, nvtx::Category::Runtime, request_identity),
+          id(request_identity), publication_order(publication_sequence), prompt(std::move(input)),
           output(std::move(output_session)), prompt_summary(std::move(summary)),
           prepare_seconds(frontend_seconds), options(std::move(request_options)),
-          consumer_mode(output_consumer), deadline(limit), submitted(submit_time) {}
+          consumer_mode(output_consumer), observation(std::move(observation)), deadline(limit),
+          submitted(submit_time) {}
 
     RequestRecord(const RequestRecord&)            = delete;
     RequestRecord& operator=(const RequestRecord&) = delete;
 
-    [[nodiscard]] bool is_waiting() const noexcept {
-        return model_state == EngineRequestState::Waiting;
-    }
-
     [[nodiscard]] bool is_prefilling() const noexcept {
         return model_state == EngineRequestState::Prefill;
+    }
+
+    [[nodiscard]] bool is_replaying() const noexcept {
+        return model_state == EngineRequestState::Replay;
     }
 
     [[nodiscard]] bool is_materializing() const noexcept {
@@ -145,6 +160,8 @@ struct RequestRecord {
         return model_state == EngineRequestState::ModelFinished;
     }
 
+    // The process range follows Request ownership across submit, worker, and consumer threads.
+    nvtx::ScopedAsyncRange generation_range;
     const std::uint64_t id;
     const std::uint64_t publication_order;
     PreparedPrompt prompt;
@@ -153,9 +170,12 @@ struct RequestRecord {
     double prepare_seconds = 0.0;
     ResolvedRequestOptions options;
     const OutputConsumerMode consumer_mode;
+    const GenerationObservationOptions observation;
     Clock::time_point deadline;
     Clock::time_point submitted;
+    std::optional<Clock::time_point> admitted_at;
     std::optional<Clock::time_point> first_token;
+    std::optional<Clock::time_point> last_token;
     bool queue_wait_recorded = false;
     std::optional<GenerationBudget> budget;
     std::optional<BeginSummary> admitted_begin;
@@ -172,18 +192,55 @@ struct RequestRecord {
     std::optional<FinishReason> terminal_reason;
 
     std::optional<BasePlan> base_plan;
-    std::uint64_t remaining_service_work = 0;
-    std::uint64_t backfill_epoch         = 0;
-    BackfillClass backfill_class         = BackfillClass::None;
+    std::optional<ResumeState> suspended;
+    ContinuationOwnerToken continuation_owner = 0;
+    std::uint64_t device_to_host_bytes        = 0;
+    std::uint64_t host_to_device_bytes        = 0;
+    EngineRequestState resume_phase           = EngineRequestState::Prefill;
+    std::uint32_t admission_bypasses          = 0;
+    std::uint64_t admission_generation        = 0;
+    bool admission_observed                   = false;
+    GenerationAdmissionStats admission;
+    std::optional<Clock::time_point> source_wait_started;
+    // Context store hydration: the store is consulted once per request. While `hydrating`, a host
+    // worker reads the stored image and the request is not offered for admission.
+    bool store_probed                   = false;
+    bool hydrating                      = false;
+    bool hydrated                       = false;
+    std::uint32_t hydration_frontier    = 0;
+    std::uint32_t hydration_reuse_before = 0;
+    Clock::time_point hydration_started{};
+    Clock::time_point hydration_deadline{};
+
+    // Single flight: while set, a resident sibling is prefilling this request's prefix towards a
+    // checkpoint it will publish, and the request is not offered for admission. One wait at most.
+    bool awaiting_sibling  = false;
+    bool sibling_wait_used = false;
+
+    bool recovery_pending                  = false;
+    std::uint64_t committed_decode_tokens  = 0;
+    GenerationRecoveryRoute recovery_route = GenerationRecoveryRoute::None;
+    std::uint64_t preemption_count         = 0;
+    std::uint64_t replay_restores          = 0;
+    std::uint64_t snapshot_restores        = 0;
+    std::uint64_t replayed_tokens          = 0;
+    std::uint64_t paused_ns                = 0;
+    std::optional<Clock::time_point> paused_at;
+    std::uint32_t computed_prompt_tokens = 0;
     GenerationTimings generation_timings;
     RequestHostTiming host_timing;
+    std::uint64_t initial_binding_ns = 0;
+    GenerationWorkTiming prefill_work;
+    GenerationWorkTiming replay_work;
+    std::array<std::array<GenerationTransferTiming, 3>, 3> context_transfers{};
+    std::optional<GenerationFirstOutputTiming> first_output_timing;
     SpeculativeStats speculative_stats;
-    MaterializationDiagnostics materialization_diagnostics;
 
     std::mutex mutex;
     std::condition_variable cv;
     std::optional<GenerationStart> stream_start;
-    std::vector<OutputDelta> events;
+    std::optional<PromptProgress> stream_progress;
+    std::vector<StreamEvent> events;
     GenerationResult result;
     std::exception_ptr error;
     bool response_done     = false;

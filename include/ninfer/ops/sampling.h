@@ -10,6 +10,15 @@
 
 namespace ninfer::ops {
 
+// Written to the token output instead of a vocabulary id when the selected token's own logit is
+// not finite. A diverged forward pass produces an all-NaN logits row, and because every ordering
+// comparison against NaN is false the reductions then return whatever index they started from,
+// after which top_k and the presence penalty walk the lowest token ids. That output reads like a
+// plausible sampling artefact rather than a fault, so the Ops emit this out-of-domain value and
+// let the runtime reject the round. The check is O(1) on the selected logit, not an exhaustive
+// scan: a row that still has a finite maximum samples normally.
+inline constexpr std::int32_t kSamplerNonFiniteToken = -1;
+
 // Counter-based RNG subkey. Distinct purposes keep draws at the same logical position separate.
 enum SamplePurpose : std::int32_t {
     kSamplePurposePrefill               = 0,
@@ -17,12 +26,23 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeSpeculativeAccept     = 2,
     kSamplePurposeSpeculativeCorrection = 3,
     kSamplePurposeSpeculativeBonus      = 4,
+    kSamplePurposeDFlash2Proposal       = 5,
 };
 
-// Device-resident sampling parameters. token_counts is an optional device I32
+// Borrowed round operand. Positions are contiguous packed vocabulary masks; null disables it.
+// Each consumed position must have at least one legal token. The caller carries dead-end status
+// separately and supplies a safe filler for dead/unreachable speculative positions.
+struct SamplingMask {
+    const std::uint32_t* words = nullptr;
+    std::int32_t stride        = 0;
+};
+
+// Device-resident sampling parameters and operands. token_counts is an optional device I32
 // [token_domain] committed generated-token occurrence-count array used by both penalties.
+// mask position p may select token v only when bit (v & 31) of mask.words[p * mask.stride +
+// (v >> 5)] is set.
 struct SamplingConfig {
-    float temperature          = 0.0f; // <= 0 => greedy argmax (bit-identical to argmax())
+    float temperature          = 0.0f; // <= 0 => greedy argmax over allowed tokens
     std::int32_t top_k         = 20;   // runtime contract is [1,20]; Op defensively caps otherwise
     float top_p                = 1.0f; // >= 1 => disabled
     float min_p                = 0.0f; // <= 0 => disabled
@@ -30,6 +50,7 @@ struct SamplingConfig {
     float frequency_penalty    = 0.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    SamplingMask mask;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -45,15 +66,18 @@ struct SamplingConfig {
  * [physical_rows,B], `out` and `logical_positions` are contiguous I32 [B], and only vocabulary
  * rows v in [0,token_domain) participate. `configs` is a device-resident contiguous
  * SamplingConfig[B] array. Greedy and stochastic rows may coexist in one invocation.
- *
- * For row b with configs[b].temperature<=0:
+ * A non-null config.mask excludes vocabulary rows before argmax/top-k and normalization. sample()
+ * consumes mask position zero; speculative acceptance consumes its corresponding verify position.
  *
  * With either greedy or positive-temperature sampling, let
  * c_v=configs[b].token_counts[v] (or zero when the pointer is null):
  *
  *   adjusted_v = float(logits[v,b])
  *                - configs[b].presence_penalty * (c_v > 0)
- *                - configs[b].frequency_penalty * c_v.
+ *                - configs[b].frequency_penalty * c_v      when v is licensed,
+ *   adjusted_v = -inf                                      otherwise,
+ *
+ * where v is licensed when configs[b].mask.words is null or its position-0 bit for v is set.
  *
  * A greedy row selects min argmax_v adjusted_v and skips filters and RNG. Candidates for a
  * positive-temperature row are sorted by adjusted_v descending with lower token id breaking
@@ -62,7 +86,9 @@ struct SamplingConfig {
  * Candidate weights are exp(adjusted_v/temperature-max). min_p removes the suffix below
  * min_p*max_weight; top_p keeps the shortest remaining prefix whose cumulative weight reaches
  * top_p times the pre-truncation candidate weight. At least the best candidate remains, the
- * support is renormalized, and one id is drawn for that row.
+ * support is renormalized, and one id is drawn for that row. An unlicensed token is never part
+ * of the support. A row whose selected logit is not finite, or whose mask licenses no token,
+ * writes kSamplerNonFiniteToken instead of an id.
  *
  * Row b uses counter-based RNG key
  * (configs[b].seed,logical_positions[b],purpose), without mutable RNG state or dependence on the

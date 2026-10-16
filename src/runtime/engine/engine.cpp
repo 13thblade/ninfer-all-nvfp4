@@ -1,15 +1,31 @@
 #include "ninfer/engine.h"
 
 #include "core/device.h"
+#include "core/nvtx.h"
+#include "core/startup.h"
 #include "runtime/contract/sampling.h"
-#include "runtime/contract/types.h"
+#include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
-#include "targets/registry.h"
+#include "runtime/engine/model_instance.h"
+#include "runtime/engine/qwen4_exp_instance.h"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <deque>
+#include <filesystem>
 #include <limits>
+#include <mutex>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -17,75 +33,27 @@
 namespace ninfer {
 namespace {
 
-EngineOptions normalize_engine_options(EngineOptions options) {
-    switch (options.purpose) {
-    case EnginePurpose::Generation:
-        break;
-    case EnginePurpose::CausalScoring:
-        options.max_concurrency      = 1;
-        options.max_pending_requests = 1;
-        options.prefill_chunk        = 1024;
-        options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
-        options.speculative          = {};
-        options.enable_vision        = false;
-        options.use_cuda_graph       = false;
-        options.context_cache        = ContextCacheOptions{.enabled = false};
-        break;
-    default:
-        throw std::invalid_argument("Engine purpose is invalid");
+DeviceContext initialize_device(const EngineOptions& options) {
+    StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
+    if (options.devices.empty()) {
+        DeviceContext device(options.device);
+        phase.complete();
+        return device;
     }
-    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
-    }
-
-    ContextCacheOptions& cache      = options.context_cache;
-    const std::uint32_t concurrency = options.max_concurrency;
-    if (!cache.enabled) {
-        if ((cache.device_state_slots && *cache.device_state_slots != 0) ||
-            (cache.max_private_continuations && *cache.max_private_continuations != concurrency) ||
-            (cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
-            (cache.max_long_anchors_per_continuation &&
-             *cache.max_long_anchors_per_continuation != 0)) {
-            throw std::invalid_argument("disabled context cache accepts only root-only capacities");
+#ifdef _WIN32
+    // Multi-GPU execution is a Linux feature. Repeating one device id still works on Windows, which
+    // exercises the whole stage path on a single card.
+    for (const int id : options.devices) {
+        if (id != options.devices.front()) {
+            throw std::invalid_argument(
+                "multi-GPU execution is supported on Linux only; repeat one device id "
+                "(for example --devices 0,0) to test the pipeline on a single GPU");
         }
-        cache.device_state_slots                = 0;
-        cache.host_state_slots                  = 0;
-        cache.host_kv_capacity_bytes            = 0;
-        cache.max_private_continuations         = concurrency;
-        cache.max_shared_prefixes               = 0;
-        cache.max_long_anchors_per_continuation = 0;
-        cache.max_cache_markers_per_request     = cache.max_cache_markers_per_request.value_or(4U);
-        return options;
     }
-
-    cache.device_state_slots            = cache.device_state_slots.value_or(concurrency);
-    const std::uint64_t default_private = 2ULL * concurrency;
-    cache.max_private_continuations =
-        cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
-    cache.max_shared_prefixes               = cache.max_shared_prefixes.value_or(concurrency);
-    cache.max_long_anchors_per_continuation = cache.max_long_anchors_per_continuation.value_or(2U);
-    cache.max_cache_markers_per_request     = cache.max_cache_markers_per_request.value_or(4U);
-
-    if (*cache.max_private_continuations < concurrency) {
-        throw std::invalid_argument(
-            "context cache max_private_continuations must cover every active request");
-    }
-    const std::uint64_t total_device_state_slots =
-        static_cast<std::uint64_t>(concurrency) + *cache.device_state_slots;
-    if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("context cache Device state capacity exceeds uint32");
-    }
-    const std::uint64_t address_spaces =
-        static_cast<std::uint64_t>(*cache.max_private_continuations) + *cache.max_shared_prefixes;
-    if (address_spaces > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("context cache address-space capacity exceeds uint32");
-    }
-    if (*cache.max_long_anchors_per_continuation != 0 &&
-        *cache.max_private_continuations >
-            std::numeric_limits<std::size_t>::max() / *cache.max_long_anchors_per_continuation) {
-        throw std::overflow_error("context cache long-anchor capacity exceeds size_t");
-    }
-    return options;
+#endif
+    DeviceContext device{std::span<const int>(options.devices)};
+    phase.complete();
+    return device;
 }
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
@@ -101,6 +69,8 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.thinking                = options.execution.thinking;
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
+    resolved.constraint                        = options.constraint;
+    resolved.tool_choice                       = std::move(options.tool_choice);
     return resolved;
 }
 
@@ -109,19 +79,100 @@ std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_
            " tokens, exceeding Engine max_context " + std::to_string(max_context);
 }
 
+// The image format every binding names: bump it together with kImageVersion in
+// models/qwen3_5/program/storage/checkpoint_image.cpp. Format 2 carries the StateImage geometry
+// (GDN state type, DFlash local rings) explicitly instead of only its total size.
+constexpr std::string_view kCheckpointImageFormat = "checkpoint-image-2";
+
+// What a stored checkpoint image binds to: the model, its weight formats and quantization, the
+// artifact file, the KV, recurrent-state and speculative settings its layout was built for, and the
+// image format. Images under any other binding are never read, so they age out of the store as
+// misses.
+//
+// The speculative part is the backend, draft window and proposal head. A DFlash or DFlash2 image
+// holds the draft model's own context (the local K/V rings in each StateImage, and DFlash's draft KV
+// pages), computed by the artifact's draft weights, so it is restored only into the same backend
+// and artifact. Restoring just the target part is not offered: the draft context could only be
+// rebuilt by prefilling the whole history again, which is what a miss does anyway. N-gram copy
+// drafting is deliberately absent: its index is rebuilt from each request's own tokens and no
+// checkpoint holds any of it.
+std::string context_store_binding(const EngineOptions& options, const LoadSummary& load) {
+    std::string binding = load.architecture + '\n' + load.model_name + '\n';
+    for (const std::string& format : load.weight_formats) { binding += format + ','; }
+    binding += '\n' + load.prefill_signature + '\n';
+    binding += std::to_string(static_cast<unsigned>(options.kv_cache)) + ',' +
+               std::to_string(static_cast<unsigned>(options.speculative.backend)) + ',' +
+               std::to_string(options.speculative.draft_tokens) + ',' +
+               std::to_string(static_cast<unsigned>(options.speculative.proposal_head)) + ',' +
+               (options.gdn_state_fp16 ? "gdn-fp16" : "gdn-fp32") + ',' +
+               (options.enable_vision ? "vision" : "text") + '\n';
+    std::error_code size_error;
+    const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, size_error);
+    binding += size_error ? std::string("?") : std::to_string(size);
+    // A re-converted artifact can have the same size; its modification time tells it apart.
+    std::error_code time_error;
+    const auto written = std::filesystem::last_write_time(options.artifact_path, time_error);
+    binding += '\n';
+    binding += time_error ? std::string("?") : std::to_string(written.time_since_epoch().count());
+    // Prompt grafts: a stored session that starts from a graft holds that graft's installed K/V and
+    // state under its placeholder ids, so a changed graft file must not match it. Any change to
+    // the configured grafts makes the store's images misses.
+    for (const GraftSource& graft : options.grafts) {
+        std::error_code graft_size_error;
+        std::error_code graft_time_error;
+        const std::uintmax_t graft_size = std::filesystem::file_size(graft.path, graft_size_error);
+        const auto graft_written = std::filesystem::last_write_time(graft.path, graft_time_error);
+        binding += "\ngraft " + graft.name + ' ' +
+                   (graft_size_error ? std::string("?") : std::to_string(graft_size)) + ' ' +
+                   (graft_time_error ? std::string("?")
+                                     : std::to_string(graft_written.time_since_epoch().count()));
+    }
+    // The checkpoint image format; stores written by an older engine become misses.
+    binding += '\n';
+    binding += kCheckpointImageFormat;
+    return binding;
+}
+
+// Images queued for the writer thread. Each holds a whole continuation, several GB for a deep one;
+// beyond the bound an idle continuation is simply written later.
+constexpr std::size_t kMaximumPendingStoreWrites = 2;
+// A conversation the cache is evicting has no later chance: its image is queued while the queue
+// holds less than this many bytes (always when it is empty), on top of the idle bound: it queues
+// behind idle writes rather than being dropped, because a dropped eviction is a recompute. Host
+// RAM, not pinned memory; it drains at the store's write rate.
+constexpr std::size_t kMaximumPendingEvictionBytes = std::size_t{4} << 30U;
+
+// The store keeps up to this share of the volume's free space when no limit is configured.
+constexpr std::uint64_t kAutomaticStoreShareDivisor = 2;
+constexpr std::uint64_t kFallbackStoreBytes         = std::uint64_t{64} << 30U;
+
+std::uint64_t directory_bytes(const std::filesystem::path& directory) noexcept {
+    std::uint64_t total = 0;
+    std::error_code error;
+    for (std::filesystem::recursive_directory_iterator it(directory, error), end;
+         !error && it != end; it.increment(error)) {
+        std::error_code size_error;
+        if (it->is_regular_file(size_error)) {
+            const auto size = it->file_size(size_error);
+            if (!size_error) { total += size; }
+        }
+    }
+    return total;
+}
+
 } // namespace
 
 class PreparedPrompt::Impl {
 public:
     Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
-         targets::qwen3_6::PreparedPrompt prepared)
+         models::qwen3_5::PreparedPrompt prepared)
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
 
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
-    targets::qwen3_6::PreparedPrompt value;
+    models::qwen3_5::PreparedPrompt value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -149,6 +200,7 @@ public:
     public:
         virtual ~Concept() = default;
         virtual GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) = 0;
+        virtual std::optional<std::uint32_t> effective_thinking_budget() const noexcept       = 0;
     };
 
     template <class Submission>
@@ -159,6 +211,10 @@ public:
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) override {
             return submission_.wait(sink, cancellation);
+        }
+
+        std::optional<std::uint32_t> effective_thinking_budget() const noexcept override {
+            return submission_.effective_thinking_budget();
         }
 
     private:
@@ -180,6 +236,10 @@ public:
         return sampling_;
     }
 
+    [[nodiscard]] std::optional<std::uint32_t> effective_thinking_budget() const noexcept {
+        return state_->effective_thinking_budget();
+    }
+
 private:
     std::unique_ptr<Concept> state_;
     ResolvedSamplingParameters sampling_;
@@ -199,6 +259,10 @@ const ResolvedSamplingParameters& GenerationHandle::resolved_sampling() const no
     return impl_ != nullptr ? impl_->resolved_sampling() : empty;
 }
 
+std::optional<std::uint32_t> GenerationHandle::effective_thinking_budget() const noexcept {
+    return impl_ != nullptr ? impl_->effective_thinking_budget() : std::nullopt;
+}
+
 GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView& cancellation) {
     if (impl_ == nullptr) { throw std::logic_error("GenerationHandle is empty"); }
     std::unique_ptr<Impl> impl = std::move(impl_);
@@ -207,115 +271,505 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 class Engine::Impl {
 public:
-    using Core27      = runtime::EngineCore<targets::Qwen3_6_27BInstance>;
-    using Core35      = runtime::EngineCore<targets::Qwen3_6_35BA3BInstance>;
-    using ScoreCore27 = runtime::CausalScoreCore<targets::Qwen3_6_27BInstance>;
-    using ScoreCore35 = runtime::CausalScoreCore<targets::Qwen3_6_35BA3BInstance>;
-    using Core = std::variant<std::monostate, std::unique_ptr<Core27>, std::unique_ptr<Core35>,
-                              std::unique_ptr<ScoreCore27>, std::unique_ptr<ScoreCore35>>;
+    using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
+    using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
+    // Qwen3.8-Flash-Next: the common core over its own Program.
+    using Qwen4ExpCore = runtime::EngineCore<runtime::Qwen4ExpInstance>;
+    using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
+                              std::unique_ptr<ScoringCore>, std::unique_ptr<Qwen4ExpCore>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(normalize_engine_options(std::move(engine_options))), device(options.device) {
-        auto constructed  = targets::construct_target(options, device);
-        active            = std::move(constructed.active);
-        load              = std::move(constructed.load);
-        sampling_defaults = constructed.sampling_defaults;
-        core              = std::visit(
-            [&](auto& target_ptr) -> Core {
-                using Instance =
-                    typename std::remove_reference_t<decltype(target_ptr)>::element_type;
-                if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
-                    if (options.purpose == EnginePurpose::CausalScoring) {
-                        return std::make_unique<ScoreCore27>(*target_ptr, device);
-                    }
-                    return std::make_unique<Core27>(*target_ptr, device, options,
-                                                                 std::move(constructed.context_cost));
-                } else {
-                    if (options.purpose == EnginePurpose::CausalScoring) {
-                        return std::make_unique<ScoreCore35>(*target_ptr, device);
-                    }
-                    return std::make_unique<Core35>(*target_ptr, device, options,
-                                                                 std::move(constructed.context_cost));
+        : options(runtime::normalize_engine_options(std::move(engine_options))),
+          device(initialize_device(options)) {
+        nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
+        if (runtime::artifact_is_qwen4_exp(options.artifact_path)) {
+            construct_qwen4_exp();
+            return;
+        }
+        auto constructed    = runtime::construct_model(options, device);
+        active              = std::move(constructed.instance);
+        load                = std::move(constructed.load);
+        load.cuda_sync_mode = device.sync_mode();
+        sampling_defaults   = active->frontend.sampling_defaults();
+        StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
+        if (options.purpose == EnginePurpose::CausalScoring) {
+            core = std::make_unique<ScoringCore>(*active, device);
+        } else {
+            auto generation = std::make_unique<GenerationCore>(
+                *active, device, options, std::move(constructed.context_cost));
+            if (options.context_store.enabled()) {
+                if (!options.context_cache.enabled) {
+                    throw std::invalid_argument(
+                        "the context store requires the context cache to be enabled");
                 }
-            },
-            active);
+                if (active->program->physical_usage().capacity.host_bytes == 0) {
+                    throw std::invalid_argument(
+                        "the context store restores sessions into the Host context cache; give it "
+                        "a nonzero Host budget (--host-context-mib or --auto-host-cache)");
+                }
+                attach_context_store(*generation);
+            }
+            core = std::move(generation);
+            if (store) { restore_from_store(); }
+        }
+        finalize_phase.complete();
     }
 
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
+        // Queued writes are older than what the final flush writes: drain them first, so none
+        // lands after it and replaces a newer image.
+        if (store) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + options.context_store.flush_budget;
+            stop_writer(deadline);
+            flush_context_store(deadline);
+        }
         core.emplace<std::monostate>();
+        // Everything written is queued for upload by now; give the uploads their budget.
+        if (store) {
+            (void)store->flush_remote(std::chrono::steady_clock::now() +
+                                          options.context_store.remote_flush_budget,
+                                      true);
+        }
         try {
             device.synchronize();
         } catch (...) {}
     }
 
+    // Adds the context store's counters to a RuntimeStats snapshot (zero when it is off).
+    void add_store_stats(RuntimeStats& out) const {
+        if (!store) { return; }
+        const runtime::ContextStore::Stats s = store->stats();
+        out.context_store_images          = s.images;
+        out.context_store_used_bytes      = s.used_bytes;
+        out.context_store_writes          = s.puts;
+        out.context_store_write_failures  = s.put_failures;
+        out.context_store_dropped         = store_dropped.load(std::memory_order_relaxed);
+        out.context_store_bytes_written   = s.bytes_written;
+        out.context_store_bytes_reused    = s.bytes_reused;
+        out.context_store_evicted         = s.evicted_for_space + s.expired + s.superseded;
+        out.context_store_corrupt         = s.corrupt_removed;
+        out.context_store_restored        = restored_sessions;
+        out.context_store_restored_bytes  = restored_bytes;
+        out.context_store_foreign         = foreign_images;
+        out.context_store_restore_seconds = restore_seconds;
+        out.context_store_remote_images            = s.remote_images;
+        out.context_store_remote_uploads           = s.remote_uploads;
+        out.context_store_remote_upload_bytes      = s.remote_upload_bytes;
+        out.context_store_remote_upload_failures   = s.remote_upload_failures;
+        out.context_store_remote_downloads         = s.remote_downloads;
+        out.context_store_remote_download_bytes    = s.remote_download_bytes;
+        out.context_store_remote_download_failures = s.remote_download_failures;
+    }
+
+    using CheckpointImage = runtime::ModelInstance::ModelContract::CheckpointImage;
+
+    [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {
+        return qwen4 != nullptr ? qwen4->frontend : active->frontend;
+    }
+
+    [[nodiscard]] std::uint32_t capacity() const {
+        return qwen4 != nullptr ? qwen4->capacity : active->capacity;
+    }
+
     EngineOptions options;
     DeviceContext device;
-    targets::ActiveTarget active;
+    std::unique_ptr<runtime::ModelInstance> active;
+    // Set instead of `active` for a Qwen3.8-Flash-Next artifact.
+    std::unique_ptr<runtime::Qwen4ExpInstance> qwen4;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
+    // Declared before `core`: the worker holds hooks that reach the store and the writer queue,
+    // so they must outlive it.
+    std::unique_ptr<runtime::ContextStore> store;
+    std::string store_binding;
+    std::uint64_t restored_sessions = 0;
+    std::uint64_t restored_bytes    = 0;
+    std::uint64_t foreign_images    = 0;
+    double restore_seconds          = 0.0;
+    std::atomic<std::uint64_t> store_dropped{0};
+    std::atomic<std::uint64_t> store_write_failures{0};
+    std::mutex writer_mutex;
+    std::condition_variable writer_cv;
+    enum class StoreWrite : std::uint8_t { Idle, Eviction, SharedPrefix };
+    struct PendingWrite {
+        CheckpointImage image;
+        bool shared = false;
+    };
+    std::deque<PendingWrite> pending_writes;
+    bool writer_active = false;
+    bool writer_stop   = false;
+    std::optional<std::chrono::steady_clock::time_point> drain_deadline;
+    std::thread writer;
     Core core;
+
+private:
+    // Qwen3.8-Flash-Next (models/qwen4_exp): the common EngineCore over its Program. Its context
+    // cache keeps checkpoints in a pinned Host tier the RAM ledger sizes (0: prefix reuse off); the
+    // resolved size replaces the requested one, as for the other models.
+    void construct_qwen4_exp() {
+        auto constructed    = runtime::construct_qwen4_exp(options, device);
+        qwen4               = std::move(constructed.instance);
+        load                = std::move(constructed.load);
+        load.cuda_sync_mode = device.sync_mode();
+        sampling_defaults   = qwen4->frontend.sampling_defaults();
+        StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
+        options.context_cache.auto_host_cache     = false;
+        options.context_cache.host_capacity_bytes = qwen4->program->physical_usage().capacity.host_bytes;
+        options.context_cache.enabled = options.context_cache.enabled && *options.context_cache.host_capacity_bytes != 0;
+        // Source ranking prices restores against recomputation: this card's measured transfer costs
+        // and the generic prefill estimate (no Flash-Next prefill calibration exists yet).
+        auto context_cost = runtime::resolve_context_machine_cost(
+            {.hardware_class    = runtime::context_cost_hardware_class(device.props.name, device.props.major,
+                                                                       device.props.minor),
+             .prefill_signature = "qwen4exp"},
+            options.context_cost.preset_path);
+        load.context_cost = std::move(context_cost.summary);
+        auto generation   = std::make_unique<Qwen4ExpCore>(*qwen4, device, options, std::move(context_cost.model));
+        if (options.context_store.enabled()) {
+            if (!options.context_cache.enabled) {
+                throw std::invalid_argument(
+                    "the context store restores sessions into the context cache, which is off: give it a Host "
+                    "budget (--host-context-mib) or an NVMe tier (--context-nvme-mib)");
+            }
+            attach_context_store(*generation);
+        }
+        core = std::move(generation);
+        if (store) { restore_from_store(); }
+        finalize_phase.complete();
+    }
+
+    // Opens the context store and hands the generation core its hooks (both cores: the Qwen3.5
+    // models' and Qwen3.8-Flash-Next's).
+    template <class GenerationCoreT>
+    void attach_context_store(GenerationCoreT& generation) {
+        open_context_store();
+        using Hooks = typename GenerationCoreT::ContextStoreHooks;
+        generation.set_context_store(Hooks{
+            .store   = store.get(),
+            .binding = store_binding,
+            .sink    = [this](CheckpointImage&& image) {
+                return enqueue_store_write(std::move(image), StoreWrite::Idle);
+            },
+            .evict_sink = [this](CheckpointImage&& image) {
+                return enqueue_store_write(std::move(image), StoreWrite::Eviction);
+            },
+            .shared_sink = [this](CheckpointImage&& image) {
+                return enqueue_store_write(std::move(image), StoreWrite::SharedPrefix);
+            },
+            .ready   =[this] { return store_queue_idle(); },
+            .failures = [this] { return store_write_failures.load(std::memory_order_relaxed); },
+            .idle_persist =
+                std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.idle_persist),
+            .hydration_budget =
+                std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.restore_budget),
+        });
+    }
+
+    // Runs `f` on the generation core (either kind); nothing for a scoring engine.
+    template <class F>
+    void with_generation(F&& f) {
+        if (auto* generation = std::get_if<std::unique_ptr<GenerationCore>>(&core); generation && *generation) {
+            f(**generation);
+        } else if (auto* next = std::get_if<std::unique_ptr<Qwen4ExpCore>>(&core); next && *next) {
+            f(**next);
+        }
+    }
+
+    void open_context_store() {
+        const ContextStoreOptions& config = options.context_store;
+        std::error_code error;
+        std::filesystem::create_directories(config.directory, error);
+        if (!std::filesystem::is_directory(config.directory)) {
+            throw std::invalid_argument("the context store directory is not usable: " +
+                                        config.directory.string());
+        }
+        std::uint64_t max_bytes = config.max_bytes;
+        if (max_bytes == 0) {
+            const std::filesystem::space_info space =
+                std::filesystem::space(config.directory, error);
+            // If the volume cannot be queried, fall back to a bounded default rather than no limit.
+            max_bytes = error ? kFallbackStoreBytes
+                              : (space.available + directory_bytes(config.directory)) /
+                                    kAutomaticStoreShareDivisor;
+        }
+        runtime::ContextStore::Options store_options;
+        store_options.directory = config.directory;
+        store_options.max_bytes = max_bytes;
+        store_options.ttl       = config.ttl;
+        store_options.remote        = config.remote;
+        store_options.remote_prefix = config.remote_prefix;
+        store         = std::make_unique<runtime::ContextStore>(std::move(store_options));
+        if (config.remote) {
+            // Images other engines left in the bucket become restorable before start-up restores.
+            (void)store->refresh_remote(std::chrono::steady_clock::now() + config.restore_budget);
+        }
+        store_binding = context_store_binding(options, load);
+    }
+
+    // Lowercase hex of the image's endpoint key: an image of the same endpoint replaces it. A
+    // shared prefix's id ends in an extra digit, so it never replaces a conversation image whose
+    // endpoint happens to fall at the same position.
+    static std::string image_id(const CheckpointImage& image, bool shared) {
+        const auto& key = image.keys.front();
+        char text[42];
+        std::snprintf(text, sizeof(text), "%016llx%016llx%08x%s",
+                      static_cast<unsigned long long>(key.digests[0]),
+                      static_cast<unsigned long long>(key.digests[1]),
+                      static_cast<unsigned>(key.frontier), shared ? "5" : "");
+        return text;
+    }
+
+    // Writes one image to the store. On the writer thread, or at shutdown.
+    void store_put(const CheckpointImage& image, bool shared) {
+        runtime::ContextStore::Description description;
+        description.id      = image_id(image, shared);
+        description.shared  = shared;
+        description.binding = store_binding;
+        description.tokens  = image.tokens;
+        description.checkpoints.reserve(image.keys.size());
+        for (const auto& key : image.keys) {
+            description.checkpoints.push_back(runtime::ContextStore::CheckpointKey{
+                .frontier = key.frontier, .digests = key.digests, .identity_tag = key.identity_tag});
+        }
+        description.prefix_digests = image.prefix_digests;
+        std::vector<runtime::ContextStore::Region> regions;
+        regions.reserve(image.regions.size());
+        for (const auto& region : image.regions) {
+            regions.push_back({.offset = region.offset, .length = region.length});
+        }
+        (void)store->put(description, image.bytes, regions);
+    }
+
+    // Restores the most recently used stored sessions into the empty cache, within the configured
+    // time and the free Host capacity. Anything that cannot be restored stays in the store.
+    void restore_from_store() noexcept {
+        const auto started = std::chrono::steady_clock::now();
+        try {
+            with_generation([&](auto& generation) {
+                const auto deadline = started + options.context_store.restore_budget;
+                auto images         = store->list();
+                // By value when not everything fits: shared prefixes first (each serves every
+                // conversation that starts with it), then conversations by recomputation time
+                // saved per byte of Host tier they take, the most recently used first among equals.
+                std::vector<double> density(images.size());
+                for (std::size_t i = 0; i < images.size(); ++i) {
+                    density[i] =
+                        static_cast<double>(generation.prefill_estimate_ns(images[i].tokens)) /
+                        static_cast<double>(std::max<std::uint64_t>(1, images[i].image_bytes));
+                }
+                std::vector<std::size_t> order(images.size());
+                for (std::size_t i = 0; i < order.size(); ++i) { order[i] = i; }
+                std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+                    if (images[a].shared != images[b].shared) { return images[a].shared; }
+                    if (density[a] != density[b]) { return density[a] > density[b]; }
+                    return images[a].last_used_ms > images[b].last_used_ms;
+                });
+                {
+                    std::vector<runtime::ContextStore::Info> sorted;
+                    sorted.reserve(images.size());
+                    for (const auto i : order) { sorted.push_back(std::move(images[i])); }
+                    images = std::move(sorted);
+                }
+                // Sessions written under another model, configuration or image format are never read;
+                // counted once here so the start-up summary says why they were not restored.
+                foreign_images = static_cast<std::uint64_t>(
+                    std::count_if(images.begin(), images.end(),
+                                  [&](const auto& info) { return info.binding != store_binding; }));
+                for (const runtime::ContextStore::Info& info : images) {
+                    if (std::chrono::steady_clock::now() >= deadline) { break; }
+                    if (info.binding != store_binding || info.tokens > options.max_context) {
+                        continue;
+                    }
+                    // The payload is nearly all of an image: one larger than the free Host space
+                    // cannot fit, and reading it would only spend the budget.
+                    if (info.image_bytes > generation.free_host_bytes()) { continue; }
+                    const auto read_started = std::chrono::steady_clock::now();
+                    std::optional<std::vector<std::uint8_t>> bytes = store->load(info.id, false);
+                    if (!bytes) { continue; }
+                    const auto read_ns = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - read_started)
+                            .count());
+                    if (generation.restore_image(*bytes, read_ns)) {
+                        store->touch(info.id);
+                        ++restored_sessions;
+                        restored_bytes += bytes->size();
+                    }
+                }
+            });
+        } catch (...) {}
+        restore_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    }
+
+    // At shutdown: everything the store does not hold in its current state, most recently used
+    // first, within the flush budget.
+    void flush_context_store(std::chrono::steady_clock::time_point deadline) noexcept {
+        try {
+            with_generation([&](auto& generation) {
+                (void)generation.persist_all(
+                    [this](CheckpointImage&& image, bool shared) {
+                        try {
+                            store_put(image, shared);
+                            return true;
+                        } catch (...) { return false; }
+                    },
+                    deadline);
+            });
+        } catch (...) {}
+    }
+
+    [[nodiscard]] bool store_queue_idle() {
+        std::scoped_lock lock(writer_mutex);
+        return pending_writes.empty() && !writer_active;
+    }
+
+    // Queues an image for the writer thread. Never blocks: when the queue is full the image is
+    // not written now; an idle continuation is tried again later, an evicted one is lost to the
+    // store as it would be without write-on-evict.
+    bool enqueue_store_write(CheckpointImage&& image, StoreWrite kind) {
+        std::unique_lock lock(writer_mutex);
+        if (writer_stop) { return false; } // shutting down: the final flush writes it instead
+        std::size_t queued_bytes = 0;
+        for (const auto& pending : pending_writes) { queued_bytes += pending.image.bytes.size(); }
+        const bool full =
+            kind == StoreWrite::Eviction
+                ? !pending_writes.empty() &&
+                      queued_bytes + image.bytes.size() > kMaximumPendingEvictionBytes
+                : pending_writes.size() >= kMaximumPendingStoreWrites;
+        if (full) {
+            store_dropped.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (!writer.joinable()) { writer = std::thread([this] { writer_loop(); }); }
+        pending_writes.push_back({std::move(image), kind == StoreWrite::SharedPrefix});
+        lock.unlock();
+        writer_cv.notify_one();
+        return true;
+    }
+
+    void writer_loop() noexcept {
+        for (;;) {
+            PendingWrite write;
+            {
+                std::unique_lock lock(writer_mutex);
+                writer_cv.wait(lock, [&] { return writer_stop || !pending_writes.empty(); });
+                if (pending_writes.empty() ||
+                    (writer_stop && drain_deadline &&
+                     std::chrono::steady_clock::now() >= *drain_deadline)) {
+                    return;
+                }
+                write = std::move(pending_writes.front());
+                pending_writes.pop_front();
+                writer_active = true;
+            }
+            ContextStoreWriteEvent event;
+            event.id           = image_id(write.image, write.shared);
+            event.tokens       = write.image.tokens;
+            event.bytes        = write.image.bytes.size();
+            const auto started = std::chrono::steady_clock::now();
+            try {
+                store_put(write.image, write.shared);
+            } catch (const std::exception& error) {
+                event.error = error.what();
+            } catch (...) { event.error = "unknown context store write failure"; }
+            if (!event.error.empty()) {
+                // The continuation was counted as stored when it was queued; have it written again.
+                store_write_failures.fetch_add(1, std::memory_order_relaxed);
+            }
+            event.seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            notify(event);
+            {
+                std::scoped_lock lock(writer_mutex);
+                writer_active = false;
+            }
+        }
+    }
+
+    // Reports one background write to the configured listener; its exceptions are ignored.
+    void notify(const ContextStoreWriteEvent& event) const noexcept {
+        if (!options.context_store.listener) { return; }
+        try {
+            options.context_store.listener(event);
+        } catch (...) {}
+    }
+
+    // Lets the writer finish the queued images until `deadline`, then stops it.
+    void stop_writer(std::chrono::steady_clock::time_point deadline) noexcept {
+        {
+            std::scoped_lock lock(writer_mutex);
+            writer_stop    = true;
+            drain_deadline = deadline;
+        }
+        writer_cv.notify_all();
+        if (writer.joinable()) { writer.join(); }
+        std::scoped_lock lock(writer_mutex);
+        // Images abandoned at the deadline were marked stored when they were queued; count them
+        // as failed writes so the final flush clears those marks and writes them again.
+        if (!pending_writes.empty()) {
+            store_write_failures.fetch_add(pending_writes.size(), std::memory_order_relaxed);
+        }
+        pending_writes.clear();
+    }
 };
 
-Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
+Engine::Engine(EngineOptions options) {
+    StartupObserver startup_observer = options.startup_observer;
+    StartupPhaseScope startup_phase(startup_observer, StartupPhase::EngineStartup);
+    impl_ = std::make_shared<Impl>(std::move(options));
+    startup_phase.complete();
+}
 
 Engine::~Engine()                            = default;
 Engine::Engine(Engine&&) noexcept            = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
+    nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    auto prepared      = impl_->frontend().prepare(std::move(input), control);
+    PromptSummary info = prepared.summary();
     const SamplingMode sampling_mode =
-        input.options.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
-    return std::visit(
-        [&](const auto& target_ptr) -> PreparedPrompt {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            auto prepared      = target_ptr->loaded->frontend.prepare(std::move(input), control);
-            PromptSummary info = prepared.summary();
-            if (info.prompt_tokens > target_ptr->capacity) {
-                throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
-            }
-            const PromptPreparationStats preparation = prepared.preparation_stats();
-            return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                info, preparation, sampling_mode, std::move(prepared)));
-        },
-        impl_->active);
+        info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
+    if (info.prompt_tokens > impl_->capacity()) {
+        throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
+    }
+    const PromptPreparationStats preparation = prepared.preparation_stats();
+    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
+                                                                 std::move(prepared)));
 }
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                                       bool allow_prefix_identity) const {
+    nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime,
+                                    static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](const auto& target_ptr) -> PreparedPrompt {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            if (token_ids.size() > target_ptr->capacity) {
-                throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                                   context_capacity_error(token_ids.size(), target_ptr->capacity));
-            }
-            auto prepared      = target_ptr->loaded->frontend.prepare_tokens(std::move(token_ids),
-                                                                             allow_prefix_identity);
-            PromptSummary info = prepared.summary();
-            if (info.prompt_tokens > target_ptr->capacity) {
-                throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
-            }
-            const PromptPreparationStats preparation = prepared.preparation_stats();
-            return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                info, preparation, SamplingMode::Thinking, std::move(prepared)));
-        },
-        impl_->active);
+    if (token_ids.size() > impl_->capacity()) {
+        throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                           context_capacity_error(token_ids.size(), impl_->capacity()));
+    }
+    auto prepared =
+        impl_->frontend().prepare_tokens(std::move(token_ids), allow_prefix_identity);
+    PromptSummary info = prepared.summary();
+    if (info.prompt_tokens > impl_->capacity()) {
+        throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
+    }
+    const PromptPreparationStats preparation = prepared.preparation_stats();
+    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+        info, preparation, SamplingMode::Thinking, std::move(prepared)));
 }
 
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](const auto& target_ptr) {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return target_ptr->loaded->frontend.tokenize_text(text);
-        },
-        impl_->active);
+    return impl_->frontend().tokenize_text(text);
 }
 
 std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
+    nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
+                                  static_cast<std::uint64_t>(tokens.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->options.purpose != EnginePurpose::CausalScoring) {
         throw std::logic_error("score_tokens requires a CausalScoring Engine");
@@ -331,8 +785,7 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     std::vector<float> result  = std::visit(
         [&](auto& core) -> std::vector<float> {
             using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore27>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>>) {
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
                 return core->score(std::move(prompt.impl_->value), first_target);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
@@ -347,22 +800,7 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
 
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](const auto& target_ptr) {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return target_ptr->loaded->frontend.count_tokens(std::move(input), control);
-        },
-        impl_->active);
-}
-
-PromptCapabilities Engine::prompt_capabilities() const {
-    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& target_ptr) {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return target_ptr->loaded->frontend.prompt_capabilities();
-        },
-        impl_->active);
+    return impl_->frontend().count_tokens(std::move(input), control);
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {
@@ -372,18 +810,33 @@ ModelSamplingDefaults Engine::sampling_defaults() const {
 
 GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                                 OutputConsumerMode consumer_mode,
+                                GenerationObservationOptions observation,
                                 std::chrono::steady_clock::time_point pending_deadline) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->options.purpose != EnginePurpose::Generation) {
         throw std::logic_error("submit requires a Generation Engine");
     }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
+    if (observation.live_timings) { observation.phase_timings = true; }
+    if (consumer_mode != OutputConsumerMode::Streaming &&
+        (observation.live_timings || observation.prompt_progress)) {
+        throw std::invalid_argument("live generation observations require a Streaming consumer");
+    }
 
     runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
         impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
+    if (const auto external = models::qwen3_5::PreparedPromptAccess::view(prompt.impl_->value)
+                                  .external_prefix_tokens;
+        external != 0 && (!resolved_options.execution.allow_prefix_reuse ||
+                          external >= prompt_summary.prompt_tokens)) {
+        // A direct graft exists only as its installed checkpoint, which only reuse can bind.
+        throw std::invalid_argument(
+            "a request selecting a direct prompt graft must allow prefix reuse and add tokens "
+            "after the graft");
+    }
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {
         throw RequestError(
             RequestErrorKind::ContextLengthExceeded,
@@ -404,13 +857,19 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 if (cancellation.requested()) { result.finish_reason = FinishReason::Cancelled; }
                 return std::move(result);
             }
+
+            [[nodiscard]] std::optional<std::uint32_t> effective_thinking_budget() const noexcept {
+                return result.thinking.effective_budget;
+            }
         } immediate{.consumer_mode = consumer_mode};
 
-        immediate.result.prompt                     = prompt_summary;
-        immediate.result.finish_reason              = FinishReason::OutputLimit;
-        immediate.result.thinking.configured_budget = resolved_options.execution.thinking.budget;
-        immediate.result.timings.prepare_seconds    = prepare_seconds;
-        immediate.result.timings.total_seconds      = prepare_seconds;
+        immediate.result.prompt                    = prompt_summary;
+        immediate.result.finish_reason             = FinishReason::OutputLimit;
+        immediate.result.thinking.requested_budget = resolved_options.execution.thinking.budget;
+        // No output is licensed, so the cap never binds: effective equals requested.
+        immediate.result.thinking.effective_budget = resolved_options.execution.thinking.budget;
+        immediate.result.timings.prepare_seconds   = prepare_seconds;
+        immediate.result.timings.total_seconds     = prepare_seconds;
         prompt.impl_.reset();
         return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
             impl_, std::move(immediate), resolved_sampling));
@@ -421,13 +880,13 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
                 throw std::logic_error("Engine core is unavailable");
-            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore27>> ||
-                                 std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>>) {
+            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
                 auto submission =
                     core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
-                                 std::move(resolved_options), consumer_mode, pending_deadline);
+                                 std::move(resolved_options), consumer_mode, std::move(observation),
+                                 pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }
@@ -439,7 +898,8 @@ GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options,
                                   const CancellationView& cancellation) {
     const OutputConsumerMode consumer_mode =
         sink != nullptr ? OutputConsumerMode::Streaming : OutputConsumerMode::Aggregate;
-    return submit(std::move(prompt), std::move(options), consumer_mode).wait(sink, cancellation);
+    return submit(std::move(prompt), std::move(options), consumer_mode, {})
+        .wait(sink, cancellation);
 }
 
 const EngineOptions& Engine::options() const {
@@ -468,23 +928,79 @@ MemorySummary Engine::memory_summary() const {
 
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& target_ptr) {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return target_ptr->loaded->frontend.media_cache_summary();
-        },
-        impl_->active);
+    return impl_->frontend().media_cache_summary();
 }
 
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
+    RuntimeStats stats = std::visit(
         [](const auto& core) -> RuntimeStats {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
                 throw std::logic_error("Engine core is unavailable");
             } else {
                 return core->runtime_stats();
+            }
+        },
+        impl_->core);
+    impl_->add_store_stats(stats);
+    return stats;
+}
+
+bool Engine::is_available() const {
+    if (impl_ == nullptr) { return false; }
+    return std::visit(
+        [](const auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                return false;
+            } else {
+                return core != nullptr && core->is_available();
+            }
+        },
+        impl_->core);
+}
+
+ResidencyStatus Engine::suspend(std::optional<bool> auto_resume) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& core) -> ResidencyStatus {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                throw std::invalid_argument("model suspend is not available for this Engine");
+            } else {
+                return core->suspend(auto_resume);
+            }
+        },
+        impl_->core);
+}
+
+ResidencyStatus Engine::resume() {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& core) -> ResidencyStatus {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                throw std::invalid_argument("model suspend is not available for this Engine");
+            } else {
+                return core->resume();
+            }
+        },
+        impl_->core);
+}
+
+ResidencyStatus Engine::residency() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& core) -> ResidencyStatus {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                return ResidencyStatus{};
+            } else {
+                return core->residency();
             }
         },
         impl_->core);

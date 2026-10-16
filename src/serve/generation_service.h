@@ -8,12 +8,18 @@
 #include "serve/serve_options.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <vector>
 
 namespace ninfer::serve {
@@ -22,13 +28,28 @@ struct RequestLifetime;
 struct RequestCapacity;
 
 struct GenerationMetrics {
-    double prepare_seconds = 0.0;
-    double ttft_seconds    = 0.0;
-    double vision_seconds  = 0.0;
-    double prefill_seconds = 0.0;
-    double decode_seconds  = 0.0;
-    double total_seconds   = 0.0;
+    std::uint64_t engine_request_id       = 0;
+    std::uint32_t computed_prefill_tokens = 0;
+    double prepare_seconds                = 0.0;
+    double ttft_seconds                   = 0.0;
+    double vision_seconds                 = 0.0;
+    double prefill_seconds                = 0.0;
+    std::uint32_t overlay_windows           = 0;
+    std::uint32_t overlay_exclusive_windows = 0;
+    std::uint32_t overlay_ahead_windows     = 0;
+    double overlay_window_seconds     = 0.0;
+    double overlay_evict_seconds      = 0.0;
+    double overlay_restore_seconds    = 0.0;
+    std::size_t overlay_evicted_bytes = 0;
+    std::size_t overlay_staged_bytes  = 0;
+    double decode_seconds             = 0.0;
+    double prompt_wall_seconds        = 0.0;
+    double generation_wall_seconds    = 0.0;
+    double total_seconds              = 0.0;
     ninfer::GenerationEngineTiming engine_timing;
+    std::optional<ninfer::GenerationFirstOutputTiming> first_output_timing;
+    ninfer::GenerationSchedulingStats scheduling;
+    ninfer::GenerationAdmissionStats admission;
 
     SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
     std::uint32_t speculative_draft_window    = 0;
@@ -37,26 +58,42 @@ struct GenerationMetrics {
     std::uint64_t speculative_accepted_tokens = 0;
     std::uint64_t speculative_fallback_steps  = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
+    // N-gram copy drafting: the window (0 when off) and the copy rounds, a subset of the above.
+    std::uint32_t speculative_ngram_draft_tokens    = 0;
+    std::uint64_t speculative_ngram_rounds          = 0;
+    std::uint64_t speculative_ngram_drafted_tokens  = 0;
+    std::uint64_t speculative_ngram_accepted_tokens = 0;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
-    ninfer::MaterializationDiagnostics materialization;
 };
 
 struct GenerationOutcome {
     std::string text;
     std::string reasoning;
+    std::vector<ninfer::TokenId> generated_token_ids;
     std::vector<ninfer::GeneratedToolCall> tool_calls;
+    ninfer::ToolCallParseDiagnostics tool_call_parse;
     int prompt_tokens     = 0;
     int completion_tokens = 0;
     int reasoning_tokens  = 0;
     ninfer::ThinkingBudgetStats thinking;
+    std::optional<ninfer::ConstraintObservation> constraint;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
     GenerationMetrics metrics;
 };
 
+// A transport may report an interrupted stream through a callback or is_cancelled().
+// Generation still settles through Engine cancellation and returns its actual work statistics.
+class ClientDisconnected final : public std::exception {
+public:
+    [[nodiscard]] const char* what() const noexcept override { return "client disconnected"; }
+};
+
 struct StreamSink {
     std::function<void(const ninfer::GenerationStart& start)> on_start;
+    std::function<void(const ninfer::PromptProgress& progress)> on_progress;
+    std::function<void(const ninfer::GenerationTimingObservation& timing)> on_timing;
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
     std::function<bool()> is_cancelled;
@@ -68,28 +105,53 @@ enum class GenerationConsumerMode : std::uint8_t {
 };
 
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
-ApiError request_error_to_api_error(const ninfer::RequestError& exception);
+ApiError
+request_error_to_api_error(const ninfer::RequestError& exception,
+                           std::string_view constraint_param = "structured_outputs.grammar",
+                           std::span<const std::string> tool_schema_params = {});
 
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().
 struct PreparedRequest {
+    std::string constraint_param;
+    std::vector<std::string> tool_schema_params;
     ninfer::GenerationHandle generation;
     ninfer::ResolvedSamplingParameters sampling;
-    double prepare_seconds     = 0.0;
+    // Service input acquisition/bookkeeping; Engine timings own prompt and constraint preparation.
+    double service_prepare_seconds = 0.0;
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;
+    // The output budget submitted to the Engine, after any remaining-context derivation.
+    int requested_output_tokens = 0;
     bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;
-    std::optional<ninfer::ReasoningEffort> effective_reasoning_effort;
-    bool preserve_thinking = false;
+    std::optional<std::uint32_t> effective_thinking_budget;
+    std::optional<ninfer::ReasoningEffort> reasoning_effort;
+    // The client's own effort choice, or unset when the server default resolved reasoning_effort
+    // instead. Logging reports this, not reasoning_effort, so a defaulted request logs null.
+    std::optional<RequestedReasoningEffort> requested_reasoning_effort;
+    std::optional<bool> preserve_thinking;
+    // The client's own choice, or unset when the server default resolved preserve_thinking
+    // instead. Logging reports this, not preserve_thinking, so a defaulted request logs null.
+    std::optional<bool> requested_preserve_thinking;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
+// The Engine configuration a serve invocation selects. Separate from the service so the mapping
+// from parsed options to what the Engine is actually started with can be checked without a model.
+[[nodiscard]] ninfer::EngineOptions make_engine_options(const ServeOptions& options);
+
 class GenerationService {
 public:
-    explicit GenerationService(ServeOptions options, LoadProgress load_progress = {});
+    explicit GenerationService(
+        ServeOptions options, StartupObserver startup_observer = {},
+        std::function<void(const ninfer::ContextStoreWriteEvent&)> store_listener = {},
+        std::function<void(const ninfer::EngineFaultEvent&)> fault_listener      = {});
+    ~GenerationService();
+    GenerationService(const GenerationService&)            = delete;
+    GenerationService& operator=(const GenerationService&) = delete;
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
@@ -103,6 +165,17 @@ public:
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    [[nodiscard]] bool is_available() const { return engine_->is_available(); }
+
+    // Model suspend (--model-suspend): see Engine::suspend. Throws std::invalid_argument when the
+    // service was started without it.
+    ninfer::ResidencyStatus suspend(std::optional<bool> auto_resume = std::nullopt);
+    ninfer::ResidencyStatus resume();
+    [[nodiscard]] ninfer::ResidencyStatus residency() const;
+
+    // Requests currently holding ingress capacity (max_concurrency + max_pending_requests).
+    [[nodiscard]] std::size_t admitted_requests() const;
+
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }
@@ -113,8 +186,9 @@ public:
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           GenerationConsumerMode consumer_mode,
-                                          std::function<bool()> is_cancelled = {},
-                                          ContextCacheHints context_cache    = {}) const;
+                                          ninfer::GenerationObservationOptions observation = {},
+                                          std::function<bool()> is_cancelled               = {},
+                                          ContextCacheHints context_cache = {}) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 
@@ -137,15 +211,22 @@ private:
 
     [[nodiscard]] PreparedRequest
     prepare_impl(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
+                 ninfer::GenerationObservationOptions observation,
                  std::function<bool()> is_cancelled, ContextCacheHints context_cache,
                  CacheParticipation cache_participation, DeadlinePolicy deadline_policy) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
 
+    void idle_sleep_loop();
+
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
-    ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
+    // --sleep-idle-seconds: the thread that suspends an idle model.
+    std::mutex idle_mutex_;
+    std::condition_variable idle_cv_;
+    bool idle_stop_ = false;
+    std::thread idle_sleeper_;
 };
 
 } // namespace ninfer::serve

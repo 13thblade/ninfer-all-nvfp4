@@ -99,6 +99,14 @@ std::vector<ChatTurn> normalize_call_graph(std::vector<ChatTurn> turns) {
                 invalid_tool_history("function_call_output identity does not match call_id '" +
                                      result.tool_call_id + "'");
             }
+            if (result.tool_result_custom && *result.tool_result_custom != call.custom) {
+                invalid_tool_history(std::string("function_call_output call_id '") +
+                                     result.tool_call_id + "' answers a " +
+                                     (call.custom ? "custom_tool_call" : "function_call") +
+                                     " with a " +
+                                     (*result.tool_result_custom ? "custom_tool_call_output"
+                                                                 : "function_call_output"));
+            }
             if (results[position->second]) {
                 invalid_tool_history("duplicate function_call_output for call_id '" +
                                      result.tool_call_id + "'");
@@ -156,7 +164,8 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
         resolved.parent = parent_record->context;
     }
 
-    const bool parent_preserve = parent_record ? parent_record->preserve_thinking : false;
+    const std::optional<bool> parent_preserve =
+        parent_record ? parent_record->preserve_thinking : std::nullopt;
     if (resolved.generation.preserve_thinking) {
         resolved.preserve_thinking_semantic_change =
             parent_record && *resolved.generation.preserve_thinking != parent_preserve;
@@ -178,6 +187,7 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
     resolved.generation.messages.insert(resolved.generation.messages.end(),
                                         std::make_move_iterator(context.begin()),
                                         std::make_move_iterator(context.end()));
+    apply_openai_prompt_cache_policy(resolved.generation, request.cache_policy);
 
     if (response_id) {
         if (parent_record) {
@@ -185,10 +195,21 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
         } else if (store_response) {
             resolved.session_key = *response_id;
         }
-        resolved.cache_hints.session_key = resolved.session_key;
-        resolved.cache_hints.retention =
-            store_response ? CacheRetentionHint::LiveSession : CacheRetentionHint::Disposable;
-        resolved.cache_hints.update_session_index = store_response;
+
+        // The session identity is independent of `store`: `store` only controls whether this
+        // Response object becomes retrievable by id later. A client that manages its own history
+        // client-side (never sends previous_response_id, never wants a retrievable Response) can
+        // still name its own conversation lineage via prompt_cache_key, so the Engine advances that
+        // lineage's session index. Only take this path when there is no parent chain and no
+        // store-based session already in play, so it never changes behavior for clients using those
+        // mechanisms (in particular, a stored parent consumed by a store=false reply must not
+        // advance the session index).
+        const bool use_prompt_cache_key =
+            !parent_record && !store_response && request.prompt_cache_key.has_value();
+
+        resolved.cache_hints.session_key =
+            use_prompt_cache_key ? request.prompt_cache_key : resolved.session_key;
+        resolved.cache_hints.update_session_index = store_response || use_prompt_cache_key;
     }
     return resolved;
 }

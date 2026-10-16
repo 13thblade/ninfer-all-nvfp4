@@ -29,7 +29,7 @@ constexpr ops::AttentionHeadGeometry kGeometry{kD, kQHeads, kKVHeads};
 constexpr ReductionCriterion kContextQueryBf16Criterion{
     .relative_l2                     = 2.95e-3,
     .gross_absolute                  = 3e-4,
-    .gross_relative_to_max_reference = 5.7e-3,
+    .gross_relative_to_max_reference = kBf16GrossRelativeFloor,
 };
 
 std::size_t q_index(int d, int q_head, int token) {
@@ -166,8 +166,7 @@ PagedKVBatchLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v,
         .block_tables = Tensor(block_tables.p, DType::I32, {logical_pages, table_rows}),
         .head_dim     = kD,
         .num_kv_heads = kKVHeads,
-        .dtype        = DType::BF16,
-        .quant_group  = 0,
+        .storage      = KvCacheStorage::BFloat16,
     };
 }
 

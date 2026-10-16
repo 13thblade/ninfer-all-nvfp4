@@ -1,8 +1,9 @@
 # Perplexity evaluation
 
-`ninfer-perplexity` measures the causal perplexity produced by a registered `.ninfer` artifact.
+`ninfer-perplexity` measures the causal perplexity produced by a v3 `.ninfer` artifact.
 It uses the artifact's tokenizer, Text model, selected Main KV representation, final normalization,
 and main output head. It is an offline evaluator, not a serving endpoint or a logits-export API.
+Only Text weights and resources are loaded; Vision and speculative components are not required.
 
 ## Run the fixed corpus
 
@@ -19,7 +20,10 @@ English reference text, English long-form text, Chinese reference text, and NInf
 
 The default evaluation uses a 4,096-token context and a 2,048-token stride. Use `--context` and
 `--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. The available Main
-KV representations are `bf16`, `int8`, and `fp8`.
+KV representations are `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `nvfp4`, and `k8v4`.
+
+All seven have been measured on this corpus; the results, alongside each format's size and decode
+speed, are in [`docs/config-calculator.html`](config-calculator.html).
 
 ```bash
 ./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
@@ -29,9 +33,33 @@ KV representations are `bf16`, `int8`, and `fp8`.
 ```
 
 Run `./build/apps/ninfer-perplexity --help` for the complete command surface. The evaluator loads
-the model once, verifies and tokenizes every selected stream before scoring, prints throttled
-progress to stderr, prints the final domain/overall table to stdout, and writes `report.json` under
-`profiles/perplexity/` unless `--output` supplies an empty directory.
+the model once, reads and tokenizes every selected stream before scoring, and writes readable
+startup, corpus, scoring, and per-stream summaries to stderr. Interactive weight loading and
+scoring use one transient progress line; redirected scoring emits persistent progress every ten
+seconds. `--log-level debug` exposes internal startup and stream-begin detail. The final
+domain/overall table remains product output on stdout; the independent full-precision machine
+report is `report.json` under `profiles/perplexity/` unless `--output` supplies an empty directory.
+
+For KV-format comparisons, the recommended long-context profile is the full corpus with
+`--context 65536 --stride 32768` and without `--quick`.
+
+## Held-out corpus
+
+`ninfer-ppl-1m-v1` is built from public datasets that the model has almost certainly trained on,
+which can understate the cost of a weight or KV representation change. The repository also
+includes `ninfer-ppl-heldout-2026-09-v1`: 12 streams written after Qwen3.8's release, covering new
+English and Chinese Wikipedia articles, arXiv abstracts, new GitHub code in four languages, this
+fork's recent code, and chat-template conversations. Use it to judge representation quality, and
+keep `ninfer-ppl-1m-v1` for comparisons with the numbers already published against it. Its
+selection rules and limitations are in its
+[README](../eval/corpora/perplexity-heldout-2026-09/README.md).
+
+```bash
+./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
+  --corpus eval/corpora/perplexity-heldout-2026-09/manifest.json \
+  --quick \
+  --kv-dtype int8
+```
 
 ## Metric
 
@@ -55,18 +83,14 @@ retaining up to `context-stride` preceding tokens as local context. Streams neve
 
 ## Comparing runs
 
-For a numerical comparison, keep the corpus bytes and stream order, tokenizer output, context,
-stride, Prefill chunk, score tile, and all execution settings fixed except the variable being
-measured. Compare KV formats with the same artifact. Compare weight formats with the same KV format
-and first confirm that both artifacts tokenize every stream identically.
+For a numerical comparison, keep the corpus, context, stride, and execution settings fixed except
+the variable being measured. Compare KV formats with the same artifact and weight formats with the
+same KV format.
 
 The corpus name is a workload scale, not an exact token count. Exact input and scored-token counts
 are runtime results from the current artifact tokenizer and are recorded in each report. Reports
 contain unrounded NLL/PPL values for every window, stream, domain, and the token-weighted overall
 aggregate.
 
-Verify the fixed corpus without loading a model:
-
-```bash
-python3 tools/perplexity/prepare_corpus.py --check
-```
+The schema-v2 report identifies the artifact's architecture, public name, actual weight formats
+and prefill signature alongside the workload and numerical results.

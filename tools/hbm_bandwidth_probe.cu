@@ -3,11 +3,12 @@
 // Build:
 //   nvcc -O3 -std=c++17 -arch=sm_120a tools/hbm_bandwidth_probe.cu -o hbm_bandwidth_probe
 //
-// The "bus GB/s" column counts physical streaming traffic: N bytes for a
+// The "bus GB/s" column counts logical streaming traffic: N bytes for a
 // read or write and 2N bytes for a copy (N read + N written). This is the
-// column to compare with the advertised memory-bus bandwidth.
+// rate to compare with the advertised bandwidth; it is not a measured DRAM counter.
 
 #include <cuda_runtime.h>
+#include "../bench/common/fixture_data.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -33,7 +34,10 @@
 namespace {
 
 constexpr int kThreads                 = 256;
-constexpr double kDefaultPeakGBps      = 1792.0;
+// 0 means "derive from the device": 2 x memory clock x bus width. The literal here used to be
+// the RTX 5090's 1792 GB/s, which on the sm_86 fork target reported every rate as roughly half
+// its true fraction of peak. --peak still overrides.
+constexpr double kDefaultPeakGBps      = 0.0;
 constexpr double kDefaultTrialSeconds  = 0.25;
 constexpr int kDefaultTrials           = 5;
 constexpr std::size_t kDefaultMaxBytes = std::size_t{4} << 30;
@@ -98,7 +102,11 @@ private:
 __global__ void write_u128_kernel(uint4* __restrict__ dst, std::size_t count, uint4 value) {
     const std::size_t tid    = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
-    for (std::size_t i = tid; i < count; i += stride) { dst[i] = value; }
+    for (std::size_t i = tid; i < count; i += stride) {
+        const auto offset = static_cast<std::uint32_t>(i);
+        dst[i] = make_uint4(value.x ^ (offset * 0x9e3779b9U), value.y ^ (offset * 0x85ebca6bU),
+                            value.z ^ (offset * 0xc2b2ae35U), value.w ^ (offset * 0x27d4eb2fU));
+    }
 }
 
 // The block checksum makes every load observable while adding only one tiny
@@ -187,9 +195,9 @@ void print_help(const char* argv0) {
                 "  --size-gib N    bytes per large buffer (default: min(4, 20%% free))\n"
                 "  --seconds N     target duration of each timed trial (default: %.2f)\n"
                 "  --trials N      timed trials per method (default: %d)\n"
-                "  --peak-gbps N   advertised bus bandwidth (default: %.0f)\n"
+                "  --peak-gbps N   advertised bus bandwidth (default: derived from the device)\n"
                 "  --help          show this text\n",
-                argv0, kDefaultTrialSeconds, kDefaultTrials, kDefaultPeakGBps);
+                argv0, kDefaultTrialSeconds, kDefaultTrials);
 }
 
 Options parse_options(int argc, char** argv) {
@@ -281,7 +289,7 @@ void print_result(const Result& result) {
 } // namespace
 
 int main(int argc, char** argv) {
-    const Options options = parse_options(argc, argv);
+    Options options = parse_options(argc, argv);
 
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
@@ -319,6 +327,16 @@ int main(int argc, char** argv) {
     const int copy_grid            = resident_grid(copy_u128_kernel, prop.multiProcessorCount);
     const int copy_x4_grid         = resident_grid(copy_u128x4_kernel, prop.multiProcessorCount);
 
+    const bool derived_peak = options.peak_gbps <= 0.0;
+    if (derived_peak) {
+        // The memory clock is the single-data-rate clock in kHz; DRAM transfers on both edges.
+        // Queried as an attribute because cudaDeviceProp dropped memoryClockRate in CUDA 13.
+        int memory_clock_khz = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&memory_clock_khz, cudaDevAttrMemoryClockRate, device));
+        options.peak_gbps = 2.0 * static_cast<double>(memory_clock_khz) * 1.0e3 *
+                            (static_cast<double>(prop.memoryBusWidth) / 8.0) / 1.0e9;
+    }
+
     std::printf("GPU:               %s\n", prop.name);
     std::printf("SMs / L2:          %d / %.1f MiB\n", prop.multiProcessorCount,
                 static_cast<double>(prop.l2CacheSize) / (1 << 20));
@@ -329,7 +347,8 @@ int main(int argc, char** argv) {
     std::printf("Working set:       %.2f GiB per buffer (%.1fx L2)\n",
                 static_cast<double>(bytes) / (std::size_t{1} << 30),
                 static_cast<double>(bytes) / prop.l2CacheSize);
-    std::printf("Advertised peak:   %.1f GB/s\n", options.peak_gbps);
+    std::printf("Advertised peak:   %.1f GB/s%s\n", options.peak_gbps,
+                derived_peak ? " (derived from device)" : " (--peak)");
     std::printf("Trial policy:      %d trials, >= %.2f s each, best + median\n", options.trials,
                 options.seconds);
     std::printf("Resident grids:    write=%d read=%d copy=%d copy-x4=%d blocks x %d threads\n\n",
@@ -342,10 +361,7 @@ int main(int argc, char** argv) {
     cudaStream_t stream{};
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-    const uint4 source_value = make_uint4(0x13579bdfu, 0x2468ace0u, 0xdeadbeefu, 0x10203040u);
-    write_u128_kernel<<<write_grid, kThreads, 0, stream>>>(source.get(), vector_count,
-                                                           source_value);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(ninfer::bench::fixture::fill_bytes(source.get(), bytes, 101U, stream));
 
     // Long preconditioning phase: make the first reported method independent
     // of idle P-state ramp-up.

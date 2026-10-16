@@ -1,7 +1,7 @@
 // Performance bench for gdn_gating at the Qwen3.6-27B Gated DeltaNet gate
 // shape ([48,T]). This binary is the ncu/nsys target; the GB/s it prints is
 // informational only -- the gate is ncu sustained DRAM % (see
-// docs/op-development.md §8).
+// docs/maintainer/op-development.md §8).
 //   ./ninfer_gdn_gating_bench [--decode] [--prefill]   (default: both)
 #include "ninfer/ops/gdn_gating.h"
 #include "ninfer_bench_common.h"
@@ -30,8 +30,8 @@ static void run(int t, const char* tag) {
     constexpr int kHeads = 48;
     const auto n         = static_cast<std::size_t>(kHeads) * static_cast<std::size_t>(t);
 
-    DeviceBuffer a       = make_bf16(n);
-    DeviceBuffer b       = make_bf16(n);
+    DeviceBuffer a       = make_bf16(n, 101U);
+    DeviceBuffer b       = make_bf16(n, 103U);
     DeviceBuffer A_log   = make_f32(kHeads, 0x1234abcdU);
     DeviceBuffer dt_bias = make_f32(kHeads, 0x9876fedcU);
     DeviceBuffer g       = make_zeros(n * sizeof(float));

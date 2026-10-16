@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ninfer/ops/sparse_moe.h"
 
 #include "ops/op_tester.h"
@@ -38,14 +39,38 @@ constexpr std::int32_t kRoutedGateRows = kExperts * kExpertGateRows;
 constexpr std::int32_t kRoutedDownRows = kExperts * kHidden;
 constexpr std::int32_t kSharedGateRows = 2 * kIntermediate;
 
-// All registered variants consume represented BF16 activations and expose one BF16 destination.
-// The bound belongs to that A16 compute profile, not to a codec, T, private route, or schedule.
-// The limits retain modest headroom over the measured maxima from the complete case matrix:
-// rel-L2 1.117e-2 and pointwise 3.687e-3.
+// This criterion belongs to the complete A16 SparseMoe compute profile, not to a codec, T, private
+// route, or schedule. `relative_l2` is the kernel-accuracy constraint and keeps modest headroom
+// over the measured maximum across the whole case matrix (1.118e-2 against 1.2e-2); #20's floor
+// argument deliberately does not touch it.
+//
+// The gross bound needed a relative term, and finding out why answered the question TODO.md §4
+// asked. Measured with NINFER_OP_REPORT_STATS=1 over the full matrix, the gross error is not
+// uniformly large -- it steps at a route boundary:
+//
+//     codec     T          max_abs   max_reference   BF16 rounding steps
+//     q4+q5     1..46     4.85e-4        0.1778             0.70
+//     q4+q5     47..4097  2.36e-3        0.1778             3.40
+//     q4+q6     1..46     4.88e-4        0.1766             0.71
+//     q4+q6     47..768   2.51e-3        0.1766             3.64
+//     w8+w8     1..19     9.18e-4        0.2718             0.87
+//     w8+w8     20..768   3.69e-3        0.2718             3.47
+//
+// So the "largest observed BF16 error in the tree, 3.64 steps against 0.09-1.53 everywhere else"
+// is one *route*, above a T boundary, and below that boundary this Op sits at 0.70-0.87 like
+// everything else. The large-T route accumulates over more terms in a different order; a 5x
+// spread between two routes of one Op is a property of the algorithm, not evidence of a defect.
+//
+// The bound was `gross_absolute` alone at 4.0e-3, which the worst case reached 0.92 of. An
+// absolute bound does not scale with the data: the same relative accuracy on a case whose
+// max_reference is 0.5 rather than 0.27 would produce ~6.8e-3 and fail spuriously. Six rounding
+// steps of max_reference covers the measured 3.64 with real headroom while still bounding a
+// genuinely wrong element hundreds of times more tightly -- the sm_86 small-T INT8 regression ran
+// 3-11x its reference. `gross_absolute` stays to carry the near-zero case.
 constexpr ReductionCriterion kSparseMoeA16Tolerance{
     /*relative_l2*/ 1.2e-2,
     /*gross_absolute*/ 4.0e-3,
-    /*gross_relative_to_max_reference*/ 0.0,
+    /*gross_relative_to_max_reference*/ 6.0 / 256.0,
 };
 
 constexpr std::size_t kOutputGuardBytes = 256;
@@ -59,13 +84,13 @@ struct QuantGeometry {
 
 QuantGeometry quant_geometry(QType qtype) {
     switch (qtype) {
-    case QType::Q4G64_F16S:
+    case QType::Q4_G64_FP16:
         return {64, 32, 0};
-    case QType::Q5G64_F16S:
+    case QType::Q5_G64_FP16:
         return {64, 32, 8};
-    case QType::Q6G64_F16S:
+    case QType::Q6_G64_FP16:
         return {64, 32, 16};
-    case QType::W8G32_F16S:
+    case QType::Q8_G32_FP16:
         return {32, 32, 0};
     default:
         throw std::invalid_argument("sparse_moe test: unsupported codec");
@@ -214,7 +239,7 @@ Weight dense_bf16_weight(void* data, std::int32_t rows, std::int32_t columns) {
     Weight result{};
     result.payload         = data;
     result.payload_bytes   = static_cast<std::uint64_t>(rows) * columns * sizeof(std::uint16_t);
-    result.qtype           = QType::BF16_CTRL;
+    result.qtype           = QType::BF16;
     result.qdata           = data;
     result.n               = rows;
     result.k               = columns;
@@ -448,8 +473,8 @@ public:
           device_router_(to_device(router_bits_)),
           routed_gate_(profile.routed_gate_up, kRoutedGateRows, kHidden),
           routed_down_(profile.routed_down, kRoutedDownRows, kIntermediate),
-          shared_gate_(QType::W8G32_F16S, kSharedGateRows, kHidden),
-          shared_down_device_(QType::W8G32_F16S, kHidden, kIntermediate) {
+          shared_gate_(QType::Q8_G32_FP16, kSharedGateRows, kHidden),
+          shared_down_device_(QType::Q8_G32_FP16, kHidden, kIntermediate) {
         for (int pattern = 0; pattern < static_cast<int>(kRoutePatterns.size()); ++pattern) {
             inputs_.push_back(make_input(pattern));
             residuals_.push_back(make_residual(pattern));
@@ -479,9 +504,9 @@ public:
             experts_.push_back({expert, std::move(gate_up), std::move(down)});
         }
 
-        shared_gate_host_ = quantized_weight::pack_w8g32_row_split(
+        shared_gate_host_ = quantized_weight::pack_q8_g32_row_split(
             make_gate_up(kSharedGateRows, kHidden, 0x512U, 0.93f), kSharedGateRows, kHidden);
-        shared_down_host_ = quantized_weight::pack_w8g32_row_split(
+        shared_down_host_ = quantized_weight::pack_q8_g32_row_split(
             make_down(kHidden, kIntermediate, 0x731U, 0.87f), kHidden, kIntermediate);
         shared_gate_.copy_rows(shared_gate_host_, 0);
         shared_down_device_.copy_rows(shared_down_host_, 0);
@@ -493,7 +518,8 @@ public:
         }
     }
 
-    int run(std::int32_t tokens, int first_pattern, bool graph_replay) {
+    int run(DeviceExecutionView execution, std::int32_t tokens, int first_pattern,
+            bool graph_replay) {
         const std::string label = std::string(profile_.name) + " T=" + std::to_string(tokens);
         std::vector<float> input(static_cast<std::size_t>(kHidden) * tokens);
         std::vector<float> residual(static_cast<std::size_t>(kHidden) * tokens);
@@ -530,6 +556,20 @@ public:
             weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens);
         WorkspaceArena workspace(workspace_bytes);
 
+        if (tokens == 1 && profile_.verify_graph_replay) {
+            for (const std::int32_t sm_count : {0, -1}) {
+                bool rejected = false;
+                try {
+                    ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination,
+                                    workspace, {execution.stream, sm_count});
+                } catch (const std::invalid_argument&) { rejected = true; }
+                if (!rejected) {
+                    std::cerr << label << ": accepted a nonpositive physical SM count\n";
+                    return 1;
+                }
+            }
+        }
+
         if (graph_replay) {
             cudaStream_t stream  = nullptr;
             cudaGraph_t graph    = nullptr;
@@ -542,7 +582,7 @@ public:
                                        cudaMemcpyDeviceToDevice, stream),
                        "capture SparseMoe residual seed");
             ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, workspace,
-                            stream);
+                            execution.on_stream(stream));
             cuda_check(cudaStreamEndCapture(stream, &graph), "end SparseMoe graph capture");
             cuda_check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
                        "instantiate SparseMoe graph");
@@ -554,7 +594,7 @@ public:
             cuda_check(cudaStreamDestroy(stream), "destroy SparseMoe graph stream");
         } else {
             ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, workspace,
-                            nullptr);
+                            execution);
             cuda_synchronize();
         }
 
@@ -607,7 +647,7 @@ private:
     std::vector<std::vector<double>> references_;
 };
 
-int run_profile(const CodecProfile& profile) {
+int run_profile(DeviceExecutionView execution, const CodecProfile& profile) {
     SparseMoeFixture fixture(profile);
     int failures        = 0;
     std::size_t witness = 0;
@@ -618,8 +658,8 @@ int run_profile(const CodecProfile& profile) {
                                   profile.routed_gate_up, profile.routed_down, tokens, tokens));
         // Decode starts with the exact top-8 boundary tie; multi-token cases cycle the tie,
         // high/low expert ids, and a different ordering of the same experts.
-        failures +=
-            fixture.run(tokens, index == 0 ? 1 : 0, profile.verify_graph_replay && index == 1);
+        failures += fixture.run(execution, tokens, index == 0 ? 1 : 0,
+                                profile.verify_graph_replay && index == 1);
     }
     const std::size_t interval = ops::sparse_moe_workspace_capacity_bytes(
         profile.routed_gate_up, profile.routed_down, 1, profile.token_cases.back());
@@ -644,15 +684,18 @@ int main() {
     // and one call crossing the 4096-token internal slice without observing any private plan.
     constexpr std::array<std::int32_t, 6> kQ4Q5Tokens{{1, 2, 46, 47, 768, 4097}};
     constexpr std::array<std::int32_t, 5> kQ4Q6Tokens{{1, 2, 46, 47, 768}};
-    constexpr std::array<std::int32_t, 5> kW8W8Tokens{{1, 2, 19, 20, 768}};
+    constexpr std::array<std::int32_t, 5> kQ8Q8Tokens{{1, 2, 19, 20, 768}};
     const std::array<CodecProfile, 3> profiles{{
-        {"sparse_moe q4+q5 a16", QType::Q4G64_F16S, QType::Q5G64_F16S, kQ4Q5Tokens, true},
-        {"sparse_moe q4+q6 a16", QType::Q4G64_F16S, QType::Q6G64_F16S, kQ4Q6Tokens, false},
-        {"sparse_moe w8+w8 a16", QType::W8G32_F16S, QType::W8G32_F16S, kW8W8Tokens, false},
+        {"sparse_moe q4+q5 a16", QType::Q4_G64_FP16, QType::Q5_G64_FP16, kQ4Q5Tokens, true},
+        {"sparse_moe q4+q6 a16", QType::Q4_G64_FP16, QType::Q6_G64_FP16, kQ4Q6Tokens, false},
+        {"sparse_moe q8+q8 a16", QType::Q8_G32_FP16, QType::Q8_G32_FP16, kQ8Q8Tokens, false},
     }};
 
-    int failures = 0;
-    for (const CodecProfile& profile : profiles) { failures += run_profile(profile); }
+    DeviceContext context;
+    // Fixture copies use the default stream; preserve their ordering with the eager call.
+    const DeviceExecutionView execution = context.execution_view().on_stream(nullptr);
+    int failures                        = 0;
+    for (const CodecProfile& profile : profiles) { failures += run_profile(execution, profile); }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe correctness\n";
     return failures == 0 ? 0 : 1;
 }

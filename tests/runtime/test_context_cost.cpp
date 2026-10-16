@@ -1,0 +1,364 @@
+#include "runtime/engine/context_cache/context_cost.h"
+
+#include <nlohmann/json.hpp>
+
+#include <array>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
+namespace {
+
+int current_process_id() noexcept {
+#ifdef _WIN32
+    return ::_getpid();
+#else
+    return ::getpid();
+#endif
+}
+
+using Json = nlohmann::json;
+
+int failures = 0;
+
+void expect(bool condition, const char* message) {
+    if (condition) { return; }
+    ++failures;
+    std::cerr << "FAIL: " << message << '\n';
+}
+
+template <class Function>
+void expect_throw(Function&& function, const char* message) {
+    try {
+        function();
+    } catch (const std::exception&) { return; }
+    expect(false, message);
+}
+
+std::array<ninfer::runtime::ContextTransferCost, 3> transfer(std::uint64_t batch_ns = 10) {
+    std::array<ninfer::runtime::ContextTransferCost, 3> result;
+    for (auto& direction : result) {
+        direction = {.batch_ns        = batch_ns,
+                     .operation_ns    = 3,
+                     .ns_per_byte_q32 = ninfer::runtime::kContextCostQ32One / 2};
+    }
+    return result;
+}
+
+ninfer::runtime::ContextPrefillCost prefill(std::uint64_t chunk_ns = 3) {
+    return {
+        .chunk_ns              = chunk_ns,
+        .token_ns_q32          = ninfer::runtime::kContextCostQ32One / 2,
+        .attention_pair_ns_q32 = ninfer::runtime::kContextCostQ32One / 4,
+        .vision_item_ns        = 5,
+        .vision_patch_ns_q32   = 2 * ninfer::runtime::kContextCostQ32One,
+    };
+}
+
+Json direction_json(const ninfer::runtime::ContextTransferCost& value) {
+    return Json{{"batch_ns", value.batch_ns},
+                {"operation_ns", value.operation_ns},
+                {"ns_per_byte_q32", value.ns_per_byte_q32}};
+}
+
+Json transfer_json(const std::array<ninfer::runtime::ContextTransferCost, 3>& value) {
+    return Json{{"d2h", direction_json(value[0])},
+                {"h2d", direction_json(value[1])},
+                {"d2d", direction_json(value[2])}};
+}
+
+Json prefill_json(const ninfer::runtime::ContextPrefillCost& value) {
+    return Json{{"chunk_ns", value.chunk_ns},
+                {"token_ns_q32", value.token_ns_q32},
+                {"attention_pair_ns_q32", value.attention_pair_ns_q32},
+                {"vision_item_ns", value.vision_item_ns},
+                {"vision_patch_ns_q32", value.vision_patch_ns_q32}};
+}
+
+Json document(Json machines) {
+    return Json{{"schema_version", 3},
+                {"artifact_type", "ninfer_context_cost_presets"},
+                {"machines", std::move(machines)}};
+}
+
+Json machine(std::string hardware, Json transfer_value, Json prefill_values) {
+    return Json{{"hardware_class", std::move(hardware)},
+                {"transfer", std::move(transfer_value)},
+                {"prefill", std::move(prefill_values)}};
+}
+
+Json prefill_entry(std::string signature, const ninfer::runtime::ContextPrefillCost& value) {
+    return Json{{"prefill_signature", std::move(signature)}, {"coefficients", prefill_json(value)}};
+}
+
+std::string read_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+void test_exact_evaluation() {
+    expect(ninfer::runtime::context_cost_hardware_class("NVIDIA GeForce RTX 5090", 12, 0) ==
+               "nvidia-geforce-rtx-5090-sm120",
+           "hardware class duplicated or lost the NVIDIA vendor");
+    expect(ninfer::runtime::context_cost_hardware_class("Example Accelerator", 9, 0) ==
+               "nvidia-example-accelerator-sm90",
+           "hardware class did not canonicalize a vendorless CUDA device name");
+
+    ninfer::runtime::ContextMachineCostModel model{.transfer = transfer(), .prefill = prefill()};
+    expect(model.transfer_ns(ninfer::runtime::ContextTransferDirection::DeviceToHost,
+                             {.payload_bytes = 4, .copy_operations = 2}) == 16,
+           "transfer operation roofline changed");
+    expect(model.transfer_ns(ninfer::runtime::ContextTransferDirection::DeviceToHost,
+                             {.payload_bytes = 100, .copy_operations = 1}) == 50,
+           "transfer bandwidth roofline changed");
+    expect(model.transfer_ns(ninfer::runtime::ContextTransferDirection::DeviceToHost, {}) == 0,
+           "empty transfer has a nonzero cost");
+    const ninfer::runtime::PrefillWork work = ninfer::runtime::make_prefill_work(100, 10, 2, 7, 8);
+    expect(work.chunks == 2 && work.tokens == 10 && work.attention_pairs == 1055 &&
+               work.vision_items == 2 && work.vision_patches == 7,
+           "prefill feature construction changed");
+    expect(ninfer::runtime::make_prefill_work(std::numeric_limits<std::uint64_t>::max(),
+                                              std::numeric_limits<std::uint64_t>::max(), 0, 0, 1)
+                   .attention_pairs == std::numeric_limits<std::uint64_t>::max(),
+           "prefill attention work did not saturate");
+    expect(model.prefill_ns(work) == 299, "prefill formula or Q32 rounding changed");
+
+    std::array requirements{
+        ninfer::runtime::ContextTransferRequirement{
+            .direction = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+            .work      = {.payload_bytes = 4, .copy_operations = 1},
+        },
+        ninfer::runtime::ContextTransferRequirement{
+            .direction = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+            .work      = {.payload_bytes = 4, .copy_operations = 1},
+        },
+    };
+    expect(ninfer::runtime::price_context_transfer_requirements(model, requirements) == 16,
+           "capture transfer requirements were not coalesced before pricing");
+    requirements[1].direction = ninfer::runtime::ContextTransferDirection::HostToDevice;
+    expect(ninfer::runtime::price_context_transfer_requirements(model, requirements) == 26,
+           "independent transfer directions were incorrectly coalesced");
+
+    model.prefill.chunk_ns = std::numeric_limits<std::uint64_t>::max();
+    expect(model.prefill_ns({.chunks = 2}) == std::numeric_limits<std::uint64_t>::max(),
+           "prefill cost did not saturate");
+}
+
+void test_schema_validation() {
+    Json entries = Json::array();
+    entries.push_back(prefill_entry("config-and-formats", prefill()));
+    const Json valid =
+        document(Json::array({machine("machine", transfer_json(transfer()), entries)}));
+    const auto parsed = ninfer::runtime::parse_context_cost_presets(valid.dump(), "test");
+    expect(parsed.size() == 1 && parsed[0].transfer == transfer() &&
+               parsed[0].prefill.size() == 1 && parsed[0].prefill[0].cost == prefill(),
+           "valid layered preset did not parse");
+
+    Json duplicate_machine = valid;
+    duplicate_machine["machines"].push_back(duplicate_machine["machines"][0]);
+    expect_throw(
+        [&] {
+            (void)ninfer::runtime::parse_context_cost_presets(duplicate_machine.dump(),
+                                                              "duplicate-machine");
+        },
+        "duplicate hardware entry was accepted");
+
+    Json duplicate_prefill = valid;
+    duplicate_prefill["machines"][0]["prefill"].push_back(
+        duplicate_prefill["machines"][0]["prefill"][0]);
+    expect_throw(
+        [&] {
+            (void)ninfer::runtime::parse_context_cost_presets(duplicate_prefill.dump(),
+                                                              "duplicate-prefill");
+        },
+        "duplicate model prefill entry was accepted");
+
+    Json invalid                                              = valid;
+    invalid["machines"][0]["transfer"]["d2h"]["operation_ns"] = -1;
+    expect_throw(
+        [&] { (void)ninfer::runtime::parse_context_cost_presets(invalid.dump(), "negative"); },
+        "negative transfer coefficient was accepted");
+
+    Json prefill_only                       = valid;
+    prefill_only["machines"][0]["transfer"] = nullptr;
+    expect(
+        ninfer::runtime::parse_context_cost_presets(prefill_only.dump(), "prefill-only").size() ==
+            1,
+        "independent prefill-only machine entry was rejected");
+    prefill_only["machines"][0]["prefill"] = Json::array();
+    expect_throw(
+        [&] { (void)ninfer::runtime::parse_context_cost_presets(prefill_only.dump(), "empty"); },
+        "empty machine cost entry was accepted");
+}
+
+void test_resolution_and_atomic_upserts() {
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() /
+        ("ninfer-context-cost-test-" + std::to_string(static_cast<long long>(current_process_id())));
+    std::filesystem::create_directories(directory);
+    const std::filesystem::path path = directory / "presets.json";
+    try {
+        const ninfer::runtime::ContextCostIdentity compiled_identity{
+            .hardware_class    = "nvidia-geforce-rtx-5090-sm120",
+            .prefill_signature = "unmeasured-config-and-formats",
+        };
+        const auto compiled = ninfer::runtime::resolve_context_machine_cost(compiled_identity);
+        expect(
+            compiled.summary.transfer_source == ninfer::ContextCostPresetSource::CompiledDefault &&
+                compiled.summary.prefill_source == ninfer::ContextCostPresetSource::GenericDefault,
+            "compiled transfer and prefill defaults did not resolve independently");
+
+        // The fork's own compiled machine preset: the 35B-A3B groupwise-int text signature, as
+        // reported by the loaded artifact on the fork host.
+        const auto rtx3090 = ninfer::runtime::resolve_context_machine_cost({
+            .hardware_class = "nvidia-geforce-rtx-3090-sm86",
+            .prefill_signature =
+                "ec5569f8250032ddd23568d599e4abf7e369d7a84971b2de3bd7fedfb9714dd1",
+        });
+        expect(rtx3090.summary.transfer_source == ninfer::ContextCostPresetSource::CompiledDefault &&
+                   rtx3090.summary.prefill_source ==
+                       ninfer::ContextCostPresetSource::CompiledDefault,
+               "RTX 3090 compiled defaults did not resolve for a measured artifact signature");
+        // The Qwen3.8-27B DFlash2 bundle the launchers download, Vision disabled and enabled: the
+        // artifact the 27B fit was measured on, which had fallen back to the generic prices.
+        for (const char* signature :
+             {"34e6977811057a534eb4c60bb56e9e9c0520ff0ecadf4852cbb176756c104c02",
+              "55d6cf832e5d519bcd43097cf00ba696ca5182ae8ec2570f05baf6cae1fc0c7b"}) {
+            const auto launcher_27b = ninfer::runtime::resolve_context_machine_cost(
+                {.hardware_class = "nvidia-geforce-rtx-3090-sm86", .prefill_signature = signature});
+            expect(launcher_27b.summary.prefill_source ==
+                       ninfer::ContextCostPresetSource::CompiledDefault,
+                   "RTX 3090 compiled prefill default did not resolve for the launcher 27B artifact");
+        }
+
+        const auto measured = ninfer::runtime::resolve_context_machine_cost({
+            .hardware_class    = compiled_identity.hardware_class,
+            .prefill_signature = "e6eae48276e11c15c932cb90d258b51b81e144dc13fb461e7ffa202d2caa440a",
+        });
+        expect(measured.summary.prefill_source ==
+                       ninfer::ContextCostPresetSource::CompiledDefault &&
+                   measured.model.prefill.token_ns_q32 == 375'800'765'711'778,
+               "measured bindings did not select their compiled prefill cost");
+
+        const ninfer::runtime::ContextCostIdentity unknown{
+            .hardware_class    = "unmeasured-machine",
+            .prefill_signature = "unmeasured-config-and-formats",
+        };
+        const auto generic = ninfer::runtime::resolve_context_machine_cost(unknown);
+        expect(
+            generic.summary.transfer_source == ninfer::ContextCostPresetSource::GenericDefault &&
+                generic.summary.prefill_source == ninfer::ContextCostPresetSource::GenericDefault &&
+                generic.model.transfer_ns(ninfer::runtime::ContextTransferDirection::DeviceToHost,
+                                          {.payload_bytes = 1024, .copy_operations = 1}) > 0 &&
+                generic.model.prefill_ns({.tokens = 1}) > 0,
+            "unknown identity did not retain a numerical cost model");
+
+        ninfer::runtime::upsert_context_transfer_cost_atomic(path, unknown.hardware_class,
+                                                             transfer(77), R"({"run":1})");
+        auto resolved = ninfer::runtime::resolve_context_machine_cost(unknown, path);
+        expect(resolved.model.transfer[0].batch_ns == 77 &&
+                   resolved.summary.transfer_source == ninfer::ContextCostPresetSource::External &&
+                   resolved.summary.prefill_source ==
+                       ninfer::ContextCostPresetSource::GenericDefault,
+               "external transfer did not layer over generic prefill");
+
+        ninfer::runtime::upsert_context_prefill_cost_atomic(path, unknown, prefill(91),
+                                                            R"({"run":2})");
+        resolved = ninfer::runtime::resolve_context_machine_cost(unknown, path);
+        expect(resolved.model.transfer[0].batch_ns == 77 && resolved.model.prefill.chunk_ns == 91 &&
+                   resolved.summary.transfer_source == ninfer::ContextCostPresetSource::External &&
+                   resolved.summary.prefill_source == ninfer::ContextCostPresetSource::External,
+               "independent external transfer/prefill entries did not compose");
+
+        const ninfer::runtime::ContextCostIdentity other_model{
+            .hardware_class    = unknown.hardware_class,
+            .prefill_signature = "other-config-and-formats",
+        };
+        const auto layered_miss = ninfer::runtime::resolve_context_machine_cost(other_model, path);
+        expect(layered_miss.summary.transfer_source == ninfer::ContextCostPresetSource::External &&
+                   layered_miss.summary.prefill_source ==
+                       ninfer::ContextCostPresetSource::GenericDefault,
+               "external model miss incorrectly discarded the matching machine transfer");
+
+        ninfer::runtime::upsert_context_transfer_cost_atomic(path, unknown.hardware_class,
+                                                             transfer(123), R"({"run":3})");
+        const auto parsed = ninfer::runtime::parse_context_cost_presets(read_file(path), "file");
+        expect(parsed.size() == 1 && parsed[0].transfer->at(0).batch_ns == 123 &&
+                   parsed[0].prefill.size() == 1 && parsed[0].prefill[0].cost.chunk_ns == 91,
+               "transfer replacement did not preserve the model prefill list");
+
+        const std::string before = read_file(path);
+        expect_throw(
+            [&] {
+                ninfer::runtime::upsert_context_prefill_cost_atomic(path, unknown, prefill(),
+                                                                    "not-json");
+            },
+            "invalid provenance was accepted");
+        expect(read_file(path) == before, "failed upsert modified the preset file");
+    } catch (...) {
+        std::filesystem::remove_all(directory);
+        throw;
+    }
+    std::filesystem::remove_all(directory);
+}
+
+} // namespace
+
+// The store read term: a fixed cost plus a per-byte rate, refined from observed reads. A stored
+// image is worth reading back only when this is below the prefill it saves, so the rate must
+// follow the volume it is read from and ignore observations that cannot be a real read.
+void test_store_read_rate() {
+    using ninfer::runtime::ContextMachineCostModel;
+    using ninfer::runtime::kContextCostQ32One;
+    ContextMachineCostModel model;
+    const std::uint64_t gib = std::uint64_t{1} << 30U;
+    // Default: 5 ms + 1 ns per byte.
+    expect(model.store_read_ns(0) == 5'000'000, "the store read has a fixed cost");
+    expect(model.store_read_ns(gib) == 5'000'000 + gib, "the default rate is 1 GB/s");
+
+    // A disk four times slower is reached within a few reads; each moves a quarter of the way.
+    model.observe_store_read(gib, 5'000'000 + 4 * gib);
+    expect(model.store_read.ns_per_byte_q32 == kContextCostQ32One * 7 / 4,
+           "one observation moves the rate a quarter of the way");
+    for (int i = 0; i < 40; ++i) { model.observe_store_read(gib, 5'000'000 + 4 * gib); }
+    const auto slow = model.store_read_ns(gib);
+    expect(slow > 5'000'000 + gib * 399 / 100 && slow <= 5'000'000 + 4 * gib,
+           "repeated observations converge on the observed rate");
+
+    // Small reads (fixed cost dominated) and impossible ones are not observations.
+    const auto before = model.store_read;
+    model.observe_store_read(std::uint64_t{1} << 20U, 1);
+    model.observe_store_read(gib, 1'000);
+    expect(model.store_read == before, "small or faster-than-the-fixed-cost reads are ignored");
+
+    // A sample beyond 50 GB/s or below 20 MB/s is clamped, never zero or unbounded.
+    ContextMachineCostModel fast;
+    for (int i = 0; i < 80; ++i) { fast.observe_store_read(gib, 5'000'001); }
+    expect(fast.store_read.ns_per_byte_q32 > 0 && fast.store_read_ns(gib) >= 5'000'000 + gib / 51,
+           "an implausibly fast read is clamped to 50 GB/s");
+    ContextMachineCostModel stuck;
+    for (int i = 0; i < 80; ++i) {
+        stuck.observe_store_read(gib, std::numeric_limits<std::uint64_t>::max());
+    }
+    expect(stuck.store_read_ns(gib) <= 5'000'000 + 50 * gib,
+           "an implausibly slow read is clamped to 20 MB/s");
+}
+
+int main() {
+    test_exact_evaluation();
+    test_store_read_rate();
+    test_schema_validation();
+    test_resolution_and_atomic_upserts();
+    if (failures == 0) { std::cout << "ok\n"; }
+    return failures == 0 ? 0 : 1;
+}

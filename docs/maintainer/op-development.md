@@ -4,10 +4,10 @@ This document defines the repository-wide rules for admitting, specifying, ownin
 qualifying, and measuring NInfer Ops. An **Op** is a semantic execution contract. A CUDA
 **kernel** is one implementation, or one stage of an implementation, of an Op.
 
-Repository-wide product scope, numerical principles, and evidence requirements remain in
-[`AGENTS.md`](../../AGENTS.md). When this document and a concrete Op contract differ about that
-Op's represented inputs, formula, supported domain, or observable effects, the contract in
-`include/ninfer/ops/` is the concrete authority and the inconsistency must be resolved.
+Repository-wide product scope and engineering policies are defined in [`AGENTS.md`](../../AGENTS.md).
+This document owns Op qualification and performance-evidence rules. When it and a concrete Op
+contract differ about that Op's represented inputs, formula, supported domain, or observable effects,
+the contract in `include/ninfer/ops/` is the concrete authority and the inconsistency must be resolved.
 
 ## 1. Scope and authorities
 
@@ -15,7 +15,7 @@ This file owns only rules that apply across Op families:
 
 - Op admission and semantic boundaries;
 - contract content and implementation freedom;
-- Op, wrapper, launcher, kernel, core, and target ownership;
+- Op, wrapper, launcher, kernel, core, and model ownership;
 - state, workspace, naming, and dependency rules;
 - Op-level qualification and performance evidence.
 
@@ -62,12 +62,12 @@ One caller, one registered shape or format, one optimized token extent, one devi
 mutable state, or a fused formula does not disqualify an Op. Reuse count and support breadth do not
 determine ownership.
 
-Classify a proposed target-callable computation in this order:
+Classify a proposed model-callable computation in this order:
 
 1. If it has no logical tensor or state effect, it is infrastructure, validation, planning, or raw
    transfer rather than an Op.
 2. If its complete transformation cannot be defined from explicit arguments and metadata, it
-   belongs to target or product schedule.
+   belongs to model or product schedule.
 3. If it decides call order, lifecycle, frontier, commit, rollback, or request policy, it belongs
    to Program, schedule, or runtime.
 4. If it is only a partial step beneath a complete transformation, it is a private implementation
@@ -84,12 +84,12 @@ boundary is not semantically closed.
 
 ### 2.1 Boundaries outside the Op layer
 
-Program, target schedule, and runtime policy own model topology, call order, weight-role and state
+Program, model schedule, and runtime policy own model topology, call order, weight-role and state
 instance selection, prompt chunking, multimodal spans, generated-token transactions,
 prefix/frontier/commit/rollback policy, persistent state lifetime, CUDA Graph variants, and
 publication of product statistics.
 
-Core owns target-neutral storage and execution mechanisms: tensor and weight views, checked
+Core owns model-independent storage and execution mechanisms: tensor and weight views, checked
 layouts, arenas, physical cache containers, CUDA Graph lifetime, and raw host/device or
 device/device transfers. A physical container may produce a checked view, but it does not acquire a
 logical sequence cursor or transaction policy.
@@ -101,18 +101,18 @@ device transformation.
 
 Wrapper validation, launchers, CUDA entry points, codecs, implementation plans, partial reductions,
 staging kernels, workspace layout helpers, and device primitives are parts of an Op implementation,
-not independently target-callable Ops.
+not independently model-callable Ops.
 
-Every target-callable device transformation belongs to the central Op layer. A target invokes a
+Every model-callable device transformation belongs to the central Op layer. A model implementation invokes a
 contract from `include/ninfer/ops/`, composes existing Ops and core mechanisms, or keeps host-side
-schedule composition in the target. There is no target-private Op category.
+schedule composition in the model implementation.
 
 ### 2.2 Semantic extents and private routes
 
 When a contract defines an axis as the Text/MTP token extent `T`, it admits every positive value
 representable by its views and available storage unless the contract declares a semantic capacity.
 Decode, latency-sensitive/hot-interval, and prefill may name private workload or benchmark
-regimes. They are not semantic variants, separate target-callable entries, or compute mechanisms.
+regimes. They are not semantic variants, separate model-callable entries, or compute mechanisms.
 
 Other axes retain the finite geometry or capacity declared by their own contracts. A matrix column
 does not become Text/MTP `T` merely because an implementation uses the same physical layout.
@@ -265,7 +265,7 @@ hidden device memory, capture graphs, or choose model call order.
 
 The launcher owns private launch declarations and host definitions, grid/block/shared-memory
 policy, template instantiation, and launch-error handling. Launcher headers are private:
-contract headers, targets, product code, permanent tests, and public benchmarks do not include
+contract headers, models, product code, permanent tests, and public benchmarks do not include
 them.
 
 ### 4.3 Kernel and common facilities
@@ -275,11 +275,11 @@ encode exact shape, format, SM capability, tiling, padding, and alignment assump
 assumption has a matching wrapper or launcher predicate and is never inferred from model identity.
 
 `src/ops/common/` and category-private common code contain narrow zero-cost arithmetic, memory,
-warp, and MMA facilities. They are not a second semantic catalog and are not included by targets.
+warp, and MMA facilities. They are not a second semantic catalog and are not included by models.
 
 A family may share private launch or computation bodies across related Ops. Each owning Op still
 defines its output mapping, observable fusion boundary, validation, and dispatch; sharing does not
-create a target-callable private backend.
+create a model-callable private backend.
 
 ## 5. State, workspace, naming, and dependencies
 
@@ -290,10 +290,15 @@ dtype and numeric format, storage layout, logical and padded shape, payload plan
 geometry, and alignment.
 
 Ops do not receive artifact object names, converter source fields, model weight roles, recipes, or
-provenance. Artifact binding and target loading translate those concepts into explicit execution
+provenance. Artifact binding and model loading translate those concepts into explicit execution
 views.
 
-Program owns persistent state instances and lifetime; core owns target-neutral physical
+A weight preparation entry resolves weight views and activation permissions into operands for a
+supported native overload, checking its parent geometry, format, layout and shape. See
+[`weight_input.h`](../../include/ninfer/ops/weight_input.h). Model execution composes the prepared
+Ops; resource queries and execution check their applicable contracts.
+
+Program owns persistent state instances and lifetime; core owns model-independent physical
 containers; an Op owns only the documented reads, writes, outputs, and state transition of one
 call.
 
@@ -337,31 +342,43 @@ ordering.
 The dependency direction is:
 
 ```text
-core <- ops <- target <- runtime/engine product route
+core <- ops <- model execution <- runtime/engine product route
 ```
 
-Artifact and loading code may materialize execution views for a target, but the Op layer does not
-depend on artifact provenance or target binding concepts.
+Artifact and loading code may materialize execution views for a model, but the Op layer does not
+depend on artifact provenance or model binding concepts.
 
 Enforce the boundary in code and build ownership:
 
-- contract headers include only required L0, CUDA host, and peer semantic contract types;
-- `src/ops/**` does not include target, Program, schedule, product, or artifact-provenance headers;
-- target schedule includes contract headers, never private launcher, kernel, common, codec, or plan
+- contract headers include only required core, CUDA host, and peer semantic contract types;
+- `src/ops/**` does not include model, Program, schedule, product, or artifact-provenance headers;
+- model execution includes contract headers, never private launcher, kernel, common, codec, or plan
   headers;
-- `ninfer_ops` does not link a target;
-- core and artifact do not link Ops or targets;
+- `ninfer_ops` does not link a model implementation;
+- core and artifact do not link Ops or models;
 - explicit source lists give every implementation one build and link owner.
+
+The owning family registers its implementation in `src/ops/<family>/sources.cmake`; Linear
+delegates to one explicit manifest per numeric format. A family manifest includes its wrappers
+even when they live in the horizontal `wrapper/` directory. Ordinary sources contribute to
+`ninfer_ops`; the three NVFP4 sources requiring non-RDC compilation contribute to
+`ninfer_nvfp4_non_rdc` from their owning manifests. Shape files retain their `.cpp` or `.cu`
+language and separate translation units. See [Build system](build-system.md) for the target policy.
 
 ## 6. Qualification
 
 Semantic Op tests live under `tests/ops/` and invoke the public contract independently of model call
-order. They link the Op layer and required L0 libraries rather than a target package. Commands and
+order. They link the Op layer and required core libraries rather than a model implementation. Commands and
 common reporting behavior belong in [`tests/README.md`](../../tests/README.md).
 
 ### 6.1 Oracle
 
-Every floating-point Op uses one independent naive FP32/FP64 mathematical oracle over the logical
+Choose the reference and comparison from the observable promise of the Op. A tensor's floating-point
+dtype alone does not determine its acceptance test. Identify the outputs, state effects, explicit
+representation boundaries, and the realistic failure that the check must detect before selecting
+an oracle.
+
+For an Op whose promise is a mathematical computation, use one independent naive FP32/FP64 oracle over the logical
 values represented by its public inputs. Test-owned fixture code independently decodes packed
 values before invoking the oracle. The oracle evaluates the complete formula at high precision and
 retains that result. It does not reproduce a production route's staging casts, activation
@@ -370,13 +387,25 @@ output.
 
 Exact transforms and codecs use an independent exact oracle. A fused oracle evaluates the complete
 fused formula instead of composing production Ops. A stateful oracle computes both output and new
-state. Another GPU route, target reference, generated model output, or pairwise implementation
-parity is supplementary evidence, never a second oracle.
+state. For such mathematical contracts, another GPU route, generated model output, or pairwise
+implementation parity is supplementary evidence, not the mathematical oracle.
+
+When the contract instead requires exact equivalence to a specified execution, that execution is
+the reference. ReplaySSM record/fold must preserve the corresponding snapshot outputs and committed
+state bit for bit. Compare the same initial state, physical block, inputs, and arithmetic policy;
+for each committed prefix, select the corresponding snapshot from that same block. Re-running a
+shorter projection can choose different arithmetic and is not an equivalent reference. Check raw
+record copies, untouched state, invalid tails, and zero-commit effects according to their contracts.
+A separate FP64 recurrence does not establish this equivalence and is not required for its acceptance.
+If the snapshot computation itself changes, validate its mathematical contract separately.
 
 The oracle determines correctness but does not prescribe production arithmetic. Private precision,
 instruction operands, reduction association, staging, workspace representation, and kernel
 decomposition remain implementation choices unless the contract makes an intermediate value
 observable.
+Unless the contract requires an intermediate representation boundary, a fused implementation must
+not retain extra low-precision intermediate rounding to reproduce an unfused route or achieve
+bitwise parity.
 
 ### 6.2 Conformance domain
 
@@ -398,7 +427,7 @@ one case establishes several dimensions.
 When CUDA Graph capture/replay is part of the public execution contract, qualify the captured
 public Op and its observable effects against the same oracle.
 
-Keep schedule composition, persistent-state lifetime, and end-to-end behavior in target or product
+Keep schedule composition, persistent-state lifetime, and end-to-end behavior in model or product
 integration tests. Private candidates, plan choices, launcher symbols, filenames, and source
 organization are not qualification subjects.
 
@@ -428,11 +457,12 @@ A long-lived Op benchmark calls the public contract and, when applicable, its pu
 capacity query. It does not include private implementation headers, call private launchers, expose
 candidate or kernel forcing, or duplicate candidate legality and production dispatch tables.
 
-The sole standing exception is `ninfer_gated_delta_net_bench --chunked-only --breakdown`: the
-complete chunked pipeline is still measured through the public Op, while the benchmark may call
-exactly its three intrinsic `prepare_wy_wu`, `state_passing`, and `output` stage launchers for
-algorithm-stage attribution. It may not call the private complete-pipeline launcher or any other
-private launcher.
+The Gated DeltaNet benchmark is an explicit exception: `--running` measures the public Op and
+uses its workspace capacity query, while `--breakdown` may call the selected production
+`prepare` and `recurrence` stage launchers with their private workspace layout. `--force-chunked`
+and `--recurrent-only` may force those production routes at matching prefill extents to measure
+their crossover; `--chunked-only` measures the same chunked route with pre-normalized BF16 Q/K.
+These controls qualify the production prefill decomposition and do not change decode or ReplaySSM.
 
 Candidate comparison is task-local development work. A temporary sweep may call private launchers
 and encode the exact overlapping candidate domains needed for a decision. Measure candidates under
@@ -487,40 +517,27 @@ plausible candidates. Instantiate only the small overlapping candidate set neede
 decision; do not create a Cartesian product of speculative knobs. Add another family or parameter
 only when evidence shows that the existing candidates cannot cover a relevant part of the
 workload. Once dispatch is selected, retain the winning instances and parameters and remove losing
-candidates and unused knobs.
+candidate instances and temporary tuning entry points. Reusable kernel families and schedule
+parameters with a clear purpose and development validation may remain as tuning assets even when
+current production dispatch does not select them. Qualify new configuration/epilogue combinations
+during development; permanent tests protect public behavior and production routes, not an unused
+configuration-by-epilogue matrix.
 
-Derive the latency-sensitive **hot interval** from the active product workload rather than fixing a
-repository-wide extent. Within that interval, a temporary private-launcher sweep may compare every
-relevant extent. Use it to establish the pointwise performance envelope, candidate crossovers, and
-adjacent-extent latency changes. Production dispatch should stay close to that envelope while
-keeping latency progression and route boundaries stable; a boundary needs repeatable benefit
-larger than measurement uncertainty and must not introduce an avoidable latency cliff. Do not add
-a universal percentage threshold: the task records the timing conditions and the scale needed to
-distinguish its candidates.
+Derive latency-sensitive extents and bulk anchors from the active workload and the Op's actual
+input semantics. Review pointwise behavior and material route seams; select a small set of useful
+implementations, accepting justified tile/CTA-wave steps. A permissive activation policy does not
+identify the arithmetic actually executed, so use the selected implementation's precision when
+interpreting throughput against a hardware peak.
 
-Review and report the pointwise curve, not only its minimum, maximum, average, or selected route.
-At minimum, identify the largest adjacent-extent increase and every route or schedule seam in the
-measured interval. An unexplained material jump blocks a claim that the interval is smooth: either
-change the kernel or dispatch, or record why the complete candidate matrix shows that the jump is
-currently unavoidable. Never omit, interpolate over, or replace an observed point with an
-invented value.
+[Linear tuning and performance reports](linear-tuning.md) defines the Linear-specific T ranges,
+priority points, specialization tradeoffs, and final report format.
 
-Beyond the hot interval, select the small number of large-extent anchors that represent the actual
-bulk workload. Optimize the primary anchor for throughput and for the roofline of the execution
-resource used by the selected route. Use sparse supporting points and as few broad routes as the
-evidence permits; a reasonable transition discontinuity is acceptable here. A permissive public
-policy does not prove that a particular accelerator route ran, so roofline evidence must identify
-and measure the implementation that production dispatch actually selects. These are completion
-requirements for the large-extent region, not a mandatory position in the development order.
-
-When a valid simple Op is the development surface for a related fused Op or epilogue, tune the
-shared computation across the current registered problem's required extent domain and performance
-regions before adapting it. Make the selected kernel bodies parameterizable at their output
-boundary, then immediately adapt them to the actual complete Op before moving to another problem.
-Do not enter the fused Op with only a provisional route, and do not turn this into a
-repository-wide simple-Op phase. The complete public fused Op, including its epilogue, post work,
-workspace traffic, outputs, and state effects, may still change the final fused route and supplies
-its own completion evidence.
+Choose the development surface from the requested complete Op. A related simple Op can help
+isolate shared computation when that answers a live design question, but completing a separate
+simple-Op tuning campaign is not a prerequisite for a fused Op. Reuse suitable kernel bodies at
+their output boundary when useful, and evaluate plausible routes through the complete public fused
+Op. Its epilogue, post work, workspace traffic, outputs, and state effects determine its selected
+route and completion evidence; an isolated contraction result cannot substitute for them.
 
 Before timing, qualify each candidate arithmetic profile against the independent oracle. After
 encoding the selected instances and boundaries in production dispatch, requalify boundary and
@@ -529,7 +546,7 @@ temporary sweep and its private entry points are then removed as described above
 
 An Op-scoped performance claim ends at the public Op boundary. Exact formats, layouts, shapes, and
 extents can be constructed directly by the Op benchmark; they do not authorize loading a model
-artifact or invoking a target, Program, Engine, or whole-round benchmark. Product-route evidence is
+artifact or invoking a model, Program, Engine, or whole-round benchmark. Product-route evidence is
 required only when the requested deliverable explicitly makes an end-to-end claim and includes
 that product route in scope.
 
@@ -546,7 +563,9 @@ Preserve only the context needed to interpret the result, as required by `AGENTS
 
 ## 8. Change checklist
 
-For a new or changed device transformation:
+For a new or changed device transformation, apply the relevant contract checks below. They do not
+require separate artifacts or a fixed execution order, and unchanged contracts need not be
+rewritten:
 
 1. classify the complete semantic boundary and reject schedule decisions, raw transfers,
    container lifecycle operations, and partial implementation helpers;
@@ -563,7 +582,7 @@ For a new or changed device transformation:
    independent oracle;
 8. measure the Op when performance changes; measure a product route only for an explicitly scoped
    end-to-end claim;
-9. integrate targets only through semantic contract headers and explicit operands;
+9. integrate models only through semantic contract headers and explicit operands;
 10. give every source and symbol one clear build and link owner.
 
 A contract change updates the authoritative comment, affected implementations, callers whose

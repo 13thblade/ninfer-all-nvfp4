@@ -1,6 +1,6 @@
 # Linear benchmark 合同与预置 suite
 
-## 状态与范围
+## 范围
 
 本文是 `bench/ops/linear_bench.cu` 的当前权威，定义 pure Linear benchmark 的命令、
 计时合同、指标、预置 suite 和扩展规则。benchmark 不改变 production Linear route，
@@ -17,10 +17,27 @@ ninfer::ops::linear(x, w, out, policy, workspace, stream)
 Linear 私有 launcher/plan/dispatch 头，不得调用 `ninfer::ops::detail`，也不得提供
 candidate、kernel 或 route forcing 选项。
 
-Q4/Q5/Q6/W8 LinearAdd、LinearSwiGLU、LinearPair 和其他 fused Ops 不属于这个
+Q4/Q5/Q6/Q8 LinearAdd、LinearSwiGLU、LinearPair 和其他 fused Ops 不属于这个
 benchmark。它们继续由各自的 benchmark 独立测量。
 
-Q4/Q5/Q6/W8 和 BF16_CTRL 使用现有 A16 route。以下 NVFP4 exact problem 同时支持 A16
+本 benchmark 回答"plan 选中的 route 有多快"。回答"boundary 该放在哪里"的是另一个
+maintainer benchmark：`bench/ops/linear_schedule_bench.cu`（`ninfer_linear_schedule_bench`），
+建立在共享的 `bench/ops/schedule_sweep.cuh` 之上。它在同一 column count 上逐个计时每个
+candidate launch，包括当前 shape table 永远不会选中的那些，并把 shape table 自己的
+function pointer 反查回 candidate 名字输出为 `routed_to`。它有意包含 Linear 私有 launcher
+头，因此不受本文"只经过 public 入口"的约束——两者是互补的，不要把其中一个的规则套到
+另一个上。
+
+```bash
+./build/bench/ninfer_benches ninfer_linear_schedule_bench q4:131072x5120 --repeat 11 --spread
+./build/bench/ninfer_benches ninfer_linear_schedule_bench q8:2048x16384 --tokens 24,32,40,48 --only k32,mma
+```
+
+2026-09-17 用它在 sm_86 上重扫了 catch-up 带进来的 Q4/Q5/Q8 全部十八个 shape table，
+十八个全部与 RTX 5090 的取值不一致，最大处相差 3.84x；逐 band 的测量值记在各 shape
+文件里，汇总见 `TODO.md` 顶部。
+
+Q4/Q5/Q6/Q8 和 BF16 使用现有 A16 route。以下 NVFP4 exact problem 同时支持 A16
 与 A4 policy，并作为永久开发 surface 使用，不加入 model suite：
 
 ```text
@@ -32,20 +49,20 @@ Q4/Q5/Q6/W8 和 BF16_CTRL 使用现有 A16 route。以下 NVFP4 exact problem �
 ```
 
 `--policy a4` 测量完整 public 调用，由 production resolver 根据 exact geometry 与 T
-选择已经资格化的 A16 或 A4 route。benchmark 不复制或推断该 private 选择。默认 prefill
-chunk `T=1024` 是 AllowA4 surface 的首要性能点；更大 T 只用于确认正 T 合同和 route
-的可扩展性。
+选择已经资格化的 A16 或 A4 route。benchmark 不复制或推断该 private 选择。
+调优区间、512/1024 大 T 锚点、重点点位与最终报告格式由
+[Linear 调优与报告规范](linear-tuning.md) 统一定义。
 
 ## 1. 使用场景
 
-新 benchmark 服务四个具体需求。
+该 benchmark 服务四个具体需求。
 
 ### 1.1 单点性能
 
 显式指定 weight type、`N`、`K` 和 `T`，测量一个 production Linear point：
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/ninfer_benches ninfer_linear_bench \
   --qtype q4 --policy a16 \
   --n 4096 --k 5120 --t 8
 ```
@@ -56,7 +73,7 @@ chunk `T=1024` 是 AllowA4 surface 的首要性能点；更大 T 只用于确认
 一个 BF16 decode exact point 的命令是：
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/ninfer_benches ninfer_linear_bench \
   --qtype bf16 --policy a16 \
   --n 14336 --k 5120 --t 1
 ```
@@ -64,7 +81,7 @@ chunk `T=1024` 是 AllowA4 surface 的首要性能点；更大 T 只用于确认
 NVFP4 的永久 A16 decode point 是：
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/ninfer_benches ninfer_linear_bench \
   --qtype nvfp4 --policy a16 \
   --n 14336 --k 5120 --t 1
 ```
@@ -72,7 +89,7 @@ NVFP4 的永久 A16 decode point 是：
 其主要 W4A4 MMA point 是：
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/ninfer_benches ninfer_linear_bench \
   --qtype nvfp4 --policy a4 \
   --n 14336 --k 5120 --t 1024
 ```
@@ -80,19 +97,19 @@ NVFP4 的永久 A16 decode point 是：
 其余四个永久 NVFP4 problem 使用同一数字入口，例如：
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/ninfer_benches ninfer_linear_bench \
   --qtype nvfp4 --policy a4 \
   --n 16384 --k 5120 --t 1024
 
-./build/bench/ninfer_linear_bench \
+./build/bench/ninfer_benches ninfer_linear_bench \
   --qtype nvfp4 --policy a4 \
   --n 34816 --k 5120 --t 1024
 
-./build/bench/ninfer_linear_bench \
+./build/bench/ninfer_benches ninfer_linear_bench \
   --qtype nvfp4 --policy a4 \
   --n 5120 --k 6144 --t 1024
 
-./build/bench/ninfer_linear_bench \
+./build/bench/ninfer_benches ninfer_linear_bench \
   --qtype nvfp4 --policy a4 \
   --n 5120 --k 17408 --t 1024
 ```
@@ -101,13 +118,24 @@ workspace 在 timed region 前按 public capacity query 分配；activation quan
 GEMM 的全部 launch 与流量都在一次 timed `linear()` 内。预量化后只计 GEMM 的结果不是
 这个 benchmark 的 production 指标。
 
+FP8 使用相同入口，例如：
+
+```bash
+./build/bench/ninfer_benches ninfer_linear_bench \
+  --qtype fp8 --policy a8 \
+  --n 14336 --k 5120 --t 1024
+```
+
+`--execution graph` 测量 CUDA Graph 中的完整 Op；`--graph-calls N` 在一次计时的 graph 中
+放入 `1..64` 次调用，并报告每次调用的时间。默认是 eager。两种计时方式都调用相同 public Op。
+
 ### 1.2 NCU 单点
 
 profile mode 必须只接受一个 exact point：
 
 ```bash
 ncu --profile-from-start off ... \
-  ./build/bench/ninfer_linear_bench \
+  ./build/bench/ninfer_benches ninfer_linear_bench \
   --qtype q4 --policy a16 \
   --n 4096 --k 5120 --t 8 --profile
 ```
@@ -137,7 +165,7 @@ cudaProfilerStop()
 固定 `(qtype,N,K,policy)`，连续扫描一个 T 区间：
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/ninfer_benches ninfer_linear_bench \
   --qtype q4 --policy a16 \
   --n 4096 --k 5120 \
   --sweep 1:32:1 \
@@ -161,9 +189,9 @@ crossover 或 candidate-legality 表。
 suite 调用顺序运行全部 point：
 
 ```bash
-./build/bench/ninfer_linear_bench --suite qwen3_6_27b
-./build/bench/ninfer_linear_bench --suite qwen3_6_35b_a3b
-./build/bench/ninfer_linear_bench --suite all
+./build/bench/ninfer_benches ninfer_linear_bench --suite qwen3_6_27b
+./build/bench/ninfer_benches ninfer_linear_bench --suite qwen3_6_35b_a3b
+./build/bench/ninfer_benches ninfer_linear_bench --suite all
 ```
 
 无参数运行仍打印 usage，不隐式启动重型 suite。suite 是显式 convenience，不是
@@ -196,10 +224,10 @@ activation/output。不同 T 复用同一组 allocation，不重复构造大权�
 | `27b.output_head` | Q6 | `(248320,5120)` | Continuous | full output head |
 | `27b.draft_head` | Q4 | `(131072,5120)` | Continuous | optimized proposal head |
 | `27b.gdn_output_gate` | Q5 | `(6144,5120)` | Continuous | GDN Z row view |
-| `27b.mtp_input` | W8 | `(5120,10240)` | Continuous | MTP input projection |
-| `27b.mtp_attention` | W8 | `(14336,5120)` | Continuous | packed MTP Q/K/gate/V projection |
-| `27b.mtp_gate_up` | W8 | `(34816,5120)` | Continuous | MTP gate/up |
-| `27b.mtp_down` | W8 | `(5120,17408)` | Continuous | MTP down |
+| `27b.mtp_input` | Q8 | `(5120,10240)` | Continuous | MTP input projection |
+| `27b.mtp_attention` | Q8 | `(14336,5120)` | Continuous | packed MTP Q/K/gate/V projection |
+| `27b.mtp_gate_up` | Q8 | `(34816,5120)` | Continuous | MTP gate/up |
+| `27b.mtp_down` | Q8 | `(5120,17408)` | Continuous | MTP down |
 
 27B Vision suite 登记实际由 public Linear 调用的七个几何：
 
@@ -210,8 +238,8 @@ activation/output。不同 T 复用同一组 allocation，不重复构造大权�
 | `27b.vision_attn_out` | Q5 | `(1152,1152)` | VisionStep4 | attention output |
 | `27b.vision_fc1` | Q4 | `(4304,1152)` | VisionStep4 | MLP expansion |
 | `27b.vision_fc2` | Q5 | `(1152,4304)` | VisionStep4 | MLP contraction |
-| `27b.vision_merger_fc1` | W8 | `(4608,4608)` | VisionStep4 | merger expansion |
-| `27b.vision_merger_fc2` | W8 | `(5120,4608)` | VisionStep4 | merger output |
+| `27b.vision_merger_fc1` | Q8 | `(4608,4608)` | VisionStep4 | merger expansion |
+| `27b.vision_merger_fc2` | Q8 | `(5120,4608)` | VisionStep4 | merger output |
 
 基础 Text Attention、GDN input 和 MLP 的 packed/fused parents 不因存在于 artifact 就加入
 pure Linear suite。它们当前由 Attention/GDN/LinearSwiGLU/LinearAdd 等独立语义 Op
@@ -226,8 +254,8 @@ DFlash 几何：
 |---|---|---:|---|---|
 | `35b.output_head` | Q6 | `(248320,2048)` | Continuous | full output head |
 | `35b.draft_head` | Q4 | `(131072,2048)` | Continuous | optimized proposal head |
-| `35b.mtp_projection` | W8 | `(2048,4096)` | Continuous | MTP input/output projection geometry |
-| `35b.dflash_feature` | W8 | `(2048,16384)` | Continuous | DFlash conditioning projection |
+| `35b.mtp_projection` | Q8 | `(2048,4096)` | Continuous | MTP input/output projection geometry |
+| `35b.dflash_feature` | Q8 | `(2048,16384)` | Continuous | DFlash conditioning projection |
 
 35B-A3B Vision backbone 与 27B 共享前六个几何，merger output 进入 2048 hidden：
 
@@ -238,8 +266,8 @@ DFlash 几何：
 | `35b.vision_attn_out` | Q5 | `(1152,1152)` | VisionStep4 | attention output |
 | `35b.vision_fc1` | Q4 | `(4304,1152)` | VisionStep4 | MLP expansion |
 | `35b.vision_fc2` | Q5 | `(1152,4304)` | VisionStep4 | MLP contraction |
-| `35b.vision_merger_fc1` | W8 | `(4608,4608)` | VisionStep4 | merger expansion |
-| `35b.vision_merger_fc2` | W8 | `(2048,4608)` | VisionStep4 | merger output |
+| `35b.vision_merger_fc1` | Q8 | `(4608,4608)` | VisionStep4 | merger expansion |
+| `35b.vision_merger_fc2` | Q8 | `(2048,4608)` | VisionStep4 | merger output |
 
 35B routed expert `[262144,2048]` gate/up 和 `[524288,512]` down 不加入 pure Linear
 suite。它们属于 `sparse_moe` 的 execution contract，当前也不是 pure Linear selector
@@ -304,12 +332,13 @@ format weight bytes 是 kernel 需要消费的各存储平面之和，不包含 
 
 | QType | group | bytes/group | weight bytes |
 |---|---:|---:|---:|
-| Q4G64_F16S | 64 | `32 code + 2 scale` | `groups * 34` |
-| Q5G64_F16S | 64 | `32 low + 8 high + 2 scale` | `groups * 42` |
-| Q6G64_F16S | 64 | `32 low + 16 high + 2 scale` | `groups * 50` |
-| W8G32_F16S | 32 | `32 code + 2 scale` | `groups * 34` |
+| q4_g64_fp16 | 64 | `32 code + 2 scale` | `groups * 34` |
+| q5_g64_fp16 | 64 | `32 low + 8 high + 2 scale` | `groups * 42` |
+| q6_g64_fp16 | 64 | `32 low + 16 high + 2 scale` | `groups * 50` |
+| q8_g32_fp16 | 32 | `32 code + 2 scale` | `groups * 34` |
 | NVFP4 | 16 | `8 code + 1 E4M3 scale` | `groups * 9` |
-| BF16_CTRL | — | direct BF16 | `2 * N * K` |
+| BF16 | — | direct BF16 | `2 * N * K` |
+| fp8_e4m3fn_row_bf16 | one row | `K code + 2 scale` | `N * (K + 2)` |
 
 一次 Linear 的理论最低流量为：
 
@@ -351,9 +380,9 @@ useful_TFLOP/s = useful_flops / seconds / 1e12
 数学工作量比较。
 
 `AllowA4` 是许可而不是 actual activation-compute profile；同一 policy 下不同 exact
-geometry 和 T 可以选择不同 route。因此长期 public benchmark 不输出
-`activation_compute`、`TC_%`、compute roof、`bound` 或组合 roofline，也不通过 policy
-猜测 private resolver。统一保留的固定规格参考只有 memory floor：
+geometry 和 T 可以选择不同 route。统一的固定规格参考是 memory floor；只有已明确关联实际
+MMA 路径的点才输出 `tensor_profile`、`tensor_peak_tflops` 和 `tensor_peak_pct`，其余留空。
+这些字段不能仅从 activation policy 推断：
 
 ```text
 memory_floor_us = model_bytes / 1792 GB/s
@@ -390,8 +419,8 @@ cache=cold
 
 ```text
 label qtype policy N K T median_us min_us p95_us
-model_GB effective_GB/s DRAM_% READ_%
-useful_TFLOP/s memory_floor_pct
+effective_GB/s DRAM_% READ_%
+useful_TFLOP/s tensor_profile tensor_peak_pct memory_floor_pct t1_linear_extrapolation
 ```
 
 sweep 额外输出相邻 T 的 `delta_%`。CSV 可以增加 weight/x/out byte breakdown、warmup、
@@ -458,9 +487,9 @@ plan 层重新引入长期 pure Linear benchmark。public `--sweep` 只观察最
 policy 只是许可，长期 benchmark 不把许可本身冒充为低精度执行。当前所有预置 suite
 显式使用 `A16Only`；NVFP4 AllowA4 保留为数字 geometry 的显式 point。
 
-## 9. 当前验证
+## 9. 已记录的验证与测量
 
-当前实现已验证：
+以下保留已完成的验证与 RTX 5090 测量记录，计时条件随各项列出：
 
 1. `ninfer_linear_bench` Release target 可构建；
 2. 27B suite 的 49 个 point 和 35B-A3B suite 的 37 个 point 均通过 public Linear
@@ -492,8 +521,7 @@ policy 只是许可，长期 benchmark 不把许可本身冒充为低精度执�
     | `[5120,6144]` | `72.992 us` | `882.62 TFLOP/s` | `52.66%` |
     | `[5120,17408]` | `197.888 us` | `922.42 TFLOP/s` | `55.04%` |
 
-    The four previously registered rows retain their 5-warmup/30-sample measurements; the new
-    `[34816,5120]` row uses 5 warmups and 40 samples.
+    `[34816,5120]` 使用 5 次 warmup 和 40 次 sample，其余四行使用 5 次 warmup 和 30 次 sample。
 
 benchmark 不承担数值 correctness；各 weight/activation-compute profile 继续由 public
 Linear conformance suite 和统一 CPU FP64 GEMM oracle 负责。

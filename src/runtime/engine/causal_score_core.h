@@ -22,8 +22,8 @@ namespace ninfer::runtime {
 template <class Instance>
 class CausalScoreCore {
 public:
-    using Package        = typename Instance::Package;
-    using PreparedPrompt = typename Package::PreparedPrompt;
+    using ModelContract  = typename Instance::ModelContract;
+    using PreparedPrompt = typename ModelContract::PreparedPrompt;
 
     CausalScoreCore(Instance& instance, DeviceContext& device)
         : instance_(instance), device_(device) {
@@ -92,10 +92,16 @@ public:
         out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
         out.kv_capacity_headroom_bytes         = resolution.automatic_headroom_bytes;
         out.planned_slack_bytes                = resolution.planned_slack_bytes;
+        out.requested_max_context              = resolution.requested_context;
         return out;
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const noexcept { return {}; }
+
+    [[nodiscard]] bool is_available() const {
+        std::lock_guard lock(queue_mutex_);
+        return !stopping_;
+    }
 
     void reset_memory_peaks() noexcept {
         try {
@@ -143,7 +149,7 @@ private:
     DeviceContext& device_;
     mutable std::mutex execution_mutex_;
     std::mutex call_mutex_;
-    std::mutex queue_mutex_;
+    mutable std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::unique_ptr<Job> job_;
     bool stopping_ = false;

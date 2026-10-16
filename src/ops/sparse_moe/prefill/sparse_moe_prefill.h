@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sparse_moe.h"
@@ -16,7 +17,7 @@ namespace ninfer::ops::detail {
 inline constexpr std::int32_t kSparseMoePrefillWorkspaceMin = 20;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q5Min      = 47;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 47;
-inline constexpr std::int32_t kSparseMoePrefillW8W8Min      = 20;
+inline constexpr std::int32_t kSparseMoePrefillQ8Q8Min      = 20;
 inline constexpr std::int32_t kSparseMoePrefillWideMin      = 768;
 inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 4096;
 inline constexpr std::int32_t kSparseMoeRouteTileTokens     = 8;
@@ -32,15 +33,20 @@ struct SparseMoePrefillPlan {
 struct SparseMoePrefillWorkspace {
     Tensor token_ids;
     Tensor token_alpha;
-    // Selection writes one rank local to a routing tile. Gather must keep this source separate
+    // Selection writes one rank local to a routing tile. The gather must keep this source separate
     // from the final inverse map because all threads in an assignment block consume the rank while
-    // thread 0 publishes the packed column.
+    // thread 0 publishes the packed column. The index kernel does both from one thread per
+    // assignment, so the separation is there for the gather the Q8 routed codec still takes.
     Tensor local_rank;
     Tensor shared_scale;
-    // Scan is the final consumer of tile_counts. The inverse map aliases its dead prefix for the
-    // remaining gather/reduce lifetime; 256 * ceil(T / 8) is at least 8 * T elements.
+    // Scan is the final consumer of tile_counts. Both maps below alias its dead prefix for the
+    // remaining lifetime; 256 * ceil(T / 8) is at least 32 * T elements and they take 8 * T each.
     Tensor tile_counts;
     Tensor packed_index;
+    // The token each packed column was routed from, so the routed gate/up GEMM can stage its
+    // activation tile from `x` instead of from a materialised copy. Sits in the same dead prefix
+    // behind packed_index and needs no allocation of its own.
+    Tensor packed_token;
     Tensor tile_bases;
     Tensor expert_offsets;
     Tensor route_job_experts;
@@ -51,7 +57,8 @@ struct SparseMoePrefillWorkspace {
 
     // The three large allocations are lifetime unions:
     //   router scores FP32 <-> shared SwiGLU BF16
-    //   gathered X BF16    <-> routed down output BF16
+    //   gathered X BF16    <-> routed down output BF16 <-> adaptive FP32 activations
+    //     (a Q4 routed gate/up stages from x and gathers nothing, so it only ever writes here)
     //   routed SwiGLU BF16 <-> routed FP32 token reduction
     Tensor score_storage;
     Tensor shared_activation;
@@ -68,12 +75,17 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
     const std::int32_t route_tiles =
         (capacity_tokens + kSparseMoeRouteTileTokens - 1) / kSparseMoeRouteTileTokens;
 
-    out.token_ids      = arena.alloc(DType::I32, {assignments}, 256);
-    out.token_alpha    = arena.alloc(DType::FP32, {assignments}, 256);
-    out.local_rank     = arena.alloc(DType::I32, {assignments}, 256);
-    out.shared_scale   = arena.alloc(DType::FP32, {capacity_tokens}, 256);
-    out.tile_counts    = arena.alloc(DType::I32, {256, route_tiles}, 256);
-    out.packed_index   = Tensor(out.tile_counts.data, DType::I32, {assignments});
+    out.token_ids    = arena.alloc(DType::I32, {assignments}, 256);
+    out.token_alpha  = arena.alloc(DType::FP32, {assignments}, 256);
+    out.local_rank   = arena.alloc(DType::I32, {assignments}, 256);
+    out.shared_scale = arena.alloc(DType::FP32, {capacity_tokens}, 256);
+    out.tile_counts  = arena.alloc(DType::I32, {256, route_tiles}, 256);
+    // Both maps alias the dead prefix of tile_counts, whose last reader is the scan. The
+    // layout builder allocates nothing, so the offset is only formed when there is a pointer.
+    auto* const counts = static_cast<std::int32_t*>(out.tile_counts.data);
+    out.packed_index   = Tensor(counts, DType::I32, {assignments});
+    out.packed_token =
+        Tensor(counts != nullptr ? counts + assignments : nullptr, DType::I32, {assignments});
     out.tile_bases     = arena.alloc(DType::I32, {256, route_tiles}, 256);
     out.expert_offsets = arena.alloc(DType::I32, {257}, 256);
     // A route job is one nonempty expert column tile. The bound is for the
@@ -81,7 +93,9 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
     const std::int32_t max_route_jobs = assignments / 32 + 256;
     out.route_job_experts             = arena.alloc(DType::I32, {max_route_jobs}, 256);
     out.route_job_columns             = arena.alloc(DType::I32, {max_route_jobs}, 256);
-    out.route_job_count               = arena.alloc(DType::I32, {1}, 256);
+    // [0] is the job count, negative when the scan hands the extent to the decode path;
+    // [1] is how many experts the route touched, which picks the gate/up pipeline depth.
+    out.route_job_count = arena.alloc(DType::I32, {2}, 256);
 
     out.score_storage = arena.alloc(DType::FP32, {kSparseMoeRouterScoreRows, capacity_tokens}, 256);
     out.shared_activation = Tensor(out.score_storage.data, DType::BF16, {512, capacity_tokens});
@@ -101,6 +115,7 @@ resolve_sparse_moe_prefill_plan(std::int32_t tokens, QType routed_gate_up, QType
 
 void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
-                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream);
+                               const SparseMoePrefillWorkspace& workspace,
+                               DeviceExecutionView execution);
 
 } // namespace ninfer::ops::detail

@@ -104,7 +104,8 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t value_heads = v.ne[1];
     const std::int32_t width       = q.ne[2];
     const std::int32_t rows        = q.ne[3];
-    const bool registered_heads    = qk_heads == 16 && (value_heads == 48 || value_heads == 32);
+    const bool registered_heads    = (qk_heads == 16 && (value_heads == 48 || value_heads == 32)) ||
+                                  (qk_heads == 48 && value_heads == 48);
     if (!registered_heads || width < 2 || width > 16 || rows <= 0 || rows > kMaximumRows) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
@@ -117,8 +118,8 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_tensor(v, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "v");
     require_tensor(g, DType::FP32, {value_heads, width, rows}, 4, kOp, "g");
     require_tensor(beta, DType::FP32, {value_heads, width, rows}, 4, kOp, "beta");
-    require_tensor(states, DType::FP32, {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp,
-                   "states");
+    require_tensor(states, states.dtype == DType::FP16 ? DType::FP16 : DType::FP32,
+                   {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp, "states");
     require_tensor(initial_slots, DType::I32, {rows}, 4, kOp, "initial state slots");
     if (valid_columns.data != nullptr) {
         require_tensor(valid_columns, DType::I32, {rows}, 4, kOp, "valid columns");
@@ -152,11 +153,15 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
 }
 
 bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
-    const bool geometry_48 = spec.layers == 48 && spec.qk_heads == 16 && spec.value_heads == 48 &&
-                             spec.conv_channels == 10240;
-    const bool geometry_30 = spec.layers == 30 && spec.qk_heads == 16 && spec.value_heads == 32 &&
-                             spec.conv_channels == 8192;
-    return geometry_48 || geometry_30;
+    // Any number of layers: a pipeline stage folds only the layers it holds.
+    const bool geometry_48 =
+        spec.qk_heads == 16 && spec.value_heads == 48 && spec.conv_channels == 10240;
+    const bool geometry_32 =
+        spec.qk_heads == 16 && spec.value_heads == 32 && spec.conv_channels == 8192;
+    // Qwen3.8-Flash-Next's tiled heads: q/k already expanded to one key head per value head.
+    const bool geometry_tiled =
+        spec.qk_heads == 48 && spec.value_heads == 48 && spec.conv_channels == 10240;
+    return spec.layers > 0 && (geometry_48 || geometry_32 || geometry_tiled);
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {
@@ -200,12 +205,16 @@ void validate_fold_states(const GdnReplayRecords& records,
     }
     require_tensor(states.conv_layer0, DType::BF16, {record.conv_channels, 3, state.slot_count},
                    256, kOp, "conv state layer 0");
-    require_tensor(states.recurrent_layer0, DType::FP32,
+    const DType recurrent_dtype = states.recurrent_layer0.dtype == DType::FP16 ? DType::FP16
+                                                                              : DType::FP32;
+    require_tensor(states.recurrent_layer0, recurrent_dtype,
                    {kStateDim, kStateDim, record.value_heads, state.slot_count}, 256, kOp,
                    "recurrent state layer 0");
     if (states.conv_layer_stride_bytes <= 0 || states.recurrent_layer_stride_bytes <= 0 ||
         states.conv_layer_stride_bytes % static_cast<std::int64_t>(sizeof(std::uint16_t)) != 0 ||
-        states.recurrent_layer_stride_bytes % static_cast<std::int64_t>(sizeof(float)) != 0 ||
+        states.recurrent_layer_stride_bytes %
+                static_cast<std::int64_t>(recurrent_dtype == DType::FP16 ? 2 : 4) !=
+            0 ||
         static_cast<std::uint64_t>(states.conv_layer_stride_bytes) < states.conv_layer0.bytes() ||
         static_cast<std::uint64_t>(states.recurrent_layer_stride_bytes) <
             states.recurrent_layer0.bytes()) {

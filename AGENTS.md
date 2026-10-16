@@ -2,341 +2,362 @@
 
 These rules apply to the whole repository.
 
-## Governing objective
+## Objective and scope
 
-Complete the user's explicit deliverable within the applicable product contract. For the declared
-product target and requested outcome, choose the technically strongest coherent solution. Optimize
-for architectural integrity, clear ownership, functional and numerical correctness, and maximum
-relevant performance. Never optimize a solution for a small diff, few changed files, low
-implementation effort, short-term simplicity, backward compatibility, or preservation of a
-superseded internal path. Make every affected implementation, test, tool, and active authority
-consistent with the selected design.
+Complete the user's explicit deliverable within the applicable product and external contracts.
+Choose a coherent solution with functional and numerical correctness, clear ownership, strong
+architecture, and maximum performance at the requested scope. Do not sacrifice these goals to
+reduce the diff or implementation effort. Evaluate complexity, maintenance cost, and verification
+risk as engineering tradeoffs, not reasons to retain a known inferior design.
 
-Correctness, performance, tests, profiling, documentation, provenance, cleanup, and tooling are
-means to the requested outcome, not independent objectives. Do not let supporting work replace,
-delay, or materially enlarge the requested deliverable.
+Before substantial work, identify the deliverable and its completion conditions. Work is relevant
+when it completes that deliverable, preserves an applicable contract, resolves a material
+uncertainty, or checks a realistic regression. A necessary redesign is in scope; unrelated cleanup,
+hardening, compatibility, and benchmark campaigns are not. Address incidental findings when they
+block the outcome or are inseparable from the selected implementation.
 
-## Responding to user corrections
+For implementation tasks, record the user's requirements, promised work, affected implementations
+and routes, and the quality dimensions to be evaluated before judging results. For comparative
+claims, also identify the baseline, workloads, metrics, aggregation method, and acceptance criteria.
+Keep this accounting current as the task develops. Explain justified changes and preserve the
+earlier findings; never narrow the scope or change the criteria after seeing unfavorable results
+to make the task appear successful. This accounting may live in the working conversation or
+existing task artifacts; it does not require a new permanent planning document.
 
-When the user points out an error in the agent's execution or reasoning, never reply with the
-formulaic opening “你说得对，……” ("you're right, ..."). This phrase and cosmetic variants of it
-are strictly prohibited in correction responses because they sound reflexive and insincere. Do not
-replace it with another generic agreement such as “确实如此”, “完全正确”, or “好问题”. Instead,
-state the specific mistake directly, explain its concrete effect when relevant, and say what has
-been or will be changed. Keep the response proportionate; do not add performative apology or praise.
+For analysis or design, deliver the explanation or design. For diagnosis, establish the cause and
+supporting evidence; implement a fix when requested. For implementation, complete the selected
+design across its affected implementations, callers, tests, tools, and active documentation.
 
-When choosing between possible work, use this order:
+Requests for analysis or proposals for review do not authorize applying them;
+implementation authorization must cover that same scope.
 
-1. respect applicable product and external-contract constraints;
-2. satisfy the user's explicit deliverable and acceptance criteria;
-3. preserve functional and numerical correctness of supported behavior;
-4. choose the strongest architecture and clearest ownership for the declared product model;
-5. maximize performance at the scope relevant to the task;
-6. gather only the evidence and provenance needed to support the result.
+The current product and architecture govern ordinary work. An explicit task may change them;
+update the affected contracts and implementation together instead of treating the current design
+as an immutable prohibition. Skills provide task-specific methods, not additional deliverables or
+approval requirements beyond the user's instructions and the actual execution environment.
 
-The product and architecture described here are the current contract for ordinary work. A task may
-explicitly change that contract; when it does, update the affected implementation, tests, and active
-authorities consistently rather than treating the current description as an immutable prohibition.
+## Product and architecture
 
-## Scope control
+NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU performance, with an
+optional layer pipeline across several GPUs on Linux. It implements
+`Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
+use the same architecture, binding and execution path.
+This fork targets **`sm_86`** and is tuned on **NVIDIA GeForce RTX 3090** (24 GB), built with
+CUDA 12.8. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090; that is where its schedules,
+route tables and published measurements come from, and none of it is authoritative here -- every
+route table this fork inherited and re-measured on sm_86 turned out to be wrong by 12-41%. Treat an
+upstream tuning constant as a hypothesis until measured on this card. The build environment and the
+compatibility constraints are in "Windows build environment (RTX 3090 fork host)" below.
 
-Before substantial work, determine the requested output, the behavior or decision it must support,
-and the conditions under which it is complete. This is an execution discipline, not a requirement
-to create a separate planning artifact.
+Generation uses one resident model on one GPU, one to eight resident execution lanes fixed at
+startup, bounded FIFO ingress with finite bypass, resource-pressure preemption with
+Snapshot/Replay recovery, and one compact decode batch per round. The layer pipeline over up to
+eight GPUs (`--devices`, Linux only; each stage owns whole layers with their KV and state, and the
+head, round state and sampling stay on the first device; design in
+`docs/maintainer/pipeline-parallel-plan.md`) is parked while it is ported to the replaced context
+engine: its sources stay in the tree, and startup rejects more than one device. Tensor
+parallelism is not built.
+Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
+capabilities and commands are documented in `README.md`, the product guides, and executable
+`--help`. New mathematical architectures, execution platforms, large-scale continuous
+batching, and priority/QoS require an explicit product change. Another training instance or mixture
+of existing representations does not require a checkpoint-specific execution registration.
 
-Work is in scope only when it:
+This is a local, single-owner project with trusted local models, generated artifacts, and
+local workflow. Do not derive requirements from a different deployment or trust model.
 
-- directly contributes to the requested deliverable;
-- is necessary to preserve an applicable product, semantic, or external contract;
-- resolves uncertainty that could materially change the result; or
-- checks a realistic regression introduced by the change.
+Keep these ownership boundaries visible when selecting a design:
 
-An architectural redesign, cross-cutting refactor, or replacement of an existing path is in scope
-when it is necessary to deliver the strongest solution for the requested outcome. Do not use scope
-control as a reason to ship an inferior patch. Do not expand into unrelated audits, cleanup,
-hardening, compatibility work, benchmark campaigns, or documentation projects. General engineering
-preferences, possible future scenarios, and concerns outside the declared product model do not
-create requirements by themselves.
+- v3 `.ninfer` is the only C++ product artifact; CLI, serving, and inference benchmarks use the public
+  Engine. NInfer has no Python model-inference route or installed/exported C++ SDK.
+- Core owns physical primitives and raw transfers; artifact owns generic framing and
+  materialization; Ops own closed mathematical and state-transition implementations.
+- Models own fixed mathematics, config interpretation, logical parameter binding, frontend
+  semantics and finite execution composition. Immutable Model data owns selected weights and
+  resources; native Parameters supply the actual operands to planning and Program execution.
+  Program owns mutable state, workspace, context stores and CUDA Graphs. Programs share no mutable
+  state or device allocation.
+- Converter recipes choose sources, formats, packing and per-input activation permissions. The
+  loader validates, uploads and binds the stored representation. Native preparation, resource
+  queries and execution enforce actual Op support; there is no whole-artifact capability registry.
+- Runtime owns common execution contracts and Engine publication policy; product/serving own input
+  acquisition and protocol translation. Model code does not acquire media or own transport.
 
-Handle incidental findings proportionally:
+Detailed model/runtime responsibilities and source ownership are defined in
+[Engine architecture](docs/maintainer/engine-architecture.md). Read the relevant boundary before
+changing it. Prefer explicit implementations for supported architectures. Do not introduce generic model
+graphs, family base classes, plugin discovery, string-driven execution, hidden device allocation,
+runtime weight repacking, or placeholders for hypothetical targets without a product requirement.
 
-- address them when they block the requested outcome or make it materially incorrect;
-- include them when they are inseparable from a coherent implementation;
-- otherwise leave them unchanged and mention them only when they are useful to the user.
+## Change consistency
 
-For analysis, review, or design work, the requested explanation or design artifact is the
-deliverable; experiments and code inspection serve only to resolve material questions. For
-implementation work, implement the selected design completely across its affected boundaries,
-remove the superseded project-owned path, and validate its supported observable behavior. For
-diagnosis, establish the cause and supporting evidence without turning the task into an unrequested
-fix or redesign.
+Project-owned APIs, CLIs, Python tools, fixtures, reports, formats, and documentation do not preserve
+backward compatibility. When replacing behavior, remove superseded aliases, fallbacks, transition
+branches, and their tests within the affected contract. Leave unrelated paths alone.
 
-## Evidence, provenance, and completion
+Advertised OpenAI and Anthropic protocol behavior is an external contract. Changes update the
+affected schema tests and serving documentation together.
 
-Select evidence from the claim or decision it supports. The availability of a tool, test suite,
-artifact, or profiler does not make its use necessary. Prefer representative evidence over
-exhaustive evidence, and do not repeat an experiment unless the previous result is invalid or
-inconclusive, or the new result could change a live decision.
+Keep stable requirements in their existing active reference. Temporary plans are useful only for
+active work; remove them when completed or abandoned. Maintain one current authority rather than
+parallel `final`, `v2`, or `new-design` documents.
 
-Verification must match the semantic contract: use exact comparison for exact formats and
-transformations, and numerical or behavioral criteria for floating-point and probabilistic work.
-Do not substitute final-output plausibility for verification of an operator or state transition.
+## Verification and completion
 
-Record only the provenance needed to interpret a material result. By default, this is the relevant
-target, hardware/toolchain, workload or command, and summarized outcome. Fixed hashes, clean
-worktrees, full command transcripts, raw profiler inventories, byte-identical regeneration, and
-exact probabilistic outputs are not validity requirements unless a concrete contract or the user
-requires them.
+Select evidence to support the changed behavior and material claims. Tests should protect supported
+observable behavior, mathematical or state semantics, and realistic regressions, including plausible
+boundary failures that have not occurred yet. Avoid tests that merely mirror implementation,
+freeze private file/class organization, or increase coverage numbers.
 
-Stop when:
+Before changing Ops, numerical or state semantics, read
+[Op development](docs/maintainer/op-development.md). For numerical changes, identify represented
+public inputs, the independent mathematical oracle,
+semantic cast/quantization/state boundaries, output criteria, and relevant real model shapes. Each
+floating-point Op uses a naive FP32/FP64 oracle; exact transforms/codecs use an exact oracle. Packed
+inputs are independently decoded with their stored scales. Qualify production routes directly
+against that oracle, not another kernel or plausible model output. Private arithmetic need not
+reproduce unfused materializations unless an intermediate is an observable semantic boundary.
+[Op development](docs/maintainer/op-development.md) defines the full qualification contract.
 
-- the requested deliverable exists;
-- applicable contracts are satisfied;
-- material claims have sufficient evidence;
-- relevant checks pass, or their limitations are stated clearly; and
-- no known in-scope issue prevents the result from being used.
+Measure performance at the claimed scope. An Op microbenchmark establishes an Op result, not an
+end-to-end improvement. Use whole-inference profiling when an in-scope end-to-end attribution is
+unresolved; use kernel profiling when an identified kernel question can change the decision. Reuse
+applicable evidence and stop collecting once the relevant alternatives can be distinguished.
 
-Do not continue merely to eliminate all uncertainty, collect more metrics, complete a process loop,
-improve descriptive provenance, investigate unrelated observations, or make working notes
-exhaustive. The final result should lead with the deliverable, key decisions, relevant verification,
-and material limitations. Raw logs, experiment diaries, exhaustive command histories, hashes, and
-intermediate artifacts are excluded unless requested or themselves the deliverable.
+Choose the affected checks, rather than running this table as a checklist:
 
-## Current product contract
-
-NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU inference performance on
-a small set of explicitly registered checkpoint artifacts. The supported identities are
-`qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
-`qwen3.8-27b/nvfp4`, and `qwen3.6-35b-a3b/groupwise-int`. The current implementation is compiled
-for `sm_120a` and tuned and measured on NVIDIA GeForce RTX 5090. All identities execute Text,
-image/video Vision, MTP, prefix reuse, CLI, OpenAI/Anthropic serving, and measurement through the
-same public `.ninfer` Engine route; the 35B-A3B target additionally supports text-only DFlash.
-
-The current workload is one GPU and one resident model instance with a startup-fixed one to eight
-active requests. The Engine forms one compact decode batch at every round boundary and uses bounded
-FIFO ingress with no request preemption. Large-scale or preemptive continuous batching, priority/QoS
-scheduling, additional checkpoint targets, and retargeting the implementation to another execution
-platform are outside the current product. This is a local, single-owner project. Registered models,
-generated artifacts, and the local workflow are trusted.
-Requirements derived from a different workload, trust model, or deployment model are out of scope
-until that product contract is explicitly changed.
-
-The 27B and 35B-A3B execution packages are peer compile-time Variants of one identity-free Qwen3.6
-family runtime. The family owns the shared `SequencePlan<Variant>`, `RequestPlan<Variant>`, and
-`Program<Variant>` algorithms; frontend and output semantics; Text/Vision/speculative schedules;
-state transactions; workspace composition; and CUDA Graph capture/replay mechanics. Each package
-separately owns its registered artifact identities and bindings, immutable model view,
-dimensions/storage facts, three closed execution-leaf families, graph frontier data, and Program
-instance bytes. No mutable state or device allocation is shared between Programs, neither package
-is defined as a delta from the other, and there is no runtime family selection or target-dependent
-branch inside family scheduling. All artifacts embed the same six frontend resources, and a
-prepared prompt carries no exact-target tag.
-
-## Engineering priorities
-
-Prioritize functional correctness, architectural quality, clear ownership, direct code, and maximum
-requested inference performance. Change size, implementation difficulty, short-term simplicity,
-and backward compatibility for project-owned contracts are not quality criteria. Low maintenance
-cost may distinguish otherwise equivalent designs, but it never justifies worse architecture or
-performance. Generality, defensive hardening, formal completeness, broad compatibility, and test
-coverage are not goals by themselves.
-
-Prefer explicit target-specific implementation over framework-like abstraction. Do not add generic
-model graphs, family base classes, plugin discovery, string-driven execution, hidden device
-allocation, runtime weight repacking, or placeholders for hypothetical models or hardware unless an
-explicitly changed product contract requires them.
-
-## Sources of truth
-
-Read only current authorities relevant to a live decision in the task. The following list is a
-routing map, not a mandatory reading list:
-
-- `README.md` and executable `--help`: delivered capabilities and exact commands;
-- `docs/README.md`: public documentation map;
-- `docs/cli.md`: CLI input, output, sampling, MTP, and runtime options;
-- `docs/serving.md`: OpenAI/Anthropic HTTP behavior;
-- `docs/performance.md`: published performance methodology and results;
-- `docs/maintainer/engine-architecture.md`: Gateway/Frontend/Engine/Runtime boundaries, execution
-  ownership, request/response/continuation lifecycles, admission, scheduling, output transactions,
-  batched execution, and CUDA Graph semantics;
-- `docs/maintainer/resource-scheduling-and-context-cache.md`: resource selection and accounting,
-  continuation/checkpoint ownership, materialization transactions, and Device/Host replica policy;
-- `docs/maintainer/paged-kv-cache.md`: shared KV capacity, page ownership, retention, physical
-  layouts, and paged consumer contracts;
-- `docs/maintainer/artifact-container.md`, `storage-layouts.md`, and `tensor-formats.md`:
-  generic `.ninfer` contracts;
-- `docs/maintainer/qwen3.6-27b-artifact.md`, `qwen3.8-27b-artifact.md`, and
-  `qwen3.6-35b-a3b-artifact.md`: exact target inventories, conversion, and binding;
-- `docs/maintainer/qwen3.6-27b-model.md` and `qwen3.6-35b-a3b-model.md`: exact model mathematics,
-  dimensions, and state semantics;
-- `docs/maintainer/op-development.md`: Op admission, contracts, implementation ownership,
-  qualification, and performance evidence rules;
-- `include/ninfer/engine.h` and `include/ninfer/types.h`: in-tree C++ product interface.
-
-Do not survey unrelated references for completeness. Read additional documents only when they
-govern a live decision in the current task.
-
-## Product and ownership boundaries
-
-These boundaries govern ordinary implementation work. An explicit architecture task may revise
-them, but must update the corresponding active authorities and affected implementation together.
-
-- `.ninfer` is the only C++ product artifact. Do not add `.qus` fallback, extension detection,
-  compatibility shims, or a second product lane.
-- `include/ninfer/engine.h` and `include/ninfer/types.h` are the opaque Engine interface used by
-  in-tree applications and owning host values. NInfer does not currently install or export a C++
-  SDK. `include/ninfer/ops/` contains repository-internal semantic Op contracts.
-- `src/core` owns device primitives, tensors/views, checked layouts, arenas, graph RAII, physical
-  KV-cache containers, and raw transfer mechanisms.
-- `src/artifact` owns generic `.ninfer` framing, descriptors, binding primitives, and
-  materialization. It has no checkpoint execution semantics.
-- `src/ops` owns every semantically closed Op implementation, including fused, fixed-shape, and
-  device-specialized paths. Op ownership follows the mathematical or state-transition contract,
-  not its first model caller or demonstrated cross-target reuse.
-- `src/targets/qwen3_6` owns only the Qwen3.6-family invariants shared by the 27B and 35B-A3B
-  targets: tokenizer/template and output semantics, media preprocessing and MRoPE prompt
-  construction, owning prepared-prompt/output-session types, semantic weight-view schemas, passive
-  Vision definitions, and the fixed
-  planning/Program/Text/Vision/speculative/state/workspace/CUDA-Graph algorithms. It has no target
-  identity, registry entry, artifact binder, target leaf
-  implementation, or storage for a live Program instance.
-- `src/targets/<package>` owns its registered checkpoint identities, storage profiles, binder,
-  `LoadedModel`, configuration, populated family model-view values and private leaf payloads,
-  diagnostics, graph frontier values, and exactly three execution-leaf families: attention
-  projection, GDN projection/control, and post-mixer. It aliases and instantiates the family
-  runtime types; it does not own a copied Program, Text/Vision/speculative schedule, workspace
-  composition, state transaction, or graph-capture algorithm. Leaf Ops remain implemented under
-  `src/ops`.
-- `src/runtime` owns common contracts, generated-token transaction/publication policy, and the
-  public Engine PIMPL. It does not own model mathematics or target state.
-- `src/media/decode` consumes already-owned bytes. URL/path/data acquisition belongs to
-  `src/product/media_acquire`, CLI, or serving and is not linked into a target.
-- `src/product/prompt_input` owns the shared product-side JSON/message-to-owning-input adapter.
-- `src/serve` owns protocol translation and transport. CLI, server, and benchmark call only the
-  public Engine for inference.
-- `tools/convert/<target>`, `tools/reference/<target>`, and `tools/parity/<target>` remain
-  target-private conversion, correctness, and diagnostic implementations.
-
-## Compatibility and document lifecycle
-
-Project-owned C++ APIs, CLIs, Python tools, fixtures, reports, formats, and active documentation do
-not preserve backward compatibility. When a task replaces project-owned behavior, remove the
-obsolete aliases, fallbacks, transition branches, and tests in the affected contract instead of
-maintaining two paths. Do not turn that rule into unrelated repository-wide cleanup.
-
-The advertised OpenAI and Anthropic protocol surfaces are real external contracts. A change to
-their behavior must update the affected schema tests and serving documentation together.
-
-Integrate stable requirements into the existing active reference. Use a temporary dated plan only
-when active work genuinely needs one; a plan is not a substitute for the requested deliverable.
-Remove completed or abandoned plans instead of retaining a historical documentation tree. Do not
-create parallel `final`, `v2`, or `new-design` references.
-
-## Numerical correctness
-
-When a task changes numerical behavior or makes a numerical claim, identify the mathematical
-oracle, represented public inputs, explicit semantic cast/quantization/state boundaries, output
-criterion, and real model shapes relevant to that claim. If a route's private precision or
-reduction profile matters to the evidence, describe it as an implementation profile rather than a
-semantic requirement. Apply exact, tolerance-based, or behavioral comparison according to the
-actual semantic contract.
-
-Every floating-point Op has one independent naive FP32/FP64 mathematical oracle; exact transforms
-and codecs have one independent exact oracle. The oracle evaluates the complete logical formula
-from the represented public inputs and, for packed weights, decodes the signed code with the exact
-stored scale. It does not copy a production kernel's staging casts, reduction tree, workspace dtype,
-or another implementation's output.
-
-The oracle does not prescribe a production arithmetic path. Unless an intermediate value is an
-observable Op output, explicit Cast/quantize/dequantize result, registered codec value, or specified
-persistent state, kernels may choose the natural intermediate precision, instruction operands,
-reduction association, workspace representation, and kernel decomposition for their route. A fused
-kernel is neither required to reproduce an unfused BF16 materialization nor forbidden from using a
-lower-precision intermediate when that is the natural qualified implementation. Every production
-route is checked directly against the same oracle with a criterion appropriate to its output and
-implementation profile; pairwise implementation parity is supplementary evidence only.
-
-Where relevant to the changed behavior, account for numeric-format decode, BF16 fusion order, FP32
-GDN state, BF16/INT8 KV, MTP accept/commit state, arena lifetime, and CUDA Graph address stability.
-This is a risk map, not a checklist for every numerical task.
-
-## Performance work
-
-Define a performance claim at the level where it matters: operator, schedule, request phase, or
-end-to-end inference. Measure that level directly when practical. An isolated microbenchmark can
-support an operator-level claim but does not establish an end-to-end improvement.
-
-Use whole-inference profiling when end-to-end attribution remains unresolved. Use kernel profiling
-only after a relevant kernel has been identified and a kernel-level answer could materially change
-the current design or implementation decision. Do not collect additional profiling data once the
-relevant alternatives can be distinguished and the requested claim has adequate support.
-
-Retain concise context sufficient to interpret a reported result: relevant hardware/toolchain,
-artifact identity at the descriptive level, workload or command, and summarized measurements. Raw
-reports and fixed repository or artifact hashes are not required by default.
-
-## Tests and verification
-
-Add or retain a test only when it protects supported observable behavior or a realistic regression:
-numerical kernel/model correctness, `.ninfer` framing/binding, external schema/report behavior, a
-small real integration route, GPU lifetime, or a reproduced bug. Do not add tests for coverage,
-private file/class shape, getters/constructors, deleted compatibility, source-string scans,
-hypothetical failures, or test ceremony.
-
-Run a focused set of checks sufficient to support the changed behavior and its material claims.
-The following are typical choices, not a cumulative checklist:
-
-| Change | Relevant evidence |
+| Change | Typical evidence |
 |---|---|
-| documentation | affected active-link/stale-reference review and `git diff --check` |
-| C++ runtime/API | affected explicit targets and meaningful tests |
-| Python tooling | `py_compile` and affected Python tests |
-| `.ninfer` reader/converter/binder | affected contract tests and a real artifact when semantics require it |
-| CUDA math | independent numerical oracle at relevant shapes |
-| memory/lifetime | the affected execution; sanitizer only for a concrete lifetime risk |
-| performance | measurement at the claimed scope; attribution tools only when needed |
-| serving | affected OpenAI/Anthropic schema tests and observable request/stream behavior |
+| Documentation | affected links/references and `git diff --check` |
+| C++ runtime/API | affected build targets and behavioral tests |
+| Python tooling | Python 3.11 `py_compile` and affected tests |
+| Artifact framing/binding/conversion | affected contract tests; real artifact when semantics require it |
+| CUDA mathematics | independent oracle at relevant shapes and route boundaries |
+| Memory or lifetime | affected execution; sanitizer for a concrete lifetime question |
+| Performance | measurement at the claimed scope; profiling only for unresolved attribution |
+| Serving | affected schema tests and observable request/stream behavior |
 
-Do not replace weak verification with low-value tests. State clearly when a relevant check could not
-run and why.
+Record the target, relevant hardware/toolchain, workload or command, and summarized result needed
+to interpret a material claim. Hashes, clean worktrees, full command transcripts, raw report
+inventories, and exact probabilistic outputs are not default requirements. Use exact comparison for
+exact outputs, and appropriate numerical or behavioral criteria otherwise. State checks that could
+not run and their implications.
 
-## Local environment
+## Reporting and completion
 
-Use unrestricted build-tool parallelism for repository compilation. Invoke CMake builds as
-`cmake --build <build-dir> -j`; do not supply a numeric job limit such as `-j2` or `-j32`.
+Selective reporting and evidence gaming are prohibited, even when every disclosed
+statement is individually true. For every implementation task:
 
-These are conventional project resources, not a checklist of resources every task must use:
+1. Cover the entire agreed deliverable, its completion status, and all affected or
+   evaluated dimensions: behavior, numerical semantics, interfaces, architecture,
+   performance, resources, and maintenance. Distinguish completed, incomplete, and
+   unverified work; never describe an unmeasured aspect as unchanged.
 
-| Purpose | Path |
+2. Put favorable and unfavorable findings in the final reply itself, including
+   regressions, costs, rejected approaches, failures subsequently fixed, unresolved
+   issues, and verification gaps. Explain their disposition. Group repetition
+   without hiding distinct problems or exceptions. Small or unexplained adverse
+   results must remain visible; attachments cannot substitute for disclosure.
+
+3. Make comparisons representative and comparable. State the baseline, workload,
+   conditions, metrics, coverage, outcome distribution, worst changes, and exceptions.
+   Distinguish new capability, fallback replacement, and improvement to an optimized
+   implementation. Keep claims within the measured scope; neither a best case nor
+   an average may stand in for the full results.
+
+4. Apply the same evidence standard to gains and regressions. Label uncertainty;
+   do not dismiss slowdowns as noise without evidence. Explain changes to scope,
+   baselines, methods, or acceptance criteria and preserve earlier adverse findings.
+   Never change these choices to manufacture a favorable conclusion.
+
+5. Reuse sufficient evidence. Additional or repeated checks must satisfy required
+   verification, replace invalidated evidence, or resolve a concrete question that
+   could change implementation or acceptance. Once the deliverable and acceptance
+   conditions are satisfied, stop and report. Report review checks existing work
+   and findings; it must not become a new audit, sweep, or reporting-tool project.
+   Disclose remaining uncertainty without silently making it a new requirement.
+   Disclosure does not excuse unmet completion conditions.
+
+## Reference navigation
+
+Read the authority relevant to the current decision; this is not a mandatory reading list.
+
+| Decision | Entry point |
 |---|---|
-| repository | current checkout |
-| Python 3.11 | `python3` in the selected maintainer environment |
-| BF16 source checkpoint | explicit local checkpoint directory |
-| product artifact | `out/qwen3_6_27b.ninfer` |
-| conversion report | `out/qwen3_6_27b.ninfer.conversion.json` |
-| normal build | `build/` |
-| profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
-| hardware/toolchain | RTX 5090, `sm_120a`, CUDA 13.1 |
+| Product capabilities and exact commands | `README.md`, executable `--help`; `docs/cli.md`, `docs/serving.md`, `docs/perplexity.md` |
+| Execution, model/runtime ownership, scheduling, transactions, graphs | `docs/maintainer/engine-architecture.md` |
+| Context resources, checkpoints, replicas; physical KV | `docs/maintainer/resource-scheduling-and-context-cache.md`; `docs/maintainer/paged-kv-cache.md` |
+| Artifact, layout, codec, conversion, or model mathematics | model/artifact references and conversion guide linked from `docs/README.md` |
+| Op contracts, implementation ownership, numerical/performance qualification | `docs/maintainer/op-development.md` |
+| Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `docs/performance.md` |
+| In-tree C++ interface | `include/ninfer/engine.h`, `include/ninfer/types.h` |
 
-Use the selected Python 3.11 interpreter explicitly. Do not install or upgrade dependencies unless
-the task requires it. Never select an artifact by glob, modification time, or an unqualified
-“latest” name. Large artifacts, source checkpoints, and profiler outputs are local prerequisites;
-do not download or regenerate them unless that work is in scope.
+[Documentation map](docs/README.md) routes to narrower authorities when needed.
 
-```bash
-PYTHON=python3
-MODEL=/path/to/Qwen3.6-27B
-NINFER_WEIGHTS=out/qwen3_6_27b.ninfer
+## Local operations
+
+### Windows build environment (RTX 3090 fork host)
+
+Verified 2026-09 by building all 444 targets and running the full 100-test suite. An earlier
+revision of this section was wrong on four points and sent at least one agent down a dead end;
+the corrections are called out at the bottom so anyone reading git history is not re-confused.
+
+**Use the existing `build-ninja/` tree. Do not reconfigure and do not delete it.** It is already
+configured correctly: Release, `CMAKE_CUDA_ARCHITECTURES=86`, `BUILD_TESTING=ON`,
+`NINFER_BUILD_APPS=ON`, FFMPEG resolved through the vcpkg manifest into
+`build-ninja/vcpkg_installed/x64-windows`. Configure on this host is slow; there is nothing to
+gain by redoing it.
+
+The one real trap is that **two MSVC toolchains are installed and the wrong one is first on
+PATH**:
+
+| | version | path |
+|---|---|---|
+| VS 2026 Community | MSVC v145 `14.50.35717` | `C:\Program Files\Microsoft Visual Studio\18\Community` |
+| VS 2022 BuildTools | MSVC v143 `14.44.35207` | `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools` |
+
+CUDA 12.8 hard-errors on v145 (`C1189: unsupported Microsoft Visual Studio version!`), and
+`nvcc` picks up whatever `cl.exe` PATH offers, which by default is VS 2026. `build-ninja`'s cache
+pins the VS 2022 compiler, so the fix is simply to put that environment in front before building.
+Note the `(x86)` in the path — that is the detail the earlier revision missed when it concluded
+VS 2022 was absent.
+
+From PowerShell, import the VS 2022 BuildTools environment and build:
+
+```powershell
+$vcvars = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
+  if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+}
+Set-Location C:\ninfer-fork\ninfer-3090\build-ninja
+cmake --build .                                  # everything
+cmake --build . --target <name>                  # one target
+ctest -j2                                        # full suite, ~13 min (159 tests, see below)
+ctest -R <regex> --output-on-failure             # one test
+pwsh tools/run-tests.ps1 [-CpuOnly|-GpuOnly]     # the suite on this shared machine (see CLAUDE.md)
 ```
+
+On this machine run tests through `tools/run-tests.ps1` rather than bare `ctest`: tests labelled
+`cpu` need no GPU lock, and the `gpu` ones take the lock one test at a time instead of for the whole
+suite.
+
+Full-suite timing, measured 2026-10-06 on the RTX 3090 with the GPU otherwise idle: 159 tests, 768 s
+wall at `-j2`, 8 of them skipped without `NINFER_TEST_ARTIFACT` (the `*_real_test` family). The
+earlier "~70 s / 100 tests" figure is stale. Three op tests account for most of it and are not
+related to engine or scheduler changes: `ninfer_softmax_attention_dflash2_test` (~575 s),
+`ninfer_context_kv_materialize_test` (~258 s) and `ninfer_softmax_attention_test` (~184 s); exclude
+them with `ctest -E` when iterating on something else. `ninfer_softmax_attention_int8_prompt_test`
+(`--int8-prompt-only`, 546 cases, CTest TIMEOUT 1500 s) is a fourth: ~530 s measured 2026-10-13 with
+the FP64 oracle on 12 threads (it was 45-60 min single-threaded), about 3,800 CPU-seconds, so it
+uses most cores while it runs. The 184 s figure above is for the no-argument invocation, which does
+not include it; exclude it with `ctest -E int8_prompt` too. Building only `ninfer_tests` leaves five
+standalone test programs unbuilt, so `ctest` reports `public_api`, `jinja`, `artifact_materialization`,
+`effective_thinking_budget` and `context_cost_measure` as Not Run, and `chat_templates` and
+`artifact_writer_interop` as Failed (they launch those programs). That is a missing build, not a
+failure: build `all`, or those targets, first.
+
+That import is reliable; the environment it produces builds cleanly. Adding only the compiler's
+`bin` directory to PATH is *not* enough — the standard library headers go missing
+(`fatal error C1083: Cannot open include file: 'cstdint'`), because `INCLUDE` and `LIB` come from
+vcvars too.
+
+For a standalone `.cu` probe outside the build tree, `nvcc` can be driven directly. Git Bash
+mangles MSVC-style flags (`/wd4819` becomes a path), so use PowerShell:
+
+```powershell
+nvcc -O3 -arch=sm_86 -allow-unsupported-compiler probe.cu -o probe.exe
+```
+
+`-allow-unsupported-compiler` is needed there and only there, because a bare `nvcc` invocation
+finds VS 2026 on PATH. It is not needed for the CMake build and is not in the cache.
+
+Other host facts:
+
+- CMake 3.31.3 at `C:\Program Files\CMake`; Ninja 1.11.1 from the Python 3.13 pip install.
+- Profilers are installed: Nsight Systems 2024.6.2 (`nsys.exe` under
+  `target-windows-x64/`) and Nsight Compute 2025.1.0 (`ncu.bat`). `ncu` needs GPU performance
+  counters, which are admin-only by default — run it from an elevated shell rather than changing
+  `RmProfilingAdminOnly`, which needs two reboots and loosens a system-wide setting.
+- Compilation needs no GPU, so building is always possible. **Executing** CUDA tests, benchmarks
+  or perplexity runs needs free VRAM, and the user often has the server loaded — ask before
+  assuming the device is free.
+- `nvcc` writes `.exp`/`.lib` next to any `-o` target; keep probe builds out of the repo root.
+- An untracked `config.bat` in the repo root is a leftover from the earlier, incorrect recipe. It
+  sets up the VS 2026 v145 environment with `-allow-unsupported-compiler` and reconfigures into
+  `build/`. It is not the supported path; prefer `build-ninja` as above.
+
+**Compiler cache (ccache) — use it, every tree shares one.** A full rebuild here is 10+ minutes
+(a few multi-minute CUDA translation units, then single-threaded device and final links), and
+editing a public header such as `include/ninfer/types.h` recompiles nearly everything. Several
+git worktrees are active at once and each changes only a few files, so builds go through one
+shared ccache. `cmake/CompilerCache.cmake` enables it automatically when ccache is found and
+prints `Compiler cache: <path> (base <main checkout>)` at configure; if it prints
+`ccache not found`, run the setup once and reconfigure:
+
+```powershell
+.\scripts\setup-ccache.ps1        # Windows: installs a pinned ccache, writes the shared settings
+scripts/setup-ccache.sh           # Linux/WSL: configures an installed ccache (apt install ccache)
+```
+
+- **Sharing across worktrees works through `base_dir`**: ccache rewrites absolute paths under
+  the main checkout (`C:\ninfer-fork\ninfer-3090`, found from git's common directory) to be relative,
+  and every tree has the same `<tree>\build-ninja` beside `<tree>\src`, so the same source hits the
+  same entry in any worktree. A worktree outside that directory (e.g. `C:\nb106`) does not share.
+  Files that include the shared vcpkg headers (FFmpeg) resolve those paths differently per tree and
+  may still miss.
+- **WSL has its own cache** (`~/.cache/ccache`; Linux objects cannot be shared with Windows ones).
+  WSL builds are `git archive` snapshots under `~` (`~/ninfer-rel-*`) with no `.git`, so CMake passes no
+  base there and ccache's own `base_dir` applies, which `scripts/setup-ccache.sh` sets to `$HOME`.
+  Install and configure once: `wsl.exe -u root -e apt-get install -y ccache`, then
+  `bash scripts/setup-ccache.sh` as the normal WSL user (it installs too when run with sudo or root).
+- **Check it:** `ccache -s` after a build. A fresh worktree configured from the same commit should
+  hit nearly everything; if it misses, `base_dir` is not set (`ccache --show-config | findstr base_dir`).
+- **Do not** clear the cache (`ccache -C`), disable it, or point `CCACHE_DIR` elsewhere to "fix" a
+  build problem; configure with `-DNINFER_COMPILER_CACHE=OFF` for a one-off uncached build instead.
+- Release is the default and is cached. MSVC `/Zi` (Debug, RelWithDebInfo) cannot be cached.
+- **A worktree session needs its own build tree** (`build-ninja` at the main checkout compiles the
+  main checkout's source, not yours). With the cache the first build of a new worktree is mostly hits:
+
+```powershell
+# from the worktree root, after importing the VS 2022 environment above
+cmake -S . -B build-ninja -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 `
+  -DBUILD_TESTING=ON -DNINFER_BUILD_APPS=OFF `
+  -DCMAKE_TOOLCHAIN_FILE="C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+  -DVCPKG_INSTALLED_DIR=C:/ninfer-fork/ninfer-3090/build-ninja/vcpkg_installed `
+  -DVCPKG_MANIFEST_INSTALL=OFF "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler -Xcompiler=/Zc:__cplusplus"
+```
+
+Tests register as phony targets that all link into `tests\ninfer_tests.exe`; build the
+`ninfer_tests` target (not a single test's name) before `ctest`. To turn the cache on in an
+existing tree such as the main `build-ninja`, re-run `cmake -S . -B build-ninja` once from the VS 2022
+environment; the next build recompiles once, filling the cache.
+
+Corrections to the previous revision of this section, all verified false:
+
+1. "VS 2022 BuildTools is **not** installed, so caches pinning `14.44.35207` are stale —
+   reconfigure fresh." It is installed, under `Program Files (x86)`, and those caches are live and
+   correct. Reconfiguring is the one thing that actually breaks the build here.
+2. "Do not invoke `vcvars64.bat` from a non-interactive shell." The VS 2022 BuildTools vcvars
+   imports cleanly and non-interactively, as above. The variable flood described belongs to the
+   VS 2026 vcvars, not this one.
+3. "FFMPEG is required and was missing." It is provided by the vcpkg manifest and already present
+   in `build-ninja/vcpkg_installed/x64-windows`. No `-DFFMPEG_DIR` is needed.
+4. "Configure must pass `-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler`." Not for this build;
+   the cache carries `-Xcompiler=/Zc:__cplusplus` and nothing else, because it uses v143.
 
 ## Commits
 
-Create a commit only when the user requests one. Use Conventional Commit-style subjects, for
-example:
+Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
+causes failures or interferes with the task, and briefly explain why.
 
-```text
-feat(engine): cut over the registered target to native artifacts
-```
+Use the selected Python 3.11 interpreter explicitly. On this machine it is
+`/home/neroued/miniconda3/envs/py311/bin/python`; the default shell's `python3` may be a different
+version. Use `python3` only after selecting the maintainer environment or checking its version.
+Normal resources are `build/`, `out/qwen3_8_27b_nvfp4.ninfer`, its `.conversion.json` report, and
+`profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; the local toolchain is CUDA 13.1.
+Select model artifacts by explicit path, never glob order, modification time, or unqualified
+“latest”. Source checkpoints and large artifacts are prerequisites; download or regenerate them
+only when that work is in scope. Install or upgrade dependencies only when the task needs it.
 
-Use concise lowercase types consistent with repository history (`feat`, `fix`, `perf`, `bench`,
-`test`, `build`, `refactor`, `docs`, `chore`).
+Create commits only when requested. Use Conventional Commit subjects with concise lowercase types
+such as `feat`, `fix`, `perf`, `bench`, `test`, `build`, `refactor`, `docs`, or `chore`.

@@ -1,7 +1,7 @@
 // Performance bench for silu_mul at the real Qwen3.6-27B MLP shape
 // (intermediate = 17408). This binary is the ncu/nsys target; the GB/s it
 // prints is informational only -- the gate is ncu sustained DRAM %% (see
-// docs/op-development.md §8).
+// docs/maintainer/op-development.md §8).
 //   ./ninfer_silu_mul_bench --tokens 1,2,3,4,5,6,48
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer_bench_common.h"
@@ -38,8 +38,8 @@ std::vector<int> parse_tokens(const char* raw) {
 
 void run(int tokens) {
     const int n      = kIntermediate * tokens;
-    DeviceBuffer g   = make_bf16(static_cast<std::size_t>(n));
-    DeviceBuffer u   = make_bf16(static_cast<std::size_t>(n));
+    DeviceBuffer g   = make_bf16(static_cast<std::size_t>(n), 101U);
+    DeviceBuffer u   = make_bf16(static_cast<std::size_t>(n), 103U);
     DeviceBuffer out = make_zeros(static_cast<std::size_t>(n) * 2);
     Tensor tg(g.p, DType::BF16, {kIntermediate, tokens});
     Tensor tu(u.p, DType::BF16, {kIntermediate, tokens});

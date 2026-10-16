@@ -1,6 +1,8 @@
 #pragma once
 
+#include "core/weight.h"
 #include "core/arena.h"
+#include "core/device.h"
 #include "core/tensor.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 
@@ -37,6 +39,7 @@ struct Bf16GdnGatingPlan {
 };
 
 enum class Bf16GdnNormGatingScheduleId {
+    FusedSimt27,
     Composed,
     MmaCooperativeSplit32,
 };
@@ -53,6 +56,13 @@ bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept;
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem);
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
                                                     const Bf16GdnGatingProblem& problem);
+// The same for a device with `sm_count` multiprocessors instead of the current one. Cooperative
+// schedules need their whole grid resident, so which schedule a width gets depends on it.
+Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem,
+                                               std::int32_t sm_count);
+Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
+                                                    const Bf16GdnGatingProblem& problem,
+                                                    std::int32_t sm_count);
 
 std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,
                                                      std::int32_t min_cols, std::int32_t max_cols);
@@ -66,18 +76,19 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
 void bf16_gdn_gating_execute_plan(const Bf16GdnGatingPlan& plan, const Tensor& x,
                                   const Weight& a_weight, const Weight& b_weight,
                                   const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-                                  Tensor& g, Tensor& beta, cudaStream_t stream);
+                                  Tensor& g, Tensor& beta, DeviceExecutionView execution);
 void bf16_gdn_gating_execute_candidate(Bf16GdnGatingScheduleId schedule, const Tensor& x,
                                        const Weight& a_weight, const Weight& b_weight,
                                        const Tensor& A_log, const Tensor& dt_bias,
                                        WorkspaceArena& ws, Tensor& g, Tensor& beta,
-                                       cudaStream_t stream);
+                                       DeviceExecutionView execution);
 void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                               const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-                              Tensor& g, Tensor& beta, cudaStream_t stream);
+                              Tensor& g, Tensor& beta, DeviceExecutionView execution);
 void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
                                    const Weight& a_weight, const Weight& b_weight,
                                    const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-                                   Tensor& g, Tensor& beta, cudaStream_t stream);
+                                   Tensor& g, Tensor& beta, DeviceExecutionView execution,
+                                   const Tensor* signs = nullptr);
 
 } // namespace ninfer::ops::detail

@@ -7,9 +7,11 @@
 
 #include "ops/common/math.h"
 #include "ops/common/sampling_workspace.h"
+#include "ops/common/score_id_order.cuh"
 #include "ninfer/ops/sampling.h"
 
 #include <cub/block/block_merge_sort.cuh>
+#include <cub/warp/warp_merge_sort.cuh>
 
 #include <cuda_bf16.h>
 #include <climits>
@@ -22,9 +24,49 @@ using SamplingPartialSort =
     cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerItemsPerThread>;
 using SamplingGroupSort =
     cub::BlockMergeSort<unsigned long long, kSamplerGroupBlock, kSamplerGroupItemsPerThread>;
+inline constexpr int kSamplingTileWarps              = kSamplerBlock / 32;
+inline constexpr int kSamplingTileIndexBits          = 9;
+inline constexpr unsigned int kSamplingTileIndexMask = (1u << kSamplingTileIndexBits) - 1u;
+static_assert(kSamplerPartialTileItems == (1 << kSamplingTileIndexBits));
+
+using SamplingTileWarpSort     = cub::WarpMergeSort<unsigned long long, kSamplerItemsPerThread>;
+using SamplingBf16TileWarpSort = cub::WarpMergeSort<unsigned int, kSamplerItemsPerThread>;
+
+struct SamplingTileTopKStorage {
+    typename SamplingTileWarpSort::TempStorage warp[kSamplingTileWarps];
+    unsigned long long candidates[kSamplingTileWarps * kSamplerCandidateCap];
+};
+
+struct SamplingBf16TileTopKStorage {
+    typename SamplingBf16TileWarpSort::TempStorage warp[kSamplingTileWarps];
+    unsigned int candidates[kSamplingTileWarps * kSamplerCandidateCap];
+};
+
+union SamplingPartialTopKStorage {
+    SamplingTileTopKStorage fp32;
+    SamplingBf16TileTopKStorage bf16;
+};
+
+// True when the value is a real number. Used to fail a round whose logits diverged instead of
+// sampling a plausible-looking token out of NaN (see kSamplerNonFiniteToken).
+__device__ __forceinline__ bool sampling_value_is_finite(float value) {
+    return value == value && value < CUDART_INF_F && value > -CUDART_INF_F;
+}
+
+__device__ __forceinline__ bool sampling_selected_logit_is_finite(const __nv_bfloat16* logits,
+                                                                  std::int64_t base,
+                                                                  std::int32_t index) {
+    return index >= 0 && sampling_value_is_finite(__bfloat162float(logits[base + index]));
+}
 
 struct SamplingKeyGreater {
     __device__ __forceinline__ bool operator()(unsigned long long a, unsigned long long b) const {
+        return a > b;
+    }
+};
+
+struct SamplingUintGreater {
+    __device__ __forceinline__ bool operator()(unsigned int a, unsigned int b) const {
         return a > b;
     }
 };
@@ -77,34 +119,35 @@ __device__ __forceinline__ bool sampling_better(float v, int i, float bv, int bi
     return v > bv || (v == bv && i < bi);
 }
 
-// True when (v,i) ranks strictly below pivot (pv,pi) in the ordering above.
-__device__ __forceinline__ bool sampling_worse_than(float v, int i, float pv, int pi) {
-    return pv > v || (pv == v && pi < i);
-}
-
-__device__ __forceinline__ unsigned int sampling_ordered_float(float v) {
-    // Numeric equality, including +0 == -0, must reach the token-id tie break.
-    // Canonicalizing zero prevents the IEEE sign bit from ranking +0 above -0.
-    if (v == 0.0f) { v = 0.0f; }
-    const unsigned int bits = __float_as_uint(v);
-    return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
-}
-
 __device__ __forceinline__ unsigned long long sampling_sort_key(float v, int idx) {
-    if (idx == INT_MAX) { return 0ull; }
-    return (static_cast<unsigned long long>(sampling_ordered_float(v)) << 32) |
-           static_cast<unsigned int>(0xffffffffu - static_cast<unsigned int>(idx));
+    return score_id_order_key(v, idx);
+}
+
+__device__ __forceinline__ unsigned int sampling_bf16_tile_sort_key(__nv_bfloat16 v,
+                                                                    int tile_index) {
+    unsigned int bits = __bfloat16_as_ushort(v);
+    if ((bits & 0x7fffu) == 0u) { bits = 0u; }
+    const unsigned int ordered = (bits & 0x8000u) ? ((~bits) & 0xffffu) : (bits ^ 0x8000u);
+    return (ordered << kSamplingTileIndexBits) |
+           (kSamplingTileIndexMask - static_cast<unsigned int>(tile_index));
+}
+
+__device__ __forceinline__ unsigned long long sampling_expand_bf16_tile_sort_key(unsigned int key,
+                                                                                 int tile_start) {
+    if (key == 0u) { return 0ull; }
+    const unsigned int ordered = key >> kSamplingTileIndexBits;
+    const unsigned int bits    = (ordered & 0x8000u) ? (ordered ^ 0x8000u) : ((~ordered) & 0xffffu);
+    const int token            = tile_start + static_cast<int>(kSamplingTileIndexMask) -
+                      static_cast<int>(key & kSamplingTileIndexMask);
+    return sampling_sort_key(__uint_as_float(bits << 16), token);
 }
 
 __device__ __forceinline__ float sampling_key_float(unsigned long long key) {
-    const unsigned int ordered = static_cast<unsigned int>(key >> 32);
-    const unsigned int bits    = (ordered & 0x80000000u) ? (ordered ^ 0x80000000u) : ~ordered;
-    return __uint_as_float(bits);
+    return score_from_order_key(key);
 }
 
 __device__ __forceinline__ int sampling_key_index(unsigned long long key) {
-    if (key == 0ull) { return INT_MAX; }
-    return static_cast<int>(0xffffffffu - static_cast<unsigned int>(key));
+    return id_from_order_key(key);
 }
 
 __device__ __forceinline__ int sampling_candidate_cap(const SamplingConfig& cfg,
@@ -122,25 +165,128 @@ __device__ __forceinline__ int sampling_partial_offset(const SamplingWorkspace& 
     return ((col * workspace.partial_stride + partial) * kSamplerCandidateCap) + j;
 }
 
+__device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamplerItemsPerThread],
+                                                int cap, SamplingWorkspace workspace, int col,
+                                                int partial, SamplingTileTopKStorage& storage) {
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    SamplingTileWarpSort(storage.warp[warp]).Sort(keys, SamplingKeyGreater{});
+#pragma unroll
+    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+        const int rank = lane * kSamplerItemsPerThread + item;
+        if (rank < kSamplerCandidateCap) {
+            storage.candidates[warp * kSamplerCandidateCap + rank] = keys[item];
+        }
+    }
+    __syncthreads();
+
+    if (warp != 0) { return; }
+    if (lane < kSamplingTileWarps) {
+        constexpr unsigned int kMergeMask = (1u << kSamplingTileWarps) - 1u;
+        int position                      = 0;
+        for (int rank = 0; rank < cap; ++rank) {
+            const unsigned long long key =
+                storage.candidates[lane * kSamplerCandidateCap + position];
+            const unsigned int high     = static_cast<unsigned int>(key >> 32);
+            const unsigned int max_high = __reduce_max_sync(kMergeMask, high);
+            const unsigned int low      = high == max_high ? static_cast<unsigned int>(key) : 0u;
+            const unsigned int max_low  = __reduce_max_sync(kMergeMask, low);
+            const unsigned int winners =
+                __ballot_sync(kMergeMask, high == max_high && low == max_low);
+            const int source = __ffs(static_cast<int>(winners)) - 1;
+            if (lane == 0) {
+                const int off = sampling_partial_offset(workspace, col, partial, rank);
+                workspace.partial_keys[off] =
+                    (static_cast<unsigned long long>(max_high) << 32) | max_low;
+            }
+            if (lane == source) { ++position; }
+        }
+    }
+}
+
+__device__ inline void sampling_store_bf16_tile_topk(unsigned int (&keys)[kSamplerItemsPerThread],
+                                                     int cap, int tile_start,
+                                                     SamplingWorkspace workspace, int col,
+                                                     int partial,
+                                                     SamplingBf16TileTopKStorage& storage) {
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    SamplingBf16TileWarpSort(storage.warp[warp]).Sort(keys, SamplingUintGreater{});
+#pragma unroll
+    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+        const int rank = lane * kSamplerItemsPerThread + item;
+        if (rank < kSamplerCandidateCap) {
+            storage.candidates[warp * kSamplerCandidateCap + rank] = keys[item];
+        }
+    }
+    __syncthreads();
+
+    if (warp != 0) { return; }
+    if (lane < kSamplingTileWarps) {
+        constexpr unsigned int kMergeMask = (1u << kSamplingTileWarps) - 1u;
+        int position                      = 0;
+        for (int rank = 0; rank < cap; ++rank) {
+            const unsigned int key     = storage.candidates[lane * kSamplerCandidateCap + position];
+            const unsigned int best    = __reduce_max_sync(kMergeMask, key);
+            const unsigned int winners = __ballot_sync(kMergeMask, key == best);
+            const int source           = __ffs(static_cast<int>(winners)) - 1;
+            if (lane == 0) {
+                const int off = sampling_partial_offset(workspace, col, partial, rank);
+                workspace.partial_keys[off] = sampling_expand_bf16_tile_sort_key(best, tile_start);
+            }
+            if (lane == source) { ++position; }
+        }
+    }
+}
+
 __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
     return col * kSamplerCandidateCap + j;
 }
 
-// Applies presence/frequency penalties to a raw logit. `overlay`/`overlay_len`
-// carry a round-local count overlay: tokens already committed earlier in the
-// current speculative round but not yet flushed to the global `token_counts`. For speculative
-// verify column `col` the overlay is exactly drafts[0..col-1] (statically known,
-// since column `col` is only consumed when every earlier draft was accepted), so
-// the penalty at each column sees the same prefix a per-token sampler would.
-// Non-speculative callers pass no overlay. The scan is bounded by k and
-// only runs when penalties are active, so it is free on the no-penalty path.
+// Whether mask position `column` of this decision may select token v (sampling.h SamplingMask).
+__device__ __forceinline__ bool sampling_token_licensed(const SamplingConfig& c, int column, int v) {
+    if (c.mask.words == nullptr) { return true; }
+    const std::uint32_t word =
+        c.mask.words[static_cast<std::int64_t>(column) * c.mask.stride + (v >> 5)];
+    return ((word >> (static_cast<unsigned int>(v) & 31U)) & 1U) != 0U;
+}
+
+// True when the decision's scores are the raw logits: no penalty and no token mask. Only such rows
+// may use the fused raw-argmax or raw-BF16 routes.
+__device__ __forceinline__ bool sampling_uses_raw_logits(const SamplingConfig& c) {
+    return c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f && c.mask.words == nullptr;
+}
+
+// Applies the token mask and presence/frequency penalties to a raw logit. `column` is the
+// decision's mask position: 0 for an ordinary sample, the verification position for speculative
+// acceptance. `overlay` carries a round-local count overlay of `column` tokens: tokens already
+// committed earlier in the current speculative round but not yet flushed to the global
+// `token_counts`. For speculative verify column `col` the overlay is exactly drafts[0..col-1]
+// (statically known, since column `col` is only consumed when every earlier draft was accepted),
+// so the penalty at each column sees the same prefix a per-token sampler would. Non-speculative
+// callers pass no overlay. The scan is bounded by k and only runs when penalties are active, so it
+// is free on the no-penalty path. An unlicensed token scores -inf before any filter, so top-k,
+// min-p and top-p operate on the licensed tokens only.
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
-                                                         int overlay_len             = 0) {
+                                                         int column                  = 0) {
+    // Masking comes first: an unlicensed token must never win, not even through a NaN key.
+    if (!sampling_token_licensed(c, column, v)) { return -CUDART_INF_F; }
+    // A non-finite raw logit must sort as itself, unperturbed. Penalty subtraction on NaN is legal
+    // IEEE-754 but not required to preserve the operand's bit pattern, and CUDA's hardware NaN
+    // canonicalization does not: `NaN - presence_penalty` comes back as a different NaN encoding
+    // than an untouched NaN, which score_id_order_key's total-order key treats as a *different,
+    // higher* score. Since the penalty overlay is round-local (only already-drafted tokens get
+    // subtracted), a poisoned verify column would then rank its drafted token above every other
+    // (untouched-NaN) candidate in that same column -- letting a diverged forward pass spuriously
+    // "match" the draft and licensing it as accepted instead of tripping the finiteness guard.
+    // Returning raw unchanged keeps every non-finite entry in a column bit-identical, so ties fall
+    // back to the id tie-break and the guard sees whichever one wins.
+    if (!sampling_value_is_finite(raw)) { return raw; }
     float x = raw;
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;
-    for (int j = 0; j < overlay_len; ++j) {
+    for (int j = 0; j < column; ++j) {
         if (overlay[j] == v) { ++cnt; }
     }
     if (cnt > 0) { x -= c.presence_penalty; }
@@ -192,32 +338,45 @@ __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, flo
                                                   int n) {
     const int tid = threadIdx.x;
     if (tid == 0) {
-        const float inv_temp = 1.0f / cfg.temperature;
-        const float m        = cand_val[0] * inv_temp;
-        float sum            = 0.0f;
-        for (int j = 0; j < n; ++j) {
-            const float e = __expf(cand_val[j] * inv_temp - m);
-            prob[j]       = e;
-            sum += e;
+        while (n > 0 && !isfinite(cand_val[n - 1])) { --n; }
+        if (n == 0 || !isfinite(cand_val[0])) {
+            // No finite support: a diverged forward pass (NaN/inf logits) or a mask that licenses
+            // nothing. Keep the best candidate as the single support entry with a NaN weight; the
+            // callers' finiteness guards then publish kSamplerNonFiniteToken, which the runtime
+            // rejects as a failed round. Trapping here instead would poison the CUDA context.
+            prob[0]    = CUDART_NAN_F;
+            *n_support = 1;
+        } else {
+            const float inv_temp = 1.0f / cfg.temperature;
+            const float m        = cand_val[0] * inv_temp;
+            float sum            = 0.0f;
+            for (int j = 0; j < n; ++j) {
+                const float e = __expf(cand_val[j] * inv_temp - m);
+                prob[j]       = e;
+                sum += e;
+            }
+            const float e0           = prob[0];
+            const float min_p_thresh = (cfg.min_p > 0.0f) ? cfg.min_p * e0 : -1.0f;
+            const bool top_p_active  = (cfg.top_p < 1.0f);
+            const float top_p_target = cfg.top_p * sum;
+            float cum                = 0.0f;
+            int support              = 0;
+            for (int j = 0; j < n; ++j) {
+                // Candidates are sorted, so a zero weight ends the support: every later candidate
+                // is an underflowed token that must not be reachable by rounding.
+                if (j != 0 && !(prob[j] > 0.0f)) { break; }
+                if (min_p_thresh >= 0.0f && prob[j] < min_p_thresh) { break; }
+                cum += prob[j];
+                support = j + 1;
+                if (top_p_active && cum >= top_p_target) { break; }
+            }
+            if (support < 1) { support = 1; }
+            float ssum = 0.0f;
+            for (int j = 0; j < support; ++j) { ssum += prob[j]; }
+            const float inv = 1.0f / ssum;
+            for (int j = 0; j < support; ++j) { prob[j] *= inv; }
+            *n_support = support;
         }
-        const float e0           = prob[0];
-        const float min_p_thresh = (cfg.min_p > 0.0f) ? cfg.min_p * e0 : -1.0f;
-        const bool top_p_active  = (cfg.top_p < 1.0f);
-        const float top_p_target = cfg.top_p * sum;
-        float cum                = 0.0f;
-        int support              = 0;
-        for (int j = 0; j < n; ++j) {
-            if (min_p_thresh >= 0.0f && prob[j] < min_p_thresh) { break; }
-            cum += prob[j];
-            support = j + 1;
-            if (top_p_active && cum >= top_p_target) { break; }
-        }
-        if (support < 1) { support = 1; }
-        float ssum = 0.0f;
-        for (int j = 0; j < support; ++j) { ssum += prob[j]; }
-        const float inv = 1.0f / ssum;
-        for (int j = 0; j < support; ++j) { prob[j] *= inv; }
-        *n_support = support;
     }
     __syncthreads();
 }
@@ -229,13 +388,13 @@ __device__ inline void
 sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab,
                                const SamplingConfig& cfg, float* tile_val, int* tile_idx,
                                float* cand_val, int* cand_idx, float* prob, int* n_support,
-                               const std::int32_t* overlay = nullptr, int overlay_len = 0) {
+                               const std::int32_t* overlay = nullptr, int column = 0) {
     const int tid = threadIdx.x;
     const int cap = sampling_candidate_cap(cfg, vocab);
     if (tid < kSamplerTileItems) {
         if (tid < vocab) {
             const float x = sampling_adjusted_logit(__bfloat162float(logits[base + tid]), tid, cfg,
-                                                    overlay, overlay_len);
+                                                    overlay, column);
             tile_val[tid] = x;
             tile_idx[tid] = tid;
         } else {
@@ -259,7 +418,7 @@ sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, s
 __device__ inline void sampling_build_truncated_block_fast(
     const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
     float* merge_val, int* merge_idx, float* cand_val, int* cand_idx, float* prob, int* n_support,
-    const std::int32_t* overlay = nullptr, int overlay_len = 0) {
+    const std::int32_t* overlay = nullptr, int column = 0) {
     const int tid = threadIdx.x;
     const int cap = sampling_candidate_cap(cfg, vocab); // always <= kSamplerFastCandidates
 
@@ -274,7 +433,7 @@ __device__ inline void sampling_build_truncated_block_fast(
     const int fast_cap = cap;
     for (int v = tid; v < vocab; v += blockDim.x) {
         const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg, overlay,
-                                                overlay_len);
+                                                column);
         sampling_insert_candidate(local_val, local_idx, fast_cap, x, v);
     }
 
