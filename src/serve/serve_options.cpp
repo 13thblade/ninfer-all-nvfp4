@@ -107,13 +107,12 @@ std::string serve_usage_text(const char* argv0) {
            "                                (Linux); excludes --device\n"
            "  --stage-layers A,B,...        layers per stage in --devices order (default:\n"
            "                                split by free memory)\n"
-           "  --expert-residency device|host|disk  Qwen3.8-Flash-Next: expert banks in GPU\n"
-           "                                memory (default), in pinned host memory read\n"
-           "                                across the bus, or left in the artifact's files\n"
-           "                                and streamed into the device expert cache\n"
-           "  --expert-cache-mib N|auto     with host or disk experts: device memory for the\n"
-           "                                most used experts (default auto: what is free;\n"
-           "                                0 turns the host cache off; disk needs one)\n" +
+           "  --expert-residency device|host|disk  Flash-Next/Gemma MoE: expert banks in GPU\n"
+           "                                memory (default), pinned host memory, or files\n"
+           "                                (Gemma brings misses into whole-layer banks)\n"
+           "  --expert-cache-mib N|auto     persistent device cache (default auto); Gemma 0\n"
+           "                                keeps the layer banks only. Flash-Next disk\n"
+           "                                residency requires a nonzero cache\n" +
            std::string(ninfer::product::kHybridExpertHelp) +
            std::string(ninfer::product::kNgramTableHelp) +
            "  --no-cuda-graph               decode without CUDA Graphs (on by default)\n"

@@ -40,8 +40,8 @@ routes to them (`--expert-residency disk`). Its n-gram table is stored in the mo
 in a separate table artifact the model names by digest (`--ngram-table`); it stays in that file,
 read a row at a time, unless `--ngram-residency ram` loads it. A model with PLE requires its table
 unless `--no-ngram-table` overrides that; a qualification layer slice without PLE needs no table.
-These are the only product modes in which model weights live off
-the GPU.
+Gemma MoE also supports these host/disk expert placements, with all expert arithmetic on the GPU
+and whole-layer device banks beside its optional persistent cache.
 Gemma 4 26B-A4B (`Gemma4ForCausalLM`, the text component of `Gemma4ForConditionalGeneration`;
 `src/models/gemma4`, `runtime/engine/gemma4_core`) is a third explicit family converted from
 Google's QAT GGUF (or a mixed-format GGUF of the same model) with its ggml blocks kept as stored.
