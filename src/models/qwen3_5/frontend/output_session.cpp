@@ -461,10 +461,11 @@ public:
         semantic.budget           = thinking.effective_budget.has_value()
                                         ? thinking.effective_budget
                                         : thinking.budget;
-        // The presentation decoder already tracks normal reasoning output. Keep the independent
-        // semantic tracker dormant unless a cap needs it, so the default unlimited path does not
-        // decode every model token twice.
-        semantic.in_reasoning = starts_in_reasoning && semantic.budget.has_value();
+        // The semantic tracker counts the model's own thinking tokens for every response that
+        // starts in thinking: the request log reports that count (model_thinking_tokens), so it
+        // must run without a budget too (upstream Neroued/ninfer#373). The budget only caps it.
+        // Cost: one close-marker scan per generated thinking token.
+        semantic.in_reasoning = starts_in_reasoning;
         if (gemma && tool_call_output_ != nullptr) {
             // A forced call's opener, `<|tool_call>call:NAME{`, is already in the prompt.
             gemma_tools.emplace(tool_call_output_->forced_tool_name);
