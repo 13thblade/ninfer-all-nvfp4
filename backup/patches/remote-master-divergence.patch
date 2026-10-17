@@ -1,0 +1,781 @@
+diff --git a/apps/calibrate/main.cpp b/apps/calibrate/main.cpp
+index 29cbccf..9d137f9 100644
+--- a/apps/calibrate/main.cpp
++++ b/apps/calibrate/main.cpp
+@@ -25,7 +25,7 @@ namespace {
+     std::fprintf(
+         code == 0 ? stdout : stderr,
+         "usage: %s [--device N] [--out PATH] [--print] [--repeat N] [--margin F]\n"
+-        "          [--no-ternary] [--no-groupwise] [--no-nvfp4] [--no-attention]\n"
++        "          [--no-ternary] [--no-groupwise] [--no-attention]\n"
+         "          [--no-linear-attention] [--only PREFIX] [--detail] [--quiet]\n"
+         "  Times every route a device profile can steer on this GPU and stores the profile\n"
+         "  at PATH (default: $NINFER_DEVICE_PROFILES, else the user cache), stamped with\n"
+@@ -64,8 +64,6 @@ int main(int argc, char** argv) {
+             options.ternary = false;
+         } else if (arg == "--no-groupwise") {
+             options.groupwise = false;
+-        } else if (arg == "--no-nvfp4") {
+-            options.nvfp4 = false;
+         } else if (arg == "--no-attention") {
+             options.attention = false;
+         } else if (arg == "--no-linear-attention") {
+diff --git a/docs/device-profiles.md b/docs/device-profiles.md
+index b7d0ef8..7e92b46 100644
+--- a/docs/device-profiles.md
++++ b/docs/device-profiles.md
+@@ -107,8 +107,7 @@ survives a second interleaved measurement, and its output matches the compiled r
+ | `q6_head/248320x5120` | the Q6 vocabulary head's per-row GEMV (`gemv`, widths 1 and 2) or small-T MMA (`small_t`, widths up to 32) | widths 1 to 32 |
+ | `q8_ksplit/<rows>x<k>` | the four-K-warp form (`kw4`: at most 128 registers a thread, four CTAs an SM) of the 8-column tile of the Q8 G32 K-split contraction, which MTP heads, DFlash2 drafters and Q8 heads run, instead of the route's own schedule | the eleven contraction shapes of those layers, widths 1 to 8 |
+ | `unified/q4_q5_attn_input`, `unified/q4_q5_gdn_input`, `unified/q4_linear_swiglu`, `unified/q4_linear_add`, `unified/q5_linear_add/5120x<k>` | upstream's routes for the fused groupwise projections over the unified Linear templates (`unified`) instead of this line's own | the model shapes, widths 1 to 64 (the small-T launches only where those are all the switch covers) |
+-| `unified/nvfp4_attn_input`, `unified/nvfp4_gdn_input`, `unified/nvfp4_linear_add`, `unified/nvfp4_linear_swiglu` | the switch of the QUASAR NVFP4 fused projections onto the unified templates (`unified`) instead of this line's own chain. Under the A16 policies both chains are registered at every width a fused launch serves, so this is a pure W4A16 chain choice: a 32-token tiling loop against one launch at prefill widths, and two distinct small-T kernel families below 17 columns | the model shapes, widths 1 to 1024; SwiGLU 1 to 16, past which both chains resolve to the same wide fused A16 MMA kernel |
+-| `unified/q4_linear_topk`, `unified/q8_*`, `unified/fp8_*`, `unified/bf16_*`, `unified/context_kv_materialize` | the same switch for the Q4 top-k head, the Q8 fused projections (attention and GDN inputs, LinearAdd, pair, SwiGLU, top-k, grouped convolution, context-KV materialization), the FP8 fused projections (attention and GDN inputs with their conv forms, LinearAdd, SwiGLU, the FP8 top-k), and the BF16 attention input and LinearAdd | not calibrated: the built-in RTX 3090, 4090 and 5090 profiles carry the widths where each Op's benchmark ran faster on the unified routes over two rounds per table (at least 3 % over the geometric mean, no case more than 3 % slower), and keep them under a calibrated file entry; elsewhere a hand-edited profile entry or `NINFER_LINEAR_ROUTES` sets them |
++| `unified/q4_linear_topk`, `unified/q8_*`, `unified/fp8_*`, `unified/nvfp4_*`, `unified/bf16_*`, `unified/context_kv_materialize` | the same switch for the Q4 top-k head, the Q8 fused projections (attention and GDN inputs, LinearAdd, pair, SwiGLU, top-k, grouped convolution, context-KV materialization), the FP8 and NVFP4 fused projections (attention and GDN inputs with their conv forms, LinearAdd, SwiGLU, the FP8 top-k), and the BF16 attention input and LinearAdd | not calibrated: the built-in RTX 3090, 4090 and 5090 profiles carry the widths where each Op's benchmark ran faster on the unified routes over two rounds per table (at least 3 % over the geometric mean, no case more than 3 % slower), and keep them under a calibrated file entry; elsewhere a hand-edited profile entry or `NINFER_LINEAR_ROUTES` sets them |
+ | `gdn_two_stage/h<value heads>` | the two-stage GDN prefill (fused Q/K normalization and control preparation, then one FP32-state recurrence that also writes the output) instead of the WY/state-passing/output pipeline | prompts of 16 to 8192 tokens, 48 and 32 value heads |
+ 
+ `NINFER_SMALLT_PV_F16`, `NINFER_PROMPT_PV_F16`, `NINFER_PROMPT_PACK_GQA`, `NINFER_PROMPT_FAST` and
+diff --git a/src/calibration/device_calibration.cu b/src/calibration/device_calibration.cu
+index 1441115..277928d 100644
+--- a/src/calibration/device_calibration.cu
++++ b/src/calibration/device_calibration.cu
+@@ -12,13 +12,9 @@
+ #include "ninfer/ops/gated_delta_net.h"
+ #include "ninfer/ops/linear.h"
+ #include "ninfer/ops/softmax_attention.h"
+-#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
+ #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
+-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
+ #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
+ #include "ops/linear/common/route_table.h"
+-#include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
+-#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
+ #include "ops/linear/t2/t2_a8.h"
+ #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
+ #include "ops/linear_add/q5/q5_linear_add_plan.h"
+@@ -51,14 +47,6 @@ __global__ void fill_u16_kernel(std::uint16_t* values, std::uint64_t count, std:
+     }
+ }
+ 
+-__global__ void fill_u8_kernel(std::uint8_t* values, std::uint64_t count, std::uint8_t byte) {
+-    const std::uint64_t stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+-    for (std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+-         index < count; index += stride) {
+-        values[index] = byte;
+-    }
+-}
+-
+ __global__ void fill_f32_kernel(float* values, std::uint64_t count, float value) {
+     const std::uint64_t stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+     for (std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+@@ -177,57 +165,6 @@ SyntheticWeight row_split_weight(QType qtype, std::int32_t n, std::int32_t k) {
+     return result;
+ }
+ 
+-// An NVFP4 weight in the layout the artifacts use: an E2M1 code plane, one E4M3 block scale per
+-// 16 elements of a 128x4 tile, and one weight divisor past the scale plane. The field list is
+-// exactly what ops::detail::validate_nvfp4_weight requires (ops/linear/nvfp4/nvfp4_format.cpp),
+-// including N%128, K%64, the 16-byte plane alignment and the divisor row count.
+-SyntheticWeight block_scale_nvfp4_weight(std::int32_t n, std::int32_t k) {
+-    const auto align = [](std::uint64_t value) { return (value + 255) / 256 * 256; };
+-    const std::uint64_t elements           = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(k);
+-    const std::uint64_t code_plane_bytes   = elements / 2;
+-    const std::uint64_t scale_plane_offset = align(code_plane_bytes);
+-    const std::uint64_t scale_plane_bytes  = elements / 16;
+-    const std::uint64_t divisor_offset     = scale_plane_offset + scale_plane_bytes;
+-    const std::uint64_t total              = divisor_offset + sizeof(float);
+-
+-    SyntheticWeight result{DeviceBuffer(static_cast<std::size_t>(total)), {}};
+-    auto* base = static_cast<std::uint8_t*>(result.storage.p);
+-    fill_random(base, code_plane_bytes, 0x4e56u + static_cast<std::uint32_t>(n));
+-    // E4M3 1.0 is 0x38. A finite scale of one keeps the two chains' products comparable: the
+-    // output check compares them, and a NaN scale would reject every candidate.
+-    fill_u8_kernel<<<fill_grid(scale_plane_bytes), 256>>>(base + scale_plane_offset,
+-                                                          scale_plane_bytes, 0x38);
+-    CUDA_CHECK(cudaGetLastError());
+-    fill_f32_kernel<<<fill_grid(1), 256>>>(reinterpret_cast<float*>(base + divisor_offset), 1, 1.0f);
+-    CUDA_CHECK(cudaGetLastError());
+-    CUDA_CHECK(cudaDeviceSynchronize());
+-
+-    Weight& w              = result.weight;
+-    w.payload              = base;
+-    w.payload_bytes        = total;
+-    w.high_plane_bytes     = 0;
+-    w.qtype                = QType::NVFP4;
+-    w.group_size           = 16;
+-    w.shape[0]             = n;
+-    w.shape[1]             = k;
+-    w.padded_shape[0]      = n;
+-    w.padded_shape[1]      = k;
+-    w.ndim                 = 2;
+-    w.qdata                = base;
+-    w.qhigh                = nullptr;
+-    w.scales               = base + scale_plane_offset;
+-    w.n                    = n;
+-    w.k                    = k;
+-    w.group                = 16;
+-    w.layout               = QuantLayout::BlockScaleK16M128x4;
+-    w.scale_dtype          = DType::FP8_E4M3FN;
+-    w.weight_scale_divisor = 1.0F;
+-    w.input_scale_divisor  = 1.0F;
+-    w.weight_divisors      = base + divisor_offset;
+-    w.weight_divisor_rows  = n;
+-    return result;
+-}
+-
+ class Timer {
+ public:
+     explicit Timer(const CalibrationOptions& options)
+@@ -733,113 +670,6 @@ void calibrate_q8_ksplit(ops::DeviceRouteProfile& profile, Timer& timer,
+     }
+ }
+ 
+-// The QUASAR NVFP4 fused projections, and the switch of each onto the unified templates.
+-//
+-// Under LinearPolicy::A16Only both chains are registered at every width a fused launch serves, so
+-// this switch is a W4A16 chain choice and nothing else: the own chain's kernels against the
+-// unified chain's own. That is a 32-token tiling loop against a single launch at prefill widths,
+-// and two distinct small-T kernel families below them (the own chain's per-width SIMT kernels
+-// against the unified chain's SIMT and sliced-K MMA). Past 16 columns both chains resolve to the
+-// same wide fused A16 MMA kernel, so the SwiGLU key stops there: above it there is no switch left
+-// to measure.
+-void calibrate_nvfp4_fused(ops::DeviceRouteProfile& profile, Timer& timer,
+-                           const CalibrationOptions& options) {
+-    // A build that cannot select the unified table has no switch onto it to measure.
+-    if (!ops::detail::kUnifiedLinearRoutes) { return; }
+-    constexpr std::int32_t hidden     = 5120;
+-    constexpr std::int32_t max_tokens = 1024;
+-    SyntheticWeight attn              = block_scale_nvfp4_weight(14336, hidden);
+-    SyntheticWeight gdn               = block_scale_nvfp4_weight(16384, hidden);
+-    SyntheticWeight out_proj          = block_scale_nvfp4_weight(hidden, 6144);
+-    SyntheticWeight down              = block_scale_nvfp4_weight(hidden, 17408);
+-    SyntheticWeight gate_up           = block_scale_nvfp4_weight(34816, hidden);
+-    DeviceBuffer x_hidden            = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
+-    DeviceBuffer x_mixer             = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
+-    DeviceBuffer x_inter             = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
+-    DeviceBuffer q                   = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
+-    DeviceBuffer gate                = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
+-    DeviceBuffer k_plane             = bf16_buffer(static_cast<std::size_t>(1024) * max_tokens);
+-    DeviceBuffer v_plane             = bf16_buffer(static_cast<std::size_t>(1024) * max_tokens);
+-    DeviceBuffer qkv                 = bf16_buffer(static_cast<std::size_t>(10240) * max_tokens);
+-    DeviceBuffer z_plane             = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
+-    DeviceBuffer residual            = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
+-    DeviceBuffer swiglu_out          = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
+-    WorkspaceArena workspace(256ULL << 20);
+-
+-    const auto tensor = [](DeviceBuffer& buffer, std::int32_t rows, std::int32_t cols) {
+-        return Tensor(buffer.p, DType::BF16, {rows, cols});
+-    };
+-    const auto view = [](DeviceBuffer& buffer, std::size_t rows) {
+-        return [&buffer, rows](std::int32_t cols) {
+-            return std::pair<const void*, std::size_t>{buffer.p,
+-                                                       rows * static_cast<std::size_t>(cols)};
+-        };
+-    };
+-    DeviceBuffer residual_pristine = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
+-    const auto reset_residual      = [&]() {
+-        CUDA_CHECK(
+-            cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+-    };
+-
+-    const auto attn_run = [&](std::int32_t cols, cudaStream_t stream) {
+-        auto scope        = workspace.scope();
+-        Tensor x          = tensor(x_hidden, hidden, cols);
+-        Tensor q_out      = tensor(q, 6144, cols);
+-        Tensor gate_out   = tensor(gate, 6144, cols);
+-        Tensor k_out      = tensor(k_plane, 1024, cols);
+-        Tensor v_out      = tensor(v_plane, 1024, cols);
+-        ops::detail::nvfp4_attn_input_dispatch(x, attn.weight, q_out, gate_out, k_out, v_out,
+-                                               ops::LinearPolicy::A16Only, &workspace, stream);
+-    };
+-    const auto gdn_run = [&](std::int32_t cols, cudaStream_t stream) {
+-        auto scope      = workspace.scope();
+-        Tensor x        = tensor(x_hidden, hidden, cols);
+-        Tensor qkv_out  = tensor(qkv, 10240, cols);
+-        Tensor z_out    = tensor(z_plane, 6144, cols);
+-        ops::detail::nvfp4_gdn_input_dispatch(x, gdn.weight, qkv_out, z_out,
+-                                              ops::LinearPolicy::A16Only, &workspace, stream);
+-    };
+-    // One key steers both residual adds, so a run exercises the pair the way a layer does.
+-    const auto add_run = [&](std::int32_t cols, cudaStream_t stream) {
+-        auto scope   = workspace.scope();
+-        Tensor x     = tensor(x_mixer, 6144, cols);
+-        Tensor res   = tensor(residual, hidden, cols);
+-        ops::detail::nvfp4_linear_add_dispatch(x, out_proj.weight, res, ops::LinearPolicy::A16Only,
+-                                               workspace, stream);
+-        Tensor x2    = tensor(x_inter, 17408, cols);
+-        Tensor res2  = tensor(residual, hidden, cols);
+-        ops::detail::nvfp4_linear_add_dispatch(x2, down.weight, res2, ops::LinearPolicy::A16Only,
+-                                               workspace, stream);
+-    };
+-    const auto swiglu_run = [&](std::int32_t cols, cudaStream_t stream) {
+-        auto scope = workspace.scope();
+-        Tensor x   = tensor(x_hidden, hidden, cols);
+-        Tensor o   = tensor(swiglu_out, 17408, cols);
+-        ops::detail::nvfp4_linear_swiglu_dispatch(x, gate_up.weight, o, ops::LinearPolicy::A16Only,
+-                                                  workspace, stream);
+-    };
+-
+-    // The decode step, the speculative verify widths, the small-T band, and the prefill chunks a
+-    // 27B serves: the bands a profile stores have to answer all of them.
+-    const std::vector<std::int32_t> widths = {1,  2,  3,  4,  5,  6,  7,  8,  9,  10,  12, 14,
+-                                              16, 20, 24, 28, 32, 48, 64, 96, 128, 256, 512, 1024};
+-    const std::vector<std::int32_t> small_t_widths = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16};
+-    const std::vector<Family> families = {
+-        {"unified/nvfp4_attn_input", widths, attn_run, view(q, 6144), {}},
+-        {"unified/nvfp4_gdn_input", widths, gdn_run, view(qkv, 10240), {}},
+-        {"unified/nvfp4_linear_add", widths, add_run, view(residual, hidden), reset_residual},
+-        {"unified/nvfp4_linear_swiglu", small_t_widths, swiglu_run, view(swiglu_out, 17408), {}},
+-    };
+-    for (const Family& family : families) {
+-        auto bands = sweep(family, timer, options);
+-        if (!bands.empty()) {
+-            profile.routes[family.key] = std::move(bands);
+-            ops::install_device_route_profile(
+-                std::make_shared<const ops::DeviceRouteProfile>(profile));
+-        }
+-    }
+-}
+-
+ // The INT8-family small-T partial kernel's tiers. A serving process captures its graphs over an
+ // envelope as wide as the KV capacity, so the tier is chosen per envelope and has to serve every
+ // depth below it: each envelope is timed at its full depth and at a sixteenth of it.
+@@ -1189,7 +1019,6 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
+         calibrate_groupwise(profile, timer, options);
+         calibrate_q8_ksplit(profile, timer, options);
+     }
+-    if (projections && options.nvfp4) { calibrate_nvfp4_fused(profile, timer, options); }
+     if (options.linear_attention) { calibrate_linear_attention(profile, timer, options); }
+     if (attention) {
+         calibrate_attention(profile, timer, options, KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
+diff --git a/src/calibration/device_calibration.h b/src/calibration/device_calibration.h
+index f1173f5..10e0e09 100644
+--- a/src/calibration/device_calibration.h
++++ b/src/calibration/device_calibration.h
+@@ -21,7 +21,6 @@ namespace ninfer::calibration {
+ struct CalibrationOptions {
+     bool ternary   = true; // T2G128 projections (Ternary Bonsai 2)
+     bool groupwise = true; // Q4/Q5 fused projections and Q8 K-split tiles (groupwise-int, MTP)
+-    bool nvfp4     = true; // QUASAR NVFP4 fused projections and their switch onto the unified table
+     bool attention = true; // INT8-family small-T attention launch tiers
+     bool linear_attention = true; // GDN prefill algorithm per prompt width
+     int warmup     = 2;
+diff --git a/src/calibration/route_catalog.cpp b/src/calibration/route_catalog.cpp
+index 0fc89bd..95fca95 100644
+--- a/src/calibration/route_catalog.cpp
++++ b/src/calibration/route_catalog.cpp
+@@ -67,15 +67,6 @@ std::vector<RouteCatalogEntry> build_catalog() {
+               "unified/q4_linear_swiglu", "unified/q4_linear_add"}) {
+             add(key, {"unified"});
+         }
+-        // QUASAR NVFP4 fused projections, and the switch of each onto the unified templates.
+-        // Under the A16 policies both chains are registered at every width a fused launch serves,
+-        // so this switch is a pure W4A16 chain choice: the own chain's per-width kernels against
+-        // the unified chain's own (a 32-token tiling loop against one launch at prefill widths,
+-        // two distinct small-T kernel families below them).
+-        for (const char* key : {"unified/nvfp4_attn_input", "unified/nvfp4_gdn_input",
+-                                "unified/nvfp4_linear_add", "unified/nvfp4_linear_swiglu"}) {
+-            add(key, {"unified"});
+-        }
+     }
+     // Q8 G32 K-split contractions (MTP heads, DFlash2 drafters, the official artifacts' heads):
+     // the four-K-warp form of each 8-column tile (ops/linear/q8/q8_ksplit_config.h).
+diff --git a/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_a16.cu b/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_a16.cu
+index bf83fa4..88ce4e6 100644
+--- a/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_a16.cu
++++ b/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_a16.cu
+@@ -55,7 +55,7 @@ void nvfp4_attn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor&
+     }
+     {
+         launch_nvfp4_a16_mma<
+-            Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>, 5120>>(
++            Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, 5120>>(
+             p, output, epilogue, stream);
+         return;
+     }
+diff --git a/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_a16.cu b/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_a16.cu
+index 5c98f8c..8bb4810 100644
+--- a/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_a16.cu
++++ b/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_a16.cu
+@@ -53,7 +53,7 @@ void nvfp4_gdn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& q
+     }
+     {
+         launch_nvfp4_a16_mma<
+-            Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>, 5120>>(
++            Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, 5120>>(
+             p, output, epilogue, stream);
+         return;
+     }
+diff --git a/src/ops/kv_cache/fp8_e4m3_row_codec.cuh b/src/ops/kv_cache/fp8_e4m3_row_codec.cuh
+index 4b6f6cb..8e89e56 100644
+--- a/src/ops/kv_cache/fp8_e4m3_row_codec.cuh
++++ b/src/ops/kv_cache/fp8_e4m3_row_codec.cuh
+@@ -88,13 +88,7 @@ __device__ __forceinline__ __half2 kv_cache_fp8_code2_to_half2_x2m8(unsigned cod
+ 
+ __device__ __forceinline__ __half2 kv_cache_fp8_dequant_code2_to_half2(std::uint16_t storage,
+                                                                        __half scale) {
+-    // The integer expansion above carries the code times 2^-8 exactly, so the 2^8 that the vendor
+-    // conversion applies rides in a second half2 operand instead: scaling by a power of two is
+-    // exact, and the final multiply rounds once, exactly where the converted code times the scale
+-    // rounds. This is the sm70 path's form, applied where the vendor conversion is not free either.
+-    const __half2 bias = __float2half2_rn(256.0F);
+-    return __hmul2(__hmul2(kv_cache_fp8_code2_to_half2_x2m8(storage), bias),
+-                   __halves2half2(scale, scale));
++    return __hmul2(kv_cache_fp8_code2_to_half2(storage), __halves2half2(scale, scale));
+ }
+ 
+ // Dequantizes 8 contiguous E4M3 codes (16 bytes) to FP16, for PV MMA operands on hardware with
+@@ -118,17 +112,15 @@ __device__ __forceinline__ int4 kv_cache_fp8_dequant_f16x8(const std::uint8_t* c
+ // Blackwell-only mma.sync...kind::f8f6f4, so K needs a real (not just reinterpreted) wide copy.
+ __device__ __forceinline__ int4 kv_cache_fp8_dequant_bf16x8(const std::uint8_t* codes,
+                                                              __half scale) {
+-    // The integer expansion carries the code times 2^-8 exactly, so the scale absorbs the 2^8
+-    // (exact, a power of two) and the product is the same FP32 value the vendor conversion feeds
+-    // the bf16 rounding. The K plane of k8v4 reads through here, and that path is issue-bound on
+-    // the outlined E4M3 conversion the same way the nvfp4 codec was.
+     const int2 raw         = load_vec<int2>(codes);
+     const std::uint16_t* c = reinterpret_cast<const std::uint16_t*>(&raw);
+-    const float scale_f    = __half2float(scale) * 256.0F;
++    const float scale_f    = __half2float(scale);
+     unsigned packed[4];
+ #pragma unroll
+     for (int i = 0; i < 4; ++i) {
+-        const float2 decoded = __half22float2(kv_cache_fp8_code2_to_half2_x2m8(c[i]));
++        __nv_fp8x2_e4m3 value;
++        value.__x                   = c[i];
++        const float2 decoded        = static_cast<float2>(value);
+         const __nv_bfloat162 value2 =
+             __floats2bfloat162_rn(decoded.x * scale_f, decoded.y * scale_f);
+         packed[i] = *reinterpret_cast<const unsigned*>(&value2);
+diff --git a/src/ops/kv_cache/nvfp4_group16_codec.cuh b/src/ops/kv_cache/nvfp4_group16_codec.cuh
+index 1050800..d79fe1a 100644
+--- a/src/ops/kv_cache/nvfp4_group16_codec.cuh
++++ b/src/ops/kv_cache/nvfp4_group16_codec.cuh
+@@ -93,26 +93,18 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t*
+     // Every finite E2M1 value times a legal nonnegative E4M3 cache scale is exactly representable
+     // in FP16 (at most four product fraction bits and magnitude <= 2688). Half2 multiplication is
+     // therefore the exact FP16 expansion boundary, not an additional approximation.
+-    //
+-    // Neither operand goes through the vendor conversions. On sm_86/sm_89 ptxas outlines
+-    // __nv_fp4x2_e2m1 and __nv_fp8_e4m3 into calls carrying BSSY/BSYNC and a divide fixup, and
+-    // this path is issue-bound on them: the nvfp4 prompt-attention kernel held 88 CALL.REL where
+-    // its bf16 counterpart holds 3. kv_cache_e2m1x2_to_half2 above is the expansion the sm70 path
+-    // already runs; the scale comes from the ue4m3 table the weight codec reads, whose entries are
+-    // exactly half the vendor value, so doubling it is exact.
+-    //
+-    // Bit-exactness: an E2M1 magnitude is an FP16 with a zero low byte, so the permuted pattern is
+-    // the same value the vendor conversion returns, and both scale routes land on the same
+-    // representable half. The one input the two disagree on is a 0x7F scale byte, which the
+-    // quantizer cannot emit (it converts a value clamped into [2^-9, 448] with __NV_SATFINITE).
+-    const float scale_f  = detail::kNvfp4E4M3ScaleA16[scale_code] * 2.0F;
+-    const __half2 scale2 = __float2half2_rn(scale_f);
+     const std::uint32_t packed = load_vec<std::uint32_t>(codes);
+     const std::uint8_t* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
++    __nv_fp8_e4m3 encoded_scale;
++    encoded_scale.__x    = scale_code;
++    const __half scale   = static_cast<__half>(encoded_scale);
++    const __half2 scale2 = __halves2half2(scale, scale);
+     unsigned half_bits[4];
+ #pragma unroll
+     for (int pair = 0; pair < 4; ++pair) {
+-        const __half2 value = __hmul2(kv_cache_e2m1x2_to_half2(bytes[pair]), scale2);
++        __nv_fp4x2_e2m1 encoded;
++        encoded.__x         = bytes[pair];
++        const __half2 value = __hmul2(static_cast<__half2>(encoded), scale2);
+         half_bits[pair]     = *reinterpret_cast<const unsigned*>(&value);
+     }
+     return make_int4(static_cast<int>(half_bits[0]), static_cast<int>(half_bits[1]),
+@@ -124,16 +116,17 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t*
+ // Q's storage) instead of FP16.
+ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_bf16x8(const std::uint8_t* codes,
+                                                               std::uint8_t scale_code) {
+-    // Same two substitutions as the FP16 form above, and the same reasoning: the E2M1 half2 the
+-    // sm70 path builds carries the exact value, so widening it to FP32 and multiplying by the
+-    // table-derived scale reproduces the vendor expression bit for bit.
+-    const float scale_f        = detail::kNvfp4E4M3ScaleA16[scale_code] * 2.0F;
+     const std::uint32_t packed = load_vec<std::uint32_t>(codes);
+     const std::uint8_t* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
++    __nv_fp8_e4m3 encoded_scale;
++    encoded_scale.__x  = scale_code;
++    const float scale_f = static_cast<float>(encoded_scale);
+     unsigned bf16_bits[4];
+ #pragma unroll
+     for (int pair = 0; pair < 4; ++pair) {
+-        const float2 decoded = __half22float2(kv_cache_e2m1x2_to_half2(bytes[pair]));
++        __nv_fp4x2_e2m1 encoded;
++        encoded.__x           = bytes[pair];
++        const float2 decoded  = static_cast<float2>(encoded);
+         const __nv_bfloat162 value =
+             __floats2bfloat162_rn(decoded.x * scale_f, decoded.y * scale_f);
+         bf16_bits[pair] = *reinterpret_cast<const unsigned*>(&value);
+@@ -149,14 +142,18 @@ struct KVCacheNvfp4DequantizedF16x16 {
+ 
+ __device__ __forceinline__ KVCacheNvfp4DequantizedF16x16
+ kv_cache_nvfp4_dequant_f16x16(const std::uint8_t* codes, std::uint8_t scale_code) {
+-    const float scale_f  = detail::kNvfp4E4M3ScaleA16[scale_code] * 2.0F;
+-    const __half2 scale2 = __float2half2_rn(scale_f);
+     const int2 packed         = load_vec<int2>(codes);
+     const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(&packed);
++    __nv_fp8_e4m3 encoded_scale;
++    encoded_scale.__x    = scale_code;
++    const __half scale   = static_cast<__half>(encoded_scale);
++    const __half2 scale2 = __halves2half2(scale, scale);
+     unsigned half_bits[8];
+ #pragma unroll
+     for (int pair = 0; pair < 8; ++pair) {
+-        const __half2 value = __hmul2(kv_cache_e2m1x2_to_half2(bytes[pair]), scale2);
++        __nv_fp4x2_e2m1 encoded;
++        encoded.__x         = bytes[pair];
++        const __half2 value = __hmul2(static_cast<__half2>(encoded), scale2);
+         half_bits[pair]     = *reinterpret_cast<const unsigned*>(&value);
+     }
+     return {
+diff --git a/src/ops/linear/nvfp4/nvfp4_a16_gemv.cuh b/src/ops/linear/nvfp4/nvfp4_a16_gemv.cuh
+index f7c42df..18c383d 100644
+--- a/src/ops/linear/nvfp4/nvfp4_a16_gemv.cuh
++++ b/src/ops/linear/nvfp4/nvfp4_a16_gemv.cuh
+@@ -163,17 +163,6 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
+     static_assert((Geometry::kInputRows % kValuesPerPhase) == 0);
+     const auto* activation_pairs = reinterpret_cast<const std::uint32_t*>(x);
+ 
+-    // Per-row code bases: loop-invariant except for the phase stride, so build
+-    // them once and advance by one stride per phase (pure addressing
+-    // arithmetic; the loaded values remain bit-identical).
+-    std::int64_t code_offset[Schedule::kRowsPerWarp];
+-#pragma unroll
+-    for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+-        code_offset[local_row] =
+-            static_cast<std::int64_t>(parent_rows[local_row]) * Geometry::kCodeBytesPerRow +
+-            lane * (Schedule::kValuesPerLane / 2);
+-    }
+-
+ #pragma unroll
+     for (int phase = 0; phase < kPhases; ++phase) {
+         float coefficients[Schedule::kRowsPerWarp][kGroupsPerLane];
+@@ -183,29 +172,18 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
+             load_nvfp4_coefficients<Geometry, Schedule>(
+                 scales, shared, parent_rows[local_row], flat_row0 + local_row, phase, lane,
+                 coefficient_gain, coefficients[local_row]);
++            const std::int64_t code_offset =
++                static_cast<std::int64_t>(parent_rows[local_row]) * Geometry::kCodeBytesPerRow +
++                phase * (kValuesPerPhase / 2) + lane * (Schedule::kValuesPerLane / 2);
+             row_codes[local_row] = load_nvfp4_codes<Schedule::kCodeCache, Schedule::kValuesPerLane>(
+-                codes + code_offset[local_row]);
+-            code_offset[local_row] += kValuesPerPhase / 2;
++                codes + code_offset);
+         }
+ 
+-        // One lane reads kValuesPerLane bf16 per phase (16 B-aligned, and for
+-        // the 16-wide schedules 32 B); kValuesPerLane/8 128-bit loads replace
+-        // the per-pair 32-bit loads.  Same addresses, same order, bit-identical.
+-        const auto* lane_activation = reinterpret_cast<const uint4*>(
+-            activation_pairs + phase * (kValuesPerPhase / 2) +
+-            lane * (Schedule::kValuesPerLane / 2));
+-        std::uint32_t activation_words[Schedule::kPairsPerLane];
+-#pragma unroll
+-        for (int quad = 0; quad < Schedule::kPairsPerLane / 4; ++quad) {
+-            const uint4 packed   = load_vec<uint4>(lane_activation + quad);
+-            activation_words[quad * 4]     = packed.x;
+-            activation_words[quad * 4 + 1] = packed.y;
+-            activation_words[quad * 4 + 2] = packed.z;
+-            activation_words[quad * 4 + 3] = packed.w;
+-        }
+ #pragma unroll
+         for (int pair = 0; pair < Schedule::kPairsPerLane; ++pair) {
+-            const float2 activation = bf16x2_bits_to_float2(activation_words[pair]);
++            const int activation_index =
++                phase * (kValuesPerPhase / 2) + lane * Schedule::kPairsPerLane + pair;
++            const float2 activation = bf16x2_bits_to_float2(activation_pairs[activation_index]);
+             const int group         = ((lane * Schedule::kValuesPerLane & 15) + pair * 2) / 16;
+ #pragma unroll
+             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+diff --git a/src/ops/linear/nvfp4/nvfp4_a16_mma.cuh b/src/ops/linear/nvfp4/nvfp4_a16_mma.cuh
+index 73388e0..29d8ec4 100644
+--- a/src/ops/linear/nvfp4/nvfp4_a16_mma.cuh
++++ b/src/ops/linear/nvfp4/nvfp4_a16_mma.cuh
+@@ -109,23 +109,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
+         }
+     };
+     const auto widen_codes = [&]() {
+-        // Eight columns per lane, so one 32-bit code read, one scale byte and one 16-byte store
+-        // cover what a lane used to spend four table lookups and four 4-byte stores on. The
+-        // column permutation is a multiple of eight, so the eight widened columns stay one
+-        // contiguous 16-byte block and the store keeps its natural width.
+-        constexpr int kColBlocks = BK / 8;
+-        constexpr int kSlots     = BM * kColBlocks;
+-        static_assert((BK % 8) == 0, "the widening pass stores eight columns at a time");
+-        static_assert((kColBlocks & (kColBlocks - 1)) == 0, "column blocks index by a shift");
+-        for (int slot = warp * 32 + lane; slot < kSlots; slot += Schedule::kWarps * 32) {
+-            const int row = slot / kColBlocks;
+-            const int col = (slot & (kColBlocks - 1)) * 8;
+-            const unsigned codes =
+-                *reinterpret_cast<const unsigned*>(code_shared + row * (BK / 2) + col / 2);
+-            unsigned widened[4];
+-            nvfp4_scaled_quad_bf16(codes, scale_shared[row * (BK / 16) + col / 16], widened);
+-            store_vec(weight_shared + row * BK + nvfp4_a16_shared_col_64(row, col),
+-                      uint4{widened[0], widened[1], widened[2], widened[3]});
++        const int half = lane >> 4, half_lane = lane & 15;
++        for (int pair = warp * 2; pair < BM; pair += Schedule::kWarps * 2) {
++            const int row = pair + half;
++#pragma unroll
++            for (int col32 = 0; col32 < BK; col32 += 32) {
++                const int col = col32 + half_lane * 2;
++                const unsigned widened =
++                    nvfp4_scaled_pair_bf16(code_shared[row * (BK / 2) + col / 2],
++                                           scale_shared[row * (BK / 16) + col / 16]);
++                store_vec(weight_shared + row * BK + nvfp4_a16_shared_col_64(row, col), widened);
++            }
+         }
+     };
+ 
+diff --git a/src/ops/linear/nvfp4/nvfp4_a16_sliced_k_mma.cuh b/src/ops/linear/nvfp4/nvfp4_a16_sliced_k_mma.cuh
+index 193e145..79b4b55 100644
+--- a/src/ops/linear/nvfp4/nvfp4_a16_sliced_k_mma.cuh
++++ b/src/ops/linear/nvfp4/nvfp4_a16_sliced_k_mma.cuh
+@@ -136,22 +136,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
+         __syncthreads();
+ #pragma unroll
+         for (int k_step = 0; k_step < kTileK / 16; ++k_step) {
+-            const int code_col = k_step * 16 + lid * 2;
+-            // Both column pairs of a k-step land inside the same 16-column scale group, so the
+-            // group byte is read once per row rather than once per pair: four pairs share two
+-            // bytes.
+-            const int scale_col = (warp_k0 + code_col) / 16;
+-            const auto scale_lo = scale_shared[stage][gid][scale_col];
+-            const auto scale_hi = scale_shared[stage][gid + 8][scale_col];
+-            const auto load_pair = [&](int row, int col, std::uint8_t scale) {
++            const int code_col   = k_step * 16 + lid * 2;
++            const auto load_pair = [&](int row, int col) {
+                 const int byte   = (warp_k0 + col) / 2;
+                 const int offset = ((byte / 16) ^ (row & kCodeSwizzle)) * 16 + (byte & 15);
+-                return nvfp4_scaled_pair_bf16(code_shared[stage][row][offset], scale);
++                return nvfp4_scaled_pair_bf16(code_shared[stage][row][offset],
++                                              scale_shared[stage][row][(warp_k0 + col) / 16]);
+             };
+-            const unsigned a0 = load_pair(gid, code_col, scale_lo);
+-            const unsigned a1 = load_pair(gid + 8, code_col, scale_hi);
+-            const unsigned a2 = load_pair(gid, code_col + 8, scale_lo);
+-            const unsigned a3 = load_pair(gid + 8, code_col + 8, scale_hi);
++            const unsigned a0 = load_pair(gid, code_col);
++            const unsigned a1 = load_pair(gid + 8, code_col);
++            const unsigned a2 = load_pair(gid, code_col + 8);
++            const unsigned a3 = load_pair(gid + 8, code_col + 8);
+ #pragma unroll
+             for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
+                 unsigned b0;
+diff --git a/src/ops/linear/nvfp4/nvfp4_codec_unified.cuh b/src/ops/linear/nvfp4/nvfp4_codec_unified.cuh
+index b2002bb..6d0642f 100644
+--- a/src/ops/linear/nvfp4/nvfp4_codec_unified.cuh
++++ b/src/ops/linear/nvfp4/nvfp4_codec_unified.cuh
+@@ -96,47 +96,6 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
+ #endif
+ }
+ 
+-// Eight elements at once: four code bytes under the one scale byte they share. The widening pass
+-// reads a 32-bit code word and one scale byte per sixteen columns anyway, so the scale expansion
+-// and its table lookup are hoisted out of four pairs here. Each pair still does exactly the
+-// arithmetic nvfp4_scaled_pair_bf16 does on the same inputs -- same inputs, same operations, same
+-// rounding -- so the output is bit-identical; the saving is the redundancy, not a change of math.
+-__device__ __forceinline__ void nvfp4_scaled_quad_bf16(unsigned codes, std::uint8_t scale,
+-                                                       unsigned out[4]) {
+-#if NINFER_NATIVE_FP8_FP4_PAIR_CVT
+-    const auto scale_pair = static_cast<std::uint16_t>(scale | (static_cast<unsigned>(scale) << 8));
+-    unsigned multiplier;
+-    asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(multiplier) : "h"(scale_pair));
+-#pragma unroll
+-    for (int i = 0; i < 4; ++i) {
+-        unsigned values, result;
+-        const unsigned code = (codes >> (8 * i)) & 0xFFu;
+-        asm("{\n"
+-            ".reg .b8 packed;\n"
+-            "mov.b32 {packed, _, _, _}, %1;\n"
+-            "cvt.rn.bf16x2.e2m1x2 %0, packed;\n"
+-            "}\n"
+-            : "=r"(values)
+-            : "r"(code));
+-        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(result) : "r"(values), "r"(multiplier));
+-        out[i] = result;
+-    }
+-#else
+-    const float multiplier = kNvfp4E4M3ScaleA16[scale] * 32768.0F;
+-#pragma unroll
+-    for (int i = 0; i < 4; ++i) {
+-        const float2 values =
+-            decode_nvfp4_e2m1x2_raw(static_cast<std::uint8_t>((codes >> (8 * i)) & 0xFFu));
+-        union {
+-            __nv_bfloat162 pair;
+-            unsigned bits;
+-        } result;
+-        result.pair = __floats2bfloat162_rn(values.x * multiplier, values.y * multiplier);
+-        out[i] = result.bits;
+-    }
+-#endif
+-}
+-
+ __device__ __forceinline__ int nvfp4_a16_shared_col_64(int row, int col) {
+     return col ^ ((row & 7) << 3);
+ }
+diff --git a/src/ops/linear/nvfp4/nvfp4_instances.cuh b/src/ops/linear/nvfp4/nvfp4_instances.cuh
+index e40797d..929bc34 100644
+--- a/src/ops/linear/nvfp4/nvfp4_instances.cuh
++++ b/src/ops/linear/nvfp4/nvfp4_instances.cuh
+@@ -6,6 +6,6 @@ namespace ninfer::ops::detail::unified {
+ template <int Tokens, int Warps, int Stages>
+ using Nvfp4SlicedInstance = Nvfp4A16SlicedKMmaSchedule<
+     Warps, Tokens,
+-    4,
++    3,
+     Cache::ca, Cache::cg, Nvfp4ActivationStage::PaddedZero, Stages>;
+ } // namespace ninfer::ops::detail::unified
+diff --git a/src/ops/linear/nvfp4/shapes/n14336_k5120_unified.cu b/src/ops/linear/nvfp4/shapes/n14336_k5120_unified.cu
+index 3552fd3..36ff4a9 100644
+--- a/src/ops/linear/nvfp4/shapes/n14336_k5120_unified.cu
++++ b/src/ops/linear/nvfp4/shapes/n14336_k5120_unified.cu
+@@ -28,7 +28,7 @@ Nvfp4Launch select_a16(int tokens) {
+         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>>;
+     if (tokens <= 128)
+         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 64, 32, 16, 2, 2>>;
+-    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>;
++    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
+ }
+ 
+ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
+diff --git a/src/ops/linear/nvfp4/shapes/n16384_k5120_unified.cu b/src/ops/linear/nvfp4/shapes/n16384_k5120_unified.cu
+index 647e9bb..f67c2de 100644
+--- a/src/ops/linear/nvfp4/shapes/n16384_k5120_unified.cu
++++ b/src/ops/linear/nvfp4/shapes/n16384_k5120_unified.cu
+@@ -27,7 +27,7 @@ Nvfp4Launch select_a16(int tokens) {
+         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 64, 32, 16, 2, 2>>;
+     if (tokens <= 96)
+         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>>;
+-    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>;
++    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
+ }
+ 
+ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
+diff --git a/src/ops/linear/nvfp4/shapes/n34816_k5120_unified.cu b/src/ops/linear/nvfp4/shapes/n34816_k5120_unified.cu
+index 168636c..516434c 100644
+--- a/src/ops/linear/nvfp4/shapes/n34816_k5120_unified.cu
++++ b/src/ops/linear/nvfp4/shapes/n34816_k5120_unified.cu
+@@ -26,7 +26,7 @@ Nvfp4Launch select_a16(int tokens) {
+         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>>;
+     if (tokens <= 96)
+         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>>;
+-    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>;
++    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
+ }
+ 
+ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
+diff --git a/src/ops/linear/nvfp4/shapes/n5120_k17408_unified.cu b/src/ops/linear/nvfp4/shapes/n5120_k17408_unified.cu
+index ce80169..5e0b6f8 100644
+--- a/src/ops/linear/nvfp4/shapes/n5120_k17408_unified.cu
++++ b/src/ops/linear/nvfp4/shapes/n5120_k17408_unified.cu
+@@ -35,7 +35,7 @@ Nvfp4Launch select_a16(int tokens) {
+     if (tokens <= 64) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<64, 2, 2>>;
+     if (tokens <= 128)
+         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 64, 128, 32, 16, 2, 2>>;
+-    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>;
++    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
+ }
+ 
+ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
+diff --git a/src/ops/linear/nvfp4/shapes/n5120_k6144_unified.cu b/src/ops/linear/nvfp4/shapes/n5120_k6144_unified.cu
+index a94260b..6802016 100644
+--- a/src/ops/linear/nvfp4/shapes/n5120_k6144_unified.cu
++++ b/src/ops/linear/nvfp4/shapes/n5120_k6144_unified.cu
+@@ -27,7 +27,7 @@ Nvfp4Launch select_a16(int tokens) {
+     if (tokens <= 64) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<64, 2, 2>>;
+     if (tokens <= 128)
+         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>>;
+-    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>;
++    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
+ }
+ 
+ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
+diff --git a/src/ops/linear/nvfp4/shapes/n8192_k4096_unified.cu b/src/ops/linear/nvfp4/shapes/n8192_k4096_unified.cu
+index 94e073f..d5a0251 100644
+--- a/src/ops/linear/nvfp4/shapes/n8192_k4096_unified.cu
++++ b/src/ops/linear/nvfp4/shapes/n8192_k4096_unified.cu
+@@ -28,7 +28,7 @@ Nvfp4Launch select_a16(int tokens) {
+     if (tokens <= 64) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<64, 2, 2>>;
+     if (tokens <= 128)
+         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>>;
+-    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>;
++    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
+ }
+ 
+ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
+diff --git a/src/ops/linear_add/nvfp4/nvfp4_linear_add_a16.cu b/src/ops/linear_add/nvfp4/nvfp4_linear_add_a16.cu
+index aec1d67..f44f427 100644
+--- a/src/ops/linear_add/nvfp4/nvfp4_linear_add_a16.cu
++++ b/src/ops/linear_add/nvfp4/nvfp4_linear_add_a16.cu
+@@ -56,7 +56,7 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
+         }
+         {
+             launch_nvfp4_a16_mma<
+-                Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>, 6144>>(
++                Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, 6144>>(
+                 p, output, epilogue, stream);
+             return;
+         }
+@@ -105,7 +105,7 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
+         }
+         {
+             launch_nvfp4_a16_mma<
+-                Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>, 17408>>(
++                Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, 17408>>(
+                 p, output, epilogue, stream);
+             return;
+         }
+diff --git a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a16_mma.cu b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a16_mma.cu
+index 535cd2e..f69dbbd 100644
+--- a/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a16_mma.cu
++++ b/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a16_mma.cu
+@@ -60,7 +60,7 @@ void nvfp4_linear_swiglu_a16_mma_launch(const Tensor& x, const Weight& weight, T
+     } else if (x.ne[1] <= 96) {
+         launch.template operator()<Nvfp4A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>>();
+     } else {
+-        launch.template operator()<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>();
++        launch.template operator()<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>();
+     }
+ }
+ 
+diff --git a/src/runtime/engine/device_profiles.json b/src/runtime/engine/device_profiles.json
+index e183cc5..838fb27 100644
+--- a/src/runtime/engine/device_profiles.json
++++ b/src/runtime/engine/device_profiles.json
+@@ -59,12 +59,12 @@
+         "unified/q8_attn_input": [[1, ""], [3, "unified"]],
+         "unified/q8_linear_pair": [[4, "unified"]]
+      }},
+-    {"hardware_class": "nvidia-geforce-rtx-3090-ti-sm86", "multiprocessors": 84, "origin": "measured: RTX 3090 Ti NVFP4 fused-route crossovers, ninfer-calibrate 2026-10-17 (route catalog 16cbb21b509171c9); widths past 1024 stay on the unified routes the 1024 measurement extrapolates",
++    {"hardware_class": "nvidia-geforce-rtx-3090-ti-sm86", "multiprocessors": 84, "origin": "built in: RTX 3090 Ti NVFP4 int8-grouped prefill routes, 2026-10-13",
+      "routes": {
+-        "unified/nvfp4_attn_input": [[2, ""], [1048576, "unified"]],
+-        "unified/nvfp4_gdn_input": [[5, ""], [1048576, "unified"]],
+-        "unified/nvfp4_linear_add": [[1, ""], [2, "unified"], [5, ""], [1048576, "unified"]],
+-        "unified/nvfp4_linear_swiglu": [[3, ""], [4, "unified"], [5, ""], [16, "unified"]]
++        "unified/nvfp4_attn_input": [[127, ""], [1048576, "unified"]],
++        "unified/nvfp4_gdn_input": [[127, ""], [1048576, "unified"]],
++        "unified/nvfp4_linear_add": [[127, ""], [1048576, "unified"]],
++        "unified/nvfp4_linear_swiglu": [[127, ""], [1048576, "unified"]]
+      }},
+     {"hardware_class": "nvidia-geforce-rtx-4090-sm89", "multiprocessors": 128, "origin": "built in: RTX 4090 at 450 W, 2026-09-25; unified routes and two-stage GDN at 300 to 450 W, 2026-09-27",
+      "routes": {
+diff --git a/tests/ops/linear_swiglu/test_nvfp4.cpp b/tests/ops/linear_swiglu/test_nvfp4.cpp
+index a89e6fe..ac49b9b 100644
+--- a/tests/ops/linear_swiglu/test_nvfp4.cpp
++++ b/tests/ops/linear_swiglu/test_nvfp4.cpp
+@@ -196,12 +196,7 @@ int main() {
+         return 77;
+     }
+     try {
+-        // The A16 ladder stops at the width the fused wide MMA takes over from the SIMT
+-        // small-T band: 16|17 is the band boundary, and 128/256/512/1024/1025 carry the
+-        // wide route over whole tiles and the ragged width just past four of them. TODO.md
+-        // section 1 asks for exactly this re-add (the committed ladder stopped at 16, which
+-        // is how a route that cannot run on sm_86 at all once had a passing Op test).
+-        constexpr std::array<std::int32_t, 10> kA16Cases{1, 4, 8, 16, 17, 128, 256, 512, 1024, 1025};
++        constexpr std::array<std::int32_t, 4> kA16Cases{1, 4, 8, 16};
+         // 511 and 513 straddle the ragged floor: the first still reaches the composition, the
+         // second is the narrowest ragged width the fused route admits and leaves one real token
+         // in a third M tile. 767 leaves that tile all but full, and 1025 leaves one after four

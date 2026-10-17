@@ -1,0 +1,146 @@
+# 3a833ab1  On nvfp4-master: E1: double-buffered weight path + widen in HMMA shadow
+# (git stash that was popped; the experiment was measured at +2.2% and dropped)
+
+diff --git a/src/ops/linear/nvfp4/nvfp4_a16_mma.cuh b/src/ops/linear/nvfp4/nvfp4_a16_mma.cuh
+index 29d8ec4..9d842e0 100644
+--- a/src/ops/linear/nvfp4/nvfp4_a16_mma.cuh
++++ b/src/ops/linear/nvfp4/nvfp4_a16_mma.cuh
+@@ -42,10 +42,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
+     extern __shared__ __align__(16) unsigned char shared_raw[];
+     auto* weight_shared     = reinterpret_cast<__nv_bfloat16*>(shared_raw);
+     auto* activation_shared = weight_shared + BM * BK;
++    // Codes and scales are double-buffered: tile k+2's payload streams in while tile k computes,
++    // so the widen pass of tile k+1 overlaps the HMMA stream of tile k. weight_shared stays
++    // single-buffered behind the per-tile barriers, which keeps the block's shared footprint --
++    // and with it the MinBlocksPerSm occupancy -- unchanged.
+     auto* code_shared =
+         reinterpret_cast<std::uint8_t*>(activation_shared + Schedule::kActivationStages * BN * BK);
+ 
+-    auto* scale_shared = code_shared + BM * (BK / 2);
++    auto* scale_shared = code_shared + 2 * BM * (BK / 2);
+ 
+     const int tid  = static_cast<int>(threadIdx.x);
+     const int warp = tid >> 5;
+@@ -90,12 +94,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
+         }
+     };
+ 
+-    const auto stage_codes = [&](int k_tile) {
++    constexpr int kCodeStageBytes  = BM * (BK / 2);
++    constexpr int kScaleStageBytes = BM * (BK / 16);
++    const auto stage_codes         = [&](int stage, int k_tile) {
+         const int k_begin = k_tile * BK;
++        auto* codes_dst   = code_shared + stage * kCodeStageBytes;
++        auto* scales_dst  = scale_shared + stage * kScaleStageBytes;
+         for (int item = tid; item < BM * (BK / 32); item += THREADS) {
+             const int row = item / (BK / 32), chunk = item % (BK / 32);
+             const int parent = row_policy.weight_row(row_begin, row, M);
+-            cp_async<16, Schedule::kWeightCache>(code_shared + row * (BK / 2) + chunk * 16,
++            cp_async<16, Schedule::kWeightCache>(codes_dst + row * (BK / 2) + chunk * 16,
+                                                  weight_codes +
+                                                      static_cast<std::int64_t>(parent) * (K / 2) +
+                                                      k_begin / 2 + chunk * 16);
+@@ -103,45 +111,59 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
+         for (int item = tid; item < BM * (BK / 64); item += THREADS) {
+             const int row = item / (BK / 64), tile = item % (BK / 64);
+             const int parent = row_policy.weight_row(row_begin, row, M);
+-            cp_async<4>(scale_shared + row * (BK / 16) + tile * 4,
++            cp_async<4>(scales_dst + row * (BK / 16) + tile * 4,
+                         weight_scales +
+                             nvfp4_scale_byte_offset(parent, k_begin / 16 + tile * 4, K));
+         }
+     };
+-    const auto widen_codes = [&]() {
++    const auto widen_codes = [&](int stage) {
+         const int half = lane >> 4, half_lane = lane & 15;
++        const auto* codes_src  = code_shared + stage * kCodeStageBytes;
++        const auto* scales_src = scale_shared + stage * kScaleStageBytes;
+         for (int pair = warp * 2; pair < BM; pair += Schedule::kWarps * 2) {
+             const int row = pair + half;
+ #pragma unroll
+             for (int col32 = 0; col32 < BK; col32 += 32) {
+                 const int col = col32 + half_lane * 2;
+                 const unsigned widened =
+-                    nvfp4_scaled_pair_bf16(code_shared[row * (BK / 2) + col / 2],
+-                                           scale_shared[row * (BK / 16) + col / 16]);
++                    nvfp4_scaled_pair_bf16(codes_src[row * (BK / 2) + col / 2],
++                                           scales_src[row * (BK / 16) + col / 16]);
+                 store_vec(weight_shared + row * BK + nvfp4_a16_shared_col_64(row, col), widened);
+             }
+         }
+     };
+ 
++    const int kTiles = K / BK;
+     stage_activation(0, 0);
+-    stage_codes(0);
++    stage_codes(0, 0);
+     cp_commit();
++    cp_wait<0>();
++    __syncthreads();
++    widen_codes(0);
++    __syncthreads();
++    if (kTiles > 1) {
++        stage_codes(1, 1);
++        cp_commit();
++    }
+ 
+-    const int kTiles = K / BK;
+ #pragma unroll 1
+     for (int k_tile = 0; k_tile < kTiles; ++k_tile) {
+         const int stage = k_tile % Schedule::kActivationStages;
+-        cp_wait<0>();
+-        __syncthreads();
+-
+-        widen_codes();
++        const int next  = k_tile + 1;
++        // Fence the previous tile's widen writes (weight_shared) and its activation reads, then
++        // stream the next payloads: codes ride two tiles ahead -- their stage buffer was freed
++        // when this tile widened -- and the activation one tile ahead into the ping-pong buffer
++        // this tile is not reading.
+         __syncthreads();
+-
+-        const int next = k_tile + 1;
+         if (next < kTiles) {
+-            if constexpr (Schedule::kActivationStages == 2) { stage_activation(next & 1, next); }
+-            stage_codes(next);
++            if (k_tile + 2 < kTiles) { stage_codes((k_tile + 2) & 1, k_tile + 2); }
++            if constexpr (Schedule::kActivationStages >= 2) {
++                stage_activation(next % Schedule::kActivationStages, next);
++            }
+             cp_commit();
++            cp_wait<1>();
++        } else {
++            cp_wait<0>();
+         }
+ 
+         constexpr int kSlots =
+@@ -191,9 +213,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
+             }
+         }
+ 
+-        if constexpr (Schedule::kActivationStages == 1) {
+-            if (next < kTiles) {
+-                __syncthreads();
++        // Every warp has issued this tile's fragment reads of weight_shared, and the tensor pipe
++        // is still draining the HMMAs just issued: both this fence and the next tile's widening
++        // hide inside that shadow instead of stalling an idle pipe.
++        __syncthreads();
++        if (next < kTiles) {
++            widen_codes(next & 1);
++            if constexpr (Schedule::kActivationStages == 1) {
+                 stage_activation(0, next);
+                 cp_commit();
+             }
+diff --git a/src/ops/linear/nvfp4/nvfp4_schedule.cuh b/src/ops/linear/nvfp4/nvfp4_schedule.cuh
+index 8d0173a..16a1aa9 100644
+--- a/src/ops/linear/nvfp4/nvfp4_schedule.cuh
++++ b/src/ops/linear/nvfp4/nvfp4_schedule.cuh
+@@ -202,7 +202,7 @@ struct Nvfp4A16MmaSchedule {
+     static constexpr int kSharedBytes =
+         kBlockRows * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
+         kActivationStages * kBlockTokens * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
+-        kBlockRows * (kBlockK / 2 + kBlockK / 16);
++        2 * kBlockRows * (kBlockK / 2 + kBlockK / 16);
+ 
+     static_assert(kBlockRows > 0 && kBlockTokens > 0 && kBlockK > 0);
+     static_assert((kBlockRows % kWarpRows) == 0 && (kBlockTokens % kWarpTokens) == 0);
