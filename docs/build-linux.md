@@ -126,33 +126,37 @@ Device route profiles of the TITAN RTX and the other Turing cards the
 start (see [device profiles](device-profiles.md)). What runs and how fast is in the
 [TITAN RTX measurements](performance/titan-rtx-2026-10.md).
 
-### A Turing card with RTX 30 series cards (`75;86`)
+## Cards of several architectures in one pipeline
 
-`-DCMAKE_CUDA_ARCHITECTURES="75;86"` builds one binary with device code for both, so a layer
-pipeline (`--devices`, `--stage-layers`) can span a TITAN RTX and RTX 30 series cards. It is the
-only multi-architecture value configure accepts:
+`CMAKE_CUDA_ARCHITECTURES` may list several architectures. The binary then carries device code for
+each, so a layer pipeline (`--devices`, `--stage-layers`) can span cards of different
+architectures: for example a Tesla V100, a TITAN RTX and RTX 30 or 40 series cards with CUDA 12.8,
+or a TITAN RTX, RTX 30 and 40 series cards and an RTX 50 series card with CUDA 13.1:
 
 ```bash
-cmake -S . -B build-7586 -G Ninja \
+cmake -S . -B build-cu128-multi -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
   -DCMAKE_CUDA_HOST_COMPILER="$CUDAHOSTCXX" \
-  "-DCMAKE_CUDA_ARCHITECTURES=75;86" \
+  "-DCMAKE_CUDA_ARCHITECTURES=70;75;80;86;89" \
   -DNINFER_BUILD_APPS=ON
 
-cmake --build build-7586 --parallel
+cmake --build build-cu128-multi --parallel
 ```
 
-- The host launches every kernel with the Turing shapes (64 KiB of shared memory, the Turing
-  kernel variants) on every card; the Ampere cards run them with the Ampere instructions (BF16 and
-  TF32 MMA, `cp.async`), the Turing card with its own forms.
-- On one card the binary gives the same tokens as the single-architecture build of that card.
-- Its route catalog differs from both, so a built-in profile does not apply: each card calibrates
-  at first start.
-- Each card computes its own layers with its own arithmetic (Turing attention rounds BF16 values
-  and probabilities to FP16), so greedy output across a mixed pipeline may diverge from either
-  card alone after some tokens.
-- A `75` or `86` build still refuses ranks of different compute capability.
+- `70` needs CUDA 12.x and `120a` needs CUDA 13.1 or newer, so no build holds both.
+- Each card runs the code of the newest listed architecture it can run, with the kernels, routes,
+  route catalog and built-in device profile of its own single-architecture build
+  ([code tiers](maintainer/build-system.md#code-tiers)). On one card the binary gives the same
+  tokens as that card's own build.
+- Each card computes its own layers with its own arithmetic (for example, Turing attention rounds
+  BF16 values and probabilities to FP16), so greedy output across a mixed pipeline may diverge from
+  any one card's after some tokens.
+- Compile time and binary size grow with the number of architectures.
+
+A build of one architecture also pipelines cards of different compute capabilities when its code
+runs on each of them, for example an `86` build across RTX 30 and RTX 40 series cards.
 
 ## Tesla V100 (sm_70)
 

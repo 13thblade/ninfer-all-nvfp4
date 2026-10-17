@@ -91,7 +91,7 @@ __device__ __forceinline__ void q5_small_t_decode_eight(unsigned word, unsigned 
     }
 }
 
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_FORMS)
 // q5_small_t_decode_eight as FP16 pairs, for Turing's FP16 MMA: v in the mantissa of FP16 1024.0
 // less 1040, the same codes, formed by native FP16 arithmetic where Turing has no BF16 arithmetic.
 __device__ __forceinline__ void q5_small_t_decode_eight_f16(unsigned word, unsigned high,

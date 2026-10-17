@@ -54,7 +54,7 @@ __device__ __forceinline__ unsigned q8_ksplit_bf16_pair_from_s8(unsigned values)
     return result.bits;
 }
 
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_FORMS)
 // Turing has neither BF16 MMA nor BF16 arithmetic: the pair above runs __hsub2_rn in software and
 // mma_bf16 converts all six operands on every call. The codes are integers, exact in FP16 as in
 // BF16, so a Turing build forms the FP16 pair directly: code + 128 in the mantissa of 1024.0, then
