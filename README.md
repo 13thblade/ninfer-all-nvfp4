@@ -321,7 +321,8 @@ Prefill of a 4,463-token prompt, in tok/s:
   operation and width: built in for the cards in [supported GPUs](#supported-gpus), measured once
   at first start on any other ([device profiles](docs/device-profiles.md)).
 - **Pipeline stages.** `--devices 0,1,...` splits the layers over up to eight GPUs on Linux, each
-  stage owning its weights, KV and state ([pipeline stages](docs/maintainer/pipeline-stages.md)).
+  stage owning its weights, KV and state; the cards may differ where the build runs on each, such as
+  RTX 30 with RTX 40 cards on the `86` build ([pipeline stages](docs/maintainer/pipeline-stages.md)).
 - FP8 A8 and NVFP4 W4A4 tensor-core routes on every `120a` build, an FP4 tensor-core prompt kernel
   for an NVFP4 KV cache, and programmatic dependent launches on Blackwell.
 

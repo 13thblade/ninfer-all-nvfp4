@@ -68,7 +68,7 @@ ninfer_add_test(ninfer_disk_kv_bridge_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_disk_kv_bridge.cpp"
   LIBRARIES ninfer_core)
 
-ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
+ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cu"
   LIBRARIES ninfer_core)
 
 set_tests_properties(ninfer_device_test PROPERTIES

@@ -115,8 +115,8 @@ struct DeviceContext {
 
     explicit DeviceContext(int device_id = 0);
     // One entry keeps the single-device route. Several entries open one rank per entry for
-    // model-parallel execution, up to kMaxRanks: matching compute capability is required across
-    // all of them, before any weight is uploaded. Peer access is only probed and recorded as a
+    // model-parallel execution, up to kMaxRanks. Every device must run this build's code, checked
+    // before any weight is uploaded; their compute capabilities may differ. Peer access is only probed and recorded as a
     // capability -- it is not required, since transfers stage through pinned host memory when it is
     // unavailable (see StageLink).
     explicit DeviceContext(std::span<const int> device_ids);

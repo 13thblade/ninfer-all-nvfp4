@@ -26,6 +26,11 @@ add_library(ninfer_core STATIC
   device_snapshot.cu
 )
 ninfer_internal_includes(ninfer_core)
+# The architectures this build carries, for the message that refuses a device it cannot run. A
+# list's semicolons would split the property into several definitions.
+string(REPLACE ";" " " _ninfer_cuda_architectures "${CMAKE_CUDA_ARCHITECTURES}")
+set_source_files_properties(device.cu PROPERTIES
+  COMPILE_DEFINITIONS "NINFER_CUDA_ARCHITECTURES=\"${_ninfer_cuda_architectures}\"")
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads CUDA::cuda_driver)
 # gpu_clock_floor.cpp loads NVML at run time.
