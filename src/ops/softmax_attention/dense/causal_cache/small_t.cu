@@ -405,14 +405,14 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
         const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, kDChunk),
                           invocation.width * invocation.batch_size);
         causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
-                                                        Offset><<<grid, kReduceBlock, 0, stream>>>(
+                                                      Offset><<<grid, kReduceBlock, 0, stream>>>(
             static_cast<const float*>(partial_acc.data), static_cast<const float*>(partial_m.data),
             static_cast<const float*>(partial_l.data), static_cast<const std::int32_t*>(pos.data),
             invocation.valid_columns
-                  ? static_cast<const std::int32_t*>(invocation.valid_columns->data)
-                  : nullptr,
+                ? static_cast<const std::int32_t*>(invocation.valid_columns->data)
+                : nullptr,
             invocation.width, invocation.full_width, invocation.column_begin, invocation.batch_size,
-            splits, Int8 ? wave_splits : 0, static_cast<__nv_bfloat16*>(out.data),
+            logical_capacity, splits, Int8 ? wave_splits : 0, static_cast<__nv_bfloat16*>(out.data),
             static_cast<const __nv_bfloat16*>(gate));
     };
     const auto launch_profile = [&]<bool Int8, bool MultiBatch, bool Masked>() {

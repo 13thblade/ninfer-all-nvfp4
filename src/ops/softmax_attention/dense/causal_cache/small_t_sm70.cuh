@@ -1109,7 +1109,8 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         return;
     }
 
-    const int window = last_pos + 1;
+    const int live_end = last_pos + 1;
+    const int window   = causal_small_t_tile_window(first_pos, tokens, logical_capacity);
     const int active_split_count =
         causal_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
@@ -1125,6 +1126,9 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         write_neutral();
         return;
     }
+    // Keys at or past the live end are beyond every live column: none is loaded.
+    const int load_end = split_end < live_end ? split_end : live_end;
+
     const int first_tile    = (split_start / Bc) * Bc;
     const int key_blocks    = div_up(split_end - first_tile, Bc);
     const int first_page    = first_tile >> kPagedKVPageShift;
@@ -1181,7 +1185,7 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         q,          tokens,       row_count, query_beyond};
     sm70_attention::attend<Geometry, TokenTile>(
         rows, q_s, p_s, stat_m, stat_l, combined, tokens, row_count, kv_head, split, split_start,
-        split_end, first_tile, key_blocks, pos, scale, partial_acc, partial_m, partial_l);
+        load_end, first_tile, key_blocks, pos, scale, partial_acc, partial_m, partial_l);
 }
 
 // The INT8-family caches (rotated keys in any key coding, INT8 or packed int4 values), launched by
@@ -1289,7 +1293,8 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         return;
     }
 
-    const int window = last_pos + 1;
+    const int live_end = last_pos + 1;
+    const int window   = causal_small_t_tile_window(first_pos, TokenTile, logical_capacity);
     const int active_split_count =
         causal_small_t_active_splits<Geometry, true>(window, split_count, TokenTile, wave_splits);
     if (split >= active_split_count) { return; }
@@ -1305,6 +1310,9 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         write_neutral();
         return;
     }
+    // Keys at or past the live end are beyond every live column: none is loaded.
+    const int load_end = split_end < live_end ? split_end : live_end;
+
     const int first_tile    = (split_start / Bc) * Bc;
     const int key_blocks    = div_up(split_end - first_tile, Bc);
     const int first_page    = first_tile >> kPagedKVPageShift;
@@ -1446,7 +1454,7 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         kv_head};
     sm70_attention::attend<Geometry, TokenTile>(
         rows, q_s, p_s, stat_m, stat_l, combined, TokenTile, RowCount, kv_head, split, split_start,
-        split_end, first_tile, key_blocks, pos, scale, partial_acc, partial_m, partial_l);
+        load_end, first_tile, key_blocks, pos, scale, partial_acc, partial_m, partial_l);
 }
 
 // The FP8 and NVFP4 caches (fp8: FP8 keys and values; nvfp4: NVFP4 keys and values; k8v4: FP8
@@ -1557,7 +1565,8 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         return;
     }
 
-    const int window = last_pos + 1;
+    const int live_end = last_pos + 1;
+    const int window   = causal_small_t_tile_window(first_pos, TokenTile, logical_capacity);
     const int active_split_count =
         causal_small_t_quantized_active_splits<Geometry>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
@@ -1581,6 +1590,9 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         write_neutral();
         return;
     }
+    // Keys at or past the live end are beyond every live column: none is loaded.
+    const int load_end = split_end < live_end ? split_end : live_end;
+
     const int first_tile    = (split_start / Bc) * Bc;
     const int key_blocks    = div_up(split_end - first_tile, Bc);
     const int first_page    = first_tile >> kPagedKVPageShift;
@@ -1699,9 +1711,9 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
             if (key_blocks <= 2) {
                 const sm70_attention::Nvfp4ScalarRows<Geometry> scalar{rows};
                 sm70_attention::attend<Geometry, TokenTile>(
-                    scalar, q_s, p_s, stat_m, stat_l, combined, TokenTile, RowCount, kv_head,
-                    split, split_start, split_end, first_tile, key_blocks, positions,
-                    attention_scale, partial_acc, partial_m, partial_l);
+                    scalar, q_s, p_s, stat_m, stat_l, combined, TokenTile, RowCount, kv_head, split,
+                    split_start, load_end, first_tile, key_blocks, positions, attention_scale,
+                    partial_acc, partial_m, partial_l);
                 return;
             }
         }
@@ -1712,14 +1724,14 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
                 cache_k, cache_v, cache_k_scale, cache_v_scale, physical_pages_s,
                 block_table, first_page, staged_pages, kv_head};
             sm70_attention::attend<Geometry, TokenTile>(
-                limited, q_s, p_s, stat_m, stat_l, combined, TokenTile, RowCount, kv_head,
-                split, split_start, split_end, first_tile, key_blocks, positions,
-                attention_scale, partial_acc, partial_m, partial_l);
+                limited, q_s, p_s, stat_m, stat_l, combined, TokenTile, RowCount, kv_head, split,
+                split_start, load_end, first_tile, key_blocks, positions, attention_scale,
+                partial_acc, partial_m, partial_l);
             return;
         }
     }
     sm70_attention::attend<Geometry, TokenTile>(rows, q_s, p_s, stat_m, stat_l, combined, TokenTile,
-                                                RowCount, kv_head, split, split_start, split_end,
+                                                RowCount, kv_head, split, split_start, load_end,
                                                 first_tile, key_blocks, positions, attention_scale,
                                                 partial_acc, partial_m, partial_l);
 }

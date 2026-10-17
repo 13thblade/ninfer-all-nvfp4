@@ -157,7 +157,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         return;
     }
 
-    const int window = last_pos + 1;
+    const int live_end = last_pos + 1;
+    const int window   = causal_small_t_tile_window(first_pos, TokenTile, logical_capacity);
     const int active_split_count =
         causal_small_t_quantized_active_splits<Geometry>(window, split_count, TokenTile);
     if (split >= active_split_count) return;
@@ -181,6 +182,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         write_neutral();
         return;
     }
+    // Keys at or past the live end are beyond every live column: none is loaded.
+    const int load_end = split_end < live_end ? split_end : live_end;
+
     const int first_tile = (split_start / Bc) * Bc;
     const int key_blocks = div_up(split_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
@@ -302,7 +306,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key             = tile_k0 + key_l;
             std::uint8_t* v_scale_dst = v_scale_s + key_l * kKVCacheNvfp4Groups;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t k_scale_offset = kv_cache_fp8_scale_index<Geometry>(
                     physical_page, kv_head, key & kPagedKVPageMask);
                 const std::int64_t v_scale_offset = kv_cache_nvfp4_scale_index<Geometry>(
@@ -321,7 +325,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int d         = dc * 16;
             const int key       = tile_k0 + key_l;
             std::uint8_t* k_dst = &k_fp8[key_l * D + d];
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t code_offset = kv_cache_fp8_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 cp_async<16, Cache::cg>(k_dst, &cache_k[code_offset]);
@@ -336,7 +340,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int d         = dc * 32;
             const int key       = tile_k0 + key_l;
             std::uint8_t* v_dst = &v_nvfp4[key_l * (D / 2) + d / 2];
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 cp_async<16, Cache::cg>(v_dst, &cache_v[code_offset]);
@@ -482,7 +486,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int d     = dc * 8;
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + causal_small_t_tc_swz(key_l, d)];
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     store_vec(dst,
                               kv_cache_nvfp4_dequant_f16x8(
                                   &v_nvfp4[key_l * (D / 2) + d / 2],
@@ -503,7 +507,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int d     = dc * 8;
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + causal_small_t_tc_swz(key_l, d)];
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     store_vec(dst,
                               kv_cache_nvfp4_dequant_f16x8(
                                   &v_nvfp4[key_l * (D / 2) + d / 2],
@@ -623,7 +627,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
     const float* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t visible_capacity, std::int32_t split_count, __nv_bfloat16* out) {
     const int q_head      = static_cast<int>(blockIdx.x);
     const int flat_column = static_cast<int>(blockIdx.y);
     int batch             = 0;
@@ -639,7 +643,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
     }
     if constexpr (Offset) positions += column_begin;
     if constexpr (MultiBatch) positions += static_cast<std::int64_t>(batch) * full_width;
-    const int window  = positions[tokens - 1] + 1;
+    const int window  = causal_small_t_tile_window(positions[0], tokens, visible_capacity);
     int output_column = token;
     if constexpr (Offset) output_column += column_begin;
     if constexpr (MultiBatch) output_column += batch * full_width;

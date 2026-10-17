@@ -102,8 +102,9 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
 
 template <typename Geometry, bool MultiBatch, bool Masked>
 void launch_k8v4_reduce(const Tensor& positions, const CausalSmallTInvocation& invocation,
-                        std::int32_t splits, const Tensor& partial_acc, const Tensor& partial_m,
-                        const Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+                        std::int32_t logical_capacity, std::int32_t splits,
+                        const Tensor& partial_acc, const Tensor& partial_m, const Tensor& partial_l,
+                        Tensor& out, cudaStream_t stream) {
     constexpr int Block = 256;
     const dim3 grid(Geometry::QHeads, invocation.width * invocation.batch_size);
     const auto launch = [&]<bool Offset>() {
@@ -117,7 +118,8 @@ void launch_k8v4_reduce(const Tensor& positions, const CausalSmallTInvocation& i
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.valid_columns->data),
                 invocation.width, invocation.full_width, invocation.column_begin,
-                invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
+                invocation.batch_size, logical_capacity, splits,
+                static_cast<__nv_bfloat16*>(out.data));
     };
     if (invocation.column_begin == 0) {
         launch.template operator()<false>();
@@ -197,18 +199,20 @@ void causal_attention_small_t_k8v4_launch_for(const Tensor& q, CacheInput input,
     const bool masked = invocation.valid_columns != nullptr;
     if (invocation.batch_size == 1) {
         if (masked) {
-            launch_k8v4_reduce<Geometry, false, true>(positions, invocation, splits, partial_acc,
-                                                      partial_m, partial_l, out, stream);
+            launch_k8v4_reduce<Geometry, false, true>(positions, invocation, logical_capacity,
+                                                      splits, partial_acc, partial_m, partial_l,
+                                                      out, stream);
         } else {
-            launch_k8v4_reduce<Geometry, false, false>(positions, invocation, splits, partial_acc,
-                                                       partial_m, partial_l, out, stream);
+            launch_k8v4_reduce<Geometry, false, false>(positions, invocation, logical_capacity,
+                                                       splits, partial_acc, partial_m, partial_l,
+                                                       out, stream);
         }
     } else if (masked) {
-        launch_k8v4_reduce<Geometry, true, true>(positions, invocation, splits, partial_acc,
-                                                 partial_m, partial_l, out, stream);
+        launch_k8v4_reduce<Geometry, true, true>(positions, invocation, logical_capacity, splits,
+                                                 partial_acc, partial_m, partial_l, out, stream);
     } else {
-        launch_k8v4_reduce<Geometry, true, false>(positions, invocation, splits, partial_acc,
-                                                  partial_m, partial_l, out, stream);
+        launch_k8v4_reduce<Geometry, true, false>(positions, invocation, logical_capacity, splits,
+                                                  partial_acc, partial_m, partial_l, out, stream);
     }
 }
 

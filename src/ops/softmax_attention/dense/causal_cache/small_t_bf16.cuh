@@ -17,7 +17,8 @@ namespace ninfer::ops {
 
 // One CTA's share of a BF16 small-T partial launch, as this file's kernel and a Turing build's
 // (small_t_bf16_sm75.cuh) take it: the inputs advanced to its column and batch row, and the keys
-// [split_start, split_end) of its split, in key_blocks tiles of Bc keys from first_tile.
+// [split_start, split_end) of its split, in key_blocks tiles of Bc keys from first_tile. Keys at or
+// past load_end lie beyond the last live column: the sweep reads none of them.
 template <class CacheInput>
 struct CausalSmallTBf16Split {
     const __nv_bfloat16* q;
@@ -35,6 +36,7 @@ struct CausalSmallTBf16Split {
     int first_pos;
     int split_start;
     int split_end;
+    int load_end;
     int first_tile;
     int key_blocks;
 };
@@ -126,7 +128,8 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
         return;
     }
 
-    const int window = last_pos + 1;
+    const int live_end = last_pos + 1;
+    const int window   = causal_small_t_tile_window(first_pos, tokens, logical_capacity);
     const int active_split_count =
         causal_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
@@ -167,7 +170,8 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
     sweep(CausalSmallTBf16Split<CacheInput>{q, input, pos, block_table, partial_acc, partial_m,
                                             partial_l, kv_head, split, tokens, row_count,
                                             valid_tokens, first_pos, split_start, split_end,
-                                            first_tile, div_up(split_end - first_tile, Bc)});
+                                            split_end < live_end ? split_end : live_end, first_tile,
+                                            div_up(split_end - first_tile, Bc)});
 }
 
 // The split-local partials of the warp's rows: each row's running max and sum (by the quad's
@@ -269,6 +273,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
             const int first_pos             = sp.first_pos;
             const int split_start           = sp.split_start;
             const int split_end             = sp.split_end;
+            const int load_end              = sp.load_end;
             const int first_tile            = sp.first_tile;
             const int key_blocks            = sp.key_blocks;
             q                               = sp.q;
@@ -345,7 +350,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                     const int key        = k0 + key_l;
                     __nv_bfloat16* k_dst = &k_s[key_l * D + causal_small_t_tc_swz(key_l, d)];
                     __nv_bfloat16* v_dst = &v_s[key_l * D + causal_small_t_tc_swz(key_l, d)];
-                    if (key >= split_start && key < split_end) {
+                    if (key >= split_start && key < load_end) {
                         if constexpr (CacheInput::writes_cache) {
                             const int new_token = key - first_pos;
                             const bool from_new =
