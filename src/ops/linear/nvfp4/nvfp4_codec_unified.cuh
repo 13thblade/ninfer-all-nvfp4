@@ -96,6 +96,47 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
 #endif
 }
 
+// Eight elements at once: four code bytes under the one scale byte they share. The widening pass
+// reads a 32-bit code word and one scale byte per sixteen columns anyway, so the scale expansion
+// and its table lookup are hoisted out of four pairs here. Each pair still does exactly the
+// arithmetic nvfp4_scaled_pair_bf16 does on the same inputs -- same inputs, same operations, same
+// rounding -- so the output is bit-identical; the saving is the redundancy, not a change of math.
+__device__ __forceinline__ void nvfp4_scaled_quad_bf16(unsigned codes, std::uint8_t scale,
+                                                       unsigned out[4]) {
+#if NINFER_NATIVE_FP8_FP4_PAIR_CVT
+    const auto scale_pair = static_cast<std::uint16_t>(scale | (static_cast<unsigned>(scale) << 8));
+    unsigned multiplier;
+    asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(multiplier) : "h"(scale_pair));
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        unsigned values, result;
+        const unsigned code = (codes >> (8 * i)) & 0xFFu;
+        asm("{\n"
+            ".reg .b8 packed;\n"
+            "mov.b32 {packed, _, _, _}, %1;\n"
+            "cvt.rn.bf16x2.e2m1x2 %0, packed;\n"
+            "}\n"
+            : "=r"(values)
+            : "r"(code));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(result) : "r"(values), "r"(multiplier));
+        out[i] = result;
+    }
+#else
+    const float multiplier = kNvfp4E4M3ScaleA16[scale] * 32768.0F;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 values =
+            decode_nvfp4_e2m1x2_raw(static_cast<std::uint8_t>((codes >> (8 * i)) & 0xFFu));
+        union {
+            __nv_bfloat162 pair;
+            unsigned bits;
+        } result;
+        result.pair = __floats2bfloat162_rn(values.x * multiplier, values.y * multiplier);
+        out[i] = result.bits;
+    }
+#endif
+}
+
 __device__ __forceinline__ int nvfp4_a16_shared_col_64(int row, int col) {
     return col ^ ((row & 7) << 3);
 }
