@@ -1047,20 +1047,30 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     // runs only a build for it, whose kernels emulate the Ampere warp primitives. 7.5 needs the
     // Turing tier of a 75 build (NINFER_SM75), whose kernels avoid the sm_80 instructions and fit
     // its 64 KiB of shared memory.
-    const int capability = device.compute_capability();
+    // Every rank is checked: pipeline stages may mix capabilities (core/device.cu).
 #if defined(NINFER_SM75)
     constexpr bool kTuringBuild = true;
 #else
     constexpr bool kTuringBuild = false;
 #endif
-    if (!(capability == 70 || capability == 80 || capability == 86 || capability == 89 ||
-          capability == 120 || (capability == 75 && kTuringBuild))) {
-        throw std::invalid_argument(
+    for (std::size_t rank = 0; rank < device.size(); ++rank) {
+        const RankContext& context = device.rank(rank);
+        const int capability       = context.compute_capability();
+        if (capability == 70 || capability == 80 || capability == 86 || capability == 89 ||
+            capability == 120 || (capability == 75 && kTuringBuild)) {
+            continue;
+        }
+        std::string message =
             kTuringBuild
                 ? "Qwen3.5 family runtime requires compute capability 7.0, 7.5, 8.0, 8.6, 8.9 or "
                   "12.0"
                 : "Qwen3.5 family runtime requires compute capability 7.0, 8.0, 8.6, 8.9 or 12.0 "
-                  "(7.5 needs a CMAKE_CUDA_ARCHITECTURES=75 build)");
+                  "(7.5 needs a CMAKE_CUDA_ARCHITECTURES=75 build)";
+        if (device.model_parallel()) {
+            message += "; CUDA device " + std::to_string(context.device) + " has " +
+                       std::to_string(capability / 10) + "." + std::to_string(capability % 10);
+        }
+        throw std::invalid_argument(message);
     }
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&

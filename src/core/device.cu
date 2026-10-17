@@ -39,6 +39,15 @@ std::string cuda_error_message(const char* prefix, cudaError_t err) {
     return std::string(prefix) + ": " + cudaGetErrorName(err) + ": " + cudaGetErrorString(err);
 }
 
+#if !defined(NINFER_CUDA_ARCHITECTURES)
+#    define NINFER_CUDA_ARCHITECTURES "unknown"
+#endif
+
+// Loaded on a device only where this build has code that runs there: its own architecture's
+// machine code, which also runs on later minor versions of that major (sm_86 code on 8.9, sm_80
+// code on 8.6 and 8.9), or its PTX compiled for a newer device.
+__global__ void kernel_image_probe() {}
+
 void log_cuda_error(const char* op, cudaError_t err) noexcept {
     if (err != cudaSuccess) {
         std::fprintf(stderr, "CUDA cleanup failed during %s: %s: %s\n", op, cudaGetErrorName(err),
@@ -168,12 +177,23 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
             }
         }
 
-        // Every rank must share one compute capability, so kernels built for it run on all of them.
-        for (std::size_t rank = 1; rank < endpoints_.size(); ++rank) {
-            if (endpoints_[rank].props.major != endpoints_[0].props.major ||
-                endpoints_[rank].props.minor != endpoints_[0].props.minor) {
+        // Every rank must run this build's code. Ranks may differ in compute capability as long as
+        // each does (an sm_86 build: RTX 30 and RTX 40 cards; sm_80: A100 with either): every
+        // rank then runs the code it would run alone, with its own route profile.
+        for (RankContext& endpoint : endpoints_) {
+            err = cudaSetDevice(endpoint.device);
+            if (err != cudaSuccess) {
+                throw std::runtime_error(cuda_error_message("cudaSetDevice failed", err));
+            }
+            cudaFuncAttributes attributes{};
+            err = cudaFuncGetAttributes(&attributes, kernel_image_probe);
+            if (err != cudaSuccess) {
+                (void)cudaGetLastError();
                 throw std::invalid_argument(
-                    "model-parallel CUDA devices must have the same compute capability");
+                    "CUDA device " + std::to_string(endpoint.device) + " (" + endpoint.props.name +
+                    ", compute capability " + std::to_string(endpoint.props.major) + "." +
+                    std::to_string(endpoint.props.minor) + ") cannot run this build, compiled for "
+                    "CUDA architectures " NINFER_CUDA_ARCHITECTURES ": " + cudaGetErrorName(err));
             }
         }
 

@@ -19,6 +19,13 @@ layer.
 stage path on a single card and is accepted everywhere, which is how the path is tested without a
 second GPU. Distinct ids are refused on Windows.
 
+**The cards may differ.** Every listed device must run the build's code, which `DeviceContext`
+(`core/device.cu`) checks before any weight is uploaded by loading a kernel on each, and the model
+family checks each device's compute capability. An `86` build therefore pipelines RTX 30 with RTX
+40 cards, and an `80` build, whose sm_80 code also runs on 8.6 and 8.9, an A100 with either. Each
+rank runs the code it would run alone and installs the route profile of its own card. The
+context-cost model of the prefix cache is the first device's.
+
 ## How it works
 
 - **`StagePlan`** (`core/stage_plan.h`) says which contiguous layers each stage owns. `--stage-layers
