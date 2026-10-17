@@ -3737,6 +3737,11 @@ void Executor::bind_cancellation(const std::atomic<bool>* cancelled) noexcept {
     if (!cancelled && impl_->hybrid) { try { impl_->hybrid->finish(); } catch (...) {} }
     impl_->cancelled = cancelled;
 }
+
+void Executor::raise_service_failure() {
+    if (impl_->misses) { impl_->misses->raise_failure(); }
+}
+
 void Executor::abort(std::uint32_t sequence) {
     if (impl_->table) { impl_->table->wait(); }
     impl_->rows_waited = true;

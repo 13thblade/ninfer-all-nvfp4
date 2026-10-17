@@ -3,9 +3,11 @@
 // straddle the boundary between two files, whatever was evicted to make room, and every down matrix
 // is followed by zero bytes even where a larger down of another layer was before (the expert matrix
 // kernel reads past a down row's end); a call that routes to more experts than the cache holds is
-// refused; and experts already resident are not read again.
+// refused; experts already resident are not read again; and a read that fails raises FileReadError
+// and leaves no slot taken for an expert it did not finish reading.
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/file_read_error.h"
 #include "models/qwen4_exp/expert_stream.h"
 
 #include <cuda_runtime.h>
@@ -150,6 +152,24 @@ int run() {
         stream.prepare(1, too_many);
     } catch (const std::runtime_error&) { refused = true; }
     require(refused, "a call that needs more experts than slots is refused");
+#ifndef _WIN32
+    // Layer 1's downs past expert 20 live in the last file. Cut short, it fails a call to experts
+    // whose gates and ups read fine; once whole again, the same call reads every byte as stored.
+    std::filesystem::resize_file(paths[2], 0);
+    bool failed = false;
+    try {
+        const std::vector<std::int32_t> past_cut{25, 26, 27};
+        stream.prepare(1, past_cut);
+    } catch (const FileReadError&) { failed = true; }
+    require(failed, "a failed read raises FileReadError");
+    {
+        std::fstream out(paths[2], std::ios::binary | std::ios::in | std::ios::out);
+        out.write(reinterpret_cast<const char*>(file_bytes.data() + cuts[1]),
+                  static_cast<std::streamsize>(cuts[2] - cuts[1]));
+    }
+    check(1, {25, 26, 27}, "after a failed read");
+    check(0, {3, 7, 12}, "layer 0 after a failed read");
+#endif
     owner.reset();
     for (const auto& path : paths) { std::filesystem::remove(path); }
     return 0;

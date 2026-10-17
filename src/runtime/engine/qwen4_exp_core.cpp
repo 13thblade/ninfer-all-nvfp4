@@ -3,6 +3,7 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/file_read_error.h"
 #include "core/startup.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/vision_control.h"
@@ -720,6 +721,35 @@ struct Qwen4ExpCore::Impl {
                            [](const Slot& slot) { return slot.request != nullptr; });
     }
 
+    // A failed model file read: every request holding a lane fails with it, their sequences drop
+    // what the interrupted round left and keep nothing for the context cache, and the Engine
+    // serves the queue on. The next round reads what it needs again.
+    void recover_from_read_failure(std::exception_ptr error) {
+        std::string what = "a model file read failed";
+        try {
+            std::rethrow_exception(error);
+        } catch (const std::exception& failure) { what = failure.what(); }
+        const auto unavailable =
+            std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable, what));
+        std::uint32_t failed_requests = 0;
+        for (std::uint32_t s = 0; s < slots.size(); ++s) {
+            Slot& slot = slots[s];
+            if (!slot.request) { continue; }
+            // A second read failure surfaces while draining the first: the drain completes anyway.
+            try {
+                instance.executor->abort(s);
+            } catch (const FileReadError&) { instance.executor->abort(s); }
+            slot.fed.clear();
+            slot.anchor.clear();
+            complete(std::exchange(slot.request, {}), unavailable);
+            ++failed_requests;
+        }
+        std::fprintf(stderr, "[ninfer] %s; failed %u running request(s), serving on\n",
+                     what.c_str(), failed_requests);
+        std::lock_guard lock(stats_mutex);
+        ++stats.engine_recoveries;
+    }
+
     void fail_engine(std::exception_ptr error) {
         {
             std::lock_guard lock(queue_mutex);
@@ -767,6 +797,12 @@ struct Qwen4ExpCore::Impl {
                     // MTP can finish the response before its catch-up observes cancellation.
                     // The sequence still needs cleanup, but no second terminal.
                     if (request) { finish_now(request, FinishReason::Cancelled); }
+                } catch (...) { fail_engine(std::current_exception()); }
+            } catch (const FileReadError&) {
+                // A model file read failed (expert or n-gram table bytes): the round cannot finish,
+                // but the readers kept nothing the failed read would have supplied.
+                try {
+                    recover_from_read_failure(std::current_exception());
                 } catch (...) { fail_engine(std::current_exception()); }
             } catch (...) {
                 // Not a request's own error: the device may be in an unknown state, so the Engine
@@ -1421,6 +1457,7 @@ struct Qwen4ExpCore::Impl {
         CUDA_CHECK(cudaMemcpyAsync(tokens, sample_out.p, n * sizeof(std::int32_t),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        instance.executor->raise_service_failure();
         for (std::size_t b = 0; b < n; ++b) {
             const std::int32_t token = tokens[b];
             if (token == ops::kSamplerNonFiniteToken || token < 0 ||
@@ -2088,6 +2125,7 @@ struct Qwen4ExpCore::Impl {
         CUDA_CHECK(cudaMemcpyAsync(host + b * w + b, spec_accepted.p, b * 4, cudaMemcpyDeviceToHost,
                                    stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        instance.executor->raise_service_failure();
 
         // The output policy takes its part of each licensed run; the executor then keeps the tokens
         // fed up to the last one taken.

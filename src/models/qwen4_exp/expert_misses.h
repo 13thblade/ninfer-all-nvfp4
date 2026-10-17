@@ -103,6 +103,10 @@ public:
     // Keeps the service (and the CPU workers) spinning for the next half second; a pass calls it
     // before its first layer. Rethrows a service failure.
     void keep_alive();
+    // Rethrows a failure the service recorded while serving a call. A failed call released the
+    // GPU with its missing experts left out, so a pass checks this once it has completed, before
+    // anything it computed is used.
+    void raise_failure();
     // Enqueued before a pass on each rank's stream: waits for the slots taken behind earlier calls
     // (the CPU experts' admissions), which the pass's tables may already point at. Call it only
     // once the earlier passes were served (they are synchronized; see the executor's pass()).

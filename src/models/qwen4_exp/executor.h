@@ -131,6 +131,10 @@ public:
     // Discards a pass interrupted inside a layer, draining its row reads and device work before
     // releasing provisional state. The caller must discard this sequence's reusable prefix.
     void abort(std::uint32_t sequence);
+    // Rethrows a failure the staged misses' service recorded while serving a pass's layers (a
+    // failed expert read among them). Such a pass ran without some missing experts, so call this
+    // once its results are on the host and before they are used. No effect without staged misses.
+    void raise_service_failure();
     // Runs the routes requests take on sequence 0 once and resets it, so the first request does
     // not pay for loading their kernels (CUDA loads each at its first launch): one token, a
     // verification's width, a full prefill chunk (16 tokens with host or disk experts, which a

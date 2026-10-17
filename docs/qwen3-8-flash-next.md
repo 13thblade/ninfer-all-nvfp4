@@ -233,7 +233,9 @@ per-request state and the expert cache; the host needs the expert banks in page-
 (34 GB for Q2_0). With disk experts the host needs no copy of the banks at all: the expert cache
 reads the missing experts from the artifact's files through the OS page cache, eight reads in
 flight, into a 256 MB page-locked staging ring, so the page cache keeps whatever the system can
-spare and the rest comes from the disk.
+spare and the rest comes from the disk. A read of the artifact's files that fails while the Engine
+runs (an expert or an n-gram row) fails the requests of that round with `unavailable`; the expert
+cache forgets what it held, the Engine counts an `engine_recoveries` and serves the queue on.
 
 Native host banks copy every miss to the GPU by default (`--expert-dma-share 1`). Values below one
 let the CPU compute a share of the missing experts; this mode is experimental: on one RTX 3090 with

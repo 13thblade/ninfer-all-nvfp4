@@ -1,5 +1,6 @@
 #include "models/qwen4_exp/expert_misses.h"
 
+#include "core/file_read_error.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
 
 #include <cuda/atomic>
@@ -250,14 +251,14 @@ public:
             const DWORD request =
                 static_cast<DWORD>(std::min<std::size_t>(bytes, std::size_t(1) << 30));
             if (!ReadFile(handle_, out, request, &done, &at) || done == 0) {
-                throw std::runtime_error("expert misses: read failed");
+                throw FileReadError("expert misses: read failed");
             }
 #else
             const ssize_t done = ::pread(descriptor_, out, bytes, static_cast<off_t>(offset));
             if (done < 0 && errno == EINTR) { continue; }
             if (done <= 0) {
-                throw std::runtime_error(std::string("expert misses: read failed: ") +
-                                         (done < 0 ? std::strerror(errno) : "end of file"));
+                throw FileReadError(std::string("expert misses: read failed: ") +
+                                    (done < 0 ? std::strerror(errno) : "end of file"));
             }
 #endif
             out += done;
@@ -1066,11 +1067,13 @@ struct ExpertMisses::Impl {
         if (rank.used && last != nullptr) { CUDA_CHECK(cudaStreamWaitEvent(stream, last, 0)); }
     }
 
+    void raise_failure() {
+        std::lock_guard lock(failure_mutex);
+        if (failure) { std::rethrow_exception(std::exchange(failure, nullptr)); }
+    }
+
     void keep_alive() {
-        {
-            std::lock_guard lock(failure_mutex);
-            if (failure) { std::rethrow_exception(std::exchange(failure, nullptr)); }
-        }
+        raise_failure();
         deadline.store(now_ns() + 500'000'000, std::memory_order_release);
         if (sleeping.load(std::memory_order_acquire)) {
             std::lock_guard lock(wake_mutex);
@@ -1096,6 +1099,8 @@ void ExpertMisses::drop_missing(std::size_t layer, const Tensor& ids, const Tens
 }
 void ExpertMisses::await(std::size_t layer, cudaStream_t stream) { impl_->await(layer, stream); }
 void ExpertMisses::keep_alive() { impl_->keep_alive(); }
+
+void ExpertMisses::raise_failure() { impl_->raise_failure(); }
 void ExpertMisses::fence(cudaStream_t stream, std::size_t rank) { impl_->fence(stream, rank); }
 void ExpertMisses::publish(cudaStream_t stream, std::size_t rank) { impl_->publish(stream, rank); }
 void ExpertMisses::set_resident(std::size_t layer, const ExpertCache::Ranges& resident) {
