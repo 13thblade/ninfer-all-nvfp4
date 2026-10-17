@@ -766,9 +766,11 @@ The WebUI's MCP client cannot reach an MCP server from the browser: the Streamab
 answer POST from a raw writer without CORS headers. `--webui-mcp-proxy` serves the `/cors-proxy`
 relay that the WebUI's "Use llama-server proxy" option targets (the target in the `url` query
 parameter, its headers prefixed with `x-llama-server-proxy-header-`) and reports
-`cors_proxy_enabled` in `/props`. The relay streams, forwards to any `http://` host it is given
-(`https://` is refused: there is no TLS client), and carries no API key, because the WebUI prefixes
-its own `Authorization` along with every other header; enable it only on a trusted bind address.
+`cors_proxy_enabled` in `/props`. The relay streams and forwards to any `http://` host it is given
+(`https://` is refused: there is no TLS client). It requires `--api-key` like every API route; the
+WebUI sends its configured key unprefixed beside the MCP server's prefixed headers. It holds at most
+1 MiB of a reply the browser has not read yet and stops reading the MCP server until the browser
+catches up. It reaches any host, so enable it only on a trusted bind address.
 
 ### Models
 
@@ -1862,7 +1864,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-max-tokens N` | output limit when omitted by a request; see [default output limit](#default-output-limit) | largest budget that keeps every lane admissible |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--no-webui` | stop serving a WebUI built in with `NINFER_WEBUI_DIR` | served when built in |
-| `--webui-mcp-proxy` | relay the WebUI's MCP traffic at `/cors-proxy` (http targets, no API key) | off |
+| `--webui-mcp-proxy` | relay the WebUI's MCP traffic at `/cors-proxy` (http targets only) | off |
 | `--structured-output` | accept JSON and JSON Schema response formats (see [Structured output](#structured-output)) | off |
 | `--unconstrained-response-format` | without `--structured-output`, generate a JSON or JSON Schema request unconstrained instead of refusing it | off |
 | `--assistant-prefill` | continue a Chat Completions request's trailing assistant message in place, as `/v1/messages` does | off |

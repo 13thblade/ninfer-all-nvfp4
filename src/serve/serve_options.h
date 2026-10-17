@@ -161,7 +161,7 @@ struct ServeOptions {
     bool log_stats_panel   = false;
     bool enable_webui      = true;  // serve a WebUI compiled in with NINFER_WEBUI_DIR
     // --webui-mcp-proxy: relay the WebUI's MCP traffic at /cors-proxy. It reaches any http host it
-    // is given and carries no API key, so it stays off unless asked for by name.
+    // is given, so it stays off unless asked for by name.
     bool webui_mcp_proxy = false;
     bool structured_output = false; // accept JSON/JSON Schema constrained requests
     bool concurrent_prefill = false; // admit to free lanes while other requests prefill
