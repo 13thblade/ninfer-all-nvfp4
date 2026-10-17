@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tma_descriptor_staging.cuh"
+#include "ops/common/device_tier.h"
 #include "ops/common/mbarrier.cuh"
 #include "ops/linear/bf16/bf16_mma_common.cuh"
 #include "ops/linear/bf16/bf16_operands.h"
@@ -163,7 +164,8 @@ template <class Schedule, class Output, class Epilogue>
 void launch_bf16_a16_mma(const Bf16A16Operands& p, Output output, Epilogue epilogue,
                          cudaStream_t stream);
 
-// sm_8x has no tensor memory accelerator; there the same tile runs over cp.async staging.
+// Cards without a tensor memory accelerator (sm_8x, and every card but a Blackwell one in a build
+// of several architectures) run the same tile over cp.async staging.
 template <class S>
 using Bf16TmaFallbackSchedule = Bf16ScheduleInstance<
     Bf16A16MmaSchedule<S::kBlockRows, S::kBlockTokens, S::kBlockK, S::kWarpRows, S::kWarpTokens,
@@ -178,6 +180,12 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
 #if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_NVFP4)
     launch_bf16_a16_mma<Bf16TmaFallbackSchedule<Schedule>>(p, output, epilogue, stream);
 #else
+    if constexpr (kBuildTiers > 1) {
+        if (!current_device_blackwell()) {
+            launch_bf16_a16_mma<Bf16TmaFallbackSchedule<Schedule>>(p, output, epilogue, stream);
+            return;
+        }
+    }
     // Descriptors are launch-owned values, copied into kernel parameters during Graph capture.
     const auto descriptors = make_bf16_tma_descriptors<Schedule>(p);
 #ifdef NINFER_TMA_STAGED_DESCRIPTORS
