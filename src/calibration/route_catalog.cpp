@@ -71,6 +71,14 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
                 add(key, {"unified"});
             }
         }
+        // The cuBLAS prefill route's width gate per Op (--prefill-cublas), over the widths the
+        // integer A8 mainloop cannot take and, under `/a8`, the multiples of its tile it can.
+        for (const char* family : {"w4_cublas/q4_linear_swiglu", "w4_cublas/linear_add/5120x17408",
+                                   "w4_cublas/linear_add/5120x6144", "w4_cublas/q4_q5_gdn_input",
+                                   "w4_cublas/q4_q5_attn_input"}) {
+            add(family, {"on", "off"});
+            add(std::string(family) + "/a8", {"on", "off"});
+        }
         // Q8 G32 K-split contractions (MTP heads, DFlash2 drafters, the official artifacts' heads):
         // the four-K-warp form of each 8-column tile (ops/linear/q8/q8_ksplit_config.h).
         for (const char* shape :

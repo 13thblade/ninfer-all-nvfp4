@@ -20,6 +20,7 @@
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
@@ -982,6 +983,13 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
+    // Decode and verify rounds run the target's projections with the prefill's Linear policies, one
+    // call over every lane's verify columns. The cuBLAS prefill route has to stay out of them -- it
+    // would put a weight-sized scratch into every round workspace and change decode numerics -- so
+    // the widest round sits at or below the floor no device profile moves its width gate past.
+    static_assert(kMaximumConcurrency * kMtpDecodeMaximumWidth <=
+                      static_cast<std::uint32_t>(ops::kCublasPrefillFloorTokens),
+                  "the widest decode/verify round must stay below the cuBLAS prefill width gate");
     if (parameters.text.rank_count != device.size()) {
         throw std::invalid_argument("the model is split into " +
                                     std::to_string(parameters.text.rank_count) +
