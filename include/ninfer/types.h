@@ -781,7 +781,14 @@ struct ThinkingControlOptions {
     bool early_close_available = true;
 };
 
-enum class StructuredOutputKind : std::uint8_t { None, JsonObject, JsonSchema };
+enum class StructuredOutputKind : std::uint8_t {
+    None,
+    JsonObject,
+    JsonSchema,
+    Regex,
+    Choice,
+    Grammar
+};
 
 struct StructuredOutputOptions {
     StructuredOutputKind kind = StructuredOutputKind::None;
@@ -790,6 +797,11 @@ struct StructuredOutputOptions {
     // unevaluatedProperties) admit only their declared properties, following the OpenAI/Anthropic
     // strict structured-output convention. When false, standard JSON Schema defaults apply.
     bool strict = false;
+    // Regex: a regular expression the whole final response matches. Grammar: a GBNF grammar
+    // (llama.cpp's syntax) whose `root` rule the whole final response matches. Otherwise empty.
+    std::string grammar;
+    // Choice: the final response is exactly one of these strings (at least one, each non-empty).
+    std::vector<std::string> choices;
 };
 
 struct ExecutionOptions {

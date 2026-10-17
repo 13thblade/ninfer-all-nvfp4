@@ -695,7 +695,6 @@ struct ParsedTool {
     ToolDefinition definition;
     ToolSource source = ToolSource::UserDefined;
     std::string source_type;
-    bool strict        = false;
     bool defer_loading = false;
     std::optional<std::vector<std::string>> allowed_callers;
 };
@@ -754,7 +753,7 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
             if (!item.at("strict").is_boolean()) {
                 bad_request("tool strict must be a boolean", "tools");
             }
-            parsed.strict = item.at("strict").get<bool>();
+            parsed.definition.strict = item.at("strict").get<bool>();
         }
         if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
             if (!item.at("defer_loading").is_boolean()) {
@@ -819,11 +818,6 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                             "' requires its predefined prompt schema or server executor, which "
                             "NInfer does not provide",
                         "tools", "anthropic_tools_not_supported");
-        }
-        if (tool.strict) {
-            bad_request("strict=true requires generated tool input to satisfy the declared JSON "
-                        "Schema, which NInfer cannot guarantee",
-                        "tools", "strict_tools_not_supported");
         }
         if (tool.defer_loading) {
             bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
@@ -912,6 +906,7 @@ void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose pur
         !config.at("format").is_null()) {
         request.structured_output =
             parse_structured_output(config.at("format"), false, "output_config.format");
+        request.structured_output_param = "output_config.format";
         // The Messages API always follows a schema strictly (declared properties only).
         request.structured_output.strict =
             request.structured_output.kind == StructuredOutputKind::JsonSchema;

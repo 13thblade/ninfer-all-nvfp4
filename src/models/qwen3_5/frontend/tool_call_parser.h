@@ -46,6 +46,10 @@ struct ToolCallOutputContract {
         std::string name;
         std::vector<Parameter> parameters;
         bool unambiguous = true;
+        // Declared `strict: true`: its arguments are generated under its parameters' JSON Schema
+        // (schema_json) rather than as free text.
+        bool strict = false;
+        std::string schema_json;
     };
 
     std::vector<Tool> tools;
@@ -69,9 +73,18 @@ struct ParsedToolCallOutput {
 build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled,
                                 std::string_view forced_tool_name = {});
 
-// Native Qwen tool-call envelope for a structured final-response request. Parameters remain
-// non-strict values, with each declared parameter emitted at most once in declaration order.
+// Native Qwen tool-call envelope for a structured final-response request. A strict tool's
+// arguments follow its parameters' JSON Schema; another's remain non-strict values, with each
+// declared parameter emitted at most once in declaration order.
 [[nodiscard]] std::string structured_tool_call_format(const ToolCallOutputContract& contract);
+
+[[nodiscard]] bool has_strict_tools(const ToolCallOutputContract& contract) noexcept;
+
+// For a response without a structured final format: free text in which every tool call follows
+// the envelope above, starting inside the forced call when the prompt opened one. An XGrammar
+// structural-tag format. A strict tool's schema that strict arguments cannot honor (unsupported,
+// or uniqueItems, which only the final-response path enforces) throws std::invalid_argument.
+[[nodiscard]] std::string tool_call_text_format(const ToolCallOutputContract& contract);
 
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,

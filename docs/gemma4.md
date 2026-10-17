@@ -375,8 +375,10 @@ round drafts shrink as requests join (same streams as above, `--spec mtp`, tok/s
 
 ## Structured output
 
-A request with `response_format` (with `--structured-output`) samples under its grammar's token
-mask. The mask of its next token is computed on a thread of its own from the grammar's state
+A request with `response_format` or another constraint of
+[Structured output](serving.md#structured-output) (with `--structured-output`) samples under its
+grammar's token mask; strict tool arguments are refused, since Gemma's tool-call markup has no
+grammar here. The mask of its next token is computed on a thread of its own from the grammar's state
 after the last accepted token, while the GPU runs the decode step that produces the token's
 logits: the step does not wait for the mask, and a row whose mask is late keeps its logits and is
 sampled once the mask is ready, while the other requests go on. With `--spec mtp` such a request

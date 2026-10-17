@@ -274,6 +274,27 @@ constrain other root types. Responses uses the flat form
 reports that format in its Response object. Anthropic Messages accepts
 `output_config.format: {"type":"json_schema","schema":{...}}`.
 
+Chat Completions, `/v1/completions` and `/completion` also take the constrained-decoding fields
+of vLLM and llama.cpp. A request may carry one of them, and not beside `response_format` or
+`json_schema`:
+
+| Field | The final content is |
+|---|---|
+| `structured_outputs.json`, `guided_json` (a schema object or its JSON text) | JSON under that schema |
+| `structured_outputs.json_object: true` | any JSON object |
+| `structured_outputs.regex`, `guided_regex` | a whole match of the regular expression |
+| `structured_outputs.choice`, `guided_choice` | exactly one of the listed strings |
+| `structured_outputs.grammar`, `guided_grammar`, `grammar` (llama.cpp; empty is none) | a sentence of the GBNF grammar, from its rule `root` |
+
+Regular expressions and grammars use XGrammar's dialects: its regex syntax and its EBNF, which
+reads llama.cpp's GBNF (`::=` rules, character classes, `*`, `+`, `?`, `{m,n}` and `#`
+comments). `structured_outputs.disable_additional_properties: true` makes a schema strict;
+`disable_fallback` and `disable_any_whitespace` are accepted without effect, since NInfer has
+no fallback backend and bounds whitespace runs anyway. `structured_outputs.structural_tag` and
+`guided_whitespace_pattern` are refused. A malformed pattern, grammar, choice list or schema, or
+two constraints at once, fails with HTTP 400 `invalid_response_format` on the field that carried
+it.
+
 Supported schema constraints are `type`, `properties`, `required`, `additionalProperties`,
 `items`, `prefixItems`, `minItems`, `maxItems`, `minLength`, `maxLength`, `enum`, `const`,
 `anyOf`, `pattern`, asserted `format` (`date`, `date-time`, `time`), `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `$defs`, `definitions`,
@@ -347,24 +368,41 @@ tool-call finish reason and need not contain a JSON content value. Tool definiti
 settings may remain enabled on later requests after tool results are supplied.
 
 Serving also exposes the requested format and schema to the model as a leading instruction,
-asking for raw JSON without Markdown fences and retaining tools for information gathering.
+asking for raw JSON without Markdown fences and retaining tools for information gathering; for a
+regular expression, a choice or a grammar the instruction gives the pattern, the options or the
+grammar text instead.
 This helps the model choose the intended final-answer branch when tools remain enabled; the
 token grammar enforces validity independently. Tool selection and termination remain model
 decisions under `tool_choice:"auto"`; use `tool_choice:"none"` when no further tools are needed.
 Requests without an explicit response format receive no format instruction or grammar.
 
 The native tool envelope restricts calls to declared names and emits each declared parameter at most
-once, in the declaration order shown in the prompt. Parameter values remain non-strict; delimiter spellings that would make
-Qwen XML ambiguous are excluded. Strict tool argument generation and arbitrary grammar/regex aliases
-remain unsupported. Custom stops and assistant-prefill continuation are rejected with structured
-output. Public C++ callers select `ExecutionOptions::structured_output` and use default stops and
-decoded text output.
+once, in the declaration order shown in the prompt. A non-strict tool's parameter values are free
+text; delimiter spellings that would make Qwen XML ambiguous are excluded.
 
-Only normal completed final-content responses guarantee a complete JSON document satisfying the supported
-schema. Token/context limits, cancellation, transport failure, or generation errors can leave a
-partial document; inspect the finish reason or Responses status before parsing it as complete.
-SSE content deltas are ordinary partial JSON bytes; concatenate them before parsing. Constraints
-guarantee format, not factual accuracy or semantic task success.
+A tool marked `strict: true` (Chat `function.strict`, the Responses and Anthropic tool `strict`)
+gets its arguments under its parameters' JSON Schema, in the Qwen XML form the chat template
+shows (`<parameter=NAME>`, a newline, the value, a newline, `</parameter>`): a string value is raw
+text and any other value JSON, required parameters appear, undeclared ones cannot, and the schema
+rules above apply. The schema must describe an object and cannot use `uniqueItems`. This holds
+with or without a response format; without one, text around the calls stays free and only the
+calls are constrained, starting inside the opened call when `tool_choice` forced it. Gemma 4
+refuses strict tools with HTTP 400, as its own tool-call markup has no grammar here. Without
+`--structured-output`, Chat Completions treats `strict` as the advisory flag OpenAI-compatible
+servers commonly do and runs the tool non-strict; Responses and Anthropic Messages refuse it with
+HTTP 400 `strict_tools_not_supported`, unless `--unconstrained-response-format` lets it run
+non-strict.
+
+Custom stops and assistant-prefill continuation are rejected with a response format. Public C++
+callers select `ExecutionOptions::structured_output` and use default stops and decoded text
+output.
+
+Only normal completed final-content responses guarantee complete content that satisfies the format
+(for JSON, a complete document under the supported schema). Token/context limits, cancellation,
+transport failure, or generation errors can leave a partial document; inspect the finish reason or
+Responses status before parsing it as complete. SSE content deltas are ordinary partial JSON bytes;
+concatenate them before parsing. Constraints guarantee format, not factual accuracy or semantic task
+success.
 
 Masks are applied before target top-k/top-p/min-p filtering at **every** speculative position,
 including correction and bonus tokens. Drafts are proposed without the mask; every verification
@@ -840,8 +878,10 @@ The endpoint supports:
   honor it;
 - `n:1` and text-only `modalities`;
 - `response_format` of type `text`, `json_object`, or `json_schema` (`name`, optional
-  `description`, `schema` and `strict`); JSON formats need `--structured-output` and are enforced
-  token by token, see [Structured output](#structured-output);
+  `description`, `schema` and `strict`), and the vLLM and llama.cpp constraint fields
+  (`structured_outputs`, `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar`,
+  `grammar`); they need `--structured-output` and are enforced token by token, see
+  [Structured output](#structured-output);
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`, optionally shaped by `--usage-chunk-choice` for strict client
   parsers;
@@ -851,8 +891,9 @@ The endpoint supports:
 - `tool_choice` `auto`, `none`, a named function, `required` over a single callable tool, or
   `allowed_tools` in either mode, which force that call; a `custom` selection is accepted as
   advisory narrowing;
-- `strict:true` as an advisory flag, since decoding is not constrained to the schema, and
-  `parallel_tool_calls:false`, honored by keeping the first call;
+- `function.strict:true`, enforced with `--structured-output` and advisory without it (see
+  [Structured output](#structured-output)), and `parallel_tool_calls:false`, honored by keeping
+  the first call;
 - assistant tool-call history, tool-result messages, and legacy function-call history;
 - the top-level `reasoning_effort` field, where the `default` and `auto` aliases resolve to the
   server-configured level;
@@ -863,13 +904,10 @@ The endpoint supports:
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
-behavior. This includes JSON constrained output on a server without `--structured-output` (unless
+behavior. This includes constrained output on a server without `--structured-output` (unless
 it runs with `--unconstrained-response-format`), nonzero `logit_bias`, audio/file input or audio
 output, `required` tool choice over several callable tools, web search, moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
-The vLLM/llama.cpp constrained-decoding extensions (`grammar`, `structured_outputs`, `guided_json`,
-`guided_regex`, `guided_choice`, and `guided_grammar`) are rejected explicitly instead of being
-treated as unknown hints; structured JSON is requested through `response_format`.
 
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
 `logit_bias`, `logprobs:false`, `verbosity:"medium"`, empty legacy tool controls,
@@ -1190,18 +1228,19 @@ curl http://127.0.0.1:8080/v1/completions -d '{"prompt": "The capital of France 
 ```
 
 Both accept `temperature` (below zero samples greedily), `top_k` (zero or below is the widest
-candidate set, 20), `top_p`, `min_p`, `presence_penalty`, `frequency_penalty`, `seed` (negative
-for a random one), `stop` (a string or up to 32 strings), `ignore_eos`, `stream`,
-`timings_per_token`, `response_format`, and llama.cpp's `cache_prompt` (`false` keeps the request
-out of the context cache). The output limit is llama.cpp's `n_predict` (then `max_tokens`) on
-`/completion`, where any negative value is no limit, and `max_tokens` on `/v1/completions`, where
-`-1` is; omitted, it is the [default output limit](#default-output-limit). llama.cpp sampler
-controls NInfer does not have are accepted at their neutral values and refused otherwise, each
-with `<field>_not_supported`: `repeat_penalty` (1), `typical_p` (1), `tfs_z` (1), `dynatemp_range`
-(0), `mirostat` (0), `xtc_probability` (0), `dry_multiplier` (0), `top_n_sigma` (0 or below),
-`n_probs` (0), `n_indent` (0) and `t_max_predict_ms` (0 or below); a non-empty `grammar`, `lora` or
-nonzero `logit_bias` is refused too. `samplers`, `n_keep`, `min_keep`, `id_slot` and the parameters
-of the controls above are accepted without effect.
+candidate set, 20), `top_p`, `min_p`, `presence_penalty`, `frequency_penalty`, `seed` (negative for
+a random one), `stop` (a string or up to 32 strings), `ignore_eos`, `stream`, `timings_per_token`,
+`response_format`, the vLLM and llama.cpp constraint fields of [Structured
+output](#structured-output) (`grammar` among them), and llama.cpp's `cache_prompt` (`false` keeps
+the request out of the context cache). The output limit is llama.cpp's `n_predict` (then
+`max_tokens`) on `/completion`, where any negative value is no limit, and `max_tokens` on
+`/v1/completions`, where `-1` is; omitted, it is the [default output limit](#default-output-limit).
+llama.cpp sampler controls NInfer does not have are accepted at their neutral values and refused
+otherwise, each with `<field>_not_supported`: `repeat_penalty` (1), `typical_p` (1), `tfs_z` (1),
+`dynatemp_range` (0), `mirostat` (0), `xtc_probability` (0), `dry_multiplier` (0), `top_n_sigma` (0
+or below), `n_probs` (0), `n_indent` (0) and `t_max_predict_ms` (0 or below); a `lora` or nonzero
+`logit_bias` is refused too. `samplers`, `n_keep`, `min_keep`, `id_slot` and the parameters of the
+controls above are accepted without effect.
 
 `/completion` adds llama.cpp's `json_schema` (the bare schema; `{}` admits any JSON object; needs
 `--structured-output`), `return_tokens`, `return_progress` and `response_fields` (the response
@@ -1441,8 +1480,10 @@ inside the opened call, so no text can precede it, and a turn that ends after th
 argument but before its closing tag (`</tool_call>`, `<tool_call|>` for Gemma 4) still returns the
 call, with `forced_call_closed` set.
 
-NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
-`strict:true`, hosted tools, remote MCP tools, and custom free-form tools are rejected. Deferred
+A function's `strict:true` constrains its arguments to its schema on a server started with
+`--structured-output` and is refused without it, unless `--unconstrained-response-format` lets it
+run non-strict (see [Structured output](#structured-output)). NInfer does not execute functions,
+so hosted tools, remote MCP tools, and custom free-form tools are rejected. Deferred
 loading, output schemas, and caller restrictions that exclude direct invocation are also rejected
 because their semantics cannot be honored.
 
@@ -1647,20 +1688,21 @@ protocol-validated value to the selected template, substituting the nearest valu
 accepts as described above. `output_config.format` accepts `{"type":"json_schema","schema":{...}}`,
 enforced strictly (see [Structured output](#structured-output)); Count Tokens ignores it.
 
-User-defined, non-strict tools support `name`, `description`, object `input_schema`, and
-`input_examples`. `tool_choice` `auto`, `none`, `tool` naming a declared tool, and `any` over a
-single callable tool are executable; the last two require reasoning to be disabled for the request.
-`any` over several tools is advisory: NInfer cannot make the model pick one of them, so the tools
-stay offered under automatic selection (Qwen Code sends `any` for its JSON side queries such as
-its permission classifier, session title and next-speaker check); `any` without tools is rejected.
-`disable_parallel_tool_use:true` is honoured as `parallel_tool_calls:false` is on the OpenAI
-endpoints: the response keeps the first tool call and drops the rest. `strict:true`, deferred
-tools, tools that exclude direct model calls, Anthropic-provided/server tools, toolsets, MCP, and
-containers are rejected because their required constraint or executor is absent. `tool_result` preserves text/image order and marks
-`is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
-User turn must provide exactly one leading result for every declared ID; valid results are matched
-by ID and normalized to call order. A history that begins with results remains valid as a truncated
-or imported conversation.
+User-defined tools support `name`, `description`, object `input_schema`, `input_examples`, and
+`strict`, which constrains the tool's input to its schema as described under [Structured
+output](#structured-output). `tool_choice` `auto`, `none`, `tool` naming a declared tool, and `any`
+over a single callable tool are executable; the last two require reasoning to be disabled for the
+request. `any` over several tools is advisory: NInfer cannot make the model pick one of them, so the
+tools stay offered under automatic selection (Qwen Code sends `any` for its JSON side queries such
+as its permission classifier, session title and next-speaker check); `any` without tools is
+rejected. `disable_parallel_tool_use:true` is honoured as `parallel_tool_calls:false` is on the
+OpenAI endpoints: the response keeps the first tool call and drops the rest. Deferred tools, tools
+that exclude direct model calls, Anthropic-provided/server tools, toolsets, MCP, and containers are
+rejected because their required constraint or executor is absent. `tool_result` preserves text/image
+order and marks `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use
+turn, the next User turn must provide exactly one leading result for every declared ID; valid
+results are matched by ID and normalized to call order. A history that begins with results remains
+valid as a truncated or imported conversation.
 
 Ephemeral `cache_control` on the request, tools, System blocks, and User text/image frontiers is a
 best-effort retention hint. NInfer maps representable breakpoints to exact prompt frontiers, keeps
@@ -1867,8 +1909,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--no-webui` | stop serving a WebUI built in with `NINFER_WEBUI_DIR` | served when built in |
 | `--webui-mcp-proxy` | relay the WebUI's MCP traffic at `/cors-proxy` (http targets only) | off |
-| `--structured-output` | accept JSON and JSON Schema response formats (see [Structured output](#structured-output)) | off |
-| `--unconstrained-response-format` | without `--structured-output`, generate a JSON or JSON Schema request unconstrained instead of refusing it | off |
+| `--structured-output` | enforce response formats (JSON, JSON Schema, regex, choice, GBNF) and strict tool arguments (see [Structured output](#structured-output)) | off |
+| `--unconstrained-response-format` | without `--structured-output`, generate a constrained request or strict tools unconstrained instead of refusing them | off |
 | `--assistant-prefill` | continue a Chat Completions request's trailing assistant message in place, as `/v1/messages` does | off |
 | `--lenient-assistant-history` | accept Responses input whose assistant message content or reasoning follows `function_call` Items in one run: it joins that run's assistant turn, as Messages flattens content blocks, and the template renders it before the calls. Without it such input fails with `invalid_assistant_history` rather than being silently reordered | off |
 | `--lenient-image-detail` | read an OpenAI image `detail` other than `auto`, `low` or `high` as `auto` instead of failing with `image_detail_not_supported`, for clients that send values NInfer does not know (see [image detail](#image-detail)) | off |

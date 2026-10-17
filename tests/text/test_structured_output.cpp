@@ -327,6 +327,49 @@ int main() {
             } catch (const std::invalid_argument&) { failed = true; }
             require(failed, "unsupported constraint silently accepted");
         }
+        // A regex, a choice and a GBNF grammar match the whole response, with or without the
+        // reasoning envelope, and a malformed one fails before any vocabulary is involved.
+        const auto with = [&](StructuredOutputKind kind, std::string grammar,
+                              std::vector<std::string> choices = {}) {
+            StructuredOutputOptions options{kind, {}};
+            options.grammar = std::move(grammar);
+            options.choices = std::move(choices);
+            return options;
+        };
+        auto regex = compiler.compile(with(StructuredOutputKind::Regex, "[a-c]{2}-[0-9]+"));
+        require(accepts_value(regex, "ab-12") && !accepts_value(regex, "ab-") &&
+                    !accepts_value(regex, "xab-1") && !accepts_value(regex, "ab-1 "),
+                "regex does not match the whole response");
+        auto choice = compiler.compile(
+            with(StructuredOutputKind::Choice, {}, {"yes", "no", "say \"maybe\"\n\\"}));
+        require(accepts_value(choice, "yes") && accepts_value(choice, "no") &&
+                    accepts_value(choice, "say \"maybe\"\n\\") && !accepts_value(choice, "ye") &&
+                    !accepts_value(choice, "yesno") && !accepts_value(choice, "No"),
+                "choice admits other than exactly one option");
+        auto gbnf = compiler.compile(with(StructuredOutputKind::Grammar,
+                                          "# a GBNF list\nroot ::= item (\",\" item)*\n"
+                                          "item ::= \"-\"? [0-9]{1,3} | \"x\"\n"));
+        require(accepts_value(gbnf, "1,x,-23") && !accepts_value(gbnf, "1,") &&
+                    !accepts_value(gbnf, "y") && !accepts_value(gbnf, "1234"),
+                "grammar does not match from its root rule");
+        auto thought = compiler.compile(with(StructuredOutputKind::Choice, {}, {"red", "blue"}),
+                                        {.reasoning_close = "</think>"});
+        require(accepts_value(thought, "mull it over</think>\n\nblue") &&
+                    !accepts_value(thought, "mull</think>green") && !accepts_value(thought, "blue"),
+                "choice after reasoning lost the reasoning close or the options");
+        for (const auto& bad :
+             {with(StructuredOutputKind::Regex, "[a-"), with(StructuredOutputKind::Regex, ""),
+              with(StructuredOutputKind::Grammar, "root ::= missing"),
+              with(StructuredOutputKind::Grammar, "start ::= \"a\""),
+              with(StructuredOutputKind::Choice, {}, {}),
+              with(StructuredOutputKind::Choice, {}, {"a", ""}),
+              with(StructuredOutputKind::JsonObject, "[a-z]")}) {
+            bool failed = false;
+            try {
+                validate_structured_output(bad);
+            } catch (const std::invalid_argument&) { failed = true; }
+            require(failed, "malformed regex, grammar or choice accepted");
+        }
         std::cout << "OK structured grammar: masks, transaction, UTF-8, schema, EOS\n";
         return 0;
     } catch (const std::exception& e) {

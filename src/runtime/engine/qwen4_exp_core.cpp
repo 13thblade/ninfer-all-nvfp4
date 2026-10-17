@@ -2430,6 +2430,11 @@ Qwen4ExpCore::Submission Qwen4ExpCore::submit(models::qwen3_5::PreparedPrompt pr
     request->output = impl_->instance.frontend.make_output_session(
         prompt, options.stop, options.output, options.execution.thinking,
         options.execution.structured_output);
+    // Strict tool arguments bring a grammar without a structured final format.
+    if (request->output.grammar_state() && !impl_->structured_output) {
+        throw std::invalid_argument(
+            "strict tool arguments require an Engine started with structured_output");
+    }
     const std::optional<std::uint32_t> budget = request->output.thinking_stats().effective_budget;
     request->prompt                           = std::move(prompt);
     request->options                          = std::move(options);

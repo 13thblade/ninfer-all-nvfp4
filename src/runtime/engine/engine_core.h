@@ -323,6 +323,11 @@ public:
             auto output = instance_.frontend.make_output_session(
                 prompt, options.stop, options.output, options.execution.thinking,
                 options.execution.structured_output);
+            // Strict tool arguments bring a grammar without a structured final format.
+            if (output.grammar_state() && !structured_output_) {
+                throw std::invalid_argument(
+                    "strict tool arguments require an Engine started with structured_output");
+            }
             options.execution.grammar = output.grammar_state();
             request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
                                                 std::move(output), prompt_summary, prepare_seconds,

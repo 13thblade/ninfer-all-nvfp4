@@ -1493,10 +1493,100 @@ int test_constrained_tool_envelope() {
     return failures;
 }
 
+// A strict tool's arguments follow its parameters' schema, with or without a final format; the
+// text around calls stays free and a non-strict tool keeps its free values.
+int test_strict_tool_arguments() {
+    const std::string weather =
+        R"({"type":"function","function":{"name":"weather","strict":true,"parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer","minimum":1,"maximum":7}},"required":["city","days"],"additionalProperties":false}}})";
+    const std::vector<std::string> tools{
+        weather, tool_definition("note", Json{{"text", Json{{"type", "integer"}}}})};
+    const auto contract = contract_from_definitions(tools);
+    std::vector<std::string> vocab(257);
+    for (int i = 0; i < 256; ++i) { vocab[i] = std::string(1, static_cast<char>(i)); }
+    ninfer::text::StructuredCompiler compiler(vocab, {256});
+    const auto accepts = [](const std::shared_ptr<ninfer::text::GrammarState>& grammar,
+                            const std::string& value) {
+        auto trial = grammar->fork();
+        std::vector<ninfer::TokenId> tokens;
+        for (unsigned char ch : value) { tokens.push_back(ch); }
+        tokens.push_back(256);
+        try {
+            trial->accept(tokens);
+            return true;
+        } catch (const std::logic_error&) { return false; }
+    };
+    const auto call = [](std::string_view city, std::string_view days) {
+        return "<tool_call>\n<function=weather>\n<parameter=city>\n" + std::string(city) +
+               "\n</parameter>\n<parameter=days>\n" + std::string(days) +
+               "\n</parameter>\n</function>\n</tool_call>";
+    };
+
+    int failures    = check(fi::has_strict_tools(*contract), "strict flag was not read");
+    const auto text = compiler.compile_format(fi::tool_call_text_format(*contract),
+                                              {.reasoning_close = "</think>"});
+    failures += check(accepts(text, "plan</think>Checking.\n" + call("Tokyo", "3") + "\nDone."),
+                      "valid strict call rejected");
+    failures += check(accepts(text, "plan</think>No tool needed."), "free text rejected");
+    failures += check(!accepts(text, "plan</think>" + call("Tokyo", "9")),
+                      "strict call escaped its numeric bound");
+    failures += check(!accepts(text, "plan</think>" + call("Tokyo", "three")),
+                      "strict call escaped its integer type");
+    failures += check(!accepts(text, "plan</think><tool_call>\n<function=weather>\n"
+                                     "<parameter=city>\nTokyo\n</parameter>\n</function>\n"
+                                     "</tool_call>"),
+                      "strict call omitted a required parameter");
+    failures +=
+        check(!accepts(text, "plan</think>" + call("Tokyo", "3")
+                                                  .insert(call("Tokyo", "3").find("</function>"),
+                                                          "<parameter=wind>\nyes\n</parameter>\n")),
+              "strict call added an undeclared parameter");
+    failures += check(accepts(text, "plan</think><tool_call>\n<function=note>\n<parameter=text>\n"
+                                    "not a number\n</parameter>\n</function>\n</tool_call>"),
+                      "non-strict tool lost its free values");
+    failures += check(!accepts(text, "plan</think><tool_call>\n<function=other>\n</function>\n"
+                                     "</tool_call>"),
+                      "undeclared tool accepted");
+    const auto parsed = fi::parse_qwen_tool_call_output(call("Tokyo", "3"), 64, *contract);
+    failures += check(parsed.tool_calls.size() == 1 && parsed.tool_calls.front().arguments_json ==
+                                                           R"({"city":"Tokyo","days":3})",
+                      "strict call did not parse back to its arguments");
+
+    // A forced call: the prompt already holds its opener.
+    const std::vector<std::string> forced_tools{weather};
+    const auto forced = fi::build_tool_call_output_contract(
+        std::span<const std::string>(forced_tools.data(), forced_tools.size()), true, "weather");
+    const auto opened           = compiler.compile_format(fi::tool_call_text_format(*forced));
+    const std::string arguments = "<parameter=city>\nOslo\n</parameter>\n<parameter=days>\n7\n"
+                                  "</parameter>\n</function>\n</tool_call>";
+    failures += check(accepts(opened, arguments), "forced strict call rejected");
+    failures += check(!accepts(opened, "Sure, here is the weather."),
+                      "forced strict call allowed prose first");
+
+    // With a final format, the strict call is the alternative to it.
+    const auto final_format =
+        compiler.compile({ninfer::StructuredOutputKind::JsonSchema, R"({"type":"object"})"},
+                         {.reasoning_close    = "</think>",
+                          .alternative_format = fi::structured_tool_call_format(*contract)});
+    failures += check(accepts(final_format, "plan</think>" + call("Paris", "1")),
+                      "strict call rejected beside a final format");
+    failures += check(!accepts(final_format, "plan</think>" + call("Paris", "0")),
+                      "strict call beside a final format escaped its bound");
+
+    const std::vector<std::string> unique{
+        R"({"type":"function","function":{"name":"tags","strict":true,"parameters":{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"},"uniqueItems":true}}}}})"};
+    bool refused = false;
+    try {
+        (void)fi::tool_call_text_format(*contract_from_definitions(unique));
+    } catch (const std::invalid_argument&) { refused = true; }
+    failures += check(refused, "strict uniqueItems was not refused");
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_duplicate_parameter_keeps_last_value();
     failures += test_constrained_tool_envelope();
+    failures += test_strict_tool_arguments();
     failures += test_basic_legacy_parsing();
     failures += test_forced_call_decoder();
     failures += test_multiple_calls();

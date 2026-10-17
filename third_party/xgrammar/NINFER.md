@@ -44,3 +44,10 @@ length. The accepted language is unchanged. The plain bounded strings of a schem
 alternatives do not reach this path: `src/text/string_constraints.cpp` takes their bounds out of
 the schema this compiler sees and enforces them on the token masks itself.
 
+
+Qwen XML parameter supplement (cpp/json_schema_converter_ext.cc): the `qwen_xml_parameter` value
+wrapper carries the newlines of Qwen's chat template, `<parameter=NAME>\nVALUE\n</parameter>\n`,
+which the model writes and NInfer's tool-call parser strips, so a raw string value is exactly the
+argument. A whitespace-only wrapper prefix is not preceded by another whitespace run, which would
+otherwise reach a raw string's value. Strict tool arguments depend on it; coverage is in
+tests/test_tool_call_parser.cpp.

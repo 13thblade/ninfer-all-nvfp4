@@ -1,5 +1,8 @@
 #include "models/qwen3_5/frontend/tool_call_parser.h"
 
+#include "text/schema_normalization.h"
+#include "text/structured_output.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -308,7 +311,14 @@ Contract::Tool compile_tool_contract(const Json& definition) {
     if (name == function->end() || !name->is_string()) { return contract; }
     contract.name = name->get<std::string>();
 
+    const auto strict = function->find("strict");
     const auto schema = function->find("parameters");
+    contract.strict   = strict != function->end() && strict->is_boolean() && strict->get<bool>();
+    if (contract.strict) {
+        contract.schema_json = schema != function->end() && schema->is_object()
+                                   ? schema->dump()
+                                   : std::string(R"({"type":"object","properties":{}})");
+    }
     if (schema == function->end() || !schema->is_object()) { return contract; }
     const auto properties = schema->find("properties");
     if (properties == schema->end() || !properties->is_object()) { return contract; }
@@ -326,7 +336,10 @@ Contract::Tool compile_tool_contract(const Json& definition) {
 }
 
 bool same_contract(const Contract::Tool& lhs, const Contract::Tool& rhs) {
-    if (lhs.parameters.size() != rhs.parameters.size()) { return false; }
+    if (lhs.parameters.size() != rhs.parameters.size() || lhs.strict != rhs.strict ||
+        lhs.schema_json != rhs.schema_json) {
+        return false;
+    }
     for (std::size_t i = 0; i < lhs.parameters.size(); ++i) {
         const Contract::Parameter& left  = lhs.parameters[i];
         const Contract::Parameter& right = rhs.parameters[i];
@@ -914,19 +927,66 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
     return contract;
 }
 
-std::string structured_tool_call_format(const ToolCallOutputContract& contract) {
-    const Json whitespace{{"type", "regex"}, {"pattern", "[ \\t\\r\\n]{0,8}"}};
-    const auto literal = [](const std::string& text) {
-        return Json{{"type", "const_string"}, {"value", text}};
-    };
-    Json alternatives = Json::array();
-    for (const auto& tool : contract.tools) {
-        if (!tool.unambiguous) {
-            throw std::invalid_argument("structured output requires unambiguous tool definitions");
+namespace {
+
+Json format_whitespace() { return Json{{"type", "regex"}, {"pattern", "[ \\t\\r\\n]{0,8}"}}; }
+
+Json literal_format(std::string text) {
+    return Json{{"type", "const_string"}, {"value", std::move(text)}};
+}
+
+bool declares_unique_items(const Json& schema) {
+    if (schema.is_object()) {
+        const auto unique = schema.find("uniqueItems");
+        if (unique != schema.end() && unique->is_boolean() && unique->get<bool>()) { return true; }
+        for (const auto& [key, value] : schema.items()) {
+            if (key != "const" && key != "enum" && key != "default" && key != "examples" &&
+                declares_unique_items(value)) {
+                return true;
+            }
         }
-        Json elements =
-            Json::array({literal(std::string(kToolOpen)), whitespace,
-                         literal(std::string(kFunctionOpen) + tool.name + ">"), whitespace});
+    } else if (schema.is_array()) {
+        for (const auto& value : schema) {
+            if (declares_unique_items(value)) { return true; }
+        }
+    }
+    return false;
+}
+
+// A strict tool's arguments: its parameters, as the chat template frames them, under its schema.
+Json strict_arguments_format(const Contract::Tool& tool) {
+    StructuredOutputOptions schema;
+    schema.kind   = StructuredOutputKind::JsonSchema;
+    schema.schema = tool.schema_json;
+    schema.strict = true;
+    try {
+        text::validate_structured_output(schema);
+    } catch (const std::invalid_argument& error) {
+        throw std::invalid_argument("strict tool " + tool.name + ": " + error.what());
+    }
+    const Json parameters = Json::parse(text::normalize_json_schema(tool.schema_json));
+    if (!parameters.is_object() || parameters.value("type", std::string("object")) != "object") {
+        throw std::invalid_argument("strict tool " + tool.name +
+                                    ": parameters must be an object schema");
+    }
+    if (declares_unique_items(parameters)) {
+        throw std::invalid_argument("strict tool " + tool.name +
+                                    ": uniqueItems is not supported in strict tool arguments");
+    }
+    return Json{{"type", "qwen_xml_parameter"}, {"json_schema", parameters}};
+}
+
+// What one call to `tool` holds after its function opener `<function=NAME>`: its parameters, the
+// function close, the call close and the whitespace after it.
+Json::array_t call_after_opener(const Contract::Tool& tool) {
+    if (!tool.unambiguous) {
+        throw std::invalid_argument("structured output requires unambiguous tool definitions");
+    }
+    Json::array_t elements;
+    if (tool.strict) {
+        elements.push_back(strict_arguments_format(tool));
+        elements.push_back(format_whitespace());
+    } else {
         for (const auto& parameter : tool.parameters) {
             if (parameter.name.empty() || parameter.name.find('>') != std::string::npos) {
                 throw std::invalid_argument("tool parameter cannot be represented in Qwen XML");
@@ -941,21 +1001,78 @@ std::string structured_tool_call_format(const ToolCallOutputContract& contract) 
             elements.push_back(
                 Json{{"type", "optional"},
                      {"content", Json{{"type", "sequence"},
-                                      {"elements", Json::array({tagged, whitespace})}}}});
+                                      {"elements", Json::array({tagged, format_whitespace()})}}}});
         }
-        elements.push_back(literal(std::string(kFunctionClose)));
-        elements.push_back(whitespace);
-        elements.push_back(literal(std::string(kToolClose)));
-        elements.push_back(whitespace);
-        alternatives.push_back(Json{{"type", "sequence"}, {"elements", elements}});
     }
+    elements.push_back(literal_format(std::string(kFunctionClose)));
+    elements.push_back(format_whitespace());
+    elements.push_back(literal_format(std::string(kToolClose)));
+    elements.push_back(format_whitespace());
+    return elements;
+}
+
+// One call to `tool` from `<tool_call>` on.
+Json call_format(const Contract::Tool& tool) {
+    Json::array_t elements = {literal_format(std::string(kToolOpen)), format_whitespace(),
+                              literal_format(std::string(kFunctionOpen) + tool.name + ">"),
+                              format_whitespace()};
+    for (Json& element : call_after_opener(tool)) { elements.push_back(std::move(element)); }
+    return Json{{"type", "sequence"}, {"elements", std::move(elements)}};
+}
+
+} // namespace
+
+std::string structured_tool_call_format(const ToolCallOutputContract& contract) {
+    Json alternatives = Json::array();
+    for (const auto& tool : contract.tools) { alternatives.push_back(call_format(tool)); }
     if (alternatives.empty()) { return {}; }
-    return Json{{"type", "sequence"},
-                {"elements",
-                 Json::array({whitespace, Json{{"type", "plus"},
-                                               {"content", Json{{"type", "or"},
-                                                                {"elements", alternatives}}}}})}}
+    return Json{
+        {"type", "sequence"},
+        {"elements",
+         Json::array({format_whitespace(),
+                      Json{{"type", "plus"},
+                           {"content", Json{{"type", "or"}, {"elements", alternatives}}}}})}}
         .dump();
+}
+
+bool has_strict_tools(const ToolCallOutputContract& contract) noexcept {
+    return std::any_of(contract.tools.begin(), contract.tools.end(),
+                       [](const auto& tool) { return tool.strict; });
+}
+
+std::string tool_call_text_format(const ToolCallOutputContract& contract) {
+    // A call is one tag opened by `<tool_call>` and dispatched on the function its body names;
+    // the text around calls is free.
+    Json bodies = Json::array();
+    for (const auto& tool : contract.tools) {
+        Json::array_t elements = {format_whitespace(),
+                                  literal_format(std::string(kFunctionOpen) + tool.name + ">"),
+                                  format_whitespace()};
+        Json::array_t after    = call_after_opener(tool);
+        // The tag's own end is the call close and what follows it is free text again.
+        after.resize(after.size() - 2);
+        for (Json& element : after) { elements.push_back(std::move(element)); }
+        bodies.push_back(Json{{"type", "sequence"}, {"elements", std::move(elements)}});
+    }
+    Json calls{{"type", "triggered_tags"},
+               {"triggers", Json::array({kToolOpen})},
+               {"tags", Json::array({Json{{"type", "tag"},
+                                          {"begin", kToolOpen},
+                                          {"content", Json{{"type", "or"}, {"elements", bodies}}},
+                                          {"end", kToolClose}}})},
+               {"at_least_one", false},
+               {"stop_after_first", false}};
+    if (contract.forced_tool_name.empty()) { return calls.dump(); }
+    // The prompt ends inside the forced call, after its function opener.
+    const auto forced =
+        std::find_if(contract.tools.begin(), contract.tools.end(),
+                     [&](const auto& t) { return t.name == contract.forced_tool_name; });
+    if (forced == contract.tools.end()) {
+        throw std::invalid_argument("the forced tool is not declared");
+    }
+    Json::array_t elements = call_after_opener(*forced);
+    elements.push_back(std::move(calls));
+    return Json{{"type", "sequence"}, {"elements", std::move(elements)}}.dump();
 }
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,

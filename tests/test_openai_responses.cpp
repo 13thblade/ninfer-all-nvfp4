@@ -4,6 +4,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/openai_responses.h"
+#include "serve/structured_output.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -897,10 +898,14 @@ int test_explicit_rejections() {
 
     Json value     = base;
     value["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}, {"strict", true}}});
-    failures += check(api_code([&] {
-                          (void)parse_openai_responses_create_request(value, limits());
-                      }) == "strict_tools_not_supported",
-                      "strict function schema is rejected explicitly");
+    const auto strict = parse_openai_responses_create_request(value, limits());
+    failures += check(strict.prompt.generation.tools.at(0).strict,
+                      "a strict function lost its strict flag");
+    failures +=
+        check(api_code([&] {
+                  (void)drop_unavailable_constraints(strict.prompt.generation, false, false);
+              }) == "strict_tools_not_supported",
+              "a strict function ran unenforced on a server without grammar masks");
 
     value         = base;
     value["text"]         = Json{{"format", Json{{"type", "json_schema"},

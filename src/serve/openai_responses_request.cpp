@@ -754,11 +754,7 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
         if (!item.at("strict").is_boolean()) {
             bad_request("function strict must be a boolean", "tools");
         }
-        if (item.at("strict").get<bool>()) {
-            bad_request("strict function schema enforcement requires constrained decoding, "
-                        "which the Engine does not provide",
-                        "tools", "strict_tools_not_supported");
-        }
+        parsed.definition.strict = item.at("strict").get<bool>();
     }
     if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
         if (!item.at("defer_loading").is_boolean()) {
@@ -795,7 +791,7 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
     parsed.canonical                    = {{"type", "function"},
                                            {"name", identity.name},
                                            {"parameters", parameters},
-                                           {"strict", false}};
+                                           {"strict", parsed.definition.strict}};
     if (!function_description.empty()) {
         parsed.canonical["description"] = std::move(function_description);
     }
@@ -1057,6 +1053,7 @@ void parse_text(const Json& body, OpenAIResponsesPromptRequest& prompt) {
     if (text.contains("format") && !text.at("format").is_null()) {
         const Json& format = text.at("format");
         prompt.generation.structured_output = parse_structured_output(format, false, "text.format");
+        prompt.generation.structured_output_param = "text.format";
         prompt.text_format                  = format;
     }
     if (text.contains("verbosity") && !text.at("verbosity").is_null()) {

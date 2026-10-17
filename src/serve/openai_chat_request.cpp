@@ -196,26 +196,6 @@ void validate_standard_output_controls(const Json& body) {
     }
 }
 
-void validate_constrained_decoding_extensions(const Json& body) {
-    // llama.cpp exposes grammar; vLLM uses structured_outputs and previously exposed the
-    // guided_* spellings. Each promises constrained generation rather than an advisory hint.
-    static constexpr const char* fields[] = {
-        "grammar",      "structured_outputs", "guided_json",
-        "guided_regex", "guided_choice",      "guided_grammar",
-    };
-    for (const char* field : fields) {
-        if (!body.contains(field) || body.at(field).is_null()) { continue; }
-        const Json& value = body.at(field);
-        if (std::string_view(field) == "grammar" && value.is_string() &&
-            value.get_ref<const std::string&>().empty()) {
-            continue;
-        }
-        bad_request(std::string(field) +
-                        " requests constrained decoding, which NInfer does not provide",
-                    field, "constrained_decoding_not_supported");
-    }
-}
-
 void validate_compatibility_hints(const Json& body) {
     // vLLM exposes repetition_penalty, but NInfer's Engine intentionally has no such sampler.
     // The neutral value is accepted so common client defaults remain harmless.
@@ -690,8 +670,8 @@ void parse_tools(const Json& body, GenerationRequest& output) {
             if (!function.at("strict").is_boolean()) {
                 bad_request("function strict must be a boolean", prefix + ".function.strict");
             }
-            // strict:true is accepted as advisory. NInfer cannot constrain decoding to the declared
-            // schema, so the flag does not change generation (docs/serving.md).
+            // Enforced with --structured-output, a hint without it (docs/serving.md).
+            tool.strict = function.at("strict").get<bool>();
         }
         output.tools.push_back(std::move(tool));
     }
@@ -976,7 +956,6 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
 OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body, "request body must be a JSON object");
     validate_standard_output_controls(body);
-    validate_constrained_decoding_extensions(body);
     validate_compatibility_hints(body);
 
     OpenAIChatRequest output;
@@ -984,6 +963,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
         output.generation.structured_output =
             parse_structured_output(body.at("response_format"), true, "response_format");
     }
+    parse_constrained_decoding_extensions(body, output.generation);
     // One model is resident, so an omitted, null or empty model means that one: llama.cpp's
     // WebUI omits it or sends "". The HTTP layer substitutes the served model. A model that is
     // present but not a string is still a malformed request.
@@ -995,6 +975,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 
     parse_tools(body, output.generation);
+    output.generation.strict_tools_advisory = true;
     parse_tool_choice(body, output.generation);
     parse_parallel_tool_calls(body, output.generation);
     parse_messages(body, limits.assistant_prefill, output.generation);

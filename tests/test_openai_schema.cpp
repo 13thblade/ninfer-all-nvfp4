@@ -1,6 +1,7 @@
 #include "serve/generation_service.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
+#include "serve/structured_output.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -349,23 +350,76 @@ int test_standard_field_policy() {
 }
 
 int test_constrained_decoding_extensions() {
-    int failures                                           = 0;
-    const std::vector<std::pair<const char*, Json>> active = {
-        {"grammar", "root ::= \"yes\" | \"no\""},
-        {"structured_outputs", Json{{"json", Json{{"type", "object"}}}}},
-        {"guided_json", Json{{"type", "object"}}},
-        {"guided_regex", "[a-z]+"},
-        {"guided_choice", Json::array({"yes", "no"})},
-        {"guided_grammar", "root ::= \"yes\" | \"no\""},
+    int failures = 0;
+
+    // Each vLLM and llama.cpp spelling reaches the Engine as the constraint it names.
+    struct Case {
+        const char* field;
+        Json value;
+        ninfer::StructuredOutputKind kind;
     };
-    for (const auto& [field, value] : active) {
-        Json body            = base_request();
-        body[field]          = value;
+
+    const std::vector<Case> active = {
+        {"grammar", "root ::= \"yes\" | \"no\"", ninfer::StructuredOutputKind::Grammar},
+        {"structured_outputs", Json{{"json", Json{{"type", "object"}}}},
+         ninfer::StructuredOutputKind::JsonSchema},
+        {"structured_outputs", Json{{"regex", "[a-z]+"}}, ninfer::StructuredOutputKind::Regex},
+        {"structured_outputs", Json{{"choice", Json::array({"yes", "no"})}},
+         ninfer::StructuredOutputKind::Choice},
+        {"structured_outputs", Json{{"grammar", "root ::= [0-9]+"}},
+         ninfer::StructuredOutputKind::Grammar},
+        {"structured_outputs", Json{{"json_object", true}},
+         ninfer::StructuredOutputKind::JsonObject},
+        {"guided_json", Json{{"type", "object"}}, ninfer::StructuredOutputKind::JsonSchema},
+        {"guided_json", "{\"type\":\"integer\"}", ninfer::StructuredOutputKind::JsonSchema},
+        {"guided_regex", "[a-z]+", ninfer::StructuredOutputKind::Regex},
+        {"guided_choice", Json::array({"yes", "no"}), ninfer::StructuredOutputKind::Choice},
+        {"guided_grammar", "root ::= \"yes\" | \"no\"", ninfer::StructuredOutputKind::Grammar},
+    };
+    for (const auto& [field, value, kind] : active) {
+        Json body                     = base_request();
+        body[field]                   = value;
+        const OpenAIChatRequest given = parse(body);
+        failures += check(given.generation.structured_output.kind == kind &&
+                              given.generation.structured_output_param == field,
+                          std::string(field) + " does not reach the Engine as its constraint");
+    }
+    Json choice             = base_request();
+    choice["guided_choice"] = Json::array({"left", "right"});
+    failures += check(parse(choice).generation.structured_output.choices ==
+                          std::vector<std::string>{"left", "right"},
+                      "guided_choice lost its options");
+    Json closed = base_request();
+    closed["structured_outputs"] =
+        Json{{"json", Json{{"type", "object"}}}, {"disable_additional_properties", true}};
+    failures += check(parse(closed).generation.structured_output.strict,
+                      "disable_additional_properties does not close objects");
+
+    // Malformed constraints, two constraints at once, or one beside response_format are refused
+    // on the field that carries them.
+    const std::vector<std::pair<Json, std::string>> refused = {
+        {Json{{"guided_regex", "[a-"}}, "guided_regex"},
+        {Json{{"guided_grammar", "root ::= missing"}}, "guided_grammar"},
+        {Json{{"guided_choice", Json::array()}}, "guided_choice"},
+        {Json{{"guided_choice", Json::array({"a", 1})}}, "guided_choice"},
+        {Json{{"guided_json", "{not json"}}, "guided_json"},
+        {Json{{"structured_outputs", Json{{"regex", "a"}, {"choice", Json::array({"a"})}}}},
+         "structured_outputs.choice"},
+        {Json{{"structured_outputs", Json{{"structural_tag", "{}"}}}},
+         "structured_outputs.structural_tag"},
+        {Json{{"structured_outputs", Json::object()}}, "structured_outputs"},
+        {Json{{"guided_regex", "a"}, {"guided_choice", Json::array({"a"})}}, "guided_choice"},
+        {Json{{"guided_regex", "a"}, {"response_format", Json{{"type", "json_object"}}}},
+         "guided_regex"},
+        {Json{{"guided_whitespace_pattern", " "}}, "guided_whitespace_pattern"},
+    };
+    for (const auto& [fields, param] : refused) {
+        Json body = base_request();
+        for (const auto& [key, value] : fields.items()) { body[key] = value; }
         const ApiError error = api_error([&] { (void)parse(body); });
-        failures +=
-            check(error.param == field && error.code == "constrained_decoding_not_supported" &&
-                      error.message.find(field) != std::string::npos,
-                  std::string(field) + " constrained decoding is explicitly rejected");
+        failures += check(error.param == param && error.code == "invalid_response_format",
+                          "a malformed or conflicting constraint is refused on " + param +
+                              " (got " + error.param + ")");
     }
 
     Json neutral                  = base_request();
@@ -375,8 +429,28 @@ int test_constrained_decoding_extensions() {
     neutral["guided_regex"]       = nullptr;
     neutral["guided_choice"]      = nullptr;
     neutral["guided_grammar"]     = nullptr;
-    failures += check(parse(neutral).generation.messages.size() == 1,
-                      "neutral constrained-decoding extension values are accepted");
+    const OpenAIChatRequest plain = parse(neutral);
+    failures +=
+        check(plain.generation.messages.size() == 1 &&
+                  plain.generation.structured_output.kind == ninfer::StructuredOutputKind::None,
+              "neutral constrained-decoding extension values constrain nothing");
+
+    // A server without grammar masks refuses a constraint on the field that asked for it, or
+    // drops it under --unconstrained-response-format.
+    Json regex                          = base_request();
+    regex["guided_regex"]               = "[a-z]+";
+    const GenerationRequest constrained = parse(regex).generation;
+    const ApiError unavailable =
+        api_error([&] { (void)drop_unavailable_constraints(constrained, false, false); });
+    failures += check(unavailable.code == "response_format_not_supported" &&
+                          unavailable.param == "guided_regex",
+                      "a constraint ran unenforced on a server without grammar masks");
+    const auto unenforced = drop_unavailable_constraints(constrained, false, true);
+    failures += check(unenforced &&
+                          unenforced->structured_output.kind == ninfer::StructuredOutputKind::None,
+                      "--unconstrained-response-format did not drop the constraint");
+    failures += check(!drop_unavailable_constraints(constrained, true, false),
+                      "a server with grammar masks dropped a constraint");
     return failures;
 }
 
@@ -582,10 +656,16 @@ int test_tools() {
     body          = base_request();
     body["tools"] = Json::array({function_tool("weather", true)});
     const OpenAIChatRequest strict_tools = parse(body);
-    failures += check(strict_tools.generation.tools.size() == 1 &&
-                          prompt(strict_tools.generation).options.tool_jsons[0].find(
-                              "\"strict\":false") != std::string::npos,
-                      "strict tools are accepted as advisory without reaching the prompt");
+    failures += check(
+        strict_tools.generation.tools.size() == 1 && strict_tools.generation.tools[0].strict &&
+            prompt(strict_tools.generation).options.tool_jsons[0].find("\"strict\":true") !=
+                std::string::npos,
+        "a strict tool did not reach the prompt as strict");
+    // Without grammar masks a Chat Completions strict flag is advisory: the tool runs non-strict.
+    const auto advisory = drop_unavailable_constraints(strict_tools.generation, false, false);
+    failures += check(advisory && prompt(*advisory).options.tool_jsons[0].find(
+                                      "\"strict\":false") != std::string::npos,
+                      "a strict tool was refused instead of advisory without grammar masks");
     body["tools"] = Json::array({Json{{"type", "custom"},
                                       {"custom",
                                        Json{{"name", "shell"},

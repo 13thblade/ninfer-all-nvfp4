@@ -1475,18 +1475,24 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     std::shared_ptr<text::GrammarState> grammar;
     text::validate_structured_output(structured);
-    if (structured.kind != StructuredOutputKind::None) {
-        if (!caller_stop.token_ids.empty() || !caller_stop.strings.empty() ||
-            !caller_stop.include_model_defaults || output.raw || output.preserve_special_tokens ||
-            caller_stop.publish_stop_token) {
+    const auto& tools       = prompt.data_->tool_call_output;
+    const bool strict_tools = tools && fi::has_strict_tools(*tools);
+    if (strict_tools && impl_->gemma) {
+        throw std::invalid_argument(
+            "strict tool arguments need Qwen's tool-call syntax, which Gemma 4 does not use");
+    }
+    if (structured.kind != StructuredOutputKind::None || strict_tools) {
+        if (structured.kind != StructuredOutputKind::None &&
+            (!caller_stop.token_ids.empty() || !caller_stop.strings.empty() ||
+             !caller_stop.include_model_defaults || output.raw || output.preserve_special_tokens ||
+             caller_stop.publish_stop_token)) {
             throw std::invalid_argument(
                 "structured output requires default stops and decoded text output");
         }
         text::StructuredOutputEnvelope envelope;
         if (prompt.data_->starts_in_reasoning) { envelope.reasoning_close = "</think>"; }
-        if (prompt.data_->tool_call_output) {
-            envelope.alternative_format =
-                fi::structured_tool_call_format(*prompt.data_->tool_call_output);
+        if (structured.kind != StructuredOutputKind::None && tools) {
+            envelope.alternative_format = fi::structured_tool_call_format(*tools);
         }
         std::lock_guard lock(impl_->grammar_mutex);
         if (!impl_->grammar_compiler) {
@@ -1501,7 +1507,10 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
             impl_->grammar_compiler = std::make_unique<text::StructuredCompiler>(
                 std::move(vocab), impl_->tokenizer->default_stop_token_ids());
         }
-        grammar = impl_->grammar_compiler->compile(structured, envelope);
+        grammar = structured.kind != StructuredOutputKind::None
+                      ? impl_->grammar_compiler->compile(structured, envelope)
+                      : impl_->grammar_compiler->compile_format(fi::tool_call_text_format(*tools),
+                                                                envelope);
     }
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(impl_->tokenizer, std::move(policy), output,
