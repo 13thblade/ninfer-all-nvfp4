@@ -126,7 +126,7 @@ means the card calibrates once at its first start.
 | ⬜ | RTX A2000 | 12 GB | Workstation | | |
 | ⬜ | RTX A1000 | 8 GB | Workstation | | |
 | ⬜ | A40 | 48 GB | Data center | ✓ | |
-| ⬜ | A10 | 24 GB | Data center | | |
+| ⬜ | A10 | 24 GB | Data center | ✓ | |
 | ⬜ | A10G | 24 GB | Data center | | |
 | ⬜ | A16 | 16 GB per GPU | Data center | | |
 | ⬜ | A2 | 16 GB | Data center | | |

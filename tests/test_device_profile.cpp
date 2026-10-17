@@ -187,6 +187,7 @@ void test_builtin_parts() {
         {"NVIDIA RTX 4000 Ada Generation", 8, 9, 48},
         {"NVIDIA RTX 5000 Ada Generation", 8, 9, 100},
         {"NVIDIA RTX 6000 Ada Generation", 8, 9, 142},
+        {"NVIDIA A10", 8, 6, 72},
         {"NVIDIA A40", 8, 6, 84},
         {"NVIDIA GeForce RTX 3060", 8, 6, 28},
         {"NVIDIA GeForce RTX 3060 Ti", 8, 6, 38},
