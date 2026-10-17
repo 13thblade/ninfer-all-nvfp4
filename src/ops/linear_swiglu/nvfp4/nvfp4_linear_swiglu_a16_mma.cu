@@ -60,7 +60,7 @@ void nvfp4_linear_swiglu_a16_mma_launch(const Tensor& x, const Weight& weight, T
     } else if (x.ne[1] <= 96) {
         launch.template operator()<Nvfp4A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>>();
     } else {
-        launch.template operator()<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>();
+        launch.template operator()<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>();
     }
 }
 
