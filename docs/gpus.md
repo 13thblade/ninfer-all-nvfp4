@@ -66,7 +66,7 @@ means the card calibrates once at its first start.
 | ⬜ | RTX 5090 D | 32 GB | GeForce | | |
 | ⬜ | RTX 5090 D V2 | 24 GB | GeForce | ✓ | |
 | ⬜ | RTX 5080 | 16 GB | GeForce | ✓ | |
-| ⬜ | RTX 5070 Ti | 16 GB | GeForce | | |
+| ⬜ | RTX 5070 Ti | 16 GB | GeForce | ✓ | |
 | ⬜ | RTX 5070 | 12 GB | GeForce | ✓ | |
 | ⬜ | RTX 5060 Ti | 16 / 8 GB | GeForce | ✓ | |
 | ⬜ | RTX 5060 | 8 GB | GeForce | | |

@@ -191,6 +191,7 @@ void test_builtin_parts() {
         {"Tesla V100-SXM2-32GB", 7, 0, 80},
         {"NVIDIA GeForce RTX 5060 Ti", 12, 0, 36},
         {"NVIDIA GeForce RTX 5070", 12, 0, 48},
+        {"NVIDIA GeForce RTX 5070 Ti", 12, 0, 70},
         {"NVIDIA GeForce RTX 5080", 12, 0, 84},
         {"NVIDIA GeForce RTX 5090 D v2", 12, 0, 170},
         {"NVIDIA RTX PRO 4000 Blackwell", 12, 0, 70},
