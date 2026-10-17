@@ -15,9 +15,14 @@ each stage read its weights once per micro-batch and win nothing.
 **It is not tensor parallelism.** No layer is divided across devices, so no collective runs inside a
 layer.
 
-**Multi-GPU is a Linux feature.** Repeating one device id (`--devices 0,0`) exercises the whole
-stage path on a single card and is accepted everywhere, which is how the path is tested without a
-second GPU. Distinct ids are refused on Windows.
+**Linux and Windows.** Repeating one device id (`--devices 0,0`) exercises the whole stage path on
+a single card, which is how the path is tested without a second GPU. Under Windows a GeForce card
+runs the WDDM driver model, which gives no peer access, so the stages exchange their boundary rows
+through pinned host memory (`StageLink`), as Linux does between cards without peer access. WDDM
+charges pinned host memory against a card's memory (measured on one card); assuming it charges
+every card of the pipeline, the pinned host KV cache is sized for the rank with the least device
+memory free. This repository has no Windows host with several GPUs: the Windows path is compiled in
+CI and was run by a contributor, not measured here.
 
 **The cards may differ.** Every listed device must run the build's code, which `DeviceContext`
 (`core/device.cu`) checks before any weight is uploaded by loading a kernel on each, and the model
