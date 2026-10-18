@@ -285,10 +285,11 @@ Prefill of a 4,463-token prompt, in tok/s:
   ([context and memory](docs/cli.md#context-and-memory)).
 - Up to 1,048,576 tokens of context, four times the native window, with plain RoPE or YaRN
   (`--rope-yarn`).
-- A context cache of checkpoints on the device, in pinned host memory and in an optional disk tier
-  that survives restarts (`--disk-kv-path`, `--disk-kv-restore`), with endpoint and branch anchors
-  that let an edited or regenerated turn resume where it left the conversation. The hybrid prefix
-  cache (`--use-alt-prefix-caching`) shares content-addressed KV blocks across requests instead.
+- A hybrid prefix cache by default, which shares content-addressed KV blocks and sparse state
+  snapshots across requests on the device and in pinned host memory; or a checkpoint catalog
+  (`--use-original-prefix-caching`) with an optional disk tier that survives restarts
+  (`--disk-kv-path`, `--disk-kv-restore`) and endpoint and branch anchors that let an edited or
+  regenerated turn resume where it left the conversation.
 - Precision trades that buy context: `--embedding-q4`, `--lm-head-q6`, `--gdn-state-fp16`
   ([quality trades](docs/maintainer/quality-trade-experiments.md)).
 
