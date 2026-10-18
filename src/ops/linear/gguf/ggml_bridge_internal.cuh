@@ -9,6 +9,8 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/vecdotq.cuh"
 
+#include "../../common/silu.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -124,7 +126,9 @@ void slice_dequantize(const void* weight, std::int64_t row_bytes, int k, const s
 template <ggml_type type>
 void vec_launch(const VecArgs& args, int columns, bool fused, cudaStream_t stream);
 
-__device__ __forceinline__ float vec_silu(float x) { return x / (1.0f + expf(-x)); }
+// SiLU from correctly rounded operations (ops/common/silu.h): the CPU's GGUF expert products
+// compute the same bits.
+__device__ __forceinline__ float vec_silu(float x) { return ops::silu(x); }
 
 // GateActivation: 0 SiLU, 1 tanh-approximated GELU.
 __device__ __forceinline__ float vec_gate(float x, int activation) {

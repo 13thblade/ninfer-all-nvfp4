@@ -87,6 +87,14 @@ __device__ __forceinline__ void scale_min_k4(const std::uint8_t* s, int j, int& 
     }
 }
 
+// The product of one slice of a type the CPU also computes (Q2_0, Q8_0, IQ4_NL, IQ4_XS, IQ3_XXS,
+// IQ3_S; IQ2_S spells out its two halves): the slice factor times the activation scale, rounded,
+// times the integer dot, rounded, never fused with the sum it joins, so that gguf_expert_cpu
+// reproduces every bit.
+__device__ __forceinline__ float cpu_product(float factor, float d, int dot) {
+    return __fmul_rn(__fmul_rn(factor, d), float(dot));
+}
+
 // dot() is the contribution of one slice to one column: d and sum are the column's slice scale and
 // the sum of its unquantized values.
 template <ggml_type type>
@@ -103,7 +111,7 @@ struct Decoder<GGML_TYPE_Q8_0> {
         for (int i = 0; i < 8; ++i) { s.w[i] = int(u32_a2(b + 2 + 4 * i)); }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -198,7 +206,7 @@ struct Decoder<GGML_TYPE_Q2_0> {
     }
 
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 
     // The transposed form for activations stored by decode_quantize<true>: word 4h + k holds the
@@ -221,7 +229,7 @@ struct Decoder<GGML_TYPE_Q2_0> {
     }
 
     __device__ __forceinline__ static float dot_t(const Slice& s, const int* a, float d, int qsum) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)) - qsum);
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)) - qsum);
     }
 };
 
@@ -267,7 +275,7 @@ struct Decoder<GGML_TYPE_IQ4_NL> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -291,7 +299,7 @@ struct Decoder<GGML_TYPE_IQ4_XS> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -517,7 +525,9 @@ struct Decoder<GGML_TYPE_IQ2_S> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return d * (s.f[0] * float(dot4(s.w, a, 0)) + s.f[1] * float(dot4(s.w + 4, a + 4, 0)));
+        // Spelled out as the CPU's product computes it (gguf_expert_cpu).
+        return __fmul_rn(d, __fmaf_rn(s.f[0], float(dot4(s.w, a, 0)),
+                                      __fmul_rn(s.f[1], float(dot4(s.w + 4, a + 4, 0)))));
     }
 };
 
@@ -540,7 +550,7 @@ struct Decoder<GGML_TYPE_IQ3_XXS> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -563,7 +573,7 @@ struct Decoder<GGML_TYPE_IQ3_S> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 

@@ -10,6 +10,7 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "ops/common/fixed_point.cuh"
+#include "ops/common/silu.h"
 #include "ops/linear/gguf/gguf_linear.h"
 
 #include <cuda_bf16.h>
@@ -54,13 +55,13 @@ bool fusable(const GgufExpertTable& gate, const GgufExpertTable& up) {
     return gate.format == up.format && gate.row_bytes == up.row_bytes;
 }
 
-// out = silu(gate) * up, rounded to BF16, over [pairs][rows] planes.
+// out = silu(gate) * up, rounded to BF16, over [pairs][rows] planes: the vector kernels' SiLU
+// (ops/common/silu.h), so every path computes the same middle.
 __global__ void swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up,
                               __nv_bfloat16* __restrict__ out, std::int64_t count) {
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) { return; }
-    const float g = gate[i];
-    out[i]        = __float2bfloat16(g / (1.0f + expf(-g)) * up[i]);
+    out[i] = __float2bfloat16(silu(gate[i]) * up[i]);
 }
 
 // fixed[t][r] += each of token t's pairs' contribution weights[p] * down[p][r] in 2^-32 fixed

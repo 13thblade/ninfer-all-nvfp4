@@ -504,9 +504,13 @@ enum class ExpertResidency : std::uint8_t {
 
 // Flash-Next host and disk experts: how a decode or verification call gets the routed experts the
 // device cache lacks. By default every miss executes on the GPU; a DMA share below one lets the CPU
-// compute the rest, with different numerical results (native banks need concurrency one).
+// compute the rest: for GGUF banks the GPU's results bit for bit, for native banks different
+// numerical results (and concurrency one).
 struct HybridExpertOptions {
     float dma_share = 1; // 0..1 of distinct uncached experts per decode/verify call
+    // GGUF experts: each call splits its misses between copies and the CPU by measured speeds
+    // instead of a fixed share (dma_share is then unused).
+    bool dma_share_auto = false;
     std::uint32_t cpu_threads = 0; // automatic, or 1..256
     // GGUF banks: copy missing experts into device staging while the cached ones run (staged), or
     // let the expert kernels read host experts across the bus (mapped; host experts only).

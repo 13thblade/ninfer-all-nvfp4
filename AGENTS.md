@@ -57,9 +57,13 @@ short) with an F16 KV cache or any
 encodes images and video with the release's vision tower (the artifact's `vision` component, from
 its llama.cpp mmproj; resident, streamed from pinned memory, or FP32 on CPU threads), and has no
 pipeline stages.
-For the current Flash-Next delivery, all model and expert arithmetic runs on the GPU. Keep the
-completed native/CPU experiments and their evidence, but do not extend CPU expert execution or
-automatically select a CPU share. Develop the existing GGUF host-RAM and disk-streaming paths;
+Flash-Next's dense and attention arithmetic runs on the GPU. Of a decode or verification call's
+routed experts that the device cache lacks, CPU threads may compute a share from the host copy
+while the GPU copies and runs the rest (hybrid execution, `--expert-dma-share`), including a share
+the engine chooses from measured CPU and bus speeds; develop it where measurements show a gain.
+The CPU's GGUF expert products reproduce the GPU's decode products bit for bit
+(`gguf_expert_cpu`); a change to either side keeps them equal.
+Develop the existing GGUF host-RAM and disk-streaming paths;
 reuse published weights and the published IQ4 table when adding MTP. Disk residency uses the OS
 page cache. An additional application-managed RAM cache of experts is excluded from this delivery
 by the user's decision. Keep the bounded transfer buffers and the device expert cache.
