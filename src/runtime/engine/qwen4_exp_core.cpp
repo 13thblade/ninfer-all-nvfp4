@@ -1582,15 +1582,14 @@ struct Qwen4ExpCore::Impl {
             r.vision_seconds = seconds(vision_start, Clock::now());
         }
         const std::uint32_t n = prompt_step_tokens(r);
-        const auto chunk = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
-        executor.forward(r.slot, chunk, 1);
+        const auto prompt     = std::span<const TokenId>(r.prompt_tokens);
+        const auto chunk      = prompt.subspan(r.prefilled, n);
+        // The next step's table rows are read while this one runs.
+        const auto next = prompt.subspan(r.prefilled + n,
+                                         std::min(executor.prompt_step(), prompt_n - r.prefilled - n));
+        executor.forward(r.slot, chunk, 1, next);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
         r.prefilled += n;
-        if (r.prefilled < prompt_n) {
-            const auto next = std::span<const TokenId>(r.prompt_tokens).subspan(
-                r.prefilled, std::min(executor.options().prefill_chunk, prompt_n - r.prefilled));
-            executor.prefetch_ngram(r.slot, next);
-        }
         if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at) {
             executor.snapshot(r.slot, slot.snapshot);
             slot.anchor = slot.fed;

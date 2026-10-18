@@ -152,12 +152,11 @@ public:
     // Runs `tokens` (at most prompt_step(); beyond prefill_chunk not a media prompt's) at the
     // sequence's next positions and leaves the logits of the last `logit_rows` of them in
     // logits(), BF16 [vocab, logit_rows] on the head device. Work is queued on the device
-    // streams; logits() is ready on head_stream().
+    // streams; logits() is ready on head_stream(). Once the table rows of `tokens` are read, the
+    // rows of `next` (the known tokens that follow, at most prompt_step()) are hinted, to be
+    // read while the device runs `tokens`.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                 std::uint32_t logit_rows);
-    // Hints the next known tokens' table rows from a copy of the sequence's hash context. Does
-    // not advance sequence state or wait for GPU work; at most prefill_chunk tokens.
-    void prefetch_ngram(std::uint32_t sequence, std::span<const std::int32_t> tokens);
+                 std::uint32_t logit_rows, std::span<const std::int32_t> next = {});
     // Runs one token of each of `sequences` (distinct) at its next position in one pass, and
     // leaves their logits in logits(), one column per sequence in that order. The experts read
     // their weights once for the whole batch; each sequence's mixers run on its own state.

@@ -264,14 +264,17 @@ memory; the Linux cache avoids huge pages so one short row does not fault 2 MiB.
 allocated capacity, not current RSS; buffered and
 mapped reads can also occupy the OS page cache. Failed batches admit no rows.
 
-The Engine hints the next prompt chunk's rows while the current chunk runs. MTP hints its anchor
+Once a prompt step (a chunk, or a span) has read its own rows, it hints the rows of the
+Engine's next step, which are then read while the GPU runs this one. MTP hints its anchor
 and both highest-logit candidates at each draft step. An auxiliary CUDA stream copies each
 step's two tokens and hashes private contexts while later draft steps run. Verification also
 hints both candidates after each actual verified prefix; predictions do not change the next
 column's context. Linux buffered/mapped readers
 issue `POSIX_FADV_WILLNEED`; Windows mapped readers use `PrefetchVirtualMemory`. These are advisory
-reads, with duplicate rows and shared pages coalesced. Direct I/O and Windows buffered I/O start one bounded
-speculative batch in separate staging; busy workers skip extra hints. Only complete successful
+reads, with duplicate rows and shared pages coalesced. A worker thread issues a batch of more than
+256 page ranges and drops a batch that arrives while it still issues the previous one. Direct I/O
+and Windows buffered I/O start one bounded speculative batch in separate staging; busy workers
+skip extra hints. Only complete successful
 batches can supply demand reads, and hints alone admit no rows into the persistent cache.
 
 Buffered/direct row misses use a bounded OS queue: io_uring on Linux and overlapped reads with
