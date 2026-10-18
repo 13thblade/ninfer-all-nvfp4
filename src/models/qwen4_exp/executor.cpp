@@ -661,6 +661,12 @@ struct Executor::Impl {
     // Each chunk's MoE input and hyper-connection injection between a layer's two phases.
     DeviceBuffer span_mixed, span_inject;
     std::size_t span_row_bytes = 0; // n-gram rows of one token
+    // A span's expert phase runs up to kGroupTokens of consecutive chunks in one wide call, whose
+    // matrix products then take wider column tiles: the group's routes and output. span_group is
+    // the chunks a group takes, 1 when groups are off.
+    static constexpr std::uint32_t kGroupTokens = 4096;
+    std::uint32_t span_group = 1;
+    DeviceBuffer span_ids, span_weights, span_shared, span_y;
     // A span's chunk before its last runs a layer's experts: the pool keeps that layer's experts.
     bool span_hold = false;
 
@@ -976,6 +982,10 @@ struct Executor::Impl {
         bytes = std::max(
             {bytes, ops::moe_experts_gguf_workspace_bytes(t),
              ops::moe_route_workspace_bytes(t, static_cast<std::int32_t>(config.num_experts))});
+        if (const std::uint32_t group = planned_group_chunks(); group > 1 && rank == 0) {
+            bytes = std::max(bytes, ops::moe_experts_gguf_workspace_bytes(
+                                        static_cast<std::int32_t>(group) * t));
+        }
         std::vector<const LayerPlan*> planned;
         for (const auto& plan : layers) {
             if (plan.rank == rank) { planned.push_back(&plan); }
@@ -2651,18 +2661,30 @@ struct Executor::Impl {
         }
     }
 
-    // Spans need one device and GGUF host experts, whose wide calls copy every uncached expert of
-    // a layer into the pool: per span instead of per chunk.
-    void allocate_span() {
+    // The tokens a prompt span takes, 0 without spans. Spans need one device and GGUF host
+    // experts, whose wide calls copy every uncached expert of a layer into the pool: per span
+    // instead of per chunk.
+    [[nodiscard]] std::uint32_t planned_span_tokens() const {
         const bool native = std::any_of(layers.begin(), layers.end(),
                                         [](const LayerPlan& plan) { return plan.moe.native.has_value(); });
         // One device: its segments split only where the PLE layer's rows arrive.
         const bool one_rank = std::all_of(segments.begin(), segments.end(),
                                           [](const Segment& segment) { return segment.rank == 0; });
-        if (model.options().experts != ExpertResidency::Host || native || !one_rank) { return; }
+        if (model.options().experts != ExpertResidency::Host || native || !one_rank) { return 0; }
         const std::uint32_t tokens =
             std::min<std::uint32_t>(options.max_context, kSpanChunks * options.prefill_chunk);
-        if (tokens <= options.prefill_chunk) { return; }
+        return tokens > options.prefill_chunk ? tokens : 0;
+    }
+
+    // The chunks one expert call of a span's expert phase takes: as many as kGroupTokens holds.
+    [[nodiscard]] std::uint32_t planned_group_chunks() const {
+        if (planned_span_tokens() == 0) { return 1; }
+        return std::clamp<std::uint32_t>(kGroupTokens / options.prefill_chunk, 1, kSpanChunks);
+    }
+
+    void allocate_span() {
+        const std::uint32_t tokens = planned_span_tokens();
+        if (tokens == 0) { return; }
         span_tokens       = tokens;
         const auto width  = std::size_t(config.hc_count) * config.hidden_size;
         RankBinding bind(device, 0);
@@ -2679,7 +2701,73 @@ struct Executor::Impl {
             span_rows      = DeviceBuffer(std::size_t(tokens) * span_row_bytes);
             bytes += span_rows.bytes;
         }
+        span_group = planned_group_chunks();
+        if (span_group > 1) {
+            const std::size_t group = std::size_t(span_group) * options.prefill_chunk;
+            const std::size_t pairs = group * config.num_experts_per_tok;
+            span_ids     = DeviceBuffer(pairs * 4);
+            span_weights = DeviceBuffer(pairs * 4);
+            span_shared  = DeviceBuffer(group * 4);
+            span_y       = DeviceBuffer(group * config.hidden_size * 4);
+            bytes += span_ids.bytes + span_weights.bytes + span_shared.bytes + span_y.bytes;
+        }
         memory.ranks[0].workspace_bytes += bytes;
+    }
+
+    // The chunk after the expert group of a span's `n` tokens that starts at chunk `first` of
+    // `chunks` (c tokens each but the last). A group needs the full pool and kPrefetchTokens or
+    // more, so that it runs from the layer's prefetched pool copy; a last chunk of
+    // kVectorTokens or fewer runs alone, as forward() runs it.
+    [[nodiscard]] std::size_t group_end(std::size_t first, std::size_t chunks, std::size_t n,
+                                        std::size_t c) const {
+        if (span_group == 1 || slot_pools.empty() || slot_pools[0].slots < config.num_experts) {
+            return first + 1;
+        }
+        std::size_t last = std::min<std::size_t>(chunks, first + span_group);
+        if (last > first + 1 && n - (last - 1) * c <= std::size_t(kVectorTokens)) { --last; }
+        return std::min(last * c, n) - first * c >= std::size_t(kPrefetchTokens) ? last
+                                                                                 : first + 1;
+    }
+
+    // The experts of a span's chunks first..last-1 in one wide call through the pool, into
+    // span_y. rank.mixed holds the first chunk's MoE input and the others' follow it. Each chunk
+    // is routed on its own, as forward() routes it, into the group's route planes.
+    void run_group(const LayerPlan& plan, RankState& rank, std::size_t index, std::size_t first,
+                   std::size_t last, std::size_t n, std::size_t c) {
+        const MoePlan& m      = plan.moe;
+        const cudaStream_t st = rank.stream;
+        const auto h          = static_cast<std::int32_t>(config.hidden_size);
+        const auto top        = static_cast<std::int32_t>(config.num_experts_per_tok);
+        auto* const ids_p     = static_cast<std::int32_t*>(span_ids.p);
+        auto* const weights_p = static_cast<float*>(span_weights.p);
+        auto* const shared_p  = static_cast<float*>(span_shared.p);
+        for (std::size_t j = first; j < last; ++j) {
+            const auto t         = static_cast<std::int32_t>(std::min(c, n - j * c));
+            const std::size_t at = (j - first) * c;
+            const Tensor mixed(static_cast<std::byte*>(rank.mixed) + at * std::size_t(h) * 2,
+                               DType::BF16, {h, t});
+            Tensor ids(ids_p + at * std::size_t(top), DType::I32, {top, t});
+            Tensor weights(weights_p + at * std::size_t(top), DType::FP32, {top, t});
+            Tensor shared(shared_p + at, DType::FP32, {t});
+            auto scope = rank.workspace->scope();
+            ops::moe_route(mixed, m.router, m.shared_gate, *rank.workspace, ids, weights, shared,
+                           st);
+        }
+        const auto t = static_cast<std::int32_t>(std::min(last * c, n) - first * c);
+        Tensor ids(ids_p, DType::I32, {top, t});
+        Tensor weights(weights_p, DType::FP32, {top, t});
+        Tensor shared(shared_p, DType::FP32, {t});
+        void* const own_y = rank.y;
+        rank.y            = span_y.p;
+        bool pooled       = false;
+        try {
+            pooled = run_through_slots(plan, rank, t, index, ids, weights, shared);
+        } catch (...) {
+            rank.y = own_y;
+            throw;
+        }
+        rank.y = own_y;
+        if (!pooled) { throw std::logic_error("qwen4_exp: a span group ran outside the pool"); }
     }
 
     // A prompt span of several chunks, layer by layer: every chunk passes a layer before any passes
@@ -2802,16 +2890,34 @@ struct Executor::Impl {
                             &inject, st);
                     }
                 }
-                for (std::size_t k = 0; k < chunks; ++k) {
-                    const std::int32_t t = count_of(k);
+                for (std::size_t k = 0; k < chunks;) {
+                    const std::size_t last = group_end(k, chunks, n, c);
+                    const auto t = static_cast<std::int32_t>(std::min(last * c, n) - k * c);
                     rank.stack = chunk_stack(k);
                     chunk_planes(k);
-                    span_hold = k + 1 < chunks;
+                    span_hold = last < chunks;
                     Tensor stack(rank.stack, DType::FP32, {h, hc, t});
                     Tensor inject(rank.inject, DType::FP32, {hc, t});
-                    run_moe(plan, rank, t, i);
-                    ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, t}), inject,
-                                                st);
+                    if (last == k + 1) {
+                        run_moe(plan, rank, t, i);
+                        ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, t}),
+                                                    inject, st);
+                    } else {
+                        run_group(plan, rank, i, k, last, n, c);
+                        ops::hyper_connection_write(stack, Tensor(span_y.p, DType::FP32, {h, t}),
+                                                    inject, st);
+                        if (last == chunks) {
+                            // record_routes() reads the last chunk's routes from the layer's
+                            // record, where run_moe() leaves them.
+                            const auto top = std::size_t(config.num_experts_per_tok);
+                            CUDA_CHECK(cudaMemcpyAsync(
+                                route_records[i],
+                                static_cast<std::int32_t*>(span_ids.p) + (chunks - 1 - k) * c * top,
+                                top * std::size_t(count_of(chunks - 1)) * 4,
+                                cudaMemcpyDeviceToDevice, st));
+                        }
+                    }
+                    k = last;
                 }
             }
             span_hold   = false;

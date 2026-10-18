@@ -490,10 +490,13 @@ draft-chain graph and each width its own verification graph, captured at their s
   uncached experts cross the bus once per span, during the attention phase that precedes them, and
   a span's short last chunk runs from the same pool (a 5,669-token prompt prefilled at 1,334 instead
   of 678 tokens/s on an RTX 3090 when spans came; the bank-shaped pool and the two phases then took a
-  9,297-token Q2_0 prompt from 1.12-1.18k to 1.35k tokens/s from a cold expert cache). With
-  `--expert-prefill-buffers 2` the pool has two buffers that consecutive layers alternate between:
-  each layer's copies start as soon as the layer two back is done with its buffer, while the
-  layer before it runs. Weighted
+  9,297-token Q2_0 prompt from 1.12-1.18k to 1.35k tokens/s from a cold expert cache). The expert
+  phase runs up to 4,096 tokens of consecutive chunks in one call, each chunk routed on its own,
+  so the matrix kernel takes 128-column tiles rather than the 32 of a 1,024-token chunk; a last
+  chunk of eight tokens or fewer runs alone (with IQ3_S, a 31,860-token prompt's expert matrix
+  products took 4.47 instead of 6.52 s on an RTX 3090). With `--expert-prefill-buffers 2` the
+  pool has two buffers that consecutive layers alternate between: each layer's copies start as
+  soon as the layer two back is done with its buffer, while the layer before it runs. Weighted
   expert outputs are summed in fixed point, so the result does not depend on the order experts
   finish in.
 - Up to eight tokens of GGUF host experts run in two stages. A kernel splits the call's routes into
