@@ -1843,15 +1843,14 @@ struct Executor::Impl {
     std::vector<MediaRun> media_runs;
     bool mrope = false;
 
-    void prefetch_ngram(std::uint32_t sequence, std::span<const std::int32_t> tokens) {
-        if (!table || options.ngram_read.residency == NgramResidency::Ram ||
+    // Hints the table rows of `next`, the known tokens after the sequence's hashed ones, from a
+    // copy of its hash context: forward() calls it once its own rows are read.
+    void hint_next(const SequenceState& sequence, std::span<const std::int32_t> next) {
+        if (next.empty() || !table || options.ngram_read.residency == NgramResidency::Ram ||
             options.ngram_read.io == NgramIo::Direct) { return; }
-        if (tokens.size() > options.prefill_chunk) {
-            throw std::invalid_argument("qwen4_exp prefetch: at most prefill_chunk tokens");
-        }
-        NgramContext context = sequences.at(sequence).context;
-        std::vector<std::uint64_t> rows(tokens.size() * config.ngram_heads());
-        ngram_row_ids(ngram, tokens, config.eos_token_id, config.vocab_size, context, rows);
+        NgramContext context = sequence.context;
+        std::vector<std::uint64_t> rows(next.size() * config.ngram_heads());
+        ngram_row_ids(ngram, next, config.eos_token_id, config.vocab_size, context, rows);
         table->prefetch(rows);
     }
 
@@ -2774,7 +2773,7 @@ struct Executor::Impl {
     // the next, so a wide call's pool copy of the layer's uncached experts serves every chunk. The
     // arithmetic of each chunk is that of forward(); the logits are the last chunk's.
     void forward_span(std::uint32_t s, std::span<const std::int32_t> tokens,
-                      std::uint32_t logit_rows) {
+                      std::uint32_t logit_rows, std::span<const std::int32_t> next) {
         const std::size_t n = tokens.size();
         const std::size_t c = options.prefill_chunk;
         if (span_tokens == 0 || n > span_tokens) {
@@ -2835,6 +2834,8 @@ struct Executor::Impl {
             sequence.position += std::uint32_t(t);
         }
         sequence.position = start;
+        // The next step's rows are read while the device runs this span.
+        hint_next(sequence, next);
         void* const own_mixed   = rank.mixed;
         float* const own_inject = rank.inject;
         // Chunk k's MoE input and injection, kept between a layer's two phases.
@@ -2967,9 +2968,13 @@ struct Executor::Impl {
         return span_tokens != 0 ? span_tokens : options.prefill_chunk;
     }
 
-    void forward(std::uint32_t s, std::span<const std::int32_t> tokens, std::uint32_t logit_rows) {
+    void forward(std::uint32_t s, std::span<const std::int32_t> tokens, std::uint32_t logit_rows,
+                 std::span<const std::int32_t> next) {
+        if (next.size() > prompt_step()) {
+            throw std::invalid_argument("qwen4_exp forward: more next tokens than a prompt step");
+        }
         if (tokens.size() > options.prefill_chunk) {
-            forward_span(s, tokens, logit_rows);
+            forward_span(s, tokens, logit_rows, next);
             return;
         }
         check_tokens(tokens, logit_rows);
@@ -2978,6 +2983,7 @@ struct Executor::Impl {
         const Part part{
             .sequence = &sequence, .column = 0, .count = static_cast<std::int32_t>(tokens.size())};
         pass(std::span(&part, 1), tokens, logit_rows);
+        hint_next(sequence, next);
         if (mtp) {
             const Committed committed{&sequence, 0, part.count, position, tokens};
             mtp_catch_up(std::span(&committed, 1));
@@ -3020,7 +3026,7 @@ struct Executor::Impl {
         const auto prefill = [&](std::uint32_t count) {
             reset(0);
             count = std::min(count, room);
-            forward(0, std::span(tokens).first(count), 1);
+            forward(0, std::span(tokens).first(count), 1, {});
         };
         warming = true;
         prefill(1);
@@ -3788,12 +3794,8 @@ std::uint32_t Executor::position(std::uint32_t sequence) const {
 }
 
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                       std::uint32_t logit_rows) {
-    impl_->forward(sequence, tokens, logit_rows);
-}
-
-void Executor::prefetch_ngram(std::uint32_t sequence, std::span<const std::int32_t> tokens) {
-    impl_->prefetch_ngram(sequence, tokens);
+                       std::uint32_t logit_rows, std::span<const std::int32_t> next) {
+    impl_->forward(sequence, tokens, logit_rows, next);
 }
 
 void Executor::decode(std::span<const std::uint32_t> sequences,

@@ -4,6 +4,7 @@
 // counts the rows RAM served. It refuses a short file, a row past the table, a hot-row budget below
 // its index, and a profile naming a row twice or past the table; a row read that fails raises
 // FileReadError. A hot-row profile reads back as written and is refused for other hash constants.
+// Hints, including the batches of many pages a worker thread issues, leave demand reads unchanged.
 #include "core/file_read_error.h"
 #include "models/qwen4_exp/ngram_hash.h"
 #include "models/qwen4_exp/ngram_profile.h"
@@ -233,6 +234,44 @@ int run() {
         require(all == expected, "bounded staged hints changed demand output");
         // Destruction drains a still-running speculative read before closing files or buffers.
         reader.prefetch(hinted);
+    }
+
+    {
+        // OS hints of more than kInlineHints page ranges run on a worker thread, which drops a
+        // batch that arrives while it still hints the previous one; destruction waits for it.
+        // Rows of a page each make every row its own range. Hints never change demand output.
+        constexpr std::uint32_t kPageRow = 4096;
+        constexpr std::uint64_t kPageRows = NgramTableReader::kInlineHints * 2 + 3;
+        const auto pages = std::filesystem::path(path.string() + ".pages");
+        std::vector<std::uint8_t> page_payload(kPageRows * kPageRow);
+        for (auto& byte : page_payload) byte = static_cast<std::uint8_t>(random());
+        {
+            std::ofstream file(pages, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(page_payload.data()),
+                       static_cast<std::streamsize>(page_payload.size()));
+        }
+        const NgramTableLayout page_layout{{{pages, 0, kPageRows * kPageRow}}, kPageRow, kPageRows};
+        std::vector<std::uint64_t> all(kPageRows);
+        std::iota(all.begin(), all.end(), 0U);
+        std::reverse(all.begin(), all.end());
+        for (const auto io : {NgramIo::Buffered, NgramIo::Mapped}) {
+            if (stages_hints(io)) { continue; }
+            for (int pass = 0; pass < 3; ++pass) {
+                NgramTableReader reader(page_layout, {.io = io, .depth = 4});
+                reader.prefetch(all);
+                reader.prefetch(all);
+                require(reader.counters().rows == 0, "worker hints count no read");
+                std::vector<std::uint8_t> out(page_payload.size());
+                reader.read_rows(all, out);
+                for (std::size_t i = 0; i < all.size(); ++i) {
+                    require(std::equal(out.begin() + i * kPageRow, out.begin() + (i + 1) * kPageRow,
+                                       page_payload.begin() + all[i] * kPageRow),
+                            "rows read beside worker hints differ from the file");
+                }
+                if (pass == 2) { reader.prefetch(all); } // destroyed while the worker may hint
+            }
+        }
+        std::filesystem::remove(pages);
     }
 
 #ifndef _WIN32
