@@ -1195,14 +1195,14 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                 if (remaining == 0) { break; }
                 if (part.kind != fi::ChatPartKind::Text) { continue; }
                 fi::check_preparation_control(control, "ngram proposal sources");
-                for (const auto& source : fi::ngram_numbered_sources(part.text)) {
+                fi::for_each_ngram_numbered_source(part.text, [&](std::string&& source) {
                     fi::check_preparation_control(control, "ngram proposal sources");
-                    if (remaining == 0) { break; }
                     auto tokens = impl_->tokenizer->encode(source, {.max_tokens = remaining});
                     fi::check_preparation_control(control, "ngram proposal sources");
                     remaining -= tokens.size();
                     result.ngram_sources.push_back(std::move(tokens));
-                }
+                    return remaining != 0;
+                });
             }
         }
     }
