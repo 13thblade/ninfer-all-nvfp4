@@ -954,10 +954,8 @@ nested parameter opener; either makes the call malformed.
 Generated prose can quote tool-call markup before the real call. Unless the first marker's region
 opens with a complete call, each marker is tried in order, and the first complete region that
 consumes the rest of the response becomes the structured turn; quoted markup before it stays
-ordinary content. Generated reasoning closes only at a `</think>` followed by format whitespace or
-the end of the turn, so a marker the model quotes while reasoning (followed by punctuation or an
-escaped newline) stays in the reasoning channel. At most sixteen markers are tried, the first one
-included, so an output that keeps repeating the marker costs a bounded amount of parsing. A region that opens a function but does not parse is recovered: complete calls
+ordinary content. At most sixteen markers are tried, the first one included, so an output that
+keeps repeating the marker costs a bounded amount of parsing. A region that opens a function but does not parse is recovered: complete calls
 before the failure are kept, a call that cannot be read is returned as a call to the reserved
 `malformed_tool_call` tool, whose arguments tell the model what went wrong so that it retries, and
 text after it is dropped.
@@ -1002,8 +1000,17 @@ cap, whatever it sends.
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
 
+Generated reasoning closes at a `</think>` followed by a line break (the model writes
+`\n</think>\n\n`) or by the end of the turn. A `</think>` the model quotes while reasoning,
+followed by a space, punctuation or other text on the same line, stays reasoning, so the rest of
+the thinking is not published as the answer. A marker at the end of a decode round waits for the
+next byte; the token that confirms it is not counted as thinking, and a stop token right after it
+ends the thinking there. Under a grammar (`response_format`, strict tools) the reasoning cannot
+contain the marker, so its first `</think>` is the close whatever follows it.
+
 At the cap boundary, Engine first honors a natural `</think>`, stop condition, cancellation, or
-total output/context limit. If thinking remains open, it commits Qwen's canonical early-close
+total output/context limit. A `</think>` that is the last licensed thinking token is the model's
+own close: no guidance follows it. If thinking remains open, it commits Qwen's canonical early-close
 guidance and close marker to the same model sequence without sampling, streams the guidance as a
 reasoning delta, and continues normal content or tool-call generation. Inserted tokens count in
 completion usage and the request's `max_tokens`/`max_output_tokens` budget.
@@ -1032,13 +1039,13 @@ Gemma 4 takes no thinking budget and reports 0.
 model that keeps rewriting the same passages in its thinking, which token penalties do not catch
 because every pass varies a little.
 
-- **Check.** Every 512 model-origin thinking tokens, at the end of a decode round, the guard tests
-  two signs of a loop. First, the last 2,048 characters of the thinking repeat one period of at
-  most 64 characters, as a loop written without spaces does. Second, the thinking is split into
-  words (a run of letters, digits and `_`, ASCII case folded) and every other non-space character,
-  each a word of its own, and at least 25 % of the last 2,000 words lie inside a 12-word passage
-  that occurs at least three times in the last 30,000 words. A passage repeated twice (a recap)
-  does not count. The measure and thresholds are those of Strata's `reasoning_loop_recovery` and
+- **Check.** Every 512 model-origin thinking tokens, at the end of a decode round that does not
+  end on a `</think>` still waiting for its next byte, the guard tests two signs of a loop. First,
+  the last 2,048 characters of the thinking repeat one period of at most 64 characters, as a loop
+  written without spaces does. Second, the thinking is split into words (a run of letters, digits
+  and `_`, ASCII case folded) and every other non-space character, each a word of its own, and at
+  least 25 % of the last 2,000 words lie inside a 12-word passage that occurs at least three times
+  in the last 30,000 words. A passage repeated twice (a recap) does not count. The measure and thresholds are those of Strata's `reasoning_loop_recovery` and
   its periodic-tail check (measured on other models; NInfer has not re-tuned them).
 - **`stop`** ends the reply there with `finish_reason` `length` (Anthropic `max_tokens`).
 - **`conclude`** commits the same control span a reached thinking budget does (Qwen's early-close

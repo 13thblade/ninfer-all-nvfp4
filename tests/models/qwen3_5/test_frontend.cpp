@@ -2347,6 +2347,18 @@ int test_reasoning_close_requires_boundary(const Frontend& frontend) {
                           channel_text(tail_output, ninfer::OutputChannel::Content).empty(),
                       "a marker followed by a quote was treated as a reasoning close");
 
+    std::vector<ninfer::TokenId> spaced = {kFixtureThinkCloseToken};
+    const auto prose                    = fixture_tokens(" tag ends reasoning.\n");
+    spaced.insert(spaced.end(), prose.begin(), prose.end());
+    const auto spaced_decision =
+        session.preview_model(spaced, 64, ninfer::FinishReason::OutputLimit);
+    const auto spaced_output = session.commit_preview();
+    failures += check(!spaced_decision.finished() &&
+                          channel_text(spaced_output, ninfer::OutputChannel::Reasoning) ==
+                              "</think> tag ends reasoning.\n" &&
+                          channel_text(spaced_output, ninfer::OutputChannel::Content).empty(),
+                      "a marker quoted in prose and followed by a space closed reasoning");
+
     std::vector<ninfer::TokenId> close = {kFixtureThinkCloseToken};
     const auto answer                  = fixture_tokens("\n\nreal answer");
     close.insert(close.end(), answer.begin(), answer.end());
@@ -2377,6 +2389,117 @@ int test_reasoning_close_resolves_at_terminal(const Frontend& frontend) {
                           channel_text(output, ninfer::OutputChannel::Content).empty(),
                       "the implicit terminal close was published into reasoning");
     return failures;
+}
+
+// A close token that waits for its following byte must not change what the thinking is: the
+// confirming token is not thinking, a close that is the last licensed budget token is the model's
+// own close (no control after it), a stop token right after a held close ends the thinking there,
+// and the reasoning-loop guard waits for the held close to resolve.
+int test_held_close_accounting(const Frontend& frontend) {
+    int failures       = 0;
+    const auto thought = fixture_tokens("weighing it up");
+    {
+        auto session = frontend.make_output_session(
+            thinking_prompt(frontend), {}, {},
+            ninfer::ThinkingControlOptions{.budget =
+                                               static_cast<std::uint32_t>(thought.size() + 1U)});
+        std::vector<ninfer::TokenId> tokens = thought;
+        tokens.push_back(kFixtureThinkCloseToken);
+        const auto boundary = session.preview_model(tokens, 64, ninfer::FinishReason::OutputLimit);
+        failures += check(!boundary.finished() &&
+                              boundary.continuation == ninfer::runtime::ContinuationAction::Decode,
+                          "a close that is the last licensed thinking token requested control");
+        (void)session.commit_preview();
+        failures += check(session.pending_control_tokens().empty(),
+                          "a close at the budget boundary left control armed");
+        (void)session.preview_model(fixture_tokens("\n\nanswer"), 64,
+                                    ninfer::FinishReason::OutputLimit);
+        const auto output = session.commit_preview();
+        const auto stats  = session.thinking_stats();
+        failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answer" &&
+                              !stats.applied && stats.injected_tokens == 0 &&
+                              stats.model_thinking_tokens == thought.size() + 1U &&
+                              session.reasoning_tokens() == thought.size() + 1U,
+                          "a close at the budget boundary was not the model's own close");
+    }
+    {
+        auto session = frontend.make_output_session(thinking_prompt(frontend), {});
+        std::vector<ninfer::TokenId> tokens = thought;
+        tokens.push_back(kFixtureThinkCloseToken);
+        tokens.push_back(frontend.default_stop_policy().token_ids.front());
+        const auto decision = session.preview_model(tokens, 64, ninfer::FinishReason::OutputLimit);
+        const auto output   = session.commit_preview();
+        failures +=
+            check(decision.finish_reason == ninfer::FinishReason::StopToken &&
+                      channel_text(output, ninfer::OutputChannel::Reasoning) == "weighing it up" &&
+                      channel_text(output, ninfer::OutputChannel::Content).empty() &&
+                      session.reasoning_tokens() == thought.size() + 1U &&
+                      session.thinking_stats().model_thinking_tokens == thought.size() + 1U,
+                  "a stop token right after a held close was counted as thinking");
+    }
+    {
+        // With special tokens published, the stop token's own bytes follow the held close: they
+        // are content after the close, not a quote that keeps the thinking open.
+        ninfer::StopPolicy published;
+        published.publish_stop_token = true;
+        auto session =
+            frontend.make_output_session(thinking_prompt(frontend), published,
+                                         ninfer::OutputOptions{.preserve_special_tokens = true});
+        std::vector<ninfer::TokenId> tokens = thought;
+        tokens.push_back(kFixtureThinkCloseToken);
+        const ninfer::TokenId stop = frontend.default_stop_policy().token_ids.front();
+        tokens.push_back(stop);
+        (void)session.preview_model(tokens, 64, ninfer::FinishReason::OutputLimit);
+        const auto output = session.commit_preview();
+        failures +=
+            check(channel_text(output, ninfer::OutputChannel::Reasoning) == "weighing it up" &&
+                      channel_text(output, ninfer::OutputChannel::Content) ==
+                          std::string(fixture_tokenizer().decoded_token(stop).bytes),
+                  "a published stop token after a held close kept the thinking open");
+    }
+    {
+        // A looping pass whose check boundary falls on a held close: the next token confirms the
+        // close, so the guard never reads that thinking as still open.
+        std::string looping;
+        for (int i = 0; i < 150; ++i) {
+            looping += "Wait, let me double-check the case where the list is empty. Then the "
+                       "function returns zero, which matches the expected output. ";
+        }
+        std::vector<ninfer::TokenId> tokens = fixture_tokens(looping);
+        tokens.push_back(kFixtureThinkCloseToken);
+        auto session = frontend.make_output_session(
+            thinking_prompt(frontend), {}, {},
+            ninfer::ThinkingControlOptions{.loop = ninfer::ReasoningLoopAction::Stop});
+        const auto held =
+            session.preview_model(tokens, 1'000'000, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        if (held.finished()) {
+            return failures + check(false, "the loop guard read a held close as open thinking");
+        }
+        (void)session.preview_model(fixture_tokens("\n\nanswer"), 1'000'000,
+                                    ninfer::FinishReason::OutputLimit);
+        const auto output = session.commit_preview();
+        failures += check(tokens.size() > 512 && !session.thinking_stats().loop_detected &&
+                              channel_text(output, ninfer::OutputChannel::Content) == "answer",
+                          "the loop guard read a held close as open thinking");
+    }
+    return failures;
+}
+
+// Under a grammar the reasoning text excludes `</think>`, so its first occurrence closes the
+// thinking whatever follows it: JSON right after the marker is the answer, not reasoning.
+int test_constrained_close_is_exact(const Frontend& frontend) {
+    auto session = frontend.make_output_session(thinking_prompt(frontend), {}, {}, {},
+                                                {ninfer::StructuredOutputKind::JsonObject, {}});
+    std::vector<ninfer::TokenId> tokens = fixture_tokens("plan");
+    tokens.push_back(kFixtureThinkCloseToken);
+    const auto json = fixture_tokens("{\"ok\":true}");
+    tokens.insert(tokens.end(), json.begin(), json.end());
+    (void)session.preview_model(tokens, 64, ninfer::FinishReason::OutputLimit);
+    const auto output = session.commit_preview();
+    return check(channel_text(output, ninfer::OutputChannel::Reasoning) == "plan" &&
+                     channel_text(output, ninfer::OutputChannel::Content) == "{\"ok\":true}",
+                 "a constrained close followed by JSON was not the reasoning close");
 }
 
 int test_thinking_budget_ignores_quoted_close(const Frontend& frontend) {
@@ -2477,7 +2600,7 @@ int test_structured_thinking_control(const Frontend& frontend) {
 
 // Without a thinking budget the model's thinking tokens are still counted (upstream
 // Neroued/ninfer#373: model_thinking_tokens stayed 0 unless a budget was set). The count covers
-// the thinking, the close marker token and the separator token that confirms the close, not the
+// the thinking and the close marker token, not the line-break token that confirms the close or the
 // rest of the answer, and equals the presentation count.
 int test_thinking_tokens_without_budget(const Frontend& frontend) {
     auto prompt                                = thinking_prompt(frontend);
@@ -2493,7 +2616,7 @@ int test_thinking_tokens_without_budget(const Frontend& frontend) {
     return check(channel_text(output, ninfer::OutputChannel::Reasoning) == "weighing it up" &&
                      channel_text(output, ninfer::OutputChannel::Content) == "answer" &&
                      !stats.requested_budget && !stats.effective_budget &&
-                     stats.model_thinking_tokens == thought.size() + 2U &&
+                     stats.model_thinking_tokens == thought.size() + 1U &&
                      stats.model_thinking_tokens < tokens.size() &&
                      stats.model_thinking_tokens == session.reasoning_tokens() &&
                      stats.injected_tokens == 0 && !stats.applied,
@@ -4006,6 +4129,8 @@ int main() {
     failures += test_thinking_tokens_without_budget(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_thinking_budget_ignores_quoted_close(frontend);
+    failures += test_held_close_accounting(frontend);
+    failures += test_constrained_close_is_exact(frontend);
     failures += test_structured_thinking_control(frontend);
     failures += test_thinking_budget_message();
     failures += test_thinking_budget_branches(frontend);

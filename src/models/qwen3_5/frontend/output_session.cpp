@@ -104,9 +104,9 @@ std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker
     return 0;
 }
 
-constexpr bool is_close_separator(char byte) noexcept {
-    return byte == ' ' || byte == '\t' || byte == '\r' || byte == '\n';
-}
+// The model serializes its reasoning close as "\n</think>\n\n", so only a line break confirms a
+// marker. Prose that quotes the marker ("the </think> tag") goes on along the same line.
+constexpr bool is_close_separator(char byte) noexcept { return byte == '\r' || byte == '\n'; }
 
 struct ReasoningCloseScan {
     std::size_t close = std::string::npos;
@@ -114,12 +114,18 @@ struct ReasoningCloseScan {
 };
 
 // Generated prose can quote the close marker while discussing the protocol, so a marker counts as
-// the reasoning close only when it is followed by format whitespace, or by the implicit end of the
-// turn. A marker inside quoted text is followed by punctuation or an escaped newline and stays in
-// the reasoning channel. Markers at the end of the available bytes stay pending until their
-// following byte arrives, which keeps a quoted marker from closing the channel across a token
-// round.
-ReasoningCloseScan scan_reasoning_close(std::string_view text, bool implicit_end) {
+// the reasoning close only when it is followed by a line break, or by the implicit end of the
+// turn. A marker inside quoted text is followed by a space, punctuation or an escaped newline and
+// stays in the reasoning channel. Markers at the end of the available bytes stay pending until
+// their following byte arrives, which keeps a quoted marker from closing the channel across a
+// token round. Under a grammar (`exact`) the reasoning text excludes the marker, so its first
+// occurrence is the close whatever follows it.
+ReasoningCloseScan scan_reasoning_close(std::string_view text, bool exact, bool implicit_end) {
+    if (exact) {
+        const std::size_t marker = text.find(kThinkClose);
+        if (marker != std::string_view::npos) { return ReasoningCloseScan{.close = marker}; }
+        return ReasoningCloseScan{.hold = longest_suffix_prefix(text, kThinkClose)};
+    }
     std::size_t search = 0;
     for (;;) {
         const std::size_t marker = text.find(kThinkClose, search);
@@ -188,6 +194,8 @@ struct DecoderState {
     std::string gemma_header_text;
     std::array<std::string, 2> stop_pending;
     bool in_reasoning              = false;
+    // A grammar constrains the output: the first close marker ends the reasoning.
+    bool exact_close               = false;
     bool strip_content_leading     = false;
     bool terminal                  = false;
     std::uint64_t decoded_bytes    = 0;
@@ -208,6 +216,7 @@ struct SemanticThinkingState {
     std::uint32_t model_thinking_tokens = 0;
     std::uint32_t injected_tokens       = 0;
     bool in_reasoning                   = false;
+    bool exact_close                    = false;
     bool control_pending                = false;
     bool applied                        = false;
     // Reasoning-loop guard: the words of the round being previewed (the committed history lives in
@@ -226,7 +235,8 @@ struct SemanticThinkingState {
 void feed_semantic_thinking(SemanticThinkingState& state, std::string_view bytes) {
     if (!state.in_reasoning || bytes.empty()) { return; }
     state.close_pending.append(bytes);
-    const ReasoningCloseScan scan = scan_reasoning_close(state.close_pending, false);
+    const ReasoningCloseScan scan =
+        scan_reasoning_close(state.close_pending, state.exact_close, false);
     if (scan.close != std::string::npos) {
         state.close_pending.clear();
         state.in_reasoning    = false;
@@ -234,6 +244,18 @@ void feed_semantic_thinking(SemanticThinkingState& state, std::string_view bytes
         return;
     }
     state.close_pending.erase(0, state.close_pending.size() - scan.hold);
+}
+
+// A complete free-output `</think>` waiting for the byte after it. The token that confirms it is
+// not thinking, and a held marker is the model's own close at a budget boundary.
+bool holds_semantic_close(const SemanticThinkingState& state) noexcept {
+    return state.in_reasoning && !state.exact_close &&
+           std::string_view(state.close_pending).ends_with(kThinkClose);
+}
+
+bool holds_presentation_close(const DecoderState& state) noexcept {
+    return state.in_reasoning && !state.exact_close && state.utf8_pending.empty() &&
+           std::string_view(state.think_marker_pending).ends_with(kThinkClose);
 }
 
 struct StopMatch {
@@ -370,7 +392,8 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
     }
 
     state.think_marker_pending.append(text);
-    const ReasoningCloseScan scan = scan_reasoning_close(state.think_marker_pending, false);
+    const ReasoningCloseScan scan =
+        scan_reasoning_close(state.think_marker_pending, state.exact_close, false);
     if (scan.close != std::string::npos) {
         feed_channel(state, OutputChannel::Reasoning,
                      std::string_view(state.think_marker_pending).substr(0, scan.close), policy,
@@ -399,6 +422,22 @@ void feed_token_bytes(DecoderState& state, std::string_view bytes, const StopPol
     feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
 }
 
+// The model's stop token after a held `</think>` ends the turn right after it, so the held marker
+// is the close; it is resolved before the stop token's own bytes (published when the caller asks
+// for them) reach the decoder.
+void close_held_reasoning(DecoderState& state, const StopPolicy& policy, PublishedOutput& emitted,
+                          std::uint32_t committed_tokens) {
+    if (!holds_presentation_close(state)) { return; }
+    const std::size_t split = state.think_marker_pending.size() - kThinkClose.size();
+    feed_channel(state, OutputChannel::Reasoning,
+                 std::string_view(state.think_marker_pending).substr(0, split), policy, emitted,
+                 committed_tokens, nullptr);
+    close_channel(state, OutputChannel::Reasoning, emitted);
+    state.think_marker_pending.clear();
+    state.in_reasoning          = false;
+    state.strip_content_leading = true;
+}
+
 void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput& emitted,
                  std::uint32_t committed_tokens) {
     if (!state.utf8_pending.empty()) {
@@ -410,7 +449,8 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
     }
     if (state.in_reasoning) {
         // A close marker still pending at the end of the turn is the model's implicit close.
-        const ReasoningCloseScan scan = scan_reasoning_close(state.think_marker_pending, true);
+        const ReasoningCloseScan scan =
+            scan_reasoning_close(state.think_marker_pending, state.exact_close, true);
         const std::size_t split =
             scan.close != std::string::npos ? scan.close : state.think_marker_pending.size();
         feed_channel(state, OutputChannel::Reasoning,
@@ -625,7 +665,9 @@ OutputSession::OutputSession(
                                    starts_in_reasoning, thinking,
                                    std::move(thinking_control_tokens), std::move(tool_call_output),
                                    std::move(gemma))) {
-    impl_->grammar = std::move(grammar);
+    impl_->grammar              = std::move(grammar);
+    impl_->state.exact_close    = impl_->grammar != nullptr;
+    impl_->semantic.exact_close = impl_->grammar != nullptr;
 }
 
 std::shared_ptr<text::GrammarState> OutputSession::grammar_state() const {
@@ -696,25 +738,43 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
             impl_->preview_execution_split_after = count;
         }
 
-        if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
-        if (impl_->preview_semantic.in_reasoning) {
-            ++impl_->preview_semantic.model_thinking_tokens;
-            if (impl_->early_close_available && impl_->preview_semantic.budget &&
-                impl_->preview_semantic.model_thinking_tokens > *impl_->preview_semantic.budget) {
-                throw std::logic_error("model output exceeded the licensed thinking budget");
-            }
-            if (impl_->preview_semantic.loop != ReasoningLoopAction::Off &&
-                !impl_->preview_semantic.loop_detected) {
-                append_words(decoded.bytes, impl_->preview_semantic.loop_partial,
-                             impl_->preview_semantic.loop_round);
-                append_tail(decoded.bytes, impl_->preview_semantic.loop_tail);
-            }
-            feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);
-        }
-
         const bool stop_token =
             std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
             impl_->policy.token_ids.end();
+
+        // A token that confirms a held close (its first byte is a line break, or it ends the
+        // turn) is the first one after the thinking, so neither count includes it.
+        const bool presentation_held = holds_presentation_close(impl_->preview_state);
+        if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
+        SemanticThinkingState& thinking = impl_->preview_semantic;
+        if (thinking.in_reasoning) {
+            const bool held = holds_semantic_close(thinking);
+            if (held) {
+                if (stop_token) {
+                    thinking.close_pending.clear();
+                    thinking.in_reasoning = false;
+                } else {
+                    feed_semantic_thinking(thinking, decoded.bytes);
+                }
+            }
+            if (thinking.in_reasoning) {
+                ++thinking.model_thinking_tokens;
+                if (impl_->early_close_available && thinking.budget &&
+                    thinking.model_thinking_tokens > *thinking.budget) {
+                    throw std::logic_error("model output exceeded the licensed thinking budget");
+                }
+                if (thinking.loop != ReasoningLoopAction::Off && !thinking.loop_detected) {
+                    append_words(decoded.bytes, thinking.loop_partial, thinking.loop_round);
+                    append_tail(decoded.bytes, thinking.loop_tail);
+                }
+                if (!held) { feed_semantic_thinking(thinking, decoded.bytes); }
+            }
+        }
+        const auto uncount_confirming_token = [&] {
+            if (presentation_held && !impl_->preview_state.in_reasoning) {
+                --impl_->preview_state.reasoning_tokens;
+            }
+        };
         DecoderState before_state;
         PublishedOutput before_output;
         if (stop_token && !impl_->policy.publish_stop_token) {
@@ -722,6 +782,9 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
             before_output = impl_->preview_output;
         }
 
+        if (stop_token && presentation_held) {
+            close_held_reasoning(impl_->preview_state, impl_->policy, impl_->preview_output, count);
+        }
         StopMatch match;
         std::string_view bytes =
             !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
@@ -749,7 +812,6 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
             } else if (markers.markup(token)) {
                 bytes = decoded.bytes;
             }
-            SemanticThinkingState& thinking = impl_->preview_semantic;
             if (thinking.loop != ReasoningLoopAction::Off && !thinking.loop_detected &&
                 decoder.in_reasoning && token != markers.channel_close) {
                 append_words(bytes, thinking.loop_partial, thinking.loop_round);
@@ -759,6 +821,7 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         const std::uint64_t fed_before = impl_->preview_state.content_fed;
         feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
                          &match);
+        if (!stop_token) { uncount_confirming_token(); }
         if (!logprobs.empty() && !bytes.empty()) {
             impl_->hold_logprob(logprobs[index], bytes, fed_before);
         }
@@ -777,6 +840,7 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
                 impl_->preview_output = std::move(before_output);
             }
             terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
+            uncount_confirming_token();
             release_logprobs(impl_->preview_state, impl_->preview_logprobs);
             return complete(count, FinishReason::StopToken);
         }
@@ -789,6 +853,14 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         release_logprobs(impl_->preview_state, impl_->preview_logprobs);
         return complete(count, limit_reason);
     }
+    // A close marker that is the last licensed thinking token is the model's own close at the
+    // boundary, not a quote: the budget is spent either way, so no control follows it.
+    if (impl_->preview_semantic.budget &&
+        impl_->preview_semantic.model_thinking_tokens == *impl_->preview_semantic.budget &&
+        holds_semantic_close(impl_->preview_semantic)) {
+        impl_->preview_semantic.close_pending.clear();
+        impl_->preview_semantic.in_reasoning = false;
+    }
     if (impl_->early_close_available && impl_->preview_semantic.in_reasoning &&
         impl_->preview_semantic.budget &&
         impl_->preview_semantic.model_thinking_tokens == *impl_->preview_semantic.budget) {
@@ -796,13 +868,15 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         return complete(count, FinishReason::None, runtime::ContinuationAction::ApplyTargetControl);
     }
     // Reasoning-loop guard: once per kLoopCheckTokens thinking tokens, at the end of a round. Gemma
-    // counts the tokens of its thought channel; it has no early-close control, so it stops.
+    // counts the tokens of its thought channel; it has no early-close control, so it stops. A held
+    // close marker defers the check to the next round, which resolves it.
     SemanticThinkingState& semantic = impl_->preview_semantic;
     const std::uint32_t thinking_tokens =
         impl_->gemma ? impl_->preview_state.reasoning_tokens : semantic.model_thinking_tokens;
     if (semantic.loop != ReasoningLoopAction::Off &&
         impl_->loop_reasoning(impl_->preview_state, semantic) && !semantic.applied &&
-        !semantic.loop_detected && thinking_tokens >= semantic.loop_next_check) {
+        !semantic.loop_detected && !holds_semantic_close(semantic) &&
+        thinking_tokens >= semantic.loop_next_check) {
         semantic.loop_next_check = (thinking_tokens / kLoopCheckTokens + 1U) * kLoopCheckTokens;
         // Strata reads a periodic tail as full coverage before its word measure.
         const double coverage =
