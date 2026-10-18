@@ -370,6 +370,79 @@ int main() {
             } catch (const std::invalid_argument&) { failed = true; }
             require(failed, "malformed regex, grammar or choice accepted");
         }
+        // Inside a length-bounded string the masks come from the counted repetition's budget
+        // (multi-scalar tokens, partial UTF-8 and escapes, closing tokens at the bounds). Every
+        // mask must equal what the grammar's own token acceptance admits.
+        {
+            std::vector<std::string> wide(256);
+            for (int i = 0; i < 256; ++i) { wide[i] = std::string(1, static_cast<char>(i)); }
+            for (const char* token : {"ab",
+                                      "abc",
+                                      "abcd",
+                                      "abcdef",
+                                      "\\n",
+                                      "\\u00",
+                                      "\\u00e9",
+                                      "\\ud83d",
+                                      "\\ude00",
+                                      "\xc3\xa9",
+                                      "\xf0\x9f\x98\x80",
+                                      "\xf0\x9f",
+                                      "\x98\x80",
+                                      "\"",
+                                      "x\"",
+                                      "ab\"",
+                                      "\"}",
+                                      "\",",
+                                      "x\",\"",
+                                      "\\\"",
+                                      "1\"",
+                                      "\"]",
+                                      "a\xc3"}) {
+                wide.emplace_back(token);
+            }
+            const int eos = static_cast<int>(wide.size());
+            wide.emplace_back();
+            StructuredCompiler wide_compiler(wide, {eos});
+            const std::size_t wide_words = (wide.size() + 31) / 32;
+            const std::vector<std::pair<const char*, std::vector<std::string>>> walks = {
+                {R"({"anyOf":[{"type":"string","minLength":2,"maxLength":5},{"type":"integer"}]})",
+                 {"\"ab\\u00e9xy\"", "\"\xc3\xa9\xf0\x9f\x98\x80x\""}},
+                {R"({"type":"object","properties":{"s":{"type":"string","maxLength":4}},"required":["s"]})",
+                 {"{\"s\":\"\\n\\\"ab\"}", "{\"s\":\"\\ud83d\\ude00abc\"}"}},
+                {R"({"type":"array","items":{"type":"string","minLength":1,"maxLength":3},"maxItems":2})",
+                 {"[\"a\\u00e9b\",\"\xc3\xa9\"]"}},
+            };
+            for (const auto& [schema, texts] : walks) {
+                for (const auto& text : texts) {
+                    auto grammar =
+                        wide_compiler.compile({StructuredOutputKind::JsonSchema, schema});
+                    for (std::size_t at = 0; at <= text.size(); ++at) {
+                        std::vector<std::uint32_t> masks(wide_words);
+                        grammar->fill_masks(masks, {});
+                        for (int token = 0; token < static_cast<int>(wide.size()); ++token) {
+                            auto trial       = grammar->fork();
+                            bool admits      = true;
+                            const TokenId id = token;
+                            try {
+                                trial->accept(std::span<const TokenId>(&id, 1));
+                            } catch (const std::logic_error&) { admits = false; }
+                            const bool masked = (masks[token / 32] >> (token % 32)) & 1U;
+                            if (masked != admits) {
+                                throw std::runtime_error(
+                                    "bounded-string mask disagrees with acceptance at byte " +
+                                    std::to_string(at) + " of " + text + " for token " +
+                                    std::to_string(token));
+                            }
+                        }
+                        if (at < text.size()) {
+                            grammar->accept(
+                                std::vector<TokenId>{static_cast<unsigned char>(text[at])});
+                        }
+                    }
+                }
+            }
+        }
         std::cout << "OK structured grammar: masks, transaction, UTF-8, schema, EOS\n";
         return 0;
     } catch (const std::exception& e) {

@@ -213,10 +213,9 @@ whose catalog is its one model.
 NInfer uses the vendored XGrammar v0.2.7 C++ compiler and token matcher to constrain final
 response content. This requires no model conversion or additional weights. Ordinary decoding,
 MTP, DFlash, and DFlash2 share the same target sampling contract, including CUDA Graphs,
-streaming, prefix reuse, and mixed constrained/unconstrained concurrent requests. The
-`minLength`/`maxLength` of plain string values in a schema without `anyOf` are enforced beside
-the grammar, which keeps their token masks cached (a counted string otherwise costs tens of
-milliseconds per token with a large vocabulary).
+streaming, prefix reuse, and mixed constrained/unconstrained concurrent requests. A string's
+`minLength`/`maxLength` is a counted repetition whose token masks are compiled once, independent
+of the count: a token inside the string is decided by the characters it adds against those left.
 
 Every model computes a constrained request's masks on host threads while the GPU runs the step
 that needs them: the next token's mask, or in a speculative round one mask per draft position,

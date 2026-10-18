@@ -388,11 +388,11 @@ drafts, its next mask starting as soon as a token is accepted, and drafts again 
 cheap. A single mask over 5 s, or a grammar with no admissible token, fails the request with an
 explicit error.
 
-String length bounds (`minLength`, `maxLength`) cost the most: a position inside a counted string
-has no cached mask. For plain string values in a schema without alternatives the bounds are
-therefore enforced beside the grammar, which compiles the string unbounded: with Gemma's
-262,144-token vocabulary a two-string schema with `maxLength: 2800` compiles in 0.9 s instead of
-28 s and its masks take 0.08 ms instead of ~80 ms (one Apple M-series core).
+String length bounds (`minLength`, `maxLength`) compile to a counted repetition whose masks do
+not depend on the count, in or out of `anyOf`: with Qwen3.5's 248,070-token vocabulary a schema
+with strings of `maxLength: 200` and `maxLength: 2800` compiles in 81 ms instead of 24.8 s, and
+its masks inside the strings take 0.04 ms instead of 70-96 ms (one Apple M-series core; Gemma's
+262,144-token vocabulary was not measured).
 
 Every running request must make progress: one that neither computes a prompt chunk nor accepts a
 token for 120 s fails with `inference request made no progress for 120 s` instead of holding its
