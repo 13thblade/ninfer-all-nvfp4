@@ -19,6 +19,7 @@
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
 #include "runtime/engine/diagnostics.h"
+#include "runtime/engine/worker_recovery.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/host_memory.h"
@@ -455,6 +456,7 @@ struct Qwen4ExpCore::Impl {
     const bool reuse_prefixes;
     const std::uint32_t drafts; // MTP drafts a speculative round proposes; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
+    const DiagnosticObserver diagnostics;
     // With --adaptive-mtp, the steps a round drafts and verifies: from one draft, since each draft
     // is a step of the MTP block of its own here, up to `drafts`.
     std::optional<runtime::MtpAdaptiveBatchController> mtp_controller;
@@ -532,12 +534,12 @@ struct Qwen4ExpCore::Impl {
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
           reuse_prefixes(options.context_cache.enabled), drafts(i.executor->draft_tokens()),
-          lookup_ngram(options.speculative.lookup_ngram),
+          lookup_ngram(options.speculative.lookup_ngram), diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
-          decode_rounds_per_prefill(options.decode_rounds_per_prefill != 0
-                                        ? options.decode_rounds_per_prefill
-                                        : std::max<std::uint32_t>(
-                                              1, i.executor->options().prefill_chunk / 64)) {
+          decode_rounds_per_prefill(
+              options.decode_rounds_per_prefill != 0
+                  ? options.decode_rounds_per_prefill
+                  : std::max<std::uint32_t>(1, i.executor->options().prefill_chunk / 64)) {
         if (drafts > 0 && options.speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
             mtp_controller.emplace();
             mtp_controller->reset(drafts, 1);
@@ -744,13 +746,22 @@ struct Qwen4ExpCore::Impl {
             complete(std::exchange(slot.request, {}), unavailable);
             ++failed_requests;
         }
-        std::fprintf(stderr, "[ninfer] %s; failed %u running request(s), serving on\n",
-                     what.c_str(), failed_requests);
+        publish_diagnostic(diagnostics, DiagnosticLevel::Warning,
+                           "%s; failed %u running request(s), serving on", what.c_str(),
+                           failed_requests);
         std::lock_guard lock(stats_mutex);
         ++stats.engine_recoveries;
     }
 
+    // Not a request's own error: the Engine stops serving, and the cause is logged here, where it
+    // is the operator's only lead.
     void fail_engine(std::exception_ptr error) {
+        const auto running = std::count_if(
+            slots.begin(), slots.end(), [](const Slot& slot) { return slot.request != nullptr; });
+        publish_diagnostic(diagnostics, DiagnosticLevel::Error,
+                           "worker failure: %s - failing %td running request(s), the Engine "
+                           "stops serving",
+                           exception_text(error).c_str(), running);
         {
             std::lock_guard lock(queue_mutex);
             failed = true;

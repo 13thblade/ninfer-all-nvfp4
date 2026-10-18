@@ -566,8 +566,10 @@ Flash-Next model file read that fails (disk experts or n-gram rows) likewise fai
 requests, with `unavailable`. Each
 recovery is counted as a top-level `engine_recoveries` counter on the request log's `throughput`
 event and as `ninfer:engine_recoveries_total` on [Metrics](#metrics). `GET /health` turns `503` for
-good after any other worker failure, when a recovery cannot complete, or after eight consecutive
-recoveries, and then the server needs a restart.
+good after any other worker failure, when a recovery cannot complete, or after eight recoveries in
+a row (no work unit completing between them and less than 30 seconds apart), and then the server
+needs a restart. Every worker failure is logged with its exception text: as a warning when the
+Engine recovers, as an error when it stops serving.
 
 ### Load
 

@@ -15,6 +15,7 @@
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/worker_fault.h"
+#include "runtime/engine/worker_recovery.h"
 #include "text/structured_output.h"
 
 #include <algorithm>
@@ -2416,7 +2417,7 @@ private:
             publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
                                "out of memory during materialization reserve: %s", oom.what());
             oom_backoff_ = kOomBackoffIterations;
-            ++oom_recovery_count_;
+            (void)recovery_streak_.record_failure(Clock::now());
             if (!erase_pending(request)) {
                 // The prompt was already moved into reserve_materialization before the
                 // throw, so the request is unrecoverable.  This is a logic error — the
@@ -3147,7 +3148,7 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_control_batch(control_membership);
                     decode_run += decode_run != std::numeric_limits<std::uint32_t>::max();
-                    oom_recovery_count_ = 0;
+                    recovery_streak_.record_success();
                     continue;
                 }
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
@@ -3169,7 +3170,7 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_prefill_step(cancelled_at_unit_start);
                     decode_run = 0;
-                    oom_recovery_count_ = 0;
+                    recovery_streak_.record_success();
                     continue;
                 }
                 if (action == ExecutionAction::Decode) {
@@ -3177,12 +3178,12 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_decode_round(membership, cancelled_at_unit_start);
                     decode_run += decode_run != std::numeric_limits<std::uint32_t>::max();
-                    oom_recovery_count_ = 0;
+                    recovery_streak_.record_success();
                     continue;
                 }
                 set_host_work_class(HostWorkClass::Control);
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                // Do NOT reset oom_recovery_count_ here: idle iterations and
+                // Do NOT end the recovery streak here: idle iterations and
                 // admission-only iterations (where admit_planned_request caught
                 // an OOM internally) did not complete a real work unit.  Only
                 // successful control/prefill/decode above clears the streak.
@@ -3211,11 +3212,11 @@ private:
                     }
                     publish_diagnostic(diagnostics_, DiagnosticLevel::Warning, "%s", buf);
                 }
-                if (++oom_recovery_count_ > kOomMaxRecoveries) {
+                if (!recovery_streak_.record_failure(Clock::now())) {
                     publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
                                        "worker out of memory: %u consecutive recoveries - failing "
                                        "all pending",
-                                       oom_recovery_count_ - 1);
+                                       recovery_streak_.count() - 1);
                     const std::exception_ptr fatal_error = oom_fallback_error_;
                     fail_all_locked(fatal_error);
                     return;
@@ -3242,10 +3243,10 @@ private:
                 }
                 publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
                                    "worker invariant failure: %s - recovering", invariant.what());
-                if (++oom_recovery_count_ > kOomMaxRecoveries) {
+                if (!recovery_streak_.record_failure(Clock::now())) {
                     publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
                                        "worker: %u consecutive recoveries - failing all pending",
-                                       oom_recovery_count_ - 1);
+                                       recovery_streak_.count() - 1);
                     fail_all_locked(std::current_exception());
                     return;
                 }
@@ -3325,8 +3326,11 @@ private:
     bool failed_   = false;
     static constexpr std::uint32_t kOomBackoffIterations = 4;
     static constexpr std::uint32_t kOomMaxRecoveries = 8;  // before failing all pending
+    // Failures further apart than this do not form a streak; see RecoveryStreak.
+    static constexpr std::chrono::seconds kRecoveryHealthyWindow{30};
     std::uint32_t oom_backoff_                    = 0;  // iterations to skip admission after OOM
-    std::uint32_t oom_recovery_count_ = 0;  // consecutive OOMs without a successful work unit
+    // Worker failures without a successful work unit between them.
+    RecoveryStreak recovery_streak_{kOomMaxRecoveries, kRecoveryHealthyWindow};
     const std::exception_ptr oom_fallback_error_ = std::make_exception_ptr(
         RequestError(RequestErrorKind::Overloaded, "engine out of memory during execution"));
     DiagnosticObserver diagnostics_;
