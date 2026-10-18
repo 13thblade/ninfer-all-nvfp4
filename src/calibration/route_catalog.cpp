@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace ninfer::calibration {
@@ -126,6 +127,8 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
                         std::erase(tiers, "12x1x64d");
                     }
                 }
+                // The pipelined kernel reads INT8 keys and values only.
+                if (std::string_view(coding) == "int8") { tiers.emplace_back("8x2x32p"); }
                 add(std::string("attn_i8_small/h24/") + coding + "/w" + std::to_string(width),
                     std::move(tiers));
             }

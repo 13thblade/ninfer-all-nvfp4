@@ -40,6 +40,7 @@
 #include "ops/common/device_limits.h"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
+#include "ops/softmax_attention/dense/causal_cache/value_fragments.cuh"
 
 #include <cstdint>
 
@@ -123,42 +124,6 @@ __device__ __forceinline__ void causal_prompt_i8_fast_mma_f16_acc(unsigned& c0, 
                                                                   unsigned a2, unsigned a3,
                                                                   unsigned b0, unsigned b1) {
     mma_f16_f16acc(c0, c1, a0, a1, a2, a3, b0, b1);
-}
-
-// One ldmatrix.trans b16 lane of an INT8 [key][d] tile holds the codes
-// {V[k][d], V[k][d+1], V[k+1][d], V[k+1][d+1]}. Returns the FP16 B-fragment halves
-// {V[k][d], V[k+1][d]} and {V[k][d+1], V[k+1][d+1]}, each code widened exactly and multiplied
-// once by its key's represented group scale.
-__device__ __forceinline__ void causal_prompt_i8_fast_decode_v_pair(unsigned codes, unsigned scales,
-                                                                    unsigned& even, unsigned& odd) {
-    // code ^ 0x80 is code + 128; 0x6400 | byte is the FP16 value 1024 + byte.
-    const unsigned biased = codes ^ 0x80808080u;
-    unsigned e            = __byte_perm(biased, 0x64646464u, 0x4240);
-    unsigned o            = __byte_perm(biased, 0x64646464u, 0x4341);
-    const __half2 offset  = __float2half2_rn(1152.0f);
-    const __half2 s2      = load_vec<__half2>(&scales);
-    const __half2 ve      = __hmul2(__hsub2(load_vec<__half2>(&e), offset), s2);
-    const __half2 vo      = __hmul2(__hsub2(load_vec<__half2>(&o), offset), s2);
-    even                  = load_vec<unsigned>(&ve);
-    odd                   = load_vec<unsigned>(&vo);
-}
-
-// One ldmatrix.trans b16 lane of a packed int4 [key][d/2] tile holds dimensions 4c..4c+3 of keys k
-// and k+1, one nibble each (low nibble first, byte order: k lo pair, k hi pair, k+1 lo, k+1 hi).
-// Returns, for r = 0..3, the FP16 B-fragment half {V[k][4c+r], V[k+1][4c+r]}, each code widened
-// exactly and multiplied once by its key's represented group scale.
-__device__ __forceinline__ void causal_prompt_i8_fast_decode_v_quad(unsigned codes, unsigned scales,
-                                                                    unsigned (&out)[4]) {
-    // Signed nibble ^ 8 is code + 8; 0x6400 | nibble is the FP16 value 1024 + nibble.
-    const unsigned biased = codes ^ 0x88888888u;
-    const __half2 offset  = __float2half2_rn(1032.0f);
-    const __half2 s2      = load_vec<__half2>(&scales);
-#pragma unroll
-    for (int r = 0; r < 4; ++r) {
-        const unsigned widened = ((biased >> (4 * r)) & 0x000F000Fu) | 0x64006400u;
-        const __half2 value    = __hmul2(__hsub2(load_vec<__half2>(&widened), offset), s2);
-        out[r]                 = load_vec<unsigned>(&value);
-    }
 }
 
 template <typename Geometry, typename Metadata, int Warps, bool PackedValues = false,
@@ -585,8 +550,8 @@ __global__ __launch_bounds__(
                 unsigned r0, r1;
                 ldmatrix_x2_t(r0, r1, smem_addr(&v_s[row * VRowBytes + ((grp ^ (row & 7)) << 4)]));
                 unsigned b_lo[4], b_hi[4];
-                causal_prompt_i8_fast_decode_v_quad(r0, load_vec<unsigned>(&lo), b_lo);
-                causal_prompt_i8_fast_decode_v_quad(r1, load_vec<unsigned>(&hi), b_hi);
+                causal_i4_value_quad_fragments(r0, load_vec<unsigned>(&lo), b_lo);
+                causal_i4_value_quad_fragments(r1, load_vec<unsigned>(&hi), b_hi);
 #pragma unroll
                 for (int r = 0; r < 4; ++r) {
                     causal_prompt_i8_fast_mma_f16_acc(h[r][0], h[r][1], pa[j][0], pa[j][1],
@@ -666,10 +631,9 @@ __global__ __launch_bounds__(
 #pragma unroll
                         for (int b = 0; b < 2; ++b) {
                             unsigned even_lo, odd_lo, even_hi, odd_hi;
-                            causal_prompt_i8_fast_decode_v_pair(r[2 * b], vsc[j][0], even_lo,
-                                                                odd_lo);
-                            causal_prompt_i8_fast_decode_v_pair(r[2 * b + 1], vsc[j][1], even_hi,
-                                                                odd_hi);
+                            causal_i8_value_pair_fragments(r[2 * b], vsc[j][0], even_lo, odd_lo);
+                            causal_i8_value_pair_fragments(r[2 * b + 1], vsc[j][1], even_hi,
+                                                           odd_hi);
                             unsigned (&he)[2] = h[2 * q2 + b][0];
                             unsigned (&ho)[2] = h[2 * q2 + b][1];
                             causal_prompt_i8_fast_mma_f16_acc(he[0], he[1], pa[j][0], pa[j][1],

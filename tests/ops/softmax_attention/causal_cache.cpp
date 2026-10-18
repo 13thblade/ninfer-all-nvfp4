@@ -8,6 +8,7 @@
 #include "ops/kv_cache_e8_root_host.h"
 #include "ops/kv_cache_lloyd4_oracle.h"
 #include "ops/op_tester.h"
+#include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
 #include "ops/softmax_attention/oracle.h"
 
 #include <algorithm>
@@ -4543,6 +4544,49 @@ int run_softmax_attention_prompt_split_tests() {
                                 MappingPattern::Identity);
     }
     std::cout << (failures ? "FAIL" : "PASS") << " split-key prompt causal attention\n";
+    return failures ? 1 : 0;
+}
+
+// The pipelined INT8 small-T tier ("8x2x32p", small_t_i8_pipelined.cuh) forced at every small-T
+// width of both geometries, against the FP64 oracle. Empty, page-crossing and deep caches over
+// fragmented pages cover splits that hold the appended positions and splits that issue their first
+// tile before the append; an envelope past the populated keys replays through a CUDA Graph; a zero
+// query and masked batched columns cover the remaining entry points. main sets
+// NINFER_SMALLT_PV_F16 from the ctest entry, so the FP32 and FP16 PV forms run separately.
+int run_softmax_attention_small_t_pipelined_tests() {
+    if (cuda_unavailable()) return 77;
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        const std::int32_t widths = 48 / geometry.query_group();
+        for (std::int32_t width = 1; width <= widths; ++width) {
+            const ops::DeviceRouteForce force(
+                ops::detail::small_t_i8_route_key(geometry.q_heads, KvCacheStorage::Int8Group64,
+                                                  width),
+                "8x2x32p");
+            const std::uint32_t seed = 940u + 16u * static_cast<std::uint32_t>(geometry.q_heads) +
+                                       static_cast<std::uint32_t>(width);
+            for (const std::int32_t depth : {0, 61, 1000, 6000, 20000}) {
+                const std::int32_t total = depth + width;
+                failures += run_a1_case(geometry, kPlanInt8,
+                                        {width, depth, static_cast<std::uint32_t>(total),
+                                         seed + static_cast<std::uint32_t>(depth)},
+                                        MappingPattern::Fragmented);
+            }
+            failures += run_a3_case(geometry, kPlanInt8, {width, 300, 4096, seed, false, true},
+                                    MappingPattern::Offset);
+            failures += run_a1_case(geometry, kPlanInt8, {width, 127, 160, seed + 1u, true},
+                                    MappingPattern::Identity);
+            const std::int32_t masked = std::max<std::int32_t>(1, width / 2);
+            failures += run_batch_case(geometry, kPlanInt8,
+                                       {width,
+                                        {61, 2047, 0},
+                                        {width, masked, 0},
+                                        {2, 0, 1},
+                                        MappingPattern::Fragmented,
+                                        seed + 2u});
+        }
+    }
+    std::cout << (failures ? "FAIL" : "PASS") << " pipelined INT8 small-T causal attention\n";
     return failures ? 1 : 0;
 }
 

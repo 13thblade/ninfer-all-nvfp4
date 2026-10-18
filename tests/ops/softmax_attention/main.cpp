@@ -7,6 +7,7 @@ int run_softmax_attention_causal_cache_tests();
 int run_softmax_attention_dflash2_tests();
 int run_softmax_attention_int8_prompt_tests();
 int run_softmax_attention_prompt_split_tests();
+int run_softmax_attention_small_t_pipelined_tests();
 int run_softmax_attention_fp8_prompt_tests();
 int run_softmax_attention_pack_gqa_tests();
 int run_softmax_attention_nvfp4_tests();
@@ -60,6 +61,8 @@ int main(int argc, char** argv) {
 #endif
         return run_guarded("split-key prompt", run_softmax_attention_prompt_split_tests);
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--small-t-pipelined-only")
+        return run_guarded("pipelined small-T", run_softmax_attention_small_t_pipelined_tests);
     if (argc == 2 && std::string_view(argv[1]) == "--fp8-prompt-only")
         return run_guarded("fp8 prompt", run_softmax_attention_fp8_prompt_tests);
     if (argc == 2 && std::string_view(argv[1]) == "--pack-gqa-only") {
@@ -89,7 +92,7 @@ int main(int argc, char** argv) {
         std::cerr
             << "usage: ninfer_softmax_attention_test "
                "[--dflash2-only|--nvfp4-only|--k8v4-only|--rk4v4-e8-only|--rk2v4-e8-only|"
-               "--int8-prompt-only|--prompt-splits-only|--fp8-prompt-only|"
+               "--int8-prompt-only|--prompt-splits-only|--small-t-pipelined-only|--fp8-prompt-only|"
                "--pack-gqa-only|--wide-only|--parallel-tiles-only|--quantized-depth-only]\n";
         return 2;
     }
