@@ -857,7 +857,11 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
         bad_request("thinking must be an object with a string type", "thinking");
     }
     const std::string type = thinking.at("type").get<std::string>();
-    if (type == "disabled") {
+    // `between_tools`, the lowest setting of models that refuse `disabled`, turns off up-front
+    // thinking and leaves only optional progress notes between tool calls, which a Qwen or Gemma
+    // template does not write: it runs as `disabled`.
+    const bool no_thinking = type == "disabled" || type == "between_tools";
+    if (no_thinking) {
         request.enable_thinking = false;
     } else if (type == "adaptive") {
         request.enable_thinking = true;
@@ -873,7 +877,8 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
         // while shrinking max_tokens to the context window left.
         request.thinking_budget = static_cast<std::uint32_t>(*budget);
     } else {
-        bad_request("thinking.type must be 'disabled', 'adaptive', or 'enabled'", "thinking");
+        bad_request("thinking.type must be 'disabled', 'between_tools', 'adaptive', or 'enabled'",
+                    "thinking");
     }
 
     if (thinking.contains("display") && !thinking.at("display").is_null()) {
@@ -884,7 +889,7 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
         if (display != "summarized" && display != "omitted") {
             bad_request("thinking.display must be 'summarized' or 'omitted'", "thinking");
         }
-        if (type == "disabled") {
+        if (no_thinking) {
             bad_request("thinking.display is valid only when thinking is adaptive or enabled",
                         "thinking");
         }

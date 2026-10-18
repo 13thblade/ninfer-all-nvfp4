@@ -530,12 +530,11 @@ int test_tool_name_diagnostics() {
               {"tool_calls",
                Json::array({Json{{"id", "call_1"},
                                  {"type", "function"},
-                                 {"function",
-                                  Json{{"name", "mcp.weather"}, {"arguments", "{}"}}}}})}}});
+                                 {"function", Json{{"name", ""}, {"arguments", "{}"}}}}})}}});
     const ApiError history_error = api_error([&] { (void)parse(history); });
     failures += check(history_error.param == "messages[1].tool_calls[0].function.name" &&
-                          history_error.message.find("'mcp.weather'") != std::string::npos,
-                      "invalid historical tool_call name reports its message location");
+                          history_error.message.find("must not be empty") != std::string::npos,
+                      "an empty historical tool_call name reports its message location");
 
     Json allowed        = base_request();
     allowed["tools"]    = Json::array({function_tool("weather")});
@@ -547,6 +546,11 @@ int test_tool_name_diagnostics() {
     const ApiError allowed_error = api_error([&] { (void)parse(allowed); });
     failures += check(allowed_error.param == "tool_choice.allowed_tools.tools[0].name",
                       "invalid allowed_tools name reports its location");
+    allowed["tool_choice"]["allowed_tools"]["tools"][0] =
+        Json{{"type", "function"}, {"function", Json{{"name", "missing"}}}};
+    failures += check(api_error([&] { (void)parse(allowed); }).param ==
+                          "tool_choice.allowed_tools.tools[0].function.name",
+                      "an undeclared allowed_tools name in the Chat form reports its location");
 
     return failures;
 }
@@ -654,6 +658,11 @@ int test_tools() {
     failures += check(allowed.tools.size() == 1 && allowed.tools[0].name == "search" &&
                           prompt(allowed).options.tool_jsons.size() == 1,
                       "allowed_tools auto narrows the executable function set");
+    body["tool_choice"]["allowed_tools"]["tools"][0] =
+        Json{{"type", "function"}, {"function", Json{{"name", "search"}}}};
+    const GenerationRequest chat_form = parse(body).generation;
+    failures += check(chat_form.tools.size() == 1 && chat_form.tools[0].name == "search",
+                      "allowed_tools entries in the Chat form narrow the function set");
 
     body["tool_choice"] =
         Json{{"type", "allowed_tools"},
@@ -871,8 +880,11 @@ int test_messages_and_media() {
 
     body                        = base_request();
     body["messages"][0]["name"] = "speaker";
-    failures += check(api_error([&] { (void)parse(body); }).code == "message_name_not_supported",
-                      "message name rejected");
+    const GenerationRequest named_user = parse(body).generation;
+    failures += check(named_user.messages.size() == 1 &&
+                          named_user.messages[0].role == ninfer::ChatRole::User &&
+                          named_user.messages[0].content.size() == 1,
+                      "user message name is accepted and ignored");
 
     body = base_request();
     body["messages"].push_back(Json{
@@ -930,6 +942,10 @@ int test_messages_and_media() {
                           legacy.messages[2].role == ninfer::ChatRole::Tool,
                       "legacy function-call history lowers to Engine tool history");
 
+    body["messages"][2]["content"] = nullptr;
+    failures += check(parse(body).generation.messages[2].role == ninfer::ChatRole::Tool,
+                      "legacy function message accepts null content");
+
     body["messages"] = Json::array(
         {Json{{"role", "assistant"},
               {"content", nullptr},
@@ -940,6 +956,13 @@ int test_messages_and_media() {
          Json{{"role", "tool"}, {"tool_call_id", ""}, {"content", "done"}}});
     failures += check(parse(body).generation.has_tool_history(),
                       "string tool-call identifiers may be empty without changing history");
+
+    body["messages"].back() = Json{{"role", "tool"}, {"tool_call_id", "c"}, {"content", "done"}};
+    body["messages"][body["messages"].size() - 2]["tool_calls"][0]["id"] = "c";
+    body["messages"][body["messages"].size() - 2]["tool_calls"][0]["function"]["name"] =
+        "mcp.server.get weather";
+    failures += check(parse(body).generation.has_tool_history(),
+                      "history tool-call names are not restricted to the definition charset");
     return failures;
 }
 
@@ -1579,8 +1602,45 @@ int test_assistant_continuation_mode() {
     return failures;
 }
 
+// A Chat request that names its conversation gets the private long anchor at the end of its prompt
+// that Responses (prompt_cache_key) and Anthropic (cache_control) requests get.
+int test_prompt_cache_key_grants_long_anchor() {
+    int failures = 0;
+    failures += check(!parse(base_request()).generation.private_cache_boundary_at_prompt_end,
+                      "a Chat request that names no conversation gets no long anchor");
+
+    Json keyed                = base_request();
+    keyed["prompt_cache_key"] = "pi-session-1";
+    failures += check(parse(keyed).generation.private_cache_boundary_at_prompt_end,
+                      "a Chat prompt_cache_key grants a long anchor at the end of the prompt");
+    keyed["prompt_cache_key"] = nullptr;
+    failures += check(!parse(keyed).generation.private_cache_boundary_at_prompt_end,
+                      "a null prompt_cache_key names no conversation");
+    keyed["prompt_cache_key"] = "";
+    failures += check(!parse(keyed).generation.private_cache_boundary_at_prompt_end,
+                      "an empty prompt_cache_key names no conversation");
+
+    // A gateway that namespaces keys per user sends more than the API's 64 bytes.
+    keyed["prompt_cache_key"] = std::string(ninfer::kMaximumContextCacheSessionKeyBytes, 'k');
+    failures += check(parse(keyed).generation.private_cache_boundary_at_prompt_end,
+                      "a prompt_cache_key up to the session-key limit is accepted");
+    keyed["prompt_cache_key"] = std::string(ninfer::kMaximumContextCacheSessionKeyBytes + 1U, 'k');
+    failures += check(api_error([&] { (void)parse(keyed); }).param == "prompt_cache_key",
+                      "a longer prompt_cache_key is rejected");
+
+    Json identified                 = base_request();
+    identified["safety_identifier"] = std::string(128, 'x');
+    failures += check(!parse(identified).generation.messages.empty(),
+                      "a safety_identifier of 128 characters is accepted");
+    identified["safety_identifier"] = std::string(129, 'x');
+    failures += check(api_error([&] { (void)parse(identified); }).param == "safety_identifier",
+                      "a longer safety_identifier is rejected");
+    return failures;
+}
+
 int main() {
     int failures = 0;
+    failures += test_prompt_cache_key_grants_long_anchor();
     failures += test_graft_extension();
     failures += test_thinking_budget_extension();
     failures += test_request_envelope_and_sampling();

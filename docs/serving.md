@@ -912,13 +912,23 @@ Semantically neutral fields do not make an otherwise executable request fail. Al
 `logit_bias`, `logprobs:false`, `verbosity:"medium"`, empty legacy tool controls,
 text-only `audio` configuration, and `prediction` are accepted without changing Engine execution.
 Metadata, user/safety identifiers, service-tier and prompt-cache hints are likewise advisory.
-Unknown top-level fields are ignored.
+`prompt_cache_key` (at most 256 bytes, beyond the API's 64 so that a gateway can namespace keys per
+user) is not a prefix identity, but a non-empty key, on Chat Completions as on Responses, makes the
+Engine keep a private long-anchor checkpoint at the end of the prompt, so an agent loop with no new
+user turn between requests resumes from its previous request. Unknown top-level fields are ignored.
 
-A string `name` on a `tool` message is accepted as an ignored, output-neutral compatibility
-extension for clients that mirror the function name onto tool results. It does not participate in
-tool identity, prompt rendering, or output. Non-string values are malformed; non-empty names on
-other message roles remain unsupported because they carry participant identity that the loaded chat
-template cannot represent.
+A string `name` on any message is accepted and ignored, as the optional OpenAI participant label
+that agent frameworks use to tag injected messages and that some clients mirror onto tool results.
+It does not participate in tool identity, prompt rendering, or output, so distinct names do not
+create distinct participants. Non-string values are malformed. A legacy `function` message may
+carry `content:null`.
+
+Function names replayed in message history (`tool_calls`, `function_call`, `function` messages)
+must be non-empty strings but are not restricted to the definition charset, so history from other
+clients or models round-trips unchanged. Tool definitions and tool choices still require
+`[A-Za-z0-9_-]`. `allowed_tools` entries use the Chat form
+`{"type":"function","function":{"name":...}}`; the flat `{"type":"function","name":...}` form is
+also accepted.
 
 For commonly generated OpenAI-compatible payloads, `repetition_penalty` is accepted only at its
 neutral value `1`, and `mm_processor_kwargs` when empty or containing only null values. String-form
@@ -1431,7 +1441,7 @@ wire response contains typed `output` Items.
 | `background` | omitted or `false` |
 | `include` | omitted, empty, or any of `reasoning.encrypted_content`, which requests the local raw-reasoning mirror described below, and `message.output_text.logprobs`, which requests [token log probabilities](#token-log-probabilities) |
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
-| cache and client hints | valid `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, `safety_identifier`, and `user` values are accepted without being mapped to Engine session identity |
+| cache and client hints | valid `prompt_cache_key` (at most 256 bytes; it keeps a private long anchor at the prompt end and names the cache session of a response that is neither stored nor chained to a previous one), `prompt_cache_options`, `prompt_cache_retention`, `safety_identifier` (at most 128 characters), and `user` values |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
 with a field-specific 400 error instead of being silently ignored. When a rejection is caused by a
@@ -1451,8 +1461,8 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `refusal` | assistant-message replay part; its text enters assistant history |
 | `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; `detail` `auto`, `high` or `low` (see [image detail](#image-detail)); requires server `--vision` |
 | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
-| `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
-| `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
+| `reasoning` | raw replay Item with `reasoning_text` content (`content` itself may be omitted); summary/encrypted metadata may accompany raw text but cannot replace it |
+| `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments`; `async` may only be `false` |
 | `function_call_output` | completed result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
 
 Contiguous assistant-owned Items form one assistant history turn in the representable order
@@ -1520,7 +1530,8 @@ NInfer renders these definitions in the Qwen prompt and parses model output into
 a later request. Only functions in the current effective tool set can become structured calls;
 undeclared model output remains ordinary text. `allowed_tools` filters that set without changing
 declaration order, while `tool_choice:"none"` disables structured tool output even when the history
-contains earlier calls.
+contains earlier calls. A function definition's `async` may be `false`; `async:true` fails with
+`async_tools_not_supported`, because the turn-based tool loop has no non-blocking call protocol.
 
 A forced selection names one function: `tool_choice` naming it directly, `required`, or
 `allowed_tools` with mode `required` over a single callable tool. NInfer executes it by ending the
@@ -1559,8 +1570,10 @@ carries en `encrypted_content` equal to its raw `reasoning_text`. This field is 
 
 Ordinary model/string stops produce `completed`. Output-token or context-capacity exhaustion
 produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`. Errors accepted after
-an SSE response has started produce `response.failed`; validation and preparation errors remain
-normal HTTP error responses. `completed_at` is populated only for completed Responses. A
+an SSE response has started produce `response.failed`, whose `error.code` is one of the API's enum
+values: `server_error` unless the failure already uses one, with its own code appended to
+`error.message`. Validation and preparation errors remain normal HTTP error responses. Every
+response carries `access_programs: null`. `completed_at` is populated only for completed Responses. A
 reasoning-only incomplete result contains no invented empty assistant message.
 
 Usage is checkpoint-native:
@@ -1568,7 +1581,7 @@ Usage is checkpoint-native:
 ```json
 {
   "input_tokens": 42,
-  "input_tokens_details": {"cached_tokens": 17},
+  "input_tokens_details": {"cached_tokens": 17, "cache_write_tokens": 0},
   "output_tokens": 12,
   "output_tokens_details": {"reasoning_tokens": 5},
   "total_tokens": 54
@@ -1576,7 +1589,8 @@ Usage is checkpoint-native:
 ```
 
 `input_tokens` includes the chat template and expanded media tokens. `cached_tokens` is the exact
-checkpoint-proven prompt prefix reused by Engine. `output_tokens` is the count of accepted generated token
+checkpoint-proven prompt prefix reused by Engine; `cache_write_tokens` is always `0`, because NInfer
+does not count the tokens a request leaves in the cache. `output_tokens` is the count of accepted generated token
 IDs, including a withheld stop token when applicable. `reasoning_tokens` is counted in the Qwen
 output decoder while accepted tokens are still in the reasoning channel; it is not estimated by
 re-tokenizing decoded text.
@@ -1676,8 +1690,8 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 {"object":"response.input_tokens","input_tokens":11}
 ```
 
-Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, `include` values other than
+Unsupported Create fields include Conversations, prompt templates, context management,
+`access_programs`, hosted moderation, `include` values other than
 `reasoning.encrypted_content`, background execution, compaction, files/audio, and
 OpenAI-hosted/MCP/custom tools. Except for the two explicitly documented placeholders,
 these are compatibility boundaries rather than silently accepted approximations.
@@ -1718,7 +1732,10 @@ like the OpenAI endpoints), and `stop_sequences` enter Engine execution. A match
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.
 
-Thinking supports `disabled`, `adaptive`, and `enabled`. Enabled Thinking requires
+Thinking supports `disabled`, `between_tools`, `adaptive`, and `enabled`. `between_tools`, the
+lowest setting of Claude models that refuse `disabled`, turns off up-front thinking and leaves only
+optional progress notes between tool calls; the served templates write no such notes, so it runs as
+`disabled`. Enabled Thinking requires
 `budget_tokens >= 1024`, and that budget is passed to Engine. Unlike the Anthropic API, a budget at
 or above `max_tokens` is accepted: the output limit ends thinking before the budget can, so the
 budget takes no effect. Clients such as Qwen Code send a fixed budget while shrinking `max_tokens`

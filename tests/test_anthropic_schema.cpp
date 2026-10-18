@@ -639,6 +639,12 @@ int test_thinking_and_count_tokens() {
     body["thinking"] = Json{{"type", "future"}};
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
                       "unknown Thinking mode defaulted to enabled");
+    body["thinking"] = Json{{"type", "between_tools"}};
+    failures += check(parse(body).generation.enable_thinking == false,
+                      "between_tools did not turn off up-front Thinking");
+    body["thinking"] = Json{{"type", "between_tools"}, {"display", "summarized"}};
+    failures += check(api_param([&] { (void)parse(body); }) == "thinking",
+                      "display was accepted with between_tools Thinking");
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
     const AnthropicMessagesRequest hidden = parse(body);
     failures += check(hidden.hide_thinking && hidden.generation.enable_thinking == true &&
