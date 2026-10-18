@@ -7,6 +7,7 @@
 #include "core/tensor.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/common/device_limits.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast_plan.h"
 
 #include <cuda_runtime.h>
 
@@ -40,6 +41,15 @@ inline constexpr int kCausalPromptI8StandardSmemBytes = 93184;
 // or the device profile's "attn_prompt_fast" says. Of the other storages only NVFP4-G16 has one
 // (prompt_nvfp4_fast.cuh, Blackwell builds, over more than 2048 visible keys).
 [[nodiscard]] bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested);
+
+// Whether the fast INT8-family prompt kernel may split a launch's keys over several CTAs
+// (prompt_i8_fast_plan.h): unless the device profile's "attn_prompt_split" says "off".
+// NINFER_PROMPT_SPLITS=0 turns splits off, and N > 0 forces N splits wherever a launch may split.
+[[nodiscard]] CausalPromptI8FastSplitPolicy causal_attention_prompt_fast_split_policy();
+
+// Whether the fast INT8-family prompt kernel's eight-warp CTA launches for this storage on the
+// current device's shape set (on Turing, INT8 values leave room for four warps only).
+[[nodiscard]] bool causal_prompt_i8_fast_wide(KvCacheStorage storage);
 
 struct CausalSmallTInvocation {
     const Tensor* valid_columns = nullptr;
@@ -138,14 +148,19 @@ void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor& 
                                                  Tensor& partial_l, Tensor& out,
                                                  cudaStream_t stream);
 
+// The fast INT8-family kernel plans its key splits at `max_visible_keys` and takes their partials
+// from `workspace` (causal_softmax_attention_workspace_capacity_bytes reserves them).
 void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                     const Tensor& positions, const Tensor& valid_columns,
                                     const Tensor& table_rows, float scale,
-                                    PagedKVBatchLayerView cache, Tensor& out, bool fast,
+                                    PagedKVBatchLayerView cache, std::uint32_t max_visible_keys,
+                                    WorkspaceArena& workspace, Tensor& out, bool fast,
                                     cudaStream_t stream);
 
 void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
-                                              const PagedKVLayerView& cache, Tensor& out, bool fast,
+                                              const PagedKVLayerView& cache,
+                                              std::uint32_t max_visible_keys,
+                                              WorkspaceArena& workspace, Tensor& out, bool fast,
                                               cudaStream_t stream);
 
 void causal_attention_prompt_fp8_launch(const Tensor& q, const Tensor& k, const Tensor& v,

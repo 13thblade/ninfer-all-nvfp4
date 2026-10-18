@@ -1,5 +1,6 @@
 #include "models/qwen4_exp/expert_misses.h"
 
+#include "core/file_read_error.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
 
 #include <cuda/atomic>
@@ -74,8 +75,11 @@ __device__ __forceinline__ bool in_ranges(std::uintptr_t at, const std::uintptr_
 }
 
 // Splits a call's pairs: a pair whose expert's gate entry lies in the layer's cached storage stays
-// in `cached` (else -1); every other expert is listed once in `missing`. With missing experts the
-// request is posted, after the pairs (and, for the CPU, the input) reach the host.
+// in `cached` (else -1); every other expert is listed once in `missing`. With `keep_ranks` above
+// zero, an uncached expert that every token of the call ranks at or past that position of its top
+// ten is left out instead: its pairs add nothing and the others keep their router weights. With
+// missing experts the request is posted, after the pairs (and, for the CPU, the input) reach the
+// host.
 __global__ void __launch_bounds__(kSplitThreads)
     split_kernel(const std::int32_t* __restrict__ ids, int pairs, int experts,
                  const void* const* __restrict__ gate, const std::uintptr_t* __restrict__ ranges,
@@ -83,8 +87,8 @@ __global__ void __launch_bounds__(kSplitThreads)
                  std::int32_t* __restrict__ host_missing, std::int32_t* __restrict__ missing_ids,
                  std::int32_t* product_count, const __nv_bfloat16* __restrict__ m,
                  __nv_bfloat16* __restrict__ host_m, int m_values, Mailbox* box,
-                 std::uint32_t layer, int tokens, std::uint32_t* need, std::uint32_t* last_use,
-                 std::uint32_t* stamps) {
+                 std::uint32_t layer, int tokens, int keep_ranks, std::uint32_t* need,
+                 std::uint32_t* last_use, std::uint32_t* stamps) {
     __shared__ unsigned char missing[kMaxExperts];
     __shared__ int warp_total[kSplitThreads / 32];
     __shared__ int count;
@@ -97,7 +101,8 @@ __global__ void __launch_bounds__(kSplitThreads)
         bool resident = false;
         if (e >= 0 && e < experts) {
             resident = in_ranges(reinterpret_cast<std::uintptr_t>(gate[e]), ranges);
-            if (!resident) { missing[e] = 1; }
+            // Pairs come in rank order, ten a token (the route's top ten, largest weight first).
+            if (!resident && (keep_ranks == 0 || p % kTop < keep_ranks)) { missing[e] = 1; }
             // The recency the slot admission reads (a host copy follows each pass).
             if (last_use != nullptr) { last_use[e] = stamp; }
         }
@@ -250,14 +255,14 @@ public:
             const DWORD request =
                 static_cast<DWORD>(std::min<std::size_t>(bytes, std::size_t(1) << 30));
             if (!ReadFile(handle_, out, request, &done, &at) || done == 0) {
-                throw std::runtime_error("expert misses: read failed");
+                throw FileReadError("expert misses: read failed");
             }
 #else
             const ssize_t done = ::pread(descriptor_, out, bytes, static_cast<off_t>(offset));
             if (done < 0 && errno == EINTR) { continue; }
             if (done <= 0) {
-                throw std::runtime_error(std::string("expert misses: read failed: ") +
-                                         (done < 0 ? std::strerror(errno) : "end of file"));
+                throw FileReadError(std::string("expert misses: read failed: ") +
+                                    (done < 0 ? std::strerror(errno) : "end of file"));
             }
 #endif
             out += done;
@@ -471,8 +476,9 @@ struct ExpertMisses::Impl {
          MissOptions o, ExpertCache* c)
         : device(d), layers(std::move(l)), cache(c), options(o), ranks(d.size()) {
         if (options.token_capacity == 0 || options.token_capacity > 64 || layers.empty() ||
-            !std::isfinite(options.cpu_share) || options.cpu_share < 0 || options.cpu_share > 1) {
-            throw std::invalid_argument("expert misses: invalid capacity or CPU share");
+            !std::isfinite(options.cpu_share) || options.cpu_share < 0 || options.cpu_share > 1 ||
+            options.tail_skip_rank >= std::uint32_t(kTop)) {
+            throw std::invalid_argument("expert misses: invalid capacity, CPU share or tail skip");
         }
         pair_capacity = options.token_capacity * kTop;
         std::uint64_t largest = 0;
@@ -1009,8 +1015,8 @@ struct ExpertMisses::Impl {
         }
         const int pairs = tokens * kTop;
         split_kernel<<<1, kSplitThreads, 0, stream>>>(
-            static_cast<const std::int32_t*>(ids.data), pairs, int(layer.experts),
-            layer.gate_table, static_cast<const std::uintptr_t*>(ranges.at(index).p),
+            static_cast<const std::int32_t*>(ids.data), pairs, int(layer.experts), layer.gate_table,
+            static_cast<const std::uintptr_t*>(ranges.at(index).p),
             static_cast<std::int32_t*>(rank.cached_ids.p),
             static_cast<std::int32_t*>(rank.host_ids->data()),
             static_cast<std::int32_t*>(rank.host_missing->data()),
@@ -1018,7 +1024,7 @@ struct ExpertMisses::Impl {
             static_cast<std::int32_t*>(rank.product_count->data()),
             static_cast<const __nv_bfloat16*>(m.data),
             rank.host_m ? static_cast<__nv_bfloat16*>(rank.host_m->data()) : nullptr,
-            tokens * kHidden, rank.box, std::uint32_t(index), tokens,
+            tokens * kHidden, rank.box, std::uint32_t(index), tokens, int(options.tail_skip_rank),
             static_cast<std::uint32_t*>(rank.need->data()),
             layer.admit ? last_use_device(index) : nullptr,
             static_cast<std::uint32_t*>(rank.stamps.p));
@@ -1066,11 +1072,13 @@ struct ExpertMisses::Impl {
         if (rank.used && last != nullptr) { CUDA_CHECK(cudaStreamWaitEvent(stream, last, 0)); }
     }
 
+    void raise_failure() {
+        std::lock_guard lock(failure_mutex);
+        if (failure) { std::rethrow_exception(std::exchange(failure, nullptr)); }
+    }
+
     void keep_alive() {
-        {
-            std::lock_guard lock(failure_mutex);
-            if (failure) { std::rethrow_exception(std::exchange(failure, nullptr)); }
-        }
+        raise_failure();
         deadline.store(now_ns() + 500'000'000, std::memory_order_release);
         if (sleeping.load(std::memory_order_acquire)) {
             std::lock_guard lock(wake_mutex);
@@ -1096,6 +1104,8 @@ void ExpertMisses::drop_missing(std::size_t layer, const Tensor& ids, const Tens
 }
 void ExpertMisses::await(std::size_t layer, cudaStream_t stream) { impl_->await(layer, stream); }
 void ExpertMisses::keep_alive() { impl_->keep_alive(); }
+
+void ExpertMisses::raise_failure() { impl_->raise_failure(); }
 void ExpertMisses::fence(cudaStream_t stream, std::size_t rank) { impl_->fence(stream, rank); }
 void ExpertMisses::publish(cudaStream_t stream, std::size_t rank) { impl_->publish(stream, rank); }
 void ExpertMisses::set_resident(std::size_t layer, const ExpertCache::Ranges& resident) {

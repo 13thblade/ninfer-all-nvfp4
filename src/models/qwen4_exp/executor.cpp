@@ -617,10 +617,16 @@ struct Executor::Impl {
     // The pool holds a bank per projection laid out as the host's: expert e at e times the
     // layer's matrix bytes, so experts adjacent on the host cross the bus in one copy.
     struct SlotPool {
-        DeviceBuffer storage;                 // gate, up and down banks, zeroed when allocated
-        std::array<std::uint64_t, 3> offset{}; // of each bank in storage
-        std::uint32_t slots = 0;              // experts the banks hold: all of a layer's, or none
-        DeviceBuffer tables;                  // gate, up and down tables of every expert
+        struct Buffer {
+            DeviceBuffer storage; // gate, up and down banks, zeroed when allocated
+            DeviceBuffer tables;  // gate, up and down tables of every expert
+        };
+
+        std::array<std::uint64_t, 3> offset{}; // of each bank in a buffer's storage
+        std::uint32_t slots = 0;               // experts a buffer holds: all of a layer's, or none
+        // One buffer, or two that consecutive layers alternate between, so that a wide call's
+        // copies of the next layer run while this layer's experts do.
+        std::vector<Buffer> buffers;
     };
 
     std::vector<SlotPool> slot_pools; // by rank; empty unless the experts are host resident
@@ -630,8 +636,14 @@ struct Executor::Impl {
     // before run, without waiting for the layer's routes. Two pinned entry tables alternate.
     static constexpr std::int32_t kPrefetchTokens = 256;
     struct PoolPrefetch {
-        std::size_t layer = ~std::size_t{0};
-        cudaEvent_t ready = nullptr, free = nullptr;
+        // Per pool buffer: the layer whose experts it holds or receives, its copies' completion
+        // and the completion of the last call that read it.
+        struct Buffer {
+            std::size_t layer = ~std::size_t{0};
+            cudaEvent_t ready = nullptr, free = nullptr;
+        };
+
+        std::array<Buffer, 2> buffers;
         // Pinned table sources: a copy reads its buffer when it runs, so a buffer is rewritten only
         // once the copy that last read it is done (`copied`); the host runs ahead of the device.
         std::array<std::unique_ptr<PinnedHostBuffer>, 2> entries;
@@ -725,6 +737,16 @@ struct Executor::Impl {
              options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share)) {
             throw std::invalid_argument("mapped misses need GGUF host experts and all misses on the GPU");
         }
+        if (options.hybrid_experts.tail_skip_rank != 0 &&
+            (residency != ExpertResidency::Host || native_host ||
+             options.hybrid_experts.mapped_misses)) {
+            throw std::invalid_argument(
+                "--expert-tail-skip needs GGUF host experts with staged misses");
+        }
+        if (options.hybrid_experts.prefill_buffers != 1 &&
+            (residency != ExpertResidency::Host || native_host)) {
+            throw std::invalid_argument("--expert-prefill-buffers needs GGUF host experts");
+        }
         plan_segments();
         allocate_ranks();
         allocate_vision();
@@ -787,8 +809,10 @@ struct Executor::Impl {
         }
         for (std::size_t r = 0; r < prefetches.size(); ++r) {
             RankBinding bind(device, r);
-            if (prefetches[r].ready != nullptr) { cudaEventDestroy(prefetches[r].ready); }
-            if (prefetches[r].free != nullptr) { cudaEventDestroy(prefetches[r].free); }
+            for (const auto& buffer : prefetches[r].buffers) {
+                if (buffer.ready != nullptr) { cudaEventDestroy(buffer.ready); }
+                if (buffer.free != nullptr) { cudaEventDestroy(buffer.free); }
+            }
             for (cudaEvent_t copied : prefetches[r].copied) {
                 if (copied != nullptr) { cudaEventDestroy(copied); }
             }
@@ -1516,6 +1540,7 @@ struct Executor::Impl {
         miss.cpu_share      = 1.0 - double(options.hybrid_experts.dma_share);
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
         miss.staging_bytes  = kStagingBytes;
+        miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
         misses              = std::make_unique<ExpertMisses>(
             device, std::move(out),
             stream ? model.files() : std::vector<std::filesystem::path>{}, miss, cache.get());
@@ -1523,7 +1548,8 @@ struct Executor::Impl {
     }
 
     // One slot per expert on every rank, sized for its layers' widest projections, when half the
-    // free memory holds them; the expert cache takes what is left.
+    // free memory holds them, and with --expert-prefill-buffers 2 a second such buffer when half
+    // holds both; the expert cache takes what is left.
     void allocate_slot_pools() {
         const std::size_t experts = config.num_experts;
         slot_pools.resize(device.size());
@@ -1547,11 +1573,15 @@ struct Executor::Impl {
             // Zeros follow the last down in its bank: the matrix kernel reads past a down.
             const std::uint64_t bytes = pool.offset[2] + round_up(experts * widest[2] + kSlotTail);
             if (bytes > free_bytes / 2) { continue; }
-            pool.slots   = static_cast<std::uint32_t>(experts);
-            pool.storage = DeviceBuffer(bytes);
-            CUDA_CHECK(cudaMemset(pool.storage.p, 0, pool.storage.bytes));
-            pool.tables = DeviceBuffer(3 * experts * sizeof(void*));
-            memory.ranks[r].workspace_bytes += pool.storage.bytes + pool.tables.bytes;
+            pool.slots = static_cast<std::uint32_t>(experts);
+            pool.buffers.resize(
+                options.hybrid_experts.prefill_buffers == 2 && 2 * bytes <= free_bytes / 2 ? 2 : 1);
+            for (auto& buffer : pool.buffers) {
+                buffer.storage = DeviceBuffer(bytes);
+                CUDA_CHECK(cudaMemset(buffer.storage.p, 0, buffer.storage.bytes));
+                buffer.tables = DeviceBuffer(3 * experts * sizeof(void*));
+                memory.ranks[r].workspace_bytes += buffer.storage.bytes + buffer.tables.bytes;
+            }
         }
         slot_entries = std::make_unique<PinnedHostBuffer>(3 * experts * sizeof(void*));
         prefetches.resize(device.size());
@@ -1559,8 +1589,12 @@ struct Executor::Impl {
             if (slot_pools[r].slots == 0) { continue; }
             RankBinding bind(device, r);
             auto& prefetch = prefetches[r];
-            CUDA_CHECK(cudaEventCreateWithFlags(&prefetch.ready, cudaEventDisableTiming));
-            CUDA_CHECK(cudaEventCreateWithFlags(&prefetch.free, cudaEventDisableTiming));
+            for (std::size_t b = 0; b < slot_pools[r].buffers.size(); ++b) {
+                CUDA_CHECK(
+                    cudaEventCreateWithFlags(&prefetch.buffers[b].ready, cudaEventDisableTiming));
+                CUDA_CHECK(
+                    cudaEventCreateWithFlags(&prefetch.buffers[b].free, cudaEventDisableTiming));
+            }
             for (auto& entries : prefetch.entries) {
                 entries = std::make_unique<PinnedHostBuffer>(3 * experts * sizeof(void*));
             }
@@ -1578,8 +1612,8 @@ struct Executor::Impl {
     // the matrix kernel reads past: inside a run the bytes after a down are the next expert's
     // down, as in a host bank.
     template <class Wanted>
-    void stage_pool(const SlotPool& pool, std::size_t index, Wanted&& wanted,
-                    const void** entries, cudaStream_t stream) {
+    void stage_pool(const SlotPool& pool, const SlotPool::Buffer& buffer, std::size_t index,
+                    Wanted&& wanted, const void** entries, cudaStream_t stream) {
         const MoePlan& m             = layers[index].moe;
         const std::size_t experts    = m.gate.pointers.size();
         const ExpertTable* tables[3] = {&m.gate, &m.up, &m.down};
@@ -1587,7 +1621,7 @@ struct Executor::Impl {
         for (int k = 0; k < 3; ++k) {
             bytes[k] = std::uint64_t(tables[k]->rows) * tables[k]->row_bytes;
         }
-        auto* storage     = static_cast<std::byte*>(pool.storage.p);
+        auto* storage     = static_cast<std::byte*>(buffer.storage.p);
         const auto cached = [&](std::size_t e) {
             return cache && cache->cached(index, 0, std::int32_t(e)) != nullptr;
         };
@@ -1627,28 +1661,48 @@ struct Executor::Impl {
         }
     }
 
-    // Copies every expert of text layer `index` that the cache lacks into its rank's pool, on the
-    // transfer stream once the pool's previous call is done with it, and points the pool's tables
-    // at the cache or the copies.
+    // The pool buffer that text layer `index`'s wide calls read: with two, consecutive layers
+    // alternate.
+    [[nodiscard]] std::size_t pool_buffer(std::size_t index) const {
+        return slot_pools[layers[index].rank].buffers.size() == 2 ? index % 2 : 0;
+    }
+
+    // Whether text layer `index` exists on `rank` and runs its wide calls through the pool.
+    [[nodiscard]] bool pooled_layer(std::size_t index, std::size_t rank) const {
+        return index < layers.size() && layers[index].rank == rank && !layers[index].moe.native;
+    }
+
+    // Copies every expert of text layer `index` that the cache lacks into its pool buffer, on the
+    // transfer stream once the buffer's previous call is done with it, and points the buffer's
+    // tables at the cache or the copies.
     void prefetch_layer(std::size_t index) {
         const LayerPlan& plan = layers[index];
         SlotPool& pool        = slot_pools[plan.rank];
         PoolPrefetch& state   = prefetches[plan.rank];
+        const std::size_t b   = pool_buffer(index);
+        auto& target          = state.buffers[b];
         RankBinding bind(device, plan.rank);
         const cudaStream_t t  = device.rank(plan.rank).transfer_stream;
-        CUDA_CHECK(cudaStreamWaitEvent(t, state.free, 0));
+        CUDA_CHECK(cudaStreamWaitEvent(t, target.free, 0));
         const MoePlan& m          = plan.moe;
         const std::size_t experts = m.gate.pointers.size();
-        const auto buffer = std::size_t(state.next);
+        const auto source         = std::size_t(state.next);
         state.next ^= 1;
-        CUDA_CHECK(cudaEventSynchronize(state.copied[buffer]));
-        auto* entries = static_cast<const void**>(state.entries[buffer]->data());
-        stage_pool(pool, index, [](std::size_t) { return true; }, entries, t);
-        CUDA_CHECK(cudaMemcpyAsync(pool.tables.p, entries, 3 * experts * sizeof(void*),
+        CUDA_CHECK(cudaEventSynchronize(state.copied[source]));
+        auto* entries = static_cast<const void**>(state.entries[source]->data());
+        stage_pool(pool, pool.buffers[b], index, [](std::size_t) { return true; }, entries, t);
+        CUDA_CHECK(cudaMemcpyAsync(pool.buffers[b].tables.p, entries, 3 * experts * sizeof(void*),
                                    cudaMemcpyHostToDevice, t));
-        CUDA_CHECK(cudaEventRecord(state.copied[buffer], t));
-        CUDA_CHECK(cudaEventRecord(state.ready, t));
-        state.layer = index;
+        CUDA_CHECK(cudaEventRecord(state.copied[source], t));
+        CUDA_CHECK(cudaEventRecord(target.ready, t));
+        target.layer = index;
+    }
+
+    // Forgets every prefetched layer, so the next wide call copies its own.
+    void forget_prefetches() {
+        for (auto& prefetch : prefetches) {
+            for (auto& buffer : prefetch.buffers) { buffer.layer = ~std::size_t{0}; }
+        }
     }
 
     // Feeds the last pass's routes to the expert cache and lets it swap experts, before the next
@@ -2218,17 +2272,27 @@ struct Executor::Impl {
         SlotPool& pool = slot_pools[rank.rank];
         if (pool.slots == 0) { return false; }
         const cudaStream_t s = rank.stream;
+        const std::size_t b        = pool_buffer(index);
+        const bool double_buffered = pool.buffers.size() == 2;
         // A span's last chunk may be shorter than kPrefetchTokens, but the pool still holds the
         // layer's experts that its earlier chunks prefetched: it runs from the pool too, rather
         // than copying its routed experts over the pool again, and the next layer's copies start
         // behind it as behind any prefetched call.
-        const bool prefetched = !prefetches.empty() && prefetches[rank.rank].layer == index;
+        const bool prefetched =
+            !prefetches.empty() && prefetches[rank.rank].buffers[b].layer == index;
         if ((t >= kPrefetchTokens || prefetched) && pool.slots >= plan.moe.gate.pointers.size()) {
             PoolPrefetch& state = prefetches[rank.rank];
-            if (state.layer != index) { prefetch_layer(index); }
-            CUDA_CHECK(cudaStreamWaitEvent(s, state.ready, 0));
+            auto& buffer        = state.buffers[b];
+            if (buffer.layer != index) { prefetch_layer(index); }
+            // With two buffers the next layer's copies need only the previous layer's calls done:
+            // they run while this layer's experts do.
+            if (double_buffered && pooled_layer(index + 1, rank.rank) &&
+                state.buffers[1 - b].layer != index + 1) {
+                prefetch_layer(index + 1);
+            }
+            CUDA_CHECK(cudaStreamWaitEvent(s, buffer.ready, 0));
             ops::GgufMoeWeights banks = plan.moe.banks();
-            const auto* table_p       = static_cast<const void* const*>(pool.tables.p);
+            const auto* table_p       = static_cast<const void* const*>(pool.buffers[b].tables.p);
             const std::size_t experts = plan.moe.gate.pointers.size();
             banks.gate.experts        = table_p;
             banks.up.experts          = table_p + experts;
@@ -2241,15 +2305,15 @@ struct Executor::Impl {
                 auto scope = rank.workspace->scope();
                 ops::moe_experts_gguf(mixed, ids, weights, shared, banks, *rank.workspace, y, s);
             }
-            CUDA_CHECK(cudaEventRecord(state.free, s));
+            CUDA_CHECK(cudaEventRecord(buffer.free, s));
             // A span's later chunks run this layer's experts again from the pool; otherwise the
-            // next text layer on this device starts its copies now.
+            // buffer takes the copies of the next text layer on this device that reads it.
             if (span_hold) { return true; }
-            if (index + 1 < layers.size() && layers[index + 1].rank == rank.rank &&
-                !layers[index + 1].moe.native) {
-                prefetch_layer(index + 1);
+            const std::size_t next = index + (double_buffered ? 2 : 1);
+            if (pooled_layer(next, rank.rank)) {
+                prefetch_layer(next);
             } else {
-                state.layer = ~std::size_t{0};
+                buffer.layer = ~std::size_t{0};
             }
             return true;
         }
@@ -2261,20 +2325,23 @@ struct Executor::Impl {
         CUDA_CHECK(cudaStreamSynchronize(s));
         const MoePlan& m          = plan.moe;
         const std::size_t experts = m.gate.pointers.size();
-        // The copies below overwrite the pool, so it no longer holds a prefetched layer.
-        if (!prefetches.empty()) { prefetches[rank.rank].layer = ~std::size_t{0}; }
+        // The copies below overwrite the first buffer, so no buffer holds a prefetched layer.
+        if (!prefetches.empty()) {
+            for (auto& buffer : prefetches[rank.rank].buffers) { buffer.layer = ~std::size_t{0}; }
+        }
         std::vector<char> routed(experts, 0);
         for (std::int32_t i = 0; i < top * t; ++i) {
             const std::int32_t e = routes[i];
             if (e >= 0 && std::size_t(e) < experts) { routed[e] = 1; }
         }
         if (pool.slots < experts) { return false; }
-        auto* entries = static_cast<const void**>(slot_entries->data());
-        stage_pool(pool, index, [&](std::size_t e) { return routed[e] != 0; }, entries, s);
-        CUDA_CHECK(cudaMemcpyAsync(pool.tables.p, entries, 3 * experts * sizeof(void*),
+        auto* entries     = static_cast<const void**>(slot_entries->data());
+        const auto wanted = [&](std::size_t e) { return routed[e] != 0; };
+        stage_pool(pool, pool.buffers[0], index, wanted, entries, s);
+        CUDA_CHECK(cudaMemcpyAsync(pool.buffers[0].tables.p, entries, 3 * experts * sizeof(void*),
                                    cudaMemcpyHostToDevice, s));
         ops::GgufMoeWeights banks = m.banks();
-        const auto* table_p       = static_cast<const void* const*>(pool.tables.p);
+        const auto* table_p       = static_cast<const void* const*>(pool.buffers[0].tables.p);
         banks.gate.experts        = table_p;
         banks.up.experts          = table_p + experts;
         banks.down.experts        = table_p + 2 * experts;
@@ -2512,7 +2579,7 @@ struct Executor::Impl {
         fence_misses();
         settle_routes();
         // A copy queued for an earlier pass may predate the cache's last swaps.
-        for (auto& prefetch : prefetches) { prefetch.layer = ~std::size_t{0}; }
+        forget_prefetches();
         if (hybrid) { hybrid->begin(cancelled, !warming); }
         stage_inputs(parts, tokens);
         // Disk-resident experts need the host between a layer's routing and its experts, so their
@@ -2652,7 +2719,7 @@ struct Executor::Impl {
         };
         fence_misses();
         settle_routes();
-        for (auto& prefetch : prefetches) { prefetch.layer = ~std::size_t{0}; }
+        forget_prefetches();
         float* const own_stack = rank.stack;
         // The chunks' inputs, staged one after another as forward() stages them, kept in the
         // span planes; their embeddings start their stacks.
@@ -3737,6 +3804,11 @@ void Executor::bind_cancellation(const std::atomic<bool>* cancelled) noexcept {
     if (!cancelled && impl_->hybrid) { try { impl_->hybrid->finish(); } catch (...) {} }
     impl_->cancelled = cancelled;
 }
+
+void Executor::raise_service_failure() {
+    if (impl_->misses) { impl_->misses->raise_failure(); }
+}
+
 void Executor::abort(std::uint32_t sequence) {
     if (impl_->table) { impl_->table->wait(); }
     impl_->rows_waited = true;

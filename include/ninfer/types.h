@@ -30,6 +30,10 @@ inline constexpr std::uint32_t kPrefixGridPageTokens = 256;
 // the shared-prefix opportunities one request can materialize on its own. Prefix-grid points are
 // excluded because they carry only observed evidence and need a second reuse domain.
 inline constexpr std::size_t kMaximumPreparedPromptCacheCandidatesPerRequest = 7;
+// Smallest nonzero ContextCacheOptions::progress_anchor_tokens. Preparation proposes one candidate
+// per multiple, so a finer stride would make a long prompt's candidate list, and the duplicate
+// scan over it, grow without bound.
+inline constexpr std::uint32_t kMinimumProgressAnchorTokens = 256;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
@@ -421,6 +425,15 @@ struct ContextCacheOptions {
     // the conversation where the cache holds the branch beside it as it stands, and otherwise
     // rewrites the conversation from the anchor, as a rewrite restore does from its checkpoint.
     bool endpoint_anchors = true;
+    // Progress anchors: every prompt offers a private long anchor at each multiple of this many
+    // tokens strictly inside it, so a prompt with no message boundary (one very long user message)
+    // still holds checkpoints while it prefills. A prefill that is cancelled part way -- a client
+    // that times out or disconnects -- keeps them when its live state cannot be kept as an
+    // endpoint (under MTP until its last chunk), so the retry resumes from the deepest one instead
+    // of token zero. They share the long-anchor capacity with every other long anchor; each costs
+    // a StateImage and may split a prefill chunk. 0 disables; a nonzero value below
+    // kMinimumProgressAnchorTokens is rejected.
+    std::uint32_t progress_anchor_tokens = 16384;
 };
 
 struct ContextCostOptions {
@@ -498,6 +511,14 @@ struct HybridExpertOptions {
     // GGUF banks: copy missing experts into device staging while the cached ones run (staged), or
     // let the expert kernels read host experts across the bus (mapped; host experts only).
     bool mapped_misses = false;
+    // GGUF host experts with staged misses: 1..9 leaves out of a decode or verification call each
+    // uncached expert that all its tokens rank past this many places of their top ten, without
+    // giving its router weight to the others (lossy); 0 (default) serves every miss.
+    std::uint32_t tail_skip_rank = 0;
+    // GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts
+    // into. 2 copies the next layer's while this layer's experts run, and takes the second
+    // buffer's memory from the expert cache; 1 (default) keeps one.
+    std::uint32_t prefill_buffers = 1;
     bool adaptive_cache = false;
     std::filesystem::path routing_profile; // initial per-layer expert counts for this artifact
     std::filesystem::path record_profile; // write accumulated counts at request boundaries
@@ -769,6 +790,17 @@ struct StopPolicy {
     bool publish_stop_token     = false;
 };
 
+// What the reasoning-loop guard does when the open thinking keeps repeating itself (every 512
+// thinking tokens: the last 2,048 characters repeat a period of at most 64 characters, or the share
+// of the last 2,000 words inside a 12-word passage seen three times reaches 25 %).
+enum class ReasoningLoopAction : std::uint8_t {
+    Off,      // no check
+    Stop,     // end the request there (FinishReason::OutputLimit)
+    Conclude, // inject the thinking-close control (as a reached thinking budget does) and let the
+              // model answer; Stop when early close is unavailable (always on Gemma 4) or the
+              // remaining output budget cannot hold the control span and one more token
+};
+
 struct ThinkingControlOptions {
     // Positive maximum accepted model-origin tokens while the Qwen thinking phase remains open.
     // Omitted means unlimited. Injected target-control tokens consume the total output budget but
@@ -779,9 +811,17 @@ struct ThinkingControlOptions {
     std::optional<std::uint32_t> effective_budget;
     // Whether canonical early-close guidance and control tokens can be inserted.
     bool early_close_available = true;
+    ReasoningLoopAction loop   = ReasoningLoopAction::Off;
 };
 
-enum class StructuredOutputKind : std::uint8_t { None, JsonObject, JsonSchema };
+enum class StructuredOutputKind : std::uint8_t {
+    None,
+    JsonObject,
+    JsonSchema,
+    Regex,
+    Choice,
+    Grammar
+};
 
 struct StructuredOutputOptions {
     StructuredOutputKind kind = StructuredOutputKind::None;
@@ -790,6 +830,11 @@ struct StructuredOutputOptions {
     // unevaluatedProperties) admit only their declared properties, following the OpenAI/Anthropic
     // strict structured-output convention. When false, standard JSON Schema defaults apply.
     bool strict = false;
+    // Regex: a regular expression the whole final response matches. Grammar: a GBNF grammar
+    // (llama.cpp's syntax) whose `root` rule the whole final response matches. Otherwise empty.
+    std::string grammar;
+    // Choice: the final response is exactly one of these strings (at least one, each non-empty).
+    std::vector<std::string> choices;
 };
 
 struct ExecutionOptions {
@@ -927,6 +972,8 @@ struct ToolCallParseDiagnostics {
     bool malformed_call_reported = false;
     // Text after the last call; the model is predicting a tool result there, so it is dropped.
     bool trailing_content_dropped = false;
+    // The structured calls came from a turn that ended on its stop token inside unclosed thinking.
+    bool recovered_from_reasoning = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
@@ -1350,13 +1397,19 @@ struct SpeculativeStats {
 struct ThinkingBudgetStats {
     std::optional<std::uint32_t> requested_budget;
     std::optional<std::uint32_t> effective_budget;
-    // Model-origin tokens accepted while capped thinking remained open.
+    // Model-origin tokens accepted while thinking remained open, with or without a budget.
     std::uint32_t model_thinking_tokens = 0;
     // Complete tokenizer-derived target-control suffix committed by Engine.
     std::uint32_t injected_tokens = 0;
     bool applied                  = false;
     // The request switched to its post-thinking sampling when its reasoning block closed.
     bool post_thinking_sampling = false;
+    // The reasoning-loop guard fired: after this many model-origin thinking tokens, at this
+    // repeated-passage coverage (ThinkingControlOptions::loop decided the action; `applied` tells
+    // whether it concluded).
+    bool loop_detected                 = false;
+    std::uint32_t loop_thinking_tokens = 0;
+    float loop_coverage                = 0.0F;
 };
 
 enum class PrefixReusePath : std::uint8_t {

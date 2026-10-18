@@ -132,7 +132,7 @@ __device__ __forceinline__ bool sweep(const Split<CacheInput>& s, __nv_bfloat16*
                 const int key   = k0 + key_l;
                 k_raw[j]        = make_int4(0, 0, 0, 0);
                 v_raw[j]        = make_int4(0, 0, 0, 0);
-                if (key >= s.split_start && key < s.split_end) {
+                if (key >= s.split_start && key < s.load_end) {
                     const __nv_bfloat16* k_src = s.cache_k;
                     const __nv_bfloat16* v_src = s.cache_v;
                     std::int64_t off = causal_cache_index<Geometry>(physical_page, s.kv_head, d,

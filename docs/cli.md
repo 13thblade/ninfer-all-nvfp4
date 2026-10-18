@@ -59,6 +59,16 @@ and suppresses this insertion. The option cannot be combined with `--no-thinking
 `--reasoning-effort none`, which both disable thinking, but it can be combined with any other
 `--reasoning-effort`.
 
+`--reasoning-loop off|stop|conclude` (default `off`) ends the reply (`stop`) or closes the thinking
+with the same control span and lets the model answer (`conclude`) when the open thinking keeps
+repeating itself. Every 512 thinking tokens the guard checks two signs: 25 % of the last 2,000
+words lie inside a 12-word passage seen three times, or the last 2,048 characters repeat one
+period of at most 64 characters. `conclude` stops instead when the output left cannot hold the
+control span and one more token; Gemma 4 has no early-close control, so there it always stops. The
+run summary prints `reasoning loop` when the guard fires. The option cannot be combined with
+`--no-thinking`. The check and its limits are described in
+[serving](serving.md#openai-chat-completions), under `--reasoning-loop`.
+
 `--max-new` counts every committed generated token, including internally inserted control tokens.
 The inserted suffix is never truncated, and a request is never rejected for lacking room for it.
 When the output capacity left after the budget cannot hold the complete tokenizer-derived control
@@ -255,6 +265,8 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; native Qwen and Gemma allow `0` and then keep only their layer banks, and Flash-Next disk mode needs a cache. With automatic KV, native Qwen gives the cache priority over KV beyond one request's context | `auto` (what is free after startup) |
 | `--expert-misses staged\|mapped` | Qwen3.8-Flash-Next only, GGUF host experts: copy each missing expert into a device cache slot while the cached experts run (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
 | `--expert-dma-share F` | Qwen3.8-Flash-Next only: host or disk experts: the GPU's share of a call's cache misses, `0..1`; below `1` the CPU computes the rest, an experimental mode; prefill always uses the GPU | `1` |
+| `--expert-tail-skip N` | Qwen3.8-Flash-Next only, GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten; the other experts keep their router weights, so results change | off |
+| `--expert-prefill-buffers 1\|2` | Qwen3.8-Flash-Next only, GGUF host experts: device buffers a long prompt's uncached experts are copied into; `2` copies the next layer's while the current layer's experts run, with the second buffer's memory taken from the expert cache | `1` |
 | `--expert-cpu-threads N` | Qwen3.8-Flash-Next only: host experts with a CPU share: `1..256` CPU workers | automatic, at most 16 |
 | `--expert-cache-adaptive` | Qwen3.8-Flash-Next only: replace cold cached experts between calls; changes the CPU/GPU arithmetic partition | off |
 | `--expert-profile PATH` | Qwen3.8-Flash-Next only: fill the host expert cache from counts recorded for the same artifact and bank geometry | none |
@@ -295,6 +307,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
+| `--reasoning-loop off\|stop\|conclude` | end the reply or close the thinking when it keeps repeating itself | `off` |
 | `--reasoning-effort none\|minimal\|low\|medium\|high\|xhigh\|max` | pass an effort value to the selected template | template default |
 | `--greedy` | exact argmax decoding | off |
 | `--post-thinking` | sample the answer with the post-thinking preset (temperature `0.2`) from the token after the reasoning block closes | off |

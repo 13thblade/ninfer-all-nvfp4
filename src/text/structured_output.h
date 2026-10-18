@@ -47,6 +47,10 @@ public:
     ~StructuredCompiler();
     std::shared_ptr<GrammarState> compile(const StructuredOutputOptions& options,
                                           const StructuredOutputEnvelope& envelope = {});
+    // A response with no final format of its own: `format`, an XGrammar structural-tag format
+    // (free text with a model's tool calls), after the reasoning close when the envelope has one.
+    std::shared_ptr<GrammarState> compile_format(const std::string& format,
+                                                 const StructuredOutputEnvelope& envelope = {});
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

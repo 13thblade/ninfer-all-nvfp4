@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/ngram_table.h"
+#include "core/file_read_error.h"
 
 #include <algorithm>
 #include <bit>
@@ -153,6 +154,17 @@ struct NgramTableReader::File {
 #endif
     }
 
+    // A row read that failed while the Engine ran; the reader caches no row of a failed batch.
+    [[noreturn]] void fail_read() const {
+#ifdef _WIN32
+        throw FileReadError("n-gram table: cannot read " + path.string() + " (error " +
+                            std::to_string(GetLastError()) + ")");
+#else
+        throw FileReadError("n-gram table: cannot read " + path.string() + ": " +
+                            error_text(errno));
+#endif
+    }
+
     // One positioned read of up to `bytes` at `offset`; 0 at the end of the file.
     std::size_t read_some(std::uint64_t offset, std::uint8_t* destination,
                           std::size_t bytes) const {
@@ -165,14 +177,14 @@ struct NgramTableReader::File {
             DWORD done          = 0;
             if (!ReadFile(handle, destination, static_cast<DWORD>(bytes), &done, &position)) {
                 if (GetLastError() == ERROR_HANDLE_EOF) { return 0; }
-                fail("cannot read");
+                fail_read();
             }
             return done;
 #else
             const ssize_t done =
                 ::pread(descriptor, destination, bytes, static_cast<off_t>(offset));
             if (done < 0 && errno == EINTR) { continue; }
-            if (done < 0) { fail("cannot read"); }
+            if (done < 0) { fail_read(); }
             return static_cast<std::size_t>(done);
 #endif
         }
@@ -187,7 +199,7 @@ struct NgramTableReader::File {
         while (bytes > 0) {
             const std::size_t done = read_some(offset, destination, bytes);
             if (done == 0) {
-                throw std::runtime_error("n-gram table: " + path.string() + " ends early");
+                throw FileReadError("n-gram table: " + path.string() + " ends early");
             }
             destination += done;
             offset += done;
@@ -213,7 +225,7 @@ struct NgramTableReader::File {
         while (have < need) {
             const std::size_t done = read_some(begin + have, bounce + have, end - begin - have);
             if (done == 0) {
-                throw std::runtime_error("n-gram table: " + path.string() + " ends early");
+                throw FileReadError("n-gram table: " + path.string() + " ends early");
             }
             have += done;
         }

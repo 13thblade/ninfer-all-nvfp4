@@ -20,6 +20,7 @@
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
@@ -427,20 +428,22 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last,
                                  bool wide_verification = false) {
-        scratch(layout,
-                execution::rotated_workspace_bytes(
-                    p.hadamard_signs, p.weight.k, last,
-                    ops::linear_add_workspace_capacity_bytes(
-                        p.weight.qtype, p.weight.n, p.weight.k,
-                        execution::residual_projection_policy(p, wide_verification), first, last)));
+        // A round's narrower families may resolve the ordinary policy at the same columns.
+        const auto bytes = [&](bool wide) {
+            return execution::rotated_workspace_bytes(
+                p.hadamard_signs, p.weight.k, last,
+                ops::linear_add_workspace_capacity_bytes(
+                    p.weight.qtype, p.weight.n, p.weight.k,
+                    execution::residual_projection_policy(p, wide), first, last));
+        };
+        scratch(layout, wide_verification ? std::max(bytes(true), bytes(false)) : bytes(false));
     };
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                  std::int32_t last, TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width,
                                  ops::CausalAttentionExecutionEnvelope envelope) {
-        const bool wide_verification =
-            wide_residual_verification(phase, batch_size, min_width, max_width);
+        const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
         for (const auto& block : parameters.text.layers) {
             {
                 auto stage = layout.scope();
@@ -490,9 +493,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             }
             auto stage = layout.scope();
             (void)workspace::post_mixer_hidden(layout, config, last);
-            scratch(layout,
-                    execution::ffn_workspace_bytes(block.ffn, first, last, false,
-                                                   phase == TextPhase::Verify, wide_verification));
+            const bool verify = phase == TextPhase::Verify;
+            scratch(layout, std::max(execution::ffn_workspace_bytes(block.ffn, first, last, false,
+                                                                    verify, wide_verification),
+                                     execution::ffn_workspace_bytes(block.ffn, first, last, false,
+                                                                    verify, false)));
         }
         // A prompt chunk projects only its last column through the head; a verify round projects
         // every column.
@@ -978,6 +983,13 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
+    // Decode and verify rounds run the target's projections with the prefill's Linear policies, one
+    // call over every lane's verify columns. The cuBLAS prefill route has to stay out of them -- it
+    // would put a weight-sized scratch into every round workspace and change decode numerics -- so
+    // the widest round sits at or below the floor no device profile moves its width gate past.
+    static_assert(kMaximumConcurrency * kMtpDecodeMaximumWidth <=
+                      static_cast<std::uint32_t>(ops::kCublasPrefillFloorTokens),
+                  "the widest decode/verify round must stay below the cuBLAS prefill width gate");
     if (parameters.text.rank_count != device.size()) {
         throw std::invalid_argument("the model is split into " +
                                     std::to_string(parameters.text.rank_count) +

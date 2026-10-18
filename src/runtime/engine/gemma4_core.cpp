@@ -16,6 +16,7 @@
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
 #include "runtime/engine/diagnostics.h"
+#include "runtime/engine/worker_recovery.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/host_memory.h"
@@ -118,7 +119,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     }
     const auto& hybrid = options.hybrid_experts;
     if (hybrid.dma_share != 1 || hybrid.cpu_threads != 0 || hybrid.mapped_misses ||
-        hybrid.adaptive_cache || !hybrid.routing_profile.empty() || !hybrid.record_profile.empty()) {
+        hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 1 || hybrid.adaptive_cache ||
+        !hybrid.routing_profile.empty() || !hybrid.record_profile.empty()) {
         throw std::invalid_argument("Gemma 4 expert residency uses GPU arithmetic and DMA only; "
                                     "Flash-Next hybrid/profile options do not apply");
     }
@@ -413,6 +415,7 @@ struct Gemma4Core::Impl {
     const bool reuse_prefixes;
     const std::uint32_t drafts;       // the assistant's drafts a round; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
+    const DiagnosticObserver diagnostics;
     // With --adaptive-mtp, the drafts a round proposes and verifies, 1..drafts.
     std::optional<runtime::MtpAdaptiveBatchController> mtp_controller;
 
@@ -486,12 +489,12 @@ struct Gemma4Core::Impl {
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
           reuse_prefixes(i.executor->options().checkpoints), drafts(i.executor->draft_tokens()),
-          lookup_ngram(options.speculative.lookup_ngram),
+          lookup_ngram(options.speculative.lookup_ngram), diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
-          decode_rounds_per_prefill(options.decode_rounds_per_prefill != 0
-                                        ? options.decode_rounds_per_prefill
-                                        : std::max<std::uint32_t>(
-                                              1, i.executor->options().prefill_chunk / 64)) {
+          decode_rounds_per_prefill(
+              options.decode_rounds_per_prefill != 0
+                  ? options.decode_rounds_per_prefill
+                  : std::max<std::uint32_t>(1, i.executor->options().prefill_chunk / 64)) {
         if (drafts > 0 && options.speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
             mtp_controller.emplace();
             mtp_controller->reset(drafts, 1);
@@ -673,7 +676,15 @@ struct Gemma4Core::Impl {
                            [](const Slot& slot) { return slot.request != nullptr; });
     }
 
+    // Not a request's own error: the Engine stops serving, and the cause is logged here, where it
+    // is the operator's only lead.
     void fail_engine(std::exception_ptr error) {
+        const auto running = std::count_if(
+            slots.begin(), slots.end(), [](const Slot& slot) { return slot.request != nullptr; });
+        publish_diagnostic(diagnostics, DiagnosticLevel::Error,
+                           "worker failure: %s - failing %td running request(s), the Engine "
+                           "stops serving",
+                           exception_text(error).c_str(), running);
         {
             std::lock_guard lock(queue_mutex);
             failed   = true;
@@ -2197,6 +2208,11 @@ Gemma4Core::Submission Gemma4Core::submit(models::qwen3_5::PreparedPrompt prompt
     request->output = impl_->instance.frontend.make_output_session(
         prompt, options.stop, options.output, options.execution.thinking,
         options.execution.structured_output);
+    // Strict tool arguments bring a grammar without a structured final format.
+    if (request->output.grammar_state() && !impl_->structured_output) {
+        throw std::invalid_argument(
+            "strict tool arguments require an Engine started with structured_output");
+    }
     const std::optional<std::uint32_t> budget = request->output.thinking_stats().effective_budget;
     request->prompt                           = std::move(prompt);
     request->options                          = std::move(options);

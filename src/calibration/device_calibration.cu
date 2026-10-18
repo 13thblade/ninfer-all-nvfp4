@@ -9,8 +9,12 @@
 #include "core/paged_kv_storage.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gated_delta_net.h"
+#include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
@@ -19,6 +23,7 @@
 #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
+#include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include <cuda_runtime.h>
@@ -33,6 +38,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -630,6 +636,142 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
     }
 }
 
+// The cuBLAS prefill route's width gate (--prefill-cublas) per Op, through the public Ops under
+// AllowPrefillCublas, at the 27B's registered shapes. Each Op is timed twice: at widths the integer
+// A8 mainloop cannot take, where the A16 mainloop is the alternative, and at multiples of its
+// 128-column tile under the `/a8` key. Widths start past the decode floor
+// (kCublasPrefillFloorTokens) and stop where the route wins on every card measured; past them the
+// compiled gate answers. One width sits just below that gate, so no band of compiled answers
+// spans it: such a band would hand the widths before the gate the answer measured past it.
+void calibrate_cublas_prefill(ops::DeviceRouteProfile& profile, Timer& timer,
+                              const CalibrationOptions& options) {
+    constexpr ops::LinearPolicy policy             = ops::LinearPolicy::AllowPrefillCublas;
+    constexpr std::int32_t hidden                  = 5120;
+    const std::vector<std::int32_t> other_widths   = {
+        136, 200, 264, 328, 400, 464, ops::kCublasPrefillMinTokens - 1, 600, 776, 1000, 1500};
+    const std::vector<std::int32_t> aligned_widths = {256, 384, 512, 640, 768, 1024, 1536, 2048};
+    const std::int32_t max_tokens                  = aligned_widths.back();
+    const std::int32_t first_tokens                = ops::kCublasPrefillFloorTokens + 1;
+    if (!options.only.empty() && std::string_view("w4_cublas/").rfind(options.only, 0) != 0 &&
+        options.only.rfind("w4_cublas/", 0) != 0) {
+        return;
+    }
+    SyntheticWeight gate_up = row_split_weight(QType::Q4_G64_FP16, 34816, hidden);
+    SyntheticWeight down    = row_split_weight(QType::Q5_G64_FP16, hidden, 17408);
+    SyntheticWeight out     = row_split_weight(QType::Q5_G64_FP16, hidden, 6144);
+    SyntheticWeight gdn_qk  = row_split_weight(QType::Q4_G64_FP16, 4096, hidden);
+    SyntheticWeight gdn_vz  = row_split_weight(QType::Q5_G64_FP16, 12288, hidden);
+    SyntheticWeight attn_qk = row_split_weight(QType::Q4_G64_FP16, 7168, hidden);
+    SyntheticWeight attn_gv = row_split_weight(QType::Q5_G64_FP16, 7168, hidden);
+    const auto columns      = [&](std::int32_t rows) {
+        return bf16_buffer(static_cast<std::size_t>(rows) * max_tokens);
+    };
+    DeviceBuffer x_hidden          = columns(hidden);
+    DeviceBuffer x_mixer           = columns(6144);
+    DeviceBuffer x_intermediate    = columns(17408);
+    DeviceBuffer swiglu_out        = columns(17408);
+    DeviceBuffer residual          = columns(hidden);
+    DeviceBuffer residual_pristine = columns(hidden);
+    DeviceBuffer qkv               = columns(10240);
+    DeviceBuffer z                 = columns(6144);
+    DeviceBuffer q                 = columns(6144);
+    DeviceBuffer gate              = columns(6144);
+    DeviceBuffer k                 = columns(1024);
+    DeviceBuffer v                 = columns(1024);
+    // Every family's widest claimant over the measured widths, the route forced on from the floor.
+    std::size_t workspace_bytes = 256;
+    const auto reserve = [&](const ops::detail::CublasPrefillFamily& family, auto capacity) {
+        const ops::DeviceRouteForce force(std::string(family.key), "on");
+        workspace_bytes = std::max(workspace_bytes, capacity(first_tokens, max_tokens));
+    };
+    reserve(ops::detail::kCublasGateUp, [&](std::int32_t lo, std::int32_t hi) {
+        return ops::linear_swiglu_workspace_capacity_bytes(QType::Q4_G64_FP16, 34816, hidden,
+                                                           policy, lo, hi);
+    });
+    reserve(ops::detail::kCublasDown, [&](std::int32_t lo, std::int32_t hi) {
+        return ops::linear_add_workspace_capacity_bytes(QType::Q5_G64_FP16, hidden, 17408, policy,
+                                                        lo, hi);
+    });
+    reserve(ops::detail::kCublasOut, [&](std::int32_t lo, std::int32_t hi) {
+        return ops::linear_add_workspace_capacity_bytes(QType::Q5_G64_FP16, hidden, 6144, policy,
+                                                        lo, hi);
+    });
+    reserve(ops::detail::kCublasGdnInput, [&](std::int32_t lo, std::int32_t hi) {
+        return ops::gdn_input_proj_split_workspace_capacity_bytes(
+            QType::Q4_G64_FP16, 4096, QType::Q5_G64_FP16, 12288, hidden, policy, lo, hi);
+    });
+    reserve(ops::detail::kCublasAttnInput, [&](std::int32_t lo, std::int32_t hi) {
+        return ops::attn_input_proj_split_workspace_capacity_bytes(
+            QType::Q4_G64_FP16, 7168, QType::Q5_G64_FP16, 7168, hidden, policy, lo, hi);
+    });
+    WorkspaceArena workspace(workspace_bytes);
+    const auto tensor = [](DeviceBuffer& buffer, std::int32_t rows, std::int32_t cols) {
+        return Tensor(buffer.p, DType::BF16, {rows, cols});
+    };
+    const auto view = [](DeviceBuffer& buffer, std::size_t rows) {
+        return [&buffer, rows](std::int32_t cols) {
+            return std::pair<const void*, std::size_t>{buffer.p,
+                                                       rows * static_cast<std::size_t>(cols)};
+        };
+    };
+    const auto reset_residual = [&]() {
+        CUDA_CHECK(
+            cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+    };
+    const auto run_gate_up = [&](std::int32_t cols, cudaStream_t stream) {
+        Tensor x = tensor(x_hidden, hidden, cols), o = tensor(swiglu_out, 17408, cols);
+        ops::linear_swiglu(x, gate_up.weight, o, policy, workspace, stream);
+    };
+    const auto run_add = [&](DeviceBuffer& input, std::int32_t k_rows, SyntheticWeight& weight) {
+        return [&, k_rows](std::int32_t cols, cudaStream_t stream) {
+            Tensor x = tensor(input, k_rows, cols), res = tensor(residual, hidden, cols);
+            ops::linear_add(x, weight.weight, res, policy, workspace, stream);
+        };
+    };
+    const auto run_gdn = [&](std::int32_t cols, cudaStream_t stream) {
+        Tensor x  = tensor(x_hidden, hidden, cols);
+        Tensor qp = tensor(qkv, 10240, cols), zp = tensor(z, 6144, cols);
+        ops::gdn_input_proj(x, gdn_qk.weight, gdn_vz.weight, qp, zp, policy, workspace, stream);
+    };
+    const auto run_attn = [&](std::int32_t cols, cudaStream_t stream) {
+        Tensor x  = tensor(x_hidden, hidden, cols);
+        Tensor qp = tensor(q, 6144, cols), gp = tensor(gate, 6144, cols);
+        Tensor kp = tensor(k, 1024, cols), vp = tensor(v, 1024, cols);
+        ops::attn_input_proj(x, attn_qk.weight, attn_gv.weight, qp, gp, kp, vp, policy, workspace,
+                             stream);
+    };
+
+    struct Op {
+        const ops::detail::CublasPrefillFamily& family;
+        std::function<void(std::int32_t, cudaStream_t)> run;
+        std::function<std::pair<const void*, std::size_t>(std::int32_t)> output;
+        std::function<void()> reset;
+    };
+
+    const std::vector<Op> op_list = {
+        {ops::detail::kCublasGateUp, run_gate_up, view(swiglu_out, 17408), {}},
+        {ops::detail::kCublasDown, run_add(x_intermediate, 17408, down), view(residual, hidden),
+         reset_residual},
+        {ops::detail::kCublasOut, run_add(x_mixer, 6144, out), view(residual, hidden),
+         reset_residual},
+        {ops::detail::kCublasGdnInput, run_gdn, view(qkv, 10240), {}},
+        {ops::detail::kCublasAttnInput, run_attn, view(q, 6144), {}},
+    };
+    for (const Op& op : op_list) {
+        for (const bool aligned : {false, true}) {
+            const Family family{std::string(aligned ? op.family.integer_key : op.family.key),
+                                aligned ? aligned_widths : other_widths, op.run, op.output,
+                                op.reset};
+            auto bands = sweep(family, timer, options);
+            if (!bands.empty()) {
+                profile.routes[family.key] = std::move(bands);
+                ops::install_device_route_profile(
+                    std::make_shared<const ops::DeviceRouteProfile>(profile));
+            }
+        }
+    }
+}
+
 // The Q8 G32 K-split contractions' 8-column tiles on their four-K-warp form, at every registered
 // geometry and decode width, through the Linear Op an MTP head, a DFlash2 drafter or an official
 // artifact's head runs. One synthetic weight at a time bounds the memory this takes.
@@ -816,8 +958,17 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
         DeviceBuffer prompt_q   = bf16_buffer(static_cast<std::size_t>(head_dim) * q_heads * max_chunk);
         DeviceBuffer prompt_out = bf16_buffer(static_cast<std::size_t>(head_dim) * q_heads * max_chunk);
         DeviceBuffer prompt_positions(max_chunk * sizeof(std::int32_t));
-        const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-            geometry, storage, {1, static_cast<std::uint32_t>(max_window)}, 1, 1, max_chunk);
+        // The fast kernel's key splits take workspace; size it for the fast kernel too, which the
+        // "attn_prompt_fast" sweep below may select.
+        const auto prompt_capacity = [&] {
+            return ops::causal_softmax_attention_workspace_capacity_bytes(
+                geometry, storage, {1, static_cast<std::uint32_t>(max_window)}, 1, 1, max_chunk);
+        };
+        std::size_t workspace_bytes = prompt_capacity();
+        {
+            const ops::DeviceRouteForce fast_prompt("attn_prompt_fast", "on");
+            workspace_bytes = std::max(workspace_bytes, prompt_capacity());
+        }
         WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
         const auto run = [&](std::int32_t tokens, std::int32_t depth, cudaStream_t stream) {
             std::vector<std::int32_t> host(static_cast<std::size_t>(tokens));
@@ -889,6 +1040,53 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
             auto fast_bands = sweep(fast, timer, options);
             if (!fast_bands.empty()) {
                 profile.routes[fast.key] = std::move(fast_bands);
+                ops::install_device_route_profile(
+                    std::make_shared<const ops::DeviceRouteProfile>(profile));
+            }
+        }
+        // Key splits of the fast prompt kernel (prompt_i8_fast_plan.h) against unsplit launches,
+        // where the fast kernel now serves prompts: a 256-token continuation at 32K and 131K of
+        // context, where few row blocks leave SMs idle, and a wave-aligned chunk at 131K. The
+        // split partials need their own workspace, sized with the fast kernel selected.
+        if (ops::detail::causal_attention_prompt_fast_kernel(storage, false)) {
+            constexpr std::int32_t kContinuation = 256;
+            const ops::CausalAttentionExecutionEnvelope split_envelope{
+                1, static_cast<std::uint32_t>(max_window)};
+            WorkspaceArena split_workspace(std::max<std::size_t>(
+                ops::causal_softmax_attention_workspace_capacity_bytes(
+                    geometry, storage, split_envelope, 1, kContinuation, max_chunk),
+                256));
+            const auto attend = [&](std::int32_t tokens, std::int32_t depth, cudaStream_t stream) {
+                std::vector<std::int32_t> host(static_cast<std::size_t>(tokens));
+                for (std::int32_t token = 0; token < tokens; ++token) {
+                    host[static_cast<std::size_t>(token)] = depth - tokens + token;
+                }
+                CUDA_CHECK(cudaMemcpyAsync(prompt_positions.p, host.data(),
+                                           host.size() * sizeof(std::int32_t),
+                                           cudaMemcpyHostToDevice, stream));
+                Tensor qt(prompt_q.p, DType::BF16, {head_dim, q_heads, tokens});
+                Tensor ot(prompt_out.p, DType::BF16, {head_dim, q_heads, tokens});
+                Tensor pt(prompt_positions.p, DType::I32, {tokens});
+                auto scope = split_workspace.scope();
+                ops::causal_softmax_attention_cached(qt, pt, geometry, 0.0625f,
+                                                     cache_view(max_window), split_envelope,
+                                                     split_workspace, ot, stream);
+            };
+            const Family split{"attn_prompt_split",
+                               {1},
+                               [&](std::int32_t, cudaStream_t stream) {
+                                   attend(kContinuation, 32768, stream);
+                                   attend(kContinuation, 131072, stream);
+                                   attend(wave_chunk, 131072, stream);
+                               },
+                               [&](std::int32_t) {
+                                   return std::pair<const void*, std::size_t>{
+                                       prompt_out.p, static_cast<std::size_t>(head_dim) * q_heads};
+                               },
+                               {}};
+            auto split_bands = sweep(split, timer, options);
+            if (!split_bands.empty()) {
+                profile.routes[split.key] = std::move(split_bands);
                 ops::install_device_route_profile(
                     std::make_shared<const ops::DeviceRouteProfile>(profile));
             }
@@ -1013,6 +1211,7 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
     if (projections && options.ternary) { calibrate_ternary(profile, timer, options); }
     if (projections && options.groupwise) {
         calibrate_groupwise(profile, timer, options);
+        calibrate_cublas_prefill(profile, timer, options);
         calibrate_q8_ksplit(profile, timer, options);
     }
     if (options.linear_attention) { calibrate_linear_attention(profile, timer, options); }

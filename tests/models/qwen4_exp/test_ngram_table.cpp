@@ -2,8 +2,9 @@
 // file, all of it in RAM, a profile's hot rows in RAM and the rest from the file) and every I/O
 // mode (buffered, direct, mapped), from a table in one file or split across two inside a row, and
 // counts the rows RAM served. It refuses a short file, a row past the table, a hot-row budget below
-// its index, and a profile naming a row twice or past the table. A hot-row profile reads back as
-// written and is refused for other hash constants.
+// its index, and a profile naming a row twice or past the table; a row read that fails raises
+// FileReadError. A hot-row profile reads back as written and is refused for other hash constants.
+#include "core/file_read_error.h"
 #include "models/qwen4_exp/ngram_hash.h"
 #include "models/qwen4_exp/ngram_profile.h"
 #include "models/qwen4_exp/ngram_table.h"
@@ -244,7 +245,7 @@ int run() {
         const std::vector<std::uint64_t> rows{0, kRows - 1};
         std::vector<std::uint8_t> out(rows.size() * kRowBytes);
         reader.prefetch(rows);
-        refused<std::runtime_error>([&] { reader.read_rows(rows, out); }, "read after truncation");
+        refused<FileReadError>([&] { reader.read_rows(rows, out); }, "read after truncation");
         require(reader.resident_rows() == 0, "failed batch admitted partial data");
         {
             std::ofstream file(path, std::ios::binary | std::ios::in);

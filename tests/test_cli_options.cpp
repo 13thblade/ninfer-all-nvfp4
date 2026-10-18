@@ -92,6 +92,29 @@ int run_tests() {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-cpu-threads", threads});
         }), "CLI accepted an invalid hybrid CPU worker count");
     }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-residency",
+                             "host"}).hybrid_experts.tail_skip_rank == 0 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--expert-residency", "host", "--expert-tail-skip", "7"})
+                                  .hybrid_experts.tail_skip_rank == 7,
+                      "CLI did not keep every miss by default or preserve the tail skip");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
+                              .hybrid_experts.prefill_buffers == 1 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--expert-prefill-buffers", "2"})
+                                  .hybrid_experts.prefill_buffers == 2,
+                      "CLI did not keep one prefill expert buffer by default or preserve two");
+    for (const auto* count : {"0", "3", "two"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-prefill-buffers",
+                         count});
+        }), "CLI accepted an invalid prefill expert buffer count");
+    }
+    for (const auto* rank : {"0", "10", "-1", "7x"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-tail-skip", rank});
+        }), "CLI accepted an invalid expert tail skip");
+    }
     for (const auto* budget : {"0", "32", "4096"}) {
         const auto disk = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
                                  "--ngram-residency", "disk", "--ngram-ram-mib", budget});
@@ -198,6 +221,27 @@ int run_tests() {
                "--reasoning-effort", "medium"});
     failures += check(with_effort.thinking_budget == 8 && with_effort.reasoning_effort,
                       "thinking budget did not coexist with reasoning effort");
+    failures += check(
+        configured.reasoning_loop == ninfer::ReasoningLoopAction::Off &&
+            parse(
+                {"ninfer-cli", "model.ninfer", "--prompt", "hello", "--reasoning-loop", "conclude"})
+                    .reasoning_loop == ninfer::ReasoningLoopAction::Conclude &&
+            parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--reasoning-loop", "stop"})
+                    .reasoning_loop == ninfer::ReasoningLoopAction::Stop,
+        "--reasoning-loop did not select its action (or was not off by default)");
+    failures +=
+        check(ninfer::cli::usage_text("ninfer-cli").find("--reasoning-loop") != std::string::npos,
+              "CLI help omits --reasoning-loop");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--reasoning-loop", "on"});
+                      }),
+                      "--reasoning-loop on was accepted");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--reasoning-loop", "stop", "--no-thinking"});
+                      }),
+                      "--reasoning-loop was accepted with --no-thinking");
     const ninfer::cli::Options dflash_vision =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision", "--spec", "dflash",
                "--draft-tokens", "7"});

@@ -15,6 +15,7 @@
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/worker_fault.h"
+#include "runtime/engine/worker_recovery.h"
 #include "text/structured_output.h"
 
 #include <algorithm>
@@ -323,6 +324,11 @@ public:
             auto output = instance_.frontend.make_output_session(
                 prompt, options.stop, options.output, options.execution.thinking,
                 options.execution.structured_output);
+            // Strict tool arguments bring a grammar without a structured final format.
+            if (output.grammar_state() && !structured_output_) {
+                throw std::invalid_argument(
+                    "strict tool arguments require an Engine started with structured_output");
+            }
             options.execution.grammar = output.grammar_state();
             request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
                                                 std::move(output), prompt_summary, prepare_seconds,
@@ -1546,6 +1552,24 @@ private:
         return changed;
     }
 
+    // Aborts an active lane. The Program may keep what the lane reached as a continuation; one
+    // that kept only a cancelled prefill's anchors has no endpoint and cannot be saved as a
+    // session, so a slot file bound to the cell (an in-place reuse of a saved session) no longer
+    // describes what is resident there.
+    [[nodiscard]] auto abort_active_lane(const Request& request) {
+        std::optional<std::uint32_t> publication;
+        if constexpr (kLegacyContextCache) {
+            publication = resources_.lane_publication_slot(*request.lane);
+        }
+        auto aborted = resources_.abort(*instance_.program, *request.lane, *request.sequence);
+        if constexpr (kLegacyContextCache) {
+            if (aborted.salvaged && !aborted.summary.endpoint && publication) {
+                clear_slot_session(*publication);
+            }
+        }
+        return aborted;
+    }
+
     void cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary,
                                 HostPhaseMeasurement& boundary) {
         if (instance_.program->has_context_transaction()) { return; }
@@ -1559,7 +1583,7 @@ private:
                 throw std::logic_error("active cancellation has no sequence binding");
             }
             (void)request->output.preview_terminal(FinishReason::Cancelled);
-            auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
+            auto aborted                = abort_active_lane(*request);
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
             if (aborted.salvaged) { ++cumulative_stats_.salvaged_continuations; }
@@ -1616,7 +1640,7 @@ private:
         if (!request->sequence || !request->lane || request->lane->value != lane) {
             throw std::logic_error("failing request has no sequence binding");
         }
-        auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
+        auto aborted                = abort_active_lane(*request);
         request->generation_timings = aborted.timings;
         request->speculative_stats  = std::move(aborted.speculative);
         if (aborted.salvaged) { ++cumulative_stats_.salvaged_continuations; }
@@ -2411,7 +2435,7 @@ private:
             publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
                                "out of memory during materialization reserve: %s", oom.what());
             oom_backoff_ = kOomBackoffIterations;
-            ++oom_recovery_count_;
+            (void)recovery_streak_.record_failure(Clock::now());
             if (!erase_pending(request)) {
                 // The prompt was already moved into reserve_materialization before the
                 // throw, so the request is unrecoverable.  This is a logic error — the
@@ -3142,7 +3166,7 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_control_batch(control_membership);
                     decode_run += decode_run != std::numeric_limits<std::uint32_t>::max();
-                    oom_recovery_count_ = 0;
+                    recovery_streak_.record_success();
                     continue;
                 }
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
@@ -3164,7 +3188,7 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_prefill_step(cancelled_at_unit_start);
                     decode_run = 0;
-                    oom_recovery_count_ = 0;
+                    recovery_streak_.record_success();
                     continue;
                 }
                 if (action == ExecutionAction::Decode) {
@@ -3172,12 +3196,12 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_decode_round(membership, cancelled_at_unit_start);
                     decode_run += decode_run != std::numeric_limits<std::uint32_t>::max();
-                    oom_recovery_count_ = 0;
+                    recovery_streak_.record_success();
                     continue;
                 }
                 set_host_work_class(HostWorkClass::Control);
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                // Do NOT reset oom_recovery_count_ here: idle iterations and
+                // Do NOT end the recovery streak here: idle iterations and
                 // admission-only iterations (where admit_planned_request caught
                 // an OOM internally) did not complete a real work unit.  Only
                 // successful control/prefill/decode above clears the streak.
@@ -3206,11 +3230,11 @@ private:
                     }
                     publish_diagnostic(diagnostics_, DiagnosticLevel::Warning, "%s", buf);
                 }
-                if (++oom_recovery_count_ > kOomMaxRecoveries) {
+                if (!recovery_streak_.record_failure(Clock::now())) {
                     publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
                                        "worker out of memory: %u consecutive recoveries - failing "
                                        "all pending",
-                                       oom_recovery_count_ - 1);
+                                       recovery_streak_.count() - 1);
                     const std::exception_ptr fatal_error = oom_fallback_error_;
                     fail_all_locked(fatal_error);
                     return;
@@ -3237,10 +3261,10 @@ private:
                 }
                 publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
                                    "worker invariant failure: %s - recovering", invariant.what());
-                if (++oom_recovery_count_ > kOomMaxRecoveries) {
+                if (!recovery_streak_.record_failure(Clock::now())) {
                     publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
                                        "worker: %u consecutive recoveries - failing all pending",
-                                       oom_recovery_count_ - 1);
+                                       recovery_streak_.count() - 1);
                     fail_all_locked(std::current_exception());
                     return;
                 }
@@ -3320,8 +3344,11 @@ private:
     bool failed_   = false;
     static constexpr std::uint32_t kOomBackoffIterations = 4;
     static constexpr std::uint32_t kOomMaxRecoveries = 8;  // before failing all pending
+    // Failures further apart than this do not form a streak; see RecoveryStreak.
+    static constexpr std::chrono::seconds kRecoveryHealthyWindow{30};
     std::uint32_t oom_backoff_                    = 0;  // iterations to skip admission after OOM
-    std::uint32_t oom_recovery_count_ = 0;  // consecutive OOMs without a successful work unit
+    // Worker failures without a successful work unit between them.
+    RecoveryStreak recovery_streak_{kOomMaxRecoveries, kRecoveryHealthyWindow};
     const std::exception_ptr oom_fallback_error_ = std::make_exception_ptr(
         RequestError(RequestErrorKind::Overloaded, "engine out of memory during execution"));
     DiagnosticObserver diagnostics_;

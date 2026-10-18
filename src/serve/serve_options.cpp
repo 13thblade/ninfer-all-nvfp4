@@ -2,6 +2,7 @@
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
+#include "product/reasoning_loop_options.h"
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
 
@@ -257,6 +258,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                anchors, doubling per anchor back from the\n"
            "                                prompt end (default 1024; 0 anchors every\n"
            "                                boundary)\n"
+           "  --progress-anchor-tokens N    anchor every prompt at each multiple of N tokens,\n"
+           "                                so a client that cancels a long prefill and\n"
+           "                                retries resumes from the deepest anchor instead\n"
+           "                                of token zero (default 16384; 0 disables;\n"
+           "                                otherwise at least 256)\n"
            "  --max-cache-markers-per-request N\n"
            "                                client cache markers one request may carry\n"
            "                                (default 4)\n"
@@ -404,6 +410,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                notice a request gets at its thinking budget;\n"
            "                                the canonical </think> close is appended when\n"
            "                                missing\n"
+           "  --reasoning-loop off|stop|conclude\n"
+           "                                every 512 thinking tokens, test whether the\n"
+           "                                thinking repeats whole passages; stop ends the\n"
+           "                                reply as length, conclude closes the thinking\n"
+           "                                and lets the model answer (default off)\n"
            "  --default-reasoning-effort E  none, minimal, low, medium, high, xhigh or max\n"
            "                                for requests that set no effort and keep\n"
            "                                thinking on\n"
@@ -418,7 +429,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                none; a request opts out with \"graft\": \"\"\n"
            "\n"
            "API BEHAVIOR\n"
-           "  --structured-output           accept JSON and JSON Schema response formats;\n"
+           "  --structured-output           enforce response formats (JSON, JSON Schema,\n"
+           "                                regex, choice, GBNF) and strict tool arguments;\n"
            "                                reserves the grammar masks and adds a grammar\n"
            "                                stage to every DFlash round\n"
            "  --unconstrained-response-format\n"
@@ -978,6 +990,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             long_anchor_spacing_explicit = true;
             continue;
         }
+        if (arg == "--progress-anchor-tokens") {
+            legacy_cache_flag = "--progress-anchor-tokens";
+            const int tokens  = parse_nonnegative_int(require_value("--progress-anchor-tokens"),
+                                                      "progress-anchor-tokens");
+            if (tokens != 0 && static_cast<std::uint32_t>(tokens) < kMinimumProgressAnchorTokens) {
+                throw std::invalid_argument("--progress-anchor-tokens must be 0 or at least " +
+                                            std::to_string(kMinimumProgressAnchorTokens));
+            }
+            options.context_cache.progress_anchor_tokens = static_cast<std::uint32_t>(tokens);
+            continue;
+        }
         if (arg == "--max-cache-markers-per-request") {
             options.context_cache.max_cache_markers_per_request = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-cache-markers-per-request"),
@@ -1137,6 +1160,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.thinking_budget_message.empty()) {
                 throw std::invalid_argument("--thinking-budget-message must not be empty");
             }
+            continue;
+        }
+        if (arg == "--reasoning-loop") {
+            options.reasoning_loop =
+                product::parse_reasoning_loop_action(require_value("--reasoning-loop"));
             continue;
         }
         if (arg == "--vision") {

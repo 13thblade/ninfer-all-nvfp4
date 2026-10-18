@@ -105,8 +105,9 @@ void launch_fp8_partial(const Tensor& q, CacheInput input, const Tensor& positio
 
 template <typename Geometry, bool MultiBatch, bool Masked>
 void launch_fp8_reduce(const Tensor& positions, const CausalSmallTInvocation& invocation,
-                       std::int32_t splits, const Tensor& partial_acc, const Tensor& partial_m,
-                       const Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+                       std::int32_t logical_capacity, std::int32_t splits,
+                       const Tensor& partial_acc, const Tensor& partial_m, const Tensor& partial_l,
+                       Tensor& out, cudaStream_t stream) {
     constexpr int Block = 256;
 
     constexpr int DChunk = Geometry::QHeads == 24 ? 256 : 64;
@@ -124,7 +125,7 @@ void launch_fp8_reduce(const Tensor& positions, const CausalSmallTInvocation& in
                 ? nullptr
                 : static_cast<const std::int32_t*>(invocation.valid_columns->data),
             invocation.width, invocation.full_width, invocation.column_begin, invocation.batch_size,
-            splits, 0, static_cast<__nv_bfloat16*>(out.data), nullptr);
+            logical_capacity, splits, 0, static_cast<__nv_bfloat16*>(out.data), nullptr);
     };
     if (invocation.column_begin == 0)
         launch.template operator()<false>();
@@ -203,18 +204,20 @@ void causal_attention_small_t_fp8_launch_for(const Tensor& q, CacheInput input,
     const bool masked = invocation.valid_columns != nullptr;
     if (invocation.batch_size == 1) {
         if (masked) {
-            launch_fp8_reduce<Geometry, false, true>(positions, invocation, splits, partial_acc,
-                                                     partial_m, partial_l, out, stream);
+            launch_fp8_reduce<Geometry, false, true>(positions, invocation, logical_capacity,
+                                                     splits, partial_acc, partial_m, partial_l, out,
+                                                     stream);
         } else {
-            launch_fp8_reduce<Geometry, false, false>(positions, invocation, splits, partial_acc,
-                                                      partial_m, partial_l, out, stream);
+            launch_fp8_reduce<Geometry, false, false>(positions, invocation, logical_capacity,
+                                                      splits, partial_acc, partial_m, partial_l,
+                                                      out, stream);
         }
     } else if (masked) {
-        launch_fp8_reduce<Geometry, true, true>(positions, invocation, splits, partial_acc,
-                                                partial_m, partial_l, out, stream);
+        launch_fp8_reduce<Geometry, true, true>(positions, invocation, logical_capacity, splits,
+                                                partial_acc, partial_m, partial_l, out, stream);
     } else {
-        launch_fp8_reduce<Geometry, true, false>(positions, invocation, splits, partial_acc,
-                                                 partial_m, partial_l, out, stream);
+        launch_fp8_reduce<Geometry, true, false>(positions, invocation, logical_capacity, splits,
+                                                 partial_acc, partial_m, partial_l, out, stream);
     }
 }
 

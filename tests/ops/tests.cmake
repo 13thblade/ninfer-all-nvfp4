@@ -89,6 +89,17 @@ add_test(NAME ninfer_softmax_attention_dflash2_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --dflash2-only)
 add_test(NAME ninfer_softmax_attention_int8_prompt_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --int8-prompt-only)
+add_test(NAME ninfer_softmax_attention_prompt_split_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --prompt-splits-only)
+# The pipelined small-T tier in both PV forms; the switch is read once per process.
+add_test(NAME ninfer_softmax_attention_small_t_pipelined_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --small-t-pipelined-only)
+add_test(NAME ninfer_softmax_attention_small_t_pipelined_pv_f16_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --small-t-pipelined-only)
+set_tests_properties(ninfer_softmax_attention_small_t_pipelined_test
+  PROPERTIES ENVIRONMENT NINFER_SMALLT_PV_F16=0)
+set_tests_properties(ninfer_softmax_attention_small_t_pipelined_pv_f16_test
+  PROPERTIES ENVIRONMENT NINFER_SMALLT_PV_F16=1)
 add_test(NAME ninfer_softmax_attention_fp8_prompt_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --fp8-prompt-only)
 add_test(NAME ninfer_softmax_attention_pack_gqa_test
@@ -102,6 +113,9 @@ set_tests_properties(
   ninfer_softmax_attention_rk2v4_e8_test
   ninfer_softmax_attention_dflash2_test
   ninfer_softmax_attention_int8_prompt_test
+  ninfer_softmax_attention_prompt_split_test
+  ninfer_softmax_attention_small_t_pipelined_test
+  ninfer_softmax_attention_small_t_pipelined_pv_f16_test
   ninfer_softmax_attention_fp8_prompt_test
   ninfer_softmax_attention_pack_gqa_test
   PROPERTIES SKIP_RETURN_CODE 77)

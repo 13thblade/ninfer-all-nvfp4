@@ -47,7 +47,9 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   (`ninfer-perplexity`).
 - **Thinking.** Off unless asked for, as the release's chat template has it: a request turns it on
   with `chat_template_kwargs: {"enable_thinking": true}`, and the reasoning arrives as
-  `reasoning_content`.
+  `reasoning_content`. Gemma has no early-close control, so thinking budgets do not apply and the
+  [reasoning-loop guard](serving.md#openai-chat-completions) stops a looping reply under `conclude`
+  as under `stop`.
 - **Sampling defaults.** The release's `generation_config.json` (temperature 1.0, top-p 0.95) with
   top-k held at the sampler's 20 candidates.
 
@@ -375,8 +377,10 @@ round drafts shrink as requests join (same streams as above, `--spec mtp`, tok/s
 
 ## Structured output
 
-A request with `response_format` (with `--structured-output`) samples under its grammar's token
-mask. The mask of its next token is computed on a thread of its own from the grammar's state
+A request with `response_format` or another constraint of
+[Structured output](serving.md#structured-output) (with `--structured-output`) samples under its
+grammar's token mask; strict tool arguments are refused, since Gemma's tool-call markup has no
+grammar here. The mask of its next token is computed on a thread of its own from the grammar's state
 after the last accepted token, while the GPU runs the decode step that produces the token's
 logits: the step does not wait for the mask, and a row whose mask is late keeps its logits and is
 sampled once the mask is ready, while the other requests go on. With `--spec mtp` such a request
@@ -386,11 +390,11 @@ drafts, its next mask starting as soon as a token is accepted, and drafts again 
 cheap. A single mask over 5 s, or a grammar with no admissible token, fails the request with an
 explicit error.
 
-String length bounds (`minLength`, `maxLength`) cost the most: a position inside a counted string
-has no cached mask. For plain string values in a schema without alternatives the bounds are
-therefore enforced beside the grammar, which compiles the string unbounded: with Gemma's
-262,144-token vocabulary a two-string schema with `maxLength: 2800` compiles in 0.9 s instead of
-28 s and its masks take 0.08 ms instead of ~80 ms (one Apple M-series core).
+String length bounds (`minLength`, `maxLength`) compile to a counted repetition whose masks do
+not depend on the count, in or out of `anyOf`: with Qwen3.5's 248,070-token vocabulary a schema
+with strings of `maxLength: 200` and `maxLength: 2800` compiles in 81 ms instead of 24.8 s, and
+its masks inside the strings take 0.04 ms instead of 70-96 ms (one Apple M-series core; Gemma's
+262,144-token vocabulary was not measured).
 
 Every running request must make progress: one that neither computes a prompt chunk nor accepts a
 token for 120 s fails with `inference request made no progress for 120 s` instead of holding its

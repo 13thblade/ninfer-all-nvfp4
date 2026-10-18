@@ -3,6 +3,7 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/file_read_error.h"
 #include "core/startup.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/vision_control.h"
@@ -18,6 +19,7 @@
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
 #include "runtime/engine/diagnostics.h"
+#include "runtime/engine/worker_recovery.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/host_memory.h"
@@ -454,6 +456,7 @@ struct Qwen4ExpCore::Impl {
     const bool reuse_prefixes;
     const std::uint32_t drafts; // MTP drafts a speculative round proposes; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
+    const DiagnosticObserver diagnostics;
     // With --adaptive-mtp, the steps a round drafts and verifies: from one draft, since each draft
     // is a step of the MTP block of its own here, up to `drafts`.
     std::optional<runtime::MtpAdaptiveBatchController> mtp_controller;
@@ -531,12 +534,12 @@ struct Qwen4ExpCore::Impl {
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
           reuse_prefixes(options.context_cache.enabled), drafts(i.executor->draft_tokens()),
-          lookup_ngram(options.speculative.lookup_ngram),
+          lookup_ngram(options.speculative.lookup_ngram), diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
-          decode_rounds_per_prefill(options.decode_rounds_per_prefill != 0
-                                        ? options.decode_rounds_per_prefill
-                                        : std::max<std::uint32_t>(
-                                              1, i.executor->options().prefill_chunk / 64)) {
+          decode_rounds_per_prefill(
+              options.decode_rounds_per_prefill != 0
+                  ? options.decode_rounds_per_prefill
+                  : std::max<std::uint32_t>(1, i.executor->options().prefill_chunk / 64)) {
         if (drafts > 0 && options.speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
             mtp_controller.emplace();
             mtp_controller->reset(drafts, 1);
@@ -720,7 +723,45 @@ struct Qwen4ExpCore::Impl {
                            [](const Slot& slot) { return slot.request != nullptr; });
     }
 
+    // A failed model file read: every request holding a lane fails with it, their sequences drop
+    // what the interrupted round left and keep nothing for the context cache, and the Engine
+    // serves the queue on. The next round reads what it needs again.
+    void recover_from_read_failure(std::exception_ptr error) {
+        std::string what = "a model file read failed";
+        try {
+            std::rethrow_exception(error);
+        } catch (const std::exception& failure) { what = failure.what(); }
+        const auto unavailable =
+            std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable, what));
+        std::uint32_t failed_requests = 0;
+        for (std::uint32_t s = 0; s < slots.size(); ++s) {
+            Slot& slot = slots[s];
+            if (!slot.request) { continue; }
+            // A second read failure surfaces while draining the first: the drain completes anyway.
+            try {
+                instance.executor->abort(s);
+            } catch (const FileReadError&) { instance.executor->abort(s); }
+            slot.fed.clear();
+            slot.anchor.clear();
+            complete(std::exchange(slot.request, {}), unavailable);
+            ++failed_requests;
+        }
+        publish_diagnostic(diagnostics, DiagnosticLevel::Warning,
+                           "%s; failed %u running request(s), serving on", what.c_str(),
+                           failed_requests);
+        std::lock_guard lock(stats_mutex);
+        ++stats.engine_recoveries;
+    }
+
+    // Not a request's own error: the Engine stops serving, and the cause is logged here, where it
+    // is the operator's only lead.
     void fail_engine(std::exception_ptr error) {
+        const auto running = std::count_if(
+            slots.begin(), slots.end(), [](const Slot& slot) { return slot.request != nullptr; });
+        publish_diagnostic(diagnostics, DiagnosticLevel::Error,
+                           "worker failure: %s - failing %td running request(s), the Engine "
+                           "stops serving",
+                           exception_text(error).c_str(), running);
         {
             std::lock_guard lock(queue_mutex);
             failed = true;
@@ -767,6 +808,12 @@ struct Qwen4ExpCore::Impl {
                     // MTP can finish the response before its catch-up observes cancellation.
                     // The sequence still needs cleanup, but no second terminal.
                     if (request) { finish_now(request, FinishReason::Cancelled); }
+                } catch (...) { fail_engine(std::current_exception()); }
+            } catch (const FileReadError&) {
+                // A model file read failed (expert or n-gram table bytes): the round cannot finish,
+                // but the readers kept nothing the failed read would have supplied.
+                try {
+                    recover_from_read_failure(std::current_exception());
                 } catch (...) { fail_engine(std::current_exception()); }
             } catch (...) {
                 // Not a request's own error: the device may be in an unknown state, so the Engine
@@ -1421,6 +1468,7 @@ struct Qwen4ExpCore::Impl {
         CUDA_CHECK(cudaMemcpyAsync(tokens, sample_out.p, n * sizeof(std::int32_t),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        instance.executor->raise_service_failure();
         for (std::size_t b = 0; b < n; ++b) {
             const std::int32_t token = tokens[b];
             if (token == ops::kSamplerNonFiniteToken || token < 0 ||
@@ -2088,6 +2136,7 @@ struct Qwen4ExpCore::Impl {
         CUDA_CHECK(cudaMemcpyAsync(host + b * w + b, spec_accepted.p, b * 4, cudaMemcpyDeviceToHost,
                                    stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        instance.executor->raise_service_failure();
 
         // The output policy takes its part of each licensed run; the executor then keeps the tokens
         // fed up to the last one taken.
@@ -2392,6 +2441,11 @@ Qwen4ExpCore::Submission Qwen4ExpCore::submit(models::qwen3_5::PreparedPrompt pr
     request->output = impl_->instance.frontend.make_output_session(
         prompt, options.stop, options.output, options.execution.thinking,
         options.execution.structured_output);
+    // Strict tool arguments bring a grammar without a structured final format.
+    if (request->output.grammar_state() && !impl_->structured_output) {
+        throw std::invalid_argument(
+            "strict tool arguments require an Engine started with structured_output");
+    }
     const std::optional<std::uint32_t> budget = request->output.thinking_stats().effective_budget;
     request->prompt                           = std::move(prompt);
     request->options                          = std::move(options);

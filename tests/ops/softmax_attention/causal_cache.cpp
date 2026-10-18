@@ -8,6 +8,7 @@
 #include "ops/kv_cache_e8_root_host.h"
 #include "ops/kv_cache_lloyd4_oracle.h"
 #include "ops/op_tester.h"
+#include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
 #include "ops/softmax_attention/oracle.h"
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <memory>
 #include <span>
 #include <string>
@@ -3547,6 +3549,154 @@ int run_wide_copy_cases(KvCacheStorage storage) {
     return failures;
 }
 
+KvCacheStorage invariance_storage(const CachePlan& plan) { return cache_plan_storage(plan); }
+
+KvCacheStorage invariance_storage(KvCacheStorage storage) { return storage; }
+
+// Speculative verification caps a round's live drafts by its output budget while the physical
+// width stays the family's. The live columns of a masked row must not depend on that cap: each
+// pair shares inputs, cache history and envelope and differs only in valid_columns, and the
+// shorter call's live columns must be bit-identical to the same columns of the longer one.
+// Contexts sit just below key-tile and partition boundaries, so a partition that followed the
+// live length would move.
+template <class Cache>
+int run_masked_prefix_invariance_case(const Geometry& geometry, const Cache& cache_spec,
+                                      std::int32_t width, const std::vector<std::int32_t>& contexts,
+                                      const std::vector<std::int32_t>& long_valid,
+                                      const std::vector<std::int32_t>& short_valid,
+                                      std::uint32_t seed) {
+    const auto batch     = static_cast<std::int32_t>(contexts.size());
+    std::int32_t maximum = 1;
+    for (const std::int32_t context : contexts) { maximum = std::max(maximum, context + width); }
+    const ops::CausalAttentionExecutionEnvelope envelope{1, static_cast<std::uint32_t>(maximum),
+                                                         false, batch == 1 && width > 16};
+    const std::size_t q_column_elements  = static_cast<std::size_t>(kHeadDim) * geometry.q_heads;
+    const std::size_t kv_column_elements = static_cast<std::size_t>(kHeadDim) * geometry.kv_heads;
+    const std::size_t columns            = static_cast<std::size_t>(width) * batch;
+    const auto q_bits =
+        to_bf16_bits(make_bf16_values(q_column_elements * columns, seed, -0.5f, 0.5f));
+    const auto k_bits =
+        to_bf16_bits(make_bf16_values(kv_column_elements * columns, seed + 1u, -0.5f, 0.5f));
+    const auto v_bits =
+        to_bf16_bits(make_bf16_values(kv_column_elements * columns, seed + 2u, -1.0f, 1.0f));
+    std::vector<HostCache> initial;
+    for (std::int32_t row = 0; row < batch; ++row) {
+        initial.push_back(make_cache(geometry, cache_spec, maximum + 3,
+                                     seed + 20u + 3u * static_cast<std::uint32_t>(row)));
+    }
+    std::vector<std::int32_t> table_rows(static_cast<std::size_t>(batch));
+    std::iota(table_rows.begin(), table_rows.end(), 0);
+    const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+        op_geometry(geometry), invariance_storage(cache_spec), envelope, batch, width, width);
+
+    const auto run = [&](const std::vector<std::int32_t>& valid) {
+        BatchDeviceCache cache(initial, MappingPattern::Fragmented);
+        GuardedDeviceBuffer dq(q_bits.size() * 2), dk(k_bits.size() * 2), dv(v_bits.size() * 2),
+            dp(columns * 4), dvalid(static_cast<std::size_t>(batch) * 4),
+            drows(static_cast<std::size_t>(batch) * 4), dout(q_bits.size() * 2);
+        GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 256));
+        WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+        std::vector<std::int32_t> positions(columns);
+        for (std::int32_t b = 0; b < batch; ++b) {
+            for (std::int32_t j = 0; j < width; ++j) {
+                positions[static_cast<std::size_t>(b * width + j)] =
+                    contexts[static_cast<std::size_t>(b)] +
+                    std::min(j, valid[static_cast<std::size_t>(b)] - 1);
+            }
+        }
+        dq.copy_from_host(q_bits.data(), q_bits.size() * 2);
+        dk.copy_from_host(k_bits.data(), k_bits.size() * 2);
+        dv.copy_from_host(v_bits.data(), v_bits.size() * 2);
+        dp.copy_from_host(positions.data(), positions.size() * 4);
+        dvalid.copy_from_host(valid.data(), valid.size() * 4);
+        drows.copy_from_host(table_rows.data(), table_rows.size() * 4);
+        const std::vector<std::uint16_t> canary(q_bits.size(), kOutputCanary);
+        dout.copy_from_host(canary.data(), canary.size() * 2);
+        Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+        Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch});
+        Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch});
+        Tensor tp(dp.data(), DType::I32, {width, batch});
+        Tensor tvalid(dvalid.data(), DType::I32, {batch});
+        Tensor trows(drows.data(), DType::I32, {batch});
+        Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+        ops::causal_softmax_attention(tq, tk, tv, tp, tvalid, trows, op_geometry(geometry),
+                                      kAttentionScale, cache.view(), envelope, workspace, tout,
+                                      nullptr);
+        cuda_synchronize();
+        return copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+    };
+
+    const auto longer  = run(long_valid);
+    const auto shorter = run(short_valid);
+    int failures       = 0;
+    for (std::int32_t b = 0; b < batch; ++b) {
+        for (std::int32_t j = 0; j < short_valid[static_cast<std::size_t>(b)]; ++j) {
+            const std::size_t begin = static_cast<std::size_t>(b * width + j) * q_column_elements;
+            if (!std::equal(shorter.begin() + static_cast<std::ptrdiff_t>(begin),
+                            shorter.begin() +
+                                static_cast<std::ptrdiff_t>(begin + q_column_elements),
+                            longer.begin() + static_cast<std::ptrdiff_t>(begin))) {
+                if (failures == 0) {
+                    std::cerr << "masked prefix invariance " << geometry.name << ' '
+                              << cache_name(cache_spec) << " W=" << width << " B=" << batch
+                              << ": row " << b << " column " << j << " (context "
+                              << contexts[static_cast<std::size_t>(b)] << ", valid "
+                              << short_valid[static_cast<std::size_t>(b)] << " vs "
+                              << long_valid[static_cast<std::size_t>(b)] << ") differs\n";
+                }
+                ++failures;
+            }
+        }
+    }
+    return failures;
+}
+
+template <class Cache>
+int run_masked_prefix_invariance_cases(const Cache& cache_spec) {
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        for (const std::int32_t width : {8, 16, 32, 64}) {
+            for (const std::int32_t shorter : {1, width / 2, width - 1}) {
+                failures += run_masked_prefix_invariance_case(
+                    geometry, cache_spec, width, {8190}, {width}, {shorter},
+                    static_cast<std::uint32_t>(3100 + width + shorter));
+            }
+        }
+        // A long window: the split targets change tier past 16K visible keys.
+        for (const std::int32_t width : {8, 64}) {
+            for (const std::int32_t shorter : {1, width - 1}) {
+                failures += run_masked_prefix_invariance_case(
+                    geometry, cache_spec, width, {40958}, {width}, {shorter},
+                    static_cast<std::uint32_t>(3150 + width + shorter));
+            }
+        }
+        // Several requests, each capped differently (batched verification reaches 16 columns).
+        for (const std::int32_t width : {8, 16}) {
+            failures += run_masked_prefix_invariance_case(
+                geometry, cache_spec, width, {8190, 30718, 4094, 127}, {width, width, width, width},
+                {1, width / 2, width - 1, 3}, static_cast<std::uint32_t>(3200 + width));
+        }
+    }
+    return failures;
+}
+
+int run_masked_prefix_invariance_tests() {
+    int failures = 0;
+    for (const CachePlan& plan : {kPlanBf16, kPlanInt8, kPlanRk8v4, kPlanRk4v4}) {
+        failures += run_masked_prefix_invariance_cases(plan);
+    }
+    failures += run_case_allowing_arch_skip("masked prefix invariance FP8 KV cache", [] {
+        return run_masked_prefix_invariance_cases(kPlanFp8);
+    });
+    failures += run_case_allowing_arch_skip("masked prefix invariance nvfp4 KV cache", [] {
+        return run_masked_prefix_invariance_cases(KvCacheStorage::Nvfp4Group16);
+    });
+    failures += run_case_allowing_arch_skip("masked prefix invariance k8v4 KV cache", [] {
+        return run_masked_prefix_invariance_cases(KvCacheStorage::Fp8KeyNvfp4Value);
+    });
+    return failures;
+}
+
 int run_batch_cases() {
     int failures = 0;
     failures += run_batch_case(kGeometries[0], kPlanInt8,
@@ -4371,6 +4521,75 @@ int run_softmax_attention_int8_prompt_tests() {
     return failures ? 1 : 0;
 }
 
+// The fast INT8-family prompt kernel with every launch of more than 64 columns split over three
+// CTAs per row block (main sets NINFER_PROMPT_SPLITS=3 before the first launch), against the FP64
+// oracle: the INT8 prompt cases, rk8v4 and rk4v4 over partial and full row blocks, launches whose
+// early row blocks see fewer key pages than splits (their late splits own no visible key), an
+// envelope far past the populated keys, and masked columns through the batched entry.
+int run_softmax_attention_prompt_split_tests() {
+    if (cuda_unavailable()) return 77;
+    int failures    = run_int8_prompt_cases(true);
+    const auto fast = [](AttentionCase test_case) {
+        test_case.fast_prompt_kernel = true;
+        return test_case;
+    };
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(geometry, kPlanRk8v4, fast({300, 2000, 2300, 931u}),
+                                MappingPattern::Fragmented);
+        failures +=
+            run_a3_case(geometry, kPlanRk8v4, fast({129, 0, 129, 932u}), MappingPattern::Identity);
+        failures += run_a3_case(geometry, kPlanRk4v4, fast({257, 3000, 3257, 933u}),
+                                MappingPattern::Offset);
+        failures += run_a1_case(geometry, kPlanInt8, fast({200, 100, 8192, 934u}),
+                                MappingPattern::Identity);
+    }
+    std::cout << (failures ? "FAIL" : "PASS") << " split-key prompt causal attention\n";
+    return failures ? 1 : 0;
+}
+
+// The pipelined INT8 small-T tier ("8x2x32p", small_t_i8_pipelined.cuh) forced at every small-T
+// width of both geometries, against the FP64 oracle. Empty, page-crossing and deep caches over
+// fragmented pages cover splits that hold the appended positions and splits that issue their first
+// tile before the append; an envelope past the populated keys replays through a CUDA Graph; a zero
+// query and masked batched columns cover the remaining entry points. main sets
+// NINFER_SMALLT_PV_F16 from the ctest entry, so the FP32 and FP16 PV forms run separately.
+int run_softmax_attention_small_t_pipelined_tests() {
+    if (cuda_unavailable()) return 77;
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        const std::int32_t widths = 48 / geometry.query_group();
+        for (std::int32_t width = 1; width <= widths; ++width) {
+            const ops::DeviceRouteForce force(
+                ops::detail::small_t_i8_route_key(geometry.q_heads, KvCacheStorage::Int8Group64,
+                                                  width),
+                "8x2x32p");
+            const std::uint32_t seed = 940u + 16u * static_cast<std::uint32_t>(geometry.q_heads) +
+                                       static_cast<std::uint32_t>(width);
+            for (const std::int32_t depth : {0, 61, 1000, 6000, 20000}) {
+                const std::int32_t total = depth + width;
+                failures += run_a1_case(geometry, kPlanInt8,
+                                        {width, depth, static_cast<std::uint32_t>(total),
+                                         seed + static_cast<std::uint32_t>(depth)},
+                                        MappingPattern::Fragmented);
+            }
+            failures += run_a3_case(geometry, kPlanInt8, {width, 300, 4096, seed, false, true},
+                                    MappingPattern::Offset);
+            failures += run_a1_case(geometry, kPlanInt8, {width, 127, 160, seed + 1u, true},
+                                    MappingPattern::Identity);
+            const std::int32_t masked = std::max<std::int32_t>(1, width / 2);
+            failures += run_batch_case(geometry, kPlanInt8,
+                                       {width,
+                                        {61, 2047, 0},
+                                        {width, masked, 0},
+                                        {2, 0, 1},
+                                        MappingPattern::Fragmented,
+                                        seed + 2u});
+        }
+    }
+    std::cout << (failures ? "FAIL" : "PASS") << " pipelined INT8 small-T causal attention\n";
+    return failures ? 1 : 0;
+}
+
 int run_softmax_attention_fp8_prompt_tests() {
     if (cuda_unavailable()) return 77;
     // Multiple 16- and 32-key tiles of the build's Bc (16 on Turing, 32 elsewhere).
@@ -4460,6 +4679,7 @@ int run_softmax_attention_causal_cache_tests() {
     failures += run_rk4v4_e8_cases();
     failures += run_rk2v4_e8_cases();
     failures += run_batch_cases();
+    failures += run_masked_prefix_invariance_tests();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention public-contract correctness\n";
     return failures == 0 ? 0 : 1;

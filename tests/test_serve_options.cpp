@@ -407,6 +407,23 @@ int main() {
                               .default_reasoning_effort == RequestedReasoningEffort::None,
                       "--default-reasoning-effort none was refused beside --no-thinking");
 
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).reasoning_loop ==
+                          ninfer::ReasoningLoopAction::Off,
+                      "the reasoning-loop guard is not off by default");
+    failures += check(
+        parse({"ninfer-serve", "model.ninfer", "--reasoning-loop", "stop"}).reasoning_loop ==
+                ninfer::ReasoningLoopAction::Stop &&
+            parse({"ninfer-serve", "model.ninfer", "--reasoning-loop", "conclude"})
+                    .reasoning_loop == ninfer::ReasoningLoopAction::Conclude &&
+            parse({"ninfer-serve", "model.ninfer", "--reasoning-loop", "off"}).reasoning_loop ==
+                ninfer::ReasoningLoopAction::Off,
+        "--reasoning-loop did not select its action");
+    bool bad_reasoning_loop_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--reasoning-loop", "on"});
+    } catch (const std::invalid_argument&) { bad_reasoning_loop_rejected = true; }
+    failures += check(bad_reasoning_loop_rejected, "--reasoning-loop on was accepted");
+
     bool empty_model_id_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--model-id", ""});
@@ -757,6 +774,7 @@ int main() {
                                                {"--auto-long-anchors"},
                                                {"--branch-anchors"},
                                                {"--no-endpoint-anchors"},
+                                               {"--progress-anchor-tokens", "4096"},
                                                {"--auto-prefix-grid"},
                                                {"--derive-session-keys"},
                                                {"--context-cache-policy", "rolling"},
@@ -1106,6 +1124,7 @@ int main() {
                                         "--prefix-cache-file",
                                         "--presence-penalty",
                                         "--preserve-thinking",
+                                        "--progress-anchor-tokens",
                                         "--recency-eviction",
                                         "--recover-invariant-failures",
                                         "--release-diverged-checkpoints",
@@ -1543,6 +1562,19 @@ int main() {
                               !parse({"ninfer-serve", "model.ninfer", "--no-endpoint-anchors"})
                                    .context_cache.endpoint_anchors,
                           "--no-endpoint-anchors did not turn the default endpoint anchors off");
+        failures += check(
+            parse({"ninfer-serve", "model.ninfer"}).context_cache.progress_anchor_tokens == 16384 &&
+                parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "0"})
+                        .context_cache.progress_anchor_tokens == 0 &&
+                parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "256"})
+                        .context_cache.progress_anchor_tokens == 256,
+            "--progress-anchor-tokens did not set the stride or its default");
+        bool fine_stride_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "255"});
+        } catch (const std::invalid_argument&) { fine_stride_rejected = true; }
+        failures +=
+            check(fine_stride_rejected, "a progress-anchor stride below 256 tokens was accepted");
         bool spacing_without_anchors_rejected = false;
         try {
             (void)parse({"ninfer-serve", "model.ninfer", "--long-anchor-spacing", "512"});

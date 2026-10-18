@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace ninfer::calibration {
@@ -71,6 +72,14 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
                 add(key, {"unified"});
             }
         }
+        // The cuBLAS prefill route's width gate per Op (--prefill-cublas), over the widths the
+        // integer A8 mainloop cannot take and, under `/a8`, the multiples of its tile it can.
+        for (const char* family : {"w4_cublas/q4_linear_swiglu", "w4_cublas/linear_add/5120x17408",
+                                   "w4_cublas/linear_add/5120x6144", "w4_cublas/q4_q5_gdn_input",
+                                   "w4_cublas/q4_q5_attn_input"}) {
+            add(family, {"on", "off"});
+            add(std::string(family) + "/a8", {"on", "off"});
+        }
         // Q8 G32 K-split contractions (MTP heads, DFlash2 drafters, the official artifacts' heads):
         // the four-K-warp form of each 8-column tile (ops/linear/q8/q8_ksplit_config.h).
         for (const char* shape :
@@ -93,6 +102,8 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
             add("attn_pack_gqa", {"on"});
             add("attn_prompt_fast", {"on"});
         }
+        // Key splits of the fast prompt kernel, measured on rk8v4 where it serves prompts.
+        add("attn_prompt_split", {"off"});
         // Parallel query tiles for single-row chunked small-T widths, measured on rk8v4.
         add("attn_parallel_tiles", {"on"});
 
@@ -116,6 +127,8 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
                         std::erase(tiers, "12x1x64d");
                     }
                 }
+                // The pipelined kernel reads INT8 keys and values only.
+                if (std::string_view(coding) == "int8") { tiers.emplace_back("8x2x32p"); }
                 add(std::string("attn_i8_small/h24/") + coding + "/w" + std::to_string(width),
                     std::move(tiers));
             }

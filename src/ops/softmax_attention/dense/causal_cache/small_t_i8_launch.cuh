@@ -7,6 +7,7 @@
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8.cuh"
+#include "ops/softmax_attention/dense/causal_cache/small_t_i8_pipelined.cuh"
 #include "ops/common/device_route.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
 #if defined(NINFER_TIER_VOLTA)
@@ -147,10 +148,48 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             }
         };
         // A device profile names the tier per window: "<warps>x<CTAs per SM>x<key block>", with a
-        // trailing "d" for the dynamic-arena variant, "q" for split QK and "e" for EarlyFetch.
+        // trailing "d" for the dynamic-arena variant, "q" for split QK, "e" for EarlyFetch and
+        // "p" for the pipelined kernel (small_t_i8_pipelined.cuh, INT8 keys and values only).
         const std::string_view routed =
             device_route_schedule(small_t_i8_route_key(Geometry::QHeads, cache.storage, TokenTile),
                                   implementation_window);
+        if (routed == "8x2x32p" && cache.storage == KvCacheStorage::Int8Group64) {
+            const auto issue = [&]<bool PvF16>() {
+                constexpr auto kernel =
+                    causal_attention_small_t_i8_pipelined_kernel<Geometry, TokenTile, MultiBatch,
+                                                                 Masked, CacheInput, PvF16>;
+                constexpr int kArena = CausalSmallTI8PipelinedShape::kArenaBytes;
+                configure_cuda_device_once([&] {
+                    return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                kArena);
+                });
+                const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+                kernel<<<grid, CausalSmallTI8PipelinedShape::kThreads, kArena, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data), input,
+                    static_cast<const std::int32_t*>(pos.data),
+                    static_cast<std::int8_t*>(cache_k.data),
+                    static_cast<std::int8_t*>(cache_v.data),
+                    static_cast<__half*>(cache_k_scale.data),
+                    static_cast<__half*>(cache_v_scale.data),
+                    static_cast<const std::int32_t*>(cache.block_tables.data),
+                    invocation.valid_columns == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                    invocation.table_rows == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.table_rows->data),
+                    cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
+                    logical_capacity, wave_splits, scale, static_cast<float*>(partial_acc.data),
+                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+            };
+            if (small_t_pv_f16()) {
+                issue.template operator()<true>();
+            } else {
+                issue.template operator()<false>();
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         if (!routed.empty()) {
             constexpr int kRowTiles = (TokenTile * Geometry::GroupSize + 15) / 16;
             bool taken              = true;

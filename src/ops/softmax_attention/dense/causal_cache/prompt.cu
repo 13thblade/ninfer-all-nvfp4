@@ -10,6 +10,7 @@
 #include "ops/softmax_attention/dense/causal_cache/prompt_bf16.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast.cuh"
+#include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast_plan.h"
 #include "core/device.h" // CUDA_CHECK
 
 #include <cstdint>
@@ -47,73 +48,75 @@ bool prompt_pack_gqa() {
     return device_route_schedule("attn_pack_gqa", 1) == "on";
 }
 
-// Both fast INT8 variants run one CTA per SM and every CTA of a launch sweeps a similar key range,
-// so a launch costs about (waves) x (one CTA's sweep). A four-warp CTA sweeps in about 0.72 of an
-// eight-warp CTA's time (measured on RTX 5090 at 64K context) but covers half the rows.
-[[maybe_unused]] bool causal_attention_prompt_i8_fast_prefers_narrow(std::int32_t tokens,
-                                                                     std::int32_t q_heads) {
-    const int multiprocessors = current_device_multiprocessors(170);
-    const auto waves = [&](int rows) {
-        return div_up(div_up(tokens, rows) * q_heads, multiprocessors);
-    };
-    constexpr int NarrowCostPercent = 72;
-    return waves(CausalPromptI8FastShape<4>::Br) * NarrowCostPercent <
-           waves(CausalPromptI8FastShape<8>::Br) * 100;
-}
-
 // The int8 cache and rk8v4 share the fast kernel: their keys are the same INT8 G64 codes, and
-// PackedValues decodes rk8v4's packed int4 value plane; Keys expands the packed key codings.
+// PackedValues decodes rk8v4's packed int4 value plane; Keys expands the packed key codings. The
+// plan (prompt_i8_fast_plan.h) picks the CTA shape and, past the envelope's key count, may split
+// every row block's keys over several CTAs whose partial rows the merge kernel combines.
 template <typename Geometry, bool PackedValues, KvKeyCoding Keys = KvKeyCoding::Int8,
           typename CacheView, typename Metadata>
 void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& positions,
                                                 float scale, const CacheView& cache,
-                                                Metadata metadata, Tensor& out,
+                                                Metadata metadata, const std::int32_t* valid,
+                                                std::uint32_t max_visible_keys,
+                                                WorkspaceArena& workspace, Tensor& out,
                                                 cudaStream_t stream) {
     with_shape_set([&]<bool TuringShapes>() {
         // Eight warps with INT8 values do not fit Turing's shared memory; those launches take four.
         constexpr bool kWide = CausalPromptI8FastShape<8, PackedValues, TuringShapes>::Launchable;
-        if constexpr (kWide) {
+        const auto tokens    = static_cast<std::int32_t>(q.ne[2]);
+        const CausalPromptI8FastPlan plan = causal_prompt_i8_fast_plan(
+            Geometry::QHeads, tokens, max_visible_keys, current_device_multiprocessors(170), kWide,
+            causal_attention_prompt_fast_split_policy());
+        auto scope = workspace.scope();
+        CausalPromptI8FastPartials partials{};
+        if (plan.splits > 1) {
+            partials = allocate_causal_prompt_i8_fast_partials(workspace, Geometry::QHeads, tokens,
+                                                               plan.splits);
+        }
+        const auto launch = [&]<int Warps, bool Split>() {
+            using Shape = CausalPromptI8FastShape<Warps, PackedValues, TuringShapes>;
+            constexpr auto kernel =
+                causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, Warps, PackedValues,
+                                                       Keys, TuringShapes, Split>;
             configure_cuda_device_once([] {
                 return cudaFuncSetAttribute(
-                    causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 8, PackedValues,
-                                                           Keys, TuringShapes>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    CausalPromptI8FastShape<8, PackedValues, TuringShapes>::SmemBytes);
+                    causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, Warps, PackedValues,
+                                                           Keys, TuringShapes, Split>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::SmemBytes);
             });
-        }
-        configure_cuda_device_once([] {
-            return cudaFuncSetAttribute(
-                causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 4, PackedValues, Keys,
-                                                       TuringShapes>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                CausalPromptI8FastShape<4, PackedValues, TuringShapes>::SmemBytes);
-        });
-
-        const auto tokens = static_cast<std::int32_t>(q.ne[2]);
-        const auto launch = [&]<int Warps>() {
-            using Shape = CausalPromptI8FastShape<Warps, PackedValues, TuringShapes>;
             const dim3 grid(static_cast<unsigned>(div_up(tokens, Shape::Br)),
-                            static_cast<unsigned>(Geometry::QHeads), 1u);
-            causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, Warps, PackedValues, Keys,
-                                                   TuringShapes>
-                <<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::int8_t*>(cache.k_pages.data),
-                    static_cast<const std::int8_t*>(cache.v_pages.data),
-                    static_cast<const __half*>(cache.k_scale_pages.data),
-                    static_cast<const __half*>(cache.v_scale_pages.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
+                            static_cast<unsigned>(Geometry::QHeads),
+                            static_cast<unsigned>(plan.splits));
+            kernel<<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data),
+                static_cast<const std::int8_t*>(cache.k_pages.data),
+                static_cast<const std::int8_t*>(cache.v_pages.data),
+                static_cast<const __half*>(cache.k_scale_pages.data),
+                static_cast<const __half*>(cache.v_scale_pages.data), metadata,
+                static_cast<const std::int32_t*>(positions.data), scale,
+                static_cast<__nv_bfloat16*>(out.data), tokens,
+                static_cast<float*>(partials.rows.data), static_cast<float2*>(partials.stats.data));
         };
-        if constexpr (kWide) {
-            if (causal_attention_prompt_i8_fast_prefers_narrow(tokens, Geometry::QHeads)) {
-                launch.template operator()<4>();
-            } else {
-                launch.template operator()<8>();
+        if (plan.splits == 1) {
+            if constexpr (kWide) {
+                if (plan.warps == 8) {
+                    launch.template operator()<8, false>();
+                    return;
+                }
             }
-        } else {
-            launch.template operator()<4>();
+            launch.template operator()<4, false>();
+            return;
         }
+        // A split launch takes the widest CTA the shape set launches (causal_prompt_i8_fast_plan).
+        launch.template operator()<kWide ? 8 : 4, true>();
+        CUDA_CHECK(cudaGetLastError());
+        constexpr float Log2E = 1.4426950408889634074f;
+        causal_attention_prompt_i8_fast_merge_kernel<Geometry>
+            <<<dim3(static_cast<unsigned>(tokens), static_cast<unsigned>(Geometry::QHeads)),
+               kCausalPromptHeadDim, 0, stream>>>(static_cast<const float*>(partials.rows.data),
+                                                  static_cast<const float2*>(partials.stats.data),
+                                                  valid, tokens, plan.splits, scale * Log2E,
+                                                  static_cast<__nv_bfloat16*>(out.data));
     });
     CUDA_CHECK(cudaGetLastError());
 }
@@ -121,7 +124,9 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
 template <typename Geometry, typename CacheView, typename Metadata>
 void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& positions,
                                                   float scale, const CacheView& cache,
-                                                  Metadata metadata, Tensor& out, bool fast,
+                                                  Metadata metadata, const std::int32_t* valid,
+                                                  std::uint32_t max_visible_keys,
+                                                  WorkspaceArena& workspace, Tensor& out, bool fast,
                                                   cudaStream_t stream) {
     fast = causal_attention_prompt_fast_kernel(cache.storage, fast);
     // The fast kernels hold 100 KiB of shared memory, past sm_70's 96 KiB: a Volta card never takes
@@ -129,28 +134,33 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
     // them.
     if constexpr (kBuildTuring || kBuildAmpere || kBuildBlackwell) {
         if (fast && cache.storage == KvCacheStorage::Int8Group64) {
-            causal_attention_prompt_i8_fast_launch_for<Geometry, false>(q, positions, scale, cache,
-                                                                        metadata, out, stream);
+            causal_attention_prompt_i8_fast_launch_for<Geometry, false>(
+                q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out,
+                stream);
             return;
         }
         if (fast && cache.storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
-            causal_attention_prompt_i8_fast_launch_for<Geometry, true>(q, positions, scale, cache,
-                                                                       metadata, out, stream);
+            causal_attention_prompt_i8_fast_launch_for<Geometry, true>(
+                q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out,
+                stream);
             return;
         }
         if (fast && cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
             causal_attention_prompt_i8_fast_launch_for<Geometry, true, KvKeyCoding::Lloyd4>(
-                q, positions, scale, cache, metadata, out, stream);
+                q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out,
+                stream);
             return;
         }
         if (fast && cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
             causal_attention_prompt_i8_fast_launch_for<Geometry, true, KvKeyCoding::Int4E8>(
-                q, positions, scale, cache, metadata, out, stream);
+                q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out,
+                stream);
             return;
         }
         if (fast && cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
             causal_attention_prompt_i8_fast_launch_for<Geometry, true, KvKeyCoding::RootE8>(
-                q, positions, scale, cache, metadata, out, stream);
+                q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out,
+                stream);
             return;
         }
     }
@@ -292,8 +302,31 @@ bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested)
     return device_route_schedule("attn_prompt_fast", 1) == "on";
 }
 
+bool causal_prompt_i8_fast_wide(KvCacheStorage storage) {
+    const bool packed = storage != KvCacheStorage::Int8Group64;
+    if (turing_shapes_here()) {
+        return packed ? CausalPromptI8FastShape<8, true, true>::Launchable
+                      : CausalPromptI8FastShape<8, false, true>::Launchable;
+    }
+    return packed ? CausalPromptI8FastShape<8, true, false>::Launchable
+                  : CausalPromptI8FastShape<8, false, false>::Launchable;
+}
+
+CausalPromptI8FastSplitPolicy causal_attention_prompt_fast_split_policy() {
+    static const int forced = [] {
+        const char* value = std::getenv("NINFER_PROMPT_SPLITS");
+        return value == nullptr ? -1 : std::max(0, std::atoi(value));
+    }();
+    if (forced == 0) { return {.maximum = 1}; }
+    if (forced > 0) { return {.maximum = kCausalPromptI8FastMaxSplits, .forced = forced}; }
+    if (device_route_schedule("attn_prompt_split", 1) == "off") { return {.maximum = 1}; }
+    return {};
+}
+
 void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
-                                              const PagedKVLayerView& cache, Tensor& out, bool fast,
+                                              const PagedKVLayerView& cache,
+                                              std::uint32_t max_visible_keys,
+                                              WorkspaceArena& workspace, Tensor& out, bool fast,
                                               cudaStream_t stream) {
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_prompt_k8v4_attention_launch(q, positions, scale, cache, out, stream);
@@ -309,18 +342,21 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
     }
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(q, positions, scale, cache,
-                                                                       metadata, out, fast, stream);
+        causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(
+            q, positions, scale, cache, metadata, nullptr, max_visible_keys, workspace, out, fast,
+            stream);
         return;
     }
-    causal_attention_prompt_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,
-                                                                   metadata, out, fast, stream);
+    causal_attention_prompt_attention_launch_for<CausalD256H16Kv2>(
+        q, positions, scale, cache, metadata, nullptr, max_visible_keys, workspace, out, fast,
+        stream);
 }
 
 void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                     const Tensor& positions, const Tensor& valid_columns,
                                     const Tensor& table_rows, float scale,
-                                    PagedKVBatchLayerView cache, Tensor& out, bool fast,
+                                    PagedKVBatchLayerView cache, std::uint32_t max_visible_keys,
+                                    WorkspaceArena& workspace, Tensor& out, bool fast,
                                     cudaStream_t stream) {
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_prompt_k8v4_launch(q, k, v, positions, valid_columns, table_rows, scale,
@@ -346,13 +382,16 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
         };
+        const std::int32_t* valid = metadata.valid_columns;
         if (q.ne[1] == CausalD256H24Kv4::QHeads) {
             causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(
-                q, positions, scale, cache, metadata, out, fast, stream);
+                q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out, fast,
+                stream);
             return;
         }
-        causal_attention_prompt_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,
-                                                                       metadata, out, fast, stream);
+        causal_attention_prompt_attention_launch_for<CausalD256H16Kv2>(
+            q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out, fast,
+            stream);
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

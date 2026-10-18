@@ -1,5 +1,5 @@
 {"schema": "ninfer.device-route-profiles", "schema_version": 2, "devices": [
-    {"hardware_class": "nvidia-geforce-rtx-3090-sm86", "multiprocessors": 82, "origin": "built in: RTX 3090 at 390 W, 2026-09-25; unified routes and two-stage GDN at 420 W, 2026-09-27",
+    {"hardware_class": "nvidia-geforce-rtx-3090-sm86", "multiprocessors": 82, "origin": "built in: RTX 3090 at 390 W, 2026-09-25; unified routes and two-stage GDN at 420 W, 2026-09-27; cuBLAS prefill gate at 350 W, 2026-10-18",
      "routes": {
         "attn_i8_small/h24/int8/w3": [[1048576, "8x2x32q"]],
         "attn_i8_small/h24/int8/w4": [[1048576, "8x2x32q"]],
@@ -57,7 +57,17 @@
         "unified/q5_linear_add/5120x17408": [[32, ""], [64, "unified"]],
         "unified/q5_linear_add/5120x6144": [[32, ""], [64, "unified"]],
         "unified/q8_attn_input": [[1, ""], [3, "unified"]],
-        "unified/q8_linear_pair": [[4, "unified"]]
+        "unified/q8_linear_pair": [[4, "unified"]],
+        "w4_cublas/linear_add/5120x17408": [[511, "on"], [1500, ""]],
+        "w4_cublas/linear_add/5120x17408/a8": [[384, "on"], [2048, ""]],
+        "w4_cublas/linear_add/5120x6144": [[511, "on"], [1500, ""]],
+        "w4_cublas/linear_add/5120x6144/a8": [[384, "on"], [2048, ""]],
+        "w4_cublas/q4_linear_swiglu": [[511, "on"], [1500, ""]],
+        "w4_cublas/q4_linear_swiglu/a8": [[384, "on"], [2048, ""]],
+        "w4_cublas/q4_q5_attn_input": [[511, "on"], [1500, ""]],
+        "w4_cublas/q4_q5_attn_input/a8": [[384, "on"], [2048, ""]],
+        "w4_cublas/q4_q5_gdn_input": [[511, "on"], [1500, ""]],
+        "w4_cublas/q4_q5_gdn_input/a8": [[384, "on"], [2048, ""]]
      }},
     {"hardware_class": "nvidia-geforce-rtx-4090-sm89", "multiprocessors": 128, "origin": "built in: RTX 4090 at 450 W, 2026-09-25; unified routes and two-stage GDN at 300 to 450 W, 2026-09-27",
      "routes": {
