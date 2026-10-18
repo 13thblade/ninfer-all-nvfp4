@@ -145,6 +145,9 @@ struct ServeOptions {
     // Empty means no default; otherwise it names an entry of `grafts`.
     std::string default_graft;
     std::optional<std::uint32_t> default_thinking_budget;
+    // --reasoning-loop off|stop|conclude: the reasoning-loop guard for every thinking request,
+    // constrained ones included (off by default).
+    ninfer::ReasoningLoopAction reasoning_loop = ninfer::ReasoningLoopAction::Off;
     // Effort for requests that name none; a request that disables thinking is left alone.
     std::optional<RequestedReasoningEffort> default_reasoning_effort;
     // End-of-thinking message fed to the model when it hits the thinking budget; empty

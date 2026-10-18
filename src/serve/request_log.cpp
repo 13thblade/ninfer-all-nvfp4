@@ -1,5 +1,6 @@
 #include "serve/request_log.h"
 #include "product/logging/pretty_format.h"
+#include "product/reasoning_loop_options.h"
 #include "product/speculative_options.h"
 
 #include <spdlog/logger.h>
@@ -645,6 +646,11 @@ std::string format_request_done(const RequestLogContext& context,
             << " control=" << (outcome.thinking.applied ? "applied" : "unused");
     }
     if (outcome.thinking.post_thinking_sampling) { out << " post_thinking=applied"; }
+    if (outcome.thinking.loop_detected) {
+        out << " reasoning_loop=" << (outcome.thinking.applied ? "concluded" : "stopped")
+            << " loop_thinking=" << outcome.thinking.loop_thinking_tokens
+            << " loop_coverage=" << outcome.thinking.loop_coverage;
+    }
     return out.str();
 }
 
@@ -722,36 +728,35 @@ std::string format_server_start_json(
     }
 
     record["version"] = options.build_version;
-    record["server"] =
-        Json{{"host", options.host},
-             {"port", options.port},
-             {"public_model_id", public_model_id},
-             {"api_key_configured", !options.api_key.empty()},
-             {"cors_enabled", options.enable_cors},
-             {"unconstrained_response_format", options.unconstrained_response_format},
-             {"assistant_prefill", options.assistant_prefill},
-             {"derive_session_keys", options.derive_session_keys},
-             {"lenient_assistant_history", options.lenient_assistant_history},
-             {"lenient_image_detail", options.lenient_image_detail},
-             {"max_request_bytes", options.max_request_bytes},
-             {"media_cache_bytes", options.media_cache_bytes},
-             {"media_live_bytes", options.media_live_bytes},
-             {"media_preprocess_threads", options.media_preprocess_threads},
-             {"request_log_jsonl", options.request_log_jsonl},
-             // null: requests that omit a limit get the Engine's concurrent lane budget.
-             {"default_output_tokens", options.default_max_tokens
-                                           ? Json(*options.default_max_tokens)
-                                           : Json(nullptr)},
-             {"default_output_policy",
-              options.default_max_tokens ? "fixed" : "concurrent_lane_budget"},
-             {"default_thinking",
-              options.enable_thinking ? Json(*options.enable_thinking) : Json(nullptr)},
-             {"default_thinking_budget", std::move(default_thinking_budget)},
-             {"default_reasoning_effort", std::move(default_reasoning_effort)},
-             {"default_preserve_thinking",
-              options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)},
-             {"default_graft",
-              options.default_graft.empty() ? Json(nullptr) : Json(options.default_graft)}};
+    record["server"]  = Json{
+        {"host", options.host},
+        {"port", options.port},
+        {"public_model_id", public_model_id},
+        {"api_key_configured", !options.api_key.empty()},
+        {"cors_enabled", options.enable_cors},
+        {"unconstrained_response_format", options.unconstrained_response_format},
+        {"assistant_prefill", options.assistant_prefill},
+        {"derive_session_keys", options.derive_session_keys},
+        {"lenient_assistant_history", options.lenient_assistant_history},
+        {"lenient_image_detail", options.lenient_image_detail},
+        {"max_request_bytes", options.max_request_bytes},
+        {"media_cache_bytes", options.media_cache_bytes},
+        {"media_live_bytes", options.media_live_bytes},
+        {"media_preprocess_threads", options.media_preprocess_threads},
+        {"request_log_jsonl", options.request_log_jsonl},
+        // null: requests that omit a limit get the Engine's concurrent lane budget.
+        {"default_output_tokens",
+         options.default_max_tokens ? Json(*options.default_max_tokens) : Json(nullptr)},
+        {"default_output_policy", options.default_max_tokens ? "fixed" : "concurrent_lane_budget"},
+        {"default_thinking",
+         options.enable_thinking ? Json(*options.enable_thinking) : Json(nullptr)},
+        {"default_thinking_budget", std::move(default_thinking_budget)},
+        {"reasoning_loop", product::reasoning_loop_name(options.reasoning_loop)},
+        {"default_reasoning_effort", std::move(default_reasoning_effort)},
+        {"default_preserve_thinking",
+         options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)},
+        {"default_graft",
+         options.default_graft.empty() ? Json(nullptr) : Json(options.default_graft)}};
     record["artifact"]                             = Json{{"path", options.artifact_path},
                                                           {"size_bytes", std::move(artifact_size)},
                                                           {"architecture", load.architecture},
@@ -949,12 +954,15 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                                      ? Json(*outcome.thinking.requested_budget)
                                      : Json(nullptr)},
              {"effective_thinking_budget", outcome.thinking.effective_budget
-                                              ? Json(*outcome.thinking.effective_budget)
-                                              : Json(nullptr)},
+                                               ? Json(*outcome.thinking.effective_budget)
+                                               : Json(nullptr)},
              {"model_thinking_tokens", outcome.thinking.model_thinking_tokens},
              {"thinking_control_tokens", outcome.thinking.injected_tokens},
              {"thinking_control_applied", outcome.thinking.applied},
              {"post_thinking_sampling", outcome.thinking.post_thinking_sampling},
+             {"reasoning_loop_detected", outcome.thinking.loop_detected},
+             {"reasoning_loop_thinking_tokens", outcome.thinking.loop_thinking_tokens},
+             {"reasoning_loop_coverage", outcome.thinking.loop_coverage},
              {"tool_call_count", outcome.tool_calls.size()},
              {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)}};
     record["timings_seconds"] = Json{

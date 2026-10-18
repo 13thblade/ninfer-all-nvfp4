@@ -2,6 +2,7 @@
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
+#include "product/reasoning_loop_options.h"
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
 
@@ -281,6 +282,11 @@ std::string usage_text(const char* argv0) {
            "  --reasoning-effort E          none, minimal, low, medium, high, xhigh or max\n"
            "  --thinking-budget N           cap model-origin thinking tokens; inserted\n"
            "                                control tokens count toward --max-new\n"
+           "  --reasoning-loop off|stop|conclude\n"
+           "                                every 512 thinking tokens, test whether the\n"
+           "                                thinking repeats whole passages; stop ends the\n"
+           "                                reply, conclude closes the thinking and lets\n"
+           "                                the model answer (default off)\n"
            "\n"
            "OUTPUT\n"
            "  --json                        constrain the answer to a JSON object\n"
@@ -472,6 +478,8 @@ Options parse_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--thinking-budget") {
             options.thinking_budget = parse_u32(value(arg), "thinking-budget");
+        } else if (arg == "--reasoning-loop") {
+            options.reasoning_loop = ninfer::product::parse_reasoning_loop_action(value(arg));
         } else if (arg == "--reasoning-effort") {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
@@ -623,6 +631,10 @@ Options parse_options(int argc, char** argv) {
     if (options.reasoning_effort == ReasoningEffort::None) options.enable_thinking = false;
     if (options.enable_thinking == false && options.thinking_budget) {
         throw std::invalid_argument("--thinking-budget cannot be combined with --no-thinking");
+    }
+    if (options.enable_thinking == false &&
+        options.reasoning_loop != ninfer::ReasoningLoopAction::Off) {
+        throw std::invalid_argument("--reasoning-loop cannot be combined with --no-thinking");
     }
     if (options.greedy) {
         options.sampling.temperature = 0.0F;

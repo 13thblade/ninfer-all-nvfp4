@@ -1024,7 +1024,34 @@ because C falls in B < C < B + R; Engine resolves it as follows:
 
 Logs report the requested budget, and the effective budget when it differs. A request that cannot
 enforce its budget reports the requested value only. The server does not promise that the model will
-emit nonempty content or a tool call after the marker.
+emit nonempty content or a tool call after the marker. `model_thinking_tokens` in the request log
+counts the model's thinking tokens for every Qwen thinking request, with or without a budget.
+
+`--reasoning-loop off|stop|conclude` (default `off`) guards thinking-enabled requests against a
+model that keeps rewriting the same passages in its thinking, which token penalties do not catch
+because every pass varies a little.
+
+- **Check.** Every 512 model-origin thinking tokens, at the end of a decode round, the guard tests
+  two signs of a loop. First, the last 2,048 characters of the thinking repeat one period of at
+  most 64 characters, as a loop written without spaces does. Second, the thinking is split into
+  words (a run of letters, digits and `_`, ASCII case folded) and every other non-space character,
+  each a word of its own, and at least 25 % of the last 2,000 words lie inside a 12-word passage
+  that occurs at least three times in the last 30,000 words. A passage repeated twice (a recap)
+  does not count. The measure and thresholds are those of Strata's `reasoning_loop_recovery` and
+  its periodic-tail check (measured on other models; NInfer has not re-tuned them).
+- **`stop`** ends the reply there with `finish_reason` `length` (Anthropic `max_tokens`).
+- **`conclude`** commits the same control span a reached thinking budget does (Qwen's early-close
+  guidance plus `</think>`), so the model answers from the thinking it has; no prompt is read again.
+  When the remaining output budget cannot hold the span and one more token, or the request's
+  thinking budget could not be enforced (early close unavailable, above), it stops instead.
+- It applies to constrained requests too (tool constraints, `response_format`): the control span
+  goes through the same grammar-checked path as a thinking budget, so a constrained request can
+  still answer or call a tool after `conclude`. With `stop`, a constrained request ends as an
+  interrupted one (completed calls only).
+- The console line and the request log (`reasoning_loop_detected`,
+  `reasoning_loop_thinking_tokens`, `reasoning_loop_coverage`) record each firing; `server_start`
+  records the mode as `reasoning_loop`. It can mistake a long, deliberately repeated checklist for a
+  loop; keep it off where the thinking legitimately repeats whole passages.
 
 For Chat Completions, `reasoning_effort: "none"` requests disabled thinking. The other standard
 values (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`) reach the template unchanged.
@@ -1914,6 +1941,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--lenient-assistant-history` | accept Responses input whose assistant message content or reasoning follows `function_call` Items in one run: it joins that run's assistant turn, as Messages flattens content blocks, and the template renders it before the calls. Without it such input fails with `invalid_assistant_history` rather than being silently reordered | off |
 | `--lenient-image-detail` | read an OpenAI image `detail` other than `auto`, `low` or `high` as `auto` instead of failing with `image_detail_not_supported`, for clients that send values NInfer does not know (see [image detail](#image-detail)) | off |
 | `--thinking-budget-message TEXT` | message a thinking-enabled request receives at its thinking budget instead of the built-in notice; the canonical `</think>` close is appended when missing | built-in |
+| `--reasoning-loop off\|stop\|conclude` | reasoning-loop guard for thinking-enabled requests: end the reply or close the thinking when it keeps repeating itself (details under [OpenAI Chat Completions](#openai-chat-completions)) | `off` |
 | `--default-reasoning-effort E` | effort for requests that name none: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-residency resident\|overlay\|cpu` | `overlay` keeps the Vision tower in pinned host memory and encodes each image inside a window borrowed from the evict-ranked text weight tail, so `--vision` no longer reserves device memory and `--kv-capacity auto` resolves the no-vision capacity; requires `--vision` and CUDA virtual memory management; Gemma 4 keeps its tower's blocks pinned and streams them through a two-block device window instead. `--vision-offload on\|off` is accepted as an alias for `overlay\|resident`. `cpu` decodes the tower to host FP32 and encodes on CPU threads with no device Vision memory (see [Vision residency](#vision-residency)); it caps `--vision-max-merged` at 256 unless given. Qwen3.8-Flash-Next keeps its tower resident | `resident` |
@@ -2083,7 +2111,7 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities and switches, n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance and measured cost, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, reasoning-loop guard firing, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
 | `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
 

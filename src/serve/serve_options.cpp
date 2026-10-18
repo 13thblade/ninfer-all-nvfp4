@@ -2,6 +2,7 @@
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
+#include "product/reasoning_loop_options.h"
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
 
@@ -404,6 +405,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                notice a request gets at its thinking budget;\n"
            "                                the canonical </think> close is appended when\n"
            "                                missing\n"
+           "  --reasoning-loop off|stop|conclude\n"
+           "                                every 512 thinking tokens, test whether the\n"
+           "                                thinking repeats whole passages; stop ends the\n"
+           "                                reply as length, conclude closes the thinking\n"
+           "                                and lets the model answer (default off)\n"
            "  --default-reasoning-effort E  none, minimal, low, medium, high, xhigh or max\n"
            "                                for requests that set no effort and keep\n"
            "                                thinking on\n"
@@ -1138,6 +1144,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.thinking_budget_message.empty()) {
                 throw std::invalid_argument("--thinking-budget-message must not be empty");
             }
+            continue;
+        }
+        if (arg == "--reasoning-loop") {
+            options.reasoning_loop =
+                product::parse_reasoning_loop_action(require_value("--reasoning-loop"));
             continue;
         }
         if (arg == "--vision") {
