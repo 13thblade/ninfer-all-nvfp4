@@ -38,6 +38,16 @@
 namespace ninfer {
 namespace {
 
+// Gemma 4 and Flash-Next keep context caches of their own, which the checkpoint catalog's options
+// configure; the hybrid prefix cache, the server's default, belongs to the Qwen3.5 Program.
+EngineOptions with_family_context_cache(EngineOptions options) {
+    if (runtime::is_gemma4_artifact(options.artifact_path) ||
+        runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+        options.context_cache.mode = ContextCacheMode::Legacy;
+    }
+    return options;
+}
+
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
     if (options.devices.empty()) {
@@ -272,7 +282,8 @@ public:
                               std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Gemma4Core>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(runtime::normalize_engine_options(std::move(engine_options))),
+        : options(runtime::normalize_engine_options(
+              with_family_context_cache(std::move(engine_options)))),
           device(initialize_device(options)),
           clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
         report_gpu_clock_floor(options, clock_floor);
