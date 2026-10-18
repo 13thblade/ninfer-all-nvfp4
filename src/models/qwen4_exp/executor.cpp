@@ -737,6 +737,12 @@ struct Executor::Impl {
              options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share)) {
             throw std::invalid_argument("mapped misses need GGUF host experts and all misses on the GPU");
         }
+        if (options.hybrid_experts.tail_skip_rank != 0 &&
+            (residency != ExpertResidency::Host || native_host ||
+             options.hybrid_experts.mapped_misses)) {
+            throw std::invalid_argument(
+                "--expert-tail-skip needs GGUF host experts with staged misses");
+        }
         if (options.hybrid_experts.prefill_buffers != 1 &&
             (residency != ExpertResidency::Host || native_host)) {
             throw std::invalid_argument("--expert-prefill-buffers needs GGUF host experts");
@@ -1534,6 +1540,7 @@ struct Executor::Impl {
         miss.cpu_share      = 1.0 - double(options.hybrid_experts.dma_share);
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
         miss.staging_bytes  = kStagingBytes;
+        miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
         misses              = std::make_unique<ExpertMisses>(
             device, std::move(out),
             stream ? model.files() : std::vector<std::filesystem::path>{}, miss, cache.get());

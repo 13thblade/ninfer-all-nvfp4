@@ -511,6 +511,10 @@ struct HybridExpertOptions {
     // GGUF banks: copy missing experts into device staging while the cached ones run (staged), or
     // let the expert kernels read host experts across the bus (mapped; host experts only).
     bool mapped_misses = false;
+    // GGUF host experts with staged misses: 1..9 leaves out of a decode or verification call each
+    // uncached expert that all its tokens rank past this many places of their top ten, without
+    // giving its router weight to the others (lossy); 0 (default) serves every miss.
+    std::uint32_t tail_skip_rank = 0;
     // GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts
     // into. 2 copies the next layer's while this layer's experts run, and takes the second
     // buffer's memory from the expert cache; 1 (default) keeps one.

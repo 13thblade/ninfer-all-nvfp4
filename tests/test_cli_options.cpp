@@ -92,6 +92,12 @@ int run_tests() {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-cpu-threads", threads});
         }), "CLI accepted an invalid hybrid CPU worker count");
     }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-residency",
+                             "host"}).hybrid_experts.tail_skip_rank == 0 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--expert-residency", "host", "--expert-tail-skip", "7"})
+                                  .hybrid_experts.tail_skip_rank == 7,
+                      "CLI did not keep every miss by default or preserve the tail skip");
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
                               .hybrid_experts.prefill_buffers == 1 &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
@@ -103,6 +109,11 @@ int run_tests() {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-prefill-buffers",
                          count});
         }), "CLI accepted an invalid prefill expert buffer count");
+    }
+    for (const auto* rank : {"0", "10", "-1", "7x"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-tail-skip", rank});
+        }), "CLI accepted an invalid expert tail skip");
     }
     for (const auto* budget : {"0", "32", "4096"}) {
         const auto disk = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",

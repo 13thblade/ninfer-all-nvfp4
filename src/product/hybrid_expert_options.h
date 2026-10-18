@@ -18,6 +18,9 @@ inline constexpr const char* kHybridExpertHelp =
     "  --expert-misses staged|mapped GGUF experts: copy misses into device staging while the\n"
     "                                cached experts run (default), or read host experts across\n"
     "                                the bus inside the expert kernels\n"
+    "  --expert-tail-skip N          GGUF host experts: leave out of a decode or verification\n"
+    "                                call each uncached expert that all its tokens rank past\n"
+    "                                place N (1..9) of their top ten; changes results\n"
     "  --expert-prefill-buffers 1|2  GGUF host experts: device buffers for a long prompt's\n"
     "                                uncached experts (default 1); 2 copies the next layer's\n"
     "                                while this one runs, with memory from the expert cache\n"
@@ -46,6 +49,14 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
             throw std::invalid_argument("--expert-cpu-threads takes an integer in 1..256");
         }
         out.cpu_threads = threads;
+    } else if (option == "--expert-tail-skip") {
+        const std::string text(value());
+        std::uint32_t rank      = 0;
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), rank);
+        if (error != std::errc{} || end != text.data() + text.size() || rank == 0 || rank > 9) {
+            throw std::invalid_argument("--expert-tail-skip takes an integer in 1..9");
+        }
+        out.tail_skip_rank = rank;
     } else if (option == "--expert-prefill-buffers") {
         const std::string_view count(value());
         if (count != "1" && count != "2") {

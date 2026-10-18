@@ -54,6 +54,9 @@ struct MissOptions {
     double cpu_share             = 0.0;  // share of a request's missing experts the CPU computes
     std::uint32_t cpu_threads    = 0;    // 0: the physical cores less two, at most 16
     std::uint64_t staging_bytes  = 128ULL << 20; // device staging per rank, two halves
+    // 1..9: a call leaves out each missing expert that all its tokens rank past this many places
+    // of their top ten (lossy); 0 serves every miss.
+    std::uint32_t tail_skip_rank = 0;
 };
 
 struct MissStats {
