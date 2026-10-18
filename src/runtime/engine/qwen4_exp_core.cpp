@@ -301,6 +301,15 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0);
+    if (const std::string cpu = instance->executor->expert_cpu_description(); !cpu.empty()) {
+        const std::string share =
+            options.hybrid_experts.dma_share_auto
+                ? std::string("split by measured speeds")
+                : std::to_string(1.0F - options.hybrid_experts.dma_share) + " of them";
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Qwen3.8-Flash-Next: the CPU computes missing experts (%s; %s)",
+                           cpu.c_str(), share.c_str());
+    }
     if (mtp) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "Qwen3.8-Flash-Next: MTP speculative decoding, %u drafts a round",

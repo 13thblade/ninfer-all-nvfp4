@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp {
@@ -52,7 +53,10 @@ struct MissLayer {
 struct MissOptions {
     std::uint32_t token_capacity = 8;    // tokens of one call
     double cpu_share             = 0.0;  // share of a request's missing experts the CPU computes
-    std::uint32_t cpu_threads    = 0;    // 0: the physical cores less two, at most 16
+    // Instead of a fixed share, each request gives the CPU the experts that make its copies and
+    // its CPU products end soonest, by times fitted to the earlier requests.
+    bool cpu_balance             = false;
+    std::uint32_t cpu_threads    = 0;    // 0: half the usable logical CPUs less two, at most 16
     std::uint64_t staging_bytes  = 128ULL << 20; // device staging per rank, two halves
     // 1..9: a call leaves out each missing expert that all its tokens rank past this many places
     // of their top ten (lossy); 0 serves every miss.
@@ -121,6 +125,8 @@ public:
     void set_resident(std::size_t layer, const ExpertCache::Ranges& resident);
     [[nodiscard]] MissStats stats() const;
     [[nodiscard]] bool cpu_enabled() const noexcept;
+    // With a CPU share: its threads and vector backend, e.g. "14 threads, avx2"; else empty.
+    [[nodiscard]] std::string cpu_description() const;
 
 private:
     struct Impl;

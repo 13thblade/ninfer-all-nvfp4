@@ -32,9 +32,36 @@
 #    include <fcntl.h>
 #    include <unistd.h>
 #endif
+#ifdef __linux__
+#    include <fstream>
+#    include <sched.h>
+#endif
 
 namespace ninfer::models::qwen4_exp {
 namespace {
+
+// Logical CPUs this process may keep busy: std::thread's count, bounded on Linux by the affinity
+// mask and by a container's CPU quota (cgroup v2 cpu.max, v1 cpu.cfs_quota_us), so spinning
+// workers do not exhaust the quota and stall the executor's thread.
+unsigned usable_cpus() {
+    unsigned count = std::max(1U, std::thread::hardware_concurrency());
+#ifdef __linux__
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        count = std::min(count, unsigned(std::max(1, CPU_COUNT(&set))));
+    }
+    double quota = -1, period = 0;
+    if (std::ifstream v2("/sys/fs/cgroup/cpu.max"); v2) {
+        std::string limit;
+        if (v2 >> limit >> period && limit != "max") { quota = std::strtod(limit.c_str(), nullptr); }
+    } else if (std::ifstream q("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), p("/sys/fs/cgroup/cpu/cpu.cfs_period_us");
+               q && p) {
+        if (!(q >> quota && p >> period)) { quota = -1; }
+    }
+    if (quota > 0 && period > 0) { count = std::min(count, std::max(1U, unsigned(quota / period))); }
+#endif
+    return count;
+}
 
 // One turn of a spin wait: the processor's pause hint where it has one, a yield elsewhere.
 // YieldProcessor() is the Windows SDK's portable spelling; the GCC/Clang builtin is not known to
@@ -61,6 +88,46 @@ constexpr std::uint64_t kAlign = 256;
 std::uint64_t aligned(std::uint64_t value) { return (value + kAlign - 1) / kAlign * kAlign; }
 
 using Atomic = cuda::atomic_ref<std::uint32_t, cuda::thread_scope_system>;
+
+// t = a + b x, fitted by least squares with exponential forgetting and the intercept drawn
+// toward its prior: how long a request's copies take for the bytes they move, or its CPU products
+// for the work they do (x in megabytes, t in microseconds). The prior line seeds the fit. A sample
+// counts at most four times the line's value (or a quarter of it), so a copy queued behind other
+// transfers or a descheduled CPU request moves the line gradually; and a negative intercept is
+// refitted as zero, the line through the origin, since samples of one size (one expert while a
+// side only probes) leave the slope to the prior's point.
+class TimeFit {
+public:
+    TimeFit(double a, double b) : prior_(a), a_(a), b_(b) { add(2.0, a + 2.0 * b, 4.0); }
+
+    void add(double x, double t, double weight = 1.0) {
+        constexpr double kDecay = 0.99, kPull = 1.0, kReach = 4.0;
+        const double line = at(x);
+        t   = std::clamp(t, line / kReach, line * kReach);
+        s0_ = kDecay * s0_ + weight;
+        s1_ = kDecay * s1_ + weight * x;
+        s2_ = kDecay * s2_ + weight * x * x;
+        t0_ = kDecay * t0_ + weight * t;
+        t1_ = kDecay * t1_ + weight * x * t;
+        const double m00 = s0_ + kPull, det = m00 * s2_ - s1_ * s1_;
+        if (!(det > 1e-12)) { return; }
+        double a = ((t0_ + kPull * prior_) * s2_ - s1_ * t1_) / det;
+        double b = (m00 * t1_ - s1_ * (t0_ + kPull * prior_)) / det;
+        if (a < 0) {
+            a = 0;
+            b = t1_ / s2_;
+        }
+        if (std::isfinite(a) && std::isfinite(b) && b > 0) {
+            a_ = a;
+            b_ = b;
+        }
+    }
+    [[nodiscard]] double at(double x) const { return a_ + b_ * x; }
+
+private:
+    double prior_, a_, b_;
+    double s0_ = 0, s1_ = 0, s2_ = 0, t0_ = 0, t1_ = 0;
+};
 
 // One device's doorbell in pinned host memory, read and written by both sides.
 struct Mailbox {
@@ -410,8 +477,12 @@ struct ExpertMisses::Impl {
         std::atomic<cudaEvent_t> behind_last{nullptr}; // the latest list's event
         DeviceBuffer stamps;                            // the calls' recency counter
         cudaStream_t copies    = nullptr;
-        cudaEvent_t copied     = nullptr;
+        cudaEvent_t copying    = nullptr; // balance only: before a request's copies
+        cudaEvent_t copied     = nullptr; // after them (timed for the balance)
         std::uint32_t served   = 0;
+        // Balance: this device's copy times, and requests since one copied or computed.
+        TimeFit copy_time{10.0, 50.0}; // about 20 GB/s
+        std::uint32_t without_copies = 0, without_cpu = 0;
     };
 
     DeviceContext& device;
@@ -450,6 +521,7 @@ struct ExpertMisses::Impl {
     std::uint64_t half_bytes = 0, file_half_bytes = 0;
     std::unique_ptr<SpinPool> pool;
     ops::GgufCpuBackend backend = ops::GgufCpuBackend::Automatic;
+    std::uint32_t cpu_threads   = 0; // the pool's workers and the service thread
     bool disk = false;
 
     // CPU work of one request.
@@ -457,10 +529,12 @@ struct ExpertMisses::Impl {
         std::int32_t expert = -1;
         std::vector<std::int32_t> pairs, tokens; // pair index and its token, per column
         std::array<const std::uint8_t*, 3> bytes{};
-        ops::GgufCpuActivation input, middle;
+        ops::GgufCpuActivation input, input_up, middle; // input_up: an up of another format
         std::vector<float> gate, up, down;
+        std::vector<std::uint16_t> middle_bf16;
     };
     std::vector<CpuExpert> cpu_experts;
+    TimeFit cpu_time{20.0, 100.0}; // about 10 GB/s, refitted by the first CPU requests
 
     mutable std::mutex stats_mutex;
     MissStats counters;
@@ -477,6 +551,7 @@ struct ExpertMisses::Impl {
         : device(d), layers(std::move(l)), cache(c), options(o), ranks(d.size()) {
         if (options.token_capacity == 0 || options.token_capacity > 64 || layers.empty() ||
             !std::isfinite(options.cpu_share) || options.cpu_share < 0 || options.cpu_share > 1 ||
+            (options.cpu_balance && options.cpu_share != 0) ||
             options.tail_skip_rank >= std::uint32_t(kTop)) {
             throw std::invalid_argument("expert misses: invalid capacity, CPU share or tail skip");
         }
@@ -521,7 +596,7 @@ struct ExpertMisses::Impl {
         half_bytes = std::max<std::uint64_t>(options.staging_bytes / 2, largest * 2);
         half_bytes = half_bytes / kAlign * kAlign;
         file_half_bytes = disk ? half_bytes : 0;
-        const bool cpu  = options.cpu_share > 0;
+        const bool cpu  = options.cpu_share > 0 || options.cpu_balance;
         for (std::size_t r = 0; r < ranks.size(); ++r) {
             Rank& rank = ranks[r];
             if (!rank.used) { continue; }
@@ -553,7 +628,10 @@ struct ExpertMisses::Impl {
             rank.stamps  = DeviceBuffer(64);
             rank.stamps.fill(0);
             CUDA_CHECK(cudaStreamCreateWithFlags(&rank.copies, cudaStreamNonBlocking));
-            CUDA_CHECK(cudaEventCreateWithFlags(&rank.copied, cudaEventDisableTiming));
+            // Timed only for the balance, which reads the copies' durations.
+            const unsigned timing = options.cpu_balance ? cudaEventDefault : cudaEventDisableTiming;
+            if (options.cpu_balance) { CUDA_CHECK(cudaEventCreate(&rank.copying)); }
+            CUDA_CHECK(cudaEventCreateWithFlags(&rank.copied, timing));
             for (auto& event : rank.behind) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
             }
@@ -568,11 +646,11 @@ struct ExpertMisses::Impl {
             // By default the physical cores (assuming two hardware threads each) less two, for the
             // executor's thread and this service.
             const std::uint32_t threads =
-                options.cpu_threads != 0
-                    ? options.cpu_threads
-                    : std::clamp(std::thread::hardware_concurrency() / 2, 3U, 18U) - 2U;
-            pool    = std::make_unique<SpinPool>(threads > 1 ? threads - 1 : 0);
-            backend = ops::gguf_cpu_backend_selected(ops::GgufCpuBackend::Automatic);
+                options.cpu_threads != 0 ? options.cpu_threads
+                                         : std::clamp(usable_cpus() / 2, 3U, 18U) - 2U;
+            pool        = std::make_unique<SpinPool>(threads > 1 ? threads - 1 : 0);
+            backend     = ops::gguf_cpu_backend_selected(ops::GgufCpuBackend::Automatic);
+            cpu_threads = threads;
         }
         service = std::thread([this] { serve(); });
     }
@@ -589,6 +667,7 @@ struct ExpertMisses::Impl {
         if (service.joinable()) { service.join(); }
         for (auto& rank : ranks) {
             if (rank.copies) { cudaStreamDestroy(rank.copies); }
+            if (rank.copying) { cudaEventDestroy(rank.copying); }
             if (rank.copied) { cudaEventDestroy(rank.copied); }
             for (auto event : rank.behind) {
                 if (event) { cudaEventDestroy(event); }
@@ -701,6 +780,12 @@ struct ExpertMisses::Impl {
             if (job.input.k() != kHidden) { job.input = ops::GgufCpuActivation(capacity, kHidden); }
             if (job.middle.k() != kWidth) { job.middle = ops::GgufCpuActivation(capacity, kWidth); }
             job.input.prepare_bf16(gate_p.format, columns.data(), kHidden, n);
+            if (up_p.format != gate_p.format) {
+                if (job.input_up.k() != kHidden) {
+                    job.input_up = ops::GgufCpuActivation(capacity, kHidden);
+                }
+                job.input_up.prepare_bf16(up_p.format, columns.data(), kHidden, n);
+            }
             job.gate.resize(std::size_t(n) * kWidth);
             job.up.resize(std::size_t(n) * kWidth);
             job.down.resize(std::size_t(n) * kHidden);
@@ -716,16 +801,16 @@ struct ExpertMisses::Impl {
             const int end    = std::min(begin + kRowsPerTask, kWidth);
             const auto& p    = is_up ? up_p : gate_p;
             const ops::GgufCpuMatrix w{p.format, job.bytes[is_up ? 1 : 0], p.row_bytes, p.rows, p.k};
-            ops::gguf_cpu_rows(w, job.input, begin, end, (is_up ? job.up : job.gate).data(), kWidth,
-                               backend);
+            const auto& x = is_up && up_p.format != gate_p.format ? job.input_up : job.input;
+            ops::gguf_cpu_rows(w, x, begin, end, (is_up ? job.up : job.gate).data(), kWidth, backend);
         });
+        // The middle in BF16, as the GPU's up kernel stores it before quantizing it.
         for (auto& job : cpu_experts) {
             const auto n = static_cast<int>(job.tokens.size());
-            for (std::size_t i = 0; i < job.gate.size(); ++i) {
-                const float g = job.gate[i];
-                job.gate[i]   = g / (1.0F + std::exp(-g)) * job.up[i];
-            }
-            job.middle.prepare(down_p.format, job.gate.data(), kWidth, n);
+            job.middle_bf16.resize(job.gate.size());
+            ops::gguf_cpu_swiglu_bf16(job.gate.data(), job.up.data(), job.gate.size(),
+                                      job.middle_bf16.data(), backend);
+            job.middle.prepare_bf16(down_p.format, job.middle_bf16.data(), kWidth, n);
         }
         const int down_tasks = kHidden / 128;
         pool->run(cpu_experts.size() * std::size_t(down_tasks), [&](std::size_t i) {
@@ -745,6 +830,49 @@ struct ExpertMisses::Impl {
             }
         }
         *static_cast<std::int32_t*>(rank.product_count->data()) = count;
+    }
+
+    // The CPU's work on one expert with `uses` pairs, in megabytes of its projections: the
+    // decode of each stored block serves every token, a token's products add about a quarter.
+    static double cpu_work(double megabytes, int uses) {
+        constexpr double kTokenWork = 0.25;
+        return megabytes * (1.0 + kTokenWork * double(std::max(uses, 1) - 1));
+    }
+
+    static double expert_megabytes(const MissLayer& layer) {
+        double bytes = 0;
+        for (const auto& p : layer.projections) { bytes += double(p.expert_bytes); }
+        return bytes / 1e6;
+    }
+
+    // The CPU's count of a request's missing experts, the last of `order` (fewest pairs first to
+    // the CPU): the split whose copies and CPU products end soonest by the fitted times. A side
+    // left unused for kProbe requests takes one expert, so both fits follow the machine.
+    std::size_t balance(Rank& rank, const MissLayer& layer,
+                        const std::vector<std::pair<int, std::int32_t>>& order) {
+        constexpr std::uint32_t kProbe = 8;
+        const std::size_t n   = order.size();
+        const double megabytes = expert_megabytes(layer);
+        std::vector<double> work(n + 1, 0.0); // the CPU's work on experts [g, n)
+        for (std::size_t i = n; i-- > 0;) { work[i] = work[i + 1] + cpu_work(megabytes, order[i].first); }
+        std::size_t gpu = n;
+        double soonest  = rank.copy_time.at(double(n) * megabytes);
+        for (std::size_t g = n; g-- > 0;) {
+            const double copies = g == 0 ? 0.0 : rank.copy_time.at(double(g) * megabytes);
+            const double end    = std::max(copies, cpu_time.at(work[g]));
+            if (end < soonest) {
+                soonest = end;
+                gpu     = g;
+            }
+        }
+        if (gpu == n && rank.without_cpu >= kProbe) {
+            gpu = n - 1;
+        } else if (gpu == 0 && rank.without_copies >= kProbe) {
+            gpu = 1;
+        }
+        rank.without_cpu    = gpu < n ? 0 : rank.without_cpu + 1;
+        rank.without_copies = gpu > 0 ? 0 : rank.without_copies + 1;
+        return n - gpu;
     }
 
     void serve_request(Rank& rank, std::uint32_t sequence) {
@@ -777,11 +905,13 @@ struct ExpertMisses::Impl {
         }
         std::stable_sort(order.begin(), order.end(),
                          [](const auto& a, const auto& b) { return a.first > b.first; });
-        std::size_t cpu_count =
-            cpu_capable(layer)
-                ? std::size_t(std::lround(double(order.size()) * options.cpu_share))
-                : 0;
-        cpu_count = std::min(cpu_count, order.size());
+        std::size_t cpu_count = 0;
+        if (cpu_capable(layer)) {
+            cpu_count = options.cpu_balance
+                            ? balance(rank, layer, order)
+                            : std::min(order.size(), std::size_t(std::lround(
+                                                         double(order.size()) * options.cpu_share)));
+        }
         const std::size_t gpu_count = order.size() - cpu_count;
         std::array<bool, kMaxExperts> on_gpu{};
         std::uint64_t used = 0, file_used = 0, staged_bytes = 0;
@@ -793,6 +923,7 @@ struct ExpertMisses::Impl {
         for (std::uint32_t p = 0; p < pairs; ++p) {
             if (ids[p] >= 0 && ids[p] < kMaxExperts) { in_use[std::size_t(ids[p])] = 1; }
         }
+        if (rank.copying && gpu_count > 0) { CUDA_CHECK(cudaEventRecord(rank.copying, rank.copies)); }
         for (std::size_t i = 0; i < gpu_count; ++i) {
             const std::int32_t e = order[i].second;
             on_gpu[std::size_t(e)] = true;
@@ -890,6 +1021,8 @@ struct ExpertMisses::Impl {
         if (copies) { CUDA_CHECK(cudaEventRecord(rank.copied, rank.copies)); }
         // The CPU's share, while the copies run.
         std::uint64_t cpu_pairs = 0;
+        const auto cpu_started  = std::chrono::steady_clock::now();
+        double cpu_work_done    = 0;
         if (cpu_count > 0) {
             cpu_experts.resize(cpu_count);
             for (std::size_t i = 0; i < cpu_count; ++i) {
@@ -904,6 +1037,7 @@ struct ExpertMisses::Impl {
                     }
                 }
                 cpu_pairs += job.pairs.size();
+                cpu_work_done += cpu_work(expert_megabytes(layer), int(job.pairs.size()));
                 for (int k = 0; k < 3; ++k) {
                     const auto& proj = layer.projections[std::size_t(k)];
                     if (disk) {
@@ -924,10 +1058,21 @@ struct ExpertMisses::Impl {
             // the tables before the copies, they join after, and the next pass waits for both.
             if (layer.admit) { admit_behind(rank, layer, layer_index, in_use); }
             compute_cpu(layer, rank);
+            if (options.cpu_balance) {
+                cpu_time.add(cpu_work_done,
+                             1e6 * std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                                 cpu_started)
+                                       .count());
+            }
         } else if (rank.product_count) {
             *static_cast<std::int32_t*>(rank.product_count->data()) = 0;
         }
         if (copies) { CUDA_CHECK(cudaEventSynchronize(rank.copied)); }
+        if (options.cpu_balance && gpu_count > 0 && staged_bytes > 0 && mapped == 0) {
+            float milliseconds = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&milliseconds, rank.copying, rank.copied));
+            rank.copy_time.add(double(staged_bytes) / 1e6, 1e3 * double(milliseconds));
+        }
         Atomic(box.prepared).store(sequence, cuda::memory_order_release);
         const double seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -1119,5 +1264,10 @@ MissStats ExpertMisses::stats() const {
     return impl_->counters;
 }
 bool ExpertMisses::cpu_enabled() const noexcept { return impl_->pool != nullptr; }
+std::string ExpertMisses::cpu_description() const {
+    if (!impl_->pool) { return {}; }
+    return std::to_string(impl_->cpu_threads) + " threads, " +
+           ops::gguf_cpu_backend_name(impl_->backend);
+}
 
 } // namespace ninfer::models::qwen4_exp

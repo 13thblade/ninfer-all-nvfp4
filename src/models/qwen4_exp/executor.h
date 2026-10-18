@@ -214,6 +214,8 @@ public:
     [[nodiscard]] std::size_t head_rank() const noexcept;
     [[nodiscard]] ExpertCacheStats expert_cache_stats() const noexcept;
     [[nodiscard]] std::string expert_execution_profile() const;
+    // GGUF host or disk experts with a CPU share: its threads and vector backend; else empty.
+    [[nodiscard]] std::string expert_cpu_description() const;
     [[nodiscard]] bool hybrid_experts() const noexcept;
     void save_expert_profile() const;
     // Worker-thread scope only. The owner retains the flag until the eager call returns, then

@@ -361,3 +361,5 @@ ninfer_add_test(ninfer_moe_expert_cpu_test
 ninfer_add_test(ninfer_gguf_expert_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_expert_cpu.cpp"
   LIBRARIES ninfer_ops)
+target_include_directories(ninfer_gguf_expert_cpu_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")

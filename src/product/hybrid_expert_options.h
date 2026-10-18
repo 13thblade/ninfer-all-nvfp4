@@ -12,9 +12,11 @@ namespace ninfer::product {
 
 inline constexpr const char* kHybridExpertHelp =
     "  Flash-Next-only expert options:\n"
-    "  --expert-dma-share F          host or disk experts: GPU share of cache misses,\n"
+    "  --expert-dma-share F|auto     host or disk experts: GPU share of cache misses,\n"
     "                                0..1 (default 1); below 1 lets the CPU compute the rest\n"
-    "                                prefill always uses the GPU\n"
+    "                                (GGUF experts: the GPU's results bit for bit); auto: each\n"
+    "                                call splits them by measured CPU and bus times (GGUF);\n"
+    "                                calls of more than 8 tokens always use the GPU\n"
     "  --expert-misses staged|mapped GGUF experts: copy misses into device staging while the\n"
     "                                cached experts run (default), or read host experts across\n"
     "                                the bus inside the expert kernels\n"
@@ -34,13 +36,19 @@ template<class Value>
 bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& out, Value&& value) {
     if (option == "--expert-dma-share") {
         const std::string text(value());
+        if (text == "auto") {
+            out.dma_share      = 1;
+            out.dma_share_auto = true;
+            return true;
+        }
         float share = 0;
         const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), share);
         if (error != std::errc{} || end != text.data() + text.size() ||
             !std::isfinite(share) || share < 0 || share > 1) {
-            throw std::invalid_argument("--expert-dma-share takes a finite value in 0..1");
+            throw std::invalid_argument("--expert-dma-share takes a finite value in 0..1 or auto");
         }
-        out.dma_share = share;
+        out.dma_share      = share;
+        out.dma_share_auto = false;
     } else if (option == "--expert-cpu-threads") {
         const std::string text(value());
         std::uint32_t threads = 0;

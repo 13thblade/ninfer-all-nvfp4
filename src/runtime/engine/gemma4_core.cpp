@@ -118,7 +118,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         throw std::invalid_argument("--lookup-ngram and --adaptive-mtp require --spec mtp");
     }
     const auto& hybrid = options.hybrid_experts;
-    if (hybrid.dma_share != 1 || hybrid.cpu_threads != 0 || hybrid.mapped_misses ||
+    if (hybrid.dma_share != 1 || hybrid.dma_share_auto || hybrid.cpu_threads != 0 ||
+        hybrid.mapped_misses ||
         hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 1 || hybrid.adaptive_cache ||
         !hybrid.routing_profile.empty() || !hybrid.record_profile.empty()) {
         throw std::invalid_argument("Gemma 4 expert residency uses GPU arithmetic and DMA only; "

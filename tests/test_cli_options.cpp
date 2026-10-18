@@ -82,7 +82,17 @@ int run_tests() {
             hybrid.hybrid_experts.record_profile == "recorded.json",
             "CLI did not preserve the native hybrid configuration");
     }
-    for (const auto* share : {"-0.1", "1.1", "nan", "inf", "0.5x"}) {
+    {
+        const auto automatic = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-residency", "host", "--expert-dma-share", "auto"});
+        const auto fixed_after = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-dma-share", "auto", "--expert-dma-share", "0.5"});
+        failures += check(automatic.hybrid_experts.dma_share_auto &&
+                              !fixed_after.hybrid_experts.dma_share_auto &&
+                              fixed_after.hybrid_experts.dma_share == 0.5F,
+                          "CLI did not preserve an automatic hybrid DMA share");
+    }
+    for (const auto* share : {"-0.1", "1.1", "nan", "inf", "0.5x", "Auto"}) {
         failures += check(rejects([&] {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-dma-share", share});
         }), "CLI accepted an invalid hybrid DMA share");

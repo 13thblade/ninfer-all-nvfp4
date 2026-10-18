@@ -70,6 +70,9 @@ two-stage GDN prefill, parallel query tiles, MX FP8 MMA and Minnnn's column-band
 - Qwen3.8-Flash-Next support was designed against the transformers, vLLM and llama.cpp
   implementations of the model and [Strata](https://github.com/Niko1221/Strata) (MIT, copyright
   2026 Niko1221 and contributors), whose transcription served as a reference for the n-gram
-  hash, the expert cache and its measured pitfalls.
+  hash, the expert cache and its measured pitfalls, and whose CPU-computed expert misses led to
+  the CPU share.
+- The SiLU shared by the GPU's GGUF expert kernels and the CPU's expert products evaluates e^x with
+  the single-precision polynomial of Stephen L. Moshier's Cephes Math Library.
 - llama.cpp's GGUF block kernels are vendored unmodified in `third_party/ggml-quants` under their
   MIT license.

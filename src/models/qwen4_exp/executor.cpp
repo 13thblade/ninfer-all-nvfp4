@@ -734,13 +734,15 @@ struct Executor::Impl {
         const auto residency = model.options().experts;
         if (residency == ExpertResidency::Device &&
             (options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
-             options.hybrid_experts.cpu_threads != 0 || options.hybrid_experts.mapped_misses)) {
+             options.hybrid_experts.dma_share_auto || options.hybrid_experts.cpu_threads != 0 ||
+             options.hybrid_experts.mapped_misses)) {
             throw std::invalid_argument("expert DMA shares, CPU threads and miss paths require "
                                         "host or disk experts");
         }
         if (options.hybrid_experts.mapped_misses &&
             (residency != ExpertResidency::Host || native_host ||
-             options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share)) {
+             options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
+             options.hybrid_experts.dma_share_auto)) {
             throw std::invalid_argument("mapped misses need GGUF host experts and all misses on the GPU");
         }
         if (options.hybrid_experts.tail_skip_rank != 0 &&
@@ -1547,7 +1549,8 @@ struct Executor::Impl {
         }
         MissOptions miss;
         miss.token_capacity = kVectorTokens;
-        miss.cpu_share      = 1.0 - double(options.hybrid_experts.dma_share);
+        miss.cpu_balance    = options.hybrid_experts.dma_share_auto;
+        miss.cpu_share      = miss.cpu_balance ? 0.0 : 1.0 - double(options.hybrid_experts.dma_share);
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
@@ -3888,15 +3891,16 @@ cudaStream_t Executor::head_stream() const noexcept {
 }
 
 std::string Executor::expert_execution_profile() const {
+    // Native hybrid banks compute some routed pairs in other arithmetic; a GGUF CPU share computes
+    // the GPU's bits (gguf_expert_cpu), so its states are the GPU's.
     if (impl_->hybrid) { return impl_->hybrid->execution_profile(); }
-    // A CPU share computes some routed pairs in other arithmetic.
-    if (impl_->misses && impl_->misses->cpu_enabled()) {
-        return "gguf-cpu-" + std::to_string(impl_->options.hybrid_experts.dma_share);
-    }
     return "gpu";
 }
 
 bool Executor::hybrid_experts() const noexcept { return impl_->hybrid != nullptr; }
+std::string Executor::expert_cpu_description() const {
+    return impl_->misses ? impl_->misses->cpu_description() : std::string();
+}
 void Executor::save_expert_profile() const {
     const auto& path = impl_->options.hybrid_experts.record_profile;
     if (path.empty()) { return; }

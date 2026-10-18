@@ -62,6 +62,9 @@ int main() {
                                  "--expert-dma-share", share}).hybrid_experts.dma_share == std::stof(share),
                           "server did not preserve an explicit hybrid DMA share");
     }
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host",
+                             "--expert-dma-share", "auto"}).hybrid_experts.dma_share_auto,
+                      "server did not preserve an automatic hybrid DMA share");
     const auto archive = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                 "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
                                 "--ngram-session-mib", "128", "--ngram-native-sessions"});

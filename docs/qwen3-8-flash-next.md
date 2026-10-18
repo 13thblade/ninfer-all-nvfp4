@@ -202,10 +202,10 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--expert-residency device\|host\|disk` | expert banks in the stage devices' memory (default); in page-locked host memory that the expert kernels read across the bus; or left in the artifact's files, each layer's routed experts read into a device cache before they run |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) takes what each device has free after startup less a margin, and after the warm-up what is still free beyond 640 MiB; `N` is the cache's size, which the warm-up leaves alone; `0` disables the host-mode cache (disk mode needs one) |
 | `--expert-misses staged\|mapped` | GGUF host experts: a decode or verification call copies each routed expert its device cache lacks straight into the slot of the layer's least recently used expert of the lowest frequency tier, by the copy engine while the cached ones run, and keeps it there (`staged`, the default); or its expert kernels read the missing experts across the bus and the cache admits between passes (`mapped`) |
-| `--expert-dma-share F` | host experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1` (default `1`); below `1` the CPU computes the rest from RAM while the GPU runs the cached ones, in its own arithmetic, and their slots fill behind the call; prefill always runs on the GPU. Neutral on an RTX 3090 with an 8-core CPU |
+| `--expert-dma-share F\|auto` | host or disk experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1` (default `1`); below `1` the CPU computes the rest from RAM while the GPU runs the cached ones, and their slots fill behind the call; `auto` (GGUF experts) gives each call the split whose copies and CPU products end soonest by the times measured on earlier calls. Only calls of up to eight tokens use the CPU; GGUF CPU products are the GPU's bit for bit ([the CPU share](#the-cpu-share)) |
 | `--expert-tail-skip N` | GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten, instead of copying it; the remaining experts keep their router weights (no renormalization). Lossy, off by default; prefill always runs every routed expert. On an RTX 3090 with Q2_0 and four short chat prompts, `7` decoded 9.0-17.6% and `6` 11.9-24.4% faster, copying 22-43% and 29-52% fewer expert bytes; perplexity over 5,115 tokens scored one token per call went from 4.667 to 4.710 with `7` and 4.688 with `6`, an order opposite to how much each leaves out, so that sample does not resolve the cost |
 | `--expert-prefill-buffers 1\|2` | GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts into (default `1`); `2` alternates two, so the next layer's copies run while this layer's experts do, when half the free memory holds both. The second buffer's memory comes from the expert cache: on an RTX 3090 with Q2_0 it took the cache from 17,296 to 16,683 MiB, prefilled a 5,462-token prompt 8.5-10.5% and a 31,860-token prompt 1.9-2.3% faster, decoded 1.5-2.8% slower once the cache was warm (within 1.5% either way from a cold one) and answered a 37-to-39-token prompt 7.5-10.2% later warm |
-| `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers; default is the physical cores less two (counted as half the logical threads), at most 16 |
+| `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers; default is half the logical CPUs the process may use (its affinity mask and container CPU quota) less two, from 1 to 16 |
 | `--expert-cache-adaptive` | replace cold cached native experts between calls; off by default because it changes the CPU/GPU arithmetic partition |
 | `--expert-profile PATH` | fill the host expert cache at startup from counts recorded for the same artifact (`--expert-profile-out`) |
 | `--expert-profile-out PATH` | record every layer's expert routes after requests, for a later `--expert-profile` |
@@ -219,8 +219,9 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--no-ngram-table` | run without the n-gram table: see [below](#without-the-n-gram-table) |
 | `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
 
-Every expert runs on the GPU by default. GGUF host experts can give the CPU a share of a call's
-missing experts (`--expert-dma-share`); native-format experiments are retained for reference. The
+Every expert runs on the GPU by default. GGUF host and disk experts can give the CPU a share of a
+call's missing experts ([the CPU share](#the-cpu-share)); native-format experiments are retained
+for reference. The
 existing GGUF artifacts support both host and disk residency. With host experts every expert
 layer gets the same number of cache slots (the MTP block's wider experts take more of the bytes);
 staged misses fill the text layers' slots by recency within tiers of decayed route counts (about
@@ -246,6 +247,34 @@ logits stay within top-1 but are not numerically qualified (maximum relative L2 
 resident experts). A GGUF bank, including a GGUF MTP companion beside native text weights, keeps
 its GPU route. Linux registers native weight objects separately; Windows uses pageable weights and
 bounded pinned staging. Use `--max-concurrency 1` for native host execution.
+
+### The CPU share
+
+With GGUF host or disk experts, `--expert-dma-share` below `1` or `auto` lets CPU threads compute
+part of a call's missing experts from their stored blocks while the GPU copies and runs the rest;
+the GPU then adds the CPU's products into the same fixed-point sum as its own. Only calls of up to
+eight tokens use the CPU: decode, verification, and prompt steps that short, such as the tail
+after a chat prompt's reusable anchor; longer prompt chunks always run on the GPU. A fixed share
+gives the CPU the experts with the fewest pairs. `auto` gives each call the split whose copies and
+CPU products end soonest by two straight lines fitted to earlier calls' copy and CPU times (a
+sample counts at most four times or a quarter of its line's value); a side left unused for eight
+calls takes one expert, so both lines follow the machine. The CPU's experts take cache slots
+behind their call, as copied ones do. On one RTX 3090 neither `auto` nor a half share decoded
+faster than the GPU alone ([measurements](#the-cpu-share-on-one-rtx-3090)).
+
+The CPU computes the GPU's decode products bit for bit, so outputs, log probabilities and context
+images do not depend on the share, on `auto`'s choices or on the thread count. The activations are
+quantized as the GPU quantizes them (q8_1: per 32 values `d = amax / 127`, codes `round(v / d)`,
+`d` rounded to binary16). A 32-value slice gives the exact integer dot of its codes and the
+activation's, and its product is `(factor * d) * dot`, each step rounded, with the slice's exact
+factor (the block's binary16 multiplier times its integer scale); IQ2_S's is
+`d * fma(factor0, dot0, factor1 * dot1)` over its two halves. Slice `s` joins lane `s mod 32` in
+slice order, and the 32 lanes meet as in a warp's butterfly (16, 8, 4, 2, 1 apart). SiLU is
+`ops/common/silu.h` on both sides, built from correctly rounded operations only, and the middle is
+rounded to BF16 before it is quantized for the down product. No compiler fuses these steps on
+either side: the GPU kernels spell them with `_rn` intrinsics and the CPU sources build without
+floating-point contraction. Q2_0, Q8_0, IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS have CPU products,
+in AVX2 (with FMA and F16C) where the CPU has it and in portable C++ elsewhere, with the same bits.
 
 ### The n-gram rows
 
@@ -661,6 +690,30 @@ back to back, a repeated prompt decodes at
 admitted every miss into the least recently used slot let a passing decode evict the experts other
 prompts keep routing to; the tiers (below 1.5, below 6, and more routes) restored second-run starts
 of 212-305 ms instead of 284-397 ms on a second RTX 3090 for at most 4.4% of first-run decode.
+
+### The CPU share on one RTX 3090
+
+One RTX 3090 (350 W, PCIe 4.0 x16) with 15.4 of the 32 threads of an EPYC 7313 and 92 GB of RAM (a
+Vast container), driver 595.71.05 and CUDA 12.8, ran the IQ3_S release with its IQ4_NL table
+through `ninfer-serve`: host experts, a 14,460 MiB expert cache, a 65,536-position context and one
+request at a time, 2026-10-18. Four prompts (a Python LRU cache, the blue sky, a Chinese prompt and
+a 5,467-token document) ran twice each with 256 greedy output tokens, in two rounds whose server
+order rotates: 16 answers per row.
+
+| `--expert-dma-share` | Decode, tok/s (range, mean) | Misses on the CPU | 5,467-token prefill |
+|---|---|---|---|
+| 1, the GPU only | 60.9-69.9, 64.7 | — | 1,538-1,726 tok/s |
+| `auto` (5 threads) | 59.4-68.9, 63.8 | 4.9% | 1,597-1,727 tok/s |
+| 0.5, 7 threads | 51.9-65.0, 57.7 | 20.9% | 1,586-1,706 tok/s |
+
+Every answer with a CPU share has the GPU-only answer's tokens and log probabilities. The misses
+count prompt chunks, which always run on the GPU. The CPU's experts take cache slots behind their
+call, so every row carried the same 985 GB across the bus; the CPU only spares a call the wait for
+its experts' copies. Left out of the cache in one round of the same answers, they cut the bus bytes
+by 11% (`auto`), 10% (a share of 0.8) and 44% (0.5), and decoded at 63.0, 65.3 and 52.3 tok/s
+against 64.7 for the GPU alone. One of these threads computes an IQ3_S expert projection of
+640 × 2,560 values in 0.30 ms for one token and 0.44 ms for four. Hosts with other ratios of CPU
+speed to bus speed have not been measured.
 
 ### MTP
 

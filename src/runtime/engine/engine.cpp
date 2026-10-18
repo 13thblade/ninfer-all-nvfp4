@@ -315,6 +315,7 @@ public:
             return;
         }
         if (options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
+            options.hybrid_experts.dma_share_auto ||
             options.hybrid_experts.cpu_threads != 0 || options.hybrid_experts.mapped_misses ||
             options.hybrid_experts.tail_skip_rank != 0 ||
             options.hybrid_experts.prefill_buffers != 1 || options.hybrid_experts.adaptive_cache ||
