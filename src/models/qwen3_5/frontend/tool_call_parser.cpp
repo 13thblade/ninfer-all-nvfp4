@@ -132,6 +132,8 @@ std::string_view unquote(std::string_view text) {
         text.back() == text.front()) {
         return trim_format_whitespace(text.substr(1, text.size() - 2));
     }
+    // A lone leading quote is an unterminated value, which callers reject as an empty name.
+    if (!text.empty() && (text.front() == '"' || text.front() == '\'')) { return {}; }
     return text;
 }
 
@@ -155,9 +157,10 @@ std::string_view tag_name(std::string_view header) {
         std::string_view value;
         if (pos < header.size() && (header[pos] == '"' || header[pos] == '\'')) {
             const std::size_t close = header.find(header[pos], pos + 1);
-            const std::size_t end   = close == std::string_view::npos ? header.size() : close;
-            value                   = header.substr(pos + 1, end - pos - 1);
-            pos                     = end == header.size() ? end : end + 1;
+            // An unterminated quoted value is malformed, not a name that runs to the `>`.
+            if (close == std::string_view::npos) { return {}; }
+            value = header.substr(pos + 1, close - pos - 1);
+            pos   = close + 1;
         } else {
             const std::size_t value_begin = pos;
             while (pos < header.size() && !is_format_whitespace(header[pos]) &&
@@ -912,6 +915,58 @@ void recover_tool_calls(std::string_view region, std::size_t max_name_length,
 
 } // namespace
 
+void MarkdownCodeTracker::feed(std::string_view text) {
+    for (const char byte : text) {
+        if (byte == '\n') {
+            end_line();
+        } else {
+            line_.push_back(byte);
+        }
+    }
+}
+
+void MarkdownCodeTracker::end_line() {
+    std::string_view line(line_);
+    const std::size_t first = line.find_first_not_of(" \t\r\f\v");
+    line = first == std::string_view::npos ? std::string_view{} : line.substr(first);
+    // Length of the leading run of `fence` characters.
+    const auto run_length = [](std::string_view text, char fence) {
+        const std::size_t end = text.find_first_not_of(fence);
+        return end == std::string_view::npos ? text.size() : end;
+    };
+    if (fence_ != '\0') {
+        // A closing fence is a run of the opener's character at least as long as the opener's,
+        // followed only by whitespace, so a content line such as `~~~shell` or a shorter `~~~`
+        // inside a `~~~~` block stays inside the block.
+        const std::size_t run = run_length(line, fence_);
+        if (run >= fence_len_ &&
+            line.find_first_not_of(" \t\r\f\v", run) == std::string_view::npos) {
+            fence_ = '\0';
+        }
+    } else if (!line.empty() && (line[0] == '`' || line[0] == '~') &&
+               run_length(line, line[0]) >= 3 &&
+               line.substr(run_length(line, line[0])).find(std::string(3, line[0])) ==
+                   std::string_view::npos) {
+        // A fence opener whose info string does not close it on the same line (that is inline
+        // code). The fence ends the paragraph, so a backtick left unmatched before it opens
+        // nothing after it.
+        fence_     = line[0];
+        fence_len_ = static_cast<std::uint32_t>(run_length(line, line[0]));
+        ticks_     = 0;
+    } else if (line.empty()) {
+        ticks_ = 0; // a blank line ends the paragraph and any inline code left open in it
+    } else {
+        ticks_ += static_cast<std::uint32_t>(std::count(line_.begin(), line_.end(), '`'));
+    }
+    line_.clear();
+}
+
+bool MarkdownCodeTracker::in_code() const noexcept {
+    return fence_ != '\0' ||
+           (ticks_ + static_cast<std::uint32_t>(std::count(line_.begin(), line_.end(), '`'))) % 2 ==
+               1;
+}
+
 std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled,
                                 std::string_view forced_tool_name) {
@@ -1077,8 +1132,22 @@ std::string tool_call_text_format(const ToolCallOutputContract& contract) {
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length,
-                                                 const ToolCallOutputContract& contract) {
-    std::size_t candidate = find_tool_marker(text, 0);
+                                                 const ToolCallOutputContract& contract,
+                                                 MarkdownCodeTracker code) {
+    // A marker inside Markdown code is a quoted example, never a call. Candidates only move
+    // forward, so the tracker reads each byte once.
+    std::size_t tracked    = 0;
+    const auto next_marker = [&](std::size_t from) {
+        std::size_t found = find_tool_marker(text, from);
+        while (found != std::string::npos) {
+            code.feed(std::string_view(text).substr(tracked, found - tracked));
+            tracked = found;
+            if (!code.in_code()) { break; }
+            found = find_tool_marker(text, found + 1);
+        }
+        return found;
+    };
+    std::size_t candidate = next_marker(0);
     if (candidate == std::string::npos) { return fallback(text); }
 
     ParsedToolCallOutput out;
@@ -1113,7 +1182,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
             // it goes to recovery rather than yielding to a later marker.
             if (!calls.empty()) { break; }
         }
-        candidate = find_tool_marker(text, candidate + 1);
+        candidate = next_marker(candidate + 1);
     }
     if (accepted == std::string::npos) {
         // No marker opens a region that parses: recover what the first one's region holds.
@@ -1162,11 +1231,28 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
     }
 
     std::string visible;
+    // Every published byte also feeds the code tracker; held whitespace joins it when published,
+    // so the tracker always describes the text before the held bytes.
+    const auto publish = [&](std::string_view bytes) {
+        visible.append(bytes);
+        code_.feed(bytes);
+    };
     for (std::size_t index = 0; index < text.size(); ++index) {
         const char byte = text[index];
         if (!pending_marker_.empty()) {
             pending_marker_.push_back(byte);
             if (opens_marker(pending_marker_)) {
+                MarkdownCodeTracker before_marker = code_;
+                before_marker.feed(trailing_whitespace_);
+                if (before_marker.in_code()) {
+                    // A quoted example inside Markdown code: the marker is text.
+                    publish(trailing_whitespace_);
+                    trailing_whitespace_.clear();
+                    publish(pending_marker_);
+                    pending_marker_.clear();
+                    continue;
+                }
+                region_code_ = code_;
                 tool_region_ = std::move(trailing_whitespace_);
                 trailing_whitespace_.clear();
                 tool_region_.append(pending_marker_);
@@ -1178,9 +1264,9 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
             if (could_open_marker(pending_marker_)) { continue; }
             // The byte that ended the candidate can start the next one, so it is read again.
             pending_marker_.pop_back();
-            visible.append(trailing_whitespace_);
+            publish(trailing_whitespace_);
             trailing_whitespace_.clear();
-            visible.append(pending_marker_);
+            publish(pending_marker_);
             pending_marker_.clear();
         }
 
@@ -1189,9 +1275,9 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
         } else if (is_format_whitespace(byte)) {
             trailing_whitespace_.push_back(byte);
         } else {
-            visible.append(trailing_whitespace_);
+            publish(trailing_whitespace_);
             trailing_whitespace_.clear();
-            visible.push_back(byte);
+            publish(std::string_view(&byte, 1));
         }
     }
     return visible;
@@ -1203,7 +1289,7 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
     if (!contract_) { return {}; }
 
     ParsedToolCallOutput parsed =
-        parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_);
+        parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_, region_code_);
     if (forced_ && parsed.diagnostics.fallback_reason != FallbackReason::None) {
         // A turn that ends after the function closed is a complete call missing only its outer
         // tag. Supplying that tag invents no argument byte; anything less complete keeps what

@@ -924,10 +924,11 @@ int test_quoted_marker_recovery_keeps_the_whole_turn() {
                       ninfer::ToolCallParseFallbackReason::TrailingContent,
               "a later call was recovered after a complete first call");
 
-    // Every candidate fails: the first marker's reason is the one reported.
-    failures += check_reported(prose + "\nthen <tool_call> again", contract,
-                               ninfer::ToolCallParseFallbackReason::UndeclaredTool, "NAME",
-                               "failed recovery lost the primary reason");
+    // Every candidate fails: the first marker's reason is the one reported. (A marker inside
+    // Markdown code is no candidate at all, so this prose quotes the opener without backticks.)
+    failures += check_reported("Avoid <tool_call>\n<function=NAME> here.\nthen <tool_call> again",
+                               contract, ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                               "NAME", "failed recovery lost the primary reason");
 
     // Streamed in uneven chunks, including a split inside the quoted marker.
     for (const std::size_t chunk : {std::size_t{1}, std::size_t{3}, std::size_t{7}}) {
@@ -949,7 +950,8 @@ int test_marker_attempts_are_bounded() {
     const std::string call  = tool_call("bash", {{"command", "echo ok"}});
     const auto quoted_times = [](int count) {
         std::string prose;
-        for (int index = 0; index < count; ++index) { prose += "quote `<tool_call>` here. "; }
+        // Outside Markdown code, so every quote is a candidate marker.
+        for (int index = 0; index < count; ++index) { prose += "quote <tool_call> here. "; }
         return prose;
     };
 
@@ -1229,6 +1231,112 @@ int test_attribute_token_boundary() {
         failures += check(args.at("description") == "Create task",
                           "parameter attribute token boundary failed");
     }
+    return failures;
+}
+
+// A quoted name attribute without its closing quote is malformed rather than a name that runs to
+// the `>`: an unterminated function name leaves the markup as text, an unterminated parameter name
+// makes the call one the model is told to retry.
+int test_unterminated_quoted_names() {
+    const auto contract =
+        contract_for("TaskCreate", Json{{"description", Json{{"type", "string"}}}});
+    int failures = 0;
+    failures += check_rejected(
+        "<tool_call>\n<function name=\"TaskCreate>\n<parameter name=\"description\">\n"
+        "Value\n</parameter>\n</function>\n</tool_call>",
+        contract, ninfer::ToolCallParseFallbackReason::InvalidToolName,
+        "an unterminated quoted function name was accepted");
+    failures += check_reported(
+        "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description>\n"
+        "Value\n</parameter>\n</function>\n</tool_call>",
+        contract, ninfer::ToolCallParseFallbackReason::MalformedStructure, "TaskCreate",
+        "an unterminated quoted parameter name was accepted");
+    return failures;
+}
+
+// A call opener inside a Markdown code fence or inline code of the answer is a quoted example:
+// it stays text, with no byte lost, while calls at the top level still fire. Only the text before
+// an opener decides, so every streamed chunking agrees with the whole output.
+int test_markdown_quoted_calls() {
+    const std::vector<std::string> definitions = {
+        tool_definition("write", Json{{"path", Json{{"type", "string"}}}})};
+    const auto contract    = contract_from_definitions(definitions);
+    const std::string call = tool_call("write", {{"path", "/tmp/a.txt"}});
+    const std::string args = R"({"path":"/tmp/a.txt"})";
+    // (arguments of every call, content) of one output.
+    using Outcome      = std::pair<std::vector<std::string>, std::string>;
+    int failures       = 0;
+    const auto outcome = [&](const std::string& text) {
+        const auto whole = fi::parse_qwen_tool_call_output(text, 64, *contract);
+        Outcome reference({}, whole.content);
+        for (const auto& parsed_call : whole.tool_calls) {
+            reference.first.push_back(parsed_call.arguments_json);
+        }
+        for (const std::size_t width :
+             {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{5}, std::size_t{7},
+              std::size_t{64}, text.size()}) {
+            fi::ToolCallOutputDecoder decoder(contract, 64);
+            Outcome streamed;
+            for (std::size_t at = 0; at < text.size(); at += width) {
+                streamed.second += decoder.feed(std::string_view(text).substr(at, width));
+            }
+            auto terminal = decoder.finish();
+            streamed.second += terminal.content;
+            for (const auto& parsed_call : terminal.tool_calls) {
+                streamed.first.push_back(parsed_call.arguments_json);
+            }
+            if (streamed != reference) {
+                failures += fail("a streamed chunking of width " + std::to_string(width) +
+                                 " disagrees with the whole output: " + text.substr(0, 40));
+            }
+        }
+        return reference;
+    };
+    const std::vector<std::string> quoted{
+        "Format:\n```xml\n" + call + "\n```\nDone.", "Format:\n~~~\n" + call + "\n~~~\nDone.",
+        "Use `" + call + "` like this.", "Use `x`, then `\n" + call + "`", "```\n" + call,
+        "Text\n\n```python\nx = 1\n```\n```\n" + call,
+        // A line that starts with the fence character but carries info text does not close it.
+        "~~~\n~~~shell\n" + call, "```\n```cpp\n" + call, "~~~\n~~~~x\n" + call,
+        // A closing fence must be at least as long as the opener, and a long run still opens one.
+        "~~~~\nx\n~~~\n" + call, "``````\nx\n```\n" + call, "``````\n" + call};
+    // (output, content before the call)
+    const std::vector<std::pair<std::string, std::string>> real{
+        {call, ""},
+        {"Let me do it.\n\n" + call, "Let me do it."},
+        {"Let me do it. " + call, "Let me do it."},
+        {"```\ncode\n```\n" + call, "```\ncode\n```"},
+        {"`a` and `b` " + call, "`a` and `b`"},
+        {"~~~\nx\n~~~\n\n" + call, "~~~\nx\n~~~"},
+        // A closing fence may be longer than the opener's three and carry trailing whitespace.
+        {"~~~\nx\n~~~~  \n" + call, "~~~\nx\n~~~~"},
+        // A fence ends the paragraph, so a backtick left unmatched before it opens no inline code
+        // after the fence closes.
+        {"Use a ` here\n```\ncode\n```\n" + call, "Use a ` here\n```\ncode\n```"}};
+    for (const std::string& body : quoted) {
+        failures += check(outcome(body) == Outcome({}, body),
+                          "a call quoted in Markdown code became a call or lost bytes: " +
+                              body.substr(0, 30));
+    }
+    for (const auto& [body, content] : real) {
+        failures += check(outcome(body) == Outcome({args}, content),
+                          "a top-level call after closed Markdown code did not fire exactly: " +
+                              body.substr(0, 30));
+    }
+    failures += check(outcome(call + "\n" + call) == Outcome({args, args}, ""),
+                      "two top-level calls did not both fire");
+    {
+        // A quoted example streams as it arrives instead of waiting for the end of the turn.
+        const std::string body = "Format:\n```xml\n" + call + "\n```\nDone.";
+        fi::ToolCallOutputDecoder decoder(contract, 64);
+        failures += check(decoder.feed(body) == body,
+                          "a call quoted in Markdown code was held instead of streamed");
+        (void)decoder.finish();
+    }
+    // A quoted example before the real call stays text; the call still fires.
+    const std::string example = "Example:\n```\n" + call + "\n```\nNow for real.";
+    failures += check(outcome(example + "\n\n" + call) == Outcome({args}, example),
+                      "a quoted example before a real call was not kept as text");
     return failures;
 }
 
@@ -1618,6 +1726,8 @@ int main() {
     failures += test_claude_code_xml_markup_variants();
     failures += test_duplicate_parameters_keep_last_value();
     failures += test_attribute_token_boundary();
+    failures += test_unterminated_quoted_names();
+    failures += test_markdown_quoted_calls();
     failures += test_mismatched_closing_tags_reported();
     failures += test_harness_forms_recovery_and_streaming();
     failures += test_claude_code_plan_and_task_create_exact_repro();

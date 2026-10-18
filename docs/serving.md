@@ -951,6 +951,14 @@ value text, while `<` or the end of the output, after optional whitespace, makes
 value. A value therefore cannot contain a closing parameter tag followed by markup, nor an unmatched
 nested parameter opener; either makes the call malformed.
 
+A marker inside Markdown code is a quoted example and stays text: inside a fenced block (a run of
+three or more backticks or tildes, closed by a run of the same character at least as long on a line
+of its own) or inside inline code (an odd number of backticks earlier in the same paragraph; a
+blank line or a fence ends the paragraph). Only the text before the marker decides, so streamed and
+complete responses agree, and quoted examples stream as they arrive. A marker after a closed fence
+still opens a call. Strict tools' grammar completes a call the model opens inside code, and that
+call is still returned as text.
+
 Generated prose can quote tool-call markup before the real call. Unless the first marker's region
 opens with a complete call, each marker is tried in order, and the first complete region that
 consumes the rest of the response becomes the structured turn; quoted markup before it stays
