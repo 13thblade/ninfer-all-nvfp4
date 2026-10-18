@@ -928,16 +928,16 @@ struct Executor::Impl {
                                              stream);
         auto* gu = static_cast<float*>(
             workspace->alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
-        gguf::moe_matrix_product(p.gate_up_type, gate_up, routing, max_active, pairs, t, true, act,
-                                 gu, stream);
+        gguf::moe_matrix_product(p.gate_up_type, gate_up, routing, max_active, pairs, true, act, gu,
+                                 stream);
         kernels::geglu_rows(gu, pairs, width, middle, stream);
         void* act2 = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(width, pairs)).data;
         gguf::quantize_moe_matrix_activation(p.down_type, middle, width, routing, pairs, 1, act2,
                                              stream);
         auto* rows = static_cast<float*>(
             workspace->alloc_bytes(std::size_t(pairs) * hidden * 4).data);
-        gguf::moe_matrix_product(p.down_type, down, routing, max_active, pairs, t, true, act2,
-                                 rows, stream);
+        gguf::moe_matrix_product(p.down_type, down, routing, max_active, pairs, true, act2, rows,
+                                 stream);
         combine.moe_rows    = rows;
         combine.moe_weights = weights;
         combine.top_k       = k;

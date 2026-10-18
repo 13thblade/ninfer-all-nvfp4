@@ -474,9 +474,12 @@ draft-chain graph and each width its own verification graph, captured at their s
   pass over each selected expert's rows for all of its tokens, through device tables of expert
   base pointers: an expert is read wherever the table points, in device memory, a cache slot or the
   pinned host block. Up to eight tokens run vector products; wider calls run ggml's integer
-  tensor-core matrix kernel over the routed pairs from device memory. That kernel reads a 640-value
-  down row in 256-value steps, so it decodes the bytes after a down matrix as the down's blocks:
-  in a bank they are the next expert's down or zeros after the last one, and every cache or stream
+  tensor-core matrix kernel over the routed pairs from device memory, one CTA per row tile and per
+  column tile that holds pairs (the sort that groups the pairs lists those tiles for each tile
+  width), rather than one per expert and possible column tile (on an RTX 3090 with IQ3_S host
+  experts, a 31,865-token prompt prefilled at 1.71k instead of 1.61k tokens/s). That kernel reads
+  a 640-value down row in 256-value steps, so it decodes the bytes after a down matrix as the
+  down's blocks: in a bank they are the next expert's down or zeros after the last one, and every cache or stream
   slot keeps zeros after its down, which a smaller down from another layer does not uncover (another
   format's bytes there can hold a non-finite scale, and NaN follows). With host experts, a wide call
   first copies the routed experts the cache does not hold into a device pool on each GPU (0.7 GB for

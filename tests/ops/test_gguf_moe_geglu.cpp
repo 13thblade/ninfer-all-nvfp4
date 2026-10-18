@@ -228,8 +228,8 @@ int run(int tokens, const Bank& gate_up, const Bank& down, std::mt19937& rng,
                                              static_cast<const __nv_bfloat16*>(d_x.p), kHidden,
                                              routing, pairs, kTopK, act.p, nullptr);
         DeviceBuffer d_gu(std::size_t(pairs) * 2 * kWidth * 4);
-        gguf::moe_matrix_product(gguf::GgmlType::Q4_0, t_gu, routing, max_active, pairs, tokens,
-                                 true, act.p, static_cast<float*>(d_gu.p), nullptr);
+        gguf::moe_matrix_product(gguf::GgmlType::Q4_0, t_gu, routing, max_active, pairs, true,
+                                 act.p, static_cast<float*>(d_gu.p), nullptr);
         check(cudaDeviceSynchronize(), "matrix gate_up");
         std::vector<float> gu(std::size_t(pairs) * 2 * kWidth);
         d_gu.copy_to_host(gu.data(), gu.size() * 4);
@@ -247,8 +247,8 @@ int run(int tokens, const Bank& gate_up, const Bank& down, std::mt19937& rng,
                                              static_cast<const __nv_bfloat16*>(d_middle.p), kWidth,
                                              routing, pairs, 1, act2.p, nullptr);
         DeviceBuffer d_rows(got_rows.size() * 4);
-        gguf::moe_matrix_product(gguf::GgmlType::Q4_0, t_down, routing, max_active, pairs, tokens,
-                                 true, act2.p, static_cast<float*>(d_rows.p), nullptr);
+        gguf::moe_matrix_product(gguf::GgmlType::Q4_0, t_down, routing, max_active, pairs, true,
+                                 act2.p, static_cast<float*>(d_rows.p), nullptr);
         check(cudaDeviceSynchronize(), "matrix down");
         d_rows.copy_to_host(got_rows.data(), got_rows.size() * 4);
         for (int t = 0; t < tokens; ++t) {
