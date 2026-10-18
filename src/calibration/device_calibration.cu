@@ -958,8 +958,17 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
         DeviceBuffer prompt_q   = bf16_buffer(static_cast<std::size_t>(head_dim) * q_heads * max_chunk);
         DeviceBuffer prompt_out = bf16_buffer(static_cast<std::size_t>(head_dim) * q_heads * max_chunk);
         DeviceBuffer prompt_positions(max_chunk * sizeof(std::int32_t));
-        const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-            geometry, storage, {1, static_cast<std::uint32_t>(max_window)}, 1, 1, max_chunk);
+        // The fast kernel's key splits take workspace; size it for the fast kernel too, which the
+        // "attn_prompt_fast" sweep below may select.
+        const auto prompt_capacity = [&] {
+            return ops::causal_softmax_attention_workspace_capacity_bytes(
+                geometry, storage, {1, static_cast<std::uint32_t>(max_window)}, 1, 1, max_chunk);
+        };
+        std::size_t workspace_bytes = prompt_capacity();
+        {
+            const ops::DeviceRouteForce fast_prompt("attn_prompt_fast", "on");
+            workspace_bytes = std::max(workspace_bytes, prompt_capacity());
+        }
         WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
         const auto run = [&](std::int32_t tokens, std::int32_t depth, cudaStream_t stream) {
             std::vector<std::int32_t> host(static_cast<std::size_t>(tokens));
@@ -1031,6 +1040,53 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
             auto fast_bands = sweep(fast, timer, options);
             if (!fast_bands.empty()) {
                 profile.routes[fast.key] = std::move(fast_bands);
+                ops::install_device_route_profile(
+                    std::make_shared<const ops::DeviceRouteProfile>(profile));
+            }
+        }
+        // Key splits of the fast prompt kernel (prompt_i8_fast_plan.h) against unsplit launches,
+        // where the fast kernel now serves prompts: a 256-token continuation at 32K and 131K of
+        // context, where few row blocks leave SMs idle, and a wave-aligned chunk at 131K. The
+        // split partials need their own workspace, sized with the fast kernel selected.
+        if (ops::detail::causal_attention_prompt_fast_kernel(storage, false)) {
+            constexpr std::int32_t kContinuation = 256;
+            const ops::CausalAttentionExecutionEnvelope split_envelope{
+                1, static_cast<std::uint32_t>(max_window)};
+            WorkspaceArena split_workspace(std::max<std::size_t>(
+                ops::causal_softmax_attention_workspace_capacity_bytes(
+                    geometry, storage, split_envelope, 1, kContinuation, max_chunk),
+                256));
+            const auto attend = [&](std::int32_t tokens, std::int32_t depth, cudaStream_t stream) {
+                std::vector<std::int32_t> host(static_cast<std::size_t>(tokens));
+                for (std::int32_t token = 0; token < tokens; ++token) {
+                    host[static_cast<std::size_t>(token)] = depth - tokens + token;
+                }
+                CUDA_CHECK(cudaMemcpyAsync(prompt_positions.p, host.data(),
+                                           host.size() * sizeof(std::int32_t),
+                                           cudaMemcpyHostToDevice, stream));
+                Tensor qt(prompt_q.p, DType::BF16, {head_dim, q_heads, tokens});
+                Tensor ot(prompt_out.p, DType::BF16, {head_dim, q_heads, tokens});
+                Tensor pt(prompt_positions.p, DType::I32, {tokens});
+                auto scope = split_workspace.scope();
+                ops::causal_softmax_attention_cached(qt, pt, geometry, 0.0625f,
+                                                     cache_view(max_window), split_envelope,
+                                                     split_workspace, ot, stream);
+            };
+            const Family split{"attn_prompt_split",
+                               {1},
+                               [&](std::int32_t, cudaStream_t stream) {
+                                   attend(kContinuation, 32768, stream);
+                                   attend(kContinuation, 131072, stream);
+                                   attend(wave_chunk, 131072, stream);
+                               },
+                               [&](std::int32_t) {
+                                   return std::pair<const void*, std::size_t>{
+                                       prompt_out.p, static_cast<std::size_t>(head_dim) * q_heads};
+                               },
+                               {}};
+            auto split_bands = sweep(split, timer, options);
+            if (!split_bands.empty()) {
+                profile.routes[split.key] = std::move(split_bands);
                 ops::install_device_route_profile(
                     std::make_shared<const ops::DeviceRouteProfile>(profile));
             }

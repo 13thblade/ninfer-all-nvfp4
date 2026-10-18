@@ -29,6 +29,9 @@
 //   * Keys selects a packed key plane (rk4v4, rk4v4-e8, rk2v4-e8). Its codes for the next tile are
 //     loaded into registers where the INT8 path issues its copy and expanded into that stage's
 //     INT8 K tile after this tile's PV, so QK is unchanged.
+//   * A split launch (gridDim.z > 1, prompt_i8_fast_plan.h) gives each CTA a contiguous run of a
+//     row block's key pages and publishes, per row, the normalized FP32 row and its (max, sum)
+//     statistics; causal_attention_prompt_i8_fast_merge_kernel combines the splits.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -107,6 +110,14 @@ static_assert(CausalPromptI8FastShape<4>::Launchable &&
               CausalPromptI8FastShape<4, true, true>::Launchable &&
               CausalPromptI8FastShape<8, true, true>::Launchable);
 
+// Split partial layout for key split s, column c and query head h: the D256 row at
+// ((s * width + c) * QHeads + h) * 256 and its (max, sum) pair at that row index.
+template <typename Geometry>
+__host__ __device__ __forceinline__ std::int64_t
+causal_prompt_i8_fast_partial_row(int split, int column, int q_head, int width) {
+    return (static_cast<std::int64_t>(split) * width + column) * Geometry::QHeads + q_head;
+}
+
 __device__ __forceinline__ void causal_prompt_i8_fast_mma_f16_acc(unsigned& c0, unsigned& c1,
                                                                   unsigned a0, unsigned a1,
                                                                   unsigned a2, unsigned a3,
@@ -151,7 +162,7 @@ __device__ __forceinline__ void causal_prompt_i8_fast_decode_v_quad(unsigned cod
 }
 
 template <typename Geometry, typename Metadata, int Warps, bool PackedValues = false,
-          KvKeyCoding Keys = KvKeyCoding::Int8, bool TuringShapes = false>
+          KvKeyCoding Keys = KvKeyCoding::Int8, bool TuringShapes = false, bool Split = false>
 __global__ __launch_bounds__(
     CausalPromptI8FastShape<Warps, PackedValues, TuringShapes>::Threads,
     1) void causal_attention_prompt_i8_fast_kernel(const __nv_bfloat16* __restrict__ q,
@@ -162,7 +173,9 @@ __global__ __launch_bounds__(
                                                    Metadata metadata,
                                                    const std::int32_t* __restrict__ positions,
                                                    float scale, __nv_bfloat16* __restrict__ out,
-                                                   std::int32_t width) {
+                                                   std::int32_t width,
+                                                   float* __restrict__ partial_rows,
+                                                   float2* __restrict__ partial_stats) {
     if constexpr (!shape_set_in_image(TuringShapes)) { return; } // not this image's set
     // A Volta card runs its own prompt route (prompt_sm70.cu) or the standard kernel: a build of
     // several architectures compiles this kernel empty in the Volta image.
@@ -220,9 +233,12 @@ __global__ __launch_bounds__(
     };
 
     if (q0 >= tokens) {
-        for (int element = tid; element < Br * (D / 4); element += Threads) {
-            const int row = element / (D / 4);
-            store_row(row, (element - row * (D / 4)) * 4, 0.0f, 0.0f, 0.0f, 0.0f);
+        // The merge publishes a split launch's inactive columns.
+        if constexpr (!Split) {
+            for (int element = tid; element < Br * (D / 4); element += Threads) {
+                const int row = element / (D / 4);
+                store_row(row, (element - row * (D / 4)) * 4, 0.0f, 0.0f, 0.0f, 0.0f);
+            }
         }
         return;
     }
@@ -232,6 +248,12 @@ __global__ __launch_bounds__(
     const int rows                  = min(Br, tokens - q0);
     const int max_query_abs         = base_pos + q0 + rows - 1;
     const int key_blocks            = max_query_abs / Bc + 1;
+    // Key pages [kb_begin, kb_end) of this split; an empty run publishes neutral statistics.
+    const int split = Split ? static_cast<int>(blockIdx.z) : 0;
+    const int pages_per_split =
+        Split ? (key_blocks + static_cast<int>(gridDim.z) - 1) / static_cast<int>(gridDim.z) : 0;
+    const int kb_begin = Split ? min(key_blocks, split * pages_per_split) : 0;
+    const int kb_end   = Split ? min(key_blocks, kb_begin + pages_per_split) : key_blocks;
 
     // Each warp rotates and encodes its own 16 rows, keeping the two rows each lane owns in the
     // MMA C layout as register scales.
@@ -684,8 +706,8 @@ __global__ __launch_bounds__(
         // One stage: a tile is staged once every warp is done with the previous one, then
         // published.
 #pragma unroll 1
-        for (int kb = 0; kb < key_blocks; ++kb) {
-            if (kb > 0) { __syncthreads(); }
+        for (int kb = kb_begin; kb < kb_end; ++kb) {
+            if (kb > kb_begin) { __syncthreads(); }
             issue_tile(kb);
             commit_keys(kb);
             cp_wait<0>();
@@ -696,16 +718,18 @@ __global__ __launch_bounds__(
     } else {
         // Every warp publishes one tile per barrier; the next tile's copy overlaps this tile's
         // math.
-        issue_tile(0);
-        commit_keys(0);
+        if (kb_begin < kb_end) {
+            issue_tile(kb_begin);
+            commit_keys(kb_begin);
+        }
 #pragma unroll 1
-        for (int kb = 0; kb < key_blocks; ++kb) {
+        for (int kb = kb_begin; kb < kb_end; ++kb) {
             cp_wait<0>();
             __syncthreads();
-            if (kb + 1 < key_blocks) { issue_tile(kb + 1); }
+            if (kb + 1 < kb_end) { issue_tile(kb + 1); }
             qk_softmax(kb);
             pv(kb);
-            if (kb + 1 < key_blocks) { commit_keys(kb + 1); }
+            if (kb + 1 < kb_end) { commit_keys(kb + 1); }
         }
     }
 
@@ -713,7 +737,39 @@ __global__ __launch_bounds__(
     running_l1         = warp_sum<4>(running_l1, FullMask);
     const float inv_l0 = running_l0 > 0.0f ? __frcp_rn(running_l0) : 0.0f;
     const float inv_l1 = running_l1 > 0.0f ? __frcp_rn(running_l1) : 0.0f;
-    if constexpr (PackedValues) {
+    if constexpr (Split) {
+        // Each split publishes its rows normalized by its own sum, beside (max, sum).
+        const auto publish = [&](int row, float maximum, float sum, float inverse, int e0) {
+            if (row >= rows) { return; }
+            const std::int64_t index =
+                causal_prompt_i8_fast_partial_row<Geometry>(split, q0 + row, q_head, width);
+            if (lid == 0) { partial_stats[index] = make_float2(maximum, sum); }
+            float* target = partial_rows + index * D;
+            if constexpr (PackedValues) {
+#    pragma unroll
+                for (int grp = 0; grp < AccOuter; ++grp) {
+                    const int d0 = grp * 32 + 8 * lid;
+                    store_vec(target + d0,
+                              make_float4(acc[grp][0][e0] * inverse, acc[grp][1][e0] * inverse,
+                                          acc[grp][2][e0] * inverse, acc[grp][3][e0] * inverse));
+                    store_vec(target + d0 + 4, make_float4(acc[grp][0][e0 + 1] * inverse,
+                                                           acc[grp][1][e0 + 1] * inverse,
+                                                           acc[grp][2][e0 + 1] * inverse,
+                                                           acc[grp][3][e0 + 1] * inverse));
+                }
+            } else {
+#    pragma unroll
+                for (int b = 0; b < DBlocks; ++b) {
+                    store_vec(target + b * 16 + 4 * lid,
+                              make_float4(acc[b][0][e0] * inverse, acc[b][1][e0] * inverse,
+                                          acc[b][0][e0 + 1] * inverse,
+                                          acc[b][1][e0 + 1] * inverse));
+                }
+            }
+        };
+        publish(row0, running_m0, running_l0, inv_l0, 0);
+        publish(row1, running_m1, running_l1, inv_l1, 2);
+    } else if constexpr (PackedValues) {
         // Tile r of group g holds dimensions 32g + 4n + r, so lane (g, t) owns the eight
         // contiguous dimensions 32g + 8t .. 32g + 8t + 7 of its two rows: columns 2t (first four)
         // and 2t + 1 (last four) of the four tiles.
@@ -742,6 +798,45 @@ __global__ __launch_bounds__(
         }
     }
 #endif
+}
+
+// Combines the key splits of one column and query head: every split row is normalized by its own
+// sum, so the merged row is sum_s w_s * row_s / sum_s w_s with w_s = sum_s * 2^((m_s - M) * c).
+// Columns past the valid count publish zeros.
+template <typename Geometry>
+__global__
+__launch_bounds__(kCausalPromptHeadDim) void causal_attention_prompt_i8_fast_merge_kernel(
+    const float* __restrict__ partial_rows, const float2* __restrict__ partial_stats,
+    const std::int32_t* __restrict__ valid_columns, std::int32_t width, std::int32_t splits,
+    float scale_l2, __nv_bfloat16* __restrict__ out) {
+    const int column = static_cast<int>(blockIdx.x);
+    const int q_head = static_cast<int>(blockIdx.y);
+    const int d      = static_cast<int>(threadIdx.x);
+    const int tokens = valid_columns == nullptr ? width : max(0, min(width, valid_columns[0]));
+    const auto index = causal_prompt_q_index<Geometry>(q_head, d, column);
+    if (column >= tokens) {
+        out[index] = __float2bfloat16(0.0f);
+        return;
+    }
+    float maximum = -CUDART_INF_F;
+    for (int split = 0; split < splits; ++split) {
+        const float2 stats = partial_stats[causal_prompt_i8_fast_partial_row<Geometry>(
+            split, column, q_head, width)];
+        if (stats.y > 0.0f) { maximum = fmaxf(maximum, stats.x); }
+    }
+    float numerator   = 0.0f;
+    float denominator = 0.0f;
+    for (int split = 0; split < splits; ++split) {
+        const std::int64_t row =
+            causal_prompt_i8_fast_partial_row<Geometry>(split, column, q_head, width);
+        const float2 stats = partial_stats[row];
+        if (stats.y > 0.0f) {
+            const float weight = stats.y * exp2f((stats.x - maximum) * scale_l2);
+            numerator = __fmaf_rn(weight, partial_rows[row * kCausalPromptHeadDim + d], numerator);
+            denominator += weight;
+        }
+    }
+    out[index] = __float2bfloat16(denominator > 0.0f ? numerator / denominator : 0.0f);
 }
 
 } // namespace ninfer::ops

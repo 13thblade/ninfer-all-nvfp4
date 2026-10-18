@@ -4520,6 +4520,32 @@ int run_softmax_attention_int8_prompt_tests() {
     return failures ? 1 : 0;
 }
 
+// The fast INT8-family prompt kernel with every launch of more than 64 columns split over three
+// CTAs per row block (main sets NINFER_PROMPT_SPLITS=3 before the first launch), against the FP64
+// oracle: the INT8 prompt cases, rk8v4 and rk4v4 over partial and full row blocks, launches whose
+// early row blocks see fewer key pages than splits (their late splits own no visible key), an
+// envelope far past the populated keys, and masked columns through the batched entry.
+int run_softmax_attention_prompt_split_tests() {
+    if (cuda_unavailable()) return 77;
+    int failures    = run_int8_prompt_cases(true);
+    const auto fast = [](AttentionCase test_case) {
+        test_case.fast_prompt_kernel = true;
+        return test_case;
+    };
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(geometry, kPlanRk8v4, fast({300, 2000, 2300, 931u}),
+                                MappingPattern::Fragmented);
+        failures +=
+            run_a3_case(geometry, kPlanRk8v4, fast({129, 0, 129, 932u}), MappingPattern::Identity);
+        failures += run_a3_case(geometry, kPlanRk4v4, fast({257, 3000, 3257, 933u}),
+                                MappingPattern::Offset);
+        failures += run_a1_case(geometry, kPlanInt8, fast({200, 100, 8192, 934u}),
+                                MappingPattern::Identity);
+    }
+    std::cout << (failures ? "FAIL" : "PASS") << " split-key prompt causal attention\n";
+    return failures ? 1 : 0;
+}
+
 int run_softmax_attention_fp8_prompt_tests() {
     if (cuda_unavailable()) return 77;
     // Multiple 16- and 32-key tiles of the build's Bc (16 on Turing, 32 elsewhere).

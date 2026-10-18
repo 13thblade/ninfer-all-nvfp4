@@ -101,6 +101,8 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
             add("attn_pack_gqa", {"on"});
             add("attn_prompt_fast", {"on"});
         }
+        // Key splits of the fast prompt kernel, measured on rk8v4 where it serves prompts.
+        add("attn_prompt_split", {"off"});
         // Parallel query tiles for single-row chunked small-T widths, measured on rk8v4.
         add("attn_parallel_tiles", {"on"});
 

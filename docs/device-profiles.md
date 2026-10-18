@@ -106,6 +106,7 @@ survives a second interleaved measurement, and its output matches the compiled r
 | `attn_pv_f16` | FP16 accumulation of the probability-times-value product per key tile | a 1024-token prompt chunk at 32K and a decode step at 131K |
 | `attn_pack_gqa` | the standard INT8 prompt kernel with each KV head's query heads packed into its tiles (PackGQA) | a 1024-token prompt chunk at 32K and 131K |
 | `attn_prompt_fast` | the fast prompt-attention kernel (rows kept in registers, FP16 PV per tile) | a wave-aligned prompt chunk at 32K and 131K |
+| `attn_prompt_split` | whether the fast INT8-family prompt kernel may split a launch's keys over several CTAs per row block and merge their partial rows (`off`), for calls of more than 64 columns whose row blocks alone would leave SMs idle; the split count comes from a cost model over the SM count | a 256-token continuation at 32K and 131K and a wave-aligned chunk at 131K, where the fast kernel serves prompts |
 | `attn_parallel_tiles` | single-row chunked small-T attention over an INT8-family cache as parallel query tiles (one batched append, one split-KV launch over every tile, one reduce) instead of serial fused chunks; widths without an exact 2-8 column tile divisor stay serial; `NINFER_ATTN_PARALLEL_TILES=0\|1` overrides | 16 and 32 verify columns at 32K and 131K |
 | `q4_linear_add/5120x<k>` | the small-T Q4 residual projections (`small_t_c8`, `small_t_c16`, `small_t_c32`) for the attention or GDN output (k = 6144) and the MLP down (k = 17408) of a Q4-output artifact | widths 1 to 32 |
 | `q6_head/248320x5120` | the Q6 vocabulary head's per-row GEMV (`gemv`, widths 1 and 2) or small-T MMA (`small_t`, widths up to 32) | widths 1 to 32 |
@@ -116,7 +117,8 @@ survives a second interleaved measurement, and its output matches the compiled r
 | `gdn_two_stage/h<value heads>` | the two-stage GDN prefill (fused Q/K normalization and control preparation, then one FP32-state recurrence that also writes the output) instead of the WY/state-passing/output pipeline | prompts of 16 to 8192 tokens, 48 and 32 value heads |
 
 `NINFER_SMALLT_PV_F16`, `NINFER_PROMPT_PV_F16`, `NINFER_PROMPT_PACK_GQA`, `NINFER_PROMPT_FAST` and
-`NINFER_GDN_TWO_STAGE` (`0` or `1`) override the profile for their route; `NINFER_LINEAR_ROUTES`
+`NINFER_GDN_TWO_STAGE` (`0` or `1`) override the profile for their route; `NINFER_PROMPT_SPLITS=0`
+turns the prompt key splits off and `N` forces N splits wherever a call may split; `NINFER_LINEAR_ROUTES`
 (`legacy` or `unified`) takes one table for every Linear shape and every `unified/*` switch. `--fast-prefill-kernel` turns the fast prompt kernel on regardless.
 
 ## Batch composition

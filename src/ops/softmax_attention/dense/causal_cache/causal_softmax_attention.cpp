@@ -6,6 +6,7 @@
 #include "core/layout.h"
 #include "core/device.h"
 #include "core/paged_kv_storage.h"
+#include "ops/common/device_multiprocessors.h"
 #include "ops/common/device_tier.h"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/kv_cache/d256_profile.h"
@@ -640,6 +641,23 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
             maximum = std::max(maximum, exact_capacity(width));
         }
     }
+    if (batch_size == 1 && kv_cache_is_int8_family(cache_storage) &&
+        detail::causal_attention_prompt_fast_kernel(cache_storage, envelope.fast_prompt_kernel)) {
+        // The fast INT8-family prompt kernel's split partials. Only widths past every
+        // graph-captured call split (prompt_i8_fast_plan.h), and those always take the prompt
+        // route, so each plans at the envelope's maximum, which bounds every launch inside it.
+        const detail::CausalPromptI8FastSplitPolicy policy =
+            detail::causal_attention_prompt_fast_split_policy();
+        const std::int32_t multiprocessors = detail::current_device_multiprocessors(170);
+        const bool wide                    = detail::causal_prompt_i8_fast_wide(cache_storage);
+        for (std::int32_t width = std::max(min_width, detail::kCausalPromptI8FastMinSplitWidth);
+             width <= max_width && policy.maximum > 1; ++width) {
+            const detail::CausalPromptI8FastPlan plan = detail::causal_prompt_i8_fast_plan(
+                q_heads, width, envelope.max_visible_keys, multiprocessors, wide, policy);
+            maximum = std::max(
+                maximum, detail::causal_prompt_i8_fast_split_bytes(q_heads, width, plan.splits));
+        }
+    }
     if (prompt_nvfp4_fast(cache_storage, envelope, batch_size)) {
         // The fast NVFP4 prompt kernel's split partials. A launch plans its split count from the
         // visible keys it passes, and fewer keys never select more splits, so each width reserves
@@ -760,7 +778,8 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     }
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                           cache, out, envelope.fast_prompt_kernel, stream);
+                                           cache, envelope.max_visible_keys, workspace, out,
+                                           envelope.fast_prompt_kernel, stream);
     if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
 }
 
@@ -800,7 +819,8 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         detail::causal_attention_prompt_sm70_launch(q, positions, scale, cache, out, stream);
         return;
     }
-    detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out,
+    detail::causal_attention_prompt_attention_launch(q, positions, scale, cache,
+                                                     envelope.max_visible_keys, workspace, out,
                                                      envelope.fast_prompt_kernel, stream);
 }
 
