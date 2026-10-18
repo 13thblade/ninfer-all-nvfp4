@@ -35,6 +35,8 @@ inline void check(cudaError_t status, const char* what) {
 // Column tiles instantiated for the matrix kernel. A product is launched with the smallest number of
 // column tiles these allow, which is where ggml's own selection lands for them as well.
 inline constexpr int kMatrixColumnTiles[] = {16, 32, 64, 128};
+// MoeRouting lists the matrix kernel's work for each of these widths.
+inline constexpr int kMoeTileWidths = 4;
 
 // The matrix kernel's activation carries one block_q8_1_mmq per 128 values per column; ggml over-reads
 // up to one widest column tile past the end, so the plane keeps that much slack.
@@ -48,8 +50,8 @@ bool moe_matrix_fits_impl(int rows, int k, bool tail);
 
 template <ggml_type type>
 void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes, int rows, int k,
-                             const MoeRouting& routing, int max_active, int pairs, int max_columns,
-                             bool tail, const void* activation, float* out, cudaStream_t stream);
+                             const MoeRouting& routing, int max_active, int pairs, bool tail,
+                             const void* activation, float* out, cudaStream_t stream);
 
 // Where and how the vector kernel (ggml_bridge_vec.cuh) writes its rows.
 struct VecStore {

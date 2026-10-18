@@ -181,9 +181,9 @@ void run_bank(const Tensor& routing_ids, std::int32_t pairs, std::int32_t expert
         }
         Tensor gate_plane = workspace.alloc(DType::FP32, {kWidth, pairs});
         Tensor up_plane   = workspace.alloc(DType::FP32, {kWidth, pairs});
-        gguf::moe_matrix_product(gate_type, gate_table, routing, active, pairs, tokens, true,
-                                 gate_x.data, static_cast<float*>(gate_plane.data), stream);
-        gguf::moe_matrix_product(up_type, up_table, routing, active, pairs, tokens, true, up_x.data,
+        gguf::moe_matrix_product(gate_type, gate_table, routing, active, pairs, true, gate_x.data,
+                                 static_cast<float*>(gate_plane.data), stream);
+        gguf::moe_matrix_product(up_type, up_table, routing, active, pairs, true, up_x.data,
                                  static_cast<float*>(up_plane.data), stream);
         const std::int64_t count = std::int64_t(kWidth) * pairs;
         swiglu_kernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(
@@ -214,7 +214,7 @@ void run_bank(const Tensor& routing_ids, std::int32_t pairs, std::int32_t expert
         Tensor down_plane = workspace.alloc(DType::FP32, {kHidden, pairs});
         auto* down_p      = static_cast<float*>(down_plane.data);
         gguf::moe_matrix_product(down_type, table(down, kHidden, kWidth), routing, active, pairs,
-                                 tokens, true, middle_x.data, down_p, stream);
+                                 true, middle_x.data, down_p, stream);
         const std::int64_t count = std::int64_t(kHidden) * tokens;
         accumulate_fixed_kernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(
             down_p, pair_weights, static_cast<const std::int32_t*>(routing_ids.data), per_token,
