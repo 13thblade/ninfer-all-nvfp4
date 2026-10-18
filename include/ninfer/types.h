@@ -776,8 +776,8 @@ enum class ReasoningLoopAction : std::uint8_t {
     Off,      // no check
     Stop,     // end the request there (FinishReason::OutputLimit)
     Conclude, // inject the thinking-close control (as a reached thinking budget does) and let the
-              // model answer; Stop when early close is unavailable or the remaining output budget
-              // cannot hold the control span and one more token
+              // model answer; Stop when early close is unavailable (always on Gemma 4) or the
+              // remaining output budget cannot hold the control span and one more token
 };
 
 struct ThinkingControlOptions {

@@ -501,9 +501,16 @@ public:
         return repeated_passage_coverage(words);
     }
 
+    // Whether the loop guard reads this point of the output: Qwen's thinking, opened by the prompt
+    // and tracked by the semantic state, or the thought channel a Gemma model opened itself.
+    [[nodiscard]] bool loop_reasoning(const DecoderState& decoder,
+                                      const SemanticThinkingState& thinking) const noexcept {
+        return gemma ? decoder.in_reasoning : thinking.in_reasoning;
+    }
+
     // Moves the committed round's words into the history (bounded); drops it once thinking ends.
     void commit_loop_words() {
-        if (!semantic.in_reasoning || semantic.loop == ReasoningLoopAction::Off ||
+        if (!loop_reasoning(state, semantic) || semantic.loop == ReasoningLoopAction::Off ||
             semantic.loop_detected) {
             loop_words.clear();
             loop_words.shrink_to_fit();
@@ -742,6 +749,12 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
             } else if (markers.markup(token)) {
                 bytes = decoded.bytes;
             }
+            SemanticThinkingState& thinking = impl_->preview_semantic;
+            if (thinking.loop != ReasoningLoopAction::Off && !thinking.loop_detected &&
+                decoder.in_reasoning && token != markers.channel_close) {
+                append_words(bytes, thinking.loop_partial, thinking.loop_round);
+                append_tail(bytes, thinking.loop_tail);
+            }
         }
         const std::uint64_t fed_before = impl_->preview_state.content_fed;
         feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
@@ -782,10 +795,13 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         impl_->preview_semantic.control_pending = true;
         return complete(count, FinishReason::None, runtime::ContinuationAction::ApplyTargetControl);
     }
-    // Reasoning-loop guard: once per kLoopCheckTokens thinking tokens, at the end of a round.
-    SemanticThinkingState& semantic     = impl_->preview_semantic;
-    const std::uint32_t thinking_tokens = semantic.model_thinking_tokens;
-    if (semantic.loop != ReasoningLoopAction::Off && semantic.in_reasoning && !semantic.applied &&
+    // Reasoning-loop guard: once per kLoopCheckTokens thinking tokens, at the end of a round. Gemma
+    // counts the tokens of its thought channel; it has no early-close control, so it stops.
+    SemanticThinkingState& semantic = impl_->preview_semantic;
+    const std::uint32_t thinking_tokens =
+        impl_->gemma ? impl_->preview_state.reasoning_tokens : semantic.model_thinking_tokens;
+    if (semantic.loop != ReasoningLoopAction::Off &&
+        impl_->loop_reasoning(impl_->preview_state, semantic) && !semantic.applied &&
         !semantic.loop_detected && thinking_tokens >= semantic.loop_next_check) {
         semantic.loop_next_check = (thinking_tokens / kLoopCheckTokens + 1U) * kLoopCheckTokens;
         // Strata reads a periodic tail as full coverage before its word measure.

@@ -3744,6 +3744,83 @@ int test_forced_tool_call(const Frontend& frontend) {
     return failures;
 }
 
+// Gemma 4's thought channel, which the model opens itself, feeds the reasoning-loop guard: a pass
+// rewritten over and over stops the reply at a check, Conclude stops as well (Gemma has no
+// early-close control), and varied thinking or Off never fires.
+int test_gemma_reasoning_loop_guard() {
+    const GemmaFixture fixture = gemma_fixture();
+    const Frontend frontend    = make_gemma_frontend(fixture);
+    const fi::Tokenizer tokenizer(fi::TokenizerResources{
+        fixture.tokenizer_json, fixture.tokenizer_config_json, fixture.generation_config});
+    constexpr ninfer::TokenId kChannelOpen = 40;
+    std::string varied;
+    unsigned state = 11;
+    for (int s = 0; s < 260; ++s) {
+        state = state * 1103515245U + 12345U;
+        varied += "step " + std::to_string(s) + " checks value " +
+                  std::to_string((state >> 8) % 9973) + " against bound " +
+                  std::to_string((state >> 4) % 811) + ". ";
+    }
+    std::string looping = varied;
+    for (int i = 0; i < 60; ++i) {
+        looping += "Wait, let me double-check the case where the list is empty. Then the function "
+                   "returns zero, which matches the expected output, so that case is fine. ";
+    }
+    const auto thought = [&](const std::string& text) {
+        std::vector<ninfer::TokenId> tokens{kChannelOpen};
+        const std::vector<int> body = tokenizer.encode("thought\n" + text);
+        tokens.insert(tokens.end(), body.begin(), body.end());
+        return tokens;
+    };
+    const auto run = [&](ninfer::ReasoningLoopAction action, const std::string& text) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        auto session = frontend.make_output_session(frontend.prepare(input), {}, {},
+                                                    ninfer::ThinkingControlOptions{.loop = action});
+        const std::vector<ninfer::TokenId> tokens = thought(text);
+        ninfer::runtime::OutputDecision last{};
+        std::string reasoning;
+        std::uint32_t budget = 1'000'000;
+        for (std::size_t at = 0; at < tokens.size() && !last.finished(); at += 200) {
+            const std::size_t n = std::min<std::size_t>(200, tokens.size() - at);
+            last = session.preview_model(std::span<const ninfer::TokenId>(tokens.data() + at, n),
+                                         budget, ninfer::FinishReason::OutputLimit);
+            reasoning += channel_text(session.commit_preview(), ninfer::OutputChannel::Reasoning);
+            budget -= last.accepted_tokens;
+        }
+        return std::tuple{last, session.thinking_stats(), reasoning,
+                          session.pending_control_tokens().empty()};
+    };
+
+    int failures = 0;
+    for (const auto action :
+         {ninfer::ReasoningLoopAction::Stop, ninfer::ReasoningLoopAction::Conclude}) {
+        const auto [decision, stats, reasoning, no_control] = run(action, looping);
+        failures += check(decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+                              stats.loop_detected && stats.loop_coverage >= 0.25F &&
+                              stats.loop_thinking_tokens >= 512 && !stats.applied && no_control &&
+                              reasoning.starts_with("step 0 checks value"),
+                          "a looping Gemma thought channel did not stop at a check");
+    }
+    {
+        const auto [decision, stats, reasoning, no_control] =
+            run(ninfer::ReasoningLoopAction::Stop, varied + varied);
+        failures += check(!decision.finished() && !stats.loop_detected,
+                          "the guard fired on a varied Gemma thought channel");
+    }
+    {
+        const auto [decision, stats, reasoning, no_control] =
+            run(ninfer::ReasoningLoopAction::Off, looping);
+        failures += check(!decision.finished() && !stats.loop_detected,
+                          "the guard fired on a Gemma thought channel while Off");
+    }
+    return failures;
+}
+
 // A forced tool choice on Gemma 4 opens the call in Gemma's own syntax: the generation prompt ends
 // with the <|tool_call> token and `call:NAME{`, the decoder starts inside that call, and the model's
 // continuation (arguments, then `}<tool_call|>`) becomes one structured call with JSON arguments.
@@ -3946,5 +4023,6 @@ int main() {
     failures += test_disabled_vision();
     failures += test_gemma_media_layout();
     failures += test_gemma_forced_tool_call();
+    failures += test_gemma_reasoning_loop_guard();
     return failures == 0 ? 0 : 1;
 }

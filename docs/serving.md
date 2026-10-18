@@ -1026,6 +1026,7 @@ Logs report the requested budget, and the effective budget when it differs. A re
 enforce its budget reports the requested value only. The server does not promise that the model will
 emit nonempty content or a tool call after the marker. `model_thinking_tokens` in the request log
 counts the model's thinking tokens for every Qwen thinking request, with or without a budget.
+Gemma 4 takes no thinking budget and reports 0.
 
 `--reasoning-loop off|stop|conclude` (default `off`) guards thinking-enabled requests against a
 model that keeps rewriting the same passages in its thinking, which token penalties do not catch
@@ -1044,6 +1045,8 @@ because every pass varies a little.
   guidance plus `</think>`), so the model answers from the thinking it has; no prompt is read again.
   When the remaining output budget cannot hold the span and one more token, or the request's
   thinking budget could not be enforced (early close unavailable, above), it stops instead.
+- **Gemma 4.** The guard reads the thought channel the model opens and counts its tokens. Gemma has
+  no early-close control, so `conclude` stops there as `stop` does.
 - It applies to constrained requests too (tool constraints, `response_format`): the control span
   goes through the same grammar-checked path as a thinking budget, so a constrained request can
   still answer or call a tool after `conclude`. With `stop`, a constrained request ends as an
