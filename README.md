@@ -1,4 +1,4 @@
-# W4(NVFP4) A16(BF16) support for sm_86/89/100/120 and A8(int8) support for sm_70/75/86/89/100/120 on ninfer, delivered on the Qwen3.8 27B
+# W4(NVFP4) A16(BF16) support for sm_86/89/100/120 and A8(int8) support for sm_70/75/80/86/89/100/120 on ninfer, delivered on the Qwen3.8 27B
 
 Upstream instantiates the fused NVFP4 SwiGLU route only to `T <= 16`, and resolves the A16 domain  
 as `T <= 16 -> SmallTFusedA16`, `T <= 64 -> Materialized`, `T > 64 -> throw`, so a long prompt does  
