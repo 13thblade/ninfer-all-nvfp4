@@ -963,10 +963,22 @@ Generated prose can quote tool-call markup before the real call. Unless the firs
 opens with a complete call, each marker is tried in order, and the first complete region that
 consumes the rest of the response becomes the structured turn; quoted markup before it stays
 ordinary content. At most sixteen markers are tried, the first one included, so an output that
-keeps repeating the marker costs a bounded amount of parsing. A region that opens a function but does not parse is recovered: complete calls
-before the failure are kept, a call that cannot be read is returned as a call to the reserved
-`malformed_tool_call` tool, whose arguments tell the model what went wrong so that it retries, and
-text after it is dropped.
+keeps repeating the marker costs a bounded amount of parsing. A region that opens a function but
+does not parse is recovered: complete calls before the failure are kept, a call that cannot be read
+is returned as a call to the reserved `malformed_tool_call` tool, whose arguments tell the model
+what went wrong so that it retries, and text after it is dropped.
+
+A model sometimes writes its tool calls inside its thinking and ends the turn with its stop token
+without closing the thinking, so no call reaches the answer. Such calls are still returned: when,
+from a marker (found by the same rules as in the answer) to the end of that thinking, there is
+nothing but complete calls to declared tools, those calls become the structured turn, and the
+operational log notes the recovery at Info severity. The thinking stays reasoning, including the
+calls' text, and none of it is published as content. Nothing is recovered when the thinking was
+closed, when the turn published any content, when it ended at the output limit, context capacity,
+a stop string or a cancellation, or when prose, a quoted marker or a cut call follows the last
+call; the recovery pass for broken calls does not apply to thinking. Under strict tools the grammar
+admits the stop token only after the thinking closes, so a constrained turn never ends inside it.
+Gemma 4's tool calls are read by their own decoder and are not recovered from its thought channel.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions. With `--assistant-prefill` a final assistant
@@ -2173,9 +2185,10 @@ Gemma 4) the decoder supplied. When the strict
 pass rejects a region, `recovered` reports that a recovery pass still produced calls from it (with
 `recovered_call_count` the calls only that pass kept), `malformed_call_reported` that an unreadable
 call became a call to the reserved error tool, and `trailing_content_dropped` that text after the
-last call was dropped. Fallback reasons are `none`, `malformed_structure`, `invalid_tool_name`,
-`undeclared_tool`, and `trailing_content`. These counters contain no tool arguments or generated
-text.
+last call was dropped. `recovered_from_reasoning` is true when the structured calls came from a
+turn that ended inside its unclosed thinking. Fallback reasons are `none`, `malformed_structure`,
+`invalid_tool_name`, `undeclared_tool`, and `trailing_content`. These counters contain no tool
+arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,

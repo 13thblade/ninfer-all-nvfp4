@@ -519,6 +519,8 @@ public:
         // must run without a budget too (upstream Neroued/ninfer#373). The budget caps it and the
         // loop guard reads it. Cost: one close-marker scan per generated thinking token.
         semantic.in_reasoning = starts_in_reasoning;
+        collect_open_reasoning =
+            split_reasoning && gemma == nullptr && tool_call_output_ != nullptr;
         if (gemma && tool_call_output_ != nullptr) {
             // A forced call's opener, `<|tool_call>call:NAME{`, is already in the prompt.
             gemma_tools.emplace(tool_call_output_->forced_tool_name);
@@ -589,6 +591,11 @@ public:
     fi::ToolCallOutputDecoder tool_call_output;
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics tool_call_parse;
+    // Free tool output keeps the open thinking, so a turn that ends inside it can still return the
+    // calls stranded there; the text is dropped once the thinking closes.
+    bool collect_open_reasoning = false;
+    std::string open_reasoning;
+    FinishReason preview_finish_reason = FinishReason::None;
 
     // Holds the record of a token the decoder just fed when its bytes went to the content channel:
     // they raised content_fed, or they wait outside the reasoning block for the rest of a code
@@ -668,6 +675,9 @@ OutputSession::OutputSession(
     impl_->grammar              = std::move(grammar);
     impl_->state.exact_close    = impl_->grammar != nullptr;
     impl_->semantic.exact_close = impl_->grammar != nullptr;
+    // A grammar admits the stop token only after the thinking closes, so a constrained turn
+    // cannot end inside it.
+    if (impl_->grammar) { impl_->collect_open_reasoning = false; }
 }
 
 std::shared_ptr<text::GrammarState> OutputSession::grammar_state() const {
@@ -709,6 +719,7 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
                               runtime::ContinuationAction continuation =
                                   runtime::ContinuationAction::Decode) {
         if (reason != FinishReason::None) { impl_->preview_semantic.control_pending = false; }
+        impl_->preview_finish_reason = reason;
         if (impl_->preview_execution_split_after && *impl_->preview_execution_split_after > count) {
             throw std::logic_error("prefix execution split exceeds the accepted token prefix");
         }
@@ -979,6 +990,7 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     }
     impl_->preview_semantic.control_pending = false;
     impl_->preview_semantic.applied         = true;
+    impl_->preview_finish_reason            = FinishReason::None;
     impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
     if (impl_->grammar) {
         auto grammar = impl_->grammar->fork();
@@ -1010,7 +1022,8 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     impl_->preview_grammar.reset();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
     release_logprobs(impl_->preview_state, impl_->preview_logprobs);
-    impl_->preview_ready = true;
+    impl_->preview_finish_reason = reason;
+    impl_->preview_ready         = true;
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
 }
 
@@ -1035,7 +1048,13 @@ PublishedOutput OutputSession::commit_preview() {
         if (delta.channel == OutputChannel::Content) {
             delta.text = impl_->gemma_tools ? impl_->gemma_tools->feed(delta.text)
                                             : impl_->tool_call_output.feed(delta.text);
+        } else if (delta.channel == OutputChannel::Reasoning && impl_->collect_open_reasoning) {
+            impl_->open_reasoning.append(delta.text);
         }
+    }
+    if (impl_->collect_open_reasoning && !impl_->state.in_reasoning) {
+        impl_->collect_open_reasoning = false;
+        impl_->open_reasoning         = {};
     }
     if (impl_->state.terminal) {
         fi::ToolCallOutputDecoder::Terminal terminal;
@@ -1045,7 +1064,9 @@ PublishedOutput OutputSession::commit_preview() {
             terminal.tool_calls = std::move(gemma.tool_calls);
             terminal.diagnostics = gemma.diagnostics;
         } else {
-            terminal = impl_->tool_call_output.finish();
+            // The collected thinking survives only when the turn ended without closing it.
+            terminal =
+                impl_->tool_call_output.finish(impl_->preview_finish_reason, impl_->open_reasoning);
         }
         impl_->tool_calls                            = std::move(terminal.tool_calls);
         impl_->tool_call_parse                       = terminal.diagnostics;

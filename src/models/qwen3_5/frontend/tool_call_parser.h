@@ -130,7 +130,11 @@ public:
                           std::size_t max_tool_name_length);
 
     [[nodiscard]] std::string feed(std::string_view text);
-    [[nodiscard]] Terminal finish();
+    // `open_reasoning` is the thinking of a turn that ended without closing it. When the turn ended
+    // on the model's stop token and no content was fed, complete declared calls that end that
+    // thinking become the structured turn.
+    [[nodiscard]] Terminal finish(FinishReason reason             = FinishReason::StopToken,
+                                  std::string_view open_reasoning = {});
 
 private:
     std::shared_ptr<const ToolCallOutputContract> contract_;
@@ -146,6 +150,7 @@ private:
     std::size_t seeded_prefix_bytes_  = 0;
     std::size_t max_tool_name_length_ = 0;
     bool saw_tool_marker_             = false;
+    bool fed_content_                 = false;
     bool forced_                      = false;
     bool finished_                    = false;
 };
