@@ -1648,6 +1648,13 @@ private:
                                      qwen3_5::ContinuationSummary& summary) noexcept;
     bool salvage_continuation(SequenceState& state, RequestControl& request, std::uint32_t lane,
                               std::uint32_t continuation_index, qwen3_5::AbortResult& out) noexcept;
+    // Keeps the checkpoints a cancelled prefill has already captured when its live state cannot
+    // be salvaged as an endpoint: they are published as a continuation without one, truncated to
+    // the deepest checkpoint. Declines, leaving the lane untouched for the strict clear, unless
+    // the lane holds a retained checkpoint and a settled exclusive writer.
+    bool retain_prefill_progress(SequenceState& state, RequestControl& request, std::uint32_t lane,
+                                 std::uint32_t continuation_index,
+                                 qwen3_5::AbortResult& out) noexcept;
     [[nodiscard]] detail::PhysicalResources
     release_checkpoint_reference(StateImageHandle checkpoint) noexcept;
     [[nodiscard]] bool can_release_shared_prefix_state(std::uint32_t index,

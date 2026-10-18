@@ -1908,6 +1908,99 @@ int test_engine_automatic_long_anchor_opportunities() {
     return failures;
 }
 
+int test_progress_anchors() {
+    // One long user message: it has no interior message boundary, so every anchor comes from the
+    // stride alone, at each multiple strictly inside the prompt.
+    const auto anchors = [](std::uint32_t stride, std::size_t* token_count) {
+        FrontendOptions options;
+        options.vision_enabled         = false;
+        options.max_context            = std::numeric_limits<std::uint32_t>::max();
+        options.progress_anchor_tokens = stride;
+        const Frontend frontend        = make_frontend(resources(), options);
+        ninfer::PromptInput input;
+        std::string text;
+        for (int index = 0; index < 1500; ++index) { text += "alpha "; }
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = text, .media = {}});
+        input.messages.push_back(std::move(message));
+        input.options.enable_thinking = false;
+        const auto prepared           = frontend.prepare(std::move(input));
+        const auto& data              = FrontendFactory::inspect(prepared);
+        *token_count                  = data.token_ids.size();
+        std::vector<std::uint32_t> frontiers;
+        for (const auto& opportunity : data.context_cache.opportunities) {
+            if (opportunity.kind == ninfer::PromptCacheMarkerKind::PrivateLongAnchor) {
+                frontiers.push_back(opportunity.frontier);
+            }
+        }
+        std::sort(frontiers.begin(), frontiers.end());
+        return frontiers;
+    };
+
+    int failures       = 0;
+    std::size_t tokens = 0;
+    failures += check(anchors(0, &tokens).empty(), "progress anchors were proposed while disabled");
+    const std::vector<std::uint32_t> placed = anchors(256, &tokens);
+    std::vector<std::uint32_t> expected;
+    for (std::uint32_t frontier = 256; frontier < tokens; frontier += 256) {
+        expected.push_back(frontier);
+    }
+    failures += check(tokens > 1024 && placed == expected,
+                      "progress anchors are not every multiple of the stride inside the prompt");
+    bool rejected = false;
+    try {
+        (void)anchors(ninfer::kMinimumProgressAnchorTokens - 1U, &tokens);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    failures += check(rejected, "a progress-anchor stride below the minimum was accepted");
+
+    // A progress anchor that lands on a frontier already carried as an opportunity is not added a
+    // second time: the stride is set to an explicit marker's own frontier.
+    const auto marked = [](std::uint32_t stride) {
+        FrontendOptions options;
+        options.vision_enabled         = false;
+        options.max_context            = std::numeric_limits<std::uint32_t>::max();
+        options.progress_anchor_tokens = stride;
+        const Frontend frontend        = make_frontend(resources(), options);
+        ninfer::PromptInput input;
+        std::string text;
+        for (int index = 0; index < 1500; ++index) { text += "alpha "; }
+        for (const auto& [role, body] :
+             {std::pair{ninfer::ChatRole::User, text},
+              std::pair{ninfer::ChatRole::Assistant, std::string("noted")},
+              std::pair{ninfer::ChatRole::User, std::string("next")}}) {
+            ninfer::ChatMessage message;
+            message.role = role;
+            message.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = body, .media = {}});
+            input.messages.push_back(std::move(message));
+        }
+        input.options.enable_thinking = false;
+        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{.after_message_count = 1});
+        const auto prepared           = frontend.prepare(std::move(input));
+        const auto& data              = FrontendFactory::inspect(prepared);
+        std::uint32_t marker_frontier = 0;
+        std::vector<std::uint32_t> frontiers;
+        for (const auto& opportunity : data.context_cache.opportunities) {
+            frontiers.push_back(opportunity.frontier);
+            if (ninfer::has_shared_candidate_evidence(
+                    opportunity.evidence, ninfer::SharedCandidateEvidence::ExplicitBoundary)) {
+                marker_frontier = opportunity.frontier;
+            }
+        }
+        return std::pair{marker_frontier, frontiers};
+    };
+    const std::uint32_t marker_frontier = marked(0).first;
+    const auto [same_frontier, frontiers] =
+        marked(std::max(marker_frontier, ninfer::kMinimumProgressAnchorTokens));
+    failures += check(marker_frontier >= ninfer::kMinimumProgressAnchorTokens &&
+                          same_frontier == marker_frontier &&
+                          std::count(frontiers.begin(), frontiers.end(), marker_frontier) == 1,
+                      "a progress anchor duplicated an explicit marker's frontier");
+    return failures;
+}
+
 int test_engine_automatic_long_anchor_spacing() {
     // With a spacing S, walking back from the prompt end a boundary joins the anchor grid only
     // when it lies at least S * 2^k below the previous grid point (k = anchors already placed).
@@ -4194,6 +4287,7 @@ int main() {
     failures += test_trimmed_source_cache_boundaries();
     failures += test_engine_automatic_long_anchor_opportunities();
     failures += test_engine_automatic_long_anchor_spacing();
+    failures += test_progress_anchors();
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);

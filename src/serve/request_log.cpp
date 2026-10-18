@@ -858,6 +858,7 @@ std::string format_server_start_json(
              {"branch_anchors", cache.branch_anchors},
              {"endpoint_anchors", cache.endpoint_anchors},
              {"long_anchor_min_spacing_tokens", cache.long_anchor_min_spacing_tokens},
+             {"progress_anchor_tokens", cache.progress_anchor_tokens},
              {"mode", cache.mode == ContextCacheMode::Hybrid ? "hybrid" : "legacy"},
              {"host_cache_budget_bytes",
               cache.host_cache_budget_bytes ? Json(*cache.host_cache_budget_bytes) : Json(nullptr)},

@@ -578,15 +578,17 @@ bool exact_vision_frontier(std::uint32_t frontier, std::span<const VisionItem> i
     return true;
 }
 
-PreparedContextCache prepare_context_cache(
-    ContextCacheHints hints, std::size_t message_count,
-    std::span<const std::optional<std::uint32_t>> message_boundaries,
-    std::span<const PromptCacheMarker> rendered_markers,
-    std::span<const std::optional<std::uint32_t>> cache_boundaries,
-    std::span<const VisionItem> vision_items, std::optional<std::size_t> engine_tool_marker_index,
-    std::optional<std::uint32_t> leading_boundary, std::uint32_t full_prompt_frontier,
-    std::uint32_t automatic_long_anchors, std::uint32_t long_anchor_min_spacing,
-    std::uint32_t graft_frontier, std::uint32_t direct_graft_slots) {
+PreparedContextCache
+prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
+                      std::span<const std::optional<std::uint32_t>> message_boundaries,
+                      std::span<const PromptCacheMarker> rendered_markers,
+                      std::span<const std::optional<std::uint32_t>> cache_boundaries,
+                      std::span<const VisionItem> vision_items,
+                      std::optional<std::size_t> engine_tool_marker_index,
+                      std::optional<std::uint32_t> leading_boundary,
+                      std::uint32_t full_prompt_frontier, std::uint32_t automatic_long_anchors,
+                      std::uint32_t long_anchor_min_spacing, std::uint32_t progress_anchor_tokens,
+                      std::uint32_t graft_frontier, std::uint32_t direct_graft_slots) {
     if (hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
@@ -667,8 +669,12 @@ PreparedContextCache prepare_context_cache(
         }
     }
 
+    const std::uint32_t progress_anchors =
+        progress_anchor_tokens == 0 || full_prompt_frontier == 0
+            ? 0U
+            : (full_prompt_frontier - 1U) / progress_anchor_tokens;
     out.opportunities.reserve(8U + (hints.allow_engine_prefix_grid ? kPrefixGridCandidates : 0U) +
-                              automatic_long_anchors);
+                              automatic_long_anchors + progress_anchors);
     const auto add_opportunity = [&](PromptCacheMarkerKind kind, SharedCandidateEvidence evidence,
                                      std::uint32_t frontier, std::uint32_t input_order) {
         // A direct graft's positions are restored whole from its pinned slot, so nothing at or
@@ -781,6 +787,18 @@ PreparedContextCache prepare_context_cache(
         add_opportunity(PromptCacheMarkerKind::PrivateLongAnchor,
                         SharedCandidateEvidence::EngineStructural, *boundary, engine_order++);
     }
+    // Progress anchors sit at absolute multiples of the stride, whatever the prompt's shape, so a
+    // prompt with no message boundary still leaves restore points behind when its prefill is
+    // cancelled. The prompt's own end is the endpoint's.
+    for (std::uint32_t index = 1; index <= progress_anchors; ++index) {
+        const std::uint32_t frontier = index * progress_anchor_tokens;
+        if (std::any_of(out.opportunities.begin(), out.opportunities.end(),
+                        [&](const auto& existing) { return existing.frontier == frontier; })) {
+            continue;
+        }
+        add_opportunity(PromptCacheMarkerKind::PrivateLongAnchor, SharedCandidateEvidence::None,
+                        frontier, engine_order++);
+    }
     return out;
 }
 
@@ -873,13 +891,18 @@ public:
         : chat_template(compile_chat_template(resources, options.chat_template_path,
                                               options.architecture != Architecture::Gemma4)),
           tokenizer(resources.tokenizer),
-          processor(!options.vision_enabled                    ? fi::ProcessorOptions{}
+          processor(!options.vision_enabled                        ? fi::ProcessorOptions{}
                     : options.architecture == Architecture::Gemma4 ? fi::ProcessorOptions{}
                                                                    : processor_options(resources)),
           vision_enabled(options.vision_enabled), max_context(options.max_context),
           automatic_long_anchors(options.automatic_long_anchors),
           long_anchor_min_spacing_tokens(options.long_anchor_min_spacing_tokens),
+          progress_anchor_tokens(options.progress_anchor_tokens),
           grafts(std::move(options.grafts)) {
+        if (progress_anchor_tokens != 0 && progress_anchor_tokens < kMinimumProgressAnchorTokens) {
+            throw std::invalid_argument("progress anchors need a stride of at least " +
+                                        std::to_string(kMinimumProgressAnchorTokens) + " tokens");
+        }
         const bool gemma_media = options.architecture == Architecture::Gemma4 && vision_enabled;
         if (gemma_media) {
             fi::GemmaMediaOptions& g = processor.gemma.emplace(gemma_media_options(resources));
@@ -1023,6 +1046,7 @@ public:
     // without a data race on a const shared implementation.
     mutable std::atomic<std::uint32_t> automatic_long_anchors{0};
     std::uint32_t long_anchor_min_spacing_tokens = 0;
+    std::uint32_t progress_anchor_tokens         = 0;
     std::vector<PromptGraft> grafts;
 };
 
@@ -1345,7 +1369,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary,
         checked_token_count(result.token_ids.size()),
         impl_->automatic_long_anchors.load(std::memory_order_relaxed),
-        impl_->long_anchor_min_spacing_tokens,
+        impl_->long_anchor_min_spacing_tokens, impl_->progress_anchor_tokens,
         (graft && !is_direct_graft) ? graft_context_slots(*graft) : 0U,
         is_direct_graft ? graft_context_slots(*graft) : 0U);
     if (impl_->ngram_sources_enabled) {

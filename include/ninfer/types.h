@@ -30,6 +30,10 @@ inline constexpr std::uint32_t kPrefixGridPageTokens = 256;
 // the shared-prefix opportunities one request can materialize on its own. Prefix-grid points are
 // excluded because they carry only observed evidence and need a second reuse domain.
 inline constexpr std::size_t kMaximumPreparedPromptCacheCandidatesPerRequest = 7;
+// Smallest nonzero ContextCacheOptions::progress_anchor_tokens. Preparation proposes one candidate
+// per multiple, so a finer stride would make a long prompt's candidate list, and the duplicate
+// scan over it, grow without bound.
+inline constexpr std::uint32_t kMinimumProgressAnchorTokens = 256;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
@@ -421,6 +425,15 @@ struct ContextCacheOptions {
     // the conversation where the cache holds the branch beside it as it stands, and otherwise
     // rewrites the conversation from the anchor, as a rewrite restore does from its checkpoint.
     bool endpoint_anchors = true;
+    // Progress anchors: every prompt offers a private long anchor at each multiple of this many
+    // tokens strictly inside it, so a prompt with no message boundary (one very long user message)
+    // still holds checkpoints while it prefills. A prefill that is cancelled part way -- a client
+    // that times out or disconnects -- keeps them when its live state cannot be kept as an
+    // endpoint (under MTP until its last chunk), so the retry resumes from the deepest one instead
+    // of token zero. They share the long-anchor capacity with every other long anchor; each costs
+    // a StateImage and may split a prefill chunk. 0 disables; a nonzero value below
+    // kMinimumProgressAnchorTokens is rejected.
+    std::uint32_t progress_anchor_tokens = 16384;
 };
 
 struct ContextCostOptions {

@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -2517,6 +2518,145 @@ int exercise_endpoint_anchor_sibling(const char* artifact) {
     return 0;
 }
 
+// Cancels the request once its prefill has reached `cancel_at` prompt tokens.
+class CancelAtProgressSink final : public ninfer::OutputSink {
+public:
+    explicit CancelAtProgressSink(std::uint32_t cancel_at) : cancel_at_(cancel_at) {}
+
+    void start(ninfer::GenerationStart) override {}
+
+    void progress(ninfer::PromptProgress progress) override {
+        if (progress.processed_prompt_tokens + progress.reused_prompt_tokens >= cancel_at_) {
+            reached_.store(true, std::memory_order_release);
+        }
+    }
+
+    void timing(ninfer::GenerationTimingObservation) override {}
+
+    void publish(ninfer::OutputDelta) override {}
+
+    [[nodiscard]] bool reached() const noexcept { return reached_.load(std::memory_order_acquire); }
+
+private:
+    std::uint32_t cancel_at_;
+    std::atomic<bool> reached_{false};
+};
+
+ninfer::PromptInput progress_anchor_prompt() {
+    // One long user message: no interior message boundary exists, so only the progress anchors
+    // give the prefill anywhere to keep what it computed.
+    std::string text = "Read the following log and answer the question at the end.";
+    for (int line = 0; line < 160; ++line) {
+        text += " Entry " + std::to_string(line) + ": the pump on line " +
+                std::to_string(line % 17) + " reported " + std::to_string(line * 37 % 1013) +
+                " kPa and the operator noted nothing unusual.";
+    }
+    text += " Question: which line reported the highest pressure?";
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = text, .media = {}});
+    ninfer::PromptInput prompt;
+    prompt.messages.push_back(std::move(message));
+    prompt.options.enable_thinking = false;
+    return prompt;
+}
+
+// A client that times out part way through a long prompt and retries must not start over. Under
+// MTP a prefill cut before its last chunk cannot be salvaged as an endpoint, so the cancelled
+// prefill publishes the progress anchors it captured, the identical retry restores the deepest
+// one, and greedy output matches a request that was never cancelled. With progress anchors off
+// the same cancel leaves nothing behind, which pins that the saving comes from them.
+int exercise_cancelled_prefill_progress(const char* artifact) {
+    constexpr std::uint32_t kStride = 512;
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 8;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    const auto options = [&](std::uint32_t stride) {
+        ninfer::EngineOptions engine_options =
+            automatic_anchor_engine_options(artifact, 4, 4, 0, false);
+        engine_options.max_context = 8192;
+        engine_options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+        engine_options.context_cache.progress_anchor_tokens = stride;
+        return engine_options;
+    };
+
+    ninfer::GenerationResult control;
+    {
+        ninfer::Engine engine(options(0));
+        control = engine.generate(engine.prepare(progress_anchor_prompt()), request);
+    }
+    const std::uint32_t prompt_tokens = control.prompt.prompt_tokens;
+    if (control.generated_token_ids.size() != 8 || prompt_tokens < 6U * kStride) {
+        std::cerr << "progress-anchor prompt is too short or did not generate: tokens="
+                  << prompt_tokens << '\n';
+        return 1;
+    }
+    const std::uint32_t cancel_at = prompt_tokens * 2U / 5U;
+
+    const auto cancel_then_retry = [&](std::uint32_t stride, ninfer::GenerationResult& retried,
+                                       ninfer::FinishReason& cancelled_reason,
+                                       std::uint64_t& salvaged) {
+        ninfer::Engine engine(options(stride));
+        CancelAtProgressSink sink(cancel_at);
+        ninfer::GenerationHandle handle =
+            engine.submit(engine.prepare(progress_anchor_prompt()), request,
+                          ninfer::OutputConsumerMode::Streaming,
+                          ninfer::GenerationObservationOptions{.prompt_progress = true});
+        const ninfer::GenerationResult cancelled =
+            handle.wait(&sink, ninfer::CancellationView([&sink] { return sink.reached(); }));
+        cancelled_reason = cancelled.finish_reason;
+        salvaged         = engine.runtime_stats().cancelled_prefills_salvaged;
+        retried          = engine.generate(engine.prepare(progress_anchor_prompt()), request);
+        return engine.is_available();
+    };
+
+    ninfer::GenerationResult kept;
+    ninfer::GenerationResult dropped;
+    ninfer::FinishReason kept_reason    = ninfer::FinishReason::None;
+    ninfer::FinishReason dropped_reason = ninfer::FinishReason::None;
+    std::uint64_t kept_salvaged         = 0;
+    std::uint64_t dropped_salvaged      = 0;
+    if (!cancel_then_retry(kStride, kept, kept_reason, kept_salvaged) ||
+        !cancel_then_retry(0, dropped, dropped_reason, dropped_salvaged)) {
+        std::cerr << "engine latched unavailable after a cancelled prefill\n";
+        return 1;
+    }
+    std::cout << "cancelled-prefill-progress: prompt=" << prompt_tokens
+              << " cancel_at=" << cancel_at
+              << " kept_path=" << static_cast<int>(kept.prefix_reuse_path)
+              << " kept_reused=" << kept.reused_prompt_tokens << " kept_salvaged=" << kept_salvaged
+              << " dropped_reused=" << dropped.reused_prompt_tokens
+              << " dropped_salvaged=" << dropped_salvaged << '\n';
+    if (kept_reason != ninfer::FinishReason::Cancelled ||
+        dropped_reason != ninfer::FinishReason::Cancelled) {
+        std::cerr << "prefill finished before the cancel landed; the prompt is too short for this "
+                     "GPU\n";
+        return 1;
+    }
+    if (kept_salvaged != 1 ||
+        kept.prefix_reuse_path != ninfer::PrefixReusePath::PrivateLongAnchor ||
+        kept.reused_prompt_tokens < 2U * kStride || kept.reused_prompt_tokens % kStride != 0 ||
+        kept.reused_prompt_tokens >= prompt_tokens ||
+        kept.reused_prompt_tokens > cancel_at + 2048U) {
+        std::cerr << "the retry did not resume from a progress anchor\n";
+        return 1;
+    }
+    if (dropped_salvaged != 0 || dropped.reused_prompt_tokens != 0) {
+        std::cerr << "a cancelled MTP prefill without progress anchors left reusable state\n";
+        return 1;
+    }
+    if (kept.generated_token_ids != control.generated_token_ids ||
+        dropped.generated_token_ids != control.generated_token_ids) {
+        std::cerr << "output after a cancelled prefill differs from an uncancelled request\n";
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_salvage_mid_prefill(const char* artifact) {
     ninfer::Engine engine(salvage_mid_prefill_engine_options(artifact));
 
@@ -4509,6 +4649,8 @@ int run() {
             result = exercise_engine_automatic_long_anchor_capture(artifact);
         } else if (scenario == "endpoint-anchor") {
             result = exercise_endpoint_anchor_sibling(artifact);
+        } else if (scenario == "cancelled-prefill-progress") {
+            result = exercise_cancelled_prefill_progress(artifact);
         } else if (scenario == "salvage-mid-prefill") {
             result = exercise_salvage_mid_prefill(artifact);
         } else if (scenario == "rewrite-checkpoint-shared") {

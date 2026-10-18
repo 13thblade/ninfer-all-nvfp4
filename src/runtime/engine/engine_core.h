@@ -1552,6 +1552,24 @@ private:
         return changed;
     }
 
+    // Aborts an active lane. The Program may keep what the lane reached as a continuation; one
+    // that kept only a cancelled prefill's anchors has no endpoint and cannot be saved as a
+    // session, so a slot file bound to the cell (an in-place reuse of a saved session) no longer
+    // describes what is resident there.
+    [[nodiscard]] auto abort_active_lane(const Request& request) {
+        std::optional<std::uint32_t> publication;
+        if constexpr (kLegacyContextCache) {
+            publication = resources_.lane_publication_slot(*request.lane);
+        }
+        auto aborted = resources_.abort(*instance_.program, *request.lane, *request.sequence);
+        if constexpr (kLegacyContextCache) {
+            if (aborted.salvaged && !aborted.summary.endpoint && publication) {
+                clear_slot_session(*publication);
+            }
+        }
+        return aborted;
+    }
+
     void cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary,
                                 HostPhaseMeasurement& boundary) {
         if (instance_.program->has_context_transaction()) { return; }
@@ -1565,7 +1583,7 @@ private:
                 throw std::logic_error("active cancellation has no sequence binding");
             }
             (void)request->output.preview_terminal(FinishReason::Cancelled);
-            auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
+            auto aborted                = abort_active_lane(*request);
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
             if (aborted.salvaged) { ++cumulative_stats_.salvaged_continuations; }
@@ -1622,7 +1640,7 @@ private:
         if (!request->sequence || !request->lane || request->lane->value != lane) {
             throw std::logic_error("failing request has no sequence binding");
         }
-        auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
+        auto aborted                = abort_active_lane(*request);
         request->generation_timings = aborted.timings;
         request->speculative_stats  = std::move(aborted.speculative);
         if (aborted.salvaged) { ++cumulative_stats_.salvaged_continuations; }

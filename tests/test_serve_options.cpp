@@ -774,6 +774,7 @@ int main() {
                                                {"--auto-long-anchors"},
                                                {"--branch-anchors"},
                                                {"--no-endpoint-anchors"},
+                                               {"--progress-anchor-tokens", "4096"},
                                                {"--auto-prefix-grid"},
                                                {"--derive-session-keys"},
                                                {"--context-cache-policy", "rolling"},
@@ -1123,6 +1124,7 @@ int main() {
                                         "--prefix-cache-file",
                                         "--presence-penalty",
                                         "--preserve-thinking",
+                                        "--progress-anchor-tokens",
                                         "--recency-eviction",
                                         "--recover-invariant-failures",
                                         "--release-diverged-checkpoints",
@@ -1560,6 +1562,19 @@ int main() {
                               !parse({"ninfer-serve", "model.ninfer", "--no-endpoint-anchors"})
                                    .context_cache.endpoint_anchors,
                           "--no-endpoint-anchors did not turn the default endpoint anchors off");
+        failures += check(
+            parse({"ninfer-serve", "model.ninfer"}).context_cache.progress_anchor_tokens == 16384 &&
+                parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "0"})
+                        .context_cache.progress_anchor_tokens == 0 &&
+                parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "256"})
+                        .context_cache.progress_anchor_tokens == 256,
+            "--progress-anchor-tokens did not set the stride or its default");
+        bool fine_stride_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "255"});
+        } catch (const std::invalid_argument&) { fine_stride_rejected = true; }
+        failures +=
+            check(fine_stride_rejected, "a progress-anchor stride below 256 tokens was accepted");
         bool spacing_without_anchors_rejected = false;
         try {
             (void)parse({"ninfer-serve", "model.ninfer", "--long-anchor-spacing", "512"});

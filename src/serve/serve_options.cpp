@@ -258,6 +258,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                anchors, doubling per anchor back from the\n"
            "                                prompt end (default 1024; 0 anchors every\n"
            "                                boundary)\n"
+           "  --progress-anchor-tokens N    anchor every prompt at each multiple of N tokens,\n"
+           "                                so a client that cancels a long prefill and\n"
+           "                                retries resumes from the deepest anchor instead\n"
+           "                                of token zero (default 16384; 0 disables;\n"
+           "                                otherwise at least 256)\n"
            "  --max-cache-markers-per-request N\n"
            "                                client cache markers one request may carry\n"
            "                                (default 4)\n"
@@ -983,6 +988,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--long-anchor-spacing"),
                                       "long-anchor-spacing"));
             long_anchor_spacing_explicit = true;
+            continue;
+        }
+        if (arg == "--progress-anchor-tokens") {
+            legacy_cache_flag = "--progress-anchor-tokens";
+            const int tokens  = parse_nonnegative_int(require_value("--progress-anchor-tokens"),
+                                                      "progress-anchor-tokens");
+            if (tokens != 0 && static_cast<std::uint32_t>(tokens) < kMinimumProgressAnchorTokens) {
+                throw std::invalid_argument("--progress-anchor-tokens must be 0 or at least " +
+                                            std::to_string(kMinimumProgressAnchorTokens));
+            }
+            options.context_cache.progress_anchor_tokens = static_cast<std::uint32_t>(tokens);
             continue;
         }
         if (arg == "--max-cache-markers-per-request") {
