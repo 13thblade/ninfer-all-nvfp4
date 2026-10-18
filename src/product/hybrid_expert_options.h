@@ -18,6 +18,9 @@ inline constexpr const char* kHybridExpertHelp =
     "  --expert-misses staged|mapped GGUF experts: copy misses into device staging while the\n"
     "                                cached experts run (default), or read host experts across\n"
     "                                the bus inside the expert kernels\n"
+    "  --expert-prefill-buffers 1|2  GGUF host experts: device buffers for a long prompt's\n"
+    "                                uncached experts (default 1); 2 copies the next layer's\n"
+    "                                while this one runs, with memory from the expert cache\n"
     "  --expert-cpu-threads N        CPU workers, 1..256 (default automatic)\n"
     "  --expert-cache-adaptive       replace cold cached experts between calls;\n"
     "                                changes the CPU/GPU arithmetic partition\n"
@@ -43,6 +46,12 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
             throw std::invalid_argument("--expert-cpu-threads takes an integer in 1..256");
         }
         out.cpu_threads = threads;
+    } else if (option == "--expert-prefill-buffers") {
+        const std::string_view count(value());
+        if (count != "1" && count != "2") {
+            throw std::invalid_argument("--expert-prefill-buffers takes 1 or 2");
+        }
+        out.prefill_buffers = count == "2" ? 2 : 1;
     } else if (option == "--expert-misses") {
         const std::string_view mode(value());
         if (mode == "staged") {

@@ -511,6 +511,10 @@ struct HybridExpertOptions {
     // GGUF banks: copy missing experts into device staging while the cached ones run (staged), or
     // let the expert kernels read host experts across the bus (mapped; host experts only).
     bool mapped_misses = false;
+    // GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts
+    // into. 2 copies the next layer's while this layer's experts run, and takes the second
+    // buffer's memory from the expert cache; 1 (default) keeps one.
+    std::uint32_t prefill_buffers = 1;
     bool adaptive_cache = false;
     std::filesystem::path routing_profile; // initial per-layer expert counts for this artifact
     std::filesystem::path record_profile; // write accumulated counts at request boundaries

@@ -92,6 +92,18 @@ int run_tests() {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-cpu-threads", threads});
         }), "CLI accepted an invalid hybrid CPU worker count");
     }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
+                              .hybrid_experts.prefill_buffers == 1 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--expert-prefill-buffers", "2"})
+                                  .hybrid_experts.prefill_buffers == 2,
+                      "CLI did not keep one prefill expert buffer by default or preserve two");
+    for (const auto* count : {"0", "3", "two"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-prefill-buffers",
+                         count});
+        }), "CLI accepted an invalid prefill expert buffer count");
+    }
     for (const auto* budget : {"0", "32", "4096"}) {
         const auto disk = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
                                  "--ngram-residency", "disk", "--ngram-ram-mib", budget});

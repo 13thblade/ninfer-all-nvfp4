@@ -119,7 +119,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     }
     const auto& hybrid = options.hybrid_experts;
     if (hybrid.dma_share != 1 || hybrid.cpu_threads != 0 || hybrid.mapped_misses ||
-        hybrid.adaptive_cache || !hybrid.routing_profile.empty() || !hybrid.record_profile.empty()) {
+        hybrid.prefill_buffers != 1 || hybrid.adaptive_cache || !hybrid.routing_profile.empty() ||
+        !hybrid.record_profile.empty()) {
         throw std::invalid_argument("Gemma 4 expert residency uses GPU arithmetic and DMA only; "
                                     "Flash-Next hybrid/profile options do not apply");
     }

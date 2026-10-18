@@ -203,6 +203,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) takes what each device has free after startup less a margin, and after the warm-up what is still free beyond 640 MiB; `N` is the cache's size, which the warm-up leaves alone; `0` disables the host-mode cache (disk mode needs one) |
 | `--expert-misses staged\|mapped` | GGUF host experts: a decode or verification call copies each routed expert its device cache lacks straight into the slot of the layer's least recently used expert of the lowest frequency tier, by the copy engine while the cached ones run, and keeps it there (`staged`, the default); or its expert kernels read the missing experts across the bus and the cache admits between passes (`mapped`) |
 | `--expert-dma-share F` | host experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1` (default `1`); below `1` the CPU computes the rest from RAM while the GPU runs the cached ones, in its own arithmetic, and their slots fill behind the call; prefill always runs on the GPU. Neutral on an RTX 3090 with an 8-core CPU |
+| `--expert-prefill-buffers 1\|2` | GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts into (default `1`); `2` alternates two, so the next layer's copies run while this layer's experts do, when half the free memory holds both. The second buffer's memory comes from the expert cache: on an RTX 3090 with Q2_0 it took the cache from 17,296 to 16,683 MiB, prefilled a 5,462-token prompt 8.5-10.5% and a 31,860-token prompt 1.9-2.3% faster, decoded 1.5-2.8% slower once the cache was warm (within 1.5% either way from a cold one) and answered a 37-to-39-token prompt 7.5-10.2% later warm |
 | `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers; default is the physical cores less two (counted as half the logical threads), at most 16 |
 | `--expert-cache-adaptive` | replace cold cached native experts between calls; off by default because it changes the CPU/GPU arithmetic partition |
 | `--expert-profile PATH` | fill the host expert cache at startup from counts recorded for the same artifact (`--expert-profile-out`) |
@@ -485,7 +486,10 @@ draft-chain graph and each width its own verification graph, captured at their s
   uncached experts cross the bus once per span, during the attention phase that precedes them, and
   a span's short last chunk runs from the same pool (a 5,669-token prompt prefilled at 1,334 instead
   of 678 tokens/s on an RTX 3090 when spans came; the bank-shaped pool and the two phases then took a
-  9,297-token Q2_0 prompt from 1.12-1.18k to 1.35k tokens/s from a cold expert cache). Weighted
+  9,297-token Q2_0 prompt from 1.12-1.18k to 1.35k tokens/s from a cold expert cache). With
+  `--expert-prefill-buffers 2` the pool has two buffers that consecutive layers alternate between:
+  each layer's copies start as soon as the layer two back is done with its buffer, while the
+  layer before it runs. Weighted
   expert outputs are summed in fixed point, so the result does not depend on the order experts
   finish in.
 - Up to eight tokens of GGUF host experts run in two stages. A kernel splits the call's routes into
