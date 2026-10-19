@@ -97,15 +97,12 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kCausalHeadDim) : 0u;
             auto issue_pv = [&]<bool PackedValues, KvKeyCoding Keys, bool PvF16>() {
                 if constexpr (DynamicArena) {
-                    configure_cuda_device_once([&] {
-                        return cudaFuncSetAttribute(
-                            causal_attention_small_t_i8_tiled_kernel<
-                                Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm, KeyBlock,
-                                DynamicArena, MultiBatch, Masked, CacheInput, PackedValues, Keys,
-                                PvF16, QkSplit, EarlyFetch>,
-                            cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            static_cast<int>(kDynamicBytes));
-                    });
+                    raise_dynamic_shared_memory(
+                        causal_attention_small_t_i8_tiled_kernel<
+                            Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm, KeyBlock,
+                            DynamicArena, MultiBatch, Masked, CacheInput, PackedValues, Keys, PvF16,
+                            QkSplit, EarlyFetch>,
+                        static_cast<int>(kDynamicBytes));
                 }
                 causal_attention_small_t_i8_tiled_kernel<
                     Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena,
@@ -159,10 +156,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     causal_attention_small_t_i8_pipelined_kernel<Geometry, TokenTile, MultiBatch,
                                                                  Masked, CacheInput, PvF16>;
                 constexpr int kArena = CausalSmallTI8PipelinedShape::kArenaBytes;
-                configure_cuda_device_once([&] {
-                    return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                kArena);
-                });
+                raise_dynamic_shared_memory(kernel, kArena);
                 const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
                 kernel<<<grid, CausalSmallTI8PipelinedShape::kThreads, kArena, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data), input,

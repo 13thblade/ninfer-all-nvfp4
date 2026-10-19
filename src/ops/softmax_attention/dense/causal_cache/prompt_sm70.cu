@@ -497,10 +497,7 @@ void launch(const Tensor& q, const Tensor& positions, const std::int32_t* valid_
                     static_cast<unsigned>(kv_heads));
     with_codings(cache.storage, [&]<Coding K, Coding V, bool RotatedKeys, bool RotatedValues>() {
         auto kernel = prompt_kernel<Metadata, K, V, RotatedKeys, RotatedValues>;
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        kSharedBytes);
-        });
+        raise_dynamic_shared_memory(kernel, kSharedBytes);
         kernel<<<grid, kThreads, kSharedBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data),
             static_cast<const std::int32_t*>(positions.data), valid_columns, metadata,

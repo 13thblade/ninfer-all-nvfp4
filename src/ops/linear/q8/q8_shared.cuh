@@ -18,9 +18,7 @@ __device__ __forceinline__ unsigned char* q8_shared_storage() {
 template <int Bytes, auto Kernel>
 int q8_prepare_shared() {
     if constexpr (Bytes > 48 * 1024) {
-        configure_cuda_device_once([] {
-            return cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
-        });
+        raise_dynamic_shared_memory(Kernel, Bytes);
         return Bytes;
     } else
         return 0;

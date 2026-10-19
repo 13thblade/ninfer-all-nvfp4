@@ -606,12 +606,7 @@ void launch_a8_mma(dim3 grid, cudaStream_t stream, const std::uint8_t* w_codes,
     with_shape_set([&]<bool TuringShapes>() {
         const std::size_t smem = shared_bytes<Codec, MT, NT, RowMap, TuringShapes>(kCols);
         auto* kernel = a8_mma_kernel<Codec, kCols, MT, NT, RowMap, Epilogue, TuringShapes>;
-        if (smem > 48 * 1024) {
-            configure_cuda_device_once([&] {
-                return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            static_cast<int>(smem));
-            });
-        }
+        if (smem > 48 * 1024) { raise_dynamic_shared_memory(kernel, static_cast<int>(smem)); }
         kernel<<<grid, kThreads, smem, stream>>>(w_codes, w_high, w_scales, x_codes, x_scales,
                                                  tokens, rows, epilogue, panel_shift);
     });

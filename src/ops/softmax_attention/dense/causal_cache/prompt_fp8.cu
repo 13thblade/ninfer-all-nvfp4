@@ -28,10 +28,7 @@ void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Ten
     with_shape_set([&]<bool TuringShapes>() {
         using Shape       = CausalPromptFp8Shape<TuringShapes>;
         const auto kernel = causal_attention_prompt_fp8_kernel<Geometry, Metadata, TuringShapes>;
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        Shape::SmemBytes);
-        });
+        raise_dynamic_shared_memory(kernel, Shape::SmemBytes);
         const dim3 grid(static_cast<unsigned>(div_up(tokens, Shape::Br)),
                         static_cast<unsigned>(Geometry::QHeads), 1u);
         kernel<<<grid, kCausalPromptFp8Threads, Shape::SmemBytes, stream>>>(

@@ -59,10 +59,7 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
                 auto kernel = causal_attention_small_t_k8v4_tiled_kernel<
                     Geometry, TokenTile, Warps, MinBlocks, KeyBlock, true, MultiBatch, Masked,
                     KernelInput, TuringShapes>;
-                configure_cuda_device_once([&] {
-                    return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                static_cast<int>(DynamicBytes));
-                });
+                raise_dynamic_shared_memory(kernel, static_cast<int>(DynamicBytes));
 
                 const auto q_ptr         = static_cast<const __nv_bfloat16*>(q.data);
                 const auto positions_ptr = static_cast<const std::int32_t*>(positions.data);

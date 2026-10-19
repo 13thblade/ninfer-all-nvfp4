@@ -31,11 +31,9 @@ void launch_mma(const Weight& weight, Tensor& qkv, Tensor& z, Fp8A8Workspace wor
                                    static_cast<__nv_bfloat16*>(z.data)};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(
-                fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue, Fp8GdnInputOutput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        });
+        raise_dynamic_shared_memory(
+            fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue, Fp8GdnInputOutput>,
+            Schedule::kSharedBytes);
     }
     fp8_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
