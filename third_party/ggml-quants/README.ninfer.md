@@ -19,3 +19,6 @@ The combine-loop barrier in `fattn-mma-f16.cuh` includes the exact condition fro
 [`1bb2b9fcbe85c35c4e3b787e1c868ef05ca702f3`](https://github.com/ggml-org/llama.cpp/commit/1bb2b9fcbe85c35c4e3b787e1c868ef05ca702f3)
 (PR #30103). It synchronizes before reusing the shared combine tile when
 `nbatch_combine != DKQ/2`, including the Turing 512-wide 16/32-column configurations.
+
+The local MMQ writeback supports BF16 Store and Accumulate. Split stream-K tiles retain FP32
+partials and the existing summation order, adding the residual before one final BF16 rounding.

@@ -124,6 +124,11 @@ void quantize_matrix_activation_padded(GgmlType type, const __nv_bfloat16* x, in
                                        const std::int32_t* input_columns, void* out,
                                        cudaStream_t stream);
 
+void matrix_product_bf16(GgmlType type, const void* weight, std::int64_t row_bytes, int rows,
+                         int k, const void* activation, int columns, __nv_bfloat16* out,
+                         std::int64_t out_column_stride, float* partial, void* fixup,
+                         cudaStream_t stream, bool accumulate = false, bool tail = false);
+
 // out <- epilogue(in) for an FP32 [rows, columns] plane whose columns are `in_column_stride` apart.
 void store_plane(const float* in, std::int64_t in_column_stride, int rows, int columns,
                  const VectorOutput& out, cudaStream_t stream);
