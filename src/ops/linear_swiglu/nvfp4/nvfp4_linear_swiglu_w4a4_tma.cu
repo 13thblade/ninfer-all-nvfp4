@@ -76,11 +76,8 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
 
     using Geometry                     = Nvfp4N34816K5120;
     constexpr std::size_t kSharedBytes = sizeof(Nvfp4LinearSwiGluTmaSharedStorage<M256N128S3>);
-    configure_cuda_device_once([] {
-        return cudaFuncSetAttribute(nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    static_cast<int>(kSharedBytes));
-    });
+    raise_dynamic_shared_memory(nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>,
+                                static_cast<int>(kSharedBytes));
 
     const Nvfp4W4a4TmaDescriptors descriptors = make_descriptors<Geometry, M256N128S3>(
         activation_codes, activation_scales, weight_codes, weight_scales, tokens);

@@ -108,10 +108,7 @@ template <class Schedule, auto Kernel>
 std::size_t nvfp4_w4a4_shared_bytes() {
     constexpr std::size_t bytes = sizeof(Nvfp4W4a4SharedStorage<Schedule>);
     if constexpr (bytes > 48 * 1024) {
-        configure_cuda_device_once([] {
-            return cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(bytes));
-        });
+        raise_dynamic_shared_memory(Kernel, static_cast<int>(bytes));
     }
     return bytes;
 }

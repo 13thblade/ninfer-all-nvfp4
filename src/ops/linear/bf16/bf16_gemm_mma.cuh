@@ -358,11 +358,8 @@ void launch_bf16_gemm_mma(const __nv_bfloat16* x, const __nv_bfloat16* weight, c
     with_shape_set([&]<bool TuringShapes>() {
         using Shaped = std::conditional_t<TuringShapes, Bf16MmaTuringSchedule<Schedule>, Schedule>;
         if constexpr (Shaped::kSharedBytes > 48 * 1024) {
-            configure_cuda_device_once([&] {
-                return cudaFuncSetAttribute(
-                    bf16_gemm_mma_kernel<Geometry, Shaped, FullTokens, Output>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, Shaped::kSharedBytes);
-            });
+            raise_dynamic_shared_memory(bf16_gemm_mma_kernel<Geometry, Shaped, FullTokens, Output>,
+                                        Shaped::kSharedBytes);
         }
         bf16_gemm_mma_kernel<Geometry, Shaped, FullTokens, Output>
             <<<blocks, Shaped::kThreads, Shaped::kSharedBytes, stream>>>(x, weight, output, tokens);

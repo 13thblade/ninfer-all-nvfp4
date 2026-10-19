@@ -10,11 +10,7 @@ namespace ninfer::ops::detail::unified {
 template <int Bytes, auto Kernel>
 int bf16_prepare_shared() {
     static_assert(Bytes <= kMaxSharedBytesPerBlockSm8x);
-    if constexpr (Bytes > 48 * 1024) {
-        configure_cuda_device_once([] {
-            return cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
-        });
-    }
+    if constexpr (Bytes > 48 * 1024) { raise_dynamic_shared_memory(Kernel, Bytes); }
     return Bytes;
 }
 

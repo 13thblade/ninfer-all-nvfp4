@@ -317,12 +317,10 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                         static_cast<unsigned>(SplitK));
         auto launch = [&](auto full_tokens) {
             constexpr bool FullTokens     = decltype(full_tokens)::value;
-            configure_cuda_device_once([&] {
-                return cudaFuncSetAttribute(
-                    bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
-                                                         NormalizeInput, NormTokenCapacity>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
-            });
+            raise_dynamic_shared_memory(
+                bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
+                                                     NormalizeInput, NormTokenCapacity>,
+                kSmemBytes);
             if constexpr (SplitK > 1) {
                 cudaLaunchConfig_t config{};
                 config.gridDim          = grid;

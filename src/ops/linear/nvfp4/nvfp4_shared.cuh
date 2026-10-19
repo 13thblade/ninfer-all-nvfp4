@@ -19,9 +19,7 @@ template <int Bytes, auto Kernel, bool Dynamic = false>
 int nvfp4_prepare_shared() {
     static_assert(Bytes <= kMaxSharedBytesPerBlockSm8x);
     if constexpr (Bytes > 48 * 1024) {
-        configure_cuda_device_once([] {
-            return cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
-        });
+        raise_dynamic_shared_memory(Kernel, Bytes);
         return Bytes;
     } else {
         return Dynamic ? Bytes : 0;

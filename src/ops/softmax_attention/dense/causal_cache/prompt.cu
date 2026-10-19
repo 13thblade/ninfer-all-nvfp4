@@ -78,12 +78,10 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
             constexpr auto kernel =
                 causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, Warps, PackedValues,
                                                        Keys, TuringShapes, Split>;
-            configure_cuda_device_once([] {
-                return cudaFuncSetAttribute(
-                    causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, Warps, PackedValues,
-                                                           Keys, TuringShapes, Split>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::SmemBytes);
-            });
+            raise_dynamic_shared_memory(
+                causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, Warps, PackedValues,
+                                                       Keys, TuringShapes, Split>,
+                Shape::SmemBytes);
             const dim3 grid(static_cast<unsigned>(div_up(tokens, Shape::Br)),
                             static_cast<unsigned>(Geometry::QHeads),
                             static_cast<unsigned>(plan.splits));
@@ -191,11 +189,7 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                         causal_attention_prompt_i8_kernel<Geometry, Metadata, PackedValues, Keys,
                                                           PvF16, PackGqa>;
                     // The kernel exceeds the default 48 KiB dynamic-smem ceiling.
-                    configure_cuda_device_once([&] {
-                        return cudaFuncSetAttribute(kernel,
-                                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                    kCausalPromptI8SmemBytes);
-                    });
+                    raise_dynamic_shared_memory(kernel, kCausalPromptI8SmemBytes);
                     const dim3 grid =
                         PackGqa ? dim3(static_cast<unsigned>(
                                            div_up(tokens * Geometry::GroupSize, kCausalPromptI8Br)),
@@ -252,10 +246,7 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
         // The kernel of the current device's shape set, past the default 48 KiB dynamic-smem
         // ceiling in both.
         const auto launch = [&](auto kernel, int smem) {
-            configure_cuda_device_once([&] {
-                return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            smem);
-            });
+            raise_dynamic_shared_memory(kernel, smem);
             kernel<<<attention_grid, kCausalPromptThreads, smem, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const __nv_bfloat16*>(cache_k.data),
