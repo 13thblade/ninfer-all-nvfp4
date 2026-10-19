@@ -1,0 +1,170 @@
+name: Windows release
+
+on:
+  push:
+    branches: [master, build/windows-release]
+    paths:
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'src/**'
+      - 'include/**'
+      - 'apps/**'
+      - 'bench/**'
+      - 'third_party/**'
+      - 'vcpkg.json'
+      - 'VERSION'
+      - 'RELEASE_NOTES_*.md'
+      - 'scripts/package-release.ps1'
+      - 'scripts/run.bat'
+      - 'scripts/download-model.bat'
+      - 'docs/release-archive-windows.md'
+      - '.github/scripts/*windows*'
+      - '.github/workflows/windows-release.yml'
+      - 'tests/release/**'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish both builds as the latest release (master only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Do not interrupt an asset upload. A superseded build cannot move latest.
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - run: python3.11 -m unittest discover -s tests/release -v
+
+  build:
+    needs: validate
+    name: Windows CUDA ${{ matrix.cuda }} (${{ matrix.archs }})
+    runs-on: windows-2022
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: '12.9.1'
+            archs: '70;75;80;86;89'
+            packages: '["nvcc", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump"]'
+          - cuda: '13.2.0'
+            archs: '75;80;86;89;120a'
+            packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump"]'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - name: Parse PowerShell scripts
+        run: |
+          foreach ($path in 'scripts/package-release.ps1', '.github/scripts/build-windows-release.ps1') {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $pwd $path), [ref]$tokens, [ref]$errors)
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
+      # Pin the action whose Windows installer table includes both versions.
+      - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          sub-packages: ${{ matrix.packages }}
+          log-file-suffix: ${{ matrix.cuda }}
+      - name: Import Visual Studio 2022 environment
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio 2022 x64 tools are missing' }
+          $vars = cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw 'vcvars64 failed' }
+          $vars | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $Matches[1] -notin 'CUDA_PATH', 'VCPKG_ROOT') {
+              "$($Matches[1])=$($Matches[2])" >> $env:GITHUB_ENV
+            }
+          }
+      - name: Resolve the pinned vcpkg revision
+        id: vcpkg
+        run: |
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          "baseline=$baseline" >> $env:GITHUB_OUTPUT
+      - uses: actions/checkout@v7
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ steps.vcpkg.outputs.baseline }}
+          path: .vcpkg
+      - uses: actions/cache@v6
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: windows-release-vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}
+      - name: Configure with real FFmpeg and curl libraries
+        env:
+          ARCHS: ${{ matrix.archs }}
+        run: |
+          & .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_TOOLCHAIN_FILE=$pwd/.vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows -DVCPKG_HOST_TRIPLET=x64-windows `
+            "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe" `
+            "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
+            -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+      - name: Build release products
+        run: .github/scripts/build-windows-release.ps1
+      - name: Package, verify device images and test startup without Toolkit on PATH
+        run: |
+          $env:NINFER_BUILD_ROOT = "$pwd/build-release"
+          ./scripts/package-release.ps1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-cuda-${{ matrix.cuda }}
+          path: |
+            dist/*.7z.*
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-logs-${{ matrix.cuda }}
+          path: |
+            build-release/*.log
+            build-release/CMakeFiles/CMakeConfigureLog.yaml
+            dist/*/BUILD-INFO.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: windows-cuda-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Publish verified assets from this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/publish-windows-release.sh

@@ -38,6 +38,12 @@ set_source_files_properties(device.cu PROPERTIES
   COMPILE_DEFINITIONS "NINFER_CUDA_ARCHITECTURES=\"${_ninfer_cuda_architectures}\"")
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads CUDA::cuda_driver)
+if(MSVC)
+  # --help must run on build hosts without an NVIDIA driver. Resolve driver entry points only
+  # when execution uses them; the CUDA runtime still checks device availability at startup.
+  target_link_libraries(ninfer_core PUBLIC delayimp)
+  target_link_options(ninfer_core INTERFACE "$<HOST_LINK:/DELAYLOAD:nvcuda.dll>")
+endif()
 # gpu_clock_floor.cpp loads NVML at run time.
 target_link_libraries(ninfer_core PRIVATE ${CMAKE_DL_LIBS})
 if(WIN32 AND NINFER_DIRECTSTORAGE)

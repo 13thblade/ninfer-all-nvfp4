@@ -12,9 +12,17 @@ build and of an `86` build with Visual Studio 2022 (MSVC 14.44) and CUDA 12.8, t
 TITAN RTX (TCC, and WDDM for the virtual-memory tests) and an RTX 3060 (WDDM), run by a contributor.
 This repository has no Windows test host. CI compiles the host code of every translation unit with
 MSVC 14.44 for `70` (CUDA 12.9), `75`, `80`, `86`, `89` and `120a` (CUDA 13.4) on each change
-to the build inputs (`scripts/check-host-compile.py`), but builds no device code and runs nothing
-on Windows; the Windows-only build option below compiles against Windows headers and has not been
-run. Users run `120a` builds from `scripts\build-native.bat` with Visual Studio 2026 Build Tools and
+to the build inputs (`scripts/check-host-compile.py`), but that host check builds no device code.
+The separate `Windows release` workflow compiles
+and links the release products for two CUDA versions, checks their device images and tests `--help`
+without the Toolkit on `PATH`. It has no GPU and does not qualify inference or performance.
+The new release workflow has not yet completed a native Windows run. The Windows-only
+DirectStorage option below has not been run.
+
+MSVC builds delay-load `nvcuda.dll`, so `--help` can run without an NVIDIA driver.
+GPU execution still requires a compatible driver and device.
+
+Users run `120a` builds from `scripts\build-native.bat` with Visual Studio 2026 Build Tools and
 CUDA 13.4 on an RTX 5070 Ti, and `89` builds with CUDA 13.4 on RTX 4090s
 ([field reports](performance/field-reports.md)).
 
@@ -101,5 +109,31 @@ on a 24 GB card that serves a desktop, an explicit capacity is easier to predict
 
 ## Release archive
 
-`scripts\package-release.ps1` (or `.\scripts\build.ps1 -Package`) builds the Windows ZIP for the
-version in `VERSION`; [cutting a release](maintainer/release-process.md) describes the flow.
+The `Windows release` workflow builds two native x64 packages with VS 2022 and Ninja:
+
+| Toolkit | Device images in each executable |
+|---|---|
+| CUDA 12.9.1 | `70;75;80;86;89` (Volta through Ada) |
+| CUDA 13.2.0 | `75;80;86;89;120a` (Turing through consumer Blackwell) |
+
+A push that changes release inputs on `master` builds both packages. The `build/windows-release`
+branch runs the same build without publication. A manual run builds the packages
+without publication by default. Select `publish` on `master` to publish. Both matrix jobs must
+pass before publication. The workflow creates an immutable `windows-<source commit>` release,
+then marks it **latest** after checking every uploaded asset. It leaves an older latest release
+available if compilation, packaging or upload fails. See [release process](maintainer/release-process.md).
+
+For a local build, `scripts\package-release.ps1` (or `.\scripts\build.ps1 -Package`) derives the
+Toolkit and device images from `CMakeCache.txt`. It requires `cuobjdump` in that Toolkit and `7z`
+on `PATH`. It packages `ninfer.exe`, `ninfer-serve.exe` and `ninfer_bench.exe`, their runtime DLLs,
+licences and launchers into `.7z.001` volumes of at most 1900 MiB. Download every volume of one
+variant into the same folder and extract the first with 7-Zip. Do not mix the CUDA variants.
+
+`BUILD-INFO.json` records the source revision, source modifications, CUDA version and device images.
+`VERSION` identifies the source's product version. The archive filename also identifies the actual
+commit, so later snapshots do not present themselves as the original versioned release.
+
+Compilation on the hosted runner still needs native verification: these five-image executables
+may encounter MSVC image-size limits or runner memory/time limits. Archive splitting addresses
+GitHub's asset limit only. It does not address linker limits. A successful `--help` check does not
+establish GPU correctness or throughput.

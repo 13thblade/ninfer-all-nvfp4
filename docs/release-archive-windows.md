@@ -1,4 +1,4 @@
-# NInfer for Windows (RTX 3090 build) — release archive
+# NInfer for Windows — release archive
 
 This is the README that ships **inside** the Windows release archive, where every file sits in one
 directory. If you are reading it in a checkout instead, the launchers and downloaders it names live
@@ -6,17 +6,25 @@ under `scripts/`, and
 [docs/build-windows.md](https://github.com/iamwavecut/ninfer-all/blob/master/docs/build-windows.md)
 is the fuller guide. Links here are absolute on purpose: the archive ships no `docs/` directory.
 
-Check `VERSION` for the release this archive was cut from, and `RELEASE_NOTES_*.md` for what
-changed.
+Check `BUILD-INFO.json` for the exact source commit, CUDA version and device images.
+`VERSION` and `RELEASE_NOTES_*.md` describe the product version in that source snapshot.
+
+Download **all** `.7z.*` volumes for one CUDA variant into the same directory. Use 7-Zip to extract
+`.7z.001`. Keep CUDA 12 and CUDA 13 packages in separate directories. The outer `SHA256SUMS-*.txt`
+checks the downloaded volumes. The inner `SHA256SUMS.txt` checks the extracted files.
 
 ## Requirements
 
 - Windows 11 x64
-- an RTX 30 or RTX 40 series card (the archive carries an `sm_86` build) with a recent NVIDIA driver
+- an NVIDIA GPU covered by the device images in `BUILD-INFO.json`, with a driver compatible with
+  the package's CUDA version
+  - CUDA 12.9 CI package: Volta, Turing, Ampere (including A100), Ada
+  - CUDA 13.2 CI package: Turing, Ampere (including A100), Ada, consumer Blackwell
+  - local packages carry the architectures selected by their builder
 - Microsoft Visual C++ 2022 runtime
 
 Everything else is in the archive: the FFmpeg and libcurl DLLs, and NVIDIA's cuBLAS runtime
-(`cublas64_12.dll`, `cublasLt64_12.dll`). You do **not** need the CUDA Toolkit installed.
+(`cublas64_12.dll` and `cublasLt64_12.dll`, or their CUDA 13 counterparts). You do **not** need the CUDA Toolkit installed.
 
 **Licensing.** NInfer is Apache-2.0 (`LICENSE`). The two cuBLAS DLLs are NVIDIA's, not part of NInfer:
 they are redistributed under the terms of the NVIDIA CUDA Toolkit EULA (`NVIDIA-CUDA-EULA.txt`,
@@ -38,7 +46,8 @@ The downloader writes into `models\` beside these files, which is where the laun
 `NINFER_MODEL_DIR` moves both: set it and the downloader puts artifacts there and the launcher looks
 there. To point the launcher at one file somewhere else, give it `NINFER_MODEL`.
 
-That is the recommended Windows profile: Qwen3.8-27B, one user, 172,032 tokens, DFlash2 speculation
+The launcher defaults were tuned on an RTX 3090 with 24 GB. Other cards may need smaller context
+and concurrency settings. The default Qwen3.8 profile uses Qwen3.8-27B, one user, 172,032 tokens, DFlash2 speculation
 plus the draft head (fastest), `rk4v4` KV, cuBLAS prefill, and vision in overlay residency.
 
 For the longest context instead, `set NINFER_SPEC=mtp && .\run.bat qwen38-27b` runs the MTP profile at
@@ -67,9 +76,11 @@ API key blank.
 | `ninfer_bench.exe` | throughput benchmark against the public Engine route |
 | `download-model.bat` | pinned, resumable artifact downloads with verification |
 | `run.bat` | serving profiles: `run.bat <model> [profile]`, or double-click it to pick a model |
-| `*.dll` | the FFmpeg and libcurl runtime dependencies, and NVIDIA's cuBLAS (`cublas64_12.dll`, `cublasLt64_12.dll`) |
+| `*.dll` | the FFmpeg and libcurl runtime dependencies, and NVIDIA's cuBLAS for the selected CUDA version |
 | `NVIDIA-CUDA-EULA.txt` | the licence under which the two cuBLAS DLLs are redistributed |
-| `SHA256SUMS.txt` | checksums for every file in this directory |
+| `SHA256SUMS.txt` | checksums for every other file in this directory |
+| `BUILD-INFO.json` | source, Toolkit, device images and validation scope |
+| `LICENSE-*.txt` | dependency notices from vcpkg |
 
 ## Overrides
 

@@ -82,7 +82,7 @@ route tables and published measurements are not authoritative here -- every rout
 inherited and re-measured on sm_86 turned out to be wrong by 12-41%. Treat an upstream tuning
 constant as a hypothesis until measured on the card in question. Windows builds and their
 toolchain constraints are in `docs/build-windows.md`; this repository has no Windows test host and
-CI does not build Windows.
+the Windows release workflow builds native multi-architecture executables but does not run GPU inference.
 
 Generation uses one resident model on one GPU, or split into pipeline stages over up to eight
 (`--devices`; each stage owns whole layers with their KV and state, and the head,
