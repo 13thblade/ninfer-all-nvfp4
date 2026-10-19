@@ -87,11 +87,16 @@ jobs:
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) { throw 'Visual Studio 2022 x64 tools are missing' }
+          $before = @{}
+          Get-ChildItem Env: | ForEach-Object { $before[$_.Name] = $_.Value }
           $vars = cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set"
           if ($LASTEXITCODE -ne 0) { throw 'vcvars64 failed' }
           $vars | ForEach-Object {
             if ($_ -match '^([^=]+)=(.*)$' -and $Matches[1] -notin 'CUDA_PATH', 'VCPKG_ROOT') {
-              "$($Matches[1])=$($Matches[2])" >> $env:GITHUB_ENV
+              # GitHub prints exported variables in later step headers. Export only toolchain changes.
+              if ($before[$Matches[1]] -cne $Matches[2]) {
+                "$($Matches[1])=$($Matches[2])" >> $env:GITHUB_ENV
+              }
             }
           }
       - name: Resolve the pinned vcpkg revision
@@ -104,11 +109,13 @@ jobs:
           repository: microsoft/vcpkg
           ref: ${{ steps.vcpkg.outputs.baseline }}
           path: .vcpkg
-      - uses: actions/cache@v6
+      - uses: actions/cache/restore@v6
+        id: dependency-cache
         with:
           path: ~/AppData/Local/vcpkg/archives
           key: windows-release-vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}
       - name: Configure with real FFmpeg and curl libraries
+        id: configure
         env:
           ARCHS: ${{ matrix.archs }}
         run: |
@@ -121,6 +128,12 @@ jobs:
             "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
             -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+      # Keep completed vcpkg packages even if configuration or NInfer compilation fails.
+      - uses: actions/cache/save@v6
+        if: always() && steps.configure.outcome != 'skipped' && steps.dependency-cache.outputs.cache-hit != 'true'
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: ${{ steps.dependency-cache.outputs.cache-primary-key }}
       - name: Build release products
         run: .github/scripts/build-windows-release.ps1
       - name: Package, verify device images and test startup without Toolkit on PATH
@@ -141,9 +154,12 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: windows-logs-${{ matrix.cuda }}
+          include-hidden-files: true
           path: |
             build-release/*.log
             build-release/CMakeFiles/CMakeConfigureLog.yaml
+            build-release/vcpkg-manifest-install.log
+            .vcpkg/buildtrees/**/*.log
             dist/*/BUILD-INFO.json
           if-no-files-found: ignore
           retention-days: 7
