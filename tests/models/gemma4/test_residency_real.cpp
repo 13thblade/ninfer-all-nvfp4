@@ -168,9 +168,11 @@ Result run(const Scenario& scenario, const char* artifact, const std::vector<Tok
         if (scenario.residency != ExpertResidency::Device && !stats.experts.transferred_bytes) {
             throw std::runtime_error("residency flag did not deliver any expert bytes");
         }
+        // A zero cache keeps the layer banks only; between prompts they serve as cache slots, so
+        // decode may still hit experts there.
         if (scenario.residency != ExpertResidency::Device && scenario.cache == 0 &&
-            (memory.expert_cache_bytes || stats.experts.hits)) {
-            throw std::runtime_error("zero-cache delivery retained persistent expert hits");
+            memory.expert_cache_bytes) {
+            throw std::runtime_error("zero-cache delivery reserved expert cache memory");
         }
         if ((scenario.residency == ExpertResidency::Host) != (load.pinned_weight_bytes != 0)) {
             throw std::runtime_error("pinned weight footprint differs from selected expert placement");
