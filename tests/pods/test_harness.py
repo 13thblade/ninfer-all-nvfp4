@@ -41,7 +41,46 @@ def test_obsolete_guard_cannot_stop_a_rearmed_stage(monkeypatch, now):
     monkeypatch.setattr(harness.time, "time", lambda: now)
     monkeypatch.setattr(harness, "state", lambda: {"id": 123, "deadline": 20})
     monkeypatch.setattr(harness, "vast", lambda *a: pytest.fail("obsolete guard called provider"))
+    monkeypatch.setattr(harness.subprocess, "run", lambda *a, **kw: pytest.fail("a newer arm keeps the job"))
     harness.main()
+
+
+@pytest.mark.parametrize("record", [{"id": 123, "deadline": 10, "destroyed": True},
+                                    {"id": 456, "deadline": 10}])
+def test_guard_of_an_ended_rental_removes_its_launchd_job(monkeypatch, record):
+    commands = []
+    monkeypatch.setattr(harness.sys, "argv", ["harness", "_guard", "123", "10"])
+    monkeypatch.setattr(harness.sys, "platform", "darwin")
+    monkeypatch.setattr(harness.time, "time", lambda: 5)
+    monkeypatch.setattr(harness, "state", lambda: record)
+    monkeypatch.setattr(harness, "vast", lambda *a: pytest.fail("ended rental called provider"))
+    monkeypatch.setattr(harness.subprocess, "run", lambda args, **kw: commands.append(args))
+    harness.main()
+    assert commands == [["launchctl", "remove", "ninfer-rental-123"]]
+
+
+def test_guard_without_its_state_file_still_stops_the_rental(monkeypatch):
+    rental = {"id": 123, "actual_status": "running", "intended_status": "running"}
+    stopped, commands = [], []
+    monkeypatch.setattr(harness.sys, "argv", ["harness", "_guard", "123", "10"])
+    monkeypatch.setattr(harness.sys, "platform", "darwin")
+    monkeypatch.setattr(harness.time, "time", lambda: 15)
+    monkeypatch.setattr(harness.time, "sleep", lambda _: None)
+    monkeypatch.setattr(harness, "STATE", harness.Path("/nonexistent/pod.json"))
+    monkeypatch.setattr(harness.subprocess, "run", lambda args, **kw: commands.append(args))
+
+    def provider(*args):
+        if args == ("show", "instances"):
+            return [rental.copy()]
+        assert args == ("stop", "instance", 123)
+        stopped.append(args)
+        rental.update(actual_status="exited", intended_status="stopped")
+        return {}
+
+    monkeypatch.setattr(harness, "vast", provider)
+    harness.main()
+    assert len(stopped) == 1
+    assert commands == [["launchctl", "remove", "ninfer-rental-123"]]
 
 
 def test_guard_carries_its_selected_rental_record(monkeypatch, tmp_path):

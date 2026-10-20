@@ -145,6 +145,16 @@ def state():
     return json.loads(STATE.read_text())
 
 
+def guard_label(instance):
+    return f"ninfer-rental-{instance}"
+
+
+def remove_guard(instance):
+    # launchd keeps a submitted job alive: it relaunches the guard whenever the guard exits.
+    if sys.platform == "darwin":
+        subprocess.run(["launchctl", "remove", guard_label(instance)], capture_output=True)
+
+
 def arm_guard(pod, hours):
     if pod["provider"] != "vast" or not 0 < hours <= 6:
         raise ValueError("guard requires a Vast rental and a deadline of zero to six hours")
@@ -155,8 +165,8 @@ def arm_guard(pod, hours):
     if sys.platform == "darwin":
         # launchd owns the guard independently of an interrupted app tool process. caffeinate
         # prevents idle sleep; provider credentials remain in their local CLI configuration.
-        label = f"ninfer-rental-{pod['id']}"
-        subprocess.run(["launchctl", "remove", label], capture_output=True)
+        label = guard_label(pod["id"])
+        remove_guard(pod["id"])
         run(["launchctl", "submit", "-l", label, "-o", str(log), "-e", str(log), "--",
              "/usr/bin/env", f"PATH={os.environ['PATH']}", f"NINFER_POD_STATE={STATE}",
              "/usr/bin/caffeinate", "-i", "-s",
@@ -420,25 +430,37 @@ def main():
     if args.command == "_guard":
         print(json.dumps({"guard": "armed", "instance": args.instance,
                           "deadline": args.deadline}), flush=True)
+
+        def released():
+            # Without its state file the guard keeps its own rental and deadline. A destroyed or
+            # replaced rental removes the guard's launchd job; another deadline is a newer arm of
+            # this rental, which owns the same job label, so the job stays.
+            try:
+                current = state()
+            except FileNotFoundError:
+                return False
+            ended = current.get("id") != args.instance or current.get("destroyed")
+            if not ended and current.get("deadline") == args.deadline:
+                return False
+            print(json.dumps({"guard": "released", "instance": args.instance}), flush=True)
+            if ended:
+                remove_guard(args.instance)
+            return True
+
         while time.time() < args.deadline:
-            current = state()
-            if (current.get("id") != args.instance or current.get("destroyed")
-                    or current.get("deadline") != args.deadline):
-                print(json.dumps({"guard": "released", "instance": args.instance}), flush=True)
+            if released():
                 return
             time.sleep(min(30, args.deadline - time.time()))
         # Stop preserves model files/results. No credential is carried in argv or logs.
         for attempt in range(6):
             try:
-                current = state()
-                if (current.get("id") != args.instance or current.get("destroyed")
-                        or current.get("deadline") != args.deadline):
-                    print(json.dumps({"guard": "released", "instance": args.instance}), flush=True)
+                if released():
                     return
                 pods = vast("show", "instances")
                 pod = next((p for p in pods if p["id"] == args.instance), None)
                 if pod is None or rental_stopped(pod.get("actual_status"), pod.get("intended_status")):
                     print(json.dumps({"guard": "stop_confirmed", "instance": args.instance}), flush=True)
+                    remove_guard(args.instance)
                     return
                 vast("stop", "instance", args.instance)
                 print(json.dumps({"guard": "stop_requested", "instance": args.instance,
@@ -471,8 +493,7 @@ def main():
         for attempt in range(6):
             pod = endpoint(pod)
             if rental_stopped(pod.get("status"), pod.get("intended_status")):
-                if sys.platform == "darwin" and pod.get("guard_label"):
-                    subprocess.run(["launchctl", "remove", pod["guard_label"]], capture_output=True)
+                remove_guard(pod["id"])
                 print(json.dumps({"stop_confirmed": pod["id"], "files": "retained"}))
                 return
             vast("stop", "instance", pod["id"])
@@ -556,6 +577,7 @@ def main():
             raise RuntimeError("instance destruction is not yet confirmed")
         pod["destroyed"] = True
         save(pod)
+        remove_guard(pod["id"])
         print(json.dumps({"discarded_empty": pod["id"]}))
         return
     pod = endpoint(state())
@@ -720,6 +742,7 @@ def main():
             raise RuntimeError("instance destruction is not yet confirmed")
         pod["destroyed"] = True
         save(pod)
+        remove_guard(pod["id"])
         print(json.dumps({"destroyed": pod["id"]}))
 
 

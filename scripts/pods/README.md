@@ -73,7 +73,10 @@ whose tmux session disappeared without an exit marker. A satellite samples host/
 two minutes, then exits. Process command arguments and environment are deliberately excluded.
 
 A local guard stops the exact rental at `--hours`, preserving its files. On macOS, launchd owns
-the guard independently of the app's tool processes and caffeinate prevents idle sleep.
+the guard independently of the app's tool processes and caffeinate prevents idle sleep. launchd
+relaunches the guard whenever it exits, so `stop`, `destroy`, `discard-empty` and the guard itself,
+after a confirmed stop or once its rental is destroyed or replaced, remove its job. A guard whose
+state file is gone still stops its rental at the deadline.
 `guard --hours 1` replaces the deadline for the attached rental and logs its
 admission immediately. Sleep prevention does not survive shutdown or logout; this is not a
 provider-side spending cap. Collect results before destroying the finished ephemeral pod;
