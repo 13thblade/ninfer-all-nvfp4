@@ -543,12 +543,12 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   bank holds, CPU threads compute a share from the stored blocks while the GPU copies and runs the
   rest (`--expert-dma-share`, `auto` by default: the split whose copies and CPU products end
   soonest by earlier calls' times; `--expert-cpu-threads`, one pinned thread per physical core by
-  default). The CPU computes GeGLU over the [gate; up] rows, the BF16 middle quantized as q8_1 and
-  the down rows as the GPU's vector kernels do, into the same 2^-32 fixed-point sums
-  ([the CPU share](qwen3-8-flash-next.md#the-cpu-share) describes the arithmetic), so outputs do
-  not depend on the split. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S
-  and IQ4_XS blocks have CPU products; other layers copy every miss. An expert the CPU computed
-  takes no slot; the cache's rounds decide whether it enters.
+  default, at most half the process's CPUs). The CPU computes GeGLU over the [gate; up] rows,
+  the BF16 middle quantized as q8_1 and the down rows as the GPU's vector kernels do, into the same
+  2^-32 fixed-point sums ([the CPU share](qwen3-8-flash-next.md#the-cpu-share) describes the
+  arithmetic), so outputs do not depend on the split. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K,
+  IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other layers copy every miss.
+  An expert the CPU computed takes no slot; the cache's rounds decide whether it enters.
 - **Calls.** Vector decode and verification run the cached pairs while the rest arrive, then the
   rest; both add to one fixed-point sum, so outputs equal resident execution bit for bit. Prompt
   chunks wait for their experts and run the existing matrix path.
@@ -562,6 +562,16 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   that every sequence's whole context fits beside the layer banks, so a context never runs out of
   memory: the cache can shrink to no slots. An explicit `--expert-cache-mib` and device experts keep
   the whole KV allocated.
+
+On an RTX 4090 (450 W, PCIe 4.0 x16, CUDA 12.8) with the QAT artifact, host experts, four sequences
+of 131,072 positions and three drafts a round, 2026-10-20: commit `5ed86dff9`, which reserves every
+sequence's KV (7,410 MiB), cached 3,251 of the 3,840 experts; with the growing KV the cache holds
+all 3,840 and 5.4 GiB of the device stays free at startup (a 59-thread CPU pool, before the pool
+took half the CPUs). Short answers decoded at 295-413 tok/s before and 288-410 after, and after a
+107,074-token prompt at 181 and 180 tok/s, since both caches serve nearly every route. The answers
+equal those of an explicit 4,096 MiB cache, whose KV stays whole, token for token with equal log
+probabilities. Against `5ed86dff9` they part after 45 to 102 tokens or not at all: the GPU's vector
+kernels now round each step of Q4_0's slice products as the CPU does.
 
 With host or disk experts and an artifact that carries the assistant, the assistant drafts three
 tokens a round unless `--spec` says otherwise ([speculative decoding](#speculative-decoding-with-the-assistant)).

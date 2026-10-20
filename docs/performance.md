@@ -660,6 +660,20 @@ decode tok/s with the expert-cache hits:
 The RTX 3060 and 3060 Ti hold 4.9 to 5.3 GiB and 0.9 to 1.3 GiB of expert cache; their
 host-memory rows peak at 32.7 GiB of RAM, their disk rows at 1.2 to 1.3 GiB.
 
+### Long contexts with host experts on one RTX 4090
+
+The IQ3_S release through `ninfer-serve` with host experts and its defaults (three MTP drafts, the
+CPU share, the streamed sparse-attention KV), against commit `5ed86dff9` with three drafts and the
+CPU share; 256 greedy tokens after short prompts and after a long document
+([details](qwen3-8-flash-next.md#host-experts-and-long-contexts-on-one-rtx-4090)):
+
+| Context | Build | Expert cache | Decode, short prompts | Decode after the document | Prefill |
+|---:|---|---:|---|---|---:|
+| 65,536 | `5ed86dff9` | 14,080 MiB | 66.5-77.1 | 66.5-75.0 (31,865 tokens) | 2,576-2,714 |
+| 65,536 | defaults | 16,059 MiB | 72.6-82.5 | 66.0-79.0 (31,865 tokens) | 2,840 |
+| 458,752 | `5ed86dff9`, no drafts | 4,589 MiB | 39.2-43.0 | 37.7 (136,077 tokens) | 2,612 |
+| 458,752 | defaults | 14,643 MiB | 67.3-70.3 | 67.6 (136,077 tokens) | 2,708 |
+
 ### MTP
 
 Two RTX 3090s (350 W), the Q2_0 release with Unsloth's `shared-Q8_0` MTP block, greedy decoding of

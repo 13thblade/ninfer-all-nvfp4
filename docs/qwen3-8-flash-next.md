@@ -205,7 +205,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--expert-dma-share F\|auto` | host or disk experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1`; the CPU computes the rest from RAM while the GPU runs the cached ones. `auto` (the default) gives each call of GGUF experts the split whose copies and CPU products end soonest by the times measured on earlier calls, and copies every miss of native experts. Only calls of up to eight tokens use the CPU; GGUF CPU products are the GPU's bit for bit ([the CPU share](#the-cpu-share)) |
 | `--expert-tail-skip N` | GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten, instead of copying it; the remaining experts keep their router weights (no renormalization). Lossy, off by default; prefill always runs every routed expert. On an RTX 3090 with Q2_0 and four short chat prompts, `7` decoded 9.0-17.6% and `6` 11.9-24.4% faster, copying 22-43% and 29-52% fewer expert bytes; perplexity over 5,115 tokens scored one token per call went from 4.667 to 4.710 with `7` and 4.688 with `6`, an order opposite to how much each leaves out, so that sample does not resolve the cost |
 | `--expert-prefill-buffers 1\|2` | GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts into (default `1`); `2` alternates two, so the next layer's copies run while this layer's experts do, when half the free memory holds both. On an RTX 3090 with Q2_0 the second buffer prefilled a 5,462-token prompt 8.5-10.5% and a 31,860-token prompt 1.9-2.3% faster. With the automatic cache both buffers hold cache slots between prompts; with an explicit `--expert-cache-mib` they take memory beside it |
-| `--expert-cpu-threads N` | host or disk experts with a CPU share: `1..256` CPU threads, the calling one included; default is one per physical core the process may use (its affinity mask), at most its container CPU quota. Each thread is pinned to a physical core and spins while requests decode |
+| `--expert-cpu-threads N` | host or disk experts with a CPU share: `1..256` CPU threads, the calling one included; default is one per physical core the process may use (its affinity mask), at most half its CPUs (the mask and a container CPU quota); the rest stay with the threads that drive the GPU and serve requests ([the CPU share on one RTX 4090](#the-cpu-share-on-one-rtx-4090)). Each thread is pinned to a physical core and spins while requests decode |
 | `--expert-cache-adaptive` | replace cold cached native experts between calls; off by default because it changes the CPU/GPU arithmetic partition |
 | `--expert-profile PATH` | fill the expert cache at startup from counts recorded for the same artifact (`--expert-profile-out`); default: the built-in profile of the model family and its bank widths, where the build has one |
 | `--expert-profile-out PATH` | record every layer's expert routes after requests, for a later `--expert-profile` |
@@ -737,29 +737,84 @@ admitted every miss into the least recently used slot let a passing decode evict
 prompts keep routing to; the tiers (below 1.5, below 6, and more routes) restored second-run starts
 of 212-305 ms instead of 284-397 ms on a second RTX 3090 for at most 4.4% of first-run decode.
 
-### The CPU share on one RTX 3090
+### Host experts and long contexts on one RTX 4090
 
-One RTX 3090 (350 W, PCIe 4.0 x16) with 15.4 of the 32 threads of an EPYC 7313 and 92 GB of RAM (a
-Vast container), driver 595.71.05 and CUDA 12.8, ran the IQ3_S release with its IQ4_NL table
-through `ninfer-serve`: host experts, a 14,460 MiB expert cache, a 65,536-position context and one
-request at a time, 2026-10-18. Four prompts (a Python LRU cache, the blue sky, a Chinese prompt and
-a 5,467-token document) ran twice each with 256 greedy output tokens, in two rounds whose server
-order rotates: 16 answers per row.
+One RTX 4090 (450 W, PCIe 4.0 x16, driver 590.48.01, CUDA 12.8) in a Vast container with two
+EPYC 7742 sockets, a 61.44-CPU quota and 503 GB of RAM ran the IQ3_S release with its IQ4_NL table
+through `ninfer-serve`: host experts, one request at a time, 256 greedy output tokens, every server
+pinned to the GPU's NUMA node (`taskset -c 0-63,128-191`), 2026-10-20. The baseline is commit
+`5ed86dff9`, the build before the expert tier, the CPU share by default, MTP by default and the
+streamed sparse-attention KV; its default copies every miss and drafts nothing, and its MTP row
+adds `--spec mtp --draft-tokens 3 --expert-dma-share auto`.
 
-| `--expert-dma-share` | Decode, tok/s (range, mean) | Misses on the CPU | 5,467-token prefill |
-|---|---|---|---|
-| 1, the GPU only | 60.9-69.9, 64.7 | — | 1,538-1,726 tok/s |
-| `auto` (5 threads) | 59.4-68.9, 63.8 | 4.9% | 1,597-1,727 tok/s |
-| 0.5, 7 threads | 51.9-65.0, 57.7 | 20.9% | 1,586-1,706 tok/s |
+At a 65,536-position context, a Python LRU cache prompt and a blue-sky prompt twice and a
+31,865-token document once per server, two rounds in rotated server order (eight short answers
+per row):
 
-Every answer with a CPU share has the GPU-only answer's tokens and log probabilities. The misses
-count prompt chunks, which always run on the GPU. The CPU's experts take cache slots behind their
-call, so every row carried the same 985 GB across the bus; the CPU only spares a call the wait for
-its experts' copies. Left out of the cache in one round of the same answers, they cut the bus bytes
-by 11% (`auto`), 10% (a share of 0.8) and 44% (0.5), and decoded at 63.0, 65.3 and 52.3 tok/s
-against 64.7 for the GPU alone. One of these threads computes an IQ3_S expert projection of
-640 × 2,560 values in 0.30 ms for one token and 0.44 ms for four. Hosts with other ratios of CPU
-speed to bus speed have not been measured.
+| Build | Expert cache | Decode, short prompts | Decode after 31,865 tokens | Prefill | Bus bytes |
+|---|---:|---|---|---|---:|
+| baseline | 14,288 MiB | 61.4-75.5 (68.3) tok/s | 68.7 tok/s | 2,833-2,846 tok/s | 660 GB |
+| baseline, MTP and CPU share | 14,080 MiB | 66.5-77.1 (71.4) tok/s | 66.5-75.0 tok/s | 2,576-2,714 tok/s | 901 GB |
+| defaults | 16,059 MiB | 72.6-82.5 (77.0) tok/s | 66.0-79.0 tok/s | 2,840 tok/s | 223 GB |
+| defaults, 59 CPU threads | 16,059 MiB | 70.2-77.8 (73.1) tok/s | 64.4-75.6 tok/s | 2,818-2,831 tok/s | 218 GB |
+| defaults, 59 CPU threads, `--kv-resident all` | 15,264 MiB | 68.7-76.9 (71.8) tok/s | 63.2-75.2 tok/s | 2,833-2,859 tok/s | 226 GB |
+
+The bus bytes are every expert byte the server copied to the GPU over its ten requests. The rows
+with 59 CPU threads (the pool's size before it took half the CPUs) ran in one sitting with the
+baseline; the defaults ran about an hour later on the same host. The defaults copy a quarter of the baseline MTP row's bytes and decode the
+short prompts 7.8% faster on its mean, with overlapping ranges; streamed and resident KV decode
+alike at this context. Before the prefill buffers became cache slots the 59-thread defaults' cache
+held 14,776 MiB and decoded the short prompts at 64.9-72.0 (68.3) tok/s.
+
+An Nsight Systems trace of one 256-token code answer shows where the step goes instead. With the
+defaults (then a 59-thread CPU pool) the GPU spent 39% of the answer computing, 38% in the kernels
+that wait for the host's expert service (the missing experts' copies and the CPU's products) and
+23% idle, and the copies took 23.8 GB; the baseline's MTP row spent 41%, 38% and 21%, with
+42.5 GB of copies.
+
+At a 458,752-position context, the same two short prompts and a 136,077-token document once,
+one server each: the baseline keeps every layer's KV on the device and has 4,589 MiB left for
+experts; the defaults keep the 12 sparse-attention layers' KV in pinned host memory (11,648 MiB)
+with 832 MiB of their blocks on the device, and the cache takes 14,643 MiB.
+
+| Build | Expert cache | Decode, code / prose | Decode after 136,077 tokens | Prefill |
+|---|---:|---|---|---|
+| baseline | 4,589 MiB | 39.2 / 43.0 tok/s | 37.7 tok/s | 2,612 tok/s |
+| defaults, 59 CPU threads, `--kv-resident all` | 4,755 MiB | 39.0 / 31.3 tok/s | 34.7 tok/s | 2,548 tok/s |
+| defaults, 59 CPU threads | 14,643 MiB | 70.0 / 67.2 tok/s | 62.3 tok/s | 2,700 tok/s |
+| defaults | 14,643 MiB | 70.3 / 67.3 tok/s | 67.6 tok/s | 2,708 tok/s |
+
+The baseline's and the defaults' answers part after a few tokens to a few hundred. Since the CPU's
+products of K-quant, Q4_0 and Q5_0 blocks were made equal to the GPU's, the GPU's vector kernels
+round each step of those slices' products, the one change to the GPU arithmetic of this release's
+decode, which keeps 177 tensors in Q4_K, Q5_K and Q6_K; prompt chunks run the matrix kernels, which
+did not change. The defaults' configurations (with and without lent buffers, 30 or 59 CPU threads,
+streamed or resident KV) give each other's answers token for token with equal log probabilities, and
+the 40 KB perplexity slice scores 1.980071 on both builds.
+
+### The CPU share on one RTX 4090
+
+The RTX 4090 host of the previous section, servers pinned to the GPU's NUMA node, the IQ3_S release
+at a 65,536-position context with its other defaults, 2026-10-20. Three prompts (a Python LRU
+cache, the blue sky, the history of the Great Wall in Chinese) ran twice per server with 256 greedy
+output tokens, in two rounds whose server order rotates: 12 answers per row.
+
+| `--expert-dma-share`, `--expert-cpu-threads` | Decode, tok/s (range, mean) | Misses on the CPU | Bus bytes per token |
+|---|---|---:|---:|
+| 1, the GPU only | 62.7-75.2, 68.4 | — | 172.5 MB |
+| `auto`, 59 threads | 64.3-78.6, 71.1 | 37.3% | 85.8 MB |
+| `auto`, 16 threads | 65.4-82.8, 74.2 | 29.9% | 102.4 MB |
+
+Every answer with a CPU share has the GPU-only answer's tokens and log probabilities. The bus bytes
+are every expert byte the server copied, prompt chunks included, over the tokens it generated. An
+expert the CPU computes takes no slot and crosses no bus, so the share halves the bytes; decode
+gains less, 4% with 59 threads and 8% with 16: the bus no longer bounds a step on this host. With
+59 threads the CPU took a larger share of the misses and still decoded slower than with 16 in 11 of
+the 12 pairs of answers. A second sweep (the same three prompts once per server, two rounds) decoded
+at a mean of 72.5 tok/s with 8 threads, 74.4 with 16, 74.3 with 24, 73.4 with 32 and 71.3 with 59,
+every answer equal; the default pool takes half the process's CPUs (30 here). Spinning on all 61
+CPUs of the container's quota, the pool had the process throttled in 208 of 211 scheduling periods
+while it decoded.
 
 ### MTP
 
