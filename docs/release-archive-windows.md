@@ -19,7 +19,7 @@ checks the downloaded volumes. The inner `SHA256SUMS.txt` checks the extracted f
 - an NVIDIA GPU covered by the device images in `BUILD-INFO.json`, with a driver compatible with
   the package's CUDA version
   - CUDA 12.9 CI package: Volta, Turing, Ampere (including A100), Ada
-  - CUDA 13.2 CI package: Turing, Ampere (including A100), Ada, consumer Blackwell
+  - CUDA 13.4 CI package: Turing, Ampere (including A100), Ada, consumer Blackwell
   - local packages carry the architectures selected by their builder
 - Microsoft Visual C++ 2022 runtime
 

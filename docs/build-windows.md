@@ -13,7 +13,7 @@ TITAN RTX (TCC, and WDDM for the virtual-memory tests) and an RTX 3060 (WDDM), r
 This repository has no Windows test host. CI compiles the host code of every translation unit with
 MSVC 14.44 for `70` (CUDA 12.9), `75`, `80`, `86`, `89` and `120a` (CUDA 13.4) on each change
 to the build inputs (`scripts/check-host-compile.py`), but that host check builds no device code.
-The separate `Windows release` workflow compiles
+The separate `Native release` workflow compiles
 and links the release products for two CUDA versions, checks their device images and tests `--help`
 without the Toolkit on `PATH`. It has no GPU and does not qualify inference or performance.
 The new release workflow has not yet completed a native Windows run. The Windows-only
@@ -109,17 +109,17 @@ on a 24 GB card that serves a desktop, an explicit capacity is easier to predict
 
 ## Release archive
 
-The `Windows release` workflow builds two native x64 packages with VS 2022 and Ninja:
+The `Native release` workflow builds two native x64 packages with VS 2022 and Ninja:
 
 | Toolkit | Device images in each executable |
 |---|---|
-| CUDA 12.9.1 | `70;75;80;86;89` (Volta through Ada) |
-| CUDA 13.2.0 | `75;80;86;89;120a` (Turing through consumer Blackwell) |
+| CUDA 12.9.2 | `70;75;80;86;89` (Volta through Ada) |
+| CUDA 13.4.3 | `75;80;86;89;120a` (Turing through consumer Blackwell) |
 
 A push that changes release inputs on `master` builds both packages. The `build/windows-release`
 branch runs the same build without publication. A manual run builds the packages
-without publication by default. Select `publish` on `master` to publish. Both matrix jobs must
-pass before publication. The workflow creates an immutable `windows-<source commit>` release,
+without publication by default. Select `publish` on `master` to publish. Both Windows and both Linux jobs must
+pass before publication. The workflow creates an immutable `native-<source commit>` release,
 then marks it **latest** after checking every uploaded asset. It leaves an older latest release
 available if compilation, packaging or upload fails. See [release process](maintainer/release-process.md).
 
@@ -130,8 +130,9 @@ licences and launchers into `.7z.001` volumes of at most 1900 MiB. Download ever
 variant into the same folder and extract the first with 7-Zip. Do not mix the CUDA variants.
 
 `BUILD-INFO.json` records the source revision, source modifications, CUDA version and device images.
-`VERSION` identifies the source's product version. The archive filename also identifies the actual
-commit, so later snapshots do not present themselves as the original versioned release.
+Archive names use the platform, CUDA version, GPU architectures and 12-character source commit,
+for example `ninfer-windows-x64-cuda13.4-sm75-80-86-89-120a-0123456789ab.7z.001`.
+`VERSION` is retained inside the package as source metadata; it is not part of the archive name.
 
 Compilation on the hosted runner still needs native verification: these five-image executables
 may encounter MSVC image-size limits or runner memory/time limits. Archive splitting addresses

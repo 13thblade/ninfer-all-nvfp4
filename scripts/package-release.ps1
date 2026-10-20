@@ -25,7 +25,7 @@ if ($LASTEXITCODE -ne 0 -or $CudaVersionText -notmatch 'release (\d+\.\d+),') {
 $CudaVersion = $Matches[1]
 $CudaMajor = $CudaVersion.Split('.')[0]
 $Version = (Get-Content -LiteralPath (Join-Path $RepoRoot 'VERSION') -Raw).Trim()
-if ($Version -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw 'VERSION is not a safe archive label' }
+if ($Version -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw 'VERSION is not a valid release-notes identifier' }
 $ReleaseNotes = Join-Path $RepoRoot "RELEASE_NOTES_$($Version.Split('-')[0]).md"
 if (-not (Test-Path -LiteralPath $ReleaseNotes)) { throw "Missing $ReleaseNotes" }
 $Revision = (& git -C $RepoRoot rev-parse HEAD).Trim()
@@ -34,7 +34,7 @@ $SourceState = @(& git -C $RepoRoot status --porcelain --untracked-files=no)
 if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect source changes' }
 if ($env:GITHUB_ACTIONS -eq 'true' -and $SourceState.Count -ne 0) { throw 'CI source tree is modified' }
 $Suffix = if ($SourceState.Count) { '-dirty' } else { '' }
-$ProductName = "ninfer-windows-x64-cuda$CudaVersion-sm$($Archs -join '-')-$Version-$($Revision.Substring(0,12))$Suffix"
+$ProductName = "ninfer-windows-x64-cuda$CudaVersion-sm$($Archs -join '-')-$($Revision.Substring(0,12))$Suffix"
 $DistRoot = Join-Path $RepoRoot 'dist'
 $ProductRoot = Join-Path $DistRoot $ProductName
 $ChecksumPath = Join-Path $DistRoot "SHA256SUMS-$ProductName.txt"
@@ -106,7 +106,7 @@ foreach ($product in $Products) {
     } finally { $env:PATH = $savedPath }
 }
 @{ source_revision = $Revision; modified_sources = [bool]$SourceState.Count; version = $Version;
-   cuda = $CudaVersion; architectures = $Archs; platform = 'windows-x64';
+   cuda = $CudaVersion; cuda_compiler = $CudaVersionText; architectures = $Archs; platform = 'windows-x64';
    validation = 'Device images present; all three executables passed --help without Toolkit on PATH. GPU inference was not tested.'
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ProductRoot 'BUILD-INFO.json') -Encoding utf8
 $innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File | Sort-Object Name | ForEach-Object {

@@ -17,7 +17,7 @@
 # A prebuilt dist directory has the layout docker/stage-dist.sh writes: bin/<build>/ and
 # packages/<build>.txt for each build (sm<arch> or multi).
 
-ARG CUDA_VERSION=13.4.2
+ARG CUDA_VERSION=13.4.3
 ARG UBUNTU_VERSION=26.04
 
 # --- toolchain: also the CI build environment ------------------------------------------------------

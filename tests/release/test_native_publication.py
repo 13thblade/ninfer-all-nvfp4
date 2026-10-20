@@ -7,9 +7,10 @@ import subprocess
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).resolve().parents[2] / '.github/scripts/publish-windows-release.sh'
+SCRIPT = Path(__file__).resolve().parents[2] / '.github/scripts/publish-native-release.sh'
 SHA = 'a' * 40
-VARIANTS = ('cuda12.9-sm70-75-80-86-89', 'cuda13.2-sm75-80-86-89-120a')
+VARIANTS = tuple(f'{os}-x64-{cuda}' for os in ('windows', 'linux')
+                 for cuda in ('cuda12.9-sm70-75-80-86-89', 'cuda13.4-sm75-80-86-89-120a'))
 
 GH = r'''#!/usr/bin/env python3.11
 import hashlib, json, os, pathlib, sys
@@ -34,13 +35,13 @@ if args[0] == 'api':
             sys.exit(0)
         assets = []
         for p in pathlib.Path('.').iterdir():
-            if '.7z.' in p.name or p.name.startswith('SHA256SUMS-'):
+            if '.7z.' in p.name or '.tar.gz.' in p.name or p.name.startswith('SHA256SUMS-'):
                 digest = hashlib.sha256(p.read_bytes()).hexdigest()
                 assets.append(dict(name=p.name, size=p.stat().st_size,
                                    digest='sha256:' + ('0'*64 if mode == 'bad-remote' else digest)))
         print(json.dumps({'assets': assets}))
     elif route.endswith('/releases/latest'):
-        print('windows-' + os.environ['GITHUB_SHA'][:12])
+        print('native-' + os.environ['GITHUB_SHA'][:12])
     else:
         raise SystemExit('Unexpected API call: ' + route)
 elif args[:2] not in (['release', 'create'], ['release', 'upload'], ['release', 'edit']):
@@ -48,7 +49,7 @@ elif args[:2] not in (['release', 'create'], ['release', 'upload'], ['release', 
 '''
 
 
-class WindowsPublicationTest(unittest.TestCase):
+class NativePublicationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -64,8 +65,9 @@ class WindowsPublicationTest(unittest.TestCase):
                         GITHUB_SHA=SHA, GITHUB_REPOSITORY='test/ninfer',
                         GITHUB_REF='refs/heads/master', GH_CALLS=str(self.calls))
         for variant in VARIANTS:
-            stem = f'ninfer-windows-x64-{variant}-0.12.0-rtx3090-{SHA[:12]}'
-            volume = self.dist / f'{stem}.7z.001'
+            stem = f'ninfer-{variant}-{SHA[:12]}'
+            extension = '7z' if variant.startswith('windows-') else 'tar.gz'
+            volume = self.dist / f'{stem}.{extension}.001'
             volume.write_bytes(b'archive fixture ' + variant.encode())
             digest = hashlib.sha256(volume.read_bytes()).hexdigest()
             (self.dist / f'SHA256SUMS-{stem}.txt').write_text(f'{digest}  {volume.name}\n')

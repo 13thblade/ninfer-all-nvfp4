@@ -26,7 +26,7 @@ driver of the CUDA 13 branch (580 or newer) and the NVIDIA Container Toolkit; ma
 can access the GPU first:
 
 ```bash
-docker run --rm --gpus all nvidia/cuda:13.4.2-base-ubuntu26.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:13.4.3-base-ubuntu26.04 nvidia-smi
 ```
 
 Download and serve the Qwen3.8 model with the measured `tuned` profile:
@@ -293,9 +293,11 @@ The launcher uses `build-linux/apps/ninfer-serve` when the executable is not bes
 Set `NINFER_SERVER` to select another executable. Profiles and the measurements behind them are in
 [launcher profiles](maintainer/launcher-profiles.md).
 
-`scripts/package-release.sh` creates the Linux `tar.gz` archive for the release named in `VERSION`,
-and `scripts/package-release.ps1` the Windows ZIP; `build.sh --package` and `build.ps1 -Package` run
-them after a build ([cutting a release](maintainer/release-process.md)).
+`scripts/package-release.sh` creates split Linux `tar.gz` volumes; `scripts/package-release.ps1`
+creates Windows 7-Zip volumes. Names contain the platform, CUDA minor version, architecture list
+and source commit, without the product `VERSION`. `build.sh --package` and `build.ps1 -Package`
+run the packagers after a build. The Native release workflow builds Debian 13 and Windows packages
+with CUDA 12.9.2 and 13.4.3. See [cutting a release](maintainer/release-process.md).
 
 ## Validation
 

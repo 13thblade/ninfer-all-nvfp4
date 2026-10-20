@@ -45,7 +45,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ env.CCACHE_HOST_DIR }}
-          key: ccache-multi-${{ github.sha }}
+          key: ccache-multi-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ccache-multi-
       # A step timeout below the job's, so that a cold build which runs out of time still saves its
       # ccache and the next push continues from there.
@@ -64,7 +64,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: ${{ env.CCACHE_HOST_DIR }}
-          key: ccache-multi-${{ github.sha }}
+          key: ccache-multi-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Stage the image binary
         run: |
           docker run --rm -v "$PWD:/src" -w /src ninfer-toolchain:ci \

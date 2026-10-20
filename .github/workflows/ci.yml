@@ -130,33 +130,33 @@ jobs:
           # CUDA 13 dropped Volta, so sm_70 builds with 12.9.
           - label: sm_70
             archs: '70'
-            cuda: 12.9.1
-            installer: cuda_12.9.1_windows_network.exe
+            cuda: 12.9.2
+            installer: cuda_12.9.2_windows_x86_64_network.exe
             packages: nvcc cudart cublas_dev nvtx thrust cuda_profiler_api
           # Their commands differ only in the architecture numbers, which check-host-compile.py
           # compiles once; a definition or source of one of them alone is compiled for it.
           - label: sm_75, sm_80, sm_86, sm_89
             archs: '75 80 86 89'
-            cuda: 13.4.2
-            installer: cuda_13.4.2_windows_x86_64_network.exe
+            cuda: 13.4.3
+            installer: cuda_13.4.3_windows_x86_64_network.exe
             packages: nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api
           - label: sm_120a
             archs: '120a'
-            cuda: 13.4.2
-            installer: cuda_13.4.2_windows_x86_64_network.exe
+            cuda: 13.4.3
+            installer: cuda_13.4.3_windows_x86_64_network.exe
             packages: nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api
           # Builds of several architectures, whose host code instantiates every tier's kernels and
           # routes (src/ops/common/device_tier.h): the CUDA 12 set with Volta and the CUDA 13 set
           # with Blackwell.
           - label: sm_70;75;80;86;89
             archs: '70;75;80;86;89'
-            cuda: 12.9.1
-            installer: cuda_12.9.1_windows_network.exe
+            cuda: 12.9.2
+            installer: cuda_12.9.2_windows_x86_64_network.exe
             packages: nvcc cudart cublas_dev nvtx thrust cuda_profiler_api
           - label: sm_75;80;86;89;120a
             archs: '75;80;86;89;120a'
-            cuda: 13.4.2
-            installer: cuda_13.4.2_windows_x86_64_network.exe
+            cuda: 13.4.3
+            installer: cuda_13.4.3_windows_x86_64_network.exe
             packages: nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api
     steps:
       - uses: actions/checkout@v7
@@ -354,7 +354,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ env.CCACHE_HOST_DIR }}
-          key: ccache-sm${{ matrix.arch }}-${{ github.sha }}
+          key: ccache-sm${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ccache-sm${{ matrix.arch }}-
       # A step timeout below the job's, so that a cold build which runs out of time still saves
       # its ccache and the next run continues from there.
@@ -384,7 +384,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: ${{ env.CCACHE_HOST_DIR }}
-          key: ccache-sm${{ matrix.arch }}-${{ github.sha }}
+          key: ccache-sm${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Run CTest
         run: |
           # No driver on the runner: the toolkit's stub libcuda lets the binaries load, cuInit fails,

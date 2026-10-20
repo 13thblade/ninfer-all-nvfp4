@@ -1,4 +1,4 @@
-name: Windows release
+name: Native release
 
 on:
   push:
@@ -15,16 +15,25 @@ on:
       - 'VERSION'
       - 'RELEASE_NOTES_*.md'
       - 'scripts/package-release.ps1'
+      - 'scripts/package-release.sh'
+      - 'scripts/package-linux-release.py'
+      - 'docker/release.Dockerfile'
+      - 'scripts/run.sh'
+      - 'scripts/download-model.sh'
+      - 'docs/release-archive-linux.md'
       - 'scripts/run.bat'
       - 'scripts/download-model.bat'
       - 'docs/release-archive-windows.md'
       - '.github/scripts/*windows*'
-      - '.github/workflows/windows-release.yml'
+      - '.github/scripts/*native*'
+      - '.github/scripts/check-compiler-cache.py'
+      - '.github/scripts/install-linux-release-tools.sh'
+      - '.github/workflows/native-release.yml'
       - 'tests/release/**'
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish both builds as the latest release (master only)
+        description: Publish Windows and Linux builds as the latest release (master only)
         type: boolean
         default: false
 
@@ -33,7 +42,7 @@ permissions:
 
 # Do not interrupt an asset upload. A superseded build cannot move latest.
 concurrency:
-  group: windows-release-${{ github.ref }}
+  group: native-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -47,7 +56,7 @@ jobs:
           python-version: '3.11'
       - run: python3.11 -m unittest discover -s tests/release -v
 
-  build:
+  windows:
     needs: validate
     name: Windows CUDA ${{ matrix.cuda }} (${{ matrix.archs }})
     runs-on: windows-2022
@@ -56,12 +65,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - cuda: '12.9.1'
+          - cuda: '12.9.2'
             archs: '70;75;80;86;89'
             packages: '["nvcc", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump"]'
-          - cuda: '13.2.0'
+          - cuda: '13.4.3'
             archs: '75;80;86;89;120a'
             packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump"]'
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      SCCACHE_IDLE_TIMEOUT: "0"
     defaults:
       run:
         shell: pwsh
@@ -75,13 +87,27 @@ jobs:
             [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $pwd $path), [ref]$tokens, [ref]$errors)
             if ($errors.Count) { throw ($errors | Out-String) }
           }
-      # Pin the action whose Windows installer table includes both versions.
-      - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+      - uses: actions/setup-python@v7
         with:
-          cuda: ${{ matrix.cuda }}
-          method: network
-          sub-packages: ${{ matrix.packages }}
-          log-file-suffix: ${{ matrix.cuda }}
+          python-version: '3.11'
+      - name: Install the official CUDA Toolkit
+        env:
+          CUDA_VERSION: ${{ matrix.cuda }}
+          CUDA_PACKAGES: ${{ matrix.packages }}
+        run: |
+          $short = ($env:CUDA_VERSION -split '\.')[0..1] -join '.'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
+          $url = "https://developer.download.nvidia.com/compute/cuda/$env:CUDA_VERSION/network_installers/cuda_$($env:CUDA_VERSION)_windows_x86_64_network.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $packages = ($env:CUDA_PACKAGES | ConvertFrom-Json) | ForEach-Object { "${_}_$short" }
+          $process = Start-Process $installer -ArgumentList (@('-s') + $packages) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "CUDA installer failed ($($process.ExitCode))" }
+          $cuda = "${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA\v$short"
+          foreach ($file in 'bin\nvcc.exe', 'bin\cuobjdump.exe', 'include\cuda_runtime.h', 'lib\x64\cublas.lib') {
+            if (-not (Test-Path (Join-Path $cuda $file))) { throw "Missing CUDA component: $file" }
+          }
+          "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
+          "$cuda\bin" >> $env:GITHUB_PATH
       - name: Import Visual Studio 2022 environment
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -99,6 +125,14 @@ jobs:
               }
             }
           }
+      - uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+      - name: Verify C++ and multiarch CUDA cache reuse
+        timeout-minutes: 10
+        env:
+          ARCHS: ${{ matrix.archs }}
+        run: python .github/scripts/check-compiler-cache.py
       - name: Resolve the pinned vcpkg revision
         id: vcpkg
         run: |
@@ -126,6 +160,8 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=x64-windows -DVCPKG_HOST_TRIPLET=x64-windows `
             "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe" `
             "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache `
             -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
       # Keep completed vcpkg packages even if configuration or NInfer compilation fails.
@@ -135,6 +171,7 @@ jobs:
           path: ~/AppData/Local/vcpkg/archives
           key: ${{ steps.dependency-cache.outputs.cache-primary-key }}
       - name: Build release products
+        timeout-minutes: 300
         run: .github/scripts/build-windows-release.ps1
       - name: Package, verify device images and test startup without Toolkit on PATH
         run: |
@@ -142,13 +179,16 @@ jobs:
           ./scripts/package-release.ps1
       - uses: actions/upload-artifact@v7
         with:
-          name: windows-cuda-${{ matrix.cuda }}
+          name: native-windows-cuda-${{ matrix.cuda }}
           path: |
             dist/*.7z.*
             dist/SHA256SUMS-*.txt
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
+      - name: Compiler cache statistics
+        if: always()
+        run: sccache --show-stats
       - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@v7
@@ -156,6 +196,7 @@ jobs:
           name: windows-logs-${{ matrix.cuda }}
           include-hidden-files: true
           path: |
+            build-cache-check/cache-stats.json
             build-release/*.log
             build-release/CMakeFiles/CMakeConfigureLog.yaml
             build-release/vcpkg-manifest-install.log
@@ -164,8 +205,88 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  linux:
+    needs: validate
+    name: Linux Debian 13 CUDA ${{ matrix.cuda }} (${{ matrix.archs }})
+    runs-on: ubuntu-24.04
+    container: debian:13-slim
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: '12.9.2'
+            archs: '70;75;80;86;89'
+          - cuda: '13.4.3'
+            archs: '75;80;86;89;120a'
+    defaults:
+      run:
+        shell: bash
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      SCCACHE_IDLE_TIMEOUT: "0"
+      DEBIAN_FRONTEND: noninteractive
+      ARCHS: ${{ matrix.archs }}
+      CUDA_VERSION: ${{ matrix.cuda }}
+    steps:
+      - name: Install checkout tools
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git
+      - uses: actions/checkout@v7
+      - name: Install Debian build dependencies and official CUDA Toolkit
+        run: .github/scripts/install-linux-release-tools.sh
+      - uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+      - name: Verify C++ and multiarch CUDA cache reuse
+        timeout-minutes: 10
+        run: python3.11 .github/scripts/check-compiler-cache.py
+      - name: Configure release products
+        run: |
+          cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DNINFER_MULTICALL=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache \
+            -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
+      - name: Build release products
+        timeout-minutes: 300
+        run: |
+          cmake --build build-release -j --target ninfer-multicall ninfer_bench > build-release/build.log 2>&1 &
+          build=$!
+          while kill -0 "$build" 2>/dev/null; do
+            printf '%s log bytes: %s\n' "$(date -u +%FT%TZ)" "$(wc -c < build-release/build.log)"
+            tail -n 2 build-release/build.log
+            sleep 15
+          done
+          wait "$build"
+      - name: Package and verify Linux binaries
+        run: NINFER_BUILD_ROOT="$PWD/build-release" scripts/package-release.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-linux-cuda-${{ matrix.cuda }}
+          path: |
+            dist/*.tar.gz.*
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Compiler cache statistics
+        if: always()
+        run: sccache --show-stats
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-logs-${{ matrix.cuda }}
+          path: |
+            build-cache-check/cache-stats.json
+            build-release/*.log
+            build-release/CMakeFiles/CMakeConfigureLog.yaml
+            dist/*/BUILD-INFO.json
+          if-no-files-found: ignore
+          retention-days: 7
+
   publish:
-    needs: build
+    needs: [windows, linux]
     if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || inputs.publish)
     runs-on: ubuntu-24.04
     permissions:
@@ -174,7 +295,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          pattern: windows-cuda-*
+          pattern: native-*
           merge-multiple: true
           path: dist
       - uses: actions/setup-python@v7
@@ -183,4 +304,4 @@ jobs:
       - name: Publish verified assets from this commit
         env:
           GH_TOKEN: ${{ github.token }}
-        run: .github/scripts/publish-windows-release.sh
+        run: .github/scripts/publish-native-release.sh

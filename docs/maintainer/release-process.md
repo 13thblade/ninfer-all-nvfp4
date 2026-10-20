@@ -1,60 +1,83 @@
 # Cutting a release
 
-The Docker workflow publishes the container image. The separate
-[`Windows release`](../../.github/workflows/windows-release.yml) workflow publishes native x64
-executables. Linux release archives remain a manual path.
+The [Native release](../../.github/workflows/native-release.yml) workflow builds Windows x64
+executables and Debian 13 x64 binaries. The existing Docker workflows remain separate.
 
-## Windows publication
+## Native publication
 
-A push to `master` that changes release inputs starts two builds on `windows-2022` with VS 2022,
-Ninja and the pinned vcpkg baseline. CUDA 12.9.1 builds `70;75;80;86;89`. CUDA 13.2.0 builds
-`75;80;86;89;120a`. Volta requires CUDA 12, while this project's Blackwell kernels require CUDA
-13.1 or newer. These are separate packages, each with multiple device images in every executable.
+Each platform builds two variants from the same source commit:
 
-The workflow uses the pinned [CUDA Toolkit action](https://github.com/Jimver/cuda-toolkit).
-[setup-msbuild](https://github.com/microsoft/setup-msbuild) exposes MSBuild but does not import
-`cl.exe`, headers or libraries. The workflow imports `vcvars64.bat` instead. VS 2022 supports both
-selected Toolkits and avoids CUDA 12's rejection of VS 2026.
+| Toolkit | Device images |
+| --- | --- |
+| CUDA 12.9.2 | `70;75;80;86;89` |
+| CUDA 13.4.3 | `75;80;86;89;120a` |
 
-1. Build `ninfer`, `ninfer-serve` and `ninfer_bench` with real vcpkg libraries and device code.
-2. Package DLLs from the build's vcpkg tree and the same CUDA Toolkit that supplied `nvcc`.
-   Include CUDA and dependency licences, launchers, source metadata and checksums.
-3. Check each exe with `cuobjdump --list-elf` for every requested device image.
-   Run each exe with `--help` and only Windows directories on `PATH`.
-4. Create and test 1900 MiB 7-Zip volumes. Preserve both variants as Actions artifacts for seven days.
-5. After **both** builds pass, validate local checksums and create a draft release named
-   `windows-<12-character source commit>`. Upload and compare remote SHA-256 digests and sizes.
-6. Check that the source is still the head of `master`. Publish the draft and mark it **latest**.
-   A superseded build keeps its Actions artifacts, or its draft if upload already started.
+These are the latest CUDA 12 and 13 releases in the
+[NVIDIA archive](https://developer.nvidia.com/cuda-toolkit-archive), checked on 20 October 2026.
+Volta requires CUDA 12. This project's Blackwell kernels require CUDA 13.1 or newer.
+Windows uses the official NVIDIA network installer, VS 2022, Ninja and pinned vcpkg libraries.
+It imports `vcvars64.bat`; setup-msbuild alone does not provide the compiler environment.
+Linux uses Debian 13 with the exact Toolkit metapackage from NVIDIA's official repository.
+CUDA 13 uses the Debian 13 repository. CUDA 12 uses NVIDIA's Debian 12 repository because no
+CUDA 12 package is published for Debian 13; this combination needs native build verification.
+Debian 13 supplies the FFmpeg version required by NInfer.
+Compilation needs no GPU. Driver installation is not part of either build.
 
-A first successful publication creates the first release. Later publications create new immutable
-snapshots. They do not overwrite assets in earlier releases. A retry can repair an unfinished draft
-for the same commit. A published snapshot is a no-op. Existing Linux or manually published releases
-retain their assets. A subsequent successful automatic Windows publication becomes latest.
+1. Compile release products. Linux uses the multicall executable to share device images between
+   commands; `ninfer_bench` remains a separate executable.
+2. Check every requested architecture with `cuobjdump`. Run executable `--help` checks.
+   Windows clears developer directories from `PATH`. Linux checks the dynamic library closure
+   and uses a temporary CUDA driver stub, which is never packaged.
+3. Package checksums, source metadata, launchers and licences. Windows includes runtime DLLs.
+   Linux records the required Debian runtime packages and includes a Dockerfile that installs
+   them and copies the prebuilt binaries without recompilation.
+4. Test the archives and split them into volumes no larger than 1900 MiB. Keep Actions artifacts
+   for seven days. Names are `ninfer-<os>-x64-cuda<major.minor>-sm<arches>-<commit12>`;
+   `VERSION` remains metadata inside the archive and does not affect its name.
+5. After all four builds pass, validate all local manifests, create draft `native-<commit12>`,
+   upload assets, and compare their remote SHA-256 digests and sizes.
+6. Publish and mark latest only if the source is still the head of `master`. Superseded builds
+   retain their Actions artifacts or the draft created before a newer commit arrived.
 
-For a manual run, choose **Actions → Windows release → Run workflow**. The default builds and
-checks artifacts without publishing. Select `publish` on `master` to publish the checked result.
-Runs on other branches cannot publish. Publication needs only the workflow's `contents: write`
-token. Build jobs have read access.
-The `build/windows-release` branch also starts builds on push, so the first native run does not
-need a merge into `master` or an existing workflow on the default branch.
+Published snapshots are immutable. A retry can repair only the same commit's unfinished draft.
+A push affecting release inputs on `master` publishes automatically. In **Actions → Native release
+→ Run workflow**, publication defaults to off; enable `publish` only on `master` when intended.
+The test branch `build/windows-release` builds on push and cannot publish. Build jobs have read
+access; only the publication job receives `contents: write`.
 
-This workflow has not yet completed a native Windows run. The matrix, linking, dependency closure
-and hosted-runner resource limits therefore remain unverified. `--help` does not test inference.
-Test the package on a real GPU before claiming numerical correctness or performance for a release.
+## Build caches
 
-## Local packaging and Linux archives
+Native Windows and Debian builds use sccache for C, C++ and CUDA. Its GitHub Actions backend stores
+completed compilation results during the build, so successfully stored entries can survive a later
+failure or cancellation. Compiler identity, inputs, headers and flags determine reuse; the source
+commit is not a cache-wide invalidation key. Before the long build, a small C++/multiarch CUDA probe
+must produce cache hits after restarting the cache server. Job logs include final hit/miss statistics.
+A timeout ends compilation before the job deadline so diagnostics can still upload.
 
-Set `VERSION` and supply its `RELEASE_NOTES_<X.Y.Z>.md`. Both packagers require those files.
-For Windows, build the three release products, then run `scripts\package-release.ps1` with
-`NINFER_BUILD_ROOT` set to that build tree. It reads the Toolkit and architecture list from CMake.
-It requires `7z` and the Toolkit's `cuobjdump`. The output is under `dist/`, with a checksum
-manifest per CUDA/architecture/source variant.
+Windows vcpkg archives are saved immediately after configuration, including after configuration
+failure. The ordinary Linux CI and multiarch image workflow retain ccache directories after failed
+or timed-out compile steps. Their save keys include run ID and attempt; restore prefixes allow the
+next run to reuse the newest partial cache. Runtime Docker jobs consume built artifacts and do not
+compile NInfer again. GitHub can evict caches under repository storage/retention policies; a cache
+hit and a shorter build time must be established from actual run statistics.
 
-For Linux, build the same commit with `-DCMAKE_CUDA_ARCHITECTURES=86`, `-DBUILD_TESTING=OFF` and
-`-DNINFER_BUILD_BENCHMARKS=ON`, targets `ninfer ninfer-serve ninfer_bench`. Then run
-`scripts/package-release.sh`. Verify the tarball and smoke-test it on a real GPU before an
-explicitly authorized `gh release create` or `gh release upload` with `-R iamwavecut/ninfer-all`.
+## Verification status
+
+The earlier uncached Windows run hit the 5h50 job limit; its CUDA 13 build reached 555/807 Ninja
+steps without a recorded compiler error. It produced no verified release package. A later obsolete
+run was cancelled before switching Toolkits and caching. The new native matrix still needs a full
+successful run. Loader and device-image checks do not establish GPU inference correctness or speed.
+
+## Local packaging
+
+Both packagers read CUDA and architecture labels from the configured build tree. Set
+`NINFER_BUILD_ROOT` to that tree. Build release products with benchmarks enabled. Linux accepts
+separate CLI/server binaries or `NINFER_MULTICALL=ON`; CI uses the latter. Run
+`scripts/package-release.sh` on the Linux build host, or `scripts\package-release.ps1` on Windows.
+The repository's `VERSION` and matching release notes are included as source metadata. Neither
+packager uses `VERSION` in the archive name. Modified local sources add `-dirty`; CI rejects them.
+Linux packaging needs Python 3.11, `strip`, `ldd`, `dpkg-query`, `tar` and the build's CUDA Toolkit.
+The runtime Dockerfile is included only when packaging a Debian 13 build.
 
 ## Gotchas
 
@@ -79,7 +102,7 @@ project's Apache-2.0 licence. Re-read the EULA of the toolkit that builds a rele
 glibc of the build host, the CUDA runtime libraries including cuBLAS, FFmpeg and libcurl. Check them
 with `ldd` on the new binaries and update the archive README when they change.
 
-**Asset sizes.** Every executable links every device image. Windows packages use 1900 MiB 7-Zip
+**Asset sizes.** Every executable links every device image. Native packages use 1900 MiB archive
 volumes to remain below GitHub's 2 GiB asset limit. This does not remove MSVC's linked-image limit
 or the hosted runner's memory and build-time limits. Their effect on the full matrix is unverified.
 
