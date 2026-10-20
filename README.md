@@ -258,6 +258,13 @@ Prefill of a 4,463-token prompt, in tok/s:
   for speculative decoding. On an RTX 3090 it prefills a 10,000-token prompt at 6,045 tok/s and decodes at 215
   tok/s, 190 after 10,000 tokens, against llama.cpp's 4,697, 169 and 152 on the same GGUF; with two
   drafts a round chat answers decode at 291 tok/s instead of 209 ([Gemma 4](docs/gemma4.md)).
+- **CPU share of host and disk experts.** With Flash-Next, Gemma 4 or native Qwen3.5/3.6 MoE
+  experts off the GPU, CPU threads compute a share of each decode call's cache misses from host
+  memory while the GPU copies the rest, bit for bit equal to the GPU's products
+  (`--expert-dma-share auto`). The pool takes `min(physical cores, usable CPUs / 2)` threads by
+  default, where usable CPUs are the affinity mask bounded by a container's CPU quota (15 threads
+  on a 30-CPU quota); `--expert-cpu-threads N` sets another count
+  ([common options](docs/cli.md#common-options)).
 
 </details>
 
