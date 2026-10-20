@@ -19,7 +19,7 @@ inline constexpr const char* kHybridExpertHelp =
     "                                CPU and bus times, native experts copy every miss; calls\n"
     "                                of more than 8 tokens always use the GPU\n"
     "  --expert-cpu-threads N        Flash-Next and Gemma 4: CPU workers, 1..256 (default: one\n"
-    "                                per physical core)\n"
+    "                                per physical core, at most half the CPUs)\n"
     "  --expert-profile FILE         fill the expert cache from recorded counts (default: the\n"
     "                                built-in profile of the model family, where one exists)\n"
     "  --expert-profile-out FILE     record expert counts for this artifact after requests\n"

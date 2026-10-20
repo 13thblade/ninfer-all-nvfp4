@@ -521,7 +521,7 @@ struct HybridExpertOptions {
     // GPU's bit for bit (GGUF experts), each call splits its misses by measured CPU and bus times;
     // other experts copy every miss.
     std::optional<float> dma_share;
-    std::uint32_t cpu_threads = 0; // automatic (one per physical core), or 1..256
+    std::uint32_t cpu_threads = 0; // automatic (one per physical core, half the CPUs), or 1..256
     // GGUF banks: copy missing experts into device staging while the cached ones run (staged), or
     // let the expert kernels read host experts across the bus (mapped; host experts only).
     bool mapped_misses = false;

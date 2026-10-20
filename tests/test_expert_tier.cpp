@@ -9,6 +9,7 @@
 #include "core/expert_split.h"
 #include "core/expert_tier.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <iostream>
@@ -153,7 +154,8 @@ void pool() {
         workers.run(8, [&](std::size_t) { after.fetch_add(1); });
         require(after.load() == 8, "the pool runs after a failure");
     }
-    require(pool_cpu_count() >= 1 && pool_cpu_count() <= usable_cpus(), "the default pool size");
+    require(pool_cpu_count() >= 1 && pool_cpu_count() <= std::max(1U, usable_cpus() / 2),
+            "the default pool leaves half the CPUs to the rest of the process");
     require(!physical_core_cpus().empty(), "every machine has a core");
 }
 

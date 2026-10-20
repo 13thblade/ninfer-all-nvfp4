@@ -134,7 +134,7 @@ std::vector<int> physical_core_cpus() {
 
 std::uint32_t pool_cpu_count() {
     const auto cores = std::uint32_t(physical_core_cpus().size());
-    return std::max(1U, std::min(cores, usable_cpus()));
+    return std::max(1U, std::min(cores, usable_cpus() / 2));
 }
 
 void spin_hint() noexcept {

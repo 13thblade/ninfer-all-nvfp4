@@ -10,7 +10,11 @@
 // The expert products read stored weights at memory speed, which one thread per physical core
 // saturates: an SMT sibling shares its core's loads. The workers are pinned one to a physical core
 // of the process's CPUs (its affinity mask), the calling thread pins itself to the first of them
-// when it first runs, and pool_cpu_count() bounds the default by the container's CPU quota.
+// when it first runs, and pool_cpu_count() bounds the default by half the CPUs the process may
+// use, the rest left to the threads that drive the GPU and serve requests: on two EPYC 7742
+// sockets with a 61-CPU quota, a pool spinning on every CPU of the quota throttled the process in
+// 208 of 211 scheduling periods while it decoded, and 59 threads decoded Flash-Next 1.7-4.2%
+// slower than 8, 16, 24 or 32.
 
 #include <atomic>
 #include <condition_variable>
@@ -34,7 +38,7 @@ namespace ninfer {
 [[nodiscard]] std::vector<int> physical_core_cpus();
 
 // The default thread count of a CPU expert pool, the calling thread included: one per physical
-// core, at most usable_cpus(), at least one.
+// core, at most half of usable_cpus(), at least one.
 [[nodiscard]] std::uint32_t pool_cpu_count();
 
 // One turn of a spin wait: the processor's pause hint where it has one, a yield elsewhere.
