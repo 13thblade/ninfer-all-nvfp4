@@ -5,8 +5,8 @@
 // its call routes. The split must give the CPU more of the misses when copies turn out slow and
 // fewer when its products do, and probe a side it left unused. The pinned pool must run every index
 // of a job exactly once, run after run, rethrow a job's failure, run a side once on the calling
-// thread and finish every job before a failing side's error; row tasks must cover a phase's rows
-// once in about three tasks per thread.
+// thread, finish every job before a failing side's error and stamp its last job's end before it
+// returns; row tasks must cover a phase's rows once in about three tasks per thread.
 #include "core/cpu_spin_pool.h"
 #include "core/expert_split.h"
 #include "core/expert_tier.h"
@@ -170,6 +170,20 @@ void pool() {
             require(hit.load() == 1, "every index runs once beside a side");
         }
         require(workers.finished().time_since_epoch().count() > 0, "the last job's end is stamped");
+        // finished() is the end of this run's last job once run() returns, never an earlier
+        // run's: the CPU-time fits of the expert split read it.
+        workers.spin(true);
+        for (int run = 0; run < 20000; ++run) {
+            std::atomic<std::chrono::steady_clock::rep> last{0};
+            workers.run(std::size_t(1 + run % 6), [&](std::size_t) {
+                const auto end = std::chrono::steady_clock::now().time_since_epoch().count();
+                auto seen      = last.load();
+                while (seen < end && !last.compare_exchange_weak(seen, end)) {}
+            });
+            require(workers.finished().time_since_epoch().count() >= last.load(),
+                    "finished() is this run's last job's end");
+        }
+        workers.spin(false);
         std::atomic<int> late{0};
         thrown = false;
         try {

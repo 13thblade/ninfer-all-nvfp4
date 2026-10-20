@@ -80,7 +80,8 @@ public:
     [[nodiscard]] std::uint32_t threads() const noexcept { return std::uint32_t(workers_.size()) + 1; }
     [[nodiscard]] bool pinned() const noexcept { return pinned_; }
 
-    // When the latest run()'s last job ended (steady clock), on whichever thread ran it.
+    // When the latest run()'s last job ended (steady clock), on whichever thread ran it; stamped
+    // before run() returns.
     [[nodiscard]] std::chrono::steady_clock::time_point finished() const noexcept {
         return std::chrono::steady_clock::time_point(
             std::chrono::steady_clock::duration(finished_.load(std::memory_order_acquire)));
@@ -120,7 +121,8 @@ public:
             side();
         } catch (...) { side_failure = std::current_exception(); }
         drain();
-        while (done_.load(std::memory_order_acquire) != count) { spin_hint(); }
+        // The last job's thread stamps finished_ and then marks the generation complete.
+        while (complete_.load(std::memory_order_acquire) != generation) { spin_hint(); }
         auto failure = std::exchange(failure_, nullptr);
         if (side_failure) { std::rethrow_exception(side_failure); }
         if (failure) { std::rethrow_exception(failure); }
@@ -140,6 +142,7 @@ private:
     std::atomic<std::uint64_t> ticket_{0}; // generation << 32 | next index
     std::atomic<std::uint64_t> size_{0};   // generation << 32 | count
     std::atomic<std::size_t> done_{0};
+    std::atomic<std::uint64_t> complete_{0}; // the generation whose last job has ended
     std::atomic<std::chrono::steady_clock::rep> finished_{0};
     std::atomic<bool> spinning_{false}, stop_{false};
     std::mutex mutex_, failure_mutex_;
