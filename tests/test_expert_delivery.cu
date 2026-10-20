@@ -398,7 +398,9 @@ int tier_policy(DeviceContext& device) {
 class PairEcho final : public ExpertCpuProducts {
 public:
     bool supports(std::size_t) const override { return true; }
-    std::size_t compute(const Work& work) override {
+
+    Done compute(const Work& work) override {
+        if (work.side) { work.side(); }
         auto* out = reinterpret_cast<std::int32_t*>(work.products);
         const auto* inputs = reinterpret_cast<const std::int32_t*>(work.inputs);
         for (std::size_t p = 0; p < work.ids.size(); ++p) {
@@ -418,7 +420,7 @@ public:
             }
         }
         ++calls;
-        return work.ids.size() * 4;
+        return {work.ids.size() * 4, 1.0};
     }
     std::uint64_t bad = 0, calls = 0;
 };

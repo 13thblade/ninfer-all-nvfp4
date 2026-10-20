@@ -1,6 +1,7 @@
 #include "core/cpu_spin_pool.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <set>
 #include <string>
@@ -137,6 +138,29 @@ std::uint32_t pool_cpu_count() {
     return std::max(1U, std::min(cores, usable_cpus() / 2));
 }
 
+std::vector<RowTask> row_tasks(std::span<const RowPart> parts, std::uint32_t threads, int quantum) {
+    constexpr double kPerThread = 3;
+    quantum                     = std::max(1, quantum);
+    double total                = 0;
+    for (const auto& part : parts) { total += double(std::max(part.rows, 0)) * part.cost; }
+    std::vector<RowTask> tasks;
+    if (!(total > 0)) { return tasks; }
+    const double target = total / (kPerThread * double(std::max(1U, threads)));
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        const int rows = parts[i].rows;
+        if (rows <= 0) { continue; }
+        const long units = (rows + quantum - 1) / quantum;
+        const long count =
+            std::clamp(std::lround(double(rows) * parts[i].cost / target), 1L, units);
+        for (long k = 0; k < count; ++k) {
+            const int begin = int(units * k / count) * quantum;
+            const int end   = std::min(rows, int(units * (k + 1) / count) * quantum);
+            tasks.push_back({std::uint32_t(i), begin, end});
+        }
+    }
+    return tasks;
+}
+
 void spin_hint() noexcept {
 #if defined(_WIN32)
     YieldProcessor();
@@ -201,7 +225,10 @@ void CpuSpinPool::drain() {
             std::lock_guard lock(failure_mutex_);
             if (!failure_) { failure_ = std::current_exception(); }
         }
-        done_.fetch_add(1, std::memory_order_release);
+        if (done_.fetch_add(1, std::memory_order_acq_rel) + 1 == (size & 0xffffffffULL)) {
+            finished_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                            std::memory_order_release);
+        }
         ticket = ticket_.load(std::memory_order_acquire);
     }
 }

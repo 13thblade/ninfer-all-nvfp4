@@ -9,7 +9,8 @@
 // newcomer's count beats it, and counts the newcomer's routes in that call as misses. Lent buffers
 // are free slots until a wide pass reclaims them: their most routed experts move into colder slots
 // of the cache's own, no entry points inside them while the pass writes them, and they come back
-// zeroed for the next admissions.
+// zeroed for the next admissions. A round's swaps start over the passes until the next round, a
+// share of them a pass.
 #include "core/arena.h"
 #include "core/device.h"
 #include "models/qwen4_exp/expert_cache.h"
@@ -170,6 +171,40 @@ void rounds(DeviceContext& device) {
     cache.observe(0, std::vector<std::int32_t>{5, 7, 50, 60}, false);
     require(cache.stats().hits == stats.hits + 3 && cache.stats().routes == stats.routes + 4,
             "a route to a cached expert is a hit");
+}
+
+// A round's swaps start over the passes until the next round, an even share of the tier's swaps
+// a pass (rounds every four passes of up to eight swaps: two a pass), best gain first, so one pass
+// never copies a whole round.
+void paced(DeviceContext& device) {
+    Model model;
+    ExpertCache cache(device, model.layers(device), std::vector<std::uint64_t>{2 * 102400}, nullptr,
+                      false, ExpertTierOptions{.every = 4, .swaps = 8});
+    // Layer 0 routes experts 0..9, expert e 10 + e times a pass.
+    std::vector<std::int32_t> ids;
+    for (int e = 0; e < 10; ++e) { ids.insert(ids.end(), std::size_t(10 + e), e); }
+    const auto pass = [&] {
+        cache.observe(0, ids, true);
+        cache.adapt();
+        require(cudaDeviceSynchronize() == cudaSuccess, "a pass's copies");
+    };
+    for (int p = 0; p < 4; ++p) { pass(); }
+    require(model.cached(0, "round started").empty(), "the round's first share is in flight");
+    // Each later pass lands the share before it and starts the next: 9 8, then 7 6, 5 4, 3 2.
+    const std::vector<std::vector<int>> landed = {{8, 9}, {6, 7, 8, 9}, {4, 5, 6, 7, 8, 9}};
+    for (const auto& expected : landed) {
+        pass();
+        auto cached = model.cached(0, "paced");
+        std::sort(cached.begin(), cached.end());
+        require(cached == expected,
+                "a pass starts two swaps, the most routed first: " + std::to_string(cached.size()));
+    }
+    // The fifth pass after the round lands its last share; the next round takes 1 and 0.
+    pass();
+    require(model.cached(0, "round done").size() == 8, "the round's eight swaps have landed");
+    pass();
+    require(model.cached(0, "next round").size() == 10, "the next round fills the rest");
+    require(cache.stats().admitted == 10, "every swap started once");
 }
 
 // Admits `expert` into layer `l` and copies it in and patches its entries, as the expert misses
@@ -347,6 +382,7 @@ int main() {
     try {
         DeviceContext device;
         rounds(device);
+        paced(device);
         admissions(device);
         profile(device);
         loans(device);

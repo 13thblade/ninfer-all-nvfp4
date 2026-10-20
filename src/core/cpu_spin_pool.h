@@ -4,8 +4,14 @@
 // host and disk experts). Workers spin between spin(true) and spin(false), so a decode call's
 // products start without a wake-up, and sleep otherwise. run(count, job) executes job(i) for every
 // i < count on the workers and the calling thread and returns when all are done, rethrowing the
-// first failure. A claim is one CAS on a ticket holding the run's generation and next index, so a
-// worker still leaving an earlier run can never claim an index of a later one.
+// first failure; run(count, job, side) first runs side() on the calling thread while the workers
+// start the jobs (a call issues its copies there). A claim is one CAS on a ticket holding the
+// run's generation and next index, so a worker still leaving an earlier run can never claim an
+// index of a later one.
+//
+// row_tasks() cuts a phase's rows into about three tasks per thread of about equal work, as
+// Strata's pool does: with fixed 64-row tasks one Flash-Next expert's 640 gate rows were ten
+// tasks, so a call of one or two CPU experts left most of a 15-thread pool idle.
 //
 // The expert products read stored weights at memory speed, which one thread per physical core
 // saturates: an SMT sibling shares its core's loads. The workers are pinned one to a physical core
@@ -17,11 +23,13 @@
 // slower than 8, 16, 24 or 32.
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <mutex>
+#include <span>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -44,6 +52,23 @@ namespace ninfer {
 // One turn of a spin wait: the processor's pause hint where it has one, a yield elsewhere.
 void spin_hint() noexcept;
 
+// A phase's rows of one part (an expert's projection) and one row's relative work.
+struct RowPart {
+    int rows    = 0;
+    double cost = 1.0;
+};
+
+// Rows [begin, end) of part `part`.
+struct RowTask {
+    std::uint32_t part = 0;
+    int begin = 0, end = 0;
+};
+
+// The parts' rows as about three tasks per thread of about equal work; a task stays in its part
+// and starts at a multiple of `quantum` rows.
+[[nodiscard]] std::vector<RowTask> row_tasks(std::span<const RowPart> parts, std::uint32_t threads,
+                                             int quantum);
+
 class CpuSpinPool {
 public:
     // `threads` counts the calling thread: threads - 1 workers. `pin`: one physical core each.
@@ -55,11 +80,26 @@ public:
     [[nodiscard]] std::uint32_t threads() const noexcept { return std::uint32_t(workers_.size()) + 1; }
     [[nodiscard]] bool pinned() const noexcept { return pinned_; }
 
+    // When the latest run()'s last job ended (steady clock), on whichever thread ran it.
+    [[nodiscard]] std::chrono::steady_clock::time_point finished() const noexcept {
+        return std::chrono::steady_clock::time_point(
+            std::chrono::steady_clock::duration(finished_.load(std::memory_order_acquire)));
+    }
+
     void spin(bool on);
 
     template <class Job>
     void run(std::size_t count, Job&& job) {
-        if (count == 0) { return; }
+        run(count, std::forward<Job>(job), [] {});
+    }
+
+    template <class Job, class Side>
+    void run(std::size_t count, Job&& job, Side&& side) {
+        if (count == 0) {
+            side();
+            finished_ = std::chrono::steady_clock::now().time_since_epoch().count();
+            return;
+        }
         pin_caller();
         context_ = &job;
         call_    = [](void* context, std::size_t i) {
@@ -74,12 +114,16 @@ public:
             ticket_.store(generation << 32, std::memory_order_release);
         }
         wake_.notify_all();
+        // The jobs reference the caller's frame: a failing side still waits for them.
+        std::exception_ptr side_failure;
+        try {
+            side();
+        } catch (...) { side_failure = std::current_exception(); }
         drain();
         while (done_.load(std::memory_order_acquire) != count) { spin_hint(); }
-        if (failure_) {
-            auto failure = std::exchange(failure_, nullptr);
-            std::rethrow_exception(failure);
-        }
+        auto failure = std::exchange(failure_, nullptr);
+        if (side_failure) { std::rethrow_exception(side_failure); }
+        if (failure) { std::rethrow_exception(failure); }
     }
 
 private:
@@ -96,6 +140,7 @@ private:
     std::atomic<std::uint64_t> ticket_{0}; // generation << 32 | next index
     std::atomic<std::uint64_t> size_{0};   // generation << 32 | count
     std::atomic<std::size_t> done_{0};
+    std::atomic<std::chrono::steady_clock::rep> finished_{0};
     std::atomic<bool> spinning_{false}, stop_{false};
     std::mutex mutex_, failure_mutex_;
     std::condition_variable wake_;

@@ -1,11 +1,13 @@
 #include "models/gemma4/cpu_experts.h"
 
 #include "core/cpu_spin_pool.h"
+#include "core/expert_split.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 // After the bridge, which brings the CUDA host definitions fixed_point.cuh's qualifiers need.
 #include "ops/common/fixed_point.cuh"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -15,14 +17,21 @@ namespace {
 
 namespace gguf = ops::gguf;
 
-// Rows of one task: a [gate; up] task takes 64 of an expert's gate or up rows, a down task 64
-// rows of every CPU expert, so that no two tasks add to the same sums.
-constexpr int kRows = 64;
+// Rows per task are a multiple of 16 (64 bytes of FP32 outputs). A [gate; up] task takes rows of
+// one expert's gate or up, a down task the same rows of every CPU expert, so that no two tasks add
+// to the same sums.
+constexpr int kRowQuantum = 16;
+
+template <class Job, class Side>
+void run(CpuSpinPool* pool, std::size_t count, Job&& job, Side&& side) {
+    if (pool) { return pool->run(count, job, side); }
+    side();
+    for (std::size_t i = 0; i < count; ++i) { job(i); }
+}
 
 template <class Job>
 void run(CpuSpinPool* pool, std::size_t count, Job&& job) {
-    if (pool) { return pool->run(count, job); }
-    for (std::size_t i = 0; i < count; ++i) { job(i); }
+    run(pool, count, job, [] {});
 }
 
 } // namespace
@@ -55,7 +64,9 @@ bool CpuExperts::supports(std::size_t layer) const {
     return layer < layers_.size() && computes(layers_[layer], hidden_, width_);
 }
 
-std::size_t CpuExperts::compute(const Work& work) {
+ExpertCpuProducts::Done CpuExperts::compute(const Work& work) {
+    using Clock                 = std::chrono::steady_clock;
+    const auto started          = Clock::now();
     const CpuExpertLayer& layer = layers_.at(work.layer);
     const int pairs  = int(work.ids.size());
     const int tokens = pairs / top_k_;
@@ -91,38 +102,62 @@ std::size_t CpuExperts::compute(const Work& work) {
         if (job.middle.k() != width_) { job.middle = ops::GgufCpuActivation(kMaxTokens, width_); }
         job.input.load_q8_1(layer.gate_up, codes, ds, job.tokens);
         const std::size_t n = job.pairs.size();
+        job.middle.reset(layer.down, int(n));
         job.gate.resize(n * width_);
         job.up.resize(n * width_);
         job.middle_bf16.resize(n * width_);
         job.rows.resize(n * hidden_);
     }
 
-    // Gate and up rows: the stored [gate; up] matrix's first and second `width` rows.
-    const int up_tasks = (width_ + kRows - 1) / kRows;
-    run(work.pool, count * std::size_t(2 * up_tasks), [&](std::size_t i) {
-        Job& job         = jobs_[i / (2 * up_tasks)];
-        const int part   = int(i % (2 * up_tasks));
-        const bool is_up = part >= up_tasks;
-        const int begin  = (part % up_tasks) * kRows;
-        const int end    = std::min(begin + kRows, width_);
-        const ops::GgufCpuMatrix w{layer.gate_up,
-                                   job.gate_up + (is_up ? std::size_t(width_) * layer.gate_up_row_bytes : 0),
-                                   layer.gate_up_row_bytes, width_, hidden_};
-        ops::gguf_cpu_rows(w, job.input, begin, end, (is_up ? job.up : job.gate).data(), width_,
-                           backend_);
+    // Gate and up rows: the stored [gate; up] matrix's first and second `width` rows, while the
+    // calling thread runs work.side.
+    std::vector<RowPart> parts;
+    double cost = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const double one = ExpertSplit::cpu_work(1.0, int(jobs_[i].pairs.size()));
+        parts.push_back({width_, one});
+        parts.push_back({width_, one});
+        cost += one;
+    }
+    const std::uint32_t threads = work.pool ? work.pool->threads() : 1;
+    auto tasks                  = row_tasks(parts, threads, kRowQuantum);
+    const auto side             = [&] {
+        if (work.side) { work.side(); }
+    };
+    run(
+        work.pool, tasks.size(),
+        [&](std::size_t index) {
+            const RowTask& task = tasks[index];
+            Job& job            = jobs_[task.part / 2];
+            const bool is_up    = (task.part & 1U) != 0;
+            const ops::GgufCpuMatrix w{
+                layer.gate_up,
+                job.gate_up + (is_up ? std::size_t(width_) * layer.gate_up_row_bytes : 0),
+                layer.gate_up_row_bytes, width_, hidden_};
+            ops::gguf_cpu_rows(w, job.input, task.begin, task.end,
+                               (is_up ? job.up : job.gate).data(), width_, backend_);
+        },
+        side);
+    const auto rows_done = work.pool ? work.pool->finished() : Clock::now();
+    const auto middle    = Clock::now();
+    // The BF16 middle, as the GPU stores it before quantizing it for the down rows, a pair a task.
+    std::vector<std::pair<std::uint32_t, int>> columns;
+    for (std::size_t i = 0; i < count; ++i) {
+        for (int j = 0; j < int(jobs_[i].pairs.size()); ++j) { columns.emplace_back(i, j); }
+    }
+    run(work.pool, columns.size(), [&](std::size_t index) {
+        const auto [i, j]    = columns[index];
+        Job& job             = jobs_[i];
+        const std::size_t at = std::size_t(j) * width_;
+        ops::gguf_cpu_geglu_bf16(job.gate.data() + at, job.up.data() + at, std::size_t(width_),
+                                 job.middle_bf16.data() + at, backend_);
+        job.middle.quantize_bf16(j, job.middle_bf16.data() + at, 0, job.middle.groups());
     });
-    // The BF16 middle, as the GPU stores it before quantizing it for the down rows.
-    run(work.pool, count, [&](std::size_t i) {
-        Job& job = jobs_[i];
-        ops::gguf_cpu_geglu_bf16(job.gate.data(), job.up.data(), job.gate.size(), job.middle_bf16.data(),
-                                 backend_);
-        job.middle.prepare_bf16(layer.down, job.middle_bf16.data(), std::size_t(width_),
-                                int(job.pairs.size()));
-    });
-    const int down_tasks = (hidden_ + kRows - 1) / kRows;
-    run(work.pool, std::size_t(down_tasks), [&](std::size_t task) {
-        const int begin = int(task) * kRows;
-        const int end   = std::min(begin + kRows, hidden_);
+    const RowPart down{hidden_, cost};
+    tasks = row_tasks(std::span(&down, 1), threads, kRowQuantum);
+    run(work.pool, tasks.size(), [&](std::size_t index) {
+        const int begin = tasks[index].begin;
+        const int end   = tasks[index].end;
         for (std::size_t i = 0; i < count; ++i) {
             Job& job = jobs_[i];
             const ops::GgufCpuMatrix w{layer.down, job.down, layer.down_row_bytes, hidden_, width_};
@@ -138,7 +173,10 @@ std::size_t CpuExperts::compute(const Work& work) {
             }
         }
     });
-    return std::size_t(tokens) * hidden_ * 8;
+    const auto done = Clock::now();
+    return {
+        std::size_t(tokens) * hidden_ * 8,
+        std::chrono::duration<double, std::micro>(rows_done - started + (done - middle)).count()};
 }
 
 } // namespace ninfer::models::gemma4

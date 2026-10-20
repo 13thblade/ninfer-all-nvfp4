@@ -309,10 +309,26 @@ struct ExpertMisses::Impl {
         std::vector<std::int32_t> pairs, tokens; // pair index and its token, per column
         std::array<const std::uint8_t*, 3> bytes{};
         ops::GgufCpuActivation input, input_up, middle; // input_up: an up of another format
-        std::vector<float> gate, up, down;
+        std::vector<float> gate, up;
         std::vector<std::uint16_t> middle_bf16;
+        std::int32_t first = 0; // its first pair's product row
+        bool every_token   = false; // routed by every token: reads the shared inputs
     };
+
+    // A 512-value piece of a token's input (`up`: for the up format), or a pair's whole middle.
+    struct Piece {
+        std::uint32_t job = 0;
+        int token = 0, part = 0;
+        bool up = false;
+    };
+
+    // Rows per task are a multiple of 16: 64 bytes of a task's FP32 outputs.
+    static constexpr int kRowQuantum = 16;
     std::vector<CpuExpert> cpu_experts;
+    ops::GgufCpuActivation shared, shared_up; // the request's tokens, quantized once per format
+    std::vector<Piece> pieces;
+    std::vector<RowPart> parts;
+    std::vector<RowTask> tasks;
 
     mutable std::mutex stats_mutex;
     MissStats counters;
@@ -463,75 +479,142 @@ struct ExpertMisses::Impl {
         return pool != nullptr;
     }
 
-    void compute_cpu(const MissLayer& layer, Rank& rank) {
-        const auto* m = static_cast<const std::uint16_t*>(rank.host_m->data());
-        auto* products = static_cast<float*>(rank.products->data());
-        const auto& gate_p = layer.projections[0];
-        const auto& up_p   = layer.projections[1];
-        const auto& down_p = layer.projections[2];
-        // Inputs and outputs per expert; workers then split rows.
-        std::vector<std::uint16_t> columns;
+    // The CPU's share of a request in four pool phases of about three tasks per thread: the
+    // request's tokens quantized once for the gate (and up) format, every expert's gate and up rows
+    // (while the calling thread runs `side`, the request's copies), the BF16 middle quantized for
+    // down, and the down rows straight into the products, the experts' pairs in turn. An expert
+    // routed by every token reads the shared inputs; any other copies its tokens' columns. Returns
+    // the microseconds the phases took, `side` left out.
+    template <class Side>
+    double compute_cpu(const MissLayer& layer, Rank& rank, Side&& side) {
+        using Clock                   = std::chrono::steady_clock;
+        const auto started            = Clock::now();
+        const auto* m                 = static_cast<const std::uint16_t*>(rank.host_m->data());
+        auto* products                = static_cast<float*>(rank.products->data());
+        auto* product_pairs           = static_cast<std::int32_t*>(rank.product_pairs->data());
+        const auto& gate_p            = layer.projections[0];
+        const auto& up_p              = layer.projections[1];
+        const auto& down_p            = layer.projections[2];
+        const bool own_up             = up_p.format != gate_p.format;
+        const int capacity            = int(options.token_capacity);
+        constexpr int kGroupsPerPiece = 16; // 512 values
+        constexpr int kHiddenPieces   = kHidden / 32 / kGroupsPerPiece;
+        int token_count               = 0;
+        for (const auto& job : cpu_experts) {
+            for (const auto t : job.tokens) { token_count = std::max(token_count, int(t) + 1); }
+        }
+        if (shared.k() != kHidden) { shared = ops::GgufCpuActivation(capacity, kHidden); }
+        shared.reset(gate_p.format, token_count);
+        if (own_up) {
+            if (shared_up.k() != kHidden) { shared_up = ops::GgufCpuActivation(capacity, kHidden); }
+            shared_up.reset(up_p.format, token_count);
+        }
+        pieces.clear();
+        for (int t = 0; t < token_count; ++t) {
+            for (int piece = 0; piece < kHiddenPieces; ++piece) {
+                pieces.push_back({0, t, piece, false});
+                if (own_up) { pieces.push_back({0, t, piece, true}); }
+            }
+        }
+        pool->run(pieces.size(), [&](std::size_t index) {
+            const Piece& piece = pieces[index];
+            (piece.up ? shared_up : shared)
+                .quantize_bf16(piece.token, m + std::size_t(piece.token) * kHidden,
+                               piece.part * kGroupsPerPiece, (piece.part + 1) * kGroupsPerPiece);
+        });
+        std::int32_t first = 0;
         for (auto& job : cpu_experts) {
-            const auto n = static_cast<int>(job.tokens.size());
-            columns.resize(std::size_t(n) * kHidden);
-            for (int j = 0; j < n; ++j) {
-                std::memcpy(columns.data() + std::size_t(j) * kHidden,
-                            m + std::size_t(job.tokens[j]) * kHidden, kHidden * 2);
+            const int n     = static_cast<int>(job.tokens.size());
+            job.every_token = n == token_count;
+            for (int j = 0; j < n && job.every_token; ++j) {
+                job.every_token = job.tokens[std::size_t(j)] == j;
             }
-            const int capacity = int(options.token_capacity);
-            if (job.input.k() != kHidden) { job.input = ops::GgufCpuActivation(capacity, kHidden); }
-            if (job.middle.k() != kWidth) { job.middle = ops::GgufCpuActivation(capacity, kWidth); }
-            job.input.prepare_bf16(gate_p.format, columns.data(), kHidden, n);
-            if (up_p.format != gate_p.format) {
-                if (job.input_up.k() != kHidden) {
-                    job.input_up = ops::GgufCpuActivation(capacity, kHidden);
+            if (!job.every_token) {
+                if (job.input.k() != kHidden) {
+                    job.input = ops::GgufCpuActivation(capacity, kHidden);
                 }
-                job.input_up.prepare_bf16(up_p.format, columns.data(), kHidden, n);
+                job.input.reset(gate_p.format, n);
+                if (own_up) {
+                    if (job.input_up.k() != kHidden) {
+                        job.input_up = ops::GgufCpuActivation(capacity, kHidden);
+                    }
+                    job.input_up.reset(up_p.format, n);
+                }
+                for (int j = 0; j < n; ++j) {
+                    job.input.copy_token(j, shared, job.tokens[std::size_t(j)]);
+                    if (own_up) {
+                        job.input_up.copy_token(j, shared_up, job.tokens[std::size_t(j)]);
+                    }
+                }
             }
+            if (job.middle.k() != kWidth) { job.middle = ops::GgufCpuActivation(capacity, kWidth); }
+            job.middle.reset(down_p.format, n);
             job.gate.resize(std::size_t(n) * kWidth);
             job.up.resize(std::size_t(n) * kWidth);
-            job.down.resize(std::size_t(n) * kHidden);
+            job.middle_bf16.resize(std::size_t(n) * kWidth);
+            job.first = first;
+            for (int j = 0; j < n; ++j) { product_pairs[first + j] = job.pairs[std::size_t(j)]; }
+            first += n;
         }
-        constexpr int kRowsPerTask = 64;
-        const int gate_tasks = (kWidth + kRowsPerTask - 1) / kRowsPerTask;
-        const std::size_t first_count = cpu_experts.size() * std::size_t(2 * gate_tasks);
-        pool->run(first_count, [&](std::size_t i) {
-            auto& job        = cpu_experts[i / (2 * gate_tasks)];
-            const int part   = int(i % (2 * gate_tasks));
-            const bool is_up = part >= gate_tasks;
-            const int begin  = (part % gate_tasks) * kRowsPerTask;
-            const int end    = std::min(begin + kRowsPerTask, kWidth);
-            const auto& p    = is_up ? up_p : gate_p;
-            const ops::GgufCpuMatrix w{p.format, job.bytes[is_up ? 1 : 0], p.row_bytes, p.rows, p.k};
-            const auto& x = is_up && up_p.format != gate_p.format ? job.input_up : job.input;
-            ops::gguf_cpu_rows(w, x, begin, end, (is_up ? job.up : job.gate).data(), kWidth, backend);
-        });
+        const auto quantized = Clock::now();
+        parts.clear();
+        for (const auto& job : cpu_experts) {
+            const double cost = ExpertSplit::cpu_work(1.0, int(job.tokens.size()));
+            parts.push_back({kWidth, cost});
+            parts.push_back({kWidth, cost});
+        }
+        tasks = row_tasks(parts, pool->threads(), kRowQuantum);
+        pool->run(
+            tasks.size(),
+            [&](std::size_t index) {
+                const RowTask& task = tasks[index];
+                auto& job           = cpu_experts[task.part / 2];
+                const bool is_up    = (task.part & 1U) != 0;
+                const auto& p       = is_up ? up_p : gate_p;
+                const ops::GgufCpuMatrix w{p.format, job.bytes[is_up ? 1 : 0], p.row_bytes, p.rows,
+                                           p.k};
+                const auto& x = is_up && own_up ? (job.every_token ? shared_up : job.input_up)
+                                                : (job.every_token ? shared : job.input);
+                ops::gguf_cpu_rows(w, x, task.begin, task.end, (is_up ? job.up : job.gate).data(),
+                                   kWidth, backend);
+            },
+            side);
+        const double rows_us =
+            std::chrono::duration<double, std::micro>(pool->finished() - quantized).count();
+        const auto middle = Clock::now();
         // The middle in BF16, as the GPU's up kernel stores it before quantizing it.
-        for (auto& job : cpu_experts) {
-            const auto n = static_cast<int>(job.tokens.size());
-            job.middle_bf16.resize(job.gate.size());
-            ops::gguf_cpu_swiglu_bf16(job.gate.data(), job.up.data(), job.gate.size(),
-                                      job.middle_bf16.data(), backend);
-            job.middle.prepare_bf16(down_p.format, job.middle_bf16.data(), kWidth, n);
-        }
-        const int down_tasks = kHidden / 128;
-        pool->run(cpu_experts.size() * std::size_t(down_tasks), [&](std::size_t i) {
-            auto& job       = cpu_experts[i / down_tasks];
-            const int begin = int(i % down_tasks) * 128;
-            const ops::GgufCpuMatrix w{down_p.format, job.bytes[2], down_p.row_bytes, down_p.rows,
-                                       down_p.k};
-            ops::gguf_cpu_rows(w, job.middle, begin, begin + 128, job.down.data(), kHidden, backend);
-        });
-        auto* pairs = static_cast<std::int32_t*>(rank.product_pairs->data());
-        std::int32_t count = 0;
-        for (auto& job : cpu_experts) {
-            for (std::size_t j = 0; j < job.pairs.size(); ++j) {
-                std::memcpy(products + std::size_t(count) * kHidden, job.down.data() + j * kHidden,
-                            kHidden * 4);
-                pairs[count++] = job.pairs[j];
+        pieces.clear();
+        for (std::uint32_t i = 0; i < cpu_experts.size(); ++i) {
+            for (int j = 0; j < int(cpu_experts[i].tokens.size()); ++j) {
+                pieces.push_back({i, j, 0, false});
             }
         }
-        *static_cast<std::int32_t*>(rank.product_count->data()) = count;
+        pool->run(pieces.size(), [&](std::size_t index) {
+            const Piece& piece   = pieces[index];
+            auto& job            = cpu_experts[piece.job];
+            const std::size_t at = std::size_t(piece.token) * kWidth;
+            ops::gguf_cpu_swiglu_bf16(job.gate.data() + at, job.up.data() + at, kWidth,
+                                      job.middle_bf16.data() + at, backend);
+            job.middle.quantize_bf16(piece.token, job.middle_bf16.data() + at, 0, kWidth / 32);
+        });
+        parts.clear();
+        for (const auto& job : cpu_experts) {
+            parts.push_back({kHidden, ExpertSplit::cpu_work(1.0, int(job.tokens.size()))});
+        }
+        tasks = row_tasks(parts, pool->threads(), kRowQuantum);
+        pool->run(tasks.size(), [&](std::size_t index) {
+            const RowTask& task = tasks[index];
+            auto& job           = cpu_experts[task.part];
+            const ops::GgufCpuMatrix w{down_p.format, job.bytes[2], down_p.row_bytes, down_p.rows,
+                                       down_p.k};
+            ops::gguf_cpu_rows(w, job.middle, task.begin, task.end,
+                               products + std::size_t(job.first) * kHidden, kHidden, backend);
+        });
+        *static_cast<std::int32_t*>(rank.product_count->data()) = first;
+
+        const auto done = Clock::now();
+        return std::chrono::duration<double, std::micro>(quantized - started).count() + rows_us +
+               std::chrono::duration<double, std::micro>(done - middle).count();
     }
 
     static double expert_megabytes(const MissLayer& layer) {
@@ -597,108 +680,120 @@ struct ExpertMisses::Impl {
         for (std::uint32_t p = 0; p < pairs; ++p) {
             if (ids[p] >= 0 && ids[p] < kMaxExperts) { in_use[std::size_t(ids[p])] = 1; }
         }
-        if (rank.copying && gpu_count > 0) { CUDA_CHECK(cudaEventRecord(rank.copying, rank.copies)); }
-        for (std::size_t i = 0; i < gpu_count; ++i) {
-            const std::int32_t e = order[i].second;
-            on_gpu[std::size_t(e)] = true;
-            ExpertCache::Admitted admitted;
-            if (layer.admit &&
-                cache->admit(layer_index, e, order[i].first, {in_use.data(), in_use.size()},
-                             admitted)) {
-                for (int k = 0; k < 3; ++k) {
-                    const auto& p = layer.projections[std::size_t(k)];
-                    CUDA_CHECK(cudaMemcpyAsync(admitted.slot[std::size_t(k)], p.host[std::size_t(e)],
-                                               std::size_t(p.expert_bytes), cudaMemcpyHostToDevice,
-                                               rank.copies));
-                    tables[std::size_t(k) * kMaxExperts + std::size_t(e)] = admitted.slot[std::size_t(k)];
-                    staged_bytes += std::uint64_t(p.expert_bytes);
-                }
-                patches[patch_count++] = TablePatch{e, {admitted.slot[0], admitted.slot[1], admitted.slot[2]}};
-                if (admitted.victim >= 0) {
+        // The GPU's share: admissions, staged copies and the second stage's missing pairs.
+        const auto issue = [&] {
+            if (rank.copying && gpu_count > 0) {
+                CUDA_CHECK(cudaEventRecord(rank.copying, rank.copies));
+            }
+            for (std::size_t i = 0; i < gpu_count; ++i) {
+                const std::int32_t e   = order[i].second;
+                on_gpu[std::size_t(e)] = true;
+                ExpertCache::Admitted admitted;
+                if (layer.admit && cache->admit(layer_index, e, order[i].first,
+                                                {in_use.data(), in_use.size()}, admitted)) {
+                    for (int k = 0; k < 3; ++k) {
+                        const auto& p = layer.projections[std::size_t(k)];
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            admitted.slot[std::size_t(k)], p.host[std::size_t(e)],
+                            std::size_t(p.expert_bytes), cudaMemcpyHostToDevice, rank.copies));
+                        tables[std::size_t(k) * kMaxExperts + std::size_t(e)] =
+                            admitted.slot[std::size_t(k)];
+                        staged_bytes += std::uint64_t(p.expert_bytes);
+                    }
                     patches[patch_count++] =
-                        TablePatch{admitted.victim, {admitted.victim_host[0], admitted.victim_host[1],
-                                                     admitted.victim_host[2]}};
+                        TablePatch{e, {admitted.slot[0], admitted.slot[1], admitted.slot[2]}};
+                    if (admitted.victim >= 0) {
+                        patches[patch_count++] =
+                            TablePatch{admitted.victim,
+                                       {admitted.victim_host[0], admitted.victim_host[1],
+                                        admitted.victim_host[2]}};
+                    }
+                    copies = true;
+                    ++staged;
+                    ++admitted_count;
+                    continue;
                 }
-                copies = true;
-                ++staged;
-                ++admitted_count;
-                continue;
-            }
-            std::uint64_t need = kTail;
-            for (const auto& p : layer.projections) { need += aligned(std::uint64_t(p.expert_bytes)); }
-            if (used + need <= half_bytes) {
-                std::uint64_t offset = 0;
-                for (int k = 0; k < 3; ++k) {
-                    const auto& p     = layer.projections[std::size_t(k)];
-                    std::byte* target = staging + used + offset;
-                    const void* source;
-                    if (disk) {
-                        if (file_used + std::uint64_t(p.expert_bytes) > file_half_bytes) {
-                            throw std::runtime_error("expert misses: file staging exhausted");
+                std::uint64_t need = kTail;
+                for (const auto& p : layer.projections) {
+                    need += aligned(std::uint64_t(p.expert_bytes));
+                }
+                if (used + need <= half_bytes) {
+                    std::uint64_t offset = 0;
+                    for (int k = 0; k < 3; ++k) {
+                        const auto& p     = layer.projections[std::size_t(k)];
+                        std::byte* target = staging + used + offset;
+                        const void* source;
+                        if (disk) {
+                            if (file_used + std::uint64_t(p.expert_bytes) > file_half_bytes) {
+                                throw std::runtime_error("expert misses: file staging exhausted");
+                            }
+                            fetch(p, e, file_staging + file_used);
+                            source = file_staging + file_used;
+                            file_used += aligned(std::uint64_t(p.expert_bytes));
+                        } else {
+                            source = p.host[std::size_t(e)];
                         }
-                        fetch(p, e, file_staging + file_used);
-                        source = file_staging + file_used;
-                        file_used += aligned(std::uint64_t(p.expert_bytes));
-                    } else {
-                        source = p.host[std::size_t(e)];
-                    }
-                    CUDA_CHECK(cudaMemcpyAsync(target, source, std::size_t(p.expert_bytes),
-                                               cudaMemcpyHostToDevice, rank.copies));
-                    if (k == 2) {
-                        CUDA_CHECK(cudaMemsetAsync(target + p.expert_bytes, 0, kTail, rank.copies));
-                    }
-                    tables[std::size_t(k) * kMaxExperts + std::size_t(e)] = target;
-                    offset += aligned(std::uint64_t(p.expert_bytes));
-                    staged_bytes += std::uint64_t(p.expert_bytes);
-                }
-                used += need;
-                copies = true;
-                ++staged;
-            } else {
-                // The staging half is full: the GPU reads this expert where it is.
-                for (int k = 0; k < 3; ++k) {
-                    const auto& p = layer.projections[std::size_t(k)];
-                    const void* where;
-                    if (disk) {
-                        if (file_used + std::uint64_t(p.expert_bytes) > file_half_bytes) {
-                            throw std::runtime_error("expert misses: file staging exhausted");
+                        CUDA_CHECK(cudaMemcpyAsync(target, source, std::size_t(p.expert_bytes),
+                                                   cudaMemcpyHostToDevice, rank.copies));
+                        if (k == 2) {
+                            CUDA_CHECK(
+                                cudaMemsetAsync(target + p.expert_bytes, 0, kTail, rank.copies));
                         }
-                        fetch(p, e, file_staging + file_used);
-                        where = file_staging + file_used;
-                        file_used += aligned(std::uint64_t(p.expert_bytes));
-                    } else {
-                        where = p.host[std::size_t(e)];
+                        tables[std::size_t(k) * kMaxExperts + std::size_t(e)] = target;
+                        offset += aligned(std::uint64_t(p.expert_bytes));
+                        staged_bytes += std::uint64_t(p.expert_bytes);
                     }
-                    tables[std::size_t(k) * kMaxExperts + std::size_t(e)] = where;
+                    used += need;
+                    copies = true;
+                    ++staged;
+                } else {
+                    // The staging half is full: the GPU reads this expert where it is.
+                    for (int k = 0; k < 3; ++k) {
+                        const auto& p = layer.projections[std::size_t(k)];
+                        const void* where;
+                        if (disk) {
+                            if (file_used + std::uint64_t(p.expert_bytes) > file_half_bytes) {
+                                throw std::runtime_error("expert misses: file staging exhausted");
+                            }
+                            fetch(p, e, file_staging + file_used);
+                            where = file_staging + file_used;
+                            file_used += aligned(std::uint64_t(p.expert_bytes));
+                        } else {
+                            where = p.host[std::size_t(e)];
+                        }
+                        tables[std::size_t(k) * kMaxExperts + std::size_t(e)] = where;
+                    }
+                    ++mapped;
                 }
-                ++mapped;
             }
-        }
-        if (patch_count > 0) {
-            const auto tables_of = cache->tables(layer_index);
-            patch_kernel<<<1, 128, 0, rank.copies>>>(static_cast<const void**>(tables_of[0]),
-                                                     static_cast<const void**>(tables_of[1]),
-                                                     static_cast<const void**>(tables_of[2]),
-                                                     patches, patch_count);
-            CUDA_CHECK(cudaGetLastError());
-        }
-        for (std::uint32_t p = 0; p < pairs; ++p) {
-            const std::int32_t e = ids[p];
-            missing_ids[p] = (e >= 0 && e < kMaxExperts && on_gpu[std::size_t(e)]) ? e : -1;
-        }
-        // The second stage reads the missing pairs from device memory, which the split kernel
-        // filled with -1.
-        if (gpu_count > 0) {
-            CUDA_CHECK(cudaMemcpyAsync(rank.missing_device.p, missing_ids, std::size_t(pairs) * 4,
-                                       cudaMemcpyHostToDevice, rank.copies));
-            copies = true;
-        }
-        if (copies) { CUDA_CHECK(cudaEventRecord(rank.copied, rank.copies)); }
-        // The CPU's share, while the copies run.
+            if (patch_count > 0) {
+                const auto tables_of = cache->tables(layer_index);
+                patch_kernel<<<1, 128, 0, rank.copies>>>(static_cast<const void**>(tables_of[0]),
+                                                         static_cast<const void**>(tables_of[1]),
+                                                         static_cast<const void**>(tables_of[2]),
+                                                         patches, patch_count);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            for (std::uint32_t p = 0; p < pairs; ++p) {
+                const std::int32_t e = ids[p];
+                missing_ids[p] = (e >= 0 && e < kMaxExperts && on_gpu[std::size_t(e)]) ? e : -1;
+            }
+            // The second stage reads the missing pairs from device memory, which the split kernel
+            // filled with -1.
+            if (gpu_count > 0) {
+                CUDA_CHECK(cudaMemcpyAsync(rank.missing_device.p, missing_ids,
+                                           std::size_t(pairs) * 4, cudaMemcpyHostToDevice,
+                                           rank.copies));
+                copies = true;
+            }
+            if (copies) { CUDA_CHECK(cudaEventRecord(rank.copied, rank.copies)); }
+        };
+        // The CPU's share, while this thread issues the copies (disk experts read the GPU's share
+        // first: both share the file staging).
         std::uint64_t cpu_pairs = 0;
-        const auto cpu_started  = std::chrono::steady_clock::now();
         double cpu_work_done    = 0;
         if (cpu_count > 0) {
+            if (disk) { issue(); }
             cpu_experts.resize(cpu_count);
             for (std::size_t i = 0; i < cpu_count; ++i) {
                 CpuExpert& job = cpu_experts[i];
@@ -729,15 +824,12 @@ struct ExpertMisses::Impl {
                     }
                 }
             }
-            compute_cpu(layer, rank);
-            if (options.cpu_balance) {
-                rank.split.computed(cpu_work_done,
-                                    1e6 * std::chrono::duration<double>(
-                                              std::chrono::steady_clock::now() - cpu_started)
-                                              .count());
-            }
-        } else if (rank.product_count) {
-            *static_cast<std::int32_t*>(rank.product_count->data()) = 0;
+            const double microseconds =
+                disk ? compute_cpu(layer, rank, [] {}) : compute_cpu(layer, rank, issue);
+            if (options.cpu_balance) { rank.split.computed(cpu_work_done, microseconds); }
+        } else {
+            issue();
+            if (rank.product_count) { *static_cast<std::int32_t*>(rank.product_count->data()) = 0; }
         }
         if (copies) { CUDA_CHECK(cudaEventSynchronize(rank.copied)); }
         if (options.cpu_balance && gpu_count > 0 && staged_bytes > 0 && mapped == 0) {

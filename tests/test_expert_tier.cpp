@@ -2,19 +2,23 @@
 // first, swap a candidate in only when its count beats the victim's by the gain, pair the hottest
 // candidates with the coldest victims of their own pool, order a round by gain over every pool,
 // cap it, decay the counts, and admit a candidate over a held expert its count beats, never one
-// its call routes. The split must give the CPU more of the misses when copies turn out slow and fewer when
-// its products do, and probe a side it left unused. The pinned pool must run every index of a job
-// exactly once, run after run, and rethrow a job's failure.
+// its call routes. The split must give the CPU more of the misses when copies turn out slow and
+// fewer when its products do, and probe a side it left unused. The pinned pool must run every index
+// of a job exactly once, run after run, rethrow a job's failure, run a side once on the calling
+// thread and finish every job before a failing side's error; row tasks must cover a phase's rows
+// once in about three tasks per thread.
 #include "core/cpu_spin_pool.h"
 #include "core/expert_split.h"
 #include "core/expert_tier.h"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace ninfer;
@@ -153,10 +157,72 @@ void pool() {
         std::atomic<int> after{0};
         workers.run(8, [&](std::size_t) { after.fetch_add(1); });
         require(after.load() == 8, "the pool runs after a failure");
+        // A side runs once on the calling thread beside the jobs; a failing side still waits
+        // for every job before its failure reaches the caller.
+        std::vector<std::atomic<int>> hits(64);
+        int sides         = 0;
+        const auto caller = std::this_thread::get_id();
+        workers.run(
+            hits.size(), [&](std::size_t i) { hits[i].fetch_add(1); },
+            [&] { sides += std::this_thread::get_id() == caller ? 1 : 100; });
+        require(sides == 1, "the side runs once on the caller");
+        for (const auto& hit : hits) {
+            require(hit.load() == 1, "every index runs once beside a side");
+        }
+        require(workers.finished().time_since_epoch().count() > 0, "the last job's end is stamped");
+        std::atomic<int> late{0};
+        thrown = false;
+        try {
+            workers.run(
+                32,
+                [&](std::size_t) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    late.fetch_add(1);
+                },
+                [] { throw std::runtime_error("side failure"); });
+        } catch (const std::runtime_error&) { thrown = true; }
+        require(thrown && late.load() == 32, "a failing side waits for every job");
     }
     require(pool_cpu_count() >= 1 && pool_cpu_count() <= std::max(1U, usable_cpus() / 2),
             "the default pool leaves half the CPUs to the rest of the process");
     require(!physical_core_cpus().empty(), "every machine has a core");
+}
+
+// Row tasks cover every row of every part once, stay in their part, start at a multiple of the
+// quantum and give a phase of one or two experts about three tasks per thread.
+void rows() {
+    for (const std::uint32_t threads : {1U, 4U, 15U, 29U}) {
+        for (const int experts : {1, 2, 5, 12}) {
+            std::vector<RowPart> parts;
+            for (int e = 0; e < experts; ++e) {
+                parts.push_back({640, 1.0 + 0.25 * double(e % 3)});
+                parts.push_back({640, 1.0 + 0.25 * double(e % 3)});
+            }
+            parts.push_back({0, 1.0});
+            parts.push_back({40, 1.0});
+            const auto tasks = row_tasks(parts, threads, 16);
+            std::vector<std::vector<int>> covered(parts.size());
+            for (std::size_t p = 0; p < parts.size(); ++p) {
+                covered[p].assign(std::size_t(parts[p].rows), 0);
+            }
+            for (const auto& task : tasks) {
+                require(task.part < parts.size() && task.begin < task.end &&
+                            task.end <= parts[task.part].rows && task.begin % 16 == 0,
+                        "a task stays in its part on a quantum boundary");
+                for (int r = task.begin; r < task.end; ++r) {
+                    ++covered[task.part][std::size_t(r)];
+                }
+            }
+            for (const auto& part : covered) {
+                for (const int count : part) { require(count == 1, "every row once"); }
+            }
+            const double per_thread = double(tasks.size()) / double(threads);
+            require(experts > 2 || threads == 1 || (per_thread >= 2.0 && per_thread <= 4.5),
+                    "about three tasks per thread: " + std::to_string(tasks.size()) + " for " +
+                        std::to_string(threads));
+        }
+    }
+    require(row_tasks({}, 8, 16).empty(), "no rows, no tasks");
 }
 
 } // namespace
@@ -167,6 +233,7 @@ int main() {
         tier_admission();
         split();
         pool();
+        rows();
         std::cout << "PASS expert tier, split and pool\n";
         return 0;
     } catch (const std::exception& error) {

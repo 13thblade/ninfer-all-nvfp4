@@ -1,11 +1,13 @@
 #include "ops/sparse_moe/streamed_cpu.h"
 
 #include "core/cpu_spin_pool.h"
+#include "core/expert_split.h"
 #include "ops/common/silu.h"
 #include "ops/sparse_moe/streamed_cpu_detail.h"
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -154,7 +156,7 @@ void StreamCpuInput::load_bf16(int column, const std::uint16_t* values) {
             }
         }
     }
-    columns_ = std::max(columns_, column + 1);
+    if (column >= columns_) { columns_ = column + 1; }
 }
 
 void StreamCpuInput::load_fp32(int column, const float* values) {
@@ -167,7 +169,14 @@ void StreamCpuInput::load_fp32(int column, const float* values) {
             }
         }
     }
-    columns_ = std::max(columns_, column + 1);
+    if (column >= columns_) { columns_ = column + 1; }
+}
+
+void StreamCpuInput::set_columns(int columns) {
+    if (columns < 0 || columns > capacity_) {
+        throw std::out_of_range("streamed SparseMoe CPU input columns");
+    }
+    columns_ = columns;
 }
 
 void stream_cpu_rows(const StreamCpuPlane& w, const StreamCpuInput& x, int row_begin, int row_end,
@@ -198,13 +207,19 @@ constexpr int kHidden       = 2048;
 constexpr int kIntermediate = 512;
 constexpr int kTopK         = 8;
 constexpr int kMaxTokens    = 46; // kSparseMoeSmallTMax: the widest streamed Small-T call
-// Rows of one task: 64 of an expert's 1024 gate/up rows or of its 2048 down rows.
-constexpr int kRows = 64;
+// Rows per task are a multiple of 16 (64 bytes of FP32 outputs).
+constexpr int kRowQuantum = 16;
+
+template <class Job, class Side>
+void run(CpuSpinPool* pool, std::size_t count, Job&& job, Side&& side) {
+    if (pool) { return pool->run(count, job, side); }
+    side();
+    for (std::size_t i = 0; i < count; ++i) { job(i); }
+}
 
 template <class Job>
 void run(CpuSpinPool* pool, std::size_t count, Job&& job) {
-    if (pool) { return pool->run(count, job); }
-    for (std::size_t i = 0; i < count; ++i) { job(i); }
+    run(pool, count, job, [] {});
 }
 
 StreamCpuPlane plane(QType format, const std::vector<const std::byte*>& blobs,
@@ -253,7 +268,9 @@ bool SparseMoeStreamCpu::supports(std::size_t layer) const {
     return layer < layers_.size() && computes(layers_[layer]);
 }
 
-std::size_t SparseMoeStreamCpu::compute(const Work& work) {
+ExpertCpuProducts::Done SparseMoeStreamCpu::compute(const Work& work) {
+    using Clock                 = std::chrono::steady_clock;
+    const auto started          = Clock::now();
     const StreamCpuLayer& layer = layers_.at(work.layer);
     const int pairs             = int(work.ids.size());
     const int tokens            = pairs / kTopK;
@@ -294,8 +311,8 @@ std::size_t SparseMoeStreamCpu::compute(const Work& work) {
             job.input  = StreamCpuInput(std::max(n, 8), kHidden);
             job.middle = StreamCpuInput(std::max(n, 8), kIntermediate);
         }
-        job.input.clear();
-        job.middle.clear();
+        job.input.set_columns(n);
+        job.middle.set_columns(n);
         job.gate_up_rows.resize(std::size_t(n) * 2 * kIntermediate);
         job.middle_values.resize(std::size_t(n) * kIntermediate);
         job.coefficients.resize(std::size_t(n));
@@ -303,39 +320,69 @@ std::size_t SparseMoeStreamCpu::compute(const Work& work) {
         job.products.resize(std::size_t(n));
         for (int j = 0; j < n; ++j) {
             const int p = job.pairs[std::size_t(j)];
-            job.input.load_bf16(j, x + std::size_t(p / kTopK) * kHidden);
             job.coefficients[std::size_t(j)] = alpha[p];
             job.gate_up_out[std::size_t(j)]  = job.gate_up_rows.data() + std::size_t(j) * 2 * kIntermediate;
             job.products[std::size_t(j)]     = products + std::size_t(row_of[std::size_t(p)]) * kHidden;
         }
     }
+    // The pairs' inputs in the lanes' order, a pair a task.
+    std::vector<std::pair<std::uint32_t, int>> columns;
+    for (std::size_t i = 0; i < count; ++i) {
+        for (int j = 0; j < int(jobs_[i].pairs.size()); ++j) { columns.emplace_back(i, j); }
+    }
+    run(work.pool, columns.size(), [&](std::size_t index) {
+        const auto [i, j] = columns[index];
+        Job& job          = jobs_[i];
+        job.input.load_bf16(j, x + std::size_t(job.pairs[std::size_t(j)] / kTopK) * kHidden);
+    });
 
-    // Gate and up rows: the [gate; up] plane's first and second 512 rows.
-    constexpr int kGateUpTasks = 2 * kIntermediate / kRows;
-    run(work.pool, count * kGateUpTasks, [&](std::size_t i) {
-        Job& job        = jobs_[i / kGateUpTasks];
-        const int begin = int(i % kGateUpTasks) * kRows;
-        stream_cpu_rows(job.gate_up, job.input, begin, begin + kRows, nullptr, job.gate_up_out,
-                        backend_);
+    // Gate and up rows (the [gate; up] plane's first and second 512) while the calling thread runs
+    // work.side.
+    std::vector<RowPart> parts;
+    for (std::size_t i = 0; i < count; ++i) {
+        parts.push_back(
+            {2 * kIntermediate, ExpertSplit::cpu_work(1.0, int(jobs_[i].pairs.size()))});
+    }
+    const std::uint32_t threads = work.pool ? work.pool->threads() : 1;
+    auto tasks                  = row_tasks(parts, threads, kRowQuantum);
+    const auto side             = [&] {
+        if (work.side) { work.side(); }
+    };
+    run(
+        work.pool, tasks.size(),
+        [&](std::size_t index) {
+            const RowTask& task = tasks[index];
+            Job& job            = jobs_[task.part];
+            stream_cpu_rows(job.gate_up, job.input, task.begin, task.end, nullptr, job.gate_up_out,
+                            backend_);
+        },
+        side);
+    const auto rows_done = work.pool ? work.pool->finished() : Clock::now();
+    const auto middle    = Clock::now();
+    // The FP32 middle silu(gate) * up, as the d3 kernel stores it for d4, a pair a task.
+    run(work.pool, columns.size(), [&](std::size_t index) {
+        const auto [i, j]    = columns[index];
+        Job& job             = jobs_[i];
+        const float* gate_up = job.gate_up_rows.data() + std::size_t(j) * 2 * kIntermediate;
+        float* out           = job.middle_values.data() + std::size_t(j) * kIntermediate;
+        stream_cpu_swiglu(gate_up, gate_up + kIntermediate, kIntermediate, out);
+        job.middle.load_fp32(j, out);
     });
-    // The FP32 middle silu(gate) * up, as the d3 kernel stores it for d4.
-    run(work.pool, count, [&](std::size_t i) {
-        Job& job = jobs_[i];
-        for (std::size_t j = 0; j < job.pairs.size(); ++j) {
-            const float* gate_up = job.gate_up_rows.data() + j * 2 * kIntermediate;
-            float* middle        = job.middle_values.data() + j * kIntermediate;
-            stream_cpu_swiglu(gate_up, gate_up + kIntermediate, kIntermediate, middle);
-            job.middle.load_fp32(int(j), middle);
-        }
-    });
-    constexpr int kDownTasks = kHidden / kRows;
-    run(work.pool, count * kDownTasks, [&](std::size_t i) {
-        Job& job        = jobs_[i / kDownTasks];
-        const int begin = int(i % kDownTasks) * kRows;
-        stream_cpu_rows(job.down, job.middle, begin, begin + kRows, job.coefficients.data(),
+    parts.clear();
+    for (std::size_t i = 0; i < count; ++i) {
+        parts.push_back({kHidden, ExpertSplit::cpu_work(1.0, int(jobs_[i].pairs.size()))});
+    }
+    tasks = row_tasks(parts, threads, kRowQuantum);
+    run(work.pool, tasks.size(), [&](std::size_t index) {
+        const RowTask& task = tasks[index];
+        Job& job            = jobs_[task.part];
+        stream_cpu_rows(job.down, job.middle, task.begin, task.end, job.coefficients.data(),
                         job.products, backend_);
     });
-    return std::size_t(rows) * kHidden * 4;
+    const auto done = Clock::now();
+    return {
+        std::size_t(rows) * kHidden * 4,
+        std::chrono::duration<double, std::micro>(rows_done - started + (done - middle)).count()};
 }
 
 } // namespace ninfer::ops::detail
