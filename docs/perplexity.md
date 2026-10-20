@@ -31,8 +31,9 @@ The evaluator also takes the server's `--devices` (one pipeline stage per GPU), 
 MoE residency options (`--expert-residency`, `--expert-cache-mib`) for native Qwen, Gemma 4 and
 Qwen3.8-Flash-Next, its Qwen3.8-Flash-Next n-gram options (`--ngram-table`,
 `--ngram-residency`, `--ngram-io`, `--ngram-io-depth`, `--ngram-hot-profile`, `--ngram-ram-mib`,
-`--ngram-lock`, `--no-ngram-table`) and its precision options (`--prefill-cublas`,
-`--lm-head-q4/q6`, `--embedding-q4/q6`, `--gdn-state-fp16`, `--mlp-a8-decode`, `--no-prefill-a8`).
+`--ngram-lock`, `--no-ngram-table`) and `--kv-resident` (streamed sparse-attention KV), and its
+precision options (`--prefill-cublas`, `--lm-head-q4/q6`, `--embedding-q4/q6`, `--gdn-state-fp16`,
+`--mlp-a8-decode`, `--no-prefill-a8`).
 
 ```bash
 ./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \

@@ -30,6 +30,10 @@ ninfer_add_test(ninfer_device_buffer_visibility_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device_buffer_visibility.cu"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_expert_tier_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_tier.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_expert_delivery_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_delivery.cu"
   LIBRARIES ninfer_core)

@@ -668,9 +668,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     workspace_logical_peak_bytes = 0;
     create_hybrid_prefix_cache(startup_observer);
     // Warm-up deliveries, the transport's asynchronous prefetches included, stay out of the
-    // request counters.
+    // request counters, and their routes out of the cache: it starts from the routing profile.
     if (experts) {
         experts->drain();
+        experts->prime();
         expert_startup_stats = experts->stats();
     }
 }

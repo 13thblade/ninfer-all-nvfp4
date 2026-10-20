@@ -254,6 +254,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     executor.hybrid_experts = options.hybrid_experts;
     executor.vision_max_merged_tokens = options.vision_max_merged_tokens;
     executor.kv_cache                 = options.kv_cache;
+    // Host and disk experts trade device KV for expert slots by default.
+    executor.kv_resident = options.kv_resident_positions.value_or(
+        options.expert_residency == ExpertResidency::Device ? 0 : kDefaultKvResidentPositions);
     instance->executor = std::make_unique<models::qwen4_exp::Executor>(*model, device, executor);
     device.synchronize();
     program.complete();
@@ -301,11 +304,18 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0);
+    if (const auto memory = instance->executor->memory(); memory.streamed_kv) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Qwen3.8-Flash-Next: sparse-attention KV in pinned host memory "
+                           "(%.0f MiB), %.0f MiB of its blocks on the device",
+                           double(memory.host_kv_bytes) / 1048576.0,
+                           double(memory.kv_bytes) / 1048576.0);
+    }
     if (const std::string cpu = instance->executor->expert_cpu_description(); !cpu.empty()) {
         const std::string share =
-            options.hybrid_experts.dma_share_auto
+            !options.hybrid_experts.dma_share
                 ? std::string("split by measured speeds")
-                : std::to_string(1.0F - options.hybrid_experts.dma_share) + " of them";
+                : std::to_string(1.0F - *options.hybrid_experts.dma_share) + " of them";
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "Qwen3.8-Flash-Next: the CPU computes missing experts (%s; %s)",
                            cpu.c_str(), share.c_str());

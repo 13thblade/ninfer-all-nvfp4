@@ -62,7 +62,9 @@ HTTP alias override and does not select or alter model execution.
 Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
 allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
 `--vision` when the server must accept image or video input. Speculative residency is likewise
-frozen by `--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
+frozen by `--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend,
+except for a Flash-Next or Gemma 4 artifact with its MTP block or assistant and host or disk experts,
+which drafts three tokens a round (`--spec none` turns that off).
 A selected backend also loads the artifact's optimized proposal head when it stores one
 (`--full-draft-head` keeps the full output head instead). DFlash on 35B-A3B and DFlash2 on
 Qwen3.8-27B can be combined with `--vision`; each accelerates generated-text decode after multimodal prefill, while Vision encode
@@ -1934,14 +1936,14 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
 | `--expert-residency device\|host\|disk` | routed MoE experts on GPU, in pinned host memory, or in artifact files: [native Qwen](maintainer/qwen3_5-model.md#routed-expert-residency), [Gemma 4](gemma4.md#expert-residency), and [Flash-Next](qwen3-8-flash-next.md#run). Native Qwen and Gemma bring misses into whole-layer device banks | `device` |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; native Qwen and Gemma allow `0` and then keep only their layer banks, and Flash-Next disk mode needs a cache. With automatic KV, native Qwen gives the cache priority over KV beyond one request's context | `auto` (what is free after startup) |
-| `--expert-misses staged\|mapped` | Qwen3.8-Flash-Next only, GGUF host experts: copy each missing expert into a device cache slot while the cached experts run (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
-| `--expert-dma-share F\|auto` | Qwen3.8-Flash-Next only: host or disk experts: the GPU's share of a call's cache misses, `0..1`; below `1` the CPU computes the rest (GGUF experts: the GPU's results bit for bit); `auto` (GGUF experts) splits each call by the copy and CPU times measured on earlier calls; calls of more than eight tokens always use the GPU ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)) | `1` |
+| `--expert-misses staged\|mapped` | Qwen3.8-Flash-Next only, GGUF host experts: copy each missing expert to the device while the cached experts run, into a cache slot when the [expert tier](qwen3-8-flash-next.md#the-expert-cache) admits it (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
+| `--expert-dma-share F\|auto` | Qwen3.8-Flash-Next and Gemma 4, host or disk experts: the GPU's share of a call's cache misses, `0..1`; the CPU computes the rest (GGUF experts: the GPU's results bit for bit); `auto` splits each call of GGUF experts by the copy and CPU times measured on earlier calls and copies every miss of native experts; calls of more than eight tokens always use the GPU ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)) | `auto` |
 | `--expert-tail-skip N` | Qwen3.8-Flash-Next only, GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten; the other experts keep their router weights, so results change | off |
 | `--expert-prefill-buffers 1\|2` | Qwen3.8-Flash-Next only, GGUF host experts: device buffers a long prompt's uncached experts are copied into; `2` copies the next layer's while the current layer's experts run, with the second buffer's memory taken from the expert cache | `1` |
-| `--expert-cpu-threads N` | Qwen3.8-Flash-Next only: host experts with a CPU share: `1..256` CPU workers | half the logical CPUs the process may use, less two; at most 16 |
+| `--expert-cpu-threads N` | Qwen3.8-Flash-Next and Gemma 4, host or disk experts with a CPU share: `1..256` CPU threads, pinned one to a physical core | one per physical core the process may use, at most its CPU quota |
 | `--expert-cache-adaptive` | Qwen3.8-Flash-Next only: replace cold cached experts between calls; changes the CPU/GPU arithmetic partition | off |
-| `--expert-profile PATH` | Qwen3.8-Flash-Next only: fill the host expert cache from counts recorded for the same artifact and bank geometry | none |
-| `--expert-profile-out PATH` | Qwen3.8-Flash-Next only: record expert counts for this artifact after requests | none |
+| `--expert-profile PATH` | host or disk experts: fill the expert cache from counts recorded for the same artifact and bank geometry | the model family's built-in profile, where the build has one |
+| `--expert-profile-out PATH` | host or disk experts: record expert counts for this artifact after requests | none |
 | `--ngram-table PATH` | Qwen3.8-Flash-Next: the n-gram table artifact of a model published without its table | the model's own table |
 | `--ngram-residency disk\|ram\|ram-hot` | Qwen3.8-Flash-Next: where the n-gram rows come from: the table's file, 16 rows per token; all of the table in RAM; or the rows a hot-row profile ranks first in RAM and the rest from the file (see [the n-gram rows](qwen3-8-flash-next.md#the-n-gram-rows)) | `disk` |
 | `--ngram-io buffered\|direct\|mmap` | Qwen3.8-Flash-Next: how rows are read from the file: through the OS page cache, past it, or out of a mapping | `buffered` |
@@ -1963,7 +1965,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; all nine are accepted on every build target (see [Context and memory](cli.md#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV | `bf16` |
-| `--spec mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)) | off |
+| `--kv-resident N\|all\|auto` | Qwen3.8-Flash-Next: positions of each sparse-attention layer's KV a sequence keeps in device memory; past them the layers' KV streams from pinned host memory (see [streamed KV](qwen3-8-flash-next.md#streamed-sparse-attention-kv)) | `auto`: 32,768 with host or disk experts, all with device experts |
+| `--spec none\|mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)), Gemma 4 from one converted with its assistant | `mtp` with 3 drafts for Flash-Next and Gemma 4 artifacts with their MTP block or assistant and host or disk experts; otherwise off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--draft-min-p P` | Flash-Next MTP only: verify through the first draft at or below this absolute probability; the full draft chain still runs; see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding) | `0` (off) |
 | `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |

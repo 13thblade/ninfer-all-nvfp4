@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/expert_tier.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -8,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ninfer {
@@ -37,6 +39,40 @@ struct ExpertDeliveryLayer {
     std::vector<std::vector<ExpertBlob>> experts;
     std::vector<ExpertAlias> aliases;
 };
+class CpuSpinPool;
+
+// A family's CPU products of the routed experts a narrow call leaves to the CPU: computed from the
+// experts' stored bytes in host memory for the call's inputs that begin() copied to the host, into
+// the products the family's second stage adds after await(). They reproduce the GPU's products bit
+// for bit, so how a call splits its misses never changes a result.
+class ExpertCpuProducts {
+public:
+    virtual ~ExpertCpuProducts() = default;
+    // Whether the CPU computes `layer`'s experts.
+    [[nodiscard]] virtual bool supports(std::size_t layer) const = 0;
+    struct Work {
+        std::size_t layer = 0;
+        std::span<const std::int32_t> experts; // the CPU's experts, each listed once
+        // blobs[i][b]: blob b of experts[i] in host memory (a disk expert's read for this call).
+        std::span<const std::vector<const std::byte*>> blobs;
+        std::span<const std::int32_t> ids; // every pair's expert, as begin() received them
+        const std::byte* inputs = nullptr; // the device inputs begin() copied, in order
+        std::byte* products     = nullptr; // ExpertCpuOptions::product_bytes
+        CpuSpinPool* pool       = nullptr; // the service thread and its pinned workers
+    };
+    // Writes the products of the pairs routed to work.experts; the second stage adds the whole
+    // buffer, so every other product must be the identity. Runs on the delivery's service thread.
+    virtual void compute(const Work& work) = 0;
+};
+
+struct ExpertCpuOptions {
+    ExpertCpuProducts* products = nullptr; // null: the GPU copies every miss
+    std::size_t input_bytes = 0, product_bytes = 0;
+    double share = 0;          // the share of a narrow call's missing experts the CPU computes
+    bool balance = false;      // instead, the split whose copies and products end soonest
+    std::uint32_t threads = 0; // the CPU pool, the service thread included; 0: pool_cpu_count()
+};
+
 struct ExpertDeliveryOptions {
     std::uint32_t pair_capacity = 0;
     // Persistent cache only; the layer banks are separate. Both explicit and automatic cache keep
@@ -49,10 +85,19 @@ struct ExpertDeliveryOptions {
     // one halves their memory and gives that up. Two fall back to one when memory is short.
     std::uint32_t banks = 2;
     bool suspendable = false; // existing VmmRegion allocations, fixed virtual addresses
+    // The cache reserves addresses for every expert and backs only the slots it has, so its owner
+    // can give slots back to memory that grows (shrink_cache) and take them again (grow_cache).
+    // Needs CUDA virtual memory management.
+    bool elastic = false;
+    // Which experts the cache holds once it is full (core/expert_tier.h), one pool for all layers.
+    ExpertTierOptions tier{};
+    ExpertCpuOptions cpu{};
 };
 struct ExpertDeliveryStats {
     std::uint64_t requests = 0, routes = 0, hits = 0, misses = 0, evictions = 0;
     std::uint64_t pairs = 0, pair_hits = 0, admissions = 0;
+    // Missing experts and their pairs the CPU computed.
+    std::uint64_t cpu_experts = 0, cpu_pairs = 0;
     // Misses found already present in a layer bank (a prefetched layer, a repeated wide call).
     std::uint64_t bank_reuses = 0, prefetched_layers = 0;
     // Host-to-device expert bytes (misses and prefetches); device copies from a bank into the cache.
@@ -70,6 +115,8 @@ struct ExpertDeliveryStats {
     now.pairs -= start.pairs;
     now.pair_hits -= start.pair_hits;
     now.admissions -= start.admissions;
+    now.cpu_experts -= start.cpu_experts;
+    now.cpu_pairs -= start.cpu_pairs;
     now.bank_reuses -= start.bank_reuses;
     now.prefetched_layers -= start.prefetched_layers;
     now.read_bytes -= start.read_bytes;
@@ -89,6 +136,8 @@ struct ExpertDeliveryStats {
     a.pairs += b.pairs;
     a.pair_hits += b.pair_hits;
     a.admissions += b.admissions;
+    a.cpu_experts += b.cpu_experts;
+    a.cpu_pairs += b.cpu_pairs;
     a.bank_reuses += b.bank_reuses;
     a.prefetched_layers += b.prefetched_layers;
     a.read_bytes += b.read_bytes;
@@ -106,12 +155,18 @@ struct ExpertDeliveryMemory {
 // stay fixed until destruction. The caller drains graph users before destroying their graphs.
 //
 // Each call splits its routes into experts the persistent cache holds and the rest. A narrow call
-// (decode, verification) admits its misses into the cache over the least recently used experts it
-// does not route. A wide call (half the layer's experts or more: a prompt chunk) brings its misses
-// into a layer bank, laid out like a resident bank (expert e of blob b at a fixed stride) with one
-// copy per run of consecutive experts, starts the bank of the layer that followed it last time,
-// and promotes its most routed experts from the bank into free cache slots by device copies, up
-// to the layer's share; it evicts nothing, so a prompt does not push out the decode working set.
+// (decode, verification) leaves a share of its missing experts to the CPU when the family computes
+// them there (ExpertCpuOptions): those cross no bus and take no slot. Its other misses enter a free
+// cache slot, else the slot of the coldest expert the call does not route when the expert tier
+// admits them, else a layer bank. The tier counts the narrow calls' routes; a call to a layer
+// below the last narrow call's ends a pass, and every few passes a round swaps the most routed
+// experts the cache lacks into the slots of the least routed ones, copied on a side stream a few
+// at a time after the calls' own work, each candidate's entries moved once its copy has landed.
+// A wide call (half the layer's experts or more: a prompt chunk) brings its misses into a layer
+// bank, laid out like a resident bank (expert e of blob b at a fixed stride) with one copy per run
+// of consecutive experts, starts the bank of the layer that followed it last time, and promotes its
+// most routed experts from the bank into free cache slots by device copies, up to the layer's
+// share; it evicts nothing and counts nothing, so a prompt does not push out the decode working set.
 class ExpertDelivery {
 public:
     ExpertDelivery(const RankContext& rank, std::vector<std::filesystem::path> files,
@@ -123,12 +178,23 @@ public:
     struct Call {
         const std::int32_t* cached_ids = nullptr;
         const std::int32_t* missing_ids = nullptr;
+        // With a CPU share, after await(): the CPU's products (ExpertCpuOptions::product_bytes),
+        // valid when *cpu is nonzero.
+        const void* products = nullptr;
+        const std::int32_t* cpu = nullptr;
+    };
+    struct Input {
+        const void* data = nullptr;
+        std::size_t bytes = 0;
     };
     // Capturable. The next begin must follow every consumer of the preceding call on stream, and
     // every begin needs its await. Cached pairs can run immediately. Missing pairs run only after
-    // await(). Neither set drops or renormalizes routes. -1 denotes a pair absent from that set.
+    // await(); with a CPU share they exclude the CPU's pairs, whose products the family adds then.
+    // Neither set drops or renormalizes routes. -1 denotes a pair absent from that set. `inputs`
+    // (device ranges, ExpertCpuOptions::input_bytes in all) reach the CPU's products; a call
+    // without them leaves nothing to the CPU (call.products and call.cpu stay null).
     [[nodiscard]] Call begin(std::size_t layer, const std::int32_t* ids, std::uint32_t pairs,
-                             cudaStream_t stream);
+                             cudaStream_t stream, std::span<const Input> inputs = {});
     void await(cudaStream_t stream);
     // Projection-major [aliases][experts], including aliases into the same blob.
     [[nodiscard]] const void* const* tables(std::size_t layer) const;
@@ -141,6 +207,22 @@ public:
     [[nodiscard]] std::uint64_t state_backing_bytes() const noexcept;
     [[nodiscard]] ExpertDeliveryStats stats() const;
     [[nodiscard]] ExpertDeliveryMemory memory() const noexcept;
+    // Once warm-up is done, before the first request: empties the cache, forgets the routes the
+    // tier and the totals learned, and fills the slots with the most routed (layer, expert) pairs
+    // of `profile` ([layer][expert], a routing profile of these layers) over every layer.
+    void prime(const std::vector<std::vector<std::uint64_t>>* profile);
+    // Every route the narrow calls took through each layer's experts since prime().
+    [[nodiscard]] std::vector<std::vector<std::uint64_t>> totals() const;
+    // With a CPU share: its threads and vector backend, e.g. "15 pinned threads"; else empty.
+    [[nodiscard]] std::string cpu_description() const;
+
+    // An elastic cache (ExpertDeliveryOptions::elastic), after the compute stream's last call:
+    // shrink_cache gives at least `bytes` of whole granules back to the device, or every slot when
+    // the cache has fewer, keeping the most routed experts it held (moved into the remaining slots
+    // when they sat past them); grow_cache takes free device memory, beyond keep_free_bytes, for
+    // empty slots. Both return the device bytes they freed or took. Graphs stay valid.
+    std::uint64_t shrink_cache(std::uint64_t bytes);
+    std::uint64_t grow_cache();
 
 private:
     struct Impl;

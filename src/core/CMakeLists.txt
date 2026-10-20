@@ -5,6 +5,9 @@ add_library(ninfer_core STATIC
   dtype.cpp
   gpu_clock_floor.cpp
   host_worker_pool.cpp
+  cpu_spin_pool.cpp
+  expert_split.cpp
+  expert_tier.cpp
   gdn_replay_records.cpp
   cyclic_kv_cache.cpp
   host_kv_arena.cpp
@@ -23,6 +26,7 @@ add_library(ninfer_core STATIC
   evictable_kv_pool.cu
   evictable_weight_pool.cu
   vmm.cu
+  growable_region.cu
   device_snapshot.cu
 )
 ninfer_internal_includes(ninfer_core)

@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -20,7 +21,7 @@ using namespace ninfer;
 namespace {
 struct Scenario {
     ExpertResidency residency;
-    std::uint64_t cache;
+    std::optional<std::uint64_t> cache; // automatic: an elastic cache beside growing KV
     bool graphs, mtp, cancel_prefill;
     std::uint32_t concurrency;
     const char* name;
@@ -174,6 +175,12 @@ Result run(const Scenario& scenario, const char* artifact, const std::vector<Tok
         if ((scenario.residency == ExpertResidency::Host) != (load.pinned_weight_bytes != 0)) {
             throw std::runtime_error("pinned weight footprint differs from selected expert placement");
         }
+        // Beside an automatic (elastic) cache the full-attention caches back only what the
+        // sequences reached; otherwise all of them.
+        const bool growing = scenario.residency != ExpertResidency::Device && !scenario.cache;
+        if (growing != (memory.sequence.used_bytes < memory.sequence.capacity_bytes)) {
+            throw std::runtime_error("the KV cache did not grow with its sequences as configured");
+        }
         std::cout << nlohmann::json{{"kind", "metrics"}, {"scenario", scenario.name},
             {"graphs", scenario.graphs}, {"mtp", scenario.mtp},
             {"concurrency", scenario.concurrency},
@@ -182,6 +189,7 @@ Result run(const Scenario& scenario, const char* artifact, const std::vector<Tok
             {"pinned_weight_bytes", load.pinned_weight_bytes},
             {"cache_bytes", memory.expert_cache_bytes}, {"workspace_bytes", memory.workspace.capacity_bytes},
             {"sequence_bytes", memory.sequence.capacity_bytes},
+            {"sequence_backed_bytes", memory.sequence.used_bytes},
             {"runtime_reservation_bytes", memory.runtime_reservation_bytes},
             {"available_after_startup_bytes", memory.available_after_startup_bytes},
             {"routes", stats.experts.routes}, {"hits", stats.experts.hits},
@@ -242,12 +250,19 @@ int main(int argc, char** argv) {
             {ExpertResidency::Host, 1536ULL << 20, true, false, false, 8, "host-mixed-graph"},
             {ExpertResidency::Disk, 0, true, false, true, 8, "disk-zero-graph"},
             {ExpertResidency::Disk, 1536ULL << 20, true, false, false, 8, "disk-mixed-graph"},
-            {ExpertResidency::Device, 0, true, false, false, mtp_concurrency, "device-mtp-plain-control"},
-            {ExpertResidency::Device, 0, true, true, false, mtp_concurrency, "device-mtp-graph"},
+            {ExpertResidency::Host, std::nullopt, true, false, false, 8, "host-auto-graph"},
+            {ExpertResidency::Disk, std::nullopt, true, false, true, 8, "disk-auto-graph"},
+            // The host and disk rounds run before any device-resident one: their verification graphs
+            // wait on the device for the experts' service, so the Engine must have loaded every
+            // round kernel at startup (a lazy load while such a graph waits never finishes).
             {ExpertResidency::Host, 1536ULL << 20, true, true, false, mtp_concurrency, "host-mtp-graph"},
             {ExpertResidency::Disk, 1536ULL << 20, true, true, false, mtp_concurrency, "disk-mtp-graph"},
+            {ExpertResidency::Device, 0, true, false, false, mtp_concurrency, "device-mtp-plain-control"},
+            {ExpertResidency::Device, 0, true, true, false, mtp_concurrency, "device-mtp-graph"},
         };
         std::map<std::tuple<bool, bool, std::uint32_t>, Result> controls;
+        // Host and disk results, compared once their resident controls have run.
+        std::vector<std::pair<const Scenario*, Result>> placements;
         int placement_failures = 0;
         for (const auto& scenario : scenarios) {
             if (std::string_view(scenario.name) == "device-mtp-plain-control" && mtp_concurrency == 8) { continue; }
@@ -276,7 +291,12 @@ int main(int argc, char** argv) {
                 controls.emplace(key, std::move(result));
                 continue;
             }
-            const auto& baseline = controls.at(key);
+            placements.emplace_back(&scenario, std::move(result));
+        }
+        for (const auto& [placed, result] : placements) {
+            const Scenario& scenario = *placed;
+            const auto& baseline =
+                controls.at(std::tuple{scenario.graphs, scenario.mtp, scenario.concurrency});
             const bool tokens_equal = result.tokens == baseline.tokens;
             const bool scores_equal = result.scores == baseline.scores;
             auto token_differences = nlohmann::json::array();

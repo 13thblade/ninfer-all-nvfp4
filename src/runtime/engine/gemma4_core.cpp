@@ -4,6 +4,7 @@
 #include "artifact/reader.h"
 #include "core/arena.h"
 #include "core/startup.h"
+#include "models/expert_profile.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/frontend/processor.h"
 #include "ninfer/ops/argmax.h"
@@ -118,12 +119,16 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         throw std::invalid_argument("--lookup-ngram and --adaptive-mtp require --spec mtp");
     }
     const auto& hybrid = options.hybrid_experts;
-    if (hybrid.dma_share != 1 || hybrid.dma_share_auto || hybrid.cpu_threads != 0 ||
-        hybrid.mapped_misses ||
-        hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 1 || hybrid.adaptive_cache ||
-        !hybrid.routing_profile.empty() || !hybrid.record_profile.empty()) {
-        throw std::invalid_argument("Gemma 4 expert residency uses GPU arithmetic and DMA only; "
-                                    "Flash-Next hybrid/profile options do not apply");
+    if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 1 ||
+        hybrid.adaptive_cache) {
+        throw std::invalid_argument("Gemma 4 has no mapped misses, tail skip, prefill buffers or "
+                                    "adaptive expert cache (Qwen3.8-Flash-Next options)");
+    }
+    if (options.expert_residency == ExpertResidency::Device &&
+        (hybrid.dma_share || hybrid.cpu_threads != 0 || !hybrid.routing_profile.empty() ||
+         !hybrid.record_profile.empty())) {
+        throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
+                                    "host or disk experts (--expert-residency host|disk)");
     }
     if (device.size() != 1) { throw std::invalid_argument("Gemma 4 runs on one device"); }
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
@@ -177,6 +182,18 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     executor.draft_tokens  = mtp ? speculative.draft_tokens : 0;
     executor.kv_cache      = options.kv_cache;
     executor.expert_cache_bytes = options.expert_cache_bytes;
+    executor.expert_dma_share   = hybrid.dma_share;
+    executor.expert_cpu_threads = hybrid.cpu_threads;
+    if (options.expert_residency != ExpertResidency::Device) {
+        const std::vector<std::size_t> widths(model->expert_banks().size(),
+                                              std::size_t(model->config().num_experts));
+        if (!hybrid.routing_profile.empty()) {
+            executor.expert_profile = models::read_expert_profile(hybrid.routing_profile,
+                                                                  model->info().artifact_id, widths);
+        } else {
+            executor.expert_profile = models::builtin_expert_profile("gemma4", widths);
+        }
+    }
     // Causal scoring keeps no context between requests.
     executor.checkpoints   = options.context_cache.enabled &&
                            options.purpose == EnginePurpose::Generation;
@@ -213,10 +230,13 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     instance->vision_budget      = vision_budget;
     instance->free_after_startup = free_bytes();
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                       "Gemma 4: %u sequence(s), prompt chunks of %u tokens, KV %.0f MiB, "
+                       "Gemma 4: %u sequence(s), prompt chunks of %u tokens, KV %.0f MiB%s, "
                        "workspace %.0f MiB",
                        executor.sequences, executor.prefill_chunk,
                        double(instance->executor->memory().kv_bytes) / 1048576.0,
+                       instance->executor->memory().kv_grows
+                           ? " at most, growing with the sequences beside an elastic expert cache"
+                           : "",
                        double(instance->executor->memory().workspace_bytes) / 1048576.0);
     if (options.expert_residency != ExpertResidency::Device) {
         const auto memory = instance->executor->memory().experts;
@@ -227,7 +247,17 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
             double(memory.cache_bytes) / 1048576, memory.cache_slots, memory.banks,
             double(memory.bank_bytes) / 1048576, double(memory.metadata_bytes) / 1048576,
             double(memory.pinned_bytes) / 1048576, double(model->expert_pinned_bytes()) / 1048576);
+        const auto cpu = instance->executor->expert_cpu_description();
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+            "Gemma 4: missing experts %s; cache seeded %s",
+            cpu.empty() ? "copied to the GPU"
+                        : ("split between copies and " + cpu + (hybrid.dma_share
+                               ? " (fixed share)" : " (by measured speeds)")).c_str(),
+            executor.expert_profile ? (hybrid.routing_profile.empty() ? "from the built-in profile"
+                                                                      : "from --expert-profile")
+                                    : "by the first requests");
     }
+    instance->record_profile = hybrid.record_profile;
     if (options.enable_vision) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "Gemma 4: vision tower %s, up to %u soft tokens per image or video frame",
@@ -577,6 +607,7 @@ struct Gemma4Core::Impl {
                                                                sizeof(std::int32_t));
         }
         sample_workspace = std::make_unique<WorkspaceArena>(workspace);
+        load_sampling_kernels();
         worker           = std::thread([this] {
             device.bind_to_current_thread();
             loop();
@@ -593,6 +624,67 @@ struct Gemma4Core::Impl {
     }
 
     [[nodiscard]] std::size_t mask_words() const noexcept { return (std::size_t(domain) + 31) / 32; }
+
+    // Launches every sampling kernel a step or a speculative round may launch once now, on scratch
+    // inputs. CUDA loads a kernel at its first launch, and a load while a decode or verification
+    // graph waits on the device for the host experts' service waits for that graph, whose service
+    // needs the driver lock the load holds: the first round after startup would never finish.
+    void load_sampling_kernels() {
+        const cudaStream_t stream = instance.executor->head_stream();
+        const ops::SamplingConfig greedy{};
+        CUDA_CHECK(cudaMemcpy(sample_config.p, &greedy, sizeof(greedy), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemset(sample_position.p, 0, sizeof(std::int32_t)));
+        const auto* config  = static_cast<const ops::SamplingConfig*>(sample_config.p);
+        const auto vocab    = static_cast<std::int32_t>(domain);
+        const Tensor flag(logprob_flag.p, DType::I32, {1});
+        const auto gather = [&](const Tensor& logits, std::int32_t columns, const Tensor* drafted) {
+            Tensor ids(logprob_ids.p, DType::I32, {ops::kLogprobTopK, columns, 1});
+            Tensor values(logprob_values.p, DType::FP32, {ops::kLogprobTopK, columns, 1});
+            Tensor lse(logprob_lse.p, DType::FP32, {columns, 1});
+            ops::logprob_topk(logits.view({logits.ne[0], columns, 1}), config, drafted, vocab, ids,
+                              values, lse, flag, *sample_workspace, stream);
+        };
+        {
+            const Tensor logits = instance.executor->logits(1);
+            Tensor sampled(sample_out.p, DType::I32, {1});
+            const Tensor logical(sample_position.p, DType::I32, {1});
+            gather(logits, 1, nullptr);
+            auto scope = sample_workspace->scope();
+            ops::sample(logits, sampled, vocab, config, logical, ops::kSamplePurposeDecode,
+                        *sample_workspace, stream);
+            // The sampled id may be the non-finite marker; the zeroed position is a valid id.
+            Tensor counts(token_counts.p, DType::I32, {vocab});
+            ops::increment_token_counts(logical, counts, stream);
+        }
+        if (drafts > 0) {
+            for (DeviceBuffer* plane : {&spec_drafts, &spec_extents, &spec_lengths, &spec_anchors}) {
+                CUDA_CHECK(cudaMemset(plane->p, 0, plane->bytes));
+            }
+            // A round's width is its drafts and the bonus column, one draft to all of them.
+            for (std::uint32_t k = 1; k <= drafts; ++k) {
+                const auto columns  = static_cast<std::int32_t>(k + 1);
+                const Tensor logits = instance.executor->logits(k + 1);
+                const Tensor drafted(spec_drafts.p, DType::I32, {static_cast<std::int32_t>(k), 1});
+                gather(logits, columns, &drafted);
+                Tensor targets(spec_targets.p, DType::I32, {columns});
+                ops::argmax(logits, targets, vocab, stream);
+                Tensor extents(spec_extents.p, DType::I32, {1});
+                Tensor lengths(spec_lengths.p, DType::I32, {1});
+                Tensor anchors(spec_anchors.p, DType::I32, {1});
+                Tensor licensed(spec_licensed.p, DType::I32, {columns, 1});
+                Tensor counts(spec_counts.p, DType::I32, {1});
+                Tensor accepted(spec_accepted.p, DType::I32, {1});
+                auto scope = sample_workspace->scope();
+                ops::speculative_accept_coupled_drafts(
+                    targets.view({columns, 1}), logits.view({logits.ne[0], columns, 1}), drafted,
+                    extents, lengths, anchors, licensed, counts, accepted, vocab, config,
+                    *sample_workspace, stream);
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        // Each request clears its own row of the counts; the scratch increment leaves no trace.
+        CUDA_CHECK(cudaMemset(token_counts.p, 0, token_counts.bytes));
+    }
 
     // A request that neither computes a prompt chunk nor accepts a token for this long fails with
     // an explicit error rather than holding its sequence, so a stall surfaces as errors.
@@ -1274,7 +1366,15 @@ struct Gemma4Core::Impl {
                          .mask     = r.mask ? r.mask->masks() : nullptr};
     }
 
+    // --expert-profile-out: every route since warm-up, rewritten at each request boundary.
+    void save_expert_profile() {
+        if (instance.record_profile.empty()) { return; }
+        models::write_expert_profile(instance.record_profile, instance.model->info().artifact_id,
+                                     instance.executor->expert_totals());
+    }
+
     void finish(const std::shared_ptr<Request>& request, FinishReason reason) {
+        save_expert_profile();
         Request& r = *request;
         GenerationResult result;
         result.prompt              = r.prompt_summary;
@@ -2026,6 +2126,7 @@ struct Gemma4Core::Impl {
             instance.executor->check_experts();
             out.insert(out.end(), host.begin(), host.end());
         }
+        save_expert_profile();
         return out;
     }
 };
@@ -2276,7 +2377,7 @@ MemorySummary Gemma4Core::memory_summary() const {
         out.host_kv_occupied_bytes = impl_->stats.host_kv_occupied_bytes;
     }
     out.weights   = arena(stats.device_capacity_by_rank.empty() ? 0 : stats.device_capacity_by_rank[0]);
-    out.sequence  = arena(memory.kv_bytes);
+    out.sequence  = {memory.kv_bytes, memory.kv_backed_bytes, memory.kv_backed_bytes};
     out.workspace = arena(memory.workspace_bytes + memory.experts.bank_bytes +
                           memory.experts.metadata_bytes);
     out.kv_payload_bytes              = memory.kv_bytes;

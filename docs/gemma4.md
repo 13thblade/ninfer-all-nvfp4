@@ -530,16 +530,43 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   every expert of every layer, so the expert bank crosses the bus about once per chunk; prompts take
   the resident chunks of up to 2048 tokens.
 - **Cache.** `--expert-cache-mib` (default: what is free after startup) holds the experts decode and
-  verification used most recently: their misses enter the cache over the least recently used experts
-  the call does not route. A prompt chunk evicts nothing; it promotes its most routed experts from
-  the bank into free slots by device copies, up to each layer's share of the cache, so a long prompt
-  does not flush decode's working set. `0` keeps the banks only.
+  verification route most, by the expert tier every MoE family with host or disk experts shares
+  ([the expert cache](qwen3-8-flash-next.md#the-expert-cache)), one pool of slots for all layers: a
+  miss the GPU copies takes a free slot, or the slot of the coldest expert the call does not route
+  when its routes beat that expert's, and every four decode passes a round swaps the most routed
+  missing experts in, copied behind the calls. A prompt chunk evicts nothing; it promotes its most
+  routed experts from the bank into free slots by device copies, up to each layer's share of the
+  cache, so a long prompt does not flush decode's working set. A routing profile
+  (`--expert-profile`, else the built-in one of the model family where the build has one) fills the
+  slots at startup. `0` keeps the banks only.
+- **CPU share.** Of a decode or verification call's misses that neither the cache nor the layer's
+  bank holds, CPU threads compute a share from the stored blocks while the GPU copies and runs the
+  rest (`--expert-dma-share`, `auto` by default: the split whose copies and CPU products end
+  soonest by earlier calls' times; `--expert-cpu-threads`, one pinned thread per physical core by
+  default). The CPU computes GeGLU over the [gate; up] rows, the BF16 middle quantized as q8_1 and
+  the down rows as the GPU's vector kernels do, into the same 2^-32 fixed-point sums
+  ([the CPU share](qwen3-8-flash-next.md#the-cpu-share) describes the arithmetic), so outputs do
+  not depend on the split. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S
+  and IQ4_XS blocks have CPU products; other layers copy every miss. An expert the CPU computed
+  takes no slot; the cache's rounds decide whether it enters.
 - **Calls.** Vector decode and verification run the cached pairs while the rest arrive, then the
   rest; both add to one fixed-point sum, so outputs equal resident execution bit for bit. Prompt
   chunks wait for their experts and run the existing matrix path.
+- **Growing KV.** With an automatic cache, the full-attention blocks' value planes and a prompt
+  chunk's derived keys, F16 values and mask are backed only as far as their sequences reach (in
+  256-position tiles, on devices with CUDA virtual memory management), and the cache takes the rest
+  of the device. When the next positions need memory the device lacks beside its 320 MiB graph
+  reserve, the cache gives slots back: it keeps its most routed experts, moved by device copies into
+  the slots that stay, and the others leave. A reset sequence's rows go back to the device, and the
+  cache takes what is free beyond 256 MiB of headroom for the next positions. Startup still checks
+  that every sequence's whole context fits beside the layer banks, so a context never runs out of
+  memory: the cache can shrink to no slots. An explicit `--expert-cache-mib` and device experts keep
+  the whole KV allocated.
 
+With host or disk experts and an artifact that carries the assistant, the assistant drafts three
+tokens a round unless `--spec` says otherwise ([speculative decoding](#speculative-decoding-with-the-assistant)).
 The loader keeps the stored GGUF blocks; nothing is repacked. Startup diagnostics report the cache,
 the layer banks, metadata and pinned buffers; runtime expert counters start at zero after warm-up.
 Disk residency uses two bounded pinned transfer halves and no application RAM cache. Flash-Next's
-CPU, hybrid and profile options do not apply. Gemma model suspend is unsupported, as with resident
-experts.
+`--expert-misses`, `--expert-tail-skip`, `--expert-prefill-buffers` and `--expert-cache-adaptive`
+do not apply. Gemma model suspend is unsupported, as with resident experts.

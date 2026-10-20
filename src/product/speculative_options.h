@@ -10,6 +10,7 @@
 namespace ninfer::product {
 
 [[nodiscard]] inline SpeculativeBackend parse_speculative_backend(std::string_view value) {
+    if (value == "none") { return SpeculativeBackend::None; }
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
@@ -39,6 +40,13 @@ inline void apply_default_ngram_draft_tokens(SpeculativeOptions& options,
     if (!width_explicit && options.backend != SpeculativeBackend::None) {
         options.ngram_draft_tokens = kDefaultNgramDraftTokens;
     }
+}
+
+// Without --spec the Engine chooses (SpeculativeOptions::automatic), unless a drafting option
+// names the backend's own settings.
+inline void apply_automatic_speculation(SpeculativeOptions& options, bool backend_explicit) noexcept {
+    options.automatic = !backend_explicit && options.backend == SpeculativeBackend::None &&
+                        options.draft_tokens == 0;
 }
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {

@@ -378,6 +378,7 @@ int main(int argc, char** argv) {
         engine_options.stage_layers             = cli.stage_layers;
         engine_options.expert_residency              = cli.expert_residency;
         engine_options.ngram_table                   = cli.ngram_table;
+        engine_options.kv_resident_positions         = cli.kv_resident_positions;
         engine_options.expert_cache_bytes            = cli.expert_cache_bytes;
         engine_options.hybrid_experts                = cli.hybrid_experts;
         engine_options.max_context              = cli.max_context;

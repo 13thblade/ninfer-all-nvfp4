@@ -68,9 +68,36 @@ int run_tests() {
     failures += check(rejects([] {
         (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--draft-min-p", "0.3"});
     }), "CLI accepted draft confidence without MTP");
+    {
+        // Without --spec the Engine chooses; --spec none and every backend are explicit.
+        const auto unset = parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).speculative;
+        const auto none  = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "none"}).speculative;
+        const auto mtp   = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                  "--draft-tokens", "4"}).speculative;
+        failures += check(unset.automatic && unset.backend == ninfer::SpeculativeBackend::None &&
+                              !none.automatic && none.backend == ninfer::SpeculativeBackend::None &&
+                              !mtp.automatic && mtp.backend == ninfer::SpeculativeBackend::Mtp,
+                          "CLI did not leave the backend to the Engine only without --spec");
+    }
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
-                             "--expert-residency", "host"}).hybrid_experts.dma_share == 1.0F,
-                      "CLI must default native host expert misses to GPU execution");
+                             "--expert-residency", "host"}).hybrid_experts.dma_share.has_value() == false,
+                      "CLI must default the expert DMA share to automatic");
+    {
+        // --kv-resident: unset (auto) leaves the choice to the Engine, all keeps every position.
+        const auto resident = [&](std::vector<std::string> tail) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            return parse(args).kv_resident_positions;
+        };
+        failures += check(!resident({}) && resident({"--kv-resident", "4096"}) == 4096U &&
+                              resident({"--kv-resident", "all"}) == 0U &&
+                              !resident({"--kv-resident", "4096", "--kv-resident", "auto"}),
+                          "CLI did not preserve --kv-resident");
+        for (const auto* value : {"0", "-1", "12x", "", "All"}) {
+            failures += check(rejects([&] { (void)resident({"--kv-resident", value}); }),
+                              "CLI accepted an invalid --kv-resident");
+        }
+    }
     for (const auto* share : {"0", "0.25", "1"}) {
         const auto hybrid = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
             "--expert-residency", "host", "--expert-dma-share", share,
@@ -87,8 +114,7 @@ int run_tests() {
             "--expert-residency", "host", "--expert-dma-share", "auto"});
         const auto fixed_after = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
             "--expert-dma-share", "auto", "--expert-dma-share", "0.5"});
-        failures += check(automatic.hybrid_experts.dma_share_auto &&
-                              !fixed_after.hybrid_experts.dma_share_auto &&
+        failures += check(!automatic.hybrid_experts.dma_share &&
                               fixed_after.hybrid_experts.dma_share == 0.5F,
                           "CLI did not preserve an automatic hybrid DMA share");
     }

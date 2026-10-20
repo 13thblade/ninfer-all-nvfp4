@@ -1,6 +1,7 @@
 #include "ninfer/engine.h"
 #include "text/structured_output.h"
 
+#include "artifact/reader.h"
 #include "core/device.h"
 #include "core/gpu_clock_floor.h"
 #include "core/nvtx.h"
@@ -45,6 +46,28 @@ EngineOptions with_family_context_cache(EngineOptions options) {
         runtime::is_qwen4_exp_artifact(options.artifact_path)) {
         options.context_cache.mode = ContextCacheMode::Legacy;
     }
+    return options;
+}
+
+// Without --spec (SpeculativeOptions::automatic), a Flash-Next or Gemma 4 artifact with host or
+// disk experts drafts with the MTP block or assistant it carries: a verification window's routes
+// share the layer's missing experts, which the CPU computes while the cached ones run.
+EngineOptions with_family_speculation(EngineOptions options) {
+    SpeculativeOptions& speculative = options.speculative;
+    if (!speculative.automatic || speculative.backend != SpeculativeBackend::None ||
+        options.expert_residency == ExpertResidency::Device ||
+        options.purpose != EnginePurpose::Generation) {
+        return options;
+    }
+    if (!runtime::is_gemma4_artifact(options.artifact_path) &&
+        !runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+        return options;
+    }
+    if (!artifact::Reader(options.artifact_path).directory().components.contains("mtp")) {
+        return options;
+    }
+    speculative.backend      = SpeculativeBackend::Mtp;
+    speculative.draft_tokens = SpeculativeOptions::kAutomaticDraftTokens;
     return options;
 }
 
@@ -283,7 +306,7 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(
-              with_family_context_cache(std::move(engine_options)))),
+              with_family_speculation(with_family_context_cache(std::move(engine_options))))),
           device(initialize_device(options)),
           clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
         report_gpu_clock_floor(options, clock_floor);
@@ -314,14 +337,19 @@ public:
             finalize_phase.complete();
             return;
         }
-        if (options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
-            options.hybrid_experts.dma_share_auto ||
-            options.hybrid_experts.cpu_threads != 0 || options.hybrid_experts.mapped_misses ||
-            options.hybrid_experts.tail_skip_rank != 0 ||
-            options.hybrid_experts.prefill_buffers != 1 || options.hybrid_experts.adaptive_cache ||
-            !options.hybrid_experts.routing_profile.empty() ||
-            !options.hybrid_experts.record_profile.empty()) {
-            throw std::invalid_argument("hybrid expert options require native Qwen3.8-Flash-Next host experts");
+        // Native Qwen3.5 MoE experts have no CPU products: their misses are copied. Routing
+        // profiles fill and record their host or disk experts' cache.
+        if (options.hybrid_experts.dma_share || options.hybrid_experts.cpu_threads != 0 ||
+            options.hybrid_experts.mapped_misses || options.hybrid_experts.tail_skip_rank != 0 ||
+            options.hybrid_experts.prefill_buffers != 1 || options.hybrid_experts.adaptive_cache) {
+            throw std::invalid_argument(
+                "expert DMA shares, CPU threads and miss paths require Qwen3.8-Flash-Next or "
+                "Gemma 4 host or disk experts");
+        }
+        if ((!options.hybrid_experts.routing_profile.empty() ||
+             !options.hybrid_experts.record_profile.empty()) &&
+            options.expert_residency == ExpertResidency::Device) {
+            throw std::invalid_argument("expert routing profiles require host or disk experts");
         }
         if (options.speculative.draft_min_p != 0) {
             throw std::invalid_argument("--draft-min-p requires Qwen3.8-Flash-Next MTP");

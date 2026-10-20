@@ -201,13 +201,13 @@ the same options, and the Docker image's `serve` command takes them with the fil
 |---|---|
 | `--expert-residency device\|host\|disk` | expert banks in the stage devices' memory (default); in page-locked host memory that the expert kernels read across the bus; or left in the artifact's files, each layer's routed experts read into a device cache before they run |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) takes what each device has free after startup less a margin, and after the warm-up what is still free beyond 640 MiB; `N` is the cache's size, which the warm-up leaves alone; `0` disables the host-mode cache (disk mode needs one) |
-| `--expert-misses staged\|mapped` | GGUF host experts: a decode or verification call copies each routed expert its device cache lacks straight into the slot of the layer's least recently used expert of the lowest frequency tier, by the copy engine while the cached ones run, and keeps it there (`staged`, the default); or its expert kernels read the missing experts across the bus and the cache admits between passes (`mapped`) |
-| `--expert-dma-share F\|auto` | host or disk experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1` (default `1`); below `1` the CPU computes the rest from RAM while the GPU runs the cached ones, and their slots fill behind the call; `auto` (GGUF experts) gives each call the split whose copies and CPU products end soonest by the times measured on earlier calls. Only calls of up to eight tokens use the CPU; GGUF CPU products are the GPU's bit for bit ([the CPU share](#the-cpu-share)) |
+| `--expert-misses staged\|mapped` | GGUF host experts: a decode or verification call copies each routed expert its device cache lacks into device memory by the copy engine while the cached ones run, into a cache slot when one is free or when the expert's routes beat the coldest cached expert the call does not route ([the expert cache](#the-expert-cache)), else into staging (`staged`, the default); or its expert kernels read the missing experts across the bus (`mapped`) |
+| `--expert-dma-share F\|auto` | host or disk experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1`; the CPU computes the rest from RAM while the GPU runs the cached ones. `auto` (the default) gives each call of GGUF experts the split whose copies and CPU products end soonest by the times measured on earlier calls, and copies every miss of native experts. Only calls of up to eight tokens use the CPU; GGUF CPU products are the GPU's bit for bit ([the CPU share](#the-cpu-share)) |
 | `--expert-tail-skip N` | GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten, instead of copying it; the remaining experts keep their router weights (no renormalization). Lossy, off by default; prefill always runs every routed expert. On an RTX 3090 with Q2_0 and four short chat prompts, `7` decoded 9.0-17.6% and `6` 11.9-24.4% faster, copying 22-43% and 29-52% fewer expert bytes; perplexity over 5,115 tokens scored one token per call went from 4.667 to 4.710 with `7` and 4.688 with `6`, an order opposite to how much each leaves out, so that sample does not resolve the cost |
 | `--expert-prefill-buffers 1\|2` | GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts into (default `1`); `2` alternates two, so the next layer's copies run while this layer's experts do, when half the free memory holds both. The second buffer's memory comes from the expert cache: on an RTX 3090 with Q2_0 it took the cache from 17,296 to 16,683 MiB, prefilled a 5,462-token prompt 8.5-10.5% and a 31,860-token prompt 1.9-2.3% faster, decoded 1.5-2.8% slower once the cache was warm (within 1.5% either way from a cold one) and answered a 37-to-39-token prompt 7.5-10.2% later warm |
-| `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers; default is half the logical CPUs the process may use (its affinity mask and container CPU quota) less two, from 1 to 16 |
+| `--expert-cpu-threads N` | host or disk experts with a CPU share: `1..256` CPU threads, the calling one included; default is one per physical core the process may use (its affinity mask), at most its container CPU quota. Each thread is pinned to a physical core and spins while requests decode |
 | `--expert-cache-adaptive` | replace cold cached native experts between calls; off by default because it changes the CPU/GPU arithmetic partition |
-| `--expert-profile PATH` | fill the host expert cache at startup from counts recorded for the same artifact (`--expert-profile-out`) |
+| `--expert-profile PATH` | fill the expert cache at startup from counts recorded for the same artifact (`--expert-profile-out`); default: the built-in profile of the model family and its bank widths, where the build has one |
 | `--expert-profile-out PATH` | record every layer's expert routes after requests, for a later `--expert-profile` |
 | `--ngram-table PATH` | the table artifact to read the n-gram rows from; required for a model stored without its table, and it must hold the table the model names (same SHA-256 and row format) |
 | `--ngram-residency disk\|ram\|ram-hot` | where the n-gram rows come from: the table's file, 16 rows a token (default); the whole 28.8 GB table in RAM; or the rows a hot-row profile ranks first in RAM and the rest from the file ([the n-gram rows](#the-n-gram-rows)) |
@@ -217,19 +217,35 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--ngram-ram-mib N` | `disk`: cached rows and their index (default `0`, off); `ram-hot`: resident profile rows and their index (default 4096 MiB) |
 | `--ngram-lock` | `ram`, `ram-hot`: lock the resident rows in physical memory (`mlock`, `VirtualLock`; needs the memlock limit or the privilege) |
 | `--no-ngram-table` | run without the n-gram table: see [below](#without-the-n-gram-table) |
+| `--kv-resident N\|all\|auto` | positions of each sparse-attention layer's KV a sequence keeps in device memory; a longer `--max-context` streams those layers ([streamed KV](#streamed-sparse-attention-kv)). `auto` (default): 32,768 with host or disk experts, all with device experts |
 | `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
 
-Every expert runs on the GPU by default. GGUF host and disk experts can give the CPU a share of a
-call's missing experts ([the CPU share](#the-cpu-share)); native-format experiments are retained
-for reference. The
-existing GGUF artifacts support both host and disk residency. With host experts every expert
-layer gets the same number of cache slots (the MTP block's wider experts take more of the bytes);
-staged misses fill the text layers' slots by recency within tiers of decayed route counts (about
-once lately, a few times, often), so a passing decode does not evict a working set other prompts
-keep routing to, and a prompt chunk lets the cache admit its
-most routed experts by decayed counts; disk residency uses a CLOCK device cache. Disk residency
+With device experts every expert runs on the GPU. With GGUF host and disk experts, by default the
+CPU computes a share of each decode or verification call's missing experts ([the CPU
+share](#the-cpu-share)), MTP drafts three tokens a round when the artifact carries the block
+([MTP](#mtp-speculative-decoding)), and the sparse-attention KV past 32,768 positions streams from
+host memory ([streamed KV](#streamed-sparse-attention-kv)), which leaves the device memory to the
+expert cache. Native-format experiments are retained for reference. The existing GGUF artifacts
+support both host and disk residency; disk residency uses a CLOCK device cache. Disk residency
 relies on the OS page cache for repeated file reads; the engine keeps no RAM cache of experts of its
 own, only the device cache and bounded transfer buffers.
+
+### The expert cache
+
+With host experts the device cache's slots follow the expert tier that every MoE family with host
+or disk experts shares (`core/expert_tier.h`), one pool of slots per layer. Each decode or
+verification call adds one to the count of every (token, expert) pair it routes; every four decode
+passes a round swaps up to 96 of the most routed experts the cache lacks into the slots of the
+least routed ones it holds, best gain first, each only when its count reaches the victim's plus 1.5
+(and at least 2), then multiplies every count by 0.7. The candidates' copies run on a side stream
+while the next passes run, and their table entries move to their slots once the copies have
+landed. A miss the GPU copies anyway takes a slot at once when one is free, or under the same rule
+against the coldest cached expert its call does not route; a miss the CPU computes moves no expert
+bytes and enters only through a round. Prompt chunks feed the statistics only. A routing profile
+(`--expert-profile`, else the built-in one of the model family) fills the slots at startup and,
+ranking its counts over every layer, gives each text layer the slots its most routed experts take;
+the MTP block keeps an even share. Strata (MIT) measured this tier and its constants on
+Qwen3.8-Flash-Next.
 
 With host experts the GPU holds only the dense weights (3.7 GB for the Q2_0 release), the
 per-request state and the expert cache; the host needs the expert banks in page-locked memory
@@ -250,17 +266,18 @@ bounded pinned staging. Use `--max-concurrency 1` for native host execution.
 
 ### The CPU share
 
-With GGUF host or disk experts, `--expert-dma-share` below `1` or `auto` lets CPU threads compute
-part of a call's missing experts from their stored blocks while the GPU copies and runs the rest;
-the GPU then adds the CPU's products into the same fixed-point sum as its own. Only calls of up to
-eight tokens use the CPU: decode, verification, and prompt steps that short, such as the tail
-after a chat prompt's reusable anchor; longer prompt chunks always run on the GPU. A fixed share
-gives the CPU the experts with the fewest pairs. `auto` gives each call the split whose copies and
-CPU products end soonest by two straight lines fitted to earlier calls' copy and CPU times (a
-sample counts at most four times or a quarter of its line's value); a side left unused for eight
-calls takes one expert, so both lines follow the machine. The CPU's experts take cache slots
-behind their call, as copied ones do. On one RTX 3090 neither `auto` nor a half share decoded
-faster than the GPU alone ([measurements](#the-cpu-share-on-one-rtx-3090)).
+With GGUF host or disk experts, CPU threads compute part of a call's missing experts from their
+stored blocks while the GPU copies and runs the rest (`--expert-dma-share auto`, the default, or a
+fixed share below `1`); the GPU then adds the CPU's products into the same fixed-point sum as its
+own. Only calls of up to eight tokens use the CPU: decode, verification, and prompt steps that
+short, such as the tail after a chat prompt's reusable anchor; longer prompt chunks always run on
+the GPU. A fixed share gives the CPU the experts with the fewest pairs. `auto` gives each call the
+split whose copies and CPU products end soonest by two straight lines fitted to earlier calls' copy
+and CPU times (a sample counts at most four times or a quarter of its line's value); a side left
+unused for eight calls takes one expert, so both lines follow the machine. An expert the CPU
+computed takes no slot and crosses no bus; the expert cache's rounds decide whether it enters the
+cache ([the expert cache](#the-expert-cache)). The CPU threads are pinned one to a physical core
+and spin while requests decode, so a call's products start without a wake-up.
 
 The CPU computes the GPU's decode products bit for bit, so outputs, log probabilities and context
 images do not depend on the share, on `auto`'s choices or on the thread count. The activations are
@@ -268,13 +285,16 @@ quantized as the GPU quantizes them (q8_1: per 32 values `d = amax / 127`, codes
 `d` rounded to binary16). A 32-value slice gives the exact integer dot of its codes and the
 activation's, and its product is `(factor * d) * dot`, each step rounded, with the slice's exact
 factor (the block's binary16 multiplier times its integer scale); IQ2_S's is
-`d * fma(factor0, dot0, factor1 * dot1)` over its two halves. Slice `s` joins lane `s mod 32` in
-slice order, and the 32 lanes meet as in a warp's butterfly (16, 8, 4, 2, 1 apart). SiLU is
-`ops/common/silu.h` on both sides, built from correctly rounded operations only, and the middle is
-rounded to BF16 before it is quantized for the down product. No compiler fuses these steps on
-either side: the GPU kernels spell them with `_rn` intrinsics and the CPU sources build without
-floating-point contraction. Q2_0, Q8_0, IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS have CPU products,
-in AVX2 (with FMA and F16C) where the CPU has it and in portable C++ elsewhere, with the same bits.
+`d * fma(factor0, dot0, factor1 * dot1)` over its two halves, Q6_K's
+`d * (factor0 * dot0 + factor1 * dot1)`, and Q4_K's and Q5_K's `(factor * d) * dot` less the
+block's minimum times the slice's activation sum (q8_1's `s`). Slice `s` joins lane `s mod 32` in
+slice order, and the 32 lanes meet as in a warp's butterfly (16, 8, 4, 2, 1 apart). SiLU (and
+Gemma 4's GELU) is `ops/common/silu.h` on both sides, built from correctly rounded operations only,
+and the middle is rounded to BF16 before it is quantized for the down product. No compiler fuses
+these steps on either side: the GPU kernels spell them with `_rn` intrinsics and the CPU sources
+build without floating-point contraction. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ2_S,
+IQ3_XXS, IQ3_S and IQ4_XS have CPU products, in AVX2 (with FMA and F16C) where the CPU has it and
+in portable C++ elsewhere, with the same bits.
 
 ### The n-gram rows
 
@@ -373,6 +393,22 @@ practical use. On the Q2_0 release it nearly doubles WikiText-2 perplexity, 2.66
 fourteen windows of the comparison below; short factual answers survive, but nothing measured
 improves.
 
+### Streamed sparse-attention KV
+
+Each query of a sparse-attention layer reads 512 blocks of four positions that the indexer selects
+and its own incomplete block, so most of a long context's KV sits unread at each step. With
+`--kv-resident N` below `--max-context` (by default 32,768 positions with host or disk experts) a
+sequence keeps each of the 12 layers' whole KV in pinned host memory, addressed by the GPU, and the
+device holds a pool of N / 4 blocks per layer (at least 513 for each token of a verification
+window). Before each decode or verification call's attention, a kernel looks up every block the
+queries read, claims the missing ones, gives each a pool slot by a CLOCK sweep (a slot the call
+uses is never taken), copies them across the bus from the host copy and re-points the table; the
+blocks the call wrote are copied again when it reads them, so no slot holds bytes older than the
+host copy. A prompt chunk reads its layer's whole history from a device staging copy, refreshed
+from the host copy once per span of chunks. The attention reads the same bytes either way: a
+streamed and a resident sequence give the same logits. The device memory saved goes to the expert
+cache. The residency scheme follows Strata's `kv_stream` (MIT).
+
 ### Sequences, KV and the context cache
 
 `--kv-dtype` stores the KV cache of the 12 sparse-attention layers in any of the nine formats the
@@ -442,7 +478,10 @@ MTP is enabled. A fresh text-only request can use MTP again after the media requ
 ### MTP speculative decoding
 
 `--spec mtp --draft-tokens N` (1 to 15) decodes with the MTP block of an artifact converted with it
-([Convert](#convert)); without the block the engine refuses to start. Text-only decoding requests then
+([Convert](#convert)); without the block the engine refuses to start. Without `--spec`, an artifact
+with the block and host or disk experts drafts three tokens a round (a verification window's routes
+share the layer's missing experts, which the CPU computes while the cached ones run); `--spec none`
+decodes without drafts. Text-only decoding requests then
 runs rounds: the MTP block (one more sparse-attention layer with its own 512-expert MoE, its own
 final mixer and the model's head) drafts N tokens from the stack the model left at the request's
 last position (the head's argmax at each step), the model verifies the last sampled token and the N

@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/expert_profile.h"
+#include "models/expert_profile.h"
 
 #include <chrono>
 #include <fstream>
@@ -7,7 +7,7 @@
 #include <stdexcept>
 
 int main() {
-    using namespace ninfer::models::qwen4_exp;
+    using namespace ninfer::models;
     const auto directory = std::filesystem::temp_directory_path() /
         ("ninfer-expert-profile-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directory(directory);

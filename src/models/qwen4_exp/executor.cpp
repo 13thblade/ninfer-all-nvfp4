@@ -11,6 +11,7 @@
 #include "ninfer/ops/target_logprobs.h"
 #include "models/qwen4_exp/ngram_hash.h"
 #include "models/qwen4_exp/ngram_draft_prefetch.h"
+#include "models/expert_profile.h"
 #include "models/qwen4_exp/expert_misses.h"
 #include "models/qwen4_exp/expert_stream.h"
 #include "models/qwen4_exp/ngram_table.h"
@@ -25,6 +26,7 @@
 #include "ninfer/ops/gdn_gating.h"
 #include "ninfer/ops/hyper_connection.h"
 #include "ninfer/ops/kv_cache_append.h"
+#include "ninfer/ops/kv_stream.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/moe_experts.h"
 #include "ninfer/ops/moe_route.h"
@@ -44,8 +46,10 @@
 #include <cmath>
 #include <cstring>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -55,6 +59,8 @@ namespace {
 constexpr std::int32_t kAlign = 256;
 // Calls wider than this run their experts through the matrix kernel, from device memory.
 constexpr std::int32_t kVectorTokens = 8;
+// The family name of Flash-Next's built-in routing profiles (models/expert_profile.h).
+constexpr std::string_view kExpertProfileFamily = "qwen3.8-flash-next";
 // Zero bytes after every device slot's down matrix (see expert_stream.cpp and moe_experts_gguf).
 constexpr std::uint64_t kSlotTail = 256;
 
@@ -379,12 +385,26 @@ struct LayerPlan {
     MoePlan moe;
 };
 
+// One plane of a sparse-attention layer's paged KV, [leading, 64, heads, pages]: device memory,
+// or pinned host memory the device addresses directly when the layer streams.
+struct KvPlane {
+    DeviceBuffer device;
+    std::unique_ptr<PinnedHostBuffer> host;
+    void* p             = nullptr;
+    std::uint64_t bytes = 0;
+};
+
 // One sequence's mutable state of one layer, on that layer's device.
 struct LayerState {
-    Tensor ssm, conv;                            // Gated DeltaNet: the sequence's slot of the pool
-    DeviceBuffer k_pages, v_pages, pooled, tail; // sparse attention
-    DeviceBuffer k_scales, v_scales;             // a quantized KV's scale planes
-    DeviceBuffer history;                        // PLE
+    Tensor ssm, conv;          // Gated DeltaNet: the sequence's slot of the pool
+    std::array<KvPlane, 4> kv; // sparse attention: K, V and a quantized KV's K and V scales
+    DeviceBuffer pooled, tail; // the indexer's pooled keys and incomplete block
+    // A streamed layer (ExecutorOptions::kv_resident): `kv` lives in host memory and the device
+    // keeps a pool of 4-position pages of the same planes, with its residency map.
+    std::array<DeviceBuffer, 4> pool;
+    DeviceBuffer map_memory;
+    ops::KvStreamMap map;
+    DeviceBuffer history; // PLE
 };
 
 struct SequenceState {
@@ -507,6 +527,12 @@ struct RankState {
     std::optional<ops::GdnReplayFoldPlan> fold;
     DeviceBuffer index_records, ple_records;
     DeviceBuffer conv_scratch, tail_scratch;
+    // Streamed sparse-attention layers: a prompt chunk reads one layer's whole KV from this
+    // device copy (the four planes, every page), which holds `kv_staged`'s positions before
+    // `kv_staged_end`; the layers of a span's attention phase keep it across the span's chunks.
+    std::array<DeviceBuffer, 4> kv_staging;
+    const LayerState* kv_staged = nullptr;
+    std::uint32_t kv_staged_end = 0;
 };
 
 } // namespace
@@ -589,6 +615,10 @@ struct Executor::Impl {
     std::uint32_t pages          = 0; // KV pages per sequence and attention layer
     PagedKVStorageLayout kv_layout;   // the planes of every sparse-attention layer's KV
     std::uint32_t pooled_slots   = 0; // indexer blocks per sequence and attention layer
+    // Streamed sparse-attention layers (options.kv_resident): each sequence's layer keeps
+    // stream_slots pages of 4 positions on the device, from which calls of at most stream_width
+    // tokens read; wider calls read the rank's staging copy. Zero: every layer resident.
+    std::uint32_t stream_slots = 0, stream_width = 0;
     std::uint32_t max_logit_rows = 0;
     ExecutorMemory memory;
     std::vector<std::uint64_t> row_ids;
@@ -609,7 +639,6 @@ struct Executor::Impl {
     std::vector<void*> route_records;       // by expert layer
     std::unique_ptr<PinnedHostBuffer> route_host;
     std::uint32_t pending_routes = 0;
-    std::uint64_t pending_chunks = 1; // chunks of the pass whose routes are pending
 
     // Host-resident experts, wide calls: a layer's routed experts that the cache does not hold are
     // copied into device slots and the matrix kernel reads them there; one pool and one set of
@@ -715,6 +744,17 @@ struct Executor::Impl {
         pooled_slots   = options.max_context / config.indexer_compress_ratio + 1;
         kv_layout =
             paged_kv_storage_layout(options.kv_cache, static_cast<std::int32_t>(config.head_dim));
+        if (options.kv_resident != 0) {
+            // A decode, verification or MTP call reads at most this many queries' blocks at once.
+            const std::uint32_t width = std::max<std::uint32_t>(verify_width, 1);
+            const std::uint32_t slots = std::max<std::uint32_t>(
+                (options.kv_resident + ops::kKvStreamPageTokens - 1) / ops::kKvStreamPageTokens,
+                std::uint32_t(ops::kv_stream_minimum_slots(std::int32_t(width))));
+            if (std::uint64_t(slots) * ops::kKvStreamPageTokens < options.max_context) {
+                stream_slots = slots;
+                stream_width = width;
+            }
+        }
         memory.ranks.resize(device.size());
         plan_weights();
         if (verify_width > 0) { plan_mtp(); }
@@ -733,16 +773,14 @@ struct Executor::Impl {
         }
         const auto residency = model.options().experts;
         if (residency == ExpertResidency::Device &&
-            (options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
-             options.hybrid_experts.dma_share_auto || options.hybrid_experts.cpu_threads != 0 ||
+            (options.hybrid_experts.dma_share || options.hybrid_experts.cpu_threads != 0 ||
              options.hybrid_experts.mapped_misses)) {
             throw std::invalid_argument("expert DMA shares, CPU threads and miss paths require "
                                         "host or disk experts");
         }
         if (options.hybrid_experts.mapped_misses &&
             (residency != ExpertResidency::Host || native_host ||
-             options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
-             options.hybrid_experts.dma_share_auto)) {
+             options.hybrid_experts.dma_share.value_or(1.0F) != 1.0F)) {
             throw std::invalid_argument("mapped misses need GGUF host experts and all misses on the GPU");
         }
         if (options.hybrid_experts.tail_skip_rank != 0 &&
@@ -759,9 +797,11 @@ struct Executor::Impl {
         allocate_ranks();
         allocate_vision();
         allocate_sequences();
+        allocate_staging();
         if (verify_width > 0) { allocate_speculation(); }
         allocate_span();
         allocate_cache();
+        memory.streamed_kv = stream_slots != 0;
         for (const auto& rank : memory.ranks) {
             memory.state_bytes += rank.state_bytes;
             memory.workspace_bytes += rank.workspace_bytes;
@@ -1192,29 +1232,119 @@ struct Executor::Impl {
         CUDA_CHECK(cudaStreamSynchronize(ranks[0].stream));
     }
 
-    // A sparse-attention layer's per-sequence state: paged KV (one plane per K or V vector and
-    // per scale, each [leading, page, head, page]), pooled keys and the indexer's tail.
-    void allocate_attention_state(LayerState& state, std::size_t rank) {
-        const auto plane = [&](std::int32_t leading, DType dtype) {
-            return DeviceBuffer(std::uint64_t(leading) * kPagedKVPageSize *
-                                config.num_key_value_heads * pages * dtype_size(dtype));
-        };
-        state.k_pages = plane(kv_layout.key.data_leading_extent, kv_layout.key.data_dtype);
-        state.v_pages = plane(kv_layout.value.data_leading_extent, kv_layout.value.data_dtype);
-        if (kv_layout.key.has_scale()) {
-            state.k_scales = plane(kv_layout.key.scale_leading_extent, kv_layout.key.scale_dtype);
+    // The planes of the sparse-attention layers' KV storage, in LayerState::kv's order (K, V,
+    // K scales, V scales), each a row width and dtype; absent scale planes have width 0.
+    [[nodiscard]] std::array<std::pair<std::int32_t, DType>, 4> kv_planes() const {
+        return {{{kv_layout.key.data_leading_extent, kv_layout.key.data_dtype},
+                 {kv_layout.value.data_leading_extent, kv_layout.value.data_dtype},
+                 {kv_layout.key.has_scale() ? kv_layout.key.scale_leading_extent : 0,
+                  kv_layout.key.scale_dtype},
+                 {kv_layout.value.has_scale() ? kv_layout.value.scale_leading_extent : 0,
+                  kv_layout.value.scale_dtype}}};
+    }
+
+    // One plane's bytes for `pages` pages of `page_tokens` positions.
+    [[nodiscard]] std::uint64_t kv_plane_bytes(std::size_t plane, std::uint64_t page_tokens,
+                                               std::uint64_t count) const {
+        const auto [leading, dtype] = kv_planes()[plane];
+        return std::uint64_t(leading) * page_tokens * config.num_key_value_heads * count *
+               dtype_size(dtype);
+    }
+
+    // A view of a sparse-attention layer's KV planes `data(i)`: pages of `page_tokens` positions,
+    // `count` of them, read through `table` (`entries` I32).
+    template <class Data>
+    [[nodiscard]] PagedKVLayerView kv_view(Data&& data, std::int32_t page_tokens,
+                                           std::int32_t count, void* table,
+                                           std::int32_t entries) const {
+        PagedKVLayerView cache{};
+        Tensor* targets[4] = {&cache.k_pages, &cache.v_pages, &cache.k_scale_pages,
+                              &cache.v_scale_pages};
+        const auto planes = kv_planes();
+        for (std::size_t i = 0; i < planes.size(); ++i) {
+            if (planes[i].first == 0) { continue; }
+            *targets[i] = Tensor(data(i), planes[i].second,
+                                 {planes[i].first, page_tokens,
+                                  static_cast<std::int32_t>(config.num_key_value_heads), count});
         }
-        if (kv_layout.value.has_scale()) {
-            state.v_scales =
-                plane(kv_layout.value.scale_leading_extent, kv_layout.value.scale_dtype);
+        cache.block_table  = Tensor(table, DType::I32, {entries});
+        cache.head_dim     = static_cast<std::int32_t>(config.head_dim);
+        cache.num_kv_heads = static_cast<std::int32_t>(config.num_key_value_heads);
+        cache.storage      = options.kv_cache;
+        return cache;
+    }
+
+    // A sparse-attention layer's per-sequence state: paged KV (one plane per K or V vector and
+    // per scale, each [leading, page, head, page]), pooled keys and the indexer's tail. A
+    // streamed layer keeps the paged KV in pinned host memory, and its pool and map on the device.
+    void allocate_attention_state(LayerState& state, std::size_t rank) {
+        std::uint64_t device_kv = 0, bytes = 0;
+        const auto planes       = kv_planes();
+        for (std::size_t i = 0; i < planes.size(); ++i) {
+            if (planes[i].first == 0) { continue; }
+            KvPlane& plane = state.kv[i];
+            plane.bytes    = kv_plane_bytes(i, kPagedKVPageSize, pages);
+            if (stream_slots != 0) {
+                plane.host    = std::make_unique<PinnedHostBuffer>(plane.bytes);
+                plane.p       = plane.host->data();
+                state.pool[i] = DeviceBuffer(kv_plane_bytes(i, ops::kKvStreamPageTokens,
+                                                            stream_slots));
+                device_kv += state.pool[i].bytes;
+                memory.host_kv_bytes += plane.bytes;
+            } else {
+                plane.device = DeviceBuffer(plane.bytes);
+                plane.p      = plane.device.p;
+                device_kv += plane.bytes;
+            }
+        }
+        if (stream_slots != 0) {
+            const auto blocks = static_cast<std::int32_t>(
+                std::uint64_t(pages) * (kPagedKVPageSize / ops::kKvStreamPageTokens));
+            const auto slots  = static_cast<std::int32_t>(stream_slots);
+            state.map_memory  = DeviceBuffer(ops::kv_stream_map_bytes(blocks, slots));
+            state.map         = ops::kv_stream_map(state.map_memory.p, blocks, slots);
+            bytes += state.map_memory.bytes;
         }
         state.pooled = DeviceBuffer(std::uint64_t(config.indexer_head_dim) * pooled_slots * 4);
         state.tail   = DeviceBuffer(std::uint64_t(config.indexer_head_dim) *
                                     (config.indexer_compress_ratio - 1) * 4);
-        const std::uint64_t kv =
-            state.k_pages.bytes + state.v_pages.bytes + state.k_scales.bytes + state.v_scales.bytes;
-        memory.ranks[rank].state_bytes += kv + state.pooled.bytes + state.tail.bytes;
-        memory.kv_bytes += kv;
+        memory.ranks[rank].state_bytes += device_kv + bytes + state.pooled.bytes + state.tail.bytes;
+        memory.kv_bytes += device_kv;
+    }
+
+    // Streamed layers: each rank that runs one gets the staging copy a prompt chunk reads.
+    void allocate_staging() {
+        if (stream_slots == 0) { return; }
+        for (RankState& rank : ranks) {
+            const bool attention =
+                std::any_of(layers.begin(), layers.end(), [&](const LayerPlan& plan) {
+                    return plan.qsa && plan.rank == rank.rank;
+                }) ||
+                (mtp && rank.rank == model.head_rank());
+            if (!attention) { continue; }
+            RankBinding bind(device, rank.rank);
+            const auto planes = kv_planes();
+            for (std::size_t i = 0; i < planes.size(); ++i) {
+                if (planes[i].first == 0) { continue; }
+                rank.kv_staging[i] = DeviceBuffer(kv_plane_bytes(i, kPagedKVPageSize, pages));
+                memory.ranks[rank.rank].workspace_bytes += rank.kv_staging[i].bytes;
+            }
+        }
+    }
+
+    // Before a prompt chunk of a streamed layer: the rank's staging copy holds the layer's
+    // positions before `first`, copied from its host copy unless the copy is still there from the
+    // layer's previous chunk.
+    void stage(const LayerState& state, RankState& rank, std::uint32_t first) {
+        if (rank.kv_staged == &state && rank.kv_staged_end >= first) { return; }
+        const std::uint64_t used = (std::uint64_t(first) + kPagedKVPageSize - 1) / kPagedKVPageSize;
+        for (std::size_t i = 0; i < state.kv.size(); ++i) {
+            const KvPlane& plane = state.kv[i];
+            if (plane.p == nullptr || used == 0) { continue; }
+            CUDA_CHECK(cudaMemcpyAsync(rank.kv_staging[i].p, plane.p, plane.bytes / pages * used,
+                                       cudaMemcpyDefault, rank.stream));
+        }
+        rank.kv_staged = &state;
     }
 
     // Each rank's Gated DeltaNet layers keep their state in one pool with a slot per sequence,
@@ -1492,16 +1622,23 @@ struct Executor::Impl {
                                                     .up     = bank(plan->moe.up),
                                                     .down   = bank(plan->moe.down)});
         }
-        cache = std::make_unique<ExpertCache>(device, std::move(cache_layers), bytes);
+        // The routing profile: the one given, else the one recorded on this family's release.
+        std::vector<std::size_t> widths;
+        for (const auto& [plan, moe] : expert) { widths.push_back(plan->moe.gate.pointers.size()); }
+        std::optional<ExpertRouteCounts> profile;
+        if (!options.hybrid_experts.routing_profile.empty()) {
+            profile = read_expert_profile(options.hybrid_experts.routing_profile,
+                                          model.info().artifact_id, widths);
+        } else {
+            profile = builtin_expert_profile(kExpertProfileFamily, widths);
+        }
+        cache = std::make_unique<ExpertCache>(device, std::move(cache_layers), bytes,
+                                              profile ? &*profile : nullptr,
+                                              expert.size() > layers.size());
         for (std::size_t r = 0; r < bytes.size(); ++r) {
             memory.ranks[r].expert_cache_bytes += bytes[r];
         }
-        if (!options.hybrid_experts.routing_profile.empty()) {
-            std::vector<std::size_t> widths;
-            for (const auto& [plan, moe] : expert) { widths.push_back(plan->moe.gate.pointers.size()); }
-            cache->seed(read_expert_profile(options.hybrid_experts.routing_profile,
-                                            model.info().artifact_id, widths));
-        }
+        if (profile) { cache->seed(*profile); }
         if (staged) { allocate_misses(); }
     }
 
@@ -1549,8 +1686,8 @@ struct Executor::Impl {
         }
         MissOptions miss;
         miss.token_capacity = kVectorTokens;
-        miss.cpu_balance    = options.hybrid_experts.dma_share_auto;
-        miss.cpu_share      = miss.cpu_balance ? 0.0 : 1.0 - double(options.hybrid_experts.dma_share);
+        miss.cpu_balance    = !options.hybrid_experts.dma_share && !options.hybrid_experts.mapped_misses;
+        miss.cpu_share      = miss.cpu_balance ? 0.0 : 1.0 - double(options.hybrid_experts.dma_share.value_or(1.0F));
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
@@ -1731,24 +1868,23 @@ struct Executor::Impl {
         const auto* host = static_cast<const std::int32_t*>(route_host->data());
         if (cache) {
             const std::size_t used = std::size_t(config.num_experts_per_tok) * pending_routes;
+            // The tier learns from decode and verification passes; a prompt chunk, which routes
+            // nearly every expert, only counts toward the statistics.
+            const bool decode = pending_routes <= std::uint32_t(kVectorTokens);
             if (pending_routes > 0) {
                 for (std::size_t i = 0; i < layers.size(); ++i) {
-                    cache->observe(i, std::span(host + i * pairs, used), pending_routes);
+                    cache->observe(i, std::span(host + i * pairs, used), decode);
                 }
             }
             if (mtp_routes > 0) {
                 cache->observe(layers.size(),
                                std::span(host + layers.size() * pairs,
                                          std::size_t(config.num_experts_per_tok) * mtp_routes),
-                               mtp_routes);
+                               true);
             }
-            // A prompt chunk moves the working set; a decode step only nudges it.
-            // A span of several chunks earns each chunk's budget.
-            cache->rebalance(pending_routes > 1 ? (2048ULL << 20) * pending_chunks : (48ULL << 20),
-                             pending_routes > kVectorTokens);
+            if (decode) { cache->adapt(); }
         }
         pending_routes = 0;
-        pending_chunks = 1;
         mtp_routes     = 0;
     }
 
@@ -1812,6 +1948,23 @@ struct Executor::Impl {
                 CUDA_CHECK(cudaMemsetAsync(buffer->p, 0, buffer->bytes, stream));
             }
         }
+        forget_streamed_kv(sequence);
+    }
+
+    // A sequence's streamed layers: every block leaves their pools, and no rank's staging copy
+    // stands for them, after a reset or a loaded image rewrote what their positions hold.
+    void forget_streamed_kv(SequenceState& sequence) {
+        if (stream_slots == 0) { return; }
+        const auto forget = [&](LayerState& state, std::size_t rank) {
+            if (state.map.table == nullptr) { return; }
+            RankBinding bind(device, rank);
+            ops::kv_stream_reset(state.map, ranks[rank].stream);
+            if (ranks[rank].kv_staged == &state) { ranks[rank].kv_staged = nullptr; }
+        };
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            forget(sequence.layers[i], layers[i].rank);
+        }
+        if (mtp) { forget(sequence.mtp, model.head_rank()); }
     }
 
     // Moves the stack's first `tokens` columns from one rank to another, ordered after the
@@ -2123,6 +2276,7 @@ struct Executor::Impl {
         const std::int32_t* rope      = nullptr; // 1-D RoPE positions
         void* index                   = nullptr; // BF16 [640, count]
         void* tail                    = nullptr; // FP32 [128, 3]
+        std::uint32_t first           = 0;       // the first position, as the host knows it
     };
 
     [[nodiscard]] AttentionInputs target_inputs(std::size_t index, LayerState& state,
@@ -2130,7 +2284,8 @@ struct Executor::Impl {
         AttentionInputs in{.positions = rank.positions + part.column,
                            .rope      = rank.rope + part.column,
                            .index     = nullptr,
-                           .tail      = state.tail.p};
+                           .tail      = state.tail.p,
+                           .first     = part.sequence->position};
         if (verifying) {
             const std::uint64_t rows =
                 std::uint64_t(config.indexer_n_heads + 1) * config.indexer_head_dim;
@@ -2185,31 +2340,31 @@ struct Executor::Impl {
             const Tensor rope(const_cast<std::int32_t*>(in.rope), DType::I32, {t});
             ops::rmsnorm_rope(rope, a.query_norm, a.key_norm, q3, k3, qo, ko, s);
         }
-        const auto plane = [&](const DeviceBuffer& memory, std::int32_t leading, DType dtype) {
-            return Tensor(memory.p, dtype,
-                          {leading, static_cast<std::int32_t>(kPagedKVPageSize), nk,
-                           static_cast<std::int32_t>(pages)});
-        };
-        PagedKVLayerView cache{};
-        cache.k_pages =
-            plane(state.k_pages, kv_layout.key.data_leading_extent, kv_layout.key.data_dtype);
-        cache.v_pages =
-            plane(state.v_pages, kv_layout.value.data_leading_extent, kv_layout.value.data_dtype);
-        if (kv_layout.key.has_scale()) {
-            cache.k_scale_pages = plane(state.k_scales, kv_layout.key.scale_leading_extent,
-                                        kv_layout.key.scale_dtype);
-        }
-        if (kv_layout.value.has_scale()) {
-            cache.v_scale_pages = plane(state.v_scales, kv_layout.value.scale_leading_extent,
-                                        kv_layout.value.scale_dtype);
-        }
-        cache.block_table =
-            Tensor(rank.block_table.p, DType::I32, {static_cast<std::int32_t>(pages)});
-        cache.head_dim     = d;
-        cache.num_kv_heads = nk;
-        cache.storage      = options.kv_cache;
+        // The paged KV: device pages, or a streamed layer's host copy. A streamed layer's call of
+        // at most stream_width tokens reads its device pool once kv_stream_resolve has made the
+        // call's blocks resident there; a wider call (a prompt chunk) reads the rank's staging
+        // copy, into which it appends as well, and then drops the blocks it wrote from the pool.
+        const auto paged_count = static_cast<std::int32_t>(pages);
+        const PagedKVLayerView cache =
+            kv_view([&](std::size_t i) { return state.kv[i].p; }, kPagedKVPageSize, paged_count,
+                    rank.block_table.p, paged_count);
+        const bool streamed = state.map.table != nullptr;
+        const bool pooled_read = streamed && t <= static_cast<std::int32_t>(stream_width);
         const Tensor v3(v.data, DType::BF16, {d, nk, t});
         ops::kv_cache_append(ko, v3, positions, cache, s);
+        PagedKVLayerView read = cache;
+        if (pooled_read) {
+            if (rank.kv_staged == &state) { rank.kv_staged = nullptr; }
+            read = kv_view([&](std::size_t i) { return state.pool[i].p; }, ops::kKvStreamPageTokens,
+                           static_cast<std::int32_t>(stream_slots), state.map.table,
+                           state.map.blocks);
+        } else if (streamed) {
+            stage(state, rank, in.first);
+            read = kv_view([&](std::size_t i) { return rank.kv_staging[i].p; }, kPagedKVPageSize,
+                           paged_count, rank.block_table.p, paged_count);
+            ops::kv_cache_append(ko, v3, positions, read, s);
+            rank.kv_staged_end = in.first + std::uint32_t(t);
+        }
         const auto di = static_cast<std::int32_t>(config.indexer_head_dim);
         Tensor pooled(state.pooled.p, DType::FP32, {di, static_cast<std::int32_t>(pooled_slots)});
         Tensor tail(in.tail, DType::FP32,
@@ -2226,11 +2381,21 @@ struct Executor::Impl {
             ops::qsa_indexer_select(index, first, iw, config.rms_norm_eps, pooled, ws, selected,
                                     counts, s);
         }
+        if (pooled_read) {
+            ops::kv_stream_resolve(state.map, first, selected, counts, cache, read, s);
+        }
         Tensor attention(rank.f, DType::BF16, {d, nq, t});
         {
             auto scope = ws.scope();
-            ops::sparse_softmax_attention(qo, first, selected, counts, cache,
+            ops::sparse_softmax_attention(qo, first, selected, counts, read,
                                           1.0F / std::sqrt(float(d)), ws, attention, s);
+        }
+        if (streamed && !pooled_read) {
+            const auto block = [](std::uint32_t position) {
+                return static_cast<std::int32_t>(position / ops::kKvStreamPageTokens);
+            };
+            ops::kv_stream_evict(state.map, block(in.first),
+                                 block(in.first + std::uint32_t(t) - 1) + 1, s);
         }
         Tensor flat(rank.f, DType::BF16, {d * nq, t});
         ops::sigmoid_mul(gate, flat, s);
@@ -2588,7 +2753,6 @@ struct Executor::Impl {
                 throw std::invalid_argument("qwen4_exp forward: the sequence exceeds max_context");
             }
         }
-        fence_misses();
         settle_routes();
         // A copy queued for an earlier pass may predate the cache's last swaps.
         forget_prefetches();
@@ -2633,27 +2797,11 @@ struct Executor::Impl {
             }
         }
         record_routes(static_cast<std::uint32_t>(t));
-        if (misses) {
-            for (std::size_t r = 0; r < ranks.size(); ++r) {
-                RankBinding bind(device, r);
-                misses->publish(ranks[r].stream, r);
-            }
-        }
         // While a staged layer waits on the device for its missing experts, no other launch may
         // load a kernel lazily: loading can wait for the device to go idle, the waiting kernel for
         // the misses' service, and the service's own calls for the loader. The caller's next
         // kernels therefore follow a pass that may have waited.
         if (misses && t <= kVectorTokens) { synchronize_ranks(); }
-    }
-
-    // Slots taken behind the last pass's calls are filled before anything later on the streams,
-    // this pass and the cache's rebalance, touches them.
-    void fence_misses() {
-        if (!misses) { return; }
-        for (std::size_t r = 0; r < ranks.size(); ++r) {
-            RankBinding bind(device, r);
-            misses->fence(ranks[r].stream, r);
-        }
     }
 
     void synchronize_ranks() {
@@ -2807,7 +2955,6 @@ struct Executor::Impl {
         const auto count_of = [&](std::size_t k) {
             return static_cast<std::int32_t>(std::min(c, n - k * c));
         };
-        fence_misses();
         settle_routes();
         forget_prefetches();
         float* const own_stack = rank.stack;
@@ -2884,7 +3031,10 @@ struct Executor::Impl {
                     if (plan.gdn) {
                         run_gdn(plan, i, state, rank, part);
                     } else {
-                        run_qsa(plan, state, rank, part, target_inputs(i, state, rank, part));
+                        // The span holds the sequence at its start; chunk k begins k chunks on.
+                        AttentionInputs in = target_inputs(i, state, rank, part);
+                        in.first           = start + std::uint32_t(k * c);
+                        run_qsa(plan, state, rank, part, in);
                     }
                     {
                         auto scope = rank.workspace->scope();
@@ -2943,8 +3093,6 @@ struct Executor::Impl {
             project(head, head_mixed, logits, *rank.workspace, st);
             sequence.position = start + std::uint32_t(n);
             record_routes(last_count);
-            // Up to four chunks' admission budget: more delays the first decode step.
-            pending_chunks = std::min<std::size_t>(chunks, 4);
             // The MTP block catches up chunk by chunk over each chunk's own final stacks.
             if (mtp) {
                 for (std::size_t k = 0; k < chunks; ++k) {
@@ -3204,7 +3352,8 @@ struct Executor::Impl {
                     {.positions = positions + part.column,
                      .rope      = positions + part.column,
                      .index     = nullptr,
-                     .tail      = drafting ? sequence.mtp_scratch_tail.p : sequence.mtp.tail.p});
+                     .tail      = drafting ? sequence.mtp_scratch_tail.p : sequence.mtp.tail.p,
+                     .first     = part.first});
         }
         mrope = media;
         {
@@ -3631,7 +3780,7 @@ struct Executor::Impl {
         sequence.rope_delta = 0;
     }
 
-    // One device region of a sequence image, on its rank.
+    // One region of a sequence image, on its rank: device memory, or a streamed layer's host copy.
     struct ImageRegion {
         void* device      = nullptr;
         std::size_t bytes = 0;
@@ -3650,10 +3799,9 @@ struct Executor::Impl {
             (std::uint64_t(position) + kPagedKVPageSize - 1) / kPagedKVPageSize;
         const std::uint64_t blocks = position / config.indexer_compress_ratio;
         const auto attention       = [&](const LayerState& state, std::size_t rank) {
-            for (const DeviceBuffer* plane :
-                 {&state.k_pages, &state.v_pages, &state.k_scales, &state.v_scales}) {
-                if (plane->p == nullptr) { continue; }
-                out.push_back({plane->p, std::size_t(plane->bytes / pages * used), rank});
+            for (const KvPlane& plane : state.kv) {
+                if (plane.p == nullptr) { continue; }
+                out.push_back({plane.p, std::size_t(plane.bytes / pages * used), rank});
             }
             out.push_back(
                 {state.pooled.p, std::size_t(config.indexer_head_dim) * 4 * blocks, rank});
@@ -3694,10 +3842,10 @@ struct Executor::Impl {
         for (const ImageRegion& region : regions) {
             if (region.bytes == 0) { continue; }
             RankBinding bind(device, region.rank);
-            CUDA_CHECK(cudaMemcpyAsync(
-                save ? static_cast<void*>(host + offset) : region.device,
-                save ? region.device : static_cast<void*>(host + offset), region.bytes,
-                save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, ranks[region.rank].stream));
+            CUDA_CHECK(cudaMemcpyAsync(save ? static_cast<void*>(host + offset) : region.device,
+                                       save ? region.device : static_cast<void*>(host + offset),
+                                       region.bytes, cudaMemcpyDefault,
+                                       ranks[region.rank].stream));
             offset += region.bytes;
         }
         for (auto& rank : ranks) {
@@ -3731,6 +3879,7 @@ struct Executor::Impl {
         }
         copy_image(image_regions(sequence, nullptr, image.position),
                    const_cast<std::byte*>(bytes.data()), false);
+        forget_streamed_kv(sequence);
         sequence.position    = image.position;
         sequence.context     = image.context;
         sequence.mtp_follows = mtp && image.mtp_follows;

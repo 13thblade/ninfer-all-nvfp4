@@ -159,8 +159,8 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
         for (int p = 0; p < kPairs; ++p) {
             if (shifting) {
                 // Narrow calls whose five experts move by three every replay, and a wide call every
-                // fourth: once the cache is full, admissions evict the least recently used experts
-                // of every layer while the GPU reads the next call's cached pairs.
+                // fourth: once the cache is full, admissions and the tier's rounds evict experts of
+                // every layer while the GPU reads the next call's cached pairs.
                 routes[p] = iteration % 4 == 3 ? p % kExperts : (3 * iteration + p % 5) % kExperts;
             } else {
                 routes[p] = iteration % 3 == 0 ? p % 5 : (p + iteration) % kExperts;
@@ -327,67 +327,280 @@ int admission_boundaries(DeviceContext& device) {
     return 0;
 }
 
-// Narrow calls on one layer with a four-slot cache, against a host model of the policy: a call's
-// cached experts become the most recent in ascending order, then each miss in ascending order
-// takes a free slot or evicts the least recently used expert the call does not route.
-int recency_order(DeviceContext& device) {
-    constexpr int experts = 12, slots = 4, calls = 400;
+// Two layers of twelve experts with a four-slot cache, every call narrow: misses fill the free
+// slots; once they are full, a miss enters only when its routes beat a cold expert its call does
+// not route by the tier's gain.
+int tier_policy(DeviceContext& device) {
+    constexpr int experts = 12, slots = 4;
     std::vector<std::unique_ptr<PinnedHostBuffer>> sources;
-    ExpertDeliveryLayer layer;
-    layer.aliases = {{0, 0}};
-    sources.push_back(std::make_unique<PinnedHostBuffer>(std::size_t(experts) * 256));
-    std::memset(sources.back()->data(), 0, sources.back()->size());
-    for (int e = 0; e < experts; ++e) {
-        auto* data = static_cast<std::byte*>(sources.back()->data()) + std::size_t(e) * 256;
-        layer.experts.push_back({ExpertBlob{.pinned = data,
-            .pinned_region = reinterpret_cast<std::uintptr_t>(sources.back()->data()), .bytes = 256}});
+    std::vector<ExpertDeliveryLayer> layers(2);
+    for (auto& layer : layers) {
+        layer.aliases = {{0, 0}};
+        sources.push_back(std::make_unique<PinnedHostBuffer>(std::size_t(experts) * 256));
+        std::memset(sources.back()->data(), 0, sources.back()->size());
+        for (int e = 0; e < experts; ++e) {
+            auto* data = static_cast<std::byte*>(sources.back()->data()) + std::size_t(e) * 256;
+            layer.experts.push_back({ExpertBlob{.pinned = data,
+                .pinned_region = reinterpret_cast<std::uintptr_t>(sources.back()->data()), .bytes = 256}});
+        }
     }
     ExpertDeliveryOptions options;
-    options.pair_capacity = 8;
+    options.pair_capacity = 64;
     options.cache_bytes = slots * 256;
-    ExpertDelivery delivery(device.rank(0), {}, {layer}, options);
-    if (delivery.memory().cache_slots != slots) { throw std::runtime_error("recency: slot count"); }
-    DeviceBuffer ids(8 * 4);
-    std::vector<int> order; // least recent first
-    std::uint64_t state = 12345, failures = 0;
-    for (int call = 0; call < calls; ++call) {
-        std::vector<std::int32_t> routed;
-        const int width = 1 + int((state = state * 6364136223846793005ULL + 1442695040888963407ULL) >> 62);
-        while (int(routed.size()) < width) {
-            const int e = int((state = state * 6364136223846793005ULL + 1442695040888963407ULL) >> 33) % 7 +
-                          (call / 100) % 2 * 5; // the hot set moves halfway through
-            if (std::find(routed.begin(), routed.end(), e) == routed.end()) { routed.push_back(e); }
-        }
-        std::sort(routed.begin(), routed.end());
-        std::uint64_t expected_hits = 0;
-        for (const int e : routed) {
-            const auto at = std::find(order.begin(), order.end(), e);
-            if (at != order.end()) { ++expected_hits; order.erase(at); order.push_back(e); }
-        }
-        for (const int e : routed) {
-            if (std::find(order.begin(), order.end(), e) != order.end()) { continue; }
-            if (int(order.size()) == slots) {
-                const auto victim = std::find_if(order.begin(), order.end(), [&](int v) {
-                    return std::find(routed.begin(), routed.end(), v) == routed.end();
-                });
-                order.erase(victim);
-            }
-            order.push_back(e);
-        }
+    options.tier.every = 1; // a round at every pass
+    ExpertDelivery delivery(device.rank(0), {}, layers, options);
+    if (delivery.memory().cache_slots != slots) { throw std::runtime_error("tier: slot count"); }
+    DeviceBuffer ids(64 * 4);
+    const auto call = [&](int layer, const std::vector<std::int32_t>& routed) {
         ids.copy_from_host(routed.data(), routed.size() * 4);
-        const auto before = delivery.stats();
-        (void)delivery.begin(0, static_cast<const std::int32_t*>(ids.p), std::uint32_t(routed.size()),
+        (void)delivery.begin(layer, static_cast<const std::int32_t*>(ids.p), std::uint32_t(routed.size()),
                              device.stream);
         delivery.await(device.stream);
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
         delivery.drain();
-        if (delivery.stats().hits - before.hits != expected_hits) { ++failures; }
+        return delivery.stats();
+    };
+    int failures = 0;
+    const auto expect = [&](bool condition, const char* what) {
+        if (!condition) {
+            std::printf("tier policy: %s\n", what);
+            ++failures;
+        }
+    };
+    // Pass 1 fills the four slots.
+    call(0, {0, 1});
+    auto stats = call(1, {0, 1});
+    expect(stats.admissions == 4 && stats.evictions == 0, "free slots take every miss");
+    // Pass 2: one pair of a new expert does not beat a held expert's route by 1.5.
+    call(0, {0, 1});
+    stats = call(0, {2});
+    expect(stats.evictions == 0 && stats.admissions == 4, "a weak miss stays out of a full cache");
+    stats = call(1, {0, 1});
+    // Pass 3: twenty pairs of expert 3 beat the coldest expert its call does not route.
+    stats = call(0, std::vector<std::int32_t>(20, 3));
+    expect(stats.evictions == 1 && stats.admissions == 5, "a strong miss takes the coldest slot");
+    const auto after = call(0, std::vector<std::int32_t>(20, 3));
+    expect(after.pair_hits - stats.pair_hits == 20, "the admitted expert hits");
+    // The slots serve every layer: a strong miss of layer 1, whose call routes its own held
+    // experts, takes the slot of layer 0's cold expert 1.
+    stats = call(1, {0, 1, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9});
+    expect(stats.evictions == 2 && call(0, {1}).misses == stats.misses + 1,
+           "a strong miss takes another layer's cold expert");
+    std::printf("tier policy admissions=%llu evictions=%llu hits=%llu %s\n",
+                (unsigned long long)stats.admissions, (unsigned long long)stats.evictions,
+                (unsigned long long)stats.pair_hits, failures ? "FAIL" : "PASS");
+    return failures ? 1 : 0;
+}
+
+// The CPU's products partition a narrow call with the cache and the copies: every pair is cached,
+// missing or computed on the CPU, which reads each expert's stored bytes (pinned or from the
+// files); and a routing profile seeds the cache, so the first call of its experts hits.
+class PairEcho final : public ExpertCpuProducts {
+public:
+    bool supports(std::size_t) const override { return true; }
+    void compute(const Work& work) override {
+        auto* out = reinterpret_cast<std::int32_t*>(work.products);
+        const auto* inputs = reinterpret_cast<const std::int32_t*>(work.inputs);
+        for (std::size_t p = 0; p < work.ids.size(); ++p) {
+            out[p] = -1;
+            if (inputs[p] != work.ids[p]) { ++bad; }
+            for (std::size_t i = 0; i < work.experts.size(); ++i) {
+                if (work.experts[i] == work.ids[p]) { out[p] = work.ids[p]; }
+            }
+        }
+        for (std::size_t i = 0; i < work.experts.size(); ++i) {
+            for (int b = 0; b < 2; ++b) {
+                const auto bytes = b ? kDown - std::uint64_t(work.layer) * 256 : kGu;
+                const auto* data = reinterpret_cast<const unsigned char*>(work.blobs[i][std::size_t(b)]);
+                for (const std::uint64_t at : {std::uint64_t(0), bytes / 2, bytes - 1}) {
+                    if (data[at] != signature(int(work.layer), work.experts[i], b, at)) { ++bad; }
+                }
+            }
+        }
+        ++calls;
     }
+    std::uint64_t bad = 0, calls = 0;
+};
+
+__global__ void partition(const std::int32_t* ids, const std::int32_t* cached, const std::int32_t* missing,
+                          const std::int32_t* products, const std::int32_t* cpu, int pairs,
+                          unsigned long long* failures, unsigned long long* cpu_pairs) {
+    const int p = int(blockIdx.x * blockDim.x + threadIdx.x);
+    if (p >= pairs) { return; }
+    const int e = ids[p];
+    const bool c = cached[p] >= 0, m = missing[p] >= 0, u = *cpu != 0 && products[p] >= 0;
+    if (int(c) + int(m) + int(u) != 1 || (c && cached[p] != e) || (m && missing[p] != e) ||
+        (u && products[p] != e)) {
+        atomicAdd(failures, 1ull);
+    }
+    if (u) { atomicAdd(cpu_pairs, 1ull); }
+}
+
+// With every miss on the CPU, only the profile and the tier's rounds fill the cache.
+int cpu_share(DeviceContext& device, bool disk, double share, const std::filesystem::path& path) {
+    Fixture fixture(disk, path);
+    PairEcho echo;
+    ExpertDeliveryOptions options;
+    options.pair_capacity = kPairs;
+    options.cache_bytes = 6ULL << 20;
+    options.cpu.products = &echo;
+    options.cpu.input_bytes = kPairs * 4;
+    options.cpu.product_bytes = kPairs * 4;
+    options.cpu.share = share;
+    options.cpu.threads = 2;
+    ExpertDelivery delivery(device.rank(0), fixture.paths, std::move(fixture.layers), options);
+    // A profile of layer 0's experts 0..2 seeds the cache.
+    std::vector<std::vector<std::uint64_t>> profile(kLayers, std::vector<std::uint64_t>(kExperts, 0));
+    profile[0] = {9, 8, 7};
+    profile[0].resize(kExperts, 0);
+    delivery.prime(&profile);
+    DeviceBuffer ids(kPairs * 4), failures(8), visited(8), cpu_pairs(8);
+    failures.fill();
+    visited.fill();
+    cpu_pairs.fill();
+    std::vector<std::int32_t> routes(kPairs);
+    std::uint64_t seeded_hits = 0;
+    for (int iteration = 0; iteration < 8; ++iteration) {
+        // Narrow calls: six experts, one shifted each time.
+        for (int p = 0; p < kPairs; ++p) { routes[p] = (iteration + p % 6) % kExperts; }
+        ids.copy_from_host(routes.data(), ids.bytes);
+        for (int l = 0; l < kLayers; ++l) {
+            const auto before = delivery.stats();
+            const ExpertDelivery::Input input{ids.p, std::size_t(kPairs) * 4};
+            const auto call = delivery.begin(l, static_cast<const std::int32_t*>(ids.p), kPairs,
+                                             device.stream, {&input, 1});
+            inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.cached_ids, kPairs, l,
+                static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            delivery.await(device.stream);
+            inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.missing_ids, kPairs, l,
+                static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            partition<<<kPairs / 256, 256, 0, device.stream>>>(
+                static_cast<const std::int32_t*>(ids.p), call.cached_ids, call.missing_ids,
+                static_cast<const std::int32_t*>(call.products), call.cpu, kPairs,
+                static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(cpu_pairs.p));
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+            delivery.drain();
+            if (iteration == 0 && l == 0) { seeded_hits = delivery.stats().hits - before.hits; }
+        }
+    }
+    unsigned long long bad = 0, computed = 0;
+    failures.copy_to_host(&bad, 8);
+    cpu_pairs.copy_to_host(&computed, 8);
     const auto stats = delivery.stats();
-    const bool ok = !failures && stats.evictions != 0;
-    std::printf("recency order calls=%d hits=%llu evictions=%llu mismatched=%llu %s\n", calls,
-                (unsigned long long)stats.hits, (unsigned long long)stats.evictions,
-                (unsigned long long)failures, ok ? "PASS" : "FAIL");
+    // Seeded experts 0..2 of layer 0 serve six routed experts' calls; with every miss on the CPU,
+    // more hits come only from slots a round filled.
+    const bool ok = !bad && !echo.bad && echo.calls != 0 && computed == stats.cpu_pairs &&
+                    stats.cpu_experts != 0 && seeded_hits == 3 &&
+                    (share < 1 || stats.hits > 6) &&
+                    delivery.cpu_description().find("2 ") == 0;
+    std::printf("%s cpu share %.1f bad=%llu echo_bad=%llu cpu_experts=%llu cpu_pairs=%llu hits=%llu "
+                "seeded_hits=%llu %s\n",
+                disk ? "disk" : "host", share, bad, (unsigned long long)echo.bad,
+                (unsigned long long)stats.cpu_experts, computed, (unsigned long long)stats.hits,
+                (unsigned long long)seeded_hits,
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// An elastic cache under a graph captured before it changes: narrow passes over experts 0..4 of
+// every layer (four times) and 5..7 (once) fill it; giving back all but two granules keeps the most
+// routed experts that fit; giving back everything leaves every expert to the banks; growing takes
+// the slots back. Every replay reads every pair's bytes.
+int elastic_cache(DeviceContext& device, bool disk, const std::filesystem::path& path) {
+    Fixture fixture(disk, path);
+    ExpertDeliveryOptions options;
+    options.pair_capacity = kPairs;
+    options.cache_bytes   = 64ULL << 20; // every expert
+    options.staging_bytes = 4096;
+    options.suspendable   = true;
+    options.elastic       = true;
+    ExpertDelivery delivery(device.rank(0), fixture.paths, std::move(fixture.layers), options);
+    constexpr std::uint64_t slot = 131584 + 98816; // each blob and its tail, 256-byte aligned
+    const std::uint64_t granule  = vmm::granularity(device.device);
+    DeviceBuffer ids(kPairs * 4), failures(8), visited(8);
+    failures.fill();
+    visited.fill();
+    const auto pass = [&] {
+        for (int l = 0; l < kLayers; ++l) {
+            const auto call = delivery.begin(l, static_cast<const std::int32_t*>(ids.p), kPairs, device.stream);
+            inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.cached_ids, kPairs, l,
+                static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            delivery.await(device.stream);
+            inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.missing_ids, kPairs, l,
+                static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            CUDA_CHECK(cudaGetLastError());
+        }
+    };
+    std::vector<std::int32_t> routes(kPairs);
+    const auto route = [&](int first, int count) {
+        for (int p = 0; p < kPairs; ++p) { routes[p] = first + p % count; }
+        ids.copy_from_host(routes.data(), ids.bytes);
+    };
+    route(0, 5);
+    pass();
+    delivery.drain();
+    delivery.prime(nullptr);
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(device.stream, cudaStreamCaptureModeThreadLocal));
+    pass();
+    CUDA_CHECK(cudaStreamEndCapture(device.stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    int replays = 0;
+    const auto replay = [&](int first, int count) {
+        route(first, count);
+        const auto before = delivery.stats();
+        CUDA_CHECK(cudaGraphLaunch(executable, device.stream));
+        delivery.drain();
+        ++replays;
+        return delivery.stats() - before;
+    };
+    int bad_steps = 0;
+    const auto expect = [&](bool condition, const char* what) {
+        if (!condition) {
+            std::printf("elastic cache: %s\n", what);
+            ++bad_steps;
+        }
+    };
+    for (int i = 0; i < 4; ++i) { replay(0, 5); }
+    replay(5, 3);
+    const auto full = delivery.memory();
+    expect(full.cache_slots == kLayers * kExperts, "the cache holds every expert");
+    // All but two granules go back.
+    const auto freed = delivery.shrink_cache(full.cache_bytes - 2 * granule);
+    const auto kept = delivery.memory();
+    const auto keep = std::min<std::uint64_t>(full.cache_slots, 2 * granule / slot);
+    expect(freed == full.cache_bytes - 2 * granule && kept.cache_bytes == 2 * granule &&
+           kept.cache_slots == keep, "shrinking keeps the slots of two granules");
+    // The hottest experts stayed: experts 0..4 of the four layers, as many as fit.
+    const auto hot = replay(0, 5);
+    expect(hot.hits == std::min<std::uint64_t>(keep, kLayers * 5), "the most routed experts stay");
+    delivery.shrink_cache(std::uint64_t(1) << 40);
+    expect(delivery.memory().cache_slots == 0 && delivery.memory().cache_bytes == 0,
+           "everything goes back");
+    const auto empty = replay(0, 5);
+    expect(empty.hits == 0 && empty.misses == kLayers * 5, "an empty cache serves from the banks");
+    const auto grown = delivery.grow_cache();
+    expect(grown != 0 && delivery.memory().cache_slots == kLayers * kExperts, "growing takes it back");
+    replay(0, 5);
+    const auto again = replay(0, 5);
+    expect(again.hits == kLayers * 5, "the grown slots fill and hit");
+    const auto* addresses = delivery.tables(0);
+    delivery.release_device_backing();
+    delivery.restore_device_backing();
+    expect(delivery.tables(0) == addresses && delivery.memory().cache_slots == kLayers * kExperts,
+           "suspend keeps the grown cache");
+    replay(5, 3);
+    CUDA_CHECK(cudaGraphExecDestroy(executable));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    unsigned long long bad = 0, count = 0;
+    failures.copy_to_host(&bad, 8);
+    visited.copy_to_host(&count, 8);
+    const bool ok = !bad_steps && !bad && count == std::uint64_t(replays + 1) * kLayers * kPairs;
+    std::printf("%s elastic cache keep=%llu hot_hits=%llu bad=%llu pairs=%llu %s\n",
+                disk ? "disk" : "host", (unsigned long long)keep, (unsigned long long)hot.hits, bad,
+                count, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 } // namespace
@@ -409,12 +622,14 @@ int main(int argc, char** argv) {
             return failure_control(device, path, true);
         }
         int failures = admission_boundaries(device);
-        failures += recency_order(device);
+        failures += tier_policy(device);
         for (bool disk : {false, true}) {
             for (auto cache : {0ULL, 6ULL << 20, 64ULL << 20}) {
                 failures += run(device, disk, cache, path);
             }
             failures += run(device, disk, 6ULL << 20, path, true);
+            for (const double share : {0.5, 1.0}) { failures += cpu_share(device, disk, share, path); }
+            failures += elastic_cache(device, disk, path);
         }
         failures += failure_control(device, path, false);
         return failures ? 1 : 0;

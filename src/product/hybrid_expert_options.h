@@ -11,12 +11,19 @@
 namespace ninfer::product {
 
 inline constexpr const char* kHybridExpertHelp =
+    "  Host and disk expert options (--expert-residency host|disk):\n"
+    "  --expert-dma-share F|auto     Flash-Next and Gemma 4: GPU share of a decode or\n"
+    "                                verification call's cache misses, 0..1; the CPU computes\n"
+    "                                the rest (GGUF experts: the GPU's results bit for bit).\n"
+    "                                auto (default): GGUF experts split each call by measured\n"
+    "                                CPU and bus times, native experts copy every miss; calls\n"
+    "                                of more than 8 tokens always use the GPU\n"
+    "  --expert-cpu-threads N        Flash-Next and Gemma 4: CPU workers, 1..256 (default: one\n"
+    "                                per physical core)\n"
+    "  --expert-profile FILE         fill the expert cache from recorded counts (default: the\n"
+    "                                built-in profile of the model family, where one exists)\n"
+    "  --expert-profile-out FILE     record expert counts for this artifact after requests\n"
     "  Flash-Next-only expert options:\n"
-    "  --expert-dma-share F|auto     host or disk experts: GPU share of cache misses,\n"
-    "                                0..1 (default 1); below 1 lets the CPU compute the rest\n"
-    "                                (GGUF experts: the GPU's results bit for bit); auto: each\n"
-    "                                call splits them by measured CPU and bus times (GGUF);\n"
-    "                                calls of more than 8 tokens always use the GPU\n"
     "  --expert-misses staged|mapped GGUF experts: copy misses into device staging while the\n"
     "                                cached experts run (default), or read host experts across\n"
     "                                the bus inside the expert kernels\n"
@@ -26,19 +33,15 @@ inline constexpr const char* kHybridExpertHelp =
     "  --expert-prefill-buffers 1|2  GGUF host experts: device buffers for a long prompt's\n"
     "                                uncached experts (default 1); 2 copies the next layer's\n"
     "                                while this one runs, with memory from the expert cache\n"
-    "  --expert-cpu-threads N        CPU workers, 1..256 (default automatic)\n"
     "  --expert-cache-adaptive       replace cold cached experts between calls;\n"
-    "                                changes the CPU/GPU arithmetic partition\n"
-    "  --expert-profile FILE         fill the host expert cache from recorded counts\n"
-    "  --expert-profile-out FILE     record expert counts for this artifact after requests\n";
+    "                                changes the CPU/GPU arithmetic partition\n";
 
 template<class Value>
 bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& out, Value&& value) {
     if (option == "--expert-dma-share") {
         const std::string text(value());
         if (text == "auto") {
-            out.dma_share      = 1;
-            out.dma_share_auto = true;
+            out.dma_share.reset();
             return true;
         }
         float share = 0;
@@ -47,8 +50,7 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
             !std::isfinite(share) || share < 0 || share > 1) {
             throw std::invalid_argument("--expert-dma-share takes a finite value in 0..1 or auto");
         }
-        out.dma_share      = share;
-        out.dma_share_auto = false;
+        out.dma_share = share;
     } else if (option == "--expert-cpu-threads") {
         const std::string text(value());
         std::uint32_t threads = 0;
