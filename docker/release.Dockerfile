@@ -9,9 +9,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* /tmp/ninfer-packages
 COPY lib/ /opt/ninfer/lib/
 COPY NVIDIA-CUDA-EULA.txt /opt/ninfer/NVIDIA-CUDA-EULA.txt
-COPY --chmod=0755 bin/multi/ /opt/ninfer/
-COPY --chmod=0755 run.sh download-model.sh /opt/ninfer/
+COPY --chmod=0755 bin/multi/ /opt/ninfer/multi/
+COPY --chmod=0755 run.sh download-model.sh entrypoint.sh /opt/ninfer/
 ENV LD_LIBRARY_PATH=/opt/ninfer/lib \
+    NINFER_IMAGE_ARCH=multi \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     NVIDIA_REQUIRE_CUDA=${CUDA_REQUIREMENT} \
@@ -23,5 +24,5 @@ VOLUME ["/models", "/grafts", "/cache"]
 WORKDIR /models
 EXPOSE 8080
 STOPSIGNAL SIGTERM
-ENTRYPOINT ["/opt/ninfer/run.sh"]
-CMD ["qwen38-27b"]
+ENTRYPOINT ["/opt/ninfer/entrypoint.sh"]
+CMD ["run", "qwen38-27b"]

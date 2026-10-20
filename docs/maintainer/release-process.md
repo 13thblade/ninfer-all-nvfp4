@@ -1,7 +1,9 @@
 # Cutting a release
 
 The [Native release](../../.github/workflows/native-release.yml) workflow builds Windows x64
-executables and Debian 13 x64 binaries. The existing Docker workflows remain separate.
+executables and Debian 13 x64 binaries. After a successful master run, `Multi-architecture image`
+packages its CUDA 13 Linux archive as `multi`. Ordinary CI still builds and tests each architecture
+separately; `Container image` packages those CI binaries as `latest`.
 
 ## Native publication
 
@@ -44,25 +46,41 @@ Compilation needs no GPU. Driver installation is not part of either build.
    retain their Actions artifacts or the draft created before a newer commit arrived.
 
 Published snapshots are immutable. A retry can repair only the same commit's unfinished draft.
-A push affecting release inputs on `master` publishes automatically. In **Actions → Native release
+Every push to `master` starts the current build, cancels the previous run and publishes on success. In **Actions → Native release
 → Run workflow**, publication defaults to off; enable `publish` only on `master` when intended.
-The test branch `build/windows-release` builds on push and cannot publish. Build jobs have read
-access; only the publication job receives `contents: write`.
+Feature branches run only through manual dispatch and cannot publish. Build jobs have read
+access; only the publication job receives `contents: write`. The master cancellation coordinator
+also cancels older container publishers. Closing a PR cancels that PR's remaining runs.
+A superseded upload can leave an unpublished draft; it cannot replace the current release.
 
 ## Build caches
 
-Native Windows and Debian builds use sccache for C, C++ and CUDA. Its GitHub Actions backend stores
+Native Windows, Debian and ordinary CUDA CI builds use sccache for C, C++ and CUDA. Its GitHub Actions backend stores
 completed compilation results during the build, so successfully stored entries can survive a later
 failure or cancellation. Compiler identity, inputs, headers and flags determine reuse; the source
 commit is not a cache-wide invalidation key. Before the long build, a small C++/multiarch CUDA probe
-must produce cache hits after restarting the cache server. Job logs include final hit/miss statistics.
-A timeout ends compilation before the job deadline so diagnostics can still upload.
+must produce cache hits after restarting the cache server. A separate cleanup step stops the build
+supervisor and requests sccache shutdown, including after cancellation. The pinned server allows
+up to ten seconds for active requests and pending uploads; cleanup waits for this interval.
+Statistics are sampled before shutdown and retained with build diagnostics. A timeout ends
+compilation before the job deadline so cleanup can run.
+
+This preserves successfully uploaded compilation results, not an executing compiler's memory.
+An unfinished file or CUDA compilation phase may need to run again. Force cancellation, runner loss,
+cache-service failures and GitHub's five-minute cancellation limit can prevent final uploads.
+Before starting heavy compilation, a gate waits for older active runs of the same workflow and
+branch to reach a terminal state. It fails after six minutes rather than starting while cleanup is
+stuck. This orders cache cleanup before the next build; it cannot recover an upload that failed.
+
+GitHub scopes caches to branches. A master build can restore earlier master entries. A PR or feature
+branch can also read eligible default-branch entries, but master cannot restore the test branch's
+private cache. The first master build of a new toolchain can therefore remain cold.
 
 Windows vcpkg archives are saved immediately after configuration, including after configuration
-failure. Run/attempt keys allow a later run to replace a partial dependency cache. The ordinary Linux CI and multiarch image workflow retain ccache directories after failed
-or timed-out compile steps. Their save keys include run ID and attempt; restore prefixes allow the
-next run to reuse the newest partial cache. Runtime Docker jobs consume built artifacts and do not
-compile NInfer again. GitHub can evict caches under repository storage/retention policies; a cache
+failure. Run/attempt keys allow a later run to replace a partial dependency cache. Ordinary CI uses
+an independent cache server in its build container, so cancelling the host's `docker exec` does not
+kill pending cache writes. Runtime Docker jobs consume built artifacts and do not compile NInfer
+again. Local Docker builds still use BuildKit's persistent ccache and Ninja directories. GitHub can evict caches under repository storage/retention policies; a cache
 hit and a shorter build time must be established from actual run statistics.
 
 ## Verification status

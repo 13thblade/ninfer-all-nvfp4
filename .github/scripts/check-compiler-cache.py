@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 
 def run(*args):
@@ -34,7 +35,9 @@ run("cmake", "-S", str(root), "-B", str(root / "out"), "-G", "Ninja",
     "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache", "-DCMAKE_CUDA_COMPILER_LAUNCHER=sccache")
 run("sccache", "--zero-stats")
 run("cmake", "--build", str(root / "out"), "-j")
-run("sccache", "--stop-server")  # Flush writes; no process-local state can serve the next build.
+run("sccache", "--stop-server")
+# Shutdown is acknowledged before the daemon drains requests (at most ten seconds).
+time.sleep(11)
 run("cmake", "--build", str(root / "out"), "--clean-first", "-j")
 result = subprocess.check_output(["sccache", "--show-stats", "--stats-format=json"], text=True)
 (root / "cache-stats.json").write_text(result)

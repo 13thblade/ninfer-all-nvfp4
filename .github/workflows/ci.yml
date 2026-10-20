@@ -25,7 +25,7 @@
 #
 #   * the CUDA build of every target for sm_75, sm_86 and sm_120a in the Dockerfile's toolchain
 #     stage, then CTest. The toolchain stage is published as ghcr.io/<owner>/<repo>-toolchain once
-#     per change of its definition (.github/scripts/toolchain-image.sh); ccache carries over
+#     per change of its definition (.github/scripts/toolchain-image.sh); sccache carries over
 #     between runs; the binaries go to the image.
 #
 # The last two run only when a file they build, test or ship from differs from the base: the
@@ -35,6 +35,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
@@ -53,6 +54,10 @@ jobs:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Build inputs changed
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     outputs:
       changed: ${{ steps.compare.outputs.changed }}
     steps:
@@ -62,6 +67,15 @@ jobs:
           fetch-depth: 2
       - id: compare
         run: .github/scripts/build-inputs.sh >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v7
+        if: github.ref == 'refs/heads/master'
+        with:
+          python-version: '3.11'
+      - name: Wait for the previous master build to finish cache cleanup
+        if: github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3.11 .github/scripts/wait-previous-builds.py
 
   calculator:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
@@ -331,60 +345,59 @@ jobs:
       matrix:
         arch: ['75', '86', '120a']
     steps:
-      # The runner's disk (about 80 GB free) holds the toolchain, a build tree and ccache with room
-      # to spare, so nothing is deleted to make space; the free space is logged.
-      - name: Cache location
-        run: |
-          # Outside the workspace, and without '..': actions/cache refuses such a path and saves nothing.
-          echo "CCACHE_HOST_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
-          df -h /
       - uses: actions/checkout@v7
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      # Published once per change of the toolchain stage (by the build-cache job) and pulled after
-      # that; a run that finds it missing builds it for itself. Rebuilding it took 3-4 minutes a job,
-      # and keeping its layers in the Actions cache saved nothing while it filled the 10 GB budget
-      # that ccache needs.
       - name: Toolchain image
         run: .github/scripts/toolchain-image.sh
-      - name: Restore ccache
-        uses: actions/cache/restore@v6
+      - uses: actions/setup-python@v7
         with:
-          path: ${{ env.CCACHE_HOST_DIR }}
-          key: ccache-sm${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ccache-sm${{ matrix.arch }}-
-      # A step timeout below the job's, so that a cold build which runs out of time still saves
-      # its ccache and the next run continues from there.
+          python-version: '3.11'
+      - id: compiler-cache
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+          disable_annotations: true
+      - name: Start build container and compiler cache
+        env:
+          NINFER_CUDA_ARCH: ${{ matrix.arch }}
+        run: .github/scripts/ci-cached-build.sh start
+      - name: Verify compiler cache in the build container
+        timeout-minutes: 10
+        run: .github/scripts/ci-cached-build.sh probe
       - name: Build every target
         id: build
         timeout-minutes: 320
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p "$CCACHE_HOST_DIR"
-          docker run --rm -v "$PWD:/src" -v "$CCACHE_HOST_DIR:/ccache" -w /src \
-            -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=4G -e NINFER_CUDA_ARCH=${{ matrix.arch }} \
-            -e NINFER_MULTICALL=ON -e NINFER_BUILD_DIR=/src/build-ci ninfer-toolchain:ci bash -c \
-            'ccache --zero-stats && scripts/build-native.sh configure && scripts/build-native.sh build && ccache --show-stats' \
-            > build-ci.log 2>&1 &
+          .github/scripts/ci-cached-build.sh build &
           build=$!
           .github/scripts/build-progress.sh watch "$build" build-ci.log "build progress (sm_${{ matrix.arch }})" &
-          tail -n +1 -f build-ci.log --pid="$build" &
           wait "$build"
+      - name: Stop compiler work and drain cache
+        if: always() && steps.compiler-cache.outcome == 'success'
+        timeout-minutes: 2
+        run: .github/scripts/ci-cached-build.sh finish
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-logs-sm${{ matrix.arch }}
+          path: |
+            build-ci.log
+            build-ci-cache.json
+            build-cache-check/cache-stats.json
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Report the build status
         if: always() && steps.build.outcome != 'skipped'
         env:
           GH_TOKEN: ${{ github.token }}
         run: .github/scripts/build-progress.sh finish "build progress (sm_${{ matrix.arch }})" "${{ steps.build.outcome }}"
-      - name: Save ccache
-        if: always()
-        uses: actions/cache/save@v6
-        with:
-          path: ${{ env.CCACHE_HOST_DIR }}
-          key: ccache-sm${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Run CTest
         run: |
           # No driver on the runner: the toolkit's stub libcuda lets the binaries load, cuInit fails,

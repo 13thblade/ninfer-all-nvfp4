@@ -149,6 +149,7 @@ def main():
     distro = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
                   if '=' in line)
     if distro.get('ID', '').strip('"') == 'debian' and distro.get('VERSION_ID', '').strip('"') == '13':
+        shutil.copy2(repo / 'docker/entrypoint.sh', package / 'entrypoint.sh')
         dockerfile = (repo / 'docker/release.Dockerfile').read_text()
         (package / 'Dockerfile').write_text(dockerfile.replace('cuda>=13.0', f"cuda>={cuda.split('.')[0]}.0"))
     patch_note = cuda_root / 'ninfer-toolchain-patches.txt'

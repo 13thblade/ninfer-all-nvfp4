@@ -2,35 +2,7 @@ name: Native release
 
 on:
   push:
-    branches: [master, build/windows-release]
-    paths:
-      - 'CMakeLists.txt'
-      - 'cmake/**'
-      - 'src/**'
-      - 'include/**'
-      - 'apps/**'
-      - 'bench/**'
-      - 'third_party/**'
-      - 'vcpkg.json'
-      - 'VERSION'
-      - 'RELEASE_NOTES_*.md'
-      - 'scripts/package-release.ps1'
-      - 'scripts/package-release.sh'
-      - 'scripts/package-linux-release.py'
-      - 'docker/release.Dockerfile'
-      - 'scripts/run.sh'
-      - 'scripts/download-model.sh'
-      - 'docs/release-archive-linux.md'
-      - 'scripts/run.bat'
-      - 'scripts/download-model.bat'
-      - 'docs/release-archive-windows.md'
-      - '.github/scripts/*windows*'
-      - '.github/scripts/*native*'
-      - '.github/scripts/check-compiler-cache.py'
-      - '.github/scripts/patch-cuda12-glibc.py'
-      - '.github/scripts/install-linux-release-tools.sh'
-      - '.github/workflows/native-release.yml'
-      - 'tests/release/**'
+    branches: [master]
   workflow_dispatch:
     inputs:
       publish:
@@ -41,21 +13,29 @@ on:
 permissions:
   contents: read
 
-# Do not interrupt an asset upload. A superseded build cannot move latest.
+# A newer commit cancels old builds. Uploaded sccache entries remain available.
+# Publication uses a draft and checks master again before moving latest.
 concurrency:
   group: native-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - run: python3.11 -m unittest discover -s tests/release -v
+      - name: Wait for the previous run to finish cache cleanup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3.11 .github/scripts/wait-previous-builds.py
 
   windows:
     needs: validate
@@ -82,7 +62,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Parse PowerShell scripts
         run: |
-          foreach ($path in 'scripts/package-release.ps1', '.github/scripts/build-windows-release.ps1') {
+          foreach ($path in 'scripts/package-release.ps1') {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $pwd $path), [ref]$tokens, [ref]$errors)
@@ -91,6 +71,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
+      - name: Check build cancellation on Windows
+        run: python -m unittest discover -s tests/release -p test_build_lifecycle.py -v
       - name: Install the official CUDA Toolkit
         env:
           CUDA_VERSION: ${{ matrix.cuda }}
@@ -130,6 +112,7 @@ jobs:
         uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+          disable_annotations: true
       - name: Verify C++ and multiarch CUDA cache reuse
         timeout-minutes: 10
         env:
@@ -175,7 +158,7 @@ jobs:
           key: ${{ steps.dependency-cache.outputs.cache-primary-key }}
       - name: Build release products
         timeout-minutes: 300
-        run: .github/scripts/build-windows-release.ps1
+        run: python .github/scripts/run-cached-build.py --log build-release/build.log -- cmake --build build-release -j --target ninfer ninfer-serve ninfer_bench
       - name: Package, verify device images and test startup without Toolkit on PATH
         run: |
           $env:NINFER_BUILD_ROOT = "$pwd/build-release"
@@ -189,9 +172,10 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
-      - name: Compiler cache statistics
+      - name: Drain compiler cache
+        timeout-minutes: 2
         if: always() && steps.compiler-cache.outcome == 'success'
-        run: sccache --show-stats
+        run: python .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
       - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@v7
@@ -201,6 +185,7 @@ jobs:
           path: |
             build-cache-check/cache-stats.json
             build-release/*.log
+            build-release/cache-stats.json
             build-release/CMakeFiles/CMakeConfigureLog.yaml
             build-release/vcpkg-manifest-install.log
             .vcpkg/buildtrees/**/*.log
@@ -241,6 +226,7 @@ jobs:
         uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+          disable_annotations: true
       - name: Verify C++ and multiarch CUDA cache reuse
         timeout-minutes: 10
         run: python3.11 .github/scripts/check-compiler-cache.py
@@ -253,15 +239,7 @@ jobs:
             -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
       - name: Build release products
         timeout-minutes: 300
-        run: |
-          cmake --build build-release -j --target ninfer-multicall ninfer_bench > build-release/build.log 2>&1 &
-          build=$!
-          while kill -0 "$build" 2>/dev/null; do
-            printf '%s log bytes: %s\n' "$(date -u +%FT%TZ)" "$(wc -c < build-release/build.log)"
-            tail -n 2 build-release/build.log
-            sleep 15
-          done
-          wait "$build"
+        run: python3.11 .github/scripts/run-cached-build.py --log build-release/build.log -- cmake --build build-release -j --target ninfer-multicall ninfer_bench
       - name: Package and verify Linux binaries
         run: NINFER_BUILD_ROOT="$PWD/build-release" scripts/package-release.sh
       - uses: actions/upload-artifact@v7
@@ -273,9 +251,10 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
-      - name: Compiler cache statistics
+      - name: Drain compiler cache
+        timeout-minutes: 2
         if: always() && steps.compiler-cache.outcome == 'success'
-        run: sccache --show-stats
+        run: python3.11 .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
       - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@v7
@@ -284,6 +263,7 @@ jobs:
           path: |
             build-cache-check/cache-stats.json
             build-release/*.log
+            build-release/cache-stats.json
             build-release/CMakeFiles/CMakeConfigureLog.yaml
             dist/*/BUILD-INFO.json
           if-no-files-found: ignore

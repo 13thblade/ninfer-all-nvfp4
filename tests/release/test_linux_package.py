@@ -39,6 +39,7 @@ class LinuxPackageTest(unittest.TestCase):
                      'scripts/run.sh', 'scripts/download-model.sh'):
             (self.repo / name).write_text('fixture')
         (self.repo / 'VERSION').write_text('0.0-undefined')
+        shutil.copy2(ROOT / 'docker/entrypoint.sh', self.repo / 'docker/entrypoint.sh')
         shutil.copy2(ROOT / 'docker/release.Dockerfile', self.repo / 'docker/release.Dockerfile')
         self.images = 'ELF file: sm_75.cubin\nELF file: sm_120a.cubin'
         self.help_failure = False

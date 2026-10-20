@@ -347,16 +347,26 @@ Prefill of a 4,463-token prompt, in tok/s:
 and Ubuntu 26.04, and is 1.6 GB compressed. It carries the `sm_75`, `sm_86` and `sm_120a` builds and starts
 the one that matches the GPUs. It needs an NVIDIA driver of the CUDA 13 branch (580 or newer) and the
 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-`ghcr.io/iamwavecut/ninfer-all:multi` carries one build of all three architectures instead, for a
-layer pipeline (`--devices`) across cards of different architectures, where each card runs its own
-kernels; given such cards, `latest` runs the oldest card's build on all of them.
+The `multi` image packages the Native release workflow's Debian 13 / CUDA 13.4 binary, with
+`sm_75`, `sm_80`, `sm_86`, `sm_89` and `sm_120a` in one executable. It supports a layer pipeline
+(`--devices`) across different GPU architectures, with each card running its own kernels.
+The image reuses the release archive without compiling NInfer again.
+
+Native Windows and Linux archives have two CUDA variants. Their architecture sets overlap;
+CUDA 12 adds Volta, while CUDA 13 adds Blackwell:
+
+![GPU architectures included in NInfer's CUDA 12.9.2 and CUDA 13.4.3 builds](docs/assets/cuda-architectures.svg)
+
+Each archive contains all device images inside its outline. These are the project's build targets,
+not the complete list of architectures supported by NVIDIA's Toolkits.
+See the [release process](docs/maintainer/release-process.md) for build and verification status.
 
 <details>
 <summary><b>Commands, volumes and tags</b> — what the container runs</summary>
 
 - **Tags.** `latest`, `sha-<commit>` and the `VERSION`. A commit that changes only documentation or
   tooling the image does not carry keeps the image before it. `multi` and `sha-<commit>-multi` are
-  the multi-architecture image, published apart from CI after each `master` push.
+  the multi-architecture image, packaged after Native release succeeds on `master`.
 - **Volumes.** `/models` holds artifacts, `/cache` the device profile measured on first start, and
   `/grafts/<model>/` optional [prompt grafts](docs/serving.md#prompt-grafts).
 - **Checked** on an RTX 3090 and an RTX 5090 with driver 580.159.03.

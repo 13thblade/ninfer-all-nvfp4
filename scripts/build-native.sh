@@ -16,6 +16,7 @@
 #   NINFER_MULTICALL   ON or OFF: the programs as one multi-call executable, ninfer-multicall,
 #                      with their names as symlinks (apps/CMakeLists.txt)   (default OFF)
 #   NINFER_PREFIX      prebuilt dependency prefix   (default none)
+#   NINFER_COMPILER_LAUNCHER  explicit compiler cache (default: ccache when installed)
 #   NINFER_JOBS        build parallelism            (default: all cores)
 set -euo pipefail
 
@@ -41,9 +42,12 @@ if [[ -n "${NINFER_PREFIX:-}" ]]; then
   prefix_args=(-DCMAKE_PREFIX_PATH="$NINFER_PREFIX")
 fi
 launcher_args=()
-if command -v ccache >/dev/null; then
-  launcher_args=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-                 -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
+launcher="${NINFER_COMPILER_LAUNCHER:-}"
+if [[ -z "$launcher" ]] && command -v ccache >/dev/null; then launcher=ccache; fi
+if [[ -n "$launcher" ]]; then
+  command -v "$launcher" >/dev/null || { echo "Compiler launcher is missing: $launcher" >&2; exit 1; }
+  launcher_args=("-DCMAKE_C_COMPILER_LAUNCHER=$launcher" "-DCMAKE_CXX_COMPILER_LAUNCHER=$launcher"
+                 "-DCMAKE_CUDA_COMPILER_LAUNCHER=$launcher")
 fi
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 

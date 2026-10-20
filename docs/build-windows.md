@@ -116,8 +116,8 @@ The `Native release` workflow builds two native x64 packages with VS 2022 and Ni
 | CUDA 12.9.2 | `70;75;80;86;89` (Volta through Ada) |
 | CUDA 13.4.3 | `75;80;86;89;120a` (Turing through consumer Blackwell) |
 
-A push that changes release inputs on `master` builds both packages. The `build/windows-release`
-branch runs the same build without publication. A manual run builds the packages
+Every push to `master` starts the current build and cancels the superseded run.
+Feature branches build only through a manual run, which builds the packages
 without publication by default. Select `publish` on `master` to publish. Both Windows and both Linux jobs must
 pass before publication. The workflow creates an immutable `native-<source commit>` release,
 then marks it **latest** after checking every uploaded asset. It leaves an older latest release
