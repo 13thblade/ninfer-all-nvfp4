@@ -33,7 +33,12 @@ void ReadPool::start(std::size_t count, std::function<void(std::size_t)> read) {
         remaining_ = count;
         ++batch_;
     }
-    ready_.notify_all();
+    // As many workers as the batch has indices: the rest would wake only to find none left.
+    if (count >= workers_.size()) {
+        ready_.notify_all();
+    } else {
+        for (std::size_t i = 0; i < count; ++i) { ready_.notify_one(); }
+    }
 }
 
 void ReadPool::finish() {

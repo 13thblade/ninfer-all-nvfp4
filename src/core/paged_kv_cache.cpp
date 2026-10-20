@@ -287,6 +287,12 @@ std::uint32_t DeviceKVPagePool::available_pages() const noexcept {
     return usable_pages() - allocated_pages_ - reserved_pages_;
 }
 
+std::uint32_t DeviceKVPagePool::loaned_pages() const noexcept { return loaned_pages_; }
+
+std::uint32_t DeviceKVPagePool::unpromised_free_pages() const noexcept {
+    return available_pages() - loaned_pages_;
+}
+
 std::size_t DeviceKVPagePool::plane_count() const noexcept { return planes_.size(); }
 
 const Tensor& DeviceKVPagePool::plane(std::size_t index) const { return planes_.at(index); }
@@ -376,6 +382,49 @@ void DeviceKVPagePool::return_pages(std::int32_t begin, std::uint32_t count) {
     lent_pages_ -= count;
 }
 
+void DeviceKVPagePool::loan_pages(std::int32_t begin, std::uint32_t count) {
+    if (count > unpromised_free_pages()) {
+        throw std::invalid_argument("Paged KV loan takes pages a reservation needs");
+    }
+    lend_pages(begin, count);
+    lent_pages_ -= count;
+    loaned_pages_ += count;
+}
+
+void DeviceKVPagePool::recall_pages(std::int32_t begin, std::uint32_t count) {
+    if (count > loaned_pages_) {
+        throw std::invalid_argument("Paged KV recall exceeds the loaned pages");
+    }
+    lent_pages_ += count;
+    loaned_pages_ -= count;
+    try {
+        return_pages(begin, count);
+    } catch (...) {
+        lent_pages_ -= count;
+        loaned_pages_ += count;
+        throw;
+    }
+}
+
+void DeviceKVPagePool::set_recall(std::function<void(std::uint32_t)> recall) {
+    recall_ = std::move(recall);
+}
+
+bool DeviceKVPagePool::cover(std::uint32_t extra) noexcept {
+    const auto free_run_pages = [&] {
+        return std::uint64_t(capacity_pages()) - lent_pages_ - loaned_pages_ - allocated_pages_;
+    };
+    const std::uint64_t need = std::uint64_t(reserved_pages_) + extra;
+    if (need <= free_run_pages()) { return true; }
+    if (!recall_ || loaned_pages_ == 0) { return false; }
+    try {
+        recall_(static_cast<std::uint32_t>(need - free_run_pages()));
+    } catch (...) {
+        return false;
+    }
+    return need <= free_run_pages();
+}
+
 std::uint32_t
 DeviceKVPagePool::contiguous_run_count(std::span<const DeviceKVPageHandle> pages) const {
     if (pages.empty()) { return 0; }
@@ -390,7 +439,7 @@ DeviceKVPagePool::contiguous_run_count(std::span<const DeviceKVPageHandle> pages
 }
 
 std::optional<DeviceKVPageReservation> DeviceKVPagePool::reserve(std::uint32_t pages) noexcept {
-    if (pages == 0 || pages > available_pages()) { return std::nullopt; }
+    if (pages == 0 || pages > available_pages() || !cover(pages)) { return std::nullopt; }
     reserved_pages_ += pages;
     return DeviceKVPageReservation(*this, pages);
 }
@@ -415,6 +464,9 @@ void DeviceKVPagePool::resize_reservation(DeviceKVPageReservation& reservation,
             " of which this reservation " + std::to_string(reservation.pages_) + ", requested " +
             std::to_string(new_reserved_pages));
     }
+    if (new_reserved_pages > reservation.pages_ && !cover(new_reserved_pages - reservation.pages_)) {
+        throw ContextCacheExhausted("Paged KV pool cannot recall the loaned pages a reservation needs");
+    }
     reserved_pages_    = reserved_pages_ - reservation.pages_ + new_reserved_pages;
     reservation.pages_ = new_reserved_pages;
 }
@@ -438,7 +490,7 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
         }
     }
     if (count == 0) { return; }
-    if (count > usable_pages() - allocated_pages_) {
+    if (count > usable_pages() - loaned_pages_ - allocated_pages_) {
         throw std::logic_error("Paged KV reservation invariant was violated");
     }
 

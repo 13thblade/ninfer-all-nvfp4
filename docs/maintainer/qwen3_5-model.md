@@ -257,15 +257,34 @@ experts shares (`core/expert_tier`; [the expert cache](../qwen3-8-flash-next.md#
 a narrow call's miss takes a free slot, or the slot of the coldest expert the call does not route
 when its routes beat that expert's, and every four decode passes a round swaps the most routed
 missing experts in, copied behind the calls. A routing profile (`--expert-profile`, else the
-built-in one of the model family where the build has one) fills the slots at startup. Native
-experts have no CPU products, so every miss is copied. A wide call evicts nothing; it promotes its
+built-in one of the model family where the build has one) fills the slots at startup. On one
+device the CPU computes a share of a narrow call's misses from their host bytes (a disk expert's
+read for the call) while the GPU runs the cached experts and the copies arrive
+(`ops/sparse_moe/streamed_cpu`, `--expert-dma-share`, by default the split whose copies and CPU
+products end soonest by earlier calls' times): each product row is the streamed d3/d4 kernels' warp
+arithmetic reproduced lane by lane (fused multiply-adds in lane order, the shfl_down tree,
+`ops::portable_silu`), so it is the GPU's bit for bit, and a placement kernel puts the rows into
+their pairs' slots before the merge. A wide call evicts nothing; it promotes its
 most routed experts from the bank into free slots by device copies, up to each layer's share of the
 cache, so a prompt does not flush the decode working set. `--expert-cache-mib 0` keeps the banks
-only. With automatic KV, the cache has priority: KV takes the minimum legal runtime (one request's
+only. Between prompts the layer banks serve as cache slots (`core/expert_delivery`): once two
+passes have run without a wide call, a narrow call's miss that the tier does not admit enters a free
+slot of a lent bank, else the slot of its least routed expert the call does not route, and stays
+there for later calls; a lent slot hits only in narrow calls, and the next wide call reads its
+entries as misses and takes back the bank it fills. A bank is lent only when its slots number at
+least half a layer's experts, so a narrow call always finds a slot it does not route. With automatic
+KV, the cache has priority: KV takes the minimum legal runtime (one request's
 full context) and the cache takes the remaining memory, because each cached expert saves bus traffic
 on every token that routes to it. Explicit KV keeps its requested shape, and a cache that would
 consume that reserved runtime is rejected. Delivery allocations are made before final KV capacity
-selection. Host and disk prompts default to 4096-token chunks: each chunk needs nearly every expert
+selection. On one device the cache also grows into free KV pages (`core/kv_expert_loan`): the KV
+arena is virtual memory, and after startup and after each commit the free pages no reservation
+needs, beyond a margin per pool (8,192 tokens or two prompt chunks, whichever is more, plus a
+Vision window), are loaned in units of at least 16,384 tokens from the highest free runs; the arena
+releases the physical granules that lie entirely inside loaned pages and the cache takes them. A
+reservation the free runs cannot cover recalls the lowest loaned pages, the cache first giving back
+the bytes of the granules they need, and a model suspend recalls every loan before it copies the
+live pages. Host and disk prompts default to 4096-token chunks: each chunk needs nearly every expert
 of every layer, so a wider chunk moves the expert bank across the bus fewer times.
 
 MTP has its own MoE source and gets every selected expert through the same full delivery path.

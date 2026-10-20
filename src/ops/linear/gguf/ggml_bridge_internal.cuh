@@ -128,7 +128,7 @@ void vec_launch(const VecArgs& args, int columns, bool fused, cudaStream_t strea
 
 // SiLU and the tanh-approximated GELU from correctly rounded operations (ops/common/silu.h): the
 // CPU's GGUF expert products compute the same bits.
-__device__ __forceinline__ float vec_silu(float x) { return ops::silu(x); }
+__device__ __forceinline__ float vec_silu(float x) { return ops::portable_silu(x); }
 
 // GateActivation: 0 SiLU, 1 tanh-approximated GELU.
 __device__ __forceinline__ float vec_gate(float x, int activation) {

@@ -494,7 +494,7 @@ void swiglu_avx2(const float* gate, const float* up, std::size_t count, std::uin
         _mm256_store_ps(products, _mm256_mul_ps(silu, _mm256_loadu_ps(up + i)));
         for (int j = 0; j < 8; ++j) { out[i + j] = float_to_bf16(products[j]); }
     }
-    for (; i < count; ++i) { out[i] = float_to_bf16(ops::silu(gate[i]) * up[i]); }
+    for (; i < count; ++i) { out[i] = float_to_bf16(ops::portable_silu(gate[i]) * up[i]); }
 }
 
 // silu.h's gelu_tanh eight values at a time.

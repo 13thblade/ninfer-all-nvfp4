@@ -528,7 +528,11 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   consecutive experts arrive in one copy. Two banks let the next layer of a prompt chunk arrive
   while the current one computes (one bank where memory is short). Each prompt chunk needs nearly
   every expert of every layer, so the expert bank crosses the bus about once per chunk; prompts take
-  the resident chunks of up to 2048 tokens.
+  the resident chunks of up to 2048 tokens. Between prompts the banks serve as cache slots: once two
+  passes have run without a prompt chunk, a decode or verification miss that the cache does not
+  admit enters a free slot of a lent bank, else the slot of its least routed expert the call does
+  not route, and stays there for later calls; the next prompt chunk reads those slots as misses and
+  takes back the bank it fills.
 - **Cache.** `--expert-cache-mib` (default: what is free after startup) holds the experts decode and
   verification route most, by the expert tier every MoE family with host or disk experts shares
   ([the expert cache](qwen3-8-flash-next.md#the-expert-cache)), one pool of slots for all layers: a
@@ -572,6 +576,13 @@ took half the CPUs). Short answers decoded at 295-413 tok/s before and 288-410 a
 equal those of an explicit 4,096 MiB cache, whose KV stays whole, token for token with equal log
 probabilities. Against `5ed86dff9` they part after 45 to 102 tokens or not at all: the GPU's vector
 kernels now round each step of Q4_0's slice products as the CPU does.
+
+Lending the banks needs a cache short of the experts decode routes. On an RTX 4090 with one
+sequence of 131,072 positions (2026-10-20, every `--kv-dtype`), the cache held all 3,840 experts
+and served every route with or without lent banks, which added 254 slots that nothing used: decode
+ran at 0.994-1.004 times `c04ea310`'s speed over 45 measurements (two short prompts twice and a
+107,074-token document per format), with the same answers and log probabilities. Cards whose cache
+holds fewer experts were not measured.
 
 With host or disk experts and an artifact that carries the assistant, the assistant drafts three
 tokens a round unless `--spec` says otherwise ([speculative decoding](#speculative-decoding-with-the-assistant)).

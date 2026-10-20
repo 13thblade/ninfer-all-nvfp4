@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <vector>
@@ -266,6 +267,17 @@ public:
     // puts it back. The caller owns the memory only between these two calls.
     void lend_pages(std::int32_t begin, std::uint32_t count);
     void return_pages(std::int32_t begin, std::uint32_t count);
+    // A loan the borrower gives back on demand (an expert cache over free KV memory): the run
+    // leaves the free runs but its pages stay usable and available, so admission and capacity
+    // planning do not see it. A reservation the free runs cannot cover any more first calls the
+    // recall hook with the missing pages; the hook returns at least that many with recall_pages()
+    // or throws, and the reservation fails. A loan takes only free pages no reservation needs.
+    void loan_pages(std::int32_t begin, std::uint32_t count);
+    void recall_pages(std::int32_t begin, std::uint32_t count);
+    void set_recall(std::function<void(std::uint32_t pages)> recall);
+    [[nodiscard]] std::uint32_t loaned_pages() const noexcept;
+    // Free pages beyond what the reservations will materialize: what a loan of either kind may take.
+    [[nodiscard]] std::uint32_t unpromised_free_pages() const noexcept;
     [[nodiscard]] std::uint32_t
     contiguous_run_count(std::span<const DeviceKVPageHandle> pages) const;
 
@@ -354,6 +366,8 @@ private:
     void release_free_page(std::int32_t index) noexcept;
     void release_page(std::int32_t index, std::uint32_t generation) noexcept;
     void release_reservation(std::uint32_t pages) noexcept;
+    // Whether the free runs hold `extra` more reserved pages, after recalling loaned pages if not.
+    [[nodiscard]] bool cover(std::uint32_t extra) noexcept;
 
     DeviceKVPagePoolSpec spec_;
     std::vector<Tensor> planes_;
@@ -370,6 +384,8 @@ private:
     std::uint32_t allocated_pages_          = 0;
     std::uint32_t reserved_pages_           = 0;
     std::uint32_t lent_pages_               = 0;
+    std::uint32_t loaned_pages_             = 0;
+    std::function<void(std::uint32_t)> recall_;
 };
 
 struct DeviceKVPageReservationRequest {

@@ -35,6 +35,12 @@ void sparse_moe_stream_experts(const Tensor& x, const SparseMoeWeights& weights,
                                 const float* alpha, const float* shared_scale,
                                 float* activations, float* products, bool shared,
                                 cudaStream_t stream);
+// After the missing pairs: the CPU's product rows of the call (ExpertDelivery::Call::products,
+// when *cpu is nonzero) into their pairs' slots of `products`.
+void sparse_moe_stream_place(const std::int32_t* ids, const std::int32_t* cached,
+                             const std::int32_t* missing, const std::int32_t* cpu,
+                             const void* rows, std::int32_t pairs, float* products,
+                             cudaStream_t stream);
 void sparse_moe_stream_merge(const float* products, Tensor& destination, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

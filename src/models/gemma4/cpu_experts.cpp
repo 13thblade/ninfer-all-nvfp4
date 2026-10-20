@@ -55,7 +55,7 @@ bool CpuExperts::supports(std::size_t layer) const {
     return layer < layers_.size() && computes(layers_[layer], hidden_, width_);
 }
 
-void CpuExperts::compute(const Work& work) {
+std::size_t CpuExperts::compute(const Work& work) {
     const CpuExpertLayer& layer = layers_.at(work.layer);
     const int pairs  = int(work.ids.size());
     const int tokens = pairs / top_k_;
@@ -138,6 +138,7 @@ void CpuExperts::compute(const Work& work) {
             }
         }
     });
+    return std::size_t(tokens) * hidden_ * 8;
 }
 
 } // namespace ninfer::models::gemma4

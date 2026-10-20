@@ -5,6 +5,7 @@
 #include <bit>
 #include <cstring>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -24,6 +25,7 @@
 #    include <fcntl.h>
 #    include <sys/mman.h>
 #    include <sys/stat.h>
+#    include <sys/uio.h>
 #    include <unistd.h>
 #endif
 
@@ -38,6 +40,9 @@ constexpr std::uint64_t kLoadChunk = 4ULL << 20;
 constexpr std::uint64_t kSparseLoad = 8192;
 // Direct row reads up to this size use a buffer each thread keeps.
 constexpr std::uint64_t kThreadBounce = 64 * 1024;
+// A batch of at most this many rows reads those the page cache holds on the submitting thread
+// (about a microsecond each); a prompt chunk's thousands go to the threads.
+constexpr std::size_t kInlineRows = 1024;
 
 std::string mib(std::uint64_t bytes) {
     return std::to_string((bytes + (1ULL << 19)) >> 20) + " MiB";
@@ -78,6 +83,11 @@ struct NgramTableReader::File {
     std::filesystem::path path;
     std::uint64_t bytes      = 0;       // the file's size
     const std::uint8_t* view = nullptr; // Mapped: the whole file
+    // Linux Buffered: a mapping of the whole file, never read, for mincore() to tell which of its
+    // pages the page cache holds where RWF_NOWAIT is refused (overlayfs).
+    const std::uint8_t* probe = nullptr;
+    std::uint64_t page        = 4096;
+    mutable std::atomic<bool> nowait_unsupported{false};
 #ifdef _WIN32
     HANDLE handle  = INVALID_HANDLE_VALUE;
     HANDLE mapping = nullptr;
@@ -128,6 +138,16 @@ struct NgramTableReader::File {
             (void)::madvise(p, bytes, MADV_RANDOM);
             view = static_cast<const std::uint8_t*>(p);
         }
+#    ifdef __linux__
+        if (io == NgramIo::Buffered && bytes > 0) {
+            void* p = ::mmap(nullptr, bytes, PROT_READ, MAP_SHARED, descriptor, 0);
+            if (p != MAP_FAILED) {
+                (void)::madvise(p, bytes, MADV_RANDOM);
+                probe = static_cast<const std::uint8_t*>(p);
+            }
+            page = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
+        }
+#    endif
 #endif
     }
 
@@ -138,6 +158,7 @@ struct NgramTableReader::File {
         if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
 #else
         if (view != nullptr) ::munmap(const_cast<std::uint8_t*>(view), bytes);
+        if (probe != nullptr) ::munmap(const_cast<std::uint8_t*>(probe), bytes);
         if (descriptor >= 0) ::close(descriptor);
 #endif
     }
@@ -239,6 +260,47 @@ struct NgramTableReader::File {
         } else {
             read_cached(offset, destination, bytes);
         }
+    }
+
+    // Reads exactly `bytes` at `offset` when the page cache holds them all, without waiting for
+    // the device; false otherwise. RWF_NOWAIT asks the kernel; where the file system refuses it,
+    // mincore() over `probe` tells, which reports the page cache for a file this process owns or
+    // may write and no page resident otherwise.
+    bool read_resident(std::uint64_t offset, std::uint8_t* destination, std::size_t bytes) const {
+#ifdef __linux__
+        if (io != NgramIo::Buffered) { return false; }
+#    ifdef RWF_NOWAIT
+        if (!nowait_unsupported.load(std::memory_order_relaxed)) {
+            iovec vector{destination, bytes};
+            for (;;) {
+                const ssize_t done =
+                    ::preadv2(descriptor, &vector, 1, static_cast<off_t>(offset), RWF_NOWAIT);
+                if (done == static_cast<ssize_t>(bytes)) { return true; }
+                if (done < 0 && errno == EINTR) { continue; }
+                if (done >= 0 || errno == EAGAIN) { return false; }
+                break;
+            }
+            nowait_unsupported.store(true, std::memory_order_relaxed);
+        }
+#    endif
+        const std::uint64_t first = offset / page * page;
+        const std::uint64_t end   = (offset + bytes + page - 1) / page * page;
+        unsigned char resident[4] = {};
+        if (probe == nullptr || (end - first) / page > std::size(resident) ||
+            ::mincore(const_cast<std::uint8_t*>(probe) + first, end - first, resident) != 0) {
+            return false;
+        }
+        for (std::uint64_t i = 0; i < (end - first) / page; ++i) {
+            if ((resident[i] & 1) == 0) { return false; }
+        }
+        read_cached(offset, destination, bytes);
+        return true;
+#else
+        (void)offset;
+        (void)destination;
+        (void)bytes;
+        return false;
+#endif
     }
 
     void prefetch(std::uint64_t offset, std::uint64_t count) const noexcept {
@@ -816,6 +878,23 @@ void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<
     batch_ids_ = row_ids;
     batch_out_ = out;
     pending_   = true;
+    if (!queue_ && options_.io == NgramIo::Buffered && misses_.size() <= kInlineRows) {
+        // Rows the page cache holds are read here at once: a decode pass's few dozen rows then
+        // need no hand-off to the threads, whose wake-ups would cost more than the reads.
+        std::size_t kept = 0;
+        for (const auto i : misses_) {
+            const std::uint64_t offset = row_ids[i] * rb;
+            const auto segment         = static_cast<std::size_t>(
+                std::upper_bound(starts_.begin(), starts_.end(), offset) - starts_.begin() - 1);
+            const auto& part           = layout_.segments[segment];
+            const std::uint64_t local  = offset - starts_[segment];
+            if (local + rb > part.bytes ||
+                !files_[segment]->read_resident(part.file_offset + local, out.data() + i * rb, rb)) {
+                misses_[kept++] = i;
+            }
+        }
+        misses_.resize(kept);
+    }
     if (misses_.empty()) { return; }
     if (queue_) {
         pool_->start(1, [this](std::size_t) { queue_->read(reads_); });

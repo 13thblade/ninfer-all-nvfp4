@@ -756,7 +756,15 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         profile.record   = options.hybrid_experts.record_profile;
         profile.artifact = instance->model->info().artifact_id;
         experts = std::make_unique<models::qwen3_5::execution::NativeExpertRuntime>(
-            *instance->model, device, reserved, options.expert_cache_bytes, std::move(profile));
+            *instance->model, device, reserved, options.expert_cache_bytes, std::move(profile),
+            models::qwen3_5::execution::NativeExpertCpu{options.hybrid_experts.dma_share,
+                                                        options.hybrid_experts.cpu_threads});
+        if (const std::string cpu = experts->cpu_description(); !cpu.empty()) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "native experts: missing experts split between copies and %s (%s)",
+                               cpu.c_str(), options.hybrid_experts.dma_share ? "fixed share"
+                                                                             : "by measured speeds");
+        }
         free_by_rank = free_bytes_by_rank(device, options.wddm_evictable_budget,
                                           instance->model->storage_stats().device_capacity_bytes);
         resolution = resolve_kv_capacity(

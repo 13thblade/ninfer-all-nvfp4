@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/gdn_replay_records.h"
+#include "core/host_worker_pool.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
@@ -45,6 +46,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <future>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -451,7 +453,10 @@ struct SequenceState {
 // Consecutive layers on one rank, in pass order. The first segment also embeds the tokens, the
 // segment on the head rank after the last layer also runs the final mixer and the head. A rank's
 // first PLE layer starts a segment (`rows`) before which the pass uploads the n-gram rows, so the
-// layers before it run while the rows are read.
+// layers before it run while the rows are read. A segment holds at most kSegmentLayers layers: a
+// captured segment is one CUDA Graph, and the device starts a graph only once its launch has
+// submitted every node (about 1.8 us a kernel on a 4090: 2.9 ms for a 44-layer verification), so
+// shorter graphs let the first run while the host launches the rest.
 struct Segment {
     std::size_t rank  = 0;
     std::size_t begin = 0, end = 0; // layers
@@ -588,6 +593,7 @@ struct Executor::Impl {
     Projection head;
     HcPlan final_mixer;
     std::vector<LayerPlan> layers;
+    static constexpr std::size_t kSegmentLayers = 6;
     std::vector<Segment> segments;
     std::vector<RankState> ranks;
     std::vector<SequenceState> sequences;
@@ -666,13 +672,18 @@ struct Executor::Impl {
     // Wide host calls of at least kPrefetchTokens touch nearly every expert of a layer: every
     // expert the cache lacks is copied into the pool on the transfer stream while the layers
     // before run, without waiting for the layer's routes. Two pinned entry tables alternate.
+    // A layer's copies are hundreds of operations, and an enqueue blocks while the stream's queue
+    // is full, so a thread of their own (pool_copier) issues them: the layers between keep being
+    // launched.
     static constexpr std::int32_t kPrefetchTokens = 256;
     struct PoolPrefetch {
         // Per pool buffer: the layer whose experts it holds or receives, its copies' completion
-        // and the completion of the last call that read it.
+        // and the completion of the last call that read it, and the copier's task that issues
+        // the copies.
         struct Buffer {
             std::size_t layer = ~std::size_t{0};
             cudaEvent_t ready = nullptr, free = nullptr;
+            std::future<void> issued;
         };
 
         std::array<Buffer, 2> buffers;
@@ -683,6 +694,7 @@ struct Executor::Impl {
         int next = 0;
     };
     std::vector<PoolPrefetch> prefetches; // by rank
+    std::unique_ptr<HostWorkerPool> pool_copier;
 
     // Layer-major prompt spans (forward_span): the chunks' stacks, staged positions and n-gram
     // rows while every chunk of a span passes a layer before any passes the next. span_tokens is 0
@@ -690,6 +702,9 @@ struct Executor::Impl {
     static constexpr std::uint32_t kSpanChunks = 8;
     std::uint32_t span_tokens = 0;
     DeviceBuffer span_stack, span_positions, span_rope, span_rows;
+    // A span's n-gram rows, read in one batch while its layers before the first PLE layer run.
+    std::unique_ptr<PinnedHostBuffer> span_host_rows;
+    std::vector<std::uint64_t> span_row_ids;
     // Each chunk's MoE input and hyper-connection injection between a layer's two phases.
     DeviceBuffer span_mixed, span_inject;
     std::size_t span_row_bytes = 0; // n-gram rows of one token
@@ -792,7 +807,7 @@ struct Executor::Impl {
             throw std::invalid_argument(
                 "--expert-tail-skip needs GGUF host experts with staged misses");
         }
-        if (options.hybrid_experts.prefill_buffers != 1 &&
+        if (options.hybrid_experts.prefill_buffers != 0 &&
             (residency != ExpertResidency::Host || native_host)) {
             throw std::invalid_argument("--expert-prefill-buffers needs GGUF host experts");
         }
@@ -814,6 +829,16 @@ struct Executor::Impl {
 
     ~Impl() {
         draft_prefetch.reset();
+        // The copier's queued copies finish before the events and buffers they use go.
+        for (auto& prefetch : prefetches) {
+            for (auto& buffer : prefetch.buffers) {
+                if (!buffer.issued.valid()) { continue; }
+                try {
+                    buffer.issued.get();
+                } catch (...) {}
+            }
+        }
+        pool_copier.reset();
         // A pass that failed between starting the row reads and waiting for them leaves them
         // writing into a staging buffer.
         if (table) {
@@ -1016,6 +1041,23 @@ struct Executor::Impl {
         }
         current.head = true;
         segments.push_back(current);
+        // Launch-sized pieces; a boundary writes the stack before the next layer reads it, the
+        // rounding the fused write-read takes (hyper_connection_write_read).
+        std::vector<Segment> pieces;
+        for (const Segment& segment : segments) {
+            Segment piece = segment;
+            while (piece.end - piece.begin > kSegmentLayers) {
+                Segment first = piece;
+                first.end     = piece.begin + kSegmentLayers;
+                first.head    = false;
+                pieces.push_back(first);
+                piece.begin = first.end;
+                piece.embed = false;
+                piece.rows  = false;
+            }
+            pieces.push_back(piece);
+        }
+        segments = std::move(pieces);
     }
 
     [[nodiscard]] std::size_t workspace_bytes(std::size_t rank) const {
@@ -1701,10 +1743,15 @@ struct Executor::Impl {
     }
 
     // One slot per expert on every rank, sized for its layers' widest projections, when half the
-    // free memory holds them, and with --expert-prefill-buffers 2 a second such buffer when half
-    // holds both; the expert cache takes what is left.
+    // free memory holds them, and a second such buffer when half holds both and two are wanted:
+    // --expert-prefill-buffers 2, or by default with the automatic expert cache, which holds both
+    // between prompts. The expert cache takes what is left.
     void allocate_slot_pools() {
         const std::size_t experts = config.num_experts;
+        const std::uint32_t wanted =
+            options.hybrid_experts.prefill_buffers != 0 ? options.hybrid_experts.prefill_buffers
+            : options.expert_cache_bytes == ExecutorOptions::kAutoExpertCache ? 2
+                                                                               : 1;
         slot_pools.resize(device.size());
         for (std::size_t r = 0; r < device.size(); ++r) {
             std::array<std::uint64_t, 3> widest{};
@@ -1727,8 +1774,7 @@ struct Executor::Impl {
             const std::uint64_t bytes = pool.offset[2] + round_up(experts * widest[2] + kSlotTail);
             if (bytes > free_bytes / 2) { continue; }
             pool.slots = static_cast<std::uint32_t>(experts);
-            pool.buffers.resize(
-                options.hybrid_experts.prefill_buffers == 2 && 2 * bytes <= free_bytes / 2 ? 2 : 1);
+            pool.buffers.resize(wanted == 2 && 2 * bytes <= free_bytes / 2 ? 2 : 1);
             for (auto& buffer : pool.buffers) {
                 buffer.storage = DeviceBuffer(bytes);
                 CUDA_CHECK(cudaMemset(buffer.storage.p, 0, buffer.storage.bytes));
@@ -1755,6 +1801,7 @@ struct Executor::Impl {
                 CUDA_CHECK(cudaEventCreateWithFlags(&copied, cudaEventDisableTiming));
                 CUDA_CHECK(cudaEventRecord(copied, device.rank(r).transfer_stream));
             }
+            if (!pool_copier) { pool_copier = std::make_unique<HostWorkerPool>(1, 4); }
         }
     }
 
@@ -1825,10 +1872,32 @@ struct Executor::Impl {
         return index < layers.size() && layers[index].rank == rank && !layers[index].moe.native;
     }
 
-    // Copies every expert of text layer `index` that the cache lacks into its pool buffer, on the
-    // transfer stream once the buffer's previous call is done with it, and points the buffer's
-    // tables at the cache or the copies.
+    // Has the copier copy every expert of text layer `index` that the cache lacks into its pool
+    // buffer (issue_prefetch), which then receives the layer.
     void prefetch_layer(std::size_t index) {
+        auto& target  = prefetches[layers[index].rank].buffers[pool_buffer(index)];
+        target.layer  = index;
+        target.issued = pool_copier->submit([this, index] { issue_prefetch(index); });
+    }
+
+    // Before a call waits for a buffer's ready event: the copier has recorded it. Rethrows the
+    // copier's failure.
+    static void await_prefetch(PoolPrefetch::Buffer& buffer) {
+        if (buffer.issued.valid()) { buffer.issued.get(); }
+    }
+
+    // Waits until the copier has issued every queued layer.
+    void drain_prefetches() {
+        for (auto& prefetch : prefetches) {
+            for (auto& buffer : prefetch.buffers) { await_prefetch(buffer); }
+        }
+    }
+
+    // On the copier thread: once the last call that read layer `index`'s pool buffer is done with
+    // it, copies every expert of the layer that the cache lacks into the buffer on the transfer
+    // stream and points the buffer's tables at the cache or the copies. Waiting on the host keeps
+    // copies that cannot run yet out of the stream's queue.
+    void issue_prefetch(std::size_t index) {
         const LayerPlan& plan = layers[index];
         SlotPool& pool        = slot_pools[plan.rank];
         PoolPrefetch& state   = prefetches[plan.rank];
@@ -1836,7 +1905,7 @@ struct Executor::Impl {
         auto& target          = state.buffers[b];
         RankBinding bind(device, plan.rank);
         const cudaStream_t t  = device.rank(plan.rank).transfer_stream;
-        CUDA_CHECK(cudaStreamWaitEvent(t, target.free, 0));
+        CUDA_CHECK(cudaEventSynchronize(target.free));
         const MoePlan& m          = plan.moe;
         const std::size_t experts = m.gate.pointers.size();
         const auto source         = std::size_t(state.next);
@@ -1848,7 +1917,6 @@ struct Executor::Impl {
                                    cudaMemcpyHostToDevice, t));
         CUDA_CHECK(cudaEventRecord(state.copied[source], t));
         CUDA_CHECK(cudaEventRecord(target.ready, t));
-        target.layer = index;
     }
 
     // Before a pass: a wide one takes the pool buffers back from the expert cache, a decode or
@@ -1868,6 +1936,7 @@ struct Executor::Impl {
 
     // Forgets every prefetched layer, so the next wide call copies its own.
     void forget_prefetches() {
+        drain_prefetches();
         for (auto& prefetch : prefetches) {
             for (auto& buffer : prefetch.buffers) { buffer.layer = ~std::size_t{0}; }
         }
@@ -2028,7 +2097,10 @@ struct Executor::Impl {
         table->prefetch(rows);
     }
 
-    void stage_inputs(std::span<const Part> parts, std::span<const std::int32_t> tokens) {
+    // Stages a pass's inputs. With `read_rows` it also starts reading the tokens' n-gram rows into
+    // the rows' staging (stage_rows uploads them); without, the rows' ids stay in row_ids.
+    void stage_inputs(std::span<const Part> parts, std::span<const std::int32_t> tokens,
+                      bool read_rows = true) {
         const auto t            = static_cast<std::int32_t>(tokens.size());
         const std::size_t c     = options.prefill_chunk;
         // Host side first: positions (sequence indices and RoPE positions), the n-gram rows of the
@@ -2114,7 +2186,7 @@ struct Executor::Impl {
             upload(rank.rope, 8 * c, rope);
             if (!scatter.empty() && rank.rank == 0) { upload(rank.scatter, 12 * c, scatter); }
             if (mrope) { upload(rank.mrope, 16 * c, mrope_positions); }
-            if (table && rank.rank == rows_rank) {
+            if (table && read_rows && rank.rank == rows_rank) {
                 // The rows are read while the layers before the PLE layer run; stage_rows()
                 // uploads them and marks the staging buffer free.
                 table->submit(row_ids, staged_rows(rank, row_ids.size() * row_b));
@@ -2123,7 +2195,7 @@ struct Executor::Impl {
             const bool ple_here =
                 std::any_of(layers.begin(), layers.end(),
                             [&](const LayerPlan& p) { return p.ple && p.rank == rank.rank; });
-            if (!ple_here) { CUDA_CHECK(cudaEventRecord(rank.staged, rank.stream)); }
+            if (!ple_here || !read_rows) { CUDA_CHECK(cudaEventRecord(rank.staged, rank.stream)); }
         }
     }
 
@@ -2141,20 +2213,7 @@ struct Executor::Impl {
     void stage_rows(RankState& rank) {
         const std::size_t bytes = row_ids.size() * ops::ngram_row_bytes(options.ngram->format);
         RankState& reader       = ranks[rows_rank];
-        if (!rows_waited) {
-            StallEvents& events = stall_events[stall_next];
-            stall_next          = (stall_next + 1) % stall_events.size();
-            if (events.wanted == nullptr) {
-                CUDA_CHECK(cudaEventCreate(&events.wanted));
-                CUDA_CHECK(cudaEventCreate(&events.ready));
-            }
-            measure_stall(events, true);
-            CUDA_CHECK(cudaEventRecord(events.wanted, reader.stream));
-            table->wait();
-            rows_waited = true;
-            CUDA_CHECK(cudaEventRecord(events.ready, reader.stream));
-            events.pending = true;
-        }
+        await_rows(reader);
         std::span<std::uint8_t> rows = staged_rows(reader, bytes);
         if (&rank != &reader) {
             const auto own = staged_rows(rank, bytes);
@@ -2164,6 +2223,24 @@ struct Executor::Impl {
         CUDA_CHECK(
             cudaMemcpyAsync(rank.rows, rows.data(), bytes, cudaMemcpyHostToDevice, rank.stream));
         CUDA_CHECK(cudaEventRecord(rank.staged, rank.stream));
+    }
+
+    // Waits for the rows being read, unless already waited for, between a pair of stall events on
+    // the reading rank's stream.
+    void await_rows(RankState& reader) {
+        if (rows_waited) { return; }
+        StallEvents& events = stall_events[stall_next];
+        stall_next          = (stall_next + 1) % stall_events.size();
+        if (events.wanted == nullptr) {
+            CUDA_CHECK(cudaEventCreate(&events.wanted));
+            CUDA_CHECK(cudaEventCreate(&events.ready));
+        }
+        measure_stall(events, true);
+        CUDA_CHECK(cudaEventRecord(events.wanted, reader.stream));
+        table->wait();
+        rows_waited = true;
+        CUDA_CHECK(cudaEventRecord(events.ready, reader.stream));
+        events.pending = true;
     }
 
     // Adds a finished wait to the stall counters; `block` waits for it to finish.
@@ -2485,6 +2562,7 @@ struct Executor::Impl {
                 state.buffers[1 - b].layer != index + 1) {
                 prefetch_layer(index + 1);
             }
+            await_prefetch(buffer);
             CUDA_CHECK(cudaStreamWaitEvent(s, buffer.ready, 0));
             ops::GgufMoeWeights banks = plan.moe.banks();
             const auto* table_p       = static_cast<const void* const*>(pool.buffers[b].tables.p);
@@ -2522,6 +2600,7 @@ struct Executor::Impl {
         const std::size_t experts = m.gate.pointers.size();
         // The copies below overwrite the first buffer, so no buffer holds a prefetched layer.
         if (!prefetches.empty()) {
+            drain_prefetches();
             for (auto& buffer : prefetches[rank.rank].buffers) { buffer.layer = ~std::size_t{0}; }
         }
         std::vector<char> routed(experts, 0);
@@ -2868,6 +2947,7 @@ struct Executor::Impl {
             span_row_bytes = std::size_t(config.ngram_heads()) *
                              ops::ngram_row_bytes(options.ngram->format);
             span_rows      = DeviceBuffer(std::size_t(tokens) * span_row_bytes);
+            span_host_rows = std::make_unique<PinnedHostBuffer>(span_rows.bytes);
             bytes += span_rows.bytes;
         }
         span_group = planned_group_chunks();
@@ -2979,11 +3059,21 @@ struct Executor::Impl {
         place_pools(true);
         float* const own_stack = rank.stack;
         // The chunks' inputs, staged one after another as forward() stages them, kept in the
-        // span planes; their embeddings start their stacks.
+        // span planes; their embeddings start their stacks. The span's n-gram rows are read in
+        // one batch while the layers before the first PLE layer run.
+        const bool reads_rows =
+            table && std::any_of(segments.begin(), segments.end(),
+                                 [](const Segment& segment) { return segment.rows; });
+        const std::size_t heads = config.ngram_heads();
+        if (reads_rows) { span_row_ids.resize(n * heads); }
         for (std::size_t k = 0; k < chunks; ++k) {
             const std::int32_t t = count_of(k);
             const Part part{.sequence = &sequence, .column = 0, .count = t};
-            stage_inputs(std::span(&part, 1), tokens.subspan(k * c, std::size_t(t)));
+            stage_inputs(std::span(&part, 1), tokens.subspan(k * c, std::size_t(t)), false);
+            if (reads_rows) {
+                std::copy(row_ids.begin(), row_ids.end(),
+                          span_row_ids.begin() + std::ptrdiff_t(k * c * heads));
+            }
             Tensor mixed(rank.mixed, DType::BF16, {h, t});
             ops::embedding(Tensor(rank.ids, DType::I32, {t}), embedding_table, mixed, st);
             Tensor stack(chunk_stack(k), DType::FP32, {h, hc, t});
@@ -2993,17 +3083,15 @@ struct Executor::Impl {
                                        cudaMemcpyDeviceToDevice, st));
             CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_rope.p) + k * c, rank.rope,
                                        std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
-            if (table && std::any_of(segments.begin(), segments.end(),
-                                     [](const Segment& segment) { return segment.rows; })) {
-                stage_rows(rank);
-                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(span_rows.p) +
-                                               k * c * span_row_bytes,
-                                           rank.rows, std::size_t(t) * span_row_bytes,
-                                           cudaMemcpyDeviceToDevice, st));
-            }
             sequence.position += std::uint32_t(t);
         }
         sequence.position = start;
+        if (reads_rows) {
+            table->submit(span_row_ids,
+                          std::span(static_cast<std::uint8_t*>(span_host_rows->data()),
+                                    n * span_row_bytes));
+            rows_waited = false;
+        }
         // The next step's rows are read while the device runs this span.
         hint_next(sequence, next);
         void* const own_mixed   = rank.mixed;
@@ -3020,6 +3108,11 @@ struct Executor::Impl {
             for (std::size_t i = 0; i < layers.size(); ++i) {
                 const LayerPlan& plan = layers[i];
                 LayerState& state     = sequence.layers[i];
+                if (plan.ple && !rows_waited) {
+                    await_rows(rank);
+                    CUDA_CHECK(cudaMemcpyAsync(span_rows.p, span_host_rows->data(),
+                                               n * span_row_bytes, cudaMemcpyHostToDevice, st));
+                }
                 for (std::size_t k = 0; k < chunks; ++k) {
                     const std::int32_t t = count_of(k);
                     const Part part{.sequence = &sequence, .column = 0, .count = t};
@@ -3595,6 +3688,9 @@ struct Executor::Impl {
         } else {
             chain();
         }
+        // The expert cache takes the last verification's routes while the device drafts; the
+        // table uploads it queues follow the draft on the stream, before the next pass.
+        settle_routes();
         auto* host = static_cast<std::int32_t*>(mtp_staging->data());
         CUDA_CHECK(cudaMemcpyAsync(host, ids + b, k * b * 4, cudaMemcpyDeviceToHost, rank.stream));
         auto* logprobs = reinterpret_cast<float*>(host + mtp_ids.bytes / 4);
@@ -3871,18 +3967,30 @@ struct Executor::Impl {
         return bytes;
     }
 
-    // Copies between a sequence image's regions and host memory (to the host when `save`) on the
-    // regions' streams, and waits for the copies.
-    void copy_image(const std::vector<ImageRegion>& regions, std::byte* host, bool save) {
-        std::size_t offset = 0;
+    // Copies between a sequence image's regions and host pages (to the host when `save`) on the
+    // regions' streams, and waits for the copies. The image runs through the pages in order, each
+    // holding `page_bytes` of it.
+    void copy_image(const std::vector<ImageRegion>& regions, std::span<std::byte* const> pages,
+                    std::size_t page_bytes, bool save) {
+        std::uint64_t total = 0;
+        for (const ImageRegion& region : regions) { total += region.bytes; }
+        if (page_bytes == 0 || pages.size() < (total + page_bytes - 1) / page_bytes) {
+            throw std::invalid_argument("qwen4_exp image: the pages do not hold the image");
+        }
+        std::uint64_t at = 0;
         for (const ImageRegion& region : regions) {
-            if (region.bytes == 0) { continue; }
             RankBinding bind(device, region.rank);
-            CUDA_CHECK(cudaMemcpyAsync(save ? static_cast<void*>(host + offset) : region.device,
-                                       save ? region.device : static_cast<void*>(host + offset),
-                                       region.bytes, cudaMemcpyDefault,
-                                       ranks[region.rank].stream));
-            offset += region.bytes;
+            auto* device_bytes = static_cast<std::byte*>(region.device);
+            for (std::size_t left = region.bytes; left > 0;) {
+                const std::size_t in_page = std::min<std::size_t>(left, page_bytes - at % page_bytes);
+                std::byte* host           = pages[at / page_bytes] + at % page_bytes;
+                CUDA_CHECK(cudaMemcpyAsync(save ? static_cast<void*>(host) : device_bytes,
+                                           save ? static_cast<void*>(device_bytes) : host, in_page,
+                                           cudaMemcpyDefault, ranks[region.rank].stream));
+                device_bytes += in_page;
+                left -= in_page;
+                at += in_page;
+            }
         }
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
@@ -3891,30 +3999,26 @@ struct Executor::Impl {
     }
 
     SequenceImage save_image(std::uint32_t s, const SequenceSnapshot* at,
-                             std::span<std::byte> out) {
+                             std::span<std::byte* const> pages, std::size_t page_bytes) {
         const SequenceState& sequence = sequences.at(s);
         if (at != nullptr && (at->layers.size() != layers.size() || (mtp && at->mtp.size() != 2))) {
             throw std::invalid_argument("qwen4_exp image: the snapshot holds no state");
         }
         const std::uint32_t position = at != nullptr ? at->position : sequence.position;
-        const auto regions           = image_regions(sequence, at, position);
-        if (out.size() != image_bytes(position)) {
-            throw std::invalid_argument("qwen4_exp image: the buffer does not fit the image");
-        }
-        copy_image(regions, out.data(), true);
+        copy_image(image_regions(sequence, at, position), pages, page_bytes, true);
         return SequenceImage{.position = position,
                              .context  = at != nullptr ? at->context : sequence.context,
                              .mtp_follows =
                                  mtp && (at != nullptr ? at->mtp_follows : sequence.mtp_follows)};
     }
 
-    void load_image(std::uint32_t s, const SequenceImage& image, std::span<const std::byte> bytes) {
+    void load_image(std::uint32_t s, const SequenceImage& image,
+                    std::span<std::byte* const> pages, std::size_t page_bytes) {
         SequenceState& sequence = sequences.at(s);
-        if (image.position > options.max_context || bytes.size() != image_bytes(image.position)) {
+        if (image.position > options.max_context) {
             throw std::invalid_argument("qwen4_exp image: the image does not fit the sequence");
         }
-        copy_image(image_regions(sequence, nullptr, image.position),
-                   const_cast<std::byte*>(bytes.data()), false);
+        copy_image(image_regions(sequence, nullptr, image.position), pages, page_bytes, false);
         forget_streamed_kv(sequence);
         sequence.position    = image.position;
         sequence.context     = image.context;
@@ -4006,13 +4110,13 @@ std::uint64_t Executor::image_bytes(std::uint32_t position) const {
 }
 
 SequenceImage Executor::save_image(std::uint32_t sequence, const SequenceSnapshot* at,
-                                   std::span<std::byte> out) {
-    return impl_->save_image(sequence, at, out);
+                                   std::span<std::byte* const> pages, std::size_t page_bytes) {
+    return impl_->save_image(sequence, at, pages, page_bytes);
 }
 
 void Executor::load_image(std::uint32_t sequence, const SequenceImage& image,
-                          std::span<const std::byte> bytes) {
-    impl_->load_image(sequence, image, bytes);
+                          std::span<std::byte* const> pages, std::size_t page_bytes) {
+    impl_->load_image(sequence, image, pages, page_bytes);
 }
 
 void Executor::set_media(std::uint32_t sequence, std::span<const MediaItem> items,

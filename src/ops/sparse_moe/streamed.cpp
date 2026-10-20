@@ -3,6 +3,7 @@
 #include "core/layout.h"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -47,9 +48,14 @@ void sparse_moe_stream(const Tensor& x, const SparseMoeWeights& weights, Tensor&
     const auto views = allocate_sparse_moe_small_t_workspace(workspace, tokens);
     Tensor products  = allocate_products(workspace, tokens);
     sparse_moe_stream_route(x, weights.router_shared_gate, views, stream);
-    const auto split = delivery.begin(layer, static_cast<const std::int32_t*>(views.token_ids.data),
-                                      std::uint32_t(8 * tokens), stream);
-    const auto* alpha  = static_cast<const float*>(views.token_alpha.data);
+    const auto* ids   = static_cast<const std::int32_t*>(views.token_ids.data);
+    const auto* alpha = static_cast<const float*>(views.token_alpha.data);
+    // The CPU's operands, should the delivery leave it a share (streamed_cpu.h).
+    const std::array<ExpertDelivery::Input, 2> inputs{{
+        {x.data, std::size_t(tokens) * kHidden * 2},
+        {alpha, std::size_t(tokens) * 8 * sizeof(float)},
+    }};
+    const auto split = delivery.begin(layer, ids, std::uint32_t(8 * tokens), stream, inputs);
     const auto* shared = static_cast<const float*>(views.shared_scale.data);
     auto* activations  = static_cast<float*>(views.scratch.data);
     auto* values       = static_cast<float*>(products.data);
@@ -58,6 +64,10 @@ void sparse_moe_stream(const Tensor& x, const SparseMoeWeights& weights, Tensor&
     delivery.await(stream);
     sparse_moe_stream_experts(x, weights, delivery.tables(layer), split.missing_ids, alpha, shared,
                               activations, values, false, stream);
+    if (split.cpu != nullptr) {
+        sparse_moe_stream_place(ids, split.cached_ids, split.missing_ids, split.cpu, split.products,
+                                8 * tokens, values, stream);
+    }
     sparse_moe_stream_merge(values, destination, stream);
 }
 

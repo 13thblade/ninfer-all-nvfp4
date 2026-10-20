@@ -204,7 +204,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--expert-misses staged\|mapped` | GGUF host experts: a decode or verification call copies each routed expert its device cache lacks into device memory by the copy engine while the cached ones run, into a cache slot when one is free or when the expert's routes beat the coldest cached expert the call does not route ([the expert cache](#the-expert-cache)), else into staging (`staged`, the default); or its expert kernels read the missing experts across the bus (`mapped`) |
 | `--expert-dma-share F\|auto` | host or disk experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1`; the CPU computes the rest from RAM while the GPU runs the cached ones. `auto` (the default) gives each call of GGUF experts the split whose copies and CPU products end soonest by the times measured on earlier calls, and copies every miss of native experts. Only calls of up to eight tokens use the CPU; GGUF CPU products are the GPU's bit for bit ([the CPU share](#the-cpu-share)) |
 | `--expert-tail-skip N` | GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten, instead of copying it; the remaining experts keep their router weights (no renormalization). Lossy, off by default; prefill always runs every routed expert. On an RTX 3090 with Q2_0 and four short chat prompts, `7` decoded 9.0-17.6% and `6` 11.9-24.4% faster, copying 22-43% and 29-52% fewer expert bytes; perplexity over 5,115 tokens scored one token per call went from 4.667 to 4.710 with `7` and 4.688 with `6`, an order opposite to how much each leaves out, so that sample does not resolve the cost |
-| `--expert-prefill-buffers 1\|2` | GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts into (default `1`); `2` alternates two, so the next layer's copies run while this layer's experts do, when half the free memory holds both. On an RTX 3090 with Q2_0 the second buffer prefilled a 5,462-token prompt 8.5-10.5% and a 31,860-token prompt 1.9-2.3% faster. With the automatic cache both buffers hold cache slots between prompts; with an explicit `--expert-cache-mib` they take memory beside it |
+| `--expert-prefill-buffers 1\|2` | GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts into; `2` alternates two, so the next layer's copies run while this layer's experts do, when half the free memory holds both. Default: `2` with the automatic cache, where both buffers hold cache slots between prompts, else `1`; with an explicit `--expert-cache-mib` the buffers take memory beside the cache. On an RTX 4090 with IQ3_S host experts the second buffer prefilled a 31,865-token prompt at 3,430 instead of 2,683 tokens/s and decoded within 2.4% of the one-buffer speed (one run each); on an RTX 3090 with Q2_0, before the buffers became cache slots, 8.5-10.5% faster at 5,462 tokens and 1.9-2.3% at 31,860 |
 | `--expert-cpu-threads N` | host or disk experts with a CPU share: `1..256` CPU threads, the calling one included; default is one per physical core the process may use (its affinity mask), at most half its CPUs (the mask and a container CPU quota); the rest stay with the threads that drive the GPU and serve requests ([the CPU share on one RTX 4090](#the-cpu-share-on-one-rtx-4090)). Each thread is pinned to a physical core and spins while requests decode |
 | `--expert-cache-adaptive` | replace cold cached native experts between calls; off by default because it changes the CPU/GPU arithmetic partition |
 | `--expert-profile PATH` | fill the expert cache at startup from counts recorded for the same artifact (`--expert-profile-out`); default: the built-in profile of the model family and its bank widths, where the build has one |
@@ -308,7 +308,8 @@ in portable C++ elsewhere, with the same bits.
 A pass reads the 16 rows each of its tokens addresses (1,440 bytes a token in IQ4_NL) as soon as it
 has hashed them, `--ngram-io-depth` reads at once, and uploads them just before the PLE layer
 (block 1): the GPU embeds the tokens and runs block 0 while the rows are read, and waits only if
-the read takes longer. `--ngram-io` chooses how the file is read. `buffered` (the default) goes
+the read takes longer. A prompt span reads the rows of all its chunks in one batch the same way,
+while every chunk passes block 0. `--ngram-io` chooses how the file is read. `buffered` (the default) goes
 through the OS page cache, which then keeps a 4 KiB page for each row it read; `direct` bypasses the
 OS page cache, so every row-cache miss reads from the drive; `mmap` copies the rows out
 of a read-only mapping of the file.
@@ -337,7 +338,13 @@ Buffered/direct row misses use a bounded OS queue: io_uring on Linux and overlap
 IOCP on Windows. One worker drives the queue while device execution continues; direct reads use
 at most `--ngram-io-depth` aligned bounce buffers. A failed batch drains its outstanding reads
 before returning and admits no rows to the cache. If Linux disables io_uring, the reader uses
-positioned-read workers. Bulk RAM/hot-set loading and mapped reads retain their existing paths.
+positioned-read workers; a buffered batch of at most 1,024 rows then first reads, on the engine
+thread, the rows the page cache holds (`RWF_NOWAIT`, or `mincore` over a mapping of the file where
+the file system refuses that flag, as overlayfs does), and wakes only as many workers as rows
+remain. On an RTX 4090 host in a container without io_uring, the 64 rows of a decode verification
+took 3.6 ms per round across 64 woken workers; read on the engine thread, the GPU's idle time
+before a verification fell from 2.4 ms to 0.8 ms a round.
+Bulk RAM/hot-set loading and mapped reads retain their existing paths.
 The Windows reader paths have not been run.
 
 On a serving workload with one RTX 3090, the table's pages evicted before the first request, the
@@ -453,10 +460,17 @@ reused. A request goes to the free sequence that holds the longest such prefix o
 `--no-prefix-reuse` (ninfer-serve) prefills every prompt from scratch.
 
 What a sequence gives up for a new request (its turn-closure snapshot and the state it ended in,
-each of 128 tokens or more) is kept as an image in pinned host memory: the paged KV and pooled keys
+each of 128 tokens or more) is kept as an image in host memory: the paged KV and pooled keys
 of its positions, its recurrent state, and the MTP block's, about 114 MB plus 26 KiB a position in
-BF16 KV. A prompt that continues a kept prefix further than any free sequence resumes from its
-image, copied back into a sequence. `--host-kv-mib` (or `--host-cache-mib`) is the budget, 8 GiB by
+BF16 KV. The images live in 8 MiB pages of pinned memory that stay pinned for later images: the
+pages of two images of a whole context (within a quarter of the budget) are pinned at startup, and
+the store pins more only when it holds more. Pinning while a request waits is slow where the
+experts and the page cache fill the host's memory: on an RTX 4090 host with IQ3_S host experts,
+pinning the two images of a 32K-token prompt held a short prompt after it for 2.3 s, and faulting
+in pageable memory for them 1.8 s; into the pages pinned at startup they copy in 15 ms, and the
+short prompt's first token came 0.45 s after it arrived (2.9 s before). Pinning the startup
+pages (2 GiB with the default 8 GiB budget) adds about 2 s to startup. A prompt that continues a kept prefix further than any free
+sequence resumes from its image, copied back into a sequence. `--host-kv-mib` (or `--host-cache-mib`) is the budget, 8 GiB by
 default; past it the least recently used images go to the disk tier with `--disk-kv-path DIR`
 (`--disk-kv-gib`, 64 by default), one file each under a directory per artifact, KV format, MTP
 draft width and n-gram enablement, or are dropped without one. A different verify width or disabling
@@ -572,9 +586,12 @@ draft-chain graph and each width its own verification graph, captured at their s
   phase runs up to 4,096 tokens of consecutive chunks in one call, each chunk routed on its own,
   so the matrix kernel takes 128-column tiles rather than the 32 of a 1,024-token chunk; a last
   chunk of eight tokens or fewer runs alone (with IQ3_S, a 31,860-token prompt's expert matrix
-  products took 4.47 instead of 6.52 s on an RTX 3090). With `--expert-prefill-buffers 2` the
-  pool has two buffers that consecutive layers alternate between: each layer's copies start as
-  soon as the layer two back is done with its buffer, while the layer before it runs. Weighted
+  products took 4.47 instead of 6.52 s on an RTX 3090). With two prefill buffers (the
+  default with the automatic expert cache, `--expert-prefill-buffers`) the pool has two buffers
+  that consecutive layers alternate between: each layer's copies start as soon as the layer two
+  back is done with its buffer, while the layer before it runs. A thread of its own issues each
+  layer's copies, hundreds of operations that would otherwise hold the launching thread while the
+  copy queue is full, so the layers in between keep being launched. Weighted
   expert outputs are summed in fixed point, so the result does not depend on the order experts
   finish in.
 - Up to eight tokens of GGUF host experts run in two stages. A kernel splits the call's routes into
@@ -815,6 +832,20 @@ at a mean of 72.5 tok/s with 8 threads, 74.4 with 16, 74.3 with 24, 73.4 with 32
 every answer equal; the default pool takes half the process's CPUs (30 here). Spinning on all 61
 CPUs of the container's quota, the pool had the process throttled in 208 of 211 scheduling periods
 while it decoded.
+
+A second RTX 4090 rental with a 30-CPU quota (the same release and context, 2026-10-20, a later
+build) answered the Python and blue-sky prompts twice and a 31,865-token prompt once per server:
+
+| `--expert-cpu-threads` | Decode, tok/s: Python, blue sky, 32K prompt, Python, blue sky | Throttled periods |
+|---|---|---:|
+| 8 | 81.8, 76.4, 70.4, 82.0, 76.4 | 4 of 291 |
+| 15 (the default here) | 84.8, 79.5, 75.2, 84.5, 84.0 | 3 of 278 |
+| 22 | 91.3, 82.8, 77.4, 91.4, 87.0 | 4 of 270 |
+| 29 | 92.3, 85.2, 76.5, 92.6, 86.7 | 13 of 271 |
+
+Every answer was equal. Here more threads decoded 3-8% faster at 22 than at the default, where the
+first host gained nothing past 16; the default stays at half the CPUs, and `--expert-cpu-threads`
+tunes a host.
 
 ### MTP
 

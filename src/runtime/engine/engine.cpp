@@ -337,14 +337,18 @@ public:
             finalize_phase.complete();
             return;
         }
-        // Native Qwen3.5 MoE experts have no CPU products: their misses are copied. Routing
-        // profiles fill and record their host or disk experts' cache.
-        if (options.hybrid_experts.dma_share || options.hybrid_experts.cpu_threads != 0 ||
-            options.hybrid_experts.mapped_misses || options.hybrid_experts.tail_skip_rank != 0 ||
-            options.hybrid_experts.prefill_buffers != 1 || options.hybrid_experts.adaptive_cache) {
+        // Native Qwen3.5 MoE host or disk experts: the CPU computes a share of a call's misses,
+        // the GPU's products bit for bit. Routing profiles fill and record their cache.
+        if (options.hybrid_experts.mapped_misses || options.hybrid_experts.tail_skip_rank != 0 ||
+            options.hybrid_experts.prefill_buffers != 0 || options.hybrid_experts.adaptive_cache) {
             throw std::invalid_argument(
-                "expert DMA shares, CPU threads and miss paths require Qwen3.8-Flash-Next or "
-                "Gemma 4 host or disk experts");
+                "mapped misses, tail skip, prefill buffers and the adaptive expert cache require "
+                "Qwen3.8-Flash-Next host or disk experts");
+        }
+        if ((options.hybrid_experts.dma_share || options.hybrid_experts.cpu_threads != 0) &&
+            options.expert_residency == ExpertResidency::Device) {
+            throw std::invalid_argument("expert DMA shares and CPU threads require host or disk "
+                                        "experts (--expert-residency host|disk)");
         }
         if ((!options.hybrid_experts.routing_profile.empty() ||
              !options.hybrid_experts.record_profile.empty()) &&

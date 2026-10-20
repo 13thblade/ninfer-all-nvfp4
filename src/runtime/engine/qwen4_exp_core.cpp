@@ -522,7 +522,7 @@ struct Qwen4ExpCore::Impl {
     std::unique_ptr<PinnedHostBuffer> host_spec;
 
     // The context cache past the sequences: images of the prefixes they give up (the state a
-    // turn closed at, and where a sequence ended), in pinned host memory up to a budget; the least
+    // turn closed at, and where a sequence ended), in host memory up to a budget; the least
     // recently used go to files under the disk path when it is set (where a restart finds them)
     // or are dropped. A prompt resumes from the longest stored prefix when no free sequence
     // serves more of it.
@@ -530,8 +530,8 @@ struct Qwen4ExpCore::Impl {
         std::vector<TokenId> tokens;
         models::qwen4_exp::SequenceImage header;
         PrefixReusePath path = PrefixReusePath::PrivateEndpoint;
-        std::unique_ptr<PinnedHostBuffer> host; // null while only on disk
-        std::filesystem::path file;             // empty unless on disk
+        std::vector<std::byte*> pages; // slices of host_chunks; empty while only on disk
+        std::filesystem::path file;    // empty unless on disk
         std::uint64_t bytes     = 0;
         std::uint64_t last_used = 0;
     };
@@ -539,6 +539,14 @@ struct Qwen4ExpCore::Impl {
     // Shorter prefixes prefill faster than their recurrent state (about 114 MB) copies back.
     static constexpr std::size_t kMinStoredTokens = 128;
     std::vector<Stored> stored;
+    // The images live in pinned pages that stay pinned once the store has needed them: pinning is
+    // slow where the experts and the page cache fill the host's memory (1.1 s for the image of a
+    // 32K-token prompt on an RTX 4090 host, while the next prompt waited; pageable memory faulted
+    // in as slowly, and huge pages took minutes), so later images reuse the pages of those the
+    // store let go. host_used counts the pages images hold, within host_budget.
+    static constexpr std::size_t kHostPageBytes = std::size_t(8) << 20;
+    std::vector<std::unique_ptr<PinnedHostBuffer>> host_chunks;
+    std::vector<std::byte*> free_pages;
     std::uint64_t host_budget = 0, host_used = 0;
     std::filesystem::path disk_dir;
     std::uint64_t disk_budget = 0, disk_used = 0;
@@ -628,6 +636,16 @@ struct Qwen4ExpCore::Impl {
                                                    options.media_live_bytes
                                              : 0U);
             host_budget = sized.host_cache_budget_bytes.value_or(cache.host_kv_capacity_bytes);
+            // The pages of two images of a whole context (where a prompt's turn closed and where
+            // its sequence ended, what a new request stores first), within a quarter of the
+            // budget, pinned now rather than while the request that displaces them waits. Without
+            // the memory, the store pins its pages as it needs them.
+            const std::uint64_t reserve = std::min<std::uint64_t>(
+                host_budget / 4 / kHostPageBytes * kHostPageBytes,
+                2 * page_rounded(i.executor->image_bytes(max_context)));
+            try {
+                pin_pages(static_cast<std::size_t>(reserve / kHostPageBytes));
+            } catch (const std::exception&) {}
             if (!cache.disk_kv_path.empty()) {
                 disk_dir     = cache.disk_kv_path / profile_name(options);
                 disk_budget  = cache.disk_kv_capacity_bytes != 0 ? cache.disk_kv_capacity_bytes
@@ -992,7 +1010,7 @@ struct Qwen4ExpCore::Impl {
     find_stored(const std::vector<TokenId>& prompt) const {
         std::pair<std::size_t, std::uint32_t> best{0, 0};
         for (std::size_t i = 0; i < stored.size(); ++i) {
-            if (stored[i].host == nullptr && !disk_restore) { continue; }
+            if (stored[i].pages.empty() && !disk_restore) { continue; }
             const std::uint32_t length = prefix_reuse(stored[i].tokens, prompt);
             if (length > best.second) { best = {i, length}; }
         }
@@ -1001,14 +1019,14 @@ struct Qwen4ExpCore::Impl {
 
     void drop_dead() {
         std::erase_if(stored, [](const Stored& image) {
-            return image.host == nullptr && image.file.empty();
+            return image.pages.empty() && image.file.empty();
         });
     }
 
     // Writes an image held in host memory to the disk tier, making room by deleting the least
     // recently used files; entries left with neither copy are dropped by the caller.
     void write_file(Stored& image) {
-        if (disk_dir.empty() || !image.file.empty() || image.host == nullptr) { return; }
+        if (disk_dir.empty() || !image.file.empty() || image.pages.empty()) { return; }
         const std::uint64_t size =
             sizeof(FileHeader) + 4 * (image.header.context.previous.size() + image.tokens.size()) +
             image.bytes;
@@ -1044,7 +1062,11 @@ struct Qwen4ExpCore::Impl {
                        std::streamsize(header.context_tokens) * 4);
             file.write(reinterpret_cast<const char*>(image.tokens.data()),
                        std::streamsize(header.prompt_tokens) * 4);
-            file.write(static_cast<const char*>(image.host->data()), std::streamsize(image.bytes));
+            for (std::uint64_t at = 0; at < image.bytes; at += kHostPageBytes) {
+                file.write(reinterpret_cast<const char*>(image.pages[at / kHostPageBytes]),
+                           std::streamsize(std::min<std::uint64_t>(kHostPageBytes,
+                                                                   image.bytes - at)));
+            }
             if (!file) {
                 std::error_code ignored;
                 std::filesystem::remove(temporary, ignored);
@@ -1058,23 +1080,52 @@ struct Qwen4ExpCore::Impl {
         disk_used += size;
     }
 
-    // Brings the images in pinned host memory within the budget with `bytes` more: the least
-    // recently used go to the disk tier, or are dropped without one. False when the budget
-    // cannot hold `bytes` at all.
+    [[nodiscard]] static std::uint64_t page_rounded(std::uint64_t bytes) {
+        return (bytes + kHostPageBytes - 1) / kHostPageBytes * kHostPageBytes;
+    }
+
+    // Pins `count` more free pages in one allocation.
+    void pin_pages(std::size_t count) {
+        if (count == 0) { return; }
+        auto chunk = std::make_unique<PinnedHostBuffer>(count * kHostPageBytes);
+        auto* base = static_cast<std::byte*>(chunk->data());
+        for (std::size_t i = count; i-- > 0;) { free_pages.push_back(base + i * kHostPageBytes); }
+        host_chunks.push_back(std::move(chunk));
+    }
+
+    // Pages for an image of `bytes`, pinning more when the free ones fall short; the caller has
+    // made room for them (make_host_room), so the pinned pages stay within the budget.
+    std::vector<std::byte*> take_pages(std::uint64_t bytes) {
+        const auto count = static_cast<std::size_t>(page_rounded(bytes) / kHostPageBytes);
+        if (free_pages.size() < count) { pin_pages(count - free_pages.size()); }
+        std::vector<std::byte*> pages(free_pages.end() - std::ptrdiff_t(count), free_pages.end());
+        free_pages.resize(free_pages.size() - count);
+        host_used += count * kHostPageBytes;
+        return pages;
+    }
+
+    void give_back(Stored& image) {
+        host_used -= image.pages.size() * kHostPageBytes;
+        free_pages.insert(free_pages.end(), image.pages.begin(), image.pages.end());
+        image.pages.clear();
+    }
+
+    // Brings the images in host pages within the budget with `bytes` more (whole pages): the
+    // least recently used go to the disk tier, or are dropped without one. False when the budget
+    // cannot hold `bytes` at all. Entries may be dropped, so indices into `stored` change.
     bool make_host_room(std::uint64_t bytes) {
         if (bytes > host_budget) { return false; }
         while (host_used + bytes > host_budget) {
             std::optional<std::size_t> oldest;
             for (std::size_t i = 0; i < stored.size(); ++i) {
-                if (stored[i].host != nullptr &&
+                if (!stored[i].pages.empty() &&
                     (!oldest || stored[i].last_used < stored[*oldest].last_used)) {
                     oldest = i;
                 }
             }
             if (!oldest) { return false; }
             write_file(stored[*oldest]);
-            stored[*oldest].host.reset();
-            host_used -= stored[*oldest].bytes;
+            give_back(stored[*oldest]);
             drop_dead();
         }
         drop_dead();
@@ -1102,16 +1153,19 @@ struct Qwen4ExpCore::Impl {
         const auto position = at != nullptr ? at->position : executor.position(s);
         if (position != tokens.size()) { return; } // the state holds other tokens
         const std::uint64_t bytes = executor.image_bytes(position);
-        if (!make_host_room(bytes)) { return; }
+        if (!make_host_room(page_rounded(bytes))) { return; }
         Stored image;
         image.tokens = tokens;
         image.path   = path;
         image.bytes  = bytes;
-        image.host   = std::make_unique<PinnedHostBuffer>(bytes);
-        image.header = executor.save_image(
-            s, at, std::span(static_cast<std::byte*>(image.host->data()), bytes));
+        image.pages  = take_pages(bytes);
+        try {
+            image.header = executor.save_image(s, at, image.pages, kHostPageBytes);
+        } catch (...) {
+            give_back(image);
+            throw;
+        }
         image.last_used = ++use_clock;
-        host_used += bytes;
         stored.push_back(std::move(image));
         std::lock_guard lock(stats_mutex);
         stats.state_d2h_count += 1;
@@ -1136,23 +1190,29 @@ struct Qwen4ExpCore::Impl {
     // Loads the stored image of `tokens` into sequence `s`, reading it from the disk tier when it
     // is only there; false when the store no longer holds it.
     bool restore_stored(std::uint32_t s, const std::vector<TokenId>& tokens) {
-        const auto index = stored_index(tokens);
+        auto index = stored_index(tokens);
         if (!index) { return false; }
-        Stored& image = stored[*index];
-        if (image.host == nullptr) {
-            image.host = std::make_unique<PinnedHostBuffer>(image.bytes);
+        if (stored[*index].pages.empty()) {
+            if (!make_host_room(page_rounded(stored[*index].bytes)) ||
+                !(index = stored_index(tokens))) {
+                return false;
+            }
+            Stored& image = stored[*index];
+            image.pages   = take_pages(image.bytes);
             std::ifstream in(image.file, std::ios::binary);
             in.seekg(std::streamoff(sizeof(FileHeader) +
                                     4 * (image.header.context.previous.size() + tokens.size())));
-            if (!in.read(static_cast<char*>(image.host->data()), std::streamsize(image.bytes))) {
-                image.host.reset();
+            for (std::uint64_t at = 0; in && at < image.bytes; at += kHostPageBytes) {
+                in.read(reinterpret_cast<char*>(image.pages[at / kHostPageBytes]),
+                        std::streamsize(std::min<std::uint64_t>(kHostPageBytes, image.bytes - at)));
+            }
+            if (!in) {
+                give_back(image);
                 return false;
             }
-            host_used += image.bytes;
         }
-        instance.executor->load_image(
-            s, image.header,
-            std::span(static_cast<const std::byte*>(image.host->data()), image.bytes));
+        Stored& image = stored[*index];
+        instance.executor->load_image(s, image.header, image.pages, kHostPageBytes);
         image.last_used           = ++use_clock;
         const std::uint64_t bytes = image.bytes;
         // Within the budget again, the image just read in being the most recently used.

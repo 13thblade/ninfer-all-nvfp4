@@ -555,7 +555,10 @@ CommitResult Program::commit(PendingBatch&& pending,
                              std::span<const runtime::CommitDecision> decisions,
                              runtime::CommitObservation observation,
                              runtime::ExecutionTiming* failed_timing) {
-    return impl_->commit(std::move(pending), decisions, observation, failed_timing);
+    CommitResult result = impl_->commit(std::move(pending), decisions, observation, failed_timing);
+    // A finished request's pages may have come free: the expert cache can take them.
+    impl_->lend_kv_to_experts();
+    return result;
 }
 
 DiscardResult Program::abort_pending(PendingBatch&& pending) noexcept {
@@ -706,10 +709,12 @@ ExpertResidencyStats Program::expert_residency_stats() const {
     const auto stats = impl_->experts->stats() - impl_->expert_startup_stats;
     out.routes = stats.pairs;
     out.hits = stats.pair_hits;
-    out.admitted = stats.admissions;
+    out.cpu_routes = stats.cpu_pairs;
+    out.admitted = stats.admissions + stats.lent_admissions;
     out.transferred_bytes = stats.copied_bytes;
     for (std::size_t rank = 0; rank < impl_->device.size(); ++rank) {
-        out.slots += impl_->experts->memory(rank).cache_slots;
+        const auto memory = impl_->experts->memory(rank);
+        out.slots += memory.cache_slots + memory.lent_slots;
     }
     return out;
 }
