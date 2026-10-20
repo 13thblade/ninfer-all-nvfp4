@@ -20,12 +20,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 add_library(cache_check OBJECT host.cpp kernel.cu)
+target_include_directories(cache_check PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 target_compile_options(cache_check PRIVATE
   "$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xfatbin=-compress-all;-compress-mode=size>")
 """)
 # A new run must write its own entries before the second build can read them.
 identity = os.environ["GITHUB_RUN_ID"] + "_" + os.environ["GITHUB_RUN_ATTEMPT"]
-(root / "host.cpp").write_text(f'int host_{identity}() {{ return 42; }}\n')
+(root / "host.cpp").write_text(f'#include <cuda_runtime.h>\nint host_{identity}() {{ return 42; }}\n')
 (root / "kernel.cu").write_text(
     f'__global__ void kernel_{identity}(int *p) {{ p[threadIdx.x] = 42; }}\n')
 run("cmake", "-S", str(root), "-B", str(root / "out"), "-G", "Ninja",

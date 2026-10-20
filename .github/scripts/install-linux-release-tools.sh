@@ -29,6 +29,9 @@ python3 -m venv /opt/ninfer-bootstrap
 /opt/ninfer-bootstrap/bin/uv python install 3.11
 /opt/ninfer-bootstrap/bin/uv venv --python 3.11 --seed /opt/ninfer-build-tools
 /opt/ninfer-build-tools/bin/pip install --disable-pip-version-check cmake==3.31.10
+if [[ "$CUDA_VERSION" == 12.9.2 ]]; then
+  /opt/ninfer-build-tools/bin/python3.11 .github/scripts/patch-cuda12-glibc.py "/usr/local/cuda-$minor"
+fi
 echo '/opt/ninfer-build-tools/bin' >> "$GITHUB_PATH"
 echo "/usr/local/cuda-$minor/bin" >> "$GITHUB_PATH"
 echo "CUDACXX=/usr/local/cuda-$minor/bin/nvcc" >> "$GITHUB_ENV"

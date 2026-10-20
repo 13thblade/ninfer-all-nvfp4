@@ -20,6 +20,8 @@ sha256sum -c SHA256SUMS.txt
 CUDA 12.9 packages contain `sm_70`, `sm_75`, `sm_80`, `sm_86` and `sm_89`.
 CUDA 13.4 packages contain `sm_75`, `sm_80`, `sm_86`, `sm_89` and `sm_120a`.
 Choose CUDA 12 for Volta. Install a compatible NVIDIA driver on the host.
+The CUDA 12 build applies a glibc 2.41 exception-declaration patch to NVIDIA headers;
+`BUILD-INFO.json` records it. Function bodies are not modified.
 
 ## Debian runtime
 

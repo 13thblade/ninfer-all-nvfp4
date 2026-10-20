@@ -151,7 +151,9 @@ def main():
     if distro.get('ID', '').strip('"') == 'debian' and distro.get('VERSION_ID', '').strip('"') == '13':
         dockerfile = (repo / 'docker/release.Dockerfile').read_text()
         (package / 'Dockerfile').write_text(dockerfile.replace('cuda>=13.0', f"cuda>={cuda.split('.')[0]}.0"))
-    info = dict(source_revision=revision, modified_sources=modified, version=version,
+    patch_note = cuda_root / 'ninfer-toolchain-patches.txt'
+    patches = patch_note.read_text() if patch_note.exists() else ''
+    info = dict(toolchain_patches=patches, source_revision=revision, modified_sources=modified, version=version,
                 cuda=cuda, cuda_compiler=compiler_version, architectures=arches,
                 platform='linux-x64', os_release=distro, glibc=output('getconf', 'GNU_LIBC_VERSION'),
                 runtime_packages=sorted(packages),

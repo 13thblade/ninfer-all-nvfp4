@@ -20,7 +20,11 @@ It imports `vcvars64.bat`; setup-msbuild alone does not provide the compiler env
 Linux uses Debian 13. CUDA 13 uses NVIDIA's exact Debian 13 Toolkit metapackage. CUDA 12 uses
 NVIDIA's official runfile installer, with only the Toolkit selected. Debian 13 rejects the SHA-1
 binding in NVIDIA's Debian 12 APT key; the workflow does not relax signature verification.
-Debian 13 supplies the FFmpeg version required by NInfer.
+Debian 13 supplies the FFmpeg version required by NInfer. CUDA 12.9 also needs matching
+`noexcept(true)` declarations for `sinpi`, `cospi`, `sinpif` and `cospif` with glibc 2.41.
+A version-guarded script patches those declarations and inline helper signatures, without changing
+function bodies. `BUILD-INFO.json` records the patch. The pre-build probe compiles CUDA headers
+through both host C++ and nvcc before testing cache reuse.
 Compilation needs no GPU. Driver installation is not part of either build.
 
 1. Compile release products. Linux uses the multicall executable to share device images between
@@ -55,7 +59,7 @@ must produce cache hits after restarting the cache server. Job logs include fina
 A timeout ends compilation before the job deadline so diagnostics can still upload.
 
 Windows vcpkg archives are saved immediately after configuration, including after configuration
-failure. The ordinary Linux CI and multiarch image workflow retain ccache directories after failed
+failure. Run/attempt keys allow a later run to replace a partial dependency cache. The ordinary Linux CI and multiarch image workflow retain ccache directories after failed
 or timed-out compile steps. Their save keys include run ID and attempt; restore prefixes allow the
 next run to reuse the newest partial cache. Runtime Docker jobs consume built artifacts and do not
 compile NInfer again. GitHub can evict caches under repository storage/retention policies; a cache

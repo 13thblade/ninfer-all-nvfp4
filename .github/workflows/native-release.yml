@@ -27,6 +27,7 @@ on:
       - '.github/scripts/*windows*'
       - '.github/scripts/*native*'
       - '.github/scripts/check-compiler-cache.py'
+      - '.github/scripts/patch-cuda12-glibc.py'
       - '.github/scripts/install-linux-release-tools.sh'
       - '.github/workflows/native-release.yml'
       - 'tests/release/**'
@@ -148,7 +149,8 @@ jobs:
         id: dependency-cache
         with:
           path: ~/AppData/Local/vcpkg/archives
-          key: windows-release-vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}
+          key: windows-release-vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.cuda }}
+          restore-keys: windows-release-vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}
       - name: Configure with real FFmpeg and curl libraries
         id: configure
         env:
