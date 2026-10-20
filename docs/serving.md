@@ -1937,10 +1937,10 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--expert-residency device\|host\|disk` | routed MoE experts on GPU, in pinned host memory, or in artifact files: [native Qwen](maintainer/qwen3_5-model.md#routed-expert-residency), [Gemma 4](gemma4.md#expert-residency), and [Flash-Next](qwen3-8-flash-next.md#run). Native Qwen and Gemma bring misses into whole-layer device banks | `device` |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; native Qwen and Gemma allow `0` and then keep only their layer banks, and Flash-Next disk mode needs a cache. With automatic KV, native Qwen gives the cache priority over KV beyond one request's context | `auto` (what is free after startup) |
 | `--expert-misses staged\|mapped` | Qwen3.8-Flash-Next only, GGUF host experts: copy each missing expert to the device while the cached experts run, into a cache slot when the [expert tier](qwen3-8-flash-next.md#the-expert-cache) admits it (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
-| `--expert-dma-share F\|auto` | Qwen3.8-Flash-Next and Gemma 4, host or disk experts: the GPU's share of a call's cache misses, `0..1`; the CPU computes the rest (GGUF experts: the GPU's results bit for bit); `auto` splits each call of GGUF experts by the copy and CPU times measured on earlier calls and copies every miss of native experts; calls of more than eight tokens always use the GPU ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)) | `auto` |
+| `--expert-dma-share F\|auto` | Host or disk experts: the GPU's share of a call's cache misses, `0..1`; the CPU computes the rest (GGUF and Qwen3.5/3.6 MoE experts: the GPU's results bit for bit); `auto` splits each such call by the copy and CPU times measured on earlier calls and copies every miss of Flash-Next native experts. Flash-Next and Gemma 4 calls of more than eight tokens, and Qwen3.5/3.6 calls that route to half the experts or more, always use the GPU ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)) | `auto` |
 | `--expert-tail-skip N` | Qwen3.8-Flash-Next only, GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten; the other experts keep their router weights, so results change | off |
-| `--expert-prefill-buffers 1\|2` | Qwen3.8-Flash-Next only, GGUF host experts: device buffers a long prompt's uncached experts are copied into; `2` copies the next layer's while the current layer's experts run. With the automatic cache the buffers hold expert cache slots between prompts ([the expert cache](qwen3-8-flash-next.md#the-expert-cache)) | `1` |
-| `--expert-cpu-threads N` | Qwen3.8-Flash-Next and Gemma 4, host or disk experts with a CPU share: `1..256` CPU threads, pinned one to a physical core | one per physical core the process may use, at most half its CPUs (affinity mask and CPU quota) |
+| `--expert-prefill-buffers 1\|2` | Qwen3.8-Flash-Next only, GGUF host experts: device buffers a long prompt's uncached experts are copied into; `2` copies the next layer's while the current layer's experts run, when half the free memory holds both. With the automatic cache the buffers hold expert cache slots between prompts ([the expert cache](qwen3-8-flash-next.md#the-expert-cache)) | `2` with the automatic expert cache, else `1` |
+| `--expert-cpu-threads N` | Host or disk experts with a CPU share: `1..256` CPU threads, pinned one to a physical core | one per physical core the process may use, at most half its CPUs (affinity mask and CPU quota) |
 | `--expert-cache-adaptive` | Qwen3.8-Flash-Next only: replace cold cached experts between calls; changes the CPU/GPU arithmetic partition | off |
 | `--expert-profile PATH` | host or disk experts: fill the expert cache from counts recorded for the same artifact and bank geometry | the model family's built-in profile, where the build has one |
 | `--expert-profile-out PATH` | host or disk experts: record expert counts for this artifact after requests | none |
@@ -2327,10 +2327,12 @@ summed, `read_latency_us` the `p50` and `p99` of a pass's read as the upper boun
 power-of-two histogram bucket, and `stalls` and `stall_seconds` the passes whose PLE layer waited
 for its rows after the layers before it and the device time it waited.
 
-With host- or disk-resident Flash-Next experts, `experts` reports the interval's routed
-(token, expert) pairs as `routes`, those served from a device slot as `hits`, the pairs the CPU
-computed as `cpu_routes`, the experts copied into device slots as `admitted`, the expert bytes
-copied to the devices as `transferred_bytes`, and the current number of device `slots`.
+With host- or disk-resident experts (Flash-Next, native Qwen3.5/3.6 MoE, Gemma 4), `experts`
+reports the interval's routed (token, expert) pairs as `routes`, those served from a device slot as
+`hits`, the pairs the CPU computed as `cpu_routes`, the experts copied into device slots as
+`admitted`, the expert bytes copied to the devices as `transferred_bytes`, and the current number
+of device `slots`. For native Qwen and Gemma, `admitted` and `slots` include the slots of layer
+banks lent to the cache between prompts.
 
 The JSONL `throughput.host_work` object is the aggregation authority: the Engine worker counts each
 wall-time segment once, independent of batch size. `elapsed_seconds` contains the same five

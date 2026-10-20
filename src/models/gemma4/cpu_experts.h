@@ -44,7 +44,7 @@ public:
     [[nodiscard]] std::size_t product_bytes() const;
 
     [[nodiscard]] bool supports(std::size_t layer) const override;
-    void compute(const Work& work) override;
+    std::size_t compute(const Work& work) override;
 
 private:
     struct Job {

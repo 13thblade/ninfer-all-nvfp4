@@ -458,20 +458,29 @@ int check_images(const Model& model, DeviceContext& device, ExecutorOptions opti
     SequenceSnapshot snapshot;
     executor.snapshot(0, snapshot);
     const std::uint32_t position = executor.position(0);
-    std::vector<std::byte> live_bytes(executor.image_bytes(position));
-    std::vector<std::byte> snapshot_bytes(executor.image_bytes(position));
-    // Pageable memory: the copies are synchronous then, which is what the test needs.
-    const SequenceImage live = executor.save_image(0, nullptr, live_bytes);
+    // Pages of an odd size, in reverse order in memory, so copies split inside regions and
+    // consecutive slices of an image are not consecutive in memory.
+    constexpr std::size_t kPage = 5'000'011;
+    const std::size_t count     = (executor.image_bytes(position) + kPage - 1) / kPage;
+    std::vector<std::byte> live_bytes(count * kPage), snapshot_bytes(count * kPage);
+    const auto pages_of = [&](std::vector<std::byte>& bytes) {
+        std::vector<std::byte*> pages(count);
+        for (std::size_t i = 0; i < count; ++i) { pages[i] = bytes.data() + (count - 1 - i) * kPage; }
+        return pages;
+    };
+    const std::vector<std::byte*> live_pages = pages_of(live_bytes);
+    const std::vector<std::byte*> snapshot_pages = pages_of(snapshot_bytes);
+    const SequenceImage live = executor.save_image(0, nullptr, live_pages, kPage);
     // The original moves on; the snapshot's positions stay as they were.
     (void)decode_alone(executor, model, 0, first, 8, logits);
-    const SequenceImage earlier = executor.save_image(0, &snapshot, snapshot_bytes);
-    const auto decoded = [&](const SequenceImage& image, std::span<const std::byte> bytes) {
+    const SequenceImage earlier = executor.save_image(0, &snapshot, snapshot_pages, kPage);
+    const auto decoded = [&](const SequenceImage& image, const std::vector<std::byte*>& pages) {
         executor.reset(1);
-        executor.load_image(1, image, bytes);
+        executor.load_image(1, image, pages, kPage);
         return decode_alone(executor, model, 1, first, int(plain[0].size()), logits);
     };
-    for (const auto& [label, tokens] : {std::pair{"live", decoded(live, live_bytes)},
-                                        std::pair{"snapshot", decoded(earlier, snapshot_bytes)}}) {
+    for (const auto& [label, tokens] : {std::pair{"live", decoded(live, live_pages)},
+                                        std::pair{"snapshot", decoded(earlier, snapshot_pages)}}) {
         const bool same = tokens == plain[0];
         std::cout << (same ? "OK   " : "FAIL ") << "sequence image (" << label
                   << ") continues as the original\n";

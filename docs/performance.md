@@ -593,6 +593,40 @@ large for 16 GB. On the TITAN RTX (engine, `rk8v4`) it prompts at 810 tok/s (512
   [NVFP4 artifact](https://huggingface.co/WaveCut/Qwen3.6-35B-A3B-NVFP4-NInfer-v3) starts in 17 s
   and leaves 7.4 GiB of the card free.
 
+### Host experts on one RTX 4090
+
+`ninfer-serve` with the official `groupwise-int` artifact, `--expert-residency host`, a
+131,072-token context, three MTP drafts and the automatic expert cache, on one RTX 4090 (PCIe 4.0
+x16, a container with a 30-CPU quota, pinned to the GPU's NUMA node), 2026-10-20; 256 greedy
+tokens after a 42-token code prompt and a 43-token prose prompt (twice each) and after a
+31,865-token document (once). `c04ea310` lends neither the layer banks nor free KV pages to the
+expert cache and copies every miss; the current build does both and, by default, has the CPU compute
+a share of each narrow call's misses ([routed expert
+residency](maintainer/qwen3_5-model.md#routed-expert-residency)). Decode in tok/s; after the
+document and its prefill: `c04ea310` / current / current with `--expert-dma-share 1` (no CPU share):
+
+| `--kv-dtype` | Decode, short prompts: `c04ea310` | current | no CPU share | Decode after the document | Prefill of the document |
+|---|---|---|---|---|---|
+| `bf16` | 183-189 | 211-245 | 200-230 | 162 / 186 / 178 | 7,700 / 8,405 / 8,386 |
+| `int8` | 195-210 | 213-254 | 200-233 | 168 / 203 / 191 | 7,621 / 7,999 / 7,942 |
+| `fp8` | 189-215 | 205-249 | 198-227 | 176 / 181 / 174 | 6,012 / 6,326 / 6,303 |
+| `k8v4` | 198-210 | 219-241 | 206-220 | 165 / 188 / 180 | 5,551 / 5,731 / 5,713 |
+| `nvfp4` | 191-210 | 221-242 | 212-227 | 174 / 191 / 184 | 5,306 / 5,425 / 5,405 |
+| `rk8v4` | 202-216 | 220-238 | 215-226 | 182 / 197 / 190 | 7,747 / 8,098 / 8,091 |
+| `rk4v4` | 201-218 | 219-246 | 209-232 | 172 / 192 / 181 | 7,755 / 8,100 / 7,835 |
+| `rk4v4-e8` | 191-223 | 212-225 | 197-217 | 180 / 179 / 173 | 7,741 / 7,934 / 7,945 |
+| `rk2v4-e8` | 180-227 | 203-241 | 195-228 | 180 / 184 / 177 | 7,714 / 7,858 / 7,945 |
+
+Over all 45 decode measurements the current build decoded 0.997-1.329 times as fast as
+`c04ea310` (geometric mean 1.109) and 0.960-1.260 times without the CPU share (1.063); the slowest
+pairs were after the document with `rk4v4-e8` (0.997, and 0.960 without the CPU share). The lent
+banks and pages raised the cache from 4,156-4,756 to 5,415-5,539 expert slots and cut the expert
+bytes copied over the run from 169-197 GB to 122-125 GB (146-151 GB without the CPU share). The
+CPU share changes no output: with and without it, all 45 answers were equal with equal log
+probabilities. Every answer differs from `c04ea310`'s, whose GPU computed SiLU with CUDA's
+`expf` (an approximate hardware exponential); the current kernels compute it from correctly rounded
+operations, as the CPU does. Startup took 1.2-1.7 s longer and device memory was unchanged (22,860 MiB).
+
 ## Qwen3.8-Flash-Next
 
 ### Expert placements
@@ -673,6 +707,29 @@ CPU share; 256 greedy tokens after short prompts and after a long document
 | 65,536 | defaults | 16,059 MiB | 72.6-82.5 | 66.0-79.0 (31,865 tokens) | 2,840 |
 | 458,752 | `5ed86dff9`, no drafts | 4,589 MiB | 39.2-43.0 | 37.7 (136,077 tokens) | 2,612 |
 | 458,752 | defaults | 14,643 MiB | 67.3-70.3 | 67.6 (136,077 tokens) | 2,708 |
+
+The same release, context and prompts on a second RTX 4090 rental (a container with a 30-CPU
+quota, pinned to the GPU's NUMA node), 2026-10-20, against `c04ea310` for every `--kv-dtype`;
+decode in tok/s over the two short prompts answered twice and after the document, and its prefill,
+as `c04ea310` / current:
+
+| `--kv-dtype` | Decode, short prompts: `c04ea310` | current | Decode after the document | Prefill of the document |
+|---|---|---|---|---|
+| `bf16` | 78.0-82.6 | 78.9-86.1 | 72.8 / 74.4 | 2,861 / 3,736 |
+| `int8` | 79.9-85.9 | 79.5-85.6 | 75.0 / 75.7 | 2,842 / 3,678 |
+| `fp8` | 80.8-89.2 | 81.0-90.4 | 76.2 / 76.0 | 2,767 / 3,599 |
+| `k8v4` | 83.0-90.4 | 81.5-91.8 | 75.9 / 77.6 | 2,778 / 3,562 |
+| `nvfp4` | 76.3-84.0 | 75.9-87.8 | 72.7 / 77.0 | 2,774 / 3,546 |
+| `rk8v4` | 82.6-95.9 | 80.7-93.9 | 74.9 / 77.9 | 2,858 / 3,704 |
+| `rk4v4` | 80.4-89.1 | 83.5-91.6 | 74.3 / 78.9 | 2,835 / 3,667 |
+| `rk4v4-e8` | 76.5-87.6 | 79.0-91.2 | 71.9 / 73.2 | 2,865 / 3,710 |
+| `rk2v4-e8` | 69.1-74.4 | 69.2-73.3 | 60.2 / 60.9 | 2,829 / 3,667 |
+
+Decode changed by 0.956-1.062 times over the 45 measurements (geometric mean 1.016), within the
+spread of repeated runs; every answer equals `c04ea310`'s. The document prefilled 1.27-1.31 times
+as fast (two prefill buffers by default), and the first token of a short prompt after it came in
+0.45-0.71 s instead of 1.03-2.75 s (sequence images in pages pinned at startup). Startup took 0-2.9 s
+longer, most of it pinning those pages; device memory was within 80 MiB.
 
 ### MTP
 

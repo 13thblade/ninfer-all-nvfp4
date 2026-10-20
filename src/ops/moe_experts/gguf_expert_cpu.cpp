@@ -304,7 +304,7 @@ void rows_scalar(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_beg
 }
 
 void swiglu_scalar(const float* gate, const float* up, std::size_t count, std::uint16_t* out) {
-    for (std::size_t i = 0; i < count; ++i) { out[i] = float_to_bf16(silu(gate[i]) * up[i]); }
+    for (std::size_t i = 0; i < count; ++i) { out[i] = float_to_bf16(portable_silu(gate[i]) * up[i]); }
 }
 
 void geglu_scalar(const float* gate, const float* up, std::size_t count, std::uint16_t* out) {

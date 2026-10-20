@@ -510,7 +510,7 @@ void check_silu(std::mt19937& rng) {
     for (int i = 0; i < 200000; ++i) { x.push_back(i % 2 ? normal(rng) : wide(rng)); }
     double worst = 0;
     for (const float v : x) {
-        const float got     = silu(v);
+        const float got     = portable_silu(v);
         const double exact  = silu64(double(v));
         require(std::isfinite(got), "nonfinite SiLU");
         if (v <= -88.7228394F) {

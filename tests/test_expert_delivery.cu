@@ -398,7 +398,7 @@ int tier_policy(DeviceContext& device) {
 class PairEcho final : public ExpertCpuProducts {
 public:
     bool supports(std::size_t) const override { return true; }
-    void compute(const Work& work) override {
+    std::size_t compute(const Work& work) override {
         auto* out = reinterpret_cast<std::int32_t*>(work.products);
         const auto* inputs = reinterpret_cast<const std::int32_t*>(work.inputs);
         for (std::size_t p = 0; p < work.ids.size(); ++p) {
@@ -418,6 +418,7 @@ public:
             }
         }
         ++calls;
+        return work.ids.size() * 4;
     }
     std::uint64_t bad = 0, calls = 0;
 };
@@ -515,6 +516,7 @@ int elastic_cache(DeviceContext& device, bool disk, const std::filesystem::path&
     options.staging_bytes = 4096;
     options.suspendable   = true;
     options.elastic       = true;
+    options.lend_banks    = false; // the banks serve every miss the cache's slots do not hold
     ExpertDelivery delivery(device.rank(0), fixture.paths, std::move(fixture.layers), options);
     constexpr std::uint64_t slot = 131584 + 98816; // each blob and its tail, 256-byte aligned
     const std::uint64_t granule  = vmm::granularity(device.device);
@@ -603,6 +605,101 @@ int elastic_cache(DeviceContext& device, bool disk, const std::filesystem::path&
                 count, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
+// Lent banks under a captured graph, with no cache: narrow passes over five experts of every layer
+// lend both banks after two passes, and their misses then stay in lent slots and hit; a wide pass
+// takes the banks back, reading every expert's bytes; narrow passes lend them again. Every replay
+// reads every pair's bytes.
+int lent_banks(DeviceContext& device, bool disk, const std::filesystem::path& path) {
+    Fixture fixture(disk, path);
+    ExpertDeliveryOptions options;
+    options.pair_capacity = kPairs;
+    options.cache_bytes   = 0;
+    options.staging_bytes = 4096;
+    options.suspendable   = true;
+    ExpertDelivery delivery(device.rank(0), fixture.paths, std::move(fixture.layers), options);
+    DeviceBuffer ids(kPairs * 4), failures(8), visited(8);
+    failures.fill();
+    visited.fill();
+    const auto pass = [&] {
+        for (int l = 0; l < kLayers; ++l) {
+            const auto call = delivery.begin(l, static_cast<const std::int32_t*>(ids.p), kPairs, device.stream);
+            inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.cached_ids, kPairs, l,
+                static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            delivery.await(device.stream);
+            inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.missing_ids, kPairs, l,
+                static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            CUDA_CHECK(cudaGetLastError());
+        }
+    };
+    std::vector<std::int32_t> routes(kPairs);
+    const auto route = [&](int first, int count) {
+        for (int p = 0; p < kPairs; ++p) { routes[p] = (first + p % count) % kExperts; }
+        ids.copy_from_host(routes.data(), ids.bytes);
+    };
+    route(0, 5);
+    pass();
+    delivery.drain();
+    delivery.prime(nullptr);
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(device.stream, cudaStreamCaptureModeThreadLocal));
+    pass();
+    CUDA_CHECK(cudaStreamEndCapture(device.stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    int replays = 0;
+    const auto replay = [&](int first, int count) {
+        route(first, count);
+        const auto before = delivery.stats();
+        CUDA_CHECK(cudaGraphLaunch(executable, device.stream));
+        delivery.drain();
+        ++replays;
+        return delivery.stats() - before;
+    };
+    int bad_steps = 0;
+    const auto expect = [&](bool condition, const char* what) {
+        if (!condition) {
+            std::printf("lent banks: %s\n", what);
+            ++bad_steps;
+        }
+    };
+    replay(0, 5);
+    replay(0, 5);
+    expect(delivery.memory().lent_slots == 0, "two narrow passes lend nothing");
+    const auto lending = replay(0, 5);
+    const auto lent = delivery.memory().lent_slots;
+    expect(lent >= kExperts && lending.lent_admissions == kLayers * 5,
+           "the third narrow pass lends both banks and its misses enter them");
+    const auto held = replay(0, 5);
+    expect(held.hits == kLayers * 5 && held.misses == 0, "lent slots hit");
+    const auto moved = replay(3, 5);
+    expect(moved.misses == kLayers * 3 && moved.lent_admissions == kLayers * 3,
+           "new experts enter free lent slots");
+    const auto wide = replay(0, kExperts);
+    expect(wide.hits == 0 && delivery.memory().lent_slots == 0 && wide.lent_evictions != 0,
+           "a wide pass reads lent slots as misses and takes the banks back");
+    replay(0, 5);
+    replay(0, 5);
+    const auto again = replay(0, 5);
+    expect(delivery.memory().lent_slots == lent && again.hits == kLayers * 5,
+           "narrow passes lend the banks again");
+    const auto* addresses = delivery.tables(0);
+    delivery.release_device_backing();
+    delivery.restore_device_backing();
+    expect(delivery.tables(0) == addresses && delivery.memory().lent_slots == 0,
+           "suspend returns the banks");
+    replay(5, 5);
+    CUDA_CHECK(cudaGraphExecDestroy(executable));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    unsigned long long bad = 0, count = 0;
+    failures.copy_to_host(&bad, 8);
+    visited.copy_to_host(&count, 8);
+    const auto stats = delivery.stats();
+    const bool ok = !bad_steps && !bad && count == std::uint64_t(replays + 1) * kLayers * kPairs;
+    std::printf("%s lent banks slots=%u lent_admissions=%llu lent_evictions=%llu bad=%llu pairs=%llu %s\n",
+                disk ? "disk" : "host", lent, (unsigned long long)stats.lent_admissions,
+                (unsigned long long)stats.lent_evictions, bad, count, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -630,6 +727,7 @@ int main(int argc, char** argv) {
             failures += run(device, disk, 6ULL << 20, path, true);
             for (const double share : {0.5, 1.0}) { failures += cpu_share(device, disk, share, path); }
             failures += elastic_cache(device, disk, path);
+            failures += lent_banks(device, disk, path);
         }
         failures += failure_control(device, path, false);
         return failures ? 1 : 0;

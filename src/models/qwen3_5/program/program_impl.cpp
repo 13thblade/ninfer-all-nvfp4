@@ -39,25 +39,26 @@ std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
     return *options.max_private_continuations;
 }
 
-// Overlay Vision residency backs the persistent arena with virtual memory so free KV granules can
-// fund a Vision window. The lendable prefix ends past the last page-major KV plane.
+// The persistent arena is virtual memory whose free KV granules can fund a Vision window (overlay
+// Vision residency) or an elastic expert cache (host or disk experts on one device). The lendable
+// prefix ends past the last page-major KV plane.
 std::unique_ptr<EvictableKVPool> make_kv_arena(DeviceContext& device,
                                                const execution::Parameters& parameters,
-                                               const SequencePlanImpl& plan) {
-    if (!plan.features.overlay_vision()) { return nullptr; }
-    const EvictableWeightPool* const pool = parameters.model.weight_pool();
-    if (pool == nullptr || !pool->mirror_captured()) {
-        throw std::logic_error("overlay Vision weight pool has no captured window");
-    }
-    const std::size_t window      = pool->window_capacity_bytes();
+                                               const SequencePlanImpl& plan, bool expert_loan) {
     const std::size_t granularity = EvictableKVPool::device_granularity(device);
-    if (window == 0 || granularity == 0 || plan.persistent.lendable_kv_end_bytes == 0) {
-        return nullptr;
-    }
-    // A KV cache smaller than one window can never fund a concurrent encode. The Engine still runs:
-    // every window then borrows the weight tail.
+    if (granularity == 0 || plan.persistent.lendable_kv_end_bytes == 0) { return nullptr; }
     const std::size_t lendable = plan.persistent.lendable_kv_end_bytes / granularity * granularity;
-    if (window > lendable) { return nullptr; }
+    std::size_t window = 0;
+    if (plan.features.overlay_vision()) {
+        const EvictableWeightPool* const pool = parameters.model.weight_pool();
+        if (pool == nullptr || !pool->mirror_captured()) {
+            throw std::logic_error("overlay Vision weight pool has no captured window");
+        }
+        // A KV cache smaller than one window can never fund a concurrent encode. The Engine still
+        // runs: every window then borrows the weight tail.
+        window = pool->window_capacity_bytes() <= lendable ? pool->window_capacity_bytes() : 0;
+    }
+    if (window == 0 && !expert_loan) { return nullptr; }
     return std::make_unique<EvictableKVPool>(
         device, EvictableKVPool::Config{
                     .arena_bytes           = plan.persistent.bytes,
@@ -242,7 +243,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
-      kv_arena(make_kv_arena(device_in, parameters_in, plan)),
+      kv_arena(make_kv_arena(device_in, parameters_in, plan,
+                             expert_runtime && expert_runtime->elastic() && device_in.size() == 1)),
       suspendable(make_suspendable_storage(device_in, parameters_in, plan, kv_arena != nullptr)),
       persistent(kv_arena                 ? DeviceArena(kv_arena->arena())
                  : suspendable.persistent ? DeviceArena(suspendable.persistent->span())
@@ -354,7 +356,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
         *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
         decoder->text_kv.execution_tables().logical_page_capacity());
-    if (vision_broker && kv_arena) {
+    if (vision_broker && kv_arena && kv_arena->window_capacity_bytes() != 0) {
         // A loan changes the admission capacity, so it may not race a sealed plan: refuse one while
         // a context transaction or a pressure-planning session is in flight, or while any lane has
         // been provisionally admitted (prefill staged) but hasn't yet bound its own KV entitlement
@@ -372,6 +374,28 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                 return true;
             },
             [this] { advance_resource_revision(); });
+    }
+    if (kv_arena && experts && experts->elastic() && device.size() == 1) {
+        // Free pages kept back from the loan: a few small reservations' worth (prompt chunks,
+        // checkpoint tails), and a Vision window's.
+        const auto keep = [&](const DeviceKVPagePool& pool) {
+            std::size_t page_bytes = 0;
+            for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+                page_bytes += static_cast<std::size_t>(pool.plane(plane).nb[3]);
+            }
+            const std::uint32_t tokens = std::max<std::uint32_t>(8192, 2 * prefill_chunk);
+            std::uint64_t pages = (tokens + kPagedKVPageSize - 1) / kPagedKVPageSize;
+            if (page_bytes != 0) { pages += (kv_arena->window_capacity_bytes() + page_bytes - 1) / page_bytes; }
+            return static_cast<std::uint32_t>(std::min<std::uint64_t>(pages, pool.capacity_pages()));
+        };
+        std::vector<DeviceKVPagePool*> pools{&decoder->text_kv.page_pool()};
+        if (decoder->mtp_kv) { pools.push_back(&decoder->mtp_kv->page_pool()); }
+        std::vector<std::uint32_t> margins;
+        for (const DeviceKVPagePool* pool : pools) { margins.push_back(keep(*pool)); }
+        kv_expert_loan = std::make_unique<KvExpertLoan>(
+            *kv_arena, std::move(pools), std::move(margins),
+            KvExpertLoan::Cache{[this] { return experts->grow_cache(); },
+                                [this](std::uint64_t bytes) { return experts->shrink_cache(bytes); }});
     }
     state_images = std::make_unique<qwen3_5::StateImageDevicePool>(backings,
                                                                     plan.persistent.state_images);
@@ -674,6 +698,19 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         experts->prime();
         expert_startup_stats = experts->stats();
     }
+    if (kv_expert_loan) {
+        // The cache grows only into what loans free: the memory free now stays free.
+        experts->set_keep_free_bytes(device.free_bytes());
+        lend_kv_to_experts();
+    }
+}
+
+void ProgramImpl::lend_kv_to_experts() {
+    if (!kv_expert_loan) { return; }
+    // At least this many pages move at once, so a lend (which drains the expert service) stays
+    // rare: 16,384 tokens.
+    constexpr std::uint32_t kMinimumPages = 16384 / kPagedKVPageSize;
+    kv_expert_loan->lend(kMinimumPages);
 }
 
 void ProgramImpl::synchronize_transfer_streams() const {

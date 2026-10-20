@@ -9,6 +9,7 @@
 #include "core/disk_kv_bridge.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
+#include "core/kv_expert_loan.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -696,6 +697,8 @@ public:
     DeviceSnapshot::Stats resume_device_state(DeviceSnapshot& snapshot);
     [[nodiscard]] std::vector<DeviceSnapshot::Range> live_persistent_ranges() const;
     void release_device_state_backing();
+    // Loans the free KV pages no reservation needs to the elastic expert cache (KvExpertLoan).
+    void lend_kv_to_experts();
     void restore_device_state_backing();
     [[nodiscard]] bool has_context_transaction() const noexcept;
     // True while this sequence waits for a media item submitted to a concurrent overlay window:
@@ -963,6 +966,9 @@ public:
     // Declared before Graphs so all graph users die before the delivery tables and service.
     std::unique_ptr<execution::NativeExpertRuntime> experts;
     ExpertDeliveryStats expert_startup_stats;
+    // One device with host or disk experts: free KV pages fund the elastic expert cache. Declared
+    // after the arena, the decoder's pools and the experts, whose recall hooks it clears first.
+    std::unique_ptr<KvExpertLoan> kv_expert_loan;
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;

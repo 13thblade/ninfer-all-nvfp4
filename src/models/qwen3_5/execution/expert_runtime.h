@@ -2,8 +2,11 @@
 
 #include "models/expert_profile.h"
 #include "models/qwen3_5/model.h"
+#include "ops/sparse_moe/streamed_cpu.h"
 
 #include <filesystem>
+#include <optional>
+#include <string>
 
 namespace ninfer::models::qwen3_5::execution {
 
@@ -15,6 +18,15 @@ struct NativeExpertProfile {
     artifact::ArtifactId artifact{};
 };
 
+// The CPU's share of a decode or verification call's missing experts (ops/sparse_moe/streamed_cpu.h,
+// the GPU's products bit for bit). dma_share: the share 0..1 the GPU copies, the CPU computing the
+// rest; unset, each call splits its misses by measured CPU and bus times. threads: the CPU pool,
+// 0 for pool_cpu_count().
+struct NativeExpertCpu {
+    std::optional<float> dma_share;
+    std::uint32_t threads = 0;
+};
+
 // Program-owned service. Immutable sources are borrowed from Model. No service or slot is shared
 // between Programs, even when their Parameters refer to the same Model.
 class NativeExpertRuntime {
@@ -22,7 +34,7 @@ public:
     NativeExpertRuntime(const Model& model, DeviceContext& device,
                          std::span<const std::uint64_t> keep_free_by_rank,
                          std::optional<std::uint64_t> cache_bytes = {},
-                         NativeExpertProfile profile = {});
+                         NativeExpertProfile profile = {}, NativeExpertCpu cpu = {});
     ~NativeExpertRuntime();
     NativeExpertRuntime(const NativeExpertRuntime&) = delete;
     NativeExpertRuntime& operator=(const NativeExpertRuntime&) = delete;
@@ -43,12 +55,23 @@ public:
     void release_device_backing();
     void restore_device_backing();
     [[nodiscard]] std::uint64_t device_backing_bytes() const noexcept;
+    // One device with virtual memory management: the cache grows into free device memory beyond
+    // the bytes set_keep_free_bytes keeps and gives memory back (ExpertDelivery::grow_cache,
+    // shrink_cache), so free KV pages can fund it (core/kv_expert_loan.h).
+    [[nodiscard]] bool elastic() const noexcept { return elastic_; }
+    std::uint64_t grow_cache();
+    std::uint64_t shrink_cache(std::uint64_t bytes);
+    void set_keep_free_bytes(std::uint64_t bytes);
+    // With a CPU share: its threads and vector backend, e.g. "15 pinned threads, avx2"; else empty.
+    [[nodiscard]] std::string cpu_description() const;
 
 private:
     struct Handle { std::size_t rank, local; };
     std::vector<Handle> handles_;
+    std::vector<std::unique_ptr<ops::detail::SparseMoeStreamCpu>> cpu_;
     std::vector<std::unique_ptr<ExpertDelivery>> ranks_;
     NativeExpertProfile profile_;
+    bool elastic_ = false;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

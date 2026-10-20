@@ -178,14 +178,15 @@ public:
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);
     // Bytes of an image at `position`.
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;
-    // Copies the sequence's state into `out` (image_bytes() of its position, pinned host memory):
-    // its live state, or the state at `at`, a snapshot it took whose positions it has not written
-    // since. Returns the image's header once the copies are done.
+    // Copies the sequence's state into `pages`, host memory that holds image_bytes() of its
+    // position in consecutive slices of `page_bytes` (the last one may be partly used): its live
+    // state, or the state at `at`, a snapshot it took whose positions it has not written since.
+    // Returns the image's header once the copies are done.
     SequenceImage save_image(std::uint32_t sequence, const SequenceSnapshot* at,
-                             std::span<std::byte> out);
+                             std::span<std::byte* const> pages, std::size_t page_bytes);
     // Makes the sequence hold the image's state; returns once the copies are done.
     void load_image(std::uint32_t sequence, const SequenceImage& image,
-                    std::span<const std::byte> bytes);
+                    std::span<std::byte* const> pages, std::size_t page_bytes);
     // Vision: encodes the media of the prompt the (just reset) sequence prefills next, whose image
     // and video tokens then take the items' merged embeddings in place of the token embedding.
     // `rope_positions` holds the prompt's three RoPE position axes, axis-major [3, tokens]; every

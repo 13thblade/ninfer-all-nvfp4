@@ -60,9 +60,10 @@ public:
         std::byte* products     = nullptr; // ExpertCpuOptions::product_bytes
         CpuSpinPool* pool       = nullptr; // the service thread and its pinned workers
     };
-    // Writes the products of the pairs routed to work.experts; the second stage adds the whole
-    // buffer, so every other product must be the identity. Runs on the delivery's service thread.
-    virtual void compute(const Work& work) = 0;
+    // Writes the products of the pairs routed to work.experts and returns the bytes of the buffer
+    // they used, from its start (at most ExpertCpuOptions::product_bytes): only those reach the
+    // device. Runs on the delivery's service thread.
+    virtual std::size_t compute(const Work& work) = 0;
 };
 
 struct ExpertCpuOptions {
@@ -84,6 +85,10 @@ struct ExpertDeliveryOptions {
     // of a wide call (a prompt chunk, a wide verification) arrive while the current one computes;
     // one halves their memory and gives that up. Two fall back to one when memory is short.
     std::uint32_t banks = 2;
+    // Between wide calls the banks serve as cache slots: once two narrow passes have run without a
+    // wide call, each bank holds whole slots for the narrow calls' misses the tier does not admit,
+    // and the next wide call takes its bank back.
+    bool lend_banks = true;
     bool suspendable = false; // existing VmmRegion allocations, fixed virtual addresses
     // The cache reserves addresses for every expert and backs only the slots it has, so its owner
     // can give slots back to memory that grows (shrink_cache) and take them again (grow_cache).
@@ -100,6 +105,9 @@ struct ExpertDeliveryStats {
     std::uint64_t cpu_experts = 0, cpu_pairs = 0;
     // Misses found already present in a layer bank (a prefetched layer, a repeated wide call).
     std::uint64_t bank_reuses = 0, prefetched_layers = 0;
+    // Misses that entered a slot of a lent bank, and experts that left one (for another miss, or
+    // because a wide call took the bank back).
+    std::uint64_t lent_admissions = 0, lent_evictions = 0;
     // Host-to-device expert bytes (misses and prefetches); device copies from a bank into the cache.
     std::uint64_t read_bytes = 0, copied_bytes = 0, promoted_bytes = 0;
     double service_seconds = 0;
@@ -119,6 +127,8 @@ struct ExpertDeliveryStats {
     now.cpu_pairs -= start.cpu_pairs;
     now.bank_reuses -= start.bank_reuses;
     now.prefetched_layers -= start.prefetched_layers;
+    now.lent_admissions -= start.lent_admissions;
+    now.lent_evictions -= start.lent_evictions;
     now.read_bytes -= start.read_bytes;
     now.copied_bytes -= start.copied_bytes;
     now.promoted_bytes -= start.promoted_bytes;
@@ -140,6 +150,8 @@ struct ExpertDeliveryStats {
     a.cpu_pairs += b.cpu_pairs;
     a.bank_reuses += b.bank_reuses;
     a.prefetched_layers += b.prefetched_layers;
+    a.lent_admissions += b.lent_admissions;
+    a.lent_evictions += b.lent_evictions;
     a.read_bytes += b.read_bytes;
     a.copied_bytes += b.copied_bytes;
     a.promoted_bytes += b.promoted_bytes;
@@ -148,7 +160,8 @@ struct ExpertDeliveryStats {
 }
 struct ExpertDeliveryMemory {
     std::uint64_t cache_bytes = 0, bank_bytes = 0, metadata_bytes = 0, pinned_bytes = 0;
-    std::uint32_t cache_slots = 0, banks = 0;
+    // lent_slots: the slots the lent banks hold now (ExpertDeliveryOptions::lend_banks).
+    std::uint32_t cache_slots = 0, banks = 0, lent_slots = 0;
 };
 
 // One Program, rank and serial compute stream. Sources outlive this object. All device addresses
@@ -167,6 +180,10 @@ struct ExpertDeliveryMemory {
 // of consecutive experts, starts the bank of the layer that followed it last time, and promotes its
 // most routed experts from the bank into free cache slots by device copies, up to the layer's
 // share; it evicts nothing and counts nothing, so a prompt does not push out the decode working set.
+// While only narrow calls run, the banks are lent to the cache (ExpertDeliveryOptions::lend_banks):
+// a narrow call's miss that no cache slot takes enters a free slot of a lent bank, else the slot of
+// its least routed expert the call does not route, and stays there for later calls. A wide call
+// treats the lent slots as misses and takes back the bank it fills.
 class ExpertDelivery {
 public:
     ExpertDelivery(const RankContext& rank, std::vector<std::filesystem::path> files,
@@ -223,6 +240,8 @@ public:
     // empty slots. Both return the device bytes they freed or took. Graphs stay valid.
     std::uint64_t shrink_cache(std::uint64_t bytes);
     std::uint64_t grow_cache();
+    // The free device memory grow_cache leaves (ExpertDeliveryOptions::keep_free_bytes).
+    void set_keep_free_bytes(std::uint64_t bytes);
 
 private:
     struct Impl;

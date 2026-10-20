@@ -135,11 +135,15 @@ int run_tests() {
                                   .hybrid_experts.tail_skip_rank == 7,
                       "CLI did not keep every miss by default or preserve the tail skip");
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
-                              .hybrid_experts.prefill_buffers == 1 &&
+                              .hybrid_experts.prefill_buffers == 0 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--expert-prefill-buffers", "1"})
+                                  .hybrid_experts.prefill_buffers == 1 &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
                                  "--expert-prefill-buffers", "2"})
                                   .hybrid_experts.prefill_buffers == 2,
-                      "CLI did not keep one prefill expert buffer by default or preserve two");
+                      "CLI did not leave the prefill expert buffers automatic by default or "
+                      "preserve one or two");
     for (const auto* count : {"0", "3", "two"}) {
         failures += check(rejects([&] {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-prefill-buffers",

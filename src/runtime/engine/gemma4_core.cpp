@@ -119,7 +119,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         throw std::invalid_argument("--lookup-ngram and --adaptive-mtp require --spec mtp");
     }
     const auto& hybrid = options.hybrid_experts;
-    if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 1 ||
+    if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||
         hybrid.adaptive_cache) {
         throw std::invalid_argument("Gemma 4 has no mapped misses, tail skip, prefill buffers or "
                                     "adaptive expert cache (Qwen3.8-Flash-Next options)");
@@ -2411,8 +2411,10 @@ RuntimeStats Gemma4Core::runtime_stats() const {
     const auto experts = impl_->instance.executor->expert_stats();
     stats.experts.routes = experts.pairs;
     stats.experts.hits = experts.pair_hits;
-    stats.experts.admitted = experts.admissions;
-    stats.experts.slots = impl_->instance.executor->memory().experts.cache_slots;
+    stats.experts.cpu_routes = experts.cpu_pairs;
+    stats.experts.admitted = experts.admissions + experts.lent_admissions;
+    const auto memory = impl_->instance.executor->memory().experts;
+    stats.experts.slots = memory.cache_slots + memory.lent_slots;
     stats.experts.transferred_bytes = experts.copied_bytes;
     return stats;
 }

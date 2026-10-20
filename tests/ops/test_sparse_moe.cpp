@@ -4,6 +4,7 @@
 #include "core/layout.h"
 #include "models/qwen3_5/expert_layout.h"
 #include "ops/sparse_moe/streamed.h"
+#include "ops/sparse_moe/streamed_cpu.h"
 
 #include "ops/common/device_route.h"
 #include "ops/op_tester.h"
@@ -985,8 +986,9 @@ public:
 private:
     void prepare_streaming(const ops::SparseMoeWeights& weights, std::uint64_t cache_bytes) {
         if (!stream_device_) { stream_device_ = std::make_unique<DeviceContext>(); }
-        if (delivery_ && stream_cache_ == cache_bytes) { return; }
+        if (delivery_ && stream_cache_ == cache_bytes && stream_cpu_share_ == cpu_share) { return; }
         delivery_.reset();
+        stream_cpu_.reset();
         ExpertDeliveryLayer layer;
         layer.experts.resize(kExperts);
         if (stream_sources_.empty()) {
@@ -1028,9 +1030,22 @@ private:
         ExpertDeliveryOptions options;
         options.pair_capacity = ops::detail::kSparseMoeStreamPairs;
         options.cache_bytes = cache_bytes;
+        if (cpu_share > 0) {
+            // The CPU computes this share of each narrow call's misses (streamed_cpu.h).
+            ops::detail::StreamCpuLayer cpu_layer{weights.routed_gate_up.qtype, weights.routed_down.qtype, {}};
+            std::copy(layer.aliases.begin(), layer.aliases.end(), cpu_layer.aliases.begin());
+            stream_cpu_ = std::make_unique<ops::detail::SparseMoeStreamCpu>(
+                std::vector<ops::detail::StreamCpuLayer>{cpu_layer});
+            options.cpu.products      = stream_cpu_.get();
+            options.cpu.input_bytes   = ops::detail::SparseMoeStreamCpu::input_bytes();
+            options.cpu.product_bytes = ops::detail::SparseMoeStreamCpu::product_bytes();
+            options.cpu.share         = cpu_share;
+            options.cpu.threads       = 4;
+        }
         delivery_ = std::make_unique<ExpertDelivery>(stream_device_->rank(0),
             std::vector<std::filesystem::path>{}, std::vector<ExpertDeliveryLayer>{std::move(layer)}, options);
         stream_cache_ = cache_bytes;
+        stream_cpu_share_ = cpu_share;
     }
 
     const CodecProfile& profile_;
@@ -1055,8 +1070,12 @@ public:
     std::unique_ptr<DeviceContext> stream_device_;
     std::vector<std::unique_ptr<PinnedHostBuffer>> stream_sources_;
     std::vector<std::uint64_t> stream_plane_sizes_;
+    std::unique_ptr<ops::detail::SparseMoeStreamCpu> stream_cpu_;
     std::unique_ptr<ExpertDelivery> delivery_;
     std::uint64_t stream_cache_ = 0;
+    double stream_cpu_share_ = 0;
+    // The share of a narrow streamed call's misses the CPU computes.
+    double cpu_share = 0;
 };
 
 int run_profile(const CodecProfile& profile, bool streamed = false) {
@@ -1078,6 +1097,7 @@ int run_profile(const CodecProfile& profile, bool streamed = false) {
                 failures += fixture.run(tokens, index == 0 ? 1 : 0, tokens == 8 || tokens == 32);
                 resident = fixture.last_output_;
             }
+            std::vector<double> first;
             for (const std::uint64_t cache : {0ULL, 16ULL << 20, 128ULL << 20}) {
                 failures += fixture.run(tokens, index == 0 ? 1 : 0, tokens == 8 || tokens == 32,
                                           true, cache);
@@ -1086,6 +1106,26 @@ int run_profile(const CodecProfile& profile, bool streamed = false) {
                     std::cerr << profile.name << " T=" << tokens << " cache=" << cache
                               << ": streamed output differs from resident\n";
                     ++failures;
+                }
+                if (first.empty()) { first = fixture.last_output_; }
+            }
+            // The CPU's share of the misses: the GPU's products bit for bit, whatever the split.
+            for (const double share : {1.0, 0.5}) {
+                for (const std::uint64_t cache : {0ULL, 16ULL << 20}) {
+                    fixture.cpu_share = share;
+                    failures += fixture.run(tokens, index == 0 ? 1 : 0, tokens == 8, true, cache);
+                    fixture.cpu_share = 0;
+                    // A call of fewer than 16 tokens routes under half the experts: narrow.
+                    if (share == 1.0 && cache == 0 && tokens < 16 &&
+                        fixture.delivery_->stats().cpu_pairs == 0) {
+                        std::cerr << profile.name << " T=" << tokens << ": the CPU computed no pair\n";
+                        ++failures;
+                    }
+                    if (fixture.last_output_ != first) {
+                        std::cerr << profile.name << " T=" << tokens << " cache=" << cache
+                                  << " CPU share " << share << ": output differs from the GPU's\n";
+                        ++failures;
+                    }
                 }
             }
         } else {

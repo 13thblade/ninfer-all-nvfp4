@@ -97,31 +97,45 @@ struct Storage {
 // One block: a shared histogram of the call's experts, then each pair's cached/missing id by the
 // table entry the expert has now. The mask is copied before publish(), on the same stream. Tables
 // change only at missing entries or at experts absent from this call, so cached consumers can
-// read them while the host prepares the rest.
+// read them while the host prepares the rest. An entry in a lent bank (`lent`: [bank][low, high),
+// empty when not lent) hits in a narrow call only: a wide call, which routes half the layer's
+// experts or more, may take that bank back while its cached pairs run.
 __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int experts,
                              const void* const* tables, std::uintptr_t low, std::uintptr_t high,
-                             std::int32_t* cached, std::int32_t* missing, std::uint32_t* needed) {
+                             const std::uintptr_t* lent, std::int32_t* cached,
+                             std::int32_t* missing, std::uint32_t* needed) {
     extern __shared__ std::uint32_t counts[];
+    __shared__ std::uint32_t routes;
+    if (threadIdx.x == 0) { routes = 0; }
     for (int e = threadIdx.x; e < experts; e += blockDim.x) { counts[e] = 0; }
     __syncthreads();
     for (std::uint32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
         const int e = ids[p];
-        bool valid  = e >= 0 && e < experts;
-        bool hit    = false;
-        if (valid) {
-            const auto address = reinterpret_cast<std::uintptr_t>(tables[e]);
-            hit = address >= low && address < high;
-            atomicAdd(counts + e, 1u);
-        }
-        cached[p]  = valid && hit ? e : -1;
-        missing[p] = valid && !hit ? e : -1;
+        if (e >= 0 && e < experts) { atomicAdd(counts + e, 1u); }
     }
     __syncthreads();
     for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+        if (counts[e]) { atomicAdd(&routes, 1u); }
+    }
+    __syncthreads();
+    const bool wide = 2 * routes >= std::uint32_t(experts);
+    const std::uintptr_t lent_low[2]{lent[0], lent[2]}, lent_high[2]{lent[1], lent[3]};
+    const auto hit = [&](const void* entry) {
+        const auto address = reinterpret_cast<std::uintptr_t>(entry);
+        if (address >= low && address < high) { return true; }
+        return !wide && ((address >= lent_low[0] && address < lent_high[0]) ||
+                         (address >= lent_low[1] && address < lent_high[1]));
+    };
+    for (std::uint32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
+        const int e       = ids[p];
+        const bool valid  = e >= 0 && e < experts;
+        const bool cached_pair = valid && hit(tables[e]);
+        cached[p]  = cached_pair ? e : -1;
+        missing[p] = valid && !cached_pair ? e : -1;
+    }
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
         const std::uint32_t count = counts[e];
-        const auto address        = reinterpret_cast<std::uintptr_t>(tables[e]);
-        const bool hit            = address >= low && address < high;
-        needed[e] = count == 0 ? 0u : (count & kCountMask) | (hit ? kHit : kMiss);
+        needed[e] = count == 0 ? 0u : (count & kCountMask) | (hit(tables[e]) ? kHit : kMiss);
     }
 }
 
@@ -147,6 +161,10 @@ struct ExpertDelivery::Impl {
         bool successor_wide    = false;
         std::vector<std::uint64_t> total; // the narrow calls' routes of each expert
         bool cpu = false;                 // the family computes its experts on the CPU
+        // Where each expert's entries point besides a cache slot: the lent slot holding it, and
+        // the bank whose layout they address (-1: none).
+        std::vector<std::int32_t> lent_of;
+        std::vector<std::int8_t> bank_of;
     };
     struct Bank {
         std::int64_t layer = -1;
@@ -157,6 +175,13 @@ struct ExpertDelivery::Impl {
         // Its table entries still point elsewhere: a promotion's are patched at the next call, a
         // round's once its copy has landed.
         bool pending = false;
+        std::vector<std::uint64_t> written;
+    };
+    // A slot of a lent bank: bank k holds slots [k * per_bank, (k + 1) * per_bank). `used`: the
+    // last call that routed its expert.
+    struct LentSlot {
+        std::int32_t layer = -1, expert = -1;
+        std::uint64_t used = 0;
         std::vector<std::uint64_t> written;
     };
     struct Deferred {
@@ -189,6 +214,18 @@ struct ExpertDelivery::Impl {
     std::vector<Storage> banks;
     std::vector<Bank> bank_state;
     int last_bank = 0;
+    // Lent banks (ExpertDeliveryOptions::lend_banks): their slots, the slots one bank holds (0:
+    // banks are never lent), which banks are lent, the device copy of their address ranges the
+    // split reads and its pinned source, the narrow passes since the last wide call, and the
+    // served calls' count.
+    std::vector<LentSlot> lent_slots;
+    std::uint32_t per_bank = 0;
+    std::vector<unsigned char> bank_lent;
+    Storage lent_ranges;
+    std::unique_ptr<PinnedHostBuffer> host_ranges;
+    bool ranges_dirty         = false;
+    std::uint32_t quiet_passes = 0;
+    std::uint64_t stamp        = 0;
     std::unique_ptr<PinnedHostBuffer> needed_host, staging;
     std::vector<Slot> slots;
     std::vector<std::int32_t> free_slots;
@@ -336,6 +373,8 @@ struct ExpertDelivery::Impl {
                                         checked_add(checked_mul(count, layer.stride.back()), tail[b]));
             }
             layer.slot_of.assign(count, -1);
+            layer.lent_of.assign(count, -1);
+            layer.bank_of.assign(count, -1);
             const auto bytes = count * spec.aliases.size() * sizeof(void*);
             layer.mirror = std::make_unique<PinnedHostBuffer>(bytes);
             std::memset(layer.mirror->data(), 0, bytes);
@@ -416,6 +455,20 @@ struct ExpertDelivery::Impl {
             allocation.bank_bytes += banks.back().backing_bytes();
         }
         allocation.banks = bank_count;
+        // A narrow call routes fewer than half a layer's experts, so one lent bank whose slots
+        // number at least that many always has a slot for a miss that its call does not route.
+        bank_lent.assign(bank_count, 0);
+        if (options.lend_banks && 2 * (bank_bytes / slot_bytes) >= max_experts) {
+            per_bank = std::uint32_t(bank_bytes / slot_bytes);
+            lent_slots.resize(std::size_t(per_bank) * bank_count);
+            for (auto& slot : lent_slots) { slot.written.assign(slot_offset.size(), 0); }
+        }
+        lent_ranges = Storage(4 * sizeof(std::uintptr_t), rank.device, options.suspendable);
+        lent_ranges.fill();
+        host_ranges = std::make_unique<PinnedHostBuffer>(4 * sizeof(std::uintptr_t));
+        std::memset(host_ranges->data(), 0, host_ranges->size());
+        allocation.metadata_bytes += lent_ranges.backing_bytes();
+        allocation.pinned_bytes += host_ranges->size();
         const std::uint64_t remaining = available();
         // Automatic slots may use only whole physical granules inside the remaining budget.
         // An explicit request must preserve the same reserve, including VMM rounding.
@@ -533,7 +586,8 @@ struct ExpertDelivery::Impl {
     }
 
     template <typename Function> void each_storage(Function&& function) {
-        for (Storage* storage : {&cache, &cached_ids, &missing_ids, &needed_device, &products, &cpu_flag}) {
+        for (Storage* storage : {&cache, &cached_ids, &missing_ids, &needed_device, &products, &cpu_flag,
+                                 &lent_ranges}) {
             if (storage->bytes) { function(*storage); }
         }
         for (auto& bank : banks) { function(bank); }
@@ -560,15 +614,136 @@ struct ExpertDelivery::Impl {
         }
         layer.dirty = true;
     }
+    // Before (li, e)'s entries point elsewhere: the lent slot holding it is free again.
+    void leave(std::size_t li, std::int32_t e) {
+        auto& layer = layers[li];
+        layer.bank_of[std::size_t(e)] = -1;
+        const auto l = layer.lent_of[std::size_t(e)];
+        if (l < 0) { return; }
+        layer.lent_of[std::size_t(e)] = -1;
+        lent_slots[std::size_t(l)].layer = lent_slots[std::size_t(l)].expert = -1;
+    }
     void point_slot(std::size_t li, std::int32_t e, std::int32_t slot) {
+        leave(li, e);
         std::byte* base = slot_base(slot);
         point(li, e, [&](std::size_t b) { return base + slot_offset[b]; });
     }
     void point_bank(std::size_t li, std::int32_t e, int bank) {
+        leave(li, e);
         point(li, e, [&](std::size_t b) { return bank_blob(bank, li, e, b); });
+        layers[li].bank_of[std::size_t(e)] = std::int8_t(bank);
     }
     void point_nowhere(std::size_t li, std::int32_t e) {
+        leave(li, e);
         point(li, e, [](std::size_t) { return static_cast<std::byte*>(nullptr); });
+    }
+    [[nodiscard]] std::byte* lent_base(std::int32_t l) const {
+        const auto bank = std::uint32_t(l) / per_bank;
+        return static_cast<std::byte*>(banks[bank].p) + std::uint64_t(std::uint32_t(l) % per_bank) * slot_bytes;
+    }
+    void point_lent(std::size_t li, std::int32_t e, std::int32_t l) {
+        leave(li, e);
+        std::byte* base = lent_base(l);
+        point(li, e, [&](std::size_t b) { return base + slot_offset[b]; });
+        layers[li].lent_of[std::size_t(e)] = l;
+        auto& slot = lent_slots[std::size_t(l)];
+        slot.layer = std::int32_t(li);
+        slot.expert = e;
+        slot.used = stamp;
+    }
+
+    // Lends bank k: nothing points into its layout any more, and its zeroed bytes hold free slots.
+    // The served call's split read every such entry as a miss, and earlier calls' consumers are done.
+    void lend_bank(int k) {
+        for (std::size_t li = 0; li < layers.size(); ++li) {
+            for (std::size_t e = 0; e < layers[li].bank_of.size(); ++e) {
+                if (layers[li].bank_of[e] == k) { point_nowhere(li, std::int32_t(e)); }
+            }
+        }
+        bank_state[std::size_t(k)].layer = -1;
+        std::fill(bank_state[std::size_t(k)].valid.begin(), bank_state[std::size_t(k)].valid.end(), 0);
+        CUDA_CHECK(cudaMemsetAsync(banks[std::size_t(k)].p, 0, banks[std::size_t(k)].bytes, copies));
+        for (std::uint32_t i = 0; i < per_bank; ++i) {
+            auto& slot = lent_slots[std::size_t(k) * per_bank + i];
+            slot.layer = slot.expert = -1;
+            std::fill(slot.written.begin(), slot.written.end(), 0);
+        }
+        bank_lent[std::size_t(k)] = 1;
+        auto* ranges = static_cast<std::uintptr_t*>(host_ranges->data());
+        ranges[2 * k]     = reinterpret_cast<std::uintptr_t>(banks[std::size_t(k)].p);
+        ranges[2 * k + 1] = ranges[2 * k] + std::uint64_t(per_bank) * slot_bytes;
+        ranges_dirty = true;
+        set_lent_count();
+    }
+
+    // A wide call takes bank k back: the experts of its slots leave (the call read their entries
+    // as misses).
+    void reclaim_bank(int k, ExpertDeliveryStats& delta) {
+        for (std::uint32_t i = 0; i < per_bank; ++i) {
+            const auto& slot = lent_slots[std::size_t(k) * per_bank + i];
+            if (slot.layer < 0) { continue; }
+            point_nowhere(std::size_t(slot.layer), slot.expert);
+            ++delta.lent_evictions;
+        }
+        bank_lent[std::size_t(k)] = 0;
+        auto* ranges = static_cast<std::uintptr_t*>(host_ranges->data());
+        ranges[2 * k] = ranges[2 * k + 1] = 0;
+        ranges_dirty = true;
+        set_lent_count();
+    }
+
+    void set_lent_count() {
+        std::uint32_t lent = 0;
+        for (const auto flag : bank_lent) { lent += flag ? per_bank : 0; }
+        std::lock_guard lock(mutex);
+        allocation.lent_slots = lent;
+    }
+
+    [[nodiscard]] bool any_lent() const {
+        return std::any_of(bank_lent.begin(), bank_lent.end(), [](unsigned char flag) { return flag != 0; });
+    }
+
+    // The lent slots a narrow call of layer li may fill, best first: free ones, then the least
+    // routed experts (the tier's counts, then the oldest use) that the call does not route.
+    std::vector<std::int32_t> lent_candidates(std::size_t li) const {
+        std::vector<std::int32_t> out;
+        for (std::size_t k = 0; k < bank_lent.size(); ++k) {
+            if (!bank_lent[k]) { continue; }
+            for (std::uint32_t i = 0; i < per_bank; ++i) {
+                const auto l = std::int32_t(k * per_bank + i);
+                const auto& slot = lent_slots[std::size_t(l)];
+                if (slot.layer == std::int32_t(li) && call_routed[std::size_t(slot.expert)]) { continue; }
+                out.push_back(l);
+            }
+        }
+        const auto key = [&](std::int32_t l) {
+            const auto& slot = lent_slots[std::size_t(l)];
+            return slot.layer < 0 ? std::tuple{0, 0.0F, std::uint64_t(0)}
+                                  : std::tuple{1, tier->count(std::size_t(slot.layer), slot.expert), slot.used};
+        };
+        std::stable_sort(out.begin(), out.end(), [&](std::int32_t a, std::int32_t b) { return key(a) < key(b); });
+        return out;
+    }
+
+    // Copies a narrow call's missing expert e of layer li into lent slot l.
+    void admit_lent(std::int32_t l, std::size_t li, std::int32_t e, ExpertDeliveryStats& delta) {
+        const auto& slot = lent_slots[std::size_t(l)];
+        if (slot.layer >= 0) {
+            point_nowhere(std::size_t(slot.layer), slot.expert);
+            ++delta.lent_evictions;
+        }
+        auto& written = lent_slots[std::size_t(l)].written;
+        std::byte* base = lent_base(l);
+        for (std::size_t b = 0; b < layers[li].source.experts[std::size_t(e)].size(); ++b) {
+            const auto& blob = layers[li].source.experts[std::size_t(e)][b];
+            add_piece(base + slot_offset[b], blob);
+            if (written[b] > blob.bytes) {
+                zeroes.push_back({base + slot_offset[b] + blob.bytes, written[b] - blob.bytes});
+            }
+            written[b] = blob.bytes;
+        }
+        point_lent(li, e, l);
+        ++delta.lent_admissions;
     }
 
     // One copy per changed table, from a pinned copy no earlier upload still reads.
@@ -878,12 +1053,13 @@ struct ExpertDelivery::Impl {
     // A served call may write any bank: the preceding call's consumers finished before it was
     // published. It takes the bank the last bank-using call did not use, which keeps that layer
     // for an immediate repeat (a second prefill slice, the next draft of the same layer).
-    int claim_bank(std::size_t li, int avoid) {
-        const int pick = bank_state.size() == 1 ? 0 : avoid >= 0 ? 1 - avoid : 1 - last_bank;
-        auto& bank = bank_state[std::size_t(pick)];
+    [[nodiscard]] int pick_bank(int avoid) const {
+        return bank_state.size() == 1 ? 0 : avoid >= 0 ? 1 - avoid : 1 - last_bank;
+    }
+    void claim_bank(int k, std::size_t li) {
+        auto& bank = bank_state[std::size_t(k)];
         bank.layer = std::int64_t(li);
         std::fill(bank.valid.begin(), bank.valid.end(), 0);
-        return pick;
     }
 
     // Copy experts of layer li into bank k at their indices, one piece per contiguous run, and keep
@@ -1014,7 +1190,10 @@ struct ExpertDelivery::Impl {
         work.inputs   = static_cast<const std::byte*>(host_inputs->data());
         work.products = static_cast<std::byte*>(host_products->data());
         work.pool     = pool.get();
-        options.cpu.products->compute(work);
+        const std::size_t used = options.cpu.products->compute(work);
+        if (used > options.cpu.product_bytes) {
+            throw std::logic_error("expert delivery: CPU products exceed their buffer");
+        }
         auto* missing = static_cast<std::int32_t*>(host_missing->data());
         const int experts = int(layer.source.experts.size());
         for (std::uint32_t p = 0; p < pairs; ++p) {
@@ -1023,8 +1202,10 @@ struct ExpertDelivery::Impl {
         }
         CUDA_CHECK(cudaMemcpyAsync(missing_ids.p, missing, std::size_t(pairs) * 4, cudaMemcpyHostToDevice,
                                    copies));
-        CUDA_CHECK(cudaMemcpyAsync(products.p, host_products->data(), options.cpu.product_bytes,
-                                   cudaMemcpyHostToDevice, copies));
+        if (used != 0) {
+            CUDA_CHECK(cudaMemcpyAsync(products.p, host_products->data(), used, cudaMemcpyHostToDevice,
+                                       copies));
+        }
         *flag = 1;
         CUDA_CHECK(cudaMemcpyAsync(cpu_flag.p, flag, 4, cudaMemcpyHostToDevice, copies));
         double work_done = 0;
@@ -1068,13 +1249,34 @@ struct ExpertDelivery::Impl {
         }
         delta.routes = routes;
         const bool wide = 2 * routes >= std::uint32_t(experts);
+        ++stamp;
+        for (int e = 0; e < experts; ++e) {
+            const auto l = layer.lent_of[std::size_t(e)];
+            if (call_routed[std::size_t(e)] && l >= 0) { lent_slots[std::size_t(l)].used = stamp; }
+        }
         if (previous_layer >= 0) {
             layers[std::size_t(previous_layer)].successor = std::int64_t(li);
             layers[std::size_t(previous_layer)].successor_wide = wide;
         }
         previous_layer = std::int64_t(li);
+        const bool new_pass = !wide && last_narrow >= 0 && std::int64_t(li) < last_narrow;
+        if (wide) { quiet_passes = 0; }
+        if (per_bank && new_pass && ++quiet_passes >= 2) {
+            // Only narrow calls ran for two passes: the banks become cache slots.
+            for (std::size_t b = 0; b < banks.size(); ++b) {
+                if (!bank_lent[b]) { lend_bank(int(b)); }
+            }
+        }
         const int held = bank_holding(li);
         int k = held;
+        if (wide && per_bank) {
+            // The wide call's bank: a lent one is taken back first.
+            if (k < 0) { k = pick_bank(-1); }
+            if (bank_lent[std::size_t(k)]) { reclaim_bank(k, delta); }
+        }
+        const bool lent = !wide && any_lent();
+        std::vector<std::int32_t> lent_order;
+        std::size_t lent_next = 0;
         const auto cpu = !wide && layer.cpu && (request.flags & kCpuCall) ? cpu_share(li, needed, held)
                                                                           : std::vector<std::int32_t>{};
         std::vector<std::int32_t> to_bank;
@@ -1093,6 +1295,9 @@ struct ExpertDelivery::Impl {
                 point_bank(li, e, held);
                 continue;
             }
+            // A wide call reads a lent slot's entry as a miss; the slot keeps its bytes until a
+            // later call takes its bank back.
+            if (layer.lent_of[std::size_t(e)] >= 0) { continue; }
             // A round's candidate whose copy is still in flight is served from the bank.
             if (!wide && s < 0) {
                 const auto slot = admit_slot(li, e, needed[e] & kCountMask, delta);
@@ -1108,12 +1313,21 @@ struct ExpertDelivery::Impl {
                     continue;
                 }
             }
+            if (lent) {
+                // Lent banks take every miss no cache slot took, so none needs a bank.
+                if (lent_order.empty()) { lent_order = lent_candidates(li); }
+                if (lent_next == lent_order.size()) {
+                    throw std::logic_error("expert delivery: no lent slot for a narrow call's miss");
+                }
+                admit_lent(lent_order[lent_next++], li, e, delta);
+                continue;
+            }
             to_bank.push_back(e);
         }
         if (!wide) {
             // The tier learns from decode and verification only; a call below the last narrow
             // one starts a pass (a draft layer's repeated calls do not).
-            if (last_narrow >= 0 && std::int64_t(li) < last_narrow) { round(delta); }
+            if (new_pass) { round(delta); }
             last_narrow = std::int64_t(li);
             std::lock_guard lock(mutex);
             for (int e = 0; e < experts; ++e) {
@@ -1123,10 +1337,13 @@ struct ExpertDelivery::Impl {
                 layer.total[std::size_t(e)] += count;
             }
         }
-        if (!to_bank.empty() && k < 0) { k = claim_bank(li, -1); }
+        if (!to_bank.empty()) {
+            if (k < 0) { k = pick_bank(-1); }
+            if (k != held) { claim_bank(k, li); }
+        }
         for (const auto e : to_bank) { point_bank(li, e, k); }
-        if (k >= 0) { last_bank = k; }
-        call_bank = k;
+        if (k >= 0 && (held >= 0 || !to_bank.empty())) { last_bank = k; }
+        call_bank = (held >= 0 || !to_bank.empty()) ? k : -1;
         call_wide = wide;
         if (!to_bank.empty()) { fill_bank(k, li, to_bank); }
         const bool timed = options.cpu.balance && !cpu.empty() && !pieces.empty();
@@ -1135,6 +1352,11 @@ struct ExpertDelivery::Impl {
         flush_pieces(delta);
         if (timed) { CUDA_CHECK(cudaEventRecord(copies_done, copies)); }
         if (layer.cpu && host_flag) { compute_cpu(li, cpu, request.width, needed, delta); }
+        if (ranges_dirty) {
+            CUDA_CHECK(cudaMemcpyAsync(lent_ranges.p, host_ranges->data(), host_ranges->size(),
+                                       cudaMemcpyHostToDevice, copies));
+            ranges_dirty = false;
+        }
         upload_tables();
         CUDA_CHECK(cudaStreamSynchronize(copies));
         if (timed) {
@@ -1194,9 +1416,11 @@ struct ExpertDelivery::Impl {
             for (std::size_t e = 0; e < layers[next].source.experts.size() && !held; ++e) {
                 if (layers[next].slot_of[e] < 0) { experts.push_back(std::int32_t(e)); }
             }
-            if (!experts.empty()) {
-                // Never the bank this call's consumers are reading.
-                const int k = claim_bank(next, call_bank);
+            // Never the bank this call's consumers are reading, nor a lent one: the next call may
+            // be narrow and read its slots.
+            const int k = pick_bank(call_bank);
+            if (!experts.empty() && !bank_lent[std::size_t(k)]) {
+                claim_bank(k, next);
                 fill_bank(k, next, experts);
                 ++delta.prefetched_layers;
             }
@@ -1409,7 +1633,8 @@ ExpertDelivery::Call ExpertDelivery::begin(std::size_t index, const std::int32_t
     const int experts = int(layer.source.experts.size());
     split_routes<<<1, 1024, std::size_t(experts) * 4, stream>>>(
         ids, pairs, experts, static_cast<const void* const*>(layer.tables.p), low,
-        low + p.cache_span, static_cast<std::int32_t*>(p.cached_ids.p),
+        low + p.cache_span, static_cast<const std::uintptr_t*>(p.lent_ranges.p),
+        static_cast<std::int32_t*>(p.cached_ids.p),
         static_cast<std::int32_t*>(p.missing_ids.p), static_cast<std::uint32_t*>(p.needed_device.p));
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpyAsync(p.needed_host->data(), p.needed_device.p, std::size_t(experts) * 4,
@@ -1470,6 +1695,18 @@ void ExpertDelivery::invalidate() {
         bank.layer = -1;
         std::fill(bank.valid.begin(), bank.valid.end(), 0);
     }
+    // No bank stays lent: the split reads an empty range for each.
+    for (auto& layer : p.layers) {
+        std::fill(layer.lent_of.begin(), layer.lent_of.end(), -1);
+        std::fill(layer.bank_of.begin(), layer.bank_of.end(), std::int8_t(-1));
+    }
+    for (auto& slot : p.lent_slots) { slot.layer = slot.expert = -1; }
+    std::fill(p.bank_lent.begin(), p.bank_lent.end(), 0);
+    std::memset(p.host_ranges->data(), 0, p.host_ranges->size());
+    p.lent_ranges.fill();
+    p.ranges_dirty = false;
+    p.quiet_passes = 0;
+    p.set_lent_count();
     for (const auto& d : p.deferred) {
         if (d.landed && std::find(p.spare_events.begin(), p.spare_events.end(), d.landed) ==
                             p.spare_events.end()) {
@@ -1607,6 +1844,11 @@ std::uint64_t ExpertDelivery::grow_cache() {
     DeviceBinding bind(p.rank.device);
     std::lock_guard lock(p.mutex);
     return p.grow();
+}
+
+void ExpertDelivery::set_keep_free_bytes(std::uint64_t bytes) {
+    std::lock_guard lock(impl_->mutex);
+    impl_->options.keep_free_bytes = bytes;
 }
 
 std::string ExpertDelivery::cpu_description() const {

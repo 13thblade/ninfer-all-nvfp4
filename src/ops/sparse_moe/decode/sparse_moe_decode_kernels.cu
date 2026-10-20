@@ -5,6 +5,7 @@
 #include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/common/silu.h"
 #include "ops/common/warp.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
@@ -471,7 +472,7 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
                                            kIntermediate + j, x_shared, 0, kHidden, gate, up,
                                            shared_divisors);
     }
-    if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = silu(gate) * up; }
+    if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = ops::portable_silu(gate) * up; }
 }
 
 template <class RoutedCodec, int PathsPerBlock, bool Adaptive, class SharedCodec = Q8Codec>
@@ -535,7 +536,7 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
         if (lane == 0) {
             token_activations[(static_cast<std::int64_t>(token) * (kTopK + 1) + path) *
                                   kIntermediate +
-                              j] = silu(gate) * up;
+                              j] = ops::portable_silu(gate) * up;
         }
         if constexpr (Adaptive) { __syncthreads(); }
     }
@@ -797,7 +798,7 @@ __global__ void sparse_moe_stream_d3_kernel(
                                            gate, up, shared_divisors);
     }
     if (lane == 0) {
-        activations[(token * (kTopK + 1) + path) * kIntermediate + j] = silu(gate) * up;
+        activations[(token * (kTopK + 1) + path) * kIntermediate + j] = ops::portable_silu(gate) * up;
     }
 }
 
@@ -846,6 +847,23 @@ __global__ void sparse_moe_stream_merge_kernel(const float* products,
         value += products[(token * (kTopK + 1) + path) * kHidden + row];
     }
     destination[token * kHidden + row] = __float2bfloat16_rn(value);
+}
+
+// The CPU's product rows (sparse_moe_stream_cpu) into their pairs' slots: a pair neither cached
+// nor missing is the CPU's, and its row is the count of CPU pairs before it.
+__global__ void sparse_moe_stream_place_kernel(const int* ids, const int* cached, const int* missing,
+                                               const int* cpu, const float* rows, int pairs,
+                                               float* products) {
+    if (*cpu == 0) { return; }
+    const int pair = static_cast<int>(blockIdx.y);
+    const auto computed = [&](int p) { return ids[p] >= 0 && cached[p] < 0 && missing[p] < 0; };
+    if (!computed(pair)) { return; }
+    int row = 0;
+    for (int p = 0; p < pair; ++p) { row += computed(p) ? 1 : 0; }
+    const int column = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int token = pair / kTopK, path = pair % kTopK;
+    products[(token * (kTopK + 1) + path) * kHidden + column] =
+        rows[static_cast<std::int64_t>(row) * kHidden + column];
 }
 
 template<class Gate, class Down, class Shared = Q8Codec>
@@ -1126,6 +1144,15 @@ void sparse_moe_stream_experts(const Tensor& x, const SparseMoeWeights& weights,
         launch_stream_experts<Q4Codec, Q6Codec>(
             x, weights, tables, ids, alpha, shared_scale, activations, products, shared, stream);
     }
+}
+
+void sparse_moe_stream_place(const std::int32_t* ids, const std::int32_t* cached,
+                             const std::int32_t* missing, const std::int32_t* cpu,
+                             const void* rows, std::int32_t pairs, float* products,
+                             cudaStream_t stream) {
+    sparse_moe_stream_place_kernel<<<dim3(kHidden / 256, pairs), 256, 0, stream>>>(
+        ids, cached, missing, cpu, static_cast<const float*>(rows), pairs, products);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void sparse_moe_stream_merge(const float* products, Tensor& destination, cudaStream_t stream) {

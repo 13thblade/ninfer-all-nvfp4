@@ -138,6 +138,8 @@ DeviceSnapshot::Stats ProgramImpl::suspend_device_state(DeviceSnapshot& snapshot
         const RankBinding bound(device, rank);
         CUDA_CHECK(cudaDeviceSynchronize());
     }
+    // Loaned pages have no backing: they return before the live bytes are copied.
+    if (kv_expert_loan) { kv_expert_loan->recall_all(); }
     const std::vector<DeviceSnapshot::Range> ranges = live_persistent_ranges();
     const DeviceSnapshot::Stats stats               = snapshot.capture(device, ranges);
     release_device_state_backing();
