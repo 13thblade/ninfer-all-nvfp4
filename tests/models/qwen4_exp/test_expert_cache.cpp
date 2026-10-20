@@ -6,7 +6,10 @@
 // entries back on the host at once and the candidate's moved only once its copy has landed; prompt
 // routes must not steer them. A routing profile must size each layer's share of the slots and fill
 // them. An admission takes a free slot, else the coldest expert its call does not route when the
-// newcomer's count beats it, and counts the newcomer's routes in that call as misses.
+// newcomer's count beats it, and counts the newcomer's routes in that call as misses. Lent buffers
+// are free slots until a wide pass reclaims them: their most routed experts move into colder slots
+// of the cache's own, no entry points inside them while the pass writes them, and they come back
+// zeroed for the next admissions.
 #include "core/arena.h"
 #include "core/device.h"
 #include "models/qwen4_exp/expert_cache.h"
@@ -169,6 +172,89 @@ void rounds(DeviceContext& device) {
             "a route to a cached expert is a hit");
 }
 
+// Admits `expert` into layer `l` and copies it in and patches its entries, as the expert misses
+// do; the result's slot is null when the cache refused it.
+ExpertCache::Admitted admit(ExpertCache& cache, const Model& model, std::size_t l, std::int32_t expert,
+                            int pairs, const std::vector<unsigned char>& in_use) {
+    ExpertCache::Admitted out;
+    if (!cache.admit(l, expert, pairs, in_use, out)) { return out; }
+    const Bank* banks[3] = {l == 0 ? &model.g0 : &model.g1, l == 0 ? &model.u0 : &model.u1,
+                            l == 0 ? &model.d0 : &model.d1};
+    for (int k = 0; k < 3; ++k) {
+        require(cudaMemcpy(out.slot[k], banks[k]->pointers[expert], banks[k]->bytes,
+                           cudaMemcpyHostToDevice) == cudaSuccess,
+                "copy an admitted expert");
+        auto* table = static_cast<const void**>(banks[k]->table.p);
+        require(cudaMemcpy(table + expert, &out.slot[k], sizeof(void*), cudaMemcpyHostToDevice) ==
+                    cudaSuccess,
+                "patch an admitted entry");
+        if (out.victim >= 0) {
+            require(cudaMemcpy(table + out.victim, &out.victim_host[k], sizeof(void*),
+                               cudaMemcpyHostToDevice) == cudaSuccess,
+                    "patch a victim entry");
+        }
+    }
+    return out;
+}
+
+void loans(DeviceContext& device) {
+    Model model;
+    // Four slots a layer of the cache's own, and a buffer of four more a layer (and slack).
+    ExpertCache cache(device, model.layers(device), std::vector<std::uint64_t>{4 * 16384});
+    DeviceBuffer buffer(4 * 16384 + 1000);
+    cudaStream_t transfer = nullptr;
+    require(cudaStreamCreateWithFlags(&transfer, cudaStreamNonBlocking) == cudaSuccess, "a stream");
+    const auto lent = cache.lend(std::vector<ExpertCache::Loan>{{.rank = 0, .base = buffer.p, .bytes = buffer.bytes}});
+    require(lent.size() == 1 && lent[0] == 4 * 16384 && cache.stats().slots == 16,
+            "a lent buffer gives each layer the same free slots: " + std::to_string(cache.stats().slots));
+    const auto ranges = cache.storage(0);
+    const auto inside = [&](const void* at) {
+        const auto a = reinterpret_cast<std::uintptr_t>(at);
+        return a >= reinterpret_cast<std::uintptr_t>(buffer.p) &&
+               a < reinterpret_cast<std::uintptr_t>(buffer.p) + buffer.bytes;
+    };
+    require(ranges[2].second - ranges[2].first == 4 * 10496 && inside(reinterpret_cast<void*>(ranges[2].first)),
+            "layer 0's lent block lies in the buffer");
+    cache.hand_over(0);
+    std::vector<unsigned char> in_use(kExperts, 0);
+    // Experts 0..3 take the cache's own slots, 4..7 the lent ones; expert e routes 5(e + 1) times.
+    for (std::int32_t e = 0; e < 8; ++e) {
+        const auto out = admit(cache, model, 0, e, 1, in_use);
+        require(out.slot[0] != nullptr && inside(out.slot[0]) == (e >= 4),
+                "the cache's own free slots come before the lent ones");
+    }
+    std::vector<std::int32_t> routes;
+    for (int e = 0; e < 8; ++e) { routes.insert(routes.end(), std::size_t(5 * (e + 1)), e); }
+    cache.observe(0, routes, true);
+    cache.adapt();
+    require(model.cached(0, "lent and filled").size() == 8, "eight slots hold their experts");
+
+    // A wide pass takes the buffer back: 4..7 move into the slots of 0..3, which leave.
+    cache.reclaim(0, transfer);
+    require(cudaStreamSynchronize(transfer) == cudaSuccess, "the handover");
+    const auto kept = model.cached(0, "reclaimed");
+    require(kept == std::vector<int>({4, 5, 6, 7}), "the most routed experts stay in the cache's own slots");
+    for (std::int32_t e = 4; e < 8; ++e) {
+        require(cache.cached(0, 0, e) != nullptr && !inside(cache.cached(0, 0, e)), "kept outside the buffer");
+    }
+    require(cudaMemsetAsync(buffer.p, 0xab, buffer.bytes, transfer) == cudaSuccess, "a wide pass writes it");
+    require(cudaStreamSynchronize(transfer) == cudaSuccess, "the wide pass");
+    require(model.cached(0, "written").size() == 4, "the buffer's writes reach no cached expert");
+    const auto refused = admit(cache, model, 0, 20, 1, in_use);
+    require(refused.slot[0] == nullptr || !inside(refused.slot[0]), "no admission into a reclaimed buffer");
+
+    // The next decode pass returns it: zeroed free slots that the next admissions take.
+    cache.give_back(0, transfer);
+    require(cudaStreamSynchronize(device.stream) == cudaSuccess, "the zeroing");
+    const auto again = admit(cache, model, 0, 9, 1, in_use);
+    require(again.slot[0] != nullptr && inside(again.slot[0]), "a returned slot takes a miss");
+    const auto after = model.cached(0, "returned");
+    require(holds(after, 9) && holds(after, 7), "returned slots hold their experts, followed by zeros");
+    cache.give_back(0, transfer);
+    require(cache.stats().slots == 16, "a second return changes nothing");
+    cudaStreamDestroy(transfer);
+}
+
 void admissions(DeviceContext& device) {
     Model model;
     ExpertCache cache(device, model.layers(device), std::vector<std::uint64_t>{2 * 102400});
@@ -176,24 +262,7 @@ void admissions(DeviceContext& device) {
     // expert misses do.
     cache.hand_over(1);
     const auto admit = [&](std::int32_t expert, int pairs, const std::vector<unsigned char>& in_use) {
-        ExpertCache::Admitted out;
-        if (!cache.admit(1, expert, pairs, in_use, out)) { return out; }
-        const Bank* banks[3] = {&model.g1, &model.u1, &model.d1};
-        for (int k = 0; k < 3; ++k) {
-            require(cudaMemcpy(out.slot[k], banks[k]->pointers[expert], banks[k]->bytes,
-                               cudaMemcpyHostToDevice) == cudaSuccess,
-                    "copy an admitted expert");
-            auto* table = static_cast<const void**>(banks[k]->table.p);
-            require(cudaMemcpy(table + expert, &out.slot[k], sizeof(void*), cudaMemcpyHostToDevice) ==
-                        cudaSuccess,
-                    "patch an admitted entry");
-            if (out.victim >= 0) {
-                require(cudaMemcpy(table + out.victim, &out.victim_host[k], sizeof(void*),
-                                   cudaMemcpyHostToDevice) == cudaSuccess,
-                        "patch a victim entry");
-            }
-        }
-        return out;
+        return ::admit(cache, model, 1, expert, pairs, in_use);
     };
     std::vector<unsigned char> in_use(kExperts, 0);
     // Free slots take any miss.
@@ -280,6 +349,7 @@ int main() {
         rounds(device);
         admissions(device);
         profile(device);
+        loans(device);
         std::cout << "PASS qwen4_exp expert cache\n";
         return 0;
     } catch (const std::exception& error) {

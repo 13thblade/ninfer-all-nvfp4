@@ -43,6 +43,7 @@ constexpr int kMaxExperts     = 512;
 constexpr int kSplitThreads   = kMaxExperts / 2; // two expert flags a thread
 constexpr std::uint64_t kTail = 256;
 constexpr std::uint64_t kAlign = 256;
+constexpr int kRanges          = int(std::tuple_size_v<ExpertCache::Ranges>);
 
 std::uint64_t aligned(std::uint64_t value) { return (value + kAlign - 1) / kAlign * kAlign; }
 
@@ -55,9 +56,12 @@ struct Mailbox {
     alignas(64) std::uint32_t prepared = 0; // host: the last request ready
 };
 
-// [ranges[0], ranges[1]) and [ranges[2], ranges[3]): a layer's cached blocks.
+// [ranges[2i], ranges[2i + 1]) for i < kRanges: a layer's cached blocks.
 __device__ __forceinline__ bool in_ranges(std::uintptr_t at, const std::uintptr_t* ranges) {
-    return (at >= ranges[0] && at < ranges[1]) || (at >= ranges[2] && at < ranges[3]);
+    bool in = false;
+#pragma unroll
+    for (int i = 0; i < kRanges; ++i) { in = in || (at >= ranges[2 * i] && at < ranges[2 * i + 1]); }
+    return in;
 }
 
 // Splits a call's pairs: a pair whose expert's gate entry lies in the layer's cached storage stays
@@ -347,7 +351,7 @@ struct ExpertMisses::Impl {
         }
         for (const auto& layer : layers) {
             RankBinding bind(device, layer.rank);
-            ranges.emplace_back(4 * sizeof(std::uintptr_t));
+            ranges.emplace_back(2 * kRanges * sizeof(std::uintptr_t));
             write_ranges(ranges.back(), layer.resident);
         }
         for (const auto& path : paths) { files.push_back(std::make_unique<File>(path)); }
@@ -428,8 +432,11 @@ struct ExpertMisses::Impl {
     }
 
     static void write_ranges(DeviceBuffer& buffer, const ExpertCache::Ranges& resident) {
-        const std::uintptr_t words[4] = {resident[0].first, resident[0].second, resident[1].first,
-                                         resident[1].second};
+        std::uintptr_t words[2 * kRanges];
+        for (int i = 0; i < kRanges; ++i) {
+            words[2 * i]     = resident[std::size_t(i)].first;
+            words[2 * i + 1] = resident[std::size_t(i)].second;
+        }
         CUDA_CHECK(cudaMemcpy(buffer.p, words, sizeof(words), cudaMemcpyHostToDevice));
     }
 

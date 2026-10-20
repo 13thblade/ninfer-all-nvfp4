@@ -32,7 +32,8 @@ inline constexpr const char* kHybridExpertHelp =
     "                                place N (1..9) of their top ten; changes results\n"
     "  --expert-prefill-buffers 1|2  GGUF host experts: device buffers for a long prompt's\n"
     "                                uncached experts (default 1); 2 copies the next layer's\n"
-    "                                while this one runs, with memory from the expert cache\n"
+    "                                while this one runs. With the automatic cache they hold\n"
+    "                                expert cache slots between prompts\n"
     "  --expert-cache-adaptive       replace cold cached experts between calls;\n"
     "                                changes the CPU/GPU arithmetic partition\n";
 

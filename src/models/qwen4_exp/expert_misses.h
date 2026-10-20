@@ -43,8 +43,8 @@ struct MissLayer {
     };
     std::array<Projection, 3> projections;   // gate, up, down
     const void* const* gate_table = nullptr; // the device table the cached stage reads
-    // Device memory holding this layer's cached experts, up to two blocks: a gate entry inside
-    // either is resident.
+    // Device memory holding this layer's cached experts (ExpertCache::storage): a gate entry
+    // inside any of its blocks is resident.
     ExpertCache::Ranges resident{};
     // Host experts whose layer the cache handed over: a missing expert the GPU copies anyway goes
     // straight into a slot when the cache's tier admits it (ExpertCache::admit), and stays.

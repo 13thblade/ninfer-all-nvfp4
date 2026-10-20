@@ -659,6 +659,9 @@ struct Executor::Impl {
     };
 
     std::vector<SlotPool> slot_pools; // by rank; empty unless the experts are host resident
+    // With the automatic expert cache the pool buffers are cache slots between prompts
+    // (ExpertCache::lend): a wide pass takes them back, the next decode pass returns them.
+    bool pools_lent = false;
     std::unique_ptr<PinnedHostBuffer> slot_entries;
     // Wide host calls of at least kPrefetchTokens touch nearly every expert of a layer: every
     // expert the cache lacks is copied into the pool on the transfer stream while the layers
@@ -1848,6 +1851,21 @@ struct Executor::Impl {
         target.layer = index;
     }
 
+    // Before a pass: a wide one takes the pool buffers back from the expert cache, a decode or
+    // verification pass returns them.
+    void place_pools(bool wide) {
+        if (!pools_lent) { return; }
+        for (std::size_t r = 0; r < slot_pools.size(); ++r) {
+            if (slot_pools[r].slots == 0) { continue; }
+            const cudaStream_t transfer = device.rank(r).transfer_stream;
+            if (wide) {
+                cache->reclaim(r, transfer);
+            } else {
+                cache->give_back(r, transfer);
+            }
+        }
+    }
+
     // Forgets every prefetched layer, so the next wide call copies its own.
     void forget_prefetches() {
         for (auto& prefetch : prefetches) {
@@ -2756,6 +2774,7 @@ struct Executor::Impl {
         settle_routes();
         // A copy queued for an earlier pass may predate the cache's last swaps.
         forget_prefetches();
+        place_pools(t > kVectorTokens);
         if (hybrid) { hybrid->begin(cancelled, !warming); }
         stage_inputs(parts, tokens);
         // Disk-resident experts need the host between a layer's routing and its experts, so their
@@ -2957,6 +2976,7 @@ struct Executor::Impl {
         };
         settle_routes();
         forget_prefetches();
+        place_pools(true);
         float* const own_stack = rank.stack;
         // The chunks' inputs, staged one after another as forward() stages them, kept in the
         // span planes; their embeddings start their stacks.
@@ -3221,6 +3241,22 @@ struct Executor::Impl {
         for (std::size_t r = 0; r < added.size(); ++r) {
             memory.ranks[r].expert_cache_bytes += added[r];
             memory.expert_cache_bytes += added[r];
+        }
+        std::vector<ExpertCache::Loan> loans;
+        for (std::size_t r = 0; r < slot_pools.size(); ++r) {
+            for (const auto& buffer : slot_pools[r].buffers) {
+                loans.push_back({.rank = r, .base = buffer.storage.p, .bytes = buffer.storage.bytes});
+            }
+        }
+        if (!loans.empty()) {
+            const auto lent = cache->lend(loans);
+            for (std::size_t r = 0; r < lent.size(); ++r) {
+                memory.ranks[r].expert_cache_bytes += lent[r];
+                memory.ranks[r].workspace_bytes -= lent[r];
+                memory.expert_cache_bytes += lent[r];
+                memory.workspace_bytes -= lent[r];
+            }
+            pools_lent = true;
         }
         if (misses) {
             for (std::size_t i = 0; i < expert_layers().size(); ++i) {
