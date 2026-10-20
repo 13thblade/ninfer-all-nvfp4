@@ -23,31 +23,27 @@ Choose CUDA 12 for Volta. Install a compatible NVIDIA driver on the host.
 
 ## Debian runtime
 
-CI builds on Debian 13 (glibc 2.41). Runtime libraries are dynamically linked and are not copied
-into this archive. Newer distributions must also provide the recorded library SONAMEs; newer glibc
-alone is insufficient. Local builds can use another Debian-family host; check `BUILD-INFO.json`.
+CI builds on Debian 13 (glibc 2.41). CUDA runtime libraries are included in `lib/`, with NVIDIA's
+EULA. System libraries remain dynamically linked. Newer distributions must also provide the
+recorded FFmpeg and other library SONAMEs; newer glibc alone is insufficient. Local builds can use
+another Debian-family host; check `BUILD-INFO.json`.
 
-On Debian 13, install NVIDIA's repository keyring and the recorded runtime packages:
+On Debian 13, install the recorded system runtime packages:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl
-cuda_repo=debian13  # Use debian12 for the CUDA 12.9 package.
-curl -fsSLo cuda-keyring.deb "https://developer.download.nvidia.com/compute/cuda/repos/$cuda_repo/x86_64/cuda-keyring_1.1-1_all.deb"
-sudo dpkg -i cuda-keyring.deb
-sudo apt-get update
-xargs -a packages/multi.txt sudo apt-get install -y
-sudo sh -c "find /usr/local -name 'libcublas.so.*' -printf '%h\\n' | sort -u > /etc/ld.so.conf.d/ninfer-cuda.conf"
-sudo ldconfig
+xargs -a packages/multi.txt sudo apt-get install -y ca-certificates curl
 ./ninfer --help
 ./ninfer-serve --help
 ./ninfer_bench --help
 ```
 
-The list includes cuBLAS, FFmpeg, libcurl and their resolved runtime dependencies. It does not
-install the CUDA compiler or a driver. The build's temporary driver stub is never shipped.
-The multicall binary shares its device images between the CLI, server and auxiliary commands.
-Keep the `bin/` directory and symlinks together when moving the installation.
+This installs FFmpeg, libcurl and the other resolved system dependencies. It does not install a
+CUDA Toolkit or a driver. The build's temporary driver stub is never shipped. The executables load
+the packaged CUDA libraries through a relative runtime path. The multicall binary shares device
+images between the CLI, server and auxiliary commands. Keep `bin/`, `lib/` and the symlinks together
+when moving the installation. NVIDIA libraries remain subject to `NVIDIA-CUDA-EULA.txt`, separately
+from NInfer's Apache-2.0 licence.
 
 ## Docker without compilation
 

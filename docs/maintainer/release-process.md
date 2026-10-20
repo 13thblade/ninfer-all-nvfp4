@@ -17,9 +17,9 @@ These are the latest CUDA 12 and 13 releases in the
 Volta requires CUDA 12. This project's Blackwell kernels require CUDA 13.1 or newer.
 Windows uses the official NVIDIA network installer, VS 2022, Ninja and pinned vcpkg libraries.
 It imports `vcvars64.bat`; setup-msbuild alone does not provide the compiler environment.
-Linux uses Debian 13 with the exact Toolkit metapackage from NVIDIA's official repository.
-CUDA 13 uses the Debian 13 repository. CUDA 12 uses NVIDIA's Debian 12 repository because no
-CUDA 12 package is published for Debian 13; this combination needs native build verification.
+Linux uses Debian 13. CUDA 13 uses NVIDIA's exact Debian 13 Toolkit metapackage. CUDA 12 uses
+NVIDIA's official runfile installer, with only the Toolkit selected. Debian 13 rejects the SHA-1
+binding in NVIDIA's Debian 12 APT key; the workflow does not relax signature verification.
 Debian 13 supplies the FFmpeg version required by NInfer.
 Compilation needs no GPU. Driver installation is not part of either build.
 
@@ -29,8 +29,8 @@ Compilation needs no GPU. Driver installation is not part of either build.
    Windows clears developer directories from `PATH`. Linux checks the dynamic library closure
    and uses a temporary CUDA driver stub, which is never packaged.
 3. Package checksums, source metadata, launchers and licences. Windows includes runtime DLLs.
-   Linux records the required Debian runtime packages and includes a Dockerfile that installs
-   them and copies the prebuilt binaries without recompilation.
+   Linux includes the CUDA runtime libraries and their EULA, records the required system packages,
+   and includes a Dockerfile that installs those packages and copies the prebuilt binaries.
 4. Test the archives and split them into volumes no larger than 1900 MiB. Keep Actions artifacts
    for seven days. Names are `ninfer-<os>-x64-cuda<major.minor>-sm<arches>-<commit12>`;
    `VERSION` remains metadata inside the archive and does not affect its name.
@@ -76,7 +76,7 @@ separate CLI/server binaries or `NINFER_MULTICALL=ON`; CI uses the latter. Run
 `scripts/package-release.sh` on the Linux build host, or `scripts\package-release.ps1` on Windows.
 The repository's `VERSION` and matching release notes are included as source metadata. Neither
 packager uses `VERSION` in the archive name. Modified local sources add `-dirty`; CI rejects them.
-Linux packaging needs Python 3.11, `strip`, `ldd`, `dpkg-query`, `tar` and the build's CUDA Toolkit.
+Linux packaging needs Python 3.11, `strip`, `patchelf`, `ldd`, `dpkg-query`, `tar` and the build's CUDA Toolkit.
 The runtime Dockerfile is included only when packaging a Debian 13 build.
 
 ## Gotchas
@@ -97,10 +97,10 @@ the EULA and protect NVIDIA's rights. The packager therefore ships the toolkit's
 `NVIDIA-CUDA-EULA.txt`, and the archive README names the two DLLs as NVIDIA's, outside the
 project's Apache-2.0 licence. Re-read the EULA of the toolkit that builds a release.
 
-**Linux links cuBLAS, FFmpeg and glibc dynamically.** The Linux archive does not ship `libcublas`
-(the Lt library alone is about 500 MB), so `release-archive-linux.md` states the requirements: the
-glibc of the build host, the CUDA runtime libraries including cuBLAS, FFmpeg and libcurl. Check them
-with `ldd` on the new binaries and update the archive README when they change.
+**Linux links cuBLAS, FFmpeg and glibc dynamically.** The packager copies the CUDA runtime closure
+into `lib/`, checks the executable loader path, and ships NVIDIA's EULA. It lists system libraries'
+Debian packages in `packages/multi.txt`; the runtime Dockerfile installs those without adding a
+CUDA APT repository. An unowned system library or unresolved dependency fails packaging.
 
 **Asset sizes.** Every executable links every device image. Native packages use 1900 MiB archive
 volumes to remain below GitHub's 2 GiB asset limit. This does not remove MSVC's linked-image limit

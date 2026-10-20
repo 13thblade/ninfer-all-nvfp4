@@ -23,7 +23,7 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def runtime_packages(binary, env, driver_stub):
+def runtime_packages(binary, env, driver_stub, cuda_root, bundle):
     dependencies = output('ldd', str(binary), env=env)
     if 'not found' in dependencies:
         raise RuntimeError(f'Unresolved libraries for {binary}:\n{dependencies}')
@@ -32,6 +32,12 @@ def runtime_packages(binary, env, driver_stub):
         path = Path(library)
         if path.resolve() == driver_stub.resolve():
             continue  # The host supplies the real driver; never package the stub.
+        if path.resolve().is_relative_to(cuda_root):
+            # Keep the SONAME from ldd; copy the real file, not a link into the build Toolkit.
+            destination = bundle / path.name
+            if not destination.exists():
+                shutil.copy2(path, destination)
+            continue
         for candidate in dict.fromkeys((str(path.resolve()), library)):
             result = subprocess.run(['dpkg-query', '-S', candidate], text=True, capture_output=True)
             if result.returncode == 0:
@@ -103,6 +109,12 @@ def main():
     for command in commands:
         (package / command).symlink_to(f'bin/multi/{command}')
     packages = set()
+    libraries = package / 'lib'
+    libraries.mkdir()
+    eula = cuda_root / 'EULA.txt'
+    if not eula.is_file():
+        raise RuntimeError(f'Missing CUDA redistribution licence: {eula}')
+    shutil.copy2(eula, package / 'NVIDIA-CUDA-EULA.txt')
     # Hosted runners have no GPU. The temporary stub only supports loader/--help checks.
     stub = cuda_root / 'lib64/stubs/libcuda.so'
     if not stub.is_file():
@@ -112,11 +124,18 @@ def main():
         env = dict(os.environ, LD_LIBRARY_PATH=f"{temporary}:{cuda_root / 'lib64'}")
         for product in products:
             binary = binaries / product
+            run('patchelf', '--set-rpath', '$ORIGIN/../../lib', str(binary))
             images = output(str(cuda_root / 'bin/cuobjdump'), '--list-elf', str(binary))
             for arch in arches:
                 if not re.search(rf'sm_{arch}(?:[.\s_]|$)', images):
                     raise RuntimeError(f'{binary} lacks sm_{arch}')
-            packages.update(runtime_packages(binary, env, stub))
+            packages.update(runtime_packages(binary, env, stub, cuda_root, libraries))
+        # Test the copied CUDA libraries; the installed Toolkit must not satisfy a missing library.
+        env['LD_LIBRARY_PATH'] = f'{temporary}:{libraries}'
+        for product in products:
+            dependencies = output('ldd', str(binaries / product), env=env)
+            if 'not found' in dependencies or str(cuda_root) in dependencies:
+                raise RuntimeError(f'Incomplete packaged runtime: {dependencies}')
         for command in commands:
             run(str(package / command), '--help', env=env, timeout=60)
     (package / 'packages').mkdir()
@@ -131,12 +150,12 @@ def main():
                   if '=' in line)
     if distro.get('ID', '').strip('"') == 'debian' and distro.get('VERSION_ID', '').strip('"') == '13':
         dockerfile = (repo / 'docker/release.Dockerfile').read_text()
-        (package / 'Dockerfile').write_text(dockerfile.replace('cuda>=13.0', f"cuda>={cuda.split('.')[0]}.0").replace('ARG CUDA_REPO=debian13', 'ARG CUDA_REPO=debian12' if cuda.startswith('12.') else 'ARG CUDA_REPO=debian13'))
+        (package / 'Dockerfile').write_text(dockerfile.replace('cuda>=13.0', f"cuda>={cuda.split('.')[0]}.0"))
     info = dict(source_revision=revision, modified_sources=modified, version=version,
                 cuda=cuda, cuda_compiler=compiler_version, architectures=arches,
                 platform='linux-x64', os_release=distro, glibc=output('getconf', 'GNU_LIBC_VERSION'),
                 runtime_packages=sorted(packages),
-                validation='Device images and dependency closure checked; all commands passed --help '
+                validation='Device images and packaged CUDA dependency closure checked; all commands passed --help '
                 'with a temporary driver stub. GPU inference was not tested.')
     (package / 'BUILD-INFO.json').write_text(json.dumps(info, indent=2) + '\n')
     files = sorted(p for p in package.rglob('*') if p.is_file())

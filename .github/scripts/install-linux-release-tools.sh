@@ -4,18 +4,26 @@ set -euo pipefail
 : "${CUDA_VERSION:?}"
 minor="${CUDA_VERSION%.*}"
 suffix="${minor/./-}"
-cuda_repo=debian13
-[[ "$CUDA_VERSION" == 12.* ]] && cuda_repo=debian12
 apt-get update
 apt-get install -y --no-install-recommends \
-  build-essential ninja-build pkg-config python3 python3-venv \
+  build-essential ninja-build pkg-config patchelf python3 python3-venv \
   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
   libcurl4-openssl-dev zlib1g-dev
-curl -fsSLo /tmp/cuda-keyring.deb \
-  "https://developer.download.nvidia.com/compute/cuda/repos/$cuda_repo/x86_64/cuda-keyring_1.1-1_all.deb"
-dpkg -i /tmp/cuda-keyring.deb
-apt-get update
-apt-get install -y --no-install-recommends "cuda-toolkit-$suffix=$CUDA_VERSION-1"
+if [[ "$CUDA_VERSION" == 12.9.2 ]]; then
+  # Debian 13 rejects the SHA-1 binding in NVIDIA's Debian 12 repository key.
+  # Use NVIDIA's release installer instead; do not weaken APT signature policy.
+  installer=/tmp/cuda-toolkit.run
+  curl --retry 3 -fL -o "$installer" \
+    https://developer.download.nvidia.com/compute/cuda/12.9.2/local_installers/cuda_12.9.2_575.57.08_linux.run
+  sh "$installer" --silent --toolkit --toolkitpath="/usr/local/cuda-$minor"
+  rm -f "$installer"
+else
+  curl -fsSLo /tmp/cuda-keyring.deb \
+    https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/cuda-keyring_1.1-1_all.deb
+  dpkg -i /tmp/cuda-keyring.deb
+  apt-get update
+  apt-get install -y --no-install-recommends "cuda-toolkit-$suffix=$CUDA_VERSION-1"
+fi
 python3 -m venv /opt/ninfer-bootstrap
 /opt/ninfer-bootstrap/bin/pip install --disable-pip-version-check uv==0.11.11
 /opt/ninfer-bootstrap/bin/uv python install 3.11

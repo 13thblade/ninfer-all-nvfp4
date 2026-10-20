@@ -28,7 +28,7 @@ class LinuxPackageTest(unittest.TestCase):
             (self.repo / directory).mkdir(parents=True)
         for directory in ('bin', 'lib64/stubs'):
             (self.cuda / directory).mkdir(parents=True)
-        for name in ('bin/nvcc', 'lib64/stubs/libcuda.so'):
+        for name in ('bin/nvcc', 'lib64/stubs/libcuda.so', 'EULA.txt'):
             (self.cuda / name).write_text('fixture')
         for name in ('apps/ninfer-multicall', 'bench/ninfer_bench'):
             (self.build / name).write_text('binary fixture')
@@ -52,7 +52,7 @@ class LinuxPackageTest(unittest.TestCase):
                       patch.object(Path, 'read_text', read_text),
                       patch.object(PACKAGE, 'output', self.output),
                       patch.object(PACKAGE, 'run', self.run_command),
-                      patch.object(PACKAGE, 'runtime_packages', return_value={'libc6:amd64', 'libcublas-13-4'})]
+                      patch.object(PACKAGE, 'runtime_packages', return_value={'libc6:amd64'})]
         for item in self.stack:
             item.start()
             self.addCleanup(item.stop)
@@ -60,6 +60,8 @@ class LinuxPackageTest(unittest.TestCase):
     def output(self, *args, **kwargs):
         if args[0] == 'git':
             return 'a' * 40 if 'rev-parse' in args else ''
+        if args[0] == 'ldd':
+            return 'libc.so.6 => /usr/lib/libc.so.6 (0x1)'
         if args[0] == 'getconf':
             return 'glibc 2.41'
         if args[0].endswith('/nvcc'):
@@ -69,7 +71,7 @@ class LinuxPackageTest(unittest.TestCase):
         raise AssertionError(args)
 
     def run_command(self, *args, **kwargs):
-        if args[0] == 'strip':
+        if args[0] in ('strip', 'patchelf'):
             return
         if args[-1] == '--help':
             if self.help_failure:
@@ -114,14 +116,14 @@ class DependencyTest(unittest.TestCase):
     def test_unresolved_library_is_rejected(self):
         with patch.object(PACKAGE, 'output', return_value='libavcodec.so.61 => not found'):
             with self.assertRaisesRegex(RuntimeError, 'Unresolved libraries'):
-                PACKAGE.runtime_packages(Path('/binary'), {}, Path('/stub'))
+                PACKAGE.runtime_packages(Path('/binary'), {}, Path('/stub'), Path('/cuda'), Path('/bundle'))
 
     def test_unowned_library_is_rejected(self):
         with patch.object(PACKAGE, 'output', return_value='libavcodec.so.61 => /unowned/libavcodec.so.61 (0x1)'), \
              patch.object(PACKAGE.subprocess, 'run') as run:
             run.return_value.returncode = 1
             with self.assertRaisesRegex(RuntimeError, 'No Debian package owns'):
-                PACKAGE.runtime_packages(Path('/binary'), {}, Path('/stub'))
+                PACKAGE.runtime_packages(Path('/binary'), {}, Path('/stub'), Path('/cuda'), Path('/bundle'))
 
 
 if __name__ == '__main__':
