@@ -59,6 +59,12 @@ struct ExecutorOptions {
     // How the sparse-attention layers store their paged KV: any storage kv_cache_append writes
     // for two heads of 256.
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    // Positions of each sparse-attention layer's KV a sequence keeps in device memory; 0 keeps
+    // all of them. Fewer than max_context streams those layers (ops/kv_stream.h): their paged KV
+    // lives in pinned host memory, and the device keeps that many positions' blocks (at least
+    // what one decode or verification call reads), the ones the indexer selected most recently.
+    // A prompt chunk reads one layer's KV from a staging copy on the device.
+    std::uint32_t kv_resident = 0;
     // MTP drafts per speculative round (1..15), for a model loaded with its MTP block; 0 runs
     // without speculation.
     std::uint32_t draft_tokens = 0;
@@ -82,7 +88,11 @@ struct ExecutorMemory {
     std::uint64_t state_bytes        = 0;
     std::uint64_t workspace_bytes    = 0;
     std::uint64_t expert_cache_bytes = 0;
-    std::uint64_t kv_bytes = 0; // the sparse-attention layers' KV and scale pages, in state_bytes
+    // The sparse-attention layers' KV and scale pages on the device (a streamed layer's pool), in
+    // state_bytes, and a streamed layer's pinned host copies.
+    std::uint64_t kv_bytes      = 0;
+    std::uint64_t host_kv_bytes = 0;
+    bool streamed_kv            = false;
     std::vector<Rank> ranks; // by device rank
 };
 

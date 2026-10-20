@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "product/kv_resident_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
@@ -210,7 +211,8 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); alias --vram-headroom-mib\n"
            "  --kv-dtype T                  KV storage: bf16 (default), int8, fp8, rk8v4,\n"
-           "                                rk4v4, rk4v4-e8, rk2v4-e8, nvfp4 or k8v4\n"
+           "                                rk4v4, rk4v4-e8, rk2v4-e8, nvfp4 or k8v4\n" +
+           std::string(product::kKvResidentHelp) +
            "\n"
            "CONTEXT CACHE\n"
            "  The hybrid prefix cache is the default. Pipeline --devices, --no-prefix-reuse,\n"
@@ -335,8 +337,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                artifact and KV format, and save it there when\n"
            "                                the server stops (Ctrl+C twice) (default off)\n"
            "\n"
-           "SPECULATIVE DECODING (off by default)\n"
-           "  --spec mtp|dflash|dflash2     speculative decoding backend\n"
+           "SPECULATIVE DECODING\n"
+           "  --spec none|mtp|dflash|dflash2\n"
+           "                                speculative decoding backend (default: mtp with 3\n"
+           "                                drafts for Flash-Next and Gemma 4 host or disk\n"
+           "                                experts whose artifact has the drafter, else none)\n"
            "  --draft-tokens N              drafts per round, 1..15\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0)\n"
            "  --lm-head-draft               draft with the optimized proposal head, which\n"
@@ -568,6 +573,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool host_cache_reserve_explicit  = false;
     bool long_anchor_spacing_explicit = false;
     bool ngram_width_explicit         = false;
+    bool spec_explicit                = false;
     bool vision_max_merged_explicit   = false;
     std::optional<std::size_t> kv_headroom_mib;
     // Last flag seen that belongs to only one prefix-cache mode, for the cross-mode error.
@@ -1088,6 +1094,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                               [&] { return require_value(arg.c_str()); })) {
             continue;
         }
+        if (product::parse_kv_resident_option(arg, options.kv_resident_positions,
+                                              [&] { return require_value(arg.c_str()); })) {
+            continue;
+        }
         if (arg == "--stage-layers") {
             options.stage_layers = parse_stage_layers(require_value("--stage-layers"));
             continue;
@@ -1099,6 +1109,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
+            spec_explicit = true;
             continue;
         }
         if (arg == "--draft-tokens") {
@@ -1721,6 +1732,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             "--unconstrained-response-format conflicts with --structured-output");
     }
     product::apply_default_ngram_draft_tokens(options.speculative, ngram_width_explicit);
+    product::apply_automatic_speculation(options.speculative, spec_explicit);
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_residency != VisionResidency::Resident && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay or cpu requires --vision");

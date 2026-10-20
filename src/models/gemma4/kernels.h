@@ -224,6 +224,12 @@ void route_select(const float* x, int hidden, int tokens, const float* router,
 // out[p][r] = bf16(gelu_tanh(x[p][r]) * x[p][width + r]) for pairs p of [2 * width] FP32 rows.
 void geglu_rows(const float* x, int pairs, int width, __nv_bfloat16* out, cudaStream_t stream);
 
+// sums[i] += products[i] for i < n when *flag is nonzero: the 2^-32 fixed-point sums of the
+// routed experts the CPU computed for a call (ExpertDelivery), added as the expert kernels add
+// theirs, modulo 2^64.
+void add_fixed(unsigned long long* sums, const void* products, const std::int32_t* flag,
+               std::int64_t n, cudaStream_t stream);
+
 // The block's FFN output into the residual:
 //   y    = rms_norm(dense) * w_dense            (w_dense null: y = dense, a dense model)
 //   y   += rms_norm(moe) * w_moe                (moe absent in a dense model)

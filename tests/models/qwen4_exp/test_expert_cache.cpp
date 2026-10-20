@@ -1,10 +1,15 @@
-// The expert cache must never change what a kernel reads: after any sequence of routes, rebalances,
+// The expert cache must never change what a kernel reads: after any sequence of routes, rounds,
 // admissions and growth, every table entry points either at the expert's bytes in the pinned host
 // block or at a device slot holding the same bytes, a cached down matrix followed by zeros (the
-// expert matrix kernel reads past a down row's end). It must also admit the experts a layer routes
-// to most, keep within its slots, give every layer the same number of slots, take on an admission
-// the least recently used slot not in use of the lowest frequency tier, and count a fresh
-// admission's routes as misses.
+// expert matrix kernel reads past a down row's end). Its rounds must fill free slots with the
+// experts decode routes most and swap a much more routed expert for a cold one, with the victim's
+// entries back on the host at once and the candidate's moved only once its copy has landed; prompt
+// routes must not steer them. A routing profile must size each layer's share of the slots and fill
+// them. An admission takes a free slot, else the coldest expert its call does not route when the
+// newcomer's count beats it, and counts the newcomer's routes in that call as misses. Lent buffers
+// are free slots until a wide pass reclaims them: their most routed experts move into colder slots
+// of the cache's own, no entry points inside them while the pass writes them, and they come back
+// zeroed for the next admissions.
 #include "core/arena.h"
 #include "core/device.h"
 #include "models/qwen4_exp/expert_cache.h"
@@ -52,15 +57,16 @@ struct Bank {
     }
 
     // Every entry's bytes equal the expert's, and `tail` zero bytes follow a cached one; returns
-    // how many entries point at device memory.
-    int verify(const std::string& label, std::size_t tail = 0) const {
+    // the experts whose entries point at device memory.
+    std::vector<int> verify(const std::string& label, std::size_t tail = 0) const {
+        require(cudaDeviceSynchronize() == cudaSuccess, label + ": the device failed");
         std::vector<const void*> entries(kExperts);
         table.copy_to_host(entries.data(), entries.size() * sizeof(void*));
-        int cached = 0;
+        std::vector<int> cached;
         std::vector<std::uint8_t> bytes_read(static_cast<std::size_t>(bytes) + tail);
         for (int e = 0; e < kExperts; ++e) {
             if (entries[e] == pointers[e]) { continue; }
-            ++cached;
+            cached.push_back(e);
             require(cudaMemcpy(bytes_read.data(), entries[e], bytes_read.size(),
                                cudaMemcpyDeviceToHost) == cudaSuccess,
                     label + ": a cached entry is not readable");
@@ -74,158 +80,260 @@ struct Bank {
     }
 };
 
-int run() {
-    DeviceContext device;
-    std::mt19937 random(9100u);
-    // Two layers; their banks have different expert sizes, as mixed block types do.
-    Bank g0(4096, random), u0(4096, random), d0(2048, random);
-    Bank g1(1536, random), u1(3072, random), d1(1024, random);
-    std::vector<ExpertCacheLayer> layers = {
-        {.rank = 0, .stream = device.stream, .gate = g0.view(), .up = u0.view(), .down = d0.view()},
-        {.rank = 0, .stream = device.stream, .gate = g1.view(), .up = u1.view(), .down = d1.view()},
-    };
-    // 2 * 102,400 bytes over slots of 4096 + 4096 + 2304 bytes for layer 0 and 1536 + 3072 + 1280
-    // for layer 1 (each down followed by its 256 zero bytes, aligned): 16,384 bytes a slot pair,
-    // so twelve slots each.
-    const std::vector<std::uint64_t> budget = {2 * 102400};
-    ExpertCache cache(device, layers, budget);
-    const auto slots = cache.stats().slots;
-    require(slots == 12 + 12,
-            "every layer gets the same number of slots: " + std::to_string(slots));
+// Two layers whose banks have different expert sizes, as mixed block types do: slots of 4096 +
+// 4096 + 2304 bytes for layer 0 and 1536 + 3072 + 1280 for layer 1 (each down followed by its 256
+// zero bytes, aligned), 16,384 bytes a slot pair.
+struct Model {
+    std::mt19937 random{9100u};
+    Bank g0{4096, random}, u0{4096, random}, d0{2048, random};
+    Bank g1{1536, random}, u1{3072, random}, d1{1024, random};
 
-    // Layer 0 routes heavily to experts 5 and 7; layer 1 spreads.
+    std::vector<ExpertCacheLayer> layers(const DeviceContext& device) const {
+        return {
+            {.rank = 0, .stream = device.stream, .gate = g0.view(), .up = u0.view(), .down = d0.view()},
+            {.rank = 0, .stream = device.stream, .gate = g1.view(), .up = u1.view(), .down = d1.view()},
+        };
+    }
+
+    // The experts layer `l` caches, after checking that its three banks agree and hold their bytes.
+    std::vector<int> cached(int l, const std::string& label) const {
+        const Bank* banks[3] = {l == 0 ? &g0 : &g1, l == 0 ? &u0 : &u1, l == 0 ? &d0 : &d1};
+        const auto gate = banks[0]->verify(label + " gate");
+        require(banks[1]->verify(label + " up") == gate && banks[2]->verify(label + " down", 256) == gate,
+                label + ": a layer's three banks cache the same experts");
+        return gate;
+    }
+};
+
+bool holds(const std::vector<int>& set, int expert) {
+    return std::find(set.begin(), set.end(), expert) != set.end();
+}
+
+// Rounds every four decode passes (the default tier).
+void rounds(DeviceContext& device) {
+    Model model;
+    ExpertCache cache(device, model.layers(device), std::vector<std::uint64_t>{2 * 102400});
+    require(cache.stats().slots == 12 + 12,
+            "without a profile every layer gets the same slots: " + std::to_string(cache.stats().slots));
+    const auto pass = [&](const std::vector<std::int32_t>& ids, bool learn) {
+        cache.observe(0, ids, learn);
+        cache.adapt();
+    };
+    // Layer 0 routes experts 5 and 7 forty times a pass and 0..39 once each.
     std::vector<std::int32_t> hot;
     for (int t = 0; t < 40; ++t) {
         hot.push_back(5);
         hot.push_back(7);
-        hot.push_back(t % kExperts);
+        hot.push_back(t);
     }
-    for (int round = 0; round < 6; ++round) {
-        cache.observe(0, hot, 40);
-        std::vector<std::int32_t> spread;
-        for (int i = 0; i < 120; ++i) { spread.push_back(int(random() % kExperts)); }
-        cache.observe(1, spread, 40);
-        cache.rebalance(round % 2 == 0 ? (1u << 20) : 30000);
-        device.synchronize();
-        const int cached0 = g0.verify("gate 0") + 0;
-        require(u0.verify("up 0") == cached0 && d0.verify("down 0", 256) == cached0,
-                "a layer's three banks cache the same experts");
-        require(cached0 <= 12, "layer 0 keeps within its slots");
-        const int cached1 = g1.verify("gate 1");
-        require(u1.verify("up 1") == cached1 && d1.verify("down 1", 256) == cached1,
-                "layer 1's banks agree");
-        require(cached1 <= 12, "layer 1 keeps within its slots");
-    }
-    std::vector<const void*> entries(kExperts);
-    g0.table.copy_to_host(entries.data(), entries.size() * sizeof(void*));
-    require(entries[5] != g0.pointers[5] && entries[7] != g0.pointers[7],
-            "the most routed experts are cached");
-    const auto stats = cache.stats();
-    require(stats.routes == 6 * 240 && stats.hits > 0 && stats.admitted > 0,
-            "the cache counts routes, hits and admissions");
+    for (int p = 0; p < 3; ++p) { pass(hot, true); }
+    require(model.cached(0, "before a round").empty(), "nothing enters before the first round");
+    pass(hot, true);
+    require(model.cached(0, "copies in flight").empty() && cache.cached(0, 0, 5) == nullptr,
+            "a candidate's entries stay on the host until its copy has landed");
+    require(cudaDeviceSynchronize() == cudaSuccess, "the round's copies");
+    pass({}, true);
+    const auto first = model.cached(0, "first round");
+    require(first.size() == 12 && holds(first, 5) && holds(first, 7),
+            "the round fills the free slots, the most routed experts first");
+    require(cache.cached(0, 0, 5) != nullptr, "a landed candidate is cached");
+    require(model.cached(1, "an idle layer").empty(), "a layer without routes takes nothing");
 
-    // Layer 1 admits on its own from now on: an admission takes the least recently used slot
-    // whose expert the call does not use, and the caller copies the expert in and patches the
-    // tables, as the expert misses do.
-    cache.hand_over(1);
-    const auto admit = [&](std::int32_t expert, const std::vector<std::uint32_t>& last_use,
-                           const std::vector<unsigned char>& in_use) {
-        ExpertCache::Admitted out;
-        if (!cache.admit(1, expert, last_use, in_use, out)) { return out; }
-        const Bank* banks[3] = {&g1, &u1, &d1};
-        for (int k = 0; k < 3; ++k) {
-            require(cudaMemcpy(out.slot[k], banks[k]->pointers[expert], banks[k]->bytes,
-                               cudaMemcpyHostToDevice) == cudaSuccess,
-                    "copy an admitted expert");
-            auto* table = static_cast<const void**>(banks[k]->table.p);
-            require(cudaMemcpy(table + expert, &out.slot[k], sizeof(void*),
-                               cudaMemcpyHostToDevice) == cudaSuccess,
-                    "patch an admitted entry");
-            if (out.victim >= 0) {
-                require(cudaMemcpy(table + out.victim, &out.victim_host[k], sizeof(void*),
-                                   cudaMemcpyHostToDevice) == cudaSuccess,
-                        "patch a victim entry");
-            }
+    // Experts 50..53 now route forty times a pass: the next round swaps them for four of the
+    // coldest held experts (routed four times), never for 5 or 7.
+    const std::vector<std::int32_t> fresh = [] {
+        std::vector<std::int32_t> ids;
+        for (int t = 0; t < 40; ++t) {
+            for (int e = 50; e < 54; ++e) { ids.push_back(e); }
         }
-        return out;
+        return ids;
+    }();
+    for (int p = 0; p < 3; ++p) { pass(fresh, true); }
+    const auto swapped = model.cached(0, "victims left");
+    require(swapped.size() == 8 && holds(swapped, 5) && holds(swapped, 7),
+            "the victims' entries return to the host at once: " + std::to_string(swapped.size()));
+    require(cudaDeviceSynchronize() == cudaSuccess, "the round's copies");
+    pass({}, true);
+    const auto second = model.cached(0, "second round");
+    require(second.size() == 12 && holds(second, 50) && holds(second, 53) && holds(second, 5),
+            "the candidates take the victims' slots");
+
+    // Prompt routes do not steer the rounds: expert 60, routed only by prompts, never enters.
+    const std::vector<std::int32_t> prompt(400, 60);
+    for (int p = 0; p < 8; ++p) { pass(prompt, false); }
+    require(cudaDeviceSynchronize() == cudaSuccess, "the rounds' copies");
+    pass({}, true);
+    require(!holds(model.cached(0, "prompt routes"), 60), "prompt routes are not counted");
+    const auto stats = cache.stats();
+    require(stats.admitted == 16 && stats.routes == 4 * 120 + 3 * 160 + 8 * 400,
+            "the cache counts routes and admissions");
+    cache.observe(0, std::vector<std::int32_t>{5, 7, 50, 60}, false);
+    require(cache.stats().hits == stats.hits + 3 && cache.stats().routes == stats.routes + 4,
+            "a route to a cached expert is a hit");
+}
+
+// Admits `expert` into layer `l` and copies it in and patches its entries, as the expert misses
+// do; the result's slot is null when the cache refused it.
+ExpertCache::Admitted admit(ExpertCache& cache, const Model& model, std::size_t l, std::int32_t expert,
+                            int pairs, const std::vector<unsigned char>& in_use) {
+    ExpertCache::Admitted out;
+    if (!cache.admit(l, expert, pairs, in_use, out)) { return out; }
+    const Bank* banks[3] = {l == 0 ? &model.g0 : &model.g1, l == 0 ? &model.u0 : &model.u1,
+                            l == 0 ? &model.d0 : &model.d1};
+    for (int k = 0; k < 3; ++k) {
+        require(cudaMemcpy(out.slot[k], banks[k]->pointers[expert], banks[k]->bytes,
+                           cudaMemcpyHostToDevice) == cudaSuccess,
+                "copy an admitted expert");
+        auto* table = static_cast<const void**>(banks[k]->table.p);
+        require(cudaMemcpy(table + expert, &out.slot[k], sizeof(void*), cudaMemcpyHostToDevice) ==
+                    cudaSuccess,
+                "patch an admitted entry");
+        if (out.victim >= 0) {
+            require(cudaMemcpy(table + out.victim, &out.victim_host[k], sizeof(void*),
+                               cudaMemcpyHostToDevice) == cudaSuccess,
+                    "patch a victim entry");
+        }
+    }
+    return out;
+}
+
+void loans(DeviceContext& device) {
+    Model model;
+    // Four slots a layer of the cache's own, and a buffer of four more a layer (and slack).
+    ExpertCache cache(device, model.layers(device), std::vector<std::uint64_t>{4 * 16384});
+    DeviceBuffer buffer(4 * 16384 + 1000);
+    cudaStream_t transfer = nullptr;
+    require(cudaStreamCreateWithFlags(&transfer, cudaStreamNonBlocking) == cudaSuccess, "a stream");
+    const auto lent = cache.lend(std::vector<ExpertCache::Loan>{{.rank = 0, .base = buffer.p, .bytes = buffer.bytes}});
+    require(lent.size() == 1 && lent[0] == 4 * 16384 && cache.stats().slots == 16,
+            "a lent buffer gives each layer the same free slots: " + std::to_string(cache.stats().slots));
+    const auto ranges = cache.storage(0);
+    const auto inside = [&](const void* at) {
+        const auto a = reinterpret_cast<std::uintptr_t>(at);
+        return a >= reinterpret_cast<std::uintptr_t>(buffer.p) &&
+               a < reinterpret_cast<std::uintptr_t>(buffer.p) + buffer.bytes;
     };
-    // Fill every free slot first, then evict by recency.
-    std::vector<std::uint32_t> last_use(kExperts, 0);
-    std::vector<std::int32_t> held;
-    for (int e = 0; e < kExperts; ++e) {
-        if (cache.cached(1, 0, e) != nullptr) { held.push_back(e); }
-    }
-    for (std::size_t i = 0; i < held.size(); ++i) { last_use[std::size_t(held[i])] = 100 + std::uint32_t(i); }
-    std::int32_t newcomer = 0;
-    while (cache.cached(1, 0, newcomer) != nullptr) { ++newcomer; }
+    require(ranges[2].second - ranges[2].first == 4 * 10496 && inside(reinterpret_cast<void*>(ranges[2].first)),
+            "layer 0's lent block lies in the buffer");
+    cache.hand_over(0);
     std::vector<unsigned char> in_use(kExperts, 0);
-    in_use[std::size_t(newcomer)] = 1;
-    in_use[std::size_t(held.front())] = 1; // the oldest is in use: the next oldest goes
-    const auto admitted = admit(newcomer, last_use, in_use);
-    require(admitted.slot[0] != nullptr, "an admission into a full layer finds a slot");
-    if (held.size() == 12) {
-        require(admitted.victim == held[1],
-                "the least recently used expert the call does not use leaves");
+    // Experts 0..3 take the cache's own slots, 4..7 the lent ones; expert e routes 5(e + 1) times.
+    for (std::int32_t e = 0; e < 8; ++e) {
+        const auto out = admit(cache, model, 0, e, 1, in_use);
+        require(out.slot[0] != nullptr && inside(out.slot[0]) == (e >= 4),
+                "the cache's own free slots come before the lent ones");
     }
-    require(cache.cached(1, 0, newcomer) == admitted.slot[0], "the newcomer is cached");
-    std::vector<std::int32_t> again(10, newcomer);
+    std::vector<std::int32_t> routes;
+    for (int e = 0; e < 8; ++e) { routes.insert(routes.end(), std::size_t(5 * (e + 1)), e); }
+    cache.observe(0, routes, true);
+    cache.adapt();
+    require(model.cached(0, "lent and filled").size() == 8, "eight slots hold their experts");
+
+    // A wide pass takes the buffer back: 4..7 move into the slots of 0..3, which leave.
+    cache.reclaim(0, transfer);
+    require(cudaStreamSynchronize(transfer) == cudaSuccess, "the handover");
+    const auto kept = model.cached(0, "reclaimed");
+    require(kept == std::vector<int>({4, 5, 6, 7}), "the most routed experts stay in the cache's own slots");
+    for (std::int32_t e = 4; e < 8; ++e) {
+        require(cache.cached(0, 0, e) != nullptr && !inside(cache.cached(0, 0, e)), "kept outside the buffer");
+    }
+    require(cudaMemsetAsync(buffer.p, 0xab, buffer.bytes, transfer) == cudaSuccess, "a wide pass writes it");
+    require(cudaStreamSynchronize(transfer) == cudaSuccess, "the wide pass");
+    require(model.cached(0, "written").size() == 4, "the buffer's writes reach no cached expert");
+    const auto refused = admit(cache, model, 0, 20, 1, in_use);
+    require(refused.slot[0] == nullptr || !inside(refused.slot[0]), "no admission into a reclaimed buffer");
+
+    // The next decode pass returns it: zeroed free slots that the next admissions take.
+    cache.give_back(0, transfer);
+    require(cudaStreamSynchronize(device.stream) == cudaSuccess, "the zeroing");
+    const auto again = admit(cache, model, 0, 9, 1, in_use);
+    require(again.slot[0] != nullptr && inside(again.slot[0]), "a returned slot takes a miss");
+    const auto after = model.cached(0, "returned");
+    require(holds(after, 9) && holds(after, 7), "returned slots hold their experts, followed by zeros");
+    cache.give_back(0, transfer);
+    require(cache.stats().slots == 16, "a second return changes nothing");
+    cudaStreamDestroy(transfer);
+}
+
+void admissions(DeviceContext& device) {
+    Model model;
+    ExpertCache cache(device, model.layers(device), std::vector<std::uint64_t>{2 * 102400});
+    // Layer 1 admits from now on: the caller copies the expert in and patches the tables, as the
+    // expert misses do.
+    cache.hand_over(1);
+    const auto admit = [&](std::int32_t expert, int pairs, const std::vector<unsigned char>& in_use) {
+        return ::admit(cache, model, 1, expert, pairs, in_use);
+    };
+    std::vector<unsigned char> in_use(kExperts, 0);
+    // Free slots take any miss.
+    for (std::int32_t e = 0; e < 12; ++e) {
+        const auto out = admit(e, 1, in_use);
+        require(out.slot[0] != nullptr && out.victim < 0, "a free slot takes a miss");
+    }
+    require(model.cached(1, "filled").size() == 12, "every free slot holds its expert");
+    const std::vector<std::int32_t> zeros(10, 0);
     const auto before = cache.stats();
-    cache.observe(1, again, 1);
-    require(cache.stats().hits == before.hits, "a fresh admission's routes are misses");
-    cache.observe(1, again, 1);
-    require(cache.stats().hits == before.hits + 10, "afterwards they are hits");
-    device.synchronize();
-    require(g1.verify("gate 1 admitted") <= 12 && d1.verify("down 1 admitted", 256) <= 12,
+    cache.observe(1, zeros, true);
+    require(cache.stats().hits == before.hits, "an admitted expert's routes in its call are misses");
+    // Expert e of 1..11 routed e times, expert 0 ten more: coldest first 1, 2, 3, ...
+    std::vector<std::int32_t> spread(zeros);
+    for (int e = 1; e < 12; ++e) { spread.insert(spread.end(), std::size_t(e), e); }
+    cache.observe(1, spread, true);
+    require(cache.stats().hits == before.hits + spread.size(), "afterwards they are hits");
+    cache.adapt(); // a pass ends: the tier ranks the held experts
+
+    const auto refused = admit(40, 2, in_use);
+    require(refused.slot[0] == nullptr && cache.cached(1, 0, 40) == nullptr,
+            "a newcomer that does not beat the coldest expert by the gain stays out");
+    in_use[1] = 1;
+    const auto taken = admit(41, 4, in_use);
+    require(taken.slot[0] != nullptr && taken.victim == 2,
+            "the coldest expert the call does not route leaves");
+    require(cache.cached(1, 0, 41) == taken.slot[0] && cache.cached(1, 0, 2) == nullptr,
+            "the newcomer holds the victim's slot");
+    const auto next = admit(42, 10, in_use);
+    require(next.victim == 3, "each victim leaves once; the next coldest follows");
+    const auto cached = model.cached(1, "admitted");
+    require(cached.size() == 12 && holds(cached, 41) && holds(cached, 42) && !holds(cached, 2) &&
+                !holds(cached, 3),
             "admitted slots hold their experts");
 
-    // Frequency outranks recency: once every route count has decayed, an expert routed often
-    // since stays although it was used longest ago, and the least recently used of the rest goes.
-    cache.observe(1, {}, 100000);
-    std::vector<std::int32_t> by_age;
-    for (int e = 0; e < kExperts; ++e) {
-        if (cache.cached(1, 0, e) != nullptr) { by_age.push_back(e); }
-    }
-    for (std::size_t i = 0; i < by_age.size(); ++i) {
-        last_use[std::size_t(by_age[i])] = 1000 + std::uint32_t(i);
-    }
-    cache.observe(1, std::vector<std::int32_t>(8, by_age.front()), 1);
-    std::int32_t third = 0;
-    while (cache.cached(1, 0, third) != nullptr) { ++third; }
-    std::fill(in_use.begin(), in_use.end(), 0);
-    in_use[std::size_t(third)] = 1;
-    const auto tiered = admit(third, last_use, in_use);
-    require(by_age.size() == 12 && tiered.victim == by_age[1],
-            "the least recently used expert of the lowest frequency tier leaves");
-    require(cache.cached(1, 0, by_age.front()) != nullptr, "the often routed expert stays");
-
     // Growth after startup: both layers gain the same number of free slots in a second block,
-    // which the next admissions and rebalances fill.
-    const auto ranges_before = cache.storage(0);
+    // which the next admissions fill.
+    const auto ranges_before = cache.storage(1);
     require(ranges_before[1].first == ranges_before[1].second, "no second block before growth");
     const auto added = cache.grow(std::vector<std::uint64_t>{4 * 16384});
     require(added.size() == 1 && added[0] == 4 * 16384 && cache.stats().slots == 24 + 8,
             "growth gives each growing layer the same slots: " + std::to_string(cache.stats().slots));
     const auto ranges_after = cache.storage(1);
     require(ranges_after[1].second - ranges_after[1].first == 4 * 5888, "layer 1's second block");
-    std::int32_t next = 0;
-    while (cache.cached(1, 0, next) != nullptr) { ++next; }
     std::fill(in_use.begin(), in_use.end(), 0);
-    const auto grown = admit(next, last_use, in_use);
+    const auto grown = admit(43, 1, in_use);
     const auto at    = reinterpret_cast<std::uintptr_t>(grown.slot[0]);
     require(grown.victim < 0 && at >= ranges_after[1].first && at < ranges_after[1].second,
             "a grown layer admits into a free slot of its second block");
-    for (int round = 0; round < 4; ++round) {
-        cache.observe(0, hot, 40);
-        cache.rebalance(1u << 20);
-    }
-    device.synchronize();
-    const int cached0 = g0.verify("gate 0 grown");
-    require(cached0 <= 16 && u0.verify("up 0 grown") == cached0 &&
-                d0.verify("down 0 grown", 256) == cached0,
-            "a grown rebalancing layer stays consistent");
-    require(g1.verify("gate 1 grown") <= 16 && d1.verify("down 1 grown", 256) <= 16,
-            "a grown handed-over layer stays consistent");
-    return 0;
+    require(model.cached(1, "grown").size() == 13, "the grown layer stays consistent");
+}
+
+void profile(DeviceContext& device) {
+    Model model;
+    // Layer 0 routed experts 0..7 a hundred times each, layer 1 experts 0..31 fifty times: the
+    // ranking gives layer 0 its eight slots (83,968 bytes) and layer 1 twenty of the rest.
+    std::vector<std::vector<std::uint64_t>> counts(2, std::vector<std::uint64_t>(kExperts, 0));
+    for (int e = 0; e < 8; ++e) { counts[0][std::size_t(e)] = 100; }
+    for (int e = 0; e < 32; ++e) { counts[1][std::size_t(e)] = 50; }
+    ExpertCache cache(device, model.layers(device), std::vector<std::uint64_t>{2 * 102400}, &counts);
+    require(cache.stats().slots == 8 + 20,
+            "a profile sizes each layer's share: " + std::to_string(cache.stats().slots));
+    cache.seed(counts);
+    const auto zero = model.cached(0, "seeded 0");
+    const auto one  = model.cached(1, "seeded 1");
+    require(zero.size() == 8 && holds(zero, 0) && holds(zero, 7), "seeding fills layer 0 by its counts");
+    require(one.size() == 20 && holds(one, 0) && holds(one, 19) && !holds(one, 20),
+            "seeding fills layer 1 with its most routed experts");
+    const auto stats = cache.stats();
+    require(stats.admitted == 28 && stats.copied_bytes == 8 * 10240 + 20 * 5632,
+            "seeding counts its copies");
 }
 
 } // namespace
@@ -237,7 +345,11 @@ int main() {
         return 77;
     }
     try {
-        run();
+        DeviceContext device;
+        rounds(device);
+        admissions(device);
+        profile(device);
+        loans(device);
         std::cout << "PASS qwen4_exp expert cache\n";
         return 0;
     } catch (const std::exception& error) {

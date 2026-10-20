@@ -5,11 +5,12 @@
 // from the device tables; the missing experts are posted to pinned host memory (one "doorbell" per
 // device) without any host synchronization, so the whole pass can replay as one CUDA graph. A host
 // thread picks the request up immediately and, for each missing expert, either copies it into a
-// device staging region by the copy engine, or has the CPU compute its pairs from the bytes in RAM
-// (host experts) or from the file (disk experts). The second stage of the layer waits for the
-// request on the GPU, then runs the staged experts and adds the CPU's products. The cache's own
-// tables never change here; the staged experts are reached through a second table that only the
-// second stage reads, so the resident stage needs no host at all.
+// device staging region (or, when the cache's expert tier admits it, straight into a slot) by the
+// copy engine, or has the CPU compute its pairs from the bytes in RAM (host experts) or from the
+// file (disk experts); an expert the CPU computes crosses no bus and takes no slot. The second
+// stage of the layer waits for the request on the GPU, then runs the staged experts and adds the
+// CPU's products. The staged experts are reached through a second table that only the second
+// stage reads, so the resident stage needs no host at all.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -42,11 +43,11 @@ struct MissLayer {
     };
     std::array<Projection, 3> projections;   // gate, up, down
     const void* const* gate_table = nullptr; // the device table the cached stage reads
-    // Device memory holding this layer's cached experts, up to two blocks: a gate entry inside
-    // either is resident.
+    // Device memory holding this layer's cached experts (ExpertCache::storage): a gate entry
+    // inside any of its blocks is resident.
     ExpertCache::Ranges resident{};
-    // Host experts whose layer the cache handed over: a missing expert is copied straight into
-    // the slot of the layer's least recently used expert (by the calls' own routes) and stays.
+    // Host experts whose layer the cache handed over: a missing expert the GPU copies anyway goes
+    // straight into a slot when the cache's tier admits it (ExpertCache::admit), and stays.
     bool admit = false;
 };
 
@@ -56,7 +57,7 @@ struct MissOptions {
     // Instead of a fixed share, each request gives the CPU the experts that make its copies and
     // its CPU products end soonest, by times fitted to the earlier requests.
     bool cpu_balance             = false;
-    std::uint32_t cpu_threads    = 0;    // 0: half the usable logical CPUs less two, at most 16
+    std::uint32_t cpu_threads    = 0;    // 0: one per physical core (pool_cpu_count())
     std::uint64_t staging_bytes  = 128ULL << 20; // device staging per rank, two halves
     // 1..9: a call leaves out each missing expert that all its tokens rank past this many places
     // of their top ten (lossy); 0 serves every miss.
@@ -68,7 +69,7 @@ struct MissStats {
     std::uint64_t staged      = 0; // experts copied to device staging or straight into slots
     std::uint64_t mapped      = 0; // experts the GPU read across the bus (staging full)
     std::uint64_t computed    = 0; // experts the CPU computed
-    std::uint64_t admitted_behind = 0; // of them, copied into slots behind their call
+    std::uint64_t admitted    = 0; // of the staged, copied straight into cache slots
     std::uint64_t cpu_pairs   = 0;
     std::uint64_t staged_bytes = 0;
     double service_seconds     = 0; // host time from a request to its readiness, summed
@@ -114,18 +115,12 @@ public:
     // GPU with its missing experts left out, so a pass checks this once it has completed, before
     // anything it computed is used.
     void raise_failure();
-    // Enqueued before a pass on each rank's stream: waits for the slots taken behind earlier calls
-    // (the CPU experts' admissions), which the pass's tables may already point at. Call it only
-    // once the earlier passes were served (they are synchronized; see the executor's pass()).
-    void fence(cudaStream_t stream, std::size_t rank);
-    // Enqueued after a pass on each rank's stream: brings the calls' recency stamps to the host,
-    // where the next pass's admissions read them.
-    void publish(cudaStream_t stream, std::size_t rank);
     // The layer's cached blocks changed (the cache grew); the device copy the kernels read follows.
     void set_resident(std::size_t layer, const ExpertCache::Ranges& resident);
     [[nodiscard]] MissStats stats() const;
     [[nodiscard]] bool cpu_enabled() const noexcept;
-    // With a CPU share: its threads and vector backend, e.g. "14 threads, avx2"; else empty.
+    // With a CPU share: its threads and vector backend, e.g. "15 pinned threads, avx2"; else
+    // empty.
     [[nodiscard]] std::string cpu_description() const;
 
 private:

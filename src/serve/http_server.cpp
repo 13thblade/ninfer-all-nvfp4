@@ -790,8 +790,9 @@ void HttpServer::handle_slots(const httplib::Request& req, httplib::Response& re
         return;
     }
     GenerationService& service = lease.service();
+    // The Engine's resolved backend: without --spec it may draft (SpeculativeOptions::automatic).
     const bool speculative =
-        service.options().speculative.backend != ninfer::SpeculativeBackend::None;
+        service.engine_options().speculative.backend != ninfer::SpeculativeBackend::None;
     const std::uint32_t context                 = service.options().max_context;
     const std::vector<ninfer::SlotState> states = service.slot_states();
     nlohmann::json slots                        = nlohmann::json::array();
@@ -1042,7 +1043,8 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
     const nlohmann::json props = {
         {"default_generation_settings",
          {{"n_ctx", facts.capacity.max_context},
-          {"speculative", options.speculative.backend != ninfer::SpeculativeBackend::None},
+          {"speculative",
+           service.engine_options().speculative.backend != ninfer::SpeculativeBackend::None},
           {"params", std::move(params)}}},
         {"total_slots", facts.capacity.max_concurrency},
         {"model_alias", lease.model()},

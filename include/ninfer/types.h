@@ -87,6 +87,8 @@ enum class KvCapacityMode : std::uint8_t {
 };
 
 inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
+// Flash-Next's default for EngineOptions::kv_resident_positions with host or disk experts.
+inline constexpr std::uint32_t kDefaultKvResidentPositions = 32768;
 
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
@@ -155,6 +157,13 @@ struct SpeculativeOptions {
     // its query instead of the whole history; target verification keeps full attention, so the
     // committed tokens do not depend on it. Zero reads the whole history.
     std::uint32_t mtp_attention_window = 0;
+    // The backend was left to the Engine (no --spec): a MoE model with host or disk experts whose
+    // artifact carries its MTP block or assistant (Qwen3.8-Flash-Next, Gemma 4) drafts with it,
+    // kAutomaticDraftTokens a round, since a verification window's routes share the layer's
+    // missing experts; others run without drafts. The Engine's options() report the resolved
+    // backend.
+    bool automatic = false;
+    static constexpr std::uint32_t kAutomaticDraftTokens = 3;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -507,11 +516,12 @@ enum class ExpertResidency : std::uint8_t {
 // compute the rest: for GGUF banks the GPU's results bit for bit, for native banks different
 // numerical results (and concurrency one).
 struct HybridExpertOptions {
-    float dma_share = 1; // 0..1 of distinct uncached experts per decode/verify call
-    // GGUF experts: each call splits its misses between copies and the CPU by measured speeds
-    // instead of a fixed share (dma_share is then unused).
-    bool dma_share_auto = false;
-    std::uint32_t cpu_threads = 0; // automatic, or 1..256
+    // Host or disk experts: the share 0..1 of a decode or verification call's missing experts the
+    // GPU copies; the CPU computes the rest. Unset (default): where the CPU's products are the
+    // GPU's bit for bit (GGUF experts), each call splits its misses by measured CPU and bus times;
+    // other experts copy every miss.
+    std::optional<float> dma_share;
+    std::uint32_t cpu_threads = 0; // automatic (one per physical core, half the CPUs), or 1..256
     // GGUF banks: copy missing experts into device staging while the cached ones run (staged), or
     // let the expert kernels read host experts across the bus (mapped; host experts only).
     bool mapped_misses = false;
@@ -599,6 +609,12 @@ struct EngineOptions {
     HybridExpertOptions hybrid_experts;
     // Qwen3.8-Flash-Next only.
     NgramTableOptions ngram_table;
+    // Qwen3.8-Flash-Next only: positions of each sparse-attention layer's KV a sequence keeps in
+    // device memory. A longer context streams those layers: their KV lives in pinned host memory
+    // and the device keeps the blocks the indexer selected most recently, which leaves the rest
+    // of the device memory to the expert cache. Unset: kDefaultKvResidentPositions with host or
+    // disk experts, every position with device experts; 0 keeps every position.
+    std::optional<std::uint32_t> kv_resident_positions;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     // Past the model's native window (max_position_embeddings), up to four times it: positions run
     // unscaled RoPE, or with rope_yarn the whole window takes Qwen's YaRN at factor

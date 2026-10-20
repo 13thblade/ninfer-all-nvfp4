@@ -14,6 +14,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "models/expert_profile.h"
 #include "models/gemma4/kv_format.h"
 #include "models/gemma4/model.h"
 
@@ -23,6 +24,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace ninfer::models::gemma4 {
@@ -50,6 +52,14 @@ struct ExecutorOptions {
     // One checkpoint of every sequence's rings (snapshot/restore), allocated with the caches.
     bool checkpoints = true;
     std::optional<std::uint64_t> expert_cache_bytes;
+    // Host or disk experts: the cache's first contents, the most routed of these counts
+    // ([expert layer][expert]) once warm-up is done; none leaves the cache empty then.
+    std::optional<ExpertRouteCounts> expert_profile;
+    // The share 0..1 of a decode or verification call's missing experts the GPU copies; the CPU
+    // computes the rest (cpu_experts.h). Unset: each call splits its misses by measured CPU and
+    // bus times. CPU threads: 0 for one per physical core.
+    std::optional<float> expert_dma_share;
+    std::uint32_t expert_cpu_threads = 0;
 };
 
 // One media item's units in a prompt chunk: consecutive units (an image, or frames of a video) of
@@ -67,6 +77,10 @@ struct ChunkMedia {
 
 struct ExecutorMemory {
     std::uint64_t kv_bytes        = 0;
+    // Beside an elastic expert cache, the full-attention caches grow with their sequences: the
+    // bytes backed now, of kv_bytes at most.
+    std::uint64_t kv_backed_bytes = 0;
+    bool kv_grows                 = false;
     std::uint64_t workspace_bytes = 0;
     // A device vision tower: the scratch of one encode within workspace_bytes, and the device bytes
     // the tower owns beside the model's weights (the streamed window and its resident copies).
@@ -102,6 +116,7 @@ public:
 
     [[nodiscard]] const ExecutorOptions& options() const noexcept;
     [[nodiscard]] ExecutorMemory memory() const noexcept;
+    // Position 0; growing caches give the sequence's rows back (ExecutorMemory::kv_grows).
     void reset(std::uint32_t sequence);
     [[nodiscard]] std::uint32_t position(std::uint32_t sequence) const;
     // Loads the kernels every route reaches, and captures the decode graphs.
@@ -109,6 +124,11 @@ public:
     // Check after a stream completion and before output publication.
     void check_experts() const;
     [[nodiscard]] ExpertDeliveryStats expert_stats() const;
+    // Every route the decode and verification calls took through each expert layer's experts
+    // since warm-up, the form a recorded routing profile takes.
+    [[nodiscard]] ExpertRouteCounts expert_totals() const;
+    // The CPU's share of missing experts: its threads and backend, or empty without one.
+    [[nodiscard]] std::string expert_cpu_description() const;
     // Runs up to prefill_chunk tokens at the sequence's next positions and leaves the logits of the
     // last `logit_rows` (at most kMaxLogitRows) in logits(). The soft tokens of `media` take the
     // place of their rows' placeholder embeddings, and with the vision config's bidirectional

@@ -10,6 +10,7 @@ set(ninfer_op_tests
   ngram_rows
   qsa_indexer
   sparse_attention
+  kv_stream
   moe_route
   moe_experts
   moe_experts_gguf

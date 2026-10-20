@@ -35,6 +35,7 @@ struct Options {
     std::optional<std::uint64_t> expert_cache_bytes;
     ninfer::HybridExpertOptions hybrid_experts;
     ninfer::NgramTableOptions ngram_table;
+    std::optional<std::uint32_t> kv_resident_positions; // Flash-Next: --kv-resident
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

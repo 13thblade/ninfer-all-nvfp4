@@ -45,8 +45,8 @@ ninfer_add_test(ninfer_qwen4_exp_expert_cache_test
   LIBRARIES ninfer_model_runtime)
 set_tests_properties(ninfer_qwen4_exp_expert_cache_test PROPERTIES SKIP_RETURN_CODE 77)
 
-ninfer_add_test(ninfer_qwen4_exp_expert_profile_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_profile.cpp"
+ninfer_add_test(ninfer_expert_profile_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_profile.cpp"
   LIBRARIES ninfer_model_runtime)
 
 ninfer_add_test(ninfer_qwen4_exp_ngram_draft_prefetch_test

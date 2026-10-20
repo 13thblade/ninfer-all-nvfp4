@@ -126,15 +126,13 @@ void slice_dequantize(const void* weight, std::int64_t row_bytes, int k, const s
 template <ggml_type type>
 void vec_launch(const VecArgs& args, int columns, bool fused, cudaStream_t stream);
 
-// SiLU from correctly rounded operations (ops/common/silu.h): the CPU's GGUF expert products
-// compute the same bits.
+// SiLU and the tanh-approximated GELU from correctly rounded operations (ops/common/silu.h): the
+// CPU's GGUF expert products compute the same bits.
 __device__ __forceinline__ float vec_silu(float x) { return ops::silu(x); }
 
 // GateActivation: 0 SiLU, 1 tanh-approximated GELU.
 __device__ __forceinline__ float vec_gate(float x, int activation) {
-    if (activation == 0) { return vec_silu(x); }
-    const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-    return 0.5f * x * (1.0f + tanhf(inner));
+    return activation == 0 ? vec_silu(x) : ops::gelu_tanh(x);
 }
 
 __device__ __forceinline__ void vec_store(const VecStore& out, int row, int column, float value) {

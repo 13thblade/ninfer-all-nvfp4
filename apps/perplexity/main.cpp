@@ -7,6 +7,7 @@
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
+#include "product/kv_resident_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/rope_yarn_options.h"
@@ -60,6 +61,7 @@ struct Options {
     std::optional<std::uint64_t> expert_cache_bytes;
     ninfer::HybridExpertOptions hybrid_experts;
     ninfer::NgramTableOptions ngram_table;
+    std::optional<std::uint32_t> kv_resident;
 #if defined(NINFER_SM8X_COMPAT)
     // FP8 E4M3 KV attention has no SM86 implementation, so the upstream default would fail at
     // engine construction on this fork. INT8 group-64 is the qualified quantized profile here.
@@ -96,7 +98,8 @@ std::string usage_text() {
            "       [--expert-prefill-buffers 1|2]\n"
            "       [--ngram-table PATH] [--ngram-residency disk|ram|ram-hot] [--ngram-lock]\n"
            "       [--ngram-io buffered|direct|mmap] [--ngram-io-depth N] [--ngram-ram-mib N]\n"
-           "       [--ngram-hot-profile PATH] [--no-ngram-table]   (Qwen3.8-Flash-Next)\n"
+           "       [--ngram-hot-profile PATH] [--no-ngram-table]\n"
+           "       [--kv-resident N|all|auto]   (Qwen3.8-Flash-Next)\n"
            "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4] [--output "
            "<directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -229,6 +232,8 @@ Options parse_options(int argc, char** argv) {
                        option, out.hybrid_experts, [&] { return value(option.data()); })) {
         } else if (ninfer::product::parse_ngram_table_option(
                        option, out.ngram_table, [&] { return value(option.data()); })) {
+        } else if (ninfer::product::parse_kv_resident_option(
+                       option, out.kv_resident, [&] { return value(option.data()); })) {
         } else if (option == "--rope-yarn") {
             out.rope_yarn = true;
         } else if (option == "--rope-yarn-factor") {
@@ -369,6 +374,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.expert_cache_bytes            = options.expert_cache_bytes;
     engine_options.hybrid_experts                = options.hybrid_experts;
     engine_options.ngram_table                   = options.ngram_table;
+    engine_options.kv_resident_positions         = options.kv_resident;
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
     engine_options.lm_head_q4       = options.lm_head_q4;

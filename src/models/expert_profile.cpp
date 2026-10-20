@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/expert_profile.h"
+#include "models/expert_profile.h"
 
 #include <nlohmann/json.hpp>
 
@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::models::qwen4_exp {
+namespace ninfer::models {
 namespace {
 std::string identity(const artifact::ArtifactId& artifact) {
     constexpr char hex[] = "0123456789abcdef";
@@ -17,6 +17,16 @@ std::string identity(const artifact::ArtifactId& artifact) {
     }
     return out;
 }
+
+// A built-in profile: its family, its layers' bank widths and their counts, layer after layer.
+struct Builtin {
+    std::string_view family;
+    std::span<const std::uint16_t> widths;
+    std::span<const std::uint32_t> counts;
+};
+
+#include "models/expert_profiles/builtin.inc"
+
 } // namespace
 
 ExpertRouteCounts read_expert_profile(const std::filesystem::path& path,
@@ -54,4 +64,25 @@ void write_expert_profile(const std::filesystem::path& path,
     if (!file) { throw std::runtime_error("cannot write expert profile " + path.string()); }
 }
 
-} // namespace ninfer::models::qwen4_exp
+std::optional<ExpertRouteCounts> builtin_expert_profile(std::string_view family,
+                                                        std::span<const std::size_t> experts) {
+    for (const Builtin& profile : kBuiltinProfiles) {
+        if (profile.family != family || profile.widths.size() != experts.size()) { continue; }
+        bool same = true;
+        for (std::size_t layer = 0; layer < experts.size(); ++layer) {
+            same = same && profile.widths[layer] == experts[layer];
+        }
+        if (!same) { continue; }
+        ExpertRouteCounts out(experts.size());
+        std::size_t at = 0;
+        for (std::size_t layer = 0; layer < experts.size(); ++layer) {
+            out[layer].assign(profile.counts.begin() + std::ptrdiff_t(at),
+                              profile.counts.begin() + std::ptrdiff_t(at + experts[layer]));
+            at += experts[layer];
+        }
+        return out;
+    }
+    return std::nullopt;
+}
+
+} // namespace ninfer::models

@@ -1,7 +1,10 @@
 #include "models/gemma4/executor.h"
 
 #include "core/decode_graph.h"
+#include "core/growable_region.h"
+#include "core/vmm.h"
 #include "core/weight_view.h"
+#include "models/gemma4/cpu_experts.h"
 #include "models/gemma4/kernels.h"
 #include "models/gemma4/vision.h"
 #include "models/gemma4/vision_kernels.h"
@@ -16,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -23,6 +27,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -71,6 +76,34 @@ std::int64_t row_bytes(const Weight& w) {
     return std::int64_t(w.k / block.elements) * block.bytes;
 }
 
+// A context-sized cache plane: rows of `row_bytes`, `rows` of them for each owner (a sequence's
+// KV heads; the prompt chunk's scratch has one owner), `position_bytes` a position. Owned whole,
+// or, beside an elastic expert cache, a growable region whose rows are backed only as far as their
+// owner has reached (Impl::back), so the expert cache holds the rest of the device until then.
+struct KvArea {
+    DeviceBuffer owned;
+    GrowableRegion region;
+    void* p = nullptr;
+    std::size_t bytes = 0, row_bytes = 0, position_bytes = 0;
+    int rows = 0;
+    std::vector<std::uint32_t> backed; // positions backed, by owner
+
+    KvArea() = default;
+    KvArea(std::size_t owners, int rows_per_owner, std::size_t row, std::size_t position,
+           bool growing, int device)
+        : bytes(owners * std::size_t(rows_per_owner) * row), row_bytes(row), position_bytes(position),
+          rows(rows_per_owner), backed(owners, 0) {
+        if (growing) {
+            region = GrowableRegion(bytes, {.device = device});
+            p      = region.data();
+        } else {
+            owned = DeviceBuffer(bytes);
+            owned.fill(0);
+            p = owned.p;
+        }
+    }
+};
+
 struct LayerPlan {
     bool full    = false;
     int head_dim = 0, kv_heads = 0, qkv_rows = 0;
@@ -89,12 +122,14 @@ struct LayerPlan {
     DeviceBuffer tables; // pointers: [E] gate, [E] up, [E] gate_up, [E] down
     // The F16 K/V cache: [sequences][kv heads][slots][D]. A full-attention block (K = V) keeps
     // V only, and its keys are derived from it where they are read.
-    DeviceBuffer k, v;
+    DeviceBuffer k;
+    KvArea v;
     int slots = 0, ring = 0;
     std::int64_t seq_stride = 0, head_stride = 0; // elements of an F16 cache (and of its staging)
     // A quantized cache (kv_format.h) in place of k and v: the key plane (sliding blocks) and the
     // value plane, codes and scales [sequences][kv heads][slots][row bytes].
-    DeviceBuffer k_codes, k_scales, v_codes, v_scales;
+    DeviceBuffer k_codes, k_scales;
+    KvArea v_codes, v_scales;
     kernels::KvPlaneView kq, vq;
     // A sliding block's checkpoint of every sequence's rings (snapshot()), allocated with the cache:
     // one buffer per ring buffer above (F16: K, V; quantized: K codes, K scales, V codes, V scales).
@@ -137,14 +172,25 @@ struct Executor::Impl {
     // (staging_k/v), while each sequence keeps only its last `ring` (the window) positions.
     int prefill_ring = 0;
     DeviceBuffer staging_k, staging_v;
-    DeviceBuffer derived_keys; // a prompt chunk's full-attention keys: [kv heads][slots][D]
+    KvArea derived_keys; // a prompt chunk's full-attention keys: [kv heads][slots][D]
     // A quantized cache: the format; a prompt chunk's full-attention values in F16 (as derived_keys);
     // a decode step's F16 K and V rows before they are stored ([kv heads][kKvRows][D] each).
     KvFormat kv;
-    DeviceBuffer full_values, kv_rows_k, kv_rows_v;
+    KvArea full_values;
+    DeviceBuffer kv_rows_k, kv_rows_v;
+    KvArea mask_full; // a prompt chunk's full-attention mask, [rows][full_slots]
+    // Beside an elastic expert cache, the full blocks' value planes (a row per sequence and KV head)
+    // and the prompt chunk's scratch above grow as far as the sequences reach: the expert cache
+    // gives memory back when they need it and takes it again when a sequence is reset.
+    bool growing = false;
+    std::vector<KvArea*> sequence_areas, chunk_areas;
+    std::atomic<std::uint64_t> kv_backed{0};
+    std::uint64_t kv_fixed = 0; // the caches' bytes that do not grow
     static constexpr int kKvRows = 8;
     float eps = 1e-6f;
     std::vector<LayerPlan> layers;
+    // The CPU's share of missing experts; it outlives the delivery that calls it.
+    std::unique_ptr<CpuExperts> cpu_experts;
     std::unique_ptr<ExpertDelivery> delivery;
     mutable std::mutex expert_stats_mutex;
     ExpertDeliveryStats expert_startup_stats;
@@ -202,6 +248,11 @@ struct Executor::Impl {
         }
         stream      = device.stream;
         kv          = kv_format(options.kv_cache);
+        // Beside an automatic cache of host or disk experts, the full-attention caches grow with
+        // their sequences and the cache is elastic (ExpertDeliveryOptions::elastic).
+        const int device_id = device.rank(0).device;
+        growing = !model.expert_banks().empty() && !options.expert_cache_bytes &&
+                  vmm::granularity(device_id) != 0;
         hidden      = int(config.hidden_size);
         query_heads = int(config.num_attention_heads);
         vocab       = int(config.vocab_size);
@@ -373,11 +424,11 @@ struct Executor::Impl {
                     p.k.fill(0);
                     kv_bytes += bytes;
                 }
-                p.v = DeviceBuffer(bytes);
-                p.v.fill(0);
+                p.v = KvArea(std::size_t(sequences), p.kv_heads, std::size_t(p.head_stride) * sizeof(__half),
+                             std::size_t(p.head_dim) * sizeof(__half), growing && p.full, device_id);
                 kv_bytes += bytes;
             } else {
-                const auto plane = [&](KvPlane format, DeviceBuffer& codes, DeviceBuffer& scales) {
+                const auto plane = [&](KvPlane format, auto& codes, auto& scales) {
                     kernels::KvPlaneView view;
                     view.coding     = format.coding;
                     view.rotated    = format.rotated;
@@ -388,10 +439,18 @@ struct Executor::Impl {
                     view.scale_head = view.scale_row * p.slots;
                     view.code_seq   = view.code_head * p.kv_heads;
                     view.scale_seq  = view.scale_head * p.kv_heads;
-                    codes  = DeviceBuffer(std::size_t(view.code_seq) * sequences);
-                    scales = DeviceBuffer(std::size_t(view.scale_seq) * sequences);
-                    codes.fill(0);
-                    scales.fill(0);
+                    if constexpr (std::is_same_v<std::decay_t<decltype(codes)>, KvArea>) {
+                        const bool grows = growing && p.full;
+                        codes  = KvArea(std::size_t(sequences), p.kv_heads, std::size_t(view.code_head),
+                                        std::size_t(view.code_row), grows, device_id);
+                        scales = KvArea(std::size_t(sequences), p.kv_heads, std::size_t(view.scale_head),
+                                        std::size_t(view.scale_row), grows, device_id);
+                    } else {
+                        codes  = DeviceBuffer(std::size_t(view.code_seq) * sequences);
+                        scales = DeviceBuffer(std::size_t(view.scale_seq) * sequences);
+                        codes.fill(0);
+                        scales.fill(0);
+                    }
                     view.codes  = static_cast<std::uint8_t*>(codes.p);
                     view.scales = static_cast<std::uint8_t*>(scales.p);
                     kv_bytes += codes.bytes + scales.bytes;
@@ -419,22 +478,29 @@ struct Executor::Impl {
                                                     p.head_dim * sizeof(__half));
                 }
             }
-            // A prompt chunk's full-attention keys, derived from one sequence's values.
-            std::size_t keys = 0;
+            // A prompt chunk's full-attention keys, derived from one sequence's values. Zeroed (or
+            // zeroed as they are backed): the slots past a chunk are masked, and a masked score must
+            // stay finite.
+            const LayerPlan* full = nullptr;
             for (const LayerPlan& p : layers) {
-                if (p.full) { keys = std::max(keys, std::size_t(p.seq_stride) * sizeof(__half)); }
+                if (!p.full) { continue; }
+                if (full != nullptr && (p.kv_heads != full->kv_heads || p.head_dim != full->head_dim)) {
+                    throw std::invalid_argument("Gemma 4: full-attention blocks of different shapes");
+                }
+                full = &p;
             }
-            if (keys != 0) {
-                // Zeroed: the slots past a chunk are masked, and a masked score must stay finite.
-                derived_keys = DeviceBuffer(keys);
-                derived_keys.fill(0);
-                kv_bytes += keys;
+            if (full != nullptr) {
+                const std::size_t row = std::size_t(full->head_stride) * sizeof(__half);
+                const std::size_t position = std::size_t(full->head_dim) * sizeof(__half);
+                derived_keys = KvArea(1, full->kv_heads, row, position, growing, device_id);
+                kv_bytes += derived_keys.bytes;
                 if (kv.quantized()) {
-                    full_values = DeviceBuffer(keys);
-                    full_values.fill(0);
-                    kv_bytes += keys;
+                    full_values = KvArea(1, full->kv_heads, row, position, growing, device_id);
+                    kv_bytes += full_values.bytes;
                 }
             }
+            mask_full = KvArea(1, 1, std::size_t(options.prefill_chunk) * global_slots * 2,
+                               std::size_t(options.prefill_chunk) * 2, growing, device_id);
             if (kv.quantized()) {
                 // A decode step's rows: at most 8 (a batch or a verification) of every block.
                 std::size_t row_bytes = 0;
@@ -483,12 +549,30 @@ struct Executor::Impl {
         if (options.draft_tokens > 0) { plan_assistant(); }
         staged      = std::make_unique<CudaCompletionEvent>(device);
         logits_bf16 = DeviceBuffer(std::size_t(vocab) * kMaxLogitRows * 2);
+        for (LayerPlan& p : layers) {
+            if (!p.full) { continue; }
+            if (kv.quantized()) {
+                sequence_areas.push_back(&p.v_codes);
+                sequence_areas.push_back(&p.v_scales);
+            } else {
+                sequence_areas.push_back(&p.v);
+            }
+        }
+        for (KvArea* area : {&derived_keys, &full_values, &mask_full}) {
+            if (area->bytes != 0) { chunk_areas.push_back(area); }
+        }
+        kv_fixed = kv_bytes;
+        if (growing) {
+            for (KvArea* area : sequence_areas) { kv_fixed -= area->bytes; }
+            kv_fixed -= derived_keys.bytes + full_values.bytes;
+        }
+        kv_backed = kv_fixed;
         workspace_bytes = plan_workspace();
         {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
             if (options.prefill_chunk < kFullChunk &&
-                workspace_bytes + kGraphReserve > free_bytes) {
+                workspace_bytes + kGraphReserve + unbacked() > free_bytes) {
                 // The destructor does not run for a constructor that throws.
                 if (media_begin != nullptr) { cudaEventDestroy(media_begin); }
                 if (media_end != nullptr) { cudaEventDestroy(media_end); }
@@ -524,15 +608,43 @@ struct Executor::Impl {
             std::size_t free = 0, total = 0;
             CUDA_CHECK(cudaMemGetInfo(&free, &total));
             const auto cache = options.expert_cache_bytes.value_or(0);
-            if (bank + metadata + cache + kGraphReserve > free) {
+            // The caches that grow later need their memory too: the elastic cache gives it back.
+            if (bank + metadata + cache + unbacked() + kGraphReserve > free) {
                 throw InsufficientMemory("Gemma 4: expert delivery needs " +
-                    std::to_string((bank + metadata + cache) >> 20) +
-                    " MiB plus the CUDA Graph reserve after workspace allocation");
+                    std::to_string((bank + metadata + cache) >> 20) + " MiB beside " +
+                    std::to_string(unbacked() >> 20) +
+                    " MiB for the growing caches and the CUDA Graph reserve after workspace allocation");
             }
             ExpertDeliveryOptions transport;
             transport.pair_capacity = options.prefill_chunk * config.top_k_experts;
             transport.cache_bytes = options.expert_cache_bytes;
-            transport.keep_free_bytes = kGraphReserve;
+            // A growing cache's next positions come from the headroom before the expert cache
+            // has to give memory back.
+            transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
+            transport.elastic = growing;
+            const float dma_share = options.expert_dma_share.value_or(0.0F);
+            if (!(dma_share >= 0 && dma_share <= 1) || options.expert_cpu_threads > 256) {
+                throw std::invalid_argument("Gemma 4: the DMA share must be 0..1 and CPU threads 0..256");
+            }
+            std::vector<CpuExpertLayer> cpu_layers;
+            bool computes = false;
+            for (const auto& bank : model.expert_banks()) {
+                cpu_layers.push_back({bank.gate_up_type, bank.down_type,
+                                      std::int64_t(bank.gate_up_row_bytes),
+                                      std::int64_t(bank.down_row_bytes)});
+                computes = computes || CpuExperts::computes(cpu_layers.back(), hidden,
+                                                            int(config.moe_intermediate_size));
+            }
+            if (computes && options.expert_dma_share.value_or(0.0F) < 1) {
+                cpu_experts = std::make_unique<CpuExperts>(std::move(cpu_layers), hidden,
+                    int(config.moe_intermediate_size), int(config.top_k_experts));
+                transport.cpu.products      = cpu_experts.get();
+                transport.cpu.input_bytes   = cpu_experts->input_bytes();
+                transport.cpu.product_bytes = cpu_experts->product_bytes();
+                transport.cpu.share         = 1.0 - double(dma_share);
+                transport.cpu.balance       = !options.expert_dma_share;
+                transport.cpu.threads       = options.expert_cpu_threads;
+            }
             delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                         std::move(sources), transport);
         }
@@ -544,6 +656,127 @@ struct Executor::Impl {
     // planned workspace with kGraphReserve beside it.
     static constexpr std::uint32_t kFullChunk  = 2048;
     static constexpr std::size_t kGraphReserve = std::size_t(320) << 20;
+    static constexpr std::size_t kKvHeadroom   = std::size_t(256) << 20;
+
+    // ---- Growing caches -------------------------------------------------------------------------
+
+    // Device bytes the growing caches may still take.
+    [[nodiscard]] std::size_t unbacked() const {
+        std::size_t bytes = 0;
+        for (const auto* list : {&sequence_areas, &chunk_areas}) {
+            for (const KvArea* area : *list) {
+                if (area->region) { bytes += area->region.bytes() - area->region.mapped_bytes(); }
+            }
+        }
+        return bytes;
+    }
+
+    void count_backed() {
+        std::uint64_t bytes = kv_fixed;
+        for (const KvArea* area : sequence_areas) { bytes += area->region.mapped_bytes(); }
+        for (const KvArea* area : {&derived_keys, &full_values}) {
+            if (area->region) { bytes += area->region.mapped_bytes(); }
+        }
+        kv_backed.store(bytes, std::memory_order_relaxed);
+    }
+
+    // A growing area's rows of `owner` up to `positions`: the bytes still to back, and backing them
+    // (each newly backed granule zeroed on the stream). False when the device has no room.
+    [[nodiscard]] std::size_t missing(const KvArea& a, std::size_t owner, std::uint32_t positions) const {
+        if (!a.region || positions <= a.backed[owner]) { return 0; }
+        std::size_t bytes = 0;
+        for (int r = 0; r < a.rows; ++r) {
+            bytes += a.region.unmapped_bytes((owner * a.rows + r) * a.row_bytes,
+                                             std::size_t(positions) * a.position_bytes);
+        }
+        return bytes;
+    }
+    [[nodiscard]] bool extend(KvArea& a, std::size_t owner, std::uint32_t positions) {
+        if (!a.region || positions <= a.backed[owner]) { return true; }
+        for (int r = 0; r < a.rows; ++r) {
+            if (!a.region.map((owner * a.rows + r) * a.row_bytes,
+                              std::size_t(positions) * a.position_bytes, stream)) {
+                return false;
+            }
+        }
+        a.backed[owner] = positions;
+        return true;
+    }
+
+    // Unbacks `owner`'s rows past `positions`, except granules another row still reaches into.
+    // The stream has finished with them.
+    void trim(KvArea& a, std::size_t owner, std::uint32_t positions) {
+        if (!a.region || a.backed[owner] <= positions) { return; }
+        const std::size_t g   = a.region.granule();
+        const std::uint32_t was = a.backed[owner];
+        a.backed[owner]       = positions;
+        const auto reached = [&](std::size_t lo, std::size_t hi) {
+            for (std::size_t o = 0; o < a.backed.size(); ++o) {
+                for (int r = 0; r < a.rows; ++r) {
+                    const std::size_t row = (o * a.rows + r) * a.row_bytes;
+                    if (row < hi && lo < row + std::size_t(a.backed[o]) * a.position_bytes) { return true; }
+                }
+            }
+            return false;
+        };
+        for (int r = 0; r < a.rows; ++r) {
+            const std::size_t row = (owner * a.rows + r) * a.row_bytes;
+            const std::size_t hi  = row + std::size_t(was) * a.position_bytes;
+            for (std::size_t at = (row + std::size_t(positions) * a.position_bytes) / g * g; at < hi; at += g) {
+                if (!reached(at, at + g)) { a.region.unmap(at, g); }
+            }
+        }
+    }
+
+    // Before a call that writes or reads `sequence`'s positions below `end`: its full-attention
+    // rows (and with `chunk`, the prompt chunk's scratch) are backed up to the 256-slot tile that
+    // holds `end`, the expert cache giving memory back when the device keeps less than the CUDA
+    // Graph reserve beside them. Outside capture.
+    void back(std::uint32_t sequence, std::uint32_t end, bool chunk) {
+        if (!growing) { return; }
+        const auto positions = std::uint32_t(round_up(end, 256));
+        std::size_t need = 0;
+        for (const KvArea* area : sequence_areas) { need += missing(*area, sequence, positions); }
+        if (chunk) {
+            for (const KvArea* area : chunk_areas) { need += missing(*area, 0, positions); }
+        }
+        const auto apply = [&] {
+            bool ok = true;
+            for (KvArea* area : sequence_areas) { ok = ok && extend(*area, sequence, positions); }
+            if (chunk) {
+                for (KvArea* area : chunk_areas) { ok = ok && extend(*area, 0, positions); }
+            }
+            return ok;
+        };
+        if (need == 0) {
+            (void)apply();
+            return;
+        }
+        std::size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        if (free < need + kGraphReserve) { delivery->shrink_cache(need + kGraphReserve - free); }
+        while (!apply()) {
+            if (delivery->shrink_cache(std::max(need, std::size_t(64) << 20)) == 0) {
+                count_backed();
+                throw InsufficientMemory("Gemma 4: no device memory left to grow the KV cache to " +
+                                         std::to_string(positions) + " positions");
+            }
+        }
+        count_backed();
+    }
+
+    // A reset sequence's rows go back to the device, the prompt scratch to what the longest
+    // remaining sequence reaches, and the expert cache takes what is free beyond its headroom.
+    void release(std::uint32_t sequence) {
+        if (!growing || sequence_areas.empty() || sequence_areas.front()->backed[sequence] == 0) { return; }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (KvArea* area : sequence_areas) { trim(*area, sequence, 0); }
+        std::uint32_t longest = 0;
+        for (const std::uint32_t backed : sequence_areas.front()->backed) { longest = std::max(longest, backed); }
+        for (KvArea* area : chunk_areas) { trim(*area, 0, longest); }
+        count_backed();
+        delivery->grow_cache();
+    }
 
     std::size_t start_reserve() const {
         return options.prefill_chunk >= kFullChunk ? std::size_t(1536) << 20
@@ -551,7 +784,7 @@ struct Executor::Impl {
     }
 
     ~Impl() {
-        if (delivery) { cudaStreamSynchronize(stream); }
+        if (delivery || growing) { cudaStreamSynchronize(stream); }
         if (media_begin != nullptr) { cudaEventDestroy(media_begin); }
         if (media_end != nullptr) { cudaEventDestroy(media_end); }
     }
@@ -647,7 +880,6 @@ struct Executor::Impl {
         add(t * config.intermediate_size * 2);
         add(t * config.intermediate_size * 2 * 4); // [gate; up] FP32 plane
         add(t * h * 2);              // dense out
-        add(t * std::size_t(global_slots) * 2); // full-attention mask
         add(t * std::size_t(prefill_ring) * 2); // sliding-window mask
         add(gguf::flash_attention_workspace_bytes(512, query_heads, 1, int(t)));
         add(gguf::flash_attention_workspace_bytes(256, query_heads, 1, int(t)));
@@ -875,9 +1107,25 @@ struct Executor::Impl {
                            weights, stream);
             routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
         }
+        // A decode or verification call may leave misses to the CPU, which reads the quantized
+        // activation and the route weights.
+        const bool cpu = cpu_experts && t <= CpuExperts::kMaxTokens && t <= gguf::kMaxVectorColumns;
+        void* act = nullptr;
+        if (t <= gguf::kMaxVectorColumns) {
+            act = xq != nullptr ? xq->base : nullptr;
+            if (act == nullptr) {
+                act = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
+                gguf::quantize_vector_activation(x, hidden, t, nullptr, act, stream);
+            }
+        }
         std::optional<ExpertDelivery::Call> call;
         if (delivery) {
-            call = delivery->begin(std::size_t(p.delivery_layer), ids, std::uint32_t(pairs), stream);
+            const std::array<ExpertDelivery::Input, 2> inputs{
+                ExpertDelivery::Input{act, cpu ? cpu_experts->activation_bytes(t) : 0},
+                ExpertDelivery::Input{weights, cpu ? cpu_experts->weight_bytes(t) : 0}};
+            call = delivery->begin(std::size_t(p.delivery_layer), ids, std::uint32_t(pairs), stream,
+                                   cpu ? std::span<const ExpertDelivery::Input>(inputs)
+                                       : std::span<const ExpertDelivery::Input>());
             if (t > gguf::kMaxVectorColumns) { delivery->await(stream); }
         }
         const auto* tables = delivery ? delivery->tables(std::size_t(p.delivery_layer))
@@ -891,11 +1139,6 @@ struct Executor::Impl {
             workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
         if (t <= gguf::kMaxVectorColumns) {
             const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
-            void* act = xq != nullptr ? xq->base : nullptr;
-            if (act == nullptr) {
-                act = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
-                gguf::quantize_vector_activation(x, hidden, t, nullptr, act, stream);
-            }
             void* act2 = workspace->alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
             auto* fixed = static_cast<unsigned long long*>(
                 workspace->alloc_bytes(std::size_t(t) * hidden * 8).data);
@@ -919,17 +1162,20 @@ struct Executor::Impl {
                 delivery->await(stream);
                 auto missing = gguf::moe_sort_routes(call->missing_ids, pairs, e, routing_space, stream);
                 compute(missing);
+                if (call->cpu != nullptr) {
+                    kernels::add_fixed(fixed, call->products, call->cpu, std::int64_t(t) * hidden, stream);
+                }
             } else { compute(routing); }
             combine.moe_fixed = fixed;
             return;
         }
-        void* act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;
-        gguf::quantize_moe_matrix_activation(p.gate_up_type, x, hidden, routing, pairs, k, act,
+        void* rows_act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;
+        gguf::quantize_moe_matrix_activation(p.gate_up_type, x, hidden, routing, pairs, k, rows_act,
                                              stream);
         auto* gu = static_cast<float*>(
             workspace->alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
-        gguf::moe_matrix_product(p.gate_up_type, gate_up, routing, max_active, pairs, true, act, gu,
-                                 stream);
+        gguf::moe_matrix_product(p.gate_up_type, gate_up, routing, max_active, pairs, true, rows_act,
+                                 gu, stream);
         kernels::geglu_rows(gu, pairs, width, middle, stream);
         void* act2 = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(width, pairs)).data;
         gguf::quantize_moe_matrix_activation(p.down_type, middle, width, routing, pairs, 1, act2,
@@ -1048,6 +1294,7 @@ struct Executor::Impl {
         if (first + std::uint32_t(t) > options.max_context) {
             throw std::invalid_argument("gemma4 forward: context capacity exceeded");
         }
+        back(sequence, first + std::uint32_t(t), true);
         std::vector<std::int32_t> pos(t);
         for (int i = 0; i < t; ++i) { pos[i] = std::int32_t(first) + i; }
         // Each row's media unit (-1 for text) and each unit's first row.
@@ -1093,8 +1340,7 @@ struct Executor::Impl {
         const int full_slots = int(round_up(first + t, 256));
         auto* mask_ring = static_cast<__half*>(
             workspace->alloc_bytes(std::size_t(t) * prefill_ring * 2).data);
-        auto* mask_full =
-            static_cast<__half*>(workspace->alloc_bytes(std::size_t(t) * full_slots * 2).data);
+        auto* mask_full = static_cast<__half*>(this->mask_full.p);
         kernels::build_mask(mask_ring, t, prefill_ring, int(first), prefill_ring,
                             int(config.sliding_window), stream,
                             bidirectional ? static_cast<const std::int32_t*>(d_blocks.p) : nullptr);
@@ -1462,6 +1708,7 @@ struct Executor::Impl {
             pos[i] = std::int32_t(positions[sequences[i]]);
             seq[i] = std::int32_t(sequences[i]);
         }
+        for (int i = 0; i < b; ++i) { back(sequences[i], positions[sequences[i]] + 1, false); }
         stage(tokens, pos, seq);
         run_graph(graphs, std::uint32_t(b), [&] { decode_body(b); });
         for (int i = 0; i < b; ++i) {
@@ -1496,6 +1743,7 @@ struct Executor::Impl {
                 seq[j * w + i] = std::int32_t(s);
             }
         }
+        for (const std::uint32_t s : sequences) { back(s, positions[s] + std::uint32_t(w), false); }
         stage(tokens, pos, seq);
         run_graph(graphs, 16 + std::uint32_t(rows), [&] { decode_body(rows, true); });
         verify_width = std::uint32_t(w);
@@ -1738,8 +1986,10 @@ struct Executor::Impl {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         if (delivery) {
             // Drained, so warm-up deliveries and their asynchronous prefetches stay out of the
-            // request counters. Runtime readers use the same mutex and report request work only.
+            // request counters, and the cache starts from the routing profile rather than the
+            // warm-up's routes. Runtime readers use the same mutex and report request work only.
             delivery->drain();
+            delivery->prime(options.expert_profile ? &*options.expert_profile : nullptr);
             std::lock_guard lock(expert_stats_mutex);
             expert_startup_stats = delivery->stats();
         }
@@ -1854,6 +2104,7 @@ struct Executor::Impl {
         if (image.position > options.max_context) {
             throw std::invalid_argument("gemma4 load_image: invalid image");
         }
+        back(sequence, image.position, false);
         copy_image(sequence, image.position, pages, page_bytes, false, false);
         positions.at(sequence) = image.position;
         if (drafting()) { anchored[sequence] = 0; }
@@ -1881,7 +2132,9 @@ const ExecutorOptions& Executor::options() const noexcept { return impl_->option
 ExecutorMemory Executor::memory() const noexcept {
     const auto& tower = impl_->vision;
     return ExecutorMemory{.kv_bytes            = impl_->kv_bytes,
-                          .workspace_bytes     = impl_->workspace_bytes,
+                          .kv_backed_bytes     = impl_->kv_backed.load(std::memory_order_relaxed),
+                          .kv_grows            = impl_->growing,
+                          .workspace_bytes     = impl_->workspace_bytes + impl_->mask_full.bytes,
                           .vision_encode_bytes = tower ? tower->workspace_bytes() : 0,
                           .vision_owned_bytes  = tower ? tower->owned_bytes() : 0,
                           .experts = impl_->delivery ? impl_->delivery->memory() : ExpertDeliveryMemory{}};
@@ -1904,6 +2157,7 @@ void Executor::load_image(std::uint32_t sequence, const SequenceImage& image,
 void Executor::reset(std::uint32_t sequence) {
     impl_->positions.at(sequence) = 0;
     if (impl_->drafting()) { impl_->anchored.at(sequence) = 0; }
+    impl_->release(sequence);
 }
 
 std::uint32_t Executor::position(std::uint32_t sequence) const {
@@ -1917,6 +2171,12 @@ ExpertDeliveryStats Executor::expert_stats() const {
     if (!impl_->delivery) { return {}; }
     std::lock_guard lock(impl_->expert_stats_mutex);
     return impl_->delivery->stats() - impl_->expert_startup_stats;
+}
+ExpertRouteCounts Executor::expert_totals() const {
+    return impl_->delivery ? impl_->delivery->totals() : ExpertRouteCounts{};
+}
+std::string Executor::expert_cpu_description() const {
+    return impl_->delivery ? impl_->delivery->cpu_description() : std::string();
 }
 
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,

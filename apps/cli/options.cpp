@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/kv_resident_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
@@ -196,10 +197,14 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); alias --vram-headroom-mib\n"
            "  --kv-dtype T                  bf16 (default), int8, fp8, rk8v4, rk4v4,\n"
-           "                                rk4v4-e8, rk2v4-e8, nvfp4 or k8v4\n"
+           "                                rk4v4-e8, rk2v4-e8, nvfp4 or k8v4\n" +
+           std::string(product::kKvResidentHelp) +
            "\n"
-           "SPECULATIVE DECODING (off by default)\n"
-           "  --spec mtp|dflash|dflash2     speculative decoding backend\n"
+           "SPECULATIVE DECODING\n"
+           "  --spec none|mtp|dflash|dflash2\n"
+           "                                speculative decoding backend (default: mtp with 3\n"
+           "                                drafts for Flash-Next and Gemma 4 host or disk\n"
+           "                                experts whose artifact has the drafter, else none)\n"
            "  --draft-tokens N              drafts per round, 1..15\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0)\n"
            "  --lm-head-draft               draft with the optimized proposal head, which\n"
@@ -334,6 +339,7 @@ Options parse_options(int argc, char** argv) {
     bool kv_capacity_explicit = false;
     bool device_explicit      = false;
     bool ngram_width_explicit       = false;
+    bool spec_explicit              = false;
     bool vision_max_merged_explicit = false;
     std::optional<std::size_t> kv_headroom_mib;
 
@@ -396,10 +402,13 @@ Options parse_options(int argc, char** argv) {
                                                       [&] { return value(arg); })) {
         } else if (product::parse_ngram_table_option(arg, options.ngram_table,
                                                      [&] { return value(arg); })) {
+        } else if (product::parse_kv_resident_option(arg, options.kv_resident_positions,
+                                                     [&] { return value(arg); })) {
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
+            spec_explicit               = true;
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--draft-min-p") {
@@ -605,6 +614,7 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::apply_default_ngram_draft_tokens(options.speculative, ngram_width_explicit);
+    product::apply_automatic_speculation(options.speculative, spec_explicit);
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_residency != VisionResidency::Resident && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay or cpu requires --vision");

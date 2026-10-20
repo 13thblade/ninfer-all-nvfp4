@@ -24,14 +24,14 @@ constexpr std::size_t kHidden = 2560, kTop = 10, kCpuTokens = 16;
 constexpr std::uint64_t kMargin = 1536ULL << 20;
 constexpr std::size_t aligned(std::size_t bytes) { return (bytes + 255) & ~std::size_t(255); }
 
+// Native experts' CPU products differ from the GPU's, so only an explicit share moves misses to
+// the CPU; unset copies every one.
 HybridExpertOptions validated(HybridExpertOptions options) {
-    if (!std::isfinite(options.dma_share) || options.dma_share < 0 || options.dma_share > 1 ||
-        options.cpu_threads > 256) {
+    const float share = options.dma_share.value_or(1.0F);
+    if (!std::isfinite(share) || share < 0 || share > 1 || options.cpu_threads > 256) {
         throw std::invalid_argument("hybrid experts: DMA share must be 0..1 and CPU threads 0..256");
     }
-    if (options.dma_share_auto) {
-        throw std::invalid_argument("--expert-dma-share auto needs GGUF experts");
-    }
+    options.dma_share = share;
     return options;
 }
 
@@ -414,7 +414,7 @@ struct HybridExperts::Impl {
         }
         std::size_t misses = 0;
         for (std::size_t e = 0; e < count; ++e) { misses += routed[e] && layer.slot_of[e] < 0; }
-        std::size_t dma_left = cpu_allowed ? static_cast<std::size_t>(std::ceil(misses * options.dma_share)) : misses;
+        std::size_t dma_left = cpu_allowed ? static_cast<std::size_t>(std::ceil(misses * *options.dma_share)) : misses;
         std::array<bool, 512> gpu{};
         for (std::size_t e = 0; e < count; ++e) {
             if (!routed[e]) { continue; }
@@ -677,7 +677,7 @@ std::string HybridExperts::execution_profile() const {
     const auto word = [&](std::uint32_t value) {
         for (int i = 0; i < 4; ++i) { hash = (hash ^ ((value >> (8 * i)) & 255U)) * 1099511628211ULL; }
     };
-    word(std::bit_cast<std::uint32_t>(impl_->options.dma_share));
+    word(std::bit_cast<std::uint32_t>(*impl_->options.dma_share));
     word(impl_->options.adaptive_cache);
     for (const auto& layer : impl_->layers) {
         word(static_cast<std::uint32_t>(layer.inputs.rank));

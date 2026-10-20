@@ -1088,6 +1088,13 @@ __global__ void ffn_combine_kernel(FfnCombineArgs a) {
     if (a.next_q.qs != nullptr) { store_q8x4(a.next_q, a.hidden, blockIdx.x, i, nxt, i < q); }
 }
 
+__global__ void add_fixed_kernel(unsigned long long* sums, const unsigned long long* products,
+                                 const std::int32_t* flag, std::int64_t n) {
+    const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n || *flag == 0) { return; }
+    sums[i] += products[i];
+}
+
 __global__ void softcap_kernel(const float* x, std::int64_t n, float cap, __nv_bfloat16* out) {
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) { return; }
@@ -1322,6 +1329,14 @@ void geglu_rows(const float* x, int pairs, int width, __nv_bfloat16* out, cudaSt
 void ffn_combine(const FfnCombineArgs& args, cudaStream_t stream) {
     ffn_combine_kernel<<<args.tokens, row_threads(args.hidden), 0, stream>>>(args);
     check_launch("ffn_combine");
+}
+
+void add_fixed(unsigned long long* sums, const void* products, const std::int32_t* flag,
+               std::int64_t n, cudaStream_t stream) {
+    if (n <= 0) { return; }
+    add_fixed_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(
+        sums, static_cast<const unsigned long long*>(products), flag, n);
+    check_launch("add_fixed");
 }
 
 void softcap(const float* x, std::int64_t n, float cap, __nv_bfloat16* out, cudaStream_t stream) {

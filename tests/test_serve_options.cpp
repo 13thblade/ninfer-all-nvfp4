@@ -54,16 +54,34 @@ int main() {
         try { (void)parse(full); } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "server accepted invalid draft confidence");
     }
-    failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host"})
-                              .hybrid_experts.dma_share == 1.0F,
-                      "server must default native host expert misses to GPU execution");
+    failures += check(!parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host"})
+                               .hybrid_experts.dma_share.has_value(),
+                      "server must default the expert DMA share to automatic");
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).kv_resident_positions &&
+                          parse({"ninfer-serve", "model.ninfer", "--kv-resident", "8192"})
+                                  .kv_resident_positions == 8192U &&
+                          parse({"ninfer-serve", "model.ninfer", "--kv-resident", "all"})
+                                  .kv_resident_positions == 0U,
+                      "server did not preserve --kv-resident");
+    for (const auto* value : {"0", "nan", "auto1"}) {
+        bool rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--kv-resident", value}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted an invalid --kv-resident");
+    }
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.automatic &&
+                          !parse({"ninfer-serve", "model.ninfer", "--spec", "none"}).speculative.automatic &&
+                          !parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"})
+                               .speculative.automatic,
+                      "server did not leave the backend to the Engine only without --spec");
     for (const auto* share : {"0", "0.5", "1"}) {
         failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host",
                                  "--expert-dma-share", share}).hybrid_experts.dma_share == std::stof(share),
                           "server did not preserve an explicit hybrid DMA share");
     }
     failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host",
-                             "--expert-dma-share", "auto"}).hybrid_experts.dma_share_auto,
+                             "--expert-dma-share", "auto", "--expert-dma-share", "0.5",
+                             "--expert-dma-share", "auto"}).hybrid_experts.dma_share.has_value() == false,
                       "server did not preserve an automatic hybrid DMA share");
     const auto archive = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                 "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",

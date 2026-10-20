@@ -252,8 +252,13 @@ calls, so both run the same arithmetic. No routes are dropped or renormalized, a
 re-encoded.
 
 The persistent cache (`--expert-cache-mib`, default: what is free after startup) holds the experts
-that decode and verification used most recently: a narrow call's misses enter the cache over the
-least recently used experts the call does not route. A wide call evicts nothing; it promotes its
+that decode and verification route most, by the expert tier every MoE family with host or disk
+experts shares (`core/expert_tier`; [the expert cache](../qwen3-8-flash-next.md#the-expert-cache)):
+a narrow call's miss takes a free slot, or the slot of the coldest expert the call does not route
+when its routes beat that expert's, and every four decode passes a round swaps the most routed
+missing experts in, copied behind the calls. A routing profile (`--expert-profile`, else the
+built-in one of the model family where the build has one) fills the slots at startup. Native
+experts have no CPU products, so every miss is copied. A wide call evicts nothing; it promotes its
 most routed experts from the bank into free slots by device copies, up to each layer's share of the
 cache, so a prompt does not flush the decode working set. `--expert-cache-mib 0` keeps the banks
 only. With automatic KV, the cache has priority: KV takes the minimum legal runtime (one request's

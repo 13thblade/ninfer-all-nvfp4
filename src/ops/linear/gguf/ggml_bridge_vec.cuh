@@ -87,12 +87,18 @@ __device__ __forceinline__ void scale_min_k4(const std::uint8_t* s, int j, int& 
     }
 }
 
-// The product of one slice of a type the CPU also computes (Q2_0, Q8_0, IQ4_NL, IQ4_XS, IQ3_XXS,
-// IQ3_S; IQ2_S spells out its two halves): the slice factor times the activation scale, rounded,
-// times the integer dot, rounded, never fused with the sum it joins, so that gguf_expert_cpu
-// reproduces every bit.
+// The product of one slice of a type the CPU also computes (Q2_0, Q4_0, Q5_0, Q8_0, IQ4_NL,
+// IQ4_XS, IQ3_XXS, IQ3_S; IQ2_S, the K-quants with a minimum and Q6_K spell out their forms): the
+// slice factor times the activation scale, rounded, times the integer dot, rounded, never fused
+// with the sum it joins, so that gguf_expert_cpu reproduces every bit.
 __device__ __forceinline__ float cpu_product(float factor, float d, int dot) {
     return __fmul_rn(__fmul_rn(factor, d), float(dot));
+}
+
+// Q4_K and Q5_K: the scaled dot less the minimum times the activation's sum, each step rounded.
+__device__ __forceinline__ float cpu_product_min(float factor, float d, int dot, float minimum,
+                                                 float sum) {
+    return __fsub_rn(cpu_product(factor, d, dot), __fmul_rn(minimum, sum));
 }
 
 // dot() is the contribution of one slice to one column: d and sum are the column's slice scale and
@@ -144,7 +150,7 @@ struct Decoder<GGML_TYPE_Q4_0> {
     }
 
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -176,7 +182,7 @@ struct Decoder<GGML_TYPE_Q5_0> {
     }
 
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -323,7 +329,7 @@ struct Decoder<GGML_TYPE_Q4_K> {
         for (int i = 0; i < 8; ++i) { s.w[i] = int((v[i] >> shift) & 0x0F0F0F0Fu); }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float sum) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0))) - s.f[1] * sum;
+        return cpu_product_min(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)), s.f[1], sum);
     }
 };
 
@@ -350,7 +356,7 @@ struct Decoder<GGML_TYPE_Q5_K> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float sum) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0))) - s.f[1] * sum;
+        return cpu_product_min(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)), s.f[1], sum);
     }
 };
 
@@ -376,7 +382,8 @@ struct Decoder<GGML_TYPE_Q6_K> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return d * (s.f[0] * float(dot4(s.w, a, 0)) + s.f[1] * float(dot4(s.w + 4, a + 4, 0)));
+        return __fmul_rn(d, __fadd_rn(__fmul_rn(s.f[0], float(dot4(s.w, a, 0))),
+                                      __fmul_rn(s.f[1], float(dot4(s.w + 4, a + 4, 0)))));
     }
 };
 

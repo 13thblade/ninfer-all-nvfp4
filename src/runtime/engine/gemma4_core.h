@@ -45,6 +45,8 @@ struct Gemma4Instance {
     std::uint32_t capacity = 0;
     std::size_t free_after_weights = 0;
     std::size_t free_after_startup = 0;
+    // --expert-profile-out: the routing profile written at request boundaries.
+    std::filesystem::path record_profile;
 };
 
 struct ConstructedGemma4 {

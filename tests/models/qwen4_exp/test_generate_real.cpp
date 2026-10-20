@@ -504,7 +504,9 @@ int record_logits(const Model& model, DeviceContext& device, ExecutorOptions opt
     payload.exceptions(std::ios::badbit | std::ios::failbit);
     nlohmann::json report{{"vocab", vocab}, {"domain", domain}, {"dtype", "bf16-le"},
         {"residency", residency}, {"devices", device_list()},
-        {"dma_share", options.hybrid_experts.dma_share}, {"prefill_chunk", options.prefill_chunk},
+        {"dma_share", options.hybrid_experts.dma_share ? nlohmann::json(*options.hybrid_experts.dma_share)
+                                                       : nlohmann::json("auto")},
+        {"prefill_chunk", options.prefill_chunk},
         {"kv", "bf16"}, {"prefixes", nlohmann::json::array()}, {"records", nlohmann::json::array()}};
     Executor executor(model, device, options);
     std::vector<__nv_bfloat16> logits(vocab);
