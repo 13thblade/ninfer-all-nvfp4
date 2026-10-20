@@ -867,6 +867,12 @@ Over the 45 pairs of answers the paced build decoded 0.970-1.144 times as fast, 
 geometric mean; three pairs (two rk8v4 and one int8 blue-sky answer) were slower. Every answer had
 the same tokens.
 
+On the same host `auto` had read the CPU's gate and up time as nearly zero in about two of five
+calls: the CPU pool's calling thread could return before the last job's thread stamped its end, and
+read the previous phase's stamp. With the stamp in place before the pool returns, the same 45 pairs
+decoded 0.985-1.128 times as fast, 1.031 on the geometric mean; per format 0.990 (rk4v4, all five
+pairs slower by 0.2-1.5%) to 1.068 (k8v4). Every answer had the same tokens.
+
 ### MTP
 
 The Q2_0 release with Unsloth's `shared-Q8_0` MTP block, converted into one file with its
