@@ -7,11 +7,14 @@ import subprocess
 import sys
 import time
 
+from build_telemetry import sample
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--pid-file", type=Path)
+    parser.add_argument("--cache-stats", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -36,7 +39,11 @@ def main():
                        if os.name == "nt" else {"start_new_session": True})
             child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, **options)
             next_report = 0
+            next_sample = 0
             while child.poll() is None and not cancelled:
+                if args.cache_stats and time.monotonic() >= next_sample:
+                    sample(args.cache_stats)
+                    next_sample = time.monotonic() + 60
                 if time.monotonic() >= next_report:
                     print(f"Build PID {child.pid}; log bytes: {args.log.stat().st_size}", flush=True)
                     with args.log.open("rb") as stream:

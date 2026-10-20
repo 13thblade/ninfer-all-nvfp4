@@ -7,6 +7,8 @@ import signal
 import subprocess
 import time
 
+from build_telemetry import sanitize_cache_log
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -30,6 +32,8 @@ def main():
     # v0.18.0 acknowledges shutdown before its server finishes. The server allows
     # up to ten seconds for active requests and pending cache writes to finish.
     time.sleep(11)
+    if os.environ.get("SCCACHE_ERROR_LOG"):
+        sanitize_cache_log(Path(os.environ["SCCACHE_ERROR_LOG"]), args.stats.with_name("cache-errors.log"))
     if stats["stats"].get("cache_write_errors", 0):
         print("::warning::Some compiler cache writes failed; see the saved cache statistics.")
 

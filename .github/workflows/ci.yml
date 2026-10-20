@@ -214,7 +214,7 @@ jobs:
           Copy-Item -Path "$zlib\include\zlib.h", "$zlib\include\zconf.h" -Destination "$tree\include"
           # Nothing links: the library only has to exist where src/media/CMakeLists.txt names it.
           New-Item -ItemType File -Force -Path "$tree\lib\z.lib" | Out-Null
-          Invoke-WebRequest -Uri 'https://curl.se/windows/latest.cgi?p=win64-mingw.zip' -OutFile "$deps\curl.zip"
+          Invoke-WebRequest -MaximumRetryCount 3 -RetryIntervalSec 10 -Uri 'https://curl.se/windows/latest.cgi?p=win64-mingw.zip' -OutFile "$deps\curl.zip"
           Expand-Archive -Path "$deps\curl.zip" -DestinationPath $deps
           $curl = Get-ChildItem -Path $deps -Directory -Filter 'curl-*' | Select-Object -First 1
           "VCPKG_ROOT=$deps" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -390,6 +390,8 @@ jobs:
           path: |
             build-ci.log
             build-ci-cache.json
+            build-ci-cache-progress.jsonl
+            cache-errors.log
             build-cache-check/cache-stats.json
           if-no-files-found: ignore
           retention-days: 7

@@ -7,6 +7,7 @@ case "${1:?start|probe|build|finish}" in
     docker run -d --name "$container" --init -v "$PWD:/src" -w /src \
       -v "$SCCACHE_PATH:/usr/local/bin/sccache:ro" -v "$pythonLocation:$pythonLocation:ro" \
       -e SCCACHE_GHA_ENABLED=on -e SCCACHE_IDLE_TIMEOUT=0 \
+      -e SCCACHE_LOG=warn -e SCCACHE_ERROR_LOG=/src/sccache-errors.raw.log \
       -e ACTIONS_CACHE_SERVICE_V2 -e ACTIONS_RESULTS_URL -e ACTIONS_RUNTIME_TOKEN \
       -e NINFER_COMPILER_LAUNCHER=sccache -e NINFER_CUDA_ARCH \
       -e "ARCHS=$NINFER_CUDA_ARCH" -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT \
@@ -20,7 +21,7 @@ case "${1:?start|probe|build|finish}" in
     ;;
   build)
     docker exec "$container" "$pythonLocation/bin/python3.11" .github/scripts/run-cached-build.py \
-      --pid-file build-ci.pid --log build-ci.log -- \
+      --pid-file build-ci.pid --log build-ci.log --cache-stats build-ci-cache-progress.jsonl -- \
       bash -c 'scripts/build-native.sh configure && scripts/build-native.sh build'
     ;;
   finish)

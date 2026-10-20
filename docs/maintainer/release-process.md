@@ -86,7 +86,9 @@ commit is not a cache-wide invalidation key. Before the long build, a small C++/
 must produce cache hits after restarting the cache server. A separate cleanup step stops the build
 supervisor and requests sccache shutdown, including after cancellation. The pinned server allows
 up to ten seconds for active requests and pending uploads; cleanup waits for this interval.
-Statistics are sampled before shutdown and retained with build diagnostics. A timeout ends
+During compilation, a sample every minute records cache hits, misses, write failures, available RAM and free disk.
+Statistics are also sampled before shutdown and retained with build diagnostics. Backend warnings
+are saved separately after removing runner credentials and URLs. A timeout ends
 compilation before the job deadline so cleanup can run.
 
 This preserves successfully uploaded compilation results, not an executing compiler's memory.
@@ -109,10 +111,16 @@ hit and a shorter build time must be established from actual run statistics.
 
 ## Verification status
 
-The earlier uncached Windows run hit the 5h50 job limit; its CUDA 13 build reached 555/807 Ninja
-steps without a recorded compiler error. It produced no verified release package. A later obsolete
-run was cancelled before switching Toolkits and caching. The new native matrix still needs a full
-successful run. Loader and device-image checks do not establish GPU inference correctness or speed.
+The four-variant native run on 20 October reached the 300-minute compilation limit on every runner:
+Windows CUDA 12.9 completed 531/789 Ninja steps, Windows CUDA 13.4 completed 559/816,
+Linux CUDA 12.9 completed 542/793, and Linux CUDA 13.4 completed 564/820. No compiler failures
+were recorded in the final sccache counters; no release archive was produced.
+Each variant reported 4,304–4,594 successful cache writes, with 12, 12, 96 and 70 write errors respectively.
+On 21 October, the repository cache limit was 10 GiB and only 2,242 entries for the test branch remained.
+These counts show that successful writes alone do not establish retention or useful reuse on the next run.
+The new telemetry must establish reuse and identify backend write errors before claiming a cache fix.
+The full matrix and Docker packaging still need a successful run. Loader and device-image checks
+alone do not establish GPU inference correctness or speed.
 
 ## Local packaging
 
