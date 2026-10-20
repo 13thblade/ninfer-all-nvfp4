@@ -227,7 +227,8 @@ void CpuSpinPool::drain() {
         }
         if (done_.fetch_add(1, std::memory_order_acq_rel) + 1 == (size & 0xffffffffULL)) {
             finished_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-                            std::memory_order_release);
+                            std::memory_order_relaxed);
+            complete_.store(size >> 32, std::memory_order_release);
         }
         ticket = ticket_.load(std::memory_order_acquire);
     }
