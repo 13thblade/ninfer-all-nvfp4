@@ -237,15 +237,17 @@ or disk experts shares (`core/expert_tier.h`), one pool of slots per layer. Each
 verification call adds one to the count of every (token, expert) pair it routes; every four decode
 passes a round swaps up to 96 of the most routed experts the cache lacks into the slots of the
 least routed ones it holds, best gain first, each only when its count reaches the victim's plus 1.5
-(and at least 2), then multiplies every count by 0.7. The candidates' copies run on a side stream
-while the next passes run, and their table entries move to their slots once the copies have
-landed. A miss the GPU copies anyway takes a slot at once when one is free, or under the same rule
-against the coldest cached expert its call does not route; a miss the CPU computes moves no expert
-bytes and enters only through a round. Prompt chunks feed the statistics only. A routing profile
-(`--expert-profile`, else the built-in one of the model family) fills the slots at startup and,
-ranking its counts over every layer, gives each text layer the slots its most routed experts take;
-the MTP block keeps an even share. Strata (MIT) measured this tier and its constants on
-Qwen3.8-Flash-Next.
+(and at least 2), then multiplies every count by 0.7. Each pass until the next round starts up to
+24 of those swaps (a quarter of the limit), best gain first: their victims leave the tables at
+once, and their candidates' copies run on a side stream beside the draft, ahead of the next
+verification, whose missing experts would otherwise queue on the bus behind a whole round. The
+candidates' table entries move to their slots once the copies have landed. A miss the GPU copies
+anyway takes a slot at once when one is free, or under the same rule against the coldest cached
+expert its call does not route; a miss the CPU computes moves no expert bytes and enters only
+through a round. Prompt chunks feed the statistics only. A routing profile (`--expert-profile`,
+else the built-in one of the model family) fills the slots at startup and, ranking its counts over
+every layer, gives each text layer the slots its most routed experts take; the MTP block keeps an
+even share. Strata (MIT) measured this tier and its constants on Qwen3.8-Flash-Next.
 
 With the automatic cache and host experts, the device buffers that prompt chunks copy a layer's
 uncached experts into (`--expert-prefill-buffers`) are cache slots between prompts: every layer
@@ -846,6 +848,24 @@ build) answered the Python and blue-sky prompts twice and a 31,865-token prompt 
 Every answer was equal. Here more threads decoded 3-8% faster at 22 than at the default, where the
 first host gained nothing past 16; the default stays at half the CPUs, and `--expert-cpu-threads`
 tunes a host.
+
+### The expert tier's paced rounds on one RTX 4090
+
+One RTX 4090 with a Ryzen 9 9950X (32 CPUs, the default 15-thread pool), the IQ3_S release at a
+65,536-position context with its other defaults, 2026-10-20: one server per `--kv-dtype` format and
+build, the Python LRU cache and blue-sky prompts twice and the 31,865-token prompt once, 256 greedy
+output tokens. Starting a round's swaps a quarter per pass instead of all after the round's pass
+([the expert cache](#the-expert-cache)) cut the GPU's wait for the first layer's misses from 2.6 to
+0.9 ms a step and decoded faster with every format:
+
+| `--kv-dtype` | bf16 | int8 | fp8 | k8v4 | nvfp4 | rk8v4 | rk4v4 | rk4v4-e8 | rk2v4-e8 |
+|---|---|---|---|---|---|---|---|---|---|
+| Decode, whole round / paced, tok/s | 86.7 / 91.8 | 88.9 / 93.0 | 85.3 / 92.4 | 90.8 / 95.3 | 86.8 / 92.8 | 92.7 / 94.6 | 89.0 / 97.2 | 88.1 / 93.6 | 75.6 / 82.9 |
+| Paced / whole round, geometric mean | 1.058 | 1.045 | 1.083 | 1.049 | 1.068 | 1.018 | 1.093 | 1.063 | 1.096 |
+
+Over the 45 pairs of answers the paced build decoded 0.970-1.144 times as fast, 1.064 on the
+geometric mean; three pairs (two rk8v4 and one int8 blue-sky answer) were slower. Every answer had
+the same tokens.
 
 ### MTP
 

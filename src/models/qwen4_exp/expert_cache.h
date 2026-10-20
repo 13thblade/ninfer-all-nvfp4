@@ -7,11 +7,13 @@
 //
 // Which experts the slots hold follows the shared expert tier (core/expert_tier.h), one pool per
 // layer: decode and verification routes raise decayed counts, and every few decode passes a round
-// swaps the most routed missing experts into the slots of the least routed cached ones, copied on
-// a side stream while the next passes run; a candidate's table entries move to its slot once its
-// copy has landed. The expert misses may also place a miss they copy anyway into a slot at once,
-// by the same rule (admit). A recorded routing profile fills the slots at startup and, through the
-// ranking of its counts over every layer, sizes each layer's share of them.
+// swaps the most routed missing experts into the slots of the least routed cached ones. The passes
+// until the next round start an even share of its swaps each, copied on a side stream beside the
+// draft and the next pass, so a round never holds the bus for longer than a pass's share; a
+// candidate's table entries move to its slot once its copy has landed. The expert misses may also
+// place a miss they copy anyway into a slot at once, by the same rule (admit). A recorded routing
+// profile fills the slots at startup and, through the ranking of its counts over every layer, sizes
+// each layer's share of them.
 //
 // Between prompts the cache also holds the device buffers a wide call copies its layer's uncached
 // experts into (lend): a wide pass takes them back (reclaim), keeping the most routed of the
@@ -73,9 +75,11 @@ public:
     // `learn`: a decode or verification pass, whose routes the tier counts (a prompt chunk's only
     // feed the statistics and the recorded totals).
     void observe(std::size_t layer, std::span<const std::int32_t> ids, bool learn);
-    // Ends a decode pass: tables of candidates whose copies have landed move to their slots, and
-    // every few passes a round of the tier evicts its victims and starts its candidates' copies.
-    // Between passes only; the next pass on each layer's stream sees every table change.
+    // Ends a decode pass: tables of candidates whose copies have landed move to their slots, every
+    // few passes the tier's round queues its swaps, and each pass starts its share of the queue:
+    // their victims leave the tables, their candidates' copies start. Between passes only, once the
+    // last pass has ended (a draft may run); the next pass on each layer's stream sees every table
+    // change.
     void adapt();
     // Projection k (0 gate, 1 up, 2 down) of `expert` in its device slot, or null when the expert
     // is not cached. Slots are zeroed when allocated and 256 zero bytes follow the last, as the
@@ -146,6 +150,8 @@ private:
     // records once a round's victims have left its tables.
     std::vector<cudaStream_t> side_;
     std::vector<cudaEvent_t> evicted_;
+    // By rank: the side stream has put the text layers' tables up; the compute stream waits on it.
+    std::vector<cudaEvent_t> uploaded_;
     struct Copy {
         std::size_t layer  = 0;
         std::int32_t expert = -1;
@@ -153,6 +159,9 @@ private:
         cudaEvent_t done    = nullptr;
     };
     std::vector<Copy> copies_;          // a round's copies in flight
+    // The last round's swaps that no pass has started yet, best gain first.
+    std::vector<ExpertTier::Swap> queued_;
+    std::size_t mtp_ = ~std::size_t{0}; // the MTP block's layer, which the draft reads
     std::vector<cudaEvent_t> spare_;    // events of landed copies, reused
     // By rank: whether the cache holds its lent buffers, and the event a reclaim's transfer
     // stream (or a give_back's compute stream) waits on.

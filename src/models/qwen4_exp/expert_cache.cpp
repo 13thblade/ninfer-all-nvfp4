@@ -221,17 +221,20 @@ ExpertCache::ExpertCache(DeviceContext& device, std::vector<ExpertCacheLayer> la
     }
     staging_ = std::make_unique<PinnedHostBuffer>(std::max<std::size_t>(staging_bytes, 64));
     tier_    = std::make_unique<ExpertTier>(experts_per_layer, pools, tier);
+    if (last_is_mtp && !layers_.empty()) { mtp_ = layers_.size() - 1; }
     for (std::size_t index = 0; index < layers_.size(); ++index) {
         tier_->set_free(std::uint32_t(index), layers_[index].slots);
     }
     side_.assign(device_.size(), nullptr);
     evicted_.assign(device_.size(), nullptr);
+    uploaded_.assign(device_.size(), nullptr);
     handover_.assign(device_.size(), nullptr);
     holding_.assign(device_.size(), 0);
     for (const auto& [rank, members] : on_rank) {
         RankBinding bind(device_, rank);
         CUDA_CHECK(cudaStreamCreateWithFlags(&side_[rank], cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&evicted_[rank], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&uploaded_[rank], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&handover_[rank], cudaEventDisableTiming));
     }
 }
@@ -243,6 +246,7 @@ ExpertCache::~ExpertCache() {
         cudaStreamSynchronize(side_[r]);
         cudaStreamDestroy(side_[r]);
         cudaEventDestroy(evicted_[r]);
+        cudaEventDestroy(uploaded_[r]);
         cudaEventDestroy(handover_[r]);
     }
     for (const auto& copy : copies_) {
@@ -307,10 +311,22 @@ void ExpertCache::adapt() {
     std::lock_guard lock(mutex_);
     // Candidates whose copies have landed: their entries move to their slots.
     land();
-    // A round: victims leave the tables now, candidates' copies start once they have.
+    // A round's swaps start over the passes until the next round, an even share each pass: a
+    // whole round at once would hold the bus past the draft and delay the next pass's misses. A
+    // started swap's victim leaves the tables now, its candidate's copy starts once it has.
+    auto round = tier_->end_pass();
+    if (!round.empty()) { queued_ = std::move(round); }
+    const std::uint32_t every = std::max<std::uint32_t>(tier_->options().every, 1);
+    const std::size_t share   = (std::size_t(tier_->options().swaps) + every - 1) / every;
+    const std::size_t take    = std::min(share, queued_.size());
+    const std::vector<ExpertTier::Swap> swaps(queued_.begin(),
+                                              queued_.begin() + std::ptrdiff_t(take));
+    queued_.erase(queued_.begin(), queued_.begin() + std::ptrdiff_t(take));
     std::vector<Copy> started;
-    for (const auto& swap : tier_->end_pass()) {
+    for (const auto& swap : swaps) {
         Layer& layer = layers_[swap.layer];
+        // The misses may have admitted the candidate or taken the victim since the round.
+        if (layer.slot_of[std::size_t(swap.in)] >= 0) { continue; }
         std::int32_t slot = -1;
         if (swap.out >= 0) {
             slot = layer.slot_of[std::size_t(swap.out)];
@@ -329,45 +345,66 @@ void ExpertCache::adapt() {
         tier_->set(swap.layer, swap.in, ExpertTier::State::Pending);
         started.push_back({swap.layer, swap.in, slot, nullptr});
     }
+    // adapt runs once the last pass has ended, and the draft that may still run reads only the MTP
+    // block's tables and slots. So the text layers' tables go up on the side stream at once, ahead
+    // of its copies, and the compute stream waits for them before the next pass; the MTP block's
+    // follow the draft on the compute stream.
+    std::map<std::size_t, cudaStream_t> side_tables;
     for (std::size_t index = 0; index < layers_.size(); ++index) {
         Layer& layer = layers_[index];
         if (!layer.dirty) { continue; }
-        RankBinding bind(device_, layer.banks.rank);
-        upload(layer, layer.banks.stream);
-    }
-    std::map<std::size_t, cudaEvent_t> round_done;
-    for (const auto& copy : started) {
-        const std::size_t rank = layers_[copy.layer].banks.rank;
-        if (round_done.count(rank) != 0) { continue; }
-        RankBinding bind(device_, rank);
-        // The side stream copies once the victims' entries have left the tables on the compute
-        // stream (the passes before them are done: adapt runs between passes).
-        CUDA_CHECK(cudaEventRecord(evicted_[rank], layers_[copy.layer].banks.stream));
-        CUDA_CHECK(cudaStreamWaitEvent(side_[rank], evicted_[rank], 0));
-        cudaEvent_t done = nullptr;
-        if (!spare_.empty()) {
-            done = spare_.back();
-            spare_.pop_back();
-        } else {
-            CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
-        }
-        round_done[rank] = done;
-    }
-    for (auto copy : started) {
-        Layer& layer          = layers_[copy.layer];
         const std::size_t rank = layer.banks.rank;
         RankBinding bind(device_, rank);
-        for (int k = 0; k < 3; ++k) {
-            const ExpertBank& bank = layer.bank(k);
-            CUDA_CHECK(cudaMemcpyAsync(layer.slot_base(copy.slot) + layer.offset(k),
-                                       bank.host[std::size_t(copy.expert)],
-                                       std::size_t(bank.expert_bytes), cudaMemcpyHostToDevice,
-                                       side_[rank]));
-            stats_.copied_bytes += std::uint64_t(bank.expert_bytes);
+        if (index == mtp_) {
+            upload(layer, layer.banks.stream);
+        } else {
+            upload(layer, side_[rank]);
+            side_tables[rank] = layer.banks.stream;
         }
-        ++stats_.admitted;
-        copy.done = round_done[rank];
-        copies_.push_back(copy);
+    }
+    for (const auto& [rank, compute] : side_tables) {
+        RankBinding bind(device_, rank);
+        CUDA_CHECK(cudaEventRecord(uploaded_[rank], side_[rank]));
+        CUDA_CHECK(cudaStreamWaitEvent(compute, uploaded_[rank], 0));
+    }
+    // A text layer's candidates are copied right after: no kernel reads a text victim's slot
+    // before the next pass, which reads its entries on the host. The MTP block's candidates wait
+    // until the compute stream is done with its victims.
+    std::map<std::size_t, cudaEvent_t> round_done;
+    std::map<std::size_t, bool> after_draft;
+    for (const bool mtp : {false, true}) {
+        for (auto copy : started) {
+            if ((copy.layer == mtp_) != mtp) { continue; }
+            Layer& layer           = layers_[copy.layer];
+            const std::size_t rank = layer.banks.rank;
+            RankBinding bind(device_, rank);
+            if (round_done.count(rank) == 0) {
+                cudaEvent_t done = nullptr;
+                if (!spare_.empty()) {
+                    done = spare_.back();
+                    spare_.pop_back();
+                } else {
+                    CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+                }
+                round_done[rank] = done;
+            }
+            if (mtp && !after_draft[rank]) {
+                CUDA_CHECK(cudaEventRecord(evicted_[rank], layer.banks.stream));
+                CUDA_CHECK(cudaStreamWaitEvent(side_[rank], evicted_[rank], 0));
+                after_draft[rank] = true;
+            }
+            for (int k = 0; k < 3; ++k) {
+                const ExpertBank& bank = layer.bank(k);
+                CUDA_CHECK(cudaMemcpyAsync(layer.slot_base(copy.slot) + layer.offset(k),
+                                           bank.host[std::size_t(copy.expert)],
+                                           std::size_t(bank.expert_bytes), cudaMemcpyHostToDevice,
+                                           side_[rank]));
+                stats_.copied_bytes += std::uint64_t(bank.expert_bytes);
+            }
+            ++stats_.admitted;
+            copy.done = round_done[rank];
+            copies_.push_back(copy);
+        }
     }
     for (const auto& [rank, done] : round_done) {
         RankBinding bind(device_, rank);
