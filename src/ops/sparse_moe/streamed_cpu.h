@@ -53,10 +53,12 @@ public:
     StreamCpuInput() = default;
     StreamCpuInput(int capacity, int k);
     // Column `column` (below the capacity) from k BF16 words or FP32 values; columns() becomes at
-    // least column + 1.
+    // least column + 1. Threads may load columns below columns() at once.
     void load_bf16(int column, const std::uint16_t* values);
     void load_fp32(int column, const float* values);
     void clear() noexcept { columns_ = 0; }
+
+    void set_columns(int columns);
     [[nodiscard]] int columns() const noexcept { return columns_; }
     [[nodiscard]] int capacity() const noexcept { return capacity_; }
     [[nodiscard]] int k() const noexcept { return k_; }
@@ -101,7 +103,7 @@ public:
     [[nodiscard]] const char* backend_name() const noexcept;
 
     [[nodiscard]] bool supports(std::size_t layer) const override;
-    std::size_t compute(const Work& work) override;
+    Done compute(const Work& work) override;
 
 private:
     struct Job {

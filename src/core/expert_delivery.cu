@@ -1141,19 +1141,21 @@ struct ExpertDelivery::Impl {
         return bytes / 1e6;
     }
 
-    // The CPU's products of `cpu` for the served call of `pairs` pairs, overlapping the call's
-    // copies, then its missing ids without the CPU's pairs, its products and flag for the device.
+    // The CPU's products of `cpu` for the served call of `pairs` pairs while this thread issues
+    // the call's copies (`issue`; before a disk expert's reads, which they would wait behind),
+    // then its missing ids without the CPU's pairs, its products and flag for the device.
     void compute_cpu(std::size_t li, const std::vector<std::int32_t>& cpu, std::uint32_t pairs,
-                     const std::uint32_t* needed, ExpertDeliveryStats& delta) {
+                     const std::uint32_t* needed, ExpertDeliveryStats& delta,
+                     const std::function<void()>& issue) {
         auto* flag = static_cast<std::int32_t*>(host_flag->data());
         if (cpu.empty()) {
+            issue();
             if (*flag != 0) {
                 *flag = 0;
                 CUDA_CHECK(cudaMemcpyAsync(cpu_flag.p, flag, 4, cudaMemcpyHostToDevice, copies));
             }
             return;
         }
-        const auto started = std::chrono::steady_clock::now();
         const auto& layer = layers[li];
         std::vector<std::vector<const std::byte*>> blobs(cpu.size());
         std::vector<QueuedFileRead> reads;
@@ -1180,7 +1182,10 @@ struct ExpertDelivery::Impl {
                 }
             }
         }
-        if (!reads.empty()) { read_now(reads); }
+        if (!reads.empty()) {
+            issue();
+            read_now(reads);
+        }
         const auto* ids = static_cast<const std::int32_t*>(host_ids->data());
         ExpertCpuProducts::Work work;
         work.layer    = li;
@@ -1190,7 +1195,8 @@ struct ExpertDelivery::Impl {
         work.inputs   = static_cast<const std::byte*>(host_inputs->data());
         work.products = static_cast<std::byte*>(host_products->data());
         work.pool     = pool.get();
-        const std::size_t used = options.cpu.products->compute(work);
+        if (reads.empty()) { work.side = issue; }
+        const auto [used, microseconds] = options.cpu.products->compute(work);
         if (used > options.cpu.product_bytes) {
             throw std::logic_error("expert delivery: CPU products exceed their buffer");
         }
@@ -1216,10 +1222,7 @@ struct ExpertDelivery::Impl {
         }
         delta.cpu_experts += cpu.size();
         delta.read_bytes += file_bytes;
-        if (options.cpu.balance) {
-            split.computed(work_done, 1e6 * std::chrono::duration<double>(
-                                                std::chrono::steady_clock::now() - started).count());
-        }
+        if (options.cpu.balance) { split.computed(work_done, microseconds); }
     }
 
     void serve(const CudaHostHandshake::Request& request) {
@@ -1348,10 +1351,17 @@ struct ExpertDelivery::Impl {
         if (!to_bank.empty()) { fill_bank(k, li, to_bank); }
         const bool timed = options.cpu.balance && !cpu.empty() && !pieces.empty();
         const auto copied_before = delta.copied_bytes;
-        if (timed) { CUDA_CHECK(cudaEventRecord(copies_begun, copies)); }
-        flush_pieces(delta);
-        if (timed) { CUDA_CHECK(cudaEventRecord(copies_done, copies)); }
-        if (layer.cpu && host_flag) { compute_cpu(li, cpu, request.width, needed, delta); }
+
+        const auto issue = [&] {
+            if (timed) { CUDA_CHECK(cudaEventRecord(copies_begun, copies)); }
+            flush_pieces(delta);
+            if (timed) { CUDA_CHECK(cudaEventRecord(copies_done, copies)); }
+        };
+        if (layer.cpu && host_flag) {
+            compute_cpu(li, cpu, request.width, needed, delta, issue);
+        } else {
+            issue();
+        }
         if (ranges_dirty) {
             CUDA_CHECK(cudaMemcpyAsync(lent_ranges.p, host_ranges->data(), host_ranges->size(),
                                        cudaMemcpyHostToDevice, copies));

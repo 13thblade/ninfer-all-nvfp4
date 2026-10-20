@@ -394,9 +394,9 @@ GgufCpuBackend gguf_cpu_backend_selected(GgufCpuBackend requested) noexcept {
 }
 
 GgufCpuActivation::GgufCpuActivation(int token_capacity, int k)
-    : capacity_(token_capacity), k_(k), groups_(k / 32),
-      codes_(std::size_t(token_capacity) * k), scales_(std::size_t(token_capacity) * (k / 32)),
-      scratch_(std::size_t(k)), value_sums_(std::size_t(token_capacity) * (k / 32)),
+    : capacity_(token_capacity), k_(k), groups_(k / 32), codes_(std::size_t(token_capacity) * k),
+      scales_(std::size_t(token_capacity) * (k / 32)),
+      value_sums_(std::size_t(token_capacity) * (k / 32)),
       sums_(std::size_t(token_capacity) * (k / 32)) {
     if (token_capacity <= 0 || k <= 0 || k % 32 != 0) {
         throw std::invalid_argument("GGUF CPU activation: k must be a positive multiple of 32");
@@ -406,37 +406,35 @@ GgufCpuActivation::GgufCpuActivation(int token_capacity, int k)
 // ggml's quantize_q8_1 as the GPU computes it (ggml_bridge_vec.cuh decode_quantize): per 32
 // values d = amax / 127 and codes round(v / d), halves away from zero; the scale used is d in
 // binary16, and s the values' warp sum in binary16.
-void GgufCpuActivation::quantize(QType format, int token, const float* values) {
+void GgufCpuActivation::quantize_group(int token, int g, const float* v) {
     std::int8_t* codes = codes_.data() + std::size_t(token) * k_;
-    float* scales      = scales_.data() + std::size_t(token) * groups_;
-    float* value_sums  = value_sums_.data() + std::size_t(token) * groups_;
-    std::int32_t* sums = sums_.data() + std::size_t(token) * groups_;
-    const bool lanes   = format == QType::GGUF_Q2_0;
+    const bool lanes   = format_ == QType::GGUF_Q2_0;
     float warp[32];
-    for (int g = 0; g < groups_; ++g) {
-        const float* v = values + 32 * g;
-        float amax     = 0;
-        for (int i = 0; i < 32; ++i) {
-            if (!std::isfinite(v[i])) { throw std::runtime_error("GGUF CPU expert: nonfinite activation"); }
-            amax = std::max(amax, std::abs(v[i]));
-            warp[i] = v[i];
+    float amax = 0;
+    for (int i = 0; i < 32; ++i) {
+        if (!std::isfinite(v[i])) {
+            throw std::runtime_error("GGUF CPU expert: nonfinite activation");
         }
-        value_sums[g] = gguf_cpu_detail::round_to_half(gguf_cpu_detail::butterfly(warp));
-        const float d    = amax / 127.0F;
-        std::int32_t sum = 0;
-        for (int i = 0; i < 32; ++i) {
-            const auto code = amax == 0 ? std::int8_t(0) : static_cast<std::int8_t>(std::round(v[i] / d));
-            sum += code;
-            const int j = 32 * g + i;
-            codes[lanes ? j / 64 * 64 + gguf_cpu_detail::q2_lane_position(j % 64) : j] = code;
-        }
-        scales[g] = gguf_cpu_detail::round_to_half(d);
-        sums[g]   = sum;
+        amax    = std::max(amax, std::abs(v[i]));
+        warp[i] = v[i];
     }
+    const std::size_t at = std::size_t(token) * groups_ + g;
+    value_sums_[at]      = gguf_cpu_detail::round_to_half(gguf_cpu_detail::butterfly(warp));
+    const float d        = amax / 127.0F;
+    std::int32_t sum     = 0;
+    for (int i = 0; i < 32; ++i) {
+        const auto code =
+            amax == 0 ? std::int8_t(0) : static_cast<std::int8_t>(std::round(v[i] / d));
+        sum += code;
+        const int j  = 32 * g + i;
+        const int to = lanes ? j / 64 * 64 + gguf_cpu_detail::q2_lane_position(j % 64) : j;
+        codes[to]    = code;
+    }
+    scales_[at] = gguf_cpu_detail::round_to_half(d);
+    sums_[at]   = sum;
 }
 
-void GgufCpuActivation::prepare_bf16(QType format, const std::uint16_t* values, std::size_t stride,
-                                     int tokens) {
+void GgufCpuActivation::reset(QType format, int tokens) {
     if (tokens <= 0 || tokens > capacity_) {
         throw std::invalid_argument("GGUF CPU activation: token count exceeds capacity");
     }
@@ -445,12 +443,39 @@ void GgufCpuActivation::prepare_bf16(QType format, const std::uint16_t* values, 
     }
     format_ = format;
     tokens_ = tokens;
-    for (int t = 0; t < tokens; ++t) {
-        const std::uint16_t* column = values + std::size_t(t) * stride;
-        for (int i = 0; i < k_; ++i) {
-            scratch_[i] = std::bit_cast<float>(std::uint32_t(column[i]) << 16);
+}
+
+void GgufCpuActivation::quantize_bf16(int token, const std::uint16_t* column, int group_begin,
+                                      int group_end) {
+    if (token < 0 || token >= tokens_ || group_begin < 0 || group_end > groups_) {
+        throw std::invalid_argument("GGUF CPU activation: token or group outside the activation");
+    }
+    float values[32];
+    for (int g = group_begin; g < group_end; ++g) {
+        for (int i = 0; i < 32; ++i) {
+            values[i] = std::bit_cast<float>(std::uint32_t(column[32 * g + i]) << 16);
         }
-        quantize(format, t, scratch_.data());
+        quantize_group(token, g, values);
+    }
+}
+
+void GgufCpuActivation::copy_token(int token, const GgufCpuActivation& from, int from_token) {
+    if (token < 0 || token >= tokens_ || from_token < 0 || from_token >= from.tokens_ ||
+        from.k_ != k_ || from.format_ != format_) {
+        throw std::invalid_argument("GGUF CPU activation: copied token outside the activations");
+    }
+    std::memcpy(codes_.data() + std::size_t(token) * k_, from.codes(from_token), std::size_t(k_));
+    const std::size_t to = std::size_t(token) * groups_, at = std::size_t(from_token) * groups_;
+    std::copy_n(from.scales_.data() + at, groups_, scales_.data() + to);
+    std::copy_n(from.value_sums_.data() + at, groups_, value_sums_.data() + to);
+    std::copy_n(from.sums_.data() + at, groups_, sums_.data() + to);
+}
+
+void GgufCpuActivation::prepare_bf16(QType format, const std::uint16_t* values, std::size_t stride,
+                                     int tokens) {
+    reset(format, tokens);
+    for (int t = 0; t < tokens; ++t) {
+        quantize_bf16(t, values + std::size_t(t) * stride, 0, groups_);
     }
 }
 

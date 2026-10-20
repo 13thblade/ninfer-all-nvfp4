@@ -55,6 +55,14 @@ public:
     GgufCpuActivation(int token_capacity, int k);
     // Quantizes `tokens` BF16 columns of k values (column-major, `stride` apart) for `format`.
     void prepare_bf16(QType format, const std::uint16_t* values, std::size_t stride, int tokens);
+    // The same in pieces, which threads may fill at once: reset() sets the format and the token
+    // count, then quantize_bf16() fills the 32-value groups [group_begin, group_end) of one
+    // token from its BF16 column.
+    void reset(QType format, int tokens);
+    void quantize_bf16(int token, const std::uint16_t* column, int group_begin, int group_end);
+    // Token `token` (after reset()) as token `from_token` of `from`, an activation of the same
+    // format and k.
+    void copy_token(int token, const GgufCpuActivation& from, int from_token);
     // The GPU's quantized columns `columns` of a planar vector activation (gguf vector_activation:
     // int8 codes [column][k], then a binary16 (d, s) pair [column][k / 32] at `ds`) for `format`.
     void load_q8_1(QType format, const std::int8_t* codes, const std::uint16_t* ds,
@@ -79,12 +87,14 @@ public:
         return value_sums_.data() + std::size_t(token) * groups_;
     }
 
+    [[nodiscard]] int groups() const noexcept { return groups_; }
+
 private:
-    void quantize(QType format, int token, const float* values);
+    void quantize_group(int token, int group, const float* values);
     int capacity_ = 0, k_ = 0, groups_ = 0, tokens_ = 0;
     QType format_ = QType::GGUF_Q2_0;
     std::vector<std::int8_t> codes_;
-    std::vector<float> scales_, scratch_, value_sums_;
+    std::vector<float> scales_, value_sums_;
     std::vector<std::int32_t> sums_;
 };
 
