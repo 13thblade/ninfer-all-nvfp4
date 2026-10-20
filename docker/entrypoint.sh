@@ -9,8 +9,8 @@
 #   anything else             executed as given
 #
 # GPUs that need different builds (a layer pipeline with --devices across, say, an RTX 2080 Ti and
-# an RTX 3090) take `multi`, the one build of all three architectures that the :multi image
-# carries, where every card runs its own kernels. Without it they take the build of the oldest
+# an RTX 3090) take `multi`, a build containing all selected architectures,
+# where every card runs its own kernels. Without it they take the build of the oldest
 # card, which the newer cards run from its PTX: slower there, and compiled at the first start.
 # An image that carries only `multi` runs it on every GPU.
 #
@@ -61,7 +61,7 @@ select_arch() {
     for build in sm75 sm86 sm120a; do
       grep -qxF "$build" <<<"$unique" && break
     done
-    printf 'GPUs of several architectures (%s): running the %s build on all of them; the :multi\n' \
+    printf 'GPUs of several architectures (%s): running the %s build on all of them; a multiarch\n' \
       "$(tr '\n' ' ' <<<"$unique" | sed 's/ $//')" "$build" >&2
     printf 'image runs each card on its own code.\n' >&2
     printf '%s' "$build"

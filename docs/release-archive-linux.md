@@ -58,8 +58,9 @@ docker run --rm --gpus all -p 8080:8080 -v ninfer-models:/models ninfer:local
 
 The included Dockerfile installs runtime packages and copies these binaries. It does not build
 NInfer again. The host needs NVIDIA Container Toolkit for GPU access. This image uses the same
-entrypoint commands, `run.sh` launcher and model profiles as the source tree. The `multi` image
-workflow packages the CUDA 13 archive from Native release without recompilation.
+entrypoint commands, `run.sh` launcher and model profiles as the source tree. The Container image
+workflow packages both Native release archives as `cuda12.9` and `cuda13.4`, with matching
+`cuda12.9-<commit12>` and `cuda13.4-<commit12>` tags, without recompilation.
 
 ## Start a model
 

@@ -1,6 +1,6 @@
 # Continuous integration, all of it without a GPU: GitHub-hosted runners have none, so the CUDA
 # builds compile every target and run the test suite with each GPU test skipping itself (exit 77).
-# A green run of this workflow on master is what publishes the container image (docker.yml).
+# Native release supplies the published container binaries; this workflow checks code and tests.
 #
 #   * docs/config-calculator.test.mjs -- pins the published calculator's arithmetic against the
 #     engine's own figures.
@@ -26,7 +26,7 @@
 #   * the CUDA build of every target for sm_75, sm_86 and sm_120a in the Dockerfile's toolchain
 #     stage, then CTest. The toolchain stage is published as ghcr.io/<owner>/<repo>-toolchain once
 #     per change of its definition (.github/scripts/toolchain-image.sh); sccache carries over
-#     between runs; the binaries go to the image.
+#     between runs.
 #
 # The last two run only when a file they build, test or ship from differs from the base: the
 # branch a pull request merges into, or on master the commit the published image was built from
@@ -406,13 +406,3 @@ jobs:
             ninfer-toolchain:ci bash -c 'mkdir -p /tmp/stub && \
               ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/stub/libcuda.so.1 && \
               LD_LIBRARY_PATH=/tmp/stub scripts/build-native.sh test'
-      - name: Stage the image binaries
-        run: |
-          docker run --rm -v "$PWD:/src" -w /src ninfer-toolchain:ci \
-            docker/stage-dist.sh build-ci ${{ matrix.arch }} dist
-      - uses: actions/upload-artifact@v7
-        with:
-          name: dist-sm${{ matrix.arch }}
-          path: dist/
-          # Only the publishing run that follows reads them.
-          retention-days: 1

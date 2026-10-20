@@ -1,84 +1,59 @@
-# Publishes ghcr.io/<owner>/<repo> after CI passes on master: the runtime image around the
-# binaries that CI built and tested (its dist-sm75, dist-sm86 and dist-sm120a artifacts), so nothing
-# is compiled twice and nothing unpublished by CI reaches the image. A CI run that changed nothing
-# the binaries are built from builds none, and the image it would publish is the one already there.
-# Tags:
-#   latest            the newest master commit that passed CI
-#   <VERSION>         the newest such commit of that release line
-#   sha-<12 hex>      the published commit
-# The registry keeps `latest` and the image published before it (docker/prune-images.sh).
+# Package both verified Linux archives from the same Native release run; no compilation.
 name: Container image
 
 on:
   workflow_run:
-    workflows: [CI]
+    workflows: [Native release]
     types: [completed]
     branches: [master]
 
-# A newer publish supersedes one still running: it takes `latest`, and the prune after it removes
-# whatever the cancelled one had pushed.
 concurrency:
   group: container-image
   cancel-in-progress: true
 
 jobs:
-  binaries:
-    name: Find the binaries
+  package:
+    name: Package CUDA ${{ matrix.cuda }}
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     runs-on: ubuntu-24.04
-    permissions:
-      actions: read
-    outputs:
-      built: ${{ steps.find.outputs.built }}
-    steps:
-      - id: find
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
-        run: |
-          count="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
-            --jq '[.artifacts[] | select(.name | startswith("dist-"))] | length')"
-          echo "CI run $RUN_ID uploaded $count dist artifacts"
-          if (( count > 0 )); then echo built=true; else echo built=false; fi >> "$GITHUB_OUTPUT"
-
-  publish:
-    name: Publish the image
-    needs: binaries
-    if: needs.binaries.outputs.built == 'true'
-    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: '12.9'
+            toolkit: '12.9.2'
+          - cuda: '13.4'
+            toolkit: '13.4.3'
     env:
       SHA: ${{ github.event.workflow_run.head_sha }}
+      CUDA_VARIANT: ${{ matrix.cuda }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
       - uses: actions/download-artifact@v8
         with:
-          pattern: dist-*
-          merge-multiple: true
-          path: dist
+          name: native-linux-cuda-${{ matrix.toolkit }}
+          path: native-artifact
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
-      # Runs finish out of order. Only the commit that is still master's head may move `latest`
-      # and the version tag; an older one is published under its sha tag alone.
-      - name: Tags
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Verify and extract the Docker context
+        id: extract
+        run: echo "context=$(python3.11 .github/scripts/extract-native-image.py native-artifact native-context "$SHA" "$CUDA_VARIANT")" >> "$GITHUB_OUTPUT"
+      - name: Commit tag
         id: tags
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           echo "image=$image" >> "$GITHUB_OUTPUT"
-          tags="$image:sha-${SHA:0:12}"
-          head="$(gh api "repos/$GITHUB_REPOSITORY/commits/master" --jq .sha)"
-          if [[ "$head" == "$SHA" ]]; then
-            tags+=",$image:latest,$image:$(tr -d '[:space:]' < VERSION)"
-          fi
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
-          ls -R dist
+          echo "tag=$image:cuda${CUDA_VARIANT}-${SHA:0:12}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -87,24 +62,38 @@ jobs:
           password: ${{ github.token }}
       - uses: docker/build-push-action@v7
         with:
-          context: .
-          target: runtime
-          build-contexts: dist=dist
+          context: ${{ steps.extract.outputs.context }}
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: ${{ steps.tags.outputs.tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ env.SHA }}
-            org.opencontainers.image.description=NInfer: Qwen3.5/3.6/3.8, Qwen3.8-Flash-Next and Gemma 4 inference server for RTX 20, 30, 40 and 50 GPUs
+            org.opencontainers.image.description=NInfer CUDA ${{ matrix.cuda }} with every supported NInfer architecture for this Toolkit
             org.opencontainers.image.licenses=Apache-2.0
-          # The layers below the binaries (Ubuntu and the libraries) come back from the last
-          # published image through its inline cache. An Actions layer cache would hold the
-          # binaries as well and evict the CI's ccache from the repository's 10 GB budget.
-          cache-from: type=registry,ref=${{ steps.tags.outputs.image }}:latest
+          cache-from: type=registry,ref=${{ steps.tags.outputs.image }}:cuda${{ matrix.cuda }}
           cache-to: type=inline
-      # Older images go, with the platform manifests and attestations their indexes list.
-      - name: Prune older images
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: docker/prune-images.sh "$GITHUB_REPOSITORY"
+
+  promote:
+    name: Update both CUDA tags
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Promote only the current master commit
+        run: .github/scripts/promote-container-images.sh

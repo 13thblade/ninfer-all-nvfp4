@@ -1,9 +1,33 @@
 # Cutting a release
 
 The [Native release](../../.github/workflows/native-release.yml) workflow builds Windows x64
-executables and Debian 13 x64 binaries. After a successful master run, `Multi-architecture image`
-packages its CUDA 13 Linux archive as `multi`. Ordinary CI still builds and tests each architecture
-separately; `Container image` packages those CI binaries as `latest`.
+executables and Debian 13 x64 binaries. After a successful master push run,
+[Container image](../../.github/workflows/docker.yml) packages both Linux archives without compilation.
+Ordinary CI builds and tests individual architectures independently.
+
+## Container publication
+
+| Toolkit | Floating tag | Commit tag | NInfer architectures |
+|---|---|---|---|
+| CUDA 12.9.2 | `cuda12.9` | `cuda12.9-<commit12>` | `70;75;80;86;89` |
+| CUDA 13.4.3 | `cuda13.4` | `cuda13.4-<commit12>` | `75;80;86;89;120a` |
+
+Both images use Debian 13 and the binaries and CUDA runtime libraries from the same native run.
+The handoff verifies volume checksums, packaged files, full source revision, CUDA version and the
+complete architecture list. Each image keeps all its device images in one multicall executable.
+`commit12` is the first 12 hexadecimal characters of the source SHA; `VERSION` is not a tag.
+
+The matrix publishes commit tags first. Only after both jobs succeed does promotion update the
+floating CUDA tags, checking the current master SHA before each update. Registry tag updates are
+separate operations: cancellation, a newer commit or registry failure can leave them temporarily
+pointing to different revisions. Use both commit tags when the same revision is required.
+A failed matrix does not promote either tag. Each variant reuses its previous image's inline
+BuildKit cache. Compiler caches remain in Native release and CI.
+
+The pipeline no longer updates `latest`, `multi`, version-only or `sha-…` tags. Existing registry
+images are not deleted. The old latest-based pruning policy is removed because it cannot retain
+both CUDA families safely; registry storage grows with published commit images until a separate
+retention policy is configured. Manual native test runs do not publish container images.
 
 ## Native publication
 

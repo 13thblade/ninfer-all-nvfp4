@@ -23,7 +23,7 @@ hf download WaveCut/Ternary-Bonsai-2-27B-NInfer-v3 Ternary-Bonsai-2-27B-ninfer-v
 
 docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
   -v "$PWD/models:/models" -v ninfer-cache:/cache \
-  ghcr.io/iamwavecut/ninfer-all serve /models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer \
+  ghcr.io/iamwavecut/ninfer-all:cuda13.4 serve /models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer \
   --model-id bonsai2-27b --max-context 262144 --kv-capacity 262144 --kv-dtype rk8v4 \
   --gdn-state-fp16 --spec dflash2 --draft-tokens 5
 
@@ -51,23 +51,24 @@ how to make one.
 
 NVIDIA GPUs from Volta (compute capability 7.0) to consumer Blackwell (12.0), from 8 GB of memory:
 Ternary Bonsai 2 27B runs on an 8 GB RTX 3060 Ti, and Qwen3.8-Flash-Next streams its experts from
-host memory or disk through 8 GB. The [Docker image](#docker) carries the `75`, `86` and `120a` builds
-and starts the one that matches the GPU. Every card by name, with what has run on it:
+host memory or disk through 8 GB. The two [Docker images](#docker) each contain all NInfer targets
+for their CUDA version in one executable: CUDA 12.9 includes Volta, and CUDA 13.4 includes Blackwell.
+Every card by name, with what has run on it:
 [Supported GPUs](docs/gpus.md).
 
 *Click a section to expand it.*
 
 <details>
-<summary><b>Architectures and builds</b> — six architectures, one build each</summary>
+<summary><b>Architectures and builds</b> — six architectures, two CUDA variants</summary>
 
-| Architecture | Compute capability | Build | CUDA | In the image | Status |
+| Architecture | Compute capability | Build | CUDA | Docker tags | Status |
 |---|---|---|---|---|---|
-| Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer | yes | measured; built-in device profiles |
-| Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | the `86` build | measured; built-in device profiles |
-| Ampere | 8.6 | `86` (the default) | 12.8 or newer | yes | measured (the reference card); built-in device profiles |
-| Ampere, A100 class | 8.0 | `80` | 12.8 or newer | no | built-in device profiles; not benchmarked |
-| Turing | 7.5 | `75` | 12.8 or newer | yes | measured; built-in device profiles |
-| Volta | 7.0 | `70` | 12.8 or 12.9 | no: [source build](docs/build-linux.md#tesla-v100-sm_70) | measured; built-in device profiles |
+| Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer | `cuda13.4` | measured; built-in device profiles |
+| Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | both, native `89` | measured; built-in device profiles |
+| Ampere | 8.6 | `86` (the default) | 12.8 or newer | both | measured (the reference card); built-in device profiles |
+| Ampere, A100 class | 8.0 | `80` | 12.8 or newer | both | built-in device profiles; not benchmarked |
+| Turing | 7.5 | `75` | 12.8 or newer | both | measured; built-in device profiles |
+| Volta | 7.0 | `70` | 12.8 or 12.9 | `cuda12.9` | measured; built-in device profiles |
 | Hopper; data-center Blackwell; GB10; Pascal and older | | none | | | no build |
 
 </details>
@@ -343,33 +344,38 @@ Prefill of a 4,463-token prompt, in tok/s:
 
 ## Docker
 
-`ghcr.io/iamwavecut/ninfer-all:latest` is built from the newest `master` commit that passes CI, on CUDA 13.4
-and Ubuntu 26.04, and is 1.6 GB compressed. It carries the `sm_75`, `sm_86` and `sm_120a` builds and starts
-the one that matches the GPUs. It needs an NVIDIA driver of the CUDA 13 branch (580 or newer) and the
-[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-The `multi` image packages the Native release workflow's Debian 13 / CUDA 13.4 binary, with
-`sm_75`, `sm_80`, `sm_86`, `sm_89` and `sm_120a` in one executable. It supports a layer pipeline
-(`--devices`) across different GPU architectures, with each card running its own kernels.
-The image reuses the release archive without compiling NInfer again.
+The release pipeline packages two Debian 13 / Linux x64 images from the native Linux archives.
+Each image contains one executable with all NInfer architectures supported by its CUDA variant.
+The image build does not compile NInfer again.
 
-Native Windows and Linux archives have two CUDA variants. Their architecture sets overlap;
-CUDA 12 adds Volta, while CUDA 13 adds Blackwell:
+| Image tag | Toolkit | Embedded GPU architectures |
+|---|---|---|
+| `ghcr.io/iamwavecut/ninfer-all:cuda12.9` | CUDA 12.9.2 | `sm_70`, `sm_75`, `sm_80`, `sm_86`, `sm_89` |
+| `ghcr.io/iamwavecut/ninfer-all:cuda13.4` | CUDA 13.4.3 | `sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_120a` |
+
+Choose `cuda12.9` for Volta and `cuda13.4` for Blackwell. Both cover Turing, Ampere and Ada.
+Both support a layer pipeline (`--devices`) across different architectures included in that image.
+The host needs a compatible NVIDIA driver and the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+Windows archives, Linux archives and Docker images use the same two architecture sets:
 
 ![GPU architectures included in NInfer's CUDA 12.9.2 and CUDA 13.4.3 builds](docs/assets/cuda-architectures.svg)
 
-Each archive contains all device images inside its outline. These are the project's build targets,
+Each archive and image contains all device images inside its outline. These are the project's build targets,
 not the complete list of architectures supported by NVIDIA's Toolkits.
 See the [release process](docs/maintainer/release-process.md) for build and verification status.
 
 <details>
 <summary><b>Commands, volumes and tags</b> — what the container runs</summary>
 
-- **Tags.** `latest`, `sha-<commit>` and the `VERSION`. A commit that changes only documentation or
-  tooling the image does not carry keeps the image before it. `multi` and `sha-<commit>-multi` are
-  the multi-architecture image, packaged after Native release succeeds on `master`.
+- **Tags.** `cuda12.9` and `cuda13.4` follow successful Native release builds of the current `master`.
+  Pin a build with `cuda12.9-<commit12>` or `cuda13.4-<commit12>`, where `commit12` is the first
+  12 hexadecimal characters of its commit SHA. Both images must build before either floating tag
+  moves. The pipeline no longer updates `latest`, `multi` or `VERSION` tags.
 - **Volumes.** `/models` holds artifacts, `/cache` the device profile measured on first start, and
   `/grafts/<model>/` optional [prompt grafts](docs/serving.md#prompt-grafts).
-- **Checked** on an RTX 3090 and an RTX 5090 with driver 580.159.03.
+- **Verification.** The new image variants still need a complete build and GPU inference checks.
+  Earlier image tests on RTX 3090 and RTX 5090 do not establish these variants' runtime behavior.
 
 The container's command chooses what runs:
 
@@ -382,16 +388,17 @@ The container's command chooses what runs:
 The official Qwen3.8-27B with the measured `tuned` profile, on http://localhost:8080/v1:
 
 ```bash
-docker run --rm -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all download qwen38-27b
+docker run --rm -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all:cuda13.4 download qwen38-27b
 docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
   -v "$PWD/models:/models" -v ninfer-cache:/cache \
-  ghcr.io/iamwavecut/ninfer-all run qwen38-27b
+  ghcr.io/iamwavecut/ninfer-all:cuda13.4 run qwen38-27b
 ```
 
 [compose.yaml](compose.yaml) wires the GPU, the port and the volumes for the same:
 `docker compose run --rm ninfer download qwen38-27b`, then `docker compose up -d`.
-`NINFER_IMAGE_ARCH=sm75|sm86|sm120a|multi` overrides the GPU detection, and `docker build -t ninfer .`
-builds the image from source (`--build-arg ARCHS=86` for one architecture,
+`NINFER_CUDA_TAG=cuda12.9 docker compose up -d` selects the Volta-capable image; Compose defaults
+to `cuda13.4`. The published images use their multiarch binary automatically.
+`docker build -t ninfer .` builds a separate Ubuntu image from source (`--build-arg ARCHS=86` for one architecture,
 `--build-arg 'ARCHS=75;86;120a'` for the multi-architecture build).
 
 </details>

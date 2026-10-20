@@ -5,7 +5,7 @@
 # cubins run on Ada sm_89) and sm_120a (consumer Blackwell) -- as one multi-call executable each
 # (NINFER_MULTICALL), next to the launcher and the downloader. A list of architectures in ARCHS
 # ("75;86;120a") builds one executable for all of them, `multi`, whose every card runs its own
-# kernels; the :multi image carries it alone, for a layer pipeline across cards of different
+# kernels, for a layer pipeline across cards of different
 # architectures. The entrypoint runs the build that matches the GPUs it is given
 # (docker/entrypoint.sh).
 #

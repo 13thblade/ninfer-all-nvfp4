@@ -14,7 +14,7 @@ The recipes are written for a build. In the container, replace `ninfer-serve mod
 ```bash
 docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
   -v "$PWD/models:/models" -v ninfer-cache:/cache \
-  ghcr.io/iamwavecut/ninfer-all serve /models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer \
+  ghcr.io/iamwavecut/ninfer-all:cuda13.4 serve /models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer \
   --model-id bonsai2-27b --max-context 262144 --kv-capacity 262144 --kv-dtype rk8v4 \
   --gdn-state-fp16 --spec dflash2 --draft-tokens 5
 ```
@@ -144,7 +144,7 @@ ninfer-serve $M --ngram-table $T --model-id qwen3.8-flash-next --max-context 327
 # The container, experts in host memory.
 docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
   -v "$PWD/models:/models" -v ninfer-cache:/cache \
-  ghcr.io/iamwavecut/ninfer-all serve /models/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-ninfer-v3.ninfer \
+  ghcr.io/iamwavecut/ninfer-all:cuda13.4 serve /models/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-ninfer-v3.ninfer \
   --ngram-table /models/Qwen3.8-Flash-Next-ngram-table-IQ4_NL-ninfer-v3.ninfer \
   --model-id qwen3.8-flash-next --max-context 32768 --expert-residency host
 ```

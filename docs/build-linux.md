@@ -18,12 +18,14 @@ what those builds change.
 
 ## Container image
 
-The published image, `ghcr.io/iamwavecut/ninfer-all:latest`, is the shortest path on any Linux
-distribution: CUDA 13.4 on Ubuntu 26.04, with an `sm_75` build for Turing, an `sm_86` build for the
-RTX 30 and 40 series and an `sm_120a` build for Blackwell, and it starts the one that matches the
-GPU. It needs a
-driver of the CUDA 13 branch (580 or newer) and the NVIDIA Container Toolkit; make sure that Docker
-can access the GPU first:
+The release pipeline packages Debian 13 images from prebuilt Linux binaries:
+
+- `ghcr.io/iamwavecut/ninfer-all:cuda12.9`: CUDA 12.9.2 with `70;75;80;86;89`, including Volta.
+- `ghcr.io/iamwavecut/ninfer-all:cuda13.4`: CUDA 13.4.3 with `75;80;86;89;120a`, including Blackwell.
+
+Each image carries all listed architectures in one executable. Both support mixed-GPU pipelines
+within their architecture set. Choose the variant for your GPUs and installed NVIDIA driver.
+The host also needs NVIDIA Container Toolkit. For a CUDA 13 host, first check GPU access:
 
 ```bash
 docker run --rm --gpus all nvidia/cuda:13.4.3-base-ubuntu26.04 nvidia-smi
@@ -32,13 +34,13 @@ docker run --rm --gpus all nvidia/cuda:13.4.3-base-ubuntu26.04 nvidia-smi
 Download and serve the Qwen3.8 model with the measured `tuned` profile:
 
 ```bash
-docker run --rm -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all download qwen38-27b
+docker run --rm -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all:cuda13.4 download qwen38-27b
 docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
-  -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all run qwen38-27b
+  -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all:cuda13.4 run qwen38-27b
 ```
 
 The API is available at `http://127.0.0.1:8080/v1`. `docker build --build-arg ARCHS=86 -t ninfer .`
-builds the same image from source with the `sm_86` build alone; the [README](../README.md#docker)
+builds a separate Ubuntu image from source with the `sm_86` build alone; the [README](../README.md#docker)
 covers the container's commands, volumes and compose file, and the [launch recipes](recipes.md)
 the command for each published artifact.
 

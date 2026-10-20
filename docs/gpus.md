@@ -9,18 +9,19 @@ each card are on the [performance](performance.md) page.
 A build targets one architecture (`CMAKE_CUDA_ARCHITECTURES`), or several for a layer pipeline across
 cards of different architectures ([several architectures](build-linux.md#cards-of-several-architectures-in-one-pipeline));
 configure refuses any other target.
-The Docker image (CUDA 13.4, NVIDIA driver 580 or newer) carries the `75`, `86` and `120a` builds and
-starts the one that matches the GPUs; its `multi` tag carries one build of all three for a pipeline
-across cards of different architectures.
+The Docker pipeline packages two multiarch images: `cuda12.9` contains `70;75;80;86;89`, and
+`cuda13.4` contains `75;80;86;89;120a`. Each uses one executable for all included architectures,
+including a pipeline across different GPU families. See [Docker](../README.md#docker) for tags
+and verification status.
 
-| Architecture | Compute capability | Build | CUDA | In the image | Status |
+| Architecture | Compute capability | Build | CUDA | Docker tags | Status |
 |---|---|---|---|---|---|
-| Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer | yes | measured; built-in device profiles |
-| Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | the `86` build | measured; built-in device profiles |
-| Ampere | 8.6 | `86` (the default) | 12.8 or newer | yes | measured (the reference card); built-in device profiles |
-| Ampere, A100 class | 8.0 | `80` | 12.8 or newer | no | built-in device profiles; not benchmarked |
-| Turing | 7.5 | `75` | 12.8 or newer | yes | measured; built-in device profiles |
-| Volta | 7.0 | `70` | 12.8 or 12.9 | no: [source build](build-linux.md#tesla-v100-sm_70) | measured; built-in device profiles |
+| Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer | `cuda13.4` | measured; built-in device profiles |
+| Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | both, native `89` | measured; built-in device profiles |
+| Ampere | 8.6 | `86` (the default) | 12.8 or newer | both | measured (the reference card); built-in device profiles |
+| Ampere, A100 class | 8.0 | `80` | 12.8 or newer | both | built-in device profiles; not benchmarked |
+| Turing | 7.5 | `75` | 12.8 or newer | both | measured; built-in device profiles |
+| Volta | 7.0 | `70` | 12.8 or 12.9 | `cuda12.9` | measured; built-in device profiles |
 | Hopper; data-center Blackwell; GB10 | 9.0; 10.x; 12.1 | none | | | no build |
 | Pascal and older | 6.x and older | none | | | no build |
 

@@ -8,10 +8,15 @@ import re
 import tarfile
 
 
-def extract(source, destination, revision):
+VARIANTS = {"12.9": ["70", "75", "80", "86", "89"],
+            "13.4": ["75", "80", "86", "89", "120a"]}
+
+
+def extract(source, destination, revision, cuda):
+    architectures = VARIANTS[cuda]
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("Invalid source revision")
-    name = f"ninfer-linux-x64-cuda13.4-sm75-80-86-89-120a-{revision[:12]}"
+    name = f"ninfer-linux-x64-cuda{cuda}-sm{'-'.join(architectures)}-{revision[:12]}"
     lines = (source / f"SHA256SUMS-{name}.txt").read_text().splitlines()
     if not lines:
         raise ValueError("Empty archive manifest")
@@ -55,8 +60,8 @@ def extract(source, destination, revision):
     root = destination / name
     info = json.loads((root / "BUILD-INFO.json").read_text())
     if (info["source_revision"] != revision or info["modified_sources"]
-            or info["cuda"] != "13.4" or info["platform"] != "linux-x64"
-            or info["architectures"] != ["75", "80", "86", "89", "120a"]):
+            or info["cuda"] != cuda or info["platform"] != "linux-x64"
+            or info["architectures"] != architectures):
         raise ValueError("Archive metadata does not match the requested source and variant")
     for line in (root / "SHA256SUMS.txt").read_text().splitlines():
         digest, relative = line.split("  ", 1)
@@ -77,5 +82,6 @@ if __name__ == "__main__":
     parser.add_argument("source", type=Path)
     parser.add_argument("destination", type=Path)
     parser.add_argument("revision")
+    parser.add_argument("cuda", choices=VARIANTS)
     args = parser.parse_args()
-    print(extract(args.source, args.destination, args.revision))
+    print(extract(args.source, args.destination, args.revision, args.cuda))

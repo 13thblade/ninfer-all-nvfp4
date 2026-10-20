@@ -36,7 +36,7 @@ case "$GITHUB_EVENT_NAME:$GITHUB_REF" in
   pull_request:*)
     base="$(git rev-parse --verify --quiet 'HEAD^1')" || base="" ;;
   push:refs/heads/master)
-    base="$(docker buildx imagetools inspect "ghcr.io/${GITHUB_REPOSITORY,,}:latest" \
+    base="$(docker buildx imagetools inspect "ghcr.io/${GITHUB_REPOSITORY,,}:cuda13.4" \
       --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}')" || base="" ;;
 esac
 [[ -n "$base" ]] || build "no base to compare with: building"

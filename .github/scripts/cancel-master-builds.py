@@ -6,7 +6,7 @@ import subprocess
 
 WORKFLOWS = {
     ".github/workflows/ci.yml", ".github/workflows/native-release.yml",
-    ".github/workflows/docker.yml", ".github/workflows/multiarch-image.yml",
+    ".github/workflows/docker.yml",
 }
 
 
