@@ -169,6 +169,11 @@ objects before packaging. Native builds stop after 300 minutes of compilation, o
 deadline set 330 minutes from the first job step. CUDA CI uses the same compilation limit and
 deadline, reserving the remaining time for tests and diagnostics. The job limit is 350 minutes.
 The supervisor exits with code 124 and leaves cleanup time; the hard step timeout is five minutes longer than its duration limit.
+Cancellation first sends a console interrupt, with up to four seconds for the build parent to exit.
+It then stops all remaining compiler descendants, even if that parent has already exited. POSIX
+uses the retained process group; Windows uses a dedicated Job Object that owns the entire tree.
+`Build workflow checks` tests cancellation on Windows and release tooling on Linux before native
+compilation. It can also be dispatched separately without starting compilers or accessing HF.
 Native save steps also run after a hard compilation-step timeout. A new native run waits for older
 runs of the same workflow and branch to finish cleanup before it can write snapshots. This allows
 the cancelled producer to flush completed objects before handing ownership to the new producer.

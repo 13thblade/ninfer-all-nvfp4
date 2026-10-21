@@ -23,6 +23,8 @@ def main():
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     checkpoint = None
+    windows_job = None
+    child = None
     checkpoint_directory = args.checkpoint_directory or Path(os.environ.get("CCACHE_DIR", ".cache/objects"))
     checkpoint_enabled = bool(args.checkpoint_family and os.environ.get("HF_TOKEN"))
     next_checkpoint = time.monotonic() + args.checkpoint_interval
@@ -57,6 +59,10 @@ def main():
         with args.log.open("wb") as log:
             options = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
                        if os.name == "nt" else {"start_new_session": True})
+            if os.name == "nt":
+                from windows_build_job import WindowsBuildJob
+                windows_job = WindowsBuildJob()
+                command = windows_job.command(command)
             child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, **options)
             next_report = 0
             next_sample = 0
@@ -93,15 +99,23 @@ def main():
                         os.killpg(child.pid, signal.SIGINT)
                     child.wait(timeout=4)
                 except (ProcessLookupError, subprocess.TimeoutExpired):
-                    if child.poll() is None:
-                        if os.name == "nt":
-                            subprocess.run(["taskkill", "/PID", str(child.pid), "/T", "/F"],
-                                           timeout=2, check=False)
-                        else:
+                    pass
+                finally:
+                    # The parent can exit before its compiler children. Retain
+                    # ownership of the group/job and stop it unconditionally.
+                    if windows_job is not None:
+                        windows_job.stop()
+                    else:
+                        try:
                             os.killpg(child.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    child.wait(timeout=2)
                 return 124 if timed_out else 130
             return child.returncode
     finally:
+        if windows_job is not None:
+            windows_job.close()
         # End an unfinished transfer before the final save step takes the writer lock.
         # Its unpublished slot cannot replace the last completed checkpoint.
         if checkpoint is not None and checkpoint.poll() is None:

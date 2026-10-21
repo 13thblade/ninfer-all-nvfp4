@@ -42,6 +42,43 @@ class BuildLifecycleTest(unittest.TestCase):
                 self.assertFalse((root / "should-not-finish").exists())
                 self.assertFalse((root / "build.pid").exists())
 
+    def test_timeout_stops_descendants_after_the_build_parent_exits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "grandchild.py").write_text(
+                "import signal, time\nfrom pathlib import Path\n"
+                "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+                "if hasattr(signal, 'SIGBREAK'): signal.signal(signal.SIGBREAK, signal.SIG_IGN)\n"
+                "Path('completed-object').write_bytes(b'object')\n"
+                "while True:\n"
+                " Path('compiler-progress').write_text(str(time.time_ns()))\n"
+                " time.sleep(.05)\n")
+            (root / "parent.py").write_text(
+                "import os, signal, subprocess, sys, time\nfrom pathlib import Path\n"
+                "def stop(*args): raise SystemExit(130)\n"
+                "signal.signal(signal.SIGINT, stop)\n"
+                "if hasattr(signal, 'SIGBREAK'): signal.signal(signal.SIGBREAK, stop)\n"
+                "Path('parent-pid').write_text(str(os.getpid()))\n"
+                "subprocess.Popen([sys.executable, 'grandchild.py'])\n"
+                "while True: time.sleep(.1)\n")
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), "--log", str(root / "build.log"),
+                     "--timeout-seconds", "2", "--", sys.executable, "parent.py"],
+                    cwd=root, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 124, result.stderr)
+                progress = (root / "compiler-progress").read_text()
+                time.sleep(.3)
+                self.assertEqual((root / "compiler-progress").read_text(), progress,
+                                 "Compiler descendant survived its cancelled parent")
+                self.assertEqual((root / "completed-object").read_bytes(), b"object")
+            finally:
+                if os.name != "nt" and (root / "parent-pid").exists():
+                    try:
+                        os.killpg(int((root / "parent-pid").read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_timeout_stops_an_inflight_checkpoint_without_losing_local_objects(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
