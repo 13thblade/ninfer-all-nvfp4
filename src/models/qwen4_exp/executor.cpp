@@ -442,12 +442,14 @@ struct SequenceState {
     };
     // The captured record strides and kernels depend on the actual verification width.
     std::array<VerifyGraphs, 17> verify;
-    // Draft chains by step count (adaptive MTP drafts fewer than draft_tokens).
+    // Draft chains by step count (adaptive MTP drafts fewer than draft_tokens), and the single
+    // steps by index of a chain a probability floor can end early.
     struct DraftGraph {
         DecodeGraphExecutable chain;
         std::uint32_t runs = 0;
     };
     std::array<DraftGraph, 16> draft;
+    std::array<DraftGraph, 15> step;
 };
 
 // Consecutive layers on one rank, in pass order. The first segment also embeds the tokens, the
@@ -857,12 +859,16 @@ struct Executor::Impl {
                     width.segments[i].reset();
                 }
             }
-            for (auto& chain : sequence.draft) {
-                if (chain.chain.ready()) {
-                    RankBinding bind(device, model.head_rank());
-                    chain.chain.reset();
+            const auto reset = [&](auto& graphs) {
+                for (auto& graph : graphs) {
+                    if (graph.chain.ready()) {
+                        RankBinding bind(device, model.head_rank());
+                        graph.chain.reset();
+                    }
                 }
-            }
+            };
+            reset(sequence.draft);
+            reset(sequence.step);
         }
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
@@ -3593,9 +3599,9 @@ struct Executor::Impl {
         if (hybrid) { hybrid->finish(); }
     }
 
-    void draft(std::span<const std::uint32_t> batch, std::span<const std::int32_t> anchors,
-               std::span<std::int32_t> out, std::span<std::uint32_t> extents = {},
-               std::uint32_t steps = 0) {
+    std::uint32_t draft(std::span<const std::uint32_t> batch, std::span<const std::int32_t> anchors,
+                        std::span<std::int32_t> out, std::span<std::uint32_t> extents = {},
+                        std::uint32_t steps = 0) {
         require_mtp("draft");
         const std::size_t b      = batch.size();
         const std::size_t stride = options.draft_tokens;
@@ -3645,78 +3651,116 @@ struct Executor::Impl {
         auto* ids        = static_cast<std::int32_t*>(mtp_ids.p);
         const auto* at   = static_cast<const std::int32_t*>(mtp_positions.p);
         const auto n     = static_cast<std::int32_t>(b);
-        const auto chain = [&] {
-            for (std::size_t j = 0; j < b; ++j) {
-                CUDA_CHECK(cudaMemcpyAsync(drafting[j]->mtp_scratch_tail.p, drafting[j]->mtp.tail.p,
-                                           drafting[j]->mtp.tail.bytes, cudaMemcpyDeviceToDevice,
-                                           rank.stream));
-                stage_hidden(drafting[j]->mtp_pending.p, 1, std::int32_t(j));
-            }
-            for (std::size_t i = 0; i < k; ++i) {
-                if (i > 0) { stage_hidden(rank.stack, n, 0); }
-                mtp_pass(parts, n, ids + i * b, at + i * b, true);
-                auto* second = draft_prefetch ?
-                    static_cast<std::int32_t*>(ngram_prefetch_tokens.p) + i * b : nullptr;
-                auto* logprobs = mtp_logprobs.p ? static_cast<float*>(mtp_logprobs.p) + i * b : nullptr;
-                mtp_head(n, ids + (i + 1) * b, second, logprobs);
-                if (draft_prefetch) {
-                    draft_prefetch->enqueue(i, ids + (i + 1) * b, second, rank.stream);
+        const auto second = [&](std::size_t i) {
+            return draft_prefetch ? static_cast<std::int32_t*>(ngram_prefetch_tokens.p) + i * b
+                                  : nullptr;
+        };
+        auto* confidence = static_cast<float*>(mtp_logprobs.p);
+        // Step i: the MTP pass over the step's cells (the anchors at step 0, with the stacks the
+        // sequences kept) and the head's pick for the next one.
+        const auto step = [&](std::size_t i) {
+            if (i == 0) {
+                for (std::size_t j = 0; j < b; ++j) {
+                    CUDA_CHECK(cudaMemcpyAsync(drafting[j]->mtp_scratch_tail.p,
+                                               drafting[j]->mtp.tail.p, drafting[j]->mtp.tail.bytes,
+                                               cudaMemcpyDeviceToDevice, rank.stream));
+                    stage_hidden(drafting[j]->mtp_pending.p, 1, std::int32_t(j));
                 }
+            } else {
+                stage_hidden(rank.stack, n, 0);
             }
-            if (draft_prefetch) { draft_prefetch->join(rank.stream); }
+            mtp_pass(parts, n, ids + i * b, at + i * b, true);
+            mtp_head(n, ids + (i + 1) * b, second(i), confidence ? confidence + i * b : nullptr);
+        };
+        const auto prefetch = [&](std::size_t i) {
+            if (draft_prefetch) {
+                draft_prefetch->enqueue(i, ids + (i + 1) * b, second(i), rank.stream);
+            }
         };
         // Tokens and positions stay in the staged buffers. Native hybrid experts use the same
         // captured exchange as text decode; GGUF host experts replay too, without counting the
-        // draft steps' routes.
-        auto& only       = drafting.front()->draft.at(k);
+        // draft steps' routes. A graph is captured at its second use.
         const bool graph = options.cuda_graphs && b == 1 && device.size() == 1 && !stream;
-        if (misses) { misses->keep_alive(); }
-        if (graph && !only.chain.ready() && only.runs++ > 0) {
-            DecodeGraphDefinition definition;
-            capturing_draft = true;
-            try {
-                definition.capture(rank.stream, chain);
-            } catch (...) {
+        const auto replay = [&](SequenceState::DraftGraph& slot, const auto& body) {
+            if (graph && !slot.chain.ready() && slot.runs++ > 0) {
+                DecodeGraphDefinition definition;
+                capturing_draft = true;
+                try {
+                    definition.capture(rank.stream, body);
+                } catch (...) {
+                    capturing_draft = false;
+                    throw;
+                }
                 capturing_draft = false;
-                throw;
+                slot.chain.instantiate(definition);
             }
-            capturing_draft = false;
-            only.chain.instantiate(definition);
-        }
-        if (graph && only.chain.ready()) {
-            only.chain.launch(rank.stream);
-        } else {
-            chain();
-        }
-        // The expert cache takes the last verification's routes while the device drafts; the
-        // table uploads it queues follow the draft on the stream, before the next pass.
-        settle_routes();
-        auto* host = static_cast<std::int32_t*>(mtp_staging->data());
-        CUDA_CHECK(cudaMemcpyAsync(host, ids + b, k * b * 4, cudaMemcpyDeviceToHost, rank.stream));
+            if (graph && slot.chain.ready()) {
+                slot.chain.launch(rank.stream);
+            } else {
+                body();
+            }
+        };
+        if (misses) { misses->keep_alive(); }
+        auto* host     = static_cast<std::int32_t*>(mtp_staging->data());
         auto* logprobs = reinterpret_cast<float*>(host + mtp_ids.bytes / 4);
-        if (mtp_logprobs.p) {
-            CUDA_CHECK(cudaMemcpyAsync(logprobs, mtp_logprobs.p, k * b * sizeof(float),
-                                       cudaMemcpyDeviceToHost, rank.stream));
+        std::vector<std::uint32_t> lengths(b, static_cast<std::uint32_t>(k));
+        std::size_t ran = k;
+        if (confidence == nullptr || extents.empty()) {
+            replay(drafting.front()->draft.at(k), [&] {
+                for (std::size_t i = 0; i < k; ++i) {
+                    step(i);
+                    prefetch(i);
+                }
+                if (draft_prefetch) { draft_prefetch->join(rank.stream); }
+            });
+            // The expert cache takes the last verification's routes while the device drafts; the
+            // table uploads it queues follow the draft on the stream, before the next pass.
+            settle_routes();
+        } else {
+            // The chain ends at the first step after which every sequence has drafted at or below
+            // the floor: each step runs from its own graph, and the host reads the step's
+            // confidences before it starts the next.
+            const float floor = std::log(options.draft_min_p);
+            std::vector<char> open(b, 1);
+            for (std::size_t i = 0; i < k; ++i) {
+                replay(drafting.front()->step.at(i), [&] { step(i); });
+                prefetch(i);
+                CUDA_CHECK(cudaMemcpyAsync(logprobs + i * b, confidence + i * b,
+                                           b * sizeof(float), cudaMemcpyDeviceToHost, rank.stream));
+                // The expert cache takes the last verification's routes while the first step
+                // runs; the MTP block's table uploads it queues precede the next step.
+                if (i == 0) { settle_routes(); }
+                CUDA_CHECK(cudaStreamSynchronize(rank.stream));
+                bool more = false;
+                for (std::size_t j = 0; j < b; ++j) {
+                    if (!std::isfinite(logprobs[i * b + j])) {
+                        throw std::runtime_error("qwen4_exp: non-finite MTP draft confidence");
+                    }
+                    if (open[j] && logprobs[i * b + j] <= floor) {
+                        open[j]    = 0;
+                        lengths[j] = static_cast<std::uint32_t>(i + 1);
+                    }
+                    more = more || open[j];
+                }
+                if (!more) {
+                    ran = i + 1;
+                    break;
+                }
+            }
+            if (draft_prefetch) { draft_prefetch->join(rank.stream); }
         }
+        CUDA_CHECK(cudaMemcpyAsync(host, ids + b, ran * b * 4, cudaMemcpyDeviceToHost, rank.stream));
         CUDA_CHECK(cudaStreamSynchronize(rank.stream));
         if (hybrid) { hybrid->finish(); }
         if (draft_prefetch) { draft_prefetch->check(); }
         for (std::size_t j = 0; j < b; ++j) {
-            for (std::size_t i = 0; i < k; ++i) { out[j * stride + i] = host[i * b + j]; }
-            std::uint32_t extent = static_cast<std::uint32_t>(k);
-            if (mtp_logprobs.p) {
-                const float floor = std::log(options.draft_min_p);
-                for (std::size_t i = 0; i < k; ++i) {
-                    if (!std::isfinite(logprobs[i * b + j])) {
-                        throw std::runtime_error("qwen4_exp: non-finite MTP draft confidence");
-                    }
-                    if (logprobs[i * b + j] <= floor && extent == k) {
-                        extent = static_cast<std::uint32_t>(i + 1);
-                    }
-                }
+            // Past the steps run no draft exists; no verification reaches those columns.
+            for (std::size_t i = 0; i < k; ++i) {
+                out[j * stride + i] = i < ran ? host[i * b + j] : -1;
             }
-            if (!extents.empty()) { extents[j] = extent; }
+            if (!extents.empty()) { extents[j] = lengths[j]; }
         }
+        return static_cast<std::uint32_t>(ran);
     }
 
     void verify(std::span<const std::uint32_t> batch, std::span<const std::int32_t> tokens) {
@@ -4132,10 +4176,10 @@ std::uint32_t Executor::draft_tokens() const noexcept {
 
 bool Executor::can_draft(std::uint32_t sequence) const { return impl_->can_draft(sequence); }
 
-void Executor::draft(std::span<const std::uint32_t> sequences,
-                     std::span<const std::int32_t> anchors, std::span<std::int32_t> out,
-                     std::span<std::uint32_t> extents, std::uint32_t steps) {
-    impl_->draft(sequences, anchors, out, extents, steps);
+std::uint32_t Executor::draft(std::span<const std::uint32_t> sequences,
+                              std::span<const std::int32_t> anchors, std::span<std::int32_t> out,
+                              std::span<std::uint32_t> extents, std::uint32_t steps) {
+    return impl_->draft(sequences, anchors, out, extents, steps);
 }
 
 void Executor::verify(std::span<const std::uint32_t> sequences,

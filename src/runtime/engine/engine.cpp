@@ -68,6 +68,10 @@ EngineOptions with_family_speculation(EngineOptions options) {
     }
     speculative.backend      = SpeculativeBackend::Mtp;
     speculative.draft_tokens = SpeculativeOptions::kAutomaticDraftTokens;
+    // Flash-Next's chain stops at an unlikely draft, which the round would likely reject.
+    if (runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+        speculative.draft_min_p = SpeculativeOptions::kAutomaticDraftMinP;
+    }
     return options;
 }
 
