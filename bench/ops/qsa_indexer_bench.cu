@@ -21,7 +21,8 @@ void run(int tokens, int capacity, cudaStream_t stream, DeviceBuffer& flush) {
     const ops::QsaIndexerWeights weights{&n, nullptr};
     TimedGraph graph;
     const auto call = [&](cudaStream_t s) {
-        ops::qsa_indexer_select(p, position, weights, 1e-6f, k, workspace, out, count, s);
+        ops::qsa_indexer_select(p, position, weights, 1e-6f, ops::RopeYarn{}, k, workspace, out,
+                                count, s);
     };
     call(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));

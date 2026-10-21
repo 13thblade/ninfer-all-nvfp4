@@ -242,6 +242,26 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     executor.sequences       = options.max_concurrency;
     executor.draft_tokens    = mtp ? speculative.draft_tokens : 0;
     executor.draft_min_p     = speculative.draft_min_p;
+    // YaRN past the native window, as the Qwen3.5 family takes it: --rope-yarn at max-context /
+    // native once the window passes it, or a fixed --rope-yarn-factor; it reaches every rotation
+    // the model makes (sparse attention, its indexer, the MTP block).
+    if (options.rope_scaling_factor > 1.0F) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next rotates past its native window with YaRN "
+                                    "(--rope-yarn, --rope-yarn-factor), not --rope-scaling-factor");
+    }
+    const std::uint32_t native = text.max_position_embeddings;
+    if (options.rope_yarn_factor > 1.0F) {
+        executor.rope_yarn = {.factor = options.rope_yarn_factor, .native_context = native};
+    } else if (options.rope_yarn && options.max_context > native) {
+        executor.rope_yarn = {.factor         = static_cast<float>(options.max_context) /
+                                                static_cast<float>(native),
+                              .native_context = native};
+    }
+    if (executor.rope_yarn.factor > 4.0F) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next's YaRN reaches four times its native "
+                                    "window: --max-context " + std::to_string(4ULL * native) +
+                                    " at most");
+    }
     // A chunk also holds a verification of every sequence at once.
     const std::uint32_t requested_chunk = options.prefill_chunk ? options.prefill_chunk : 1024;
     executor.prefill_chunk   = std::max(std::clamp<std::uint32_t>(requested_chunk, 64, 4096),

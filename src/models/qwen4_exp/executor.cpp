@@ -1433,6 +1433,10 @@ struct Executor::Impl {
     void allocate_sequences() {
         const std::uint64_t width = std::uint64_t(config.hc_count) * config.hidden_size;
         allocate_gdn_pools();
+        if (options.rope_yarn.active()) {
+            std::fprintf(stderr, "qwen4_exp: YaRN at factor %.4g past the native %u positions\n",
+                         double(options.rope_yarn.factor), options.rope_yarn.native_context);
+        }
         for (std::uint32_t s = 0; s < options.sequences; ++s) {
             SequenceState sequence;
             sequence.slot = s;
@@ -2429,14 +2433,23 @@ struct Executor::Impl {
         Tensor ko(rank.e, DType::BF16, {d, nk, t});
         auto* const part_positions = const_cast<std::int32_t*>(in.positions);
         const Tensor positions(part_positions, DType::I32, {t});
-        if (mrope) {
+        const ops::RopeYarn& yarn = options.rope_yarn;
+        if (mrope || yarn.active()) {
             // A media prompt: the three-axis positions of its images and video, each pair of
-            // rotated dimensions on axis i % 3 (the interleaved MRoPE sections).
+            // rotated dimensions on axis i % 3 (the interleaved MRoPE sections). Under YaRN, text
+            // too: the fused norm and rotation fixes the unscaled one, so the rotation is its own
+            // Op, one tensor at a time (its YaRN forms cover 24 query and 2 key heads that way).
             const Tensor axes(rank.mrope, DType::I32, {t, 3});
+            const Tensor line(const_cast<std::int32_t*>(in.rope), DType::I32, {t});
+            const int rotary = static_cast<int>(float(d) * config.partial_rotary_factor);
             ops::rmsnorm(q3, a.query_norm, config.rms_norm_eps, true, qo, s);
             ops::rmsnorm(k3, a.key_norm, config.rms_norm_eps, true, ko, s);
-            ops::rope(axes, static_cast<int>(float(d) * config.partial_rotary_factor),
-                      config.rope_theta, qo, ko, s);
+            if (yarn.active()) {
+                ops::rope(mrope ? axes : line, rotary, config.rope_theta, yarn, qo, s);
+                ops::rope(mrope ? axes : line, rotary, config.rope_theta, yarn, ko, s);
+            } else {
+                ops::rope(axes, rotary, config.rope_theta, qo, ko, s);
+            }
         } else {
             const Tensor rope(const_cast<std::int32_t*>(in.rope), DType::I32, {t});
             ops::rmsnorm_rope(rope, a.query_norm, a.key_norm, q3, k3, qo, ko, s);
@@ -2473,14 +2486,14 @@ struct Executor::Impl {
         const ops::QsaIndexerWeights iw{&a.index_query_norm, &a.index_key_norm};
         // The call's first position is the part's first staged one, read on the device.
         const Tensor first(part_positions, DType::I32, {1});
-        ops::qsa_indexer_append(index, first, iw, config.rms_norm_eps, pooled, tail, s);
+        ops::qsa_indexer_append(index, first, iw, config.rms_norm_eps, yarn, pooled, tail, s);
         Tensor selected(rank.selected, DType::I32,
                         {static_cast<std::int32_t>(config.indexer_block_budget()), t});
         Tensor counts(rank.counts, DType::I32, {t});
         {
             auto scope = ws.scope();
-            ops::qsa_indexer_select(index, first, iw, config.rms_norm_eps, pooled, ws, selected,
-                                    counts, s);
+            ops::qsa_indexer_select(index, first, iw, config.rms_norm_eps, yarn, pooled, ws,
+                                    selected, counts, s);
         }
         if (pooled_read) {
             ops::kv_stream_resolve(state.map, first, selected, counts, cache, read, s);
@@ -3860,8 +3873,8 @@ struct Executor::Impl {
                     Tensor tail(state.tail.p, DType::FP32,
                                 {di, static_cast<std::int32_t>(config.indexer_compress_ratio - 1)});
                     const ops::QsaIndexerWeights iw{&a.index_query_norm, &a.index_key_norm};
-                    ops::qsa_indexer_append(projection, first, iw, config.rms_norm_eps, pooled,
-                                            tail, rank.stream);
+                    ops::qsa_indexer_append(projection, first, iw, config.rms_norm_eps,
+                                            options.rope_yarn, pooled, tail, rank.stream);
                 }
                 if (plan.ple) {
                     // The PLE history advances over the kept positions' recorded input.
