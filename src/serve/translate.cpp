@@ -125,14 +125,19 @@ std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& requ
     return tools;
 }
 
+// The members follow the order the Qwen templates were trained on, name, description and
+// parameters; `strict` is the server's enforcement flag for the output contract, and the frontend
+// leaves it out of the rendered prompt.
 std::string render_tool_definition(const ToolDefinition& tool) {
     using Json  = RequestJson;
     Json schema = Json::parse(tool.input_schema_json);
-    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", tool.strict}};
+    Json function{{"name", tool.name}};
     if (!tool.description.empty()) { function["description"] = tool.description; }
+    function["parameters"] = std::move(schema);
     if (tool.input_examples_json) {
         function["input_examples"] = Json::parse(*tool.input_examples_json);
     }
+    function["strict"] = tool.strict;
     return Json{{"type", "function"}, {"function", std::move(function)}}.dump();
 }
 
@@ -454,6 +459,18 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.execution.post_thinking_sampling =
         resolve_post_thinking_overrides(request.post_thinking, server);
+    // A second tool call repeats the first one's markup and function name, which a presence penalty
+    // punishes: under the Qwen presets' 1.5 the model drops calls it would otherwise make. A request
+    // that offers tools samples without one unless the request or the server named a value.
+    if (request.uses_tools()) {
+        if (!options.execution.sampling.presence_penalty) {
+            options.execution.sampling.presence_penalty = 0.0F;
+        }
+        if (options.execution.post_thinking_sampling &&
+            !options.execution.post_thinking_sampling->presence_penalty) {
+            options.execution.post_thinking_sampling->presence_penalty = 0.0F;
+        }
+    }
     options.execution.logprobs = request.logprobs;
     options.output.raw                     = false;
     options.output.preserve_special_tokens =

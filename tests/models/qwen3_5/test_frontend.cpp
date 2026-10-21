@@ -7,6 +7,7 @@
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "text/unicode.h"
 #include "text/structured_output.h"
 
@@ -1028,6 +1029,33 @@ int test_selected_template_recovery_boundary() {
                 qwen38.rewrite_checkpoint->offset == qwen38.text.rfind("<|im_start|>assistant\n"),
             "recovery candidates ignored the selected template's default history policy");
     }
+    return failures;
+}
+
+// The model reads a tool as the maintained templates were trained on it: name, description and
+// parameters in that order, without the server's `strict` flag, which still selects the output
+// contract's grammar.
+int test_tool_definitions_in_prompt() {
+    fi::ChatRenderOptions options;
+    options.enable_thinking = false;
+    options.tool_jsons      = {
+        R"({"type":"function","function":{"name":"weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}},"strict":true}})"};
+    const std::string expected =
+        R"({"type": "function", "function": {"name": "weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}})";
+    int failures = 0;
+    for (const auto& source :
+         {thinking_toggle_template_source(), reasoning_effort_template_source()}) {
+        const std::string text =
+            fi::CompiledChatTemplate::resolve(source)
+                .render({chat_message(ninfer::ChatRole::User, "weather?")}, options)
+                .text;
+        failures += check(text.find(expected) != std::string::npos &&
+                              text.find("strict") == std::string::npos,
+                          "a tool reached the prompt out of order or with the strict flag");
+    }
+    const auto contract = fi::build_tool_call_output_contract(options.tool_jsons, true);
+    failures += check(contract && contract->tools.size() == 1 && contract->tools.front().strict,
+                      "the strict flag no longer reaches the output contract");
     return failures;
 }
 
@@ -4300,6 +4328,7 @@ int main() {
     failures += test_open_reasoning_tool_recovery();
     failures += test_forced_tool_call(frontend);
     failures += test_tool_marker_after_quoted_marker();
+    failures += test_tool_definitions_in_prompt();
     failures += test_reasoning_split(frontend);
     failures += test_reasoning_close_requires_boundary(frontend);
     failures += test_reasoning_close_resolves_at_terminal(frontend);

@@ -339,7 +339,8 @@ and rendered prompt mode:
 | Qwen3.8-Flash-Next | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 
 Frequency penalty is `0` in every registered preset. Task-specific profiles such as Qwen's
-precise-coding profile use explicit sampling overrides.
+precise-coding profile use explicit sampling overrides. `ninfer-serve` drops the presence penalty
+for a request that offers tools ([HTTP serving](serving.md#server-options)).
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include
