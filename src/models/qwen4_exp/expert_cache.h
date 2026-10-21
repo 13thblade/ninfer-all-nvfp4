@@ -116,7 +116,8 @@ public:
     // them. Nothing when the buffers are not with the cache.
     void reclaim(std::size_t rank, cudaStream_t transfer);
     // Between passes, before a decode pass: the compute stream waits for `transfer`'s writes, the
-    // buffers are zeroed on it and become free slots again.
+    // buffers are zeroed on it and become slots again. They take the most routed experts the cache
+    // lacks (copies on the side stream, landing as a round's do); the rest are free.
     void give_back(std::size_t rank, cudaStream_t transfer);
 
     // Slot admission by the expert misses, whose service thread calls it while the layer's call

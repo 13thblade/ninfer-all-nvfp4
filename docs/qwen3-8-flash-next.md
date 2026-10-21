@@ -254,7 +254,13 @@ uncached experts into (`--expert-prefill-buffers`) are cache slots between promp
 gets the same share of them, free until misses and rounds fill them. A prompt pass takes them
 back: the most routed of the experts they hold move into the slots of colder ones in the cache's
 own memory, the rest leave, and the copies into the buffers wait for the moves. The next decode
-or verification pass returns them zeroed.
+or verification pass returns them zeroed and refills them at once with the most routed experts the
+cache lacks (those the tier counts at least twice), copied on the side stream as a round's are and
+serving once a layer's copies have landed, so the decode after a prompt does not wait for many
+rounds to fill them again; buffers' slots left over stay free. On an RTX 4090 with the IQ3_S
+release's host experts the 256 tokens after a 31,865-token document decoded 1.052 times as fast as
+without the refill (geomean over the nine `--kv-dtype` formats, 0.992-1.118); after short prompts
+the ratio stayed within the run-to-run spread (code 0.993, prose 1.011).
 
 With host experts the GPU holds only the dense weights (3.7 GB for the Q2_0 release), the
 per-request state and the expert cache; the host needs the expert banks in page-locked memory

@@ -9,8 +9,8 @@
 // newcomer's count beats it, and counts the newcomer's routes in that call as misses. Lent buffers
 // are free slots until a wide pass reclaims them: their most routed experts move into colder slots
 // of the cache's own, no entry points inside them while the pass writes them, and they come back
-// zeroed for the next admissions. A round's swaps start over the passes until the next round, a
-// share of them a pass.
+// zeroed, refilled with the most routed experts outside the cache and free for admissions past
+// those. A round's swaps start over the passes until the next round, a share of them a pass.
 #include "core/arena.h"
 #include "core/device.h"
 #include "models/qwen4_exp/expert_cache.h"
@@ -278,13 +278,29 @@ void loans(DeviceContext& device) {
     const auto refused = admit(cache, model, 0, 20, 1, in_use);
     require(refused.slot[0] == nullptr || !inside(refused.slot[0]), "no admission into a reclaimed buffer");
 
-    // The next decode pass returns it: zeroed free slots that the next admissions take.
+    // The next decode pass returns it zeroed. Layer 0's returned slots take the experts that left
+    // (0..3, the most routed outside the cache), which serve once their copies have landed.
+    const auto admitted = cache.stats().admitted;
     cache.give_back(0, transfer);
-    require(cudaStreamSynchronize(device.stream) == cudaSuccess, "the zeroing");
-    const auto again = admit(cache, model, 0, 9, 1, in_use);
-    require(again.slot[0] != nullptr && inside(again.slot[0]), "a returned slot takes a miss");
-    const auto after = model.cached(0, "returned");
-    require(holds(after, 9) && holds(after, 7), "returned slots hold their experts, followed by zeros");
+    require(cudaDeviceSynchronize() == cudaSuccess, "the zeroing and the copies");
+    require(model.cached(0, "refilling") == std::vector<int>({4, 5, 6, 7}),
+            "a refilled expert's entries stay on the host until its copy has landed");
+    cache.adapt();
+    const auto refilled = model.cached(0, "refilled");
+    require(refilled.size() == 8 && holds(refilled, 0) && holds(refilled, 3), "the returned slots are refilled");
+    for (std::int32_t e = 0; e < 4; ++e) {
+        require(inside(cache.cached(0, 0, e)), "a refilled expert lies in a returned slot");
+    }
+    require(cache.stats().admitted == admitted + 4, "the refill copies four experts");
+    // Layer 1 routed nothing: its returned slots stay free for the admissions past its own.
+    cache.hand_over(1);
+    for (std::int32_t e = 0; e < 5; ++e) {
+        const auto out = admit(cache, model, 1, 9 + e, 1, in_use);
+        require(out.slot[0] != nullptr && inside(out.slot[0]) == (e == 4),
+                "a returned slot takes a miss after the cache's own free slots");
+    }
+    require(model.cached(1, "returned").size() == 5,
+            "returned slots hold their experts, followed by zeros");
     cache.give_back(0, transfer);
     require(cache.stats().slots == 16, "a second return changes nothing");
     cudaStreamDestroy(transfer);

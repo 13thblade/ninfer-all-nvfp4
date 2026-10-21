@@ -731,11 +731,56 @@ void ExpertCache::give_back(std::size_t rank, cudaStream_t transfer) {
         for (const Loan& loan : loans_) {
             if (loan.rank == rank) { CUDA_CHECK(cudaMemsetAsync(loan.base, 0, loan.bytes, compute)); }
         }
+        CUDA_CHECK(cudaEventRecord(handover_[rank], compute));
+        CUDA_CHECK(cudaStreamWaitEvent(side_[rank], handover_[rank], 0));
     }
+    // The returned slots take the most routed experts outside the cache at once, rather than over
+    // the rounds of the decode that follows: their copies run on the side stream after the
+    // zeroing, and a layer's experts serve once its copies have landed. The rest stay free.
     for (std::size_t index = 0; index < layers_.size(); ++index) {
         Layer& layer = layers_[index];
         if (layer.banks.rank != rank || layer.lent_end() == layer.lent_first) { continue; }
-        for (auto slot = layer.lent_first; slot < layer.lent_end(); ++slot) {
+        const auto count = [&](std::int32_t expert) { return tier_->count(index, expert); };
+        std::vector<std::int32_t> missing;
+        for (std::int32_t expert = 0; expert < std::int32_t(layer.experts()); ++expert) {
+            if (layer.slot_of[std::size_t(expert)] < 0 &&
+                count(expert) >= tier_->options().min_count) {
+                missing.push_back(expert);
+            }
+        }
+        const std::size_t take =
+            std::min<std::size_t>(layer.lent_end() - layer.lent_first, missing.size());
+        std::partial_sort(missing.begin(), missing.begin() + std::ptrdiff_t(take), missing.end(),
+                          [&](std::int32_t a, std::int32_t b) { return count(a) > count(b); });
+        cudaEvent_t done = nullptr;
+        if (take != 0) {
+            if (!spare_.empty()) {
+                done = spare_.back();
+                spare_.pop_back();
+            } else {
+                CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+            }
+        }
+        auto slot = layer.lent_first;
+        for (std::size_t i = 0; i < take; ++i, ++slot) {
+            const std::int32_t expert           = missing[i];
+            layer.expert_of[slot]               = expert;
+            layer.slot_of[std::size_t(expert)]  = std::int32_t(slot);
+            layer.pending[std::size_t(expert)]  = 1;
+            tier_->set(index, expert, ExpertTier::State::Pending);
+            for (int k = 0; k < 3; ++k) {
+                const ExpertBank& bank = layer.bank(k);
+                CUDA_CHECK(cudaMemcpyAsync(layer.slot_base(std::int32_t(slot)) + layer.offset(k),
+                                           bank.host[std::size_t(expert)],
+                                           std::size_t(bank.expert_bytes), cudaMemcpyHostToDevice,
+                                           side_[rank]));
+                stats_.copied_bytes += std::uint64_t(bank.expert_bytes);
+            }
+            ++stats_.admitted;
+            copies_.push_back({index, expert, std::int32_t(slot), done});
+        }
+        if (done != nullptr) { CUDA_CHECK(cudaEventRecord(done, side_[rank])); }
+        for (; slot < layer.lent_end(); ++slot) {
             layer.free_slots.insert(layer.free_slots.begin(), std::int32_t(slot));
         }
         tier_->set_free(std::uint32_t(index), std::uint32_t(layer.free_slots.size()));
