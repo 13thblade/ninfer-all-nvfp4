@@ -80,38 +80,57 @@ A superseded upload can leave an unpublished draft; it cannot replace the curren
 ## Build caches
 
 Native Windows, Debian and ordinary CUDA CI use pinned ccache 4.14.2. It stores complete object
-files rather than sccache's per-architecture CUDA intermediate stages. Each native variant has a
-1.5 GiB local limit; each of the three ordinary CUDA CI variants has a 256 MiB limit. The seven
-current compiler-cache snapshots therefore have a combined limit of 6.75 GiB before archive
-metadata. Windows vcpkg archives also use repository cache storage. The repository remains at
-its free 10 GiB limit. Older snapshots and other branches compete for that limit and can be evicted.
+files. Trusted builds save compiler and Windows vcpkg caches in the private HF bucket
+`WaveCut/ninfer-cache`, under `github-actions/`. Existing pod caches and model files use separate
+prefixes and are not changed. `HF_BUILD_CACHE_TOKEN` must be a fine-grained token with read/write
+access to this bucket only. The client is pinned to `huggingface_hub==1.17.0`.
 
-Cache keys separate the platform and CUDA version or CI architecture. Source commits are not
-restore-prefix boundaries. Ccache checks compiler content, source, headers and compilation flags
-before reusing an entry. Depend mode hashes raw source and compiler-reported header dependencies,
-without falling back to device-only preprocessing. The pre-build probe checks unchanged C++ and
-multiarch CUDA objects, then verifies that changing host-only CUDA code or a host-only header
-causes a cache miss.
+Each native variant has an 8 GiB local compiler-cache limit; each trusted CUDA CI variant has a
+4 GiB limit. These are capacity limits, not measured working-set sizes. Ccache can evict older
+objects when a local cache reaches its limit. Each platform/toolkit or CI architecture has its own
+family, with separate branch prefixes and two rotating snapshots. Readers try the current branch,
+then master. Source commits are not cache-family boundaries. A trusted branch's caches must be
+explicitly promoted if they are to seed master; this workflow does not do that automatically.
+
+Pull-request jobs receive no HF credential. They use Actions Cache with a 256 MiB local limit per
+architecture, including an explicit save after interruption. Python dependency caches also remain
+in Actions Cache. The repository remains at the free 10 GiB limit; PR snapshots and dependency
+caches can still be evicted by GitHub. Docker publication reuses prebuilt native archives and
+per-CUDA inline image-layer caches. Local source Docker builds retain their BuildKit cache mounts.
+
+Ccache checks compiler content, source, headers and compilation flags before reusing an entry.
+Depend mode hashes raw source and compiler-reported header dependencies, without falling back to
+device-only preprocessing. The pre-build probe checks unchanged C++ and multiarch CUDA objects,
+then verifies that changing host-only CUDA code or a host-only header causes a cache miss.
 Compilation reports cache counters, available RAM and disk space every minute.
 
-Successful compiler invocations commit their object-cache entries to local disk. After success,
-failure or ordinary cancellation, cleanup stops compiler work, applies the cache size limit and
-runs an explicit Actions cache save. Native builds stop after 300 minutes of compilation, or earlier at a deadline set 330 minutes
-from the first job step. Ordinary CUDA CI uses a 320-minute compilation limit and the same job
-deadline. The job limit is 350 minutes. The supervisor exits with code 124 and leaves cleanup time;
-the hard step timeout is five minutes longer than the supervisor's duration limit. Native cache
-upload runs before packaging. Explicit save steps also run after a hard compilation-step timeout. The next run waits for older runs of the same workflow and branch to finish cleanup.
-The save has a three-minute limit within GitHub's five-minute cancellation window. Runner loss,
-force cancellation, a failed upload or a full cancellation window can still lose the new snapshot.
-There is no promise that an executing compiler process itself can resume.
+Successful compiler invocations commit their entries to local disk. During trusted builds, the
+supervisor uploads a snapshot every ten minutes after the previous upload completes. Windows
+configuration also checkpoints completed vcpkg archives. Uploads run while compilation continues;
+an entry that finishes after the snapshot starts is retained by a subsequent snapshot. Temporary
+files and mutable cache statistics are excluded. An upload writes the inactive archive slot,
+then publishes its manifest with size and SHA-256. Readers verify the archive and try the previous
+slot if the latest archive is damaged. A partial upload does not publish a new manifest.
 
-The first build after switching from sccache starts with a cold object cache. Earlier sccache entries
-are incompatible; they remain subject to GitHub's normal eviction. A warm rerun must establish
-actual hits, retained size and completion time before the new cache is considered verified.
-GitHub's branch restrictions still apply: master cannot restore a feature branch's private cache.
-Windows vcpkg archives are saved after configuration, including configuration failure.
-Docker publication reuses prebuilt native archives and per-CUDA inline image-layer caches.
-Local source Docker builds retain their BuildKit cache mounts.
+After success, failure or ordinary cancellation, cleanup stops compiler work and saves completed
+objects before packaging. Native builds stop after 300 minutes of compilation, or earlier at a
+deadline set 330 minutes from the first job step. Ordinary CUDA CI uses a 320-minute compilation
+limit and the same job deadline. The job limit is 350 minutes. The supervisor exits with code 124
+and leaves cleanup time; the hard step timeout is five minutes longer than its duration limit.
+Explicit save steps also run after a hard compilation-step timeout. The next run waits for older
+runs of the same workflow and branch to finish cleanup.
+
+The final save has a three-minute limit within GitHub's five-minute cancellation window. Runner
+loss, force cancellation or a failed upload can lose work since the last completed checkpoint.
+That interval can exceed ten minutes by the upload duration or by a failed checkpoint. An executing
+compiler process itself cannot resume. Periodic checkpoint failures produce a warning and retry;
+final-save failures fail the step. Retention, transfer duration and useful reuse must be measured
+on the complete CUDA working set before claiming that every matrix job will finish.
+
+Migration preserves existing Actions caches under `github-actions/migration/`. Each archive is
+uploaded and downloaded on a GitHub runner, and its manifest is published only after a matching
+SHA-256. Restore can merge these preserved snapshots to seed the new cache family. Existing
+single-architecture Ubuntu pod caches are not assumed compatible with Debian multiarch builds.
 
 ## Verification status
 

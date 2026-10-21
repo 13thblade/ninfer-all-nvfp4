@@ -68,11 +68,11 @@ jobs:
       - id: compare
         run: .github/scripts/build-inputs.sh >> "$GITHUB_OUTPUT"
       - uses: actions/setup-python@v7
-        if: github.ref == 'refs/heads/master'
+        if: github.event_name != 'pull_request'
         with:
           python-version: '3.11'
-      - name: Wait for the previous master build to finish cache cleanup
-        if: github.ref == 'refs/heads/master'
+      - name: Wait for the previous build to finish cache cleanup
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3.11 .github/scripts/wait-previous-builds.py
@@ -173,8 +173,6 @@ jobs:
             installer: cuda_13.4.3_windows_x86_64_network.exe
             packages: nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api
     steps:
-      - name: Reserve time for cache upload
-        run: echo "BUILD_DEADLINE=$(( $(date +%s) + 19800 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       # The compiler, runtime, cuBLAS import library and the NVTX and CCCL headers: a configure and
       # a host-only compile need nothing else.
@@ -357,6 +355,8 @@ jobs:
       matrix:
         arch: ['75', '86', '120a']
     steps:
+      - name: Reserve time for cache upload
+        run: echo "BUILD_DEADLINE=$(( $(date +%s) + 19800 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - uses: docker/login-action@v4
         with:
