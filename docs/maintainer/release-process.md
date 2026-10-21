@@ -250,7 +250,15 @@ Periodic snapshots had succeeded. Removing CI writers removes that final-save pa
 [CI run](https://github.com/iamwavecut/ninfer-all/actions/runs/39608375823), CUDA 13.4 restored the
 native snapshot in 16 seconds. Its first minute recorded 564 direct cache hits and zero completed
 misses, while the native producer was still running. Compilers still in flight are not included in
-those counters. Full multiarch CI completion and CTest results remain unverified.
+those counters.
+
+The complete dual-CUDA [CI run](https://github.com/iamwavecut/ninfer-all/actions/runs/39663063679)
+compiled every target and completed CTest on GitHub-hosted Debian containers. Each variant passed
+90 tests and skipped 247 GPU tests, with no failures. This required recognizing
+`cudaErrorStubLibrary` as a no-GPU condition; the preceding run failed four tests per variant on
+that message. Final ccache counters were 768 hits and 344 misses for CUDA 12.9, and 794 hits and
+344 misses for CUDA 13.4. These runs used the previous cache families. Reuse of the corrected
+`host-v2` snapshots on a fresh CI runner still needs verification.
 
 The full matrix and Docker packaging still need a successful run. Loader and device-image checks
 alone do not establish GPU inference correctness or speed.
