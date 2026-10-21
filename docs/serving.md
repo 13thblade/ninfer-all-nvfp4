@@ -1534,8 +1534,10 @@ separate `namespace` and `name` fields in aggregate output, SSE events, and repl
 function name may therefore appear in different namespaces. Namespace members remain ordinary
 client-executed functions; this does not add a remote MCP executor.
 
-NInfer renders these definitions in the Qwen prompt and parses model output into separate
-`function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
+NInfer renders a function definition in the Qwen prompt, whichever protocol declared it, as
+`{"type":"function","function":{"name":…,"description":…,"parameters":…}}` in declaration order
+and without `strict`, which only selects the server's output contract, and parses model output
+into separate `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
 a later request. Only functions in the current effective tool set can become structured calls;
 undeclared model output remains ordinary text. `allowed_tools` filters that set without changing
@@ -2082,6 +2084,10 @@ Qwen3.6-27B, Qwen3.8-27B and the artifacts built from it, and Qwen3.8-Flash-Next
 penalty, which is `1.5`.
 Frequency penalty is `0` for all registered presets. Process flags override registered values,
 request fields override process flags, and `--greedy` finally forces temperature `0`.
+A request that offers tools (`tools` with a `tool_choice` other than `none`, on every protocol)
+samples without the presence penalty unless the request or `--presence-penalty` sets one: a second
+tool call repeats the first call's markup and function name, and under `1.5` the model drops calls
+it would otherwise make. The request log records the resolved value.
 
 ### Post-thinking sampling
 

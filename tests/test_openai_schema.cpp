@@ -563,6 +563,39 @@ int test_tools() {
     failures += check(automatic.generation.uses_tools(), "function tools default to auto");
     failures += check(prompt(automatic.generation).options.tool_jsons.size() == 1,
                       "auto tools reach PromptInput");
+    // The definition keeps the member order the templates were trained on; `strict` rides along
+    // for the output contract and the frontend leaves it out of the prompt.
+    failures += check(
+        prompt(automatic.generation).options.tool_jsons[0] ==
+            R"({"type":"function","function":{"name":"weather","description":"Get weather","parameters":{"type":"object"},"strict":false}})",
+        "a tool definition did not reach the prompt as name, description, parameters");
+    // A second call repeats the first call's markup and name, so a request that offers tools
+    // samples without the preset's presence penalty unless the request or the server names one.
+    failures += check(options(automatic.generation).execution.sampling.presence_penalty == 0.0F,
+                      "a request with tools kept the preset's presence penalty");
+    failures += check(!options(parse(base_request()).generation).execution.sampling.presence_penalty,
+                      "a request without tools lost the preset's presence penalty");
+    Json penalized                = body;
+    penalized["presence_penalty"] = 1.0;
+    failures +=
+        check(options(parse(penalized).generation).execution.sampling.presence_penalty == 1.0F,
+              "a request with tools lost its own presence penalty");
+    ServeOptions penalizing;
+    penalizing.sampling_overrides.presence_penalty = 0.5F;
+    failures += check(to_request_options(automatic.generation, penalizing,
+                                         semantics(automatic.generation), true)
+                              .execution.sampling.presence_penalty == 0.5F,
+                      "a request with tools lost the server's presence penalty");
+    Json post             = body;
+    post["post_thinking"] = Json{{"temperature", 0.1}};
+    const ninfer::RequestOptions post_options = options(parse(post).generation);
+    failures += check(post_options.execution.post_thinking_sampling &&
+                          post_options.execution.post_thinking_sampling->presence_penalty == 0.0F,
+                      "a request with tools kept the post-thinking preset's presence penalty");
+    post["post_thinking"] = Json{{"presence_penalty", 0.7}};
+    failures += check(options(parse(post).generation)
+                              .execution.post_thinking_sampling->presence_penalty == 0.7F,
+                      "a request with tools lost its own post-thinking presence penalty");
 
     body["tools"][0]["future_item_field"]                 = "ignored";
     body["tools"][0]["function"]["future_function_field"] = "ignored";
@@ -577,6 +610,8 @@ int test_tools() {
     failures +=
         check(!none.generation.uses_tools() && prompt(none.generation).options.tool_jsons.empty(),
               "tool_choice none makes parallel_tool_calls neutral and removes executable tools");
+    failures += check(!options(none.generation).execution.sampling.presence_penalty,
+                      "tool_choice none did not restore the preset's presence penalty");
 
     body["parallel_tool_calls"]             = true;
     body["enable_thinking"]                 = false;
