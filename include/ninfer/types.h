@@ -1075,6 +1075,8 @@ struct PromptOptions {
     // JSON object of template parameters. Unset typed fields leave template defaults intact.
     std::string chat_template_kwargs_json;
     bool add_vision_id = false;
+    // OpenAI-shaped function definitions in declaration order. `function.strict` configures the
+    // output contract and is not rendered into the prompt.
     std::vector<std::string> tool_jsons;
     // Function the caller selected. Its call opener is appended to the generation prompt, so the
     // answer can only continue inside that call. Requires a new assistant turn with thinking off.

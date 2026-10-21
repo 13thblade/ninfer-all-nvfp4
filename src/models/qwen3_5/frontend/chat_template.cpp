@@ -344,7 +344,14 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
     if (!options.tool_jsons.empty()) {
         context["tools"] = Json::array();
         for (std::size_t i = 0; i < options.tool_jsons.size(); ++i) {
-            context["tools"].push_back(Json::parse(options.tool_jsons[i]));
+            Json tool = Json::parse(options.tool_jsons[i]);
+            // `strict` selects the output contract's grammar; the model reads a definition as its
+            // template was trained on it, without that server flag.
+            if (tool.is_object()) {
+                const auto function = tool.find("function");
+                if (function != tool.end() && function->is_object()) { function->erase("strict"); }
+            }
+            context["tools"].push_back(std::move(tool));
             tool_tags.push_back(tag("/tools/" + std::to_string(i)));
         }
     }
