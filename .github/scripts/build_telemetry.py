@@ -26,32 +26,21 @@ def available_memory():
     return None
 
 
+def cache_stats():
+    result = subprocess.run(["ccache", "--print-stats"], capture_output=True,
+                            text=True, check=True, timeout=5)
+    return {key: int(value) for key, value in
+            (line.split() for line in result.stdout.splitlines())}
+
+
 def sample(destination):
     report = {"cpu_count": os.cpu_count(), "available_memory_bytes": available_memory(),
               "free_disk_bytes": shutil.disk_usage(Path.cwd()).free}
     try:
-        result = subprocess.run(["sccache", "--show-stats", "--stats-format=json"],
-                                capture_output=True, text=True, check=True, timeout=5)
-        stats = json.loads(result.stdout)["stats"]
-        report.update({key: stats[key] for key in
-                       ("cache_hits", "cache_misses", "cache_writes", "cache_write_errors", "compile_fails")})
+        report.update(cache_stats())
     except (OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
         report["cache_statistics_unavailable"] = type(error).__name__
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("a", encoding="utf-8") as output:
         output.write(json.dumps(report) + "\n")
     print("Build resources and cache: " + json.dumps(report), flush=True)
-
-
-def sanitize_cache_log(source, destination):
-    """Backend errors can contain signed URLs or runner tokens. Do not publish those."""
-    if not source.is_file():
-        return
-    text = source.read_text(errors="replace")
-    for key, value in os.environ.items():
-        if value and len(value) >= 8 and any(word in key.upper() for word in ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")):
-            text = text.replace(value, "<redacted>")
-    text = re.sub(r"https?://[^\s\"<>]+", "<redacted-url>", text)
-    text = re.sub(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+", r"\1<redacted>", text)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(text, encoding="utf-8")

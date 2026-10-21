@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Check that completed C++ and CUDA compilations survive a cache-server restart."""
+"""Check object-cache reuse and invalidation of CUDA host-only source changes."""
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
-import time
+
+from build_telemetry import cache_stats
 
 
 def run(*args):
@@ -28,25 +29,37 @@ target_compile_options(cache_check PRIVATE
 # A new run must write its own entries before the second build can read them.
 identity = os.environ["GITHUB_RUN_ID"] + "_" + os.environ["GITHUB_RUN_ATTEMPT"]
 (root / "host.cpp").write_text(f'#include <cuda_runtime.h>\nint host_{identity}() {{ return 42; }}\n')
+(root / "host_only.h").write_text("#define HOST_VALUE 20\n")
 (root / "kernel.cu").write_text(
-    f'__global__ void kernel_{identity}(int *p) {{ p[threadIdx.x] = 42; }}\n')
+    f'__global__ void kernel_{identity}(int *p) {{ p[threadIdx.x] = 42; }}\n'
+    '#ifndef __CUDA_ARCH__\n#include "host_only.h"\nint host_only() { return 17 + HOST_VALUE; }\n#endif\n')
 run("cmake", "-S", str(root), "-B", str(root / "out"), "-G", "Ninja",
     "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CUDA_ARCHITECTURES=" + os.environ["ARCHS"],
-    "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache", "-DCMAKE_CUDA_COMPILER_LAUNCHER=sccache")
-run("sccache", "--zero-stats")
+    "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache", "-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache")
+run("ccache", "--zero-stats")
 run("cmake", "--build", str(root / "out"), "-j")
-run("sccache", "--stop-server")
-# Shutdown is acknowledged before the daemon drains requests (at most ten seconds).
-time.sleep(11)
+run("ccache", "--zero-stats")
+# New checkout timestamps must not invalidate unchanged content.
+for source in (root / "host.cpp", root / "kernel.cu"):
+    os.utime(source, None)
 run("cmake", "--build", str(root / "out"), "--clean-first", "-j")
-result = subprocess.check_output(["sccache", "--show-stats", "--stats-format=json"], text=True)
-(root / "cache-stats.json").write_text(result)
-data = json.loads(result)
-stats = data["stats"]
-hits = sum(stats["cache_hits"]["counts"].values())
-misses = sum(stats["cache_misses"]["counts"].values())
-print(f"After server restart: {hits} cache hits, {misses} misses", flush=True)
-run("sccache", "--show-stats")
-if hits < 2 or misses or stats["cache_write_errors"] or stats["requests_not_cacheable"]:
-    sys.exit("C++/CUDA cache reuse failed; do not start the long build")
-run("sccache", "--zero-stats")
+stats = cache_stats()
+(root / "cache-stats.json").write_text(json.dumps(stats, indent=2) + "\n")
+hits = stats["direct_cache_hit"] + stats["preprocessed_cache_hit"]
+print(f"Unchanged C++/CUDA: {hits} cache hits, {stats['cache_miss']} misses", flush=True)
+if hits != 2 or stats["cache_miss"]:
+    sys.exit("C++/CUDA object-cache reuse failed; do not start the long build")
+# nvcc preprocessing defines __CUDA_ARCH__; changes outside that branch must also invalidate.
+run("ccache", "--zero-stats")
+kernel = root / "kernel.cu"
+kernel.write_text(kernel.read_text().replace("return 17", "return 18"))
+run("cmake", "--build", str(root / "out"), "-j")
+if cache_stats()["cache_miss"] != 1:
+    sys.exit("CUDA host-only source change did not invalidate its cached object")
+run("ccache", "--zero-stats")
+run("ccache", "--zero-stats")
+(root / "host_only.h").write_text("#define HOST_VALUE 21\n")
+run("cmake", "--build", str(root / "out"), "--clean-first", "-j")
+if cache_stats()["cache_miss"] != 1:
+    sys.exit("CUDA host-only header change did not invalidate its cached object")
+run("ccache", "--zero-stats")

@@ -1,20 +1,16 @@
 #!/usr/bin/env bash
-# Keep the cache server outside the cancelled docker-exec process.
+# Keep completed compiler outputs on the workspace mount across cancellation.
 set -euo pipefail
 container="ninfer-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
 case "${1:?start|probe|build|finish}" in
   start)
     docker run -d --name "$container" --init -v "$PWD:/src" -w /src \
-      -v "$SCCACHE_PATH:/usr/local/bin/sccache:ro" -v "$pythonLocation:$pythonLocation:ro" \
-      -e SCCACHE_GHA_ENABLED=on -e SCCACHE_IDLE_TIMEOUT=0 \
-      -e SCCACHE_LOG=warn -e SCCACHE_ERROR_LOG=/src/sccache-errors.raw.log \
-      -e ACTIONS_CACHE_SERVICE_V2 -e ACTIONS_RESULTS_URL -e ACTIONS_RUNTIME_TOKEN \
-      -e NINFER_COMPILER_LAUNCHER=sccache -e NINFER_CUDA_ARCH \
+      -v "$CCACHE_PATH:/usr/local/bin/ccache:ro" -v "$pythonLocation:$pythonLocation:ro" \
+      -e CCACHE_DIR=/src/.cache/objects -e CCACHE_MAXSIZE -e CCACHE_COMPILERCHECK -e CCACHE_DEPEND -e CCACHE_COMPRESSLEVEL \
+      -e NINFER_COMPILER_LAUNCHER=ccache -e NINFER_CUDA_ARCH \
       -e "ARCHS=$NINFER_CUDA_ARCH" -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT \
       -e NINFER_MULTICALL=ON -e NINFER_BUILD_DIR=/src/build-ci \
       ninfer-toolchain:ci sleep infinity
-    # Start the server before the build step, so cancelling that step leaves it alive.
-    docker exec "$container" sccache --start-server
     ;;
   probe)
     docker exec "$container" "$pythonLocation/bin/python3.11" .github/scripts/check-compiler-cache.py
@@ -27,7 +23,7 @@ case "${1:?start|probe|build|finish}" in
   finish)
     if docker container inspect "$container" >/dev/null 2>&1; then
       # A cancellation of the host docker client need not stop the exec inside it.
-      # Signal the recorded supervisor, then drain its independent cache server.
+      # Signal the recorded supervisor before saving completed cache entries.
       trap 'docker rm -f "$container" >/dev/null' EXIT
       docker exec "$container" "$pythonLocation/bin/python3.11" .github/scripts/finish-compiler-cache.py \
         --pid-file build-ci.pid --stats build-ci-cache.json

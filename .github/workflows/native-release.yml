@@ -13,7 +13,7 @@ on:
 permissions:
   contents: read
 
-# A newer commit cancels old builds. Uploaded sccache entries remain available.
+# A newer commit cancels old builds. Cleanup saves completed object-cache entries.
 # Publication uses a draft and checks master again before moving latest.
 concurrency:
   group: native-release-${{ github.ref }}
@@ -53,10 +53,11 @@ jobs:
             archs: '75;80;86;89;120a'
             packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump"]'
     env:
-      SCCACHE_GHA_ENABLED: "on"
-      SCCACHE_IDLE_TIMEOUT: "0"
-      SCCACHE_LOG: warn
-      SCCACHE_ERROR_LOG: ${{ github.workspace }}/sccache-errors.raw.log
+      CCACHE_DIR: ${{ github.workspace }}/.cache/objects
+      CCACHE_MAXSIZE: 1536Mi
+      CCACHE_COMPILERCHECK: content
+      CCACHE_DEPEND: "true"
+      CCACHE_COMPRESSLEVEL: "5"
     defaults:
       run:
         shell: pwsh
@@ -111,11 +112,15 @@ jobs:
             }
           }
       - id: compiler-cache
-        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        name: Install pinned object cache
+        run: python .github/scripts/install-compiler-cache.py
+      - uses: actions/cache/restore@v6
+        id: object-cache
         with:
-          version: v0.18.0
-          disable_annotations: true
-      - name: Verify C++ and multiarch CUDA cache reuse
+          path: .cache/objects
+          key: objects-v1-windows-cuda-${{ matrix.cuda }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: objects-v1-windows-cuda-${{ matrix.cuda }}-
+      - name: Verify object-cache reuse and CUDA invalidation
         timeout-minutes: 10
         env:
           ARCHS: ${{ matrix.archs }}
@@ -148,8 +153,8 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=x64-windows -DVCPKG_HOST_TRIPLET=x64-windows `
             "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe" `
             "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
-            -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
             -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
       # Keep completed vcpkg packages even if configuration or NInfer compilation fails.
@@ -159,6 +164,7 @@ jobs:
           path: ~/AppData/Local/vcpkg/archives
           key: ${{ steps.dependency-cache.outputs.cache-primary-key }}
       - name: Build release products
+        id: build
         timeout-minutes: 300
         run: python .github/scripts/run-cached-build.py --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- cmake --build build-release -j --target ninfer ninfer-serve ninfer_bench
       - name: Package, verify device images and test startup without Toolkit on PATH
@@ -174,10 +180,17 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
-      - name: Drain compiler cache
+      - name: Prepare completed object cache for upload
         timeout-minutes: 2
         if: always() && steps.compiler-cache.outcome == 'success'
         run: python .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
+      - name: Save completed objects even after cancellation
+        if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
+        timeout-minutes: 3
+        uses: actions/cache/save@v6
+        with:
+          path: .cache/objects
+          key: ${{ steps.object-cache.outputs.cache-primary-key }}
       - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@v7
@@ -214,10 +227,11 @@ jobs:
       run:
         shell: bash
     env:
-      SCCACHE_GHA_ENABLED: "on"
-      SCCACHE_IDLE_TIMEOUT: "0"
-      SCCACHE_LOG: warn
-      SCCACHE_ERROR_LOG: ${{ github.workspace }}/sccache-errors.raw.log
+      CCACHE_DIR: ${{ github.workspace }}/.cache/objects
+      CCACHE_MAXSIZE: 1536Mi
+      CCACHE_COMPILERCHECK: content
+      CCACHE_DEPEND: "true"
+      CCACHE_COMPRESSLEVEL: "5"
       DEBIAN_FRONTEND: noninteractive
       ARCHS: ${{ matrix.archs }}
       CUDA_VERSION: ${{ matrix.cuda }}
@@ -228,21 +242,26 @@ jobs:
       - name: Install Debian build dependencies and official CUDA Toolkit
         run: .github/scripts/install-linux-release-tools.sh
       - id: compiler-cache
-        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        name: Install pinned object cache
+        run: python3.11 .github/scripts/install-compiler-cache.py
+      - uses: actions/cache/restore@v6
+        id: object-cache
         with:
-          version: v0.18.0
-          disable_annotations: true
-      - name: Verify C++ and multiarch CUDA cache reuse
+          path: .cache/objects
+          key: objects-v1-linux-cuda-${{ matrix.cuda }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: objects-v1-linux-cuda-${{ matrix.cuda }}-
+      - name: Verify object-cache reuse and CUDA invalidation
         timeout-minutes: 10
         run: python3.11 .github/scripts/check-compiler-cache.py
       - name: Configure release products
         run: |
           cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DNINFER_MULTICALL=ON \
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
             -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
       - name: Build release products
+        id: build
         timeout-minutes: 300
         run: python3.11 .github/scripts/run-cached-build.py --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- cmake --build build-release -j --target ninfer-multicall ninfer_bench
       - name: Package and verify Linux binaries
@@ -256,10 +275,17 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
-      - name: Drain compiler cache
+      - name: Prepare completed object cache for upload
         timeout-minutes: 2
         if: always() && steps.compiler-cache.outcome == 'success'
         run: python3.11 .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
+      - name: Save completed objects even after cancellation
+        if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
+        timeout-minutes: 3
+        uses: actions/cache/save@v6
+        with:
+          path: .cache/objects
+          key: ${{ steps.object-cache.outputs.cache-primary-key }}
       - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@v7

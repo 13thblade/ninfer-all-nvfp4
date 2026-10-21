@@ -1,4 +1,4 @@
-"""Stop new build work and allow sccache's bounded shutdown to finish."""
+"""Stop compiler work and prepare its bounded object cache for upload."""
 import argparse
 import json
 import os
@@ -7,7 +7,7 @@ import signal
 import subprocess
 import time
 
-from build_telemetry import sanitize_cache_log
+from build_telemetry import cache_stats
 
 
 def main():
@@ -23,19 +23,11 @@ def main():
         deadline = time.monotonic() + 6
         while args.pid_file.exists() and time.monotonic() < deadline:
             time.sleep(0.2)
-    result = subprocess.run(["sccache", "--show-stats", "--stats-format=json"],
-                            capture_output=True, text=True, timeout=20, check=True)
-    stats = json.loads(result.stdout)
+    # Each successful compiler invocation has already committed its cache entry atomically.
+    subprocess.run(["ccache", "--cleanup"], check=True, timeout=60)
     args.stats.parent.mkdir(parents=True, exist_ok=True)
-    args.stats.write_text(json.dumps(stats, indent=2) + "\n")
-    subprocess.run(["sccache", "--stop-server"], check=True, timeout=20)
-    # v0.18.0 acknowledges shutdown before its server finishes. The server allows
-    # up to ten seconds for active requests and pending cache writes to finish.
-    time.sleep(11)
-    if os.environ.get("SCCACHE_ERROR_LOG"):
-        sanitize_cache_log(Path(os.environ["SCCACHE_ERROR_LOG"]), args.stats.with_name("cache-errors.log"))
-    if stats["stats"].get("cache_write_errors", 0):
-        print("::warning::Some compiler cache writes failed; see the saved cache statistics.")
+    args.stats.write_text(json.dumps(cache_stats(), indent=2) + "\n")
+    subprocess.run(["ccache", "--show-stats"], check=True, timeout=20)
 
 
 if __name__ == "__main__":

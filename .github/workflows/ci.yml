@@ -25,7 +25,7 @@
 #
 #   * the CUDA build of every target for sm_75, sm_86 and sm_120a in the Dockerfile's toolchain
 #     stage, then CTest. The toolchain stage is published as ghcr.io/<owner>/<repo>-toolchain once
-#     per change of its definition (.github/scripts/toolchain-image.sh); sccache carries over
+#     per change of its definition (.github/scripts/toolchain-image.sh); the object cache carries over
 #     between runs.
 #
 # The last two run only when a file they build, test or ship from differs from the base: the
@@ -340,6 +340,12 @@ jobs:
       contents: read
       packages: read
       statuses: write
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.cache/objects
+      CCACHE_MAXSIZE: 256Mi
+      CCACHE_COMPILERCHECK: content
+      CCACHE_DEPEND: "true"
+      CCACHE_COMPRESSLEVEL: "5"
     strategy:
       fail-fast: false
       matrix:
@@ -357,11 +363,15 @@ jobs:
         with:
           python-version: '3.11'
       - id: compiler-cache
-        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        name: Install pinned object cache
+        run: python3.11 .github/scripts/install-compiler-cache.py
+      - uses: actions/cache/restore@v6
+        id: object-cache
         with:
-          version: v0.18.0
-          disable_annotations: true
-      - name: Start build container and compiler cache
+          path: .cache/objects
+          key: objects-v1-ci-sm${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: objects-v1-ci-sm${{ matrix.arch }}-
+      - name: Start build container
         env:
           NINFER_CUDA_ARCH: ${{ matrix.arch }}
         run: .github/scripts/ci-cached-build.sh start
@@ -378,10 +388,17 @@ jobs:
           build=$!
           .github/scripts/build-progress.sh watch "$build" build-ci.log "build progress (sm_${{ matrix.arch }})" &
           wait "$build"
-      - name: Stop compiler work and drain cache
+      - name: Stop compiler work and prepare object cache
         if: always() && steps.compiler-cache.outcome == 'success'
         timeout-minutes: 2
         run: .github/scripts/ci-cached-build.sh finish
+      - name: Save completed objects even after cancellation
+        if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
+        timeout-minutes: 3
+        uses: actions/cache/save@v6
+        with:
+          path: .cache/objects
+          key: ${{ steps.object-cache.outputs.cache-primary-key }}
       - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@v7
@@ -391,7 +408,6 @@ jobs:
             build-ci.log
             build-ci-cache.json
             build-ci-cache-progress.jsonl
-            cache-errors.log
             build-cache-check/cache-stats.json
           if-no-files-found: ignore
           retention-days: 7

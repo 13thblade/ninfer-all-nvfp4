@@ -52,7 +52,7 @@ def main():
                     next_report = time.monotonic() + 15
                 time.sleep(0.2)
             if cancelled:
-                print("Stopping compiler work; the following cleanup step drains sccache.", flush=True)
+                print("Stopping compiler work; completed object-cache entries will be saved by the cleanup steps.", flush=True)
                 try:
                     if os.name == "nt":
                         child.send_signal(signal.CTRL_BREAK_EVENT)

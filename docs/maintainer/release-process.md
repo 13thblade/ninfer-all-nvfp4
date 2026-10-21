@@ -79,35 +79,36 @@ A superseded upload can leave an unpublished draft; it cannot replace the curren
 
 ## Build caches
 
-Native Windows, Debian and ordinary CUDA CI builds use sccache for C, C++ and CUDA. Its GitHub Actions backend stores
-completed compilation results during the build, so successfully stored entries can survive a later
-failure or cancellation. Compiler identity, inputs, headers and flags determine reuse; the source
-commit is not a cache-wide invalidation key. Before the long build, a small C++/multiarch CUDA probe
-must produce cache hits after restarting the cache server. A separate cleanup step stops the build
-supervisor and requests sccache shutdown, including after cancellation. The pinned server allows
-up to ten seconds for active requests and pending uploads; cleanup waits for this interval.
-During compilation, a sample every minute records cache hits, misses, write failures, available RAM and free disk.
-Statistics are also sampled before shutdown and retained with build diagnostics. Backend warnings
-are saved separately after removing runner credentials and URLs. A timeout ends
-compilation before the job deadline so cleanup can run.
+Native Windows, Debian and ordinary CUDA CI use pinned ccache 4.14.2. It stores complete object
+files rather than sccache's per-architecture CUDA intermediate stages. Each native variant has a
+1.5 GiB local limit; each of the three ordinary CUDA CI variants has a 256 MiB limit. The seven
+current compiler-cache snapshots therefore have a combined limit of 6.75 GiB before archive
+metadata. Windows vcpkg archives also use repository cache storage. The repository remains at
+its free 10 GiB limit. Older snapshots and other branches compete for that limit and can be evicted.
 
-This preserves successfully uploaded compilation results, not an executing compiler's memory.
-An unfinished file or CUDA compilation phase may need to run again. Force cancellation, runner loss,
-cache-service failures and GitHub's five-minute cancellation limit can prevent final uploads.
-Before starting heavy compilation, a gate waits for older active runs of the same workflow and
-branch to reach a terminal state. It fails after six minutes rather than starting while cleanup is
-stuck. This orders cache cleanup before the next build; it cannot recover an upload that failed.
+Cache keys separate the platform and CUDA version or CI architecture. Source commits are not
+restore-prefix boundaries. Ccache checks compiler content, source, headers and compilation flags
+before reusing an entry. Depend mode hashes raw source and compiler-reported header dependencies,
+without falling back to device-only preprocessing. The pre-build probe checks unchanged C++ and
+multiarch CUDA objects, then verifies that changing host-only CUDA code or a host-only header
+causes a cache miss.
+Compilation reports cache counters, available RAM and disk space every minute.
 
-GitHub scopes caches to branches. A master build can restore earlier master entries. A PR or feature
-branch can also read eligible default-branch entries, but master cannot restore the test branch's
-private cache. The first master build of a new toolchain can therefore remain cold.
+Successful compiler invocations commit their object-cache entries to local disk. After success,
+failure or ordinary cancellation, cleanup stops compiler work, applies the cache size limit and
+runs an explicit Actions cache save. This also saves completed work from a build that reached its
+step timeout. The next run waits for older runs of the same workflow and branch to finish cleanup.
+The save has a three-minute limit within GitHub's five-minute cancellation window. Runner loss,
+force cancellation, a failed upload or a full cancellation window can still lose the new snapshot.
+There is no promise that an executing compiler process itself can resume.
 
-Windows vcpkg archives are saved immediately after configuration, including after configuration
-failure. Run/attempt keys allow a later run to replace a partial dependency cache. Ordinary CI uses
-an independent cache server in its build container, so cancelling the host's `docker exec` does not
-kill pending cache writes. Runtime Docker jobs consume built artifacts and do not compile NInfer
-again. Local Docker builds still use BuildKit's persistent ccache and Ninja directories. GitHub can evict caches under repository storage/retention policies; a cache
-hit and a shorter build time must be established from actual run statistics.
+The first build after switching from sccache starts with a cold object cache. Earlier sccache entries
+are incompatible; they remain subject to GitHub's normal eviction. A warm rerun must establish
+actual hits, retained size and completion time before the new cache is considered verified.
+GitHub's branch restrictions still apply: master cannot restore a feature branch's private cache.
+Windows vcpkg archives are saved after configuration, including configuration failure.
+Docker publication reuses prebuilt native archives and per-CUDA inline image-layer caches.
+Local source Docker builds retain their BuildKit cache mounts.
 
 ## Verification status
 
