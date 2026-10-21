@@ -15,7 +15,7 @@ spelling and defaults.
 | [Ngram copy proposals](ngram.md) | copy acceleration alongside MTP, DFlash or DFlash2, on by default with a drafter |
 | [Launch recipes](recipes.md) | the `ninfer-serve` commands for every model and memory size, from an 8 GB card to the largest context, and the flags they use |
 | [Supported GPUs](gpus.md) | architectures and their builds, every card of 8 GB and more with what has run on it, and what fits in a given amount of GPU memory |
-| [Performance](performance.md) | every measured result card by card: largest context, decode and prompt rates by model, KV format, depth and drafter, several requests at once, Flash-Next's expert placements, quality; and the measurement pages |
+| [Performance](performance.md) | every measured result card by card: largest context, decode and prompt rates by model, KV format, depth and drafter, several requests at once, Flash-Next's expert placements, quality; the measurement pages and users' field reports |
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
 | [GGUF block formats](gguf.md) | GGUF releases with a ggml type per tensor: the eighteen block formats, their products, serving and measurements |
 | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md) | converting the GSQ-RCO GGUF releases and their n-gram table; experts on one or several GPUs, in host memory or on disk; measurements |

@@ -14,7 +14,9 @@ This repository has no Windows test host. CI compiles the host code of every tra
 MSVC 14.44 for `70` (CUDA 12.9), `75`, `80`, `86`, `89` and `120a` (CUDA 13.4) on each change
 to the build inputs (`scripts/check-host-compile.py`), but builds no device code and runs nothing
 on Windows; the Windows-only build option below compiles against Windows headers and has not been
-run.
+run. Users run `120a` builds from `scripts\build-native.bat` with Visual Studio 2026 Build Tools and
+CUDA 13.4 on an RTX 5070 Ti, and `89` builds with CUDA 13.4 on RTX 4090s
+([field reports](performance/field-reports.md)).
 
 ## Requirements
 

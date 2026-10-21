@@ -44,7 +44,7 @@ Measured, one request; context in tokens is the largest `--max-context` the serv
 | 8 GB | Ternary Bonsai 2 27B (24,576 tokens with `rk4v4`, no MTP); Qwen3.8-Flash-Next with its experts in host memory or on disk | RTX 3060 Ti |
 | 11 GB | Ternary Bonsai 2 27B (200,704 tokens with `rk4v4`; 143,360 with MTP) | RTX 2080 Ti |
 | 12 GB | Ternary Bonsai 2 27B (266,240 tokens); Qwen3.8-27B GSQ-RCO IQ3_S (8,192 tokens, no MTP) | RTX 3060 |
-| 16 GB | Gemma 4 26B-A4B Q4_0 (61,440 tokens); Qwen3.8-27B IQ3_S (241,664 tokens); the official Qwen3.8-27B with `--embedding-q4 --lm-head-q4` | Tesla V100-SXM2-16GB |
+| 16 GB | Gemma 4 26B-A4B Q4_0 (61,440 tokens); Qwen3.8-27B IQ3_S (241,664 tokens; 122,880 with `rk4v4-e8` and 98,304 with MTP on a card that also drives a desktop); the official Qwen3.8-27B with `--embedding-q4 --lm-head-q4` | Tesla V100-SXM2-16GB, RTX 5070 Ti ([field report](performance/field-reports.md#rtx-5070-ti-windows-11)) |
 | 24 GB | the official Qwen3.8-27B (20 GiB) and its MXFP8 tune (17 GiB); Qwen3.6-35B-A3B `groupwise-int` (19.6 GiB of weights) on an RTX 3090, over two cards on the TITAN RTX; Flash-Next with every expert on the GPU over two cards | RTX 3090, RTX 4090, TITAN RTX |
 | 32 GB | Qwen3.6-35B-A3B NVFP4 (Blackwell only) | RTX 5090 |
 | 48 GB | Flash-Next Q2_0 with every expert on one card | L40S, RTX PRO 6000 |
@@ -54,7 +54,8 @@ Gemma 4 does not fit 12 GB, and IQ3_S does not fit 11 GB: their weights alone ar
 ## Cards
 
 Desktop, workstation and data-center cards with 8 GB or more; laptop GPUs are not listed.
-✅ measured with the models listed · ⬜ not measured. **Profile:** ✓ the binary carries a
+✅ ran the models listed: measured by the project, or reported by a user in a
+[field report](performance/field-reports.md) · ⬜ no result yet. **Profile:** ✓ the binary carries a
 [device profile](device-profiles.md) measured on this card (or on the variant named); an empty cell
 means the card calibrates once at its first start.
 
@@ -66,7 +67,7 @@ means the card calibrates once at its first start.
 | ⬜ | RTX 5090 D | 32 GB | GeForce | | |
 | ⬜ | RTX 5090 D V2 | 24 GB | GeForce | ✓ | |
 | ⬜ | RTX 5080 | 16 GB | GeForce | ✓ | |
-| ⬜ | RTX 5070 Ti | 16 GB | GeForce | ✓ | |
+| ✅ | RTX 5070 Ti | 16 GB | GeForce | ✓ | IQ3_S, Swift 1.5 IQ3_S ([field report](performance/field-reports.md#rtx-5070-ti-windows-11)) |
 | ⬜ | RTX 5070 | 12 GB | GeForce | ✓ | |
 | ⬜ | RTX 5060 Ti | 16 / 8 GB | GeForce | ✓ | |
 | ⬜ | RTX 5060 | 8 GB | GeForce | | |
@@ -85,10 +86,10 @@ means the card calibrates once at its first start.
 
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
-| ✅ | RTX 4090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next |
+| ✅ | RTX 4090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next; Swift 1.5 IQ3_S ([field reports](performance/field-reports.md#rtx-4090-qwen-code-with-dflash2)) |
 | ⬜ | RTX 4090 D | 24 GB | GeForce | | |
 | ⬜ | RTX 4080 Super | 16 GB | GeForce | ✓ | |
-| ⬜ | RTX 4080 | 16 GB | GeForce | ✓ | |
+| ✅ | RTX 4080 | 16 GB | GeForce | ✓ | IQ3_S ([field report](performance/field-reports.md#rtx-4080-and-rtx-4090-windows-11)) |
 | ⬜ | RTX 4070 Ti Super | 16 GB | GeForce | ✓ | |
 | ⬜ | RTX 4070 Ti | 12 GB | GeForce | ✓ | |
 | ⬜ | RTX 4070 Super | 12 GB | GeForce | | |
