@@ -137,6 +137,7 @@ void sampling_test(const char* artifact) {
             std::cout << " content_bytes=" << result.content.size()
                       << " finish=" << static_cast<int>(result.finish_reason)
                       << " rounds=" << result.speculative.rounds
+                      << " drafted=" << result.speculative.drafted_tokens
                       << " accepted=" << result.speculative.accepted_tokens << '\n';
             if (repeat == 0) { reference = result; continue; }
             const auto mismatch = std::mismatch(
@@ -370,21 +371,37 @@ void hybrid_test(const char* artifact) {
     std::cout << "HYBRID_ENGINE_DONE failures=" << failures << '\n';
 }
 
-// At floor one, a wider draft chain must verify exactly the same first draft as K=1.
-// Repeated requests exercise width-specific graph capture/replay, logprob strides and recovery.
+// At floor one, a wider draft chain must stop after, and verify exactly, the same first draft as
+// K=1. Repeated requests exercise the per-step graphs' capture and replay, width-specific
+// verification graphs, logprob strides and recovery. Without --spec, host experts draft
+// kAutomaticDraftTokens a round with the floor kAutomaticDraftMinP.
 void draft_confidence_test(const char* artifact) {
     const auto input = tokens(128, 47);
     std::vector<ninfer::TokenId> one_draft;
-    for (const auto& [drafts, floor] : std::vector<std::pair<unsigned, float>>{
-             {1, 0}, {4, 1}, {4, 0.3F}, {4, 0}}) {
-        auto o = options(artifact, drafts);
+    struct Case {
+        unsigned drafts;
+        float floor;
+        bool automatic;
+    };
+    for (const Case c : std::vector<Case>{{1, 0, false}, {4, 1, false}, {0, 0, true}, {4, 0, false}}) {
+        auto o = options(artifact, c.drafts);
         o.devices = {0};
         o.max_concurrency = 1;
         o.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(4096);
         o.expert_residency = ninfer::ExpertResidency::Host;
         o.expert_cache_bytes = std::uint64_t{4} << 30;
-        o.speculative.draft_min_p = floor;
+        o.speculative.draft_min_p = c.floor;
+        o.speculative.automatic   = c.automatic;
         ninfer::Engine engine(o);
+        const auto& resolved = engine.options().speculative;
+        const unsigned drafts = resolved.draft_tokens;
+        const float floor     = resolved.draft_min_p;
+        if (c.automatic) {
+            check(resolved.backend == ninfer::SpeculativeBackend::Mtp &&
+                      drafts == ninfer::SpeculativeOptions::kAutomaticDraftTokens &&
+                      floor == ninfer::SpeculativeOptions::kAutomaticDraftMinP,
+                  "host experts draft with the automatic width and floor");
+        }
         auto r = request(64);
         r.execution.logprobs = true;
         std::vector<ninfer::TokenId> expected;
@@ -403,14 +420,17 @@ void draft_confidence_test(const char* artifact) {
                       "floor one agrees with K=1 including committed recurrent/MTP state");
                 check(result.speculative.accepted_per_position[1] == 0,
                       "floor one accepted a draft past its confidence prefix");
+                check(result.speculative.drafted_tokens == result.speculative.rounds,
+                      "floor one ends every draft chain after its first step");
             }
             std::cout << "DRAFT_CONFIDENCE K=" << drafts << " floor=" << floor
                       << " repeat=" << repeat << " seconds=" << elapsed
                       << " rounds=" << result.speculative.rounds
+                      << " drafted=" << result.speculative.drafted_tokens
                       << " accepted=" << result.speculative.accepted_tokens << '\n';
         }
         if (drafts == 1) { one_draft = expected; }
-        if (floor == 0.3F) {
+        if (c.automatic) {
             CancelAfterTokens observer;
             auto handle = engine.submit(engine.prepare_tokens(input), request(64),
                 ninfer::OutputConsumerMode::Streaming, {.live_timings = true});

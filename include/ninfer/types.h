@@ -133,8 +133,8 @@ struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP, DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
-    // Flash-Next MTP: truncate verification after the first draft whose absolute probability
-    // is at or below this floor. Zero keeps the full window; drafting still runs the captured chain.
+    // Flash-Next MTP: end drafting and verification at the first draft whose absolute probability
+    // is at or below this floor. Zero keeps the full window.
     float draft_min_p = 0;
     // An Engine's options() report the resolved head.
     ProposalHead proposal_head = ProposalHead::Auto;
@@ -160,10 +160,12 @@ struct SpeculativeOptions {
     // The backend was left to the Engine (no --spec): a MoE model with host or disk experts whose
     // artifact carries its MTP block or assistant (Qwen3.8-Flash-Next, Gemma 4) drafts with it,
     // kAutomaticDraftTokens a round, since a verification window's routes share the layer's
-    // missing experts; others run without drafts. The Engine's options() report the resolved
+    // missing experts (Flash-Next ending a round's drafting at its first draft at or below
+    // kAutomaticDraftMinP); others run without drafts. The Engine's options() report the resolved
     // backend.
     bool automatic = false;
     static constexpr std::uint32_t kAutomaticDraftTokens = 3;
+    static constexpr float kAutomaticDraftMinP           = 0.5F;
 };
 
 enum class StartupPhase : std::uint8_t {

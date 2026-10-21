@@ -2033,6 +2033,7 @@ struct Qwen4ExpCore::Impl {
         // only, and no row when all have a proposal.
         std::vector<char> looked_up(b, 0);
         std::size_t lookups = 0;
+        std::uint32_t mtp_steps = 0;
         if (lookup_ngram != 0) {
             for (std::size_t j = 0; j < b; ++j) {
                 std::vector<TokenId>& ledger = slots[batch[j]->slot].fed;
@@ -2057,7 +2058,7 @@ struct Qwen4ExpCore::Impl {
             }
             std::vector<TokenId> mtp_drafts(mtp_sequences.size() * drafts);
             std::vector<std::uint32_t> mtp_extents(mtp_sequences.size(), steps);
-            executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, mtp_extents, steps);
+            mtp_steps = executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, mtp_extents, steps);
             for (std::size_t j = 0, m = 0; j < b; ++j) {
                 if (looked_up[j]) { continue; }
                 std::copy_n(mtp_drafts.begin() + std::ptrdiff_t(m * drafts), drafts,
@@ -2249,8 +2250,8 @@ struct Qwen4ExpCore::Impl {
                 }
             }
             r.speculative.rounds += 1;
-            // The MTP draft chain runs all its steps; a lookup proposes what it found.
-            r.speculative.drafted_tokens += looked_up[j] ? draft_extents[j] : steps;
+            // The MTP draft chain's steps run for the round; a lookup proposes what it found.
+            r.speculative.drafted_tokens += looked_up[j] ? draft_extents[j] : mtp_steps;
             r.speculative.accepted_tokens += std::uint32_t(drafts_n);
             if (looked_up[j]) {
                 // Reported with the n-gram proposals: what the context, not the model, proposed.

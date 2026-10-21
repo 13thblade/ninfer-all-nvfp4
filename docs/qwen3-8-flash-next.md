@@ -254,7 +254,13 @@ uncached experts into (`--expert-prefill-buffers`) are cache slots between promp
 gets the same share of them, free until misses and rounds fill them. A prompt pass takes them
 back: the most routed of the experts they hold move into the slots of colder ones in the cache's
 own memory, the rest leave, and the copies into the buffers wait for the moves. The next decode
-or verification pass returns them zeroed.
+or verification pass returns them zeroed and refills them at once with the most routed experts the
+cache lacks (those the tier counts at least twice), copied on the side stream as a round's are and
+serving once a layer's copies have landed, so the decode after a prompt does not wait for many
+rounds to fill them again; buffers' slots left over stay free. On an RTX 4090 with the IQ3_S
+release's host experts the 256 tokens after a 31,865-token document decoded 1.052 times as fast as
+without the refill (geomean over the nine `--kv-dtype` formats, 0.992-1.118); after short prompts
+the ratio stayed within the run-to-run spread (code 0.993, prose 1.011).
 
 With host experts the GPU holds only the dense weights (3.7 GB for the Q2_0 release), the
 per-request state and the expert cache; the host needs the expert banks in page-locked memory
@@ -502,9 +508,9 @@ MTP is enabled. A fresh text-only request can use MTP again after the media requ
 
 `--spec mtp --draft-tokens N` (1 to 15) decodes with the MTP block of an artifact converted with it
 ([Convert](#convert)); without the block the engine refuses to start. Without `--spec`, an artifact
-with the block and host or disk experts drafts three tokens a round (a verification window's routes
-share the layer's missing experts, which the CPU computes while the cached ones run); `--spec none`
-decodes without drafts. Text-only decoding requests then
+with the block and host or disk experts drafts up to three tokens a round with `--draft-min-p 0.5`
+(a verification window's routes share the layer's missing experts, which the CPU computes while the
+cached ones run); `--spec none` decodes without drafts. Text-only decoding requests then
 runs rounds: the MTP block (one more sparse-attention layer with its own 512-expert MoE, its own
 final mixer and the model's head) drafts N tokens from the stack the model left at the request's
 last position (the head's argmax at each step), the model verifies the last sampled token and the N
@@ -520,15 +526,20 @@ decode byte for byte. The kernels are qualified against independent mathematical
 repetition holds the execution configuration fixed. Acceptance is bounded by the remaining output
 and thinking-token budgets, including the correction or bonus token.
 
-`--draft-min-p P` optionally shortens the verification after the first draft whose absolute
-probability over the public vocabulary is at or below P. It includes that draft, so every round
-verifies at least one; P=0 disables the calculation and P=1 verifies one. A batch verifies its
-largest selected prefix, with acceptance bounded separately for each request. This is distinct
-from the sampling `--min-p` filter. The full captured draft chain still runs, and `drafted_tokens`
-counts that work. Only verification shrinks; a throughput gain is not established. The floor is
-part of the disk context-cache profile, and each verification width has its own CUDA Graph.
-On the published Q2 artifact a floor of 0.3 produced the same tokens and acceptance as zero, which
-stays the default.
+`--draft-min-p P` optionally ends a round's drafting at the first draft whose absolute
+probability over the public vocabulary is at or below P. The round verifies the drafts up to and
+including that one, so every round verifies at least one; P=0 disables the calculation and P=1
+drafts and verifies one. A batch drafts until each of its requests has reached such a draft (or the
+last step), verifies its largest selected prefix, and bounds acceptance separately for each
+request. This is distinct from the sampling `--min-p` filter. With a floor each draft step runs
+from its own CUDA Graph and the host reads the step's probabilities before it starts the next, so
+`drafted_tokens` counts the steps that ran; each verification width has its own CUDA Graph. The
+floor is part of the disk context-cache profile. `--spec mtp` keeps the full window unless
+`--draft-min-p` is set; the automatic drafting uses 0.5. On an RTX 4090 with the IQ3_S release's
+host experts (EPYC 7V13, 32-CPU quota, 64K context; 256 greedy tokens after a code prompt, a prose
+prompt and a 31,865-token document, once per `--kv-dtype` format) three drafts with the floor 0.5
+decoded 1.040 times as fast as without it (geomean of 27 pairs, 0.953-1.131, slower in 5): a round
+drafted 2.48 tokens instead of 3 and committed 2.27 instead of 2.31.
 
 The verification leaves the sequence's state where it was: each Gated DeltaNet layer records its
 transitions and the commit replays the kept ones into the state (the Qwen3.5 family's ReplaySSM
@@ -622,9 +633,15 @@ draft-chain graph and each width its own verification graph, captured at their s
 - With MTP, a verification of one request (at most eight tokens, so its experts take the vector
   products) replays graphs of its own the same way, and so does the draft chain of one request on
   one GPU, host experts included; several requests' rounds, the MTP catch-up and disk experts run
-  eagerly. With staged host misses the MTP block runs only its cached experts, their weights
-  renormalized per token: it only steers drafts, which verification checks, so the output is
-  unchanged while drafting never waits for the bus.
+  eagerly. With staged host misses the MTP block serves its missing experts in draft steps and a
+  round's cells (at most eight tokens) as a decode layer does, copied or computed by the CPU, so
+  the drafts follow the block's own routing; over longer prompt chunks it runs only its cached
+  experts, their weights renormalized per token, since it only steers drafts, which verification
+  checks. On an RTX 4090 with the IQ3_S release's host experts (EPYC 7742, 64K context, three
+  drafts with `--draft-min-p 0.5`, 256 greedy tokens after a code prompt, a prose
+  prompt and a 31,865-token document, once per `--kv-dtype` format) serving those misses instead
+  of dropping them committed 5-21% more tokens a round and decoded 1.025 times as fast (geomean of
+  27 pairs, 0.959-1.092; slower in 4, the two largest losses after the document).
 - A pass whose layers may wait on the device for their missing experts ends synchronized: CUDA
   loads a kernel lazily at its first launch, a load may wait for the device to go idle, and a
   launch during such a wait would deadlock with the service it waits for.
