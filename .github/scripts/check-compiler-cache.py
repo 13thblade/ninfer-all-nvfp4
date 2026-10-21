@@ -68,6 +68,12 @@ if os.name != "nt":
     # establish that ccache hashes the host compiler's content.
     host_tools = (root / "host-tools").resolve()
     host_tools.mkdir(exist_ok=True)
+    # GCC resolves its internal programs and standard headers relative to bin.
+    # Retain that layout while keeping private, independently mutable drivers.
+    for name in ("include", "lib", "libexec"):
+        sibling = root / name
+        if not sibling.exists():
+            sibling.symlink_to(Path("/usr") / name, target_is_directory=True)
     for name in ("gcc", "g++"):
         shutil.copy2(shutil.which(name), host_tools / name)
     source = root / "host_compiler.cu"
