@@ -85,6 +85,18 @@ A superseded upload can leave an unpublished draft; it cannot replace the curren
 
 ## Build caches
 
+For a manual cache bootstrap, select `linux_runner: ninfer-native-debian13`. Register a temporary
+Debian 13 x64 runner with that label and work directory `/__w` before dispatch. It runs the same
+native Linux job without a nested container, using the hosted path `/__w/ninfer-all/ninfer-all`.
+The two CUDA variants run sequentially so each can use the machine's CPUs and the same source path.
+The workflow supplies the existing bucket credential. Keep compiler versions and flags unchanged
+to preserve cache compatibility. Remove the runner registration and rental after verifying the
+archives and HF snapshots. The default remains GitHub-hosted runners in Debian 13 containers.
+
+Manual runs can select `platforms: linux` or `windows` for a targeted build without publication.
+Publication requires `platforms: all`. Starting any new native run on the same branch cancels the
+whole previous run, including its other platform. The cleanup wait preserves its completed caches.
+
 Native Windows, Debian and CUDA CI use pinned ccache 4.14.2. Only Native release writes compiler
 and Windows vcpkg snapshots to the private HF bucket `WaveCut/ninfer-cache`, under `github-actions/`.
 `HF_BUILD_CACHE_TOKEN` has read/write access to this bucket only. Native jobs use it for snapshots;

@@ -9,6 +9,16 @@ on:
         description: Publish native release assets and both Docker images (master only)
         type: boolean
         default: false
+      platforms:
+        description: Platforms to build (publication requires all)
+        type: choice
+        options: [all, linux, windows]
+        default: all
+      linux_runner:
+        description: Linux runner (the temporary runner must already provide Debian 13)
+        type: choice
+        options: [github-hosted, ninfer-native-debian13]
+        default: github-hosted
 
 permissions:
   contents: read
@@ -32,6 +42,15 @@ jobs:
         with:
           python-version: '3.11'
       - run: python3.11 -m unittest discover -s tests/release -v
+      - name: Check publication scope
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          if [[ "$PUBLISH" == true && "$PLATFORMS" != all ]]; then
+            echo 'Publication requires both Linux and Windows artifacts.' >&2
+            exit 1
+          fi
       - name: Wait for the previous run to finish cache cleanup
         env:
           GH_TOKEN: ${{ github.token }}
@@ -39,6 +58,7 @@ jobs:
 
   windows:
     needs: validate
+    if: inputs.platforms != 'linux'
     name: Windows CUDA ${{ matrix.cuda }} (${{ matrix.archs }})
     runs-on: windows-2022
     timeout-minutes: 350
@@ -218,12 +238,15 @@ jobs:
 
   linux:
     needs: validate
+    if: inputs.platforms != 'windows'
     name: Linux Debian 13 CUDA ${{ matrix.cuda }} (${{ matrix.archs }})
-    runs-on: ubuntu-24.04
-    container: debian:13-slim
+    runs-on: ${{ inputs.linux_runner == 'ninfer-native-debian13' && 'ninfer-native-debian13' || 'ubuntu-24.04' }}
+    container: ${{ inputs.linux_runner != 'ninfer-native-debian13' && 'debian:13-slim' || '' }}
     timeout-minutes: 350
     strategy:
       fail-fast: false
+      # The temporary machine uses one workspace and gives each Toolkit all its CPUs.
+      max-parallel: ${{ inputs.linux_runner == 'ninfer-native-debian13' && 1 || 2 }}
       matrix:
         include:
           - cuda: '12.9.2'
@@ -250,6 +273,11 @@ jobs:
         run: echo "BUILD_DEADLINE=$(( $(date +%s) + 19800 ))" >> "$GITHUB_ENV"
       - name: Install checkout tools
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git
+      - name: Check the compiler-cache environment
+        run: |
+          . /etc/os-release
+          test "$ID:$VERSION_ID" = debian:13
+          test "$GITHUB_WORKSPACE" = /__w/ninfer-all/ninfer-all
       - uses: actions/checkout@v7
       - name: Install Debian build dependencies and official CUDA Toolkit
         run: .github/scripts/install-linux-release-tools.sh
