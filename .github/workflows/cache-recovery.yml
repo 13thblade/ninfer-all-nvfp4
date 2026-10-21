@@ -36,6 +36,9 @@ jobs:
       matrix:
         os: [ubuntu-24.04, windows-2022]
     env:
+      HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_CACHE_FAMILY: recovery-${{ matrix.os }}-${{ inputs.source_run || github.run_id }}-${{ inputs.source_attempt || github.run_attempt }}
       CCACHE_DIR: ${{ github.workspace }}/.cache/objects
       CCACHE_MAXSIZE: 16Mi
       CCACHE_COMPILERCHECK: content
@@ -69,12 +72,16 @@ jobs:
       - name: Install pinned object cache
         id: compiler-cache
         run: python .github/scripts/install-compiler-cache.py
-      - uses: actions/cache/restore@v6
+      - name: Install HF bucket client
+        run: python -m pip install huggingface_hub==1.17.0
+      - name: Restore the HF checkpoint on a fresh runner
         id: object-cache
-        with:
-          path: .cache/objects
-          key: recovery-v1-${{ runner.os }}-${{ env.CACHE_SOURCE_RUN }}-${{ inputs.source_attempt || github.run_attempt }}
-          fail-on-cache-miss: ${{ inputs.mode == 'restore' }}
+        env:
+          REQUIRE_CACHE: ${{ inputs.mode == 'restore' && '--required' || '' }}
+        run: |
+          options=()
+          if [[ -n "$REQUIRE_CACHE" ]]; then options+=("$REQUIRE_CACHE"); fi
+          python .github/scripts/hf-build-cache.py restore --directory .cache/objects --family "$HF_CACHE_FAMILY" "${options[@]}"
       - name: Compile the completed object
         if: inputs.mode != 'restore'
         run: python .github/scripts/check-cache-recovery.py seed
@@ -83,7 +90,7 @@ jobs:
         if: inputs.mode != 'restore'
         timeout-minutes: ${{ inputs.mode == 'cancel' && 10 || 1 }}
         continue-on-error: ${{ inputs.mode != 'cancel' }}
-        run: python .github/scripts/run-cached-build.py --log build-cache-recovery/wait.log -- python .github/scripts/check-cache-recovery.py wait
+        run: python .github/scripts/run-cached-build.py --checkpoint-interval 10 --log build-cache-recovery/wait.log -- python .github/scripts/check-cache-recovery.py wait
       - name: Prepare completed object cache for upload
         if: always() && inputs.mode != 'restore' && steps.compiler-cache.outcome == 'success'
         timeout-minutes: 2
@@ -91,10 +98,7 @@ jobs:
       - name: Save completed objects even after cancellation
         if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
         timeout-minutes: 3
-        uses: actions/cache/save@v6
-        with:
-          path: .cache/objects
-          key: ${{ steps.object-cache.outputs.cache-primary-key }}
+        run: python .github/scripts/hf-build-cache.py save --directory .cache/objects --family "$HF_CACHE_FAMILY" --verify-upload
       - name: Confirm the timeout occurred
         if: inputs.mode != 'restore' && inputs.mode != 'cancel'
         env:

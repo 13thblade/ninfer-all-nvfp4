@@ -53,8 +53,11 @@ jobs:
             archs: '75;80;86;89;120a'
             packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump"]'
     env:
+      HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_CACHE_FAMILY: native-windows-cuda-${{ matrix.cuda }}
       CCACHE_DIR: ${{ github.workspace }}/.cache/objects
-      CCACHE_MAXSIZE: 1536Mi
+      CCACHE_MAXSIZE: 8Gi
       CCACHE_COMPILERCHECK: content
       CCACHE_DEPEND: "true"
       CCACHE_COMPRESSLEVEL: "5"
@@ -116,12 +119,11 @@ jobs:
       - id: compiler-cache
         name: Install pinned object cache
         run: python .github/scripts/install-compiler-cache.py
-      - uses: actions/cache/restore@v6
+      - name: Install HF bucket client
+        run: python -m pip install --disable-pip-version-check huggingface_hub==1.17.0
+      - name: Restore completed objects from HF
         id: object-cache
-        with:
-          path: .cache/objects
-          key: objects-v1-windows-cuda-${{ matrix.cuda }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: objects-v1-windows-cuda-${{ matrix.cuda }}-
+        run: python .github/scripts/hf-build-cache.py restore --directory .cache/objects --family native-windows-cuda-${{ matrix.cuda }} --legacy-prefix objects-v1-windows-cuda-${{ matrix.cuda }}-
       - name: Verify object-cache reuse and CUDA invalidation
         timeout-minutes: 10
         env:
@@ -137,12 +139,13 @@ jobs:
           repository: microsoft/vcpkg
           ref: ${{ steps.vcpkg.outputs.baseline }}
           path: .vcpkg
-      - uses: actions/cache/restore@v6
+      - name: Restore vcpkg packages from HF
         id: dependency-cache
-        with:
-          path: ~/AppData/Local/vcpkg/archives
-          key: windows-release-vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.cuda }}
-          restore-keys: windows-release-vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}
+        run: >-
+          python .github/scripts/hf-build-cache.py restore
+          --directory ~/AppData/Local/vcpkg/archives
+          --family vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}-${{ matrix.cuda }}
+          --legacy-prefix windows-release-vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}
       - name: Configure with real FFmpeg and curl libraries
         id: configure
         env:
@@ -150,7 +153,10 @@ jobs:
         run: |
           & .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
           if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
-          cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release `
+          python .github/scripts/run-cached-build.py --deadline-env BUILD_DEADLINE `
+            --checkpoint-directory ~/AppData/Local/vcpkg/archives `
+            --checkpoint-family vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}-${{ matrix.cuda }} `
+            --log build-release/configure.log -- cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release `
             "-DCMAKE_TOOLCHAIN_FILE=$pwd/.vcpkg/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows -DVCPKG_HOST_TRIPLET=x64-windows `
             "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe" `
@@ -160,11 +166,13 @@ jobs:
             -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
       # Keep completed vcpkg packages even if configuration or NInfer compilation fails.
-      - uses: actions/cache/save@v6
-        if: always() && steps.configure.outcome != 'skipped' && steps.dependency-cache.outputs.cache-hit != 'true'
-        with:
-          path: ~/AppData/Local/vcpkg/archives
-          key: ${{ steps.dependency-cache.outputs.cache-primary-key }}
+      - name: Save completed vcpkg packages to HF
+        if: always() && steps.configure.outcome != 'skipped' && steps.dependency-cache.outcome == 'success'
+        timeout-minutes: 3
+        run: >-
+          python .github/scripts/hf-build-cache.py save
+          --directory ~/AppData/Local/vcpkg/archives
+          --family vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}-${{ matrix.cuda }}
       - name: Build release products
         id: build
         timeout-minutes: 305
@@ -176,10 +184,7 @@ jobs:
       - name: Save completed objects even after cancellation
         if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
         timeout-minutes: 3
-        uses: actions/cache/save@v6
-        with:
-          path: .cache/objects
-          key: ${{ steps.object-cache.outputs.cache-primary-key }}
+        run: python .github/scripts/hf-build-cache.py save --directory .cache/objects --family native-windows-cuda-${{ matrix.cuda }}
       - name: Package, verify device images and test startup without Toolkit on PATH
         run: |
           $env:NINFER_BUILD_ROOT = "$pwd/build-release"
@@ -229,8 +234,11 @@ jobs:
       run:
         shell: bash
     env:
+      HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_CACHE_FAMILY: native-linux-cuda-${{ matrix.cuda }}
       CCACHE_DIR: ${{ github.workspace }}/.cache/objects
-      CCACHE_MAXSIZE: 1536Mi
+      CCACHE_MAXSIZE: 8Gi
       CCACHE_COMPILERCHECK: content
       CCACHE_DEPEND: "true"
       CCACHE_COMPRESSLEVEL: "5"
@@ -248,12 +256,11 @@ jobs:
       - id: compiler-cache
         name: Install pinned object cache
         run: python3.11 .github/scripts/install-compiler-cache.py
-      - uses: actions/cache/restore@v6
+      - name: Install HF bucket client
+        run: python3.11 -m pip install --disable-pip-version-check huggingface_hub==1.17.0
+      - name: Restore completed objects from HF
         id: object-cache
-        with:
-          path: .cache/objects
-          key: objects-v1-linux-cuda-${{ matrix.cuda }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: objects-v1-linux-cuda-${{ matrix.cuda }}-
+        run: python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --family native-linux-cuda-${{ matrix.cuda }} --legacy-prefix objects-v1-linux-cuda-${{ matrix.cuda }}-
       - name: Verify object-cache reuse and CUDA invalidation
         timeout-minutes: 10
         run: python3.11 .github/scripts/check-compiler-cache.py
@@ -275,10 +282,7 @@ jobs:
       - name: Save completed objects even after cancellation
         if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
         timeout-minutes: 3
-        uses: actions/cache/save@v6
-        with:
-          path: .cache/objects
-          key: ${{ steps.object-cache.outputs.cache-primary-key }}
+        run: python3.11 .github/scripts/hf-build-cache.py save --directory .cache/objects --family native-linux-cuda-${{ matrix.cuda }}
       - name: Package and verify Linux binaries
         run: NINFER_BUILD_ROOT="$PWD/build-release" scripts/package-release.sh
       - uses: actions/upload-artifact@v7

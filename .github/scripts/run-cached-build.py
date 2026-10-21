@@ -17,8 +17,15 @@ def main():
     parser.add_argument("--cache-stats", type=Path)
     parser.add_argument("--timeout-seconds", type=float)
     parser.add_argument("--deadline-env", help="Environment variable containing a Unix deadline")
+    parser.add_argument("--checkpoint-family", default=os.environ.get("HF_CACHE_FAMILY"))
+    parser.add_argument("--checkpoint-directory", type=Path)
+    parser.add_argument("--checkpoint-interval", type=float, default=600)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    checkpoint = None
+    checkpoint_directory = args.checkpoint_directory or Path(os.environ.get("CCACHE_DIR", ".cache/objects"))
+    checkpoint_enabled = bool(args.checkpoint_family and os.environ.get("HF_TOKEN"))
+    next_checkpoint = time.monotonic() + args.checkpoint_interval
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("a build command is required")
@@ -57,6 +64,15 @@ def main():
                 if time.monotonic() >= deadline:
                     timed_out = True
                     break
+                if checkpoint is not None and checkpoint.poll() is not None:
+                    if checkpoint.returncode:
+                        print(f"::warning::Periodic HF checkpoint failed ({checkpoint.returncode}); the previous snapshot remains available.", flush=True)
+                    checkpoint = None
+                    next_checkpoint = time.monotonic() + args.checkpoint_interval
+                if checkpoint_enabled and checkpoint is None and time.monotonic() >= next_checkpoint:
+                    checkpoint = subprocess.Popen([
+                        sys.executable, str(Path(__file__).with_name("hf-build-cache.py")),
+                        "save", "--directory", str(checkpoint_directory), "--family", args.checkpoint_family], **options)
                 if args.cache_stats and time.monotonic() >= next_sample:
                     sample(args.cache_stats)
                     next_sample = time.monotonic() + 60
@@ -86,6 +102,15 @@ def main():
                 return 124 if timed_out else 130
             return child.returncode
     finally:
+        # End an unfinished transfer before the final save step takes the writer lock.
+        # Its unpublished slot cannot replace the last completed checkpoint.
+        if checkpoint is not None and checkpoint.poll() is None:
+            checkpoint.terminate()
+            try:
+                checkpoint.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                checkpoint.kill()
+                checkpoint.wait(timeout=2)
         if args.pid_file:
             args.pid_file.unlink(missing_ok=True)
         if args.log.exists():

@@ -7,6 +7,7 @@ case "${1:?start|probe|build|finish}" in
     docker run -d --name "$container" --init -v "$PWD:/src" -w /src \
       -v "$CCACHE_PATH:/usr/local/bin/ccache:ro" -v "$pythonLocation:$pythonLocation:ro" \
       -e CCACHE_DIR=/src/.cache/objects -e CCACHE_MAXSIZE -e CCACHE_COMPILERCHECK -e CCACHE_DEPEND -e CCACHE_COMPRESSLEVEL \
+      -e HF_TOKEN -e HF_CACHE_FAMILY -e HF_HUB_DISABLE_TELEMETRY -e GITHUB_REF \
       -e BUILD_DEADLINE -e NINFER_COMPILER_LAUNCHER=ccache -e NINFER_CUDA_ARCH \
       -e "ARCHS=$NINFER_CUDA_ARCH" -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT \
       -e NINFER_MULTICALL=ON -e NINFER_BUILD_DIR=/src/build-ci \

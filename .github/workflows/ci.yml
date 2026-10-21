@@ -343,8 +343,12 @@ jobs:
       packages: read
       statuses: write
     env:
+      # PR code must never receive the private bucket write credential.
+      HF_TOKEN: ${{ github.event_name != 'pull_request' && secrets.HF_BUILD_CACHE_TOKEN || '' }}
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_CACHE_FAMILY: ci-sm${{ matrix.arch }}
       CCACHE_DIR: ${{ github.workspace }}/.cache/objects
-      CCACHE_MAXSIZE: 256Mi
+      CCACHE_MAXSIZE: ${{ github.event_name == 'pull_request' && '256Mi' || '4Gi' }}
       CCACHE_COMPILERCHECK: content
       CCACHE_DEPEND: "true"
       CCACHE_COMPRESSLEVEL: "5"
@@ -367,12 +371,20 @@ jobs:
       - id: compiler-cache
         name: Install pinned object cache
         run: python3.11 .github/scripts/install-compiler-cache.py
-      - uses: actions/cache/restore@v6
+      - name: Install HF bucket client
+        if: github.event_name != 'pull_request'
+        run: python3.11 -m pip install --disable-pip-version-check huggingface_hub==1.17.0
+      - name: Restore completed objects from HF
         id: object-cache
+        if: github.event_name != 'pull_request'
+        run: python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --family "$HF_CACHE_FAMILY" --legacy-prefix objects-v1-ci-sm${{ matrix.arch }}-
+      - uses: actions/cache/restore@v6
+        if: github.event_name == 'pull_request'
+        id: pr-cache
         with:
           path: .cache/objects
-          key: objects-v1-ci-sm${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: objects-v1-ci-sm${{ matrix.arch }}-
+          key: pr-objects-v1-sm${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: pr-objects-v1-sm${{ matrix.arch }}-
       - name: Start build container
         env:
           NINFER_CUDA_ARCH: ${{ matrix.arch }}
@@ -397,10 +409,14 @@ jobs:
       - name: Save completed objects even after cancellation
         if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
         timeout-minutes: 3
+        run: python3.11 .github/scripts/hf-build-cache.py save --directory .cache/objects --family "$HF_CACHE_FAMILY"
+      - name: Save PR cache without private credentials
+        if: always() && steps.build.outcome != 'skipped' && steps.pr-cache.outcome == 'success'
+        timeout-minutes: 3
         uses: actions/cache/save@v6
         with:
           path: .cache/objects
-          key: ${{ steps.object-cache.outputs.cache-primary-key }}
+          key: ${{ steps.pr-cache.outputs.cache-primary-key }}
       - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@v7
