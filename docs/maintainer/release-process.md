@@ -147,12 +147,29 @@ Its `timeout` mode caches a real C++ object, then reaches a one-minute GitHub st
 Its `cancel` mode waits for an ordinary workflow cancellation after caching that object.
 Run `restore` with the producer's `source_run` and `source_attempt` to require a cache hit on fresh
 Windows and Linux runners. These small probes test cache recovery, not retention of the full CUDA
-working set. On 21 October 2026, both interruption modes saved their caches on Windows 2022 and Ubuntu 24.04.
+working set. Before the HF migration on 21 October 2026, both interruption modes saved their Actions caches on Windows 2022 and Ubuntu 24.04.
 Separate restore runs on fresh runners each recorded one compiler cache hit and zero misses:
 [after timeout](https://github.com/iamwavecut/ninfer-all/actions/runs/39569140529) and
 [after cancellation](https://github.com/iamwavecut/ninfer-all/actions/runs/39569242802).
 The producers were [39568919978](https://github.com/iamwavecut/ninfer-all/actions/runs/39568919978)
 and [39568972360](https://github.com/iamwavecut/ninfer-all/actions/runs/39568972360).
+The HF migration preserved 13 snapshots (4,084,951,040 archive bytes), including the final caches
+from all four cancelled native variants and all three CUDA CI architectures. Every migration
+uploaded and downloaded its archive on the runner and verified SHA-256 before publishing metadata.
+The first native-Linux restore missed because its Debian archive compression differed from the
+Ubuntu runner; restoring in the original Debian environment resolved it. The Actions source
+caches were retained. Migration records remain under `github-actions/migration/`; the temporary
+migration workflow was removed after verification.
+
+The HF [timeout producer](https://github.com/iamwavecut/ninfer-all/actions/runs/39584240411)
+saved both periodic and final snapshots. Its [fresh-runner restore](https://github.com/iamwavecut/ninfer-all/actions/runs/39584567971)
+recorded one hit and zero misses on Windows and Linux. A second
+[restore](https://github.com/iamwavecut/ninfer-all/actions/runs/39584614325) recorded the same result
+while its [producer](https://github.com/iamwavecut/ninfer-all/actions/runs/39584404425) was still
+running, demonstrating that recovery does not depend on the job reaching cleanup. These probes
+use a ten-second checkpoint interval; production uses ten minutes. They do not measure multi-GiB
+upload times or full CUDA working-set retention.
+
 The full matrix and Docker packaging still need a successful run. Loader and device-image checks
 alone do not establish GPU inference correctness or speed.
 

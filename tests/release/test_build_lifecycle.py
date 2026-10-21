@@ -42,6 +42,36 @@ class BuildLifecycleTest(unittest.TestCase):
                 self.assertFalse((root / "should-not-finish").exists())
                 self.assertFalse((root / "build.pid").exists())
 
+    def test_timeout_stops_an_inflight_checkpoint_without_losing_local_objects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "objects"
+            cache.mkdir()
+            (cache / "completed").write_bytes(b"object")
+            # A stalled transport must not keep the writer lock or outlive the supervisor.
+            (root / "huggingface_hub.py").write_text(
+                "from pathlib import Path\nfrom types import SimpleNamespace\nimport time\n"
+                "class HfApi:\n"
+                " def bucket_info(self, *a): return SimpleNamespace(private=True)\n"
+                " def get_bucket_paths_info(self, *a): return []\n"
+                " def batch_bucket_files(self, *a, **kw):\n"
+                "  while True:\n"
+                "   Path('transfer-progress').write_text(str(time.time_ns()))\n"
+                "   time.sleep(.05)\n")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--log", str(root / "build.log"),
+                 "--timeout-seconds", "2", "--checkpoint-family", "test",
+                 "--checkpoint-directory", str(cache), "--checkpoint-interval", ".1",
+                 "--", sys.executable, "-c", "import time; time.sleep(30)"],
+                cwd=root, env=os.environ | {"HF_TOKEN": "test-only", "PYTHONPATH": str(root),
+                                           "GITHUB_REF": "refs/heads/test"},
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 124, result.stderr)
+            progress = (root / "transfer-progress").read_text()
+            time.sleep(.2)
+            self.assertEqual((root / "transfer-progress").read_text(), progress)
+            self.assertEqual((cache / "completed").read_bytes(), b"object")
+
     def test_expired_job_budget_does_not_start_a_compiler(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

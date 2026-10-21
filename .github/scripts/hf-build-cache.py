@@ -141,11 +141,13 @@ def save(api, directory, family, ref, verify=False):
 
 def restore(api, directory, family, ref, legacy_prefix=None, required=False):
     directory.mkdir(parents=True, exist_ok=True)
+    had_snapshots = False
     with tempfile.TemporaryDirectory(dir=directory.parent) as temporary:
         work = Path(temporary)
         refs = list(dict.fromkeys([ref, 'refs/heads/master']))
         for source_ref in refs:
             choices = manifests(api, prefix(family, source_ref), work)
+            had_snapshots = had_snapshots or bool(choices)
             for item in choices:
                 archive = work / 'cache.tar'
                 try:
@@ -180,7 +182,7 @@ def restore(api, directory, family, ref, legacy_prefix=None, required=False):
                 print(json.dumps({'state':'migration-restored', 'key':item['key'], 'files':item['files']}), flush=True)
             if restored:
                 return True
-    if required:
+    if required or had_snapshots:
         raise ValueError('No verified cache checkpoint exists')
     print(json.dumps({'state':'cold', 'family':family}), flush=True)
     return False

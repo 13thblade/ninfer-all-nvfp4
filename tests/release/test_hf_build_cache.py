@@ -77,6 +77,13 @@ class CheckpointTests(unittest.TestCase):
         self.bucket.files[f'{base}/1.tar'] = b'corrupt'
         self.assertEqual(self.restored(), 'first')
 
+    def test_all_corrupt_snapshots_fail_instead_of_silently_starting_cold(self):
+        self.save('first')
+        base = CACHE.prefix(self.family, self.ref)
+        self.bucket.files[f'{base}/0.tar'] = b'corrupt'
+        with self.assertRaises(ValueError):
+            CACHE.restore(self.bucket, self.root / 'restored', self.family, self.ref)
+
     def test_empty_cache_cannot_replace_completed_checkpoint(self):
         self.save('first')
         (self.source / 'object').unlink()
