@@ -118,7 +118,11 @@ family, with separate branch prefixes and two rotating snapshots. CI reads the c
 for an artifact build to finish. It tries its branch, then master; a PR starts from its target branch.
 Source commits are not cache-family boundaries. Missing credentials, unavailable storage or rejected
 snapshots produce a warning and allow a cold CI build. Fork PRs receive no repository secret.
-A branch's snapshots require explicit promotion to seed master; this workflow does not promote them.
+To bootstrap master from a completed branch build, set repository variable
+`HF_BUILD_CACHE_SEED_REF` to that branch's full ref, such as `refs/heads/build/windows-release`.
+Readers try this explicit seed only after their branch and master have no usable snapshot.
+They verify its checksum and do not write to the seed. After master saves its own snapshot,
+that snapshot takes precedence. This avoids overwriting master's cache from a feature branch.
 
 CI does not upload compiler caches to HF or Actions Cache. Python dependency caches remain in
 Actions Cache, within the repository's free 10 GiB limit. Docker publication downloads the compiled

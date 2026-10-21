@@ -144,12 +144,14 @@ def save(api, directory, family, ref, verify=False):
         print(json.dumps({'state': 'saved', **item}), flush=True)
 
 
-def restore(api, directory, family, ref, legacy_prefix=None, required=False):
+def restore(api, directory, family, ref, legacy_prefix=None, required=False, seed_ref=None):
+    if seed_ref and not seed_ref.startswith('refs/heads/'):
+        raise ValueError('The seed cache must belong to a branch')
     directory.mkdir(parents=True, exist_ok=True)
     had_snapshots = False
     with tempfile.TemporaryDirectory(dir=directory.parent) as temporary:
         work = Path(temporary)
-        refs = list(dict.fromkeys([ref, 'refs/heads/master']))
+        refs = list(dict.fromkeys([ref, 'refs/heads/master'] + ([seed_ref] if seed_ref else [])))
         for source_ref in refs:
             choices = manifests(api, prefix(family, source_ref), work)
             had_snapshots = had_snapshots or bool(choices)
@@ -236,7 +238,8 @@ def main():
         if args.action == 'save':
             save(api, args.directory, args.family, ref, args.verify_upload)
         else:
-            restore(api, args.directory, args.family, ref, args.legacy_prefix, args.required)
+            restore(api, args.directory, args.family, ref, args.legacy_prefix, args.required,
+                    os.environ.get('HF_BUILD_CACHE_SEED_REF'))
     except Exception as error:
         if not args.optional:
             raise

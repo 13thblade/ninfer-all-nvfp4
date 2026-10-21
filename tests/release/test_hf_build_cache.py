@@ -103,6 +103,33 @@ class CheckpointTests(unittest.TestCase):
         CACHE.save(self.bucket, self.source, self.family, 'refs/heads/master')
         self.assertTrue(CACHE.restore(self.bucket, target, self.family, 'refs/heads/other'))
 
+    def test_explicit_seed_bootstraps_master_without_writing_to_bucket(self):
+        self.save('completed seed object')
+        before = self.bucket.files.copy()
+        target = self.root / 'master'
+        self.assertTrue(CACHE.restore(self.bucket, target, self.family, 'refs/heads/master',
+                                      required=True, seed_ref=self.ref))
+        self.assertEqual((target / 'object').read_text(), 'completed seed object')
+        self.assertEqual(self.bucket.files, before)
+
+    def test_master_checkpoint_supersedes_initial_seed(self):
+        self.save('initial seed')
+        (self.source / 'object').write_text('current master')
+        CACHE.save(self.bucket, self.source, self.family, 'refs/heads/master')
+        target = self.root / 'reader'
+        CACHE.restore(self.bucket, target, self.family, 'refs/heads/other', seed_ref=self.ref)
+        self.assertEqual((target / 'object').read_text(), 'current master')
+
+    def test_seed_checksums_are_required_and_pr_refs_are_rejected(self):
+        self.save('initial seed')
+        self.bucket.files[CACHE.prefix(self.family, self.ref) + '/0.tar'] = b'corrupt'
+        with self.assertRaises(ValueError):
+            CACHE.restore(self.bucket, self.root / 'reader', self.family, 'refs/heads/master',
+                          required=True, seed_ref=self.ref)
+        with self.assertRaises(ValueError):
+            CACHE.restore(self.bucket, self.root / 'reader', self.family, 'refs/heads/master',
+                          seed_ref='refs/pull/1/merge')
+
     def test_migration_merges_all_preserved_objects(self):
         for index in (1, 2):
             source = self.root / f'seed{index}'
