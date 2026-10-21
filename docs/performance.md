@@ -26,7 +26,8 @@ drafts with the tokens committed per verify round in brackets.
 |---|---:|---|---|---|
 | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | `120a` | 600 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements) |
-| RTX 4090 | 24 GB | `89` | 450 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements) |
+| RTX 5070 Ti | 16 GB | `120a` | 300 W | [field report](performance/field-reports.md#rtx-5070-ti-windows-11) |
+| RTX 4090 | 24 GB | `89` | 450 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [field reports](performance/field-reports.md) |
 | L40S | 48 GB | | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | RTX 3090 Ti, two | 24 GB each | `86` | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | RTX 3090 | 24 GB | `86` | 300 to 420 W by campaign | every page |
@@ -57,7 +58,9 @@ a drafter / with MTP 3 / with DFlash2 5:
 | Qwen3.8-27B IQ3_S | `rk4v4` | | | | | 241,664 / 176,128 / 32,768 | 8,192 / does not fit | | |
 | Gemma 4 26B-A4B Q4_0 | `bf16` | | | | | 61,440 / 28,672 (MTP 2) | | | |
 
-Gemma 4's windows at eight sequences on an RTX 3090 are in [its section](#gemma-4-26b-a4b).
+Gemma 4's windows at eight sequences on an RTX 3090 are in [its section](#gemma-4-26b-a4b). An RTX
+5070 Ti that also drives a desktop started IQ3_S with `rk4v4-e8` at 122,880 tokens without a
+drafter and 98,304 with MTP 3 ([field report](performance/field-reports.md#rtx-5070-ti-windows-11)).
 
 Filled to that window without a drafter (one request: a document with three codes at 33, 66 and
 90%, asked back in order):
@@ -554,6 +557,10 @@ On the V100, decode after 1,024 and 8,192 tokens is 45.4 and 44.9 tok/s without 
 and 64.3 with MTP 3 (64.2 after 32,768) and 53.4 and 53.1 with DFlash2 5; prompt time is 1.18 s at
 1,024 tokens and 8.3 s at 8,192.
 
+Users' measurements are in the [field reports](performance/field-reports.md): an RTX 5070 Ti
+from 1.2K to 104K prompt tokens against llama.cpp, and RTX 4090s serving long Qwen Code and agent
+sessions with DFlash2 and MTP.
+
 ### Engine and CLI rates
 
 Prompt and decode in tok/s:
@@ -866,6 +873,7 @@ On the Tesla V100 (window 28,672 tokens), short chat decodes 164.3 tok/s without
 | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#measurements) | every expert placement of the GSQ-RCO releases, MTP, perplexity against llama.cpp, AIME and GPQA | RTX 3090, 3090 Ti, 4090, 5090, PRO 6000, L40S |
 | [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
 | [Gemma 4 26B-A4B](gemma4.md#measurements) | against llama.cpp, KV formats, the assistant's drafts, parallel streams | RTX 3090 |
+| [Field reports](performance/field-reports.md) | users' own measurements: Qwen3.8-27B IQ3_S and its Swift 1.5 fine-tune against llama.cpp, long Qwen Code and agent sessions with DFlash2 and MTP, prefix-cache hits and the time to the first token | RTX 5070 Ti, 4090, 4080 |
 | [Quality trades](maintainer/quality-trade-experiments.md) | what each precision option costs in perplexity and buys in memory or speed | RTX 3090 |
 | [Configuration calculator](config-calculator.html) | which context, KV format and speculation fit an RTX 3090, from measured sizes | RTX 3090 |
 

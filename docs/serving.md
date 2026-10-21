@@ -1116,11 +1116,16 @@ record the effort the client asked for.
 the request decides: a request effort replaces it, and a request that disables thinking, forces a
 tool call or prefills the assistant turn is served as if it were unset. `none` turns thinking off
 by default; any other value conflicts with `--no-thinking` and fails startup. Request logs record
-only the effort a request named itself: one the server default filled in is logged as `null`.
+only the effort a request named itself: one the server default filled in is logged as `null`, and
+`server_start` records the default as `default_reasoning_effort`.
 
 `preserve_thinking` controls reasoning retention according to the selected template. Request
 options override server defaults set with `--no-thinking` and `--preserve-thinking`. Unspecified
-thinking, effort and preservation options use the template's defaults.
+thinking, effort and preservation options use the template's defaults; the Qwen3.8 template's effort
+is `xhigh` ([templates](weight-conversion.md#resources-files-and-inspection)). A client that sends no
+effort, as Qwen Code 0.25.3 did in a
+[field report](performance/field-reports.md#rtx-4090-qwen-code-with-dflash2), therefore thinks at
+`xhigh` on Qwen3.8 unless the server sets `--default-reasoning-effort`.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
