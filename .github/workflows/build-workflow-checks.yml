@@ -1,6 +1,12 @@
 name: Build workflow checks
 
 on:
+  push:
+    branches: ['build/**']
+    paths:
+      - '.github/scripts/**'
+      - '.github/workflows/build-workflow-checks.yml'
+      - 'tests/release/**'
   workflow_call:
   workflow_dispatch:
 
