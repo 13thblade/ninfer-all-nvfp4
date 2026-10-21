@@ -96,8 +96,11 @@ Compilation reports cache counters, available RAM and disk space every minute.
 
 Successful compiler invocations commit their object-cache entries to local disk. After success,
 failure or ordinary cancellation, cleanup stops compiler work, applies the cache size limit and
-runs an explicit Actions cache save. This also saves completed work from a build that reached its
-step timeout. The next run waits for older runs of the same workflow and branch to finish cleanup.
+runs an explicit Actions cache save. Native builds stop after 300 minutes of compilation, or earlier at a deadline set 330 minutes
+from the first job step. Ordinary CUDA CI uses a 320-minute compilation limit and the same job
+deadline. The job limit is 350 minutes. The supervisor exits with code 124 and leaves cleanup time;
+the hard step timeout is five minutes longer than the supervisor's duration limit. Native cache
+upload runs before packaging. Explicit save steps also run after a hard compilation-step timeout. The next run waits for older runs of the same workflow and branch to finish cleanup.
 The save has a three-minute limit within GitHub's five-minute cancellation window. Runner loss,
 force cancellation, a failed upload or a full cancellation window can still lose the new snapshot.
 There is no promise that an executing compiler process itself can resume.
@@ -119,7 +122,13 @@ were recorded in the final sccache counters; no release archive was produced.
 Each variant reported 4,304–4,594 successful cache writes, with 12, 12, 96 and 70 write errors respectively.
 On 21 October, the repository cache limit was 10 GiB and only 2,242 entries for the test branch remained.
 These counts show that successful writes alone do not establish retention or useful reuse on the next run.
-The new telemetry must establish reuse and identify backend write errors before claiming a cache fix.
+The new telemetry must establish useful reuse before claiming that the full matrix can finish.
+[Compiler cache recovery](../../.github/workflows/cache-recovery.yml) tests the transport separately.
+Its `timeout` mode caches a real C++ object, then reaches a one-minute GitHub step timeout.
+Its `cancel` mode waits for an ordinary workflow cancellation after caching that object.
+Run `restore` with the producer's `source_run` and `source_attempt` to require a cache hit on fresh
+Windows and Linux runners. These small probes test cache recovery, not retention of the full CUDA
+working set. The live recovery qualification is pending.
 The full matrix and Docker packaging still need a successful run. Loader and device-image checks
 alone do not establish GPU inference correctness or speed.
 

@@ -15,12 +15,25 @@ def main():
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--pid-file", type=Path)
     parser.add_argument("--cache-stats", type=Path)
+    parser.add_argument("--timeout-seconds", type=float)
+    parser.add_argument("--deadline-env", help="Environment variable containing a Unix deadline")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("a build command is required")
+    budgets = []
+    if args.timeout_seconds is not None:
+        budgets.append(args.timeout_seconds)
+    if args.deadline_env:
+        budgets.append(float(os.environ[args.deadline_env]) - time.time())
+    budget = min(budgets) if budgets else float("inf")
+    if budget <= 0:
+        print("Build deadline already reached; leave time to save completed cache entries.", flush=True)
+        return 124
+    deadline = time.monotonic() + budget
     cancelled = False
+    timed_out = False
 
     def cancel(_signum, _frame):
         nonlocal cancelled
@@ -41,6 +54,9 @@ def main():
             next_report = 0
             next_sample = 0
             while child.poll() is None and not cancelled:
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
                 if args.cache_stats and time.monotonic() >= next_sample:
                     sample(args.cache_stats)
                     next_sample = time.monotonic() + 60
@@ -51,8 +67,9 @@ def main():
                         print(stream.read().decode(errors="replace").splitlines()[-2:], flush=True)
                     next_report = time.monotonic() + 15
                 time.sleep(0.2)
-            if cancelled:
-                print("Stopping compiler work; completed object-cache entries will be saved by the cleanup steps.", flush=True)
+            if cancelled or timed_out:
+                reason = "Build deadline reached" if timed_out else "Build cancelled"
+                print(f"{reason}; stopping compiler work before saving completed object-cache entries.", flush=True)
                 try:
                     if os.name == "nt":
                         child.send_signal(signal.CTRL_BREAK_EVENT)
@@ -66,7 +83,7 @@ def main():
                                            timeout=2, check=False)
                         else:
                             os.killpg(child.pid, signal.SIGKILL)
-                return 130
+                return 124 if timed_out else 130
             return child.returncode
     finally:
         if args.pid_file:

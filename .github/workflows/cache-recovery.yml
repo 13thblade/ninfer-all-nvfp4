@@ -1,0 +1,112 @@
+name: Compiler cache recovery
+run-name: Cache recovery ${{ inputs.mode || 'timeout' }} from ${{ inputs.source_run || github.run_id }}
+
+on:
+  # Qualify the failure path on the test branch without starting the full native matrix.
+  push:
+    branches: [build/windows-release]
+    paths:
+      - '.github/workflows/cache-recovery.yml'
+      - '.github/scripts/check-cache-recovery.py'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Interrupt a producer or verify its saved object on a fresh runner
+        type: choice
+        options: [timeout, cancel, restore]
+        default: timeout
+      source_run:
+        description: Producer run ID (required for restore)
+        type: string
+      source_attempt:
+        description: Producer attempt number
+        type: string
+        default: '1'
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    name: ${{ matrix.os }} cache recovery
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.cache/objects
+      CCACHE_MAXSIZE: 16Mi
+      CCACHE_COMPILERCHECK: content
+      CCACHE_DEPEND: 'true'
+      CCACHE_COMPRESSLEVEL: '5'
+      CACHE_SOURCE_RUN: ${{ inputs.source_run || github.run_id }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Import Visual Studio 2022 environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio 2022 x64 tools are missing' }
+          $before = @{}
+          Get-ChildItem Env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          $vars = cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw 'vcvars64 failed' }
+          $vars | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $before[$Matches[1]] -cne $Matches[2]) {
+              "$($Matches[1])=$($Matches[2])" >> $env:GITHUB_ENV
+            }
+          }
+      - name: Install pinned object cache
+        id: compiler-cache
+        run: python .github/scripts/install-compiler-cache.py
+      - uses: actions/cache/restore@v6
+        id: object-cache
+        with:
+          path: .cache/objects
+          key: recovery-v1-${{ runner.os }}-${{ env.CACHE_SOURCE_RUN }}-${{ inputs.source_attempt || github.run_attempt }}
+          fail-on-cache-miss: ${{ inputs.mode == 'restore' }}
+      - name: Compile the completed object
+        if: inputs.mode != 'restore'
+        run: python .github/scripts/check-cache-recovery.py seed
+      - name: Wait for real timeout or cancellation
+        id: build
+        if: inputs.mode != 'restore'
+        timeout-minutes: ${{ inputs.mode == 'cancel' && 10 || 1 }}
+        continue-on-error: ${{ inputs.mode != 'cancel' }}
+        run: python .github/scripts/run-cached-build.py --log build-cache-recovery/wait.log -- python .github/scripts/check-cache-recovery.py wait
+      - name: Prepare completed object cache for upload
+        if: always() && inputs.mode != 'restore' && steps.compiler-cache.outcome == 'success'
+        timeout-minutes: 2
+        run: python .github/scripts/finish-compiler-cache.py --stats build-cache-recovery/cache-stats.json
+      - name: Save completed objects even after cancellation
+        if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
+        timeout-minutes: 3
+        uses: actions/cache/save@v6
+        with:
+          path: .cache/objects
+          key: ${{ steps.object-cache.outputs.cache-primary-key }}
+      - name: Confirm the timeout occurred
+        if: inputs.mode != 'restore' && inputs.mode != 'cancel'
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: test "$BUILD_OUTCOME" = failure
+      - name: Require a compiler cache hit on this fresh runner
+        if: inputs.mode == 'restore'
+        run: python .github/scripts/check-cache-recovery.py verify
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: cache-recovery-${{ runner.os }}
+          path: build-cache-recovery/*.json
+          if-no-files-found: ignore
+          retention-days: 7

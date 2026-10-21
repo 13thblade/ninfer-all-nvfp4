@@ -7,7 +7,7 @@ case "${1:?start|probe|build|finish}" in
     docker run -d --name "$container" --init -v "$PWD:/src" -w /src \
       -v "$CCACHE_PATH:/usr/local/bin/ccache:ro" -v "$pythonLocation:$pythonLocation:ro" \
       -e CCACHE_DIR=/src/.cache/objects -e CCACHE_MAXSIZE -e CCACHE_COMPILERCHECK -e CCACHE_DEPEND -e CCACHE_COMPRESSLEVEL \
-      -e NINFER_COMPILER_LAUNCHER=ccache -e NINFER_CUDA_ARCH \
+      -e BUILD_DEADLINE -e NINFER_COMPILER_LAUNCHER=ccache -e NINFER_CUDA_ARCH \
       -e "ARCHS=$NINFER_CUDA_ARCH" -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT \
       -e NINFER_MULTICALL=ON -e NINFER_BUILD_DIR=/src/build-ci \
       ninfer-toolchain:ci sleep infinity
@@ -17,7 +17,7 @@ case "${1:?start|probe|build|finish}" in
     ;;
   build)
     docker exec "$container" "$pythonLocation/bin/python3.11" .github/scripts/run-cached-build.py \
-      --pid-file build-ci.pid --log build-ci.log --cache-stats build-ci-cache-progress.jsonl -- \
+      --timeout-seconds 19200 --deadline-env BUILD_DEADLINE --pid-file build-ci.pid --log build-ci.log --cache-stats build-ci-cache-progress.jsonl -- \
       bash -c 'scripts/build-native.sh configure && scripts/build-native.sh build'
     ;;
   finish)

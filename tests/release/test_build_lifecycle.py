@@ -22,6 +22,38 @@ SPEC.loader.exec_module(WAIT)
 
 
 class BuildLifecycleTest(unittest.TestCase):
+    def test_soft_timeout_stops_work_and_preserves_completed_outputs(self):
+        for option in ("duration", "job-deadline"):
+            with self.subTest(option=option), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                env = os.environ | {"TEST_BUILD_DEADLINE": str(time.time() + 2)}
+                budget = (["--timeout-seconds", "1"] if option == "duration" else
+                          ["--timeout-seconds", "60", "--deadline-env", "TEST_BUILD_DEADLINE"])
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), "--log", str(root / "build.log"),
+                     "--pid-file", str(root / "build.pid"), *budget, "--", sys.executable, "-c",
+                     "from pathlib import Path; import time; "
+                     "Path('completed-object').write_bytes(b'object'); time.sleep(30); "
+                     "Path('should-not-finish').touch()"],
+                    cwd=root, env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 124, result.stderr)
+                self.assertIn("Build deadline reached", result.stdout)
+                self.assertEqual((root / "completed-object").read_bytes(), b"object")
+                self.assertFalse((root / "should-not-finish").exists())
+                self.assertFalse((root / "build.pid").exists())
+
+    def test_expired_job_budget_does_not_start_a_compiler(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--log", str(root / "build.log"),
+                 "--deadline-env", "TEST_BUILD_DEADLINE", "--", sys.executable, "-c",
+                 "from pathlib import Path; Path('started').touch()"], cwd=root,
+                env=os.environ | {"TEST_BUILD_DEADLINE": str(time.time() - 1)},
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 124)
+            self.assertFalse((root / "started").exists())
+
     def test_handoff_waits_for_cleanup_but_never_waits_for_a_newer_run(self):
         polls = []
 
