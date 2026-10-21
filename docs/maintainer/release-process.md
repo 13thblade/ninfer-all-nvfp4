@@ -93,6 +93,11 @@ The workflow supplies the existing bucket credential. Keep compiler versions and
 to preserve cache compatibility. Remove the runner registration and rental after verifying the
 archives and HF snapshots. The default remains GitHub-hosted runners in Debian 13 containers.
 
+Linux native builds and CUDA CI set `LANG`, `LC_ALL` and `LC_CTYPE` to `C.UTF-8`.
+Ccache hashes these variables separately, even when they select the same effective locale.
+The explicit values keep rented runners and hosted containers compatible. Entries created with
+different locale variables require one rebuild; the resulting entries can then be shared.
+
 Manual runs can select `platforms: linux` or `windows` for a targeted build without publication.
 Publication requires `platforms: all`. Starting any new native run on the same branch cancels the
 whole previous run, including its other platform. The cleanup wait preserves its completed caches.

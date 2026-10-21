@@ -269,6 +269,9 @@ jobs:
       CCACHE_DEPEND: "true"
       CCACHE_COMPRESSLEVEL: "5"
       DEBIAN_FRONTEND: noninteractive
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      LC_CTYPE: C.UTF-8
       ARCHS: ${{ matrix.archs }}
       CUDA_VERSION: ${{ matrix.cuda }}
     steps:
