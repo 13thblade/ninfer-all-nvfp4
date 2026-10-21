@@ -185,7 +185,7 @@ jobs:
         run: python .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
       - name: Save completed objects even after cancellation
         if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
-        timeout-minutes: 3
+        timeout-minutes: ${{ job.status == 'cancelled' && 3 || 20 }}
         run: python .github/scripts/hf-build-cache.py save --directory .cache/objects --family $env:HF_CACHE_FAMILY
       - name: Package, verify device images and test startup without Toolkit on PATH
         if: inputs.phase == 'package'

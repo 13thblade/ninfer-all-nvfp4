@@ -180,7 +180,11 @@ the cancelled producer to flush completed objects before handing ownership to th
 The cache command rejects writes from other workflows/jobs and prevents an older run from replacing
 snapshots already saved by a newer run. CI cancels immediately and has no shared-cache cleanup.
 
-The final save has a three-minute limit within GitHub's five-minute cancellation window. Runner
+The final save has a twenty-minute limit after normal completion or failure. Cancellation reduces
+that limit to three minutes within GitHub's five-minute cancellation window. A measured 6.2 GB
+Linux snapshot took 183 seconds to upload on the bootstrap rental, excluding archive creation;
+such a transfer does not fit the cancellation limit. Completed periodic snapshots remain available.
+Runner
 loss, force cancellation or a failed upload can lose work since the last completed checkpoint.
 That interval can exceed ten minutes by the upload duration or by a failed checkpoint. An executing
 compiler process itself cannot resume. Periodic checkpoint failures produce a warning and retry;
