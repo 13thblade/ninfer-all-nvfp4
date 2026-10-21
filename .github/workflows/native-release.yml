@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish Windows and Linux builds as the latest release (master only)
+        description: Publish native release assets and both Docker images (master only)
         type: boolean
         default: false
 
@@ -303,6 +303,17 @@ jobs:
             dist/*/BUILD-INFO.json
           if-no-files-found: ignore
           retention-days: 7
+
+  containers:
+    name: Docker images from Linux artifacts
+    needs: linux
+    uses: ./.github/workflows/docker.yml
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    with:
+      publish: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || inputs.publish) }}
 
   publish:
     needs: [windows, linux]

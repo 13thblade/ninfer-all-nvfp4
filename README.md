@@ -368,7 +368,8 @@ See the [release process](docs/maintainer/release-process.md) for build and veri
 <details>
 <summary><b>Commands, volumes and tags</b> — what the container runs</summary>
 
-- **Tags.** `cuda12.9` and `cuda13.4` follow successful Native release builds of the current `master`.
+- **Tags.** `cuda12.9` and `cuda13.4` update after both Linux CUDA builds and both Docker jobs succeed for the
+  current `master`. Windows builds do not block them.
   Pin a build with `cuda12.9-<commit12>` or `cuda13.4-<commit12>`, where `commit12` is the first
   12 hexadecimal characters of its commit SHA. Both images must build before either floating tag
   moves. The pipeline no longer updates `latest`, `multi` or `VERSION` tags.

@@ -1,8 +1,10 @@
 # Cutting a release
 
 The [Native release](../../.github/workflows/native-release.yml) workflow builds Windows x64
-executables and Debian 13 x64 binaries. After a successful master push run,
-[Container image](../../.github/workflows/docker.yml) packages both Linux archives without compilation.
+executables and Debian 13 x64 binaries. As soon as both Linux matrix jobs succeed, its `containers`
+job calls [Container image](../../.github/workflows/docker.yml) to package their archives without
+compilation. This dependency excludes Windows and native release publication. A Windows failure
+therefore does not block Docker. A failed or cancelled Linux job prevents both Docker variants.
 CI builds every target and runs CTest for the same two multiarch CUDA configurations.
 
 ## Container publication
@@ -12,7 +14,10 @@ CI builds every target and runs CTest for the same two multiarch CUDA configurat
 | CUDA 12.9.2 | `cuda12.9` | `cuda12.9-<commit12>` | `70;75;80;86;89` |
 | CUDA 13.4.3 | `cuda13.4` | `cuda13.4-<commit12>` | `75;80;86;89;120a` |
 
-Both images use Debian 13 and the binaries and CUDA runtime libraries from the same native run.
+Both images use Debian 13 and the binaries and CUDA runtime libraries from the calling native run.
+The reusable workflow downloads artifacts from that run and checks out its exact commit. It needs
+no dispatch token or separate workflow-completion event. The parent workflow's concurrency group
+cancels obsolete builds and their Docker jobs together.
 The handoff verifies volume checksums, packaged files, full source revision, CUDA version and the
 complete architecture list. Each image keeps all its device images in one multicall executable.
 `commit12` is the first 12 hexadecimal characters of the source SHA; `VERSION` is not a tag.
@@ -27,7 +32,8 @@ BuildKit cache. Native release alone saves shared compiler caches; CI only reads
 The pipeline no longer updates `latest`, `multi`, version-only or `sha-…` tags. Existing registry
 images are not deleted. The old latest-based pruning policy is removed because it cannot retain
 both CUDA families safely; registry storage grows with published commit images until a separate
-retention policy is configured. Manual native test runs do not publish container images.
+retention policy is configured. Manual native test runs build both images locally without pushing.
+Publishing is enabled for master pushes, or for a manual master run with `publish: true`.
 
 ## Native publication
 
@@ -104,7 +110,7 @@ A branch's snapshots require explicit promotion to seed master; this workflow do
 
 CI does not upload compiler caches to HF or Actions Cache. Python dependency caches remain in
 Actions Cache, within the repository's free 10 GiB limit. Docker publication downloads the compiled
-Linux archive from the exact successful Native release run, checks its commit, CUDA version,
+Linux archive from the same run after both Linux jobs succeed, checks its commit, CUDA version,
 architecture set and checksums, and packages it without invoking a compiler or reading HF caches.
 Local source Docker builds retain their BuildKit cache mounts.
 

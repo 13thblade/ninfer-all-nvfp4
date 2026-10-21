@@ -1,20 +1,18 @@
 # Package both verified Linux archives from the same Native release run; no compilation.
 name: Container image
 
+# Called as a job after the entire Linux matrix succeeds. The parent owns cancellation.
 on:
-  workflow_run:
-    workflows: [Native release]
-    types: [completed]
-    branches: [master]
-
-concurrency:
-  group: container-image
-  cancel-in-progress: true
+  workflow_call:
+    inputs:
+      publish:
+        description: Push both images and update the current master tags
+        type: boolean
+        default: false
 
 jobs:
   package:
     name: Package CUDA ${{ matrix.cuda }}
-    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -30,18 +28,16 @@ jobs:
           - cuda: '13.4'
             toolkit: '13.4.3'
     env:
-      SHA: ${{ github.event.workflow_run.head_sha }}
+      SHA: ${{ github.sha }}
       CUDA_VARIANT: ${{ matrix.cuda }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.sha }}
       - uses: actions/download-artifact@v8
         with:
           name: native-linux-cuda-${{ matrix.toolkit }}
           path: native-artifact
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ github.token }}
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
@@ -56,6 +52,7 @@ jobs:
           echo "tag=$image:cuda${CUDA_VARIANT}-${SHA:0:12}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
+        if: inputs.publish
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -64,7 +61,8 @@ jobs:
         with:
           context: ${{ steps.extract.outputs.context }}
           platforms: linux/amd64
-          push: true
+          push: ${{ inputs.publish }}
+          load: ${{ !inputs.publish }}
           tags: ${{ steps.tags.outputs.tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -77,20 +75,22 @@ jobs:
   promote:
     name: Update both CUDA tags
     needs: package
+    if: inputs.publish
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
       packages: write
     env:
-      SHA: ${{ github.event.workflow_run.head_sha }}
+      SHA: ${{ github.sha }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.sha }}
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
+        if: inputs.publish
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

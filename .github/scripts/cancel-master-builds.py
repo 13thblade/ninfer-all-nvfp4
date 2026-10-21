@@ -6,13 +6,12 @@ import subprocess
 
 WORKFLOWS = {
     ".github/workflows/ci.yml", ".github/workflows/native-release.yml",
-    ".github/workflows/docker.yml",
 }
 
 
 def superseded(run, trigger):
     return (run["status"] != "completed" and run["head_branch"] == "master"
-            and run["event"] in ("push", "workflow_run", "workflow_dispatch")
+            and run["event"] in ("push", "workflow_dispatch")
             and run["path"].split("@", 1)[0] in WORKFLOWS
             and run["head_sha"] != trigger["head_sha"]
             and run["created_at"] <= trigger["created_at"])
