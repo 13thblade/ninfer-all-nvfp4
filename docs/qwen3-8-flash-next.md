@@ -633,9 +633,15 @@ draft-chain graph and each width its own verification graph, captured at their s
 - With MTP, a verification of one request (at most eight tokens, so its experts take the vector
   products) replays graphs of its own the same way, and so does the draft chain of one request on
   one GPU, host experts included; several requests' rounds, the MTP catch-up and disk experts run
-  eagerly. With staged host misses the MTP block runs only its cached experts, their weights
-  renormalized per token: it only steers drafts, which verification checks, so the output is
-  unchanged while drafting never waits for the bus.
+  eagerly. With staged host misses the MTP block serves its missing experts in draft steps and a
+  round's cells (at most eight tokens) as a decode layer does, copied or computed by the CPU, so
+  the drafts follow the block's own routing; over longer prompt chunks it runs only its cached
+  experts, their weights renormalized per token, since it only steers drafts, which verification
+  checks. On an RTX 4090 with the IQ3_S release's host experts (EPYC 7742, 64K context, three
+  drafts with `--draft-min-p 0.5`, 256 greedy tokens after a code prompt, a prose
+  prompt and a 31,865-token document, once per `--kv-dtype` format) serving those misses instead
+  of dropping them committed 5-21% more tokens a round and decoded 1.025 times as fast (geomean of
+  27 pairs, 0.959-1.092; slower in 4, the two largest losses after the document).
 - A pass whose layers may wait on the device for their missing experts ends synchronized: CUDA
   loads a kernel lazily at its first launch, a load may wait for the device to go idle, and a
   launch during such a wait would deadlock with the service it waits for.

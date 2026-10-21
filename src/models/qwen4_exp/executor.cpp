@@ -2659,9 +2659,10 @@ struct Executor::Impl {
             ops::moe_experts_native(mixed, ids, weights, shared, m.native->banks(), nullptr, ws, y, s);
             return;
         }
-        if (misses && index == layers.size()) {
-            // The MTP block only steers drafts, which verification checks: its missing experts
-            // are dropped rather than fetched.
+        if (misses && index == layers.size() && t > kVectorTokens) {
+            // The MTP block only steers drafts, which verification checks: a prompt chunk's
+            // missing experts are dropped rather than fetched. Draft steps and a round's cells
+            // serve them as a decode layer does, so the drafts follow the block's own routing.
             Tensor y(rank.y, DType::FP32, {h, t});
             auto scope = ws.scope();
             Tensor kept_ids     = ws.alloc(DType::I32, {top, t});
