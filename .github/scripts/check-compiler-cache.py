@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 
 from build_telemetry import cache_stats
@@ -62,4 +63,28 @@ run("ccache", "--zero-stats")
 run("cmake", "--build", str(root / "out"), "--clean-first", "-j")
 if cache_stats()["cache_miss"] != 1:
     sys.exit("CUDA host-only header change did not invalidate its cached object")
+if os.name != "nt":
+    # Change a private copy at the same path: changing only its path would not
+    # establish that ccache hashes the host compiler's content.
+    host_tools = (root / "host-tools").resolve()
+    host_tools.mkdir(exist_ok=True)
+    for name in ("gcc", "g++"):
+        shutil.copy2(shutil.which(name), host_tools / name)
+    source = root / "host_compiler.cu"
+    source.write_text(f'__global__ void host_compiler_{identity}(int *p) {{ *p = 7; }}\n')
+    command = ("ccache", "nvcc", "-ccbin", str(host_tools), "-MD", "-c", str(source),
+               "-o", str(root / "host_compiler.o"))
+    run(*command)
+    run("ccache", "--zero-stats")
+    run(*command)
+    if cache_stats()["direct_cache_hit"] != 1:
+        sys.exit("Unchanged CUDA host compiler did not reuse its cached object")
+    for name in ("gcc", "g++"):
+        # ELF ignores bytes after its segments; the compiler remains executable.
+        with (host_tools / name).open("ab") as output:
+            output.write(b"\nccache host compiler content probe\n")
+    run("ccache", "--zero-stats")
+    run(*command)
+    if cache_stats()["cache_miss"] != 1:
+        sys.exit("CUDA host compiler content change did not invalidate its cached object")
 run("ccache", "--zero-stats")

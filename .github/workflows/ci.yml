@@ -353,7 +353,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
           HF_BUILD_CACHE_SEED_REF: ${{ vars.HF_BUILD_CACHE_SEED_REF }}
           CACHE_SOURCE_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
-        run: python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --family native-linux-cuda-${{ matrix.cuda }} --source-ref "$CACHE_SOURCE_REF" --optional
+        run: python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --family native-linux-cuda-${{ matrix.cuda }}-host-v2 --fallback-family native-linux-cuda-${{ matrix.cuda }} --source-ref "$CACHE_SOURCE_REF" --optional
       - name: Verify object-cache reuse and CUDA invalidation
         timeout-minutes: 10
         run: python3.11 .github/scripts/check-compiler-cache.py

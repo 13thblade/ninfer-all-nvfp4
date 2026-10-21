@@ -67,6 +67,30 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(self.restored(), 'third')
         self.assertEqual(len(self.bucket.files), 4)
 
+    def test_new_family_reads_previous_objects_without_replacing_old_snapshots(self):
+        self.save('old compiler objects')
+        preserved = self.bucket.files.copy()
+        target = self.root / 'new-cache'
+        new_family = self.family + '-host-v2'
+        self.assertTrue(CACHE.restore(self.bucket, target, new_family, self.ref,
+                                     fallback_families=[self.family], required=True))
+        (target / 'new-object').write_text('new compiler objects')
+        CACHE.save(self.bucket, target, new_family, self.ref)
+        self.assertTrue(all(self.bucket.files[key] == value for key, value in preserved.items()))
+        again = self.root / 'again'
+        self.assertTrue(CACHE.restore(self.bucket, again, new_family, self.ref,
+                                     fallback_families=[self.family]))
+        self.assertEqual((again / 'new-object').read_text(), 'new compiler objects')
+
+    def test_corrupt_new_family_cannot_silently_use_an_old_family(self):
+        self.save('previous')
+        new_family = self.family + '-host-v2'
+        CACHE.save(self.bucket, self.source, new_family, self.ref)
+        self.bucket.files[CACHE.prefix(new_family, self.ref) + '/0.tar'] = b'corrupt'
+        with self.assertRaises(ValueError):
+            CACHE.restore(self.bucket, self.root / 'new-cache', new_family, self.ref,
+                          fallback_families=[self.family])
+
     def test_interrupted_replacement_retains_last_completed_snapshot(self):
         self.save('first')
         self.save('second')

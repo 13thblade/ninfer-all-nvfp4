@@ -144,7 +144,8 @@ def save(api, directory, family, ref, verify=False):
         print(json.dumps({'state': 'saved', **item}), flush=True)
 
 
-def restore(api, directory, family, ref, legacy_prefix=None, required=False, seed_ref=None):
+def restore(api, directory, family, ref, legacy_prefix=None, required=False, seed_ref=None,
+            fallback_families=()):
     if seed_ref and not seed_ref.startswith('refs/heads/'):
         raise ValueError('The seed cache must belong to a branch')
     directory.mkdir(parents=True, exist_ok=True)
@@ -189,7 +190,16 @@ def restore(api, directory, family, ref, legacy_prefix=None, required=False, see
                 print(json.dumps({'state':'migration-restored', 'key':item['key'], 'files':item['files']}), flush=True)
             if restored:
                 return True
-    if required or had_snapshots:
+    if had_snapshots:
+        raise ValueError('No verified cache checkpoint exists')
+    # Read previous families without replacing their snapshots. Compiler input hashes
+    # still decide which restored entries are valid under the current toolchain.
+    for fallback in dict.fromkeys(fallback_families):
+        if fallback == family:
+            raise ValueError('A cache family cannot fall back to itself')
+        if restore(api, directory, fallback, ref, seed_ref=seed_ref):
+            return True
+    if required:
         raise ValueError('No verified cache checkpoint exists')
     print(json.dumps({'state':'cold', 'family':family}), flush=True)
     return False
@@ -215,12 +225,13 @@ def main():
     parser.add_argument('--directory', type=Path, required=True)
     parser.add_argument('--family', required=True)
     parser.add_argument('--legacy-prefix')
+    parser.add_argument('--fallback-family', action='append', default=[])
     parser.add_argument('--source-ref', help='Reader branch; defaults to the current branch')
     parser.add_argument('--optional', action='store_true', help='Continue without an unavailable reader cache')
     parser.add_argument('--required', action='store_true')
     parser.add_argument('--verify-upload', action='store_true')
     args = parser.parse_args()
-    if args.action == 'save' and (args.optional or args.source_ref):
+    if args.action == 'save' and (args.optional or args.source_ref or args.fallback_family):
         parser.error('Reader options cannot be used for saves')
     if args.optional and args.required:
         parser.error('--optional and --required are mutually exclusive')
@@ -239,7 +250,7 @@ def main():
             save(api, args.directory, args.family, ref, args.verify_upload)
         else:
             restore(api, args.directory, args.family, ref, args.legacy_prefix, args.required,
-                    os.environ.get('HF_BUILD_CACHE_SEED_REF'))
+                    os.environ.get('HF_BUILD_CACHE_SEED_REF'), args.fallback_family)
     except Exception as error:
         if not args.optional:
             raise

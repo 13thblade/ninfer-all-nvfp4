@@ -119,10 +119,20 @@ feed back into the production cache. Broader test builds can take longer on a co
 Each native or CI variant has an 8 GiB local compiler-cache limit. This is a capacity limit, not a
 measured working-set size; ccache can evict older objects. Each native platform/toolkit has its own
 family, with separate branch prefixes and two rotating snapshots. CI reads the corresponding
-`native-linux-cuda-<toolkit>` family. It takes the latest available verified snapshot without waiting
+`native-linux-cuda-<toolkit>-host-v2` family. It takes the latest available verified snapshot without waiting
 for an artifact build to finish. It tries its branch, then master; a PR starts from its target branch.
 Source commits are not cache-family boundaries. Missing credentials, unavailable storage or rejected
 snapshots produce a warning and allow a cold CI build. Fork PRs receive no repository secret.
+The `host-v2` families leave the previous families untouched and can read their entries when
+the new family is absent. Corrected compiler lookup adds the CUDA host compiler's content to
+the cache key. Previous CUDA entries therefore miss once; unchanged C++ entries remain eligible.
+The old snapshots are retained, but retaining them does not make the old CUDA keys compatible.
+
+Windows uses eight object shards per Toolkit, each with a separate
+`native-windows-cuda-<toolkit>-host-v2-shard-<index>` family. The final Windows job merges those
+snapshots, links and packages the same multiarch executables, and saves the aggregate family
+without the shard suffix. Only shard zero and the subsequent final job write the shared vcpkg
+family. The reusable Windows workflow remains part of Native release; CI has no cache writer.
 To bootstrap master from a completed branch build, set repository variable
 `HF_BUILD_CACHE_SEED_REF` to that branch's full ref, such as `refs/heads/build/windows-release`.
 Readers try this explicit seed only after their branch and master have no usable snapshot.
@@ -134,6 +144,11 @@ Actions Cache, within the repository's free 10 GiB limit. Docker publication dow
 Linux archive from the same run after both Linux jobs succeed, checks its commit, CUDA version,
 architecture set and checksums, and packages it without invoking a compiler or reading HF caches.
 Local source Docker builds retain their BuildKit cache mounts.
+
+Each Linux artifact job also uploads its archive volumes, checksum manifest and build metadata
+to `WaveCut/ninfer-cache/native-artifacts/v1/iamwavecut/ninfer-all/<run>/<artifact>/`.
+It downloads each uploaded file on the runner, checks SHA-256, and publishes `COMPLETE.json`
+only after all checks pass. These private backups do not publish a GitHub release.
 
 Ccache checks compiler content, source, headers and compilation flags before reusing an entry.
 Depend mode hashes raw source and compiler-reported header dependencies, without falling back to

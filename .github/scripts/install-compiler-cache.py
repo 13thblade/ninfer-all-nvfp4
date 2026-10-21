@@ -46,8 +46,8 @@ def main():
     subprocess.run([str(binary), "--version"], check=True)
     with open(os.environ["GITHUB_PATH"], "a") as output:
         output.write(str(binary.parent) + "\n")
-    with open(os.environ["GITHUB_ENV"], "a") as output:
-        output.write(f"CCACHE_PATH={binary}\n")
+    # CCACHE_PATH is the compiler search path, not the ccache executable. Leave it
+    # unset so CUDA cache keys include the host compiler found on PATH.
 
 
 if __name__ == "__main__":

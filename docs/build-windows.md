@@ -116,6 +116,13 @@ The `Native release` workflow builds two native x64 packages with VS 2022 and Ni
 | CUDA 12.9.2 | `70;75;80;86;89` (Volta through Ada) |
 | CUDA 13.4.3 | `75;80;86;89;120a` (Turing through consumer Blackwell) |
 
+Each Toolkit compiles its release objects in eight jobs. Every CUDA object retains the complete
+architecture set above. Jobs checkpoint separate HF cache families; a final job restores them,
+links the executables and verifies the package. At most eight object jobs run together across
+both Toolkits. Each runner uses two compiler processes with two nvcc optimization threads each,
+to limit the memory pressure observed on the four-CPU Windows runners. This does not establish
+a bound on compilation time for the largest individual source files.
+
 Every push to `master` starts the current build and cancels the superseded run.
 Feature branches build only through a manual run, which builds the packages
 without publication by default. Select `publish` on `master` to publish. Both Windows and both Linux jobs must
