@@ -237,7 +237,7 @@ Both packagers read CUDA and architecture labels from the configured build tree.
 `NINFER_BUILD_ROOT` to that tree. Build release products with benchmarks enabled. Linux accepts
 separate CLI/server binaries or `NINFER_MULTICALL=ON`; CI uses the latter. Run
 `scripts/package-release.sh` on the Linux build host, or `scripts\package-release.ps1` on Windows.
-The repository's `VERSION` and matching release notes are included as source metadata. Neither
+The repository's `VERSION` is included as source metadata, with matching release notes when present. Neither
 packager uses `VERSION` in the archive name. Modified local sources add `-dirty`; CI rejects them.
 Linux packaging needs Python 3.11, `strip`, `patchelf`, `ldd`, `dpkg-query`, `tar` and the build's CUDA Toolkit.
 The runtime Dockerfile is included only when packaging a Debian 13 build.

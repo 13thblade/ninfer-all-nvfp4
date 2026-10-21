@@ -83,8 +83,6 @@ def main():
             raise RuntimeError(f'Missing release product: {source}')
     version = (repo / 'VERSION').read_text().strip()
     notes = repo / f"RELEASE_NOTES_{version.split('-')[0]}.md"
-    if not notes.is_file():
-        raise RuntimeError(f'Missing {notes}')
     dist = repo / 'dist'
     dist.mkdir(exist_ok=True)
     package = dist / name
@@ -141,11 +139,13 @@ def main():
     (package / 'packages').mkdir()
     (package / 'packages/multi.txt').write_text(''.join(f'{p}\n' for p in sorted(packages)))
     for source, destination in (
-        (repo / 'LICENSE', 'LICENSE'), (repo / 'VERSION', 'VERSION'), (notes, notes.name),
+        (repo / 'LICENSE', 'LICENSE'), (repo / 'VERSION', 'VERSION'),
         (repo / 'docs/release-archive-linux.md', 'README.md'),
         (repo / 'scripts/run.sh', 'run.sh'), (repo / 'scripts/download-model.sh', 'download-model.sh'),
     ):
         shutil.copy2(source, package / destination)
+    if notes.is_file():
+        shutil.copy2(notes, package / notes.name)
     distro = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
                   if '=' in line)
     if distro.get('ID', '').strip('"') == 'debian' and distro.get('VERSION_ID', '').strip('"') == '13':

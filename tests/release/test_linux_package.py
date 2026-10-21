@@ -105,6 +105,15 @@ class LinuxPackageTest(unittest.TestCase):
             PACKAGE.main()
         self.assertFalse(list((self.repo / 'dist').glob('SHA256SUMS-*')))
 
+    def test_commit_archive_does_not_require_release_notes(self):
+        (self.repo / 'RELEASE_NOTES_0.0.md').unlink()
+        PACKAGE.main()
+        volume = next((self.repo / 'dist').glob('*.tar.gz.001'))
+        with tarfile.open(volume, 'r:gz') as archive:
+            names = archive.getnames()
+            self.assertFalse(any('RELEASE_NOTES_' in name for name in names))
+            self.assertTrue(any(name.endswith('/BUILD-INFO.json') for name in names))
+
     def test_failed_startup_removes_old_manifest(self):
         PACKAGE.main()
         self.help_failure = True

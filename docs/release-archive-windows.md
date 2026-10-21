@@ -7,7 +7,7 @@ under `scripts/`, and
 is the fuller guide. Links here are absolute on purpose: the archive ships no `docs/` directory.
 
 Check `BUILD-INFO.json` for the exact source commit, CUDA version and device images.
-`VERSION` and `RELEASE_NOTES_*.md` describe the product version in that source snapshot.
+`VERSION` records the source snapshot's version field. Matching `RELEASE_NOTES_*.md` are included when present.
 
 Download **all** `.7z.*` volumes for one CUDA variant into the same directory. Use 7-Zip to extract
 `.7z.001`. Keep CUDA 12 and CUDA 13 packages in separate directories. The outer `SHA256SUMS-*.txt`

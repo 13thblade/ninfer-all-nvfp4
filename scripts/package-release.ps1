@@ -27,7 +27,6 @@ $CudaMajor = $CudaVersion.Split('.')[0]
 $Version = (Get-Content -LiteralPath (Join-Path $RepoRoot 'VERSION') -Raw).Trim()
 if ($Version -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw 'VERSION is not a valid release-notes identifier' }
 $ReleaseNotes = Join-Path $RepoRoot "RELEASE_NOTES_$($Version.Split('-')[0]).md"
-if (-not (Test-Path -LiteralPath $ReleaseNotes)) { throw "Missing $ReleaseNotes" }
 $Revision = (& git -C $RepoRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the source revision' }
 $SourceState = @(& git -C $RepoRoot status --porcelain --untracked-files=no)
@@ -76,7 +75,9 @@ foreach ($name in "cublas64_$CudaMajor.dll", "cublasLt64_$CudaMajor.dll") {
 }
 Copy-Item -LiteralPath $Eula -Destination (Join-Path $ProductRoot 'NVIDIA-CUDA-EULA.txt')
 foreach ($file in 'VERSION', 'LICENSE') { Copy-Item -LiteralPath (Join-Path $RepoRoot $file) -Destination $ProductRoot }
-Copy-Item -LiteralPath $ReleaseNotes -Destination $ProductRoot
+if (Test-Path -LiteralPath $ReleaseNotes) {
+    Copy-Item -LiteralPath $ReleaseNotes -Destination $ProductRoot
+}
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'docs\release-archive-windows.md') -Destination (Join-Path $ProductRoot 'README.md')
 foreach ($script in 'run.bat', 'download-model.bat') {
     Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\$script") -Destination $ProductRoot
