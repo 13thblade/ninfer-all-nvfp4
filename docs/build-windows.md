@@ -11,7 +11,7 @@ this guide is for a checkout.
 build and of an `86` build with Visual Studio 2022 (MSVC 14.44) and CUDA 12.8, the test suite on a
 TITAN RTX (TCC, and WDDM for the virtual-memory tests) and an RTX 3060 (WDDM), run by a contributor.
 This repository has no Windows test host. CI compiles the host code of every translation unit with
-MSVC 14.44 for `70` (CUDA 12.9), `75`, `80`, `86`, `89` and `120a` (CUDA 13.4) on each change
+MSVC 14.44 for `70;75;80;86;89` (CUDA 12.9) and `75;80;86;89;120a` (CUDA 13.4) on each change
 to the build inputs (`scripts/check-host-compile.py`), but that host check builds no device code.
 The separate `Native release` workflow compiles
 and links the release products for two CUDA versions, checks their device images and tests `--help`

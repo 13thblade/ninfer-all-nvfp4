@@ -23,10 +23,9 @@
 #
 #   * tests/test_docker_build_cache.sh -- the Dockerfile's incremental build cache.
 #
-#   * the CUDA build of every target for sm_75, sm_86 and sm_120a in the Dockerfile's toolchain
-#     stage, then CTest. The toolchain stage is published as ghcr.io/<owner>/<repo>-toolchain once
-#     per change of its definition (.github/scripts/toolchain-image.sh); the object cache carries over
-#     between runs.
+#   * Debian multiarch CUDA 12.9 and 13.4 builds of every target, then CTest. They use the
+#     release toolchains and read the latest available native compiler snapshot without waiting
+#     for its producer. CI never uploads compiler caches.
 #
 # The last two run only when a file they build, test or ship from differs from the base: the
 # branch a pull request merges into, or on master the commit the published image was built from
@@ -67,15 +66,6 @@ jobs:
           fetch-depth: 2
       - id: compare
         run: .github/scripts/build-inputs.sh >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-python@v7
-        if: github.event_name != 'pull_request'
-        with:
-          python-version: '3.11'
-      - name: Wait for the previous build to finish cache cleanup
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3.11 .github/scripts/wait-previous-builds.py
 
   calculator:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
@@ -141,27 +131,6 @@ jobs:
         # third each.
         shard: [1, 2, 3]
         build:
-          # CUDA 13 dropped Volta, so sm_70 builds with 12.9.
-          - label: sm_70
-            archs: '70'
-            cuda: 12.9.2
-            installer: cuda_12.9.2_windows_x86_64_network.exe
-            packages: nvcc cudart cublas_dev nvtx thrust cuda_profiler_api
-          # Their commands differ only in the architecture numbers, which check-host-compile.py
-          # compiles once; a definition or source of one of them alone is compiled for it.
-          - label: sm_75, sm_80, sm_86, sm_89
-            archs: '75 80 86 89'
-            cuda: 13.4.3
-            installer: cuda_13.4.3_windows_x86_64_network.exe
-            packages: nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api
-          - label: sm_120a
-            archs: '120a'
-            cuda: 13.4.3
-            installer: cuda_13.4.3_windows_x86_64_network.exe
-            packages: nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api
-          # Builds of several architectures, whose host code instantiates every tier's kernels and
-          # routes (src/ops/common/device_tier.h): the CUDA 12 set with Volta and the CUDA 13 set
-          # with Blackwell.
           - label: sm_70;75;80;86;89
             archs: '70;75;80;86;89'
             cuda: 12.9.2
@@ -331,114 +300,85 @@ jobs:
         run: bash tests/test_docker_build_cache.sh docker
 
   cuda:
-    name: CUDA build and tests (sm_${{ matrix.arch }}, no GPU)
+    name: CUDA ${{ matrix.cuda }} multiarch build and tests (no GPU)
     needs: build-inputs
     if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.changed == 'true'
     runs-on: ubuntu-24.04
+    container: debian:13-slim
     timeout-minutes: 350
     permissions:
       contents: read
-      packages: read
-      statuses: write
+    defaults:
+      run:
+        shell: bash
     env:
-      # PR code must never receive the private bucket write credential.
-      HF_TOKEN: ${{ github.event_name != 'pull_request' && secrets.HF_BUILD_CACHE_TOKEN || '' }}
       HF_HUB_DISABLE_TELEMETRY: '1'
-      HF_CACHE_FAMILY: ci-sm${{ matrix.arch }}
       CCACHE_DIR: ${{ github.workspace }}/.cache/objects
-      CCACHE_MAXSIZE: ${{ github.event_name == 'pull_request' && '256Mi' || '4Gi' }}
+      CCACHE_MAXSIZE: 8Gi
       CCACHE_COMPILERCHECK: content
       CCACHE_DEPEND: "true"
       CCACHE_COMPRESSLEVEL: "5"
+      DEBIAN_FRONTEND: noninteractive
+      ARCHS: ${{ matrix.archs }}
+      CUDA_VERSION: ${{ matrix.cuda }}
     strategy:
       fail-fast: false
       matrix:
-        arch: ['75', '86', '120a']
+        include:
+          - cuda: '12.9.2'
+            archs: '70;75;80;86;89'
+          - cuda: '13.4.3'
+            archs: '75;80;86;89;120a'
     steps:
-      - name: Reserve time for cache upload
+      - name: Reserve time for tests and diagnostics
         run: echo "BUILD_DEADLINE=$(( $(date +%s) + 19800 ))" >> "$GITHUB_ENV"
+      - name: Install checkout tools
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git
       - uses: actions/checkout@v7
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - name: Toolchain image
-        run: .github/scripts/toolchain-image.sh
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.11'
+      - name: Install Debian build dependencies and official CUDA Toolkit
+        run: .github/scripts/install-linux-release-tools.sh
       - id: compiler-cache
         name: Install pinned object cache
         run: python3.11 .github/scripts/install-compiler-cache.py
-      - name: Install HF bucket client
-        if: github.event_name != 'pull_request'
-        run: python3.11 -m pip install --disable-pip-version-check huggingface_hub==1.17.0
-      - name: Restore completed objects from HF
-        id: object-cache
-        if: github.event_name != 'pull_request'
-        run: python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --family "$HF_CACHE_FAMILY" --legacy-prefix objects-v1-ci-sm${{ matrix.arch }}-
-      - uses: actions/cache/restore@v6
-        if: github.event_name == 'pull_request'
-        id: pr-cache
-        with:
-          path: .cache/objects
-          key: pr-objects-v1-sm${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: pr-objects-v1-sm${{ matrix.arch }}-
-      - name: Start build container
-        env:
-          NINFER_CUDA_ARCH: ${{ matrix.arch }}
-        run: .github/scripts/ci-cached-build.sh start
-      - name: Verify compiler cache in the build container
+      - name: Install cache client and CTest Python dependency
+        run: python3.11 -m pip install --disable-pip-version-check huggingface_hub==1.17.0 jinja2
+      - name: Read available native snapshot (optional)
         timeout-minutes: 10
-        run: .github/scripts/ci-cached-build.sh probe
+        continue-on-error: true
+        env:
+          # Reuse the bucket token only for restore. Fork PRs receive no secret.
+          HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
+          CACHE_SOURCE_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
+        run: python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --family native-linux-cuda-${{ matrix.cuda }} --source-ref "$CACHE_SOURCE_REF" --optional
+      - name: Verify object-cache reuse and CUDA invalidation
+        timeout-minutes: 10
+        run: python3.11 .github/scripts/check-compiler-cache.py
+      - name: Configure release products and tests
+        run: .github/scripts/configure-linux-build.sh ON
       - name: Build every target
         id: build
-        timeout-minutes: 325
-        env:
-          GH_TOKEN: ${{ github.token }}
+        timeout-minutes: 305
+        run: python3.11 .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- cmake --build build-release -j
+      - name: Run CTest
+        timeout-minutes: 15
         run: |
-          .github/scripts/ci-cached-build.sh build &
-          build=$!
-          .github/scripts/build-progress.sh watch "$build" build-ci.log "build progress (sm_${{ matrix.arch }})" &
-          wait "$build"
-      - name: Stop compiler work and prepare object cache
+          # The stub lets binaries load without a driver; GPU tests skip with exit 77.
+          mkdir -p /tmp/stub
+          ln -s "$CUDA_PATH/lib64/stubs/libcuda.so" /tmp/stub/libcuda.so.1
+          LD_LIBRARY_PATH=/tmp/stub ctest --test-dir build-release --output-on-failure -j
+      - name: Record local cache counters
         if: always() && steps.compiler-cache.outcome == 'success'
-        timeout-minutes: 2
-        run: .github/scripts/ci-cached-build.sh finish
-      - name: Save completed objects even after cancellation
-        if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
-        timeout-minutes: 3
-        run: python3.11 .github/scripts/hf-build-cache.py save --directory .cache/objects --family "$HF_CACHE_FAMILY"
-      - name: Save PR cache without private credentials
-        if: always() && steps.build.outcome != 'skipped' && steps.pr-cache.outcome == 'success'
-        timeout-minutes: 3
-        uses: actions/cache/save@v6
-        with:
-          path: .cache/objects
-          key: ${{ steps.pr-cache.outputs.cache-primary-key }}
+        run: python3.11 .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
       - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ci-logs-sm${{ matrix.arch }}
+          name: ci-logs-cuda-${{ matrix.cuda }}
           path: |
-            build-ci.log
-            build-ci-cache.json
-            build-ci-cache-progress.jsonl
+            build-release/*.log
+            build-release/cache-stats.json
+            build-release/cache-progress.jsonl
+            build-release/Testing/Temporary/LastTest.log
             build-cache-check/cache-stats.json
           if-no-files-found: ignore
           retention-days: 7
-      - name: Report the build status
-        if: always() && steps.build.outcome != 'skipped'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: .github/scripts/build-progress.sh finish "build progress (sm_${{ matrix.arch }})" "${{ steps.build.outcome }}"
-      - name: Run CTest
-        run: |
-          # No driver on the runner: the toolkit's stub libcuda lets the binaries load, cuInit fails,
-          # and every test that needs a device skips itself.
-          docker run --rm -v "$PWD:/src" -w /src -e NINFER_BUILD_DIR=/src/build-ci \
-            ninfer-toolchain:ci bash -c 'mkdir -p /tmp/stub && \
-              ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/stub/libcuda.so.1 && \
-              LD_LIBRARY_PATH=/tmp/stub scripts/build-native.sh test'

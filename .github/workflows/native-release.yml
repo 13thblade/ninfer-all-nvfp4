@@ -265,12 +265,7 @@ jobs:
         timeout-minutes: 10
         run: python3.11 .github/scripts/check-compiler-cache.py
       - name: Configure release products
-        run: |
-          cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DNINFER_MULTICALL=ON \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
-            -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
+        run: .github/scripts/configure-linux-build.sh OFF
       - name: Build release products
         id: build
         timeout-minutes: 305

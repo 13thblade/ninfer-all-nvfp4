@@ -60,11 +60,13 @@ class BuildLifecycleTest(unittest.TestCase):
                 "   time.sleep(.05)\n")
             result = subprocess.run(
                 [sys.executable, str(SCRIPT), "--log", str(root / "build.log"),
-                 "--timeout-seconds", "2", "--checkpoint-family", "test",
+                 "--timeout-seconds", "2", "--checkpoint-family", "native-linux-cuda-test",
                  "--checkpoint-directory", str(cache), "--checkpoint-interval", ".1",
                  "--", sys.executable, "-c", "import time; time.sleep(30)"],
                 cwd=root, env=os.environ | {"HF_TOKEN": "test-only", "PYTHONPATH": str(root),
-                                           "GITHUB_REF": "refs/heads/test"},
+                                           "GITHUB_REF": "refs/heads/test", "GITHUB_RUN_ID": "1",
+                                           "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_JOB": "linux",
+                                           "GITHUB_WORKFLOW_REF": "iamwavecut/ninfer-all/.github/workflows/native-release.yml@refs/heads/test"},
                 capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 124, result.stderr)
             progress = (root / "transfer-progress").read_text()

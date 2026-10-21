@@ -3,7 +3,7 @@
 The [Native release](../../.github/workflows/native-release.yml) workflow builds Windows x64
 executables and Debian 13 x64 binaries. After a successful master push run,
 [Container image](../../.github/workflows/docker.yml) packages both Linux archives without compilation.
-Ordinary CI builds and tests individual architectures independently.
+CI builds every target and runs CTest for the same two multiarch CUDA configurations.
 
 ## Container publication
 
@@ -22,7 +22,7 @@ floating CUDA tags, checking the current master SHA before each update. Registry
 separate operations: cancellation, a newer commit or registry failure can leave them temporarily
 pointing to different revisions. Use both commit tags when the same revision is required.
 A failed matrix does not promote either tag. Each variant reuses its previous image's inline
-BuildKit cache. Compiler caches remain in Native release and CI.
+BuildKit cache. Native release alone saves shared compiler caches; CI only reads them.
 
 The pipeline no longer updates `latest`, `multi`, version-only or `sha-…` tags. Existing registry
 images are not deleted. The old latest-based pruning policy is removed because it cannot retain
@@ -79,24 +79,34 @@ A superseded upload can leave an unpublished draft; it cannot replace the curren
 
 ## Build caches
 
-Native Windows, Debian and ordinary CUDA CI use pinned ccache 4.14.2. It stores complete object
-files. Trusted builds save compiler and Windows vcpkg caches in the private HF bucket
-`WaveCut/ninfer-cache`, under `github-actions/`. Existing pod caches and model files use separate
-prefixes and are not changed. `HF_BUILD_CACHE_TOKEN` must be a fine-grained token with read/write
-access to this bucket only. The client is pinned to `huggingface_hub==1.17.0`.
+Native Windows, Debian and CUDA CI use pinned ccache 4.14.2. Only Native release writes compiler
+and Windows vcpkg snapshots to the private HF bucket `WaveCut/ninfer-cache`, under `github-actions/`.
+`HF_BUILD_CACHE_TOKEN` has read/write access to this bucket only. Native jobs use it for snapshots;
+CI reuses it only in its restore step, by owner decision. The token itself can write, but CI has no
+upload steps, receives no token during compilation, and the save command rejects CI jobs. Existing
+pod caches and model files use separate prefixes and are not changed. The client is pinned to `huggingface_hub==1.17.0`.
 
-Each native variant has an 8 GiB local compiler-cache limit; each trusted CUDA CI variant has a
-4 GiB limit. These are capacity limits, not measured working-set sizes. Ccache can evict older
-objects when a local cache reaches its limit. Each platform/toolkit or CI architecture has its own
-family, with separate branch prefixes and two rotating snapshots. Readers try the current branch,
-then master. Source commits are not cache-family boundaries. A trusted branch's caches must be
-explicitly promoted if they are to seed master; this workflow does not do that automatically.
+CI uses Debian 13, the same official Toolkit installation, pinned ccache, Release flags, multicall
+setting, architecture sets and `build-release` directory as the Linux artifact build. The shared
+configure script enables additional test targets for CI. Both CUDA variants compile all targets;
+CTest runs without a GPU and device tests skip. Windows host checks also use the two complete
+architecture sets. Test-only objects compile locally and are discarded after CI; they do not
+feed back into the production cache. Broader test builds can take longer on a cold cache.
 
-Pull-request jobs receive no HF credential. They use Actions Cache with a 256 MiB local limit per
-architecture, including an explicit save after interruption. Python dependency caches also remain
-in Actions Cache. The repository remains at the free 10 GiB limit; PR snapshots and dependency
-caches can still be evicted by GitHub. Docker publication reuses prebuilt native archives and
-per-CUDA inline image-layer caches. Local source Docker builds retain their BuildKit cache mounts.
+Each native or CI variant has an 8 GiB local compiler-cache limit. This is a capacity limit, not a
+measured working-set size; ccache can evict older objects. Each native platform/toolkit has its own
+family, with separate branch prefixes and two rotating snapshots. CI reads the corresponding
+`native-linux-cuda-<toolkit>` family. It takes the latest available verified snapshot without waiting
+for an artifact build to finish. It tries its branch, then master; a PR starts from its target branch.
+Source commits are not cache-family boundaries. Missing credentials, unavailable storage or rejected
+snapshots produce a warning and allow a cold CI build. Fork PRs receive no repository secret.
+A branch's snapshots require explicit promotion to seed master; this workflow does not promote them.
+
+CI does not upload compiler caches to HF or Actions Cache. Python dependency caches remain in
+Actions Cache, within the repository's free 10 GiB limit. Docker publication downloads the compiled
+Linux archive from the exact successful Native release run, checks its commit, CUDA version,
+architecture set and checksums, and packages it without invoking a compiler or reading HF caches.
+Local source Docker builds retain their BuildKit cache mounts.
 
 Ccache checks compiler content, source, headers and compilation flags before reusing an entry.
 Depend mode hashes raw source and compiler-reported header dependencies, without falling back to
@@ -104,7 +114,7 @@ device-only preprocessing. The pre-build probe checks unchanged C++ and multiarc
 then verifies that changing host-only CUDA code or a host-only header causes a cache miss.
 Compilation reports cache counters, available RAM and disk space every minute.
 
-Successful compiler invocations commit their entries to local disk. During trusted builds, the
+Successful compiler invocations commit their entries to local disk. During native artifact builds, the
 supervisor uploads a snapshot every ten minutes after the previous upload completes. Windows
 configuration also checkpoints completed vcpkg archives. Uploads run while compilation continues;
 an entry that finishes after the snapshot starts is retained by a subsequent snapshot. Temporary
@@ -114,11 +124,14 @@ slot if the latest archive is damaged. A partial upload does not publish a new m
 
 After success, failure or ordinary cancellation, cleanup stops compiler work and saves completed
 objects before packaging. Native builds stop after 300 minutes of compilation, or earlier at a
-deadline set 330 minutes from the first job step. Ordinary CUDA CI uses a 320-minute compilation
-limit and the same job deadline. The job limit is 350 minutes. The supervisor exits with code 124
-and leaves cleanup time; the hard step timeout is five minutes longer than its duration limit.
-Explicit save steps also run after a hard compilation-step timeout. The next run waits for older
-runs of the same workflow and branch to finish cleanup.
+deadline set 330 minutes from the first job step. CUDA CI uses the same compilation limit and
+deadline, reserving the remaining time for tests and diagnostics. The job limit is 350 minutes.
+The supervisor exits with code 124 and leaves cleanup time; the hard step timeout is five minutes longer than its duration limit.
+Native save steps also run after a hard compilation-step timeout. A new native run waits for older
+runs of the same workflow and branch to finish cleanup before it can write snapshots. This allows
+the cancelled producer to flush completed objects before handing ownership to the new producer.
+The cache command rejects writes from other workflows/jobs and prevents an older run from replacing
+snapshots already saved by a newer run. CI cancels immediately and has no shared-cache cleanup.
 
 The final save has a three-minute limit within GitHub's five-minute cancellation window. Runner
 loss, force cancellation or a failed upload can lose work since the last completed checkpoint.
@@ -142,12 +155,11 @@ Each variant reported 4,304–4,594 successful cache writes, with 12, 12, 96 and
 On 21 October, the repository cache limit was 10 GiB and only 2,242 entries for the test branch remained.
 These counts show that successful writes alone do not establish retention or useful reuse on the next run.
 The new telemetry must establish useful reuse before claiming that the full matrix can finish.
-[Compiler cache recovery](../../.github/workflows/cache-recovery.yml) tests the transport separately.
-Its `timeout` mode caches a real C++ object, then reaches a one-minute GitHub step timeout.
-Its `cancel` mode waits for an ordinary workflow cancellation after caching that object.
-Run `restore` with the producer's `source_run` and `source_attempt` to require a cache hit on fresh
-Windows and Linux runners. These small probes test cache recovery, not retention of the full CUDA
-working set. Before the HF migration on 21 October 2026, both interruption modes saved their Actions caches on Windows 2022 and Ubuntu 24.04.
+The retired compiler-cache recovery workflow tested transport with a single C++ object on fresh
+Windows and Linux runners. It was removed when Native release became the only shared-cache writer;
+its stored snapshots and historical runs remain. These probes test recovery, not retention of the
+full CUDA working set. Before the HF migration on 21 October 2026, both timeout and cancellation
+modes saved their Actions caches on Windows 2022 and Ubuntu 24.04.
 Separate restore runs on fresh runners each recorded one compiler cache hit and zero misses:
 [after timeout](https://github.com/iamwavecut/ninfer-all/actions/runs/39569140529) and
 [after cancellation](https://github.com/iamwavecut/ninfer-all/actions/runs/39569242802).
@@ -179,6 +191,12 @@ hits and zero misses, reusing every object retained from the cancelled Windows b
 migration of the 1,082,204,160-byte Linux CUDA 12.9 archive took 8.7 seconds for upload, download
 and SHA-256 verification; the 548,229,120-byte Windows CUDA 12.9 archive took 19.4 seconds.
 These transfer measurements exclude archive creation and do not predict a full cache's duration.
+
+The former single-architecture CI run
+[39584887267](https://github.com/iamwavecut/ninfer-all/actions/runs/39584887267) compiled all three
+CUDA variants but failed its final HF saves with `PermissionError`; CTest was consequently skipped.
+Periodic snapshots had succeeded. Removing CI writers removes that final-save path. Useful cache
+hits across native and multiarch CI builds, and completed CTest runs, still require live verification.
 
 The full matrix and Docker packaging still need a successful run. Loader and device-image checks
 alone do not establish GPU inference correctness or speed.

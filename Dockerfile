@@ -12,7 +12,7 @@
 #   docker build -t ninfer .                               every architecture, from source
 #   docker build --build-arg ARCHS=86 -t ninfer .          one architecture
 #   docker build --build-arg 'ARCHS=75;86;120a' -t ninfer:multi .   one build for all three
-#   docker build --build-context dist=<dir> -t ninfer .    package prebuilt binaries (what CI does)
+#   docker build --build-context dist=<dir> -t ninfer .    package a local prebuilt distribution
 #
 # A prebuilt dist directory has the layout docker/stage-dist.sh writes: bin/<build>/ and
 # packages/<build>.txt for each build (sm<arch> or multi).
@@ -20,7 +20,7 @@
 ARG CUDA_VERSION=13.4.3
 ARG UBUNTU_VERSION=26.04
 
-# --- toolchain: also the CI build environment ------------------------------------------------------
+# --- toolchain: local source builds and build-cache regression tests ------------------------------------------------------
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS toolchain
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \

@@ -112,6 +112,11 @@ def save(api, directory, family, ref, verify=False):
     with writer_lock(directory), tempfile.TemporaryDirectory(dir=directory.parent) as temporary:
         work = Path(temporary)
         previous = manifests(api, base, work)
+        run_id = os.environ.get('GITHUB_RUN_ID', 'local')
+        if run_id.isdecimal() and any(str(item.get('run_id', '')).isdecimal() and
+                                      int(item['run_id']) > int(run_id) for item in previous):
+            print('A newer native run already saved this family; skipping stale writer.', flush=True)
+            return False
         slot = 1 - previous[0]['slot'] if previous else 0
         archive = work / 'cache.tar'
         count = pack(directory, archive)
@@ -188,27 +193,55 @@ def restore(api, directory, family, ref, legacy_prefix=None, required=False):
     return False
 
 
+def require_native_writer(family, ref):
+    """Reject accidental writes from CI, PRs and retired recovery workflows."""
+    workflow = os.environ.get('GITHUB_WORKFLOW_REF', '').split('@')[0]
+    if (workflow != 'iamwavecut/ninfer-all/.github/workflows/native-release.yml' or
+            os.environ.get('GITHUB_EVENT_NAME') not in ('push', 'workflow_dispatch') or
+            not ref.startswith('refs/heads/') or
+            not os.environ.get('GITHUB_RUN_ID', '').isdecimal()):
+        raise ValueError('Only a native artifact build may save shared caches')
+    job = os.environ.get('GITHUB_JOB')
+    if not ((job == 'linux' and family.startswith('native-linux-cuda-')) or
+            (job == 'windows' and family.startswith(('native-windows-cuda-', 'vcpkg-')))):
+        raise ValueError('Cache family does not belong to this native job')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=('save', 'restore'))
     parser.add_argument('--directory', type=Path, required=True)
     parser.add_argument('--family', required=True)
     parser.add_argument('--legacy-prefix')
+    parser.add_argument('--source-ref', help='Reader branch; defaults to the current branch')
+    parser.add_argument('--optional', action='store_true', help='Continue without an unavailable reader cache')
     parser.add_argument('--required', action='store_true')
     parser.add_argument('--verify-upload', action='store_true')
     args = parser.parse_args()
+    if args.action == 'save' and (args.optional or args.source_ref):
+        parser.error('Reader options cannot be used for saves')
+    if args.optional and args.required:
+        parser.error('--optional and --required are mutually exclusive')
     args.directory = args.directory.expanduser()
-    if not os.environ.get('HF_TOKEN'):
-        raise ValueError('HF_BUILD_CACHE_TOKEN is not configured')
-    from huggingface_hub import HfApi
-    api = HfApi()
-    if api.bucket_info(BUCKET).private is not True:
-        raise ValueError('Build cache bucket must be private')
-    ref = os.environ['GITHUB_REF']
+    ref = args.source_ref or os.environ['GITHUB_REF']
     if args.action == 'save':
-        save(api, args.directory, args.family, ref, args.verify_upload)
-    else:
-        restore(api, args.directory, args.family, ref, args.legacy_prefix, args.required)
+        require_native_writer(args.family, ref)
+    try:
+        if not os.environ.get('HF_TOKEN'):
+            raise ValueError('HF cache credential is not configured')
+        from huggingface_hub import HfApi
+        api = HfApi()
+        if api.bucket_info(BUCKET).private is not True:
+            raise ValueError('Build cache bucket must be private')
+        if args.action == 'save':
+            save(api, args.directory, args.family, ref, args.verify_upload)
+        else:
+            restore(api, args.directory, args.family, ref, args.legacy_prefix, args.required)
+    except Exception as error:
+        if not args.optional:
+            raise
+        # CI can compile without the cache. Do not print transport errors with signed URLs.
+        print(f'::warning::Native cache unavailable ({type(error).__name__}); continuing with local compilation.', flush=True)
 
 
 def heartbeat(done):

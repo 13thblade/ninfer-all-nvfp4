@@ -1,12 +1,17 @@
 """Check checkpoint recovery and preservation without network access."""
 import importlib.util
+from contextlib import redirect_stdout
 import io
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location('hf_cache', Path(__file__).resolve().parents[2] / '.github/scripts/hf-build-cache.py')
 CACHE = importlib.util.module_from_spec(SPEC)
@@ -140,3 +145,84 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(CACHE.pack(self.source, archive), 1)
         with tarfile.open(archive) as package:
             self.assertEqual(package.getnames(), ['object'])
+
+
+class CacheOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        self.env = dict(GITHUB_REF='refs/heads/master', GITHUB_RUN_ID='200',
+                        GITHUB_JOB='linux', GITHUB_EVENT_NAME='push',
+                        GITHUB_WORKFLOW_REF='iamwavecut/ninfer-all/.github/workflows/native-release.yml@refs/heads/master')
+
+    def test_only_native_builds_can_write_their_own_families(self):
+        with patch.dict(os.environ, self.env, clear=True):
+            CACHE.require_native_writer('native-linux-cuda-13.4.3', 'refs/heads/master')
+            for override in (dict(GITHUB_JOB='cuda'), dict(GITHUB_EVENT_NAME='pull_request'),
+                             dict(GITHUB_WORKFLOW_REF='iamwavecut/ninfer-all/.github/workflows/ci.yml@refs/heads/master')):
+                with patch.dict(os.environ, override), self.assertRaises(ValueError):
+                    CACHE.require_native_writer('native-linux-cuda-13.4.3', 'refs/heads/master')
+            with self.assertRaises(ValueError):
+                CACHE.require_native_writer('native-windows-cuda-13.4.3', 'refs/heads/master')
+            with patch.dict(os.environ, GITHUB_JOB='windows'):
+                CACHE.require_native_writer('vcpkg-baseline', 'refs/heads/master')
+
+    def test_older_rerun_cannot_replace_newer_native_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'objects'
+            source.mkdir()
+            (source / 'object').write_text('new build')
+            bucket = Bucket()
+            with patch.dict(os.environ, GITHUB_RUN_ID='200'):
+                CACHE.save(bucket, source, 'native-linux-cuda-test', 'refs/heads/master')
+            original = bucket.files.copy()
+            (source / 'object').write_text('old rerun')
+            with patch.dict(os.environ, GITHUB_RUN_ID='100'):
+                self.assertFalse(CACHE.save(bucket, source, 'native-linux-cuda-test', 'refs/heads/master'))
+            self.assertEqual(bucket.files, original)
+
+    def test_optional_reader_without_secret_can_start_cold_but_writer_cannot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = [sys.executable, SPEC.origin, 'restore', '--directory', directory,
+                       '--family', 'native-linux-cuda-test', '--source-ref', 'refs/heads/master']
+            env = os.environ | self.env
+            env.pop('HF_TOKEN', None)
+            optional = subprocess.run(command + ['--optional'], env=env, capture_output=True, text=True)
+            self.assertEqual(optional.returncode, 0, optional.stderr)
+            self.assertIn('::warning::Native cache unavailable', optional.stdout)
+            required = subprocess.run(command + ['--required'], env=env, capture_output=True)
+            self.assertNotEqual(required.returncode, 0)
+
+    def test_optional_reader_transport_failure_warns_without_leaking_url(self):
+        class Unavailable:
+            def bucket_info(self, *_args):
+                raise ConnectionError('https://secret-signed-url.invalid')
+
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, self.env | {'HF_TOKEN': 'test-only'}), \
+                patch.dict(sys.modules, huggingface_hub=SimpleNamespace(HfApi=Unavailable)), \
+                patch.object(sys, 'argv', ['cache', 'restore', '--directory', directory,
+                                          '--family', 'native-linux-cuda-test', '--optional']), \
+                redirect_stdout(output):
+            CACHE.main()
+        self.assertIn('ConnectionError', output.getvalue())
+        self.assertNotIn('secret-signed-url', output.getvalue())
+
+    def test_pr_reads_target_branch_without_modifying_bucket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'producer'
+            source.mkdir()
+            (source / 'object').write_text('release object')
+            bucket = Bucket()
+            family = 'native-linux-cuda-test'
+            CACHE.save(bucket, source, family, 'refs/heads/master')
+            snapshot = bucket.files.copy()
+            bucket.bucket_info = lambda *_args: SimpleNamespace(private=True)
+            with patch.dict(os.environ, self.env | {'GITHUB_REF': 'refs/pull/1/merge', 'HF_TOKEN': 'test-only'}), \
+                    patch.dict(sys.modules, huggingface_hub=SimpleNamespace(HfApi=lambda: bucket)), \
+                    patch.object(sys, 'argv', ['cache', 'restore', '--directory', str(root / 'reader'),
+                                              '--family', family, '--source-ref', 'refs/heads/master']):
+                CACHE.main()
+            self.assertEqual((root / 'reader/object').read_text(), 'release object')
+            self.assertEqual(bucket.files, snapshot)
