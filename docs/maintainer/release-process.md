@@ -195,8 +195,11 @@ These transfer measurements exclude archive creation and do not predict a full c
 The former single-architecture CI run
 [39584887267](https://github.com/iamwavecut/ninfer-all/actions/runs/39584887267) compiled all three
 CUDA variants but failed its final HF saves with `PermissionError`; CTest was consequently skipped.
-Periodic snapshots had succeeded. Removing CI writers removes that final-save path. Useful cache
-hits across native and multiarch CI builds, and completed CTest runs, still require live verification.
+Periodic snapshots had succeeded. Removing CI writers removes that final-save path. In the replacement
+[CI run](https://github.com/iamwavecut/ninfer-all/actions/runs/39608375823), CUDA 13.4 restored the
+native snapshot in 16 seconds. Its first minute recorded 564 direct cache hits and zero completed
+misses, while the native producer was still running. Compilers still in flight are not included in
+those counters. Full multiarch CI completion and CTest results remain unverified.
 
 The full matrix and Docker packaging still need a successful run. Loader and device-image checks
 alone do not establish GPU inference correctness or speed.
