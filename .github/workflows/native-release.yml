@@ -169,7 +169,8 @@ jobs:
       - name: Build release products
         id: build
         timeout-minutes: 305
-        run: python3.11 .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- cmake --build build-release -j --target ninfer-multicall ninfer_bench
+        # The rental exposes all host CPUs, beyond its container CPU and RAM quota.
+        run: python3.11 .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- cmake --build build-release -j ${{ inputs.linux_runner == 'ninfer-native-debian13' && 64 || 4 }} --target ninfer-multicall ninfer_bench
       - name: Prepare completed object cache for upload
         timeout-minutes: 2
         if: always() && steps.compiler-cache.outcome == 'success'
