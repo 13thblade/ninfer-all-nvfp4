@@ -168,7 +168,17 @@ recorded one hit and zero misses on Windows and Linux. A second
 while its [producer](https://github.com/iamwavecut/ninfer-all/actions/runs/39584404425) was still
 running, demonstrating that recovery does not depend on the job reaching cleanup. These probes
 use a ten-second checkpoint interval; production uses ten minutes. They do not measure multi-GiB
-upload times or full CUDA working-set retention.
+upload times or full CUDA working-set retention. Both final saves also succeeded after ordinary
+cancellation; the [subsequent restore](https://github.com/iamwavecut/ninfer-all/actions/runs/39585023434)
+again recorded one hit and zero misses on each OS.
+
+In the first [native HF run](https://github.com/iamwavecut/ninfer-all/actions/runs/39584883032),
+Windows CUDA 13.4 restored its objects in six seconds and its vcpkg archives in seven seconds.
+Configuration took 30 seconds; the first production-build sample after one minute recorded 244
+hits and zero misses, reusing every object retained from the cancelled Windows build. The earlier
+migration of the 1,082,204,160-byte Linux CUDA 12.9 archive took 8.7 seconds for upload, download
+and SHA-256 verification; the 548,229,120-byte Windows CUDA 12.9 archive took 19.4 seconds.
+These transfer measurements exclude archive creation and do not predict a full cache's duration.
 
 The full matrix and Docker packaging still need a successful run. Loader and device-image checks
 alone do not establish GPU inference correctness or speed.
