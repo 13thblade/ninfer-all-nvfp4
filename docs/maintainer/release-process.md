@@ -148,7 +148,8 @@ Local source Docker builds retain their BuildKit cache mounts.
 Each Linux artifact job also uploads its archive volumes, checksum manifest and build metadata
 to `WaveCut/ninfer-cache/native-artifacts/v1/iamwavecut/ninfer-all/<run>/<artifact>/`.
 It downloads each uploaded file on the runner, checks SHA-256, and publishes `COMPLETE.json`
-only after all checks pass. These private backups do not publish a GitHub release.
+only after all checks pass. This step allows sixty minutes for upload and download verification
+of the multi-gigabyte archives. These private backups do not publish a GitHub release.
 
 Ccache checks compiler content, source, headers and compilation flags before reusing an entry.
 Depend mode hashes raw source and compiler-reported header dependencies, without falling back to

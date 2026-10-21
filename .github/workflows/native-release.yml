@@ -185,7 +185,7 @@ jobs:
       - name: Package and verify Linux binaries
         run: NINFER_BUILD_ROOT="$PWD/build-release" scripts/package-release.sh
       - name: Preserve Linux archive in HF and verify its checksum
-        timeout-minutes: 20
+        timeout-minutes: 60
         run: python3.11 .github/scripts/archive-linux-artifact.py
       - uses: actions/upload-artifact@v7
         with:
