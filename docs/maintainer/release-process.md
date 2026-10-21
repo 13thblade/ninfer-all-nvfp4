@@ -128,7 +128,12 @@ Its `timeout` mode caches a real C++ object, then reaches a one-minute GitHub st
 Its `cancel` mode waits for an ordinary workflow cancellation after caching that object.
 Run `restore` with the producer's `source_run` and `source_attempt` to require a cache hit on fresh
 Windows and Linux runners. These small probes test cache recovery, not retention of the full CUDA
-working set. The live recovery qualification is pending.
+working set. On 21 October 2026, both interruption modes saved their caches on Windows 2022 and Ubuntu 24.04.
+Separate restore runs on fresh runners each recorded one compiler cache hit and zero misses:
+[after timeout](https://github.com/iamwavecut/ninfer-all/actions/runs/39569140529) and
+[after cancellation](https://github.com/iamwavecut/ninfer-all/actions/runs/39569242802).
+The producers were [39568919978](https://github.com/iamwavecut/ninfer-all/actions/runs/39568919978)
+and [39568972360](https://github.com/iamwavecut/ninfer-all/actions/runs/39568972360).
 The full matrix and Docker packaging still need a successful run. Loader and device-image checks
 alone do not establish GPU inference correctness or speed.
 
