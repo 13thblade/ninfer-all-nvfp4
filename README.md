@@ -1,3 +1,95 @@
+# W4(NVFP4) A16(BF16) support for sm_75/80/86/89/120 and A8(int8) support for sm_70/75/80/86/89/120 on ninfer, delivered on the Qwen3.8 27B (English version below)
+
+## 中文
+
+上游只把 fused NVFP4 SwiGLU 通路实例化到 `T <= 16`，A16 域的解析是 `T <= 16 -> SmallTFusedA16`、`T <= 64 -> Materialized`、`T > 64 -> throw`：所以长 prompt 不是"prefill 很慢"，而是**直接抛异常**。本 fork 补上缺失的宽 T 内核，然后把整条通路做快：在 RTX 3090 Ti 上 **T1 的 decode 大约是上游 16 tok/s 的 3.0 倍**（50 对 16.1，同一 prompt 基准）；prefill 不再抛异常，同一段 4202 token prompt 上跑到 1293 tok/s（W4A16）、1669 tok/s（W4A8-int），而最初把宽 T 内核接上去时只有约 780 tok/s。
+
+对于支持 BF16 和 int8 的 GPUs（sm_75/80/86/89，其中 sm_75 通过 FP16 模拟实现），默认走 W4A16 通路支持 NVFP4，可通过 --nvfp4-w4a8-int 开启 W4A8-int 通路；在原生 FP4 的卡上使用 --nvfp4-w4a16 改用 BF16 路径（其它架构上是空操作），开启 --nvfp4-w4a8-int 用 W4A8-int 替换默认的 W4A4。对于 sm_70 默认走上游提供的 FP16 路线，可开启 --nvfp4-w4a8-int 替换为 W4A8-int。--nvfp4-w4a8-int 与 --nvfp4-w4a16 都是布尔开关，不需要取值。
+
+对包括 RTX 3090/4090/5090 在内的所有 GPU，都强烈建议启用 --device-profile calibrate 进行校准：上游仓库中尚未完成的预设校准键值并不符合最佳性能状态，且本人没有对应 GPU 可以测试。
+
+注：NVFP4 并不代表更高质量（那只是英伟达的营销宣传），各种不同的量化精度均可通过缩放因子提高保真度，只是 W4A4 在原生 NVFP4 路径的 GPU 上具有更快速度。本仓库只是为 pre-Blackwell 的 GPU 提供更多选择，例如 Qwen3.8-27B-QUASAR-NVFP4 是相对原生 BF16 模型进行了 quantization-aware training（QAT）的版本。Blackwell 也可通过启用 W4A16 或 W4A8-int 以速度为代价获得更高质量。
+
+本仓库未改变上游已经支持的模型范围，仅新增。
+
+按时间顺序，一共四处改动：
+
+1. **新增宽 T fused SwiGLU 内核**，让宽的 prompt 段落能 prefill 而不是抛异常。
+2. **整条通路的 kernel 性能优化工作。**
+3. **把 W4A16 和 W4A8-int 通路的开关接进 `ninfer-calibrate`**，最优化性能校准可在目标设备上首次启动时实测得出。
+4. 顺带优化了无原生 FP4 路径的 KV NVFP4 和 k8v4 的性能。
+
+### 吞吐
+
+全程同一个制品（`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`，带 proposal 头），RTX 3090 Ti，贪心解码，KV bf16，32,768 token 上下文，prefill 由 4K 的长 prompt 测出，decode 速度来自于多个真实场景下测得的均值。
+
+| 构建与投机解码设置                    | Prefill tok/s | Decode tok/s | 接受率   |
+| ---------------------------- | ------------- | ------------ | ----- |
+| 上游原样（宽 T 路由之前）               | throws        | throws       | —     |
+| 接上宽 T SwiGLU、尚未做任何 kernel 优化 | 780           | 16           | —     |
+| 本构建，W4A16，无投机（T1）           | 1293          | 50           | —     |
+| 本构建，W4A16，MTP K=3             | 1287          | 91           | 55%   |
+| 本构建，W4A16，DFlash2 K=5         | 1281          | 107          | 46%   |
+| 本构建，W4A16，DFlash2 K=7         | 1281          | 108          | 34%   |
+| 本构建，W4A8-int，无投机（T1）        | 1669          | 53           | —     |
+| 本构建，W4A8-int，MTP K=3          | 1665          | 101          | 51%   |
+| 本构建，W4A8-int，DFlash2 K=5      | 1650          | 112          | 41%   |
+| 本构建，W4A8-int，DFlash2 K=7      | 1649          | 120          | 42%   |
+
+这张表有一点要说明。**上游会抛异常**，所以那一行是空的：fused NVFP4 SwiGLU 通路只实例化到 `T <= 16`，后面没有宽内核兜底，这里没有"局部状态"可绕 —— 内核在构建里根本不存在，prompt 走不到 decode。
+
+### 下一步
+
+W4A16 与 W4A8-int 两条通路的内核均已完成，目前进入广泛测试阶段。
+
+---
+
+## English
+
+Upstream instantiates the fused NVFP4 SwiGLU route only to `T <= 16`, and resolves the A16 domain as `T <= 16 -> SmallTFusedA16`, `T <= 64 -> Materialized`, `T > 64 -> throw`, so a long prompt does not prefill slowly — it throws. This fork adds the missing wide-T kernel, then makes the route faster: **on the RTX 3090 Ti, at T1, decode is about 3.0x upstream's 16 tok/s** (50 against 16.1, same prompt basis), and prefill stops throwing — 1293 tok/s on the 4202-token prompt (W4A16) and 1669 tok/s (W4A8-int), against the roughly 780 tok/s the first graft of the wide-T kernel managed.
+
+For GPUs that support both BF16 and int8 (sm_75/80/86/89, where sm_75 runs the BF16 forms through FP16 emulation), W4A16 is the default route for NVFP4 and the W4A8-int route can be turned on with `--nvfp4-w4a8-int`; on a card with a native FP4 path, `--nvfp4-w4a16` switches to the BF16 route instead (a no-op on other architectures), and `--nvfp4-w4a8-int` replaces the default W4A4 with W4A8-int. On sm_70 the default is the FP16 route upstream provides, and `--nvfp4-w4a8-int` replaces it with W4A8-int. Both flags are boolean switches and take no value.
+
+For every GPU, including the RTX 3090/4090/5090, turning on `--device-profile calibrate` is strongly recommended: the preset calibration keys upstream leaves unfinished do not describe the best-performance state, and I have no matching GPUs to test them.
+
+Note: NVFP4 does not mean higher quality (that is NVIDIA marketing); any quantisation precision can gain fidelity through its scaling factors — W4A4 is simply faster on GPUs with a native FP4 path. This repository only adds choices for pre-Blackwell GPUs; Qwen3.8-27B-QUASAR-NVFP4, for example, is a quantization-aware-training (QAT) version of the native BF16 model. Blackwell can also gain quality at the cost of speed by enabling W4A16 or W4A8-int.
+
+This repository does not change the model scope upstream already supports; it only adds to it.
+
+Four changes, in order:
+
+1. **A wide-T fused SwiGLU kernel**, so a wide span prefills instead of throwing.
+2. **Kernel work across the route.**
+3. **The W4A16 and W4A8-int route switches wired into `ninfer-calibrate`**, so the optimal performance calibration is measured on first start on the target device.
+4. Alongside them, **KV-cache performance for NVFP4 and k8v4 on cards without a native FP4 path** was improved as well.
+
+## Throughput
+
+Same artifact throughout (`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`, proposal head) on an RTX 3090 Ti: greedy decoding, KV bf16, 32,768-token context. Prefill is measured on the 4K long prompt; decode is the mean over several realistic tasks.
+
+| Build and speculative setting                 | Prefill tok/s | Decode tok/s | Acceptance |
+| --------------------------------------------- | ------------- | ------------ | ---------- |
+| Upstream as shipped, before the wide-T route  | throws        | throws       | —          |
+| Wide-T SwiGLU grafted, before any kernel work | 780           | 16           | —          |
+| This build, W4A16, no speculation (T1)        | 1293          | 50           | —          |
+| This build, W4A16, MTP K=3                    | 1287          | 91           | 55%        |
+| This build, W4A16, DFlash2 K=5                | 1281          | 107          | 46%        |
+| This build, W4A16, DFlash2 K=7                | 1281          | 108          | 34%        |
+| This build, W4A8-int, no speculation (T1)     | 1669          | 53           | —          |
+| This build, W4A8-int, MTP K=3                 | 1665          | 101          | 51%        |
+| This build, W4A8-int, DFlash2 K=5             | 1650          | 112          | 41%        |
+| This build, W4A8-int, DFlash2 K=7             | 1649          | 120          | 42%        |
+
+One thing about the table: **upstream throws**, hence the empty row. The fused NVFP4 SwiGLU route is instantiated only to `T <= 16` and there is no wide fallback behind it — the kernel is absent from the build and there is no partial state to patch around, so that prompt never reaches decode.
+
+## Next steps
+
+The kernels for both the W4A16 and W4A8-int routes are complete, and broad testing is now underway.
+
+---
+
+**This is the upstream original documentation.**
+
 # NInfer-all
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,

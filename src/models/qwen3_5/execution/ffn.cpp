@@ -160,9 +160,20 @@ const Tensor* ffn_input_signs(const FfnParameters& parameters) {
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, cudaStream_t stream, bool mtp,
-         bool verify, InputBasis basis, bool wide_verification, NativeExpertRuntime* experts) {
+         bool verify, InputBasis basis, bool wide_verification, NativeExpertRuntime* experts,
+         const InputNorm* input_norm) {
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
+    if (input_norm != nullptr) {
+        // Only the composition at the bottom of this function folds the norm, so a caller that hands
+        // an un-normed row to any other path must not be answered.
+        const auto* dense = std::get_if<DenseParameters>(&parameters);
+        const bool fusable =
+            dense != nullptr && !mtp && basis == InputBasis::Primal && !rotated_dense(*dense) &&
+            !dense->up.has_value() && !is_gguf(dense->gate_up.weight.qtype) &&
+            dense->gate_up.weight.qtype != QType::Q6_G64_FP16 && experts == nullptr;
+        if (!fusable) { throw std::invalid_argument("FFN: this path cannot fold its input norm"); }
+    }
     if (const auto* moe = std::get_if<StreamedMoeParameters>(&parameters)) {
         if (experts == nullptr) { throw std::logic_error("streamed SparseMoe has no Program delivery service"); }
         if (hidden.dtype != DType::BF16 || residual.dtype != DType::BF16 ||
@@ -226,8 +237,13 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
     {
         auto call = workspace.scope();
-        ops::linear_swiglu(hidden, gu, activation,
-                           verify ? p.verify_gate_up_policy : p.gate_up.policy, workspace, stream);
+        const auto policy = verify ? p.verify_gate_up_policy : p.gate_up.policy;
+        if (input_norm != nullptr) {
+            ops::linear_swiglu_fused_rmsnorm_int8(hidden, *input_norm->weight, input_norm->eps, gu,
+                                                  activation, policy, workspace, stream);
+        } else {
+            ops::linear_swiglu(hidden, gu, activation, policy, workspace, stream);
+        }
     }
     ops::linear_add(activation, down, residual,
                     residual_projection_policy(p.down, wide_verification), workspace, stream);

@@ -715,6 +715,15 @@ struct EngineOptions {
     // already costs, the GDN half carrying nearly all of both. Separable because that is a
     // different trade from the MLP one and an owner may want only the cheaper half.
     bool prefill_cublas_projections        = true;
+    // NVFP4 weights on the integer tensor cores with s8-quantised activations (W4A8), prefill and
+    // decode alike: the same activation trade the Q4/Q5 integer routes carry, opt-in per engine.
+    // Which wide mainloop answers follows the route profile's nvfp4_int8/* bands; T <= 8 runs the
+    // row-form kernel under either chain. On a native-FP4 card it replaces the A4 permission.
+    bool nvfp4_w4a8_int                    = false;
+    // A native-FP4 card stores the A4 permission for NVFP4 weights; this asks for the dequantising
+    // A16 routes instead. A no-op elsewhere (the permission was already lowered while loading), and
+    // it wins over nvfp4_w4a8_int when both are set.
+    bool nvfp4_w4a16                       = false;
     // Largest merged-token count one media item may occupy; larger media is downscaled at
     // preprocessing. Also bounds the overlay window.
     std::uint32_t vision_max_merged_tokens = 16384;
