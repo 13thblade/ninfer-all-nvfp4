@@ -120,7 +120,14 @@ jobs:
         timeout-minutes: 10
         env:
           ARCHS: ${{ inputs.archs }}
-        run: python .github/scripts/check-compiler-cache.py
+        run: |
+          python .github/scripts/check-compiler-cache.py
+          if ($LASTEXITCODE -ne 0) { throw 'Object cache probe failed' }
+          if ('${{ inputs.phase }}' -eq 'package') {
+            # Exercise a second invocation with every previous probe variant already cached.
+            python .github/scripts/check-compiler-cache.py
+            if ($LASTEXITCODE -ne 0) { throw 'Repeated object cache probe failed' }
+          }
       - name: Resolve the pinned vcpkg revision
         id: vcpkg
         run: |

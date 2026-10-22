@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import shutil
 import sys
+import uuid
 
 from build_telemetry import cache_stats
 
@@ -27,8 +28,9 @@ target_include_directories(cache_check PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRE
 target_compile_options(cache_check PRIVATE
   "$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xfatbin=-compress-all;-compress-mode=size>")
 """)
-# A new run must write its own entries before the second build can read them.
-identity = os.environ["GITHUB_RUN_ID"] + "_" + os.environ["GITHUB_RUN_ATTEMPT"]
+# Restored shards can contain every probe variant from this same workflow run.
+# Give each invocation fresh source content so invalidation must cause a miss.
+identity = uuid.uuid4().hex
 (root / "host.cpp").write_text(f'#include <cuda_runtime.h>\nint host_{identity}() {{ return 42; }}\n')
 (root / "host_only.h").write_text("#define HOST_VALUE 20\n")
 (root / "kernel.cu").write_text(

@@ -99,6 +99,11 @@ The explicit values keep rented runners and hosted containers compatible. Entrie
 different locale variables require one rebuild; the resulting entries can then be shared.
 
 Manual runs can select `platforms: linux` or `windows` for a targeted build without publication.
+After all Windows object shards have succeeded, select `platforms: windows` and
+`windows_phase: package` to retry only the two final jobs. Each final job requires all eight HF
+shard snapshots, verifies their archives, and builds against the selected source revision before
+packaging. Missing snapshots fail restoration; changed inputs rebuild through ccache normally.
+The default `windows_phase: full` builds the shards first.
 Publication requires `platforms: all`. Starting any new native run on the same branch cancels the
 whole previous run, including its other platform. The cleanup wait preserves its completed caches.
 
@@ -253,16 +258,26 @@ native snapshot in 16 seconds. Its first minute recorded 564 direct cache hits a
 misses, while the native producer was still running. Compilers still in flight are not included in
 those counters.
 
-The complete dual-CUDA [CI run](https://github.com/iamwavecut/ninfer-all/actions/runs/39663063679)
-compiled every target and completed CTest on GitHub-hosted Debian containers. Each variant passed
+The complete dual-CUDA [CI run](https://github.com/iamwavecut/ninfer-all/actions/runs/39689626725)
+restored the corrected `host-v2` snapshots on fresh GitHub-hosted Debian containers, compiled every
+target and completed CTest. Each variant passed
 90 tests and skipped 247 GPU tests, with no failures. This required recognizing
 `cudaErrorStubLibrary` as a no-GPU condition; the preceding run failed four tests per variant on
 that message. Final ccache counters were 768 hits and 344 misses for CUDA 12.9, and 794 hits and
-344 misses for CUDA 13.4. These runs used the previous cache families. Reuse of the corrected
-`host-v2` snapshots on a fresh CI runner still needs verification.
+344 misses for CUDA 13.4, including cache probes. CI does not save its test-only cache entries.
 
-The full matrix and Docker packaging still need a successful run. Loader and device-image checks
-alone do not establish GPU inference correctness or speed.
+[Native run 39664338995](https://github.com/iamwavecut/ninfer-all/actions/runs/39664338995)
+produced both Linux archives, verified their HF backups by downloading and hashing them, and
+uploaded both GitHub artifacts. The dependent Docker jobs verified those archives and built and
+loaded both images without compilation. Registry cache imports found no existing CUDA tags, so
+these image builds used no registry layer cache. This test run did not publish images or a release.
+
+All 16 Windows object shards succeeded and saved their HF snapshots. Both final jobs restored
+all eight required snapshots but stopped at the cache probe: its run-wide source identity reused
+an earlier job's modified probe object and mistook that valid cache hit for failed invalidation.
+The probe now generates fresh source content for each invocation. Windows linking, packaging and
+startup checks still need a successful run. Loader and device-image checks alone do not establish
+GPU inference correctness or speed.
 
 ## Local packaging
 
