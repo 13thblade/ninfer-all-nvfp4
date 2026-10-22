@@ -139,6 +139,9 @@ use a shared library with the same architecture set, while the other components 
 The existing bridge exposes functions and plain values; it imports no mutable globals or virtual
 tables. CMake exports those functions and stages the DLL beside consumers. The DLL is not passed
 to `nvprune`, which accepts static archives and relocatable objects, so it retains PTX.
+Compilation uses an object library with the static build's target name and flags; a separate
+target links those objects into the DLL. This avoids the `_WINDLL` definition that CMake adds
+when CUDA sources belong directly to a shared-library target.
 
 Product commands and prerequisites are in the README's [Quick start](../../README.md#quick-start) and
 [Building](../../README.md#building) sections; test and measurement workflows live in

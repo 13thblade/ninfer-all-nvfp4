@@ -75,8 +75,8 @@ endfunction()
 # Collect the FFMPEG + libcurl runtime DLLs from the vcpkg bin tree into <out_var>.
 function(ninfer_runtime_dll_list out_var)
   set(_list "")
-  if(WIN32 AND NINFER_WINDOWS_KERNEL_DLL AND TARGET ninfer_ggml_quants)
-    list(APPEND _list "$<TARGET_FILE:ninfer_ggml_quants>")
+  if(WIN32 AND NINFER_WINDOWS_KERNEL_DLL AND TARGET ninfer_ggml_quants_dll)
+    list(APPEND _list "$<TARGET_FILE:ninfer_ggml_quants_dll>")
   endif()
   if(WIN32 AND DEFINED FFMPEG_VCPKG_TREE)
     foreach(_ninfer_dll_glob

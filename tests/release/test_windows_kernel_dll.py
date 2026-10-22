@@ -17,16 +17,19 @@ cmake_minimum_required(VERSION 3.28)
 project(kernel_dll_fixture LANGUAGES CXX)
 set(NINFER_WINDOWS_KERNEL_DLL ON)
 include("{module.as_posix()}")
-add_library(ninfer_ggml_quants SHARED kernel.cpp)
-set_target_properties(ninfer_ggml_quants PROPERTIES
-  WINDOWS_EXPORT_ALL_SYMBOLS ON DEFINE_SYMBOL "" POSITION_INDEPENDENT_CODE OFF
+add_library(ninfer_ggml_quants OBJECT kernel.cpp)
+add_library(ninfer_ggml_quants_dll SHARED $<TARGET_OBJECTS:ninfer_ggml_quants>)
+set_target_properties(ninfer_ggml_quants_dll PROPERTIES
+  OUTPUT_NAME ninfer_ggml_quants WINDOWS_EXPORT_ALL_SYMBOLS ON
   RUNTIME_OUTPUT_DIRECTORY "${{CMAKE_BINARY_DIR}}/kernels")
 add_executable(consumer main.cpp)
 set_target_properties(consumer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${{CMAKE_BINARY_DIR}}/apps")
-target_link_libraries(consumer PRIVATE ninfer_ggml_quants)
+target_link_libraries(consumer PRIVATE ninfer_ggml_quants_dll)
 ninfer_stage_runtime_dlls(consumer)
 ''')
-            (root / 'kernel.cpp').write_text('namespace bridge { int value() { return 42; } }\n')
+            (root / 'kernel.cpp').write_text(
+                '#ifdef _WINDLL\n#error Object compilation must not depend on DLL linkage\n#endif\n'
+                'namespace bridge { int value() { return 42; } }\n')
             (root / 'main.cpp').write_text(
                 'namespace bridge { int value(); } int main() { return bridge::value() != 42; }\n')
             build = root / 'build'

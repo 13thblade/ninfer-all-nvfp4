@@ -3,7 +3,7 @@
 set(NINFER_GGML_QUANTS_ROOT "${PROJECT_SOURCE_DIR}/third_party/ggml-quants")
 set(_ninfer_ggml_library_type STATIC)
 if(NINFER_WINDOWS_KERNEL_DLL)
-  set(_ninfer_ggml_library_type SHARED)
+  set(_ninfer_ggml_library_type OBJECT)
 endif()
 add_library(ninfer_ggml_quants ${_ninfer_ggml_library_type}
   "${CMAKE_CURRENT_LIST_DIR}/ggml_bridge.cu"
@@ -43,12 +43,6 @@ add_library(ninfer_ggml_quants ${_ninfer_ggml_library_type}
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq1_m.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq4_nl.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq4_xs.cu")
-if(NINFER_WINDOWS_KERNEL_DLL)
-  # The bridge exposes functions and plain value types, with no imported global data or vtables.
-  # No export macro changes CUDA compilation, so the static build's cached objects remain usable.
-  set_target_properties(ninfer_ggml_quants PROPERTIES
-    WINDOWS_EXPORT_ALL_SYMBOLS ON DEFINE_SYMBOL "" POSITION_INDEPENDENT_CODE OFF)
-endif()
 target_include_directories(ninfer_ggml_quants PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}"
   "${NINFER_GGML_QUANTS_ROOT}/include"
@@ -58,5 +52,17 @@ target_compile_options(ninfer_ggml_quants PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe=--diag_suppress=177>)
 target_link_libraries(ninfer_ggml_quants PRIVATE ${NINFER_CUDART_TARGET} CUDA::cublas)
-target_link_libraries(ninfer_ops PRIVATE ninfer_ggml_quants)
+if(NINFER_WINDOWS_KERNEL_DLL)
+  # Keep the static build's compile owner and flags, without CMake's SHARED-only _WINDLL.
+  # Only linking changes. The bridge imports no global data or virtual tables.
+  add_library(ninfer_ggml_quants_dll SHARED $<TARGET_OBJECTS:ninfer_ggml_quants>)
+  set_target_properties(ninfer_ggml_quants_dll PROPERTIES
+    OUTPUT_NAME ninfer_ggml_quants WINDOWS_EXPORT_ALL_SYMBOLS ON
+    LINKER_LANGUAGE CUDA CUDA_RUNTIME_LIBRARY Static
+    CUDA_SEPARABLE_COMPILATION OFF CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+  target_link_libraries(ninfer_ggml_quants_dll PRIVATE ${NINFER_CUDART_TARGET} CUDA::cublas)
+  target_link_libraries(ninfer_ops PRIVATE ninfer_ggml_quants_dll)
+else()
+  target_link_libraries(ninfer_ops PRIVATE ninfer_ggml_quants)
+endif()
 target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/gguf_linear.cpp")
