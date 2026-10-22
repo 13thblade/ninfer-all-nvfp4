@@ -1,9 +1,42 @@
 """Exercise automatic function exports and runtime DLL staging on a real Windows linker."""
 import os
+import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+
+
+class KernelCompileCommandTest(unittest.TestCase):
+    def test_static_and_dll_object_compile_commands_match(self):
+        # Generate MSVC commands on any host. The forced compiler is never executed.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'CMakeLists.txt').write_text('''
+cmake_minimum_required(VERSION 3.28)
+project(kernel_commands LANGUAGES CXX)
+add_library(kernels ${KIND} kernel.cpp)
+if(KIND STREQUAL "OBJECT")
+  set_target_properties(kernels PROPERTIES COMPILE_PDB_NAME kernels
+    COMPILE_PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/kernels.dir")
+endif()
+''')
+            (root / 'kernel.cpp').write_text('int value() { return 42; }\n')
+            commands = []
+            for kind in ('STATIC', 'OBJECT'):
+                build = root / kind
+                result = subprocess.run([
+                    'cmake', '-S', str(root), '-B', str(build), '-G', 'Ninja',
+                    '-DCMAKE_SYSTEM_NAME=Windows', f'-DCMAKE_CXX_COMPILER={Path(sys.executable).as_posix()}',
+                    '-DCMAKE_CXX_COMPILER_FORCED=ON', '-DCMAKE_CXX_COMPILER_ID_RUN=TRUE',
+                    '-DCMAKE_CXX_COMPILER_ID=MSVC', '-DCMAKE_CXX_COMPILER_VERSION=19.44',
+                    '-DCMAKE_CXX_COMPILER_ARCHITECTURE_ID=x64', '-DCMAKE_BUILD_TYPE=Release',
+                    '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON', f'-DKIND={kind}',
+                ], text=True, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                commands.append(json.loads((build / 'compile_commands.json').read_text())[0]['command'])
+            self.assertEqual(commands[0], commands[1])
 
 
 @unittest.skipUnless(os.name == 'nt', 'Requires the Windows loader and MSVC')

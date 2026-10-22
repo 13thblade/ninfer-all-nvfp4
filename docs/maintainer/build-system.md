@@ -140,8 +140,11 @@ The existing bridge exposes functions and plain values; it imports no mutable gl
 tables. CMake exports those functions and stages the DLL beside consumers. The DLL is not passed
 to `nvprune`, which accepts static archives and relocatable objects, so it retains PTX.
 Compilation uses an object library with the static build's target name and flags; a separate
-target links those objects into the DLL. This avoids the `_WINDLL` definition that CMake adds
-when CUDA sources belong directly to a shared-library target.
+target links those objects into the DLL. DLL export definitions therefore do not affect the
+CUDA compilation target.
+The compile PDB is fixed to `CMakeFiles/ninfer_ggml_quants.dir/ninfer_ggml_quants.pdb` in both modes:
+CMake otherwise changes `/Fd`
+from the static library's named PDB to a directory for object libraries, changing the cache key.
 
 Product commands and prerequisites are in the README's [Quick start](../../README.md#quick-start) and
 [Building](../../README.md#building) sections; test and measurement workflows live in
