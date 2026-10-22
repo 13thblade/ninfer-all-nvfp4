@@ -289,6 +289,34 @@ Source-list maintenance must preserve language, architecture, RDC mode, device-l
 and numerical compiler options. Splitting a manifest does not reduce kernel instantiation work
 or justify combining shape translation units or enabling unity builds.
 
+## Include boundaries
+
+The value types of the in-tree interface live in one header per domain under `include/ninfer/`:
+
+| Header | Types |
+|---|---|
+| `base.h` | `TokenId`, shared limits and defaults |
+| `model_enums.h` | Engine purpose, KV capacity mode, speculative drafting, weight residency |
+| `kv_cache_storage.h` | `KvCacheStorage` (`--kv-dtype`) |
+| `startup.h` | startup phases, events and observer |
+| `engine_options.h` | `EngineOptions` and the options it holds |
+| `request.h` | requests, prompts, media, tool calls, streamed output, `GenerationResult` |
+| `observability/execution.h` | per-request timings, speculative counters, materialization diagnostics |
+| `observability/resources.h` | memory and resource summaries |
+| `observability/snapshot.h` | `RuntimeStats`, model metadata and residency, slot state, `LoadSummary` |
+
+`include/ninfer/types_fwd.h` declares every struct, class and enum of these headers. A header that
+names a type only by reference or pointer, or an enum without its enumerators, includes
+`types_fwd.h` instead of the defining header; the file that reads the members includes the
+definition. `include/ninfer/types.h` lists all of them, and only `include/ninfer/engine.h` includes
+it, which also keeps the declarations consistent with the definitions. Other code includes the
+header that defines the types it uses, so a change to one domain recompiles only the code of that
+domain. CUDA translation units under `src/` take only `base.h`, `model_enums.h`,
+`kv_cache_storage.h` and `startup.h`. `scripts/check-include-boundaries.py` fails when a file other
+than `engine.h` includes `ninfer/types.h`, when a `.cu` under `src/` reaches `engine.h`,
+`engine_options.h`, `request.h` or `observability/`, or when `types_fwd.h` and the definitions
+disagree; CI runs it.
+
 ## Consumers and verification
 
 `apps/CMakeLists.txt` explicitly defines the four product executables, or with `NINFER_MULTICALL`

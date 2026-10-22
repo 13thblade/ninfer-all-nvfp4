@@ -1,7 +1,7 @@
 #include "ninfer/ops/speculative_round.h"
 #include "ops/common/sampling_workspace.h"
 #include "ops/launcher/speculative_round.h"
-#include "ninfer/types.h"
+#include "ninfer/base.h"
 
 #include <algorithm>
 #include <limits>

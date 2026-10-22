@@ -5,6 +5,11 @@
 #   * docs/config-calculator.test.mjs -- pins the published calculator's arithmetic against the
 #     engine's own figures.
 #
+#   * scripts/check-include-boundaries.py -- only include/ninfer/engine.h includes the umbrella
+#     ninfer/types.h, and no CUDA translation unit under src/ reaches the Engine-level public
+#     headers, so a change to the Engine options, requests or statistics does not recompile the
+#     kernels.
+#
 #   * scripts/check-linux-scripts.sh -- the guard over the shell scripts shipped in the Linux
 #     release archive. Running it *here* rather than only on the Windows box is the point: two
 #     launchers once shipped with CRLF that made them unparseable on Linux, and every tool on the
@@ -250,6 +255,15 @@ jobs:
             fi
           done < <(git ls-files '*.sh')
           exit $status
+
+  include-boundaries:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    name: Include boundaries of the public interface
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run scripts/check-include-boundaries.py
+        run: python3 scripts/check-include-boundaries.py
 
   python:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft

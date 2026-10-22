@@ -1,7 +1,13 @@
 #pragma once
 
 #include "core/device_snapshot.h"
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/observability/execution.h"
+#include "ninfer/observability/resources.h"
+#include "ninfer/observability/snapshot.h"
+#include "ninfer/request.h"
+#include "ninfer/startup.h"
+#include "ninfer/types_fwd.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/graft.h"

@@ -1,4 +1,5 @@
 #include "text/structured_output.h"
+#include "ninfer/request.h"
 #include "text/schema_normalization.h"
 #include "text/string_constraints.h"
 #include <bit>

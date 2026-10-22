@@ -2,7 +2,8 @@
 
 #include "product/media_acquire/source.h"
 
-#include <ninfer/types.h>
+#include "ninfer/base.h"
+#include "ninfer/request.h"
 
 // Internal, wire-format-independent representation of a generation request.
 //

@@ -24,7 +24,7 @@
 // format's keys -- INT8 for int8 and rk8v4, FP8 for fp8 and k8v4, NVFP4 for nvfp4, and the packed
 // int4 value coding for the 4-bit and 2-bit key formats (rk4v4, rk4v4-e8, rk2v4-e8).
 
-#include "ninfer/types.h"
+#include "ninfer/kv_cache_storage.h"
 
 #include <cstdint>
 

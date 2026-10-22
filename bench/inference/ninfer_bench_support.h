@@ -3,7 +3,13 @@
 // Host-only support for the product throughput benchmark. The benchmark itself drives only the
 // public ninfer::Engine API; this file owns its CLI, matrix, statistics, and report schema.
 
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/kv_cache_storage.h"
+#include "ninfer/model_enums.h"
+#include "ninfer/observability/execution.h"
+#include "ninfer/observability/resources.h"
+#include "ninfer/observability/snapshot.h"
 
 #include <cstddef>
 #include <cstdint>

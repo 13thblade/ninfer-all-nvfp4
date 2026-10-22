@@ -8,7 +8,8 @@
 #pragma once
 
 #include "ninfer/ops/rope.h"
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/observability/snapshot.h"
 
 #include <cstdint>
 #include <stdexcept>

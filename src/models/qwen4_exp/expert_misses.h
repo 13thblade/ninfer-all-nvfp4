@@ -16,7 +16,7 @@
 #include "core/device.h"
 #include "core/weight.h"
 #include "models/qwen4_exp/expert_cache.h"
-#include "models/qwen4_exp/model.h"
+#include "models/qwen4_exp/expert_location.h"
 #include "ninfer/ops/moe_experts.h"
 
 #include <array>

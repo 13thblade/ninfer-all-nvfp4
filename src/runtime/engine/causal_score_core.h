@@ -1,7 +1,8 @@
 #pragma once
 
 #include "core/device.h"
-#include "ninfer/types.h"
+#include "ninfer/observability/resources.h"
+#include "ninfer/observability/snapshot.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <condition_variable>

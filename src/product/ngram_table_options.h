@@ -3,7 +3,8 @@
 // The Qwen3.8-Flash-Next n-gram table options that ninfer, ninfer-serve and ninfer-perplexity
 // share: where the table comes from, where its rows live and how they are read.
 
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/model_enums.h"
 
 #include <charconv>
 #include <cstdint>

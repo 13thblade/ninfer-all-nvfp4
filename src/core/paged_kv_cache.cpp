@@ -2,7 +2,7 @@
 
 #include "core/device.h"
 #include "core/host_kv_arena.h"
-#include "ninfer/types.h"
+#include "ninfer/request.h"
 
 #include <algorithm>
 #include <exception>

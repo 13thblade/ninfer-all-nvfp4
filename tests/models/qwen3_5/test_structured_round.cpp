@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/structured_round.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "ninfer/request.h"
 #include "ops/op_tester.h"
 #include <array>
 #include <iostream>
