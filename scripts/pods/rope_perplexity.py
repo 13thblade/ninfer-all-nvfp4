@@ -6,7 +6,8 @@ native window), with plain RoPE and with `--rope-yarn`, and in disjoint windows 
 width as the reference. Each run's report.json is kept beside this script's summary.
 
 usage: rope_perplexity.py --build DIR --models DIR --corpus DIR --out DIR [--long N]
-       [--models-run qwen38-27b,gemma4,flash-next] [--expert-residency host|disk] [--text-bytes N]
+       [--models-run qwen38-27b,gemma4,flash-next] [--runs native,plain,yarn]
+       [--expert-residency host|disk] [--text-bytes N]
 """
 from __future__ import annotations
 
@@ -101,6 +102,8 @@ def main() -> int:
     parser.add_argument("--corpus", required=True, type=pathlib.Path)
     parser.add_argument("--out", required=True, type=pathlib.Path)
     parser.add_argument("--long", type=int, default=2 * NATIVE)
+    parser.add_argument("--runs", default="native,plain,yarn",
+                        help="which of the three runs to make: native, plain, yarn")
     parser.add_argument("--text-bytes", type=int, default=0,
                         help="score only the first N bytes of the joined text (0: the whole corpus)")
     parser.add_argument("--models-run", default=",".join(MODELS))
@@ -114,7 +117,8 @@ def main() -> int:
     extra = args.extra.split() if args.extra else []
     results: dict[str, dict] = {}
     for name in args.models_run.split(","):
-        for context, yarn in ((NATIVE, False), (args.long, False), (args.long, True)):
+        runs = {"native": (NATIVE, False), "plain": (args.long, False), "yarn": (args.long, True)}
+        for context, yarn in (runs[r] for r in args.runs.split(",")):
             label = f"{name}-{'yarn' if yarn else 'plain'}-{context}"
             results[label] = run(binary, args.models, name, text, context, yarn, args.out, extra,
                                  args.expert_residency)
