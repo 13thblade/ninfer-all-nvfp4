@@ -343,11 +343,11 @@ Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySumm
                 {"handoff_peak_bytes", vision->handoff_peak_bytes}};
 }
 
-Json rope_json(const std::optional<ninfer::RopeScalingSummary>& rope) {
-    if (!rope) { return nullptr; }
-    return Json{{"type", rope->type == ninfer::RopeScalingType::Yarn ? "yarn" : "none"},
-                {"factor", rope->factor},
-                {"native_context", rope->native_context}};
+Json rope_json(const ninfer::RopeScalingSummary& rope) {
+    const char* type = rope.type == ninfer::RopeScalingType::Yarn            ? "yarn"
+                       : rope.type == ninfer::RopeScalingType::Interpolation ? "interpolation"
+                                                                             : "none";
+    return Json{{"type", type}, {"factor", rope.factor}, {"native_context", rope.native_context}};
 }
 
 Json speculative_json(const GenerationMetrics& metrics) {

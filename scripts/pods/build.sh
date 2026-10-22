@@ -37,8 +37,35 @@ if [ ! -f "$build/CMakeCache.txt" ] || [ ! -f "$build/build.ninja" ] || \
         -DNINFER_BUILD_BENCHMARKS=ON -DPython3_EXECUTABLE=/workspace/ninfer-work/py311/bin/python \
         ${launcher[@]+"${launcher[@]}"}
 fi
-# Each nvcc can use several GiB; cgroup RAM, not the host's total, controls the bound.
-jobs=$(/workspace/ninfer-work/py311/bin/python -c 'import os; from pathlib import Path; cap=Path("/sys/fs/cgroup/memory.max"); limit=cap.read_text().strip() if cap.exists() else "max"; ram=int(limit) if limit != "max" else os.sysconf("SC_PAGE_SIZE")*os.sysconf("SC_PHYS_PAGES"); print(max(1,min(os.cpu_count(),ram//(3*1024**3))))')
+# Each nvcc can use several GiB; the container's cgroup (v2 or v1) RAM and CPU quota, not the
+# host's totals, bound the parallelism.
+jobs=$(/workspace/ninfer-work/py311/bin/python - <<'PY'
+import math, os
+from pathlib import Path
+
+def first(*paths):
+    for path in paths:
+        file = Path(path)
+        if file.exists():
+            return file.read_text().split()
+    return []
+
+ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+limit = first("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+if limit and limit[0].isdigit() and int(limit[0]) < ram:
+    ram = int(limit[0])
+cpus = os.cpu_count()
+quota = first("/sys/fs/cgroup/cpu.max")
+if quota and quota[0].isdigit():
+    cpus = min(cpus, math.ceil(int(quota[0]) / int(quota[1])))
+else:
+    v1 = first("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") + first("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    if len(v1) == 2 and v1[0].isdigit():
+        cpus = min(cpus, math.ceil(int(v1[0]) / int(v1[1])))
+print(max(1, min(cpus, ram // (3 * 1024**3))))
+PY
+)
+echo "build jobs: $jobs"
 started=$SECONDS
 cmake --build "$build" -j "$jobs" "$@"
 echo "build seconds: $((SECONDS - started))"

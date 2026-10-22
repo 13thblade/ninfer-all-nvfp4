@@ -2011,8 +2011,10 @@ public:
 };
 
 // How the Engine rotates positions past the model's native window, as it resolved the rope
-// options: unscaled RoPE, or YaRN at `factor` over the `native_context` positions.
-enum class RopeScalingType : std::uint8_t { None, Yarn };
+// options for the loaded family (runtime/contract/rope_scaling.h): unscaled RoPE, YaRN at
+// `factor` over the `native_context` positions, or linear position interpolation by `factor` past
+// the `native_context` threshold.
+enum class RopeScalingType : std::uint8_t { None, Yarn, Interpolation };
 
 struct RopeScalingSummary {
     RopeScalingType type         = RopeScalingType::None;
@@ -2036,9 +2038,8 @@ struct LoadSummary {
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;
     ContextCostSummary context_cost;
-    // The resolved rotation past the native window; Qwen3.8-Flash-Next reports it, the other
-    // families leave it empty.
-    std::optional<RopeScalingSummary> rope;
+    // The rotation past the native window, as every family resolves it from the rope options.
+    RopeScalingSummary rope;
 
     // Hybrid prefix cache restored from its persistent file at startup.
     struct PrefixCacheRestore {

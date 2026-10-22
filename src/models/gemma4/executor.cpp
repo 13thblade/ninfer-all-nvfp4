@@ -200,6 +200,9 @@ struct Executor::Impl {
     // The full-attention rotations of every position, (cos, sin) [slots][rotary pairs]: the keys a
     // full block derives from its values turn by them.
     DeviceBuffer rope_full;
+    // What the full-attention blocks' rotated queries are multiplied by: the square of YaRN's
+    // attention factor, one without YaRN.
+    float full_query_scale = 1.0f;
     std::vector<std::uint32_t> positions;
     // Device staging: tokens, positions, sequences for up to max(prefill_chunk, sequences) rows.
     // d_keys: the assistant's last visible key position per row. d_blocks: a prompt chunk row's
@@ -273,16 +276,26 @@ struct Executor::Impl {
         const auto& w = model.weights();
         head          = matrix(model, {w.output_head});
         final_norm    = fp32(model, w.final_norm, hidden);
-        // RoPE frequencies, as the reference computes them in FP32.
+        // RoPE frequencies, as the reference computes them in FP32. Under YaRN the full-attention
+        // blocks' proportional schedule (over the whole head, its first rotary_pairs_full pairs
+        // rotated) takes YaRN's frequencies, and their queries the square of its attention factor.
         {
             std::vector<float> sliding(config.head_dim / 2), full(config.global_head_dim / 2, 0.0f);
             for (std::size_t i = 0; i < sliding.size(); ++i) {
                 sliding[i] = float(1.0 / std::pow(double(config.rope_theta_sliding),
                                                   double(2 * i) / double(config.head_dim)));
             }
-            for (std::uint32_t i = 0; i < config.rotary_pairs_full; ++i) {
-                full[i] = float(1.0 / std::pow(double(config.rope_theta_full),
-                                               double(2 * i) / double(config.global_head_dim)));
+            if (options.rope_yarn.factor > 1.0f) {
+                const ops::RopeYarnFrequencies yarn = ops::rope_yarn_frequencies(
+                    int(config.global_head_dim), int(config.rotary_pairs_full),
+                    config.rope_theta_full, options.rope_yarn);
+                std::copy_n(yarn.inverse_frequency, config.rotary_pairs_full, full.begin());
+                full_query_scale = yarn.attention_factor * yarn.attention_factor;
+            } else {
+                for (std::uint32_t i = 0; i < config.rotary_pairs_full; ++i) {
+                    full[i] = float(1.0 / std::pow(double(config.rope_theta_full),
+                                                   double(2 * i) / double(config.global_head_dim)));
+                }
             }
             inv_freq_sliding = DeviceBuffer(sliding.size() * 4);
             inv_freq_sliding.copy_from_host(sliding.data(), sliding.size() * 4);
@@ -1385,6 +1398,7 @@ struct Executor::Impl {
             qa.eps         = eps;
             qa.positions   = static_cast<const std::int32_t*>(d_positions.p);
             qa.inv_freq    = static_cast<const float*>(p.full ? inv_freq_full.p : inv_freq_sliding.p);
+            qa.q_scale     = p.full ? full_query_scale : 1.0f;
             qa.q_out       = q;
             // A sliding block attends over the staging ring: the window before the chunk first
             // comes over from the sequence's ring, the chunk's keys land there, and the window that
@@ -1611,6 +1625,7 @@ struct Executor::Impl {
             qa.eps         = eps;
             qa.positions   = static_cast<const std::int32_t*>(d_positions.p);
             qa.inv_freq    = static_cast<const float*>(p.full ? inv_freq_full.p : inv_freq_sliding.p);
+            qa.q_scale     = p.full ? full_query_scale : 1.0f;
             qa.q_out       = q;
             qa.sequences   = static_cast<const std::int32_t*>(d_sequences.p);
             if (kv.quantized()) {
@@ -1877,6 +1892,7 @@ struct Executor::Impl {
         qa.eps         = draft_eps;
         qa.positions   = static_cast<const std::int32_t*>(d_positions.p);
         qa.inv_freq    = static_cast<const float*>(d.full ? inv_freq_full.p : inv_freq_sliding.p);
+        qa.q_scale     = d.full ? full_query_scale : 1.0f;
         qa.q_out       = q;
         kernels::qkv_post(qa, stream);
         turn_queries(t, q, n);

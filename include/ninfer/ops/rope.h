@@ -73,17 +73,25 @@ void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& 
 void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& yarn, Tensor& x,
           cudaStream_t stream);
 
-// The rotation YaRN gives each pair of a 64-dim rotation (as `rope` applies it above): the pair's
-// inverse frequency, rounded to FP32, and the attention factor that cos and sin both carry. For an
-// Op that rotates inside its own kernels at the same frequencies, Flash-Next's block indexer.
+/**
+ * The rotation YaRN gives a schedule of inverse frequencies, for a kernel that rotates with its
+ * own frequencies rather than through `rope`: Flash-Next's block indexer and Gemma 4's attention.
+ * The schedule is theta^(-2i/dim) for the first `pairs` pairs (pairs <= dim/2 <= 128): Qwen's
+ * quarter-head rotation is dim 64 with all 32 pairs, Gemma 4's proportional RoPE dim 512 (the
+ * whole head) with its first 64 pairs rotated. Each pair's frequency takes the ramp of `rope`
+ * above, with the correction range and the ramp in pair indices of that schedule, and is rounded
+ * to FP32 as the kernels take it; cos and sin carry the attention factor. A factor of one leaves
+ * the schedule unscaled with attention factor one.
+ */
 struct RopeYarnFrequencies {
-    float inverse_frequency[32] = {};
-    float attention_factor      = 1.0F;
+    float inverse_frequency[128] = {};
+    int pairs                    = 0;
+    float attention_factor       = 1.0F;
 };
 
-// Requires rotary_dim 64, a positive finite theta, a YaRN factor above one over a nonzero native
-// context, and no linear position interpolation.
-[[nodiscard]] RopeYarnFrequencies rope_yarn_frequencies(int rotary_dim, float theta,
+// Requires an even dim, 1 <= pairs <= dim/2 <= 128, a positive finite theta, a finite YaRN factor
+// of at least one over a nonzero native context, and no linear position interpolation.
+[[nodiscard]] RopeYarnFrequencies rope_yarn_frequencies(int dim, int pairs, float theta,
                                                         const RopeYarn& yarn);
 
 } // namespace ninfer::ops

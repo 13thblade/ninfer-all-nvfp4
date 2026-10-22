@@ -18,6 +18,7 @@
 #include "runtime/contract/grammar_masks.h"
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
+#include "runtime/contract/rope_scaling.h"
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/worker_recovery.h"
 #include "runtime/engine/effective_thinking_budget.h"
@@ -77,32 +78,6 @@ bool request_error(const std::exception_ptr& error) {
         return true;
     } catch (...) {}
     return false;
-}
-
-// The rotation past the native window that --rope-yarn and --rope-yarn-factor ask for, resolved as
-// for the Qwen3.5 family: YaRN at a fixed --rope-yarn-factor, or at max-context / native once the
-// window passes the native positions; unscaled otherwise. It reaches every rotation the model
-// makes (sparse attention, its indexer, the MTP block). Linear position interpolation is refused,
-// and so is a factor past four.
-ops::RopeYarn planned_rope_yarn(const EngineOptions& options, std::uint32_t native) {
-    if (options.rope_scaling_factor > 1.0F) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next rotates past its native window with YaRN "
-                                    "(--rope-yarn, --rope-yarn-factor), not --rope-scaling-factor");
-    }
-    ops::RopeYarn yarn;
-    if (options.rope_yarn_factor > 1.0F) {
-        yarn = {.factor = options.rope_yarn_factor, .native_context = native};
-    } else if (options.rope_yarn && options.max_context > native) {
-        yarn = {.factor =
-                    static_cast<float>(options.max_context) / static_cast<float>(native),
-                .native_context = native};
-    }
-    if (yarn.factor > 4.0F) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next's YaRN reaches four times its native "
-                                    "window: --max-context " + std::to_string(4ULL * native) +
-                                    " at most");
-    }
-    return yarn;
 }
 
 } // namespace
@@ -268,7 +243,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     executor.sequences       = options.max_concurrency;
     executor.draft_tokens    = mtp ? speculative.draft_tokens : 0;
     executor.draft_min_p     = speculative.draft_min_p;
-    executor.rope_yarn       = planned_rope_yarn(options, text.max_position_embeddings);
+    // The rotation past the native window, as every family resolves it (rope_scaling.h): YaRN
+    // reaches every rotation this model makes (sparse attention, its indexer, the MTP block);
+    // linear position interpolation is refused.
+    const runtime::RopeScalingPlan rope = runtime::resolve_rope_scaling(
+        options, text.max_position_embeddings, runtime::kQwen4ExpRopeScaling);
+    executor.rope_yarn       = rope.yarn;
     // A chunk also holds a verification of every sequence at once.
     const std::uint32_t requested_chunk = options.prefill_chunk ? options.prefill_chunk : 1024;
     executor.prefill_chunk   = std::max(std::clamp<std::uint32_t>(requested_chunk, 64, 4096),
@@ -390,11 +370,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     out.load.pinned_weight_bytes      = stats.pinned_bytes;
     out.load.device_object_count      = stats.device_object_count;
     out.load.host_object_count        = stats.host_object_count;
-    const bool yarn                   = executor.rope_yarn.active();
-    out.load.rope                     = RopeScalingSummary{
-        .type           = yarn ? RopeScalingType::Yarn : RopeScalingType::None,
-        .factor         = yarn ? executor.rope_yarn.factor : 1.0F,
-        .native_context = text.max_position_embeddings};
+    out.load.rope                     = rope.summary;
     const auto& config                = model->config();
     out.model_metadata.model_id       = out.load.model_name;
     out.model_metadata.vocab_size     = config.vocab_size;

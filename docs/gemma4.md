@@ -127,6 +127,17 @@ ninfer-serve models/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer --model-id 
   --max-context 40960 --max-concurrency 4 --spec mtp --draft-tokens 2 --vision
 ```
 
+Past the native 262,144 positions `--rope-yarn` (or a fixed `--rope-yarn-factor F`, `1..4`) rotates
+the five full-attention blocks, the assistant's included, with YaRN at factor `--max-context` /
+262,144, as it does for the Qwen families: their proportional RoPE schedule takes YaRN's
+frequencies, and their queries the square of its attention factor; the sliding-window blocks never
+see a distance past their 1024 positions and keep their rotation. Google publishes no extension of
+this model's window, so this is the same mathematics without the vendor's measurement behind it:
+the flag is accepted, the startup diagnostic and the `server_start` record's `engine.rope` say it
+is on, and a perplexity past the window is the way to judge it on your text
+([perplexity](perplexity.md#past-the-native-window)). Linear position interpolation
+(`--rope-scaling-factor`) is refused for this model.
+
 On a 24 GB card the weights take 13.4 GiB (the assistant 0.25 GiB more) and the prompt-chunk
 workspace about 1.1 GiB. Every sequence holds its whole context from the start: the rings of the 25
 sliding blocks (their 1024-token windows; 1280 rows with `--spec mtp`, whose rounds write their

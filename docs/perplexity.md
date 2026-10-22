@@ -106,11 +106,15 @@ joined by blank lines, 2,048-token windows). With the test split written to a fi
 
 Past the model's native window `--rope-yarn` applies YaRN at factor `--context` / native, and
 `--rope-yarn-factor F` at a fixed factor in `[1,4]` whatever the window is (default `1`, native
-RoPE). `--rope-scaling-factor F` instead interpolates positions past
-`--rope-scaling-original-context` (default: the native window) linearly by `F` in `[1,32]`, keeping
-the angles of every position up to it. None changes the artifact or the default 4,096-token window;
-long-context extrapolation is not a quality guarantee, so keep the factor fixed while comparing other
-numerical settings. The report records all four settings.
+RoPE), for every family (the Qwen3.5 text and MTP layers, Qwen3.8-Flash-Next's sparse attention
+with its indexer, Gemma 4's full-attention blocks). `--rope-scaling-factor F` instead interpolates
+positions past `--rope-scaling-original-context` (default: the native window) linearly by `F` in
+`[1,32]`, keeping the angles of every position up to it; the Qwen3.5 family takes it, the others
+refuse it. None changes the artifact or the default 4,096-token window; long-context extrapolation
+is not a quality guarantee, so keep the factor fixed while comparing other numerical settings. The
+report records all four settings. A window past the native positions is the way to measure the
+extension: one `--disjoint` window of `--context` tokens, with `--rope-yarn` and without, against
+the native window on the same text ([measured](#past-the-native-window)).
 
 ## Metric
 

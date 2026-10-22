@@ -27,6 +27,7 @@
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
+#include "runtime/contract/rope_scaling.h"
 #include <algorithm>
 #include <cstdlib>
 #include <initializer_list>
@@ -1351,18 +1352,14 @@ std::uint32_t vision_item_token_bound(std::uint32_t capacity, const models::Load
         std::min<std::uint64_t>({capacity, kMaximumVisionItemTokens, requested}));
 }
 
+// The rotation past the native window, as every family resolves it (rope_scaling.h); this family
+// takes YaRN and linear position interpolation alike, for its text and MTP layers.
 ops::RopeYarn planned_rope_yarn(const execution::Parameters& parameters,
                                 const EngineOptions& options) {
-    const std::uint32_t native = parameters.model.config().text.max_position_embeddings;
-    if (options.rope_scaling_factor > 1.0F) {
-        return {.interpolation_factor    = options.rope_scaling_factor,
-                .interpolation_threshold = options.rope_scaling_original_context != 0
-                                               ? options.rope_scaling_original_context
-                                               : native};
-    }
-    if (options.rope_yarn_factor > 1.0F) { return {options.rope_yarn_factor, native}; }
-    if (!options.rope_yarn || options.max_context <= native) { return {}; }
-    return {static_cast<float>(options.max_context) / static_cast<float>(native), native};
+    return runtime::resolve_rope_scaling(options,
+                                         parameters.model.config().text.max_position_embeddings,
+                                         runtime::kQwen35RopeScaling)
+        .yarn;
 }
 
 // Every chunk but a prompt's last one has the effective width, so it is chosen near the request

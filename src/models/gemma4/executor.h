@@ -17,6 +17,7 @@
 #include "models/expert_profile.h"
 #include "models/gemma4/kv_format.h"
 #include "models/gemma4/model.h"
+#include "ninfer/ops/rope.h"
 
 #include <cuda_runtime.h>
 
@@ -60,6 +61,11 @@ struct ExecutorOptions {
     // bus times. CPU threads: 0 for one per physical core.
     std::optional<float> expert_dma_share;
     std::uint32_t expert_cpu_threads = 0;
+    // YaRN past the model's native window (a factor above one) for the full-attention blocks'
+    // rotation, the assistant's included: their proportional schedule takes YaRN's frequencies,
+    // and the queries the square of its attention factor. The sliding-window blocks never see a
+    // distance past their window and keep their rotation. Inactive keeps every rotation as is.
+    ops::RopeYarn rope_yarn;
 };
 
 // One media item's units in a prompt chunk: consecutive units (an image, or frames of a video) of

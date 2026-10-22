@@ -291,7 +291,7 @@ Prefill of a 4,463-token prompt, in tok/s:
   all-round choice and `rk4v4` holds the native 262,144-token window of Qwen3.8-27B on a 24 GB card
   ([context and memory](docs/cli.md#context-and-memory)).
 - Up to 1,048,576 tokens of context, four times the native window, with plain RoPE or YaRN
-  (`--rope-yarn`).
+  (`--rope-yarn`, for every family: Qwen3.5, Qwen3.8-Flash-Next and Gemma 4).
 - A hybrid prefix cache by default, which shares content-addressed KV blocks and sparse state
   snapshots across requests on the device and in pinned host memory; or a checkpoint catalog
   (`--use-original-prefix-caching`) with an optional disk tier that survives restarts
