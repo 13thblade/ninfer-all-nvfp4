@@ -197,6 +197,8 @@ if(NOT NINFER_NVCC_SPLIT_COMPILE STREQUAL "")
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--split-compile=${NINFER_NVCC_SPLIT_COMPILE}>)
 endif()
 option(NINFER_PTXAS_VERBOSE "Print each kernel's registers and local-memory spills (-Xptxas=-v)" OFF)
+option(NINFER_CUDA_PRUNE_PTX
+       "Remove PTX from CUDA archives while retaining every configured machine-code image" OFF)
 if(NINFER_PTXAS_VERBOSE)
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
 endif()

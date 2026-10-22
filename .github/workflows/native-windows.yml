@@ -73,7 +73,7 @@ jobs:
           $process = Start-Process $installer -ArgumentList (@('-s') + $packages) -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "CUDA installer failed ($($process.ExitCode))" }
           $cuda = "${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA\v$short"
-          foreach ($file in 'bin\nvcc.exe', 'bin\cuobjdump.exe', 'include\cuda_runtime.h', 'lib\x64\cublas.lib') {
+          foreach ($file in 'bin\nvcc.exe', 'bin\cuobjdump.exe', 'bin\nvprune.exe', 'include\cuda_runtime.h', 'lib\x64\cublas.lib') {
             if (-not (Test-Path (Join-Path $cuda $file))) { throw "Missing CUDA component: $file" }
           }
           "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
@@ -164,7 +164,7 @@ jobs:
             "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
-            -DNINFER_NVCC_SPLIT_COMPILE=2 `
+            -DNINFER_NVCC_SPLIT_COMPILE=2 -DNINFER_CUDA_PRUNE_PTX=ON `
             -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
       # Keep completed vcpkg packages even if configuration or NInfer compilation fails.

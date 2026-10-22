@@ -108,6 +108,7 @@ foreach ($product in $Products) {
 }
 @{ source_revision = $Revision; modified_sources = [bool]$SourceState.Count; version = $Version;
    cuda = $CudaVersion; cuda_compiler = $CudaVersionText; architectures = $Archs; platform = 'windows-x64';
+   cuda_archive_ptx_pruned = ((Read-Cache 'NINFER_CUDA_PRUNE_PTX') -eq 'ON');
    validation = 'Device images present; all three executables passed --help without Toolkit on PATH. GPU inference was not tested.'
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ProductRoot 'BUILD-INFO.json') -Encoding utf8
 $innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File | Sort-Object Name | ForEach-Object {

@@ -128,6 +128,12 @@ same card in any build that runs it on the same tier. `DeviceContext` admits ran
 compute capabilities when each runs the build's code (`docs/maintainer/pipeline-stages.md`).
 Compile time and binary size grow with the number of architectures.
 
+`NINFER_CUDA_PRUNE_PTX=ON` runs NVIDIA `nvprune` on CUDA static archives before host linking.
+It retains all configured SASS targets and host code, and removes PTX. Object-cache entries remain
+unmodified. Windows release builds enable it to reduce image size; local and Linux builds default
+to OFF. A pruned build needs a GPU compatible with one of its SASS images, with no PTX fallback
+for other targets.
+
 Product commands and prerequisites are in the README's [Quick start](../../README.md#quick-start) and
 [Building](../../README.md#building) sections; test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).

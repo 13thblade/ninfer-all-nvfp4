@@ -123,6 +123,12 @@ both Toolkits. Each runner uses two compiler processes with two nvcc optimizatio
 to limit the memory pressure observed on the four-CPU Windows runners. This does not establish
 a bound on compilation time for the largest individual source files.
 
+Windows release builds set `NINFER_CUDA_PRUNE_PTX=ON`. NVIDIA's `nvprune` removes PTX from
+the CUDA static archives before linking, retaining machine code for every listed GPU architecture.
+This reduces the image size without recompiling cached objects. These packages do not provide
+PTX fallback for GPUs that cannot run any of their machine-code images. Local builds retain PTX
+by default; enabling this option requires the Toolkit's `nvprune` component.
+
 Every push to `master` starts the current build and cancels the superseded run.
 Feature branches build only through a manual run, which builds the packages
 without publication by default. Select `publish` on `master` to publish. Both Windows and both Linux jobs must

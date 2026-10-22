@@ -78,10 +78,10 @@ jobs:
         toolkit:
           - cuda: '12.9.2'
             archs: '70;75;80;86;89'
-            packages: '["nvcc", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump"]'
+            packages: '["nvcc", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump", "nvprune"]'
           - cuda: '13.4.3'
             archs: '75;80;86;89;120a'
-            packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump"]'
+            packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump", "nvprune"]'
     uses: ./.github/workflows/native-windows.yml
     with:
       cuda: ${{ matrix.toolkit.cuda }}
@@ -105,10 +105,10 @@ jobs:
         toolkit:
           - cuda: '12.9.2'
             archs: '70;75;80;86;89'
-            packages: '["nvcc", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump"]'
+            packages: '["nvcc", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump", "nvprune"]'
           - cuda: '13.4.3'
             archs: '75;80;86;89;120a'
-            packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump"]'
+            packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump", "nvprune"]'
     uses: ./.github/workflows/native-windows.yml
     with:
       cuda: ${{ matrix.toolkit.cuda }}

@@ -275,9 +275,14 @@ these image builds used no registry layer cache. This test run did not publish i
 All 16 Windows object shards succeeded and saved their HF snapshots. Both final jobs restored
 all eight required snapshots but stopped at the cache probe: its run-wide source identity reused
 an earlier job's modified probe object and mistook that valid cache hit for failed invalidation.
-The probe now generates fresh source content for each invocation. Windows linking, packaging and
-startup checks still need a successful run. Loader and device-image checks alone do not establish
-GPU inference correctness or speed.
+The probe now generates fresh source content for each invocation. In the
+[package-only retry](https://github.com/iamwavecut/ninfer-all/actions/runs/39728471200), both variants
+passed the probe twice, restored their compiled objects and reached linking in under 90 seconds
+of build time. Both failed with `LNK1248`: their images exceeded the 2 GiB linker limit. Both final
+aggregate caches were saved. Windows now enables archive PTX pruning while retaining all configured
+machine-code images; its effect on image size and successful linking still needs verification.
+Windows packaging and startup checks also remain unverified. Loader and device-image checks alone
+do not establish GPU inference correctness or speed.
 
 ## Local packaging
 

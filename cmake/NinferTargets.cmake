@@ -17,6 +17,24 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
   list(APPEND NINFER_CUDA_FATBIN_OPTIONS "-compress-mode=size")
 endif()
 
+if(NINFER_CUDA_PRUNE_PTX)
+  get_filename_component(_ninfer_cuda_bin "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+  find_program(NINFER_NVPRUNE nvprune HINTS "${_ninfer_cuda_bin}" REQUIRED)
+endif()
+
+function(ninfer_prune_cuda_ptx target)
+  if(NINFER_CUDA_PRUNE_PTX)
+    # Archive-only processing preserves compiler-cache entries and all selected GPU targets.
+    add_custom_command(TARGET ${target} POST_BUILD
+      COMMAND ${CMAKE_COMMAND}
+        "-DNVPRUNE=${NINFER_NVPRUNE}"
+        "-DARCHIVE=$<TARGET_FILE:${target}>"
+        "-DARCHITECTURES=$<TARGET_PROPERTY:${target},CUDA_ARCHITECTURES>"
+        -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/PruneCudaPtx.cmake"
+      VERBATIM)
+  endif()
+endfunction()
+
 # Whole-program device code: every device symbol is defined and used in one translation unit (no
 # extern __device__ or __constant__, no cross-unit device calls), and relocatable device code made
 # ptxas assume external linkage, lower computed-lane shuffles to out-of-line calls and give up
@@ -27,6 +45,7 @@ function(ninfer_cuda_archive target)
   endif()
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     "$<$<COMPILE_LANGUAGE:CUDA>:${NINFER_CUDA_FATBIN_OPTIONS}>")
+  ninfer_prune_cuda_ptx(${target})
 endfunction()
 
 function(ninfer_cuda_non_rdc_archive target)
@@ -38,6 +57,7 @@ function(ninfer_cuda_non_rdc_archive target)
   endif()
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     "$<$<COMPILE_LANGUAGE:CUDA>:${NINFER_CUDA_FATBIN_OPTIONS}>")
+  ninfer_prune_cuda_ptx(${target})
 endfunction()
 
 # Runtime DLL staging for the apps and tests.
