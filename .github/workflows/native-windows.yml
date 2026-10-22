@@ -181,6 +181,10 @@ jobs:
         id: build
         timeout-minutes: 305
         run: |
+          $kernelCommands = & ninja -C build-release -t commands ninfer_ggml_quants
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect CUDA kernel compile commands' }
+          $kernelCommands | Set-Content build-release/ggml-commands.log
+          $kernelCommands | Select-Object -First 1
           if ('${{ inputs.phase }}' -eq 'objects') {
             $build = @('python', '.github/scripts/build-object-shard.py', '--shard', '${{ inputs.shard }}', '--count', '${{ inputs.count }}', '--jobs', '2')
           } else {
