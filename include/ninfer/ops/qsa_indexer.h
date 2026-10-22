@@ -28,6 +28,9 @@ namespace ninfer::ops {
  * dims 64..127 through. Under `yarn` (a factor above one; the model's attention takes the same
  * rotation) f_i is instead the pair's YaRN inverse frequency, rope_yarn_frequencies(64, 1e7, yarn),
  * and cos and sin both carry its attention factor; linear position interpolation is not supported.
+ * The indexer's rotation carries YaRN's attention factor as the main attention's does: the
+ * reference indexer (Hugging Face's `Qwen4ExpTextQSAIndexer`) rotates with the layer's shared
+ * `position_embeddings`, whose cos and sin carry `attention_scaling`.
  * The query's own incomplete block (positions 4 floor((p+1)/4) .. p) is attended by every query
  * and is not part of the selection.
  *

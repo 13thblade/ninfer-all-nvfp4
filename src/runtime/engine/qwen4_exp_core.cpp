@@ -79,6 +79,32 @@ bool request_error(const std::exception_ptr& error) {
     return false;
 }
 
+// The rotation past the native window that --rope-yarn and --rope-yarn-factor ask for, resolved as
+// for the Qwen3.5 family: YaRN at a fixed --rope-yarn-factor, or at max-context / native once the
+// window passes the native positions; unscaled otherwise. It reaches every rotation the model
+// makes (sparse attention, its indexer, the MTP block). Linear position interpolation is refused,
+// and so is a factor past four.
+ops::RopeYarn planned_rope_yarn(const EngineOptions& options, std::uint32_t native) {
+    if (options.rope_scaling_factor > 1.0F) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next rotates past its native window with YaRN "
+                                    "(--rope-yarn, --rope-yarn-factor), not --rope-scaling-factor");
+    }
+    ops::RopeYarn yarn;
+    if (options.rope_yarn_factor > 1.0F) {
+        yarn = {.factor = options.rope_yarn_factor, .native_context = native};
+    } else if (options.rope_yarn && options.max_context > native) {
+        yarn = {.factor =
+                    static_cast<float>(options.max_context) / static_cast<float>(native),
+                .native_context = native};
+    }
+    if (yarn.factor > 4.0F) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next's YaRN reaches four times its native "
+                                    "window: --max-context " + std::to_string(4ULL * native) +
+                                    " at most");
+    }
+    return yarn;
+}
+
 } // namespace
 
 bool is_qwen4_exp_artifact(const std::filesystem::path& path) {
@@ -242,26 +268,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     executor.sequences       = options.max_concurrency;
     executor.draft_tokens    = mtp ? speculative.draft_tokens : 0;
     executor.draft_min_p     = speculative.draft_min_p;
-    // YaRN past the native window, as the Qwen3.5 family takes it: --rope-yarn at max-context /
-    // native once the window passes it, or a fixed --rope-yarn-factor; it reaches every rotation
-    // the model makes (sparse attention, its indexer, the MTP block).
-    if (options.rope_scaling_factor > 1.0F) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next rotates past its native window with YaRN "
-                                    "(--rope-yarn, --rope-yarn-factor), not --rope-scaling-factor");
-    }
-    const std::uint32_t native = text.max_position_embeddings;
-    if (options.rope_yarn_factor > 1.0F) {
-        executor.rope_yarn = {.factor = options.rope_yarn_factor, .native_context = native};
-    } else if (options.rope_yarn && options.max_context > native) {
-        executor.rope_yarn = {.factor         = static_cast<float>(options.max_context) /
-                                                static_cast<float>(native),
-                              .native_context = native};
-    }
-    if (executor.rope_yarn.factor > 4.0F) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next's YaRN reaches four times its native "
-                                    "window: --max-context " + std::to_string(4ULL * native) +
-                                    " at most");
-    }
+    executor.rope_yarn       = planned_rope_yarn(options, text.max_position_embeddings);
     // A chunk also holds a verification of every sequence at once.
     const std::uint32_t requested_chunk = options.prefill_chunk ? options.prefill_chunk : 1024;
     executor.prefill_chunk   = std::max(std::clamp<std::uint32_t>(requested_chunk, 64, 4096),
@@ -350,6 +357,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                "proposals (--ngram-draft-tokens) are not available for it");
         }
     }
+    if (executor.rope_yarn.active()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Qwen3.8-Flash-Next: YaRN at factor %.4g past the native %u positions",
+                           double(executor.rope_yarn.factor), executor.rope_yarn.native_context);
+    }
     if (table.disabled && has_ple) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
                            "Qwen3.8-Flash-Next runs WITHOUT its n-gram table (--no-ngram-table): "
@@ -378,6 +390,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     out.load.pinned_weight_bytes      = stats.pinned_bytes;
     out.load.device_object_count      = stats.device_object_count;
     out.load.host_object_count        = stats.host_object_count;
+    const bool yarn                   = executor.rope_yarn.active();
+    out.load.rope                     = RopeScalingSummary{
+        .type           = yarn ? RopeScalingType::Yarn : RopeScalingType::None,
+        .factor         = yarn ? executor.rope_yarn.factor : 1.0F,
+        .native_context = text.max_position_embeddings};
     const auto& config                = model->config();
     out.model_metadata.model_id       = out.load.model_name;
     out.model_metadata.vocab_size     = config.vocab_size;

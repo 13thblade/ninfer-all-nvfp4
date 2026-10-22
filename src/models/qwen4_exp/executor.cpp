@@ -1433,10 +1433,6 @@ struct Executor::Impl {
     void allocate_sequences() {
         const std::uint64_t width = std::uint64_t(config.hc_count) * config.hidden_size;
         allocate_gdn_pools();
-        if (options.rope_yarn.active()) {
-            std::fprintf(stderr, "qwen4_exp: YaRN at factor %.4g past the native %u positions\n",
-                         double(options.rope_yarn.factor), options.rope_yarn.native_context);
-        }
         for (std::uint32_t s = 0; s < options.sequences; ++s) {
             SequenceState sequence;
             sequence.slot = s;
