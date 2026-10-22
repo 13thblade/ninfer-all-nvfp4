@@ -22,6 +22,23 @@ SPEC.loader.exec_module(WAIT)
 
 
 class BuildLifecycleTest(unittest.TestCase):
+    def test_packaging_can_disable_inherited_cache_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "huggingface_hub.py").write_text(
+                "from pathlib import Path\nPath('unexpected-cache-write').touch()\n"
+                "raise RuntimeError('Packaging must not start a cache upload')\n")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--log", str(root / "package.log"),
+                 "--checkpoint-family=", "--checkpoint-interval", ".01", "--", sys.executable,
+                 "-c", "import time; print('archive complete', flush=True); time.sleep(.5)"],
+                cwd=root, env=os.environ | {"HF_TOKEN": "test-only", "PYTHONPATH": str(root),
+                                           "HF_CACHE_FAMILY": "native-windows-cuda-test"},
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("archive complete", (root / "package.log").read_text())
+            self.assertFalse((root / "unexpected-cache-write").exists())
+
     def test_soft_timeout_stops_work_and_preserves_completed_outputs(self):
         for option in ("duration", "job-deadline"):
             with self.subTest(option=option), tempfile.TemporaryDirectory() as directory:

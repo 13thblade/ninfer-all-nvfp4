@@ -6,6 +6,8 @@ on:
     paths:
       - '.github/scripts/**'
       - '.github/workflows/build-workflow-checks.yml'
+      - '.github/workflows/native-windows.yml'
+      - 'scripts/package-release.ps1'
       - 'tests/release/**'
   workflow_call:
   workflow_dispatch:
@@ -31,5 +33,11 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
+      - name: Parse Windows packager
+        shell: pwsh
+        run: |
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$pwd/scripts/package-release.ps1", [ref]$null, [ref]$parseErrors) | Out-Null
+          if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
       - run: python -m unittest discover -s tests/release -p test_build_lifecycle.py -v
       - run: python -m unittest discover -s tests/release -p test_windows_kernel_dll.py -v

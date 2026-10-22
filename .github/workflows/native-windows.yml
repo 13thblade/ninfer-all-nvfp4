@@ -204,7 +204,7 @@ jobs:
         if: inputs.phase == 'package'
         run: |
           $env:NINFER_BUILD_ROOT = "$pwd/build-release"
-          ./scripts/package-release.ps1
+          python .github/scripts/run-cached-build.py --checkpoint-family= --log build-release/package.log -- pwsh -NoProfile -File scripts/package-release.ps1
       - uses: actions/upload-artifact@v7
         if: inputs.phase == 'package'
         with:

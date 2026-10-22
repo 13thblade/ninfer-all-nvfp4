@@ -107,6 +107,7 @@ foreach ($module in $DeviceModules) {
     foreach ($arch in $Archs) {
         if ($images -notmatch "sm_$arch(?:[.\s_]|$)") { throw "$exe lacks the sm_$arch device image" }
     }
+    Write-Host "Device images verified: $module; architectures: $($Archs -join ',')"
 }
 foreach ($product in $Products) {
     $exe = Join-Path $ProductRoot (Split-Path -Leaf $product)
@@ -114,8 +115,10 @@ foreach ($product in $Products) {
     $savedPath = $env:PATH
     try {
         $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+        Write-Host "Startup check: $exe"
         & $exe --help
         if ($LASTEXITCODE -ne 0) { throw "$exe --help failed with a clean PATH ($LASTEXITCODE)" }
+        Write-Host "Startup check passed: $exe"
     } finally { $env:PATH = $savedPath }
 }
 @{ source_revision = $Revision; modified_sources = [bool]$SourceState.Count; version = $Version;
@@ -125,13 +128,16 @@ foreach ($product in $Products) {
    validation = 'Device images present; all three executables passed --help without Toolkit on PATH. GPU inference was not tested.'
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ProductRoot 'BUILD-INFO.json') -Encoding utf8
 $innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File | Sort-Object Name | ForEach-Object {
+    Write-Host "Hashing package file: $($_.Name); bytes: $($_.Length)"
     "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
 }
 [IO.File]::WriteAllText((Join-Path $ProductRoot 'SHA256SUMS.txt'), (($innerHashes -join "`n") + "`n"), [Text.ASCIIEncoding]::new())
 # Always use volumes. Every asset stays below GitHub's 2 GiB limit, even as the fatbins grow.
-& $SevenZip a -t7z -mx=3 -v1900m $ArchivePath $ProductRoot
+Write-Host "Creating archive: $ArchivePath"
+& $SevenZip a -t7z -mx=3 -bsp1 -v1900m $ArchivePath $ProductRoot
 if ($LASTEXITCODE -ne 0) { throw 'Archive creation failed' }
-& $SevenZip t "$ArchivePath.001"
+Write-Host "Verifying archive: $ArchivePath.001"
+& $SevenZip t -bsp1 "$ArchivePath.001"
 if ($LASTEXITCODE -ne 0) { throw 'Archive verification failed' }
 $volumes = @(Get-ChildItem -LiteralPath $DistRoot -File | Where-Object {
     $_.Name -match "^$([regex]::Escape($ProductName))\.7z\.\d+$"
@@ -139,6 +145,7 @@ $volumes = @(Get-ChildItem -LiteralPath $DistRoot -File | Where-Object {
 if ($volumes.Count -eq 0) { throw 'No archive volumes were created' }
 $outerHashes = foreach ($volume in $volumes) {
     if ($volume.Length -ge 2GB) { throw "Release asset is too large: $($volume.Name)" }
+    Write-Host "Hashing archive volume: $($volume.Name); bytes: $($volume.Length)"
     "$((Get-FileHash -LiteralPath $volume.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($volume.Name)"
 }
 [IO.File]::WriteAllText($ChecksumPath, (($outerHashes -join "`n") + "`n"), [Text.ASCIIEncoding]::new())
