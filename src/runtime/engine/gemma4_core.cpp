@@ -16,6 +16,7 @@
 #include "runtime/contract/grammar_masks.h"
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
+#include "runtime/contract/rope_scaling.h"
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/worker_recovery.h"
 #include "runtime/engine/effective_thinking_budget.h"
@@ -184,6 +185,13 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
+    // The rotation past the native window, as every family resolves it (rope_scaling.h): YaRN
+    // for the full-attention blocks, the assistant's included; linear position interpolation is
+    // refused. Google publishes no extension of this model's 262,144-token window, so YaRN here is
+    // the same mathematics without the vendor's measurement behind it.
+    const runtime::RopeScalingPlan rope = runtime::resolve_rope_scaling(
+        options, model->config().max_position_embeddings, runtime::kGemma4RopeScaling);
+    executor.rope_yarn = rope.yarn;
     if (options.expert_residency != ExpertResidency::Device) {
         const std::vector<std::size_t> widths(model->expert_banks().size(),
                                               std::size_t(model->config().num_experts));
@@ -280,6 +288,13 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         }
     }
 
+    if (executor.rope_yarn.active()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Gemma 4: YaRN at factor %.4g past the native %u positions, on the "
+                           "full-attention blocks; its quality past the window is not "
+                           "published by Google and was not verified here",
+                           double(executor.rope_yarn.factor), executor.rope_yarn.native_context);
+    }
     ConstructedGemma4 out;
     const auto& stats              = model->storage_stats();
     out.load.architecture          = std::string(models::architecture_name(models::Architecture::Gemma4));
@@ -300,6 +315,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     out.load.pinned_weight_bytes  = stats.pinned_bytes;
     out.load.device_object_count  = stats.device_object_count;
     out.load.host_object_count    = stats.host_object_count;
+    out.load.rope                 = rope.summary;
     const auto& config                = model->config();
     out.model_metadata.model_id       = out.load.model_name;
     out.model_metadata.vocab_size     = config.vocab_size;

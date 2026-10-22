@@ -26,8 +26,9 @@ namespace ninfer::ops {
  * RMSNorm x / sqrt(mean x^2 + eps) * (1 + w) over 128 values; rope rotates the first 64 dims
  * rotate-half at angle fl32(fl32(position) * f_i), f_i = fl32(1e7^(-2i/64)), i < 32, and passes
  * dims 64..127 through. Under `yarn` (a factor above one; the model's attention takes the same
- * rotation) f_i is instead the pair's YaRN inverse frequency, rope_yarn_frequencies(64, 1e7, yarn),
- * and cos and sin both carry its attention factor; linear position interpolation is not supported.
+ * rotation) f_i is instead the pair's YaRN inverse frequency, rope_yarn_frequencies(64, 32, 1e7,
+ * yarn), and cos and sin both carry its attention factor; linear position interpolation is not
+ * supported.
  * The indexer's rotation carries YaRN's attention factor as the main attention's does: the
  * reference indexer (Hugging Face's `Qwen4ExpTextQSAIndexer`) rotates with the layer's shared
  * `position_embeddings`, whose cos and sin carry `attention_scaling`.

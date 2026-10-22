@@ -173,8 +173,8 @@ __global__ void qkv_post_kernel(QkvArgs a) {
         const float inv = rsqrtf(block_sum(x0 * x0 + x1 * x1) / float(d) + a.eps);
         const float n0 = x0 * inv * a.q_norm[i], n1 = x1 * inv * a.q_norm[i + half];
         float* q = a.q_out + (std::int64_t(t) * a.query_heads + head) * d;
-        q[i]        = n0 * c - n1 * s;
-        q[i + half] = n1 * c + n0 * s;
+        q[i]        = (n0 * c - n1 * s) * a.q_scale;
+        q[i + half] = (n1 * c + n0 * s) * a.q_scale;
         return;
     }
     const int kh = head - a.query_heads;

@@ -445,7 +445,8 @@ QsaRope make_rope(const RopeYarn& yarn) {
     require(!(yarn.interpolation_factor > 1.0F), "linear position interpolation is not supported");
     QsaRope rope{};
     if (yarn.factor > 1.0F) {
-        const RopeYarnFrequencies f = rope_yarn_frequencies(2 * kRotaryPairs, 1.0e7F, yarn);
+        const RopeYarnFrequencies f =
+            rope_yarn_frequencies(2 * kRotaryPairs, kRotaryPairs, 1.0e7F, yarn);
         for (int i = 0; i < kRotaryPairs; ++i) rope.inverse_frequency[i] = f.inverse_frequency[i];
         rope.attention_factor = f.attention_factor;
         rope.scaled           = 1;

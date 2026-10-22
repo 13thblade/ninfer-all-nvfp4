@@ -18,6 +18,7 @@
 #include "models/qwen3_5/expert_admission.h"
 #include "models/qwen3_5/measurement.h"
 #include "runtime/engine/host_memory.h"
+#include "runtime/contract/rope_scaling.h"
 
 #include <algorithm>
 #include <cmath>
@@ -851,6 +852,10 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     summary.host_object_count    = stats.host_object_count;
     summary.context_cost         = std::move(context_cost.summary);
     summary.prefix_cache         = std::move(restore);
+    summary.rope                 = runtime::resolve_rope_scaling(
+                           options, instance->model->config().text.max_position_embeddings,
+                           runtime::kQwen35RopeScaling)
+                           .summary;
 
     // Static /v1/models metadata: the model identity and dimension facts come from the loaded
     // model; the parameters, weight bytes, and weights profile are pure functions of the

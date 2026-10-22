@@ -102,6 +102,7 @@ int main() {
     load.peak_staging_bytes   = 128;
     load.device_object_count  = 42;
     load.host_object_count    = 6;
+    load.rope.native_context  = 262144;
     load.context_cost         = {
                 .transfer_source   = ninfer::ContextCostPresetSource::External,
                 .prefill_source    = ninfer::ContextCostPresetSource::CompiledDefault,
@@ -258,8 +259,9 @@ int main() {
         saturated, environment, std::uint64_t{123456}));
     failures += check(saturated_server.at("memory").at("cuda_graph_measured_bytes").is_null(),
                       "CUDA Graph bytes measured with no free memory left are not reported null");
-    failures += check(server.at("engine").at("rope").is_null(),
-                      "server_start reports a rotation the family did not resolve");
+    failures += check(server.at("engine").at("rope") ==
+                          Json{{"type", "none"}, {"factor", 1.0}, {"native_context", 262144}},
+                      "server_start does not report the unscaled rotation");
     ninfer::LoadSummary yarn_load = load;
     yarn_load.rope = ninfer::RopeScalingSummary{.type           = ninfer::RopeScalingType::Yarn,
                                                 .factor         = 2.25F,
@@ -270,6 +272,17 @@ int main() {
     failures += check(yarn_server.at("engine").at("rope") ==
                           Json{{"type", "yarn"}, {"factor", 2.25}, {"native_context", 262144}},
                       "server_start does not report the resolved YaRN rotation");
+    ninfer::LoadSummary interpolated_load = load;
+    interpolated_load.rope =
+        ninfer::RopeScalingSummary{.type           = ninfer::RopeScalingType::Interpolation,
+                                   .factor         = 8.0F,
+                                   .native_context = 131072};
+    const Json interpolated_server = Json::parse(format_server_start_json(
+        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias",
+        interpolated_load, memory, environment, std::uint64_t{123456}));
+    failures += check(interpolated_server.at("engine").at("rope") ==
+                          Json{{"type", "interpolation"}, {"factor", 8.0}, {"native_context", 131072}},
+                      "server_start does not report the resolved position interpolation");
     failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
                       "CUDA Graph allowance missing");
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&

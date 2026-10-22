@@ -45,7 +45,10 @@ struct QkvArgs {
     float eps           = 1e-6f;
     const std::int32_t* positions = nullptr; // [T]
     const float* inv_freq         = nullptr; // [D/2]
-    float* q_out                  = nullptr; // [T][Hq][D]
+    // Every value of the rotated Q is multiplied by it: the square of YaRN's attention factor, so
+    // that Q and K carry the factor together as the reference's cos and sin do (one, unscaled).
+    float q_scale = 1.0f;
+    float* q_out  = nullptr; // [T][Hq][D]
     // Cache element (d, slot, head, sequence) at base + sequence * seq_stride + head * head_stride
     // + slot * D + d; slot = position, or position % ring for a ring.
     __half* k_cache = nullptr;

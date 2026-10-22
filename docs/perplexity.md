@@ -106,11 +106,47 @@ joined by blank lines, 2,048-token windows). With the test split written to a fi
 
 Past the model's native window `--rope-yarn` applies YaRN at factor `--context` / native, and
 `--rope-yarn-factor F` at a fixed factor in `[1,4]` whatever the window is (default `1`, native
-RoPE). `--rope-scaling-factor F` instead interpolates positions past
-`--rope-scaling-original-context` (default: the native window) linearly by `F` in `[1,32]`, keeping
-the angles of every position up to it. None changes the artifact or the default 4,096-token window;
-long-context extrapolation is not a quality guarantee, so keep the factor fixed while comparing other
-numerical settings. The report records all four settings.
+RoPE), for every family (the Qwen3.5 text and MTP layers, Qwen3.8-Flash-Next's sparse attention
+with its indexer, Gemma 4's full-attention blocks). `--rope-scaling-factor F` instead interpolates
+positions past `--rope-scaling-original-context` (default: the native window) linearly by `F` in
+`[1,32]`, keeping the angles of every position up to it; the Qwen3.5 family takes it, the others
+refuse it. None changes the artifact or the default 4,096-token window; long-context extrapolation
+is not a quality guarantee, so keep the factor fixed while comparing other numerical settings. The
+report records all four settings. A window past the native positions is the way to measure the
+extension: one `--disjoint` window of `--context` tokens, with `--rope-yarn` and without, against
+the native window on the same text ([measured](#past-the-native-window)).
+
+## Past the native window
+
+`scripts/pods/rope_perplexity.py` joins the fixed corpus's sixteen streams in manifest order into
+one text of about a million tokens and scores it in one `--disjoint` window of 524,288 tokens, twice
+the native 262,144 positions, with plain RoPE and with `--rope-yarn` (factor 2), and in windows of
+the native width. The reference column scores the same tokens as the long window, in native
+windows. On an NVIDIA A40 (CUDA 12.8, sm_86 build) with the default KV format (`int8`),
+Flash-Next with `--expert-residency host`:
+
+| Model | Scored tokens | Native windows | Plain RoPE | `--rope-yarn` | Tokens/s, plain / YaRN |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.8-27B IQ3_S | 524,287 | 6.5626 | 6.5750 (+0.2%) | 6.5724 (+0.1%) | 592 / 593 |
+| Qwen3.8-Flash-Next IQ3_S | 524,287 | 5.2979 | 5.3079 (+0.2%) | 5.3325 (+0.7%) | 183 / 223 |
+| Gemma 4 26B-A4B QAT Q4_0 | 1,048,574 | 270.51 | 296.72 (+9.7%) | 230.79 (−14.7%) | 744 / 777 |
+
+Only whole windows are scored: the Qwen tokenizer makes the text 1.04 million tokens, one long
+window, and Gemma's 1.09 million, two. A long window gives its later tokens up to twice the
+context, which can lower perplexity by itself, so the plain and YaRN columns, at the same window,
+isolate the rotation:
+
+- Qwen3.8-27B scores within 0.04% of itself with YaRN and without, and within 0.2% of the native
+  windows: on this text twice its window neither helps nor hurts.
+- Qwen3.8-Flash-Next scores 0.5% higher with YaRN than with plain RoPE (5.3325 against 5.3079),
+  and within 0.2% of the native windows without it. Its plain and YaRN runs ran on two different
+  2×A40 pods; YaRN changes only the rotation table, so the speeds compare the hosts.
+- Gemma 4 scores 22% lower with YaRN than with plain RoPE, in both long windows (1,216 against
+  1,498 on the English prose, 43.8 against 58.8 on the Chinese and code). This checkpoint's
+  perplexity on raw prose is high at any window (1,093 on the WikiText stream and 338 on the PG-19
+  stream in 8,192-token windows; about 20 on the NInfer code stream), so the comparison holds for
+  this text, not as a quality level; Google publishes no extension of the window, and no task past
+  it was measured.
 
 ## Metric
 
