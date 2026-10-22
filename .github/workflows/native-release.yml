@@ -189,6 +189,8 @@ jobs:
   universal-windows:
     name: Assemble universal windows package
     needs: windows
+    # Package-only runs skip the object-shard ancestor.
+    if: ${{ !cancelled() && needs.windows.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
