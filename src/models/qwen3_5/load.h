@@ -1,7 +1,8 @@
 #pragma once
 
 #include "models/qwen3_5/model.h"
-#include "ninfer/types.h"
+#include "ninfer/kv_cache_storage.h"
+#include "ninfer/startup.h"
 #include "ops/common/device_tier.h"
 
 #include <filesystem>

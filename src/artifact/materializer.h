@@ -6,7 +6,7 @@
 #include "core/evictable_weight_pool.h"
 #include "core/vmm.h"
 #include "core/weight_view.h"
-#include "ninfer/types.h"
+#include "ninfer/startup.h"
 
 #include <memory>
 #include <optional>

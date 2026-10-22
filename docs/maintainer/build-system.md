@@ -289,6 +289,15 @@ Source-list maintenance must preserve language, architecture, RDC mode, device-l
 and numerical compiler options. Splitting a manifest does not reduce kernel instantiation work
 or justify combining shape translation units or enabling unity builds.
 
+## Include boundaries
+
+`include/ninfer/types.h` is the umbrella of the in-tree interface, and `include/ninfer/engine.h`
+includes it. CUDA translation units under `src/` take only the small public headers they need:
+`ninfer/kv_cache_storage.h` (the KV storage formats) and `ninfer/startup.h` (startup progress).
+`scripts/check-include-boundaries.py` fails when a `.cu` under `src/` reaches `ninfer/types.h` or
+`ninfer/engine.h`, and CI runs it. The boundary keeps a change to the Engine options, requests or
+statistics from recompiling the attention and KV-cache kernels.
+
 ## Consumers and verification
 
 `apps/CMakeLists.txt` explicitly defines the four product executables, or with `NINFER_MULTICALL`

@@ -16,6 +16,7 @@
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/weights.h"
 #include "models/qwen4_exp/config.h"
+#include "models/qwen4_exp/expert_location.h"
 #include "ninfer/ops/weight_input.h"
 #include "ninfer/types.h"
 
@@ -55,22 +56,6 @@ struct SparseAttentionWeights {
 struct GdnWeights {
     WeightId query, key, value, z, a_projection, b_projection, a_log, dt_bias;
     WeightId convolution, norm, output;
-};
-
-// Where one expert's rows of one projection sit in the artifact's files (disk-resident experts):
-// one run of one file, or two when the rows straddle the boundary between two files.
-struct ExpertLocation {
-    struct Run {
-        std::size_t file     = 0; // index into Model::files()
-        std::uint64_t offset = 0; // byte offset in that file
-        std::uint64_t bytes  = 0; // 0: unused
-    };
-
-    std::array<Run, 2> runs{};
-    std::uint64_t bytes    = 0; // of all runs
-    QType format           = QType::GGUF_Q8_0;
-    std::int64_t row_bytes = 0;
-    std::int32_t rows      = 0;
 };
 
 struct MoeWeights {

@@ -1,5 +1,8 @@
 #pragma once
 
+#include "ninfer/kv_cache_storage.h"
+#include "ninfer/startup.h"
+
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -49,32 +52,6 @@ inline constexpr std::size_t kMaxSupportedResidualHiddenSize = 5120;
 inline constexpr std::size_t kResidualStreamBytesPerElement = 2;
 // Pinned Host tier of the hybrid prefix cache when --host-cache-mib is not given.
 inline constexpr std::size_t kDefaultHybridHostCacheBytes = 8ULL << 30;
-
-enum class KvCacheStorage : std::uint8_t {
-    BFloat16,
-    Int8Group64,
-    Fp8E4M3Row256,
-    // RotorQuant rk8v4: rotated INT8 keys with a packed signed int4 value plane over a group-32
-    // scale. Ported onto the kv_cache_append Op that owns KV quantization, and opt-in through
-    // --kv-dtype rk8v4. See docs/cli.md, "Context and memory".
-    RotatedInt8KeyInt4ValueGroup64,
-    // NVFP4 e2m1, group-16 scale, both K and V planes packed two codes per byte.
-    Nvfp4Group16,
-    // K8V4: FP8 E4M3 key plane (same coding as Fp8E4M3Row256) paired with an NVFP4 value plane.
-    Fp8KeyNvfp4Value,
-    // rk4v4 (this fork only): rotated keys as 4-bit indices into a Lloyd-Max codebook with a
-    // group-64 FP16 scale, paired with rk8v4's packed signed int4 group-32 value plane. Opt-in
-    // through --kv-dtype rk4v4.
-    RotatedLloyd4KeyInt4Value,
-    // rk4v4-e8: rotated keys snapped per 8-dimension block to the E8 lattice and stored as packed
-    // signed int4 over a group-64 scale, paired with the rk8v4 packed int4 value plane. Opt-in
-    // through --kv-dtype rk4v4-e8. Appended last so the existing values keep their numbering.
-    RotatedInt4KeyInt4ValueE8,
-    // rk2v4-e8: rotated keys stored per 8-dimension block as the nearest E8 root, a log-radius and
-    // a residual axis (two bytes per block) over a group-64 scale, paired with the rk8v4 packed
-    // int4 value plane. Opt-in through --kv-dtype rk2v4-e8.
-    RotatedE8RootKeyInt4Value,
-};
 
 enum class EnginePurpose : std::uint8_t {
     Generation,
@@ -166,50 +143,6 @@ struct SpeculativeOptions {
     bool automatic = false;
     static constexpr std::uint32_t kAutomaticDraftTokens = 3;
     static constexpr float kAutomaticDraftMinP           = 0.5F;
-};
-
-enum class StartupPhase : std::uint8_t {
-    EngineStartup,
-    CudaInitialize,
-    ArtifactInspect,
-    TargetPlan,
-    WeightsMaterialize,
-    WeightsStagingPin,
-    TargetFinalize,
-    FrontendInitialize,
-    ProgramInitialize,
-    HostStatePin,
-    HostKvPin,
-    CudaGraphPrepare,
-    PrefixCacheLoad,
-    EngineFinalize,
-};
-
-enum class StartupStatus : std::uint8_t {
-    Begin,
-    Progress,
-    Complete,
-    Failed,
-};
-
-enum class StartupProgressUnit : std::uint8_t {
-    None,
-    Bytes,
-};
-
-struct StartupEvent {
-    StartupPhase phase                = StartupPhase::EngineStartup;
-    StartupStatus status              = StartupStatus::Begin;
-    StartupProgressUnit progress_unit = StartupProgressUnit::None;
-    std::uint64_t current             = 0;
-    std::uint64_t total               = 0;
-    std::uint64_t elapsed_ns          = 0;
-};
-
-struct StartupObserver {
-    // Startup diagnostics never participate in Engine control flow. Callback exceptions are
-    // ignored by the publishing boundary so a logging failure cannot invalidate model startup.
-    std::function<void(const StartupEvent& event)> callback;
 };
 
 enum class DiagnosticLevel : std::uint8_t {
