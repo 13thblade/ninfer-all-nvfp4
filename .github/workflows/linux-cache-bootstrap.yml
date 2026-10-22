@@ -1,10 +1,6 @@
 name: Linux cache bootstrap
 
 on:
-  # Register and start this branch-only bootstrap before it exists on master.
-  push:
-    branches: ['build/windows-release']
-    paths: ['.github/workflows/linux-cache-bootstrap.yml']
   workflow_dispatch:
 
 permissions:
