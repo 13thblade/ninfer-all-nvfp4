@@ -4,6 +4,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/systemone.h"
+#include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
 
@@ -28,6 +29,13 @@ void expect(bool condition, const std::string& label) {
 }
 
 bool close_to(double a, double b) { return std::abs(a - b) < 1e-6; }
+
+// The user turn's text as the chat template renders it: its parts back to back.
+std::string user_text(const GenerationRequest& read) {
+    std::string text;
+    for (const ContentPart& part : read.messages.at(1).content) { text += part.text; }
+    return text;
+}
 
 struct Refusal {
     int status = 0;
@@ -236,7 +244,31 @@ void prompts() {
                choice.messages[0].content.at(0).text.find("one label only") != std::string::npos &&
                choice.messages[1].role == ninfer::ChatRole::User,
            "the system turn asking for one label, then the user turn");
-    const std::string& text = choice.messages[1].content.at(0).text;
+    const std::vector<ContentPart>& parts = choice.messages[1].content;
+    expect(parts.size() == 2 && parts[0].text.rfind("State:\n{\"ticket\"", 0) == 0 &&
+               parts[0].text.ends_with("}\n\n") &&
+               parts[0].cache_boundary_after == CacheBoundary{} &&
+               parts[1].text.rfind("Question: Which team?\n", 0) == 0 &&
+               !parts[1].cache_boundary_after,
+           "the state ends the first part, with an explicit cache boundary, and the question "
+           "starts the second");
+    const ninfer::PromptInput input =
+        to_prompt_input(choice, resolve_prompt_semantics(choice, ServeOptions{}),
+                        [](const ContentPart&) -> ninfer::OwnedMedia {
+                            throw std::logic_error("a decision read has no media");
+                        });
+    const ninfer::PromptCacheMarker after_state{
+        .after_message_count      = 2,
+        .kind                     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence                 = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .location                 = ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+        .after_message_part_count = 1,
+    };
+    expect(input.messages.size() == 2 && input.messages[1].parts.size() == 2 &&
+               input.context_cache.markers ==
+                   std::vector<ninfer::PromptCacheMarker>({after_state}),
+           "the Engine sees one shared-prefix marker, after the state part");
+    const std::string text = user_text(choice);
     expect(text.find("State:\n{\"ticket\"") == 0 &&
                text.find("Question: Which team?\nOptions:\nA. billing - payments and refunds\n"
                          "B. shipping\nReply with a single letter (A or B) and nothing else.") !=
@@ -248,12 +280,12 @@ void prompts() {
                choice.sampling.presence_penalty == 0.0,
            "one greedy token with the labels read out, no thinking, no graft, no penalties");
     const GenerationRequest noul = make_decision_read(request, request.questions[1], {1, 2, 3, 4});
-    expect(noul.messages[1].content.at(0).text.find(
+    expect(user_text(noul).find(
                "Question: Reply within the hour?\nyes: money is moving\n"
                "Answer with one word, yes or no, in lower case.") != std::string::npos,
            "a noul shows the described answers");
     const GenerationRequest score = make_decision_read(request, request.questions[2], {1, 2, 3});
-    expect(score.messages[1].content.at(0).text.find(
+    expect(user_text(score).find(
                "Levels, lowest first:\n0. calm\n1. annoyed\n2. furious\n"
                "Reply with a single number (0, 1 or 2) and nothing else.") != std::string::npos,
            "a score lists its levels under their numbers");
@@ -262,15 +294,14 @@ void prompts() {
             "questions": {"q": {"type": "noul", "instructions": "i"},
                           "wide": {"type": "choice", "instructions": "i",
                                    "criteria": {"a": null, "b": null, "c": null, "d": null, "e": null}}}})"));
-    expect(make_decision_read(with_context, with_context.questions[0], {1, 2, 3, 4})
-                   .messages[1]
-                   .content.at(0)
-                   .text.rfind("ctx\n\nState:\ns\n\n", 0) == 0,
-           "context goes ahead of the state");
-    expect(make_decision_read(with_context, with_context.questions[1], {1, 2, 3, 4, 5})
-                   .messages[1]
-                   .content.at(0)
-                   .text.find("Reply with a single letter (A to E) and nothing else.") !=
+    const GenerationRequest first = make_decision_read(with_context, with_context.questions[0],
+                                                       {1, 2, 3, 4});
+    const GenerationRequest wide = make_decision_read(with_context, with_context.questions[1],
+                                                      {1, 2, 3, 4, 5});
+    expect(first.messages[1].content.at(0).text == "ctx\n\nState:\ns\n\n" &&
+               wide.messages[1].content.at(0).text == first.messages[1].content.at(0).text,
+           "context goes ahead of the state, and every question shares that part");
+    expect(user_text(wide).find("Reply with a single letter (A to E) and nothing else.") !=
                std::string::npos,
            "many options are spanned");
 }

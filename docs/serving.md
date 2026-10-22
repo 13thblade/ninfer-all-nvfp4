@@ -1437,9 +1437,12 @@ limits, and answers with `answers` in question order: a `predicate` with its `pr
 an unnamed question. `safety_identifier` is accepted and ignored; streaming, tools, images and
 refusal scoring are not implemented.
 
-The reads of one request run a lane's worth (`--max-concurrency`) at a time, so a request leaves
-room for other clients' generation between its windows, and every read starts with the state, which
-the prefix cache prefills once: a question costs its own text and one token. On an RTX 3090 with
+Every read of a request starts with the same system turn, context and state, and its prompt carries
+an explicit cache boundary after the state. The first question runs alone and leaves the state in
+the context cache; the rest resume from it a lane's worth (`--max-concurrency`) at a time, so a
+question costs its own text and one token, and a request leaves room for other clients' generation
+between its windows. The reads are disposable: the cache evicts their own continuations first, and
+they start no session lineage under `--derive-session-keys`. On an RTX 3090 with
 Ternary Bonsai 2 27B and four lanes, a request about a 370-token state took 17 ms for one question
 and 235 ms for sixteen once the state was cached (150 ms and 0.8 s with the state's prefill); about
 a 13.5K-token state, 39 ms and 0.33 s (5.3 s and 6.1 s cold). Sixteen questions beside a streaming
