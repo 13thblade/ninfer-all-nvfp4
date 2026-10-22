@@ -97,6 +97,11 @@ if ($KernelDll) { $DeviceModules += 'ninfer_ggml_quants.dll' }
 foreach ($module in $DeviceModules) {
     $exe = Join-Path $ProductRoot $module
     if (-not (Test-Path -LiteralPath $exe)) { throw "Missing device module: $exe" }
+    Write-Host "Device module: $module; bytes: $((Get-Item -LiteralPath $exe).Length)"
+    if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
+        & dumpbin /headers $exe
+        if ($LASTEXITCODE -ne 0) { throw "Cannot inspect PE headers for $exe" }
+    }
     $images = (& $Cuobjdump --list-elf $exe 2>&1) -join "`n"
     if ($LASTEXITCODE -ne 0) { throw "cuobjdump failed for $exe" }
     foreach ($arch in $Archs) {

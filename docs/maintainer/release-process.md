@@ -288,6 +288,10 @@ checking its SHA-256 against NVIDIA's redistribution manifest. In the
 exceeded the limit in all three executables: benchmark `80D58000`, CLI `80DCC000`, server `80F92000`
 (hexadecimal image sizes, limit `80000000`). The workflow now links GGML kernels as a separate
 DLL, retaining all GPU targets; this change still needs native linking and startup verification.
+The same retry's CUDA 12.9 job found all configured device images in `ninfer.exe`, but Windows
+refused to start it with "not a valid application for this OS platform". Its loader failure is
+unresolved. Packaging now records module sizes and PE headers when `dumpbin` is available so the
+next run can distinguish the image layout from missing dependencies.
 Windows packaging, startup and packaged device-image checks remain unverified. Those checks alone
 do not establish GPU inference correctness or speed.
 
