@@ -76,6 +76,8 @@ jobs:
           foreach ($file in 'bin\nvcc.exe', 'bin\cuobjdump.exe', 'bin\nvprune.exe', 'include\cuda_runtime.h', 'lib\x64\cublas.lib') {
             if (-not (Test-Path (Join-Path $cuda $file))) { throw "Missing CUDA component: $file" }
           }
+          python .github/scripts/fetch-cuda-license.py --version $env:CUDA_VERSION --output "$cuda/EULA.txt"
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA licence extraction failed' }
           "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
           "$cuda\bin" >> $env:GITHUB_PATH
       - name: Import Visual Studio 2022 environment
