@@ -5,6 +5,7 @@
 // key and two ordered passes that keep ties at the lower block index and write the blocks in
 // increasing order.
 #include "ninfer/ops/qsa_indexer.h"
+#include "ninfer/ops/rope.h"
 
 #include "core/device.h"
 #include "core/layout.h"
@@ -37,10 +38,28 @@ __device__ __forceinline__ float rope_frequency(int pair) {
     return static_cast<float>(exp(-(2.0 * pair / 64.0) * 16.11809565095832)); // ln(1e7)
 }
 
+// YaRN's rotation: each pair's inverse frequency and the attention factor on cos and sin. A kernel
+// parameter, so a captured graph keeps it. The kernels take it as a template choice: their unscaled
+// instantiation is the original code, so it rounds as before.
+struct QsaRope {
+    float inverse_frequency[kRotaryPairs];
+    float attention_factor;
+    int scaled;
+};
+
+// cos and sin of pair `pair` at `position` under YaRN.
+__device__ __forceinline__ void yarn_sincos(const QsaRope& rope, int pair, int position,
+                                            float* sine, float* cosine) {
+    sincosf(static_cast<float>(position) * rope.inverse_frequency[pair], sine, cosine);
+    *sine *= rope.attention_factor;
+    *cosine *= rope.attention_factor;
+}
+
 // Zero-centred RMSNorm of a 128-vector held one value per thread of a 128-thread group, then the
 // rotate-half rotation of its first 64 dims at `position`. `values` is the group's shared row.
+template <bool Yarn>
 __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float eps, int position,
-                              int lane128, float* reduce) {
+                              int lane128, float* reduce, const QsaRope& rope) {
     const float x = values[lane128];
     float square  = x * x;
 #pragma unroll
@@ -56,9 +75,13 @@ __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float 
     values[lane128] = normed;
     __syncthreads();
     if (lane128 < kRotaryPairs) {
-        const float angle = static_cast<float>(position) * rope_frequency(lane128);
         float sine, cosine;
-        sincosf(angle, &sine, &cosine);
+        if constexpr (Yarn) {
+            yarn_sincos(rope, lane128, position, &sine, &cosine);
+        } else {
+            const float angle = static_cast<float>(position) * rope_frequency(lane128);
+            sincosf(angle, &sine, &cosine);
+        }
         const float x1 = values[lane128], x2 = values[lane128 + kRotaryPairs];
         values[lane128]                = x1 * cosine - x2 * sine;
         values[lane128 + kRotaryPairs] = x2 * cosine + x1 * sine;
@@ -69,10 +92,12 @@ __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float 
 // One 128-thread CTA per block completing in the call: mean of its four raw keys (from the tail
 // or the projection), norm, rope at the block's first position. The grid covers every block a call
 // of `tokens` can complete; a CTA past the call's completed blocks has nothing to do.
+template <bool Yarn>
 __global__ void __launch_bounds__(kHeadDim)
     qsa_pool_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
                     int tokens, const __nv_bfloat16* __restrict__ key_norm, float eps,
-                    const float* __restrict__ tail, int capacity, float* __restrict__ pooled) {
+                    const float* __restrict__ tail, int capacity, float* __restrict__ pooled,
+                    const QsaRope rope) {
     __shared__ float row[kHeadDim];
     __shared__ float reduce[4];
     const int first_position = *first;
@@ -91,7 +116,7 @@ __global__ void __launch_bounds__(kHeadDim)
     }
     row[d] = sum * 0.25f;
     __syncthreads();
-    norm_rope_row(row, key_norm, eps, block * kBlock, d, reduce);
+    norm_rope_row<Yarn>(row, key_norm, eps, block * kBlock, d, reduce, rope);
     pooled[static_cast<std::int64_t>(block) * kHeadDim + d] = row[d];
 }
 
@@ -119,9 +144,11 @@ __device__ __forceinline__ unsigned order_key(float value) {
 
 // One query preparation per token, shared by every block tile. Keep the original FP32
 // normalization/reduction and angle boundaries; only its materialization location changes.
+template <bool Yarn>
 __global__ void __launch_bounds__(kThreads)
     qsa_query_kernel(const __nv_bfloat16* projection, const int* first,
-                     const __nv_bfloat16* query_norm, float eps, float* queries) {
+                     const __nv_bfloat16* query_norm, float eps, float* queries,
+                     const QsaRope rope) {
     __shared__ float row[kHeads * kHeadDim];
     __shared__ float reduce[kHeads][4];
     const int tid = threadIdx.x, head = tid / kHeadDim, lane = tid % kHeadDim;
@@ -129,7 +156,7 @@ __global__ void __launch_bounds__(kThreads)
     if ((position + 1) / kBlock <= kTopBlocks) { return; }
     row[tid] = __bfloat162float(projection[static_cast<std::int64_t>(t) * kProjection + tid]);
     __syncthreads();
-    norm_rope_row(row + head * kHeadDim, query_norm, eps, position, lane, reduce[head]);
+    norm_rope_row<Yarn>(row + head * kHeadDim, query_norm, eps, position, lane, reduce[head], rope);
     queries[static_cast<std::int64_t>(t) * kHeads * kHeadDim + tid] = row[tid];
 }
 
@@ -236,11 +263,12 @@ __global__ void __launch_bounds__(128)
 
 // The scores of blocks [64 x, 64 x + 64) for query y (the 1/sqrt(128) scale does not change the
 // order), as orderable keys. A query that sees at most 512 blocks needs none.
+template <bool Yarn>
 __global__ void __launch_bounds__(kThreads)
     qsa_score_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
                      const __nv_bfloat16* __restrict__ query_norm, float eps,
                      const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
-                     int capacity) {
+                     int capacity, const QsaRope rope) {
     __shared__ __align__(16) float query[kHeads * kHeadDim];
     __shared__ float reduce[kHeads][4];
     const int t        = blockIdx.y;
@@ -270,9 +298,13 @@ __global__ void __launch_bounds__(kThreads)
         row[lane] = normed;
         __syncthreads();
         if (lane < kRotaryPairs) {
-            const float angle = static_cast<float>(position) * rope_frequency(lane);
             float sine, cosine;
-            sincosf(angle, &sine, &cosine);
+            if constexpr (Yarn) {
+                yarn_sincos(rope, lane, position, &sine, &cosine);
+            } else {
+                const float angle = static_cast<float>(position) * rope_frequency(lane);
+                sincosf(angle, &sine, &cosine);
+            }
             const float x1 = row[lane], x2 = row[lane + kRotaryPairs];
             row[lane]                = x1 * cosine - x2 * sine;
             row[lane + kRotaryPairs] = x2 * cosine + x1 * sine;
@@ -409,11 +441,23 @@ void require_pooled(const Tensor& pooled) {
             "pooled must be contiguous FP32 [128, capacity]");
 }
 
+QsaRope make_rope(const RopeYarn& yarn) {
+    require(!(yarn.interpolation_factor > 1.0F), "linear position interpolation is not supported");
+    QsaRope rope{};
+    if (yarn.factor > 1.0F) {
+        const RopeYarnFrequencies f = rope_yarn_frequencies(2 * kRotaryPairs, 1.0e7F, yarn);
+        for (int i = 0; i < kRotaryPairs; ++i) rope.inverse_frequency[i] = f.inverse_frequency[i];
+        rope.attention_factor = f.attention_factor;
+        rope.scaled           = 1;
+    }
+    return rope;
+}
+
 } // namespace
 
 void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
-                        const QsaIndexerWeights& weights, float eps, Tensor& pooled, Tensor& tail,
-                        cudaStream_t stream) {
+                        const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
+                        Tensor& pooled, Tensor& tail, cudaStream_t stream) {
     require_projection(projection);
     const int* first = require_position(first_position);
     require_norm(weights.key_norm, "key_norm must be BF16 [128]");
@@ -422,12 +466,15 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
     require(tail.dtype == DType::FP32 && tail.is_contiguous() && tail.data != nullptr &&
                 tail.ne[0] == kHeadDim && tail.ne[1] == kBlock - 1,
             "tail must be contiguous FP32 [128, 3]");
+    const QsaRope rope        = make_rope(yarn);
     const std::int32_t tokens = projection.ne[1];
     // A call of `tokens` positions completes at most tokens / 4 + 1 blocks, wherever it starts.
-    qsa_pool_kernel<<<tokens / kBlock + 1, kHeadDim, 0, stream>>>(
+    auto* const pool_kernel = rope.scaled ? qsa_pool_kernel<true> : qsa_pool_kernel<false>;
+    pool_kernel<<<tokens / kBlock + 1, kHeadDim, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(projection.data), first, tokens,
         static_cast<const __nv_bfloat16*>(weights.key_norm->data), eps,
-        static_cast<const float*>(tail.data), pooled.ne[1], static_cast<float*>(pooled.data));
+        static_cast<const float*>(tail.data), pooled.ne[1], static_cast<float*>(pooled.data),
+        rope);
     CUDA_CHECK(cudaGetLastError());
     qsa_tail_kernel<<<1, kHeadDim, 0, stream>>>(static_cast<const __nv_bfloat16*>(projection.data),
                                                 first, tokens, static_cast<float*>(tail.data));
@@ -445,14 +492,15 @@ std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens, std::int32_t
 }
 
 void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
-                        const QsaIndexerWeights& weights, float eps, const Tensor& pooled,
-                        WorkspaceArena& workspace, Tensor& selected, Tensor& counts,
-                        cudaStream_t stream) {
+                        const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
+                        const Tensor& pooled, WorkspaceArena& workspace, Tensor& selected,
+                        Tensor& counts, cudaStream_t stream) {
     require_projection(projection);
     const int* first = require_position(first_position);
     require_norm(weights.query_norm, "query_norm must be BF16 [128]");
     require(eps > 0.0f, "eps must be positive");
     require_pooled(pooled);
+    const QsaRope rope = make_rope(yarn);
     const std::int32_t tokens = projection.ne[1];
     require(selected.dtype == DType::I32 && selected.is_contiguous() && selected.data != nullptr &&
                 selected.ne[0] == kTopBlocks && selected.ne[1] == tokens,
@@ -467,16 +515,21 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                           static_cast<unsigned>(tokens));
     if (capacity > kTopBlocks) {
         if (tokens < kMmaTokens) {
-            qsa_score_kernel<<<score_grid, kThreads, 0, stream>>>(
+            auto* const score_kernel =
+                rope.scaled ? qsa_score_kernel<true> : qsa_score_kernel<false>;
+            score_kernel<<<score_grid, kThreads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(projection.data), first,
                 static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
-                static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity);
+                static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity,
+                rope);
         } else {
             Tensor queries = workspace.alloc(DType::FP32, {kHeads * kHeadDim, tokens});
-            qsa_query_kernel<<<tokens, kThreads, 0, stream>>>(
+            auto* const query_kernel =
+                rope.scaled ? qsa_query_kernel<true> : qsa_query_kernel<false>;
+            query_kernel<<<tokens, kThreads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(projection.data), first,
                 static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
-                static_cast<float*>(queries.data));
+                static_cast<float*>(queries.data), rope);
             CUDA_CHECK(cudaGetLastError());
             qsa_mma_score_kernel<<<dim3((capacity + 63) / 64, (tokens + 3) / 4), 128, 0, stream>>>(
                 static_cast<const float*>(queries.data), first, static_cast<const float*>(pooled.data),

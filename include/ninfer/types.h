@@ -2010,6 +2010,16 @@ public:
     using std::invalid_argument::invalid_argument;
 };
 
+// How the Engine rotates positions past the model's native window, as it resolved the rope
+// options: unscaled RoPE, or YaRN at `factor` over the `native_context` positions.
+enum class RopeScalingType : std::uint8_t { None, Yarn };
+
+struct RopeScalingSummary {
+    RopeScalingType type         = RopeScalingType::None;
+    float factor                 = 1.0F;
+    std::uint32_t native_context = 0;
+};
+
 struct LoadSummary {
     std::string architecture;
     std::string model_name;
@@ -2026,6 +2036,9 @@ struct LoadSummary {
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;
     ContextCostSummary context_cost;
+    // The resolved rotation past the native window; Qwen3.8-Flash-Next reports it, the other
+    // families leave it empty.
+    std::optional<RopeScalingSummary> rope;
 
     // Hybrid prefix cache restored from its persistent file at startup.
     struct PrefixCacheRestore {

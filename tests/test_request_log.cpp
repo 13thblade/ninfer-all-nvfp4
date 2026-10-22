@@ -258,6 +258,18 @@ int main() {
         saturated, environment, std::uint64_t{123456}));
     failures += check(saturated_server.at("memory").at("cuda_graph_measured_bytes").is_null(),
                       "CUDA Graph bytes measured with no free memory left are not reported null");
+    failures += check(server.at("engine").at("rope").is_null(),
+                      "server_start reports a rotation the family did not resolve");
+    ninfer::LoadSummary yarn_load = load;
+    yarn_load.rope = ninfer::RopeScalingSummary{.type           = ninfer::RopeScalingType::Yarn,
+                                                .factor         = 2.25F,
+                                                .native_context = 262144};
+    const Json yarn_server = Json::parse(format_server_start_json(
+        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias",
+        yarn_load, memory, environment, std::uint64_t{123456}));
+    failures += check(yarn_server.at("engine").at("rope") ==
+                          Json{{"type", "yarn"}, {"factor", 2.25}, {"native_context", 262144}},
+                      "server_start does not report the resolved YaRN rotation");
     failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
                       "CUDA Graph allowance missing");
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&

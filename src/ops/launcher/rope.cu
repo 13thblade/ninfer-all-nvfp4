@@ -286,3 +286,22 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, co
 }
 
 } // namespace ninfer::ops::detail
+
+namespace ninfer::ops {
+
+RopeYarnFrequencies rope_yarn_frequencies(int rotary_dim, float theta, const RopeYarn& yarn) {
+    if (rotary_dim != 64 || !std::isfinite(theta) || !(theta > 0.0F) || !(yarn.factor > 1.0F) ||
+        !std::isfinite(yarn.factor) || yarn.native_context == 0 ||
+        yarn.interpolation_factor > 1.0F) {
+        throw std::invalid_argument("rope_yarn_frequencies: needs 64 rotated dims, a positive "
+                                    "theta and a YaRN factor above one over a native window, "
+                                    "without position interpolation");
+    }
+    const RopeYarnKernelTable table = detail::yarn_table(rotary_dim, theta, yarn);
+    RopeYarnFrequencies out;
+    std::copy_n(table.inverse_frequency, 32, out.inverse_frequency);
+    out.attention_factor = table.attention_factor;
+    return out;
+}
+
+} // namespace ninfer::ops

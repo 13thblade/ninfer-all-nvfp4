@@ -523,6 +523,16 @@ int main() {
                               31, 16, 8);
     failures +=
         run_single_case({"27b mtp k yarn", 256, 64, 1, 128, kTextTheta, 4.0F, 262'144}, 4, 8192);
+    // Qwen3.8-Flash-Next under YaRN rotates its 24 query and 2 key heads with the single-tensor
+    // form, 1-D and MRoPE, at the factor of its 589,824-token window over 262,144.
+    failures +=
+        run_single_case({"flash q yarn", 256, 64, 1, 128, kTextTheta, 2.25F, 262'144}, 24, 4096);
+    failures +=
+        run_single_case({"flash k yarn", 256, 64, 1, 128, kTextTheta, 2.25F, 262'144}, 2, 4096);
+    failures += run_single_case({"flash q mrope yarn", 256, 64, 3, 7, kTextTheta, 2.25F, 262'144},
+                                24, 2048);
+    failures += run_single_case({"flash k mrope yarn", 256, 64, 3, 7, kTextTheta, 2.25F, 262'144},
+                                2, 2048);
 
     // Linear position interpolation past a threshold the positions cross, 1-D, MRoPE and the
     // single-tensor form: positions up to the threshold keep their angles.

@@ -343,6 +343,13 @@ Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySumm
                 {"handoff_peak_bytes", vision->handoff_peak_bytes}};
 }
 
+Json rope_json(const std::optional<ninfer::RopeScalingSummary>& rope) {
+    if (!rope) { return nullptr; }
+    return Json{{"type", rope->type == ninfer::RopeScalingType::Yarn ? "yarn" : "none"},
+                {"factor", rope->factor},
+                {"native_context", rope->native_context}};
+}
+
 Json speculative_json(const GenerationMetrics& metrics) {
     Json out{{"backend", product::speculative_backend_name(metrics.speculative_backend)},
              {"draft_window", metrics.speculative_draft_window},
@@ -804,6 +811,7 @@ std::string format_server_start_json(
         {"rope_yarn_factor", engine_options.rope_yarn_factor},
         {"rope_scaling_factor", engine_options.rope_scaling_factor},
         {"rope_scaling_original_context", engine_options.rope_scaling_original_context},
+        {"rope", rope_json(load.rope)},
         {"structured_output", engine_options.structured_output},
         {"concurrent_prefill", engine_options.concurrent_prefill},
         {"recover_invariant_failures", engine_options.recover_invariant_failures},

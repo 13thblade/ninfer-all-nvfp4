@@ -73,4 +73,17 @@ void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& 
 void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& yarn, Tensor& x,
           cudaStream_t stream);
 
+// The rotation YaRN gives each pair of a 64-dim rotation (as `rope` applies it above): the pair's
+// inverse frequency, rounded to FP32, and the attention factor that cos and sin both carry. For an
+// Op that rotates inside its own kernels at the same frequencies, Flash-Next's block indexer.
+struct RopeYarnFrequencies {
+    float inverse_frequency[32] = {};
+    float attention_factor      = 1.0F;
+};
+
+// Requires rotary_dim 64, a positive finite theta, a YaRN factor above one over a nonzero native
+// context, and no linear position interpolation.
+[[nodiscard]] RopeYarnFrequencies rope_yarn_frequencies(int rotary_dim, float theta,
+                                                        const RopeYarn& yarn);
+
 } // namespace ninfer::ops
