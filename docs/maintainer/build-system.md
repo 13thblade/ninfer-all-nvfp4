@@ -305,12 +305,17 @@ The value types of the in-tree interface live in one header per domain under `in
 | `observability/resources.h` | memory and resource summaries |
 | `observability/snapshot.h` | `RuntimeStats`, model metadata and residency, slot state, `LoadSummary` |
 
-`include/ninfer/types.h` lists them, and only `include/ninfer/engine.h` includes it. Other code
-includes the header that defines the types it uses, so a change to one domain recompiles only the
-code of that domain. CUDA translation units under `src/` take only `base.h`, `model_enums.h`,
+`include/ninfer/types_fwd.h` declares every struct, class and enum of these headers. A header that
+names a type only by reference or pointer, or an enum without its enumerators, includes
+`types_fwd.h` instead of the defining header; the file that reads the members includes the
+definition. `include/ninfer/types.h` lists all of them, and only `include/ninfer/engine.h` includes
+it, which also keeps the declarations consistent with the definitions. Other code includes the
+header that defines the types it uses, so a change to one domain recompiles only the code of that
+domain. CUDA translation units under `src/` take only `base.h`, `model_enums.h`,
 `kv_cache_storage.h` and `startup.h`. `scripts/check-include-boundaries.py` fails when a file other
-than `engine.h` includes `ninfer/types.h`, or when a `.cu` under `src/` reaches `engine.h`,
-`engine_options.h`, `request.h` or `observability/`; CI runs it.
+than `engine.h` includes `ninfer/types.h`, when a `.cu` under `src/` reaches `engine.h`,
+`engine_options.h`, `request.h` or `observability/`, or when `types_fwd.h` and the definitions
+disagree; CI runs it.
 
 ## Consumers and verification
 

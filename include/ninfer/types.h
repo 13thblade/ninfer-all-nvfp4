@@ -13,3 +13,4 @@
 #include "ninfer/observability/snapshot.h"
 #include "ninfer/request.h"
 #include "ninfer/startup.h"
+#include "ninfer/types_fwd.h"

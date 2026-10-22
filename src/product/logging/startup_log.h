@@ -1,7 +1,7 @@
 #pragma once
 
-#include "ninfer/observability/snapshot.h"
 #include "ninfer/startup.h"
+#include "ninfer/types_fwd.h"
 
 #include <memory>
 

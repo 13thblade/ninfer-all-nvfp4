@@ -7,6 +7,8 @@
   options, requests or statistics would otherwise recompile the kernels. The kernels take what
   they need from the small headers (ninfer/base.h, ninfer/model_enums.h,
   ninfer/kv_cache_storage.h, ninfer/startup.h).
+- ninfer/types_fwd.h declares every struct, class and enum the headers listed in ninfer/types.h
+  define, with the same keyword, and nothing else.
 
 The check reads #include lines as text and resolves them against the include directories the build
 uses, so an include inside an #if counts.
@@ -21,6 +23,7 @@ SOURCE_DIRS = ['include', 'src', 'apps', 'tests', 'bench', 'tools']
 SOURCE_SUFFIXES = ('.h', '.hpp', '.cuh', '.inl', '.cpp', '.cc', '.cu')
 UMBRELLA = 'include/ninfer/types.h'
 UMBRELLA_OWNER = 'include/ninfer/engine.h'
+DECLARATIONS = 'include/ninfer/types_fwd.h'
 ENGINE_LEVEL = {
     'include/ninfer/engine.h',
     'include/ninfer/engine_options.h',
@@ -31,6 +34,7 @@ ENGINE_LEVEL = {
     'include/ninfer/types.h',
 }
 INCLUDE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.M)
+TYPE = re.compile(r'^(struct|class|enum class)\s+(\w+)\b[^;]*?(\{|;)', re.M)
 
 
 def resolve(source, name, cache):
@@ -71,8 +75,27 @@ def chain_to(start, targets, memo, cache):
     return None
 
 
+def read(path):
+    with open(os.path.join(ROOT, path), encoding='utf-8') as file:
+        return file.read()
+
+
+def declaration_failures(memo, cache):
+    defined = {}
+    for header in includes(UMBRELLA, memo, cache):
+        if header != DECLARATIONS:
+            defined.update({m[1]: m[0] for m in TYPE.findall(read(header)) if m[2] == '{'})
+    declared = {m[1]: m[0] for m in TYPE.findall(read(DECLARATIONS)) if m[2] == ';'}
+    failures = [f'{DECLARATIONS} lacks {kind} {name}' for name, kind in sorted(defined.items())
+                if declared.get(name) != kind]
+    failures += [f'{DECLARATIONS} declares {name}, which no listed header defines'
+                 for name in sorted(set(declared) - set(defined))]
+    return failures
+
+
 def main():
     memo, cache, failures = {}, set(), []
+    failures += declaration_failures(memo, cache)
     for top in SOURCE_DIRS:
         for directory, _, names in os.walk(os.path.join(ROOT, top)):
             for name in sorted(names):

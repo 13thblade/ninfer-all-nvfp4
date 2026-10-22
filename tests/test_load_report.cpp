@@ -1,3 +1,4 @@
+#include "ninfer/engine_options.h"
 #include "serve/load_report.h"
 
 #include <nlohmann/json.hpp>

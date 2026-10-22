@@ -22,10 +22,10 @@
 #include "models/gemma4/model.h"
 #include "models/gemma4/vision_cpu.h"
 #include "models/qwen3_5/frontend/frontend.h"
-#include "ninfer/engine_options.h"
 #include "ninfer/observability/resources.h"
 #include "ninfer/observability/snapshot.h"
 #include "ninfer/request.h"
+#include "ninfer/types_fwd.h"
 #include "runtime/contract/request.h"
 
 #include <chrono>
