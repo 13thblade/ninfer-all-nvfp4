@@ -23,7 +23,8 @@ if(NINFER_CUDA_PRUNE_PTX)
 endif()
 
 function(ninfer_prune_cuda_ptx target)
-  if(NINFER_CUDA_PRUNE_PTX)
+  get_target_property(_ninfer_library_type ${target} TYPE)
+  if(NINFER_CUDA_PRUNE_PTX AND _ninfer_library_type STREQUAL "STATIC_LIBRARY")
     # Archive-only processing preserves compiler-cache entries and all selected GPU targets.
     add_custom_command(TARGET ${target} POST_BUILD
       COMMAND ${CMAKE_COMMAND}
@@ -74,6 +75,9 @@ endfunction()
 # Collect the FFMPEG + libcurl runtime DLLs from the vcpkg bin tree into <out_var>.
 function(ninfer_runtime_dll_list out_var)
   set(_list "")
+  if(WIN32 AND NINFER_WINDOWS_KERNEL_DLL AND TARGET ninfer_ggml_quants)
+    list(APPEND _list "$<TARGET_FILE:ninfer_ggml_quants>")
+  endif()
   if(WIN32 AND DEFINED FFMPEG_VCPKG_TREE)
     foreach(_ninfer_dll_glob
       "avutil-*.dll" "avcodec-*.dll" "avformat-*.dll" "swscale-*.dll"
@@ -106,7 +110,7 @@ endfunction()
 # exes share a single per-config runtime directory, so one copy serves every one of
 # them (anchored on any always-built test target for the directory).
 function(ninfer_stage_test_runtime_dlls anchor_target)
-  if(NOT WIN32 OR NOT DEFINED FFMPEG_VCPKG_TREE)
+  if(NOT WIN32)
     return()
   endif()
   ninfer_runtime_dll_list(_ninfer_test_rt_dlls)

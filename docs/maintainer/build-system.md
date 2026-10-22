@@ -134,6 +134,12 @@ unmodified. Windows release builds enable it to reduce image size; local and Lin
 to OFF. A pruned build needs a GPU compatible with one of its SASS images, with no PTX fallback
 for other targets.
 
+Windows releases also enable `NINFER_WINDOWS_KERNEL_DLL` (local default OFF). The GGML kernels
+use a shared library with the same architecture set, while the other components remain static.
+The existing bridge exposes functions and plain values; it imports no mutable globals or virtual
+tables. CMake exports those functions and stages the DLL beside consumers. The DLL is not passed
+to `nvprune`, which accepts static archives and relocatable objects, so it retains PTX.
+
 Product commands and prerequisites are in the README's [Quick start](../../README.md#quick-start) and
 [Building](../../README.md#building) sections; test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).

@@ -32,3 +32,4 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m unittest discover -s tests/release -p test_build_lifecycle.py -v
+      - run: python -m unittest discover -s tests/release -p test_windows_kernel_dll.py -v

@@ -166,7 +166,7 @@ jobs:
             "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
-            -DNINFER_NVCC_SPLIT_COMPILE=2 -DNINFER_CUDA_PRUNE_PTX=ON `
+            -DNINFER_NVCC_SPLIT_COMPILE=2 -DNINFER_CUDA_PRUNE_PTX=ON -DNINFER_WINDOWS_KERNEL_DLL=ON `
             -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
       # Keep completed vcpkg packages even if configuration or NInfer compilation fails.

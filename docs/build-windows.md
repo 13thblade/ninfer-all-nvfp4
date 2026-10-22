@@ -111,7 +111,7 @@ on a 24 GB card that serves a desktop, an explicit capacity is easier to predict
 
 The `Native release` workflow builds two native x64 packages with VS 2022 and Ninja:
 
-| Toolkit | Device images in each executable |
+| Toolkit | Device images available to each executable |
 |---|---|
 | CUDA 12.9.2 | `70;75;80;86;89` (Volta through Ada) |
 | CUDA 13.4.3 | `75;80;86;89;120a` (Turing through consumer Blackwell) |
@@ -128,6 +128,13 @@ the CUDA static archives before linking, retaining machine code for every listed
 This reduces the image size without recompiling cached objects. These packages do not provide
 PTX fallback for GPUs that cannot run any of their machine-code images. Local builds retain PTX
 by default; enabling this option requires the Toolkit's `nvprune` component.
+
+The workflow also sets `NINFER_WINDOWS_KERNEL_DLL=ON`: GGML kernels reside in
+`ninfer_ggml_quants.dll` beside the executables. The DLL carries the same architecture set and
+retains its PTX; the other CUDA archives are pruned. This separates device code across PE images
+to address MSVC's 2 GiB limit without removing GPU targets. The DLL uses the existing function-only
+GGML bridge and is staged for apps, the product benchmark and tests. Local builds default to the
+static library. The packager checks device images in the DLL as well as in each executable.
 
 Every push to `master` starts the current build and cancels the superseded run.
 Feature branches build only through a manual run, which builds the packages
@@ -147,7 +154,7 @@ Archive names use the platform, CUDA version, GPU architectures and 12-character
 for example `ninfer-windows-x64-cuda13.4-sm75-80-86-89-120a-0123456789ab.7z.001`.
 `VERSION` is retained inside the package as source metadata; it is not part of the archive name.
 
-Compilation on the hosted runner still needs native verification: these five-image executables
-may encounter MSVC image-size limits or runner memory/time limits. Archive splitting addresses
+CUDA 12.9 linked all three executables after PTX pruning. CUDA 13.4 exceeded MSVC's image-size limit
+in all three; the kernel DLL change still needs native verification. Archive splitting addresses
 GitHub's asset limit only. It does not address linker limits. A successful `--help` check does not
 establish GPU correctness or throughput.

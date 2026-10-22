@@ -93,6 +93,29 @@ target_link_libraries(check_host PRIVATE kernels)
         self.assertEqual(args[:-3], ['--generate-code=arch=compute_75,code=sm_75',
                                     '--generate-code=arch=compute_120a,code=sm_120a'])
 
+    def test_shared_library_is_never_sent_to_archive_pruner(self):
+        module = SCRIPT.parent / 'NinferTargets.cmake'
+        (self.root / 'CMakeLists.txt').write_text(f'''
+cmake_minimum_required(VERSION 3.28)
+project(shared_fixture LANGUAGES CXX)
+set(NINFER_CUDA_PRUNE_PTX ON)
+set(NINFER_NVPRUNE "{self.tool}")
+include("{module}")
+add_library(kernels SHARED kernels.cpp)
+ninfer_cuda_non_rdc_archive(kernels)
+add_executable(check_host main.cpp)
+target_link_libraries(check_host PRIVATE kernels)
+''')
+        (self.root / 'kernels.cpp').write_text('int answer() { return 42; }\n')
+        (self.root / 'main.cpp').write_text('int answer(); int main() { return answer() != 42; }\n')
+        env = dict(os.environ, PRUNE_ARGUMENTS=str(self.root / 'args.json'), PRUNE_MODE='fail')
+        build = self.root / 'build'
+        for command in (['cmake', '-S', str(self.root), '-B', str(build)],
+                        ['cmake', '--build', str(build), '-j'], [str(build / 'check_host')]):
+            result = subprocess.run(command, env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.root / 'args.json').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

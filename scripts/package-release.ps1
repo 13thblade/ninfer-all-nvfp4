@@ -39,6 +39,7 @@ $ProductRoot = Join-Path $DistRoot $ProductName
 $ChecksumPath = Join-Path $DistRoot "SHA256SUMS-$ProductName.txt"
 $ArchivePath = Join-Path $DistRoot "$ProductName.7z"
 $SevenZip = (Get-Command 7z -ErrorAction Stop).Source
+$KernelDll = (Read-Cache 'NINFER_WINDOWS_KERNEL_DLL') -eq 'ON'
 $Products = @('apps\ninfer.exe', 'apps\ninfer-serve.exe', 'bench\ninfer_bench.exe')
 foreach ($product in $Products) {
     if (-not (Test-Path -LiteralPath (Join-Path $BuildRoot $product))) { throw "Missing product: $product" }
@@ -91,13 +92,19 @@ if ($VcpkgEntry.Count -eq 1) {
     }
 }
 $Cuobjdump = Join-Path $CudaRoot 'bin\cuobjdump.exe'
-foreach ($product in $Products) {
-    $exe = Join-Path $ProductRoot (Split-Path -Leaf $product)
+$DeviceModules = @($Products | ForEach-Object { Split-Path -Leaf $_ })
+if ($KernelDll) { $DeviceModules += 'ninfer_ggml_quants.dll' }
+foreach ($module in $DeviceModules) {
+    $exe = Join-Path $ProductRoot $module
+    if (-not (Test-Path -LiteralPath $exe)) { throw "Missing device module: $exe" }
     $images = (& $Cuobjdump --list-elf $exe 2>&1) -join "`n"
     if ($LASTEXITCODE -ne 0) { throw "cuobjdump failed for $exe" }
     foreach ($arch in $Archs) {
         if ($images -notmatch "sm_$arch(?:[.\s_]|$)") { throw "$exe lacks the sm_$arch device image" }
     }
+}
+foreach ($product in $Products) {
+    $exe = Join-Path $ProductRoot (Split-Path -Leaf $product)
     # No Toolkit, vcpkg or developer directories can satisfy missing runtime DLLs.
     $savedPath = $env:PATH
     try {
@@ -109,6 +116,7 @@ foreach ($product in $Products) {
 @{ source_revision = $Revision; modified_sources = [bool]$SourceState.Count; version = $Version;
    cuda = $CudaVersion; cuda_compiler = $CudaVersionText; architectures = $Archs; platform = 'windows-x64';
    cuda_archive_ptx_pruned = ((Read-Cache 'NINFER_CUDA_PRUNE_PTX') -eq 'ON');
+   ggml_kernel_dll = $KernelDll;
    validation = 'Device images present; all three executables passed --help without Toolkit on PATH. GPU inference was not tested.'
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ProductRoot 'BUILD-INFO.json') -Encoding utf8
 $innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File | Sort-Object Name | ForEach-Object {

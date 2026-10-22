@@ -199,6 +199,11 @@ endif()
 option(NINFER_PTXAS_VERBOSE "Print each kernel's registers and local-memory spills (-Xptxas=-v)" OFF)
 option(NINFER_CUDA_PRUNE_PTX
        "Remove PTX from CUDA archives while retaining every configured machine-code image" OFF)
+option(NINFER_WINDOWS_KERNEL_DLL
+       "Link GGML CUDA kernels as a Windows DLL to keep multi-architecture executables below 2 GiB" OFF)
+if(NINFER_WINDOWS_KERNEL_DLL AND NOT WIN32)
+  message(FATAL_ERROR "NINFER_WINDOWS_KERNEL_DLL is only supported on Windows")
+endif()
 if(NINFER_PTXAS_VERBOSE)
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
 endif()

@@ -25,6 +25,9 @@ checks the downloaded volumes. The inner `SHA256SUMS.txt` checks the extracted f
 
 Everything else is in the archive: the FFmpeg and libcurl DLLs, and NVIDIA's cuBLAS runtime
 (`cublas64_12.dll` and `cublasLt64_12.dll`, or their CUDA 13 counterparts). You do **not** need the CUDA Toolkit installed.
+Packages built with `ggml_kernel_dll: true` in `BUILD-INFO.json` also require the included
+`ninfer_ggml_quants.dll`. Keep it beside the executables; it contains NInfer's GGML CUDA kernels
+for the package's full architecture set.
 
 **Licensing.** NInfer is Apache-2.0 (`LICENSE`). The two cuBLAS DLLs are NVIDIA's, not part of NInfer:
 they are redistributed under the terms of the NVIDIA CUDA Toolkit EULA (`NVIDIA-CUDA-EULA.txt`,
@@ -74,6 +77,7 @@ API key blank.
 | `ninfer-serve.exe` | the server: OpenAI- and Anthropic-compatible HTTP APIs |
 | `ninfer.exe` | one-shot CLI generation, for smoke tests and scripting |
 | `ninfer_bench.exe` | throughput benchmark against the public Engine route |
+| `ninfer_ggml_quants.dll` | GGML CUDA kernels when `ggml_kernel_dll` is enabled |
 | `download-model.bat` | pinned, resumable artifact downloads with verification |
 | `run.bat` | serving profiles: `run.bat <model> [profile]`, or double-click it to pick a model |
 | `*.dll` | the FFmpeg and libcurl runtime dependencies, and NVIDIA's cuBLAS for the selected CUDA version |

@@ -1,7 +1,11 @@
 # ggml's block-quant kernels (third_party/ggml-quants) behind a plain bridge. They build as their own
 # archive: the ggml headers define CUDA_CHECK and friends, so no NInfer translation unit may see them.
 set(NINFER_GGML_QUANTS_ROOT "${PROJECT_SOURCE_DIR}/third_party/ggml-quants")
-add_library(ninfer_ggml_quants STATIC
+set(_ninfer_ggml_library_type STATIC)
+if(NINFER_WINDOWS_KERNEL_DLL)
+  set(_ninfer_ggml_library_type SHARED)
+endif()
+add_library(ninfer_ggml_quants ${_ninfer_ggml_library_type}
   "${CMAKE_CURRENT_LIST_DIR}/ggml_bridge.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_fattn.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq1_s.cu"
@@ -39,6 +43,12 @@ add_library(ninfer_ggml_quants STATIC
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq1_m.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq4_nl.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq4_xs.cu")
+if(NINFER_WINDOWS_KERNEL_DLL)
+  # The bridge exposes functions and plain value types, with no imported global data or vtables.
+  # No export macro changes CUDA compilation, so the static build's cached objects remain usable.
+  set_target_properties(ninfer_ggml_quants PROPERTIES
+    WINDOWS_EXPORT_ALL_SYMBOLS ON DEFINE_SYMBOL "" POSITION_INDEPENDENT_CODE OFF)
+endif()
 target_include_directories(ninfer_ggml_quants PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}"
   "${NINFER_GGML_QUANTS_ROOT}/include"

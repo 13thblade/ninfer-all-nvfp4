@@ -283,9 +283,11 @@ aggregate caches were saved. The [PTX-pruning retry](https://github.com/iamwavec
 retained all configured machine-code images and linked all three CUDA 12.9 executables. Packaging
 then stopped because the component installer omitted the Toolkit's root `EULA.txt`. The workflow
 now extracts the licence from the exact Toolkit release's official CUDA runtime archive, after
-checking its SHA-256 against NVIDIA's redistribution manifest. CUDA 13.4's benchmark still exceeded
-the linker limit by about 13 MiB; the other two links were not attempted before Ninja stopped.
-Final builds now attempt all three links to expose their separate results.
+checking its SHA-256 against NVIDIA's redistribution manifest. In the
+[complete-link retry](https://github.com/iamwavecut/ninfer-all/actions/runs/39731382003), CUDA 13.4
+exceeded the limit in all three executables: benchmark `80D58000`, CLI `80DCC000`, server `80F92000`
+(hexadecimal image sizes, limit `80000000`). The workflow now links GGML kernels as a separate
+DLL, retaining all GPU targets; this change still needs native linking and startup verification.
 Windows packaging, startup and packaged device-image checks remain unverified. Those checks alone
 do not establish GPU inference correctness or speed.
 
@@ -325,8 +327,8 @@ CUDA APT repository. An unowned system library or unresolved dependency fails pa
 
 **Asset sizes.** Every executable links every device image. Native packages use 1900 MiB archive
 volumes to remain below GitHub's 2 GiB asset limit. This does not remove MSVC's linked-image limit
-or the hosted runner's memory and build-time limits. CUDA 13.4's Windows benchmark still exceeds
-the linker limit after PTX pruning; see the validation record above.
+or the hosted runner's memory and build-time limits. All three CUDA 13.4 Windows executables
+exceeded the linker limit after PTX pruning; see the kernel DLL change and validation record above.
 
 **Smoke-test the launcher default on the real card.** A desktop holding 2-3 GiB of a 24 GB card
 refuses the default DFlash2 profile, both on the engine's runtime reservation and, on Windows, on
