@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -142,6 +144,39 @@ class DependencyTest(unittest.TestCase):
             run.return_value.returncode = 1
             with self.assertRaisesRegex(RuntimeError, 'No Debian package owns'):
                 PACKAGE.runtime_packages(Path('/binary'), {}, Path('/stub'), Path('/cuda'), Path('/bundle'))
+
+
+@unittest.skipUnless(sys.platform.startswith('linux') and shutil.which('patchelf'),
+                     'Requires the Linux ELF loader and patchelf')
+class BackendIsolationTest(unittest.TestCase):
+    def test_installed_toolkit_path_cannot_replace_packaged_dependency(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            backend, ambient = root / 'backend', root / 'toolkit'
+            backend.mkdir()
+            ambient.mkdir()
+            for directory, value in ((backend, 7), (ambient, 9)):
+                source = directory / 'dependency.c'
+                source.write_text(f'int backend_value(void) {{ return {value}; }}\n')
+                subprocess.run(['cc', '-shared', '-fPIC', str(source), '-o',
+                                str(directory / 'libninfer_fixture.so')], check=True)
+            source = root / 'runtime.c'
+            source.write_text('int backend_value(void); int entry(void) { return backend_value(); }\n')
+            runtime = backend / 'libninfer-runtime.so'
+            subprocess.run(['cc', '-shared', '-fPIC', str(source), '-L' + str(backend),
+                            '-lninfer_fixture', '-o', str(runtime)], check=True)
+            PACKAGE.set_backend_rpath(runtime)
+            source = root / 'launcher.c'
+            source.write_text('#include <dlfcn.h>\nint main(int argc, char** argv) {\n'
+                              'void* module = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);\n'
+                              'if (!module) return 100;\n'
+                              'int (*entry)(void) = (int (*)(void))dlsym(module, "entry");\n'
+                              'return entry ? entry() : 101; }\n')
+            launcher = root / 'launcher'
+            subprocess.run(['cc', str(source), '-ldl', '-o', str(launcher)], check=True)
+            result = subprocess.run([str(launcher), str(runtime)],
+                                    env=dict(os.environ, LD_LIBRARY_PATH=str(ambient)), timeout=10)
+            self.assertEqual(result.returncode, 7)
 
 
 if __name__ == '__main__':

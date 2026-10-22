@@ -23,6 +23,11 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def set_backend_rpath(binary):
+    # A user's Toolkit in LD_LIBRARY_PATH must not replace this backend's libraries.
+    run('patchelf', '--force-rpath', '--set-rpath', '$ORIGIN', str(binary))
+
+
 def runtime_packages(binary, env, driver_stub, cuda_root, bundle):
     dependencies = output('ldd', str(binary), env=env)
     if 'not found' in dependencies:
@@ -119,14 +124,14 @@ def main():
         Path(temporary, 'libcuda.so.1').symlink_to(stub)
         env = dict(os.environ, LD_LIBRARY_PATH=f"{temporary}:{cuda_root / 'lib64'}")
         binary = package / runtime
-        run('patchelf', '--set-rpath', '$ORIGIN', str(binary))
+        set_backend_rpath(binary)
         images = output(str(cuda_root / 'bin/cuobjdump'), '--list-elf', str(binary))
         for arch in arches:
             if not re.search(rf'sm_{arch}(?:[.\s_]|$)', images):
                 raise RuntimeError(f'{binary} lacks sm_{arch}')
         packages.update(runtime_packages(binary, env, stub, cuda_root, libraries))
         for library in libraries.glob('*.so*'):
-            run('patchelf', '--set-rpath', '$ORIGIN', str(library))
+            set_backend_rpath(library)
         # Check runtime closure without the installed Toolkit.
         env['LD_LIBRARY_PATH'] = str(temporary)
         dependencies = output('ldd', str(binary), env=env)
