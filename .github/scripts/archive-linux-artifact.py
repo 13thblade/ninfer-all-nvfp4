@@ -56,8 +56,11 @@ def archive(api, manifest, revision, run_id):
 
 
 def main():
-    if os.environ.get("GITHUB_JOB") not in ("linux", "universal-linux") or not os.environ["GITHUB_WORKFLOW_REF"].startswith(
-            "iamwavecut/ninfer-all/.github/workflows/native-release.yml@refs/heads/"):
+    workflow = os.environ.get("GITHUB_WORKFLOW_REF", "").split("@", 1)
+    allowed = ("iamwavecut/ninfer-all/.github/workflows/native-release.yml",
+               "iamwavecut/ninfer-all/.github/workflows/linux-cache-bootstrap.yml")
+    if (len(workflow) != 2 or workflow[0] not in allowed or not workflow[1].startswith("refs/heads/")
+            or os.environ.get("GITHUB_JOB") not in ("linux", "universal-linux")):
         raise ValueError("Only a native Linux artifact job may archive release volumes")
     from huggingface_hub import HfApi
     api = HfApi()

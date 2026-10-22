@@ -216,6 +216,17 @@ class CacheOwnershipTests(unittest.TestCase):
             with patch.dict(os.environ, GITHUB_JOB='windows'):
                 CACHE.require_native_writer('vcpkg-baseline', 'refs/heads/master')
 
+    def test_bootstrap_can_write_only_its_linux_shared_cache(self):
+        env = dict(self.env, GITHUB_EVENT_NAME='workflow_dispatch',
+                   GITHUB_WORKFLOW_REF='iamwavecut/ninfer-all/.github/workflows/linux-cache-bootstrap.yml@refs/heads/build/windows-release')
+        with patch.dict(os.environ, env, clear=True):
+            CACHE.require_native_writer('native-linux-cuda-13.4.3-shared-v1', env['GITHUB_REF'])
+            for family in ('native-linux-cuda-13.4.3-host-v2', 'native-windows-cuda-13.4.3', 'vcpkg-test'):
+                with self.assertRaises(ValueError):
+                    CACHE.require_native_writer(family, env['GITHUB_REF'])
+            with patch.dict(os.environ, GITHUB_EVENT_NAME='push'), self.assertRaises(ValueError):
+                CACHE.require_native_writer('native-linux-cuda-13.4.3-shared-v1', env['GITHUB_REF'])
+
     def test_older_rerun_cannot_replace_newer_native_cache(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

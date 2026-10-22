@@ -7,6 +7,8 @@ on:
       - '.github/scripts/**'
       - '.github/workflows/build-workflow-checks.yml'
       - '.github/workflows/native-windows.yml'
+      - '.github/workflows/native-linux.yml'
+      - '.github/workflows/linux-cache-bootstrap.yml'
       - 'scripts/package-release.ps1'
       - 'scripts/package-linux-release.py'
       - 'scripts/assemble-universal-release.py'

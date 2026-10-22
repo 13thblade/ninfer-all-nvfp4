@@ -27,7 +27,7 @@ floating CUDA tags, checking the current master SHA before each update. Registry
 separate operations: cancellation, a newer commit or registry failure can leave them temporarily
 pointing to different revisions. Use both commit tags when the same revision is required.
 A failed matrix does not promote either tag. Each variant reuses its previous image's inline
-BuildKit cache. Native release alone saves shared compiler caches; CI only reads them.
+BuildKit cache. Native artifact jobs save shared compiler caches; CI only reads them.
 
 The pipeline no longer updates `latest`, `multi`, version-only or `sha-…` tags. Existing registry
 images are not deleted. The old latest-based pruning policy is removed because it cannot retain
@@ -112,13 +112,20 @@ Existing HF snapshots remain available. Windows keeps the original CUDA object c
 
 ## Build caches
 
-For a manual cache bootstrap, select `linux_runner: ninfer-native-debian13`. Register a temporary
-Debian 13 x64 runner with that label and work directory `/__w` before dispatch. It runs the same
-native Linux job without a nested container, using the hosted path `/__w/ninfer-all/ninfer-all`.
-The two CUDA variants run sequentially so each can use the machine's CPUs and the same source path.
+The manual `Linux cache bootstrap` workflow uses the same reusable `native-linux.yml` job as
+Native release. Register two temporary Debian 13 x64 runners with label `ninfer-native-debian13`
+and work directory `/__w` before dispatch. Each machine runs one CUDA variant at the hosted path
+`/__w/ninfer-all/ninfer-all`. Both variants can compile and upload independently. The compiler
+process limit is at most 32 and is reduced for the container's CPU quota, affinity and RAM limit.
 The workflow supplies the existing bucket credential. Keep compiler versions and flags unchanged
-to preserve cache compatibility. Remove the runner registration and rental after verifying the
-archives and HF snapshots. The default remains GitHub-hosted runners in Debian 13 containers.
+to preserve cache compatibility. Remove the runner registrations and rentals after verifying the
+archives and HF snapshots. Native release also accepts `linux_runner: ninfer-native-debian13`;
+its default remains GitHub-hosted runners in Debian 13 containers.
+
+The shared-runtime bootstrap writes `native-linux-cuda-<toolkit>-shared-v1`, leaving any older
+`host-v2` producer running without a conflicting writer. Both artifact workflows serialize writes
+per branch and Toolkit. They restore the existing `host-v2` family when the new family is absent,
+so completed compatible PIC objects remain reusable. This bootstrap does not cancel Windows jobs.
 
 Linux native builds and CUDA CI set `LANG`, `LC_ALL` and `LC_CTYPE` to `C.UTF-8`.
 Ccache hashes these variables separately, even when they select the same effective locale.
@@ -134,8 +141,8 @@ The default `windows_phase: full` builds the shards first.
 Publication requires `platforms: all`. Starting any new native run on the same branch cancels the
 whole previous run, including its other platform. The cleanup wait preserves its completed caches.
 
-Native Windows, Debian and CUDA CI use pinned ccache 4.14.2. Only Native release writes compiler
-and Windows vcpkg snapshots to the private HF bucket `WaveCut/ninfer-cache`, under `github-actions/`.
+Native Windows, Debian and CUDA CI use pinned ccache 4.14.2. Native release and its Linux artifact bootstrap write compiler
+snapshots. Only Native release writes Windows vcpkg snapshots to the private HF bucket `WaveCut/ninfer-cache`, under `github-actions/`.
 `HF_BUILD_CACHE_TOKEN` has read/write access to this bucket only. Native jobs use it for snapshots;
 CI reuses it only in its restore step, by owner decision. The token itself can write, but CI has no
 upload steps, receives no token during compilation, and the save command rejects CI jobs. Existing
@@ -151,7 +158,7 @@ feed back into the production cache. Broader test builds can take longer on a co
 Each native or CI variant has an 8 GiB local compiler-cache limit. This is a capacity limit, not a
 measured working-set size; ccache can evict older objects. Each native platform/toolkit has its own
 family, with separate branch prefixes and two rotating snapshots. CI reads the corresponding
-`native-linux-cuda-<toolkit>-host-v2` family. It takes the latest available verified snapshot without waiting
+`native-linux-cuda-<toolkit>-shared-v1` family. It takes the latest available verified snapshot without waiting
 for an artifact build to finish. It tries its branch, then master; a PR starts from its target branch.
 Source commits are not cache-family boundaries. Missing credentials, unavailable storage or rejected
 snapshots produce a warning and allow a cold CI build. Fork PRs receive no repository secret.

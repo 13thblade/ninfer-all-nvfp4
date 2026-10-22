@@ -208,12 +208,16 @@ def restore(api, directory, family, ref, legacy_prefix=None, required=False, see
 def require_native_writer(family, ref):
     """Reject accidental writes from CI, PRs and retired recovery workflows."""
     workflow = os.environ.get('GITHUB_WORKFLOW_REF', '').split('@')[0]
-    if (workflow != 'iamwavecut/ninfer-all/.github/workflows/native-release.yml' or
+    bootstrap = workflow == 'iamwavecut/ninfer-all/.github/workflows/linux-cache-bootstrap.yml'
+    if ((workflow != 'iamwavecut/ninfer-all/.github/workflows/native-release.yml' and not bootstrap) or
             os.environ.get('GITHUB_EVENT_NAME') not in ('push', 'workflow_dispatch') or
             not ref.startswith('refs/heads/') or
             not os.environ.get('GITHUB_RUN_ID', '').isdecimal()):
         raise ValueError('Only a native artifact build may save shared caches')
     job = os.environ.get('GITHUB_JOB')
+    if bootstrap and (job != 'linux' or not family.startswith('native-linux-cuda-') or
+                      not family.endswith('-shared-v1') or os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'):
+        raise ValueError('Bootstrap may write only the shared Linux artifact cache')
     if not ((job == 'linux' and family.startswith('native-linux-cuda-')) or
             (job == 'windows' and family.startswith(('native-windows-cuda-', 'vcpkg-')))):
         raise ValueError('Cache family does not belong to this native job')
