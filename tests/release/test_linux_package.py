@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -16,6 +17,88 @@ ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('linux_package', ROOT / 'scripts/package-linux-release.py')
 PACKAGE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PACKAGE)
+
+
+def fatbin(payload):
+    return struct.pack('<IHHQ', 0xBA55ED50, 1, 16, len(payload)) + payload
+
+
+def section_listing(offset, size):
+    return f'  [29] .nv_fatbin PROGBITS 0000000001000000 {offset:06x} {size:06x} 00 A 0 0 8\n'
+
+
+class DeviceImagesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.binary = Path(self.tmp.name) / 'runtime.so'
+        self.modules = [fatbin(b'first'), fatbin(b'second module')]
+        self.section = b''.join(module + bytes((-len(module)) % 8) for module in self.modules)
+        self.binary.write_bytes(b'prefix' + self.section + b'unrelated ELF data')
+        self.listing = section_listing(6, len(self.section))
+        self.seen = []
+
+    def output(self, *args):
+        if args[0] == 'readelf':
+            return self.listing
+        self.assertEqual(args[:2], ('cuobjdump', '--list-elf'))
+        self.seen.append(Path(args[2]).read_bytes())
+        return f'ELF file: sm_{75 if len(self.seen) == 1 else "120a"}.cubin'
+
+    def inspect(self):
+        with patch.object(PACKAGE, 'output', self.output):
+            return PACKAGE.device_images(self.binary, Path('cuobjdump'))
+
+    def test_every_module_is_inspected_separately_with_exact_payload(self):
+        images = self.inspect()
+        self.assertEqual(self.seen, self.modules)
+        self.assertIn('sm_75.cubin', images)
+        self.assertIn('sm_120a.cubin', images)
+
+    def test_missing_or_duplicate_section_is_rejected(self):
+        for listing in ('', self.listing * 2):
+            with self.subTest(listing=listing):
+                self.listing = listing
+                with self.assertRaisesRegex(RuntimeError, 'Expected one'):
+                    self.inspect()
+
+    def test_section_outside_file_is_rejected(self):
+        self.listing = section_listing(6, self.binary.stat().st_size)
+        with self.assertRaisesRegex(RuntimeError, 'section bounds'):
+            self.inspect()
+
+    def test_corrupt_headers_payload_and_padding_are_rejected(self):
+        cases = [(b'bad', 'Truncated.*header'),
+                 (bytes(16), 'Invalid.*header'),
+                 (struct.pack('<IHHQ', 0xBA55ED50, 1, 16, 100), 'Truncated.*payload'),
+                 (fatbin(b'a') + b'x' * 7, 'padding'),
+                 (self.section + b'trailing', 'Truncated.*header')]
+        for data, error in cases:
+            with self.subTest(error=error):
+                self.binary.write_bytes(data)
+                self.listing = section_listing(0, len(data))
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self.inspect()
+
+    def test_cuobjdump_failure_is_not_ignored(self):
+        with patch.object(PACKAGE, 'output', side_effect=[self.listing,
+                          subprocess.CalledProcessError(1, 'cuobjdump')]):
+            with self.assertRaises(subprocess.CalledProcessError):
+                PACKAGE.device_images(self.binary, Path('cuobjdump'))
+
+    @unittest.skipUnless(sys.platform.startswith('linux') and shutil.which('cc') and shutil.which('readelf'),
+                         'Requires Linux binutils and a C compiler')
+    def test_real_elf_section_location(self):
+        source = self.binary.with_suffix('.c')
+        data = ','.join(str(byte) for byte in self.section)
+        source.write_text(f'const unsigned char modules[] __attribute__((section(".nv_fatbin"), aligned(8))) = {{{data}}};')
+        subprocess.run(['cc', '-shared', '-fPIC', str(source), '-o', str(self.binary)], check=True)
+        original = PACKAGE.output
+        def output(*args):
+            return original(*args) if args[0] == 'readelf' else self.output(*args)
+        with patch.object(PACKAGE, 'output', output):
+            PACKAGE.device_images(self.binary, Path('cuobjdump'))
+        self.assertEqual(self.seen, self.modules)
 
 
 class LinuxPackageTest(unittest.TestCase):
@@ -38,6 +121,8 @@ class LinuxPackageTest(unittest.TestCase):
                      'portable/backends/cuda13/architectures.txt'):
             (self.build / name).write_text('binary fixture')
         (self.build / 'portable/backends/cuda13/architectures.txt').write_text('75 120a\n')
+        self.module = fatbin(b'fixture device images')
+        (self.build / 'portable/backends/cuda13/libninfer-runtime.so').write_bytes(self.module)
         (self.build / 'CMakeCache.txt').write_text(
             f'CMAKE_CUDA_COMPILER:FILEPATH={self.cuda}/bin/nvcc\n'
             'CMAKE_CUDA_ARCHITECTURES:STRING=75;120a\nNINFER_SHARED_RUNTIME:BOOL=ON\n')
@@ -65,6 +150,8 @@ class LinuxPackageTest(unittest.TestCase):
             self.addCleanup(item.stop)
 
     def output(self, *args, **kwargs):
+        if args[0] == 'readelf':
+            return section_listing(0, len(self.module))
         if args[0] == 'git':
             return 'a' * 40 if 'rev-parse' in args else ''
         if args[0] == 'ldd':

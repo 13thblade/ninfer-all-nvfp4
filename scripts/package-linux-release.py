@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 
@@ -26,6 +27,56 @@ def digest(path):
 def set_backend_rpath(binary):
     # A user's Toolkit in LD_LIBRARY_PATH must not replace this backend's libraries.
     run('patchelf', '--force-rpath', '--set-rpath', '$ORIGIN', str(binary))
+
+
+def device_images(binary, cuobjdump):
+    # The linker concatenates CUDA modules in .nv_fatbin. Inspect one module at a
+    # time to limit cuobjdump's input on runners with less memory than build hosts.
+    sections = output('readelf', '--wide', '--section-headers', str(binary))
+    matches = re.findall(r'^\s*\[\s*\d+\]\s+\.nv_fatbin\s+PROGBITS\s+[0-9a-fA-F]+\s+'
+                         r'([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s', sections, re.MULTILINE)
+    if len(matches) != 1:
+        raise RuntimeError(f'Expected one .nv_fatbin section in {binary}')
+    offset, size = (int(value, 16) for value in matches[0])
+    if size == 0 or offset + size > binary.stat().st_size:
+        raise RuntimeError(f'Invalid .nv_fatbin section bounds in {binary}')
+    images = []
+    count = largest = 0
+    with binary.open('rb') as source, tempfile.TemporaryDirectory(prefix='ninfer-fatbin-') as temporary:
+        source.seek(offset)
+        end = offset + size
+        module = Path(temporary) / 'module.fatbin'
+        while source.tell() < end:
+            position = source.tell()
+            if end - position < 16:
+                raise RuntimeError(f'Truncated CUDA fatbinary header at {position} in {binary}')
+            # NVIDIA fatbinary v1 framing, also emitted by Clang's CUDA driver.
+            magic, version, header_size, payload_size = struct.unpack('<IHHQ', source.read(16))
+            if magic != 0xBA55ED50 or version != 1 or header_size != 16 or payload_size == 0:
+                raise RuntimeError(f'Invalid CUDA fatbinary header at {position} in {binary}')
+            length = header_size + payload_size
+            if position + length > end:
+                raise RuntimeError(f'Truncated CUDA fatbinary payload at {position} in {binary}')
+            source.seek(position)
+            with module.open('wb') as target:
+                remaining = length
+                while remaining:
+                    chunk = source.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise RuntimeError(f'Truncated CUDA fatbinary in {binary}')
+                    target.write(chunk)
+                    remaining -= len(chunk)
+            images.append(output(str(cuobjdump), '--list-elf', str(module)))
+            count += 1
+            largest = max(largest, length)
+            if count % 50 == 0:
+                print(f'Checked {count} CUDA modules ({source.tell() - offset}/{size} bytes)', flush=True)
+            # Input sections have 8-byte alignment; padding is not part of a module.
+            padding = min((-length) % 8, end - source.tell())
+            if source.read(padding) != bytes(padding):
+                raise RuntimeError(f'Invalid CUDA fatbinary padding in {binary}')
+    print(f'Checked {count} CUDA modules; largest {largest} bytes; total {size} bytes', flush=True)
+    return '\n'.join(images)
 
 
 def runtime_packages(binary, env, driver_stub, cuda_root, bundle):
@@ -125,7 +176,7 @@ def main():
         env = dict(os.environ, LD_LIBRARY_PATH=f"{temporary}:{cuda_root / 'lib64'}")
         binary = package / runtime
         set_backend_rpath(binary)
-        images = output(str(cuda_root / 'bin/cuobjdump'), '--list-elf', str(binary))
+        images = device_images(binary, cuda_root / 'bin/cuobjdump')
         for arch in arches:
             if not re.search(rf'sm_{arch}(?:[.\s_]|$)', images):
                 raise RuntimeError(f'{binary} lacks sm_{arch}')
