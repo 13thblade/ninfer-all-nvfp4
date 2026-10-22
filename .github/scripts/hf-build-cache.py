@@ -216,7 +216,7 @@ def require_native_writer(family, ref):
         raise ValueError('Only a native artifact build may save shared caches')
     job = os.environ.get('GITHUB_JOB')
     if bootstrap and (job != 'linux' or not family.startswith('native-linux-cuda-') or
-                      not family.endswith('-shared-v1') or os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'):
+                      not family.endswith('-shared-v1')):
         raise ValueError('Bootstrap may write only the shared Linux artifact cache')
     if not ((job == 'linux' and family.startswith('native-linux-cuda-')) or
             (job == 'windows' and family.startswith(('native-windows-cuda-', 'vcpkg-')))):

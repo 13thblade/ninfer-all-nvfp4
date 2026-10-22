@@ -224,7 +224,7 @@ class CacheOwnershipTests(unittest.TestCase):
             for family in ('native-linux-cuda-13.4.3-host-v2', 'native-windows-cuda-13.4.3', 'vcpkg-test'):
                 with self.assertRaises(ValueError):
                     CACHE.require_native_writer(family, env['GITHUB_REF'])
-            with patch.dict(os.environ, GITHUB_EVENT_NAME='push'), self.assertRaises(ValueError):
+            with patch.dict(os.environ, GITHUB_EVENT_NAME='pull_request'), self.assertRaises(ValueError):
                 CACHE.require_native_writer('native-linux-cuda-13.4.3-shared-v1', env['GITHUB_REF'])
 
     def test_older_rerun_cannot_replace_newer_native_cache(self):
