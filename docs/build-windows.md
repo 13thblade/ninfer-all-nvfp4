@@ -16,8 +16,10 @@ to the build inputs (`scripts/check-host-compile.py`), but that host check build
 The separate `Native release` workflow compiles
 and links the release products for two CUDA versions, checks their device images and tests `--help`
 without the Toolkit on `PATH`. It has no GPU and does not qualify inference or performance.
-The new release workflow has not yet completed a native Windows run. The Windows-only
-DirectStorage option below has not been run.
+The October 22 [dual-CUDA release run](https://github.com/iamwavecut/ninfer-all/actions/runs/39741764110)
+completed native linking, device-image checks, startup checks, archive verification and upload
+for both variants.
+The Windows-only DirectStorage option below has not been run.
 
 MSVC builds delay-load `nvcuda.dll`, so `--help` can run without an NVIDIA driver.
 GPU execution still requires a compatible driver and device.
@@ -154,7 +156,12 @@ Archive names use the platform, CUDA version, GPU architectures and 12-character
 for example `ninfer-windows-x64-cuda13.4-sm75-80-86-89-120a-0123456789ab.7z.001`.
 `VERSION` is retained inside the package as source metadata; it is not part of the archive name.
 
-CUDA 12.9 linked all three executables after PTX pruning. CUDA 13.4 exceeded MSVC's image-size limit
-in all three; the kernel DLL change still needs native verification. Archive splitting addresses
-GitHub's asset limit only. It does not address linker limits. A successful `--help` check does not
-establish GPU correctness or throughput.
+PTX pruning alone left all three CUDA 13.4 executables above MSVC's image-size limit. Moving GGML
+and the shared device-tier probe into the kernel DLL allowed both CUDA variants to link. CUDA 13.4
+executables are about 1.95 GB each and the kernel DLL is 313 MB in the validated build.
+Each executable still statically includes the main CUDA code. This duplicates that code three
+times in the package: the CUDA 13.4 package is 6.73 GB unpacked and 6.37 GB archived. The size is
+primarily the repeated application code, not external runtime libraries. Sharing the remaining
+engine code across executables has not been implemented.
+Archive splitting addresses GitHub's asset limit only. It does not address linker limits.
+A successful `--help` check does not establish GPU correctness or throughput.

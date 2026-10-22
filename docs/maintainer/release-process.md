@@ -287,17 +287,38 @@ checking its SHA-256 against NVIDIA's redistribution manifest. In the
 [complete-link retry](https://github.com/iamwavecut/ninfer-all/actions/runs/39731382003), CUDA 13.4
 exceeded the limit in all three executables: benchmark `80D58000`, CLI `80DCC000`, server `80F92000`
 (hexadecimal image sizes, limit `80000000`). The workflow now links GGML kernels as a separate
-DLL, retaining all GPU targets; this change still needs native linking and startup verification.
+DLL, retaining all GPU targets.
 The [first object-library DLL retry](https://github.com/iamwavecut/ninfer-all/actions/runs/39736621855)
 compiled CUDA 13.4 objects but failed DLL linking with an unresolved `current_device_tier()` call
 from GGML FlashAttention. Its final cache was saved. The device-tier probe and cache now belong
 to that DLL in Windows DLL builds, with both GGML and static Ops using the exported functions.
-The same retry's CUDA 12.9 job found all configured device images in `ninfer.exe`, but Windows
-refused to start it with "not a valid application for this OS platform". Its loader failure is
-unresolved. Packaging now records module sizes and PE headers when `dumpbin` is available so the
-next run can distinguish the image layout from missing dependencies.
-Windows packaging, startup and packaged device-image checks remain unverified. Those checks alone
-do not establish GPU inference correctness or speed.
+The earlier complete-link retry's CUDA 12.9 job found all configured device images in `ninfer.exe`,
+but Windows refused to start it with "not a valid application for this OS platform". The DLL build
+no longer reproduces that failure. Packaging records module sizes and PE headers when `dumpbin`
+is available.
+
+In [run 39741764110](https://github.com/iamwavecut/ninfer-all/actions/runs/39741764110), both variants
+linked all three executables and the kernel DLL. CUDA 13.4 took 96 seconds for the build step,
+with 789 direct cache hits and four misses; CUDA 12.9 took 105 seconds with 763 hits and four
+misses. These timings exclude
+Toolkit installation, cache transfers and packaging. Fixing the compile PDB path preserved
+GGML's cache identity when moving from a static archive to the object library used by the DLL.
+Both variants verified all five configured device images in each module, passed all three
+`--help` checks with only Windows on `PATH`, verified their four-volume archives and uploaded
+them: CUDA 12.9 is 6.29 GB and CUDA 13.4 is 6.37 GB. The uploaded artifact directories and SHA-256
+manifests were read back; no full local download was used. CI is the authority for subsequent
+artifact checks; do not repeat archive downloads or validation outside CI without a concrete
+failure or a user request. GPU inference and performance remain untested by these jobs; no
+release or image was published. The large archive size remains a limitation: all three
+executables statically include the main CUDA code, so only the GGML portion is shared through
+the DLL.
+
+The preceding cancelled CUDA 12.9 job stopped compiler work and then saved its 6.69 GB final
+snapshot in 87 seconds. The replacement run restored that exact snapshot. Completed object
+entries survive cancellation; an unfinished translation unit must compile again. Packaging now
+uses the process monitor with cache writes disabled, reports hashing and startup stages, and
+enables 7-Zip progress output. These diagnostics were added after the validated build's source
+revision and passed the Windows workflow checks.
 
 ## Local packaging
 
