@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/request.h"
 
 #include <cstddef>
 #include <cstdint>

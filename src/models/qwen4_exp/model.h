@@ -18,7 +18,8 @@
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/expert_location.h"
 #include "ninfer/ops/weight_input.h"
-#include "ninfer/types.h"
+#include "ninfer/model_enums.h"
+#include "ninfer/startup.h"
 
 #include <array>
 #include <cstdint>
@@ -91,7 +92,6 @@ struct MtpWeights {
     LayerWeights layer;
     HyperConnectionWeights final_mixer;
 };
-
 
 struct LoadOptions {
     // The artifact's entry file; its part files sit next to it.

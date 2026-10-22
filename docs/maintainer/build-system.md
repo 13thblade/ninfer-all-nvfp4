@@ -291,12 +291,26 @@ or justify combining shape translation units or enabling unity builds.
 
 ## Include boundaries
 
-`include/ninfer/types.h` is the umbrella of the in-tree interface, and `include/ninfer/engine.h`
-includes it. CUDA translation units under `src/` take only the small public headers they need:
-`ninfer/kv_cache_storage.h` (the KV storage formats) and `ninfer/startup.h` (startup progress).
-`scripts/check-include-boundaries.py` fails when a `.cu` under `src/` reaches `ninfer/types.h` or
-`ninfer/engine.h`, and CI runs it. The boundary keeps a change to the Engine options, requests or
-statistics from recompiling the attention and KV-cache kernels.
+The value types of the in-tree interface live in one header per domain under `include/ninfer/`:
+
+| Header | Types |
+|---|---|
+| `base.h` | `TokenId`, shared limits and defaults |
+| `model_enums.h` | Engine purpose, KV capacity mode, speculative drafting, weight residency |
+| `kv_cache_storage.h` | `KvCacheStorage` (`--kv-dtype`) |
+| `startup.h` | startup phases, events and observer |
+| `engine_options.h` | `EngineOptions` and the options it holds |
+| `request.h` | requests, prompts, media, tool calls, streamed output, `GenerationResult` |
+| `observability/execution.h` | per-request timings, speculative counters, materialization diagnostics |
+| `observability/resources.h` | memory and resource summaries |
+| `observability/snapshot.h` | `RuntimeStats`, model metadata and residency, slot state, `LoadSummary` |
+
+`include/ninfer/types.h` lists them, and only `include/ninfer/engine.h` includes it. Other code
+includes the header that defines the types it uses, so a change to one domain recompiles only the
+code of that domain. CUDA translation units under `src/` take only `base.h`, `model_enums.h`,
+`kv_cache_storage.h` and `startup.h`. `scripts/check-include-boundaries.py` fails when a file other
+than `engine.h` includes `ninfer/types.h`, or when a `.cu` under `src/` reaches `engine.h`,
+`engine_options.h`, `request.h` or `observability/`; CI runs it.
 
 ## Consumers and verification
 

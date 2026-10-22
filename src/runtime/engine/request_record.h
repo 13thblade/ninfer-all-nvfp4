@@ -1,7 +1,9 @@
 #pragma once
 
 #include "core/nvtx.h"
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/observability/execution.h"
+#include "ninfer/request.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/admission_policy.h"

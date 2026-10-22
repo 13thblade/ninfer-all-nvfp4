@@ -1142,6 +1142,6 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive 
 | State stores | `src/models/qwen3_5/program/storage/state_store.h` |
 | logical KV/address spaces | `src/models/qwen3_5/program/storage/kv_store.h` |
 | Host KV extents | `src/models/qwen3_5/program/storage/host_kv_store.h` |
-| public capacity options | `include/ninfer/types.h` |
+| public capacity options | `include/ninfer/engine_options.h` |
 
 路径用于定位当前实现，不改变本文定义的所有权边界。

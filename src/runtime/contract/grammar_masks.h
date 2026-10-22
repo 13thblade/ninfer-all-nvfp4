@@ -10,7 +10,7 @@
 // columns fill in parallel (GrammarState::fill_masks) while the verification runs, which hides a few
 // milliseconds per column. A request whose masks cost more decodes without drafts.
 
-#include "ninfer/types.h"
+#include "ninfer/base.h"
 #include "text/structured_output.h"
 
 #include <atomic>

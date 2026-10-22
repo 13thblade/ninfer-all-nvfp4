@@ -1,6 +1,7 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/observability/snapshot.h"
+#include "ninfer/startup.h"
 
 #include <memory>
 

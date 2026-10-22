@@ -3,8 +3,6 @@
 // --kv-resident, which ninfer, ninfer-serve and ninfer-perplexity share: how much of each
 // Qwen3.8-Flash-Next sparse-attention layer's KV stays in device memory.
 
-#include "ninfer/types.h"
-
 #include <charconv>
 #include <cstdint>
 #include <optional>

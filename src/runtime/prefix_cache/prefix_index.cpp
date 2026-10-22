@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <functional>
 #include <stdexcept>
+#include <utility>
 
 namespace ninfer::runtime::prefix_cache {
 namespace {

@@ -11,6 +11,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #ifdef _WIN32
 #    ifndef _WIN32_WINNT

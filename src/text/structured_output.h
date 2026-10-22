@@ -1,5 +1,6 @@
 #pragma once
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/request.h"
 #include <cstdint>
 #include <memory>
 #include <span>

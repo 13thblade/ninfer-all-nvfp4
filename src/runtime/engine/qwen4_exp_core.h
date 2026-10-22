@@ -17,7 +17,10 @@
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen4_exp/executor.h"
 #include "models/qwen4_exp/model.h"
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/observability/resources.h"
+#include "ninfer/observability/snapshot.h"
+#include "ninfer/request.h"
 #include "runtime/contract/request.h"
 
 #include <chrono>

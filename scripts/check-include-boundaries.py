@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Include boundaries of the public interface.
 
-CUDA translation units under src/ must not reach the Engine-level headers: a change to the Engine
-options, requests or statistics would otherwise recompile the kernels. The kernels take what they
-need from the small headers (ninfer/kv_cache_storage.h, ninfer/startup.h).
+- Only include/ninfer/engine.h includes the umbrella ninfer/types.h. Other code includes the
+  header that defines the types it uses, so a change to one domain recompiles only its users.
+- CUDA translation units under src/ do not reach the Engine-level headers: a change to the Engine
+  options, requests or statistics would otherwise recompile the kernels. The kernels take what
+  they need from the small headers (ninfer/base.h, ninfer/model_enums.h,
+  ninfer/kv_cache_storage.h, ninfer/startup.h).
 
 The check reads #include lines as text and resolves them against the include directories the build
 uses, so an include inside an #if counts.
@@ -14,8 +17,17 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INCLUDE_DIRS = ['include', 'src', 'tests', 'bench', 'third_party']
+SOURCE_DIRS = ['include', 'src', 'apps', 'tests', 'bench', 'tools']
+SOURCE_SUFFIXES = ('.h', '.hpp', '.cuh', '.inl', '.cpp', '.cc', '.cu')
+UMBRELLA = 'include/ninfer/types.h'
+UMBRELLA_OWNER = 'include/ninfer/engine.h'
 ENGINE_LEVEL = {
     'include/ninfer/engine.h',
+    'include/ninfer/engine_options.h',
+    'include/ninfer/observability/execution.h',
+    'include/ninfer/observability/resources.h',
+    'include/ninfer/observability/snapshot.h',
+    'include/ninfer/request.h',
     'include/ninfer/types.h',
 }
 INCLUDE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.M)
@@ -61,6 +73,14 @@ def chain_to(start, targets, memo, cache):
 
 def main():
     memo, cache, failures = {}, set(), []
+    for top in SOURCE_DIRS:
+        for directory, _, names in os.walk(os.path.join(ROOT, top)):
+            for name in sorted(names):
+                if not name.endswith(SOURCE_SUFFIXES):
+                    continue
+                source = os.path.relpath(os.path.join(directory, name), ROOT)
+                if source != UMBRELLA_OWNER and UMBRELLA in includes(source, memo, cache):
+                    failures.append(f'{source} includes {UMBRELLA}; include the defining headers')
     for directory, _, names in os.walk(os.path.join(ROOT, 'src')):
         for name in sorted(names):
             if not name.endswith('.cu'):
@@ -72,7 +92,7 @@ def main():
     for failure in failures:
         print(failure)
     if failures:
-        print(f'{len(failures)} CUDA translation unit(s) reach Engine-level headers', file=sys.stderr)
+        print(f'{len(failures)} include boundary violation(s)', file=sys.stderr)
         return 1
     return 0
 

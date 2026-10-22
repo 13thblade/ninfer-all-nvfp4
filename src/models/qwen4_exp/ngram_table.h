@@ -10,7 +10,8 @@
 
 #include "core/file_read_queue.h"
 #include "models/qwen4_exp/read_pool.h"
-#include "ninfer/types.h"
+#include "ninfer/model_enums.h"
+#include "ninfer/observability/resources.h"
 
 #include <array>
 #include <atomic>

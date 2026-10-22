@@ -4,7 +4,7 @@
 // <channel|>` and tool calls `<|tool_call>call:NAME{key:value,...}<tool_call|>`, whose strings are
 // delimited by `<|"|>`.
 
-#include "ninfer/types.h"
+#include "ninfer/request.h"
 
 #include <cstddef>
 #include <cstdint>

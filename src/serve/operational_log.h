@@ -1,6 +1,7 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/observability/snapshot.h"
 #include "serve/request_events.h"
 
 #include <cstdint>

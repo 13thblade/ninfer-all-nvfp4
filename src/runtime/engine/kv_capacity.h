@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ninfer/engine_options.h"
 #include "runtime/contract/resources.h"
 
 #include <cstddef>

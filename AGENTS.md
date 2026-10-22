@@ -223,7 +223,7 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 | Artifact, layout, codec, conversion, or model mathematics | model/artifact references and conversion guide linked from `docs/README.md` |
 | Op contracts, implementation ownership, numerical/performance qualification | `docs/maintainer/op-development.md` |
 | Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `docs/performance.md` |
-| In-tree C++ interface | `include/ninfer/engine.h`, `include/ninfer/types.h` |
+| In-tree C++ interface | `include/ninfer/engine.h`; types in the headers `include/ninfer/types.h` lists |
 
 [Documentation map](docs/README.md) routes to narrower authorities when needed.
 

@@ -2,6 +2,7 @@
 
 // OpenAI wire objects shared by Chat Completions and Responses HTTP handlers.
 
+#include "ninfer/observability/snapshot.h"
 #include "serve/request.h"
 #include "serve/request_json.h"
 

@@ -1,6 +1,10 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/kv_cache_storage.h"
+#include "ninfer/model_enums.h"
+#include "ninfer/request.h"
 #include "product/logging/logging.h"
 #include "serve/request.h"
 

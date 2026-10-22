@@ -1,6 +1,8 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/observability/resources.h"
+#include "ninfer/request.h"
 #include "models/qwen3_5/ngram.h"
 #include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/frontend/output_session.h"

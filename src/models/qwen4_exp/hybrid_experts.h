@@ -5,7 +5,7 @@
 #include "models/expert_profile.h"
 #include "ninfer/ops/moe_expert_cpu.h"
 #include "ninfer/ops/moe_experts.h"
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
 
 #include <cstdint>
 #include <functional>

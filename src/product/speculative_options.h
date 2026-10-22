@@ -1,6 +1,7 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/model_enums.h"
 
 #include <cmath>
 #include <stdexcept>

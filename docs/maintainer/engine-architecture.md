@@ -645,8 +645,11 @@ checkpoint catalog。
 
 这些路径用于定位当前 authority，不把文件拆分固化为外部接口。
 
-`include/ninfer/engine.h` 与 `include/ninfer/types.h` 是 in-tree application 使用的 opaque Engine
-interface 和 owning host values；NInfer 当前不安装或导出 C++ SDK。`include/ninfer/ops/` 是
+`include/ninfer/engine.h` 是 in-tree application 使用的 opaque Engine interface；owning host values
+按领域分布在 `include/ninfer/` 的头文件中：`base.h`、`model_enums.h`、`kv_cache_storage.h`、
+`startup.h`、`engine_options.h`、`request.h` 与 `observability/{execution,resources,snapshot}.h`。
+`types.h` 汇总这些头文件，只有 `engine.h` 包含它；其他代码包含定义所用类型的头文件。NInfer 当前不
+安装或导出 C++ SDK。`include/ninfer/ops/` 是
 repository-internal semantic Op contracts。`.ninfer` 是唯一 C++ 产品 artifact，不通过扩展名检测、
 兼容 shim 或第二套产品入口加载其他格式。CLI、server 和 inference benchmark 只通过公共 Engine
 推理；converter 不提供 Python model-inference route。

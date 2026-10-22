@@ -4,7 +4,8 @@
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/model_enums.h"
 
 #include <array>
 #include <cstddef>
