@@ -182,7 +182,7 @@ jobs:
           if ('${{ inputs.phase }}' -eq 'objects') {
             $build = @('python', '.github/scripts/build-object-shard.py', '--shard', '${{ inputs.shard }}', '--count', '${{ inputs.count }}', '--jobs', '2')
           } else {
-            $build = @('cmake', '--build', 'build-release', '-j', '2', '--target', 'ninfer', 'ninfer-serve', 'ninfer_bench')
+            $build = @('cmake', '--build', 'build-release', '-j', '2', '--target', 'ninfer', 'ninfer-serve', 'ninfer_bench', '--', '-k', '0')
           }
           python .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- @build
           if ($LASTEXITCODE -ne 0) { throw 'Release compilation failed' }
