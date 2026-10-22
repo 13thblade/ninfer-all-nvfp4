@@ -19,7 +19,7 @@ def digest(path):
 
 def archive(api, manifest, revision, run_id):
     name = manifest.name.removeprefix("SHA256SUMS-").removesuffix(".txt")
-    if not re.fullmatch(r"ninfer-linux-x64-cuda[0-9.]+-sm[0-9a-]+-[0-9a-f]{12}", name):
+    if not re.fullmatch(r"ninfer-linux-x64-cuda(?:[0-9.]+-sm[0-9a-]+|12\.9-13\.4)-[0-9a-f]{12}", name):
         raise ValueError("Unexpected Linux artifact name")
     metadata = manifest.parent / name / "BUILD-INFO.json"
     info = json.loads(metadata.read_text())
@@ -56,7 +56,7 @@ def archive(api, manifest, revision, run_id):
 
 
 def main():
-    if os.environ.get("GITHUB_JOB") != "linux" or not os.environ["GITHUB_WORKFLOW_REF"].startswith(
+    if os.environ.get("GITHUB_JOB") not in ("linux", "universal-linux") or not os.environ["GITHUB_WORKFLOW_REF"].startswith(
             "iamwavecut/ninfer-all/.github/workflows/native-release.yml@refs/heads/"):
         raise ValueError("Only a native Linux artifact job may archive release volumes")
     from huggingface_hub import HfApi

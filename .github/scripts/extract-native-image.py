@@ -61,7 +61,7 @@ def extract(source, destination, revision, cuda):
     info = json.loads((root / "BUILD-INFO.json").read_text())
     if (info["source_revision"] != revision or info["modified_sources"]
             or info["cuda"] != cuda or info["platform"] != "linux-x64"
-            or info["architectures"] != architectures):
+            or info["architectures"] != architectures or info.get("layout") != "shared-runtime-v1"):
         raise ValueError("Archive metadata does not match the requested source and variant")
     for line in (root / "SHA256SUMS.txt").read_text().splitlines():
         digest, relative = line.split("  ", 1)
@@ -71,7 +71,12 @@ def extract(source, destination, revision, cuda):
         with path.open("rb") as stream:
             if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
                 raise ValueError(f"Packaged file checksum mismatch: {relative}")
-    for required in ("Dockerfile", "bin/multi/ninfer-multicall", "packages/multi.txt"):
+    commands = ('ninfer', 'ninfer-serve', 'ninfer_bench', 'ninfer-calibrate',
+                'ninfer-perplexity', 'ninfer-ngram-profile')
+    for required in ("Dockerfile", "packages/multi.txt", *commands,
+                     *(f"help/{command}.txt" for command in commands),
+                     f"backends/cuda{cuda.split('.')[0]}/libninfer-runtime.so",
+                     f"backends/cuda{cuda.split('.')[0]}/architectures.txt"):
         if not (root / required).is_file():
             raise ValueError(f"Missing Docker input: {required}")
     return root

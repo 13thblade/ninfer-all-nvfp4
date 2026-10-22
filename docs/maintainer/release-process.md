@@ -19,7 +19,7 @@ The reusable workflow downloads artifacts from that run and checks out its exact
 no dispatch token or separate workflow-completion event. The parent workflow's concurrency group
 cancels obsolete builds and their Docker jobs together.
 The handoff verifies volume checksums, packaged files, full source revision, CUDA version and the
-complete architecture list. Each image keeps all its device images in one multicall executable.
+complete architecture list. Each image keeps its device images in the shared backend runtime.
 `commit12` is the first 12 hexadecimal characters of the source SHA; `VERSION` is not a tag.
 
 The matrix publishes commit tags first. Only after both jobs succeed does promotion update the
@@ -59,8 +59,9 @@ function bodies. `BUILD-INFO.json` records the patch. The pre-build probe compil
 through both host C++ and nvcc before testing cache reuse.
 Compilation needs no GPU. Driver installation is not part of either build.
 
-1. Compile release products. Linux uses the multicall executable to share device images between
-   commands; `ninfer_bench` remains a separate executable.
+1. Compile release products with `NINFER_SHARED_RUNTIME=ON`. Six small command executables load
+   one private runtime per CUDA family. Windows also keeps GGML in its existing kernel DLL.
+   Component archives remain the compile owners. Linux compiles them as PIC for the shared runtime.
 2. Check every requested architecture with `cuobjdump`. Run executable `--help` checks.
    Windows clears developer directories from `PATH`. Linux checks the dynamic library closure
    and uses a temporary CUDA driver stub, which is never packaged.
@@ -70,9 +71,12 @@ Compilation needs no GPU. Driver installation is not part of either build.
 4. Test the archives and split them into volumes no larger than 1900 MiB. Keep Actions artifacts
    for seven days. Names are `ninfer-<os>-x64-cuda<major.minor>-sm<arches>-<commit12>`;
    `VERSION` remains metadata inside the archive and does not affect its name.
-5. After all four builds pass, validate all local manifests, create draft `native-<commit12>`,
+5. Assemble one universal package per OS from the two verified single-CUDA archives. Require matching
+   source revisions, command sets, metadata and checksums. No compilation occurs in these jobs.
+   Universal names are `ninfer-<os>-x64-cuda12.9-13.4-<commit12>`. Docker continues to use single-CUDA archives.
+6. After all four builds and both assembly jobs pass, validate all six manifests, create draft `native-<commit12>`,
    upload assets, and compare their remote SHA-256 digests and sizes.
-6. Publish and mark latest only if the source is still the head of `master`. Superseded builds
+7. Publish and mark latest only if the source is still the head of `master`. Superseded builds
    retain their Actions artifacts or the draft created before a newer commit arrived.
 
 Published snapshots are immutable. A retry can repair only the same commit's unfinished draft.
@@ -82,6 +86,29 @@ Feature branches run only through manual dispatch and cannot publish. Build jobs
 access; only the publication job receives `contents: write`. The master cancellation coordinator
 also cancels older container publishers. Closing a PR cancels that PR's remaining runs.
 A superseded upload can leave an unpublished draft; it cannot replace the current release.
+
+## Portable runtime boundary
+
+`cmake/NinferRuntime.cmake` links the command objects and their static component dependencies into
+`ninfer-runtime.dll` or `libninfer-runtime.so`. The private C boundary exposes command dispatch and
+a build-ID check. It exports no C++ SDK. Allocation, Engine objects and exceptions stay inside the
+runtime. Existing CUDA compile owners remain intact. No whole-archive linkage is used.
+
+The launcher imports no CUDA library. It reads the selected device ordinals through the Driver API,
+then checks the available backend's generated `architectures.txt` and minimum Driver API family.
+CUDA 12 requires API 12.0 and CUDA 13 requires API 13.0. Selection prefers CUDA 13 on overlapping
+architectures. `--cuda-backend auto|12|13` overrides the choice. The launcher never loads a second
+backend after the first one fails. One process cannot mix a Volta-only and Blackwell-only backend.
+Router mode reads the existing model catalog and checks the union of its GPU ordinals, respecting
+command-line precedence over presets. The n-gram profiler is a CPU command and does not query GPU
+compatibility. Persisted prefix caches identify the module that owns inference code, including its
+backend directory, file size and modification time, rather than the small launcher.
+
+The packagers capture real command help into `help/`. Shipped `--help` and `--version` need no
+backend or driver. CI validates architecture images in the runtime modules, dependency closure,
+startup and archive contents. These checks do not qualify GPU execution or performance.
+The shared runtime changes Linux archives to PIC, so affected objects need an initial rebuild.
+Existing HF snapshots remain available. Windows keeps the original CUDA object compile owners.
 
 ## Build caches
 
@@ -114,8 +141,8 @@ CI reuses it only in its restore step, by owner decision. The token itself can w
 upload steps, receives no token during compilation, and the save command rejects CI jobs. Existing
 pod caches and model files use separate prefixes and are not changed. The client is pinned to `huggingface_hub==1.17.0`.
 
-CI uses Debian 13, the same official Toolkit installation, pinned ccache, Release flags, multicall
-setting, architecture sets and `build-release` directory as the Linux artifact build. The shared
+CI uses Debian 13, the same official Toolkit installation, pinned ccache, Release flags, shared-runtime/PIC
+settings, architecture sets and `build-release` directory as the Linux artifact build. The shared
 configure script enables additional test targets for CI. Both CUDA variants compile all targets;
 CTest runs without a GPU and device tests skip. Windows host checks also use the two complete
 architecture sets. Test-only objects compile locally and are discarded after CI; they do not
@@ -369,6 +396,6 @@ confirm it serves a request.
 
 - `scripts/check-linux-scripts.sh` passes.
 - Every package: files match the inner `SHA256SUMS.txt`, and the outer checksum manifest verifies.
-- Windows: all three executables start with only Windows on `PATH`.
+- Windows: all six command executables start with only Windows on `PATH`.
 - Linux: a fresh unpack runs `./ninfer-serve --help` and `./run.sh --help`.
 - The default launcher profile starts and serves a chat completion on a real 24 GB card.

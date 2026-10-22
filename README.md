@@ -52,7 +52,15 @@ how to make one.
 NVIDIA GPUs from Volta (compute capability 7.0) to consumer Blackwell (12.0), from 8 GB of memory:
 Ternary Bonsai 2 27B runs on an 8 GB RTX 3060 Ti, and Qwen3.8-Flash-Next streams its experts from
 host memory or disk through 8 GB. The two [Docker images](#docker) each contain all NInfer targets
-for their CUDA version in one executable: CUDA 12.9 includes Volta, and CUDA 13.4 includes Blackwell.
+for their CUDA version in a shared runtime: CUDA 12.9 includes Volta, and CUDA 13.4 includes Blackwell.
+The native release pipeline also assembles a portable Windows or Linux package with **both** CUDA
+backends: `ninfer-<os>-x64-cuda12.9-13.4-<commit12>`. Its small command executables share one
+runtime per CUDA family. The launcher selects CUDA 12 for Volta, CUDA 13 for consumer Blackwell,
+and prefers CUDA 13 on overlapping targets when the driver supports it. All selected `--devices`
+must fit one backend. Use `--cuda-backend auto|12|13` to select it explicitly. No CUDA Toolkit
+installation is needed. Keep `backends/` and `help/` beside the executables. Linux also needs the
+recorded Debian system libraries. `--help` and `--version` do not load CUDA.
+
 Every card by name, with what has run on it:
 [Supported GPUs](docs/gpus.md).
 

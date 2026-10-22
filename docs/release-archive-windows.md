@@ -1,7 +1,6 @@
 # NInfer for Windows — release archive
 
-This is the README that ships **inside** the Windows release archive, where every file sits in one
-directory. If you are reading it in a checkout instead, the launchers and downloaders it names live
+This is the README that ships **inside** the Windows release archive, with command executables at its root and CUDA libraries in backend subdirectories. If you are reading it in a checkout instead, the launchers and downloaders it names live
 under `scripts/`, and
 [docs/build-windows.md](https://github.com/iamwavecut/ninfer-all/blob/master/docs/build-windows.md)
 is the fuller guide. Links here are absolute on purpose: the archive ships no `docs/` directory.
@@ -9,8 +8,8 @@ is the fuller guide. Links here are absolute on purpose: the archive ships no `d
 Check `BUILD-INFO.json` for the exact source commit, CUDA version and device images.
 `VERSION` records the source snapshot's version field. Matching `RELEASE_NOTES_*.md` are included when present.
 
-Download **all** `.7z.*` volumes for one CUDA variant into the same directory. Use 7-Zip to extract
-`.7z.001`. Keep CUDA 12 and CUDA 13 packages in separate directories. The outer `SHA256SUMS-*.txt`
+Download **all** `.7z.*` volumes for one package into the same directory. Use 7-Zip to extract
+`.7z.001`. The `cuda12.9-13.4` package contains both backends. Do not flatten or merge their subdirectories. The outer `SHA256SUMS-*.txt`
 checks the downloaded volumes. The inner `SHA256SUMS.txt` checks the extracted files.
 
 ## Requirements
@@ -26,15 +25,25 @@ checks the downloaded volumes. The inner `SHA256SUMS.txt` checks the extracted f
 Everything else is in the archive: the FFmpeg and libcurl DLLs, and NVIDIA's cuBLAS runtime
 (`cublas64_12.dll` and `cublasLt64_12.dll`, or their CUDA 13 counterparts). You do **not** need the CUDA Toolkit installed.
 Packages built with `ggml_kernel_dll: true` in `BUILD-INFO.json` also require the included
-`ninfer_ggml_quants.dll`. Keep it beside the executables; it contains NInfer's GGML CUDA kernels
+`ninfer_ggml_quants.dll`. Keep it in its backend directory; it contains NInfer's GGML CUDA kernels
 for the package's full architecture set.
 
 **Licensing.** NInfer is Apache-2.0 (`LICENSE`). The two cuBLAS DLLs are NVIDIA's, not part of NInfer:
-they are redistributed under the terms of the NVIDIA CUDA Toolkit EULA (`NVIDIA-CUDA-EULA.txt`,
+they are redistributed under the terms of the NVIDIA CUDA Toolkit EULA (`backends/cuda12/NVIDIA-CUDA-EULA.txt` or `backends/cuda13/NVIDIA-CUDA-EULA.txt`,
 Attachment A), for use only with the NInfer executables in this folder, and they are not covered by the
 Apache licence.
 
 Model artifacts are **not** included — they are 17–21 GB each. The downloaders below fetch them.
+
+## Backend selection
+
+The universal package selects CUDA 12 for Volta and CUDA 13 for consumer Blackwell. On overlapping
+architectures it prefers CUDA 13 when the driver supports it, otherwise CUDA 12. Use
+`--cuda-backend auto|12|13` to override the choice. The minimum Driver API family is 12.0 or 13.0,
+respectively. Admission does not establish GPU correctness on every driver release.
+All devices in one process must fit the same backend. Keep `backends/` and `help/` beside the EXEs.
+`--help` and `--version` run without an NVIDIA driver. Each command loads the same private runtime
+DLL for its selected CUDA family. It does not load both families into one process.
 
 ## Quick start
 
@@ -77,12 +86,15 @@ API key blank.
 | `ninfer-serve.exe` | the server: OpenAI- and Anthropic-compatible HTTP APIs |
 | `ninfer.exe` | one-shot CLI generation, for smoke tests and scripting |
 | `ninfer_bench.exe` | throughput benchmark against the public Engine route |
-| `ninfer_ggml_quants.dll` | GGML CUDA kernels when `ggml_kernel_dll` is enabled |
+| `backends/cuda*/ninfer_ggml_quants.dll` | GGML CUDA kernels when `ggml_kernel_dll` is enabled |
+| `backends/cuda*/ninfer-runtime.dll` | shared Engine and command implementations |
+| `help/*.txt` | command help without loading CUDA |
+| `ninfer-calibrate.exe`, `ninfer-perplexity.exe`, `ninfer-ngram-profile.exe` | calibration, scoring and n-gram tools |
 | `download-model.bat` | pinned, resumable artifact downloads with verification |
 | `run.bat` | serving profiles: `run.bat <model> [profile]`, or double-click it to pick a model |
-| `*.dll` | the FFmpeg and libcurl runtime dependencies, and NVIDIA's cuBLAS for the selected CUDA version |
-| `NVIDIA-CUDA-EULA.txt` | the licence under which the two cuBLAS DLLs are redistributed |
-| `SHA256SUMS.txt` | checksums for every other file in this directory |
+| `backends/cuda*/*.dll` | the FFmpeg and libcurl runtime dependencies, and NVIDIA's cuBLAS for the selected CUDA version |
+| `backends/cuda*/NVIDIA-CUDA-EULA.txt` | the licence under which the two cuBLAS DLLs are redistributed |
+| `SHA256SUMS.txt` | checksums for the package files, including subdirectories |
 | `BUILD-INFO.json` | source, Toolkit, device images and validation scope |
 | `LICENSE-*.txt` | dependency notices from vcpkg |
 

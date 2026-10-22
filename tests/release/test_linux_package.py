@@ -24,17 +24,21 @@ class LinuxPackageTest(unittest.TestCase):
         self.repo = self.root / 'repo'
         self.cuda = self.root / 'cuda'
         self.build = self.repo / 'build'
-        for directory in ('scripts', 'docs', 'docker', 'build/apps', 'build/bench'):
+        for directory in ('scripts', 'docs', 'docker', 'build/portable/backends/cuda13',):
             (self.repo / directory).mkdir(parents=True)
         for directory in ('bin', 'lib64/stubs'):
             (self.cuda / directory).mkdir(parents=True)
         for name in ('bin/nvcc', 'lib64/stubs/libcuda.so', 'EULA.txt'):
             (self.cuda / name).write_text('fixture')
-        for name in ('apps/ninfer-multicall', 'bench/ninfer_bench'):
+        for name in ('portable/ninfer', 'portable/ninfer-serve', 'portable/ninfer_bench',
+                     'portable/ninfer-calibrate', 'portable/ninfer-perplexity', 'portable/ninfer-ngram-profile',
+                     'portable/backends/cuda13/libninfer-runtime.so',
+                     'portable/backends/cuda13/architectures.txt'):
             (self.build / name).write_text('binary fixture')
+        (self.build / 'portable/backends/cuda13/architectures.txt').write_text('75 120a\n')
         (self.build / 'CMakeCache.txt').write_text(
             f'CMAKE_CUDA_COMPILER:FILEPATH={self.cuda}/bin/nvcc\n'
-            'CMAKE_CUDA_ARCHITECTURES:STRING=75;120a\nNINFER_MULTICALL:BOOL=ON\n')
+            'CMAKE_CUDA_ARCHITECTURES:STRING=75;120a\nNINFER_SHARED_RUNTIME:BOOL=ON\n')
         for name in ('LICENSE', 'RELEASE_NOTES_0.0.md', 'docs/release-archive-linux.md',
                      'scripts/run.sh', 'scripts/download-model.sh'):
             (self.repo / name).write_text('fixture')
@@ -69,12 +73,16 @@ class LinuxPackageTest(unittest.TestCase):
             return 'Cuda compilation tools, release 13.4, V13.4.92'
         if args[0].endswith('/cuobjdump'):
             return self.images
+        if args[-1] in ('--help', '--version'):
+            if self.help_failure:
+                raise RuntimeError('fixture startup failure')
+            return 'fixture help'
         raise AssertionError(args)
 
     def run_command(self, *args, **kwargs):
         if args[0] in ('strip', 'patchelf'):
             return
-        if args[-1] == '--help':
+        if args[-1] in ('--help', '--version'):
             if self.help_failure:
                 raise RuntimeError('fixture startup failure')
             self.assertTrue(Path(args[0]).is_file())
@@ -93,8 +101,8 @@ class LinuxPackageTest(unittest.TestCase):
             names = archive.getnames()
             self.assertFalse(any('libcuda.so' in name for name in names))
             prefix = names[0]
-            self.assertTrue(archive.getmember(prefix + '/ninfer').issym())
-            self.assertTrue(archive.getmember(prefix + '/bin/multi/ninfer').issym())
+            self.assertTrue(archive.getmember(prefix + '/ninfer').isfile())
+            self.assertTrue(archive.getmember(prefix + '/backends/cuda13/libninfer-runtime.so').isfile())
             self.assertIn(prefix + '/Dockerfile', names)
             info = json.load(archive.extractfile(prefix + '/BUILD-INFO.json'))
             self.assertEqual(info['architectures'], ['75', '120a'])

@@ -166,7 +166,7 @@ jobs:
             "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
-            -DNINFER_NVCC_SPLIT_COMPILE=2 -DNINFER_CUDA_PRUNE_PTX=ON -DNINFER_WINDOWS_KERNEL_DLL=ON `
+            -DNINFER_NVCC_SPLIT_COMPILE=2 -DNINFER_CUDA_PRUNE_PTX=ON -DNINFER_WINDOWS_KERNEL_DLL=ON -DNINFER_SHARED_RUNTIME=ON `
             -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
       # Keep completed vcpkg packages even if configuration or NInfer compilation fails.
@@ -188,7 +188,7 @@ jobs:
           if ('${{ inputs.phase }}' -eq 'objects') {
             $build = @('python', '.github/scripts/build-object-shard.py', '--shard', '${{ inputs.shard }}', '--count', '${{ inputs.count }}', '--jobs', '2')
           } else {
-            $build = @('cmake', '--build', 'build-release', '-j', '2', '--target', 'ninfer', 'ninfer-serve', 'ninfer_bench', '--', '-k', '0')
+            $build = @('cmake', '--build', 'build-release', '-j', '2', '--target', 'ninfer', 'ninfer-serve', 'ninfer_bench', 'ninfer-calibrate', 'ninfer-perplexity', 'ninfer-ngram-profile', '--', '-k', '0')
           }
           python .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- @build
           if ($LASTEXITCODE -ne 0) { throw 'Release compilation failed' }
@@ -233,4 +233,3 @@ jobs:
             dist/*/BUILD-INFO.json
           if-no-files-found: ignore
           retention-days: 7
-

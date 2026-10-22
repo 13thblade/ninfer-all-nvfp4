@@ -10,7 +10,7 @@ import unittest
 SCRIPT = Path(__file__).resolve().parents[2] / '.github/scripts/publish-native-release.sh'
 SHA = 'a' * 40
 VARIANTS = tuple(f'{os}-x64-{cuda}' for os in ('windows', 'linux')
-                 for cuda in ('cuda12.9-sm70-75-80-86-89', 'cuda13.4-sm75-80-86-89-120a'))
+                 for cuda in ('cuda12.9-sm70-75-80-86-89', 'cuda13.4-sm75-80-86-89-120a', 'cuda12.9-13.4'))
 
 GH = r'''#!/usr/bin/env python3.11
 import hashlib, json, os, pathlib, sys

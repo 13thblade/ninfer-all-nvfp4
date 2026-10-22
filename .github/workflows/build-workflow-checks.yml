@@ -8,6 +8,11 @@ on:
       - '.github/workflows/build-workflow-checks.yml'
       - '.github/workflows/native-windows.yml'
       - 'scripts/package-release.ps1'
+      - 'scripts/package-linux-release.py'
+      - 'scripts/assemble-universal-release.py'
+      - 'apps/launcher/**'
+      - 'cmake/NinferRuntime.cmake'
+      - 'cmake/runtime_dispatch.cpp.in'
       - 'tests/release/**'
   workflow_call:
   workflow_dispatch:
@@ -41,3 +46,4 @@ jobs:
           if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
       - run: python -m unittest discover -s tests/release -p test_build_lifecycle.py -v
       - run: python -m unittest discover -s tests/release -p test_windows_kernel_dll.py -v
+      - run: python -m unittest discover -s tests/release -p test_portable_runtime.py -v

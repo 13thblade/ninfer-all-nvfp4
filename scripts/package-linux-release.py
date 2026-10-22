@@ -72,15 +72,21 @@ def main():
     name = f"ninfer-linux-x64-cuda{cuda}-sm{'-'.join(arches)}-{revision[:12]}"
     if modified:
         name += '-dirty'
-    multicall = cache.get('NINFER_MULTICALL') == 'ON'
-    products = {'ninfer_bench': build / 'bench/ninfer_bench'}
-    if multicall:
-        products['ninfer-multicall'] = build / 'apps/ninfer-multicall'
-    else:
-        products.update({p: build / 'apps' / p for p in ('ninfer', 'ninfer-serve')})
+    if cache.get('NINFER_SHARED_RUNTIME') != 'ON':
+        raise RuntimeError('Native releases require NINFER_SHARED_RUNTIME=ON')
+    commands = ['ninfer', 'ninfer-serve', 'ninfer_bench', 'ninfer-calibrate',
+                'ninfer-perplexity', 'ninfer-ngram-profile']
+    products = {p: build / 'portable' / p for p in commands}
+    backend_relative = Path('backends') / f"cuda{cuda.split('.')[0]}"
+    runtime = backend_relative / 'libninfer-runtime.so'
+    products[str(runtime)] = build / 'portable' / runtime
+    config = backend_relative / 'architectures.txt'
+    products[str(config)] = build / 'portable' / config
     for source in products.values():
         if not source.is_file():
             raise RuntimeError(f'Missing release product: {source}')
+    if products[str(config)].read_text().split() != arches:
+        raise RuntimeError('Backend architecture metadata differs from the build')
     version = (repo / 'VERSION').read_text().strip()
     notes = repo / f"RELEASE_NOTES_{version.split('-')[0]}.md"
     dist = repo / 'dist'
@@ -92,27 +98,19 @@ def main():
         old.unlink()
     if package.exists():
         shutil.rmtree(package)
-    binaries = package / 'bin/multi'
-    binaries.mkdir(parents=True)
+    package.mkdir(parents=True)
     for product, source in products.items():
-        target = binaries / product
+        target = package / product
+        target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
-        run('strip', '--strip-unneeded', str(target))
-    commands = ['ninfer', 'ninfer-serve', 'ninfer_bench']
-    if multicall:
-        commands += ['ninfer-calibrate', 'ninfer-perplexity', 'ninfer-ngram-profile']
-        for command in commands:
-            if command != 'ninfer_bench':
-                (binaries / command).symlink_to('ninfer-multicall')
-    for command in commands:
-        (package / command).symlink_to(f'bin/multi/{command}')
+        if target.suffix != '.txt':
+            run('strip', '--strip-unneeded', str(target))
     packages = set()
-    libraries = package / 'lib'
-    libraries.mkdir()
+    libraries = package / backend_relative
     eula = cuda_root / 'EULA.txt'
     if not eula.is_file():
         raise RuntimeError(f'Missing CUDA redistribution licence: {eula}')
-    shutil.copy2(eula, package / 'NVIDIA-CUDA-EULA.txt')
+    shutil.copy2(eula, libraries / 'NVIDIA-CUDA-EULA.txt')
     # Hosted runners have no GPU. The temporary stub only supports loader/--help checks.
     stub = cuda_root / 'lib64/stubs/libcuda.so'
     if not stub.is_file():
@@ -120,22 +118,34 @@ def main():
     with tempfile.TemporaryDirectory(prefix='ninfer-driver-check-') as temporary:
         Path(temporary, 'libcuda.so.1').symlink_to(stub)
         env = dict(os.environ, LD_LIBRARY_PATH=f"{temporary}:{cuda_root / 'lib64'}")
-        for product in products:
-            binary = binaries / product
-            run('patchelf', '--set-rpath', '$ORIGIN/../../lib', str(binary))
-            images = output(str(cuda_root / 'bin/cuobjdump'), '--list-elf', str(binary))
-            for arch in arches:
-                if not re.search(rf'sm_{arch}(?:[.\s_]|$)', images):
-                    raise RuntimeError(f'{binary} lacks sm_{arch}')
-            packages.update(runtime_packages(binary, env, stub, cuda_root, libraries))
-        # Test the copied CUDA libraries; the installed Toolkit must not satisfy a missing library.
-        env['LD_LIBRARY_PATH'] = f'{temporary}:{libraries}'
-        for product in products:
-            dependencies = output('ldd', str(binaries / product), env=env)
-            if 'not found' in dependencies or str(cuda_root) in dependencies:
-                raise RuntimeError(f'Incomplete packaged runtime: {dependencies}')
+        binary = package / runtime
+        run('patchelf', '--set-rpath', '$ORIGIN', str(binary))
+        images = output(str(cuda_root / 'bin/cuobjdump'), '--list-elf', str(binary))
+        for arch in arches:
+            if not re.search(rf'sm_{arch}(?:[.\s_]|$)', images):
+                raise RuntimeError(f'{binary} lacks sm_{arch}')
+        packages.update(runtime_packages(binary, env, stub, cuda_root, libraries))
+        for library in libraries.glob('*.so*'):
+            run('patchelf', '--set-rpath', '$ORIGIN', str(library))
+        # Check runtime closure without the installed Toolkit.
+        env['LD_LIBRARY_PATH'] = str(temporary)
+        dependencies = output('ldd', str(binary), env=env)
+        if 'not found' in dependencies or str(cuda_root) in dependencies:
+            raise RuntimeError(f'Incomplete packaged runtime: {dependencies}')
+        (package / 'help').mkdir()
         for command in commands:
-            run(str(package / command), '--help', env=env, timeout=60)
+            text = output(str(package / command), '--help', env=env, timeout=60)
+            (package / 'help' / f'{command}.txt').write_text(text + '\n')
+    # Launchers and saved help must work with no driver stub or Toolkit.
+    clean_env = dict(os.environ)
+    clean_env.pop('LD_LIBRARY_PATH', None)
+    for command in commands:
+        dependencies = output('ldd', str(package / command), env=clean_env)
+        if re.search(r'lib(?:cuda|cublas|ninfer)', dependencies) or 'not found' in dependencies:
+            raise RuntimeError(f'Launcher imports a CUDA backend: {dependencies}')
+        packages.update(runtime_packages(package / command, clean_env, stub, cuda_root, libraries))
+        run(str(package / command), '--help', env=clean_env, timeout=60)
+        run(str(package / command), '--version', env=clean_env, timeout=60)
     (package / 'packages').mkdir()
     (package / 'packages/multi.txt').write_text(''.join(f'{p}\n' for p in sorted(packages)))
     for source, destination in (
@@ -156,10 +166,10 @@ def main():
     patches = patch_note.read_text() if patch_note.exists() else ''
     info = dict(toolchain_patches=patches, source_revision=revision, modified_sources=modified, version=version,
                 cuda=cuda, cuda_compiler=compiler_version, architectures=arches,
-                platform='linux-x64', os_release=distro, glibc=output('getconf', 'GNU_LIBC_VERSION'),
+                layout='shared-runtime-v1', commands=commands, platform='linux-x64', os_release=distro, glibc=output('getconf', 'GNU_LIBC_VERSION'),
                 runtime_packages=sorted(packages),
                 validation='Device images and packaged CUDA dependency closure checked; all commands passed --help '
-                'with a temporary driver stub. GPU inference was not tested.')
+                'without a driver. Runtime help captured with a temporary driver stub. GPU inference was not tested.')
     (package / 'BUILD-INFO.json').write_text(json.dumps(info, indent=2) + '\n')
     files = sorted(p for p in package.rglob('*') if p.is_file())
     hashes = {p.resolve(): digest(p) for p in files if not p.is_symlink()}

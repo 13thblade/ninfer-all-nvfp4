@@ -9,9 +9,9 @@ tag="native-${GITHUB_SHA:0:12}"
 cd dist
 shopt -s nullglob
 checksums=(SHA256SUMS-ninfer-*.txt)
-[[ ${#checksums[@]} == 4 ]] || { echo 'Expected all four OS/CUDA checksum manifests' >&2; exit 1; }
+[[ ${#checksums[@]} == 6 ]] || { echo 'Expected all six single-CUDA and universal checksum manifests' >&2; exit 1; }
 # Validate the exact expected variants and this source revision, not merely four arbitrary files.
-for variant in {windows,linux}-x64-cuda12.9-sm70-75-80-86-89 {windows,linux}-x64-cuda13.4-sm75-80-86-89-120a; do
+for variant in {windows,linux}-x64-cuda12.9-sm70-75-80-86-89 {windows,linux}-x64-cuda13.4-sm75-80-86-89-120a {windows,linux}-x64-cuda12.9-13.4; do
   manifests=(SHA256SUMS-ninfer-"$variant-${GITHUB_SHA:0:12}.txt")
   [[ ${#manifests[@]} == 1 && -f "${manifests[0]}" ]] || { echo "Missing package: $variant" >&2; exit 1; }
 done
@@ -66,7 +66,7 @@ Native Windows and Debian 13 x64 builds from $GITHUB_SHA.
 - CUDA 12.9.2: sm_70, sm_75, sm_80, sm_86, sm_89.
 - CUDA 13.4.3: sm_75, sm_80, sm_86, sm_89, sm_120a.
 
-Download every volume and the checksum manifest for ONE platform/CUDA variant.
+Download every volume and the checksum manifest for ONE package. The cuda12.9-13.4 package contains both backends and selects one for the GPU and driver. Single-CUDA packages contain one backend.
 Windows: extract the .7z.001 file with 7-Zip. Runtime DLLs are included; install a compatible NVIDIA driver and the Microsoft Visual C++ x64 runtime.
 Linux: concatenate the .tar.gz volumes in numeric order and extract the result. The archive README lists Debian runtime installation steps. The included Dockerfile packages these binaries without compiling them again.
 

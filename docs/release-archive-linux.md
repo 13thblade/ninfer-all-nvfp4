@@ -1,7 +1,7 @@
 # NInfer Linux archive
 
-This archive contains prebuilt x64 binaries. Its name records the CUDA minor version, embedded GPU
-architectures and source commit. `BUILD-INFO.json` records the complete revision, compiler, build
+This archive contains prebuilt x64 binaries. Single-CUDA names record the Toolkit, GPU architectures and source commit.
+Universal names use `cuda12.9-13.4-<commit12>` and contain both backends. `BUILD-INFO.json` records the complete revision, compiler, build
 system and runtime requirements. `VERSION` is source metadata, not the archive identifier.
 
 ## Extract and verify
@@ -10,7 +10,7 @@ Download every numbered volume and the matching `SHA256SUMS-*.txt` for one varia
 replace `<commit12>` below with the commit in the downloaded filenames:
 
 ```bash
-name='ninfer-linux-x64-cuda13.4-sm75-80-86-89-120a-<commit12>'
+name='ninfer-linux-x64-cuda12.9-13.4-<commit12>'
 sha256sum -c "SHA256SUMS-$name.txt"
 cat "$name".tar.gz.[0-9][0-9][0-9] | tar -xz
 cd "$name"
@@ -19,14 +19,18 @@ sha256sum -c SHA256SUMS.txt
 
 CUDA 12.9 packages contain `sm_70`, `sm_75`, `sm_80`, `sm_86` and `sm_89`.
 CUDA 13.4 packages contain `sm_75`, `sm_80`, `sm_86`, `sm_89` and `sm_120a`.
-Choose CUDA 12 for Volta. Install a compatible NVIDIA driver on the host.
+The universal package selects CUDA 12 for Volta and CUDA 13 for consumer Blackwell. On overlapping
+targets it prefers CUDA 13 if the driver supports it, otherwise CUDA 12. Use `--cuda-backend 12`
+or `--cuda-backend 13` to require one backend. Every GPU in `--devices` must fit that backend.
+V100 plus Blackwell cannot share a process with these sets. Install a compatible NVIDIA driver
+on the host. The minimum Driver API family is 12.0 for CUDA 12 and 13.0 for CUDA 13. This is a
+compatibility admission check, not GPU qualification of every driver release.
 The CUDA 12 build applies a glibc 2.41 exception-declaration patch to NVIDIA headers;
 `BUILD-INFO.json` records it. Function bodies are not modified.
 
 ## Debian runtime
 
-CI builds on Debian 13 (glibc 2.41). CUDA runtime libraries are included in `lib/`, with NVIDIA's
-EULA. System libraries remain dynamically linked. Newer distributions must also provide the
+CI builds on Debian 13 (glibc 2.41). CUDA runtime libraries are included under `backends/cuda12/` or `backends/cuda13/`, with NVIDIA's EULA. System libraries remain dynamically linked. Newer distributions must also provide the
 recorded FFmpeg and other library SONAMEs; newer glibc alone is insufficient. Local builds can use
 another Debian-family host; check `BUILD-INFO.json`.
 
@@ -42,14 +46,14 @@ xargs -a packages/multi.txt sudo apt-get install -y ca-certificates curl
 
 This installs FFmpeg, libcurl and the other resolved system dependencies. It does not install a
 CUDA Toolkit or a driver. The build's temporary driver stub is never shipped. The executables load
-the packaged CUDA libraries through a relative runtime path. The multicall binary shares device
-images between the CLI, server and auxiliary commands. Keep `bin/`, `lib/` and the symlinks together
-when moving the installation. NVIDIA libraries remain subject to `NVIDIA-CUDA-EULA.txt`, separately
-from NInfer's Apache-2.0 licence.
+one private runtime from the selected backend directory. All commands share that backend's kernel
+images. Keep `backends/` and `help/` beside the executables when moving the installation.
+`--help` and `--version` work without a driver. NVIDIA libraries remain subject to the
+`NVIDIA-CUDA-EULA.txt` in their backend directory, separately from NInfer's Apache-2.0 licence.
 
 ## Docker without compilation
 
-From the extracted Debian 13 archive:
+From an extracted **single-CUDA** Debian 13 archive (the universal archive has no Dockerfile):
 
 ```bash
 docker build -t ninfer:local .

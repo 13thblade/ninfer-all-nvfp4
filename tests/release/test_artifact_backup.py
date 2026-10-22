@@ -50,6 +50,17 @@ class ArtifactBackupTest(unittest.TestCase):
         for item in receipt["files"]:
             self.assertEqual(len(api.files[receipt["prefix"] + "/" + item["name"]]), item["bytes"])
 
+    def test_universal_linux_archive_is_preserved(self):
+        name = 'ninfer-linux-x64-cuda12.9-13.4-' + 'a' * 12
+        (self.root / self.name).rename(self.root / name)
+        self.volume.rename(self.root / (name + '.tar.gz.001'))
+        volume = self.root / (name + '.tar.gz.001')
+        manifest = self.root / ('SHA256SUMS-' + name + '.txt')
+        manifest.write_text(f'{BACKUP.digest(volume)}  {volume.name}\n')
+        api = Bucket()
+        BACKUP.archive(api, manifest, self.revision, '123')
+        self.assertTrue(any(key.endswith('/COMPLETE.json') for key in api.files))
+
     def test_corrupt_download_never_publishes_completion(self):
         api = Bucket(corrupt=True)
         with self.assertRaisesRegex(ValueError, "round-trip"):

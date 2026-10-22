@@ -111,7 +111,7 @@ on a 24 GB card that serves a desktop, an explicit capacity is easier to predict
 
 ## Release archive
 
-The `Native release` workflow builds two native x64 packages with VS 2022 and Ninja:
+The `Native release` workflow builds two single-CUDA x64 packages with VS 2022 and Ninja, then assembles a universal package:
 
 | Toolkit | Device images available to each executable |
 |---|---|
@@ -132,11 +132,11 @@ PTX fallback for GPUs that cannot run any of their machine-code images. Local bu
 by default; enabling this option requires the Toolkit's `nvprune` component.
 
 The workflow also sets `NINFER_WINDOWS_KERNEL_DLL=ON`: GGML kernels reside in
-`ninfer_ggml_quants.dll` beside the executables. The DLL carries the same architecture set and
+`ninfer_ggml_quants.dll` inside the selected backend directory. The DLL carries the same architecture set and
 retains its PTX; the other CUDA archives are pruned. This separates device code across PE images
 to address MSVC's 2 GiB limit without removing GPU targets. The DLL uses the existing function-only
 GGML bridge and is staged for apps, the product benchmark and tests. Local builds default to the
-static library. The packager checks device images in the DLL as well as in each executable.
+static library. The packager checks device images in the kernel DLL and the shared runtime DLL.
 
 Every push to `master` starts the current build and cancels the superseded run.
 Feature branches build only through a manual run, which builds the packages
@@ -147,21 +147,23 @@ available if compilation, packaging or upload fails. See [release process](maint
 
 For a local build, `scripts\package-release.ps1` (or `.\scripts\build.ps1 -Package`) derives the
 Toolkit and device images from `CMakeCache.txt`. It requires `cuobjdump` in that Toolkit and `7z`
-on `PATH`. It packages `ninfer.exe`, `ninfer-serve.exe` and `ninfer_bench.exe`, their runtime DLLs,
+on `PATH` and `NINFER_SHARED_RUNTIME=ON` in the build. It packages all six command EXEs, their runtime DLLs,
 licences and launchers into `.7z.001` volumes of at most 1900 MiB. Download every volume of one
-variant into the same folder and extract the first with 7-Zip. Do not mix the CUDA variants.
+package into the same folder and extract the first with 7-Zip. Keep the backend subdirectories intact.
 
 `BUILD-INFO.json` records the source revision, source modifications, CUDA version and device images.
 Archive names use the platform, CUDA version, GPU architectures and 12-character source commit,
 for example `ninfer-windows-x64-cuda13.4-sm75-80-86-89-120a-0123456789ab.7z.001`.
 `VERSION` is retained inside the package as source metadata; it is not part of the archive name.
 
-PTX pruning alone left all three CUDA 13.4 executables above MSVC's image-size limit. Moving GGML
-and the shared device-tier probe into the kernel DLL allowed both CUDA variants to link. CUDA 13.4
-executables are about 1.95 GB each and the kernel DLL is 313 MB in the validated build.
-Each executable still statically includes the main CUDA code. This duplicates that code three
-times in the package: the CUDA 13.4 package is 6.73 GB unpacked and 6.37 GB archived. The size is
-primarily the repeated application code, not external runtime libraries. Sharing the remaining
-engine code across executables has not been implemented.
-Archive splitting addresses GitHub's asset limit only. It does not address linker limits.
-A successful `--help` check does not establish GPU correctness or throughput.
+The previous static-EXE layout produced CUDA 13.4 executables of about 1.95 GB each, plus a 313 MB
+GGML DLL. Its package was 6.73 GB unpacked and 6.37 GB archived. The shared-runtime layout removes
+this duplication between commands. Its actual linked sizes and GPU behavior still require native
+validation. The packager rejects device modules at or above 2 GiB. Archive splitting only addresses
+GitHub's asset limit.
+
+The universal name is `ninfer-windows-x64-cuda12.9-13.4-<commit12>`. Each small EXE chooses one backend
+from `backends/cuda12/` and `backends/cuda13/`. Use `--cuda-backend auto|12|13` to override selection.
+`--help` and `--version` need no driver. See the [release process](maintainer/release-process.md)
+for selection, cache and verification details. A successful startup check does not establish GPU
+correctness or throughput.

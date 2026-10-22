@@ -39,8 +39,12 @@ $ProductRoot = Join-Path $DistRoot $ProductName
 $ChecksumPath = Join-Path $DistRoot "SHA256SUMS-$ProductName.txt"
 $ArchivePath = Join-Path $DistRoot "$ProductName.7z"
 $SevenZip = (Get-Command 7z -ErrorAction Stop).Source
+$SharedRuntime = (Read-Cache 'NINFER_SHARED_RUNTIME') -eq 'ON'
+if (-not $SharedRuntime) { throw 'Native releases require NINFER_SHARED_RUNTIME=ON' }
 $KernelDll = (Read-Cache 'NINFER_WINDOWS_KERNEL_DLL') -eq 'ON'
-$Products = @('apps\ninfer.exe', 'apps\ninfer-serve.exe', 'bench\ninfer_bench.exe')
+$Commands = @('ninfer', 'ninfer-serve', 'ninfer_bench', 'ninfer-calibrate', 'ninfer-perplexity', 'ninfer-ngram-profile')
+$Products = @($Commands | ForEach-Object { "portable\$_.exe" })
+$BackendRoot = Join-Path $ProductRoot "backends\cuda$CudaMajor"
 foreach ($product in $Products) {
     if (-not (Test-Path -LiteralPath (Join-Path $BuildRoot $product))) { throw "Missing product: $product" }
 }
@@ -56,8 +60,13 @@ New-Item -ItemType Directory -Path $ProductRoot | Out-Null
 foreach ($product in $Products) {
     Copy-Item -LiteralPath (Join-Path $BuildRoot $product) -Destination $ProductRoot
 }
+New-Item -ItemType Directory -Force -Path $BackendRoot | Out-Null
+Copy-Item -Path (Join-Path $BuildRoot "portable\backends\cuda$CudaMajor\*.dll") -Destination $BackendRoot
+Copy-Item -LiteralPath (Join-Path $BuildRoot "portable\backends\cuda$CudaMajor\architectures.txt") -Destination $BackendRoot
+$RecordedArchs = ((Get-Content -LiteralPath (Join-Path $BackendRoot 'architectures.txt') -Raw).Trim() -split '\s+') -join ';'
+if ($RecordedArchs -ne ($Archs -join ';')) { throw 'Backend architecture metadata differs from the build' }
 # Include the vcpkg runtime closure, including dependencies of FFmpeg and curl.
-$DllDirectories = @((Join-Path $BuildRoot 'apps'), (Join-Path $BuildRoot 'bench'))
+$DllDirectories = @()
 $VcpkgEntry = @($Cache | Where-Object { $_ -match '^VCPKG_INSTALLED_DIR:[^=]+=' })
 if ($VcpkgEntry.Count -eq 1) {
     $VcpkgInstalled = ($VcpkgEntry[0] -split '=', 2)[1]
@@ -65,16 +74,16 @@ if ($VcpkgEntry.Count -eq 1) {
 }
 foreach ($directory in $DllDirectories) {
     if (Test-Path -LiteralPath $directory) {
-        Get-ChildItem -LiteralPath $directory -Filter '*.dll' | Copy-Item -Destination $ProductRoot
+        Get-ChildItem -LiteralPath $directory -Filter '*.dll' | Copy-Item -Destination $BackendRoot
     }
 }
 foreach ($name in "cublas64_$CudaMajor.dll", "cublasLt64_$CudaMajor.dll") {
     $candidates = @((Join-Path $CudaRoot "bin\$name"), (Join-Path $CudaRoot "bin\x64\$name"))
     $found = @($candidates | Where-Object { Test-Path -LiteralPath $_ })
     if ($found.Count -ne 1) { throw "Expected one $name under $CudaRoot" }
-    Copy-Item -LiteralPath $found[0] -Destination $ProductRoot
+    Copy-Item -LiteralPath $found[0] -Destination $BackendRoot
 }
-Copy-Item -LiteralPath $Eula -Destination (Join-Path $ProductRoot 'NVIDIA-CUDA-EULA.txt')
+Copy-Item -LiteralPath $Eula -Destination (Join-Path $BackendRoot 'NVIDIA-CUDA-EULA.txt')
 foreach ($file in 'VERSION', 'LICENSE') { Copy-Item -LiteralPath (Join-Path $RepoRoot $file) -Destination $ProductRoot }
 if (Test-Path -LiteralPath $ReleaseNotes) {
     Copy-Item -LiteralPath $ReleaseNotes -Destination $ProductRoot
@@ -92,10 +101,11 @@ if ($VcpkgEntry.Count -eq 1) {
     }
 }
 $Cuobjdump = Join-Path $CudaRoot 'bin\cuobjdump.exe'
-$DeviceModules = @($Products | ForEach-Object { Split-Path -Leaf $_ })
+$DeviceModules = @('ninfer-runtime.dll')
 if ($KernelDll) { $DeviceModules += 'ninfer_ggml_quants.dll' }
 foreach ($module in $DeviceModules) {
-    $exe = Join-Path $ProductRoot $module
+    $exe = Join-Path $BackendRoot $module
+    if ((Get-Item -LiteralPath $exe).Length -ge 2GB) { throw "PE device module exceeds 2 GiB: $module" }
     if (-not (Test-Path -LiteralPath $exe)) { throw "Missing device module: $exe" }
     Write-Host "Device module: $module; bytes: $((Get-Item -LiteralPath $exe).Length)"
     if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
@@ -109,27 +119,39 @@ foreach ($module in $DeviceModules) {
     }
     Write-Host "Device images verified: $module; architectures: $($Archs -join ',')"
 }
+New-Item -ItemType Directory -Path (Join-Path $ProductRoot 'help') | Out-Null
 foreach ($product in $Products) {
     $exe = Join-Path $ProductRoot (Split-Path -Leaf $product)
+    $imports = (& dumpbin /imports $exe 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw "Cannot inspect launcher imports: $exe" }
+    if ($imports -match '(?im)^\s*(?:nvcuda|cudart|cublas|ninfer[-_])[^\s]*\.dll\s*$') {
+        throw "Launcher imports a CUDA backend: $exe"
+    }
     # No Toolkit, vcpkg or developer directories can satisfy missing runtime DLLs.
     $savedPath = $env:PATH
     try {
         $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
         Write-Host "Startup check: $exe"
-        & $exe --help
+        $helpText = & $exe --help
         if ($LASTEXITCODE -ne 0) { throw "$exe --help failed with a clean PATH ($LASTEXITCODE)" }
+        $command = [IO.Path]::GetFileNameWithoutExtension($exe)
+        [IO.File]::WriteAllText((Join-Path $ProductRoot "help\$command.txt"), (($helpText -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+        & $exe --help
+        if ($LASTEXITCODE -ne 0) { throw 'Saved help check failed' }
+        & $exe --version
+        if ($LASTEXITCODE -ne 0) { throw 'Version check failed' }
         Write-Host "Startup check passed: $exe"
     } finally { $env:PATH = $savedPath }
 }
 @{ source_revision = $Revision; modified_sources = [bool]$SourceState.Count; version = $Version;
    cuda = $CudaVersion; cuda_compiler = $CudaVersionText; architectures = $Archs; platform = 'windows-x64';
    cuda_archive_ptx_pruned = ((Read-Cache 'NINFER_CUDA_PRUNE_PTX') -eq 'ON');
-   ggml_kernel_dll = $KernelDll;
-   validation = 'Device images present; all three executables passed --help without Toolkit on PATH. GPU inference was not tested.'
+   ggml_kernel_dll = $KernelDll; layout = 'shared-runtime-v1'; commands = $Commands;
+   validation = 'Device images present; all launchers passed --help without Toolkit on PATH. GPU inference was not tested.'
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ProductRoot 'BUILD-INFO.json') -Encoding utf8
-$innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File | Sort-Object Name | ForEach-Object {
+$innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File -Recurse | Sort-Object FullName | ForEach-Object {
     Write-Host "Hashing package file: $($_.Name); bytes: $($_.Length)"
-    "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
+    "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $([IO.Path]::GetRelativePath($ProductRoot, $_.FullName).Replace('\', '/'))"
 }
 [IO.File]::WriteAllText((Join-Path $ProductRoot 'SHA256SUMS.txt'), (($innerHashes -join "`n") + "`n"), [Text.ASCIIEncoding]::new())
 # Always use volumes. Every asset stays below GitHub's 2 GiB limit, even as the fatbins grow.

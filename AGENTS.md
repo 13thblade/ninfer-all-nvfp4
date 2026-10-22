@@ -74,7 +74,8 @@ of the kernels past its 64 KiB of shared memory, `docs/maintainer/build-system.m
 (A100 class: device profiles calibrated, not benchmarked) and `sm_70` (Tesla V100, CUDA 12.x only, its own small-T,
 attention and prompt routes over emulated Ampere warp primitives). The Docker pipeline packages
 the native Debian 13 archives as `cuda12.9` (`70;75;80;86;89`) and `cuda13.4`
-(`75;80;86;89;120a`), with all targets in each executable. It was tuned on the **NVIDIA
+(`75;80;86;89;120a`), with all targets in each shared backend. Portable native packages also combine both CUDA backends
+behind Toolkit-independent launchers, selecting one backend per process. It was tuned on the **NVIDIA
 GeForce RTX 3090** (24 GB) first, and each card's kernel routes now come from its measured device
 profile, built in for every card the Profile column of `docs/gpus.md` marks, from the Tesla V100
 to Blackwell. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX

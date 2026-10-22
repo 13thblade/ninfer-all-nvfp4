@@ -296,6 +296,17 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
   set(NINFER_BUILD_PRODUCT_SUPPORT ON)
 endif()
 
+option(NINFER_SHARED_RUNTIME "Build portable launchers and a private CUDA runtime library" OFF)
+if(NINFER_SHARED_RUNTIME)
+  if(NOT NINFER_BUILD_APPS)
+    message(FATAL_ERROR "NINFER_SHARED_RUNTIME requires NINFER_BUILD_APPS")
+  endif()
+  if(NOT WIN32)
+    # Static component archives contribute to the shared runtime. CI uses the same policy.
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+  endif()
+endif()
+
 include(cmake/Dependencies.cmake)
 include(cmake/NinferTargets.cmake)
 
@@ -334,4 +345,8 @@ if(BUILD_TESTING)
 endif()
 if(NINFER_BUILD_BENCHMARKS)
   add_subdirectory(bench)
+endif()
+
+if(NINFER_SHARED_RUNTIME)
+  ninfer_finalize_runtime()
 endif()
