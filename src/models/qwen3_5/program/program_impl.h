@@ -217,6 +217,8 @@ struct RequestBasePlanImpl {
     std::shared_ptr<text::GrammarState> grammar;
     // The request asked for each generated token's log probability.
     bool logprobs = false;
+    // With logprobs: the token ids read out exactly on the first generated token.
+    std::vector<TokenId> readout_tokens;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
@@ -283,6 +285,7 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     ops::SamplingConfig sampling;
     std::shared_ptr<text::GrammarState> grammar;
     bool logprobs                             = false;
+    std::vector<TokenId> readout_tokens;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     runtime::LaneId destination{};
@@ -305,6 +308,7 @@ struct HybridQuoteImpl {
     ops::SamplingConfig sampling;
     std::shared_ptr<text::GrammarState> grammar;
     bool logprobs                             = false;
+    std::vector<TokenId> readout_tokens;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
@@ -542,6 +546,8 @@ struct RequestControl {
     std::uint32_t next_mask_frontier = 0;
     std::chrono::steady_clock::time_point next_mask_started;
     bool logprobs = false;
+    // The typed readout's token ids; read on the sequence's first generated token only.
+    std::vector<TokenId> readout_tokens;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
     // Adaptive MTP: how far this request's drafts survive.
@@ -987,6 +993,8 @@ public:
         round_logprobs{};
     std::optional<PinnedHostBuffer> logprobs_host;
     std::optional<bool> logprobs_armed;
+    // The host copy of a prefill's typed readout (io.readout_values).
+    std::optional<PinnedHostBuffer> readout_host;
 
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_5::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
@@ -1693,6 +1701,12 @@ private:
     void fetch_logprobs(std::int32_t rows);
     // The fetched record of gather row `row`, for the token that row produced.
     [[nodiscard]] runtime::RawTokenLogprob fetched_logprob(std::int32_t row, TokenId token) const;
+    // Uploads a request's readout token ids ahead of its prefill and returns their count.
+    std::int32_t arm_readout(std::span<const TokenId> ids);
+    // Copies the first `count` readout values to the host, ordered after the enqueued prefill.
+    void fetch_readout(std::int32_t count);
+    // Attaches the fetched readout values to the first token's record.
+    void attach_readout(runtime::RawTokenLogprob& record, std::int32_t count) const;
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
     void

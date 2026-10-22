@@ -187,6 +187,8 @@ const char* endpoint_name(std::string_view request_path) noexcept {
         path == "/v1/reranking") {
         return "rerank";
     }
+    if (path == "/v1/systemone") { return "systemone"; }
+    if (path == "/v1/decisions") { return "openai_decisions"; }
     if (path == "/v1/responses") { return "openai_responses"; }
     if (path == "/v1/responses/input_tokens") { return "openai_responses_input_tokens"; }
     if (path == "/v1/messages") { return "anthropic_messages"; }
@@ -695,6 +697,14 @@ void HttpServer::register_routes() {
         register_post(endpoint, rerank);
         register_post(api_route_pattern(endpoint), rerank);
     }
+    register_post(api_route_pattern("/systemone"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_decisions(req, res, DecisionDialect::SystemOne);
+                  });
+    register_post(api_route_pattern("/decisions"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_decisions(req, res, DecisionDialect::OpenAI);
+                  });
     register_post(api_route_pattern("/responses"),
                   [this](const httplib::Request& req, httplib::Response& res) {
                       handle_responses(req, res);

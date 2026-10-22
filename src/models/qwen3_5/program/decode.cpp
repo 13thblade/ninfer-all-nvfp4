@@ -248,6 +248,34 @@ runtime::RawTokenLogprob ProgramImpl::fetched_logprob(std::int32_t row, TokenId 
     return record;
 }
 
+std::int32_t ProgramImpl::arm_readout(std::span<const TokenId> ids) {
+    if (ids.empty()) { return 0; }
+    if (ids.size() > kMaximumReadoutTokens ||
+        static_cast<std::int64_t>(ids.size()) > io.readout_ids.ne[0]) {
+        throw std::logic_error("readout token ids exceed the round buffer");
+    }
+    // A pageable source: the copy completes on the host before it returns.
+    CUDA_CHECK(cudaMemcpyAsync(io.readout_ids.data, ids.data(), ids.size() * sizeof(TokenId),
+                               cudaMemcpyHostToDevice, device.stream));
+    return static_cast<std::int32_t>(ids.size());
+}
+
+void ProgramImpl::fetch_readout(std::int32_t count) {
+    if (count <= 0) { return; }
+    if (!readout_host) { readout_host.emplace(kMaximumReadoutTokens * sizeof(float)); }
+    CUDA_CHECK(cudaMemcpyAsync(readout_host->data(), io.readout_values.data,
+                               static_cast<std::size_t>(count) * sizeof(float),
+                               cudaMemcpyDeviceToHost, device.stream));
+}
+
+void ProgramImpl::attach_readout(runtime::RawTokenLogprob& record, std::int32_t count) const {
+    record.readout_count = 0;
+    if (count <= 0) { return; }
+    const auto* values = static_cast<const float*>(readout_host->data());
+    std::copy_n(values, count, record.readout_values.begin());
+    record.readout_count = static_cast<std::uint32_t>(count);
+}
+
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
     if (source.dtype != DType::BF16 ||
         source.ne[0] != dimension(parameters.model.config().text.hidden_size) ||

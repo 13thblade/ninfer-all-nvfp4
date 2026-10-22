@@ -29,6 +29,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/scatter.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/sigmoid_gate_mul.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/silu_and_mul.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/readout_logprobs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/target_logprobs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/vision_pos_embed.cu"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/add_bias.cpp"
@@ -70,6 +71,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_expert_cpu.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/silu_mul.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/wrapper/readout_logprobs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/target_logprobs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/vision_pos_embed.cpp"
 )

@@ -103,6 +103,9 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
             add_tensor(builder, DType::FP32, {ops::kLogprobTopK, rows}, "logprob top values");
         layout.logprob_lse    = add_tensor(builder, DType::FP32, {rows}, "logprob lse");
         layout.logprob_active = add_tensor(builder, DType::I32, {1}, "logprob gather flag");
+        const auto readout    = static_cast<std::int32_t>(kMaximumReadoutTokens);
+        layout.readout_ids    = add_tensor(builder, DType::I32, {readout}, "readout token ids");
+        layout.readout_values = add_tensor(builder, DType::FP32, {readout}, "readout logprobs");
     }
     return layout;
 }
@@ -483,6 +486,8 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
         logprob_values       = layout.logprob_values.bind(backing);
         logprob_lse          = layout.logprob_lse.bind(backing);
         logprob_active       = layout.logprob_active.bind(backing);
+        readout_ids          = layout.readout_ids.bind(backing);
+        readout_values       = layout.readout_values.bind(backing);
     }
     if (layout.mtp) { mtp.emplace(backing, *layout.mtp); }
     if (layout.dflash_prefill) { dflash_prefill.emplace(backing, *layout.dflash_prefill); }

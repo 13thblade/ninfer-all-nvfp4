@@ -110,6 +110,13 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
         throw std::invalid_argument("thinking budget must be positive");
     }
     text::validate_structured_output(options.execution.structured_output);
+    if (options.execution.readout_tokens.size() > kMaximumReadoutTokens) {
+        throw std::invalid_argument("readout_tokens names more than " +
+                                    std::to_string(kMaximumReadoutTokens) + " tokens");
+    }
+    if (!options.execution.readout_tokens.empty() && !options.execution.logprobs) {
+        throw std::invalid_argument("readout_tokens requires logprobs");
+    }
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
@@ -124,6 +131,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.thinking                = options.execution.thinking;
     resolved.execution.structured_output       = std::move(options.execution.structured_output);
     resolved.execution.logprobs                = options.execution.logprobs;
+    resolved.execution.readout_tokens          = std::move(options.execution.readout_tokens);
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     resolved.ngram_session                      = std::move(options.ngram_session);

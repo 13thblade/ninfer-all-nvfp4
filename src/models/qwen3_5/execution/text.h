@@ -94,6 +94,10 @@ public:
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
+    // The typed readout a finalizing chunk performs on its sampled token's logits: the first
+    // `count` ids of io.readout_ids, read into io.readout_values; zero reads nothing.
+    void set_readout(std::int32_t count) noexcept { readout_count_ = count; }
+
     void set_rope_yarn(const ops::RopeYarn& yarn) noexcept { rope_yarn_ = yarn; }
 
     // Keys before its first query that the MTP draft attention reads past its one-page sink;
@@ -301,6 +305,7 @@ private:
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
+    std::int32_t readout_count_                 = 0;
     ops::RopeYarn rope_yarn_;
     std::uint32_t mtp_attention_window_         = 0;
     const MtpParameters* mtp_                   = nullptr;

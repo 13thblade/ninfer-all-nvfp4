@@ -616,6 +616,10 @@ public:
                 record.top_bytes[k] = std::string(tokenizer->decoded_token(raw.top_ids[k]).bytes);
             }
         }
+        if (raw.readout_count > 0) {
+            const std::size_t count = std::min<std::size_t>(raw.readout_count, kMaximumReadoutTokens);
+            record.readout.assign(raw.readout_values.begin(), raw.readout_values.begin() + count);
+        }
         if (!fed) {
             decoder.utf8_logprobs.push_back(std::move(record));
             return;

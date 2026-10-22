@@ -1,0 +1,400 @@
+// Typed decisions on the wire, without an Engine: System One's and OpenAI's requests, the labels
+// and the prompt each question becomes, the answer read from the first token's readout (or its
+// top alternatives), and both responses.
+
+#include "serve/generation_service.h"
+#include "serve/systemone.h"
+
+#include <nlohmann/json.hpp>
+
+#include <cmath>
+#include <cstddef>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+using namespace ninfer::serve;
+using Json = nlohmann::json;
+
+int failures = 0;
+
+void expect(bool condition, const std::string& label) {
+    if (condition) { return; }
+    std::cerr << "expectation failed: " << label << '\n';
+    ++failures;
+}
+
+bool close_to(double a, double b) { return std::abs(a - b) < 1e-6; }
+
+struct Refusal {
+    int status = 0;
+    std::string param;
+};
+
+Refusal systemone_refusal(const char* body) {
+    try {
+        (void)parse_systemone_request(RequestJson::parse(body));
+    } catch (const ApiException& error) {
+        return {.status = error.error().status, .param = error.error().param};
+    }
+    return {};
+}
+
+Refusal decisions_refusal(const char* body) {
+    try {
+        (void)parse_decisions_request(RequestJson::parse(body));
+    } catch (const ApiException& error) {
+        return {.status = error.error().status, .param = error.error().param};
+    }
+    return {};
+}
+
+const char* kSystemOne = R"({
+  "model": "m",
+  "state": {"ticket": "My card was charged twice for one order."},
+  "questions": {
+    "team": {"type": "choice", "instructions": "Which team?",
+             "criteria": {"billing": "payments and refunds", "shipping": null}},
+    "urgent": {"type": "noul", "instructions": "Reply within the hour?",
+               "criteria": {"true": "money is moving"}},
+    "tone": {"type": "score", "instructions": "How upset?",
+             "criteria": ["calm", "annoyed", "furious"]}
+  }
+})";
+
+const char* kOpenAI = R"({
+  "model": "m",
+  "input": [{"role": "user", "content": [{"type": "input_text", "text": "Broken screen."}]},
+            {"role": "user", "content": "Second message."}],
+  "questions": [
+    {"type": "predicate", "name": "damaged", "instructions": "Damaged item?"},
+    {"type": "choice", "name": "department", "instructions": "Which department?",
+     "choices": [{"value": "returns", "description": "RMA"}, {"value": true}]},
+    {"type": "score", "instructions": "How severe?",
+     "levels": [{"label": "cosmetic"}, {"label": "broken"}]}
+  ]
+})";
+
+// A first-token record whose readout holds the given label log probabilities and whose top
+// alternatives are the given (id, probability) pairs, most likely first.
+GenerationOutcome read(std::vector<double> readout,
+                       std::vector<std::pair<ninfer::TokenId, double>> top) {
+    ninfer::TokenLogprob first;
+    first.top_ids.fill(-1);
+    for (std::size_t k = 0; k < top.size(); ++k) {
+        first.top_ids[k]    = top[k].first;
+        first.top_values[k] = static_cast<float>(std::log(top[k].second));
+    }
+    first.id      = first.top_ids[0];
+    first.logprob = first.top_values[0];
+    first.readout.assign(readout.begin(), readout.end());
+    GenerationOutcome out;
+    out.content_logprobs.push_back(std::move(first));
+    out.prompt_tokens     = 10;
+    out.completion_tokens = 1;
+    return out;
+}
+
+void systemone_parsing() {
+    const DecisionRequest request = parse_systemone_request(RequestJson::parse(kSystemOne));
+    expect(request.dialect == DecisionDialect::SystemOne && request.model == "m",
+           "System One dialect and model");
+    expect(request.state == R"({"ticket":"My card was charged twice for one order."})",
+           "a JSON state becomes its compact text");
+    expect(request.questions.size() == 3 && request.questions[0].id == "team" &&
+               request.questions[1].id == "urgent" && request.questions[2].id == "tone",
+           "questions keep the request's order");
+    const DecisionQuestion& team = request.questions[0];
+    expect(team.type == DecisionType::Choice && team.options.size() == 2 &&
+               team.options[0].text == "billing" &&
+               team.options[0].description == "payments and refunds" &&
+               team.options[1].text == "shipping" && !team.options[1].description,
+           "a choice's options with and without descriptions");
+    const DecisionQuestion& urgent = request.questions[1];
+    expect(urgent.type == DecisionType::Noul && urgent.options.size() == 2 &&
+               urgent.options[0].text == "yes" && urgent.options[0].description == "money is moving" &&
+               urgent.options[1].text == "no" && !urgent.options[1].description,
+           "a noul's yes and no with the true description");
+    const DecisionQuestion& tone = request.questions[2];
+    expect(tone.type == DecisionType::Score && tone.options.size() == 3 &&
+               tone.options[2].text == "furious" && tone.options[2].value == Json(2),
+           "a score's levels, lowest first");
+    const DecisionRequest plain = parse_systemone_request(RequestJson::parse(
+        R"({"state": "s", "instructions": "ctx",
+            "questions": {"q": {"type": "noul", "instructions": {"k": 1}}}})"));
+    expect(plain.state == "s" && plain.instructions == "ctx" &&
+               plain.questions[0].instructions == R"({"k":1})" &&
+               !plain.questions[0].options[0].description,
+           "a string state, context, JSON instructions, a noul without criteria");
+
+    expect(systemone_refusal(R"({"questions": {"q": {"type": "noul", "instructions": "i"}}})")
+                   .param == "state",
+           "a state is required");
+    expect(systemone_refusal(R"({"state": "s", "questions": {}})").param == "questions",
+           "at least one question");
+    expect(systemone_refusal(R"({"state": "s", "extra": 1, "questions": {}})").param == "extra",
+           "unknown top-level fields are refused");
+    expect(systemone_refusal(
+               R"({"state": "s", "questions": {"q": {"type": "noul", "instructions": "i", "x": 1}}})")
+                   .param == "questions.q.x",
+           "unknown question fields are refused");
+    expect(systemone_refusal(
+               R"({"state": "s", "questions": {"q": {"type": "choice", "instructions": "i",
+                   "criteria": {"only": null}}}})")
+                   .param == "questions.q.criteria",
+           "a choice needs two options");
+    expect(systemone_refusal(
+               R"({"state": "s", "questions": {"q": {"type": "score", "instructions": "i",
+                   "criteria": ["a"]}}})")
+                   .param == "questions.q.criteria",
+           "a score needs two levels");
+    expect(systemone_refusal(
+               R"({"state": "s", "questions": {"q": {"type": "predicate", "instructions": "i"}}})")
+                   .param == "questions.q.type",
+           "OpenAI's predicate is not a System One type");
+    expect(systemone_refusal(
+               R"({"state": "s", "joint": true, "questions": {"q": {"type": "noul", "instructions": "i"}}})")
+                   .param == "joint",
+           "joint reads are refused");
+    expect(systemone_refusal(
+               R"({"state": "s", "images": ["data:image/png;base64,AA=="],
+                   "questions": {"q": {"type": "noul", "instructions": "i"}}})")
+                   .status == 501,
+           "images are not implemented");
+    std::string many = R"({"state": "s", "questions": {)";
+    for (int q = 0; q < 65; ++q) {
+        many += (q ? "," : "") + std::string("\"q") + std::to_string(q) +
+                R"(": {"type": "noul", "instructions": "i"})";
+    }
+    many += "}}";
+    expect(systemone_refusal(many.c_str()).param == "questions", "at most 64 questions");
+}
+
+void decisions_parsing() {
+    const DecisionRequest request = parse_decisions_request(RequestJson::parse(kOpenAI));
+    expect(request.dialect == DecisionDialect::OpenAI && request.model == "m",
+           "OpenAI dialect and model");
+    expect(request.state == "Broken screen.\n\nSecond message.",
+           "user messages with input_text parts and strings join the state");
+    expect(request.questions.size() == 3, "three questions");
+    const DecisionQuestion& damaged = request.questions[0];
+    expect(damaged.type == DecisionType::Noul && damaged.named && damaged.id == "damaged" &&
+               damaged.options.size() == 2,
+           "a predicate is a noul");
+    const DecisionQuestion& department = request.questions[1];
+    expect(department.type == DecisionType::Choice && department.options.size() == 2 &&
+               department.options[0].text == "returns" && department.options[0].description == "RMA" &&
+               department.options[1].text == "true" && department.options[1].value == Json(true),
+           "choice values keep their type");
+    const DecisionQuestion& severity = request.questions[2];
+    expect(severity.type == DecisionType::Score && !severity.named &&
+               severity.options[1].text == "broken",
+           "an unnamed score with labelled levels");
+
+    expect(decisions_refusal(R"({"input": "i", "questions": [{"type": "noul", "instructions": "i"}]})")
+                   .param == "questions[0].type",
+           "System One's noul is not an OpenAI type");
+    expect(decisions_refusal(
+               R"({"input": "i", "questions": [{"type": "choice", "instructions": "i",
+                   "choices": [{"value": "a"}, {"value": "a"}]}]})")
+                   .param == "questions[0].choices[1]",
+           "choice values are unique");
+    expect(decisions_refusal(
+               R"({"input": [{"role": "system", "content": "s"}],
+                   "questions": [{"type": "predicate", "instructions": "i"}]})")
+                   .param == "input[0].role",
+           "only user messages");
+    expect(decisions_refusal(
+               R"({"input": "i", "stream": true, "questions": [{"type": "predicate", "instructions": "i"}]})")
+                   .param == "stream",
+           "unknown fields are refused");
+    expect(decisions_refusal(
+               R"({"input": "i", "questions": [{"type": "predicate", "instructions": "i",
+                   "levels": [{"label": "a"}, {"label": "b"}]}]})")
+                   .param == "questions[0]",
+           "a predicate takes no levels");
+}
+
+void prompts() {
+    const DecisionRequest request = parse_systemone_request(RequestJson::parse(kSystemOne));
+    const DecisionLabels team     = decision_labels(request.questions[0]);
+    const DecisionLabels urgent   = decision_labels(request.questions[1]);
+    const DecisionLabels tone     = decision_labels(request.questions[2]);
+    expect(team.texts == std::vector<std::string>({"A", "B"}) &&
+               team.option == std::vector<std::size_t>({0, 1}) &&
+               tone.texts == std::vector<std::string>({"0", "1", "2"}) &&
+               tone.option == std::vector<std::size_t>({0, 1, 2}),
+           "letters and digits label the options");
+    expect(urgent.texts == std::vector<std::string>({"yes", "Yes", "no", "No"}) &&
+               urgent.option == std::vector<std::size_t>({0, 0, 1, 1}),
+           "a noul reads yes and no in both cases");
+    const GenerationRequest choice = make_decision_read(request, request.questions[0], {32, 33});
+    expect(choice.messages.size() == 2 && choice.messages[0].role == ninfer::ChatRole::System &&
+               choice.messages[0].content.at(0).text.find("one label only") != std::string::npos &&
+               choice.messages[1].role == ninfer::ChatRole::User,
+           "the system turn asking for one label, then the user turn");
+    const std::string& text = choice.messages[1].content.at(0).text;
+    expect(text.find("State:\n{\"ticket\"") == 0 &&
+               text.find("Question: Which team?\nOptions:\nA. billing - payments and refunds\n"
+                         "B. shipping\nReply with a single letter (A or B) and nothing else.") !=
+                   std::string::npos,
+           "the state, the question and the labelled options");
+    expect(choice.enable_thinking == false && choice.max_tokens == 1 && choice.logprobs &&
+               choice.readout_tokens == std::vector<ninfer::TokenId>({32, 33}) && choice.graft &&
+               choice.graft->empty() && choice.sampling.temperature == 0.0 &&
+               choice.sampling.presence_penalty == 0.0,
+           "one greedy token with the labels read out, no thinking, no graft, no penalties");
+    const GenerationRequest noul = make_decision_read(request, request.questions[1], {1, 2, 3, 4});
+    expect(noul.messages[1].content.at(0).text.find(
+               "Question: Reply within the hour?\nyes: money is moving\n"
+               "Answer with one word, yes or no, in lower case.") != std::string::npos,
+           "a noul shows the described answers");
+    const GenerationRequest score = make_decision_read(request, request.questions[2], {1, 2, 3});
+    expect(score.messages[1].content.at(0).text.find(
+               "Levels, lowest first:\n0. calm\n1. annoyed\n2. furious\n"
+               "Reply with a single number (0, 1 or 2) and nothing else.") != std::string::npos,
+           "a score lists its levels under their numbers");
+    const DecisionRequest with_context = parse_systemone_request(RequestJson::parse(
+        R"({"state": "s", "instructions": "ctx",
+            "questions": {"q": {"type": "noul", "instructions": "i"},
+                          "wide": {"type": "choice", "instructions": "i",
+                                   "criteria": {"a": null, "b": null, "c": null, "d": null, "e": null}}}})"));
+    expect(make_decision_read(with_context, with_context.questions[0], {1, 2, 3, 4})
+                   .messages[1]
+                   .content.at(0)
+                   .text.rfind("ctx\n\nState:\ns\n\n", 0) == 0,
+           "context goes ahead of the state");
+    expect(make_decision_read(with_context, with_context.questions[1], {1, 2, 3, 4, 5})
+                   .messages[1]
+                   .content.at(0)
+                   .text.find("Reply with a single letter (A to E) and nothing else.") !=
+               std::string::npos,
+           "many options are spanned");
+}
+
+void reading() {
+    const DecisionLabels three{.texts = {"A", "B", "C"}, .option = {0, 1, 2}};
+    const std::vector<ninfer::TokenId> labels{7, 8, 9};
+    // Exact readout: 0.6, 0.2 and 0.1 of the vocabulary on the labels.
+    const DecisionAnswer exact =
+        read_decision(read({std::log(0.6), std::log(0.2), std::log(0.1)}, {{7, 0.6}, {8, 0.2}}),
+                      three, labels);
+    expect(exact.exact && close_to(exact.label_mass, 0.9) &&
+               close_to(exact.probabilities[0], 0.6 / 0.9) &&
+               close_to(exact.probabilities[2], 0.1 / 0.9) && exact.argmax_is_label,
+           "softmax over the exact label log probabilities, their total as the label mass");
+    const DecisionAnswer other = read_decision(
+        read({std::log(0.3), std::log(0.1), std::log(0.1)}, {{5, 0.5}, {7, 0.3}}), three, labels);
+    expect(!other.argmax_is_label && close_to(other.label_mass, 0.5),
+           "the model's favourite token outside the labels is reported");
+    // No readout: the top alternatives, a missing label as likely as the least likely of them.
+    const DecisionAnswer top =
+        read_decision(read({}, {{7, 0.5}, {4, 0.2}, {9, 0.1}}), three, labels);
+    expect(!top.exact && close_to(top.label_mass, 0.7) && close_to(top.probabilities[0], 0.5 / 0.7) &&
+               close_to(top.probabilities[1], 0.1 / 0.7) && close_to(top.probabilities[2], 0.1 / 0.7),
+           "without a readout the labels are read from the top alternatives");
+    const DecisionAnswer short_readout = read_decision(read({0.0, 0.0}, {{7, 0.5}}), three, labels);
+    expect(!short_readout.exact, "a readout of another size is not this question's");
+    // A noul's two cases add up per option.
+    const DecisionLabels noul{.texts = {"yes", "Yes", "no", "No"}, .option = {0, 0, 1, 1}};
+    const std::vector<ninfer::TokenId> noul_tokens{11, 12, 13, 14};
+    const DecisionAnswer merged = read_decision(
+        read({std::log(0.5), std::log(0.2), std::log(0.1), std::log(0.1)}, {{7, 0.5}}), noul,
+        noul_tokens);
+    expect(merged.exact && merged.probabilities.size() == 2 &&
+               close_to(merged.probabilities[0], 0.7 / 0.9) &&
+               close_to(merged.probabilities[1], 0.2 / 0.9) && close_to(merged.label_mass, 0.9),
+           "yes and Yes answer yes, no and No answer no");
+    bool refused = false;
+    try {
+        (void)read_decision(GenerationOutcome{}, three, labels);
+    } catch (const std::runtime_error&) { refused = true; }
+    expect(refused, "a read without an answer token is an error, not an answer");
+}
+
+void responses() {
+    const DecisionRequest request = parse_systemone_request(RequestJson::parse(kSystemOne));
+    std::vector<DecisionAnswer> answers(3);
+    answers[0] = {.probabilities = {0.25, 0.75}, .label_mass = 0.8, .argmax_is_label = true};
+    answers[1] = {.probabilities = {0.9, 0.1}, .label_mass = 0.5, .argmax_is_label = false};
+    answers[2] = {.probabilities = {0.2, 0.5, 0.3},
+                  .label_mass    = 1.0,
+                  .argmax_is_label = true,
+                  .exact         = false};
+    const Json body = Json::parse(make_decision_response(request, answers, 120, 3));
+    expect(body["object"] == "structured_decision" && body["model"] == "m" &&
+               body["id"].get<std::string>().rfind("decision-", 0) == 0 &&
+               body["usage"]["input_tokens"] == 120 && body["usage"]["output_tokens"] == 3,
+           "a structured decision with usage");
+    const Json& team = body["answers"]["team"];
+    expect(team["type"] == "choice" && team["choice"] == "shipping" &&
+               close_to(team["probabilities"]["billing"].get<double>(), 0.25) &&
+               close_to(team["confidence"].get<double>(), 0.6),
+           "the choice, its probabilities and the winner's share of the vocabulary");
+    const Json& urgent = body["answers"]["urgent"];
+    expect(urgent["type"] == "noul" && close_to(urgent["noul"].get<double>(), 0.9) &&
+               close_to(urgent["probabilities"]["no"].get<double>(), 0.1) &&
+               close_to(urgent["confidence"].get<double>(), 0.45),
+           "a noul's probability of yes");
+    const Json& tone = body["answers"]["tone"];
+    expect(tone["type"] == "score" && close_to(tone["score"].get<double>(), 1.1) &&
+               tone["legend"]["2"] == "furious" &&
+               close_to(tone["probabilities"]["1"].get<double>(), 0.5) &&
+               close_to(tone["confidence"].get<double>(), 0.5),
+           "a score's expected level, legend and probabilities by level index");
+    expect(close_to(body["diagnostics"]["team"]["label_mass"].get<double>(), 0.8) &&
+               body["diagnostics"]["urgent"]["argmax_is_label"] == false &&
+               body["diagnostics"]["team"]["readout"] == "exact" &&
+               body["diagnostics"]["tone"]["readout"] == "top_k",
+           "diagnostics per question");
+
+    const DecisionRequest openai = parse_decisions_request(RequestJson::parse(kOpenAI));
+    std::vector<DecisionAnswer> openai_answers(3);
+    openai_answers[0] = {.probabilities = {0.3, 0.7}, .label_mass = 1.0};
+    openai_answers[1] = {.probabilities = {0.4, 0.6}, .label_mass = 0.5};
+    openai_answers[2] = {.probabilities = {0.8, 0.2}, .label_mass = 1.0};
+    const Json decision = Json::parse(make_decision_response(openai, openai_answers, 40, 3));
+    expect(decision["object"] == "decision" && decision["answers"].is_array() &&
+               decision["answers"].size() == 3 && decision["usage"]["total_tokens"] == 43,
+           "an OpenAI decision with answers in question order");
+    const Json& damaged = decision["answers"][0];
+    expect(damaged["type"] == "predicate" && damaged["name"] == "damaged" &&
+               close_to(damaged["probability"].get<double>(), 0.3),
+           "a predicate's probability");
+    const Json& department = decision["answers"][1];
+    expect(department["type"] == "choice" && department["choice"] == true &&
+               department["probabilities"][0]["value"] == "returns" &&
+               close_to(department["probabilities"][1]["probability"].get<double>(), 0.6) &&
+               close_to(department["confidence"].get<double>(), 0.3),
+           "a choice echoes its values with their types");
+    const Json& severity = decision["answers"][2];
+    expect(severity["type"] == "score" && severity["name"].is_null() &&
+               close_to(severity["score"].get<double>(), 0.2) &&
+               severity["probabilities"][1]["label"] == "broken" &&
+               severity["probabilities"][1]["value"] == 1,
+           "an unnamed score with labelled, indexed levels");
+}
+
+} // namespace
+
+int main() {
+    try {
+        systemone_parsing();
+        decisions_parsing();
+        prompts();
+        reading();
+        responses();
+    } catch (const std::exception& error) {
+        std::cerr << "error: " << error.what() << '\n';
+        return 1;
+    }
+    if (failures != 0) {
+        std::cerr << failures << " expectation(s) failed\n";
+        return 1;
+    }
+    std::cout << "systemone: ok\n";
+    return 0;
+}
