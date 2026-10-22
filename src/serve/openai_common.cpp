@@ -364,6 +364,8 @@ Json make_api_index(const std::string& model_id) {
               endpoint("POST", "/detokenize", "llama.cpp token ids back to text"),
               endpoint("POST", "/apply-template", "llama.cpp chat template rendering"),
               endpoint("POST", "/v1/rerank", "documents ranked by relevance to a query"),
+              endpoint("POST", "/v1/systemone", "typed decisions about a state (System One)"),
+              endpoint("POST", "/v1/decisions", "typed decisions about an input (OpenAI)"),
               endpoint("GET", "/models", "llama.cpp router: every configured model and its state"),
               endpoint("POST", "/models/load|unload|sleep", "llama.cpp router model lifecycle"),
               endpoint("GET", "/models/sse", "llama.cpp router model state events"),
@@ -412,6 +414,8 @@ void validate_openai_model(std::string_view requested, std::string_view availabl
 std::string new_openai_chat_completion_id() { return chat_identifier("chatcmpl-"); }
 
 std::string new_openai_completion_id() { return chat_identifier("cmpl-"); }
+
+std::string new_openai_decision_id() { return chat_identifier("decision-"); }
 
 std::string new_openai_chat_tool_call_id() { return chat_identifier("call_"); }
 

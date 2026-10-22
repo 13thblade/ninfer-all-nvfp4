@@ -286,6 +286,9 @@ struct GenerationRequest {
     // kMaximumTokenLogprobs) of its most likely alternatives in the response.
     bool logprobs    = false;
     int top_logprobs = 0;
+    // With logprobs: token ids whose exact log probabilities the first content token's record
+    // carries (ninfer::ExecutionOptions::readout_tokens), the typed decisions' label readout.
+    std::vector<ninfer::TokenId> readout_tokens;
 
     // The alternatives each reported token carries, absent unless the request asked for logprobs.
     [[nodiscard]] std::optional<int> reported_top_logprobs() const noexcept {

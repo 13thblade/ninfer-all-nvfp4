@@ -10,6 +10,7 @@
 #include "serve/request_log.h"
 #include "serve/serve_metrics.h"
 #include "serve/serve_options.h"
+#include "serve/systemone.h"
 #include "serve/text_completion.h"
 
 #include <httplib.h>
@@ -181,6 +182,9 @@ private:
                                 TextCompletionDialect dialect);
     // POST /rerank, /reranking, /v1/rerank and /v1/reranking: the documents scored by the model.
     void handle_rerank(const httplib::Request& req, httplib::Response& res);
+    // POST /v1/systemone and /v1/decisions: typed questions about a state, one read each.
+    void handle_decisions(const httplib::Request& req, httplib::Response& res,
+                          DecisionDialect dialect);
     void handle_props(const httplib::Request& req, httplib::Response& res) const;
     void handle_webui(const httplib::Request& req, httplib::Response& res) const;
 

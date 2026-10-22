@@ -36,6 +36,7 @@ set(ninfer_op_tests
   scatter
   scatter_bf16_batch
   target_logprobs
+  readout_logprobs
   paged_kv_window
   logprob_topk
   position)

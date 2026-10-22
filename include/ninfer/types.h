@@ -861,6 +861,9 @@ struct StructuredOutputOptions {
     std::vector<std::string> choices;
 };
 
+// The most token ids one request may name for the typed readout (ExecutionOptions::readout_tokens).
+inline constexpr std::size_t kMaximumReadoutTokens = 32;
+
 struct ExecutionOptions {
     StructuredOutputOptions structured_output;
     SamplingOverrides sampling;
@@ -875,6 +878,12 @@ struct ExecutionOptions {
     // kMaximumTokenLogprobs most likely tokens under the distribution the sampler draws from
     // (see GenerationResult::content_logprobs). Sampling is unaffected.
     bool logprobs = false;
+    // Typed readout, with logprobs: the exact log probability of each of these token ids at the
+    // first generated token, under the softmax of the head's logits (the distribution of a greedy
+    // request without penalties), whether or not the id is among the top alternatives
+    // (TokenLogprob::readout). At most kMaximumReadoutTokens ids, each within the model's public
+    // token domain. A core without the readout leaves TokenLogprob::readout empty.
+    std::vector<TokenId> readout_tokens;
 };
 
 struct OutputOptions {
@@ -1275,6 +1284,10 @@ struct TokenLogprob {
     std::array<float, kMaximumTokenLogprobs> top_values{};
     // Decoded byte string for each top-k alternative, aligned with top_ids.
     std::array<std::string, kMaximumTokenLogprobs> top_bytes;
+    // The log probability of each ExecutionOptions::readout_tokens id, in the request's order,
+    // under the softmax of the head's logits at the first generated token; empty on every other
+    // token and when the request named no readout tokens or the core has no typed readout.
+    std::vector<float> readout;
 };
 
 struct OutputDelta {

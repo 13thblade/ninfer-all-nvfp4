@@ -88,6 +88,9 @@ struct PrefillContext {
     // the landing batch, which the cache's next poll() frees, so each chunk function calls this
     // immediately before its pass and nothing outside the chunk call can hold the view.
     std::function<std::span<const cudaEvent_t>()> take_layer_ready;
+    // The typed readout's token count: the first generated token's logits are read at
+    // io.readout_ids[0..readout_count) into io.readout_values; zero reads nothing.
+    std::int32_t readout_count = 0;
 };
 
 struct OrdinaryBatchContext {

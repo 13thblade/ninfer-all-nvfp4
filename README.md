@@ -309,6 +309,11 @@ Prefill of a 4,463-token prompt, in tok/s:
   `/tokenize`, `/detokenize`, `/apply-template`, `/v1/rerank`, `/metrics`, `/slots` and `/props`,
   streaming, tool calls, structured output through xgrammar (`--structured-output`), token log
   probabilities and prompt grafts ([HTTP serving](docs/serving.md)).
+- **Typed decisions.** `/v1/systemone` (TypeSafe's System One API, as llama.cpp, vLLM and Ollama
+  serve it) and `/v1/decisions` (OpenAI's Decisions API) answer choice, yes/no and score questions
+  about a state with the served chat model: one prompt per question, the answer read from the
+  first token's exact label log probabilities, the state prefilled once
+  ([typed decisions](docs/serving.md#typed-decisions)).
 - **Model suspend.** `--model-suspend` lets an idle server give its device memory back without
   exiting and take it again on the next request, retained conversations included. Ternary Bonsai 2
   27B on an RTX 3090: 7.9 GiB down to 0.3 GiB in 0.33 s, back in 1.1 s

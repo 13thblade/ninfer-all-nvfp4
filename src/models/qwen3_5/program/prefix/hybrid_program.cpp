@@ -223,6 +223,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
     quote->sampling                    = plan.sampling;
     quote->grammar                     = plan.grammar;
     quote->logprobs                    = plan.logprobs;
+    quote->readout_tokens              = plan.readout_tokens;
     quote->text_kv_page_entitlement    = plan.text_kv_page_entitlement;
     quote->backend_kv_page_entitlement = plan.backend_kv_page_entitlement;
     quote->vision_control_plan         = plan.vision_control_plan;
@@ -918,6 +919,7 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
         ensure_sequence_kv_mapped(sequence, n, backend_materialized);
         request.grammar  = quote.grammar;
         request.logprobs = quote.logprobs;
+        request.readout_tokens = quote.readout_tokens;
         install_sampling(sequence, request, quote.sampling);
         sequence.mtp_draft_count = 0;
         sequence.rope_delta = prompt.rope_delta;

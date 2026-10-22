@@ -6,6 +6,7 @@
 #include "core/device.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/logprob_topk.h"
+#include "ninfer/ops/readout_logprobs.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/scatter.h"
@@ -100,6 +101,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_mtp_attention_window(state.execution.mtp_attention_window);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    card.set_readout(state.readout_count);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -177,6 +179,8 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
                            bridge.rope_position, false, composed_embedding);
 }
 
+static_assert(kMaximumReadoutTokens == static_cast<std::size_t>(ops::kReadoutLogprobsMaximum));
+
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
                         std::int32_t purpose) {
     if (hidden.dtype != DType::BF16 ||
@@ -190,6 +194,11 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
             state.execution.device.stream);
     // Before sampling adds the token to the penalty counts.
     gather_logprobs(state.execution, logits.view({logits.ne[0], 1, 1}), state.sampling, nullptr);
+    if (state.readout_count > 0) {
+        ops::readout_logprobs(logits, state.execution.io.readout_ids, state.readout_count,
+                              dimension(state.execution.parameters.model.resources().public_token_count),
+                              state.execution.io.readout_values, state.execution.device.stream);
+    }
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
@@ -718,6 +727,7 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
         request.grammar  = request_plan.grammar;
         request.logprobs = request_plan.logprobs;
+        request.readout_tokens = request_plan.readout_tokens;
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -1177,6 +1187,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             return hybrid_take_restore_layers(lane);
         };
         arm_logprobs(request.logprobs);
+        schedule_state.readout_count = arm_readout(request.readout_tokens);
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -1367,7 +1378,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         }
 
         copy_round_token();
-        if (request.logprobs) { fetch_logprobs(1); }
+        if (request.logprobs) {
+            fetch_logprobs(1);
+            fetch_readout(schedule_state.readout_count);
+        }
         std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> initial_drafts{};
         if (staged.prepare_mtp && staged.initial_mtp_extent != 0) {
             CUDA_CHECK(cudaMemcpyAsync(initial_drafts.data(), io.mtp->draft_tokens.data,
@@ -1382,7 +1396,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
 
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
-        if (request.logprobs) { round_logprobs[0] = fetched_logprob(0, host_tokens[0]); }
+        if (request.logprobs) {
+            round_logprobs[0] = fetched_logprob(0, host_tokens[0]);
+            attach_readout(round_logprobs[0], schedule_state.readout_count);
+        }
         if (sequence.ledger.size() != prompt_tokens) {
             throw std::logic_error("candidate token ledger does not match prompt length");
         }

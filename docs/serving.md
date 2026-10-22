@@ -461,6 +461,8 @@ up. A router instead unloads the failed model once its requests are gone and rep
 | `POST /tokenize`, `POST /detokenize` | the model's tokenizer, in llama.cpp's shape |
 | `POST /apply-template` | the prompt a chat request renders to, as text, without generation |
 | `POST /v1/rerank`, `POST /rerank` (and `/reranking`) | documents ranked by relevance to a query, scored by the model (see [Rerank](#rerank)) |
+| `POST /v1/systemone` | typed questions about a state answered by the model, TypeSafe's System One API (see [Typed decisions](#typed-decisions)) |
+| `POST /v1/decisions` | the same reads in OpenAI's Decisions API shape |
 | `GET /models`, `POST /models/load\|unload\|sleep`, `GET /models/sse` | llama.cpp's router API: the catalog and its lifecycle (see [Several models](#several-models-router)) |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
@@ -1378,6 +1380,72 @@ request with `texts` instead of `documents` follows TEI, as llama.cpp's `/rerank
 array of `{"index", "score"}`, with `text` when `return_text` is set. The judgements run a lane's
 worth (`--max-concurrency`) at a time and share the cached judging prefix; on an RTX 3090 with a 27B
 model and two lanes, four short documents took 0.4 s.
+
+## Typed decisions
+
+`POST /v1/systemone` answers typed questions about a `state` in the shape of TypeSafe's System One
+API, as llama.cpp, vLLM and Ollama serve it, and `POST /v1/decisions` takes the same reads in the
+shape of OpenAI's Decisions API. The served chat model is the decision model: each question becomes
+one prompt -- a fixed system turn asking for one label, then the state, the question and its
+options under one-token labels (`A`.. for a choice, `yes`/`no` for a noul, `0`.. for a score),
+thinking off -- and its answer is read from the first reply token's exact log probabilities of
+those labels (a noul's `yes` and `Yes`, `no` and `No` added up), without sampling past it. No
+startup option is needed; a Qwen3.5-core model reads the labels exactly, Flash-Next and Gemma 4
+read them from the token's 20 most likely alternatives (`diagnostics.<id>.readout` says which).
+
+```bash
+curl http://127.0.0.1:8080/v1/systemone -d '{
+  "state": {"ticket": "My card was charged twice for one order."},
+  "questions": {
+    "team": {"type": "choice", "instructions": "Which team should handle this?",
+             "criteria": {"billing": "payments and refunds", "shipping": "deliveries"}},
+    "urgent": {"type": "noul", "instructions": "Does the customer need a reply within the hour?"},
+    "tone": {"type": "score", "instructions": "How upset is the customer?",
+             "criteria": ["calm", "annoyed", "furious"]}}}'
+```
+
+The request takes `state` (a string, or JSON that the prompt shows as its compact text),
+`questions` (an object of 1 to 64 question ids, each `{type, instructions, criteria}`, asked in
+request order) and optionally `instructions` (context placed ahead of the state) and
+`chat_template_kwargs` (accepted for compatibility; thinking stays off). A `choice` lists 2 to 26
+options as `{name: description or null}`, a `score` 2 to 10 level descriptions lowest first, and a
+`noul` takes no criteria or `{"true": ..., "false": ...}` descriptions. Unknown fields, `joint`
+reads and a thinking request are refused with 400; `images`, `files`, `audio` and `videos` with 501.
+
+The response holds `answers` by question id: a `choice` with the most likely option, its
+`probabilities` by option (summing to 1) and `confidence`; a `noul` with `noul` (the probability of
+yes) and the same `probabilities` and `confidence`; a `score` with `score` (the expected level index,
+weighted by probability), the `legend` and `probabilities` by level index, and `confidence`.
+Probabilities are the softmax over the labels; `confidence` is the chosen label's probability over
+the whole vocabulary, its share of the labels times `diagnostics.<id>.label_mass`, the probability
+the model put on the labels at all. `diagnostics.<id>.argmax_is_label` says whether the model's most
+likely token was one of the labels, and `readout` whether the labels were read exactly (`exact`) or
+from the top alternatives (`top_k`, where a label outside them counts as likely as the least likely
+alternative, its upper bound). `usage.input_tokens` sums the prompts of every read and
+`output_tokens` counts one token per question. The probabilities are those of a general chat model
+under this prompt, not calibrated to any data, and the head's logits are BF16, so two options the
+model scores within one BF16 step (about 0.1 nat at these magnitudes) share one probability; a label
+the tokenizer does not hold as one token is refused with 400.
+
+`POST /v1/decisions` takes OpenAI's request -- `input` as a string or user messages with string
+content or `input_text` parts, `questions` as an array of `{type, name, instructions}` with
+`choices: [{value, description}]` (string or boolean values, echoed with their type) for a `choice`
+and `levels: [{label, description}]` for a `score`; a `predicate` is a noul -- within the same
+limits, and answers with `answers` in question order: a `predicate` with its `probability`, a
+`choice` with `choice`, `probabilities: [{value, probability}]` and `confidence`, a `score` with
+`score`, `probabilities: [{value, label, probability}]` and `confidence`; `name` is echoed, null for
+an unnamed question. `safety_identifier` is accepted and ignored; streaming, tools, images and
+refusal scoring are not implemented.
+
+The reads of one request run a lane's worth (`--max-concurrency`) at a time, so a request leaves
+room for other clients' generation between its windows, and every read starts with the state, which
+the prefix cache prefills once: a question costs its own text and one token. On an RTX 3090 with
+Ternary Bonsai 2 27B and four lanes, a request about a 370-token state took 17 ms for one question
+and 235 ms for sixteen once the state was cached (150 ms and 0.8 s with the state's prefill); about
+a 13.5K-token state, 39 ms and 0.33 s (5.3 s and 6.1 s cold). Sixteen questions beside a streaming
+256-token chat completion took 0.42 s instead of 0.26 s and slowed the chat's decode from 90 to
+83 tokens/s. With the system turn the labels held 98-99% of the first token's probability on that
+model, where the user turn alone left 60-90%.
 
 ## OpenAI Responses Core
 

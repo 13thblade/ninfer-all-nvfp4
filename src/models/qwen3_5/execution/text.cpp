@@ -22,6 +22,7 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/logprob_topk.h"
+#include "ninfer/ops/readout_logprobs.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/speculative_round.h"
@@ -1641,6 +1642,11 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     ops::logprob_topk(logits.view({logits.ne[0], 1, 1}), sampling_config_, nullptr,
                                       dimension(parameters_.model.resources().public_token_count),
                                       ids, values, lse, io_.logprob_active, work_, s);
+                }
+                if (readout_count_ > 0) {
+                    ops::readout_logprobs(logits, io_.readout_ids, readout_count_,
+                                          dimension(parameters_.model.resources().public_token_count),
+                                          io_.readout_values, s);
                 }
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first

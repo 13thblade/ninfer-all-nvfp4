@@ -8,6 +8,8 @@ add_library(ninfer_serve STATIC
   openai_chat_http.cpp
   text_completion.cpp
   rerank.cpp
+  systemone.cpp
+  decisions_http.cpp
   llamacpp_http.cpp
   openai_common.cpp
   openai_responses_request.cpp

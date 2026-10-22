@@ -26,6 +26,9 @@ struct ResolvedExecutionOptions {
     ThinkingControlOptions thinking;
     // Gather each generated token's log probability and its likely alternatives.
     bool logprobs = false;
+    // With logprobs: the token ids whose exact log probabilities the first generated token's
+    // record carries (ExecutionOptions::readout_tokens).
+    std::vector<TokenId> readout_tokens;
 };
 
 struct ResolvedRequestOptions {
