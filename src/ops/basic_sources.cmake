@@ -1,7 +1,15 @@
+if(NINFER_WINDOWS_KERNEL_DLL)
+  # Both the GGML bridge and Ops use one device-tier probe and cache in the DLL.
+  add_library(ninfer_device_tier OBJECT "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu")
+  ninfer_internal_includes(ninfer_device_tier)
+  ninfer_cuda_archive(ninfer_device_tier)
+else()
+  target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu")
+endif()
+
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/weight_input.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/common/device_route.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/add_bias.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/argmax.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/cast.cu"

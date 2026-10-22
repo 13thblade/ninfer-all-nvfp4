@@ -51,7 +51,9 @@ project(kernel_dll_fixture LANGUAGES CXX)
 set(NINFER_WINDOWS_KERNEL_DLL ON)
 include("{module.as_posix()}")
 add_library(ninfer_ggml_quants OBJECT kernel.cpp)
-add_library(ninfer_ggml_quants_dll SHARED $<TARGET_OBJECTS:ninfer_ggml_quants>)
+add_library(ninfer_device_tier OBJECT policy.cpp)
+add_library(ninfer_ggml_quants_dll SHARED
+  $<TARGET_OBJECTS:ninfer_ggml_quants> $<TARGET_OBJECTS:ninfer_device_tier>)
 set_target_properties(ninfer_ggml_quants_dll PROPERTIES
   OUTPUT_NAME ninfer_ggml_quants WINDOWS_EXPORT_ALL_SYMBOLS ON
   RUNTIME_OUTPUT_DIRECTORY "${{CMAKE_BINARY_DIR}}/kernels")
@@ -62,9 +64,14 @@ ninfer_stage_runtime_dlls(consumer)
 ''')
             (root / 'kernel.cpp').write_text(
                 '#ifdef _WINDLL\n#error Object compilation must not depend on DLL linkage\n#endif\n'
-                'namespace bridge { int value() { return 42; } }\n')
+                'namespace policy { int get(); }\n'
+                'namespace bridge { int value() { return policy::get(); } }\n')
+            (root / 'policy.cpp').write_text(
+                'namespace { int cached = 0; }\n'
+                'namespace policy { void set(int value) { cached = value; } int get() { return cached; } }\n')
             (root / 'main.cpp').write_text(
-                'namespace bridge { int value(); } int main() { return bridge::value() != 42; }\n')
+                'namespace bridge { int value(); } namespace policy { void set(int); }\n'
+                'int main() { policy::set(42); return bridge::value() != 42; }\n')
             build = root / 'build'
             for command in (['cmake', '-S', str(root), '-B', str(build), '-G', 'Visual Studio 17 2022', '-A', 'x64'],
                             ['cmake', '--build', str(build), '--config', 'Release', '-j']):
