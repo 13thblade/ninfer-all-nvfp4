@@ -24,7 +24,7 @@ Generation purpose 的 NInfer Engine 固定运行：
 - 一张 GPU，或 Linux 上按层切成最多八个 pipeline stage 的多张 GPU（见第 8 节）；
 - 一个常驻模型实例；
 - 启动时确定的 `max_concurrency=1..8`；
-- 一个有界 FIFO 等待队列；
+- 一个有界 FIFO 等待队列（等待中的单 token 读取请求之间按剩余工作量交换位置，见 5.2）；
 - 不抢占已经激活的请求；
 - 每个 decode round 将全部 decode-ready 请求组成一个紧凑批次。
 
@@ -369,6 +369,10 @@ Session key 只是查找提示，不拥有 continuation。每个请求进入 Eng
 Scheduler 先确定唯一可尝试的 waiting request，ResourceManager 再为它选择缓存与资源终态。
 资源条件不能反向改变 FIFO 所有权。
 
+每次 admission 尝试前，Scheduler 按 PrefillOnly（arXiv 2505.07203）的规则重排等待中的单 token
+请求（决策读取）：它们只在彼此占有的队列位置之间交换，按 prompt token 数（含分支）减去已等待时间
+折算的 token 数（每秒 4096）升序，长读取不会被饿死；其他请求位置不变；存在 protected head 时不重排。
+
 FIFO head 暂时受 active incumbents 阻塞时，Scheduler 记录 protected head 和必须结束的 donor set。
 后续请求只有在 Program 证明以下条件时才能 backfill：
 
@@ -384,10 +388,13 @@ Scheduler 保证：
 
 - staged prefill 按 lane 持有；prefill unit 每次 worker boundary 推进一个 lane 的一个
   chunk（剩余 prompt 最短的可运行 lane；被跳过 `kPrefillMaxSkip` 次的 lane 优先）。若该 chunk
-  是 prompt 的最后一段且可共享（`Program::prefill_batch_tokens`：纯文本、无 grammar、段内无
-  capture、exact tap 或 drafter 工作），其它 staged lane 同样可共享的最后一段在合计不超过
+  是 prompt 的最后一段且可共享（`Program::prefill_batch_unit`：纯文本、段内无 capture、exact
+  tap 或 drafter 工作；带 grammar 的 request 以其 lane 采样记录中的首个 mask 采样自己的行），
+  其它 staged lane 同样可共享的最后一段在合计不超过
   `prefill_chunk` 时并入同一次 pass（`Program::prefill_batch`），随后各 lane 按 lane 顺序各自
-  完成 prefill step。lane 在其 staged prefill 完成、settle 或 cancel 时从集合中清除。默认情况下
+  完成 prefill step。分支读取（`Engine::submit_branches`）的 step 总以这种 pass 运行，但 pass
+  只含它自己的 segment（前缀的最后一段与分支块），不并入其它 lane，因此它的答案不取决于同时
+  运行的其它请求。lane 在其 staged prefill 完成、settle 或 cancel 时从集合中清除。默认情况下
   staged prefill 期间不进行 admission，除非每个 staged prefill 都只剩可共享的最后一段：此时新
   request 被接纳并可加入同一次 pass。启用 `concurrent_prefill`（`--concurrent-prefill`）后，由于
   prefill 不持有 resource transaction，admission 可以在其它 request prefill 期间进行（仍受 open

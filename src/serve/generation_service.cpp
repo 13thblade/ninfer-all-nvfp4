@@ -100,6 +100,9 @@ using Clock = std::chrono::steady_clock;
 // several times that pass gets one.
 constexpr std::size_t kRawPromptAnchorMinimumTokens = 512;
 
+// The branched reads' records the memo keeps, about 1 KiB each.
+constexpr std::size_t kBranchMemoRecords = 8192;
+
 [[noreturn]] void throw_preparation_cancelled();
 
 [[noreturn]] void throw_media_error(const ninfer::product::media_acquire::Error& exception) {
@@ -358,6 +361,7 @@ GenerationService::GenerationService(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     count_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    branch_memo_ = std::make_shared<BranchMemo>(kBranchMemoRecords);
 }
 
 std::size_t GenerationService::admitted_requests() const {
@@ -448,6 +452,113 @@ GenerationService::submit_group(std::vector<StagedRequest> staged) const {
     return prepared;
 }
 
+StagedRequest GenerationService::stage_read(const BranchRead& read,
+                                            ninfer::GenerationObservationOptions observation,
+                                            std::function<bool()> is_cancelled,
+                                            const ContextCacheHints& context_cache) const {
+    StagedRequest staged = stage(*read.request, GenerationConsumerMode::Aggregate, observation,
+                                 std::move(is_cancelled), context_cache);
+    if (!read.continuation.empty()) {
+        const std::span<const ninfer::TokenId> base = staged.submission.prompt.token_ids();
+        std::vector<ninfer::TokenId> tokens(base.begin(), base.end());
+        tokens.insert(tokens.end(), read.continuation.begin(), read.continuation.end());
+        staged.prepared.prompt_tokens = static_cast<int>(tokens.size());
+        try {
+            staged.submission.prompt = engine_->prepare_tokens(std::move(tokens), true, false,
+                                                               read.request->speculative_drafting);
+        } catch (const std::out_of_range& exception) {
+            throw_invalid_input(std::invalid_argument(exception.what()), "invalid_prompt");
+        }
+    }
+    staged.submission.options.execution.readout_tokens = read.readout;
+    return staged;
+}
+
+PreparedRequest GenerationService::submit_branches(std::span<const BranchRead> reads,
+                                                   ninfer::GenerationObservationOptions observation,
+                                                   std::function<bool()> is_cancelled,
+                                                   const ContextCacheHints& context_cache) const {
+    if (reads.empty()) { throw std::invalid_argument("submit_branches needs one read or more"); }
+    StagedRequest first = stage_read(BranchRead{.request = reads.front().request}, observation,
+                                     is_cancelled, context_cache);
+    ninfer::RequestOptions options = std::move(first.submission.options);
+    options.execution.readout_tokens.clear();
+    // The prompt of the request whose reads come next, without any read's continuation.
+    const GenerationRequest* base_request               = reads.front().request;
+    const std::span<const ninfer::TokenId> first_tokens = first.submission.prompt.token_ids();
+    std::vector<ninfer::TokenId> base_tokens(first_tokens.begin(), first_tokens.end());
+    const auto continued = [&](std::span<const ninfer::TokenId> continuation) {
+        std::vector<ninfer::TokenId> tokens = base_tokens;
+        tokens.insert(tokens.end(), continuation.begin(), continuation.end());
+        try {
+            // A branch's prompt only supplies its tokens: it drafts nothing.
+            return engine_->prepare_tokens(std::move(tokens), true, false, false);
+        } catch (const std::out_of_range& exception) {
+            throw_invalid_input(std::invalid_argument(exception.what()), "invalid_prompt");
+        }
+    };
+    std::vector<ninfer::GenerationBranch> branches;
+    branches.reserve(reads.size());
+    branches.push_back(ninfer::GenerationBranch{
+        .prompt = reads.front().continuation.empty() ? std::move(first.submission.prompt)
+                                                     : continued(reads.front().continuation),
+        .readout_tokens = reads.front().readout});
+    for (std::size_t index = 1; index < reads.size(); ++index) {
+        const BranchRead& read = reads[index];
+        if (read.request != base_request) {
+            StagedRequest next = stage(*read.request, GenerationConsumerMode::Aggregate,
+                                       observation, is_cancelled, context_cache);
+            const std::span<const ninfer::TokenId> tokens = next.submission.prompt.token_ids();
+            base_tokens.assign(tokens.begin(), tokens.end());
+            base_request = read.request;
+            if (read.continuation.empty()) {
+                branches.push_back(ninfer::GenerationBranch{
+                    .prompt = std::move(next.submission.prompt), .readout_tokens = read.readout});
+                continue;
+            }
+        }
+        branches.push_back(ninfer::GenerationBranch{.prompt         = continued(read.continuation),
+                                                    .readout_tokens = read.readout});
+    }
+    // The memo answers the reads it holds; the Engine runs the rest.
+    const std::optional<int> top_logprobs = reads.front().request->reported_top_logprobs();
+    HeldBranches held;
+    held.records.resize(reads.size());
+    std::vector<ninfer::GenerationBranch> pending;
+    pending.reserve(branches.size());
+    for (std::size_t index = 0; index < branches.size(); ++index) {
+        std::optional<BranchKey> key;
+        if (reads[index].memo && reads[index].request->cache_prompt) {
+            key = branch_key(branches[index].prompt.token_ids(), branches[index].readout_tokens,
+                             top_logprobs);
+            if (std::optional<ninfer::BranchResult> record = branch_memo_->find(*key)) {
+                held.records[index] = std::move(record);
+                continue;
+            }
+        }
+        held.run.push_back(key);
+        pending.push_back(std::move(branches[index]));
+    }
+    ninfer::GenerationHandle handle;
+    if (!pending.empty()) {
+        try {
+            handle = engine_->submit_branches(
+                std::move(pending), std::move(options), first.submission.consumer_mode,
+                first.submission.observation, first.submission.pending_deadline);
+        } catch (const ninfer::RequestError& exception) {
+            throw_request_error(exception);
+        } catch (const std::invalid_argument& exception) {
+            throw_invalid_input(exception, "invalid_prompt");
+        }
+    }
+    PreparedRequest prepared           = std::move(first.prepared);
+    prepared.generation                = std::move(handle);
+    prepared.sampling                  = prepared.generation.resolved_sampling();
+    prepared.effective_thinking_budget = prepared.generation.effective_thinking_budget();
+    prepared.held_branches             = std::move(held);
+    return prepared;
+}
+
 StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
                                             GenerationConsumerMode consumer_mode,
                                             ninfer::GenerationObservationOptions observation,
@@ -503,7 +614,8 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
             const bool cached = cache_participation == CacheParticipation::ReadWrite;
             const bool anchor = cached && tokens.size() >= kRawPromptAnchorMinimumTokens;
             try {
-                prompt = engine_->prepare_tokens(std::move(tokens), cached, anchor);
+                prompt = engine_->prepare_tokens(std::move(tokens), cached, anchor,
+                                                 request.speculative_drafting);
             } catch (const std::out_of_range& exception) {
                 // A token id outside the vocabulary is the client's input, not a server fault.
                 invalid_prompt(exception.what());
@@ -662,15 +774,47 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         });
     }
 
+    if (prepared.held_branches && !prepared.generation) {
+        // The memo held every read: no Engine request ran, and none of the prompt was computed.
+        GenerationOutcome outcome;
+        outcome.prompt_tokens = prepared.prompt_tokens;
+        outcome.metrics.prefix_cache_hit_tokens =
+            static_cast<std::uint32_t>(prepared.prompt_tokens);
+        outcome.metrics.prepare_seconds = prepared.prepare_seconds;
+        outcome.metrics.total_seconds   = prepared.prepare_seconds;
+        for (std::optional<ninfer::BranchResult>& record : prepared.held_branches->records) {
+            outcome.branches.push_back(std::move(*record));
+        }
+        return outcome;
+    }
     ninfer::GenerationResult result;
     try {
         result = prepared.generation.wait(public_sink, cancellation);
     } catch (const ninfer::RequestError& exception) { throw_request_error(exception); }
+    if (prepared.held_branches && result.branches.size() == prepared.held_branches->run.size()) {
+        // The Engine's records in read order between the held ones, and into the memo.
+        HeldBranches& held                         = *prepared.held_branches;
+        std::vector<ninfer::BranchResult> computed = std::move(result.branches);
+        result.branches.clear();
+        result.branches.reserve(held.records.size());
+        std::size_t next = 0;
+        for (std::optional<ninfer::BranchResult>& record : held.records) {
+            if (record) {
+                result.branches.push_back(std::move(*record));
+                continue;
+            }
+            if (const std::optional<BranchKey>& key = held.run[next]) {
+                branch_memo_->keep(*key, computed[next]);
+            }
+            result.branches.push_back(std::move(computed[next++]));
+        }
+    }
     GenerationOutcome outcome;
     outcome.tokens              = result.generated_token_ids;
     outcome.text                = std::move(result.content);
     outcome.reasoning           = std::move(result.reasoning);
     outcome.content_logprobs    = std::move(result.content_logprobs);
+    outcome.branches            = std::move(result.branches);
     outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);

@@ -975,14 +975,26 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence,
     }
 }
 
-std::optional<std::uint32_t>
-ProgramImpl::prefill_batch_tokens(SequenceHandle sequence) const noexcept {
+std::optional<PrefillBatchUnit>
+ProgramImpl::prefill_batch_unit(SequenceHandle sequence) const noexcept {
     if (pending_transaction_ || !valid_sequence(sequence)) { return std::nullopt; }
     try {
-        return prefill_batch_tokens(ContractAccess::lane(sequence).value);
+        return prefill_batch_unit(ContractAccess::lane(sequence).value);
     } catch (...) {
         return std::nullopt;
     }
+}
+
+std::uint32_t ProgramImpl::pending_branch_tokens(SequenceHandle sequence) const noexcept {
+    if (!valid_sequence(sequence)) { return 0; }
+    const RequestControl& request = requests[ContractAccess::lane(sequence).value];
+    if (request.branches == nullptr || !request.prefill) { return 0; }
+    std::uint32_t tokens = 0;
+    for (std::size_t branch = request.prefill->next_branch; branch < request.branches->size();
+         ++branch) {
+        tokens += static_cast<std::uint32_t>((*request.branches)[branch].tokens.size());
+    }
+    return tokens;
 }
 
 runtime::ExecutionTiming ProgramImpl::prefill_batch(std::span<const SequenceHandle> sequences,

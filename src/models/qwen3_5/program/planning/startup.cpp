@@ -8,6 +8,7 @@
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
 #include "models/qwen3_5/execution/vision.h"
+#include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
 #include "core/host_kv_arena.h"
@@ -17,6 +18,7 @@
 #include "ninfer/ops/context_kv_materialize.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/logprob_topk.h"
+#include "ninfer/ops/readout_logprobs.h"
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -591,14 +593,41 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     WorkspacePlan out;
     WorkspaceLayoutBuilder text_prefill;
     text_common_root(text_prefill, chunk);
+    if (!plan.causal_scoring && config.gdn) {
+        // A branch block's convolution window and recurrent state, held while its layer runs
+        // (TextContext::prefill_final_batch).
+        matrix(text_prefill, DType::BF16, dimension(config.gdn->conv_channels()),
+               dimension(config.gdn->linear_conv_kernel_dim - 1));
+        (void)text_prefill.alloc(DType::FP32, {dimension(config.gdn->linear_key_head_dim),
+                                               dimension(config.gdn->linear_value_head_dim),
+                                               dimension(config.gdn->linear_num_value_heads)});
+    }
     target_body(text_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
                 1, chunk, prefill_envelope);
     if (!plan.causal_scoring) {
-        scratch(text_prefill,
-                ops::sampling_workspace_capacity_bytes(
-                    dimension(parameters.model.resources().public_token_count), 1, 1));
-        scratch(text_prefill, ops::logprob_topk_workspace_capacity_bytes(
-                                  dimension(parameters.model.resources().public_token_count), 1));
+        // A shared pass reads up to kMaximumPrefillSegments rows: their hidden, logits, sampling
+        // records, logprob gather and readout, and samples up to one row per lane.
+        const auto vocabulary = dimension(parameters.model.resources().public_token_count);
+        const auto rows       = static_cast<std::int32_t>(execution::kMaximumPrefillSegments);
+        const auto lanes      = static_cast<std::int32_t>(plan.max_concurrency);
+        auto tail             = text_prefill.scope();
+        (void)text_prefill.alloc(DType::BF16, {dimension(config.hidden_size), rows});
+        (void)text_prefill.alloc(DType::BF16, {dimension(config.vocab_size), rows});
+        (void)text_prefill.alloc_bytes(sizeof(ops::SamplingConfig) *
+                                       execution::kMaximumPrefillSegments);
+        (void)text_prefill.alloc(DType::I32, {ops::kLogprobTopK, 1, rows});
+        (void)text_prefill.alloc(DType::FP32, {ops::kLogprobTopK, 1, rows});
+        (void)text_prefill.alloc(DType::FP32, {1, rows});
+        (void)text_prefill.alloc(DType::I32, {ops::kReadoutLogprobsMaximum, rows});
+        (void)text_prefill.alloc(DType::FP32, {ops::kReadoutLogprobsMaximum, rows});
+        (void)text_prefill.alloc(DType::I32, {rows});
+        (void)text_prefill.alloc(DType::BF16, {dimension(config.vocab_size), lanes});
+        (void)text_prefill.alloc_bytes(sizeof(ops::SamplingConfig) *
+                                       static_cast<std::size_t>(lanes));
+        (void)text_prefill.alloc(DType::I32, {lanes});
+        (void)text_prefill.alloc(DType::I32, {lanes});
+        scratch(text_prefill, ops::sampling_workspace_capacity_bytes(vocabulary, 1, lanes));
+        scratch(text_prefill, ops::logprob_topk_workspace_capacity_bytes(vocabulary, rows));
     }
     out.text_prefill = finish(text_prefill);
 

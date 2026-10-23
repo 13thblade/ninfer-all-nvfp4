@@ -459,11 +459,25 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence,
     return result;
 }
 
-std::optional<std::uint32_t> Program::prefill_batch_tokens(SequenceHandle sequence) const noexcept {
-    return impl_->prefill_batch_tokens(sequence);
+std::optional<PrefillBatchUnit>
+Program::prefill_batch_unit(SequenceHandle sequence) const noexcept {
+    return impl_->prefill_batch_unit(sequence);
 }
 
 std::uint32_t Program::prefill_batch_capacity() const noexcept { return impl_->prefill_chunk; }
+
+std::uint32_t Program::prefill_batch_segments() const noexcept {
+    return static_cast<std::uint32_t>(execution::kMaximumPrefillSegments);
+}
+
+bool Program::runs_branched_reads() const noexcept {
+    return !impl_->stage_runtime && impl_->prefill_hidden.data != nullptr &&
+           impl_->round_host.has_value();
+}
+
+std::uint32_t Program::pending_branch_tokens(SequenceHandle sequence) const noexcept {
+    return impl_->pending_branch_tokens(sequence);
+}
 
 runtime::ExecutionTiming Program::prefill_batch(std::span<const SequenceHandle> sequences,
                                                 runtime::ExecutionTiming* failed_timing) {

@@ -173,6 +173,19 @@ public:
     // read while the device runs `tokens`.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::span<const std::int32_t> next = {});
+    // Branches of a sequence in one pass, each from the state `at` (a snapshot of the sequence):
+    // branch b runs `lengths[b]` of `tokens` (in branch order, at most prefill_chunk in all) at the
+    // positions after `at`, its mixers from `at`'s state, while every layer's experts run over all
+    // branches' tokens at once. Leaves the logits of each branch's last token in logits(), one
+    // column per branch in order, at most max_logit_rows() branches. The sequence then holds the
+    // last branch's state, which its MTP block does not follow; restore it before it runs again.
+    // Needs runs_branches(): no streamed KV layer.
+    void forward_branches(std::uint32_t sequence, const SequenceSnapshot& at,
+                          std::span<const std::int32_t> tokens,
+                          std::span<const std::uint32_t> lengths);
+    [[nodiscard]] bool runs_branches() const noexcept;
+    // The most logit rows one pass leaves.
+    [[nodiscard]] std::uint32_t max_logit_rows() const noexcept;
     // Runs one token of each of `sequences` (distinct) at its next position in one pass, and
     // leaves their logits in logits(), one column per sequence in that order. The experts read
     // their weights once for the whole batch; each sequence's mixers run on its own state.
@@ -208,6 +221,9 @@ public:
     // Whether the sequence's MTP state follows its tokens, which a media prompt breaks until the
     // sequence is reset; a sequence drafts only from a position past its first.
     [[nodiscard]] bool can_draft(std::uint32_t sequence) const;
+    // The sequence's MTP state stops following its tokens until a reset or a restore of a state
+    // that follows them: its passes skip the MTP block's catch-up, for a request that never drafts.
+    void stop_drafting(std::uint32_t sequence);
     // Drafts `steps` tokens (1..draft_tokens(); 0 means draft_tokens()) for each of `sequences`
     // (distinct) from its next position: the MTP block runs its anchor (the token it sampled last
     // and has not fed) and then its own drafts, greedily. `out` receives them sequence-major, each

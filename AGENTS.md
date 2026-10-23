@@ -90,7 +90,8 @@ Generation uses one resident model on one GPU, or split into pipeline stages ove
 (`--devices`; each stage owns whole layers with their KV and state, and the head,
 round state and sampling stay on the first device; design in
 `docs/maintainer/pipeline-stages.md`). It runs startup-fixed concurrency of one to eight
-requests, bounded FIFO ingress, no active-request preemption, and one compact decode batch per
+requests, bounded FIFO ingress (whose one-token reads trade places by remaining work), no
+active-request preemption, and one compact decode batch per
 round. Tensor parallelism is not built.
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable

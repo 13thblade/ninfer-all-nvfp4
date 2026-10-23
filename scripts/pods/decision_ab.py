@@ -3,11 +3,15 @@
 
 usage: decision_ab.py --bench DIR --model PATH --server NAME=PATH [--server NAME=PATH ...]
                       [--config NAME:SERVER[:FLAG,FLAG...] ...] [--conc 1,4] [--rounds 2]
-                      [--out DIR] [--cpus LIST]
+                      [--out DIR] [--cpus LIST] [--flag OPTION ...]
 
-Each round starts every configuration once, in an order rotated by the round, and runs the bench's
-`node bench.mjs --conc N` against /v1/systemone for every N (the bench directory needs bench.mjs
-and data.mjs; it warms up with three cases of its own). Per run it records the bench's wall time,
+`--flag` adds a server option (its value after a space) to every configuration, such as the model's
+`--kv-capacity` or `--ngram-table`; a configuration without `--kv-dtype` runs int8.
+
+Each round runs every configuration, in an order rotated by the round, under the bench's
+`node bench.mjs --conc N` against /v1/systemone for every N, each on a server of its own, so no run
+answers from another's context cache or branch memo (the bench directory needs bench.mjs and
+data.mjs; it warms up with three cases of its own). Per run it records the bench's wall time,
 per-case latencies and answers, and from the server's request log every read's prompt and cached
 tokens, time to first token and queue time. Writes DIR/summary.json and DIR/summary.md: each
 configuration's medians over the rounds, the new (uncached) prompt tokens per case, and how far its
@@ -32,12 +36,11 @@ from pathlib import Path
 PORT = int(os.environ.get("DECISION_AB_PORT", "18092"))
 BASE = f"http://127.0.0.1:{PORT}"
 COMMON = ["--host", "127.0.0.1", "--port", str(PORT), "--device", "0", "--max-context", "16384",
-          "--kv-capacity", "65536", "--max-concurrency", "4", "--kv-dtype", "int8",
-          "--concurrent-prefill"]
+          "--max-concurrency", "4", "--concurrent-prefill"]
 # Options only the checkpoint catalog serves, as the field report ran it; naming any selects it.
 CATALOG = ["--auto-prefix-grid", "--auto-long-anchors", "--derive-session-keys"]
-# The bench warms up with three triage cases of three questions each before its timed cases.
-WARMUP_READS = 9
+# The bench warms up with three triage cases before its timed cases.
+WARMUP_CASES = 3
 # Token counts of 1,000 and more are logged with thousands separators.
 DONE = re.compile(r"req#(\d+) done \|.*?\| prompt ([\d,]+) \| output ([\d,]+) \| cache ([\d,]+)"
                   r"(?: \(([^)]*)\))?.*?\| TTFT ([\d.]+) ?(ms|s)(?:.*?\| queue ([\d.]+) ?(ms|s))?")
@@ -73,7 +76,8 @@ def healthy() -> bool:
 
 def start_server(binary: Path, model: Path, flags: list[str], log: Path,
                  cpus: str | None) -> subprocess.Popen:
-    command = [str(binary), str(model), *COMMON, *flags]
+    kv = [] if "--kv-dtype" in flags else ["--kv-dtype", "int8"]
+    command = [str(binary), str(model), *COMMON, *kv, *flags]
     if cpus:
         command = ["taskset", "-c", cpus, *command]
     log.write_text("")
@@ -187,7 +191,10 @@ def main() -> int:
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--out", type=Path, default=Path("decision-ab"))
     parser.add_argument("--cpus", help="taskset CPU list for every server")
+    parser.add_argument("--flag", action="append", default=[],
+                        help="a server option for every configuration, its value after a space")
     args = parser.parse_args()
+    shared = [part for flag in args.flag for part in flag.split(" ")]
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
     servers = dict(item.split("=", 1) for item in args.server)
@@ -197,7 +204,7 @@ def main() -> int:
         flags = []
         for flag in (rest[0].split(",") if rest and rest[0] else []):
             flags += CATALOG if flag == "catalog" else flag.split(" ")
-        configs.append({"name": name, "binary": Path(servers[server]), "flags": flags})
+        configs.append({"name": name, "binary": Path(servers[server]), "flags": shared + flags})
     concs = [int(c) for c in args.conc.split(",")]
     args.out.mkdir(parents=True, exist_ok=True)
     runs: dict[str, dict[int, list[dict]]] = {c["name"]: {n: [] for n in concs} for c in configs}
@@ -207,18 +214,21 @@ def main() -> int:
             for config in order:
                 tag = f"r{round_index}-{config['name']}"
                 print(f"round {round_index} {config['name']}", flush=True)
-                log = args.out / f"{tag}.server.log"
-                start_server(config["binary"], args.model, config["flags"], log, args.cpus)
                 for conc in concs:
-                    offset = len(log.read_text(errors="replace"))
+                    log = args.out / f"{tag}-c{conc}.server.log"
+                    start_server(config["binary"], args.model, config["flags"], log, args.cpus)
                     result = run_bench(args.bench, args.out / f"{tag}-c{conc}", conc)
                     time.sleep(1)
-                    result["reads"] = reads(log.read_text(errors="replace")[offset:])[WARMUP_READS:]
+                    stop_servers()
+                    logged = reads(log.read_text(errors="replace"))
+                    # A branched read logs one request for a case's questions, a window one per
+                    # question: the warm-up's share follows from the count.
+                    warmup = len(logged) * WARMUP_CASES // (result["cases"] + WARMUP_CASES)
+                    result["reads"] = logged[warmup:]
                     runs[config["name"]][conc].append(result)
                     new = sum(r["prompt"] - r["cache"] for r in result["reads"])
                     print(f"  conc {conc}: wall {result['wall']:.1f} s, errors {result['errors']}, "
                           f"reads {len(result['reads'])}, new prompt tokens {new}", flush=True)
-                stop_servers()
     finally:
         stop_servers()
     base = configs[0]["name"]

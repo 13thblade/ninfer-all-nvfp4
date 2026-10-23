@@ -226,6 +226,7 @@ void test_builtin_parts() {
         {"NVIDIA GeForce RTX 2070 SUPER", 7, 5, 40},
         {"NVIDIA GeForce RTX 2080 Ti", 7, 5, 68},
         {"Quadro RTX 6000", 7, 5, 72},
+        {"Quadro RTX 8000", 7, 5, 72},
         {"Tesla T4", 7, 5, 40},
     };
     for (const Part& part : parts) {

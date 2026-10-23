@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <string>
 #include <string_view>
@@ -240,6 +241,47 @@ int run() {
         opens                    = text == std::string::npos || bytes[text] == '{';
     }
     check(opens, "the grammar's mask reached the gather");
+
+    // Two constrained requests admitted together: on a Qwen3.5-core model under the hybrid cache
+    // (the server's default) their prompts share one prefill pass, whose rows each sample under
+    // their own lane's first mask. The legacy cache splits a chat prompt at its turn closure, and
+    // no shared pass crosses that split.
+    {
+        const ninfer::RuntimeStats before = engine.runtime_stats();
+        std::vector<ninfer::GenerationSubmission> group;
+        for (const char* question : {"Name one color.", "Name one animal."}) {
+            group.push_back(ninfer::GenerationSubmission{.prompt = engine.prepare(prompt(question)),
+                                                         .options = json});
+        }
+        std::size_t index = 0;
+        for (ninfer::GenerationHandle& handle : engine.submit_group(std::move(group))) {
+            const ninfer::GenerationResult result = handle.wait();
+            const std::string label               = "grouped json " + std::to_string(index++);
+            std::cout << label << ": " << result.content << '\n';
+            check_records(result.content_logprobs, true, label);
+            bool masked = !result.content_logprobs.empty();
+            for (std::size_t k = 0; masked && k < ninfer::kMaximumTokenLogprobs; ++k) {
+                const ninfer::TokenLogprob& first = result.content_logprobs.front();
+                if (first.top_ids[k] < 0) { break; }
+                const std::string& bytes = first.top_bytes[k];
+                const std::size_t text   = bytes.find_first_not_of(" \t\r\n");
+                masked                   = text == std::string::npos || bytes[text] == '{';
+            }
+            check(masked, label + ": its own mask reached the shared pass");
+        }
+        const ninfer::RuntimeStats after = engine.runtime_stats();
+        const std::uint64_t passes = after.shared_prefill_passes - before.shared_prefill_passes;
+        const std::uint64_t requests =
+            after.shared_prefill_requests - before.shared_prefill_requests;
+        std::cout << "grouped json: " << passes << " shared passes of " << requests
+                  << " requests\n";
+        const char* cache         = std::getenv("NINFER_LOGPROBS_CONTEXT_CACHE");
+        const bool hybrid         = cache != nullptr && std::string_view(cache) == "hybrid";
+        const std::uint32_t limit = engine.branch_token_limit();
+        if (hybrid && limit != 0 && limit != std::numeric_limits<std::uint32_t>::max()) {
+            check(passes == 1 && requests == 2, "the constrained requests shared one prefill pass");
+        }
+    }
 
     // Schemas whose root is not an object constrain the answer from its first token: every
     // alternative for it opens the root's value, and the answer is that value.

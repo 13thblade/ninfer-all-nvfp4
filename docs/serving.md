@@ -1380,10 +1380,12 @@ says what relevance means (Qwen3-Reranker's default: "Given a web search query, 
 passages that answer the query"). The response is a list of `results`, best first, each with its
 `index`, `relevance_score` and `document.text`, and `usage.prompt_tokens` over all judgements. A
 request with `texts` instead of `documents` follows TEI, as llama.cpp's `/rerank` does: a bare
-array of `{"index", "score"}`, with `text` when `return_text` is set. The judgements run a lane's
-worth (`--max-concurrency`) at a time, each window submitted as one group so that on a Qwen3.5-core
-model its short prompts share one prefill pass, and share the cached judging prefix; on an RTX 3090
-with a 27B model and two lanes, four short documents took 0.4 s before windows were grouped.
+array of `{"index", "score"}`, with `text` when `return_text` is set. The judgements of a request
+run as one branched read ([Typed decisions](#typed-decisions)): the system turn and the query run
+once, and each document runs as a branch after them. A Qwen3.5-core model split over several
+devices runs no branched reads, and on a Qwen3.5-core model a branch holds at most
+`--prefill-chunk` tokens; there, or when a document is longer, the judgements run a lane's worth
+(`--max-concurrency`) at a time, each window submitted as one group.
 
 ## Typed decisions
 
@@ -1394,8 +1396,7 @@ one prompt -- a fixed system turn asking for one label, then the state, the ques
 options under one-token labels (`A`.. for a choice, `yes`/`no` for a noul, `0`.. for a score),
 thinking off -- and its answer is read from the first reply token's exact log probabilities of
 those labels (a noul's `yes` and `Yes`, `no` and `No` added up), without sampling past it. No
-startup option is needed; a Qwen3.5-core model reads the labels exactly, Flash-Next and Gemma 4
-read them from the token's 20 most likely alternatives (`diagnostics.<id>.readout` says which).
+startup option is needed; every model family reads the labels exactly.
 
 ```bash
 curl http://127.0.0.1:8080/v1/systemone -d '{
@@ -1409,18 +1410,56 @@ curl http://127.0.0.1:8080/v1/systemone -d '{
 ```
 
 The request takes `state` (a string, or JSON that the prompt shows as its compact text),
-`questions` (an object of 1 to 64 question ids, each `{type, instructions, criteria}`, asked in
+`questions` (an object of 1 to 200 question ids, each `{type, instructions, criteria}`, asked in
 request order) and optionally `instructions` (context placed ahead of the state) and
-`chat_template_kwargs` (accepted for compatibility; thinking stays off). A `choice` lists 2 to 26
+`chat_template_kwargs` (accepted for compatibility; thinking stays off). A `choice` lists 2 to 255
 options as `{name: description or null}`, a `score` 2 to 10 level descriptions lowest first, and a
-`noul` takes no criteria or `{"true": ..., "false": ...}` descriptions. Unknown fields, `joint`
-reads and a thinking request are refused with 400; `images`, `files`, `audio` and `videos` with 501.
+`noul` takes no criteria or `{"true": ..., "false": ...}` descriptions. A choice of up to 26 options
+is labeled `A`..`Z`; a wider one `00`..`99`, or `000`.. past 100 options, and each label is read a
+digit at a time: one read for the first digit, one for the next digit after each first digit, its
+probability the product along the label. Unknown fields, `joint` reads and a thinking request are
+refused with 400; `audio` and `videos` fields and audio data with 501.
+
+Images and video come as data URLs (`data:image/...;base64,...`, `data:video/...`), as llama.cpp's
+System One takes them, and need a model with a vision tower started with `--vision` (otherwise
+501): `files` and its alias `images` (arrays of data URLs), and the `image_url` parts of a `state`
+made of chat messages (an array of `{role, content}` messages, or an object with a `messages`
+array), which leave the state's text. `/v1/decisions` takes `input_image` parts (`image_url` a
+data URL, optional `detail`) in its input messages. Every read places the media, `files` first,
+then `images`, then the state's own, ahead of the state, inside the part that the state's cache
+boundary closes; `state` may be left out of a request about its media alone. A URL that is not a
+data URL and `input_image.file_id` are refused with 400, and so is a choice of more than 26
+options, whose later digits are read from token prompts that carry no media. Each read's request
+holds its own copy of the media, and their size times the reads may not exceed 512 MiB.
+
+Four fields change how the questions are asked, in both endpoints:
+
+- `conversation`: an OpenAI chat completion request body (`messages`, and `tools` and
+  `chat_template_kwargs` as the agent sent them). Its messages come first, rendered as that
+  request's prompt is, with a cache boundary after the last message, so a session the context
+  cache holds for the conversation serves every question, which then costs only its own tokens;
+  the decision instructions, the state (optional with a conversation) and the question follow in a
+  new user turn. The conversation's images and video are read as its request reads them.
+- `layout`: `state_first` (the default) or `schema_first`, which puts the questions with their
+  options ahead of the state, so the state comes last before the reply. A conversation keeps
+  `state_first`.
+- `runoff: true` answers each `choice` by Runoff, whose answer does not depend on the options'
+  order: every option is first judged alone as a yes-or-no read, the options are kept by
+  decreasing odds of yes until they hold 99% of the normalized odds and number at least three,
+  and those are compared in listings where each takes every position, their probabilities the
+  geometric mean over the listings. An option outside that set keeps its pointwise probability.
+  It costs one read per option plus one per kept option. It needs `state_first`.
+- `recheck_margin` (0 to 1, default 0): an answer whose `margin` lies below it is read again alone,
+  outside any shared pass, and that read is its answer, so near ties do not depend on what else ran
+  with them.
 
 The response holds `answers` by question id: a `choice` with the most likely option, its
 `probabilities` by option (summing to 1) and `confidence`; a `noul` with `noul` (the probability of
 yes) and the same `probabilities` and `confidence`; a `score` with `score` (the expected level index,
-weighted by probability), the `legend` and `probabilities` by level index, and `confidence`.
-Probabilities are the softmax over the labels; `confidence` is the chosen label's probability over
+weighted by probability), the `legend` and `probabilities` by level index, and `confidence`. Every
+answer also carries `margin`, its most likely option's probability less the second's, by which a
+client can send a near tie on to a generation with reasoning. Probabilities are the softmax over
+the labels; `confidence` is the chosen label's probability over
 the whole vocabulary, its share of the labels times `diagnostics.<id>.label_mass`, the probability
 the model put on the labels at all. `diagnostics.<id>.argmax_is_label` says whether the model's most
 likely token was one of the labels, and `readout` whether the labels were read exactly (`exact`) or
@@ -1437,39 +1476,80 @@ content or `input_text` parts, `questions` as an array of `{type, name, instruct
 and `levels: [{label, description}]` for a `score`; a `predicate` is a noul -- within the same
 limits, and answers with `answers` in question order: a `predicate` with its `probability`, a
 `choice` with `choice`, `probabilities: [{value, probability}]` and `confidence`, a `score` with
-`score`, `probabilities: [{value, label, probability}]` and `confidence`; `name` is echoed, null for
-an unnamed question. `safety_identifier` is accepted and ignored; streaming, tools, images and
-refusal scoring are not implemented.
+`score`, `probabilities: [{value, label, probability}]` and `confidence`, and every answer with its
+`margin`; `name` is echoed, null for an unnamed question. `safety_identifier` is accepted and
+ignored; streaming, tools and refusal scoring are not implemented.
 
 Every read of a request starts with the same system turn, context and state, and its prompt carries
 explicit cache boundaries after the system turn and after the state, so the first read about a new
-state resumes after the system turn. The first question runs alone and leaves the state in the
-context cache; the rest resume from it a lane's worth (`--max-concurrency`) at a time. Each window
-is submitted as one group, and on a Qwen3.5-core model its questions run in one shared prefill pass
-([Execution behavior](#execution-behavior)): a window costs one pass over the weights and its
-questions' text, and a request leaves room for other clients' generation between its windows. The
-reads draft nothing: under `--spec` the drafter runs over the first read's prompt only up to the
-state's boundary, whose snapshot keeps the drafter's state for generation requests, and over no
-question. The reads are disposable: a read supersedes nothing it resumed from, keeps no cache tap
-past the state, the checkpoint catalog evicts the reads' own continuations first, and they start no
-session lineage under `--derive-session-keys`. A read that ends within 64 tokens of the state's
-boundary, and under `--spec` every read, leaves no snapshot of its own, so the same request sent
-again prefills each question again.
+state resumes after the system turn. The reads of a request run as one branched read on one lane
+(`Engine::submit_branches`): the state runs once, or resumes from the context cache, and each
+question runs as a branch that sees only the state and itself, in shared passes that hold no
+other request's tokens. On a Qwen3.5-core model the branches run as blocks of shared prefill
+passes, up to 64 blocks and `--prefill-chunk` tokens a pass. On Gemma 4 a pass holds up to 256
+branches and 2048 tokens, each branch continuing the state in cache slots of its own. On
+Flash-Next a pass holds up to `--prefill-chunk` tokens: each branch's recurrent layers start from
+the state at its end, and each layer's routed experts run over every branch's tokens at once, so a
+routed expert the device cache lacks crosses the bus once a pass. A branch longer than a pass runs
+alone from a device snapshot of the state, and so does every branch on a Flash-Next model whose
+sparse-attention KV streams from host memory (`--kv-resident`). A request with media runs no
+branched read, since a branch's prompt is its tokens alone: its reads go the way described next,
+each decoding the media on the host again while the later ones resume past them, and past the
+state, from the context cache. A Runoff choice adds a second
+branched read for its listings, and `recheck_margin` one read per near tie. A Qwen3.5-core model split over several devices runs no branched reads, and on a
+Qwen3.5-core model a branch holds at most `--prefill-chunk` tokens; there, when a question with
+its options is longer, or with media, the first question runs alone and leaves the state in the context cache,
+and the rest resume from it a lane's worth (`--max-concurrency`) at a time, each window submitted
+as one group. The reads draft
+nothing: under `--spec` the drafter runs over the state only up to its boundary, whose snapshot
+keeps the drafter's state for generation requests, and over no question; Flash-Next runs no MTP
+block over a read's prompt at all, and its cache images of such prompts serve only requests that
+do not draft. The reads are disposable: a read supersedes nothing it resumed from, keeps no cache
+tap or image past the state, the checkpoint catalog evicts the reads' own continuations first, and
+they start no session lineage under `--derive-session-keys`. Gemma 4 and Flash-Next keep an image
+of the state at its boundary in their host store when copying it back costs less than computing it
+again, and requests submitted as one group are admitted together, so the first to reach the
+boundary stores the state and the others resume from it.
 
-On an RTX 3090 with Ternary Bonsai 2 27B and four lanes, a question about a cached state took 50 ms
-on a 370-token state and 73 ms on a 13.5K-token state; four questions took 0.12 s and 0.19 s, and
-sixteen 0.39 s and 0.68 s. The first question about a new 13.5K-token state took 5.6 s, the state's
-prefill. Sixteen questions about a cached 2K-token state beside a streaming 256-token chat
-completion took 0.62 s instead of 0.46 s and slowed the chat's decode from 89 to 75 tokens/s. The
-SystemOne bench attached to issue #64 (160 cases of three questions, about 180 tokens per read;
-`scripts/pods/decision_ab.py`) took 32.0 s with one client and 31.7 s with four; 33.6 s and 30.5 s
-under `--spec mtp`; 36.0 s and 32.5 s under `--spec dflash2`; and 62.2 s and 57.2 s with the checkpoint catalog (`--auto-prefix-grid
---auto-long-anchors --derive-session-keys`), whose reads do not share passes. A read in a shared
-pass can round the head's BF16 logits differently than it would alone: on that bench the answers
-moved by up to 0.05 in probability against reads made one at a time without the system-turn
-boundary, and 4 of 960 picks changed, each between options within 0.05 of each other. With the
-system turn the labels held 98-99% of the first token's probability on that model, where the user
-turn alone left 60-90%.
+The server keeps the records of the last 8,192 branched reads (about 1 KiB each), by the read's
+whole prompt, its readout tokens and the alternatives it reports: a read asked again exactly answers
+from its record without running, and a request whose reads all have one runs nothing on the Engine
+(its `usage` still counts every read's prompt). A record is the read's answer as first read, beside
+the questions of that request. A `recheck_margin` read always runs, alone, and keeps no record.
+
+On an RTX 3090 with four lanes, Ternary Bonsai 2 27B answered one question about a cached state in
+58 ms on a 370-token state and 85 ms on a 13.5K-token state, four in 0.10 s and 0.19 s, and sixteen
+in 0.35 s and 0.68 s; the first question about a new 13.5K-token state took 5.4 s, the state's
+prefill. Gemma 4 26B-A4B took 50 and 73 ms for one question, 0.08 and 0.16 s for four and 0.20 and
+0.48 s for sixteen; Qwen3.8-Flash-Next (Q2_0, `--expert-residency host`) 0.31 and 0.34 s, 0.54 and
+0.60 s, and 0.88 and 0.96 s, each branch pass copying the routed experts the device cache lacks.
+Sixteen questions asked again answered from the branch memo in 11-13 ms about the short state and
+in 62 ms (Bonsai, Flash-Next) and 0.25 s (Gemma) about the long one, the time to render and
+tokenize their prompts. Sixteen questions about a cached 2K-token state beside a streaming
+256-token chat completion took 0.42 s on Bonsai and slowed the chat's decode from 89 to 79
+tokens/s; 0.26 s on Gemma, from 204 to 177 tokens/s; and 0.89 s on Flash-Next, from 92 to 79
+tokens/s. The SystemOne bench attached to issue #64 (160 cases of three questions, about 180 tokens
+per read; `scripts/pods/decision_ab.py`) took 22.3-22.6 s with one client and 22.0-22.3 s with four
+on Bonsai under `bf16`, `int8` and `rk2v4-e8`, 24.6 and 24.3 s under `--spec mtp`, 24.7 and 24.3 s
+under `--spec dflash2`, and 22.3 and 21.9 s with the checkpoint catalog (`--auto-prefix-grid
+--auto-long-anchors --derive-session-keys`); 21.0-23.1 s and 20.5-22.6 s on Gemma over the nine
+`--kv-dtype` formats, and 22.9 and 22.5 s under `--spec mtp`; 157.9-167.4 s and 157.2-166.3 s on
+Flash-Next under `bf16`, `int8` and `rk2v4-e8`, and 161.4 and 160.9 s under `--spec mtp`.
+
+A branch attends to the state through the KV cache, so its answer carries the cache format's
+rounding, and the width of a pass changes how its kernels and the head's BF16 logits round. On that
+bench, against each question read as a request of its own, Bonsai's answers moved by at most 0.06
+in probability under `bf16` and `int8` with no pick changed, and by 0.27 under `rk2v4-e8`, 5 of 480
+picks; Gemma's picks changed 5 to 10 of 480 times under `bf16`, `fp8`, `int8`, `k8v4` and `rk8v4`,
+13 to 30 under `rk4v4`, `nvfp4` and `rk4v4-e8`, and 85 under `rk2v4-e8`, where those requests
+themselves change 97 picks between `bf16` and `rk2v4-e8`; Flash-Next's 9 and 11 under `bf16` and
+`int8` and 29 under `rk2v4-e8` (39 between the two formats). The moved picks are near ties both
+ways: of the bench's labelled questions, those the requests of their own answered right and the
+shared passes wrong numbered 5, 100 and 35 over the measured configurations, and the reverse 3, 85 and 27
+(Bonsai, Gemma, Flash-Next; a sign test gives p = 0.73, 0.30 and 0.37). Answers do not depend on
+what runs beside them: one and four clients gave the same probabilities on all three models, and
+`recheck_margin` reads a near tie again alone. With the system turn the labels held 98-99% of the
+first token's probability on Bonsai, where the user turn alone left 60-90%.
 
 ## OpenAI Responses Core
 
@@ -2497,13 +2577,20 @@ so a short or prefix-cached request is not held behind a long prompt for its who
 passed over eight times runs next, so a long prompt is not starved. On a Qwen3.5-core model, when
 that chunk is the last of a text prompt, the last chunks of other staged lanes ride along in the
 same pass, up to `--prefill-chunk` tokens together: one pass over the model instead of one per
-request. A last chunk
-shares a pass unless the prompt has media or a grammar, a cache snapshot or tap splits the chunk,
+request; a request under a grammar samples its row with its own first mask. A last chunk
+shares a pass unless the prompt has media, a cache snapshot or tap splits the chunk,
 the speculative drafter works over it (a request that drafts runs its drafter over its prompt; a
 decision read does not), or the model is split over several devices. `/v1/load` and `/stats` count
-these passes as `shared_prefill_passes`. Requests that arrive together share them best: the
-decision and rerank endpoints submit each window of reads as one group, which enters the queue at
-once, so the first read does not start alone before the others arrive.
+these passes as `shared_prefill_passes`. Requests that arrive together share them best:
+`submit_group` puts several requests in the queue at once, so the first does not start alone before
+the others arrive. A branched read, the decision and rerank endpoints' reads of one request, runs
+its state's last chunk and its branches as blocks of these passes, up to 64 blocks a pass.
+
+On a Qwen3.5-core model the waiting one-token requests (decision reads) are ordered by remaining
+work, as PrefillOnly (arXiv 2505.07203) schedules prefill-only jobs: they trade the queue positions
+they hold, the fewest prompt tokens (branches included) first, less 4,096 tokens per second waited,
+so a long read is not starved. Other requests keep their positions, and while the scheduler protects
+a blocked head nothing moves. Gemma 4 and Flash-Next admit in arrival order.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in

@@ -9,6 +9,7 @@
 #include "models/qwen3_5/frontend/processor.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/logprob_topk.h"
+#include "ninfer/ops/readout_logprobs.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
@@ -393,6 +394,18 @@ struct Gemma4Core::Request {
 
     std::uint32_t anchor_at = 0;
     bool reusable           = true;
+    // CacheRetentionHint::Disposable: no request continues where this one ends (a decision read),
+    // so the store keeps no image of its end.
+    bool disposable = false;
+    // Engine::submit_branches: the prompt is the branches' shared prefix, and once it is in, each
+    // branch runs from the snapshot at its end and its first token is read. branch_fed counts the
+    // current branch's tokens fed, branch_results the branches read; the first branch's token and
+    // record are what the content publishes.
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
+    std::uint32_t branch_fed = 0;
+    std::vector<BranchResult> branch_results;
+    TokenId branch_token = 0;
+    runtime::RawTokenLogprob branch_record;
     // With a grammar (structured output): the mask of the token it samples next, started once a
     // token is accepted when the request decodes plainly, else by the plain step that needs it. A
     // decode step runs without waiting for it: when the mask is late, the row's logits are kept
@@ -441,6 +454,7 @@ struct Gemma4Core::Impl {
         std::vector<MediaMark> media, anchor_media;
         models::gemma4::SequenceSnapshot snapshot;
         std::uint64_t last_used = 0;
+        bool disposable         = false; // its last request's
     };
 
     struct SampleRow {
@@ -450,6 +464,8 @@ struct Gemma4Core::Impl {
         bool counts                              = false;
         bool logprobs                            = false;
         const std::uint32_t* mask                = nullptr; // a grammar's next-token mask
+        // The typed readout's token ids, on a request's first generated token only.
+        const std::vector<TokenId>* readout = nullptr;
     };
 
     Gemma4Instance& instance;
@@ -500,11 +516,13 @@ struct Gemma4Core::Impl {
     std::unique_ptr<PinnedHostBuffer> host_pages;
     std::vector<std::byte*> free_pages;
     // An image holds the sliding rings whatever its length (about 100 MiB in rk8v4, 250 MiB in F16
-    // with the assistant), which copy back in a few milliseconds against about 0.2 ms of prefill per
-    // token: the bound is the budget. A conversation's prefixes are many and keep 1024 tokens or
-    // more; a shared prefix, which many requests reuse, from 256.
+    // with the assistant), which copy back in a few milliseconds against about 0.2 ms of prefill
+    // per token: the bound is the budget. A conversation's prefixes are many and keep 1024 tokens
+    // or more; a shared prefix, which many requests reuse, once its image pays (image_pays).
     static constexpr std::size_t kMinStoredTokens = 1024;
-    static constexpr std::size_t kMinSharedTokens = 256;
+    // Host copies of an image each way, about PCIe 4.0 x16's; and the prefill time per token.
+    static constexpr double kImageCopyBytesPerSecond = 12e9;
+    static constexpr double kPrefillSecondsPerToken  = 2e-4;
     std::vector<Stored> stored;
     std::uint64_t host_budget = 0, host_used = 0;
     std::uint32_t decode_run                = 0;
@@ -517,6 +535,8 @@ struct Gemma4Core::Impl {
     std::size_t vocab_rows = 0; // logits per row
     DeviceBuffer token_mask;
     DeviceBuffer logprob_ids, logprob_values, logprob_lse, logprob_flag;
+    DeviceBuffer readout_ids, readout_values;
+    std::unique_ptr<PinnedHostBuffer> host_readout;
     std::unique_ptr<PinnedHostBuffer> host_mask, host_sample, host_logprobs;
     std::unique_ptr<WorkspaceArena> sample_workspace;
     // A speculative round's acceptance, a row per verified sequence: its drafts, the verification's
@@ -591,6 +611,10 @@ struct Gemma4Core::Impl {
         logprob_values = DeviceBuffer(top * sizeof(float));
         logprob_lse    = DeviceBuffer(rows * width * sizeof(float));
         logprob_flag   = DeviceBuffer(sizeof(std::int32_t));
+        readout_ids           = DeviceBuffer(rows * kMaximumReadoutTokens * sizeof(std::int32_t));
+        readout_values        = DeviceBuffer(rows * kMaximumReadoutTokens * sizeof(float));
+        host_readout = std::make_unique<PinnedHostBuffer>(rows * kMaximumReadoutTokens *
+                                                          (sizeof(std::int32_t) + sizeof(float)));
         host_logprobs =
             std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
         const std::int32_t enabled = 1;
@@ -879,8 +903,11 @@ struct Gemma4Core::Impl {
     static std::uint32_t prefix_reuse(const std::vector<TokenId>& held,
                                       const std::vector<MediaMark>& held_media,
                                       const Request& prompt) {
-        const auto& tokens = prompt.prompt_tokens;
-        if (held.empty() || held.size() >= tokens.size() ||
+        // A prompt's last token is fed, since its first sample needs the logits there; a
+        // branched read's branches bring their own, so it can resume at its prompt's end.
+        const auto& tokens     = prompt.prompt_tokens;
+        const std::size_t most = prompt.branches ? tokens.size() : tokens.size() - 1;
+        if (held.empty() || tokens.empty() || held.size() > most ||
             !std::equal(held.begin(), held.end(), tokens.begin())) {
             return 0;
         }
@@ -928,14 +955,27 @@ struct Gemma4Core::Impl {
         return best;
     }
 
+    // Whether a shared prefix of `tokens` is worth an image: saving it and copying it back take
+    // less time than computing its tokens again. The prompt's chunks end where such images lie,
+    // so the answer depends on the prefix alone, never on what ran before or beside it: a prompt
+    // computes in the same chunks, and to the same values, under any load.
+    [[nodiscard]] bool image_pays(std::uint32_t tokens) const {
+        const double copy =
+            2.0 * double(instance.executor->image_bytes(tokens)) / kImageCopyBytesPerSecond;
+        return double(tokens) * kPrefillSecondsPerToken > copy;
+    }
+
     // Keeps the state of sequence `s` up to `tokens` (its live state, or its checkpoint `at`) in
     // the store, unless the store already holds that prefix or it is too short to be worth it.
     void store_image(std::uint32_t s, const std::vector<TokenId>& tokens,
                      const std::vector<MediaMark>& media,
                      const models::gemma4::SequenceSnapshot* at, PrefixReusePath path) {
-        const std::size_t least =
-            path == PrefixReusePath::SharedStablePrefix ? kMinSharedTokens : kMinStoredTokens;
-        if (tokens.size() < least || host_budget == 0) { return; }
+        if (host_budget == 0) { return; }
+        if (path == PrefixReusePath::SharedStablePrefix
+                ? !image_pays(static_cast<std::uint32_t>(tokens.size()))
+                : tokens.size() < kMinStoredTokens) {
+            return;
+        }
         if (const auto known = stored_index(tokens, media)) {
             stored[*known].last_used = ++use_clock;
             return;
@@ -973,7 +1013,7 @@ struct Gemma4Core::Impl {
             store_image(s, slot.anchor, slot.anchor_media, &slot.snapshot,
                         PrefixReusePath::PrivateTurnClosure);
         }
-        if (slot.fed != slot.anchor) {
+        if (slot.fed != slot.anchor && !slot.disposable) {
             store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
         }
     }
@@ -1086,8 +1126,9 @@ struct Gemma4Core::Impl {
             slot.media.clear();
             slot.anchor_media.clear();
         }
-        slot.request   = request;
-        slot.last_used = ++use_clock;
+        slot.request    = request;
+        slot.last_used  = ++use_clock;
+        slot.disposable = r.disposable;
         r.reused = r.prefilled = reused;
         if (drafts > 0) {
             r.speculative.backend      = SpeculativeBackend::Mtp;
@@ -1160,6 +1201,12 @@ struct Gemma4Core::Impl {
     // it would otherwise split, since a unit's soft tokens attend each other.
     [[nodiscard]] std::uint32_t prefill_step_tokens(const Request& r) const {
         const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        if (r.branches && r.prefilled == prompt_n) {
+            const std::size_t left =
+                (*r.branches)[r.branch_results.size()].tokens.size() - r.branch_fed;
+            return static_cast<std::uint32_t>(
+                std::min<std::size_t>(left, instance.executor->options().prefill_chunk));
+        }
         std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
         for (const std::uint32_t frontier : r.shared_at) {
             if (frontier > r.prefilled) {
@@ -1340,6 +1387,35 @@ struct Gemma4Core::Impl {
             CUDA_CHECK(cudaMemcpyAsync(host_values, logprob_values.p, top * sizeof(float),
                                        cudaMemcpyDeviceToHost, stream));
         }
+        auto* readout_host_ids = static_cast<std::int32_t*>(host_readout->data());
+        auto* readout_host_values =
+            reinterpret_cast<float*>(readout_host_ids + slots.size() * kMaximumReadoutTokens);
+        const bool read = std::any_of(rows.begin(), rows.end(),
+                                      [](const SampleRow& row) { return row.readout != nullptr; });
+        if (read) {
+            for (std::size_t b = 0; b < n; ++b) {
+                if (rows[b].readout == nullptr) { continue; }
+                std::copy(rows[b].readout->begin(), rows[b].readout->end(),
+                          readout_host_ids + b * kMaximumReadoutTokens);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(readout_ids.p, readout_host_ids,
+                                       n * kMaximumReadoutTokens * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, stream));
+            for (std::size_t b = 0; b < n; ++b) {
+                if (rows[b].readout == nullptr) { continue; }
+                const auto offset = b * kMaximumReadoutTokens;
+                const Tensor ids(static_cast<std::int32_t*>(readout_ids.p) + offset, DType::I32,
+                                 {static_cast<std::int32_t>(kMaximumReadoutTokens)});
+                Tensor values(static_cast<float*>(readout_values.p) + offset, DType::FP32,
+                              {static_cast<std::int32_t>(kMaximumReadoutTokens)});
+                ops::readout_logprobs(logits.slice(1, static_cast<std::int32_t>(b), 1), ids,
+                                      static_cast<std::int32_t>(rows[b].readout->size()),
+                                      static_cast<std::int32_t>(domain), values, stream);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(readout_host_values, readout_values.p,
+                                       n * kMaximumReadoutTokens * sizeof(float),
+                                       cudaMemcpyDeviceToHost, stream));
+        }
         {
             auto scope = sample_workspace->scope();
             ops::sample(logits, sampled, static_cast<std::int32_t>(domain), device_configs,
@@ -1365,6 +1441,11 @@ struct Gemma4Core::Impl {
                 record.top_values[k]   = host_values[slot];
                 if (host_ids[slot] == token) { record.logprob = host_values[slot]; }
             }
+            if (rows[b].readout != nullptr) {
+                record.readout_count = static_cast<std::uint32_t>(rows[b].readout->size());
+                std::copy_n(readout_host_values + b * kMaximumReadoutTokens, record.readout_count,
+                            record.readout_values.begin());
+            }
         }
     }
 
@@ -1373,13 +1454,16 @@ struct Gemma4Core::Impl {
         if (!r.post_thinking && exec.post_thinking_sampling && r.output.reasoning_closed()) {
             r.post_thinking = true;
         }
-        return SampleRow{.params   = r.post_thinking ? &*exec.post_thinking_sampling
-                                                     : &exec.sampling,
+        return SampleRow{.params = r.post_thinking ? &*exec.post_thinking_sampling : &exec.sampling,
                          .position = r.position,
                          .slot     = r.slot,
                          .counts   = r.penalties,
                          .logprobs = exec.logprobs,
-                         .mask     = r.mask ? r.mask->masks() : nullptr};
+                         .mask     = r.mask ? r.mask->masks() : nullptr,
+                         .readout  = exec.logprobs && !exec.readout_tokens.empty() &&
+                                             r.first_token == Clock::time_point{}
+                                         ? &exec.readout_tokens
+                                         : nullptr};
     }
 
     // --expert-profile-out: every route since warm-up, rewritten at each request boundary.
@@ -1413,6 +1497,7 @@ struct Gemma4Core::Impl {
         result.thinking.post_thinking_sampling = r.post_thinking;
         result.reused_prompt_tokens            = r.reused;
         result.prefix_reuse_path               = r.reuse_path;
+        result.branches                        = std::move(r.branch_results);
         if (drafts > 0) { result.speculative = r.speculative; }
         result.timings.prepare_seconds         = r.prepare_seconds;
         result.timings.vision_seconds          = r.vision_seconds;
@@ -1457,6 +1542,10 @@ struct Gemma4Core::Impl {
                 stats.reused_prompt_tokens += from_store;
             }
         }
+        if (r.branches && r.prefilled == prompt_n) {
+            branch_step(request);
+            return;
+        }
         const std::uint32_t n = prefill_step_tokens(r);
         if (n == 0) { throw std::logic_error("gemma4: an empty prefill step"); }
         const auto chunk = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
@@ -1497,6 +1586,137 @@ struct Gemma4Core::Impl {
             r.cv.notify_all();
         }
         if (r.prefilled < prompt_n) { return; }
+        if (r.branches) { return; } // the next steps run the branches
+        finish_prompt(request);
+    }
+
+    // One step of a branched read: the current branch's next tokens, from the snapshot at the
+    // prompt's end when the branch begins, and once they are in, its first token read. When the
+    // last branch is read, the request publishes the first branch's token and finishes.
+    void branch_step(const std::shared_ptr<Request>& request) {
+        Request& r                        = *request;
+        Slot& slot                        = slots[r.slot];
+        auto& executor                    = *instance.executor;
+        const auto prompt_n               = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const runtime::ReadBranch& branch = (*r.branches)[r.branch_results.size()];
+        // Branches that fit a prompt chunk run in shared passes, which leave the sequence at the
+        // prompt's end (branch_pass); a longer one runs alone, chunk by chunk, from the snapshot
+        // it leaves at the prompt's end.
+        const std::size_t room = std::min<std::size_t>(executor.options().prefill_chunk,
+                                                       executor.options().max_context - prompt_n);
+        if (r.branch_fed == 0 && branch.tokens.size() <= room) {
+            if (slot.fed != r.prompt_tokens) {
+                if (slot.anchor != r.prompt_tokens) {
+                    throw std::logic_error("a branched read lost the state at its prompt's end");
+                }
+                executor.restore(r.slot, slot.snapshot);
+                slot.fed   = slot.anchor;
+                slot.media = slot.anchor_media;
+            }
+            branch_pass(request);
+            return;
+        }
+        // A branch starts from the state at the prompt's end: the sequence's own at the first
+        // branch, kept in its snapshot (the anchor) for the others.
+        if (r.branch_fed == 0) {
+            if (slot.fed == r.prompt_tokens) {
+                if (slot.anchor != slot.fed) {
+                    executor.snapshot(r.slot, slot.snapshot);
+                    slot.anchor       = slot.fed;
+                    slot.anchor_media = slot.media;
+                }
+            } else {
+                if (slot.anchor != r.prompt_tokens) {
+                    throw std::logic_error("a branched read lost the state at its prompt's end");
+                }
+                executor.restore(r.slot, slot.snapshot);
+                slot.fed   = slot.anchor;
+                slot.media = slot.anchor_media;
+            }
+        }
+        const std::uint32_t n = prefill_step_tokens(r);
+        const auto chunk      = std::span<const TokenId>(branch.tokens).subspan(r.branch_fed, n);
+        executor.forward(r.slot, chunk, 1);
+        slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
+        r.branch_fed += n;
+        r.progress = Clock::now();
+        if (r.branch_fed < branch.tokens.size()) { return; }
+        SampleRow row = sample_row(r);
+        row.readout   = branch.readout_tokens.empty() ? nullptr : &branch.readout_tokens;
+        TokenId token = 0;
+        runtime::RawTokenLogprob record;
+        sample(std::span(&row, 1), ops::kSamplePurposePrefill, std::span(&token, 1),
+               std::span(&record, 1));
+        if (r.branch_results.empty()) {
+            r.branch_token  = token;
+            r.branch_record = record;
+        }
+        r.branch_results.push_back(BranchResult{
+            .prompt_tokens = prompt_n + static_cast<std::uint32_t>(branch.tokens.size()),
+            .first         = instance.frontend.token_logprob(record)});
+        r.branch_fed = 0;
+        if (r.branch_results.size() < r.branches->size()) { return; }
+        finish_prompt(request);
+    }
+
+    // The next branches of a branched read that fit one prompt chunk together, in one pass from
+    // the sequence at the prompt's end (Executor::forward_branches), which leaves it there. Their
+    // first tokens are read a lane's worth of rows at a time.
+    void branch_pass(const std::shared_ptr<Request>& request) {
+        Request& r          = *request;
+        auto& executor      = *instance.executor;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const std::vector<runtime::ReadBranch>& branches = *r.branches;
+        const std::size_t first                          = r.branch_results.size();
+        // The branches take cache slots one after another past the prompt.
+        const std::size_t room = std::min<std::size_t>(executor.options().prefill_chunk,
+                                                       executor.options().max_context - prompt_n);
+        std::vector<TokenId> tokens;
+        std::vector<std::uint32_t> lengths;
+        for (std::size_t b = first;
+             b < branches.size() && lengths.size() < models::gemma4::Executor::kMaxLogitRows &&
+             tokens.size() + branches[b].tokens.size() <= room;
+             ++b) {
+            tokens.insert(tokens.end(), branches[b].tokens.begin(), branches[b].tokens.end());
+            lengths.push_back(static_cast<std::uint32_t>(branches[b].tokens.size()));
+        }
+        executor.forward_branches(r.slot, tokens, lengths);
+        r.progress              = Clock::now();
+        const Tensor logits     = executor.logits(static_cast<std::uint32_t>(lengths.size()));
+        const std::size_t width = slots.size();
+        for (std::size_t at = 0; at < lengths.size(); at += width) {
+            const std::size_t n = std::min(width, lengths.size() - at);
+            std::vector<SampleRow> rows(n, sample_row(r));
+            for (std::size_t k = 0; k < n; ++k) {
+                const runtime::ReadBranch& branch = branches[first + at + k];
+                rows[k].readout = branch.readout_tokens.empty() ? nullptr : &branch.readout_tokens;
+            }
+            std::vector<TokenId> sampled(n);
+            std::vector<runtime::RawTokenLogprob> records(n);
+            const Tensor source =
+                logits.slice(1, static_cast<std::int32_t>(at), static_cast<std::int32_t>(n));
+            sample(rows, ops::kSamplePurposePrefill, sampled, records, &source);
+            for (std::size_t k = 0; k < n; ++k) {
+                if (r.branch_results.empty()) {
+                    r.branch_token  = sampled[k];
+                    r.branch_record = records[k];
+                }
+                const auto own = static_cast<std::uint32_t>(branches[first + at + k].tokens.size());
+                r.branch_results.push_back(
+                    BranchResult{.prompt_tokens = prompt_n + own,
+                                 .first         = instance.frontend.token_logprob(records[k])});
+            }
+        }
+        if (r.branch_results.size() < branches.size()) { return; }
+        finish_prompt(request);
+    }
+
+    // The prompt is in (and a branched read's branches): the request takes its first token and
+    // decodes from there.
+    void finish_prompt(const std::shared_ptr<Request>& request) {
+        Request& r          = *request;
+        auto& executor      = *instance.executor;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
         CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
         executor.check_experts();
         r.prefill_end = Clock::now();
@@ -1526,6 +1746,10 @@ struct Gemma4Core::Impl {
         r.decoding = true;
         // The first token's mask began with the request; when it is not done yet, the prompt's
         // last logits wait for it instead of the engine thread.
+        if (r.branches) {
+            accept(request, r.branch_token, &r.branch_record);
+            return;
+        }
         if (!mask_ready(r)) {
             defer_sample(r, executor.logits(1), 0, ops::kSamplePurposePrefill);
             return;
@@ -2249,13 +2473,38 @@ void Gemma4Core::stop() noexcept {
     impl_->queue_cv.notify_all();
 }
 
-Gemma4Core::Submission Gemma4Core::submit(models::qwen3_5::PreparedPrompt prompt,
-                                          PromptSummary prompt_summary, double prepare_seconds,
-                                          ResolvedRequestOptions options,
-                                          OutputConsumerMode consumer_mode,
-                                          GenerationObservationOptions observation,
-                                          Clock::time_point pending_deadline) {
-    const auto submitted = Clock::now();
+std::shared_ptr<Gemma4Core::Request>
+Gemma4Core::make_request(GroupMember& member, std::optional<std::uint32_t>& budget_out) {
+    models::qwen3_5::PreparedPrompt& prompt         = member.prompt;
+    const PromptSummary& prompt_summary             = member.prompt_summary;
+    const double prepare_seconds                    = member.prepare_seconds;
+    ResolvedRequestOptions& options                 = member.options;
+    const OutputConsumerMode consumer_mode          = member.consumer_mode;
+    const GenerationObservationOptions& observation = member.observation;
+    Clock::time_point& pending_deadline             = member.pending_deadline;
+    const auto submitted                            = Clock::now();
+    for (const TokenId id : options.execution.readout_tokens) {
+        if (id < 0 || static_cast<std::uint32_t>(id) >= impl_->domain) {
+            throw std::invalid_argument("readout token is outside the public token domain");
+        }
+    }
+    if (const auto& branches = options.execution.branches) {
+        if (branches->empty() || options.execution.grammar ||
+            prompt.token_ids().size() + 1 > impl_->max_context) {
+            throw std::invalid_argument("a branched read needs branches and a text prompt");
+        }
+        for (const runtime::ReadBranch& branch : *branches) {
+            if (branch.tokens.empty() ||
+                prompt.token_ids().size() + branch.tokens.size() > impl_->max_context) {
+                throw std::invalid_argument("a branch needs tokens within the context");
+            }
+            for (const TokenId id : branch.readout_tokens) {
+                if (id < 0 || static_cast<std::uint32_t>(id) >= impl_->domain) {
+                    throw std::invalid_argument("readout token is outside the public token domain");
+                }
+            }
+        }
+    }
     if (options.execution.structured_output.kind != StructuredOutputKind::None &&
         !impl_->structured_output) {
         throw std::invalid_argument(
@@ -2270,6 +2519,9 @@ Gemma4Core::Submission Gemma4Core::submit(models::qwen3_5::PreparedPrompt prompt
     {
         const auto& data     = models::qwen3_5::PreparedPromptAccess::view(prompt);
         const auto& identity = data.identity;
+        if (options.execution.branches && data.has_media()) {
+            throw std::invalid_argument("a branched read needs a text prompt");
+        }
         const auto prompt_n  = static_cast<std::uint32_t>(request->prompt_tokens.size());
         if (data.has_media() && !impl_->instance.executor->vision()) {
             throw std::invalid_argument("Vision is disabled for this Engine");
@@ -2284,8 +2536,9 @@ Gemma4Core::Submission Gemma4Core::submit(models::qwen3_5::PreparedPrompt prompt
         }
         std::sort(request->media.begin(), request->media.end(),
                   [](const MediaMark& a, const MediaMark& b) { return a.begin < b.begin; });
-        request->reusable  = identity.reusable;
-        request->anchor_at = prompt_n;
+        request->reusable   = identity.reusable;
+        request->disposable = data.tap_hints.disposable;
+        request->anchor_at  = prompt_n;
         if (identity.rewrite_checkpoint &&
             identity.rewrite_checkpoint->kind ==
                 models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
@@ -2304,7 +2557,7 @@ Gemma4Core::Submission Gemma4Core::submit(models::qwen3_5::PreparedPrompt prompt
                               SharedCandidateEvidence::EngineStructural);
             const std::uint32_t frontier = opportunity.frontier;
             if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix && structural &&
-                frontier >= Impl::kMinSharedTokens && frontier < request->anchor_at) {
+                frontier > 0 && frontier < request->anchor_at && impl_->image_pays(frontier)) {
                 request->shared_at.push_back(frontier);
             }
         }
@@ -2334,21 +2587,58 @@ Gemma4Core::Submission Gemma4Core::submit(models::qwen3_5::PreparedPrompt prompt
     const std::optional<std::uint32_t> budget = request->output.thinking_stats().effective_budget;
     request->prompt                           = std::move(prompt);
     request->options                          = std::move(options);
+    request->branches                         = request->options.execution.branches;
+    budget_out                                = budget;
+    return request;
+}
+
+Gemma4Core::Submission Gemma4Core::submit(models::qwen3_5::PreparedPrompt prompt,
+                                          PromptSummary prompt_summary, double prepare_seconds,
+                                          ResolvedRequestOptions options,
+                                          OutputConsumerMode consumer_mode,
+                                          GenerationObservationOptions observation,
+                                          Clock::time_point pending_deadline) {
+    std::vector<GroupMember> one;
+    one.push_back(GroupMember{.prompt           = std::move(prompt),
+                              .prompt_summary   = prompt_summary,
+                              .prepare_seconds  = prepare_seconds,
+                              .options          = std::move(options),
+                              .consumer_mode    = consumer_mode,
+                              .observation      = observation,
+                              .pending_deadline = pending_deadline});
+    return std::move(submit_group(std::move(one)).front());
+}
+
+std::vector<Gemma4Core::Submission> Gemma4Core::submit_group(std::vector<GroupMember> group) {
+    std::vector<std::shared_ptr<Request>> requests;
+    std::vector<std::optional<std::uint32_t>> budgets(group.size());
+    requests.reserve(group.size());
+    for (std::size_t k = 0; k < group.size(); ++k) {
+        requests.push_back(make_request(group[k], budgets[k]));
+    }
+    if (requests.empty()) { return {}; }
     {
         std::lock_guard lock(impl_->queue_mutex);
         if (impl_->stopping || impl_->failed) {
             throw RequestError(RequestErrorKind::Unavailable, "inference engine is unavailable");
         }
-        if (impl_->outstanding >= impl_->max_outstanding) {
+        if (impl_->outstanding + requests.size() > impl_->max_outstanding) {
             throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
         }
-        ++impl_->outstanding;
-        request->id = impl_->next_id++;
-        impl_->pending.push_back(request);
+        impl_->outstanding += requests.size();
+        for (const auto& request : requests) {
+            request->id = impl_->next_id++;
+            impl_->pending.push_back(request);
+        }
     }
     impl_->queue_cv.notify_one();
     impl_->publish_queue();
-    return Submission(*this, std::move(request), budget);
+    std::vector<Submission> submissions;
+    submissions.reserve(requests.size());
+    for (std::size_t k = 0; k < requests.size(); ++k) {
+        submissions.push_back(Submission(*this, std::move(requests[k]), budgets[k]));
+    }
+    return submissions;
 }
 
 std::vector<float> Gemma4Core::score(models::qwen3_5::PreparedPrompt prompt,

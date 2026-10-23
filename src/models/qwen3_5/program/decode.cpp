@@ -318,9 +318,8 @@ ProgramImpl::propose_ngram(std::span<const std::uint32_t> lanes,
 }
 
 void ProgramImpl::take_ngram_index(RequestControl& request, PreparedPromptData& prompt) {
-    if (!prompt.ngram_index) {
-        throw std::logic_error("prepared prompt carries no ngram index while ngram drafting is on");
-    }
+    // A prompt prepared for a request that does not draft carries none: that request reads one
+    // token and proposes nothing, and request planning refuses a drafting request without one.
     request.ngram          = std::move(prompt.ngram_index);
     request.ngram_indexed  = prompt.token_ids.size();
     request.ngram_snapshot = std::move(prompt.ngram_snapshot);

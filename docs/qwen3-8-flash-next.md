@@ -469,7 +469,12 @@ reused. A request goes to the free sequence that holds the longest such prefix o
 `--no-prefix-reuse` (ninfer-serve) prefills every prompt from scratch.
 
 What a sequence gives up for a new request (its turn-closure snapshot and the state it ended in,
-each of 128 tokens or more) is kept as an image in host memory: the paged KV and pooled keys
+each of 128 tokens or more, the end of a disposable request such as a decision read excepted) is
+kept as an image in host memory, and so is the state where the frontend marks a prefix other
+requests share (the end of the leading system messages, of the tool declarations, a declared
+cache boundary, 128 tokens or more): a prompt step ends there, and requests with the same prefix
+resume after it on any sequence, also when they arrive together, since a prompt that has not
+started prefilling looks for images again at its first step. An image is the paged KV and pooled keys
 of its positions, its recurrent state, and the MTP block's, about 114 MB plus 26 KiB a position in
 BF16 KV. The images live in 8 MiB pages of pinned memory that stay pinned for later images: the
 pages of two images of a whole context (within a quarter of the budget) are pinned at startup, and
@@ -484,6 +489,8 @@ default; past it the least recently used images go to the disk tier with `--disk
 (`--disk-kv-gib`, 64 by default), one file each under a directory per artifact, KV format, MTP
 draft width and n-gram enablement, or are dropped without one. A different verify width or disabling
 the n-gram table can change sequence state, so those runs cannot restore another profile's images.
+A request that does not draft (a decision read) runs its prompt without the MTP block, so its
+sequence's snapshots and images carry no MTP state and serve only requests that do not draft.
 With `--disk-kv-restore` a
 prompt also resumes from an image on
 disk, which a later run finds there too.

@@ -112,7 +112,7 @@ Every card by name, with what has run on it:
 <summary><b>Device profiles and limits</b> — how a card gets its kernel routes</summary>
 
 - **Device profiles.** A profile picks the kernel route of every operation and width. The binary
-  carries profiles measured on 47 GPU models, from the Tesla V100 and RTX 2060 Super to the RTX PRO
+  carries profiles measured on 48 GPU models, from the Tesla V100 and RTX 2060 Super to the RTX PRO
   6000 (the Profile column of [supported GPUs](docs/gpus.md#cards)); a built-in profile applies to
   the same GPU name, compute capability and SM count. Any other card is calibrated once at first
   start, which takes about half a minute to three and a half minutes, and the result is stored for
@@ -333,10 +333,10 @@ Prefill of a 4,463-token prompt, in tok/s:
 - **Typed decisions.** `/v1/systemone` (TypeSafe's System One API, as llama.cpp, vLLM and Ollama
   serve it) and `/v1/decisions` (OpenAI's Decisions API) answer choice, yes/no and score questions
   about a state with the served chat model: one prompt per question, the answer read from the
-  first token's exact label log probabilities, the state prefilled once and each window of
-  questions run in one shared prefill pass. Ternary Bonsai 2 27B on an RTX 3090 answers sixteen
-  questions about a cached 370-token state in 0.39 s
-  ([typed decisions](docs/serving.md#typed-decisions)).
+  first token's exact label log probabilities, the state prefilled once and every question run
+  after it as a branch of one read; up to 200 questions, 255 options, Runoff's order-independent
+  choices, a conversation as the state, images and video as data URLs (with `--vision`), and a
+  margin by which a client escalates near ties ([typed decisions](docs/serving.md#typed-decisions)).
 - **Model suspend.** `--model-suspend` lets an idle server give its device memory back without
   exiting and take it again on the next request, retained conversations included. Ternary Bonsai 2
   27B on an RTX 3090: 7.9 GiB down to 0.3 GiB in 0.33 s, back in 1.1 s

@@ -224,6 +224,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
     quote->grammar                     = plan.grammar;
     quote->logprobs                    = plan.logprobs;
     quote->readout_tokens              = plan.readout_tokens;
+    quote->branches                    = plan.branches;
     quote->drafting                    = plan.drafting;
     quote->text_kv_page_entitlement    = plan.text_kv_page_entitlement;
     quote->backend_kv_page_entitlement = plan.backend_kv_page_entitlement;
@@ -278,8 +279,20 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
         if (prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) {
             throw std::logic_error("prepared prompt carries no hybrid block keys");
         }
+        // A branched read resumes at its whole prompt too: its branches follow the frontier, so
+        // the lookup reads one branch token past it.
+        std::vector<TokenId> branched_tokens;
+        std::span<const TokenId> lookup(prompt.token_ids);
+        std::uint32_t lookup_tokens = n;
+        if (plan.branches != nullptr) {
+            branched_tokens.reserve(n + 1U);
+            branched_tokens.assign(prompt.token_ids.begin(), prompt.token_ids.end());
+            branched_tokens.push_back(plan.branches->front().tokens.front());
+            lookup        = branched_tokens;
+            lookup_tokens = n + 1U;
+        }
         pc::MatchResult match =
-            index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+            index.match(lookup, prompt.block_hashes, prompt.block_extras, lookup_tokens);
         const auto filling = [](const pc::MatchResult& result) {
             return std::any_of(
                 result.candidates.begin(), result.candidates.end(),
@@ -289,7 +302,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
             // A prefetch (§6.6) is copying blocks this prompt resumes over: they land within a
             // batch's copy time, and skipping them would pick a shallower source.
             hybrid_->settle_prefetch();
-            match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+            match = index.match(lookup, prompt.block_hashes, prompt.block_extras, lookup_tokens);
         }
         quote->cached_prefix_tokens = static_cast<std::uint32_t>(match.path.size()) * kBlock;
         const std::vector<VisionTokenRange> ranges =
@@ -297,7 +310,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
             return candidate.filling_blocks != 0 || inside_vision(candidate.frontier, ranges);
         });
-        const pc::AdmissionChoice choice = index.choose(match, n);
+        const pc::AdmissionChoice choice = index.choose(match, lookup_tokens);
         std::vector<std::size_t> order;
         if (choice.candidate) { order.push_back(*choice.candidate); }
         for (std::size_t i = 0; i < match.candidates.size(); ++i) {
@@ -353,6 +366,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
     if (quote->summary.effective_output_tokens != 0) {
         units += quote->summary.effective_output_tokens - 1ULL;
     }
+    units += branch_service_work(plan.branches.get(), prefill_chunk);
     quote->summary.service_work_quanta = units;
 
     out.readiness = runtime::Readiness::Ready;
@@ -923,6 +937,7 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
         request.grammar  = quote.grammar;
         request.logprobs = quote.logprobs;
         request.readout_tokens = quote.readout_tokens;
+        request.branches       = quote.branches;
         install_sampling(sequence, request, quote.sampling);
         sequence.mtp_draft_count = 0;
         sequence.rope_delta = prompt.rope_delta;
@@ -930,11 +945,13 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
 
         request.timings              = {};
         request.pending              = {};
-        request.publish_continuation = quote.summary.publish_continuation && quote.drafting;
+        request.publish_continuation =
+            quote.summary.publish_continuation && quote.drafting && !quote.branches;
         request.lease_ceiling =
-            std::min(capacity, n + (quote.summary.effective_output_tokens == 0
-                                        ? 0U
-                                        : quote.summary.effective_output_tokens - 1U));
+            std::min(capacity, n + std::max(quote.summary.effective_output_tokens == 0
+                                                ? 0U
+                                                : quote.summary.effective_output_tokens - 1U,
+                                            branch_extent(quote.branches.get())));
         request.active_resources = detail::PhysicalResources{
             .device = {.active_lanes     = 1,
                        .state_slots      = 1,
@@ -1005,7 +1022,10 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
                 });
             }
             const std::array<std::uint32_t, 1> existing{reuse};
-            taps = pc::plan_taps(n, reuse, hints,
+            // A branched read's prompt frontier is a tap position: its branches follow it, and its
+            // explicit boundary is what the next read of the same state resumes from.
+            const std::uint32_t tap_tokens = quote.branches != nullptr ? n + 1U : n;
+            taps = pc::plan_taps(tap_tokens, reuse, hints,
                                  reuse != 0 ? std::span<const std::uint32_t>(existing)
                                             : std::span<const std::uint32_t>(),
                                  exclusions, hybrid_->taps());

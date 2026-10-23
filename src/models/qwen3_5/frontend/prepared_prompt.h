@@ -158,7 +158,8 @@ struct PreparedPromptData {
     std::vector<NgramSourceView> ngram_archive_sources;
     std::shared_ptr<const NgramSnapshot> ngram_snapshot;
     // The request's live ngram index over token_ids and ngram_sources, present whenever ngram
-    // drafting is enabled. Preparation builds it so admission only moves it into the request.
+    // drafting is enabled and the prompt was prepared for a drafting request. Preparation builds
+    // it so admission only moves it into the request.
     std::unique_ptr<detail::NgramProposer> ngram_index;
     // Hybrid prefix-cache lookup keys over token_ids (program/prefix/block_keys.h): one chained
     // hash per full 64-token block and, with media, one cumulative Vision key per block.

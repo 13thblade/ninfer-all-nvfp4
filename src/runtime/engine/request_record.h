@@ -178,6 +178,8 @@ struct RequestRecord {
     std::vector<TokenId> generated;
     // The content tokens' logprob records in generation order, when the request asked for them.
     std::vector<TokenLogprob> content_logprobs;
+    // A branched read's records (Engine::submit_branches), one per branch.
+    std::vector<BranchResult> branch_results;
     std::string content;
     std::string reasoning;
     std::optional<LaneId> lane;

@@ -156,7 +156,7 @@ means the card calibrates once at its first start.
 | ⬜ | RTX 2070 | 8 GB | GeForce | ✓ | |
 | ⬜ | RTX 2060 | 12 GB | GeForce | | |
 | ⬜ | RTX 2060 Super | 8 GB | GeForce | ✓ | |
-| ⬜ | Quadro RTX 8000 | 48 GB | Workstation | | |
+| ✅ | Quadro RTX 8000 | 48 GB | Workstation | ✓ | Bonsai 2, Gemma 4, Flash-Next |
 | ⬜ | Quadro RTX 6000 | 24 GB | Workstation | ✓ | |
 | ⬜ | Quadro RTX 5000 | 16 GB | Workstation | | |
 | ⬜ | Quadro RTX 4000 | 8 GB | Workstation | | |

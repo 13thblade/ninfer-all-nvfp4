@@ -4,6 +4,10 @@
 //    and long contexts and two sequences in one batch; the BF16 rows and the q8_1 rows; and keys
 //    derived from the values (K = V blocks: RoPE(V * k_norm), proportional over 64 of 256 pairs).
 //  - route_select: the logits, the top-k ids and weights and the expert grouping of the pairs.
+//  - a branch pass's rows (several branches one after another past the state, each continuing it
+//    at the state's end): qkv_post's rotation at the branch position with the value stored at the
+//    row's own slot, keys derived at the branch positions, and the prompt masks of a sliding ring
+//    and of a linear cache, where a row sees the state as its position does and its own branch.
 
 #include "core/arena.h"
 #include "models/gemma4/kernels.h"
@@ -282,10 +286,14 @@ void route(int tokens, std::mt19937& rng) {
 // qkv_post against an FP64 oracle: per-head RMSNorm of Q and K, Q rotated at its position by the
 // given frequencies and multiplied by q_scale (the square of YaRN's attention factor), K = V
 // blocks storing the RMS-normalized K rows as the values of their positions (a null k_cache).
-void qkv(int head_dim, float q_scale, const std::vector<int>& positions, std::mt19937& rng) {
+// With `stored`, token t's value goes to slot stored[t] (a branch pass's rows) while it rotates
+// at positions[t].
+void qkv(int head_dim, float q_scale, const std::vector<int>& positions, std::mt19937& rng,
+         const std::vector<int>& stored = {}) {
+    const std::vector<int>& at_slot = stored.empty() ? positions : stored;
     const int d = head_dim, t = int(positions.size()), hq = 4, hkv = 1;
     const int rows  = (hq + hkv) * d;
-    const int slots = *std::max_element(positions.begin(), positions.end()) + 1;
+    const int slots = *std::max_element(at_slot.begin(), at_slot.end()) + 1;
     std::normal_distribution<float> normal(0.0f, 1.0f);
     std::vector<__nv_bfloat16> qkv(std::size_t(t) * rows);
     std::vector<float> qkv_f(qkv.size());
@@ -300,13 +308,16 @@ void qkv(int head_dim, float q_scale, const std::vector<int>& positions, std::mt
         ninfer::ops::rope_yarn_frequencies(d, std::min(64, d / 2), 1e6f, {2.0f, 262144});
     std::copy_n(yarn.inverse_frequency, yarn.pairs, inv_freq.begin());
     std::vector<std::int32_t> pos(positions.begin(), positions.end());
+    const std::vector<std::int32_t> slot_of(at_slot.begin(), at_slot.end());
     DeviceBuffer d_qkv(qkv.size() * 2), d_qn(d * 4), d_kn(d * 4), d_f(inv_freq.size() * 4),
-        d_pos(t * 4), d_q(std::size_t(t) * hq * d * 4), d_v(std::size_t(slots) * d * 2);
+        d_pos(t * 4), d_slots(t * 4), d_q(std::size_t(t) * hq * d * 4),
+        d_v(std::size_t(slots) * d * 2);
     d_qkv.copy_from_host(qkv.data(), qkv.size() * 2);
     d_qn.copy_from_host(q_norm.data(), d * 4);
     d_kn.copy_from_host(k_norm.data(), d * 4);
     d_f.copy_from_host(inv_freq.data(), inv_freq.size() * 4);
     d_pos.copy_from_host(pos.data(), t * 4);
+    d_slots.copy_from_host(slot_of.data(), t * 4);
     k::QkvArgs a;
     a.qkv         = static_cast<const __nv_bfloat16*>(d_qkv.p);
     a.tokens      = t;
@@ -325,13 +336,15 @@ void qkv(int head_dim, float q_scale, const std::vector<int>& positions, std::mt
     a.v_cache     = static_cast<__half*>(d_v.p);
     a.seq_stride  = std::int64_t(slots) * d;
     a.head_stride = std::int64_t(slots) * d;
+    if (!stored.empty()) { a.slots = static_cast<const std::int32_t*>(d_slots.p); }
     k::qkv_post(a, nullptr);
     check(cudaDeviceSynchronize(), "qkv_post");
     std::vector<float> q(std::size_t(t) * hq * d);
     std::vector<__half> v(std::size_t(slots) * d);
     check(cudaMemcpy(q.data(), d_q.p, q.size() * 4, cudaMemcpyDeviceToHost), "q copy");
     check(cudaMemcpy(v.data(), d_v.p, v.size() * 2, cudaMemcpyDeviceToHost), "v copy");
-    const std::string label = "qkv_post D" + std::to_string(d) + " scale " + std::to_string(q_scale);
+    const std::string label = "qkv_post D" + std::to_string(d) + " scale " +
+                              std::to_string(q_scale) + (stored.empty() ? "" : " branch rows");
     double worst = 0.0;
     for (int token = 0; token < t; ++token) {
         for (int h = 0; h < hq; ++h) {
@@ -360,17 +373,124 @@ void qkv(int head_dim, float q_scale, const std::vector<int>& positions, std::mt
         for (int i = 0; i < d; ++i) { ksum += double(kr[i]) * kr[i]; }
         const double kinv = 1.0 / std::sqrt(ksum / d + 1e-6);
         for (int i = 0; i < d; ++i) {
-            const float stored = __half2float(v[std::size_t(positions[token]) * d + i]);
-            const double e     = kr[i] * kinv;
-            if (std::fabs(stored - e) > 1e-3 * (std::fabs(e) + 1e-3)) {
-                expect(false, label + ": value row of position " + std::to_string(positions[token]) +
-                                  " at " + std::to_string(i) + ": " + std::to_string(stored) +
+            const float kept = __half2float(v[std::size_t(at_slot[token]) * d + i]);
+            const double e   = kr[i] * kinv;
+            if (std::fabs(kept - e) > 1e-3 * (std::fabs(e) + 1e-3)) {
+                expect(false, label + ": value row of slot " + std::to_string(at_slot[token]) +
+                                  " at " + std::to_string(i) + ": " + std::to_string(kept) +
                                   " for " + std::to_string(e));
                 break;
             }
         }
     }
     expect(worst <= 2e-5, label + ": rotated queries off by " + std::to_string(worst));
+}
+
+// The rows of three branches (5, 8 and 7 tokens) one after another past a state of `first`
+// positions: row t of the branch starting at row b rotates as position first + t - b.
+const std::vector<int> kBranchLengths{5, 8, 7};
+
+std::vector<std::int32_t> branch_starts() {
+    std::vector<std::int32_t> starts;
+    int row = 0;
+    for (const int length : kBranchLengths) {
+        for (int j = 0; j < length; ++j) { starts.push_back(row); }
+        row += length;
+    }
+    return starts;
+}
+
+// Keys derived from stored values: slots from `turned` on are a branch pass's rows and turn at
+// their branch positions, the slots before at their own.
+void branch_keys(std::mt19937& rng) {
+    constexpr int d = 512, heads = 2, turned = 30;
+    const std::vector<std::int32_t> starts = branch_starts();
+    const int count                        = turned + int(starts.size());
+    std::vector<std::int32_t> turns;
+    for (int t = 0; t < int(starts.size()); ++t) { turns.push_back(turned + t - starts[t]); }
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<__half> v(std::size_t(heads) * count * d);
+    for (auto& x : v) { x = __float2half(normal(rng)); }
+    std::vector<float> k_norm(d), inv_freq(64);
+    for (auto& w : k_norm) { w = 1.0f + 0.25f * normal(rng); }
+    for (int i = 0; i < 64; ++i) {
+        inv_freq[i] = float(1.0 / std::pow(1e6, double(2 * i) / double(d)));
+    }
+    DeviceBuffer dv(v.size() * 2), dk(v.size() * 2), dw(d * 4), df(64 * 4),
+        dr(std::size_t(count) * 64 * 8), dt(turns.size() * 4);
+    dv.copy_from_host(v.data(), v.size() * 2);
+    dw.copy_from_host(k_norm.data(), d * 4);
+    df.copy_from_host(inv_freq.data(), 64 * 4);
+    dt.copy_from_host(turns.data(), turns.size() * 4);
+    k::rope_table(static_cast<const float*>(df.p), 64, count, static_cast<float2*>(dr.p), nullptr);
+    k::derive_keys(static_cast<const __half*>(dv.p), std::int64_t(count) * d, heads, d, count,
+                   static_cast<const float*>(dw.p), static_cast<const float2*>(dr.p), 64,
+                   static_cast<__half*>(dk.p), nullptr, static_cast<const std::int32_t*>(dt.p),
+                   turned);
+    check(cudaDeviceSynchronize(), "derive_keys");
+    std::vector<__half> got(v.size());
+    dk.copy_to_host(got.data(), got.size() * 2);
+    double worst = 0.0;
+    for (int h = 0; h < heads; ++h) {
+        for (int p = 0; p < count; ++p) {
+            const int position   = p < turned ? p : turned + (p - turned) - starts[p - turned];
+            const std::size_t at = (std::size_t(h) * count + p) * d;
+            for (int i = 0; i < d / 2; ++i) {
+                double c = 1.0, s = 0.0;
+                if (i < 64) {
+                    const double angle = double(position) * inv_freq[i];
+                    c                  = std::cos(angle);
+                    s                  = std::sin(angle);
+                }
+                const double n0 = double(__half2float(v[at + i])) * k_norm[i];
+                const double n1 = double(__half2float(v[at + i + d / 2])) * k_norm[i + d / 2];
+                const double e0 = n0 * c - n1 * s, e1 = n1 * c + n0 * s;
+                worst = std::max(
+                    {worst, std::fabs(__half2float(got[at + i]) - e0) / (std::fabs(e0) + 1e-1),
+                     std::fabs(__half2float(got[at + i + d / 2]) - e1) / (std::fabs(e1) + 1e-1)});
+            }
+        }
+    }
+    expect(worst <= 2e-3, "derive_keys at branch positions off by " + std::to_string(worst));
+}
+
+// A branch pass's prompt mask over a sliding ring (`ring`, `window`) or a linear cache (ring 0):
+// row t, of the branch starting at row b, is at position first + t - b. It sees the state's
+// positions up to its own, within the window on a ring, and its branch's rows up to itself, within
+// the window; no other branch's rows. A ring slot holds the latest position written to it.
+void branch_mask(int ring, int window) {
+    constexpr int first                    = 300;
+    const std::vector<std::int32_t> starts = branch_starts();
+    const int tokens                       = int(starts.size());
+    const int last                         = first + tokens - 1;
+    const int slots                        = ring != 0 ? ring : 512;
+    std::vector<int> held(slots, -1);
+    for (int p = 0; p <= last; ++p) { held[ring != 0 ? p % ring : p] = p; }
+    DeviceBuffer dstarts(starts.size() * 4), dmask(std::size_t(tokens) * slots * 2);
+    dstarts.copy_from_host(starts.data(), starts.size() * 4);
+    k::build_mask(static_cast<__half*>(dmask.p), tokens, slots, first, ring, window, nullptr,
+                  nullptr, static_cast<const std::int32_t*>(dstarts.p));
+    check(cudaDeviceSynchronize(), "build_mask");
+    std::vector<__half> mask(std::size_t(tokens) * slots);
+    dmask.copy_to_host(mask.data(), mask.size() * 2);
+    int wrong = 0;
+    for (int t = 0; t < tokens; ++t) {
+        const int position = first + t - starts[t];
+        for (int s = 0; s < slots; ++s) {
+            const int p = held[s];
+            bool want   = false;
+            if (p >= 0 && p < first) {
+                want = p <= position && (ring == 0 || p > position - window);
+            } else if (p >= first) {
+                const int row = p - first;
+                want = starts[row] == starts[t] && row <= t && (ring == 0 || t - row < window);
+            }
+            const bool visible = __half2float(mask[std::size_t(t) * slots + s]) == 0.0f;
+            wrong += visible != want ? 1 : 0;
+        }
+    }
+    expect(wrong == 0, "build_mask of branch rows, ring " + std::to_string(ring) + ": " +
+                           std::to_string(wrong) + " wrong entries");
 }
 
 int main() {
@@ -407,6 +527,13 @@ int main() {
         qkv(512, 1.1434f, {5, 1000, 7}, rng);
         qkv(256, 1.21f, {0, 1023, 300}, rng);
         for (const int tokens : {1, 3, 8}) { route(tokens, rng); }
+        // A branch pass: rows 0..4, 5..12 and 13..19 continue a 300-position state.
+        qkv(512, 1.0f, {300, 301, 302, 303, 304, 300, 301, 302}, rng,
+            {300, 301, 302, 303, 304, 305, 306, 307});
+        branch_keys(rng);
+        branch_mask(256, 128);
+        branch_mask(256, 4);
+        branch_mask(0, 0);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Gemma 4 kernels\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
