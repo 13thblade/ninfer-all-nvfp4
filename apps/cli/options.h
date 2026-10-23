@@ -61,6 +61,7 @@ struct Options {
     bool wddm_evictable_budget = false;
     bool mlp_a8_decode  = false;
     bool prefill_a8     = true;
+    bool nvfp4_w4a8_int = false;
     bool nvfp4_w4a16    = false;
     bool prefill_cublas = false;
     bool prefill_cublas_projections = true;

@@ -144,6 +144,72 @@ __global__ void probe_d(float* sink, unsigned seed) {
     if (acc == 1234.5678f) { sink[0] = acc; }
 }
 
+// Variant E: pure __dp4a chain. A-D measure the tensor core; the narrow-T route (nvfp4_mmvq_mma.cuh)
+// spends its trips on IDP.4A.S8.S8, whose two candidate peaks differ by 4x (64 lanes/cycle/SM =>
+// ~39.9 TMAC/s, vs 16 => ~10). E reports lanes/cycle/SM, the quantity in dispute.
+//
+// kEChains independent accumulators, kEPerChain dots each: 16 dots = 64 MACs per thread per trip,
+// dependency length 2 so the scheduler always has another chain to issue.
+constexpr int kEChains    = 8;
+constexpr int kEPerChain  = 2;
+constexpr int kEDots      = kEChains * kEPerChain;
+
+__global__ void probe_e(float* sink, unsigned seed) {
+    unsigned a[kEDots];
+#pragma unroll
+    for (int i = 0; i < kEDots; ++i) { a[i] = seed * (i + 2u) + 0x2545u; }
+    unsigned b = seed ^ 0xabcd1234u;
+    int acc[kEChains] = {};
+    for (int g = 0; g < kGroups; ++g) {
+#pragma unroll
+        for (int i = 0; i < kEChains; ++i) {
+#pragma unroll
+            for (int q = 0; q < kEPerChain; ++q) {
+                acc[i] = __dp4a(static_cast<int>(a[i * kEPerChain + q]), static_cast<int>(b), acc[i]);
+            }
+        }
+    }
+    int total = 0;
+#pragma unroll
+    for (int i = 0; i < kEChains; ++i) { total += acc[i]; }
+    if (total == 0x7fffffff) { sink[0] = (float)total; }
+}
+
+/// E's work is counted in dp4a lanes (4 MACs each), not in MMA tiles. CUDA 13 dropped
+/// cudaDeviceProp::clockRate, so the clock comes from the attribute API.
+static double device_clock_khz() {
+    int khz = 0;
+    if (cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, 0) != cudaSuccess || khz <= 0) {
+        return 0.0;
+    }
+    return static_cast<double>(khz);
+}
+
+static double run_dp4a(int blocks, int threads, float* sink, int sms, double* lanes_per_cycle_per_sm) {
+    probe_e<<<blocks, threads>>>(sink, 1u);
+    cudaDeviceSynchronize();
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    cudaEventRecord(a);
+    const int reps = 5;
+    for (int r = 0; r < reps; ++r) { probe_e<<<blocks, threads>>>(sink, 1u); }
+    cudaEventRecord(b);
+    cudaEventSynchronize(b);
+    float ms = 0.f;
+    cudaEventElapsedTime(&ms, a, b);
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+
+    const double macs = (double)blocks * threads * kGroups * kEDots * 4.0 * reps;
+    const double tmac_per_s = macs / (ms / 1000.0) / 1e12;
+    const double khz        = device_clock_khz();
+    // One dp4a retires four int8 lanes, so lanes/cycle/SM is MACs per cycle per SM divided by four.
+    *lanes_per_cycle_per_sm =
+        khz > 0.0 ? tmac_per_s * 1e12 / (sms * khz * 1000.0) / 4.0 : 0.0;
+    return tmac_per_s;
+}
+
 template <class K> double run(K kernel, int blocks, int threads, float* sink) {
     kernel<<<blocks, threads>>>(sink, 1u);
     cudaDeviceSynchronize();
@@ -181,7 +247,12 @@ int main() {
     const double b = run(probe_b, blocks, threads, sink);
     const double c = run(probe_c, blocks, threads, sink);
 
-    printf("GPU: %s  sm_%d%d\n\n", p.name, p.major, p.minor);
+    double lanes = 0.0;
+    const double e = run_dp4a(blocks, threads, sink, p.multiProcessorCount, &lanes);
+    const double khz = device_clock_khz();
+
+    printf("GPU: %s  sm_%d%d  %d SMs @ %.0f MHz (attribute 13)\n\n", p.name, p.major, p.minor,
+           p.multiProcessorCount, khz / 1000.0);
     printf("  %-46s %7.1f T/s   1.00x   <- today's route\n", "D  bf16 MMA (f32 acc)", d);
     printf("  %-46s %7.1f T/s   %.2fx\n", "A  s8 MMA, no overhead", a, a / d);
     printf("  %-46s %7.1f T/s   %.2fx\n", "B  s8 MMA + group-64 rescale", b, b / d);
@@ -189,6 +260,12 @@ int main() {
            c / d);
     printf("\n  Gate B1 threshold on the inner loop: 1.80x\n");
     printf("  Result: %s (%.2fx)\n", (c / d >= 1.80) ? "PASS" : "FAIL", c / d);
+
+    printf("\n  %-46s %7.2f TMAC/s  = %.1f lanes/cycle/SM\n", "E  pure __dp4a chain", e, lanes);
+    printf("  Hypothesis (conflict #3): 64 lanes/cycle/SM (~39.9 TMAC/s) vs 16 (~10)\n");
+    printf("  Result: %s  (%.1f lanes/cycle/SM; %.1f%% of the 64-lane peak)\n",
+           (lanes >= 32.0) ? "64-lane peak SUPPORTED" : "64-lane peak REFUTED", lanes,
+           100.0 * lanes / 64.0);
 
     cudaFree(sink);
     return 0;

@@ -291,6 +291,7 @@ const char* policy_name(LinearPolicy policy) {
     if (policy == LinearPolicy::AllowA8) { return "A8"; }
     if (policy == LinearPolicy::AllowA4) { return "A4"; }
     if (policy == LinearPolicy::AllowA8Int) { return "A8I"; }
+    if (policy == LinearPolicy::AllowNvfp4Int8) { return "NVFP4I8"; }
     throw std::invalid_argument("unsupported Linear benchmark policy");
 }
 
@@ -316,7 +317,9 @@ LinearPolicy parse_policy(std::string_view text) {
     if (value == "a8" || value == "allowa8") { return LinearPolicy::AllowA8; }
     if (value == "a4" || value == "allowa4") { return LinearPolicy::AllowA4; }
     if (value == "a8int" || value == "allowa8int") { return LinearPolicy::AllowA8Int; }
-    throw std::invalid_argument("Linear benchmark policy must be a16, a8, a4, or a8int");
+    if (value == "nvfp4int8" || value == "allownvfp4int8") { return LinearPolicy::AllowNvfp4Int8; }
+    throw std::invalid_argument(
+        "Linear benchmark policy must be a16, a8, a4, a8int, or nvfp4int8");
 }
 
 std::uint64_t parse_u64(std::string_view text, const char* label) {
@@ -382,7 +385,7 @@ void usage(const char* argv0) {
                  "  iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_nl, iq4_xs, q4_0, q5_0, q2_0) over\n"
                  "  random blocks.\n\n"
                  "Options:\n"
-                 "  --policy a16|a8|a4|a8int Activation-compute policy (default a16).\n"
+                 "  --policy a16|a8|a4|a8int|nvfp4int8 Activation-compute policy (default a16).\n"
                  "  --execution MODE   eager (default) or graph; time the complete Op.\n"
                  "  --graph-calls N    Calls per timed graph (1..64, default 1); report per call.\n"
                  "  --profile          Capture exactly one post-warmup public Linear call.\n"
