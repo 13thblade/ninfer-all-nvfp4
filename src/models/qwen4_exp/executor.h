@@ -183,6 +183,14 @@ public:
     void forward_branches(std::uint32_t sequence, const SequenceSnapshot& at,
                           std::span<const std::int32_t> tokens,
                           std::span<const std::uint32_t> lengths);
+    // A prompt's last tokens and the first branches of a branched read in one pass, so their
+    // experts cross the bus once: the first `prompt` of `tokens` continue the sequence, `at` takes
+    // its state at their end (as snapshot() would; the MTP block follows none of the pass), and
+    // the branches (`lengths`, the rest of `tokens`) run from there as forward_branches() runs
+    // them, with the same logits. Needs runs_branches().
+    void forward_prompt_branches(std::uint32_t sequence, std::uint32_t prompt, SequenceSnapshot& at,
+                                 std::span<const std::int32_t> tokens,
+                                 std::span<const std::uint32_t> lengths);
     [[nodiscard]] bool runs_branches() const noexcept;
     // The most logit rows one pass leaves.
     [[nodiscard]] std::uint32_t max_logit_rows() const noexcept;

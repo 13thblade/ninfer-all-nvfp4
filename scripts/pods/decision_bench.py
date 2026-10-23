@@ -223,8 +223,8 @@ def agreement_section(record: dict, failures: list[str]) -> None:
                              "technical": "defects and repairs"}}
     decision = read_alone({"state": state, "questions": {"team": question}})
     # The prompt make_decision_read renders for this question: its system turn and user turn, with
-    # its cache boundaries, so the chat prefills in the read's steps (a chat that drafts cannot
-    # resume from a read's cache entries on Flash-Next, which hold no MTP state).
+    # its cache boundaries (a chat that drafts cannot resume from a read's cache entries on
+    # Flash-Next, which hold no MTP state).
     system = ("You answer typed questions about a state with one label only: the letter of the best "
               "option, yes or no, or the number of the level. No words before or after the label.")
     text = (f"Question: {question['instructions']}\nOptions:\n"
@@ -258,16 +258,19 @@ def agreement_section(record: dict, failures: list[str]) -> None:
                                     "chat_label_mass": mass}}), flush=True)
     check(len(chat_probabilities) >= 1, "the chat's top-20 shows at least one label", failures)
     if chat_probabilities:
-        # The question runs as a branch, the chat's as a prompt step: on Flash-Next the two round
-        # one label's BF16 logit a step apart (0.125 between 16 and 32), which moves every label's
-        # log probability by up to that step. A wrong label or normalization moves them further.
+        # The chat prefills in steps that end at the cache boundaries, a read in passes of its own:
+        # on Flash-Next the state's last chunk and the question share one, which rounds otherwise.
+        # On an RTX 3090 that moved a label's log probability by up to 0.23 and the label mass by
+        # up to 0.015 over seven states (0.12 and 0.011 when the read ran the state and the
+        # question in passes apart, as the chat does). A swapped label moves it by 0.88 or more
+        # here (the closest pair, shipping and technical): the bounds lie between.
         for option, probability in chat_probabilities.items():
             readout = ours[option] * diagnostics["label_mass"]
-            check(abs(math.log(probability) - math.log(readout)) <= 0.13,
-                  f"{option}: readout {readout:.5f} vs chat {probability:.5f} (one BF16 logit step)",
+            check(abs(math.log(probability) - math.log(readout)) <= 0.4,
+                  f"{option}: readout {readout:.5f} vs chat {probability:.5f} (within 0.4)",
                   failures)
-        check(abs(mass - diagnostics["label_mass"]) < 5e-3 or len(chat_probabilities) < 3,
-              "label mass agrees when every label is in the top 20", failures)
+        check(abs(mass - diagnostics["label_mass"]) < 0.03 or len(chat_probabilities) < 3,
+              "label mass agrees within 0.03 when every label is in the top 20", failures)
 
 
 def branch_oracle(record: dict, failures: list[str]) -> None:
