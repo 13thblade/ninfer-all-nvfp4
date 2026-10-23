@@ -194,8 +194,9 @@ void HttpServer::handle_rerank(const httplib::Request& req, httplib::Response& r
     }
     GenerationService& service = lease.service();
     const auto cancelled       = [&req] { return client_disconnected(req); };
-    // One judgement per document, submitted a lane's worth at a time: the Engine runs a window
-    // together, and the ingress queue keeps room for other clients' requests.
+    // One judgement per document, submitted a lane's worth at a time as one group: the Engine runs
+    // a window together, their prompts' last chunks in one shared prefill pass, and the ingress
+    // queue keeps room for other clients' requests.
     const std::size_t window =
         std::max<std::size_t>(1, static_cast<std::size_t>(service.options().max_concurrency));
     std::vector<RerankScore> scores;
@@ -205,16 +206,18 @@ void HttpServer::handle_rerank(const httplib::Request& req, httplib::Response& r
         for (std::size_t begin = 0; begin < request.documents.size(); begin += window) {
             const std::size_t end = std::min(begin + window, request.documents.size());
             std::vector<GenerationRequest> judgements;
-            std::vector<PreparedRequest> batch;
-            std::vector<std::shared_ptr<RequestLifecycle>> lifecycles;
+            std::vector<StagedRequest> staged;
             for (std::size_t index = begin; index < end; ++index) {
                 judgements.push_back(make_rerank_judgement(request, request.documents[index]));
-                batch.push_back(service.prepare(judgements.back(),
-                                                GenerationConsumerMode::Aggregate,
-                                                {.phase_timings = true}, cancelled));
+                staged.push_back(service.stage(judgements.back(), GenerationConsumerMode::Aggregate,
+                                               {.phase_timings = true}, cancelled));
+            }
+            std::vector<PreparedRequest> batch = service.submit_group(std::move(staged));
+            std::vector<std::shared_ptr<RequestLifecycle>> lifecycles;
+            for (std::size_t offset = 0; offset < batch.size(); ++offset) {
                 const RequestLogMetadata metadata{.model = request.model};
                 lifecycles.push_back(begin_request(make_request_log_context(
-                    ++request_seq_, "rerank", judgements.back(), metadata, batch.back())));
+                    ++request_seq_, "rerank", judgements[offset], metadata, batch[offset])));
             }
             for (std::size_t offset = 0; offset < batch.size(); ++offset) {
                 GenerationOutcome outcome;

@@ -162,13 +162,16 @@ def answers_section(record: dict, failures: list[str]) -> None:
             else:
                 check(abs(answer["noul"] - answer["probabilities"]["yes"]) < 1e-9,
                       f"{name} noul is P(yes)", failures)
+    # The choice goes first: like System One's choice_0 it is then read alone, so both endpoints
+    # must give it the same probabilities. A read sharing a prefill pass with others may round the
+    # head's BF16 logits differently.
     openai = {"input": [{"role": "user", "content": [{"type": "input_text", "text": state}]}],
               "questions": [
-                  {"type": "predicate", "name": "refund", "instructions": "Does the customer ask for a refund?"},
                   {"type": "choice", "name": "team", "instructions": "Which team should handle this?",
                    "choices": [{"value": "billing", "description": "payments and refunds"},
                                {"value": "shipping", "description": "deliveries"},
                                {"value": "technical", "description": "defects and repairs"}]},
+                  {"type": "predicate", "name": "refund", "instructions": "Does the customer ask for a refund?"},
                   {"type": "score", "instructions": "How upset is the customer?",
                    "levels": [{"label": "calm"}, {"label": "annoyed"}, {"label": "furious"}]}]}
     status, response = call_status("/v1/decisions", openai)
@@ -180,7 +183,7 @@ def answers_section(record: dict, failures: list[str]) -> None:
               response["answers"][2]["name"] is None, "decisions shape", failures)
         same = record["systemone"]["response"]["answers"]["choice_0"]["probabilities"]
         theirs = {entry["value"]: entry["probability"]
-                  for entry in response["answers"][1]["probabilities"]}
+                  for entry in response["answers"][0]["probabilities"]}
         check(all(abs(same[k] - theirs[k]) < 1e-3 for k in same),
               "the same choice reads the same through both endpoints", failures)
     status, response = call_status("/v1/systemone", {"state": state, "questions": {

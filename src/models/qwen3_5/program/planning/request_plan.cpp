@@ -325,6 +325,7 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         }
     }
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    base->drafting = options.speculative_drafting || speculative_backend == SpeculativeBackend::None;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
     if (!context_cache.kv_lease_growth) {
@@ -555,6 +556,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     plan->grammar                     = base.grammar;
     plan->logprobs                    = base.logprobs;
     plan->readout_tokens              = base.readout_tokens;
+    plan->drafting                    = base.drafting;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->root_rebuild_work           = base.root_rebuild_work;

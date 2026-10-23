@@ -31,6 +31,8 @@ struct ResolvedExecutionOptions {
     // With logprobs: the token ids whose exact log probabilities the first generated token's
     // record carries (ExecutionOptions::readout_tokens).
     std::vector<TokenId> readout_tokens;
+    // ExecutionOptions::speculative_drafting.
+    bool speculative_drafting = true;
 };
 
 struct ResolvedRequestOptions {

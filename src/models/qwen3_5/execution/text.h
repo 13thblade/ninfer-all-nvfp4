@@ -69,6 +69,28 @@ struct DFlashFeatureSink {
 
 class VisionPrefillSession;
 
+// One request's last prompt chunk in a batched prefill pass (TextContext::prefill_final_batch).
+struct PrefillSegment {
+    // The chunk's tokens, ending at the request's prompt frontier.
+    std::span<const int> ids;
+    // The absolute position of ids[0]: the request's resident prefix.
+    std::uint32_t begin                 = 0;
+    std::int32_t kv_table_row           = 0;
+    std::int32_t state_source_slot      = 0;
+    std::int32_t state_destination_slot = 0;
+    // The request's device sampling record.
+    const ops::SamplingConfig* sampling = nullptr;
+    // The typed readout's token ids; empty reads nothing.
+    std::span<const std::int32_t> readout;
+};
+
+// Host destinations of a batched prefill: one token per segment, and kReadoutLogprobsMaximum
+// values per segment, of which a segment's first readout.size() are written.
+struct PrefillBatchHost {
+    std::int32_t* tokens = nullptr;
+    float* readout       = nullptr;
+};
+
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const execution::Parameters& weights, WorkspaceArena& work,
@@ -151,6 +173,15 @@ public:
                                                    std::uint32_t nominal_length,
                                                    VisionPrefillSession& vision,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+    // The last chunks of several requests' text prompts in one pass over the layer stack. Token-wise
+    // work runs over all columns at once; each segment's attention reads and writes its own KV
+    // row and each GDN layer advances its own state slots, as prefill_chunk would for that segment
+    // alone. Each segment then samples its next token as a finalizing chunk does: logprob records
+    // into io rows [0,segments), its readout, and the sampler keyed by its prompt frontier. The
+    // tokens and readouts reach `host` before this returns; prefill_hidden holds the final-norm
+    // hidden of every column, segment after segment. No drafter work or pipeline stages.
+    [[nodiscard]] PrefillChunkResult prefill_final_batch(std::span<const PrefillSegment> segments,
+                                                         PrefillBatchHost host);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& linear_state_source_slots,
@@ -263,6 +294,18 @@ private:
     [[nodiscard]] PrefillChunkResult
     prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
                  const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
+
+    // A batched prefill segment's columns and sequence bindings within one pass.
+    struct SegmentBinding {
+        std::int32_t column  = 0;
+        std::int32_t columns = 0;
+        Tensor positions;
+        Tensor kv_table_row;
+        ops::CausalAttentionExecutionEnvelope envelope;
+        std::int32_t state_source_slot      = 0;
+        std::int32_t state_destination_slot = 0;
+    };
+
     DeviceContext& ctx_;
     const Parameters& parameters_;
     NativeExpertRuntime* experts_ = nullptr;
@@ -288,6 +331,8 @@ private:
     const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
     std::int32_t active_sequence_batch_                                            = 0;
     std::int32_t active_sequence_width_                                            = 0;
+    // Non-empty during prefill_final_batch: a prefill pass's sequences, column range by range.
+    std::span<const SegmentBinding> active_segments_;
     std::int32_t rope_delta_                                                       = 0;
     std::int32_t linear_state_source_slot_                                         = 0;
     std::int32_t linear_state_destination_slot_                                    = 0;

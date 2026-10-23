@@ -181,8 +181,10 @@ int main() {
                           scheduler.choose_execution(true, false, 0, 0) == ExecutionAction::Decode,
                       "admission and GPU-unit fairness gates changed");
     scheduler.set_prefill_lane(0);
-    failures += check(!scheduler.should_attempt_admission(true, true, true, true, false),
-                      "a staged prefill admitted without concurrent prefill");
+    failures += check(!scheduler.should_attempt_admission(true, true, true, true, false) &&
+                          scheduler.should_attempt_admission(true, true, true, true, false, true) &&
+                          !scheduler.should_attempt_admission(true, true, true, false, false, true),
+                      "a staged prefill admitted without concurrent prefill or a shared pass");
     scheduler.allow_concurrent_prefill(true);
     failures +=
         check(scheduler.owns_prefill_lane(0) && scheduler.select_prefill_lane() == std::optional(0U) &&

@@ -406,24 +406,61 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            ninfer::GenerationObservationOptions observation,
                                            std::function<bool()> is_cancelled,
                                            ContextCacheHints context_cache) const {
-    return prepare_impl(
+    std::vector<StagedRequest> one;
+    one.push_back(stage(request, consumer_mode, observation, std::move(is_cancelled),
+                        std::move(context_cache)));
+    return std::move(submit_group(std::move(one)).front());
+}
+
+StagedRequest GenerationService::stage(const GenerationRequest& request,
+                                       GenerationConsumerMode consumer_mode,
+                                       ninfer::GenerationObservationOptions observation,
+                                       std::function<bool()> is_cancelled,
+                                       ContextCacheHints context_cache) const {
+    return stage_impl(
         request, consumer_mode, observation, std::move(is_cancelled), std::move(context_cache),
         options_.allow_prefix_reuse ? CacheParticipation::ReadWrite : CacheParticipation::Disabled,
         DeadlinePolicy::ClientPendingTimeout);
 }
 
-PreparedRequest GenerationService::prepare_impl(const GenerationRequest& incoming,
-                                                GenerationConsumerMode consumer_mode,
-                                                ninfer::GenerationObservationOptions observation,
-                                                std::function<bool()> is_cancelled,
-                                                ContextCacheHints context_cache,
-                                                CacheParticipation cache_participation,
-                                                DeadlinePolicy deadline_policy) const {
+std::vector<PreparedRequest>
+GenerationService::submit_group(std::vector<StagedRequest> staged) const {
+    std::vector<ninfer::GenerationSubmission> submissions;
+    submissions.reserve(staged.size());
+    for (StagedRequest& request : staged) { submissions.push_back(std::move(request.submission)); }
+    std::vector<ninfer::GenerationHandle> handles;
+    try {
+        handles = engine_->submit_group(std::move(submissions));
+    } catch (const ninfer::RequestError& exception) {
+        throw_request_error(exception);
+    } catch (const std::invalid_argument& exception) {
+        throw_invalid_input(exception, "invalid_prompt");
+    }
+    std::vector<PreparedRequest> prepared;
+    prepared.reserve(staged.size());
+    for (std::size_t index = 0; index < staged.size(); ++index) {
+        PreparedRequest& request          = staged[index].prepared;
+        request.generation                = std::move(handles[index]);
+        request.sampling                  = request.generation.resolved_sampling();
+        request.effective_thinking_budget = request.generation.effective_thinking_budget();
+        prepared.push_back(std::move(request));
+    }
+    return prepared;
+}
+
+StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
+                                            GenerationConsumerMode consumer_mode,
+                                            ninfer::GenerationObservationOptions observation,
+                                            std::function<bool()> is_cancelled,
+                                            ContextCacheHints context_cache,
+                                            CacheParticipation cache_participation,
+                                            DeadlinePolicy deadline_policy) const {
     const std::optional<GenerationRequest> unconstrained = drop_unavailable_constraints(
         incoming, options_.structured_output, options_.unconstrained_response_format);
     const GenerationRequest& request = unconstrained ? *unconstrained : incoming;
     if (!request.cache_prompt) { cache_participation = CacheParticipation::Disabled; }
-    PreparedRequest prepared;
+    StagedRequest staged;
+    PreparedRequest& prepared               = staged.prepared;
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     ninfer::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
@@ -527,19 +564,20 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& incomin
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
-        prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
-                                              consumer_mode == GenerationConsumerMode::Streaming
-                                                  ? ninfer::OutputConsumerMode::Streaming
-                                                  : ninfer::OutputConsumerMode::Aggregate,
-                                              observation, prepared.lifetime->deadline);
-        prepared.sampling                  = prepared.generation.resolved_sampling();
-        prepared.effective_thinking_budget = prepared.generation.effective_thinking_budget();
+        staged.submission = ninfer::GenerationSubmission{
+            .prompt           = std::move(prompt),
+            .options          = std::move(request_options),
+            .consumer_mode    = consumer_mode == GenerationConsumerMode::Streaming
+                                    ? ninfer::OutputConsumerMode::Streaming
+                                    : ninfer::OutputConsumerMode::Aggregate,
+            .observation      = observation,
+            .pending_deadline = prepared.lifetime->deadline};
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) {
         throw_invalid_input(exception, "invalid_prompt");
     }
-    return prepared;
+    return staged;
 }
 
 int GenerationService::count_prompt_tokens(const GenerationRequest& request,
@@ -708,9 +746,10 @@ void GenerationService::warmup() {
     turn.content.push_back(std::move(content));
     request.messages.push_back(std::move(turn));
     request.max_tokens = 4;
-    PreparedRequest prepared =
-        prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {}, {},
-                     CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);
+    std::vector<StagedRequest> staged;
+    staged.push_back(stage_impl(request, GenerationConsumerMode::Aggregate, {}, {}, {},
+                                CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup));
+    PreparedRequest prepared = std::move(submit_group(std::move(staged)).front());
     run(prepared, nullptr);
 }
 

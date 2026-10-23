@@ -276,22 +276,54 @@ public:
                       ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
                       GenerationObservationOptions observation,
                       Clock::time_point pending_deadline = {}) {
-        const Clock::time_point submitted = Clock::now();
-        if (options.execution.structured_output.kind != StructuredOutputKind::None &&
-            !structured_output_) {
-            throw std::invalid_argument(
-                "structured output requires an Engine started with structured_output");
-        }
-        if (pending_deadline == Clock::time_point{}) {
-            pending_deadline = submitted + pending_timeout_;
-        }
-        if (submitted >= pending_deadline) {
-            throw RequestError(RequestErrorKind::QueueTimeout,
-                               "inference request expired before submission");
-        }
+        std::vector<GroupMember> one;
+        one.push_back(GroupMember{.prompt           = std::move(prompt),
+                                  .prompt_summary   = prompt_summary,
+                                  .prepare_seconds  = prepare_seconds,
+                                  .options          = std::move(options),
+                                  .consumer_mode    = consumer_mode,
+                                  .observation      = observation,
+                                  .pending_deadline = pending_deadline});
+        return std::move(submit_group(std::move(one)).front());
+    }
 
-        std::uint64_t request_id        = 0;
-        std::uint64_t publication_order = 0;
+    // One request of submit_group: the arguments of submit.
+    struct GroupMember {
+        PreparedPrompt prompt;
+        PromptSummary prompt_summary;
+        double prepare_seconds = 0.0;
+        ResolvedRequestOptions options;
+        OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
+        GenerationObservationOptions observation;
+        Clock::time_point pending_deadline;
+    };
+
+    // Queues the members together, in order, under one queue lock, so one worker boundary sees
+    // all of them: admission takes every member a lane can take, and their last prompt chunks
+    // share a prefill pass. Capacity is reserved for the whole group, and an error for one member
+    // queues none.
+    std::vector<Submission> submit_group(std::vector<GroupMember> group) {
+        const Clock::time_point submitted = Clock::now();
+        for (GroupMember& member : group) {
+            if (member.options.execution.structured_output.kind != StructuredOutputKind::None &&
+                !structured_output_) {
+                throw std::invalid_argument(
+                    "structured output requires an Engine started with structured_output");
+            }
+            if (member.pending_deadline == Clock::time_point{}) {
+                member.pending_deadline = submitted + pending_timeout_;
+            }
+            if (submitted >= member.pending_deadline) {
+                throw RequestError(RequestErrorKind::QueueTimeout,
+                                   "inference request expired before submission");
+            }
+        }
+        const std::size_t count = group.size();
+        if (count == 0) { return {}; }
+        const auto identities = static_cast<std::uint64_t>(count);
+
+        std::uint64_t first_request_id        = 0;
+        std::uint64_t first_publication_order = 0;
         {
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
@@ -302,61 +334,80 @@ public:
                 !auto_resume_.load(std::memory_order_acquire)) {
                 throw RequestError(RequestErrorKind::Unavailable, "model is suspended");
             }
-            if (outstanding_ >= max_outstanding_) {
+            if (outstanding_ + count > max_outstanding_) {
                 throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
             }
-            if (next_request_id_ == 0 || next_publication_order_ == 0) {
+            constexpr std::uint64_t kLast = std::numeric_limits<std::uint64_t>::max();
+            if (next_request_id_ == 0 || next_publication_order_ == 0 ||
+                next_request_id_ - 1 > kLast - identities ||
+                next_publication_order_ - 1 > kLast - identities) {
                 throw std::overflow_error("request identity space exhausted");
             }
-            ++outstanding_;
-            request_id        = next_request_id_++;
-            publication_order = next_publication_order_++;
+            outstanding_ += count;
+            first_request_id        = next_request_id_;
+            first_publication_order = next_publication_order_;
+            next_request_id_ += identities;
+            next_publication_order_ += identities;
         }
 
-        std::shared_ptr<Request> request;
-        std::optional<std::uint32_t> effective_budget;
+        std::vector<std::shared_ptr<Request>> requests;
+        std::vector<std::optional<std::uint32_t>> effective_budgets;
+        requests.reserve(group.size());
+        effective_budgets.reserve(group.size());
         try {
-            if (ngram_archive_ && !options.ngram_session.key.empty()) {
-                std::random_device entropy;
-                options.execution.sampling.seed ^=
-                    (static_cast<std::uint64_t>(entropy()) << 32) ^ entropy();
+            for (std::size_t k = 0; k < count; ++k) {
+                GroupMember& member             = group[k];
+                ResolvedRequestOptions& options = member.options;
+                if (ngram_archive_ && !options.ngram_session.key.empty()) {
+                    std::random_device entropy;
+                    options.execution.sampling.seed ^=
+                        (static_cast<std::uint64_t>(entropy()) << 32) ^ entropy();
+                }
+                apply_effective_thinking_budget(
+                    options.execution.thinking,
+                    effective_output_capacity(options.execution.requested_output_tokens,
+                                              max_context_, member.prompt_summary.prompt_tokens),
+                    instance_.frontend.thinking_control_token_count());
+                auto output = instance_.frontend.make_output_session(
+                    member.prompt, options.stop, options.output, options.execution.thinking,
+                    options.execution.structured_output);
+                // Strict tool arguments bring a grammar without a structured final format.
+                if (output.grammar_state() && !structured_output_) {
+                    throw std::invalid_argument(
+                        "strict tool arguments require an Engine started with structured_output");
+                }
+                options.execution.grammar = output.grammar_state();
+                requests.push_back(std::make_shared<Request>(
+                    first_request_id + k, first_publication_order + k, std::move(member.prompt),
+                    std::move(output), member.prompt_summary, member.prepare_seconds,
+                    std::move(options), member.consumer_mode, member.observation,
+                    member.pending_deadline, submitted));
+                effective_budgets.push_back(
+                    requests.back()->output.thinking_stats().effective_budget);
             }
-            apply_effective_thinking_budget(
-                options.execution.thinking,
-                effective_output_capacity(options.execution.requested_output_tokens, max_context_,
-                                          prompt_summary.prompt_tokens),
-                instance_.frontend.thinking_control_token_count());
-            auto output = instance_.frontend.make_output_session(
-                prompt, options.stop, options.output, options.execution.thinking,
-                options.execution.structured_output);
-            // Strict tool arguments bring a grammar without a structured final format.
-            if (output.grammar_state() && !structured_output_) {
-                throw std::invalid_argument(
-                    "strict tool arguments require an Engine started with structured_output");
-            }
-            options.execution.grammar = output.grammar_state();
-            request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
-                                                std::move(output), prompt_summary, prepare_seconds,
-                                                std::move(options), consumer_mode, observation,
-                                                pending_deadline, submitted);
-            effective_budget = request->output.thinking_stats().effective_budget;
         } catch (...) {
-            release_reserved_capacity();
+            std::lock_guard lock(queue_mutex_);
+            outstanding_ -= count;
             throw;
         }
 
         {
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
-                --outstanding_;
+                outstanding_ -= count;
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
-            pending_.push_back(request);
+            for (const std::shared_ptr<Request>& request : requests) { pending_.push_back(request); }
         }
         request_admission_check();
         queue_cv_.notify_one();
-        return Submission(*this, std::move(request), effective_budget);
+        std::vector<Submission> submissions;
+        submissions.reserve(requests.size());
+        for (std::size_t k = 0; k < requests.size(); ++k) {
+            submissions.push_back(Submission(*this, std::move(requests[k]), effective_budgets[k]));
+        }
+        return submissions;
     }
 
     [[nodiscard]] MemorySummary memory_summary() const {
@@ -2128,6 +2179,24 @@ private:
             begin.prompt_tokens > computed ? begin.prompt_tokens - computed : 0U);
     }
 
+    // True when every lane owning staged prefill has only a last chunk left that can share one
+    // pass with others: a request admitted meanwhile can join that pass.
+    [[nodiscard]] bool staged_prefills_share() const {
+        std::uint64_t mask = scheduler_.prefill_lane_mask();
+        if (mask == 0) { return false; }
+        while (mask != 0) {
+            const auto lane = static_cast<std::uint32_t>(std::countr_zero(mask));
+            mask &= mask - 1U;
+            const auto& request = lane < max_concurrency_ ? slots_[lane] : nullptr;
+            if (request == nullptr || !request->is_prefilling() || request->capture_pending ||
+                !request->sequence ||
+                !instance_.program->prefill_batch_tokens(*request->sequence)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     [[nodiscard]] std::optional<std::uint32_t> runnable_prefill_lane() const {
         return scheduler_.select_runnable_prefill_lane(
             max_concurrency_, [&](std::uint32_t lane) -> std::optional<std::uint32_t> {
@@ -2150,10 +2219,40 @@ private:
         if (request == nullptr || !request->is_prefilling() || request->capture_pending) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
-        scheduler_.record_prefill_unit(lane);
         if (!request->sequence) {
             throw std::logic_error("prefill request has no sequence handle");
         }
+        // Other lanes' last prompt chunks share the pass when the selected lane's step is a last
+        // chunk too: one pass over the model instead of one per request.
+        std::array<std::uint32_t, kMaximumConcurrency> batch{};
+        std::size_t batch_size = 0;
+        if (const auto tokens = instance_.program->prefill_batch_tokens(*request->sequence)) {
+            const std::uint32_t capacity = instance_.program->prefill_batch_capacity();
+            std::uint32_t total          = *tokens;
+            batch[batch_size++]          = lane;
+            std::uint64_t mask           = scheduler_.prefill_lane_mask();
+            while (mask != 0) {
+                const auto other = static_cast<std::uint32_t>(std::countr_zero(mask));
+                mask &= mask - 1U;
+                const auto& candidate = slots_[other];
+                if (other == lane || other >= max_concurrency_ || candidate == nullptr ||
+                    !candidate->is_prefilling() || candidate->capture_pending ||
+                    !candidate->sequence) {
+                    continue;
+                }
+                const auto other_tokens =
+                    instance_.program->prefill_batch_tokens(*candidate->sequence);
+                if (!other_tokens || *other_tokens > capacity - total) { continue; }
+                total += *other_tokens;
+                batch[batch_size++] = other;
+            }
+        }
+        if (batch_size > 1) {
+            run_prefill_batch(std::span<const std::uint32_t>(batch.data(), batch_size),
+                              cancelled_at_unit_start, setup);
+            return;
+        }
+        scheduler_.record_prefill_unit(lane);
         setup.finish();
         ProgramCallScope program_call(*this);
         auto progress =
@@ -2167,6 +2266,45 @@ private:
         // the request keeps prefilling: each prefill boundary is an admission point, so a waiting
         // request can be admitted to a free lane while another request is still prefilling.
         if (!progress.complete && request->is_prefilling()) { request_admission_check(); }
+        publish_runtime_stats();
+    }
+
+    // One pass computes the rest of every lane's prompt; each lane's step then completes on its
+    // own, in lane order, exactly as a step that ran alone.
+    void run_prefill_batch(std::span<const std::uint32_t> lanes,
+                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+                           EnginePhaseScope& setup) {
+        std::array<SequenceHandle, kMaximumConcurrency> sequences{};
+        std::uint64_t ran = 0;
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            sequences[row] = *slots_[lanes[row]]->sequence;
+            ran |= 1ULL << lanes[row];
+        }
+        scheduler_.record_prefill_units(ran);
+        setup.finish();
+        {
+            ProgramCallScope program_call(*this);
+            const runtime::ExecutionTiming timing = instance_.program->prefill_batch(
+                std::span<const SequenceHandle>(sequences.data(), lanes.size()),
+                &program_call.failed_timing());
+            program_call.finish(timing);
+            cumulative_stats_.prefill_seconds_total +=
+                static_cast<double>(timing.elapsed_ns()) * 1e-9;
+            ++cumulative_stats_.shared_prefill_passes;
+            cumulative_stats_.shared_prefill_requests += lanes.size();
+            consume_armed_worker_failure();
+        }
+        for (const std::uint32_t lane : lanes) {
+            const auto request = slots_[lane];
+            if (request == nullptr || !request->is_prefilling() || !request->sequence) {
+                throw std::logic_error("batched prefill lane lost its request");
+            }
+            ProgramCallScope program_call(*this);
+            auto progress =
+                instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
+            program_call.finish(progress.timing);
+            resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+        }
         publish_runtime_stats();
     }
 
@@ -3153,9 +3291,24 @@ private:
                 if (!skip_admission &&
                     scheduler_.should_attempt_admission(
                         have_pending, admission_check_pending, !membership.empty(), decode_run,
-                        instance_.program->has_context_transaction()) &&
+                        instance_.program->has_context_transaction(), staged_prefills_share()) &&
                     consume_admission_check()) {
                     (void)try_admit_one();
+                    // Every waiting request a lane can take now is admitted before the next unit
+                    // while the gate stays open, so the last prompt chunks of short requests that
+                    // arrive together can share one prefill pass.
+                    for (std::uint32_t extra = 1;
+                         extra < max_concurrency_ && !materializing_ &&
+                         scheduler_.should_attempt_admission(
+                             has_pending_requests(),
+                             admission_check_pending_.load(std::memory_order_acquire),
+                             !scheduler_.build_round_membership(slots_, max_concurrency_).empty(),
+                             decode_run, instance_.program->has_context_transaction(),
+                             staged_prefills_share()) &&
+                         consume_admission_check();
+                         ++extra) {
+                        if (try_admit_one() == AdmissionProgress::None) { break; }
+                    }
                     membership = scheduler_.build_round_membership(slots_, max_concurrency_);
                 }
 

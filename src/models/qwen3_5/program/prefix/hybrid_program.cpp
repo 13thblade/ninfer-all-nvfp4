@@ -224,6 +224,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
     quote->grammar                     = plan.grammar;
     quote->logprobs                    = plan.logprobs;
     quote->readout_tokens              = plan.readout_tokens;
+    quote->drafting                    = plan.drafting;
     quote->text_kv_page_entitlement    = plan.text_kv_page_entitlement;
     quote->backend_kv_page_entitlement = plan.backend_kv_page_entitlement;
     quote->vision_control_plan         = plan.vision_control_plan;
@@ -506,10 +507,12 @@ bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::ui
         }
         if (wait && !inside_exclusion(wait->target, state.exclusions) &&
             wait->target > state.last_capture) {
-            // Waiting saves this request's prefill of the shared tokens; a new tap costs the
-            // sibling one split. The sibling's remaining prefill to the snapshot is the wait,
-            // doubled because decode rounds of other lanes interleave with it.
-            const double saved = hybrid_cost_.prefill_seconds(reuse, wait->target - reuse);
+            // Waiting saves this request's prefill of the shared tokens, beyond the pass it runs
+            // either way; a new tap costs the sibling one split. The sibling's remaining prefill
+            // to the snapshot is the wait, doubled because decode rounds of other lanes
+            // interleave with it.
+            const double saved = hybrid_cost_.prefill_seconds(reuse, n - reuse) -
+                                 hybrid_cost_.prefill_seconds(wait->target, n - wait->target);
             const double predicted =
                 2.0 * hybrid_cost_.prefill_seconds(prefill.cursor, wait->target - prefill.cursor);
             if (saved > (wait->plan_tap ? hybrid_cost_.chunk_seconds : 0.0) &&
@@ -927,7 +930,7 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
 
         request.timings              = {};
         request.pending              = {};
-        request.publish_continuation = quote.summary.publish_continuation;
+        request.publish_continuation = quote.summary.publish_continuation && quote.drafting;
         request.lease_ceiling =
             std::min(capacity, n + (quote.summary.effective_output_tokens == 0
                                         ? 0U
@@ -1006,6 +1009,28 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
                                  reuse != 0 ? std::span<const std::uint32_t>(existing)
                                             : std::span<const std::uint32_t>(),
                                  exclusions, hybrid_->taps());
+            if (prompt.tap_hints.disposable) {
+                // No request continues a disposable one: past the last boundary its client named,
+                // the prompt is its own (a decision read's question), so no snapshot there serves
+                // another request, and an exact tap would only cost a prefill pass.
+                std::uint32_t named = 0;
+                for (const pc::TapHint& hint : hints) {
+                    if (hint.kind == pc::TapHintKind::Explicit) {
+                        named = std::max(named, hint.position);
+                    }
+                }
+                std::erase_if(taps,
+                              [named](const pc::PlannedTap& tap) { return tap.position > named; });
+            }
+        }
+        // Without drafting the drafter stops at the deepest exact tap; a flexible tap lands at a
+        // chunk boundary, possibly past it.
+        std::optional<std::uint32_t> drafter_frontier;
+        if (!quote.drafting) {
+            std::erase_if(taps, [](const pc::PlannedTap& tap) {
+                return tap.placement != pc::TapPlacement::Exact;
+            });
+            drafter_frontier = taps.empty() ? reuse : std::max(reuse, taps.back().position);
         }
         const bool disposable = prompt.tap_hints.disposable;
         const std::uint64_t path_hash =
@@ -1021,6 +1046,7 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
             .cursor             = reuse,
             .prompt_tokens      = n,
             .initial_mtp_extent = initial_mtp_extent,
+            .drafter_frontier   = drafter_frontier,
             .elapsed_seconds    = 0.0,
             .prepare_mtp        = prepare_mtp,
             .reuse              = quote.summary.prefix_reuse_path,
@@ -1400,7 +1426,8 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                 text_kv_addresses->can_release_after_deactivate(sequence.kv->text) &&
                 (!sequence.kv->backend || backend_kv_addresses->can_release_after_deactivate(
                                               *sequence.kv->backend));
-            if (endpoint && kv_releasable && backend_caught_up && frontier != 0 &&
+            if (endpoint && request.publish_continuation && kv_releasable && backend_caught_up &&
+                frontier != 0 &&
                 frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation &&
                 frontier <= sequence.ledger.size() && lane_state.path.size() >= anchor_blocks &&
                 !sequence.state.fork_pending && sequence.state.read == sequence.state.write &&

@@ -972,6 +972,25 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
             a_batch, s, rotated_output ? nullptr : &gate_batch);
+    } else if (!active_segments_.empty()) {
+        // Each segment attends over its own sequence exactly as its prefill alone would.
+        for (const SegmentBinding& segment : active_segments_) {
+            auto scope           = work_.scope();
+            Tensor a_segment     = a.slice(2, segment.column, segment.columns);
+            Tensor gate_segment  = gate.slice(2, segment.column, segment.columns);
+            ops::causal_softmax_attention(
+                qn.slice(2, segment.column, segment.columns),
+                kn.slice(2, segment.column, segment.columns),
+                v.slice(2, segment.column, segment.columns), segment.positions, Tensor{},
+                segment.kv_table_row,
+                {dimension(config_.attention->head_dim),
+                 dimension(config_.attention->num_attention_heads),
+                 dimension(config_.attention->num_key_value_heads)},
+                static_cast<float>(1.0 /
+                                   std::sqrt(static_cast<double>(config_.attention->head_dim))),
+                batch_text_kv_->batch_layer_view(fidx), segment.envelope, work_, a_segment, s,
+                rotated_output ? nullptr : &gate_segment);
+        }
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
@@ -1056,11 +1075,27 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
         gdn_projection(h, p, qkv, z_flat, work_, s, projection_basis);
         const GdnStateRef gdn_pool = gdn_state(static_cast<std::uint32_t>(gidx));
-        Tensor conv_state_in       = gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_source_slot_);
-        Tensor conv_state_out =
-            gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_destination_slot_);
-        ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
-                                      s);
+        if (!active_segments_.empty()) {
+            for (const SegmentBinding& segment : active_segments_) {
+                const Tensor conv_state_in =
+                    gdn_pool.pool->conv_slot(gdn_pool.local, segment.state_source_slot);
+                Tensor conv_state_out =
+                    gdn_pool.pool->conv_slot(gdn_pool.local, segment.state_destination_slot);
+                Tensor q_segment = qc.slice(1, segment.column, segment.columns);
+                Tensor k_segment = kc.slice(1, segment.column, segment.columns);
+                Tensor v_segment = vc.slice(1, segment.column, segment.columns);
+                ops::causal_conv1d_silu_split(qkv.slice(1, segment.column, segment.columns),
+                                              p.convolution, conv_state_in, conv_state_out,
+                                              q_segment, k_segment, v_segment, s);
+            }
+        } else {
+            Tensor conv_state_in =
+                gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_source_slot_);
+            Tensor conv_state_out =
+                gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_destination_slot_);
+            ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc,
+                                          kc, vc, s);
+        }
     }
 
     Tensor q_recurrent = qc.view({dimension(config_.gdn->linear_key_head_dim),
@@ -1110,6 +1145,26 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                     1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
                 /*normalize_qk=*/true, recurrent_states, *active_linear_state_source_slots_,
                 *active_linear_state_destination_slots_, out_batch, s);
+        }
+    } else if (!active_segments_.empty()) {
+        const GdnStateRef recurrent_pool = gdn_state(static_cast<std::uint32_t>(gidx));
+        for (const SegmentBinding& segment : active_segments_) {
+            auto scope = work_.scope();
+            const Tensor recurrent_state_in =
+                recurrent_pool.pool->recurrent_slot(recurrent_pool.local, segment.state_source_slot);
+            Tensor recurrent_state_out = recurrent_pool.pool->recurrent_slot(
+                recurrent_pool.local, segment.state_destination_slot);
+            Tensor o_segment = o.slice(2, segment.column, segment.columns);
+            ops::gated_delta_net(
+                q_recurrent.slice(2, segment.column, segment.columns),
+                k_recurrent.slice(2, segment.column, segment.columns),
+                vv.slice(2, segment.column, segment.columns),
+                g.slice(1, segment.column, segment.columns),
+                beta.slice(1, segment.column, segment.columns),
+                static_cast<float>(
+                    1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
+                /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o_segment,
+                s);
         }
     } else {
         const GdnStateRef recurrent_pool = gdn_state(static_cast<std::uint32_t>(gidx));
@@ -1779,6 +1834,164 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T,
+                              .timing           = timing.finish()};
+}
+
+PrefillChunkResult TextContext::prefill_final_batch(std::span<const PrefillSegment> segments,
+                                                    PrefillBatchHost host) {
+    runtime::ExecutionTimingRecorder timing;
+    if (segments.empty() || segments.size() > kMaximumConcurrency || host.tokens == nullptr ||
+        host.readout == nullptr) {
+        throw std::invalid_argument("batched prefill needs one to eight segments and host outputs");
+    }
+    if (prefill_hidden_.data == nullptr || mtp_enabled() || parameters_.text.split_execution()) {
+        throw std::logic_error(
+            "batched prefill runs without drafter work or stages and needs prefill hidden");
+    }
+    cudaStream_t s          = ctx_.stream;
+    const auto count        = static_cast<std::int32_t>(segments.size());
+    constexpr auto readouts = static_cast<std::int32_t>(ops::kReadoutLogprobsMaximum);
+    std::array<SegmentBinding, kMaximumConcurrency> bindings{};
+    std::vector<std::int32_t> ids;
+    std::vector<std::int32_t> positions_host;
+    std::array<std::int32_t, kMaximumConcurrency> rows_host{};
+    std::array<std::int32_t, kMaximumConcurrency> frontiers_host{};
+    std::vector<std::int32_t> readout_ids_host(static_cast<std::size_t>(readouts * count), 0);
+    bool any_readout     = false;
+    std::int32_t columns = 0;
+    for (std::int32_t i = 0; i < count; ++i) {
+        const PrefillSegment& segment = segments[static_cast<std::size_t>(i)];
+        const std::uint64_t frontier  = std::uint64_t(segment.begin) + segment.ids.size();
+        if (segment.ids.empty() || segment.sampling == nullptr ||
+            segment.readout.size() > static_cast<std::size_t>(readouts) ||
+            frontier > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()) ||
+            std::uint64_t(columns) + segment.ids.size() > prefill_chunk_) {
+            throw std::invalid_argument("batched prefill segment is outside the pass");
+        }
+        const auto length = static_cast<std::int32_t>(segment.ids.size());
+        ids.insert(ids.end(), segment.ids.begin(), segment.ids.end());
+        for (std::int32_t t = 0; t < length; ++t) {
+            positions_host.push_back(static_cast<std::int32_t>(segment.begin) + t);
+        }
+        rows_host[static_cast<std::size_t>(i)]      = segment.kv_table_row;
+        frontiers_host[static_cast<std::size_t>(i)] = static_cast<std::int32_t>(frontier);
+        std::copy(segment.readout.begin(), segment.readout.end(),
+                  readout_ids_host.begin() + static_cast<std::ptrdiff_t>(i) * readouts);
+        any_readout = any_readout || !segment.readout.empty();
+        const auto visible = static_cast<std::uint32_t>(frontier);
+        bindings[static_cast<std::size_t>(i)] = SegmentBinding{
+            .column                 = columns,
+            .columns                = length,
+            .envelope               = {.min_visible_keys   = visible,
+                                       .max_visible_keys   = visible,
+                                       .fast_prompt_kernel = fast_prefill_kernel_,
+                                       .small_prefill      = true},
+            .state_source_slot      = segment.state_source_slot,
+            .state_destination_slot = segment.state_destination_slot,
+        };
+        columns += length;
+    }
+
+    work_.reset();
+    nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
+                                  static_cast<std::uint64_t>(columns));
+    rope_delta_ = 0;
+    ops::set_i32_scalar(io_.rope_delta, 0, s);
+    const auto roots = workspace::text_prefill_roots(work_, config_, columns, 0, 0);
+    Tensor ids_device = roots.ids;
+    copy_i32(ids.data(), ids_device, s);
+    Tensor positions = roots.positions;
+    copy_i32(positions_host.data(), positions, s);
+    Tensor rows = work_.alloc(DType::I32, {count});
+    copy_i32(rows_host.data(), rows, s);
+    for (std::int32_t i = 0; i < count; ++i) {
+        SegmentBinding& binding = bindings[static_cast<std::size_t>(i)];
+        binding.positions       = positions.slice(0, binding.column, binding.columns);
+        binding.kv_table_row    = rows.slice(0, i, 1);
+    }
+
+    Tensor x = roots.residual;
+    {
+        // Token-wise work reads the widest segment's envelope; attention uses each segment's own.
+        const auto widest = std::max_element(
+            bindings.begin(), bindings.begin() + count,
+            [](const SegmentBinding& a, const SegmentBinding& b) {
+                return a.envelope.max_visible_keys < b.envelope.max_visible_keys;
+            });
+        ScopedPositions scoped_cache(active_cache_positions_, positions);
+        ScopedPositions scoped_rope(active_rope_positions_, positions);
+        ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, widest->envelope);
+        ScopedValue<std::span<const SegmentBinding>> scoped_segments(
+            active_segments_, std::span<const SegmentBinding>(bindings.data(), count));
+        embed_tokens(ids_device, *embed_, parameters_.text.token_embedding_signs, x, s);
+        run_layers(x, Phase::Prefill);
+    }
+
+    Tensor xf = matrix_window(prefill_hidden_, columns);
+    ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+    Tensor last = work_.alloc(DType::BF16, {dimension(config_.hidden_size), count});
+    for (std::int32_t i = 0; i < count; ++i) {
+        const SegmentBinding& binding = bindings[static_cast<std::size_t>(i)];
+        const Tensor source           = xf.slice(1, binding.column + binding.columns - 1, 1);
+        CUDA_CHECK(cudaMemcpyAsync(last.slice(1, i, 1).data, source.data, source.bytes(),
+                                   cudaMemcpyDeviceToDevice, s));
+    }
+    const std::int32_t physical_rows = io_.logits.ne[0];
+    const auto token_domain = dimension(parameters_.model.resources().public_token_count);
+    Tensor logits           = work_.alloc(DType::BF16, {physical_rows, count});
+    project(last, *lm_head_, logits, work_, s);
+
+    // The sampler and the logprob gather read one contiguous record per column.
+    const DeviceSpan configs_span =
+        work_.alloc_bytes(sizeof(ops::SamplingConfig) * static_cast<std::size_t>(count));
+    auto* configs = static_cast<ops::SamplingConfig*>(configs_span.data);
+    for (std::int32_t i = 0; i < count; ++i) {
+        CUDA_CHECK(cudaMemcpyAsync(configs + i, segments[static_cast<std::size_t>(i)].sampling,
+                                   sizeof(ops::SamplingConfig), cudaMemcpyDeviceToDevice, s));
+    }
+    // The tokens' logprob records, gathered before sampling adds them to the penalty counts; a
+    // device no-op unless a request asked for them.
+    if (io_.logprob_active.data != nullptr) {
+        Tensor top_ids =
+            io_.logprob_ids.slice(1, 0, count).view({ops::kLogprobTopK, 1, count});
+        Tensor top_values =
+            io_.logprob_values.slice(1, 0, count).view({ops::kLogprobTopK, 1, count});
+        Tensor lse = io_.logprob_lse.slice(0, 0, count).view({1, count});
+        ops::logprob_topk(logits.view({physical_rows, 1, count}), configs, nullptr, token_domain,
+                          top_ids, top_values, lse, io_.logprob_active, work_, s);
+    }
+    Tensor readout_values;
+    if (any_readout) {
+        Tensor readout_ids = work_.alloc(DType::I32, {readouts, count});
+        copy_i32(readout_ids_host.data(), readout_ids, s);
+        readout_values = work_.alloc(DType::FP32, {readouts, count});
+        for (std::int32_t i = 0; i < count; ++i) {
+            const auto requested =
+                static_cast<std::int32_t>(segments[static_cast<std::size_t>(i)].readout.size());
+            if (requested == 0) { continue; }
+            Tensor values = readout_values.slice(1, i, 1).view({readouts});
+            ops::readout_logprobs(logits.slice(1, i, 1), readout_ids.slice(1, i, 1).view({readouts}),
+                                  requested, token_domain, values, s);
+        }
+    }
+    Tensor sample_positions = work_.alloc(DType::I32, {count});
+    copy_i32(frontiers_host.data(), sample_positions, s);
+    Tensor tokens = work_.alloc(DType::I32, {count});
+    ops::sample(logits, tokens, token_domain, configs, sample_positions, ops::kSamplePurposePrefill,
+                work_, s);
+    CUDA_CHECK(cudaMemcpyAsync(host.tokens, tokens.data, tokens.bytes(), cudaMemcpyDeviceToHost,
+                               s));
+    if (any_readout) {
+        CUDA_CHECK(cudaMemcpyAsync(host.readout, readout_values.data, readout_values.bytes(),
+                                   cudaMemcpyDeviceToHost, s));
+    }
+
+    timing.begin_wait();
+    ctx_.synchronize();
+    timing.end_wait();
+    work_.reset();
+    return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(columns),
+                              .finalized        = true,
                               .timing           = timing.finish()};
 }
 

@@ -63,6 +63,15 @@ private:
     friend class Engine;
 };
 
+// One request of Engine::submit_group: the arguments of Engine::submit.
+struct GenerationSubmission {
+    PreparedPrompt prompt;
+    RequestOptions options;
+    OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
+    GenerationObservationOptions observation;
+    std::chrono::steady_clock::time_point pending_deadline;
+};
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
@@ -112,6 +121,14 @@ public:
            OutputConsumerMode consumer_mode                       = OutputConsumerMode::Aggregate,
            GenerationObservationOptions observation               = {},
            std::chrono::steady_clock::time_point pending_deadline = {});
+
+    // submit() for several requests that enter the queue together, in order. The executor sees
+    // them at one boundary, so a Qwen3.5-core Engine admits them at once and runs their last prompt
+    // chunks in one shared pass instead of starting the first before the rest arrive; Gemma 4 and
+    // Qwen3.8-Flash-Next queue them one by one. Every request is checked before a Qwen3.5-core
+    // Engine queues any; an error for one request cancels the group.
+    [[nodiscard]] std::vector<GenerationHandle>
+    submit_group(std::vector<GenerationSubmission> submissions);
 
     // The largest requested_output_tokens for this prompt whose admission entitlement -- Main KV
     // plus any MTP/DFlash backend KV, draft window included -- fits one lane's share of each pool,

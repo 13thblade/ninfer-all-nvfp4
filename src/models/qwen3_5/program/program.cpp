@@ -459,6 +459,20 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence,
     return result;
 }
 
+std::optional<std::uint32_t> Program::prefill_batch_tokens(SequenceHandle sequence) const noexcept {
+    return impl_->prefill_batch_tokens(sequence);
+}
+
+std::uint32_t Program::prefill_batch_capacity() const noexcept { return impl_->prefill_chunk; }
+
+runtime::ExecutionTiming Program::prefill_batch(std::span<const SequenceHandle> sequences,
+                                                runtime::ExecutionTiming* failed_timing) {
+    if (impl_->experts) { impl_->experts->check(); }
+    auto result = impl_->prefill_batch(sequences, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    return result;
+}
+
 CaptureAssessment
 Program::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                          const SharedPrefixHandle* replacement,
