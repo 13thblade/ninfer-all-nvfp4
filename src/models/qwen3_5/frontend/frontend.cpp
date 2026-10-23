@@ -817,6 +817,7 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
     // shared-prefix publication. Hybrid taps are cheap and content-deduplicated, so explicit
     // markers only add taps; automatic placement is never suppressed.
     PreparedTapHints out;
+    out.disposable = hints.retention == CacheRetentionHint::Disposable;
     out.hints.reserve(message_boundaries.size() + hints.markers.size() + 3U);
     const auto add = [&](std::optional<std::uint32_t> frontier, TapHintKind kind) {
         if (frontier && *frontier != 0) { out.hints.push_back(TapHint{*frontier, kind}); }

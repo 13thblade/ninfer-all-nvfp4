@@ -917,7 +917,12 @@ whose template re-renders the reply (stripped thinking) resumes from that tap. A
 snapshot retains it again, until that lineage moves on. A `Boundary` snapshot (a tap at a client
 breakpoint or structural boundary, or at the divergence of coalesced requests, §12.2) may be shared
 by conversations, so it is superseded only while no other conversation has continued from it: while
-the tree below it is a single chain. Until then it is just its lineage's snapshot.
+the tree below it is a single chain. Until then it is just its lineage's snapshot. A request with
+`CacheRetentionHint::Disposable` (the decision endpoints' reads) has no lineage, since no request
+continues it, and supersedes nothing it resumed from. The first of several reads that share a
+boundary would otherwise supersede it with its endpoint, so far the only branch below the boundary,
+and the boundary would then give up its Device slot and Host slabs first while the other reads
+still wait to resume from it.
 
 Allocation of `k` slabs:
 
