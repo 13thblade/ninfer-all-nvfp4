@@ -141,7 +141,7 @@ static library. The packager checks device images in the kernel DLL and the shar
 Every push to `master` starts the current build and cancels the superseded run.
 Feature branches build only through a manual run, which builds the packages
 without publication by default. Select `publish` on `master` to publish. Both Windows and both Linux jobs must
-pass before publication. The workflow creates an immutable `native-<source commit>` release,
+pass before publication. The workflow creates an source-identified `YYYY-MM-DD.N` release,
 then marks it **latest** after checking every uploaded asset. It leaves an older latest release
 available if compilation, packaging or upload fails. See [release process](maintainer/release-process.md).
 

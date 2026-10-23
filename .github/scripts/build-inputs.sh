@@ -1,56 +1,36 @@
 #!/usr/bin/env bash
-# Decides whether a CI run builds and tests the CUDA targets: prints `changed=true` when a file they
-# are built, tested or shipped from differs from the base, `changed=false` when none does (for
-# $GITHUB_OUTPUT). The changed files go to stderr.
-#
-# The base:
-#   pull request   the branch it merges into: the first parent of the merge commit checked out
-#                  (actions/checkout with fetch-depth 2).
-#   master         the commit the published image was built from (its revision label). A push
-#                  cancels the run of the push before it, so comparing with that push would lose
-#                  its changes; comparing with the image cannot.
-#   anything else  none: a ci/** branch runs the whole workflow.
-# A missing base, or one that cannot be fetched, builds.
-#
-#   .github/scripts/build-inputs.sh >> "$GITHUB_OUTPUT"
+# Compare with the published revision so cancelled builds cannot hide pending source changes.
+# --native uses the public native release; CI uses the published CUDA image.
+# Manual dispatch forces all scopes. Automatic runs classify paths without starting a compiler.
 set -euo pipefail
-
-# The paths outside the build. Nothing the compiler, CTest (whose Python helpers read tools/) or the
-# image reads is here, and a path this list does not name builds.
-outside_build() {
-  case "$1" in
-    *.md | docs/* | eval/* | examples/* | LICENSE) ;;
-    tests/convert/* | tests/pods/* | tests/reference/*) ;;   # pytest alone runs these
-    scripts/pods/* | scripts/sweeps/* | scripts/multi-gpu-testing/* | scripts/sm80-probe/*) ;;
-    *.bat | *.ps1) ;;                                         # Windows; CI builds Linux only
-    .claude/* | .codex/* | .clang-format | .clangd | .gitignore | compose.yaml | flake.*) ;;
-    .github/workflows/cancel-superseded.yml) ;;
-    *) return 1 ;;
-  esac
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+force() {
+  printf '%s\n' "$1" >&2
+  python3.11 "$script_dir/change-scopes.py" --force </dev/null
+  exit 0
 }
-
-build() { printf '%s\n' "$1" >&2; echo changed=true; exit 0; }
-
-base=""
-case "$GITHUB_EVENT_NAME:$GITHUB_REF" in
-  pull_request:*)
-    base="$(git rev-parse --verify --quiet 'HEAD^1')" || base="" ;;
+[[ "${GITHUB_EVENT_NAME:-}" != workflow_dispatch ]] || force 'Manual dispatch: all checks and builds requested.'
+base=''
+case "${GITHUB_EVENT_NAME:-}:${GITHUB_REF:-}" in
+  pull_request:*) base="$(git rev-parse --verify --quiet 'HEAD^1')" || base='' ;;
   push:refs/heads/master)
-    base="$(docker buildx imagetools inspect "ghcr.io/${GITHUB_REPOSITORY,,}:cuda13.4" \
-      --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}')" || base="" ;;
+    if [[ "${1:-}" == --native ]]; then
+      base="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .target_commitish)" || base=''
+    else
+      repository="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+      base="$(docker buildx imagetools inspect "ghcr.io/$repository:cuda13.4" \
+        --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}')" || base=''
+    fi ;;
+  push:*) base="$(git rev-parse --verify --quiet 'HEAD^1')" || base='' ;;
 esac
-[[ -n "$base" ]] || build "no base to compare with: building"
+[[ "$base" =~ ^[0-9a-f]{40}$ ]] || {
+  echo 'Cannot resolve an immutable comparison base; no automatic build admitted. Use manual dispatch for bootstrap.' >&2
+  exit 1
+}
 if ! git cat-file -e "$base^{commit}" 2>/dev/null \
     && ! git fetch --quiet --no-tags --depth=1 origin "$base"; then
-  build "base $base cannot be fetched: building"
+  echo "Base $base cannot be fetched; no automatic build admitted." >&2
+  exit 1
 fi
-paths="$(git diff --name-only --no-renames "$base" HEAD)" || build "no diff against $base: building"
-
-inside=()
-while IFS= read -r path; do
-  [[ -z "$path" ]] || outside_build "$path" || inside+=("$path")
-done <<< "$paths"
-printf 'base %s; %d changed files, %d of them in the build\n' \
-  "$base" "$(grep -c . <<< "$paths" || true)" "${#inside[@]}" >&2
-(( ${#inside[@]} == 0 )) || build "$(printf '  %s\n' "${inside[@]:0:20}")"
-echo changed=false
+printf 'Comparing %s with HEAD\n' "$base" >&2
+git diff --name-only --no-renames -z "$base" HEAD | python3.11 "$script_dir/change-scopes.py"

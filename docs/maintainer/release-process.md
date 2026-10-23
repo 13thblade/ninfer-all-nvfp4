@@ -74,13 +74,32 @@ Compilation needs no GPU. Driver installation is not part of either build.
 5. Assemble one universal package per OS from the two verified single-CUDA archives. Require matching
    source revisions, command sets, metadata and checksums. No compilation occurs in these jobs.
    Universal names are `ninfer-<os>-x64-cuda12.9-13.4-<commit12>`. Docker continues to use single-CUDA archives.
-6. After all four builds and both assembly jobs pass, validate all six manifests, create draft `native-<commit12>`,
+6. After all four builds and both assembly jobs pass, validate all six manifests, create a draft tagged `YYYY-MM-DD.N` (UTC date and daily build number),
    upload assets, and compare their remote SHA-256 digests and sizes.
+   The publisher generates the release description with `.github/scripts/render-native-release-notes.py`.
+   It lists all six package choices, their platforms and CUDA backends, exact part filenames and links,
+   checksum manifests, part counts, compressed download totals and extraction commands. Counts and sizes
+   come from the verified manifests and archive files. Draft retries refresh this guide when publishing.
+   A retry finds its draft by the full source revision and keeps its original date/number. Numbers are
+   reserved by both drafts and existing Git tags. Creation returns the draft ID directly, without a
+   read-after-write lookup through the release list.
 7. Publish and mark latest only if the source is still the head of `master`. Superseded builds
    retain their Actions artifacts or the draft created before a newer commit arrived.
 
-Published snapshots are immutable. A retry can repair only the same commit's unfinished draft.
-Every push to `master` starts the current build, cancels the previous run and publishes on success. In **Actions → Native release
+Published assets are never overwritten. A retry repairs the same commit's unfinished draft, or
+verifies an already published latest snapshot and retries its cleanup without uploading or editing assets.
+After asset verification and publication as latest, the publisher removes older published native
+releases from ancestor revisions. It retains Git tags, drafts, prereleases and unrelated release tags.
+Cleanup checks latest and its verified asset inventory again before each deletion. A failure before
+publication retains the previous release. A cleanup failure does not undo the verified new release.
+Legacy `native-<commit12>` releases remain valid retry targets; new releases use `YYYY-MM-DD.N`.
+Archive filenames still identify their full source through `<commit12>` and `BUILD-INFO.json`.
+
+Every push to `master` compares inputs with the published native revision. Product C++/CUDA, headers,
+dependencies, build configuration and shipped runtime inputs start native builds and Docker packaging.
+Documentation and publication/control scripts run only their affected checks. Pending source changes
+from a cancelled or failed build remain in this comparison. Manual dispatch forces builds and checks.
+A new run cancels the previous run and publishes on success when build inputs changed. In **Actions → Native release
 → Run workflow**, publication defaults to off; enable `publish` only on `master` when intended.
 Feature branches run only through manual dispatch and cannot publish. Build jobs have read
 access; only the publication job receives `contents: write`. The master cancellation coordinator
@@ -406,3 +425,16 @@ confirm it serves a request.
 - Windows: all six command executables start with only Windows on `PATH`.
 - Linux: a fresh unpack runs `./ninfer-serve --help` and `./run.sh --help`.
 - The default launcher profile starts and serves a chat completion on a real 24 GB card.
+
+## CI change scopes
+
+`.github/scripts/build-inputs.sh` and `change-scopes.py` select individual CI jobs. Empty or
+Markdown-only PRs run the short change detector and skip the check/build jobs. Python tooling,
+shell syntax, launcher behavior, calculator tests and release tools have separate scopes. C++/CUDA
+test changes run CI compilation without repackaging native binaries. Runtime/package input changes
+can rebuild native packages without repeating the independent CI CUDA build. Missing comparison
+metadata fails the decision job without admitting builds. Manual dispatch explicitly enables every
+scope and supports an initial build before a published comparison revision exists.
+
+CI still has a separate CUDA compilation/CTest matrix when its compiled inputs change. Moving CTest
+into the native build tree to compile once is a separate, unimplemented change.

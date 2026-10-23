@@ -32,10 +32,9 @@
 #     release toolchains and read the latest available native compiler snapshot without waiting
 #     for its producer. CI never uploads compiler caches.
 #
-# The last two run only when a file they build, test or ship from differs from the base: the
-# branch a pull request merges into, or on master the commit the published image was built from
-# (.github/scripts/build-inputs.sh). A change to documentation or to tooling that neither CTest nor
-# the image reads builds nothing, and master keeps the image it has.
+# CUDA/MSVC jobs compare compiled inputs with the PR base or published image revision.
+# Other jobs have individual path scopes; Docker cache checks require a Docker definition change.
+# Empty/Markdown-only PRs run only the change detector. Manual dispatch forces all scopes.
 name: CI
 
 on:
@@ -64,16 +63,34 @@ jobs:
       actions: read
     outputs:
       changed: ${{ steps.compare.outputs.changed }}
+      calculator: ${{ steps.compare.outputs.calculator }}
+      host: ${{ steps.compare.outputs.host }}
+      includes: ${{ steps.compare.outputs.includes }}
+      linux_scripts: ${{ steps.compare.outputs.linux_scripts }}
+      linux_runtime: ${{ steps.compare.outputs.linux_runtime }}
+      python: ${{ steps.compare.outputs.python }}
+      docker: ${{ steps.compare.outputs.docker }}
+      release_tools: ${{ steps.compare.outputs.release_tools }}
     steps:
       - uses: actions/checkout@v7
         with:
           # A pull request's merge commit and the branch head it merges into.
           fetch-depth: 2
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
       - id: compare
         run: .github/scripts/build-inputs.sh >> "$GITHUB_OUTPUT"
 
+  release-tools:
+    needs: build-inputs
+    # Master runs these checks in Native release; PRs and ci/** branches need them here.
+    if: (github.ref != 'refs/heads/master' || github.event_name == 'workflow_dispatch') && needs.build-inputs.outputs.release_tools == 'true'
+    uses: ./.github/workflows/build-workflow-checks.yml
+
   calculator:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: build-inputs
+    if: needs.build-inputs.outputs.calculator == 'true'
     name: Config calculator arithmetic
     runs-on: ubuntu-24.04
     steps:
@@ -90,7 +107,8 @@ jobs:
         run: node docs/config-calculator.render.test.mjs
 
   host-kv-clamp:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: build-inputs
+    if: needs.build-inputs.outputs.host == 'true'
     name: Host KV clamp arithmetic
     runs-on: ubuntu-24.04
     steps:
@@ -102,7 +120,8 @@ jobs:
           ./test_host_kv_clamp
 
   cxx20-libcxx:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: build-inputs
+    if: needs.build-inputs.outputs.host == 'true'
     name: C++20 text and resource contracts (libc++)
     runs-on: ubuntu-24.04
     steps:
@@ -233,7 +252,8 @@ jobs:
           python -u scripts/check-host-compile.py $builds --shard ${{ matrix.shard }}/3 --jobs 4
 
   linux-scripts:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: build-inputs
+    if: needs.build-inputs.outputs.linux_scripts == 'true'
     name: Linux launcher and downloader guard
     runs-on: ubuntu-24.04
     steps:
@@ -242,6 +262,7 @@ jobs:
       # default is to write out whatever .gitattributes says, which is exactly what a release
       # archive would carry, so this is the honest input.
       - name: Run scripts/check-linux-scripts.sh
+        if: needs.build-inputs.outputs.linux_runtime == 'true'
         run: bash scripts/check-linux-scripts.sh
       # bash -n on every shell script in the tree, under real Linux bash rather than Git Bash.
       # This is the check that would have caught the CRLF breakage directly.
@@ -257,7 +278,8 @@ jobs:
           exit $status
 
   include-boundaries:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: build-inputs
+    if: needs.build-inputs.outputs.includes == 'true'
     name: Include boundaries of the public interface
     runs-on: ubuntu-24.04
     steps:
@@ -266,7 +288,8 @@ jobs:
         run: python3 scripts/check-include-boundaries.py
 
   python:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: build-inputs
+    if: needs.build-inputs.outputs.python == 'true'
     name: Python suites (CPU)
     runs-on: ubuntu-24.04
     steps:
@@ -288,7 +311,7 @@ jobs:
   docker-build-cache:
     name: Dockerfile build cache
     needs: build-inputs
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.docker == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read

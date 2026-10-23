@@ -38,11 +38,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Native inputs changed
+    runs-on: ubuntu-24.04
+    outputs:
+      native: ${{ steps.compare.outputs.native }}
+      release_tools: ${{ steps.compare.outputs.release_tools }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/build-inputs.sh --native >> "$GITHUB_OUTPUT"
+
   checks:
+    needs: changes
+    if: needs.changes.outputs.native == 'true' || needs.changes.outputs.release_tools == 'true'
     uses: ./.github/workflows/build-workflow-checks.yml
 
   validate:
-    needs: checks
+    needs: [changes, checks]
+    if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

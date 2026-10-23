@@ -5,7 +5,7 @@ set -euo pipefail
 [[ "$GITHUB_REF" == refs/heads/master ]] || { echo 'Publication requires master' >&2; exit 1; }
 [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid source revision' >&2; exit 1; }
 repo="$GITHUB_REPOSITORY"
-tag="native-${GITHUB_SHA:0:12}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd dist
 shopt -s nullglob
 checksums=(SHA256SUMS-ninfer-*.txt)
@@ -49,37 +49,37 @@ if [[ "$head" != "$GITHUB_SHA" ]]; then
   echo 'Source was superseded on master; packages remain in Actions artifacts.'
   exit 0
 fi
-# A failed API request is an error, not evidence that the release does not exist.
-releases="$(gh api --paginate "repos/$repo/releases?per_page=100" --jq ".[] | select(.tag_name == \"$tag\") | [.id, .draft] | @tsv")"
-if [[ -n "$releases" ]]; then
-  read -r release_id draft <<< "$releases"
+# Resolve retries by full source revision; reserve daily numbers across releases and Git tags.
+gh api --paginate --slurp "repos/$repo/releases?per_page=100" > releases.json
+gh api --paginate --slurp "repos/$repo/git/matching-refs/tags/" > release-refs.json
+read -r tag release_id draft < <(python3.11 "$script_dir/native-release-tag.py" \
+  --releases releases.json --refs release-refs.json --revision "$GITHUB_SHA")
+published=false
+if [[ "$release_id" != 0 ]]; then
   [[ "$(gh api "repos/$repo/releases/$release_id" --jq .target_commitish)" == "$GITHUB_SHA" ]] || {
-    echo 'Existing release tag points to a different source revision' >&2; exit 1;
+    echo 'Existing release points to a different source revision' >&2; exit 1;
   }
-  [[ "$draft" == true ]] || { echo "Release $tag is already published; leaving it unchanged."; exit 0; }
-else
-  notes="$(mktemp)"
-  trap 'rm -f "$notes"' EXIT
-  cat > "$notes" <<NOTES
-Native Windows and Debian 13 x64 builds from $GITHUB_SHA.
-
-- CUDA 12.9.2: sm_70, sm_75, sm_80, sm_86, sm_89.
-- CUDA 13.4.3: sm_75, sm_80, sm_86, sm_89, sm_120a.
-
-Download every volume and the checksum manifest for ONE package. The cuda12.9-13.4 package contains both backends and selects one for the GPU and driver. Single-CUDA packages contain one backend.
-Windows: extract the .7z.001 file with 7-Zip. Runtime DLLs are included; install a compatible NVIDIA driver and the Microsoft Visual C++ x64 runtime.
-Linux: concatenate the .tar.gz volumes in numeric order and extract the result. The archive README lists Debian runtime installation steps. The included Dockerfile packages these binaries without compiling them again.
-
-CI checks every requested device image and executable --help. GPU inference and performance are not tested. BUILD-INFO.json records the source, compiler, CUDA version and architectures.
-
-NOTES
-  gh release create "$tag" -R "$repo" --target "$GITHUB_SHA" --draft \
-    --title "Native builds ${GITHUB_SHA:0:12}" --notes-file "$notes"
-  release_id="$(gh api --paginate "repos/$repo/releases?per_page=100" --jq ".[] | select(.tag_name == \"$tag\") | .id")"
+  [[ "$draft" == true ]] || published=true
+fi
+notes="$(mktemp)"
+trap 'rm -f "$notes"' EXIT
+python3.11 "$script_dir/render-native-release-notes.py" --dist . \
+  --repository "$repo" --revision "$GITHUB_SHA" --tag "$tag" --output "$notes"
+if [[ "$release_id" == 0 ]]; then
+  python3.11 - "$tag" "$GITHUB_SHA" "$notes" <<'PYCREATE'
+import json, pathlib, sys
+pathlib.Path('create-release.json').write_text(json.dumps(dict(
+    tag_name=sys.argv[1], target_commitish=sys.argv[2], draft=True,
+    name='NInfer ' + sys.argv[1], body=pathlib.Path(sys.argv[3]).read_text())))
+PYCREATE
+  # The creation response supplies the ID; no read-after-write list lookup is needed.
+  release_id="$(gh api --method POST "repos/$repo/releases" --input create-release.json --jq .id)"
 fi
 [[ "$release_id" =~ ^[0-9]+$ ]] || { echo 'Could not resolve the draft release ID' >&2; exit 1; }
 # A retry can repair only this commit's draft. Published releases are immutable here.
-gh release upload "$tag" -R "$repo" "${assets[@]}" "${checksums[@]}" --clobber
+if [[ "$published" != true ]]; then
+  gh release upload "$tag" -R "$repo" "${assets[@]}" "${checksums[@]}" --clobber
+fi
 # Check the remote asset digests before making the draft visible or moving latest.
 # A draft's tag may not exist until publication, so the tag endpoint can return 404.
 gh api "repos/$repo/releases/$release_id" > assets.json
@@ -103,8 +103,14 @@ if [[ "$head" != "$GITHUB_SHA" ]]; then
   echo "Source was superseded during upload; $tag remains a draft."
   exit 0
 fi
-gh release edit "$tag" -R "$repo" --draft=false --latest
+if [[ "$published" != true ]]; then
+  gh release edit "$tag" -R "$repo" --draft=false --latest --notes-file "$notes"
+elif [[ "$(gh api "repos/$repo/releases/latest" --jq .tag_name)" != "$tag" ]]; then
+  echo "Published release $tag is no longer latest; leaving it unchanged."
+  exit 0
+fi
 [[ "$(gh api "repos/$repo/releases/latest" --jq .tag_name)" == "$tag" ]] || {
   echo 'Latest release verification failed' >&2; exit 1;
 }
 echo "Published https://github.com/$repo/releases/tag/$tag"
+python3.11 "$script_dir/prune-native-releases.py" --repository "$repo" --tag "$tag" --revision "$GITHUB_SHA" --verified-assets assets.json
