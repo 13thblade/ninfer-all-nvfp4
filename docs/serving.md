@@ -1456,18 +1456,20 @@ session lineage under `--derive-session-keys`. A read that ends within 64 tokens
 boundary, and under `--spec` every read, leaves no snapshot of its own, so the same request sent
 again prefills each question again.
 
-On an RTX 3090 with Ternary Bonsai 2 27B and four lanes, a question about a cached state took 48 ms
-on a 370-token state and 71 ms on a 13.5K-token state, and the reads of one window prefill one after
-another: sixteen questions took 0.67 s and 0.92 s. The first question about a new 13.5K-token state
-took 5.4 s, the state's prefill. Sixteen questions about a cached 2K-token state beside a streaming
-256-token chat completion took 0.90 s instead of 0.73 s and slowed the chat's decode from 89 to
-72 tokens/s. The SystemOne bench attached to issue #64 (160 cases of three questions, about 180
-tokens per read; `scripts/pods/decision_ab.py`) took 41.6 s with one client and 41.3 s with four,
-and 62.4 s and 57.2 s with the checkpoint catalog (`--auto-prefix-grid --auto-long-anchors
---derive-session-keys`). `--spec mtp` and `--spec dflash2` draft nothing for a one-token read, but
-their drafters still run over its prompt: that bench took 2-8% longer with them. With the system
-turn the labels held 98-99% of the first token's probability on that model, where the user turn
-alone left 60-90%.
+On an RTX 3090 with Ternary Bonsai 2 27B and four lanes, a question about a cached state took 50 ms
+on a 370-token state and 73 ms on a 13.5K-token state; four questions took 0.12 s and 0.19 s, and
+sixteen 0.39 s and 0.68 s. The first question about a new 13.5K-token state took 5.6 s, the state's
+prefill. Sixteen questions about a cached 2K-token state beside a streaming 256-token chat
+completion took 0.62 s instead of 0.46 s and slowed the chat's decode from 89 to 75 tokens/s. The
+SystemOne bench attached to issue #64 (160 cases of three questions, about 180 tokens per read;
+`scripts/pods/decision_ab.py`) took 32.0 s with one client and 31.7 s with four; 33.6 s and 30.5 s
+under `--spec mtp`; 36.0 s and 32.5 s under `--spec dflash2`; and 62.2 s and 57.2 s with the checkpoint catalog (`--auto-prefix-grid
+--auto-long-anchors --derive-session-keys`), whose reads do not share passes. A read in a shared
+pass can round the head's BF16 logits differently than it would alone: on that bench the answers
+moved by up to 0.05 in probability against reads made one at a time without the system-turn
+boundary, and 4 of 960 picks changed, each between options within 0.05 of each other. With the
+system turn the labels held 98-99% of the first token's probability on that model, where the user
+turn alone left 60-90%.
 
 ## OpenAI Responses Core
 

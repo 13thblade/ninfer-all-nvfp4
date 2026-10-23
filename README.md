@@ -3,7 +3,9 @@
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
 their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next and Gemma 4 26B-A4B, on NVIDIA GPUs from
 Volta to consumer Blackwell, from 8 GB of memory. It serves the OpenAI, Anthropic and llama.cpp APIs
-from one GPU, or from up to eight as pipeline stages on Linux.
+from one GPU, or from up to eight as pipeline stages on Linux. The same chat model answers
+[typed decisions](docs/serving.md#typed-decisions): choice, yes/no and score questions about a
+state, each option with its probability, through TypeSafe's System One and OpenAI's Decisions APIs.
 
 [Quick start](#quick-start) · [Supported GPUs](#supported-gpus) · [Models](#artifacts) ·
 [Highlights](#highlights) · [Features](#features) · [Docker](#docker) · [Building](#building) ·
@@ -15,8 +17,8 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 ## Quick start
 
 Download an artifact ([all models](#artifacts)) and serve it from the [Docker image](#docker). The server
-speaks the OpenAI and Anthropic APIs on http://localhost:8080/v1, and each card picks up its device
-profile on its own.
+speaks the OpenAI and Anthropic APIs on http://localhost:8080/v1, answers typed decisions there, and
+each card picks up its device profile on its own.
 
 ```bash
 hf download WaveCut/Ternary-Bonsai-2-27B-NInfer-v3 Ternary-Bonsai-2-27B-ninfer-v3.ninfer --local-dir models
@@ -29,7 +31,17 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
 
 curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"bonsai2-27b","messages":[{"role":"user","content":"Hello"}]}'
+
+curl http://localhost:8080/v1/systemone -H 'Content-Type: application/json' -d '{
+  "state": {"ticket": "My card was charged twice for one order."},
+  "questions": {
+    "team": {"type": "choice", "instructions": "Which team should handle this?",
+             "criteria": {"billing": "payments and refunds", "shipping": "deliveries"}},
+    "urgent": {"type": "noul", "instructions": "Does the customer need a reply within the hour?"}}}'
 ```
+
+The second request is a [typed decision](docs/serving.md#typed-decisions): each answer comes with the
+probability of every option, read from the model's first-token log probabilities of the labels.
 
 Flags for every model and memory size, from an 8 GB card to the largest context: [launch recipes](docs/recipes.md).
 
@@ -312,7 +324,7 @@ Prefill of a 4,463-token prompt, in tok/s:
 </details>
 
 <details>
-<summary><b>Serving</b> — OpenAI, Anthropic and llama.cpp APIs, model suspend, several models behind one server</summary>
+<summary><b>Serving</b> — OpenAI, Anthropic and llama.cpp APIs, typed decisions, model suspend, several models behind one server</summary>
 
 - OpenAI Responses and Chat Completions, Anthropic Messages, llama.cpp's `/completion`,
   `/tokenize`, `/detokenize`, `/apply-template`, `/v1/rerank`, `/metrics`, `/slots` and `/props`,
@@ -321,7 +333,9 @@ Prefill of a 4,463-token prompt, in tok/s:
 - **Typed decisions.** `/v1/systemone` (TypeSafe's System One API, as llama.cpp, vLLM and Ollama
   serve it) and `/v1/decisions` (OpenAI's Decisions API) answer choice, yes/no and score questions
   about a state with the served chat model: one prompt per question, the answer read from the
-  first token's exact label log probabilities, the state prefilled once
+  first token's exact label log probabilities, the state prefilled once and each window of
+  questions run in one shared prefill pass. Ternary Bonsai 2 27B on an RTX 3090 answers sixteen
+  questions about a cached 370-token state in 0.39 s
   ([typed decisions](docs/serving.md#typed-decisions)).
 - **Model suspend.** `--model-suspend` lets an idle server give its device memory back without
   exiting and take it again on the next request, retained conversations included. Ternary Bonsai 2
