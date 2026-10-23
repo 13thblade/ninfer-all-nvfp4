@@ -39,8 +39,8 @@ the compiled route best is stored with an empty schedule, which overrides a buil
 A GPU with neither a file entry nor a built-in one is calibrated once when the engine starts, before
 the weights are loaded. For the built-in table this took 35 to 75 seconds on most Ampere, Ada and
 Blackwell cards with 46 or more SMs, 75 to 132 seconds on smaller ones and 94 to 204 seconds on
-Turing cards, and the result is written to the profile file for later starts. A `70` build runs its own projection and attention routes, which no profile key
-steers, so it calibrates the two-stage GDN switch alone, in about nine seconds on a V100.
+Turing cards, and the result is written to the profile file for later starts. A `70` build runs its own native projection and attention routes. It calibrates the two-stage GDN switch and the
+GGUF vector/MoE schedules; the earlier nine-second V100 figure covered the GDN switch alone.
 
 An entry applies only to the same hardware class (the GPU name and compute capability) and the same
 SM count, so a laptop part that shares a desktop part's name but not its SM count is calibrated on its
@@ -109,6 +109,8 @@ survives a second interleaved measurement, and its output matches the compiled r
 | `attn_prompt_split` | whether the fast INT8-family prompt kernel may split a launch's keys over several CTAs per row block and merge their partial rows (`off`), for calls of more than 64 columns whose row blocks alone would leave SMs idle; the split count comes from a cost model over the SM count | a 256-token continuation at 32K and 131K and a wave-aligned chunk at 131K, where the fast kernel serves prompts |
 | `attn_parallel_tiles` | single-row chunked small-T attention over an INT8-family cache as parallel query tiles (one batched append, one split-KV launch over every tile, one reduce) instead of serial fused chunks; widths without an exact 2-8 column tile divisor stay serial; `NINFER_ATTN_PARALLEL_TILES=0\|1` overrides | 16 and 32 verify columns at 32K and 131K |
 | `q4_linear_add/5120x<k>` | the small-T Q4 residual projections (`small_t_c8`, `small_t_c16`, `small_t_c32`) for the attention or GDN output (k = 6144) and the MLP down (k = 17408) of a Q4-output artifact | widths 1 to 32 |
+| `gguf_vector/q4_k`, `gguf_vector/q6_k` | scalar or cooperative vector loads in the public GGUF Linear Op and SwiGLU, measured on both 17,408x5,120 and 5,120x17,408 plain projections and the 34,816x5,120 gate/up projection | widths 1 to 8; calibration requires both plain and fused sweeps to win. Prior measurements seed the RTX 3090 profile with Q4_K at width 1 and Q6_K at widths 1 to 8 |
+| `gguf_moe_vector/q4_k`, `gguf_moe_vector/q6_k`, `gguf_moe_up/q4_k`, `gguf_moe_up/q6_k` | scalar or cooperative GGUF MoE vector loads, measured with three experts and reordered slots; generic products test separate plain and fused SwiGLU forms on 640x2,560 rows at chunks 1, 2, 4, 8, and decode-up uses 640x2,560 rows at chunks 1, 2, 4 | per-type, per-chunk calibration; no built-in device schedules are seeded |
 | `q6_head/248320x5120` | the Q6 vocabulary head's per-row GEMV (`gemv`, widths 1 and 2) or small-T MMA (`small_t`, widths up to 32) | widths 1 to 32 |
 | `q8_ksplit/<rows>x<k>` | the four-K-warp form (`kw4`: at most 128 registers a thread, four CTAs an SM) of the 8-column tile of the Q8 G32 K-split contraction, which MTP heads, DFlash2 drafters and Q8 heads run, instead of the route's own schedule | the eleven contraction shapes of those layers, widths 1 to 8 |
 | `unified/q4_q5_attn_input`, `unified/q4_q5_gdn_input`, `unified/q4_linear_swiglu`, `unified/q4_linear_add`, `unified/q5_linear_add/5120x<k>` | upstream's routes for the fused groupwise projections over the unified Linear templates (`unified`) instead of this line's own | the model shapes, widths 1 to 64 (the small-T launches only where those are all the switch covers) |

@@ -23,6 +23,13 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
         catalog.push_back({std::move(key), std::move(candidates)});
     };
 
+    add("gguf_vector/q4_k", {"scalar", "cooperative"});
+    add("gguf_vector/q6_k", {"scalar", "cooperative"});
+    add("gguf_moe_vector/q4_k", {"scalar", "cooperative"});
+    add("gguf_moe_vector/q6_k", {"scalar", "cooperative"});
+    add("gguf_moe_up/q4_k", {"scalar", "cooperative"});
+    add("gguf_moe_up/q6_k", {"scalar", "cooperative"});
+
     if (!volta) {
         // A Volta card runs its own projection, decode-attention and single-row prompt routes
         // (ops/linear/sm70, small_t_sm70.cuh, prompt_sm70.cu), which consult none of the projection

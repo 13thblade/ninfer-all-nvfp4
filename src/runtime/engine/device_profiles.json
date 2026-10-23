@@ -40,6 +40,8 @@
         "attn_pv_f16": [[1, "on"]],
         "gdn_two_stage/h32": [[2147483647, "on"]],
         "gdn_two_stage/h48": [[2147483647, "on"]],
+        "gguf_vector/q4_k": [[1, "cooperative"], [8, ""]],
+        "gguf_vector/q6_k": [[8, "cooperative"]],
         "q4_linear_add/5120x17408": [[8, ""], [16, "small_t_c16"], [32, "small_t_c32"]],
         "q6_head/248320x5120": [[2, "gemv"], [3, "small_t"], [18, ""], [20, "small_t"]],
         "t2_i8_small/248320x5120": [[12, ""], [16, "r32c16"]],

@@ -49,6 +49,7 @@ if(WIN32)
     COMPILE_PDB_NAME ninfer_ggml_quants
     COMPILE_PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/ninfer_ggml_quants.dir")
 endif()
+
 target_include_directories(ninfer_ggml_quants PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}"
   "${NINFER_GGML_QUANTS_ROOT}/include"
