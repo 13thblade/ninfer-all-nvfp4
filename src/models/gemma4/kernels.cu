@@ -186,7 +186,8 @@ __global__ void qkv_post_kernel(QkvArgs a) {
     const float vinv = rsqrtf(block_sum(v0 * v0 + v1 * v1) / float(d) + a.eps);
     const float n0 = k0 * kinv * a.k_norm[i], n1 = k1 * kinv * a.k_norm[i + half];
     const int sequence = a.sequences != nullptr ? a.sequences[t] : a.sequence;
-    const int slot     = a.row_slots ? t : a.ring != 0 ? position % a.ring : position;
+    const int stored   = a.slots != nullptr ? a.slots[t] : position;
+    const int slot     = a.row_slots ? t : a.ring != 0 ? stored % a.ring : stored;
     const std::int64_t at =
         std::int64_t(sequence) * a.seq_stride + std::int64_t(kh) * a.head_stride +
         std::int64_t(slot) * d;
@@ -199,13 +200,26 @@ __global__ void qkv_post_kernel(QkvArgs a) {
 }
 
 __global__ void build_mask_kernel(__half* mask, int tokens, int slots, int first, int ring,
-                                  int window, const std::int32_t* __restrict__ blocks) {
+                                  int window, const std::int32_t* __restrict__ blocks,
+                                  const std::int32_t* __restrict__ starts) {
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (s >= slots) { return; }
     const int query = first + t;
     bool visible    = false;
-    if (ring == 0) {
+    if (starts != nullptr) {
+        // A branch row: the positions before `first` as its own position sees them (the window
+        // ends at the same distance), and its branch's rows, which lie at positions first +
+        // starts[t] onwards, up to itself.
+        const int own  = first + starts[t];
+        const int last = first + tokens - 1;
+        const int p    = ring == 0 ? s : s <= last ? s + ((last - s) / ring) * ring : -1;
+        if (p >= 0 && p < first) {
+            visible = ring == 0 || p > query - (own - first) - window;
+        } else if (p >= own && p <= query) {
+            visible = ring == 0 || p > query - window;
+        }
+    } else if (ring == 0) {
         visible = s <= query;
     } else {
         const int last = first + tokens - 1;
@@ -243,10 +257,12 @@ __global__ void rope_table_kernel(const float* __restrict__ freq, int pairs, int
 // Block (position, head): D/2 threads, one pair each.
 __global__ void derive_keys_kernel(const __half* __restrict__ v, std::int64_t head_stride, int d,
                                    const float* __restrict__ w, const float2* __restrict__ rope,
-                                   int pairs, __half* __restrict__ k) {
+                                   int pairs, __half* __restrict__ k,
+                                   const std::int32_t* __restrict__ turns, int turned_from) {
     const int p = blockIdx.x, h = blockIdx.y, i = threadIdx.x, half = d >> 1;
     const std::int64_t at = h * head_stride + std::int64_t(p) * d;
-    const float2 cs = i < pairs ? rope[std::int64_t(p) * pairs + i] : make_float2(1.0f, 0.0f);
+    const int turn        = turns != nullptr && p >= turned_from ? turns[p - turned_from] : p;
+    const float2 cs = i < pairs ? rope[std::int64_t(turn) * pairs + i] : make_float2(1.0f, 0.0f);
     derived_key_pair(__half2float(v[at + i]), __half2float(v[at + i + half]), w[i], w[i + half],
                      cs, k[at + i], k[at + i + half]);
 }
@@ -1161,9 +1177,10 @@ void qkv_post(const QkvArgs& args, cudaStream_t stream) {
 }
 
 void build_mask(__half* mask, int tokens, int slots, int first, int ring, int window,
-                cudaStream_t stream, const std::int32_t* blocks) {
+                cudaStream_t stream, const std::int32_t* blocks, const std::int32_t* starts) {
     const dim3 grid(blocks_for(slots, 256), tokens, 1);
-    build_mask_kernel<<<grid, 256, 0, stream>>>(mask, tokens, slots, first, ring, window, blocks);
+    build_mask_kernel<<<grid, 256, 0, stream>>>(mask, tokens, slots, first, ring, window, blocks,
+                                                starts);
     check_launch("build_mask");
 }
 
@@ -1354,10 +1371,10 @@ void rope_table(const float* inv_freq, int pairs, int positions, float2* rope, c
 
 void derive_keys(const __half* v, std::int64_t head_stride, int kv_heads, int head_dim, int count,
                  const float* k_norm, const float2* rope, int rope_pairs, __half* k,
-                 cudaStream_t stream) {
+                 cudaStream_t stream, const std::int32_t* turns, int turned_from) {
     if (count <= 0) { return; }
     derive_keys_kernel<<<dim3(count, kv_heads, 1), head_dim / 2, 0, stream>>>(
-        v, head_stride, head_dim, k_norm, rope, rope_pairs, k);
+        v, head_stride, head_dim, k_norm, rope, rope_pairs, k, turns, turned_from);
     check_launch("derive_keys");
 }
 

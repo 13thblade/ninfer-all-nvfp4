@@ -161,8 +161,10 @@ struct ExecutionOptions {
     // False keeps the Engine's speculative drafter (--spec) off this request: a one-token request
     // drafts nothing, and the drafter's work over the prompt then stops at the deepest cache entry
     // the request publishes (its last explicit cache boundary), so the entries up to there still
-    // serve drafting requests and the request leaves no continuation of its own. Requires
-    // requested_output_tokens == 1. A core without this control runs its drafter as configured.
+    // serve drafting requests and the request leaves no continuation of its own. Qwen3.8-Flash-Next
+    // runs no MTP block over such a prompt at all; its entries of it serve only requests that do
+    // not draft. Requires requested_output_tokens == 1. A core without this control runs its
+    // drafter as configured.
     bool speculative_drafting = true;
 };
 
@@ -373,6 +375,9 @@ struct PromptOptions {
     // Name of an EngineOptions::grafts entry to place in front of the rendered prompt; empty for
     // none. The rendered prompt should carry no system turn of its own: the graft already holds one.
     std::string graft;
+    // The request drafts (ExecutionOptions::speculative_drafting). False prepares no n-gram
+    // proposal index or sources: a request that does not draft reads one token.
+    bool speculative_drafting = true;
 };
 
 enum class CacheRetentionHint : std::uint8_t {
@@ -544,6 +549,14 @@ struct TokenLogprob {
     std::vector<float> readout;
 };
 
+// One prompt of Engine::submit_branches: its length, shared prefix included, and the record of the
+// first token the model generates after it. TokenLogprob::readout holds the branch's readout
+// tokens' log probabilities and `bytes` the generated token's.
+struct BranchResult {
+    std::uint32_t prompt_tokens = 0;
+    TokenLogprob first;
+};
+
 struct OutputDelta {
     OutputChannel channel = OutputChannel::Content;
     std::string text;
@@ -644,6 +657,8 @@ struct GenerationResult {
     SpeculativeStats speculative;
     NgramArchiveStats ngram_archive;
     ThinkingBudgetStats thinking;
+    // Engine::submit_branches: one record per branch, in order; empty for every other request.
+    std::vector<BranchResult> branches;
 };
 
 } // namespace ninfer

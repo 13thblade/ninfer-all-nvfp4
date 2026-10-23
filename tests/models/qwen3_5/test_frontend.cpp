@@ -26,6 +26,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <random>
 #include <span>
 #include <string>
 #include <thread>
@@ -598,6 +599,127 @@ int test_boundary_aware_tokenization() {
                               fixture.encode("<think>", {.parse_added_tokens = false}) &&
                           fixture.encode("<think>") == std::vector<int>{248068},
                       "an added token crossing a literal boundary was recognized as a control");
+    return failures;
+}
+
+// A long run of text between added tokens that starts with an earlier run's text takes that run's
+// words up to where the two texts can split differently (OrdinaryRunCache); its tokens and
+// boundary frontiers must be those of a tokenizer that has encoded nothing before. Texts mix
+// letters, whitespace runs, newlines, apostrophe suffixes, digits, punctuation, composed and
+// decomposed accents, no-break and ideographic spaces, CJK and an added token, over merges that
+// join a space or a newline with what follows.
+int test_tokenizer_run_reuse() {
+    nlohmann::json vocab = nlohmann::json::object();
+    for (int value = 0; value <= 255; ++value) {
+        vocab[byte_level_symbol(static_cast<std::uint8_t>(value))] = value;
+    }
+    // Byte-level symbols: U+0120 a space, U+010A a newline.
+    const std::string space = "\u0120", newline = "\u010a";
+    const std::vector<std::pair<std::string, std::string>> merges{
+        {newline, space},   {space, "t"}, {"h", "e"},     {space + "t", "he"},
+        {newline, newline}, {"o", "n"},   {space, space}, {"'", "s"},
+        {"e", "r"},         {space, "a"}, {"a", "n"},     {space + "a", "n"},
+        {newline, "N"},     {"N", "o"},   {space, "1"},   {".", newline}};
+    nlohmann::json merge_rules = nlohmann::json::array();
+    int next                   = 256;
+    for (const auto& [left, right] : merges) {
+        if (!vocab.contains(left + right)) { vocab[left + right] = next++; }
+        merge_rules.push_back(nlohmann::json::array({left, right}));
+    }
+    const std::string tokenizer_json =
+        nlohmann::json{{"model", {{"type", "BPE"}, {"vocab", vocab}, {"merges", merge_rules}}},
+                       {"added_tokens", nlohmann::json::array({added(1000, "<|im_start|>", true)})}}
+            .dump();
+    const std::string tokenizer_config_json =
+        nlohmann::json{{"added_tokens_decoder", nlohmann::json::object()}}.dump();
+    const fi::TokenizerResources resources{.tokenizer_json         = tokenizer_json,
+                                           .tokenizer_config_json  = tokenizer_config_json,
+                                           .generation_config_json = R"({"eos_token_id":0})"};
+    const fi::Tokenizer kept(resources);
+
+    std::mt19937 rng(20261023);
+    const std::vector<std::string> pieces{"a",
+                                          "n",
+                                          "t",
+                                          "h",
+                                          "e",
+                                          "r",
+                                          "o",
+                                          "N",
+                                          "x",
+                                          "the",
+                                          " ",
+                                          " ",
+                                          "  ",
+                                          "   ",
+                                          "\n",
+                                          "\n\n",
+                                          " \n",
+                                          "'s",
+                                          "'t",
+                                          "'ll",
+                                          "1",
+                                          "23",
+                                          ".",
+                                          ",",
+                                          "!",
+                                          "-",
+                                          "\xC3\xA9",
+                                          "e\xCC\x81",
+                                          "\xC2\xA0",
+                                          "\xE3\x80\x80",
+                                          "\xE4\xB8\xAD",
+                                          "\t"};
+    const auto text_of = [&](std::size_t bytes) {
+        std::string text;
+        std::uniform_int_distribution<std::size_t> pick(0, pieces.size() - 1);
+        while (text.size() < bytes) { text += pieces[pick(rng)]; }
+        return text;
+    };
+    const auto same_as_fresh = [&](const std::string& text,
+                                   std::span<const std::size_t> boundaries) {
+        const fi::Tokenizer fresh(resources);
+        const fi::BoundaryEncodedText want = fresh.encode_with_boundaries(text, boundaries);
+        const fi::BoundaryEncodedText got  = kept.encode_with_boundaries(text, boundaries);
+        bool same =
+            want.input_ids == got.input_ids && want.boundaries.size() == got.boundaries.size();
+        for (std::size_t b = 0; same && b < want.boundaries.size(); ++b) {
+            same = want.boundaries[b].exact_frontier == got.boundaries[b].exact_frontier &&
+                   want.boundaries[b].stable_frontier == got.boundaries[b].stable_frontier;
+        }
+        return same;
+    };
+    // A newline then ten spaces: a later newline in the same whitespace run makes it one word, so
+    // the word that ends after the first newline is not where the second text may resume.
+    const std::string filler(5000, 'a');
+    int failures = check(same_as_fresh(filler + "\n" + std::string(10, ' ') + "x tail", {}) &&
+                             same_as_fresh(filler + "\n" + std::string(10, ' ') + "\n tail", {}),
+                         "a reused run resumed inside a whitespace run");
+    // Runs past the kept-run size on both sides of an added token.
+    std::string previous = text_of(5000) + "<|im_start|>" + text_of(5000);
+    // A random offset of `text` past `from`, moved back to a code point's first byte.
+    const auto cut = [&](const std::string& text, std::size_t from = 0) {
+        std::size_t at = std::uniform_int_distribution<std::size_t>(from, text.size())(rng);
+        while (at > 0 && at < text.size() &&
+               (static_cast<unsigned char>(text[at]) & 0xC0) == 0x80) {
+            --at;
+        }
+        return at;
+    };
+    for (int round = 0; round < 300 && failures == 0; ++round) {
+        // Another text that shares most of the last long one, the whole of it at times, or a
+        // short prefix of it.
+        std::string text =
+            previous.substr(0, cut(previous, round % 5 == 0 ? 0 : previous.size() / 2));
+        if (round % 7 != 0) {
+            text += text_of(std::uniform_int_distribution<std::size_t>(1, 400)(rng));
+        }
+        std::vector<std::size_t> boundaries;
+        for (int b = 0; b < 4; ++b) { boundaries.push_back(cut(text)); }
+        failures += check(same_as_fresh(text, boundaries),
+                          "a reused ordinary run changed the tokens or a boundary frontier");
+        if (text.size() >= 8000) { previous = std::move(text); }
+    }
     return failures;
 }
 
@@ -3935,6 +4057,28 @@ int test_ngram_proposal_only_sources() {
     failures += check(!compacted_prompt.bind_ngram(archive, {}) &&
                           !FrontendTestAccess::inspect(compacted_prompt).ngram_snapshot,
                       "unbound prepared prompt retained a previous archive view");
+    // A request that does not draft reads one token: its prompt carries the same target input
+    // and no proposal sources, index or archive views.
+    auto reading_input                         = retained_input;
+    reading_input.options.speculative_drafting = false;
+    auto reading_prompt                        = retaining.prepare(reading_input);
+    const auto& reading                        = FrontendFactory::inspect(reading_prompt);
+    auto drafting_tokens                       = retaining.prepare_tokens(retained.token_ids);
+    auto reading_tokens      = retaining.prepare_tokens(retained.token_ids, true, false, false);
+    const auto& raw_drafting = FrontendTestAccess::inspect(drafting_tokens);
+    const auto& raw_reading  = FrontendTestAccess::inspect(reading_tokens);
+    failures +=
+        check(reading.token_ids == retained.token_ids && reading.positions == retained.positions &&
+                  reading.block_hashes == retained.block_hashes && retained.ngram_index &&
+                  !reading.ngram_index && reading.ngram_sources.empty() &&
+                  reading.ngram_archive_sources.empty(),
+              "a prompt prepared without drafting kept n-gram work or changed its input");
+    failures += check(raw_drafting.ngram_index && !raw_reading.ngram_index &&
+                          !raw_drafting.ngram_archive_sources.empty() &&
+                          raw_reading.ngram_archive_sources.empty() &&
+                          raw_reading.token_ids == raw_drafting.token_ids &&
+                          raw_reading.block_hashes == raw_drafting.block_hashes,
+                      "raw tokens prepared without drafting kept n-gram work");
     options.max_context    = 128;
     const Frontend bounded = make_frontend(resources(), options);
     std::string oversized;
@@ -4290,6 +4434,7 @@ int main() {
     failures += test_tokenizer_config_merge();
     failures += test_bpe_merge_order();
     failures += test_boundary_aware_tokenization();
+    failures += test_tokenizer_run_reuse();
     failures += test_rendered_special_tokens();
     failures += test_developer_role_without_template_support();
     failures += test_repeated_special_tokens_scan_linearly();

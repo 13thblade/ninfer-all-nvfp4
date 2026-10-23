@@ -662,7 +662,7 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
 }
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity,
-                                      bool anchor_prompt_end) const {
+                                      bool anchor_prompt_end, bool speculative_drafting) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime,
                                     static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -671,7 +671,7 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids, bool allow
                            context_capacity_error(token_ids.size(), impl_->capacity()));
     }
     auto prepared = impl_->frontend().prepare_tokens(std::move(token_ids), allow_prefix_identity,
-                                                     anchor_prompt_end);
+                                                     anchor_prompt_end, speculative_drafting);
     PromptSummary info = prepared.summary();
     if (info.prompt_tokens > impl_->capacity()) {
         throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
@@ -851,45 +851,137 @@ std::vector<GenerationHandle> Engine::submit_group(std::vector<GenerationSubmiss
                     keep_alive.push_back(std::move(held));
                 }
                 using Core = typename CoreState::element_type;
-                if constexpr (std::is_same_v<Core, Impl::GenerationCore> ||
-                              std::is_same_v<Core, Impl::HybridGenerationCore>) {
-                    std::vector<typename Core::GroupMember> group;
-                    group.reserve(queued.size());
-                    for (const std::size_t index : queued) {
-                        GenerationSubmission& submission = submissions[index];
-                        group.push_back(typename Core::GroupMember{
-                            .prompt           = std::move(submission.prompt.impl_->value),
-                            .prompt_summary   = resolved[index].summary,
-                            .prepare_seconds  = resolved[index].prepare_seconds,
-                            .options          = std::move(resolved[index].options),
-                            .consumer_mode    = submission.consumer_mode,
-                            .observation      = submission.observation,
-                            .pending_deadline = submission.pending_deadline});
-                    }
-                    auto members = core->submit_group(std::move(group));
-                    for (std::size_t k = 0; k < queued.size(); ++k) {
-                        handles[queued[k]] = GenerationHandle(std::make_unique<GenerationHandle::Impl>(
-                            std::move(keep_alive[k]), std::move(members[k]),
-                            resolved[queued[k]].sampling));
-                    }
-                } else {
-                    // A handle destroyed by a later member's error cancels its request.
-                    for (std::size_t k = 0; k < queued.size(); ++k) {
-                        const std::size_t index          = queued[k];
-                        GenerationSubmission& submission = submissions[index];
-                        auto member                      = core->submit(
-                            std::move(submission.prompt.impl_->value), resolved[index].summary,
-                            resolved[index].prepare_seconds, std::move(resolved[index].options),
-                            submission.consumer_mode, submission.observation,
-                            submission.pending_deadline);
-                        handles[index] = GenerationHandle(std::make_unique<GenerationHandle::Impl>(
-                            std::move(keep_alive[k]), std::move(member), resolved[index].sampling));
-                    }
+                std::vector<typename Core::GroupMember> group;
+                group.reserve(queued.size());
+                for (const std::size_t index : queued) {
+                    GenerationSubmission& submission = submissions[index];
+                    group.push_back(typename Core::GroupMember{
+                        .prompt           = std::move(submission.prompt.impl_->value),
+                        .prompt_summary   = resolved[index].summary,
+                        .prepare_seconds  = resolved[index].prepare_seconds,
+                        .options          = std::move(resolved[index].options),
+                        .consumer_mode    = submission.consumer_mode,
+                        .observation      = submission.observation,
+                        .pending_deadline = submission.pending_deadline});
+                }
+                auto members = core->submit_group(std::move(group));
+                for (std::size_t k = 0; k < queued.size(); ++k) {
+                    handles[queued[k]] = GenerationHandle(std::make_unique<GenerationHandle::Impl>(
+                        std::move(keep_alive[k]), std::move(members[k]),
+                        resolved[queued[k]].sampling));
                 }
             }
         },
         impl_->core);
     return handles;
+}
+
+GenerationHandle Engine::submit_branches(std::vector<GenerationBranch> branches,
+                                         RequestOptions options, OutputConsumerMode consumer_mode,
+                                         GenerationObservationOptions observation,
+                                         std::chrono::steady_clock::time_point pending_deadline) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->options.purpose != EnginePurpose::Generation) {
+        throw std::logic_error("submit_branches requires a Generation Engine");
+    }
+    if (branches.empty() || branches.size() > kMaximumGenerationBranches) {
+        throw std::invalid_argument("submit_branches reads 1 to " +
+                                    std::to_string(kMaximumGenerationBranches) + " prompts");
+    }
+    if (!runs_branches()) { throw std::invalid_argument("this Engine runs no branched reads"); }
+    if (options.execution.requested_output_tokens != 1 || !options.execution.logprobs ||
+        options.execution.structured_output.kind != StructuredOutputKind::None ||
+        !options.execution.readout_tokens.empty()) {
+        throw std::invalid_argument("branched reads take one token with logprobs, no structured "
+                                    "output and no readout of their own");
+    }
+    if (observation.live_timings) { observation.phase_timings = true; }
+    if (consumer_mode != OutputConsumerMode::Streaming &&
+        (observation.live_timings || observation.prompt_progress)) {
+        throw std::invalid_argument("live generation observations require a Streaming consumer");
+    }
+    std::vector<models::qwen3_5::PreparedPrompt> prompts;
+    prompts.reserve(branches.size());
+    auto read         = std::make_shared<std::vector<runtime::ReadBranch>>(branches.size());
+    SamplingMode mode = SamplingMode::Thinking;
+    for (std::size_t index = 0; index < branches.size(); ++index) {
+        GenerationBranch& branch = branches[index];
+        if (branch.prompt.impl_ == nullptr) {
+            throw std::invalid_argument("PreparedPrompt is empty");
+        }
+        if (branch.readout_tokens.size() > kMaximumReadoutTokens) {
+            throw std::invalid_argument("readout_tokens names more than " +
+                                        std::to_string(kMaximumReadoutTokens) + " tokens");
+        }
+        if (branch.prompt.impl_->summary.prompt_tokens > impl_->options.max_context) {
+            throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                               context_capacity_error(branch.prompt.impl_->summary.prompt_tokens,
+                                                      impl_->options.max_context));
+        }
+        if (index == 0) { mode = branch.prompt.impl_->sampling_mode; }
+        (*read)[index].readout_tokens = std::move(branch.readout_tokens);
+        prompts.push_back(std::move(branch.prompt.impl_->value));
+    }
+    models::qwen3_5::BranchedPrompt split = models::qwen3_5::split_branches(std::move(prompts));
+    const std::uint32_t limit             = branch_token_limit();
+    for (std::size_t index = 0; index < read->size(); ++index) {
+        if (split.suffixes[index].size() > limit) {
+            throw std::length_error("a branch is longer than branch_token_limit()");
+        }
+        (*read)[index].tokens = std::move(split.suffixes[index]);
+    }
+    options.execution.speculative_drafting = false;
+    runtime::ResolvedRequestOptions resolved =
+        resolve_request_options(impl_->sampling_defaults, mode, std::move(options));
+    const ResolvedSamplingParameters sampling = resolved.execution.sampling;
+    if (sampling.temperature > 0.0F || sampling.presence_penalty != 0.0F ||
+        sampling.frequency_penalty != 0.0F) {
+        throw std::invalid_argument("branched reads are greedy and take no penalties");
+    }
+    resolved.execution.branches  = std::move(read);
+    const PromptSummary summary  = split.prefix.summary();
+    const double prepare_seconds = split.prefix.preparation_stats().seconds;
+    std::shared_ptr<void> held   = impl_;
+    if (auto clock_floor = impl_->clock_floor.hold()) {
+        held = std::make_shared<HeldEngine>(
+            HeldEngine{.engine = impl_, .clock_floor = std::move(clock_floor)});
+    }
+    return std::visit(
+        [&](auto& core) -> GenerationHandle {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                throw std::logic_error("Engine generation core is unavailable");
+            } else {
+                using Core = typename CoreState::element_type;
+                std::vector<typename Core::GroupMember> group;
+                group.push_back(typename Core::GroupMember{.prompt = std::move(split.prefix),
+                                                           .prompt_summary   = summary,
+                                                           .prepare_seconds  = prepare_seconds,
+                                                           .options          = std::move(resolved),
+                                                           .consumer_mode    = consumer_mode,
+                                                           .observation      = observation,
+                                                           .pending_deadline = pending_deadline});
+                auto members = core->submit_group(std::move(group));
+                return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
+                    std::move(held), std::move(members.front()), sampling));
+            }
+        },
+        impl_->core);
+}
+
+bool Engine::runs_branches() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->options.purpose != EnginePurpose::Generation) { return false; }
+    if (impl_->flash || impl_->gemma) { return true; }
+    return impl_->active->program->runs_branched_reads();
+}
+
+std::uint32_t Engine::branch_token_limit() const {
+    if (!runs_branches()) { return 0; }
+    if (impl_->flash || impl_->gemma) { return std::numeric_limits<std::uint32_t>::max(); }
+    return impl_->active->program->prefill_batch_capacity();
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,

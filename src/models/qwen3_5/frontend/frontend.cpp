@@ -1158,6 +1158,81 @@ std::unique_ptr<NgramArchive::Request> PreparedPrompt::bind_ngram(NgramArchive& 
     return request;
 }
 
+BranchedPrompt split_branches(std::vector<PreparedPrompt> prompts) {
+    if (prompts.empty()) { throw std::invalid_argument("branched prompts are empty"); }
+    std::size_t shared = std::numeric_limits<std::size_t>::max();
+    for (const PreparedPrompt& prompt : prompts) {
+        const PreparedPromptData& data = PreparedPromptAccess::view(prompt);
+        if (data.has_media()) { throw std::invalid_argument("branched prompts must be text"); }
+        if (data.token_ids.size() < 2) {
+            throw std::invalid_argument("a branched prompt needs a token after the shared prefix");
+        }
+        shared = std::min(shared, data.token_ids.size() - 1U);
+    }
+    const std::vector<TokenId>& first = PreparedPromptAccess::view(prompts.front()).token_ids;
+    for (std::size_t index = 1; index < prompts.size(); ++index) {
+        const std::vector<TokenId>& other = PreparedPromptAccess::view(prompts[index]).token_ids;
+        std::size_t agree                 = 0;
+        while (agree < shared && first[agree] == other[agree]) { ++agree; }
+        shared = agree;
+    }
+    PreparedPromptData data = PreparedPromptAccess::take(std::move(prompts.front()));
+    std::uint32_t prefix    = 0;
+    for (const PreparedCacheOpportunity& opportunity : data.context_cache.opportunities) {
+        if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix &&
+            has_shared_candidate_evidence(opportunity.evidence,
+                                          SharedCandidateEvidence::ExplicitBoundary) &&
+            opportunity.frontier <= shared) {
+            prefix = std::max(prefix, opportunity.frontier);
+        }
+    }
+    if (prefix == 0) { prefix = checked_token_count(shared); }
+
+    BranchedPrompt out;
+    out.suffixes.reserve(prompts.size());
+    out.suffixes.emplace_back(data.token_ids.begin() + prefix, data.token_ids.end());
+    for (std::size_t index = 1; index < prompts.size(); ++index) {
+        const std::vector<TokenId>& tokens = PreparedPromptAccess::view(prompts[index]).token_ids;
+        out.suffixes.emplace_back(tokens.begin() + prefix, tokens.end());
+        const PrepareStats& stats = PreparedPromptAccess::view(prompts[index]).prepare;
+        data.prepare.seconds += stats.seconds;
+        data.prepare.tokenize_seconds += stats.tokenize_seconds;
+    }
+
+    const std::size_t count = data.token_ids.size();
+    std::vector<std::int32_t> positions(std::size_t{3} * prefix);
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        std::copy_n(data.positions.begin() + static_cast<std::ptrdiff_t>(axis * count), prefix,
+                    positions.begin() + static_cast<std::ptrdiff_t>(axis * prefix));
+    }
+    data.positions = std::move(positions);
+    data.token_ids.resize(prefix);
+    data.token_types.resize(prefix);
+    const auto beyond = [prefix](std::uint32_t frontier) { return frontier > prefix; };
+    std::erase_if(
+        data.context_cache.opportunities,
+        [&](const PreparedCacheOpportunity& opportunity) { return beyond(opportunity.frontier); });
+    std::erase_if(data.tap_hints.hints, [&](const runtime::prefix_cache::TapHint& hint) {
+        return beyond(hint.position);
+    });
+    std::erase_if(data.identity.rewrite_execution_frontiers, beyond);
+    if (data.identity.rewrite_checkpoint && beyond(data.identity.rewrite_checkpoint->frontier)) {
+        data.identity.rewrite_checkpoint.reset();
+    }
+    if (data.graft_frontier > prefix) {
+        data.graft_name.clear();
+        data.graft_frontier = 0;
+    }
+    // A read drafts nothing: it takes no n-gram index or archive views.
+    data.ngram_archive_sources.clear();
+    data.ngram_snapshot.reset();
+    data.ngram_sources.clear();
+    data.ngram_index.reset();
+    detail::prompt_block_keys(data, data.block_hashes, data.block_extras);
+    out.prefix = PreparedPrompt(std::make_unique<PreparedPromptData>(std::move(data)));
+    return out;
+}
+
 PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     auto data = std::move(prompt.data_);
@@ -1210,7 +1285,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.tool_call_output    = tool_call_output;
-    if (impl_->ngram_sources_enabled) {
+    // A request that does not draft reads one token: it needs no proposal sources or index.
+    const bool drafts_ngrams = impl_->ngram_sources_enabled && options.speculative_drafting;
+    if (drafts_ngrams) {
         result.ngram_boundaries = impl_->ngram_boundaries;
         std::size_t remaining   = impl_->max_context;
         for (const auto& message : messages) {
@@ -1309,7 +1386,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     // request builds on, so it publishes no prefix of its own; a prefill graft is replayed, and its
     // end is published as a shared prefix.
     const bool is_direct_graft = graft && graft->kind != GraftKind::PrefillKV;
-    if (impl_->ngram_archive_enabled) {
+    if (impl_->ngram_archive_enabled && options.speculative_drafting) {
         const std::span<const TokenId> tokens(result.token_ids);
         auto add = [&](std::span<const TokenId> span, NgramSourceKind kind, int priority) {
             if (static_cast<int>(kind) == priority && span.size() >= 4 &&
@@ -1373,7 +1450,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         impl_->long_anchor_min_spacing_tokens, impl_->progress_anchor_tokens,
         (graft && !is_direct_graft) ? graft_context_slots(*graft) : 0U,
         is_direct_graft ? graft_context_slots(*graft) : 0U);
-    if (impl_->ngram_sources_enabled) {
+    if (drafts_ngrams) {
         fi::check_preparation_control(control, "ngram index");
         build_ngram_index(result);
     }
@@ -1435,7 +1512,7 @@ MediaCacheSummary Frontend::media_cache_summary() const {
 }
 
 PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity,
-                                        bool anchor_prompt_end) const {
+                                        bool anchor_prompt_end, bool speculative_drafting) const {
     const auto start = Clock::now();
     if (token_ids.size() > impl_->max_context) {
         throw_context_length_exceeded(impl_->max_context);
@@ -1450,11 +1527,11 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool all
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
-    if (impl_->ngram_sources_enabled) {
+    if (impl_->ngram_sources_enabled && speculative_drafting) {
         result.ngram_boundaries = impl_->ngram_boundaries;
         build_ngram_index(result);
     }
-    if (impl_->ngram_archive_enabled) {
+    if (impl_->ngram_archive_enabled && speculative_drafting) {
         result.ngram_archive_sources.push_back({result.token_ids, NgramSourceKind::Text});
     }
     assign_text_positions(result);
@@ -1489,6 +1566,22 @@ std::string Frontend::token_bytes(TokenId token) const {
         throw std::out_of_range("token id is outside the tokenizer vocabulary");
     }
     return std::string(impl_->tokenizer->decode_token_bytes(token, false));
+}
+
+TokenLogprob Frontend::token_logprob(const runtime::RawTokenLogprob& raw) const {
+    TokenLogprob record;
+    record.id         = raw.id;
+    record.logprob    = raw.logprob;
+    record.bytes      = token_bytes(raw.id);
+    record.top_ids    = raw.top_ids;
+    record.top_values = raw.top_values;
+    for (std::size_t k = 0; k < kMaximumTokenLogprobs; ++k) {
+        if (raw.top_ids[k] >= 0) { record.top_bytes[k] = token_bytes(raw.top_ids[k]); }
+    }
+    const std::size_t count = std::min<std::size_t>(raw.readout_count, kMaximumReadoutTokens);
+    record.readout.assign(raw.readout_values.begin(),
+                          raw.readout_values.begin() + static_cast<std::ptrdiff_t>(count));
+    return record;
 }
 
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,

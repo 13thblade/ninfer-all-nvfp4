@@ -72,6 +72,9 @@ struct GeneratedRound {
     std::span<const TokenId> tokens;
     // Aligned with `tokens` when the request asked for logprobs, else empty.
     std::span<const RawTokenLogprob> logprobs;
+    // A branched read's Begin round (ResolvedExecutionOptions::branches): one record per branch,
+    // in branch order; `tokens` then holds the first branch's token.
+    std::span<const RawTokenLogprob> branches;
 };
 
 struct BatchedGeneratedRound {

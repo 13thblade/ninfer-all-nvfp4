@@ -60,6 +60,9 @@ struct QkvArgs {
     // Token t's K and V at slot t rather than at its position's (rows a quantized cache stores from,
     // kv_store).
     bool row_slots = false;
+    // [T]; the position whose slot token t's K and V take, when it is not the token's own (a
+    // branch pass's tokens rotate at their branch's positions and lie one branch after another).
+    const std::int32_t* slots = nullptr;
 };
 void qkv_post(const QkvArgs& args, cudaStream_t stream);
 
@@ -138,8 +141,13 @@ void kv_store_rows(const KvRowsArgs& args, cudaStream_t stream);
 // With `blocks` ([tokens], the media unit of each chunk row, -1 for text) a ring's slot holding a
 // chunk position of the query's own unit is visible too, ahead of the query (a media unit's soft
 // tokens attend each other in both directions).
+// With `starts` ([tokens]) the chunk holds branches one after another, each continuing the sequence
+// at `first`: row t belongs to the branch whose first row is starts[t], sees the positions before
+// `first` as a query at first + t - starts[t] would and the rows of its own branch up to itself,
+// and no other branch's.
 void build_mask(__half* mask, int tokens, int slots, int first, int ring, int window,
-                cudaStream_t stream, const std::int32_t* blocks = nullptr);
+                cudaStream_t stream, const std::int32_t* blocks = nullptr,
+                const std::int32_t* starts = nullptr);
 
 void f32_to_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, cudaStream_t stream);
 
@@ -267,9 +275,11 @@ void rope_table(const float* inv_freq, int pairs, int positions, float2* rope, c
 
 // The keys of positions [0, count) of one sequence from its values: k[h][p] = RoPE_p(v[h][p] *
 // k_norm) in F16, both [kv heads][slots][D] with heads head_stride elements apart (linear caches).
+// With `turns`, slot p from `turned_from` on rotates as position turns[p - turned_from] (a branch
+// pass's rows).
 void derive_keys(const __half* v, std::int64_t head_stride, int kv_heads, int head_dim, int count,
                  const float* k_norm, const float2* rope, int rope_pairs, __half* k,
-                 cudaStream_t stream);
+                 cudaStream_t stream, const std::int32_t* turns = nullptr, int turned_from = 0);
 
 // out = bf16(cap * tanh(x / cap)) (cap 0: bf16(x)).
 void softcap(const float* x, std::int64_t n, float cap, __nv_bfloat16* out, cudaStream_t stream);

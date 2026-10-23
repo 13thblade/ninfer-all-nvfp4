@@ -1432,6 +1432,7 @@ private:
         result.prompt                  = request->prompt_summary;
         result.generated_token_ids     = std::move(request->generated);
         result.content_logprobs        = std::move(request->content_logprobs);
+        result.branches                = std::move(request->branch_results);
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
         result.tool_calls              = request->output.take_tool_calls();
@@ -2160,23 +2161,48 @@ private:
             request_admission_check();
         }
         request->begin = progress.summary;
+        record_branch_results(*request, progress.branches);
         const std::array<std::uint32_t, 1> lanes{lane};
         phase.finish();
         commit_pending(std::move(*progress.pending), lanes, false, cancelled_at_unit_start);
         progress.pending.reset();
     }
 
+    // A branched read's records as the result reports them: each branch's whole prompt length and
+    // its first token's logprob record.
+    void record_branch_results(Request& request,
+                               std::span<const runtime::RawTokenLogprob> records) const {
+        const auto& branches = request.options.execution.branches;
+        if (records.empty() && branches == nullptr) { return; }
+        if (branches == nullptr || records.size() != branches->size() || !request.begin) {
+            throw std::logic_error("branched read completed without one record per branch");
+        }
+        request.branch_results.clear();
+        request.branch_results.reserve(records.size());
+        for (std::size_t branch = 0; branch < records.size(); ++branch) {
+            BranchResult result;
+            result.prompt_tokens = request.begin->prompt_tokens +
+                                   static_cast<std::uint32_t>((*branches)[branch].tokens.size());
+            result.first         = instance_.frontend.token_logprob(records[branch]);
+            request.branch_results.push_back(std::move(result));
+        }
+    }
+
     // The lowest lane owning staged prefill that can advance now. A lane offering an active
     // capture, or whose media item still encodes in a concurrent overlay window, yields its unit.
-    // The prompt tokens a staged-prefill lane has left to compute.
+    // The prompt tokens a staged-prefill lane has left to compute, a branched read's branches
+    // included.
     [[nodiscard]] std::uint32_t remaining_prompt(std::uint32_t lane) const {
         const auto& request = slots_[lane];
         if (request == nullptr || !request->admitted_begin) { return 0U; }
         const BeginSummary& begin    = *request->admitted_begin;
         const std::uint64_t computed =
             std::uint64_t(begin.reused_prompt_tokens) + request->computed_prompt_tokens;
+        const std::uint32_t branches =
+            request->sequence ? instance_.program->pending_branch_tokens(*request->sequence) : 0U;
         return static_cast<std::uint32_t>(
-            begin.prompt_tokens > computed ? begin.prompt_tokens - computed : 0U);
+                   begin.prompt_tokens > computed ? begin.prompt_tokens - computed : 0U) +
+               branches;
     }
 
     // True when every lane owning staged prefill has only a last chunk left that can share one
@@ -2189,8 +2215,7 @@ private:
             mask &= mask - 1U;
             const auto& request = lane < max_concurrency_ ? slots_[lane] : nullptr;
             if (request == nullptr || !request->is_prefilling() || request->capture_pending ||
-                !request->sequence ||
-                !instance_.program->prefill_batch_tokens(*request->sequence)) {
+                !request->sequence || !instance_.program->prefill_batch_unit(*request->sequence)) {
                 return false;
             }
         }
@@ -2223,12 +2248,17 @@ private:
             throw std::logic_error("prefill request has no sequence handle");
         }
         // Other lanes' last prompt chunks share the pass when the selected lane's step is a last
-        // chunk too: one pass over the model instead of one per request.
+        // chunk too: one pass over the model instead of one per request. A branched read's steps
+        // always run as such a pass.
         std::array<std::uint32_t, kMaximumConcurrency> batch{};
         std::size_t batch_size = 0;
-        if (const auto tokens = instance_.program->prefill_batch_tokens(*request->sequence)) {
+        bool branched          = false;
+        if (const auto unit = instance_.program->prefill_batch_unit(*request->sequence)) {
             const std::uint32_t capacity = instance_.program->prefill_batch_capacity();
-            std::uint32_t total          = *tokens;
+            const std::uint32_t segment_capacity = instance_.program->prefill_batch_segments();
+            std::uint32_t columns                = unit->tokens;
+            std::uint32_t segments               = unit->segments;
+            branched                             = unit->branched;
             batch[batch_size++]          = lane;
             std::uint64_t mask           = scheduler_.prefill_lane_mask();
             while (mask != 0) {
@@ -2240,14 +2270,20 @@ private:
                     !candidate->sequence) {
                     continue;
                 }
-                const auto other_tokens =
-                    instance_.program->prefill_batch_tokens(*candidate->sequence);
-                if (!other_tokens || *other_tokens > capacity - total) { continue; }
-                total += *other_tokens;
+                const auto other_unit = instance_.program->prefill_batch_unit(*candidate->sequence);
+                // A branched read's pass holds its own segments only, so its answers do not depend
+                // on what else runs.
+                if (!other_unit || branched || other_unit->branched ||
+                    other_unit->tokens > capacity - columns ||
+                    other_unit->segments > segment_capacity - segments) {
+                    continue;
+                }
+                columns += other_unit->tokens;
+                segments += other_unit->segments;
                 batch[batch_size++] = other;
             }
         }
-        if (batch_size > 1) {
+        if (batch_size > 1 || branched) {
             run_prefill_batch(std::span<const std::uint32_t>(batch.data(), batch_size),
                               cancelled_at_unit_start, setup);
             return;
@@ -2306,6 +2342,40 @@ private:
             resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         }
         publish_runtime_stats();
+    }
+
+    // Shortest remaining work first among queued prefill-only reads (one output token), as
+    // PrefillOnly (arXiv 2505.07203) schedules them: the reads trade the queue positions they hold
+    // by their prompt tokens less the tokens their wait has earned, so a long read cannot starve.
+    // Other requests keep their positions, and a blocked head the scheduler protects keeps its
+    // place: nothing moves while one is protected.
+    static constexpr double kReadAgingTokensPerSecond = 4096.0;
+
+    void order_prefill_reads() {
+        if (scheduler_.protection_epoch()) { return; }
+        std::lock_guard lock(queue_mutex_);
+        std::vector<std::size_t> positions;
+        std::vector<std::pair<double, std::shared_ptr<Request>>> reads;
+        const Clock::time_point now = Clock::now();
+        for (std::size_t index = 0; index < pending_.size(); ++index) {
+            const std::shared_ptr<Request>& request = pending_[index];
+            if (request->options.execution.requested_output_tokens > 1) { continue; }
+            double work = request->prompt_summary.prompt_tokens;
+            if (const auto& branches = request->options.execution.branches) {
+                for (const runtime::ReadBranch& branch : *branches) {
+                    work += static_cast<double>(branch.tokens.size());
+                }
+            }
+            const double waited = std::chrono::duration<double>(now - request->submitted).count();
+            positions.push_back(index);
+            reads.emplace_back(work - kReadAgingTokensPerSecond * waited, request);
+        }
+        if (reads.size() < 2) { return; }
+        std::stable_sort(reads.begin(), reads.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (std::size_t k = 0; k < reads.size(); ++k) {
+            pending_[positions[k]] = std::move(reads[k].second);
+        }
     }
 
     [[nodiscard]] FifoSnapshot pending_snapshot() const {
@@ -2638,6 +2708,7 @@ private:
                            nvtx::Name::AdmissionPolicy);
         bool control_progress = false;
         for (;;) {
+            order_prefill_reads();
             const FifoSnapshot queued = pending_snapshot();
             if (queued.empty()) {
                 scheduler_.observe_fifo_head(std::nullopt);

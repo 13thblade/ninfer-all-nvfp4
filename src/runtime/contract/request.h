@@ -8,12 +8,20 @@
 #include <optional>
 
 #include <memory>
+#include <vector>
 
 namespace ninfer::text {
 class GrammarState;
 }
 
 namespace ninfer::runtime {
+
+// One branch of Engine::submit_branches: the tokens that continue the request's prompt, and the
+// token ids whose exact log probabilities the record of its first generated token carries.
+struct ReadBranch {
+    std::vector<TokenId> tokens;
+    std::vector<TokenId> readout_tokens;
+};
 
 // Engine has already selected the model/mode preset, applied every explicit override,
 // and validated these values before constructing the runtime request.
@@ -33,6 +41,10 @@ struct ResolvedExecutionOptions {
     std::vector<TokenId> readout_tokens;
     // ExecutionOptions::speculative_drafting.
     bool speculative_drafting = true;
+    // Engine::submit_branches: after the prompt, each branch runs as a block over it and its first
+    // generated token is read; null for an ordinary request. Such a request is greedy, reads one
+    // token and drafts nothing; its own readout_tokens are empty.
+    std::shared_ptr<const std::vector<ReadBranch>> branches;
 };
 
 struct ResolvedRequestOptions {

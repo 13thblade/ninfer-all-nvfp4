@@ -73,6 +73,10 @@ ninfer_add_test(ninfer_systemone_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_systemone.cpp"
   LIBRARIES ninfer_serve)
 
+ninfer_add_test(ninfer_branch_memo_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_branch_memo.cpp"
+  LIBRARIES ninfer_serve)
+
 ninfer_add_test(ninfer_serve_metrics_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_metrics.cpp"
   LIBRARIES ninfer_serve)

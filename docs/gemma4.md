@@ -291,9 +291,12 @@ keeps instead of prefilling those tokens again:
   before them, so no sequence waits for the host.
 - **Shared prefixes.** A prompt chunk also ends where the frontend marks a prefix other requests
   share (the end of the leading system messages, of the tool declarations, a declared cache
-  boundary), and the state there goes to an image too, from 256 tokens on: requests with the same
-  system prompt resume after it on any sequence, also when they arrive together, since a prompt
-  that has not started prefilling looks for images again at its first chunk.
+  boundary), and the state there goes to an image too when saving it and copying it back (at
+  12 GB/s each way) take less time than computing its tokens again at the measured prefill rate
+  (0.2 ms a token until 4,096 tokens are measured): about 90 tokens on in `rk8v4`, 220 in F16 with
+  the assistant. Requests with the same system prompt resume after it on any sequence, also when
+  they arrive together, since a prompt that has not started prefilling looks for images again at
+  its first chunk. A disposable request (a decision read) leaves no image of its end.
 
 A sliding-window state cannot be cut back: the rings at a position hold the window before it, and
 each block's window reaches further back through the blocks below. A prompt therefore resumes only

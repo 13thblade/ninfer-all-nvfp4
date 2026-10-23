@@ -60,6 +60,7 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
             .row_stride = 1,
         };
         out.pending.emplace(wrap_pending(lanes, round));
+        out.branches.assign(step.round.branches.begin(), step.round.branches.end());
     } else if (requests[lane].prefill && requests[lane].prefill->pending_capture_offer != 0) {
         out.capture.emplace(
             ContractAccess::make_capture_offer(this, runtime::LaneId{lane}, lane_epochs[lane],

@@ -207,6 +207,19 @@ struct CaptureAssessmentImpl {
     PhysicalResources capacity_preparation_removed;
 };
 
+// The most tokens a branched read's branches extend its prompt by; zero without branches.
+[[nodiscard]] inline std::uint32_t
+branch_extent(const std::vector<runtime::ReadBranch>* branches) noexcept {
+    std::size_t extent = 0;
+    if (branches != nullptr) {
+        for (const runtime::ReadBranch& branch : *branches) {
+            extent = std::max(extent, branch.tokens.size());
+        }
+    }
+    return static_cast<std::uint32_t>(
+        std::min<std::size_t>(extent, std::numeric_limits<std::uint32_t>::max()));
+}
+
 struct RequestBasePlanImpl {
     runtime::RequestPlanSummary summary;
     detail::PhysicalDemand root_demand;
@@ -219,6 +232,8 @@ struct RequestBasePlanImpl {
     bool logprobs = false;
     // With logprobs: the token ids read out exactly on the first generated token.
     std::vector<TokenId> readout_tokens;
+    // A branched read's branches (runtime::ResolvedExecutionOptions::branches), or null.
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
     // The speculative drafter serves this request (ExecutionOptions::speculative_drafting, or a
     // Program without one). Without it, the drafter's prompt work stops at the deepest cache entry
     // the request publishes.
@@ -290,6 +305,7 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::shared_ptr<text::GrammarState> grammar;
     bool logprobs                             = false;
     std::vector<TokenId> readout_tokens;
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
     bool drafting                             = true;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
@@ -314,6 +330,7 @@ struct HybridQuoteImpl {
     std::shared_ptr<text::GrammarState> grammar;
     bool logprobs                             = false;
     std::vector<TokenId> readout_tokens;
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
     bool drafting                             = true;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
@@ -556,6 +573,9 @@ struct RequestControl {
     bool logprobs = false;
     // The typed readout's token ids; read on the sequence's first generated token only.
     std::vector<TokenId> readout_tokens;
+    // A branched read: after the prompt, each branch runs as a block over it and its first
+    // generated token is read (runtime::ResolvedExecutionOptions::branches); null otherwise.
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
     // Adaptive MTP: how far this request's drafts survive.
@@ -606,8 +626,17 @@ struct RequestControl {
             TokenId token = 0;
             runtime::RawTokenLogprob logprob;
             std::uint32_t processed_prompt_tokens = 0;
+            // False when a branched read still has branches to run: the step reports the
+            // prompt tokens the pass computed and stays incomplete.
+            bool complete = true;
         };
         std::optional<Batched> batched;
+        // A branched read: the next branch a pass computes, and the records of those computed.
+        // Its prompt ends without sampling; the branches then run in one pass or several.
+        std::size_t next_branch = 0;
+        std::vector<runtime::RawTokenLogprob> branch_records;
+        // A pass computed the prompt's last column, so the tail hidden is the prompt frontier's.
+        bool branch_tail = false;
     };
 
     std::optional<Prefill> prefill;
@@ -622,6 +651,7 @@ struct RequestControl {
         mask_cost            = {};
         next_mask_frontier   = 0;
         logprobs             = false;
+        branches.reset();
         active_resources     = {};
         optional_resources   = {};
         publish_continuation = true;
@@ -738,10 +768,10 @@ public:
     void release_seal_window() noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing);
-    // The prompt tokens the sequence's next prefill step computes when it can join a batched
-    // pass (advance_prefill_batch), or empty.
-    [[nodiscard]] std::optional<std::uint32_t>
-    prefill_batch_tokens(SequenceHandle sequence) const noexcept;
+    // The sequence's share of a batched pass (advance_prefill_batch), or empty.
+    [[nodiscard]] std::optional<PrefillBatchUnit>
+    prefill_batch_unit(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] std::uint32_t pending_branch_tokens(SequenceHandle sequence) const noexcept;
     [[nodiscard]] runtime::ExecutionTiming
     prefill_batch(std::span<const SequenceHandle> sequences,
                   runtime::ExecutionTiming* failed_timing);
@@ -1021,9 +1051,13 @@ public:
         round_logprobs{};
     std::optional<PinnedHostBuffer> logprobs_host;
     std::optional<bool> logprobs_armed;
-    // The host copy of a prefill's typed readout (io.readout_values); a batched prefill's rows lie
-    // kMaximumReadoutTokens apart.
+    // The host copy of a prefill's typed readout (io.readout_values).
     std::optional<PinnedHostBuffer> readout_host;
+    // A batched prefill's outputs (execution::PrefillBatchHost), kMaximumPrefillSegments rows.
+    std::optional<PinnedHostBuffer> prefill_batch_host;
+    // A completed branched read's records; its returned round's branches span points here until
+    // the step is wrapped.
+    std::vector<runtime::RawTokenLogprob> branch_round;
 
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_5::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
@@ -1751,11 +1785,13 @@ private:
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
                     runtime::ExecutionTiming* failed_timing);
-    // The rest of the lane's prompt in one final pass, when it can share that pass with others.
-    [[nodiscard]] std::optional<std::uint32_t> prefill_batch_tokens(std::uint32_t lane) const;
-    // One pass computing the rest of each lane's prompt (every lane prefill_batch_tokens admits,
-    // together within one prefill chunk) and sampling each lane's first token; each lane's next
-    // advance_prefill returns its completed step.
+    // The lane's share of one pass shared with others: the rest of its prompt, or a branched
+    // read's prompt part and the branches that fit after it.
+    [[nodiscard]] std::optional<PrefillBatchUnit> prefill_batch_unit(std::uint32_t lane) const;
+    // One pass computing each lane's unit (every lane prefill_batch_unit admits, together within
+    // one prefill chunk and kMaximumPrefillSegments segments): the rest of a prompt and its first
+    // token, or a branched read's prompt part and next branches' first tokens; each lane's next
+    // advance_prefill returns its step.
     [[nodiscard]] runtime::ExecutionTiming
     advance_prefill_batch(std::span<const std::uint32_t> lanes,
                           runtime::ExecutionTiming* failed_timing);

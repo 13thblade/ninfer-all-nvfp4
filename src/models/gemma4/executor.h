@@ -142,6 +142,13 @@ public:
     // whole in one chunk.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::span<const ChunkMedia> media = {});
+    // Branches of a text prompt in one pass, each continuing the sequence from its position:
+    // branch b runs `lengths[b]` of `tokens` (in branch order, at most prefill_chunk in all, at
+    // most kMaxLogitRows branches) at the positions after the sequence's, seeing the sequence's
+    // keys and its own, no other branch's. Leaves the logits of each branch's last token in
+    // logits(), one column per branch in order. The sequence keeps its position and window.
+    void forward_branches(std::uint32_t sequence, std::span<const std::int32_t> tokens,
+                          std::span<const std::uint32_t> lengths);
     // Whether prompt chunks may carry media.
     [[nodiscard]] bool vision() const noexcept;
     // The device time the last forward() spent on its media (encoding and placing its soft
