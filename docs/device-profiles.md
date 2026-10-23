@@ -18,7 +18,7 @@ Up to three layers answer, per route key:
 1. **Your profile file.** `$NINFER_DEVICE_PROFILES`, else `$XDG_CACHE_HOME/ninfer/device-profiles.json`,
    else `~/.cache/ninfer/device-profiles.json` (`%LOCALAPPDATA%\ninfer\device-profiles.json` on
    Windows). `--device-profile-path` names another file.
-2. **The built-in table.** Profiles measured on 47 GPU models ship inside the binary
+2. **The built-in table.** Profiles measured on 48 GPU models ship inside the binary
    (`src/runtime/engine/device_profiles.json`); the Profile column of the
    [card tables](gpus.md#cards) shows which. Each entry was measured at the card's default power
    limit by the build that serves it: the image's `75`, `86` and `120a` builds (an Ada card runs the
