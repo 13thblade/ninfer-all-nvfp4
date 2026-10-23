@@ -179,8 +179,8 @@ std::string usage_text(const char* argv0) {
            "                                free memory)\n"
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
-           "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen\n"
-           "                                and Gemma allow 0 (layer banks only).\n"
+           "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
+           "                                Gemma and Flint allow 0 (layer banks only).\n"
            "                                Flash-Next disk requires a nonzero cache\n" +
            std::string(ninfer::product::kHybridExpertHelp) +
            std::string(ninfer::product::kNgramTableHelp) +
@@ -223,10 +223,10 @@ std::string usage_text(const char* argv0) {
            "                                --spec is set, 0 disables it\n"
            "  --ngram-min-match N           shortest match a copy is drawn from, 4..64\n"
            "                                (default 12)\n"
-           "  --lookup-ngram N              context-lookup drafting alongside --spec: the\n"
-           "                                last N tokens are matched against the sequence\n"
-           "                                so far and what followed is proposed (default 0:\n"
-           "                                off)\n"
+           "  --lookup-ngram N              context-lookup drafting alongside --spec (Flint,\n"
+           "                                which has no drafter, without it): the last N\n"
+           "                                tokens are matched against the sequence so far\n"
+           "                                and what followed is proposed (default 0: off)\n"
            "\n"
            "PRECISION & KERNELS (off by default)\n"
            "  --lm-head-q4 | --lm-head-q6   store the output head as Q4 or Q6 while loading\n"

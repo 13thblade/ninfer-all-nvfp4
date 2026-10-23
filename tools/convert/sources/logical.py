@@ -112,6 +112,8 @@ def select_rows(
             for part in pieces
         ):
             raise ValueError(f"{source.label}: incompatible encoded row groups")
+        if len(pieces) == 1:
+            return first
         return EncodedRows(
             first.format,
             torch.cat([p.codes for p in pieces]),

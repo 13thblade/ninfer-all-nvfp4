@@ -359,8 +359,8 @@ struct ModelSuspendOptions {
 
 // Host and disk experts: how a decode or verification call gets the routed experts the device
 // cache lacks. The GPU copies a share of them and the CPU computes the rest: for GGUF banks
-// (Flash-Next, Gemma 4) and Qwen3.5/3.6 MoE experts the GPU's results bit for bit, for Flash-Next
-// native banks different numerical results (and concurrency one).
+// (Flash-Next, Gemma 4, Flint) and Qwen3.5/3.6 MoE experts the GPU's results bit for bit, for
+// Flash-Next native banks different numerical results (and concurrency one).
 struct HybridExpertOptions {
     // Host or disk experts: the share 0..1 of a decode or verification call's missing experts the
     // GPU copies; the CPU computes the rest. Unset (default): where the CPU's products are the
@@ -425,7 +425,7 @@ struct EngineOptions {
     // Layers per stage, one count per entry of `devices`. Empty lets the engine choose from each
     // device's free memory.
     std::vector<std::uint32_t> stage_layers;
-    // Native Qwen MoE, Qwen3.8-Flash-Next and Gemma 4 MoE.
+    // Native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4 MoE and Flint.
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Host/disk experts: device memory lent to the persistent cache, split
     // evenly over the devices. Automatic sizing follows each family's KV/workspace reservations.
@@ -481,7 +481,7 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     // Prompt tokens per prefill chunk; 0 is automatic: 1024, or 4096 for a native Qwen3.5-family MoE
     // whose routed experts live in host memory or files (each chunk carries the whole expert bank
-    // across the bus once). Gemma 4 chooses its own chunk.
+    // across the bus once). Gemma 4 and Flint choose their own chunk.
     std::uint32_t prefill_chunk        = 0;
     // Decode rounds that run before a prefill chunk while other requests generate, proportionally
     // fewer (at least one) before a shorter prefill unit and more before a longer one. A decode

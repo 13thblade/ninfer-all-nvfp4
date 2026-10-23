@@ -4,6 +4,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/frontend/chat_template.h"
+#include "models/qwen3_5/frontend/flint_output.h"
 #include "models/qwen3_5/frontend/gemma_output.h"
 #include "models/qwen3_5/frontend/media_cache.h"
 #include "models/qwen3_5/frontend/processor.h"
@@ -856,6 +857,18 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
 
 ModelSamplingDefaults default_sampling(Architecture architecture) {
     ModelSamplingDefaults sampling;
+    if (architecture == Architecture::Flint) {
+        // Flint's generation_config.json, whether or not it reasons (it decides that itself).
+        sampling.thinking      = {.temperature       = 1.0F,
+                                  .top_k             = 20,
+                                  .top_p             = 0.95F,
+                                  .min_p             = 0.0F,
+                                  .presence_penalty  = 0.0F,
+                                  .frequency_penalty = 0.0F};
+        sampling.non_thinking  = sampling.thinking;
+        sampling.post_thinking = sampling.thinking;
+        return sampling;
+    }
     if (architecture == Architecture::Gemma4) {
         // generation_config.json of the Gemma 4 releases (top_k 64), thinking or not, with
         // top_k held at the 20 candidates the sampler keeps.
@@ -890,7 +903,8 @@ class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, FrontendOptions options)
         : chat_template(compile_chat_template(resources, options.chat_template_path,
-                                              options.architecture != Architecture::Gemma4)),
+                                              options.architecture != Architecture::Gemma4 &&
+                                                  options.architecture != Architecture::Flint)),
           tokenizer(resources.tokenizer),
           processor(!options.vision_enabled                        ? fi::ProcessorOptions{}
                     : options.architecture == Architecture::Gemma4 ? fi::ProcessorOptions{}
@@ -967,6 +981,15 @@ public:
             gemma = std::make_shared<const fi::GemmaMarkers>(fi::GemmaMarkers::from(*tokenizer));
             return;
         }
+        if (options.architecture == Architecture::Flint) {
+            // Flint opens its reasoning when it decides to, with no early-close control: thinking
+            // budgets do not apply either.
+            flint = std::make_shared<const fi::FlintMarkers>(fi::FlintMarkers::from(*tokenizer));
+            if (flint->think_open < 0 || flint->think_close < 0) {
+                throw std::invalid_argument("Flint's tokenizer lacks its <think> markers");
+            }
+            return;
+        }
         std::string control_suffix(kThinkingControl);
         const char* control_name = "canonical thinking control suffix";
         if (!options.thinking_budget_message.empty()) {
@@ -1014,7 +1037,9 @@ public:
 
     // The syntax the model writes its calls in, which a forced call's opener has to match.
     [[nodiscard]] fi::ToolCallSyntax tool_call_syntax() const noexcept {
-        return gemma ? fi::ToolCallSyntax::Gemma : fi::ToolCallSyntax::Qwen;
+        return gemma   ? fi::ToolCallSyntax::Gemma
+               : flint ? fi::ToolCallSyntax::Flint
+                       : fi::ToolCallSyntax::Qwen;
     }
 
     // The graft a request names, or null for none.
@@ -1036,6 +1061,7 @@ public:
     ModelSamplingDefaults sampling;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     std::shared_ptr<const fi::GemmaMarkers> gemma; // the Gemma 4 dialect, null for Qwen
+    std::shared_ptr<const fi::FlintMarkers> flint; // the Flint dialect, null for Qwen
     bool ngram_sources_enabled = false;
     bool ngram_archive_enabled = false;
     std::vector<TokenId> ngram_think_open, ngram_think_close;
@@ -1595,9 +1621,15 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     text::validate_structured_output(structured);
     const auto& tools       = prompt.data_->tool_call_output;
     const bool strict_tools = tools && fi::has_strict_tools(*tools);
-    if (strict_tools && impl_->gemma) {
+    if (strict_tools && (impl_->gemma || impl_->flint)) {
+        throw std::invalid_argument("strict tool arguments need Qwen's tool-call syntax, which " +
+                                    std::string(impl_->gemma ? "Gemma 4" : "Flint") +
+                                    " does not use");
+    }
+    if (structured.kind != StructuredOutputKind::None && tools && impl_->flint) {
         throw std::invalid_argument(
-            "strict tool arguments need Qwen's tool-call syntax, which Gemma 4 does not use");
+            "structured output beside tool calls needs Qwen's tool-call syntax, which Flint does "
+            "not use");
     }
     if (structured.kind != StructuredOutputKind::None || strict_tools) {
         if (structured.kind != StructuredOutputKind::None &&
@@ -1634,7 +1666,7 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     return OutputSession(impl_->tokenizer, std::move(policy), output,
                          prompt.data_->starts_in_reasoning, thinking,
                          impl_->thinking_control_tokens, prompt.data_->tool_call_output,
-                         std::move(grammar), impl_->gemma);
+                         std::move(grammar), impl_->gemma, impl_->flint);
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

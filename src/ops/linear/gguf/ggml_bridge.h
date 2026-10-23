@@ -100,6 +100,9 @@ void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, in
 // Activation for the matrix kernel, laid out for the type's scale/sum schedule. Types that share a
 // schedule share an activation, see matrix_activation_layout().
 [[nodiscard]] int matrix_activation_layout(GgmlType type);
+// Whether the type's matrix activation keeps each 32 values' sum in F16 (Q4_0, Q4_1, Q5_1, Q4_K,
+// Q5_K, IQ1_S): a sum past 65504 is infinite there, so callers whose rows can reach it scale them.
+[[nodiscard]] bool matrix_activation_f16_sums(GgmlType type);
 [[nodiscard]] std::size_t matrix_activation_bytes(int k, int columns);
 void quantize_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k, int columns,
                                 const std::int32_t* input_columns, void* out, cudaStream_t stream);

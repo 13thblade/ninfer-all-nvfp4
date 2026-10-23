@@ -132,6 +132,10 @@ struct BoundaryEncodedText {
 
 class OrdinaryRunCache;
 
+// The pre-tokenizer of a byte-level tokenizer: Qwen's one split, or Flint's three (digits in
+// groups of up to three, CJK runs, o200k's words).
+enum class ByteLevelSplit : std::uint8_t { Qwen, Flint };
+
 class Tokenizer {
 public:
     explicit Tokenizer(TokenizerResources resources);
@@ -167,6 +171,9 @@ private:
                             const nlohmann::json& model, TokenizerResources resources);
 
     bool sentencepiece_ = false;
+    // Byte-level: whether ordinary text is NFC-normalized first, and how it splits into words.
+    bool nfc_              = true;
+    ByteLevelSplit split_ = ByteLevelSplit::Qwen;
     std::vector<std::string> decoded_token_bytes_;
     std::vector<bool> valid_token_ids_;
     std::vector<bool> special_token_ids_;

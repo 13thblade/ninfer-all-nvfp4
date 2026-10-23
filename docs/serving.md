@@ -224,11 +224,11 @@ that needs them: the next token's mask, or in a speculative round one mask per d
 filled in parallel. Speculation is automatic: a constrained request verifies drafts (MTP,
 DFlash/DFlash2, a context lookup) while its masks take at most 4 ms, which the verification
 hides, and decodes without drafts while they cost more, resuming once they are cheap again.
-A costly mask holds only its own request. Gemma 4 and Qwen3.8-Flash-Next run the decode step
+A costly mask holds only its own request. Gemma 4, Flint and Qwen3.8-Flash-Next run the decode step
 without it: the row keeps its logits and samples once the mask is ready, while the other requests
 go on. The Qwen3.5 family computes such a request's next mask after each of its tokens and leaves
 the request out of decode rounds until the mask is ready. A mask over 5 s fails its request with
-an explicit error, and so does a Gemma 4 or Flash-Next decoding request without a token for 120 s
+an explicit error, and so does a Gemma 4, Flint or Flash-Next decoding request without a token for 120 s
 ([Gemma 4](gemma4.md#structured-output)). A generated token the grammar does not admit, which the
 masks should have excluded, fails its own request with an internal error (HTTP 500) and leaves
 the others running; in the Qwen3.5 family it still fails the whole engine when it arrives while
@@ -388,7 +388,8 @@ text and any other value JSON, required parameters appear, undeclared ones canno
 rules above apply. The schema must describe an object and cannot use `uniqueItems`. This holds
 with or without a response format; without one, text around the calls stays free and only the
 calls are constrained, starting inside the opened call when `tool_choice` forced it. Gemma 4
-refuses strict tools with HTTP 400, as its own tool-call markup has no grammar here. Without
+and Flint refuse strict tools with HTTP 400, as their own tool-call markup has no grammar here;
+Flint also refuses a response format beside tools. Without
 `--structured-output`, Chat Completions treats `strict` as the advisory flag OpenAI-compatible
 servers commonly do and runs the tool non-strict; Responses and Anthropic Messages refuse it with
 HTTP 400 `strict_tools_not_supported`, unless `--unconstrained-response-format` lets it run
@@ -998,7 +999,8 @@ closed, when the turn published any content, when it ended at the output limit, 
 a stop string or a cancellation, or when prose, a quoted marker or a cut call follows the last
 call; the recovery pass for broken calls does not apply to thinking. Under strict tools the grammar
 admits the stop token only after the thinking closes, so a constrained turn never ends inside it.
-Gemma 4's tool calls are read by their own decoder and are not recovered from its thought channel.
+Gemma 4's and Flint's tool calls are read by their own decoders and are not recovered from their
+reasoning.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions. With `--assistant-prefill` a final assistant
@@ -1073,7 +1075,7 @@ Logs report the requested budget, and the effective budget when it differs. A re
 enforce its budget reports the requested value only. The server does not promise that the model will
 emit nonempty content or a tool call after the marker. `model_thinking_tokens` in the request log
 counts the model's thinking tokens for every Qwen thinking request, with or without a budget.
-Gemma 4 takes no thinking budget and reports 0.
+Gemma 4 and Flint take no thinking budget and report 0.
 
 `--reasoning-loop off|stop|conclude` (default `off`) guards thinking-enabled requests against a
 model that keeps rewriting the same passages in its thinking, which token penalties do not catch
@@ -1092,8 +1094,9 @@ because every pass varies a little.
   guidance plus `</think>`), so the model answers from the thinking it has; no prompt is read again.
   When the remaining output budget cannot hold the span and one more token, or the request's
   thinking budget could not be enforced (early close unavailable, above), it stops instead.
-- **Gemma 4.** The guard reads the thought channel the model opens and counts its tokens. Gemma has
-  no early-close control, so `conclude` stops there as `stop` does.
+- **Gemma 4 and Flint.** The guard reads the thought channel (Flint: the `<think>` block) the
+  model opens and counts its tokens. Neither has an early-close control, so `conclude` stops there
+  as `stop` does.
 - It applies to constrained requests too (tool constraints, `response_format`): the control span
   goes through the same grammar-checked path as a thinking budget, so a constrained request can
   still answer or call a tool after `conclude`. With `stop`, a constrained request ends as an
@@ -1394,7 +1397,7 @@ API, as llama.cpp, vLLM and Ollama serve it, and `POST /v1/decisions` takes the 
 shape of OpenAI's Decisions API. The served chat model is the decision model: each question becomes
 one prompt -- a fixed system turn asking for one label, then the state, the question and its
 options under one-token labels (`A`.. for a choice, `yes`/`no` for a noul, `0`.. for a score),
-thinking off -- and its answer is read from the first reply token's exact log probabilities of
+thinking off (on Flint an empty reasoning block, [Flint](flint.md#what-runs)) -- and its answer is read from the first reply token's exact log probabilities of
 those labels (a noul's `yes` and `Yes`, `no` and `No` added up), without sampling past it. No
 startup option is needed; every model family reads the labels exactly.
 
@@ -1486,8 +1489,10 @@ state resumes after the system turn. The reads of a request run as one branched 
 (`Engine::submit_branches`): the state runs once, or resumes from the context cache, and each
 question runs as a branch that sees only the state and itself, in shared passes that hold no
 other request's tokens. On a Qwen3.5-core model the branches run as blocks of shared prefill
-passes, up to 64 blocks and `--prefill-chunk` tokens a pass. On Gemma 4 a pass holds up to 256
-branches and 2048 tokens, each branch continuing the state in cache slots of its own. On
+passes, up to 64 blocks and `--prefill-chunk` tokens a pass. On Gemma 4 and Flint a pass holds up
+to 256 branches and 2048 tokens, each branch continuing the state in cache slots of its own; on
+Flint the state's last chunk runs in the first of these passes, ahead of the branches, when the
+first branch fits beside it, so a question about a new short state costs one pass. On
 Flash-Next a pass holds up to `--prefill-chunk` tokens: each branch's recurrent layers start from
 the state at its end, and each layer's routed experts run over every branch's tokens at once, so a
 routed expert the device cache lacks crosses the bus once a pass. The state's last chunk runs in
@@ -1510,7 +1515,7 @@ keeps the drafter's state for generation requests, and over no question; Flash-N
 block over a read's prompt at all, and its cache images of such prompts serve only requests that
 do not draft. The reads are disposable: a read supersedes nothing it resumed from, keeps no cache
 tap or image past the state, the checkpoint catalog evicts the reads' own continuations first, and
-they start no session lineage under `--derive-session-keys`. Gemma 4 and Flash-Next keep an image
+they start no session lineage under `--derive-session-keys`. Gemma 4, Flint and Flash-Next keep an image
 of the state at its boundary in their host store when copying it back costs less than computing it
 again, and requests submitted as one group are admitted together, so the first to reach the
 boundary stores the state and the others resume from it.
@@ -1728,7 +1733,8 @@ A forced selection names one function: `tool_choice` naming it directly, `requir
 `allowed_tools` with mode `required` over a single callable tool. NInfer executes it by ending the
 generation prompt with that call's opener in the model's own call syntax, so the answer can only
 continue inside the call: `<tool_call>\n<function=NAME>\n` for Qwen, `<|tool_call>call:NAME{` for
-Gemma 4, where `<|tool_call>` is the special token the chat template writes for an earlier call. It
+Gemma 4, where `<|tool_call>` is the special token the chat template writes for an earlier call,
+and `<tool_call>NAME` for Flint. It
 therefore requires a fresh answer position and a prompt without a thinking block: reasoning that
 the request itself enables is rejected with `tool_choice_not_supported`, while reasoning that only a
 default turns on, the server's or the chat template's, is switched off for that request. `required`
@@ -2100,9 +2106,9 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
-| `--rope-yarn` | past the model's native window, YaRN at factor `--max-context` / native instead of plain RoPE, for every family: the Qwen3.5 text and MTP layers, Qwen3.8-Flash-Next's sparse attention with its indexer and MTP block, Gemma 4's full-attention blocks (its sliding-window blocks never leave their window). Qwen documents the extension for its models; for Gemma 4 it is the same mathematics without a published or measured quality ([Gemma 4](gemma4.md#running)). The `server_start` record's `engine.rope` names the rotation the Engine resolved | off |
+| `--rope-yarn` | past the model's native window, YaRN at factor `--max-context` / native instead of plain RoPE, for every family: the Qwen3.5 text and MTP layers, Qwen3.8-Flash-Next's sparse attention with its indexer and MTP block, Gemma 4's full-attention blocks (its sliding-window blocks never leave their window); Flint, whose full-attention blocks carry no rotation, refuses it. Qwen documents the extension for its models; for Gemma 4 it is the same mathematics without a published or measured quality ([Gemma 4](gemma4.md#running)). The `server_start` record's `engine.rope` names the rotation the Engine resolved | off |
 | `--rope-yarn-factor F` | YaRN at a fixed factor in `[1,4]` for every position whatever `--max-context` is, as Qwen documents one factor per deployment; it grows neither the default context nor the KV pool, and long-context extrapolation is not a quality guarantee | `1` (as `--rope-yarn` decides) |
-| `--rope-scaling-factor F` | instead of YaRN, linear position interpolation for the Qwen3.5 text and MTP layers: a position past `--rope-scaling-original-context` rotates at original + (position - original) / F, so positions up to it keep their exact angles; `[1,32]`, excludes `--rope-yarn` and `--rope-yarn-factor`, and raises neither the four-times-native window cap nor the KV pool. The DFlash adapter keeps its plain RoPE; Qwen3.8-Flash-Next and Gemma 4 refuse it and take YaRN only | `1` (off) |
+| `--rope-scaling-factor F` | instead of YaRN, linear position interpolation for the Qwen3.5 text and MTP layers: a position past `--rope-scaling-original-context` rotates at original + (position - original) / F, so positions up to it keep their exact angles; `[1,32]`, excludes `--rope-yarn` and `--rope-yarn-factor`, and raises neither the four-times-native window cap nor the KV pool. The DFlash adapter keeps its plain RoPE; Qwen3.8-Flash-Next and Gemma 4 refuse it and take YaRN only, Flint refuses both | `1` (off) |
 | `--rope-scaling-original-context N` | the interpolation threshold | the native window |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `auto` with the hybrid prefix cache and `--max-context` with the checkpoint catalog | `auto`; `--max-context` with the checkpoint catalog |
 | `--kv-headroom-mib N` | device memory in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto`. `--vram-headroom-mib` is accepted as an alias | `1024` |
@@ -2120,10 +2126,10 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device N` | CUDA device index | `0` |
 | `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8; the cards may differ where the build runs on each; see [pipeline stages](maintainer/pipeline-stages.md)); on the Qwen3.5 family MTP, DFlash, DFlash2 and resident or CPU Vision run across the stages (the Vision tower stays on the first device; `--vision-residency overlay` is refused); overrides `--device` | none |
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
-| `--expert-residency device\|host\|disk` | routed MoE experts on GPU, in pinned host memory, or in artifact files: [native Qwen](maintainer/qwen3_5-model.md#routed-expert-residency), [Gemma 4](gemma4.md#expert-residency), and [Flash-Next](qwen3-8-flash-next.md#run). Native Qwen and Gemma bring misses into whole-layer device banks | `device` |
-| `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; native Qwen and Gemma allow `0` and then keep only their layer banks, and Flash-Next disk mode needs a cache. With automatic KV, native Qwen gives the cache priority over KV beyond one request's context | `auto` (what is free after startup) |
+| `--expert-residency device\|host\|disk` | routed MoE experts on GPU, in pinned host memory, or in artifact files: [native Qwen](maintainer/qwen3_5-model.md#routed-expert-residency), [Gemma 4](gemma4.md#expert-residency), [Flint](flint.md#expert-residency) and [Flash-Next](qwen3-8-flash-next.md#run). Native Qwen, Gemma 4 and Flint bring misses into whole-layer device banks | `device` |
+| `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; native Qwen, Gemma 4 and Flint allow `0` and then keep only their layer banks, and Flash-Next disk mode needs a cache. With automatic KV, native Qwen gives the cache priority over KV beyond one request's context | `auto` (what is free after startup) |
 | `--expert-misses staged\|mapped` | Qwen3.8-Flash-Next only, GGUF host experts: copy each missing expert to the device while the cached experts run, into a cache slot when the [expert tier](qwen3-8-flash-next.md#the-expert-cache) admits it (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
-| `--expert-dma-share F\|auto` | Host or disk experts: the GPU's share of a call's cache misses, `0..1`; the CPU computes the rest (GGUF and Qwen3.5/3.6 MoE experts: the GPU's results bit for bit); `auto` splits each such call by the copy and CPU times measured on earlier calls and copies every miss of Flash-Next native experts. Flash-Next and Gemma 4 calls of more than eight tokens, and Qwen3.5/3.6 calls that route to half the experts or more, always use the GPU ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)) | `auto` |
+| `--expert-dma-share F\|auto` | Host or disk experts: the GPU's share of a call's cache misses, `0..1`; the CPU computes the rest (GGUF and Qwen3.5/3.6 MoE experts: the GPU's results bit for bit); `auto` splits each such call by the copy and CPU times measured on earlier calls and copies every miss of Flash-Next native experts. Flash-Next, Gemma 4 and Flint calls of more than eight tokens, and Qwen3.5/3.6 calls that route to half the experts or more, always use the GPU ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)) | `auto` |
 | `--expert-tail-skip N` | Qwen3.8-Flash-Next only, GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten; the other experts keep their router weights, so results change | off |
 | `--expert-prefill-buffers 1\|2` | Qwen3.8-Flash-Next only, GGUF host experts: device buffers a long prompt's uncached experts are copied into; `2` copies the next layer's while the current layer's experts run, when half the free memory holds both. With the automatic cache the buffers hold expert cache slots between prompts ([the expert cache](qwen3-8-flash-next.md#the-expert-cache)) | `2` with the automatic expert cache, else `1` |
 | `--expert-cpu-threads N` | Host or disk experts with a CPU share: `1..256` CPU threads, the calling one included, pinned one to a physical core | `min(physical cores, usable CPUs / 2)`, at least one. Usable CPUs: the process's affinity mask, bounded by a container's CPU quota; physical cores: those in the mask. A 30-CPU container quota gives 15 threads, a 16-core/32-thread desktop 16 |
@@ -2150,16 +2156,16 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--request-log-keep N` | rotated request logs kept; `0` keeps none | `4` |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
-| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; all nine are accepted on every build target (see [Context and memory](cli.md#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV | `bf16` |
+| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; all nine are accepted on every build target (see [Context and memory](cli.md#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV; Flint keeps F16 only (`bf16`) | `bf16` |
 | `--kv-resident N\|all\|auto` | Qwen3.8-Flash-Next: positions of each sparse-attention layer's KV a sequence keeps in device memory; past them the layers' KV streams from pinned host memory (see [streamed KV](qwen3-8-flash-next.md#streamed-sparse-attention-kv)) | `auto`: 32,768 with host or disk experts, all with device experts |
-| `--spec none\|mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)), Gemma 4 from one converted with its assistant | `mtp` with 3 drafts for Flash-Next (with `--draft-min-p 0.5`) and Gemma 4 artifacts with their MTP block or assistant and host or disk experts; otherwise off |
-| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
+| `--spec none\|mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)), Gemma 4 from one converted with its assistant; Flint has no drafter and takes `--lookup-ngram` without `--spec` | `mtp` with 3 drafts for Flash-Next (with `--draft-min-p 0.5`) and Gemma 4 artifacts with their MTP block or assistant and host or disk experts; otherwise off |
+| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2; `1..7` for Gemma 4's assistant and Flint's context lookup | unset (Flint's lookup: 3) |
 | `--draft-min-p P` | Flash-Next MTP only: end the round's drafting at the first draft at or below this absolute probability and verify through it; see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding) | `0` (off); `0.5` when the engine chooses MTP (no `--spec`) |
 | `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |
 | `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |
 | `--adaptive-mtp` | MTP only: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens`, drafting only those), the width favored by the drafts' measured survival and the measured round cost; see [Adaptive MTP](#adaptive-mtp) | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query; verification keeps full attention; see [MTP attention window](#mtp-attention-window) | `0` (whole history) |
-| `--lookup-ngram N` | context-lookup drafting alongside `--spec` (Qwen3.8-Flash-Next: `--spec mtp`): the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
+| `--lookup-ngram N` | context-lookup drafting alongside `--spec` (Qwen3.8-Flash-Next: `--spec mtp`; Flint, which has no drafter, without it): the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
 | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; above 15 only at `--max-concurrency 1`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
 | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
 | `--ngram-archive-mib N` | RAM archive that keeps finished requests' copy sources for later requests naming the same `X-NInfer-Draft-Session` | `0` (off) |

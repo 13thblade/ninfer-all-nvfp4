@@ -8,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::frontend {
@@ -92,6 +93,13 @@ struct ParsedToolCallOutput {
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled,
                                 std::string_view forced_tool_name = {});
+
+// A call whose arguments came as untyped text, (name, value) pairs in order (Qwen's syntax and
+// Flint's), with each value read by its declared parameter's types; a mismatch or an undeclared
+// parameter is counted in `diagnostics` and kept.
+[[nodiscard]] GeneratedToolCall normalize_untyped_tool_call(
+    std::string_view name, std::span<const std::pair<std::string_view, std::string_view>> arguments,
+    const ToolCallOutputContract& contract, ToolCallParseDiagnostics& diagnostics);
 
 // Native Qwen tool-call envelope for a structured final-response request. A strict tool's
 // arguments follow its parameters' JSON Schema; another's remain non-strict values, with each

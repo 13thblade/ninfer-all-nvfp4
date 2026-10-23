@@ -112,8 +112,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                split by free memory)\n"
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
-           "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen\n"
-           "                                and Gemma allow 0 (layer banks only).\n"
+           "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
+           "                                Gemma and Flint allow 0 (layer banks only).\n"
            "                                Flash-Next disk requires a nonzero cache\n" +
            std::string(ninfer::product::kHybridExpertHelp) +
            std::string(ninfer::product::kNgramTableHelp) +
@@ -369,10 +369,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --ngram-session-mib N         per-session share of that archive (default 128)\n"
            "  --ngram-native-sessions       also recognize the session identities Kilo,\n"
            "                                Codex and Claude send\n"
-           "  --lookup-ngram N              context-lookup drafting alongside --spec: the\n"
-           "                                last N tokens are matched against the sequence\n"
-           "                                so far and what followed is proposed (default 0:\n"
-           "                                off)\n"
+           "  --lookup-ngram N              context-lookup drafting alongside --spec (Flint,\n"
+           "                                which has no drafter, without it): the last N\n"
+           "                                tokens are matched against the sequence so far\n"
+           "                                and what followed is proposed (default 0: off)\n"
            "\n"
            "VISION (off by default)\n"
            "  --vision                      accept images and video and load the Vision GPU\n"
