@@ -53,7 +53,7 @@ fi
 releases="$(gh api --paginate "repos/$repo/releases?per_page=100" --jq ".[] | select(.tag_name == \"$tag\") | [.id, .draft] | @tsv")"
 if [[ -n "$releases" ]]; then
   read -r release_id draft <<< "$releases"
-  [[ "$(gh api "repos/$repo/releases/tags/$tag" --jq .target_commitish)" == "$GITHUB_SHA" ]] || {
+  [[ "$(gh api "repos/$repo/releases/$release_id" --jq .target_commitish)" == "$GITHUB_SHA" ]] || {
     echo 'Existing release tag points to a different source revision' >&2; exit 1;
   }
   [[ "$draft" == true ]] || { echo "Release $tag is already published; leaving it unchanged."; exit 0; }
@@ -75,11 +75,14 @@ CI checks every requested device image and executable --help. GPU inference and 
 NOTES
   gh release create "$tag" -R "$repo" --target "$GITHUB_SHA" --draft \
     --title "Native builds ${GITHUB_SHA:0:12}" --notes-file "$notes"
+  release_id="$(gh api --paginate "repos/$repo/releases?per_page=100" --jq ".[] | select(.tag_name == \"$tag\") | .id")"
 fi
+[[ "$release_id" =~ ^[0-9]+$ ]] || { echo 'Could not resolve the draft release ID' >&2; exit 1; }
 # A retry can repair only this commit's draft. Published releases are immutable here.
 gh release upload "$tag" -R "$repo" "${assets[@]}" "${checksums[@]}" --clobber
 # Check the remote asset digests before making the draft visible or moving latest.
-gh api "repos/$repo/releases/tags/$tag" > assets.json
+# A draft's tag may not exist until publication, so the tag endpoint can return 404.
+gh api "repos/$repo/releases/$release_id" > assets.json
 python3.11 - <<'PY'
 import hashlib
 import json

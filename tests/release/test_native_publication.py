@@ -27,9 +27,14 @@ if args[0] == 'api':
         stale = mode == 'superseded' or (mode == 'superseded-upload' and '"upload"' in calls)
         print('b' * 40 if stale else os.environ['GITHUB_SHA'])
     elif route.endswith('/releases?per_page=100'):
-        if mode in ('draft', 'published'):
-            print('1\t' + ('true' if mode == 'draft' else 'false'))
+        created = '"create"' in pathlib.Path(os.environ['GH_CALLS']).read_text()
+        if mode in ('draft', 'published') or created:
+            print('1' if args[-1].endswith('.id') else
+                  '1\t' + ('false' if mode == 'published' else 'true'))
     elif '/releases/tags/' in route:
+        # A draft for a tag that does not exist yet is available only by release ID.
+        sys.exit(1)
+    elif route.endswith('/releases/1'):
         if '--jq' in args:
             print(os.environ['GITHUB_SHA'])
             sys.exit(0)
@@ -81,7 +86,7 @@ class NativePublicationTest(unittest.TestCase):
     def test_complete_matrix_publishes_after_remote_verification(self):
         calls = self.run_publish()
         edit = next(i for i, c in enumerate(calls) if c[:2] == ['release', 'edit'])
-        verification = next(i for i, c in enumerate(calls) if any('/releases/tags/' in a for a in c))
+        verification = next(i for i, c in enumerate(calls) if any(a.endswith('/releases/1') for a in c))
         self.assertLess(verification, edit)
         self.assertIn('--latest', calls[edit])
         self.assertTrue(any(c[:2] == ['release', 'create'] and '--draft' in c for c in calls))
