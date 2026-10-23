@@ -915,6 +915,17 @@ void recover_tool_calls(std::string_view region, std::size_t max_name_length,
 
 } // namespace
 
+GeneratedToolCall normalize_untyped_tool_call(
+    std::string_view name, std::span<const std::pair<std::string_view, std::string_view>> arguments,
+    const ToolCallOutputContract& contract, ToolCallParseDiagnostics& diagnostics) {
+    RawToolCall raw{.name = name};
+    raw.parameters.reserve(arguments.size());
+    for (const auto& [key, value] : arguments) {
+        raw.parameters.push_back(RawParameter{.name = key, .value = value});
+    }
+    return normalize_raw_tool_call(raw, contract, diagnostics);
+}
+
 void MarkdownCodeTracker::feed(std::string_view text) {
     for (const char byte : text) {
         if (byte == '\n') {

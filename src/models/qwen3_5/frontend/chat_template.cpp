@@ -1,5 +1,6 @@
 #include "models/qwen3_5/frontend/chat_template.h"
 
+#include "models/qwen3_5/frontend/flint_output.h"
 #include "models/qwen3_5/frontend/gemma_output.h"
 #include "models/qwen3_5/frontend/media_cache.h"
 #include "models/qwen3_5/frontend/prompt_layout.h"
@@ -50,6 +51,9 @@ ForcedCallOpener forced_call_opener(ToolCallSyntax syntax) {
         // template's own rendering of an earlier call; the name is the only literal text.
         return {.head = std::string(kGemmaCallOpen) + std::string(kGemmaCallHead),
                 .tail = kGemmaArgumentsOpen};
+    case ToolCallSyntax::Flint:
+        // <tool_call> is a token of Flint's vocabulary; the arguments follow the name directly.
+        return {.head = std::string(kFlintCallOpen), .tail = {}};
     }
     throw std::invalid_argument("invalid tool call syntax");
 }
@@ -580,6 +584,14 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
             }
             break;
         }
+    }
+    if (options.tool_call_syntax == ToolCallSyntax::Flint && !continuation &&
+        options.add_generation_prompt && context.value("enable_thinking", true) == false) {
+        // Flint's template has no thinking switch, and the model opens <think> itself when it
+        // reasons. Disabled thinking closes an empty reasoning block, GLM's switch for the same
+        // role-marker format: after it Flint answers at once.
+        output.text.append(kFlintThinkOpen);
+        output.text.append(kFlintThinkClose);
     }
     if (!options.forced_tool_name.empty()) {
         // The syntax's call opens with the function name; everything the model produces after

@@ -1,7 +1,8 @@
 #pragma once
 
-// Structured-output masks off the engine thread (the Gemma 4 and Qwen3.8-Flash-Next cores) and the
-// per-request mask cost that decides whether a structured request speculates (every core).
+// Structured-output masks off the engine thread (the Gemma 4, Flint and Qwen3.8-Flash-Next cores)
+// and the per-request mask cost that decides whether a structured request speculates (every
+// core).
 //
 // A structured request samples under its grammar's token mask. Computing a mask can cost from
 // microseconds to many milliseconds with a large vocabulary, so the cores compute it on a thread of

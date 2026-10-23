@@ -30,6 +30,7 @@ drafts with the tokens committed per verify round in brackets.
 | RTX 4090 | 24 GB | `89` | 450 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [field reports](performance/field-reports.md) |
 | L40S | 48 GB | | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | RTX 3090 Ti, two | 24 GB each | `86` | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
+| A40 | 48 GB | `86` | 300 W | [Flint](flint.md#measurements) |
 | RTX 3090 | 24 GB | `86` | 300 to 420 W by campaign | every page |
 | RTX 3060 | 12 GB | `86`, the image | 170 W | [small cards](performance/small-cards-2026-10.md) |
 | RTX 3060 Ti | 8 GB | `86`, the image | 200 W | [small cards](performance/small-cards-2026-10.md) |

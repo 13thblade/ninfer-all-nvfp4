@@ -18,6 +18,7 @@ namespace frontend {
 class Tokenizer;
 struct ToolCallOutputContract;
 struct GemmaMarkers;
+struct FlintMarkers;
 } // namespace frontend
 class Frontend;
 
@@ -100,7 +101,8 @@ private:
                   std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
                   std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
                   std::shared_ptr<text::GrammarState> grammar          = {},
-                  std::shared_ptr<const frontend::GemmaMarkers> gemma = {});
+                  std::shared_ptr<const frontend::GemmaMarkers> gemma = {},
+                  std::shared_ptr<const frontend::FlintMarkers> flint = {});
     std::unique_ptr<Impl> impl_;
 
     friend class Frontend;

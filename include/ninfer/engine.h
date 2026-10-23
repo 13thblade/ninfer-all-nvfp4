@@ -137,10 +137,10 @@ public:
 
     // submit() for several requests that enter the queue together, in order. The executor sees
     // them at one boundary, so a Qwen3.5-core Engine admits them at once and runs their last prompt
-    // chunks in one shared pass instead of starting the first before the rest arrive; Gemma 4 and
-    // Qwen3.8-Flash-Next admit them at once, and the first to reach a declared cache boundary they
-    // share keeps its state there for the others. Every request is checked before any is queued;
-    // an error for one request cancels the group.
+    // chunks in one shared pass instead of starting the first before the rest arrive; Gemma 4,
+    // Flint and Qwen3.8-Flash-Next admit them at once, and the first to reach a declared cache
+    // boundary they share keeps its state there for the others. Every request is checked before any
+    // is queued; an error for one request cancels the group.
     [[nodiscard]] std::vector<GenerationHandle>
     submit_group(std::vector<GenerationSubmission> submissions);
 
@@ -148,10 +148,10 @@ public:
     // on one lane: the prefix runs once, and each prompt's own tokens see only the prefix and
     // themselves, at the positions they have in their own prompt, so each branch reads what a
     // request for its prompt alone would, up to the rounding of a shared pass. A Qwen3.5-core
-    // Engine without pipeline stages runs the branches as blocks of shared prefill passes; Gemma 4
-    // and Qwen3.8-Flash-Next run the branches that fit a prompt chunk together in shared passes
-    // over the state at the prefix's end, and a longer branch alone from a device snapshot of it
-    // (Flash-Next with streamed KV layers runs each alone). The prefix ends at
+    // Engine without pipeline stages runs the branches as blocks of shared prefill passes; Gemma 4,
+    // Flint and Qwen3.8-Flash-Next run the branches that fit a prompt chunk together in shared
+    // passes over the state at the prefix's end, and a longer branch alone from a device snapshot
+    // of it (Flash-Next with streamed KV layers runs each alone). The prefix ends at
     // the deepest explicit cache boundary of the first prompt inside the tokens all prompts share,
     // or where they stop agreeing when there is none, and leaves every prompt at least one token
     // of its own; the cache serves and keeps it as it would that prompt's. `options` asks for one
@@ -169,8 +169,8 @@ public:
                     std::chrono::steady_clock::time_point pending_deadline = {});
     [[nodiscard]] bool runs_branches() const;
     // The most tokens one branch of submit_branches may hold past the shared prefix: one shared
-    // pass's columns on a Qwen3.5-core model, unbounded on Gemma 4 and Flash-Next, which run a
-    // branch in prompt chunks; 0 when runs_branches() is false.
+    // pass's columns on a Qwen3.5-core model, unbounded on Gemma 4, Flint and Flash-Next, which
+    // run a branch in prompt chunks; 0 when runs_branches() is false.
     [[nodiscard]] std::uint32_t branch_token_limit() const;
 
     // The largest requested_output_tokens for this prompt whose admission entitlement -- Main KV
