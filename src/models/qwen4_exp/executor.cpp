@@ -481,6 +481,8 @@ struct Part {
     SequenceState* sequence = nullptr;
     std::int32_t column     = 0;
     std::int32_t count      = 0;
+    // Its first position past the sequence's: a branch after the prompt part of its pass.
+    std::uint32_t offset = 0;
 };
 
 // What one device holds for the layers it runs: activation planes sized for a full chunk and a
@@ -614,6 +616,10 @@ struct Executor::Impl {
     // a branch of one sequence, and each part after the first takes the snapshot's recurrent state
     // of a layer before it runs that layer.
     const SequenceSnapshot* branch_origin = nullptr;
+    // While forward_prompt_branches() runs: the snapshot the pass's first part, the prompt's last
+    // tokens, leaves its state in, a layer's as soon as that part has run it; branch_origin points
+    // to it, and the branches start from it.
+    SequenceSnapshot* branch_capture = nullptr;
     // The MTP chain on the head rank: token ids and positions of a pass's cells (a draft step's at
     // step * sequences), staged from the host.
     DeviceBuffer mtp_ids, mtp_positions, ngram_prefetch_tokens;
@@ -2129,17 +2135,19 @@ struct Executor::Impl {
         for (const Part& part : parts) {
             const SequenceState& sequence = *part.sequence;
             const auto first = positions.begin() + part.column;
-            std::iota(first, first + part.count, static_cast<std::int32_t>(sequence.position));
+            const auto start = static_cast<std::int32_t>(sequence.position + part.offset);
+            std::iota(first, first + part.count, start);
             for (std::int32_t i = 0; i < part.count; ++i) {
-                rope[std::size_t(part.column + i)] =
-                    static_cast<std::int32_t>(sequence.position) + i + sequence.rope_delta;
+                rope[std::size_t(part.column + i)] = start + i + sequence.rope_delta;
             }
             if (table) {
                 // A verification hashes from a copy, which commit() replaces by the context
                 // advanced over the tokens it keeps. Each branch hashes from the origin's context,
-                // which the sequence holds: the last branch advances it, the others a copy.
+                // which the sequence holds: the last branch advances it, the others a copy. A
+                // pass's prompt part advances it first, and the origin takes it there.
                 NgramContext branch_context;
-                const bool copied = branch_origin != nullptr && &part != &parts.back();
+                const bool opening = branch_capture != nullptr && &part == &parts.front();
+                const bool copied  = branch_origin != nullptr && !opening && &part != &parts.back();
                 if (copied) { branch_context = branch_origin->context; }
                 NgramContext& context = copied      ? branch_context
                                         : verifying ? part.sequence->verify_context
@@ -2149,6 +2157,7 @@ struct Executor::Impl {
                               config.eos_token_id, config.vocab_size, context,
                               std::span(row_ids).subspan(std::size_t(part.column) * heads,
                                                          std::size_t(part.count) * heads));
+                if (opening) { branch_capture->context = context; }
             }
             const std::size_t prompt = sequence.media_rope.size() / 3;
             if (prompt == 0 || sequence.position >= prompt) { continue; }
@@ -2395,7 +2404,7 @@ struct Executor::Impl {
                            .rope      = rank.rope + part.column,
                            .index     = nullptr,
                            .tail      = state.tail.p,
-                           .first     = part.sequence->position};
+                           .first     = part.sequence->position + part.offset};
         if (verifying) {
             const std::uint64_t rows =
                 std::uint64_t(config.indexer_n_heads + 1) * config.indexer_head_dim;
@@ -2775,6 +2784,10 @@ struct Executor::Impl {
         // A layer's MoE output is written into the stack by the next layer's read, which takes
         // the same rounding, unless the PLE comes between.
         Tensor inject(rank.inject, DType::FP32, {hc, t});
+        // In a branch pass the first branch continues the state its sequence holds and each later
+        // one starts a layer from the origin's; a prompt part ahead of the branches leaves its
+        // state there as it goes.
+        const std::size_t first_branch = branch_capture != nullptr ? 1 : 0;
         const Tensor moe_out(rank.y, DType::FP32, {h, t});
         bool pending = false;
         for (std::size_t i = segment.begin; i < segment.end; ++i) {
@@ -2782,11 +2795,11 @@ struct Executor::Impl {
             if (plan.ple) {
                 if (pending) { ops::hyper_connection_write(stack, moe_out, inject, rank.stream); }
                 pending = false;
-                for (const Part& part : parts) {
-                    if (&part != &parts.front()) {
-                        restore_branch_layer(part.sequence->layers[i], i, rank, kPleRegions);
-                    }
-                    run_ple(plan, part.sequence->layers[i], rank, part);
+                for (std::size_t k = 0; k < parts.size(); ++k) {
+                    LayerState& state = parts[k].sequence->layers[i];
+                    if (k > first_branch) { restore_branch_layer(state, i, rank, kPleRegions); }
+                    run_ple(plan, state, rank, parts[k]);
+                    if (k == 0) { capture_branch_layer(state, i, rank, kPleRegions); }
                 }
             }
             {
@@ -2801,16 +2814,16 @@ struct Executor::Impl {
                 }
                 pending = false;
             }
-            for (const Part& part : parts) {
+            for (std::size_t k = 0; k < parts.size(); ++k) {
+                const Part& part  = parts[k];
                 LayerState& state = part.sequence->layers[i];
-                if (&part != &parts.front()) {
-                    restore_branch_layer(state, i, rank, kMixerRegions);
-                }
+                if (k > first_branch) { restore_branch_layer(state, i, rank, kMixerRegions); }
                 if (plan.gdn) {
                     run_gdn(plan, i, state, rank, part);
                 } else {
                     run_qsa(plan, state, rank, part, target_inputs(i, state, rank, part));
                 }
+                if (k == 0) { capture_branch_layer(state, i, rank, kMixerRegions); }
             }
             {
                 auto scope = rank.workspace->scope();
@@ -2828,8 +2841,9 @@ struct Executor::Impl {
             // Each branch's last column, to the front of the stack in branch order. A branch's
             // last column lies at or past its index, so no copy overwrites a later one's source.
             const std::size_t bytes = std::size_t(hc) * h * 4;
-            for (std::size_t b = 0; b < parts.size(); ++b) {
-                const std::size_t last = std::size_t(parts[b].column + parts[b].count - 1);
+            for (std::size_t b = 0; b + first_branch < parts.size(); ++b) {
+                const Part& part       = parts[b + first_branch];
+                const std::size_t last = std::size_t(part.column + part.count - 1);
                 if (last == b) { continue; }
                 CUDA_CHECK(cudaMemcpyAsync(rank.stack + b * std::size_t(hc) * h,
                                            rank.stack + last * std::size_t(hc) * h, bytes,
@@ -2890,7 +2904,8 @@ struct Executor::Impl {
               std::uint32_t logit_rows) {
         const auto t = static_cast<std::int32_t>(tokens.size());
         for (const Part& part : parts) {
-            if (part.sequence->position + std::uint32_t(part.count) > options.max_context) {
+            if (part.sequence->position + part.offset + std::uint32_t(part.count) >
+                options.max_context) {
                 throw std::invalid_argument("qwen4_exp forward: the sequence exceeds max_context");
             }
         }
@@ -3339,11 +3354,85 @@ struct Executor::Impl {
         sequences.at(s).mtp_follows = false;
     }
 
+    void forward_prompt_branches(std::uint32_t s, std::uint32_t prompt, SequenceSnapshot& at,
+                                 std::span<const std::int32_t> tokens,
+                                 std::span<const std::uint32_t> lengths) {
+        if (!runs_branches()) {
+            throw std::logic_error("qwen4_exp forward_prompt_branches: a streamed KV layer");
+        }
+        check_tokens(tokens, static_cast<std::uint32_t>(lengths.size()));
+        SequenceState& sequence = sequences.at(s);
+        if (prompt == 0 || lengths.empty()) {
+            throw std::invalid_argument("qwen4_exp forward_prompt_branches: no prompt or branch");
+        }
+        std::vector<Part> parts;
+        parts.reserve(lengths.size() + 1);
+        parts.push_back(
+            {.sequence = &sequence, .column = 0, .count = static_cast<std::int32_t>(prompt)});
+        std::uint32_t column = prompt;
+        for (const std::uint32_t length : lengths) {
+            if (length == 0) {
+                throw std::invalid_argument("qwen4_exp forward_prompt_branches: an empty branch");
+            }
+            parts.push_back({.sequence = &sequence,
+                             .column   = static_cast<std::int32_t>(column),
+                             .count    = static_cast<std::int32_t>(length),
+                             .offset   = prompt});
+            column += length;
+        }
+        if (column != tokens.size()) {
+            throw std::invalid_argument(
+                "qwen4_exp forward_prompt_branches: lengths unlike the tokens");
+        }
+        size_snapshot(sequence, at);
+        const std::uint32_t position = sequence.position;
+        at.context                   = sequence.context;
+        branch_origin                = &at;
+        branch_capture               = &at;
+        try {
+            pass(parts, tokens, static_cast<std::uint32_t>(lengths.size()));
+        } catch (...) {
+            branch_origin  = nullptr;
+            branch_capture = nullptr;
+            throw;
+        }
+        branch_origin  = nullptr;
+        branch_capture = nullptr;
+        // The MTP block followed none of the pass's tokens; its state goes along as snapshot()
+        // keeps it.
+        if (mtp) {
+            RankBinding bind(device, model.head_rank());
+            const cudaStream_t stream = ranks[model.head_rank()].stream;
+            CUDA_CHECK(cudaMemcpyAsync(at.mtp[0].p, sequence.mtp.tail.p, at.mtp[0].bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(at.mtp[1].p, sequence.mtp_pending.p, at.mtp[1].bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+        synchronize_ranks();
+        at.position          = position + prompt;
+        at.mtp_follows       = false;
+        sequence.position    = at.position + lengths.back();
+        sequence.mtp_follows = false;
+    }
+
     // Each part after a branch pass's first starts a layer from the origin's state of it: its
     // mixers' (Gated DeltaNet, convolution, indexer tail) before them, its PLE history before the
     // PLE (recurrent_regions order).
     static constexpr std::array<bool, 4> kMixerRegions{true, true, true, false};
     static constexpr std::array<bool, 4> kPleRegions{false, false, false, true};
+
+    // The prompt part's state of a layer, into the snapshot the pass's branches start from.
+    void capture_branch_layer(const LayerState& state, std::size_t i, RankState& rank,
+                              const std::array<bool, 4>& which) {
+        if (branch_capture == nullptr) { return; }
+        const auto regions = recurrent_regions(state);
+        auto& kept         = branch_capture->layers.at(i).buffers;
+        for (std::size_t k = 0; k < regions.size(); ++k) {
+            if (!which[k] || regions[k].first == nullptr || kept[k].bytes == 0) { continue; }
+            CUDA_CHECK(cudaMemcpyAsync(kept[k].p, regions[k].first, kept[k].bytes,
+                                       cudaMemcpyDeviceToDevice, rank.stream));
+        }
+    }
 
     void restore_branch_layer(const LayerState& state, std::size_t i, RankState& rank,
                               const std::array<bool, 4>& which) {
@@ -4015,6 +4104,15 @@ struct Executor::Impl {
 
     void snapshot(std::uint32_t s, SequenceSnapshot& out) {
         SequenceState& sequence = sequences.at(s);
+        size_snapshot(sequence, out);
+        copy_state(sequence, out, true);
+        out.position    = sequence.position;
+        out.context     = sequence.context;
+        out.mtp_follows = mtp && sequence.mtp_follows;
+    }
+
+    // Gives `out` its buffers, sized as `sequence`'s regions, unless it has them.
+    void size_snapshot(const SequenceState& sequence, SequenceSnapshot& out) {
         if (out.layers.size() != layers.size()) {
             out.layers.clear();
             for (std::size_t i = 0; i < layers.size(); ++i) {
@@ -4031,10 +4129,6 @@ struct Executor::Impl {
             out.mtp.emplace_back(sequence.mtp.tail.bytes);
             out.mtp.emplace_back(sequence.mtp_pending.bytes);
         }
-        copy_state(sequence, out, true);
-        out.position    = sequence.position;
-        out.context     = sequence.context;
-        out.mtp_follows = mtp && sequence.mtp_follows;
     }
 
     void restore(std::uint32_t s, const SequenceSnapshot& from) {
@@ -4235,6 +4329,12 @@ void Executor::forward_branches(std::uint32_t sequence, const SequenceSnapshot& 
                                 std::span<const std::int32_t> tokens,
                                 std::span<const std::uint32_t> lengths) {
     impl_->forward_branches(sequence, at, tokens, lengths);
+}
+
+void Executor::forward_prompt_branches(std::uint32_t sequence, std::uint32_t prompt,
+                                       SequenceSnapshot& at, std::span<const std::int32_t> tokens,
+                                       std::span<const std::uint32_t> lengths) {
+    impl_->forward_prompt_branches(sequence, prompt, at, tokens, lengths);
 }
 
 bool Executor::runs_branches() const noexcept { return impl_->runs_branches(); }

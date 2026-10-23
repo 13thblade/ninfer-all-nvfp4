@@ -1801,6 +1801,10 @@ struct Qwen4ExpCore::Impl {
             r.vision_seconds = seconds(vision_start, Clock::now());
         }
         const std::uint32_t n = prompt_step_tokens(r);
+        if (opens_branches(r, n)) {
+            prompt_branch_pass(request, n);
+            return;
+        }
         const auto prompt     = std::span<const TokenId>(r.prompt_tokens);
         const auto chunk      = prompt.subspan(r.prefilled, n);
         // The next step's table rows are read while this one runs.
@@ -1819,14 +1823,7 @@ struct Qwen4ExpCore::Impl {
         }
         if (r.observation.prompt_progress) {
             CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
-            {
-                std::lock_guard lock(r.mutex);
-                r.stream_progress = PromptProgress{.total_prompt_tokens     = prompt_n,
-                                                   .reused_prompt_tokens    = r.reused,
-                                                   .processed_prompt_tokens = r.prefilled,
-                                                   .elapsed_ns = elapsed_ns(r.admitted, Clock::now())};
-            }
-            r.cv.notify_all();
+            observe_prompt(r);
         }
         if (r.prefilled < prompt_n) { return; }
         if (r.branches) { return; } // the next steps run the branches
@@ -1893,19 +1890,38 @@ struct Qwen4ExpCore::Impl {
         finish_prompt(request);
     }
 
-    // The next branches of a branched read that fit one prompt chunk together, from the snapshot
-    // at the prompt's end in one pass (Executor::forward_branches): each layer's experts cross the
-    // bus once for all of them. Their first tokens are read a lane's worth of rows at a time.
-    void branch_pass(const std::shared_ptr<Request>& request) {
-        Request& r          = *request;
-        Slot& slot          = slots[r.slot];
-        auto& executor      = *instance.executor;
-        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+    // Publishes how much of the prompt is in to a request that observes its progress.
+    void observe_prompt(Request& r) {
+        {
+            std::lock_guard lock(r.mutex);
+            r.stream_progress = PromptProgress{
+                .total_prompt_tokens     = static_cast<std::uint32_t>(r.prompt_tokens.size()),
+                .reused_prompt_tokens    = r.reused,
+                .processed_prompt_tokens = r.prefilled,
+                .elapsed_ns              = elapsed_ns(r.admitted, Clock::now())};
+        }
+        r.cv.notify_all();
+    }
+
+    // Whether a branched read's prompt step of `n` tokens is its last and its first branch fits
+    // the chunk beside it, so the step and the branches run in one pass (prompt_branch_pass). A
+    // media prompt prefills in passes of its own.
+    [[nodiscard]] bool opens_branches(const Request& r, std::uint32_t n) const {
+        const auto& executor = *instance.executor;
+        const auto prompt_n  = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        return r.branches && !r.media && executor.runs_branches() && n > 0 &&
+               r.prefilled + n == prompt_n &&
+               n + (*r.branches)[0].tokens.size() <= executor.options().prefill_chunk;
+    }
+
+    // Appends the next branches of a branched read from `first` to `tokens` while they fit one
+    // prompt chunk beside what it holds and their rows the logits; their lengths, in order.
+    [[nodiscard]] std::vector<std::uint32_t> pack_branches(const Request& r, std::size_t first,
+                                                           std::vector<TokenId>& tokens) const {
+        const auto& executor                             = *instance.executor;
         const std::vector<runtime::ReadBranch>& branches = *r.branches;
-        const std::size_t first                          = r.branch_results.size();
         const std::size_t room                           = executor.options().prefill_chunk;
         const std::size_t rows                           = executor.max_logit_rows();
-        std::vector<TokenId> tokens;
         std::vector<std::uint32_t> lengths;
         for (std::size_t b = first; b < branches.size() && lengths.size() < rows &&
                                     tokens.size() + branches[b].tokens.size() <= room;
@@ -1913,10 +1929,62 @@ struct Qwen4ExpCore::Impl {
             tokens.insert(tokens.end(), branches[b].tokens.begin(), branches[b].tokens.end());
             lengths.push_back(static_cast<std::uint32_t>(branches[b].tokens.size()));
         }
+        return lengths;
+    }
+
+    // A branched read's last prompt step and its first branches in one pass
+    // (Executor::forward_prompt_branches): the state at the prompt's end goes to the slot's
+    // snapshot, the anchor the later branches start from, as the pass reaches it, and each layer's
+    // experts cross the bus once for the prompt's tokens and the branches'.
+    void prompt_branch_pass(const std::shared_ptr<Request>& request, std::uint32_t n) {
+        Request& r          = *request;
+        Slot& slot          = slots[r.slot];
+        auto& executor      = *instance.executor;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const auto chunk    = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
+        std::vector<TokenId> tokens(chunk.begin(), chunk.end());
+        const std::vector<std::uint32_t> lengths = pack_branches(r, 0, tokens);
+        executor.forward_prompt_branches(r.slot, n, slot.snapshot, tokens, lengths);
+        r.prefilled = prompt_n;
+        slot.fed.assign(r.prompt_tokens.begin(), r.prompt_tokens.end());
+        slot.anchor = slot.fed;
+        if (reuse_prefixes && r.reusable &&
+            std::binary_search(r.shared_at.begin(), r.shared_at.end(), prompt_n)) {
+            store_image(r.slot, slot.anchor, &slot.snapshot, PrefixReusePath::SharedStablePrefix);
+        }
+        // The pass waited for its copies, so the prompt is in.
+        if (r.observation.prompt_progress) { observe_prompt(r); }
+        const std::vector<TokenId>& last = (*r.branches)[lengths.size() - 1].tokens;
+        slot.fed.insert(slot.fed.end(), last.begin(), last.end());
+        read_branches(request, lengths);
+    }
+
+    // The next branches of a branched read that fit one prompt chunk together, from the snapshot
+    // at the prompt's end in one pass (Executor::forward_branches): each layer's experts cross the
+    // bus once for all of them.
+    void branch_pass(const std::shared_ptr<Request>& request) {
+        Request& r              = *request;
+        Slot& slot              = slots[r.slot];
+        auto& executor          = *instance.executor;
+        const std::size_t first = r.branch_results.size();
+        std::vector<TokenId> tokens;
+        const std::vector<std::uint32_t> lengths = pack_branches(r, first, tokens);
         executor.forward_branches(r.slot, slot.snapshot, tokens, lengths);
-        const std::vector<TokenId>& last = branches[first + lengths.size() - 1].tokens;
+        const std::vector<TokenId>& last = (*r.branches)[first + lengths.size() - 1].tokens;
         slot.fed.assign(r.prompt_tokens.begin(), r.prompt_tokens.end());
         slot.fed.insert(slot.fed.end(), last.begin(), last.end());
+        read_branches(request, lengths);
+    }
+
+    // The first tokens of the branches a pass just ran (`lengths`, after those already read), a
+    // lane's worth of logit rows at a time; once the last branch is read, the prompt is in.
+    void read_branches(const std::shared_ptr<Request>& request,
+                       std::span<const std::uint32_t> lengths) {
+        Request& r          = *request;
+        auto& executor      = *instance.executor;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const std::vector<runtime::ReadBranch>& branches = *r.branches;
+        const std::size_t first                          = r.branch_results.size();
         r.progress              = Clock::now();
         const Tensor logits     = executor.logits(static_cast<std::uint32_t>(lengths.size()));
         const std::size_t width = slots.size();

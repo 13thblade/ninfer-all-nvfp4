@@ -1490,7 +1490,11 @@ passes, up to 64 blocks and `--prefill-chunk` tokens a pass. On Gemma 4 a pass h
 branches and 2048 tokens, each branch continuing the state in cache slots of its own. On
 Flash-Next a pass holds up to `--prefill-chunk` tokens: each branch's recurrent layers start from
 the state at its end, and each layer's routed experts run over every branch's tokens at once, so a
-routed expert the device cache lacks crosses the bus once a pass. A branch longer than a pass runs
+routed expert the device cache lacks crosses the bus once a pass. The state's last chunk runs in
+the first of these passes, ahead of the branches, when the first branch fits beside it: each layer
+leaves the state at the chunk's end in a device snapshot as it finishes the chunk, the later
+branches and passes start from that snapshot, and the context cache stores its image of the state
+from it, so a question about a new short state costs one pass. A branch longer than a pass runs
 alone from a device snapshot of the state, and so does every branch on a Flash-Next model whose
 sparse-attention KV streams from host memory (`--kv-resident`). A request with media runs no
 branched read, since a branch's prompt is its tokens alone: its reads go the way described next,
@@ -1522,7 +1526,10 @@ On an RTX 3090 with four lanes, Ternary Bonsai 2 27B answered one question about
 in 0.35 s and 0.68 s; the first question about a new 13.5K-token state took 5.4 s, the state's
 prefill. Gemma 4 26B-A4B took 50 and 73 ms for one question, 0.08 and 0.16 s for four and 0.20 and
 0.48 s for sixteen; Qwen3.8-Flash-Next (Q2_0, `--expert-residency host`) 0.31 and 0.34 s, 0.54 and
-0.60 s, and 0.88 and 0.96 s, each branch pass copying the routed experts the device cache lacks.
+0.60 s, and 0.88 and 0.96 s, each branch pass copying the routed experts the device cache lacks;
+about a new 370-token state, where the first pass runs the state's last chunk with the questions
+that fit beside it, it answered one question in 0.88 s, four in 0.96 s and sixteen in 1.39 s, and one about a new
+13.5K-token state in 6.0 s.
 Sixteen questions asked again answered from the branch memo in 11-13 ms about the short state and
 in 62 ms (Bonsai, Flash-Next) and 0.25 s (Gemma) about the long one, the time to render and
 tokenize their prompts. Sixteen questions about a cached 2K-token state beside a streaming
@@ -1533,8 +1540,8 @@ per read; `scripts/pods/decision_ab.py`) took 22.3-22.6 s with one client and 22
 on Bonsai under `bf16`, `int8` and `rk2v4-e8`, 24.6 and 24.3 s under `--spec mtp`, 24.7 and 24.3 s
 under `--spec dflash2`, and 22.3 and 21.9 s with the checkpoint catalog (`--auto-prefix-grid
 --auto-long-anchors --derive-session-keys`); 21.0-23.1 s and 20.5-22.6 s on Gemma over the nine
-`--kv-dtype` formats, and 22.9 and 22.5 s under `--spec mtp`; 157.9-167.4 s and 157.2-166.3 s on
-Flash-Next under `bf16`, `int8` and `rk2v4-e8`, and 161.4 and 160.9 s under `--spec mtp`.
+`--kv-dtype` formats, and 22.9 and 22.5 s under `--spec mtp`; 143.8 s on Flash-Next under `bf16`
+with one client.
 
 A branch attends to the state through the KV cache, so its answer carries the cache format's
 rounding, and the width of a pass changes how its kernels and the head's BF16 logits round. On that
@@ -1542,11 +1549,11 @@ bench, against each question read as a request of its own, Bonsai's answers move
 in probability under `bf16` and `int8` with no pick changed, and by 0.27 under `rk2v4-e8`, 5 of 480
 picks; Gemma's picks changed 5 to 10 of 480 times under `bf16`, `fp8`, `int8`, `k8v4` and `rk8v4`,
 13 to 30 under `rk4v4`, `nvfp4` and `rk4v4-e8`, and 85 under `rk2v4-e8`, where those requests
-themselves change 97 picks between `bf16` and `rk2v4-e8`; Flash-Next's 9 and 11 under `bf16` and
-`int8` and 29 under `rk2v4-e8` (39 between the two formats). The moved picks are near ties both
-ways: of the bench's labelled questions, those the requests of their own answered right and the
-shared passes wrong numbered 5, 100 and 35 over the measured configurations, and the reverse 3, 85 and 27
-(Bonsai, Gemma, Flash-Next; a sign test gives p = 0.73, 0.30 and 0.37). Answers do not depend on
+themselves change 97 picks between `bf16` and `rk2v4-e8`; Flash-Next's 9 under `bf16`, its answers
+moving by at most 0.29. The moved picks are near ties both ways: of the bench's labelled questions,
+those the requests of their own answered right and the shared passes wrong numbered 5 and 100 over
+the measured configurations, and the reverse 3 and 85 (Bonsai, Gemma; a sign test gives p = 0.73
+and 0.30). Answers do not depend on
 what runs beside them: one and four clients gave the same probabilities on all three models, and
 `recheck_margin` reads a near tie again alone. With the system turn the labels held 98-99% of the
 first token's probability on Bonsai, where the user turn alone left 60-90%.
