@@ -146,6 +146,9 @@ struct PrepareStats {
 // (docs/maintainer/hybrid-prefix-cache-spec.md §7.1). Frontiers are exact token positions.
 struct PreparedTapHints {
     std::vector<runtime::prefix_cache::TapHint> hints;
+    // CacheRetentionHint::Disposable: no request continues this one, so it supersedes nothing it
+    // resumed from (docs/maintainer/hybrid-prefix-cache-spec.md §9.3).
+    bool disposable = false;
 };
 
 struct PreparedPromptData {

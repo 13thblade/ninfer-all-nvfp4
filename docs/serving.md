@@ -1437,15 +1437,27 @@ limits, and answers with `answers` in question order: a `predicate` with its `pr
 an unnamed question. `safety_identifier` is accepted and ignored; streaming, tools, images and
 refusal scoring are not implemented.
 
-The reads of one request run a lane's worth (`--max-concurrency`) at a time, so a request leaves
-room for other clients' generation between its windows, and every read starts with the state, which
-the prefix cache prefills once: a question costs its own text and one token. On an RTX 3090 with
-Ternary Bonsai 2 27B and four lanes, a request about a 370-token state took 17 ms for one question
-and 235 ms for sixteen once the state was cached (150 ms and 0.8 s with the state's prefill); about
-a 13.5K-token state, 39 ms and 0.33 s (5.3 s and 6.1 s cold). Sixteen questions beside a streaming
-256-token chat completion took 0.42 s instead of 0.26 s and slowed the chat's decode from 90 to
-83 tokens/s. With the system turn the labels held 98-99% of the first token's probability on that
-model, where the user turn alone left 60-90%.
+Every read of a request starts with the same system turn, context and state, and its prompt carries
+an explicit cache boundary after the state. The first question runs alone and leaves the state in
+the context cache; the rest resume from it a lane's worth (`--max-concurrency`) at a time, so a
+question costs its own text and one token, and a request leaves room for other clients' generation
+between its windows. The reads are disposable: a read supersedes nothing it resumed from, the
+checkpoint catalog evicts the reads' own continuations first, and they start no session lineage
+under `--derive-session-keys`. A read that ends within 64 tokens of the boundary leaves no snapshot
+of its own, so the same request sent again prefills each question again.
+
+On an RTX 3090 with Ternary Bonsai 2 27B and four lanes, a question about a cached state took 48 ms
+on a 370-token state and 71 ms on a 13.5K-token state, and the reads of one window prefill one after
+another: sixteen questions took 0.67 s and 0.92 s. The first question about a new 13.5K-token state
+took 5.4 s, the state's prefill. Sixteen questions about a cached 2K-token state beside a streaming
+256-token chat completion took 0.90 s instead of 0.73 s and slowed the chat's decode from 89 to
+72 tokens/s. The SystemOne bench attached to issue #64 (160 cases of three questions, about 180
+tokens per read; `scripts/pods/decision_ab.py`) took 41.6 s with one client and 41.3 s with four,
+and 62.4 s and 57.2 s with the checkpoint catalog (`--auto-prefix-grid --auto-long-anchors
+--derive-session-keys`). `--spec mtp` and `--spec dflash2` draft nothing for a one-token read, but
+their drafters still run over its prompt: that bench took 2-8% longer with them. With the system
+turn the labels held 98-99% of the first token's probability on that model, where the user turn
+alone left 60-90%.
 
 ## OpenAI Responses Core
 

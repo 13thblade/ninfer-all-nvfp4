@@ -1007,6 +1007,7 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
                                             : std::span<const std::uint32_t>(),
                                  exclusions, hybrid_->taps());
         }
+        const bool disposable = prompt.tap_hints.disposable;
         const std::uint64_t path_hash =
             full == 0 ? pc::kRootLookupHash : transaction.hashes[full - 1U];
         const std::uint64_t trailing = all_vision_key(ranges);
@@ -1073,6 +1074,7 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
         lane_state.path.swap(transaction.path);
         lane_state.active                 = true;
         lane_state.publish                = publish;
+        lane_state.disposable             = disposable;
         lane_state.path_hash              = path_hash;
         lane_state.trailing_extra         = trailing;
         lane_state.deepest_snapshot       = reuse;
@@ -1321,7 +1323,9 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
 
 void ProgramImpl::hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier) {
     pc::PrefixCacheIndex& index = hybrid_->index();
-    if (!lane.resume_snapshot.valid() || frontier <= lane.resume_frontier ||
+    // No request continues a disposable one, so the snapshot it resumed from still serves the
+    // requests that share it (the other reads of one decision request).
+    if (lane.disposable || !lane.resume_snapshot.valid() || frontier <= lane.resume_frontier ||
         !index.valid(lane.resume_snapshot)) {
         return;
     }

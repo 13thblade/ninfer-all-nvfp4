@@ -80,7 +80,9 @@ struct DecisionLabels {
 
 // The request that reads `question`: the system turn, then one user turn with the state, the
 // question and its options under the labels, thinking off, one output token, with the labels'
-// token ids (aligned with decision_labels(question).texts) read out exactly.
+// token ids (aligned with decision_labels(question).texts) read out exactly. The user turn's first
+// part holds the context and the state, with an explicit cache boundary after it; the second holds
+// the question.
 [[nodiscard]] GenerationRequest make_decision_read(const DecisionRequest& request,
                                                    const DecisionQuestion& question,
                                                    std::vector<ninfer::TokenId> label_tokens);

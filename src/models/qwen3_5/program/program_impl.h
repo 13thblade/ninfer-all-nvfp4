@@ -336,6 +336,8 @@ struct HybridPendingTap {
 struct HybridLaneState {
     bool active  = false;
     bool publish = false;
+    // PreparedTapHints::disposable: the snapshot it resumed from is never superseded.
+    bool disposable = false;
     // Root path of full blocks this sequence pins, in prompt order. Blocks past the reuse
     // frontier are appended as the sequence commits them.
     std::vector<runtime::prefix_cache::NodeRef> path;

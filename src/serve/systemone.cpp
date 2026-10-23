@@ -460,10 +460,13 @@ GenerationRequest make_decision_read(const DecisionRequest& request,
                                      const DecisionQuestion& question,
                                      std::vector<ninfer::TokenId> label_tokens) {
     const std::vector<std::string> labels = shown_labels(question);
-    std::string text;
-    if (!request.instructions.empty()) { text += request.instructions + "\n\n"; }
-    text += "State:\n" + request.state + "\n\n";
-    text += "Question: " + question.instructions + "\n";
+    // The context and the state are the same for every question of the request: a cache boundary
+    // after them lets the later reads resume from the first one's state instead of prefilling it
+    // again. The two parts render as one user turn, byte for byte.
+    std::string shared;
+    if (!request.instructions.empty()) { shared += request.instructions + "\n\n"; }
+    shared += "State:\n" + request.state + "\n\n";
+    std::string text = "Question: " + question.instructions + "\n";
     switch (question.type) {
     case DecisionType::Choice:
         text += "Options:\n";
@@ -491,7 +494,10 @@ GenerationRequest make_decision_read(const DecisionRequest& request,
     }
     GenerationRequest out;
     out.messages.push_back(text_turn(ChatRole::System, kSystem));
-    out.messages.push_back(text_turn(ChatRole::User, std::move(text)));
+    ChatTurn user = text_turn(ChatRole::User, std::move(shared));
+    user.content.front().cache_boundary_after = CacheBoundary{};
+    user.content.push_back(ContentPart{.kind = ContentKind::Text, .text = std::move(text)});
+    out.messages.push_back(std::move(user));
     out.enable_thinking            = false;
     out.max_tokens                 = 1;
     out.sampling.temperature       = 0.0;

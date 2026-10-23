@@ -1,5 +1,6 @@
 // HTTP handling of the typed decision endpoints: POST /v1/systemone and POST /v1/decisions, one
 // read per question on the served chat model.
+#include "ninfer/request.h"
 #include "serve/http_server.h"
 #include "serve/http_transport.h"
 #include "serve/request_events.h"
@@ -55,18 +56,24 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
     }
     GenerationService& service = lease.service();
     const auto cancelled       = [&req] { return client_disconnected(req); };
-    // One read per question, submitted a lane's worth at a time: the Engine runs a window
-    // together, the reads of one window share the state's cached prefix, and the ingress queue
-    // keeps room for other clients' requests.
-    const std::size_t window =
+    // One read per question. The first runs alone and leaves the state at its cache boundary; the
+    // rest resume from there, submitted a lane's worth at a time so the ingress queue keeps room
+    // for other clients' requests. A read is never continued, so its own continuation is the first
+    // the cache evicts, and it starts no session lineage.
+    const std::size_t lanes =
         std::max<std::size_t>(1, static_cast<std::size_t>(service.options().max_concurrency));
+    const ninfer::ContextCacheHints read_cache{
+        .retention            = ninfer::CacheRetentionHint::Disposable,
+        .update_session_index = false,
+    };
     std::vector<DecisionAnswer> answers;
     answers.reserve(request.questions.size());
     int input_tokens  = 0;
     int output_tokens = 0;
     try {
-        for (std::size_t begin = 0; begin < request.questions.size(); begin += window) {
-            const std::size_t end = std::min(begin + window, request.questions.size());
+        for (std::size_t begin = 0; begin < request.questions.size();) {
+            const std::size_t end =
+                std::min(begin == 0 ? std::size_t{1} : begin + lanes, request.questions.size());
             std::vector<GenerationRequest> reads;
             std::vector<PreparedRequest> batch;
             std::vector<std::shared_ptr<RequestLifecycle>> lifecycles;
@@ -74,7 +81,7 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
                 reads.push_back(make_decision_read(request, request.questions[index],
                                                    label_tokens[index]));
                 batch.push_back(service.prepare(reads.back(), GenerationConsumerMode::Aggregate,
-                                                {.phase_timings = true}, cancelled));
+                                                {.phase_timings = true}, cancelled, read_cache));
                 const RequestLogMetadata metadata{.model = request.model};
                 lifecycles.push_back(begin_request(make_request_log_context(
                     ++request_seq_, protocol, reads.back(), metadata, batch.back())));
@@ -93,6 +100,7 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
                 answers.push_back(
                     read_decision(outcome, labels[begin + offset], label_tokens[begin + offset]));
             }
+            begin = end;
         }
     } catch (const ApiException& exception) {
         write_openai_error(res, exception.error());
