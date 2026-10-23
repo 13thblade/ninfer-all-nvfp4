@@ -71,5 +71,8 @@ if(NINFER_WINDOWS_KERNEL_DLL)
   target_link_libraries(ninfer_ops PRIVATE ninfer_ggml_quants_dll)
 else()
   target_link_libraries(ninfer_ops PRIVATE ninfer_ggml_quants)
+  # The flash attention's launch reads the device tier ninfer_ops keeps: a program whose other
+  # objects never reach it still links (a link-only cycle the static archives resolve).
+  target_link_libraries(ninfer_ggml_quants PRIVATE $<LINK_ONLY:ninfer_ops>)
 endif()
 target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/gguf_linear.cpp")
