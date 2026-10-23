@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """The typed decision endpoints against a served model.
 
-usage: decision_bench.py [--model PATH] [--server PATH] [--out DIR] [--lanes N]
+usage: decision_bench.py [--model PATH] [--server PATH] [--out DIR] [--lanes N] [--flag OPTION ...]
 
 Starts ninfer-serve on the model, then:
   1. answers: /v1/systemone and /v1/decisions on one short state, every question type;
   2. agreement: a choice question's probabilities against /v1/chat/completions' top log
-     probabilities of the same prompt (greedy, no penalties, thinking off);
-  3. latency: /v1/systemone with 1, 4 and 16 questions on a ~200-token and a ~10K-token state,
-     a cold pass (the state prefilled) and warm passes (the state cached), per request wall time;
-  4. concurrency: 16 questions while a 256-token chat completion streams, and the chat's decode
-     rate with and without the decisions beside it.
+     probabilities of the same prompt with the read's cache boundaries (greedy, no penalties,
+     thinking off), and sixteen questions
+     read as branches of one request against each read alone;
+  3. features: a 30-option choice (two-digit labels), Runoff, a conversation, schema_first,
+     recheck_margin, margins, and the 200-question limit;
+  4. latency: /v1/systemone with 1, 4 and 16 questions on a ~200-token and a ~10K-token state,
+     a cold pass (the state prefilled), warm passes of new questions (the state cached) and exact
+     repeats of the cold request, per request wall time;
+  5. concurrency: 16 new questions on a cached state while a 256-token chat completion streams,
+     and the chat's decode rate with and without the decisions beside it.
 Writes DIR/decisions.json and prints one line per measurement. Exits nonzero when an answer,
 agreement or shape check fails.
 """
@@ -83,10 +88,10 @@ def handle_signal(number, _frame) -> None:
     raise SystemExit(128 + number)
 
 
-def start_server(server: Path, model: Path, lanes: int, log_path: Path) -> subprocess.Popen:
+def start_server(server: Path, model: Path, lanes: int, log_path: Path,
+                 flags: list[str]) -> subprocess.Popen:
     command = [str(server), str(model), "--host", "127.0.0.1", "--port", str(PORT),
-               "--device", "0", "--max-context", "16384", "--kv-capacity", "65536",
-               "--max-concurrency", str(lanes)]
+               "--device", "0", "--max-context", "16384", "--max-concurrency", str(lanes), *flags]
     process = subprocess.Popen(command, stdout=log_path.open("w"), stderr=subprocess.STDOUT,
                                start_new_session=True)
     RUNNING.append(process)
@@ -111,7 +116,7 @@ def state_text(target_tokens: int) -> str:
     return "\n".join(lines)
 
 
-def questions(count: int) -> dict:
+def questions(count: int, salt: int = 0) -> dict:
     kinds = [
         ("choice", {"type": "choice", "instructions": "Which team should handle this?",
                     "criteria": {"billing": "payments and refunds", "shipping": "deliveries",
@@ -122,11 +127,28 @@ def questions(count: int) -> dict:
         ("noul2", {"type": "noul", "instructions": "Is the parcel reported as damaged?",
                    "criteria": {"true": "the customer reports physical damage"}}),
     ]
+    # Each question is a distinct prompt, and a nonzero salt makes another set: a repeated question
+    # answers from the branch memo or an earlier read's image, which no new question does.
     out = {}
     for index in range(count):
         name, body = kinds[index % len(kinds)]
+        if index >= len(kinds) or salt:
+            mark = f"Check {index + 1}" + (f", pass {salt}" if salt else "")
+            body = dict(body, instructions=f"{body['instructions']} ({mark}.)")
         out[f"{name}_{index}"] = body
     return out
+
+
+def read_alone(body: dict) -> dict:
+    # A margin of 1 reads every question again alone and past the branch memo, which may hold a
+    # record read beside other questions (an answer of margin 1 keeps it). A server without
+    # recheck_margin refuses it, and reads each question afresh anyway.
+    status, response = call_status("/v1/systemone", dict(body, recheck_margin=1.0))
+    if status == 400:
+        return call("/v1/systemone", body)
+    if status != 200:
+        raise RuntimeError(f"/v1/systemone returned {status}: {response}")
+    return response
 
 
 def check(condition: bool, label: str, failures: list[str]) -> None:
@@ -191,7 +213,7 @@ def answers_section(record: dict, failures: list[str]) -> None:
     check(status == 400, "a one-option choice is refused", failures)
     status, response = call_status("/v1/systemone", {"state": state, "images": ["data:image/png;base64,AA=="],
                                                      "questions": {"q": {"type": "noul", "instructions": "i"}}})
-    check(status == 501, "images are not implemented", failures)
+    check(status == 501, "images without --vision are not implemented", failures)
 
 
 def agreement_section(record: dict, failures: list[str]) -> None:
@@ -199,15 +221,23 @@ def agreement_section(record: dict, failures: list[str]) -> None:
     question = {"type": "choice", "instructions": "Which team should handle this?",
                 "criteria": {"billing": "payments and refunds", "shipping": "deliveries",
                              "technical": "defects and repairs"}}
-    decision = call("/v1/systemone", {"state": state, "questions": {"team": question}})
-    # The prompt make_decision_read renders for this question: its system turn and user turn.
+    decision = read_alone({"state": state, "questions": {"team": question}})
+    # The prompt make_decision_read renders for this question: its system turn and user turn, with
+    # its cache boundaries, so the chat prefills in the read's steps (a chat that drafts cannot
+    # resume from a read's cache entries on Flash-Next, which hold no MTP state).
     system = ("You answer typed questions about a state with one label only: the letter of the best "
               "option, yes or no, or the number of the level. No words before or after the label.")
-    text = (f"State:\n{state}\n\nQuestion: {question['instructions']}\nOptions:\n"
+    text = (f"Question: {question['instructions']}\nOptions:\n"
             "A. billing - payments and refunds\nB. shipping - deliveries\n"
             "C. technical - defects and repairs\nReply with a single letter (A, B or C) and nothing else.")
+    boundary = {"mode": "explicit"}
     chat = call("/v1/chat/completions", {
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
+        "messages": [
+            {"role": "system", "content": [{"type": "text", "text": system,
+                                            "prompt_cache_breakpoint": boundary}]},
+            {"role": "user", "content": [{"type": "text", "text": f"State:\n{state}\n\n",
+                                          "prompt_cache_breakpoint": boundary},
+                                         {"type": "text", "text": text}]}],
         "max_tokens": 1, "temperature": 0,
         "presence_penalty": 0, "frequency_penalty": 0, "logprobs": True, "top_logprobs": 20,
         "graft": "", "chat_template_kwargs": {"enable_thinking": False}})
@@ -228,12 +258,104 @@ def agreement_section(record: dict, failures: list[str]) -> None:
                                     "chat_label_mass": mass}}), flush=True)
     check(len(chat_probabilities) >= 1, "the chat's top-20 shows at least one label", failures)
     if chat_probabilities:
+        # The question runs as a branch, the chat's as a prompt step: on Flash-Next the two round
+        # one label's BF16 logit a step apart (0.125 between 16 and 32), which moves every label's
+        # log probability by up to that step. A wrong label or normalization moves them further.
         for option, probability in chat_probabilities.items():
-            check(abs(probability - ours[option] * diagnostics["label_mass"]) < 2e-3,
-                  f"{option}: readout {ours[option] * diagnostics['label_mass']:.5f} vs chat "
-                  f"{probability:.5f}", failures)
+            readout = ours[option] * diagnostics["label_mass"]
+            check(abs(math.log(probability) - math.log(readout)) <= 0.13,
+                  f"{option}: readout {readout:.5f} vs chat {probability:.5f} (one BF16 logit step)",
+                  failures)
         check(abs(mass - diagnostics["label_mass"]) < 5e-3 or len(chat_probabilities) < 3,
               "label mass agrees when every label is in the top 20", failures)
+
+
+def branch_oracle(record: dict, failures: list[str]) -> None:
+    state = state_text(400) + "\nOracle marker."
+    asked = questions(16)
+    together = call("/v1/systemone", {"state": state, "questions": asked})
+    # A shared pass's kernels round otherwise than a pass of one question's, which moves a near tie
+    # (on Gemma 4 up to 0.15 between two levels a BF16 logit step apart); an answer the model is
+    # sure of moves only if a branch sees what it should not.
+    worst, sure_worst, flips, sure_flips = 0.0, 0.0, 0, 0
+    for name, body in asked.items():
+        alone = read_alone({"state": state, "questions": {name: body}})
+        ours, theirs = together["answers"][name], alone["answers"][name]
+        change = max(abs(value - theirs["probabilities"][key])
+                     for key, value in ours["probabilities"].items())
+        worst = max(worst, change)
+        best = max(ours["probabilities"], key=ours["probabilities"].get)
+        flipped = best != max(theirs["probabilities"], key=theirs["probabilities"].get)
+        flips += flipped
+        ranked = sorted(theirs["probabilities"].values(), reverse=True)
+        margin = ranked[0] - ranked[1]
+        if margin >= 0.5:
+            sure_worst = max(sure_worst, change)
+        if margin >= 0.1:
+            sure_flips += flipped
+    record["branch_oracle"] = {"questions": len(asked), "max_probability_change": worst,
+                               "argmax_changes": flips,
+                               "max_change_margin_over_half": sure_worst,
+                               "argmax_changes_margin_over_tenth": sure_flips}
+    print(json.dumps({"branch_oracle": record["branch_oracle"]}), flush=True)
+    check(sure_worst <= 0.03 and sure_flips == 0,
+          f"branches read as alone: answers of margin 0.5 or more within 0.03 ({sure_worst:.4f}), "
+          f"none of margin 0.1 or more flips ({sure_flips})", failures)
+
+
+def features_section(record: dict, failures: list[str]) -> None:
+    state = state_text(300)
+    rows = {}
+    wide = {"type": "choice", "instructions": "Which note number is about the invoice?",
+            "criteria": {f"note {k + 1}": None for k in range(30)}}
+    status, response = call_status("/v1/systemone", {"state": state, "questions": {"wide": wide}})
+    check(status == 200, "a 30-option choice is answered", failures)
+    if status == 200:
+        answer = response["answers"]["wide"]
+        ranked = sorted(answer["probabilities"].values(), reverse=True)
+        check(abs(sum(ranked) - 1.0) < 1e-6, "the 30 options' probabilities sum to 1", failures)
+        check(abs(answer["margin"] - (ranked[0] - ranked[1])) < 1e-9, "margin is top less second",
+              failures)
+        rows["wide"] = {"choice": answer["choice"], "top": ranked[:3],
+                        "label_mass": response["diagnostics"]["wide"]["label_mass"]}
+    team = questions(1)
+    status, response = call_status("/v1/systemone", {"state": state, "questions": team,
+                                                     "runoff": True})
+    check(status == 200, "runoff answers", failures)
+    if status == 200:
+        answer = next(iter(response["answers"].values()))
+        check(abs(sum(answer["probabilities"].values()) - 1.0) < 1e-6 and
+              answer["choice"] == max(answer["probabilities"], key=answer["probabilities"].get),
+              "runoff's choice is its most likely option", failures)
+        rows["runoff"] = answer["probabilities"]
+    conversation = {"messages": [
+        {"role": "system", "content": "You are a support agent."},
+        {"role": "user", "content": "My card was charged twice for one order."},
+        {"role": "assistant", "content": "I am sorry, let me check the payment."}]}
+    status, response = call_status("/v1/systemone", {"conversation": conversation,
+                                                     "questions": questions(3)})
+    check(status == 200, "questions about a conversation are answered", failures)
+    if status == 200:
+        rows["conversation"] = {k: v["probabilities"] for k, v in response["answers"].items()}
+    status, response = call_status("/v1/systemone", {"state": state, "questions": questions(3),
+                                                     "layout": "schema_first"})
+    check(status == 200, "schema_first answers", failures)
+    plain = call("/v1/systemone", {"state": state, "questions": questions(8)})
+    status, rechecked = call_status("/v1/systemone", {"state": state, "questions": questions(8),
+                                                      "recheck_margin": 1.0})
+    check(status == 200, "recheck_margin answers", failures)
+    if status == 200:
+        worst = max(abs(value - rechecked["answers"][name]["probabilities"][key])
+                    for name, answer in plain["answers"].items()
+                    for key, value in answer["probabilities"].items())
+        rows["recheck_max_probability_change"] = worst
+    status, response = call_status("/v1/systemone", {"state": state, "questions": questions(200)})
+    check(status == 200 and len(response.get("answers", {})) == 200, "200 questions are answered",
+          failures)
+    status, _ = call_status("/v1/systemone", {"state": state, "questions": questions(201)})
+    check(status == 400, "201 questions are refused", failures)
+    record["features"] = rows
+    print(json.dumps({"features": rows}), flush=True)
 
 
 def timed(path: str, body: dict) -> tuple[float, dict]:
@@ -249,16 +371,22 @@ def latency_section(record: dict, lanes: int) -> None:
             state = state_text(state_tokens) + f"\nRequest marker {state_tokens}-{count}."
             body = {"state": state, "questions": questions(count)}
             cold, response = timed("/v1/systemone", body)
-            warm = []
+            warm, repeat = [], []
+            for salt in (1, 2, 3):
+                wall, _ = timed("/v1/systemone",
+                                {"state": state, "questions": questions(count, salt)})
+                warm.append(wall)
             for _ in range(3):
                 wall, response = timed("/v1/systemone", body)
-                warm.append(wall)
+                repeat.append(wall)
             masses = [d["label_mass"] for d in response["diagnostics"].values()]
             argmax = sum(1 for d in response["diagnostics"].values() if d["argmax_is_label"])
             row = {"state_tokens": response["usage"]["input_tokens"] // count, "questions": count,
                    "cold_s": round(cold, 3), "warm_s": [round(w, 3) for w in warm],
                    "warm_median_s": round(statistics.median(warm), 3),
                    "per_question_ms": round(1000 * statistics.median(warm) / count, 1),
+                   "repeat_s": [round(w, 3) for w in repeat],
+                   "repeat_median_s": round(statistics.median(repeat), 3),
                    "label_mass_min": round(min(masses), 4), "label_mass_mean": round(statistics.mean(masses), 4),
                    "argmax_is_label": f"{argmax}/{count}", "lanes": lanes}
             results.append(row)
@@ -278,16 +406,15 @@ def chat_stream(max_tokens: int, out: dict) -> None:
 
 def concurrency_section(record: dict) -> None:
     state = state_text(2000) + "\nConcurrency marker."
-    body = {"state": state, "questions": questions(16)}
-    call("/v1/systemone", body)  # the state is cached
+    call("/v1/systemone", {"state": state, "questions": questions(16)})  # the state is cached
     alone_chat: dict = {}
     chat_stream(256, alone_chat)
-    alone_decision, _ = timed("/v1/systemone", body)
+    alone_decision, _ = timed("/v1/systemone", {"state": state, "questions": questions(16, 1)})
     shared_chat: dict = {}
     thread = threading.Thread(target=chat_stream, args=(256, shared_chat))
     thread.start()
     time.sleep(0.5)
-    shared_decision, _ = timed("/v1/systemone", body)
+    shared_decision, _ = timed("/v1/systemone", {"state": state, "questions": questions(16, 2)})
     thread.join()
     row = {"decision_alone_s": round(alone_decision, 3), "decision_beside_chat_s": round(shared_decision, 3),
            "chat_alone_tok_s": alone_chat["timings"].get("predicted_per_second"),
@@ -304,6 +431,8 @@ def main() -> int:
     parser.add_argument("--server", default=str(ROOT / "build/apps/ninfer-serve"))
     parser.add_argument("--out", default=os.environ.get("NINFER_JOB_DIR", "."))
     parser.add_argument("--lanes", type=int, default=4)
+    parser.add_argument("--flag", action="append", default=[],
+                        help="a server option, its value after a space")
     arguments = parser.parse_args()
     out = Path(arguments.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -312,11 +441,15 @@ def main() -> int:
     record: dict = {"model": arguments.model, "lanes": arguments.lanes}
     failures: list[str] = []
     try:
+        flags = [part for flag in arguments.flag for part in flag.split(" ")]
+        record["flags"] = flags
         process = start_server(Path(arguments.server), Path(arguments.model), arguments.lanes,
-                               out / "decisions.server.log")
+                               out / "decisions.server.log", flags)
         record["server_pid"] = process.pid
         answers_section(record, failures)
         agreement_section(record, failures)
+        branch_oracle(record, failures)
+        features_section(record, failures)
         latency_section(record, arguments.lanes)
         concurrency_section(record)
     finally:
