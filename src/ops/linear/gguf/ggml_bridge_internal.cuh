@@ -148,10 +148,10 @@ __device__ __forceinline__ void vec_store(const VecStore& out, int row, int colu
     out.bf16[at] = __float2bfloat16(value);
 }
 
-template <ggml_type type>
+template <ggml_type type, typename Dst = float, bool accumulate = false>
 void matrix_product_impl(const void* weight, std::int64_t row_bytes, int rows, int k,
-                         const void* activation, int columns, float* out,
+                         const void* activation, int columns, Dst* out,
                          std::int64_t out_column_stride, void* fixup, cudaStream_t stream,
-                         bool tail);
+                         bool tail, float* partial = nullptr);
 
 } // namespace ninfer::ops::gguf::detail

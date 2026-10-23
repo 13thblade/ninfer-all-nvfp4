@@ -878,6 +878,47 @@ void matrix_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
     throw std::invalid_argument("gguf matrix product: no integer kernel for this block type");
 }
 
+void matrix_product_bf16(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
+                         const void* activation, int columns, __nv_bfloat16* out,
+                         std::int64_t out_column_stride, float* partial, void* fixup,
+                         cudaStream_t stream, bool accumulate, bool tail) {
+#define NINFER_GGUF_MATRIX_CASE(NAME)                                                              \
+    case GgmlType::NAME:                                                                           \
+        if (accumulate) {                                                                         \
+            detail::matrix_product_impl<GGML_TYPE_##NAME, __nv_bfloat16, true>(                     \
+                weight, row_bytes, rows, k, activation, columns, out, out_column_stride,           \
+                fixup, stream, tail, partial);                                                     \
+        } else {                                                                                  \
+            detail::matrix_product_impl<GGML_TYPE_##NAME, __nv_bfloat16, false>(                    \
+                weight, row_bytes, rows, k, activation, columns, out, out_column_stride,           \
+                fixup, stream, tail, partial);                                                     \
+        }                                                                                         \
+        return
+    switch (type) {
+        NINFER_GGUF_MATRIX_CASE(Q8_0);
+        NINFER_GGUF_MATRIX_CASE(Q4_0);
+        NINFER_GGUF_MATRIX_CASE(Q5_0);
+        NINFER_GGUF_MATRIX_CASE(Q2_0);
+        NINFER_GGUF_MATRIX_CASE(Q2_K);
+        NINFER_GGUF_MATRIX_CASE(Q3_K);
+        NINFER_GGUF_MATRIX_CASE(Q4_K);
+        NINFER_GGUF_MATRIX_CASE(Q5_K);
+        NINFER_GGUF_MATRIX_CASE(Q6_K);
+        NINFER_GGUF_MATRIX_CASE(IQ2_XXS);
+        NINFER_GGUF_MATRIX_CASE(IQ2_XS);
+        NINFER_GGUF_MATRIX_CASE(IQ2_S);
+        NINFER_GGUF_MATRIX_CASE(IQ3_XXS);
+        NINFER_GGUF_MATRIX_CASE(IQ3_S);
+        NINFER_GGUF_MATRIX_CASE(IQ1_S);
+        NINFER_GGUF_MATRIX_CASE(IQ4_NL);
+        NINFER_GGUF_MATRIX_CASE(IQ4_XS);
+    case GgmlType::IQ1_M:
+        break;
+    }
+#undef NINFER_GGUF_MATRIX_CASE
+    throw std::invalid_argument("gguf matrix product: no integer kernel for this block type");
+}
+
 bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail) {
 #define NINFER_GGUF_MOE_FITS_CASE(NAME)                                                            \
     case GgmlType::NAME:                                                                           \
