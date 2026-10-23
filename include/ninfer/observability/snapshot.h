@@ -68,6 +68,10 @@ struct RuntimeStats {
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds             = 0;
     std::uint64_t decode_row_rounds         = 0;
+    // Prefill passes that computed the last prompt chunks of several requests at once, and the
+    // sum of the requests in them.
+    std::uint64_t shared_prefill_passes     = 0;
+    std::uint64_t shared_prefill_requests   = 0;
     std::uint32_t running_requests          = 0;
     std::uint32_t prefilling_requests       = 0;
     std::uint32_t decode_ready_requests     = 0;

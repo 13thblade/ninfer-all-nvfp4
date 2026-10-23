@@ -65,7 +65,7 @@ Hybrid mode configures itself: the only capacity a deployment chooses is `--host
 | §7.7 endpoint snapshots at finish and consistent abort | implemented |
 | §6.2 cost model | implemented: the Engine's context-cost coefficients (prefill and Host-to-Device transfer) rank sources and value snapshots |
 | §5.5 persistence across restarts | implemented (opt-in `--prefix-cache-file`) |
-| §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again; in this line a request is admitted while another prefills only with `--concurrent-prefill`, so coalescing needs it |
+| §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again; in this line a request is admitted while another prefills with `--concurrent-prefill`, or without it only while every staged prefill is a last chunk that can share a pass, so coalescing needs the option |
 | reuse-loss attribution | implemented: the request log's `materialization` record carries `cached_prefix_tokens` (longest cached block prefix, reusable or not), and `restored_host_bytes` |
 | §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1) |
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
@@ -656,6 +656,15 @@ Candidates, in priority order:
   generation opener is not tapped. Measured on a tool-calling agent trace (27B NVFP4, INT8 KV,
   `--preserve-thinking`), the opener split cost about 15 ms of a ~70–130 ms turn TTFT. Requests
   that resumed from a tap keep the exact opener: their client re-renders history.
+- A `Disposable` request (a decision read) keeps no tap past its last explicit marker: no request
+  continues it, so a snapshot of its own text (the question) serves nobody and an exact tap there
+  only costs a pass.
+- On an Engine with a drafter (`--spec`), a request without drafting
+  (`ExecutionOptions::speculative_drafting = false`, one output token; the decision reads) keeps
+  only exact taps, and the drafter's prompt work (the MTP bridge and KV, the DFlash context) runs
+  only below the deepest one or its resume point: the snapshots it publishes there carry the
+  drafter's state for drafting requests, and the rest of its prompt runs without the drafter. It
+  publishes no endpoint, since its drafter state stops short of it.
 - Hints are the Frontend's existing `message_boundaries` plus the structural boundaries it already
   computes.
 - At most `max_new_taps` (default 8 with a Host tier, 2 without) taps are kept per request.
@@ -1085,7 +1094,10 @@ Uncalibrated terms keep the index's generic defaults. No separate calibration ru
      chunk.
    - It waits only when the prefill it saves exceeds the split it may add, and when twice the
      sibling's predicted prefill up to the target (other lanes' decode rounds interleave) is within
-     half the Engine's queue timeout (`pending_timeout_ms`). A waiting head stays in the FIFO.
+     half the Engine's queue timeout (`pending_timeout_ms`). The saving is its prefill from its
+     own resume point less its prefill from the target: the pass it runs either way is not saved.
+     Counting it as saved once made questions that share their first token after a cached state
+     wait one token deeper and split the sibling's pass for it. A waiting head stays in the FIFO.
    - Vision prompts do not coalesce: placeholder tokens are equal for different media.
    - Every sibling prefill boundary re-arms admission, and the head stops waiting once the sibling
      passes the target, finishes or is cancelled. So a missing snapshot never blocks it for long.

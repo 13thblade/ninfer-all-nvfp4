@@ -135,6 +135,13 @@ struct PreparedRequest {
     std::shared_ptr<void> model_hold;
 };
 
+// A request prepared up to its Engine submission: its prompt is rendered and tokenized and it
+// holds ingress capacity, but the Engine has not seen it.
+struct StagedRequest {
+    PreparedRequest prepared;
+    ninfer::GenerationSubmission submission;
+};
+
 // The Engine configuration a serve invocation selects. Separate from the service so the mapping
 // from parsed options to what the Engine is actually started with can be checked without a model.
 [[nodiscard]] ninfer::EngineOptions make_engine_options(const ServeOptions& options);
@@ -221,6 +228,15 @@ public:
                                           ninfer::GenerationObservationOptions observation = {},
                                           std::function<bool()> is_cancelled               = {},
                                           ContextCacheHints context_cache = {}) const;
+    // prepare() up to the Engine submission, which submit_group() makes.
+    [[nodiscard]] StagedRequest stage(const GenerationRequest& req,
+                                      GenerationConsumerMode consumer_mode,
+                                      ninfer::GenerationObservationOptions observation = {},
+                                      std::function<bool()> is_cancelled               = {},
+                                      ContextCacheHints context_cache                  = {}) const;
+    // Submits staged requests at once, in order: they enter the Engine's queue together, so a
+    // Qwen3.5-core Engine runs the last prompt chunks of short ones in one shared prefill pass.
+    [[nodiscard]] std::vector<PreparedRequest> submit_group(std::vector<StagedRequest> staged) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 
@@ -244,8 +260,8 @@ private:
         UnboundedStartup,
     };
 
-    [[nodiscard]] PreparedRequest
-    prepare_impl(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
+    [[nodiscard]] StagedRequest
+    stage_impl(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
                  ninfer::GenerationObservationOptions observation,
                  std::function<bool()> is_cancelled, ContextCacheHints context_cache,
                  CacheParticipation cache_participation, DeadlinePolicy deadline_policy) const;

@@ -975,6 +975,41 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence,
     }
 }
 
+std::optional<std::uint32_t>
+ProgramImpl::prefill_batch_tokens(SequenceHandle sequence) const noexcept {
+    if (pending_transaction_ || !valid_sequence(sequence)) { return std::nullopt; }
+    try {
+        return prefill_batch_tokens(ContractAccess::lane(sequence).value);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+runtime::ExecutionTiming ProgramImpl::prefill_batch(std::span<const SequenceHandle> sequences,
+                                                    runtime::ExecutionTiming* failed_timing) {
+    if (pending_transaction_ || sequences.empty() || sequences.size() > max_concurrency) {
+        throw std::logic_error("batched prefill membership is invalid");
+    }
+    std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+    for (std::size_t row = 0; row < sequences.size(); ++row) {
+        if (!valid_sequence(sequences[row])) {
+            throw std::logic_error("prefill sequence capability is invalid");
+        }
+        lanes[row] = ContractAccess::lane(sequences[row]).value;
+    }
+    const std::span<const std::uint32_t> members(lanes.data(), sequences.size());
+    try {
+        return advance_prefill_batch(members, failed_timing);
+    } catch (...) {
+        const Clock::time_point cleanup_started = Clock::now();
+        clear_execution_failure_lanes(members);
+        if (failed_timing != nullptr) {
+            failed_timing->post_host_ns += elapsed_ns(cleanup_started);
+        }
+        throw;
+    }
+}
+
 bool ProgramImpl::can_clear_lane_strict(const SequenceState& sequence) const {
     const auto* begin = continuation_states.data();
     const auto* end   = begin + continuation_capacity;

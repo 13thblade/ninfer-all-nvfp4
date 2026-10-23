@@ -219,6 +219,10 @@ struct RequestBasePlanImpl {
     bool logprobs = false;
     // With logprobs: the token ids read out exactly on the first generated token.
     std::vector<TokenId> readout_tokens;
+    // The speculative drafter serves this request (ExecutionOptions::speculative_drafting, or a
+    // Program without one). Without it, the drafter's prompt work stops at the deepest cache entry
+    // the request publishes.
+    bool drafting                             = true;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
@@ -286,6 +290,7 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::shared_ptr<text::GrammarState> grammar;
     bool logprobs                             = false;
     std::vector<TokenId> readout_tokens;
+    bool drafting                             = true;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     runtime::LaneId destination{};
@@ -309,6 +314,7 @@ struct HybridQuoteImpl {
     std::shared_ptr<text::GrammarState> grammar;
     bool logprobs                             = false;
     std::vector<TokenId> readout_tokens;
+    bool drafting                             = true;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
@@ -585,10 +591,23 @@ struct RequestControl {
         std::uint32_t hidden_replay_tokens  = 0;
         std::uint32_t prompt_tokens         = 0;
         std::uint32_t initial_mtp_extent    = 0;
+        // A request without drafting runs the drafter's prompt work (the MTP bridge and KV, the
+        // DFlash context) only below this frontier, the deepest cache entry it may publish; every
+        // prefill pass lies wholly below or above it. Empty: over the whole prompt.
+        std::optional<std::uint32_t> drafter_frontier;
         double elapsed_seconds              = 0.0;
         bool prepare_mtp                    = false;
         ReusePath reuse                     = ReusePath::Root;
         MtpBridgeMode mtp_bridge            = MtpBridgeMode::None;
+        // Set once a batched pass (advance_prefill_batch) has computed the rest of the prompt:
+        // the KV and state reach the prompt frontier, and the sampled token waits here for the
+        // lane's next advance_prefill, which completes the step without device work.
+        struct Batched {
+            TokenId token = 0;
+            runtime::RawTokenLogprob logprob;
+            std::uint32_t processed_prompt_tokens = 0;
+        };
+        std::optional<Batched> batched;
     };
 
     std::optional<Prefill> prefill;
@@ -719,6 +738,13 @@ public:
     void release_seal_window() noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing);
+    // The prompt tokens the sequence's next prefill step computes when it can join a batched
+    // pass (advance_prefill_batch), or empty.
+    [[nodiscard]] std::optional<std::uint32_t>
+    prefill_batch_tokens(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] runtime::ExecutionTiming
+    prefill_batch(std::span<const SequenceHandle> sequences,
+                  runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -995,7 +1021,8 @@ public:
         round_logprobs{};
     std::optional<PinnedHostBuffer> logprobs_host;
     std::optional<bool> logprobs_armed;
-    // The host copy of a prefill's typed readout (io.readout_values).
+    // The host copy of a prefill's typed readout (io.readout_values); a batched prefill's rows lie
+    // kMaximumReadoutTokens apart.
     std::optional<PinnedHostBuffer> readout_host;
 
     std::optional<PinnedHostBuffer> ordinary_host;
@@ -1707,8 +1734,9 @@ private:
     std::int32_t arm_readout(std::span<const TokenId> ids);
     // Copies the first `count` readout values to the host, ordered after the enqueued prefill.
     void fetch_readout(std::int32_t count);
-    // Attaches the fetched readout values to the first token's record.
-    void attach_readout(runtime::RawTokenLogprob& record, std::int32_t count) const;
+    // Attaches the fetched readout values of batched prefill row `row` to its token's record.
+    void attach_readout(runtime::RawTokenLogprob& record, std::int32_t count,
+                        std::int32_t row = 0) const;
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
     void
@@ -1723,6 +1751,22 @@ private:
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
                     runtime::ExecutionTiming* failed_timing);
+    // The rest of the lane's prompt in one final pass, when it can share that pass with others.
+    [[nodiscard]] std::optional<std::uint32_t> prefill_batch_tokens(std::uint32_t lane) const;
+    // One pass computing the rest of each lane's prompt (every lane prefill_batch_tokens admits,
+    // together within one prefill chunk) and sampling each lane's first token; each lane's next
+    // advance_prefill returns its completed step.
+    [[nodiscard]] runtime::ExecutionTiming
+    advance_prefill_batch(std::span<const std::uint32_t> lanes,
+                          runtime::ExecutionTiming* failed_timing);
+    // The bookkeeping of a step that sampled the lane's first token, host_tokens[0] (and with
+    // logprobs round_logprobs[0]): the ledger, the Begin candidate and the step result.
+    [[nodiscard]] runtime::PrefillStepResult
+    complete_prefill_step(SequenceState& sequence, RequestControl& request,
+                          const runtime::BeginSummary& summary,
+                          std::uint32_t processed_prompt_tokens,
+                          std::span<const TokenId> initial_drafts,
+                          runtime::ExecutionTimingRecorder& timing);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);

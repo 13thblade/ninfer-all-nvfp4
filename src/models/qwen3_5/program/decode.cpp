@@ -262,16 +262,20 @@ std::int32_t ProgramImpl::arm_readout(std::span<const TokenId> ids) {
 
 void ProgramImpl::fetch_readout(std::int32_t count) {
     if (count <= 0) { return; }
-    if (!readout_host) { readout_host.emplace(kMaximumReadoutTokens * sizeof(float)); }
+    if (!readout_host) {
+        readout_host.emplace(kMaximumConcurrency * kMaximumReadoutTokens * sizeof(float));
+    }
     CUDA_CHECK(cudaMemcpyAsync(readout_host->data(), io.readout_values.data,
                                static_cast<std::size_t>(count) * sizeof(float),
                                cudaMemcpyDeviceToHost, device.stream));
 }
 
-void ProgramImpl::attach_readout(runtime::RawTokenLogprob& record, std::int32_t count) const {
+void ProgramImpl::attach_readout(runtime::RawTokenLogprob& record, std::int32_t count,
+                                 std::int32_t row) const {
     record.readout_count = 0;
     if (count <= 0) { return; }
-    const auto* values = static_cast<const float*>(readout_host->data());
+    const auto* values = static_cast<const float*>(readout_host->data()) +
+                         static_cast<std::size_t>(row) * kMaximumReadoutTokens;
     std::copy_n(values, count, record.readout_values.begin());
     record.readout_count = static_cast<std::uint32_t>(count);
 }

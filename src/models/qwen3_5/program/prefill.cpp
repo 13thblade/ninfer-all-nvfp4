@@ -94,7 +94,9 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base,
+                     state.drafter ? state.mtp_kv : qwen3_5::PagedKVCacheView{},
+                     &state.text_cache, state.drafter ? state.mtp_cache : nullptr);
     card.set_stage_runtime(state.execution.stages);
     card.set_expert_runtime(state.execution.experts);
     card.set_rope_yarn(state.execution.rope_yarn);
@@ -107,7 +109,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                                                    : -1);
     if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
     const std::span<const int> prompt(ids.data(), ids.size());
-    if (state.dflash != nullptr) {
+    if (state.dflash != nullptr && state.drafter) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
                                   sink);
@@ -123,7 +125,9 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base,
+                     state.drafter ? state.mtp_kv : qwen3_5::PagedKVCacheView{},
+                     &state.text_cache, state.drafter ? state.mtp_cache : nullptr);
     card.set_stage_runtime(state.execution.stages);
     card.set_expert_runtime(state.execution.experts);
     card.set_rope_yarn(state.execution.rope_yarn);
@@ -134,7 +138,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
-    if (state.dflash != nullptr) {
+    if (state.dflash != nullptr && state.drafter) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
                                   finalize_at_end, sink);
@@ -734,7 +738,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
 
         request.timings              = {};
         request.pending              = {};
-        request.publish_continuation = request_plan.summary.publish_continuation;
+        request.publish_continuation =
+            request_plan.summary.publish_continuation && request_plan.drafting;
         sequence.mtp_draft_count     = 0;
         sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.swap(materialization_ledger_);
@@ -1110,6 +1115,15 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     };
     const auto started                    = Clock::now();
     try {
+        if (staged.batched) {
+            // A batched pass has computed the rest of the prompt (advance_prefill_batch).
+            const RequestControl::Prefill::Batched batched = *staged.batched;
+            staged.batched.reset();
+            host_tokens[0] = batched.token;
+            if (request.logprobs) { round_logprobs[0] = batched.logprob; }
+            processed_prompt_tokens = batched.processed_prompt_tokens;
+            return complete_prefill_step(sequence, request, summary, reported_tokens(), {}, timing);
+        }
         if (staged.next_capture < staged.capture_groups.size() &&
             staged.capture_groups[staged.next_capture].frontier == staged.cursor) {
             // A capture before any prefill records the resumed state itself: a shared promotion of
@@ -1188,6 +1202,13 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         };
         arm_logprobs(request.logprobs);
         schedule_state.readout_count = arm_readout(request.readout_tokens);
+        // A request without drafting leaves the drafter where its frontier stops it.
+        const auto drafter_at = [&staged](std::uint32_t position) {
+            return !staged.drafter_frontier || position < *staged.drafter_frontier;
+        };
+        if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix && !drafter_at(staged.base)) {
+            staged.mtp_bridge = MtpBridgeMode::None;
+        }
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -1269,6 +1290,13 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 if (hybrid_split && (!split_frontier || *hybrid_split < *split_frontier)) {
                     split_frontier = *hybrid_split;
                 }
+                if (staged.drafter_frontier && *staged.drafter_frontier > staged.cursor &&
+                    *staged.drafter_frontier < staged.prompt_tokens &&
+                    (!split_frontier || *staged.drafter_frontier < *split_frontier)) {
+                    split_frontier = *staged.drafter_frontier;
+                }
+                const bool drafter     = drafter_at(staged.cursor);
+                schedule_state.drafter = drafter;
                 execution::PrefillChunkResult result;
                 timing.pause();
                 if (staged.vision) {
@@ -1298,8 +1326,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 remaining -= result.processed_tokens;
                 final_chunk_tokens     = result.processed_tokens;
                 sequence.text_kv_valid = staged.cursor;
-                if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
-                if (is_masked_draft_backend(speculative_backend)) {
+                if (staged.prepare_mtp && drafter) { sequence.mtp_kv_valid = staged.cursor; }
+                if (is_masked_draft_backend(speculative_backend) && drafter) {
                     sequence.dflash_context_frontier = staged.cursor;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
@@ -1360,7 +1388,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                           ops::kSamplePurposePrefill);
             set_device_i32(io.rope_pos, checked_i32(staged.prompt_tokens, "rope position") +
                                             sequence.rope_delta);
-            if (staged.prepare_mtp) {
+            if (staged.prepare_mtp && drafter_at(staged.base)) {
                 if (staged.mtp_bridge != MtpBridgeMode::AfterExactHit) {
                     throw std::logic_error("zero-suffix MTP reuse has no exact-hit bridge");
                 }
@@ -1392,71 +1420,15 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         device.synchronize();
         timing.end_wait();
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
-        const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
-        const std::uint32_t prompt_tokens = staged.prompt_tokens;
-
-        validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
         if (request.logprobs) {
             round_logprobs[0] = fetched_logprob(0, host_tokens[0]);
             attach_readout(round_logprobs[0], schedule_state.readout_count);
         }
-        if (sequence.ledger.size() != prompt_tokens) {
-            throw std::logic_error("candidate token ledger does not match prompt length");
-        }
-        sequence.ledger.push_back(host_tokens[0]);
-        sequence.prefix_identity.append_generated(1, sequence.rope_delta);
-        sequence.prefix_digests.append_generated(std::span<const TokenId>(host_tokens, 1),
-                                                 sequence.rope_delta);
-        sequence.text_kv_valid = prompt_tokens;
-        if (staged.prepare_mtp) {
-            if (sequence.mtp_kv_valid != prompt_tokens) {
-                throw std::logic_error("staged MTP prefill did not reach the prompt frontier");
-            }
-            sequence.mtp_draft_count = staged.initial_mtp_extent;
-            std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
-                        sequence.mtp_drafts.begin());
-        } else if (is_masked_draft_backend(speculative_backend) &&
-                   sequence.dflash_context_frontier != prompt_tokens) {
-            throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
-        }
-        sequence.tail_hidden_valid      = true;
-        request.timings.vision_seconds  = vision_seconds;
-        request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
-        if (staged.vision) {
-            const execution::VisionOverlayWindowStats overlay = staged.vision->overlay_stats();
-            request.timings.overlay_windows           = overlay.windows;
-            request.timings.overlay_exclusive_windows = overlay.exclusive_windows;
-            request.timings.overlay_window_seconds    = overlay.window_seconds;
-            request.timings.overlay_evict_seconds     = overlay.evict_seconds;
-            request.timings.overlay_restore_seconds   = overlay.restore_seconds;
-            request.timings.overlay_evicted_bytes     = overlay.evicted_bytes;
-            request.timings.overlay_staged_bytes      = overlay.staged_bytes;
-        }
-        staged.prompt.release_all_media_payloads();
-        if (staged.vision) { staged.vision->retire_handoff(); }
-
-        const bool prompt_frontier_capture =
-            staged.next_capture < staged.capture_groups.size() &&
-            staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
-        if (!prompt_frontier_capture) { request.prefill.reset(); }
-        request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
-                                             .base_E        = 0,
-                                             .base_S        = 0,
-                                             .prompt_tokens = prompt_tokens,
-                                             .produced      = 1};
-        request.lifecycle = Lifecycle::Pending;
-        return runtime::PrefillStepResult{
-            .summary = summary,
-            .round   = runtime::GeneratedRound{
-                .tokens   = std::span<const TokenId>(host_tokens, 1),
-                .logprobs = request.logprobs
-                                ? std::span<const runtime::RawTokenLogprob>(round_logprobs.data(), 1)
-                                : std::span<const runtime::RawTokenLogprob>{},
-            },
-            .processed_prompt_tokens = reported_tokens(),
-            .complete                = true,
-            .timing                  = timing.finish(),
-        };
+        return complete_prefill_step(
+            sequence, request, summary, reported_tokens(),
+            std::span<const TokenId>(initial_drafts.data(),
+                                     staged.prepare_mtp ? staged.initial_mtp_extent : 0U),
+            timing);
     } catch (...) {
         timing.begin_wait();
         try {
@@ -1469,5 +1441,243 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     }
 }
 
+runtime::PrefillStepResult ProgramImpl::complete_prefill_step(
+    SequenceState& sequence, RequestControl& request, const runtime::BeginSummary& summary,
+    std::uint32_t processed_prompt_tokens, std::span<const TokenId> initial_drafts,
+    runtime::ExecutionTimingRecorder& timing) {
+    RequestControl::Prefill& staged   = *request.prefill;
+    const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
+    const std::uint32_t prompt_tokens = staged.prompt_tokens;
+
+    validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
+    if (sequence.ledger.size() != prompt_tokens) {
+        throw std::logic_error("candidate token ledger does not match prompt length");
+    }
+    sequence.ledger.push_back(host_tokens[0]);
+    sequence.prefix_identity.append_generated(1, sequence.rope_delta);
+    sequence.prefix_digests.append_generated(std::span<const TokenId>(host_tokens, 1),
+                                             sequence.rope_delta);
+    sequence.text_kv_valid = prompt_tokens;
+    if (staged.prepare_mtp) {
+        if (!staged.drafter_frontier && sequence.mtp_kv_valid != prompt_tokens) {
+            throw std::logic_error("staged MTP prefill did not reach the prompt frontier");
+        }
+        sequence.mtp_draft_count = static_cast<std::uint32_t>(initial_drafts.size());
+        std::copy(initial_drafts.begin(), initial_drafts.end(), sequence.mtp_drafts.begin());
+    } else if (is_masked_draft_backend(speculative_backend) && !staged.drafter_frontier &&
+               sequence.dflash_context_frontier != prompt_tokens) {
+        throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
+    }
+    sequence.tail_hidden_valid      = true;
+    request.timings.vision_seconds  = vision_seconds;
+    request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
+    if (staged.vision) {
+        const execution::VisionOverlayWindowStats overlay = staged.vision->overlay_stats();
+        request.timings.overlay_windows           = overlay.windows;
+        request.timings.overlay_exclusive_windows = overlay.exclusive_windows;
+        request.timings.overlay_window_seconds    = overlay.window_seconds;
+        request.timings.overlay_evict_seconds     = overlay.evict_seconds;
+        request.timings.overlay_restore_seconds   = overlay.restore_seconds;
+        request.timings.overlay_evicted_bytes     = overlay.evicted_bytes;
+        request.timings.overlay_staged_bytes      = overlay.staged_bytes;
+    }
+    staged.prompt.release_all_media_payloads();
+    if (staged.vision) { staged.vision->retire_handoff(); }
+
+    const bool prompt_frontier_capture =
+        staged.next_capture < staged.capture_groups.size() &&
+        staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
+    if (!prompt_frontier_capture) { request.prefill.reset(); }
+    request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
+                                         .base_E        = 0,
+                                         .base_S        = 0,
+                                         .prompt_tokens = prompt_tokens,
+                                         .produced      = 1};
+    request.lifecycle = Lifecycle::Pending;
+    return runtime::PrefillStepResult{
+        .summary = summary,
+        .round   = runtime::GeneratedRound{
+            .tokens   = std::span<const TokenId>(host_tokens, 1),
+            .logprobs = request.logprobs
+                            ? std::span<const runtime::RawTokenLogprob>(round_logprobs.data(), 1)
+                            : std::span<const runtime::RawTokenLogprob>{},
+        },
+        .processed_prompt_tokens = processed_prompt_tokens,
+        .complete                = true,
+        .timing                  = timing.finish(),
+    };
+}
+
+std::optional<std::uint32_t> ProgramImpl::prefill_batch_tokens(std::uint32_t lane) const {
+    if (lane >= max_concurrency || stage_runtime || prefill_hidden.data == nullptr ||
+        !round_host) {
+        return std::nullopt;
+    }
+    const RequestControl& request = requests[lane];
+    if (request.lifecycle != Lifecycle::Prefilling || !request.prefill || request.grammar) {
+        return std::nullopt;
+    }
+    const RequestControl::Prefill& staged = *request.prefill;
+    const SequenceState& sequence         = active_sequence(lane);
+    // Only an unconstrained text prompt's last chunk with nothing that splits or extends the pass:
+    // no capture, bridge, drafter work or exact tap ahead of the cursor.
+    if (staged.batched || staged.pending_capture_offer != 0 || staged.vision ||
+        staged.prompt.has_media() || sequence.rope_delta != 0 ||
+        staged.cursor >= staged.prompt_tokens ||
+        staged.prompt_tokens - staged.cursor > prefill_chunk ||
+        staged.next_capture != staged.capture_groups.size() || staged.initial_mtp_extent != 0) {
+        return std::nullopt;
+    }
+    const bool drafter =
+        !staged.drafter_frontier || staged.cursor < *staged.drafter_frontier;
+    if (drafter && speculative_backend != SpeculativeBackend::None) { return std::nullopt; }
+    if (staged.mtp_bridge != MtpBridgeMode::None &&
+        !(staged.mtp_bridge == MtpBridgeMode::BeforeSuffix && staged.drafter_frontier &&
+          staged.base >= *staged.drafter_frontier)) {
+        return std::nullopt;
+    }
+    const HybridLaneState* hybrid_lane = hybrid_ ? &hybrid_lanes_[lane] : nullptr;
+    if (hybrid_lane != nullptr && hybrid_lane->active) {
+        if (hybrid_lane->publish) {
+            for (std::size_t tap = hybrid_lane->next_tap; tap < hybrid_lane->taps.size(); ++tap) {
+                const runtime::prefix_cache::PlannedTap& planned = hybrid_lane->taps[tap];
+                if (planned.placement == runtime::prefix_cache::TapPlacement::Exact &&
+                    planned.position > staged.cursor && planned.position < staged.prompt_tokens) {
+                    return std::nullopt;
+                }
+            }
+        }
+    } else {
+        const auto& rewrite_frontiers = staged.prompt.identity.rewrite_execution_frontiers;
+        const auto rewrite_split =
+            std::upper_bound(rewrite_frontiers.begin(), rewrite_frontiers.end(), staged.cursor);
+        if (rewrite_split != rewrite_frontiers.end() && *rewrite_split < staged.prompt_tokens) {
+            return std::nullopt;
+        }
+    }
+    return staged.prompt_tokens - staged.cursor;
+}
+
+runtime::ExecutionTiming
+ProgramImpl::advance_prefill_batch(std::span<const std::uint32_t> lanes,
+                                   runtime::ExecutionTiming* failed_timing) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
+    if (lanes.empty() || lanes.size() > max_concurrency) {
+        throw std::invalid_argument("batched prefill needs one to max-concurrency lanes");
+    }
+    std::uint64_t seen      = 0;
+    std::uint32_t columns   = 0;
+    for (const std::uint32_t lane : lanes) {
+        const std::optional<std::uint32_t> tokens = prefill_batch_tokens(lane);
+        if (!tokens || (seen & (1ULL << lane)) != 0) {
+            throw std::logic_error("batched prefill lane cannot join the pass");
+        }
+        seen |= 1ULL << lane;
+        columns += *tokens;
+    }
+    if (columns > prefill_chunk) {
+        throw std::logic_error("batched prefill exceeds one prefill chunk");
+    }
+    const auto started = Clock::now();
+    try {
+        std::array<execution::PrefillSegment, kMaximumConcurrency> segments{};
+        bool logprobs = false;
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const std::uint32_t lane            = lanes[row];
+            SequenceState& sequence             = active_sequence(lane);
+            RequestControl& request             = requests[lane];
+            const RequestControl::Prefill& staged = *request.prefill;
+            bind_sequence_kv(sequence);
+            const StateImageSelectors selectors = state_selectors(sequence);
+            segments[row]                       = execution::PrefillSegment{
+                                      .ids = std::span<const int>(staged.prompt.token_ids)
+                                   .subspan(staged.cursor, staged.prompt_tokens - staged.cursor),
+                                      .begin        = staged.cursor,
+                                      .kv_table_row = static_cast<std::int32_t>(
+                    text_kv_addresses->bound_row(sequence.kv->text)),
+                                      .state_source_slot      = selectors.source,
+                                      .state_destination_slot = selectors.destination,
+                                      .sampling               = static_cast<const ops::SamplingConfig*>(
+                    sampling_config.slice(1, static_cast<std::int32_t>(lane), 1).data),
+                                      .readout = request.readout_tokens,
+            };
+            logprobs = logprobs || request.logprobs;
+            if (request.readout_tokens.size() > kMaximumReadoutTokens) {
+                throw std::logic_error("readout token ids exceed the round buffer");
+            }
+            // A Host restore still landing: the shared pass waits for all of its layers.
+            for (const cudaEvent_t ready : hybrid_take_restore_layers(lane)) {
+                CUDA_CHECK(cudaStreamWaitEvent(device.stream, ready, 0));
+            }
+        }
+        mark_workspace_usage(workspace_plan.text_prefill);
+        arm_logprobs(logprobs);
+        if (!readout_host) {
+            readout_host.emplace(kMaximumConcurrency * kMaximumReadoutTokens * sizeof(float));
+        }
+
+        const SequenceState& first = active_sequence(lanes.front());
+        execution::TextContext card(device, parameters, work, text_kv_view(first),
+                                    state_images->linear(0), io, prefill_hidden, prefill_chunk,
+                                    segments.front().begin, qwen3_5::PagedKVCacheView{},
+                                    &decoder->text_kv, nullptr);
+        card.set_expert_runtime(experts.get());
+        card.set_rope_yarn(rope_yarn);
+        card.set_fast_prefill_kernel(fast_prefill_kernel);
+        card.set_gdn_state_action(execution::GdnStateAction::UpdateInPlace, nullptr);
+        timing.pause();
+        const execution::PrefillChunkResult result = card.prefill_final_batch(
+            std::span<const execution::PrefillSegment>(segments.data(), lanes.size()),
+            execution::PrefillBatchHost{.tokens  = host_tokens,
+                                        .readout = static_cast<float*>(readout_host->data())});
+        timing.include(result.timing);
+        timing.resume_post();
+
+        // Each lane's state and KV now reach its prompt frontier; its continuation hidden is the
+        // last column of its segment.
+        std::int32_t column = 0;
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            SequenceState& sequence          = active_sequence(lanes[row]);
+            RequestControl::Prefill& staged  = *requests[lanes[row]].prefill;
+            const std::uint32_t processed    = staged.prompt_tokens - staged.cursor;
+            column                          += static_cast<std::int32_t>(processed);
+            staged.cursor                    = staged.prompt_tokens;
+            sequence.text_kv_valid           = staged.cursor;
+            commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+            settle_state_fork(sequence);
+            copy_tail(sequence, prefill_hidden.slice(1, column - 1, 1));
+        }
+        if (logprobs) { fetch_logprobs(static_cast<std::int32_t>(lanes.size())); }
+        timing.begin_wait();
+        device.synchronize();
+        timing.end_wait();
+
+        const double elapsed = std::chrono::duration<double>(Clock::now() - started).count();
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            RequestControl& request         = requests[lanes[row]];
+            RequestControl::Prefill& staged = *request.prefill;
+            RequestControl::Prefill::Batched batched{.token = host_tokens[row]};
+            if (request.logprobs) {
+                batched.logprob = fetched_logprob(static_cast<std::int32_t>(row), batched.token);
+                attach_readout(batched.logprob,
+                               static_cast<std::int32_t>(request.readout_tokens.size()),
+                               static_cast<std::int32_t>(row));
+            }
+            batched.processed_prompt_tokens =
+                static_cast<std::uint32_t>(segments[row].ids.size());
+            staged.elapsed_seconds += elapsed;
+            staged.batched = batched;
+        }
+        return timing.finish();
+    } catch (...) {
+        timing.begin_wait();
+        try {
+            device.synchronize();
+        } catch (...) {}
+        timing.end_wait();
+        clear_execution_failure_lanes(lanes);
+        throw;
+    }
+}
 
 } // namespace ninfer::models::qwen3_5::detail

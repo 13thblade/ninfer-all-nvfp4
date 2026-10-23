@@ -79,10 +79,10 @@ struct DecisionLabels {
 [[nodiscard]] DecisionLabels decision_labels(const DecisionQuestion& question);
 
 // The request that reads `question`: the system turn, then one user turn with the state, the
-// question and its options under the labels, thinking off, one output token, with the labels'
-// token ids (aligned with decision_labels(question).texts) read out exactly. The user turn's first
-// part holds the context and the state, with an explicit cache boundary after it; the second holds
-// the question.
+// question and its options under the labels, thinking off, one output token without the
+// speculative drafter, with the labels' token ids (aligned with decision_labels(question).texts)
+// read out exactly. Explicit cache boundaries follow the system turn and the user turn's first
+// part, which holds the context and the state; the second part holds the question.
 [[nodiscard]] GenerationRequest make_decision_read(const DecisionRequest& request,
                                                    const DecisionQuestion& question,
                                                    std::vector<ninfer::TokenId> label_tokens);

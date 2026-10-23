@@ -382,13 +382,21 @@ FIFO head 暂时受 active incumbents 阻塞时，Scheduler 记录 protected hea
 
 Scheduler 保证：
 
-- staged prefill 按 lane 持有；prefill unit 每次 worker boundary 只推进一个 lane 的一个
-  chunk（剩余 prompt 最短的可运行 lane；被跳过 `kPrefillMaxSkip` 次的 lane 优先），lane 在其
-  staged prefill 完成、settle 或 cancel 时从集合中清除。默认情况下 staged prefill 期间不进行
-  admission，因此同时最多一个 staged-prefill request；启用
-  `concurrent_prefill`（`--concurrent-prefill`）后，由于 prefill 不持有 resource transaction，
-  admission 可以在其它 request prefill 期间进行（仍受 open global topology transition 与 decode
-  连续性的门控），多个 request 可以同时处于 staged-prefill 状态；
+- staged prefill 按 lane 持有；prefill unit 每次 worker boundary 推进一个 lane 的一个
+  chunk（剩余 prompt 最短的可运行 lane；被跳过 `kPrefillMaxSkip` 次的 lane 优先）。若该 chunk
+  是 prompt 的最后一段且可共享（`Program::prefill_batch_tokens`：纯文本、无 grammar、段内无
+  capture、exact tap 或 drafter 工作），其它 staged lane 同样可共享的最后一段在合计不超过
+  `prefill_chunk` 时并入同一次 pass（`Program::prefill_batch`），随后各 lane 按 lane 顺序各自
+  完成 prefill step。lane 在其 staged prefill 完成、settle 或 cancel 时从集合中清除。默认情况下
+  staged prefill 期间不进行 admission，除非每个 staged prefill 都只剩可共享的最后一段：此时新
+  request 被接纳并可加入同一次 pass。启用 `concurrent_prefill`（`--concurrent-prefill`）后，由于
+  prefill 不持有 resource transaction，admission 可以在其它 request prefill 期间进行（仍受 open
+  global topology transition 与 decode 连续性的门控），多个 request 可以同时处于 staged-prefill
+  状态。admission 门打开时，一个 boundary 接纳所有能立即进入空闲 lane 的等待 request，使同时
+  到达的短 request 共享一次 prefill pass。`Engine::submit_group` 在一次 queue lock 下按序入队
+  一组 request（先为整组预留容量，任一成员出错则整组都不入队），worker 因此在同一 boundary
+  看到整组，而不是先启动第一个、其余在它的 pass 期间才到达（serve 的 decision read 与 rerank
+  window 即如此提交）；
 - 已有 decode work 不会被连续 prefill 饿死：只要有 decode work，每个 prefill unit 之前先运行
   `decode_rounds_per_prefill` 个 decode（或 control）unit（按该 unit 的 token 数相对一个 chunk
   成比例，至少一个；`0` 为 `prefill_chunk / 64`，`1` 为严格交替），短 prompt 因此一轮之后即可

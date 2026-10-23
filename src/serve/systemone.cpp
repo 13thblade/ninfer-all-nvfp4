@@ -493,7 +493,12 @@ GenerationRequest make_decision_read(const DecisionRequest& request,
         break;
     }
     GenerationRequest out;
-    out.messages.push_back(text_turn(ChatRole::System, kSystem));
+    // Every read of every request starts with this turn; a boundary after it lets a request's
+    // first read resume there. The planner drops a structural boundary this close to the prompt
+    // start, an explicit one it keeps.
+    ChatTurn system            = text_turn(ChatRole::System, kSystem);
+    system.cache_boundary_after = CacheBoundary{};
+    out.messages.push_back(std::move(system));
     ChatTurn user = text_turn(ChatRole::User, std::move(shared));
     user.content.front().cache_boundary_after = CacheBoundary{};
     user.content.push_back(ContentPart{.kind = ContentKind::Text, .text = std::move(text)});
@@ -505,6 +510,8 @@ GenerationRequest make_decision_read(const DecisionRequest& request,
     out.sampling.frequency_penalty = 0.0;
     out.logprobs                   = true;
     out.readout_tokens             = std::move(label_tokens);
+    // One token drafts nothing; --spec's drafter would only run over the prompt.
+    out.speculative_drafting = false;
     // The server's default graft would be a hidden prefix the question does not expect.
     out.graft = std::string();
     return out;

@@ -242,8 +242,10 @@ void prompts() {
     const GenerationRequest choice = make_decision_read(request, request.questions[0], {32, 33});
     expect(choice.messages.size() == 2 && choice.messages[0].role == ninfer::ChatRole::System &&
                choice.messages[0].content.at(0).text.find("one label only") != std::string::npos &&
+               choice.messages[0].cache_boundary_after == CacheBoundary{} &&
                choice.messages[1].role == ninfer::ChatRole::User,
-           "the system turn asking for one label, then the user turn");
+           "the system turn asking for one label, with an explicit cache boundary, then the "
+           "user turn");
     const std::vector<ContentPart>& parts = choice.messages[1].content;
     expect(parts.size() == 2 && parts[0].text.rfind("State:\n{\"ticket\"", 0) == 0 &&
                parts[0].text.ends_with("}\n\n") &&
@@ -257,6 +259,12 @@ void prompts() {
                         [](const ContentPart&) -> ninfer::OwnedMedia {
                             throw std::logic_error("a decision read has no media");
                         });
+    const ninfer::PromptCacheMarker after_system{
+        .after_message_count = 1,
+        .kind                = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence            = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+    };
     const ninfer::PromptCacheMarker after_state{
         .after_message_count      = 2,
         .kind                     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
@@ -266,8 +274,8 @@ void prompts() {
     };
     expect(input.messages.size() == 2 && input.messages[1].parts.size() == 2 &&
                input.context_cache.markers ==
-                   std::vector<ninfer::PromptCacheMarker>({after_state}),
-           "the Engine sees one shared-prefix marker, after the state part");
+                   std::vector<ninfer::PromptCacheMarker>({after_system, after_state}),
+           "the Engine sees shared-prefix markers after the system turn and the state part");
     const std::string text = user_text(choice);
     expect(text.find("State:\n{\"ticket\"") == 0 &&
                text.find("Question: Which team?\nOptions:\nA. billing - payments and refunds\n"
@@ -277,8 +285,9 @@ void prompts() {
     expect(choice.enable_thinking == false && choice.max_tokens == 1 && choice.logprobs &&
                choice.readout_tokens == std::vector<ninfer::TokenId>({32, 33}) && choice.graft &&
                choice.graft->empty() && choice.sampling.temperature == 0.0 &&
-               choice.sampling.presence_penalty == 0.0,
-           "one greedy token with the labels read out, no thinking, no graft, no penalties");
+               choice.sampling.presence_penalty == 0.0 && !choice.speculative_drafting,
+           "one greedy token with the labels read out, no thinking, no graft, no penalties, no "
+           "drafter");
     const GenerationRequest noul = make_decision_read(request, request.questions[1], {1, 2, 3, 4});
     expect(user_text(noul).find(
                "Question: Reply within the hour?\nyes: money is moving\n"

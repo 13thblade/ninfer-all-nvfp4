@@ -57,9 +57,10 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
     GenerationService& service = lease.service();
     const auto cancelled       = [&req] { return client_disconnected(req); };
     // One read per question. The first runs alone and leaves the state at its cache boundary; the
-    // rest resume from there, submitted a lane's worth at a time so the ingress queue keeps room
-    // for other clients' requests. A read is never continued, so its own continuation is the first
-    // the cache evicts, and it starts no session lineage.
+    // rest resume from there, a lane's worth at a time so the ingress queue keeps room for other
+    // clients' requests. A window's reads are submitted as one group: they enter the Engine's queue
+    // together, so their questions share one prefill pass. A read is never continued, so its own
+    // continuation is the first the cache evicts, and it starts no session lineage.
     const std::size_t lanes =
         std::max<std::size_t>(1, static_cast<std::size_t>(service.options().max_concurrency));
     const ninfer::ContextCacheHints read_cache{
@@ -75,16 +76,19 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
             const std::size_t end =
                 std::min(begin == 0 ? std::size_t{1} : begin + lanes, request.questions.size());
             std::vector<GenerationRequest> reads;
-            std::vector<PreparedRequest> batch;
-            std::vector<std::shared_ptr<RequestLifecycle>> lifecycles;
+            std::vector<StagedRequest> staged;
             for (std::size_t index = begin; index < end; ++index) {
                 reads.push_back(make_decision_read(request, request.questions[index],
                                                    label_tokens[index]));
-                batch.push_back(service.prepare(reads.back(), GenerationConsumerMode::Aggregate,
-                                                {.phase_timings = true}, cancelled, read_cache));
+                staged.push_back(service.stage(reads.back(), GenerationConsumerMode::Aggregate,
+                                               {.phase_timings = true}, cancelled, read_cache));
+            }
+            std::vector<PreparedRequest> batch = service.submit_group(std::move(staged));
+            std::vector<std::shared_ptr<RequestLifecycle>> lifecycles;
+            for (std::size_t offset = 0; offset < batch.size(); ++offset) {
                 const RequestLogMetadata metadata{.model = request.model};
                 lifecycles.push_back(begin_request(make_request_log_context(
-                    ++request_seq_, protocol, reads.back(), metadata, batch.back())));
+                    ++request_seq_, protocol, reads[offset], metadata, batch[offset])));
             }
             for (std::size_t offset = 0; offset < batch.size(); ++offset) {
                 GenerationOutcome outcome;

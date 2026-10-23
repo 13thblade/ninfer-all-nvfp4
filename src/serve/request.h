@@ -290,6 +290,9 @@ struct GenerationRequest {
     // With logprobs: token ids whose exact log probabilities the first content token's record
     // carries (ninfer::ExecutionOptions::readout_tokens), the typed decisions' label readout.
     std::vector<ninfer::TokenId> readout_tokens;
+    // ninfer::ExecutionOptions::speculative_drafting: false keeps --spec's drafter off a one-token
+    // read (the typed decisions).
+    bool speculative_drafting = true;
 
     // The alternatives each reported token carries, absent unless the request asked for logprobs.
     [[nodiscard]] std::optional<int> reported_top_logprobs() const noexcept {

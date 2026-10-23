@@ -158,6 +158,12 @@ struct ExecutionOptions {
     // (TokenLogprob::readout). At most kMaximumReadoutTokens ids, each within the model's public
     // token domain. A core without the readout leaves TokenLogprob::readout empty.
     std::vector<TokenId> readout_tokens;
+    // False keeps the Engine's speculative drafter (--spec) off this request: a one-token request
+    // drafts nothing, and the drafter's work over the prompt then stops at the deepest cache entry
+    // the request publishes (its last explicit cache boundary), so the entries up to there still
+    // serve drafting requests and the request leaves no continuation of its own. Requires
+    // requested_output_tokens == 1. A core without this control runs its drafter as configured.
+    bool speculative_drafting = true;
 };
 
 struct OutputOptions {

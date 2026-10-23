@@ -71,7 +71,9 @@ Json load_report(const LoadCapacity& capacity, const LoadSample& sample) {
                           {"committed_decode_tokens", stats.committed_decode_tokens},
                           {"reused_prompt_tokens", stats.reused_prompt_tokens},
                           {"decode_rounds", stats.decode_rounds},
-                          {"decode_row_rounds", stats.decode_row_rounds}}},
+                          {"decode_row_rounds", stats.decode_row_rounds},
+                          {"shared_prefill_passes", stats.shared_prefill_passes},
+                          {"shared_prefill_requests", stats.shared_prefill_requests}}},
     };
     return report;
 }

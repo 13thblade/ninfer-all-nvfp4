@@ -1095,6 +1095,20 @@ public:
     [[nodiscard]] bool wait_context_transfer() noexcept;
     [[nodiscard]] PrefillProgress
     advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    // The prompt tokens that remain for a sequence whose next prefill step can share one pass with
+    // other sequences' last chunks; empty when its step must run alone (a media prompt, a capture
+    // or tap inside the rest of the prompt, drafter work, more than one chunk left, ...).
+    [[nodiscard]] std::optional<std::uint32_t>
+    prefill_batch_tokens(SequenceHandle sequence) const noexcept;
+    // The most prompt tokens one shared pass computes.
+    [[nodiscard]] std::uint32_t prefill_batch_capacity() const noexcept;
+    // Computes the rest of each sequence's prompt in one pass over the model and samples each one's
+    // first token; every sequence must be admitted by prefill_batch_tokens, the tokens together
+    // within prefill_batch_capacity. Each sequence's next advance_prefill then returns its
+    // completed step without device work. A failure releases every member's lane.
+    [[nodiscard]] runtime::ExecutionTiming
+    prefill_batch(std::span<const SequenceHandle> sequences,
+                  runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,

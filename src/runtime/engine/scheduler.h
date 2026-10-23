@@ -234,16 +234,19 @@ public:
     // A staged prefill does not hold a resource transaction: materialization has already
     // committed the destination lane's full execution reservation, and prefill units are
     // interleaved one chunk per worker boundary. With concurrent prefill admission is therefore
-    // allowed while other requests prefill; without it a staged prefill holds admission back.
-    // Either way it stays gated by any open global resource topology transition
-    // (context_transaction) and by decode continuity (existing decode is never starved by
-    // admission work).
+    // allowed while other requests prefill; without it a staged prefill holds admission back,
+    // unless every staged prefill has only a last chunk left that can share one pass with others
+    // (`staged_prefills_share`): a short request admitted then joins that pass. Either way it
+    // stays gated by any open global resource topology transition (context_transaction) and by
+    // decode continuity (existing decode is never starved by admission work).
     // `decode_run` counts the decode and control units executed since the last prefill unit.
     [[nodiscard]] bool should_attempt_admission(bool have_pending, bool admission_check_pending,
                                                 bool have_decode, std::uint32_t decode_run,
-                                                bool context_transaction) const noexcept {
+                                                bool context_transaction,
+                                                bool staged_prefills_share = false) const noexcept {
         return have_pending && admission_check_pending && !context_transaction &&
-               (concurrent_prefill_ || prefill_lanes_ == 0) && (!have_decode || decode_run != 0);
+               (concurrent_prefill_ || prefill_lanes_ == 0 || staged_prefills_share) &&
+               (!have_decode || decode_run != 0);
     }
 
     void allow_concurrent_prefill(bool allowed) noexcept { concurrent_prefill_ = allowed; }
@@ -334,13 +337,23 @@ public:
 
     // Accounts one prefill unit that ran on `lane` against the other lanes owning staged prefill.
     void record_prefill_unit(std::uint32_t lane) noexcept {
-        std::uint64_t mask = prefill_lanes_;
+        if (lane < kMaximumConcurrency) { record_prefill_units(1ULL << lane); }
+    }
+
+    // Accounts one prefill unit that ran on every lane in `ran` (one pass shared by several
+    // lanes) against the other lanes owning staged prefill.
+    void record_prefill_units(std::uint64_t ran) noexcept {
+        std::uint64_t mask = prefill_lanes_ | ran;
         while (mask != 0) {
-            const auto other = static_cast<std::uint32_t>(std::countr_zero(mask));
+            const auto lane = static_cast<std::uint32_t>(std::countr_zero(mask));
             mask &= mask - 1U;
-            if (other != lane && prefill_skips_[other] != UINT32_MAX) { ++prefill_skips_[other]; }
+            if (lane >= kMaximumConcurrency) { continue; }
+            if ((ran & (1ULL << lane)) != 0) {
+                prefill_skips_[lane] = 0;
+            } else if (prefill_skips_[lane] != UINT32_MAX) {
+                ++prefill_skips_[lane];
+            }
         }
-        if (lane < kMaximumConcurrency) { prefill_skips_[lane] = 0; }
     }
 
     [[nodiscard]] std::optional<std::uint64_t> protection_epoch() const noexcept {

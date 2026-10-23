@@ -601,7 +601,8 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
                 "device_state_slots": 5, "host_state_slots": 7, "host_kv_bytes": 2147483648},
   "counters": {"computed_prefill_tokens": 48200113, "committed_decode_tokens": 6120452,
                "reused_prompt_tokens": 30911840, "decode_rounds": 861307,
-               "decode_row_rounds": 2448180}
+               "decode_row_rounds": 2448180, "shared_prefill_passes": 5120,
+               "shared_prefill_requests": 14830}
 }
 ```
 
@@ -613,7 +614,7 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
 - `requests.admitted` counts requests holding ingress capacity, from preparation until the response
   is released; a new generation request is rejected with `server_overloaded` (HTTP 429, or 529 on
   Anthropic endpoints) when it would exceed `max_admitted_requests`. `running` counts occupied execution lanes (at most
-  `max_concurrency`), of which `prefilling` is the lane that owns the staged prefill and
+  `max_concurrency`), of which `prefilling` are the lanes that own a staged prefill and
   `decode_ready` the lanes in the decode batch. `waiting` counts requests submitted to the Engine
   FIFO that have not been admitted to a lane, including those held back until their KV entitlement
   fits.
@@ -625,6 +626,8 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
   `reused_prompt_tokens`). `committed_decode_tokens` counts tokens committed by decode rounds and
   excludes each request's first token, which prefill emits; with speculative decoding a round commits
   several tokens per row. `decode_row_rounds` is the sum of decode batch sizes over `decode_rounds`.
+  `shared_prefill_passes` counts prefill passes that computed the last prompt chunks of several
+  requests at once, and `shared_prefill_requests` the requests those passes completed.
 - Gauges and counters come from the snapshot the Engine publishes at execution boundaries, so they
   can trail the instant of the poll by up to one boundary.
 
@@ -1378,8 +1381,9 @@ passages that answer the query"). The response is a list of `results`, best firs
 `index`, `relevance_score` and `document.text`, and `usage.prompt_tokens` over all judgements. A
 request with `texts` instead of `documents` follows TEI, as llama.cpp's `/rerank` does: a bare
 array of `{"index", "score"}`, with `text` when `return_text` is set. The judgements run a lane's
-worth (`--max-concurrency`) at a time and share the cached judging prefix; on an RTX 3090 with a 27B
-model and two lanes, four short documents took 0.4 s.
+worth (`--max-concurrency`) at a time, each window submitted as one group so that on a Qwen3.5-core
+model its short prompts share one prefill pass, and share the cached judging prefix; on an RTX 3090
+with a 27B model and two lanes, four short documents took 0.4 s before windows were grouped.
 
 ## Typed decisions
 
@@ -1438,13 +1442,19 @@ an unnamed question. `safety_identifier` is accepted and ignored; streaming, too
 refusal scoring are not implemented.
 
 Every read of a request starts with the same system turn, context and state, and its prompt carries
-an explicit cache boundary after the state. The first question runs alone and leaves the state in
-the context cache; the rest resume from it a lane's worth (`--max-concurrency`) at a time, so a
-question costs its own text and one token, and a request leaves room for other clients' generation
-between its windows. The reads are disposable: a read supersedes nothing it resumed from, the
-checkpoint catalog evicts the reads' own continuations first, and they start no session lineage
-under `--derive-session-keys`. A read that ends within 64 tokens of the boundary leaves no snapshot
-of its own, so the same request sent again prefills each question again.
+explicit cache boundaries after the system turn and after the state, so the first read about a new
+state resumes after the system turn. The first question runs alone and leaves the state in the
+context cache; the rest resume from it a lane's worth (`--max-concurrency`) at a time. Each window
+is submitted as one group, and on a Qwen3.5-core model its questions run in one shared prefill pass
+([Execution behavior](#execution-behavior)): a window costs one pass over the weights and its
+questions' text, and a request leaves room for other clients' generation between its windows. The
+reads draft nothing: under `--spec` the drafter runs over the first read's prompt only up to the
+state's boundary, whose snapshot keeps the drafter's state for generation requests, and over no
+question. The reads are disposable: a read supersedes nothing it resumed from, keeps no cache tap
+past the state, the checkpoint catalog evicts the reads' own continuations first, and they start no
+session lineage under `--derive-session-keys`. A read that ends within 64 tokens of the state's
+boundary, and under `--spec` every read, leaves no snapshot of its own, so the same request sent
+again prefills each question again.
 
 On an RTX 3090 with Ternary Bonsai 2 27B and four lanes, a question about a cached state took 48 ms
 on a 370-token state and 71 ms on a 13.5K-token state, and the reads of one window prefill one after
@@ -2126,7 +2136,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--disk-kv-restore` | seed a new request's matching prefix from the disk tier | write-only |
 | `--disk-kv-directstorage` | read restores through Microsoft DirectStorage; Windows builds with `-DNINFER_DIRECTSTORAGE=ON` only, untested | mapped reads |
 | `--context-cache-policy default\|rolling` | `rolling`: within one cache session (a Responses `prompt_cache_key`), a capture that extends a resident checkpoint the request matched exactly inherits that resident's demand, so a conversation whose prompt only grows keeps rolling its frontier forward; with conversations sharing a prefix, one conversation's extension can evict the prefix the others use | `default` |
-| `--concurrent-prefill` | admit waiting requests to free lanes while other requests prefill, instead of holding admission until the staged prefill finishes | off |
+| `--concurrent-prefill` | admit waiting requests to free lanes while other requests prefill, instead of holding admission until the staged prefill finishes; without it a staged prefill whose last chunk can share a pass with others still admits them ([Execution behavior](#execution-behavior)) | off |
 | `--kv-lease-growth` | admission reserves the prompt plus a 4096-token output window (or `--prefill-chunk` when larger) instead of the whole `max_tokens` budget and extends it at decode-round boundaries, releasing idle retained cache owners least recently used first when the pool is short; an answer whose smallest step still does not fit ends with `finish_reason=length` before `max_tokens` | off |
 | `--recency-eviction` | pressure ranks private conversations and shared prefixes in one least-recently-used order (latest hit or publication): a request that does not fit gives up the fewest oldest owners that make it fit and spares those it does not need, instead of clearing every owner it cannot reuse; kept owners, shared prefixes included, are demoted to Host where it has room, and the search may fully evict only inside that tail and only an owner Host cannot take. A private checkpoint that finds the state pools full reclaims the idle conversation that is oldest in this order, not the oldest publication | off |
 | `--value-aware-demote` | pressure search charges evicting a private conversation its rank by rebuild cost among the request's victims, so among otherwise equal plans it keeps the conversations most expensive to rebuild, demoted to Host, and evicts the cheapest; it only reorders a bounded search, which can then settle on a different plan | off |
@@ -2476,11 +2486,22 @@ requests. At each decode boundary, every decode-ready request is compacted into 
 processed by one model traversal and, when graphs are enabled, one exact-batch CUDA Graph replay.
 A request joins that batch only after its staged prefill finishes; when it completes or is
 cancelled, the next boundary rebuilds the batch without an empty row. A staged prefill holds
-admission back until it finishes. With `--concurrent-prefill` waiting requests are still admitted
-to free lanes while others prefill, so a new request's admission and prefill overlap the prefill
-and decode of the others. Each prefill unit advances one chunk of the staged lane with the shortest
-remaining prompt, so a short or prefix-cached request is not held behind a long prompt for its
-whole prefill; a lane passed over eight times runs next, so a long prompt is not starved.
+admission back until it finishes, unless every staged prefill has only a last chunk left that can
+share a pass (below). With `--concurrent-prefill` waiting requests are still admitted to free lanes
+while others prefill, so a new request's admission and prefill overlap the prefill and decode of
+the others. Whenever admission is open, every waiting request a free lane can take is admitted at
+once. Each prefill unit advances one chunk of the staged lane with the shortest remaining prompt,
+so a short or prefix-cached request is not held behind a long prompt for its whole prefill; a lane
+passed over eight times runs next, so a long prompt is not starved. On a Qwen3.5-core model, when
+that chunk is the last of a text prompt, the last chunks of other staged lanes ride along in the
+same pass, up to `--prefill-chunk` tokens together: one pass over the model instead of one per
+request. A last chunk
+shares a pass unless the prompt has media or a grammar, a cache snapshot or tap splits the chunk,
+the speculative drafter works over it (a request that drafts runs its drafter over its prompt; a
+decision read does not), or the model is split over several devices. `/v1/load` and `/stats` count
+these passes as `shared_prefill_passes`. Requests that arrive together share them best: the
+decision and rerank endpoints submit each window of reads as one group, which enters the queue at
+once, so the first read does not start alone before the others arrive.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in
@@ -2497,7 +2518,8 @@ response the deployment allows rather than to a connection timeout: at C1 on an 
 6,500-token response occupies the engine for about 106 seconds. The 600,000 ms default admits a
 queued caller behind roughly ten such responses; lower it only to fail fast on purpose.
 
-One request owns the staged prefill at a time, and before each prefill chunk the executor runs
+Without `--concurrent-prefill` one request owns the staged prefill at a time (or several whose last
+chunks share a pass), and before each prefill chunk the executor runs
 `--decode-rounds-per-prefill` decode rounds while other requests generate (by default the chunk
 over 64: 8 at chunk 512, 16 at 1024; proportionally fewer, at least one, before a shorter prefill
 unit such as a short prompt's), so `--prefill-chunk` sets the worst-case pause every active

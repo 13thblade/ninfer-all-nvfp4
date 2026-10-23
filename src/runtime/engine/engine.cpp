@@ -117,6 +117,9 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     if (!options.execution.readout_tokens.empty() && !options.execution.logprobs) {
         throw std::invalid_argument("readout_tokens requires logprobs");
     }
+    if (!options.execution.speculative_drafting && options.execution.requested_output_tokens != 1) {
+        throw std::invalid_argument("speculative_drafting off requires one output token");
+    }
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
@@ -132,7 +135,8 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.structured_output       = std::move(options.execution.structured_output);
     resolved.execution.logprobs                = options.execution.logprobs;
     resolved.execution.readout_tokens          = std::move(options.execution.readout_tokens);
-    resolved.stop                              = std::move(options.stop);
+    resolved.execution.speculative_drafting    = options.execution.speculative_drafting;
+    resolved.stop                            = std::move(options.stop);
     resolved.output                            = options.output;
     resolved.ngram_session                      = std::move(options.ngram_session);
     return resolved;
@@ -735,82 +739,157 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                                 OutputConsumerMode consumer_mode,
                                 GenerationObservationOptions observation,
                                 std::chrono::steady_clock::time_point pending_deadline) {
+    std::vector<GenerationSubmission> one;
+    one.push_back(GenerationSubmission{.prompt           = std::move(prompt),
+                                       .options          = std::move(options),
+                                       .consumer_mode    = consumer_mode,
+                                       .observation      = observation,
+                                       .pending_deadline = pending_deadline});
+    return std::move(submit_group(std::move(one)).front());
+}
+
+namespace {
+
+// A request licensed no output tokens completes at submission, without entering the queue.
+struct ImmediateSubmission {
+    GenerationResult result;
+    OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
+
+    GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
+        const bool streaming = consumer_mode == OutputConsumerMode::Streaming;
+        if (streaming != (sink != nullptr)) {
+            throw std::invalid_argument(
+                "GenerationHandle wait sink does not match its submitted consumer mode");
+        }
+        if (cancellation.requested()) { result.finish_reason = FinishReason::Cancelled; }
+        return std::move(result);
+    }
+
+    [[nodiscard]] std::optional<std::uint32_t> effective_thinking_budget() const noexcept {
+        return result.thinking.effective_budget;
+    }
+};
+
+} // namespace
+
+std::vector<GenerationHandle> Engine::submit_group(std::vector<GenerationSubmission> submissions) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->options.purpose != EnginePurpose::Generation) {
         throw std::logic_error("submit requires a Generation Engine");
     }
-    if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
-    if (observation.live_timings) { observation.phase_timings = true; }
-    if (consumer_mode != OutputConsumerMode::Streaming &&
-        (observation.live_timings || observation.prompt_progress)) {
-        throw std::invalid_argument("live generation observations require a Streaming consumer");
+    struct Resolved {
+        runtime::ResolvedRequestOptions options;
+        ResolvedSamplingParameters sampling;
+        PromptSummary summary;
+        double prepare_seconds = 0.0;
+    };
+    std::vector<Resolved> resolved;
+    resolved.reserve(submissions.size());
+    for (GenerationSubmission& submission : submissions) {
+        if (submission.prompt.impl_ == nullptr) {
+            throw std::invalid_argument("PreparedPrompt is empty");
+        }
+        GenerationObservationOptions& observation = submission.observation;
+        if (observation.live_timings) { observation.phase_timings = true; }
+        if (submission.consumer_mode != OutputConsumerMode::Streaming &&
+            (observation.live_timings || observation.prompt_progress)) {
+            throw std::invalid_argument("live generation observations require a Streaming consumer");
+        }
+        Resolved entry{.options = resolve_request_options(impl_->sampling_defaults,
+                                                          submission.prompt.impl_->sampling_mode,
+                                                          std::move(submission.options))};
+        entry.sampling        = entry.options.execution.sampling;
+        entry.summary         = submission.prompt.impl_->summary;
+        entry.prepare_seconds = submission.prompt.impl_->prepare.seconds;
+        if (entry.summary.prompt_tokens > impl_->options.max_context) {
+            throw RequestError(
+                RequestErrorKind::ContextLengthExceeded,
+                context_capacity_error(entry.summary.prompt_tokens, impl_->options.max_context));
+        }
+        resolved.push_back(std::move(entry));
     }
 
-    runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
-        impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
-    const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
-
-    const PromptSummary prompt_summary = prompt.impl_->summary;
-    if (prompt_summary.prompt_tokens > impl_->options.max_context) {
-        throw RequestError(
-            RequestErrorKind::ContextLengthExceeded,
-            context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
-    }
-    const double prepare_seconds = prompt.impl_->prepare.seconds;
-    if (resolved_options.execution.requested_output_tokens == 0) {
-        struct ImmediateSubmission {
-            GenerationResult result;
-            OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
-
-            GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
-                const bool streaming = consumer_mode == OutputConsumerMode::Streaming;
-                if (streaming != (sink != nullptr)) {
-                    throw std::invalid_argument(
-                        "GenerationHandle wait sink does not match its submitted consumer mode");
-                }
-                if (cancellation.requested()) { result.finish_reason = FinishReason::Cancelled; }
-                return std::move(result);
-            }
-
-            [[nodiscard]] std::optional<std::uint32_t> effective_thinking_budget() const noexcept {
-                return result.thinking.effective_budget;
-            }
-        } immediate{.consumer_mode = consumer_mode};
-
-        immediate.result.prompt                    = prompt_summary;
+    std::vector<GenerationHandle> handles(submissions.size());
+    std::vector<std::size_t> queued;
+    for (std::size_t index = 0; index < submissions.size(); ++index) {
+        Resolved& entry = resolved[index];
+        if (entry.options.execution.requested_output_tokens != 0) {
+            queued.push_back(index);
+            continue;
+        }
+        ImmediateSubmission immediate{.consumer_mode = submissions[index].consumer_mode};
+        immediate.result.prompt                    = entry.summary;
         immediate.result.finish_reason             = FinishReason::OutputLimit;
-        immediate.result.thinking.requested_budget = resolved_options.execution.thinking.budget;
+        immediate.result.thinking.requested_budget = entry.options.execution.thinking.budget;
         // No output is licensed, so the cap never binds: effective equals requested.
-        immediate.result.thinking.effective_budget = resolved_options.execution.thinking.budget;
-        immediate.result.timings.prepare_seconds = prepare_seconds;
-        immediate.result.timings.total_seconds   = prepare_seconds;
-        prompt.impl_.reset();
-        return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
-            impl_, std::move(immediate), resolved_sampling));
+        immediate.result.thinking.effective_budget = entry.options.execution.thinking.budget;
+        immediate.result.timings.prepare_seconds   = entry.prepare_seconds;
+        immediate.result.timings.total_seconds     = entry.prepare_seconds;
+        submissions[index].prompt.impl_.reset();
+        handles[index] = GenerationHandle(
+            std::make_unique<GenerationHandle::Impl>(impl_, std::move(immediate), entry.sampling));
     }
+    if (queued.empty()) { return handles; }
 
-    return std::visit(
-        [&](auto& core) -> GenerationHandle {
+    std::visit(
+        [&](auto& core) {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
                 throw std::logic_error("Engine core is unavailable");
             } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
-                // Held before the core can start the request, so its prompt runs at the floor.
-                std::shared_ptr<void> keep_alive = impl_;
-                if (auto clock_floor = impl_->clock_floor.hold()) {
-                    keep_alive = std::make_shared<HeldEngine>(
-                        HeldEngine{.engine = impl_, .clock_floor = std::move(clock_floor)});
+                // Held before the core can start a request, so its prompt runs at the floor.
+                std::vector<std::shared_ptr<void>> keep_alive;
+                keep_alive.reserve(queued.size());
+                for (std::size_t k = 0; k < queued.size(); ++k) {
+                    std::shared_ptr<void> held = impl_;
+                    if (auto clock_floor = impl_->clock_floor.hold()) {
+                        held = std::make_shared<HeldEngine>(
+                            HeldEngine{.engine = impl_, .clock_floor = std::move(clock_floor)});
+                    }
+                    keep_alive.push_back(std::move(held));
                 }
-                auto submission = core->submit(std::move(prompt.impl_->value), prompt_summary,
-                                               prepare_seconds, std::move(resolved_options),
-                                               consumer_mode, observation, pending_deadline);
-                return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
-                    std::move(keep_alive), std::move(submission), resolved_sampling));
+                using Core = typename CoreState::element_type;
+                if constexpr (std::is_same_v<Core, Impl::GenerationCore> ||
+                              std::is_same_v<Core, Impl::HybridGenerationCore>) {
+                    std::vector<typename Core::GroupMember> group;
+                    group.reserve(queued.size());
+                    for (const std::size_t index : queued) {
+                        GenerationSubmission& submission = submissions[index];
+                        group.push_back(typename Core::GroupMember{
+                            .prompt           = std::move(submission.prompt.impl_->value),
+                            .prompt_summary   = resolved[index].summary,
+                            .prepare_seconds  = resolved[index].prepare_seconds,
+                            .options          = std::move(resolved[index].options),
+                            .consumer_mode    = submission.consumer_mode,
+                            .observation      = submission.observation,
+                            .pending_deadline = submission.pending_deadline});
+                    }
+                    auto members = core->submit_group(std::move(group));
+                    for (std::size_t k = 0; k < queued.size(); ++k) {
+                        handles[queued[k]] = GenerationHandle(std::make_unique<GenerationHandle::Impl>(
+                            std::move(keep_alive[k]), std::move(members[k]),
+                            resolved[queued[k]].sampling));
+                    }
+                } else {
+                    // A handle destroyed by a later member's error cancels its request.
+                    for (std::size_t k = 0; k < queued.size(); ++k) {
+                        const std::size_t index          = queued[k];
+                        GenerationSubmission& submission = submissions[index];
+                        auto member                      = core->submit(
+                            std::move(submission.prompt.impl_->value), resolved[index].summary,
+                            resolved[index].prepare_seconds, std::move(resolved[index].options),
+                            submission.consumer_mode, submission.observation,
+                            submission.pending_deadline);
+                        handles[index] = GenerationHandle(std::make_unique<GenerationHandle::Impl>(
+                            std::move(keep_alive[k]), std::move(member), resolved[index].sampling));
+                    }
+                }
             }
         },
         impl_->core);
+    return handles;
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
