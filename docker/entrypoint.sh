@@ -14,7 +14,7 @@
 # card, which the newer cards run from its PTX: slower there, and compiled at the first start.
 # An image that carries only `multi` runs it on every GPU.
 #
-# NINFER_IMAGE_ARCH=sm75|sm86|sm120a|multi skips detection.
+# NINFER_IMAGE_ARCH=sm75|sm86|sm89|sm120a|multi skips detection.
 set -euo pipefail
 home=/opt/ninfer
 : "${NINFER_HOST:=0.0.0.0}" "${NINFER_PORT:=8080}"
@@ -46,7 +46,7 @@ select_arch() {
     build="$(build_of "$capability")"
     if [[ -z "$build" ]]; then
       printf 'Compute capability %s is not supported: NInfer runs on 7.5 (RTX 20, TITAN RTX), 8.6\n' "$capability" >&2
-      printf '(RTX 30), 8.9 (RTX 40) and 12.0 (RTX 50). NINFER_IMAGE_ARCH=sm75|sm86|sm120a|multi\n' >&2
+      printf '(RTX 30), 8.9 (RTX 40) and 12.0 (RTX 50). NINFER_IMAGE_ARCH=sm75|sm86|sm89|sm120a|multi\n' >&2
       printf 'overrides the detection; CUDA_VISIBLE_DEVICES hides a GPU from the container.\n' >&2
       exit 1
     fi
