@@ -373,10 +373,13 @@ jobs:
         run: python3.11 .github/scripts/check-compiler-cache.py
       - name: Configure release products and tests
         run: .github/scripts/configure-linux-build.sh ON
+      - name: Check compiler resource budget
+        id: capacity
+        run: python3.11 .github/scripts/check-build-capacity.py --jobs 4
       - name: Build every target
         id: build
         timeout-minutes: 305
-        run: python3.11 .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- cmake --build build-release -j
+        run: python3.11 .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- cmake --build build-release -j ${{ steps.capacity.outputs.jobs }}
       - name: Run CTest
         timeout-minutes: 15
         run: |
