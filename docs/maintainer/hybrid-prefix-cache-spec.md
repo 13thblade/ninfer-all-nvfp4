@@ -900,10 +900,15 @@ comes from its own lineage when it can. A tap or endpoint takes a slot in this o
    at least as high. The snapshot is lost, and `L` rises to its priority;
 4. the least recently hit Host-backed snapshot's slot, which loses only its Device copy.
 
-Otherwise the tap or endpoint is skipped. A Device-only owner's slot is its last copy, so value
-decides there rather than recency: least-recently-hit eviction let a short request's snapshots
-push out the snapshot a long conversation resumes from, and taking Host-backed slots first left
-owners that Host eviction had made Device-only in their slots for good.
+Otherwise the tap or endpoint is skipped, and `L` rises to its estimated priority, as if it had
+been inserted and evicted at once. A Device-only owner's slot is its last copy, so value decides
+there rather than recency: least-recently-hit eviction let a short request's snapshots push out the
+snapshot a long conversation resumes from, and taking Host-backed slots first left owners that
+Host eviction had made Device-only in their slots for good. Without the rise, nothing would age
+owners that are never hit again: decision reads about a stream of new states hit each state's
+snapshot two or three times, and once those snapshots filled the Host tier and the slots, every
+later state's snapshot was refused (about 50 states into a run on an RTX 3090 with an 8 GiB Host
+tier) and every read prefilled its state again.
 
 ### 9.3 Host (superseded snapshots first, then GDSF; dead-KV first)
 
@@ -936,7 +941,9 @@ Allocation of `k` slabs:
 
 A snapshot image write stops at step 3 when the victim is worth more than the new snapshot
 (`H(victim) > H(new)`): GDSF never inserts what it would evict next, and the new snapshot stays
-Device-only (§9.2). KV block writes (write-through at release) are not bounded this way.
+Device-only (§9.2). `L` still rises to `H(new)`, as if the new snapshot had been inserted and
+evicted, so retained snapshots that are not hit again age out. KV block writes (write-through at
+release) are not bounded this way.
 
 ```text
 H(s)  = L_s + F(s) · C(s) / Z(s)                // L_s: L when s was published or last hit
