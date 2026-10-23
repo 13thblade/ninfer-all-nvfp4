@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -129,6 +130,8 @@ struct BoundaryEncodedText {
     std::vector<TokenBoundaryResult> boundaries;
 };
 
+class OrdinaryRunCache;
+
 class Tokenizer {
 public:
     explicit Tokenizer(TokenizerResources resources);
@@ -173,6 +176,10 @@ private:
     std::vector<AddedToken> added_tokens_;
     std::array<std::vector<std::size_t>, 256> added_token_candidates_;
     std::vector<int> default_stop_token_ids_;
+    // The byte-level tokenizer's last long runs of text between added tokens: a later run that
+    // starts with the same text encodes only from where the two can differ (null for
+    // SentencePiece, whose runs are one BPE word each).
+    std::shared_ptr<OrdinaryRunCache> run_cache_;
 };
 
 } // namespace ninfer::models::qwen3_5::frontend

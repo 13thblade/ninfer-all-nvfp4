@@ -11,6 +11,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -599,11 +602,13 @@ std::array<int, 256> load_byte_token_ids(const std::unordered_map<std::string, i
     return ids;
 }
 
+// `offset` is where `normalized` starts in the run whose token_ends and word_ends it extends.
 bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalized,
                                const BpeMergeTable& merge_rules,
                                const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
                                std::vector<std::size_t>* token_ends = nullptr,
-                               std::vector<BpeWordEnd>* word_ends   = nullptr) {
+                               std::vector<BpeWordEnd>* word_ends   = nullptr,
+                               std::size_t offset                   = 0) {
     if (normalized.empty()) { return true; }
     if (ids.size() == max_tokens) { return false; }
 
@@ -672,13 +677,13 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
              node     = nodes[static_cast<std::size_t>(node)].next) {
             ids.push_back(nodes[static_cast<std::size_t>(node)].symbol);
             if (token_ends != nullptr) {
-                token_ends->push_back(begin + nodes[static_cast<std::size_t>(node)].end);
+                token_ends->push_back(offset + begin + nodes[static_cast<std::size_t>(node)].end);
             }
             if (ids.size() == max_tokens) { return false; }
         }
         if (word_ends != nullptr) {
             word_ends->push_back(
-                BpeWordEnd{.normalized_offset = end, .token_frontier = ids.size()});
+                BpeWordEnd{.normalized_offset = offset + end, .token_frontier = ids.size()});
         }
         begin = end;
     }
@@ -855,10 +860,95 @@ bool append_sentencepiece_text(BoundaryEncodedText& encoded, std::string_view te
     return complete;
 }
 
+// A kept ordinary run: its normalized text, its tokens, each token's and each word's end in the
+// text, and the tokens before each word end.
+struct OrdinaryRun {
+    std::string normalized;
+    std::vector<int> ids;
+    std::vector<std::size_t> token_ends;
+    std::vector<BpeWordEnd> word_ends;
+};
+
+// Where a run continues a kept one: its first `words` words are the kept run's, which end at
+// `offset`.
+struct RunReuse {
+    std::shared_ptr<const OrdinaryRun> run;
+    std::size_t words  = 0;
+    std::size_t offset = 0;
+};
+
+// Ordinary runs of this many normalized bytes or more are kept.
+constexpr std::size_t kKeptRunBytes = 4096;
+constexpr std::size_t kKeptRuns     = 8;
+// The bytes past a word's end that decide where it ends: the code point there (qwen_word_end
+// reads one past a word, past a whitespace run's last, and two past an apostrophe).
+constexpr std::size_t kWordLookaheadBytes = 4;
+
+} // namespace
+
+// The byte-level tokenizer's last long ordinary runs (the text between added tokens), most recent
+// first. A run that starts with a kept run's text takes its words up to a word end both texts
+// decide alike, and encodes only the rest: the prompts of one decision request share their state,
+// and a conversation's turns their earlier messages' text.
+class OrdinaryRunCache {
+public:
+    [[nodiscard]] std::optional<RunReuse> find(std::string_view normalized) const {
+        std::shared_ptr<const OrdinaryRun> best;
+        std::size_t common = 0;
+        {
+            const std::lock_guard lock(mutex_);
+            for (const auto& run : runs_) {
+                const std::size_t limit = std::min(run->normalized.size(), normalized.size());
+                const auto first =
+                    std::mismatch(normalized.begin(), normalized.begin() + std::ptrdiff_t(limit),
+                                  run->normalized.begin())
+                        .first;
+                const auto shared = static_cast<std::size_t>(first - normalized.begin());
+                if (shared > common) {
+                    common = shared;
+                    best   = run;
+                }
+            }
+        }
+        if (!best || common < kWordLookaheadBytes) { return std::nullopt; }
+        // The last word end whose next code point lies within the shared text and is not
+        // whitespace: every word before it ends where it does in both texts, a whitespace run
+        // included, since such a run stops before that code point.
+        const auto& ends = best->word_ends;
+        auto at          = std::upper_bound(
+            ends.begin(), ends.end(), common - kWordLookaheadBytes,
+            [](std::size_t bound, const BpeWordEnd& end) { return bound < end.normalized_offset; });
+        while (at != ends.begin()) {
+            --at;
+            const std::size_t offset = at->normalized_offset;
+            if (offset == 0) { break; }
+            if (!uni::is_whitespace(qwen_codepoint_at(normalized, offset).value)) {
+                return RunReuse{.run    = std::move(best),
+                                .words  = static_cast<std::size_t>(at - ends.begin()) + 1,
+                                .offset = offset};
+            }
+        }
+        return std::nullopt;
+    }
+
+    void keep(std::shared_ptr<const OrdinaryRun> run) {
+        const std::lock_guard lock(mutex_);
+        if (runs_.size() == kKeptRuns) { runs_.pop_back(); }
+        runs_.insert(runs_.begin(), std::move(run));
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<std::shared_ptr<const OrdinaryRun>> runs_;
+};
+
+namespace {
+
 bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
                           std::size_t text_offset, std::span<const IndexedByteBoundary> boundaries,
                           const BpeMergeTable& merge_rules,
-                          const std::array<int, 256>& byte_token_ids, std::size_t max_tokens) {
+                          const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
+                          OrdinaryRunCache* cache) {
     const std::size_t token_base = encoded.input_ids.size();
     if (text.empty()) {
         for (const IndexedByteBoundary boundary : boundaries) {
@@ -874,15 +964,51 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
             const std::size_t local = boundary.offset - text_offset;
             return local != 0 && local != text.size();
         });
+    const bool kept = cache != nullptr && normalized.size() >= kKeptRunBytes;
+    const bool ends = has_internal_boundary || kept;
     std::vector<std::size_t> token_ends;
     std::vector<BpeWordEnd> word_ends;
-    if (has_internal_boundary) { token_ends.reserve(normalized.size()); }
-    if (!append_normalized_bpe_ids(encoded.input_ids, normalized, merge_rules, byte_token_ids,
-                                   max_tokens, has_internal_boundary ? &token_ends : nullptr,
-                                   has_internal_boundary ? &word_ends : nullptr)) {
+    if (ends) { token_ends.reserve(normalized.size() / 2); }
+    // The words a kept run shares with this one come from it.
+    std::size_t restart = 0;
+    if (kept) {
+        if (const std::optional<RunReuse> reuse = cache->find(normalized)) {
+            const OrdinaryRun& run   = *reuse->run;
+            const std::size_t tokens = run.word_ends[reuse->words - 1].token_frontier;
+            if (token_base + tokens < max_tokens) {
+                encoded.input_ids.insert(encoded.input_ids.end(), run.ids.begin(),
+                                         run.ids.begin() + std::ptrdiff_t(tokens));
+                token_ends.assign(run.token_ends.begin(),
+                                  run.token_ends.begin() + std::ptrdiff_t(tokens));
+                for (std::size_t word = 0; word < reuse->words; ++word) {
+                    word_ends.push_back(BpeWordEnd{
+                        .normalized_offset = run.word_ends[word].normalized_offset,
+                        .token_frontier    = token_base + run.word_ends[word].token_frontier});
+                }
+                restart = reuse->offset;
+            }
+        }
+    }
+    if (!append_normalized_bpe_ids(encoded.input_ids, std::string_view(normalized).substr(restart),
+                                   merge_rules, byte_token_ids, max_tokens,
+                                   ends ? &token_ends : nullptr, ends ? &word_ends : nullptr,
+                                   restart)) {
         return false;
     }
     const std::size_t token_end = encoded.input_ids.size();
+    if (kept) {
+        auto run        = std::make_shared<OrdinaryRun>();
+        run->normalized = normalized;
+        run->ids.assign(encoded.input_ids.begin() + std::ptrdiff_t(token_base),
+                        encoded.input_ids.end());
+        run->token_ends = token_ends;
+        run->word_ends.reserve(word_ends.size());
+        for (const BpeWordEnd& end : word_ends) {
+            run->word_ends.push_back(BpeWordEnd{.normalized_offset = end.normalized_offset,
+                                                .token_frontier = end.token_frontier - token_base});
+        }
+        cache->keep(std::move(run));
+    }
     if (!has_internal_boundary) {
         for (const IndexedByteBoundary boundary : boundaries) {
             const std::size_t frontier = boundary.offset == text_offset ? token_base : token_end;
@@ -1007,6 +1133,7 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     bpe_merge_rules_        = load_bpe_merge_rules(model, tokenizer_label, vocab_token_to_id_);
     byte_token_ids_         = load_byte_token_ids(vocab_token_to_id_);
     default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
+    run_cache_              = std::make_shared<OrdinaryRunCache>();
 }
 
 void Tokenizer::load_sentencepiece(const nlohmann::json& root, const nlohmann::json& config,
@@ -1118,7 +1245,8 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
                                             requests, bpe_merge_rules_, vocab_token_to_id_,
                                             byte_token_ids_, options.max_tokens)
                 : append_ordinary_text(encoded, text.substr(begin, end - begin), begin, requests,
-                                       bpe_merge_rules_, byte_token_ids_, options.max_tokens);
+                                       bpe_merge_rules_, byte_token_ids_, options.max_tokens,
+                                       run_cache_.get());
         boundary_cursor = request_end;
         return complete;
     };
