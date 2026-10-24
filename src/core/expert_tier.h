@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace ninfer {
@@ -94,10 +95,15 @@ private:
     std::vector<std::size_t> offset_; // first entry of each layer
     std::vector<Entry> entries_;
     std::vector<std::uint32_t> free_; // by pool
-    // By pool: held entries, coldest first as of the last pass, and the first one still held.
-    std::vector<std::vector<std::size_t>> cold_;
-    std::vector<std::size_t> cold_next_;
-    static constexpr std::size_t kScan = 32;
+    // By pool: held entries with their counts as the last pass ended, coldest first (lower entry
+    // first among equal counts), and the first one still held. A pass orders only the first
+    // kColdOrdered of them; a scan that reaches past the ordered ones orders the rest by the same
+    // counts (cold_ordered_), so the order is a whole sort's at the cost of a selection.
+    std::vector<std::vector<std::pair<float, std::size_t>>> cold_;
+    std::vector<std::size_t> cold_next_, cold_ordered_;
+    static constexpr std::size_t kScan        = 32;
+    static constexpr std::size_t kColdOrdered = 512;
+    void order_cold(std::uint32_t pool, std::size_t at);
     std::vector<std::uint32_t> layer_of_; // by entry
     std::uint32_t passes_ = 0;
 };

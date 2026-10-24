@@ -203,9 +203,13 @@ public:
     ExpertDelivery(const ExpertDelivery&) = delete;
     ExpertDelivery& operator=(const ExpertDelivery&) = delete;
 
+    // The call's cached and missing sets on the device: per pair, its expert or -1 when the pair
+    // lies in the other set, and as lists of experts (their count, then the experts ascending).
     struct Call {
-        const std::int32_t* cached_ids = nullptr;
-        const std::int32_t* missing_ids = nullptr;
+        const std::int32_t* cached_ids      = nullptr;
+        const std::int32_t* missing_ids     = nullptr;
+        const std::int32_t* cached_experts  = nullptr;
+        const std::int32_t* missing_experts = nullptr;
         // With a CPU share, after await(): the CPU's products (ExpertCpuOptions::product_bytes),
         // valid when *cpu is nonzero.
         const void* products = nullptr;
@@ -215,10 +219,11 @@ public:
         const void* data = nullptr;
         std::size_t bytes = 0;
     };
+
     // Capturable. The next begin must follow every consumer of the preceding call on stream, and
     // every begin needs its await. Cached pairs can run immediately. Missing pairs run only after
     // await(); with a CPU share they exclude the CPU's pairs, whose products the family adds then.
-    // Neither set drops or renormalizes routes. -1 denotes a pair absent from that set. `inputs`
+    // Neither set drops or renormalizes routes; an expert's pairs all fall in one set. `inputs`
     // (device ranges, ExpertCpuOptions::input_bytes in all) reach the CPU's products; a call
     // without them leaves nothing to the CPU (call.products and call.cpu stay null).
     [[nodiscard]] Call begin(std::size_t layer, const std::int32_t* ids, std::uint32_t pairs,

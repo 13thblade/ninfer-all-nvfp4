@@ -110,13 +110,14 @@ void decode_attention(const DecodeAttentionArgs& args, cudaStream_t stream);
 void route(const float* x, int hidden, int tokens, const float* router, int experts, int top_k,
            float* logits, std::int32_t* ids, float* weights, cudaStream_t stream);
 
-// route() for at most 8 tokens, with the pairs also grouped by expert into the arrays of a
-// gguf::MoeRouting (bounds [E + 1], sorted [T * top_k], active [E], active_count [1]), as
-// moe_sort_routes would group them, without its separate launch.
+// route() for at most 8 tokens in one launch (the same logits, experts and weights bit for bit),
+// with the pairs also grouped by expert into the arrays of a gguf::MoeRouting (bounds [E + 1],
+// sorted [T * top_k], active [E], active_count [1]), as moe_sort_routes would group them. `done`: a
+// zeroed device word, zero again when the launch ends (its blocks count themselves there).
 void route_select(const float* x, int hidden, int tokens, const float* router, int experts,
                   int top_k, float* logits, std::int32_t* ids, float* weights,
                   std::int32_t* bounds, std::int32_t* sorted, std::int32_t* active,
-                  std::int32_t* active_count, cudaStream_t stream);
+                  std::int32_t* active_count, std::uint32_t* done, cudaStream_t stream);
 
 // A matrix activation that keeps each 32 values' sum in F16 (Q4_K, Q5_K and the like,
 // gguf::matrix_activation_f16_sums) is kept to sums of at most this magnitude: a row or column with

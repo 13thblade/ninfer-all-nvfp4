@@ -67,6 +67,7 @@ ninfer_bench --weights <artifact.ninfer>
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>] [--fast-prefill-kernel]
           [--expert-residency <device|host|disk>] [--expert-cache-mib <N|auto>]
+          [--expert-dma-share <F|auto>] [--expert-cpu-threads <n>]
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft|--full-draft-head]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -87,9 +88,10 @@ Drafts use the optimized proposal head when the artifact stores one; `--lm-head-
 and `--full-draft-head` keeps the full output head. CUDA Graph decode is enabled by default.
 
 `--expert-residency host|disk` keeps a MoE model's routed experts in pinned host memory or in the
-artifact's files, as the CLI does; `--expert-cache-mib` sizes the device expert cache. The report's
-configuration records the residency, the cache bytes and the delivery counters of the whole run
-(`expert_routes`, `expert_hits`, `expert_admissions`, `expert_transferred_bytes`).
+artifact's files, as the CLI does; `--expert-cache-mib` sizes the device expert cache, and
+`--expert-dma-share` and `--expert-cpu-threads` set the hybrid CPU share as `ninfer` does. The
+report's configuration records the residency, the cache bytes and the delivery counters of the
+whole run (`expert_routes`, `expert_hits`, `expert_admissions`, `expert_transferred_bytes`).
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with

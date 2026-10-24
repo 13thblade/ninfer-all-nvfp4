@@ -62,6 +62,30 @@ __global__ void inspect(const void* const* table, const std::int32_t* ids, int p
     }
 }
 
+// A set's list (its count, then its experts ascending) against its pairs: exactly the experts some
+// pair of the set routes to.
+__global__ void listed(const std::int32_t* set, int pairs, const std::int32_t* list,
+                       unsigned long long* failures) {
+    __shared__ int routed[kExperts];
+    for (int e = threadIdx.x; e < kExperts; e += blockDim.x) { routed[e] = 0; }
+    __syncthreads();
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+        if (set[p] >= 0 && set[p] < kExperts) { routed[set[p]] = 1; }
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) { return; }
+    int count = 0;
+    for (int e = 0; e < kExperts; ++e) {
+        if (!routed[e]) { continue; }
+        if (count >= list[0] || list[1 + count] != e) {
+            atomicAdd(failures, 1ull);
+            return;
+        }
+        ++count;
+    }
+    if (count != list[0]) { atomicAdd(failures, 1ull); }
+}
+
 struct Fixture {
     std::vector<std::unique_ptr<PinnedHostBuffer>> pinned;
     std::vector<ExpertDeliveryLayer> layers;
@@ -137,9 +161,13 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
             const auto call = delivery.begin(l, static_cast<const std::int32_t*>(ids.p), kPairs, device.stream);
             inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.cached_ids, kPairs, l,
                 static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            listed<<<1, 256, 0, device.stream>>>(call.cached_ids, kPairs, call.cached_experts,
+                                                 static_cast<unsigned long long*>(failures.p));
             delivery.await(device.stream);
             inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.missing_ids, kPairs, l,
                 static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            listed<<<1, 256, 0, device.stream>>>(call.missing_ids, kPairs, call.missing_experts,
+                                                 static_cast<unsigned long long*>(failures.p));
             CUDA_CHECK(cudaGetLastError());
         }
     };
@@ -477,6 +505,9 @@ int cpu_share(DeviceContext& device, bool disk, double share, const std::filesys
             delivery.await(device.stream);
             inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.missing_ids, kPairs, l,
                 static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            // Without the CPU's experts: the list the host rewrote.
+            listed<<<1, 256, 0, device.stream>>>(call.missing_ids, kPairs, call.missing_experts,
+                                                 static_cast<unsigned long long*>(failures.p));
             partition<<<kPairs / 256, 256, 0, device.stream>>>(
                 static_cast<const std::int32_t*>(ids.p), call.cached_ids, call.missing_ids,
                 static_cast<const std::int32_t*>(call.products), call.cpu, kPairs,
@@ -530,9 +561,13 @@ int elastic_cache(DeviceContext& device, bool disk, const std::filesystem::path&
             const auto call = delivery.begin(l, static_cast<const std::int32_t*>(ids.p), kPairs, device.stream);
             inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.cached_ids, kPairs, l,
                 static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            listed<<<1, 256, 0, device.stream>>>(call.cached_ids, kPairs, call.cached_experts,
+                                                 static_cast<unsigned long long*>(failures.p));
             delivery.await(device.stream);
             inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.missing_ids, kPairs, l,
                 static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            listed<<<1, 256, 0, device.stream>>>(call.missing_ids, kPairs, call.missing_experts,
+                                                 static_cast<unsigned long long*>(failures.p));
             CUDA_CHECK(cudaGetLastError());
         }
     };
@@ -627,9 +662,13 @@ int lent_banks(DeviceContext& device, bool disk, const std::filesystem::path& pa
             const auto call = delivery.begin(l, static_cast<const std::int32_t*>(ids.p), kPairs, device.stream);
             inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.cached_ids, kPairs, l,
                 static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            listed<<<1, 256, 0, device.stream>>>(call.cached_ids, kPairs, call.cached_experts,
+                                                 static_cast<unsigned long long*>(failures.p));
             delivery.await(device.stream);
             inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.missing_ids, kPairs, l,
                 static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            listed<<<1, 256, 0, device.stream>>>(call.missing_ids, kPairs, call.missing_experts,
+                                                 static_cast<unsigned long long*>(failures.p));
             CUDA_CHECK(cudaGetLastError());
         }
     };
@@ -702,6 +741,7 @@ int lent_banks(DeviceContext& device, bool disk, const std::filesystem::path& pa
                 (unsigned long long)stats.lent_evictions, bad, count, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
+
 } // namespace
 
 int main(int argc, char** argv) {

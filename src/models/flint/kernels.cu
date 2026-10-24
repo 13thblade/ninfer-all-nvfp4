@@ -498,11 +498,13 @@ __global__ void route_logits_kernel(const float* __restrict__ x, int hidden, int
 // eight warps, so every SM streams part of the router.
 constexpr int kRouteSmallThreads = 256;
 
-__global__ void route_logits_small_kernel(const float* __restrict__ x, int hidden, int tokens,
-                                          const float* __restrict__ router, int experts,
-                                          float* __restrict__ logits) {
+// Expert e's logits of the tokens by a kRouteSmallThreads-thread block (route_logits_small_kernel's
+// and route_decode_kernel's blocks).
+__device__ __forceinline__ void router_row(const float* __restrict__ x, int hidden, int tokens,
+                                           const float* __restrict__ router, int experts, int e,
+                                           float* __restrict__ logits) {
     __shared__ float part[kRouteSmallThreads / 32][kRouteTokens];
-    const int e = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const float4* w = reinterpret_cast<const float4*>(router + std::int64_t(e) * hidden);
     const int quads = hidden / 4;
     float dot[kRouteTokens] = {};
@@ -527,6 +529,12 @@ __global__ void route_logits_small_kernel(const float* __restrict__ x, int hidde
         for (int w4 = 0; w4 < kRouteSmallThreads / 32; ++w4) { v += part[w4][threadIdx.x]; }
         logits[std::int64_t(threadIdx.x) * experts + e] = v;
     }
+}
+
+__global__ void route_logits_small_kernel(const float* __restrict__ x, int hidden, int tokens,
+                                          const float* __restrict__ router, int experts,
+                                          float* __restrict__ logits) {
+    router_row(x, hidden, tokens, router, experts, blockIdx.x, logits);
 }
 
 constexpr int kTopkMaxExperts = 256;
@@ -564,31 +572,45 @@ __global__ void route_topk_kernel(const float* __restrict__ logits, int experts,
     }
 }
 
-// Decode routing after the logits, in one block of at least max(experts, tokens * top_k)
-// threads: each token's top_k as route_topk_kernel picks them, then the pairs grouped by expert as
-// moe_sort_routes lists them (bounds, pairs per expert, active experts ascending).
-__global__ void route_select_kernel(const float* __restrict__ logits, int tokens, int experts,
-                                    int top_k, std::int32_t* __restrict__ ids,
-                                    float* __restrict__ weights, std::int32_t* __restrict__ bounds,
-                                    std::int32_t* __restrict__ sorted,
-                                    std::int32_t* __restrict__ active,
-                                    std::int32_t* __restrict__ active_count) {
-    __shared__ float v[kTopkMaxExperts];
+// The rank of `mine`, expert e's logit, among values[0, kTopkMaxExperts) (larger first, lower id on
+// equal values), as route_topk_kernel ranks it: the values past the experts are -inf, which never
+// rank before an expert. Unrolled float4 reads keep a lone block's loads in flight.
+__device__ __forceinline__ int rank_among(const float* values, float mine, int e) {
+    const float4* v4 = reinterpret_cast<const float4*>(values);
+    int rank         = 0;
+#pragma unroll
+    for (int j4 = 0; j4 < kTopkMaxExperts / 4; ++j4) {
+        const float4 o = v4[j4];
+        const int j    = 4 * j4;
+        rank += (o.x > mine) | ((o.x == mine) & (j < e));
+        rank += (o.y > mine) | ((o.y == mine) & (j + 1 < e));
+        rank += (o.z > mine) | ((o.z == mine) & (j + 2 < e));
+        rank += (o.w > mine) | ((o.w == mine) & (j + 3 < e));
+    }
+    return rank;
+}
+
+// Decode routing after the logits, by one block of kTopkMaxExperts threads: each token's top_k as
+// route_topk_kernel picks them, then the pairs grouped by expert as moe_sort_routes lists them
+// (bounds, pairs per expert, active experts ascending). Other blocks wrote the logits: they are
+// read from L2.
+__device__ void select_routes(const float* logits, int tokens, int experts, int top_k,
+                              std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                              std::int32_t* __restrict__ bounds, std::int32_t* __restrict__ sorted,
+                              std::int32_t* __restrict__ active,
+                              std::int32_t* __restrict__ active_count) {
+    __shared__ __align__(16) float v[kTopkMaxExperts];
     __shared__ float chosen[kRouteTokens * 8];
     __shared__ int chosen_id[kRouteTokens * 8];
     __shared__ int cursor[kTopkMaxExperts];
     __shared__ int warp_total[kTopkMaxExperts / 32][2];
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5;
     for (int t = 0; t < tokens; ++t) {
-        if (e < experts) { v[e] = logits[std::int64_t(t) * experts + e]; }
+        v[e] = e < experts ? __ldcg(logits + std::int64_t(t) * experts + e) : -INFINITY;
         __syncthreads();
         if (e < experts) {
             const float mine = v[e];
-            int rank         = 0;
-            for (int j = 0; j < experts; ++j) {
-                const float other = v[j];
-                rank += (other > mine || (other == mine && j < e)) ? 1 : 0;
-            }
+            const int rank   = rank_among(v, mine, e);
             if (rank < top_k) {
                 chosen[t * top_k + rank]    = sigmoid(mine);
                 chosen_id[t * top_k + rank] = e;
@@ -640,6 +662,32 @@ __global__ void route_select_kernel(const float* __restrict__ logits, int tokens
     }
     __syncthreads();
     if (e < pairs) { sorted[atomicAdd(cursor + chosen_id[e], 1)] = e; }
+}
+
+static_assert(kRouteSmallThreads == kTopkMaxExperts, "a routing block computes a row, then selects");
+
+// Decode routing in one launch: block e computes expert e's logits as route_logits_small_kernel
+// does, and the last block to finish selects (select_routes). `done` counts the finished blocks;
+// the last one sets it back to zero.
+__global__ void route_decode_kernel(const float* __restrict__ x, int hidden, int tokens,
+                                    const float* __restrict__ router, int experts, int top_k,
+                                    float* __restrict__ logits, std::int32_t* __restrict__ ids,
+                                    float* __restrict__ weights, std::int32_t* __restrict__ bounds,
+                                    std::int32_t* __restrict__ sorted,
+                                    std::int32_t* __restrict__ active,
+                                    std::int32_t* __restrict__ active_count,
+                                    unsigned* __restrict__ done) {
+    __shared__ bool last;
+    router_row(x, hidden, tokens, router, experts, blockIdx.x, logits);
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) { last = atomicAdd(done, 1u) == gridDim.x - 1; }
+    __syncthreads();
+    if (!last) { return; }
+    __threadfence();
+    select_routes(logits, tokens, experts, top_k, ids, weights, bounds, sorted, active,
+                  active_count);
+    if (threadIdx.x == 0) { *done = 0; }
 }
 
 constexpr int kGuardThreads = 128;
@@ -833,20 +881,17 @@ void route(const float* x, int hidden, int tokens, const float* router, int expe
 }
 
 void route_select(const float* x, int hidden, int tokens, const float* router, int experts,
-                  int top_k, float* logits, std::int32_t* ids, float* weights,
-                  std::int32_t* bounds, std::int32_t* sorted, std::int32_t* active,
-                  std::int32_t* active_count, cudaStream_t stream) {
+                  int top_k, float* logits, std::int32_t* ids, float* weights, std::int32_t* bounds,
+                  std::int32_t* sorted, std::int32_t* active, std::int32_t* active_count,
+                  std::uint32_t* done, cudaStream_t stream) {
     if (tokens > kRouteTokens || top_k > 8 || top_k > experts || experts > kTopkMaxExperts ||
         hidden % 4 != 0) {
         throw std::invalid_argument("flint route_select: at most 8 tokens, 8 of 256 experts");
     }
-    route_logits_small_kernel<<<experts, kRouteSmallThreads, 0, stream>>>(x, hidden, tokens, router,
-                                                                         experts, logits);
-    check_launch("route logits");
-    const int threads = (std::max(experts, tokens * top_k) + 31) / 32 * 32;
-    route_select_kernel<<<1, threads, 0, stream>>>(logits, tokens, experts, top_k, ids, weights,
-                                                   bounds, sorted, active, active_count);
-    check_launch("route select");
+    route_decode_kernel<<<experts, kTopkMaxExperts, 0, stream>>>(
+        x, hidden, tokens, router, experts, top_k, logits, ids, weights, bounds, sorted, active,
+        active_count, done);
+    check_launch("route_select");
 }
 
 void swiglu_rows(const float* x, int pairs, int width, __nv_bfloat16* out, float* weights,
