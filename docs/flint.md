@@ -131,32 +131,46 @@ where a state was kept, not at an arbitrary common prefix.
 
 ## Measurements
 
-On an NVIDIA A40 (48 GB, `sm_86`, 300 W, CUDA 12.8) with the UD-Q4_K_XL artifact and every expert
-on the GPU, `ninfer_bench` against llama.cpp b11845's `llama-bench` on the same GGUF (flash
-attention on, every layer on the GPU), one sequence, three repetitions each (every spread under
-0.5%). NInfer's prompts are Flint-tokenized source code, llama-bench's its own tokens; the experts
-a prompt reaches depend on its tokens.
+`ninfer_bench` against llama.cpp b11804's `llama-bench` on the same UD-Q4_K_XL GGUF (flash
+attention on, F16 KV), one sequence, three repetitions each. NInfer's prompts are Flint-tokenized
+source code, llama-bench's its own tokens; the experts a prompt reaches depend on its tokens. Decode
+after 10,000 tokens follows a 10,000-token prompt (`-pg 10000,128` and `tg128 @ d10000`). The
+23.4 GiB of weights fit only the RTX 5090, where both engines keep every expert on the GPU. On the
+24 GB cards NInfer keeps the experts in pinned host memory (`--expert-residency host`) with the
+cache it sizes itself, 19.3 GiB, and llama.cpp keeps the experts of its first four blocks on the
+CPU (`-ncmoe 4`; with fewer, the 10,000-token prompt ran out of memory).
 
-| Test | NInfer tok/s | llama.cpp tok/s | NInfer / llama.cpp |
-|---|---:|---:|---:|
-| Prefill, 2,048 tokens | 5,685 | 3,295 | 1.73 |
-| Prefill, 10,000 tokens | 5,332 | 3,145 | 1.70 |
-| Prefill, 40,000 tokens | 4,399 | 2,759 | 1.59 |
-| Decode, 128 tokens | 149.6 | 114.3 | 1.31 |
-| Decode after 10,000 tokens | 135.0 | 106.9 | 1.26 |
-| Decode after 40,000 tokens | 112.3 | 92.2 | 1.22 |
+| Card | Engine | Prefill 2,048 | Prefill 10,000 | Decode 128 | Decode after 10,000 |
+|---|---|---:|---:|---:|---:|
+| RTX 5090 | NInfer | 15,670 | 14,656 | 347.7 | 314.6 |
+| RTX 5090 | llama.cpp | 8,702 | 8,679 | 222.7 | 209.2 |
+| RTX 4090 | NInfer, host experts | 12,423 | 11,466 | 210.2 | 188.0 |
+| RTX 4090 | llama.cpp, `-ncmoe 4` | 4,868 | 4,725 | 165.7 | 149.4 |
+| RTX 3090 | NInfer, host experts | 6,225 | 5,755 | 161.4 | 140.2 |
+| RTX 3090 | llama.cpp, `-ncmoe 4` | 2,633 | 2,553 | 79.9 | 77.1 |
 
-- **Context lookup.** `--lookup-ngram 4` on a greedy rewrite of a code module through
-  `ninfer-serve`: 145.2 → 227.9 tok/s (1.57x) for a direct 669-token answer, 340 of 396 proposed
-  tokens accepted; 145.1 → 175.5 tok/s (1.21x) for a 1,024-token answer that reasons first, 264 of
-  348 accepted. The output equals plain decoding's in both.
-- **Typed decisions.** `scripts/pods/decision_bench.py` (four sequences): about a 340-token state,
-  1, 4 and 16 questions answer in 118, 135 and 236 ms cold and 59, 95 and 203 ms once the state is
-  kept; about an 11,660-token state in 2.20, 2.22 and 2.39 s cold and 68, 118 and 274 ms warm. A
-  cold read runs the state's last chunk and the first questions in one pass; reading them after
-  it took 162, 195 and 299 ms (short state) and 2.24, 2.27 and 2.44 s (long one). A chat decoding
-  beside a stream of decisions slows from 148.9 to 135.0 tok/s, the decisions from 0.209 to
-  0.213 s.
+NInfer against llama.cpp: 1.80, 1.69, 1.56 and 1.50 times on the RTX 5090; 2.55, 2.43, 1.27 and
+1.26 on the RTX 4090; 2.36, 2.25, 2.02 and 1.82 on the RTX 3090. NInfer's spreads stay under 1.1%.
+llama.cpp's stay under 2.7% except its 5090 prefill of 2,048 tokens (±4.4%) and its 3090 decode
+after 10,000 tokens (±7.4%); its 5090 decode after 10,000 tokens comes from a second run of five
+repetitions, the first having spread ±22%.
+
+| Card | Board power | Host CPU | CUDA | Build |
+|---|---:|---|---:|---|
+| RTX 5090 | 575 W | 2 × EPYC 9654 | 13.4 | `120a` |
+| RTX 4090 | 500 W | Ryzen 9 7950X | 13.4 | `89` |
+| RTX 3090 | 370 W | Threadripper PRO 3955WX | 12.8 | `86` |
+
+- **Context lookup.** `--lookup-ngram 4` through `ninfer-serve` on the RTX 5090, a greedy rewrite
+  of a six-function Python module with type hints and docstrings (1,024 tokens, reasoning first):
+  335.0 → 377.7 tok/s (1.13x), 164 of 255 proposed tokens accepted. The output equals plain
+  decoding's.
+- **Typed decisions.** On an NVIDIA A40 (48 GB, `sm_86`, 300 W), `scripts/pods/decision_bench.py`
+  (four sequences): about a 340-token state, 1, 4 and 16 questions answer in 118, 135 and 236 ms
+  cold and 59, 95 and 203 ms once the state is kept; about an 11,660-token state in 2.20, 2.22 and
+  2.39 s cold and 68, 118 and 274 ms warm. A cold read runs the state's last chunk and the first
+  questions in one pass; reading them after it took 162, 195 and 299 ms (short state) and 2.24,
+  2.27 and 2.44 s (long one).
 
 ## Numerical checks
 
@@ -236,7 +250,10 @@ rounds and the growing KV):
   out like the resident bank; two banks let the next layer arrive while the current one computes.
 - **Cache.** `--expert-cache-mib` (default: what is free after startup) holds the experts decode
   routes most, filled at startup from a routing profile (`--expert-profile`, else the built-in
-  Flint profile recorded on coding, chat and reasoning requests). `0` keeps the banks only.
+  Flint profile recorded on coding, chat and reasoning requests). `0` keeps the banks only. A
+  slot takes the room of its layer's largest expert, from 1.6 to 2.5 MiB with the layer's formats,
+  and each layer gets about as many slots: on a 24 GB card the 19.3 GiB cache holds 10,564 of the
+  12,032 routed experts.
 - **CPU share.** Of a decode or verification call's misses, CPU threads compute a share from the
   stored blocks while the GPU copies and runs the rest (`--expert-dma-share`, `auto` by default;
   `--expert-cpu-threads`). The CPU computes SwiGLU over the [gate; up] rows, the BF16 middle
@@ -244,17 +261,12 @@ rounds and the growing KV):
   fixed-point sums, so outputs do not depend on the split. Calls of more than eight tokens always
   use the GPU.
 
-On the A40, caches of 8 and 16 GiB stand for the room a 16 GB and a 24 GB card leave
-(`ninfer_bench`, one sequence, two repetitions; 30 CPU threads of an EPYC 7662 take a share of the
-decode misses). Disk experts read through the page cache of a host with 2 TB of RAM, in whatever
-state the earlier runs left it, which shows in their spread.
+On the RTX 3090 of the measurements above, with the cache NInfer sizes itself (`ninfer_bench`, one
+sequence, three repetitions; three CPU threads take a share of the decode misses). Disk experts read
+through the page cache of a host with 503 GB of RAM, in whatever state the earlier runs left it,
+which shows in their spread.
 
-| Experts | Cache | Prefill 2,048 | Decode 128 | Prefill 10,000 | Decode after it |
+| Experts | Cache | Prefill 2,048 | Prefill 10,000 | Decode 128 | Decode after 10,000 |
 |---|---:|---:|---:|---:|---:|
-| host | 8 GiB | 2,640 | 26.9 | 2,408 | 23.0 |
-| host | 16 GiB | 4,645 | 34.8 | 3,403 | 32.7 |
-| disk | 8 GiB | 286 | 10.0 | 321 | 7.2 |
-| disk | 16 GiB | 466 | 30.1 ± 20.9 | 592 | 13.2 |
-
-llama.cpp with its experts on the CPU (`-ot exps=CPU`) on the same host: 255.5 tok/s prefill of
-2,048 tokens and 14.0 tok/s decode.
+| host | 19.3 GiB | 6,225 | 5,755 | 161.4 | 140.2 |
+| disk | 19.4 GiB | 4,495 | 3,879 | 130.0 ± 7.1 | 108.8 |

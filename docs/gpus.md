@@ -64,7 +64,7 @@ means the card calibrates once at its first start.
 
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
-| ✅ | RTX 5090 | 32 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, 35B-A3B NVFP4 |
+| ✅ | RTX 5090 | 32 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, 35B-A3B NVFP4, Flint |
 | ⬜ | RTX 5090 D | 32 GB | GeForce | | |
 | ⬜ | RTX 5090 D V2 | 24 GB | GeForce | ✓ | |
 | ⬜ | RTX 5080 | 16 GB | GeForce | ✓ | |
@@ -87,7 +87,7 @@ means the card calibrates once at its first start.
 
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
-| ✅ | RTX 4090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next; Swift 1.5 IQ3_S ([field reports](performance/field-reports.md#rtx-4090-qwen-code-with-dflash2)) |
+| ✅ | RTX 4090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, Flint (experts in host memory); Swift 1.5 IQ3_S ([field reports](performance/field-reports.md#rtx-4090-qwen-code-with-dflash2)) |
 | ⬜ | RTX 4090 D | 24 GB | GeForce | | |
 | ⬜ | RTX 4080 Super | 16 GB | GeForce | ✓ | |
 | ✅ | RTX 4080 | 16 GB | GeForce | ✓ | IQ3_S ([field report](performance/field-reports.md#rtx-4080-and-rtx-4090-windows-11)) |
@@ -114,7 +114,7 @@ means the card calibrates once at its first start.
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
 | ✅ | RTX 3090 Ti | 24 GB | GeForce | | Flash-Next over two cards |
-| ✅ | RTX 3090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, 35B-A3B, Flash-Next, Gemma 4 (the reference card) |
+| ✅ | RTX 3090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, 35B-A3B, Flash-Next, Gemma 4, Flint (experts in host memory, on disk; the reference card) |
 | ⬜ | RTX 3080 Ti | 12 GB | GeForce | ✓ | |
 | ⬜ | RTX 3080 | 12 / 10 GB | GeForce | 10 GB (68 SMs) | |
 | ⬜ | RTX 3070 Ti | 8 GB | GeForce | | |

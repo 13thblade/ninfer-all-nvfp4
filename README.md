@@ -286,9 +286,11 @@ Prefill of a 4,463-token prompt, in tok/s:
   blocks with learned sinks, 256 routed experts beside a shared one, up to eight concurrent
   requests with prefix reuse through host memory, the model's own reasoning, GLM-4.7 tool calls,
   structured output, typed decisions, context-lookup drafting, and experts on the GPU, in pinned
-  host memory or in the artifact's files. On an A40 it prefills a 10,000-token prompt at 5,332
-  tok/s and decodes at 150 tok/s, 135 after 10,000 tokens, against llama.cpp's 3,145, 114 and 107
-  on the same GGUF ([Flint](docs/flint.md)).
+  host memory or in the artifact's files. On an RTX 5090 it prefills a 10,000-token prompt at
+  14,656 tok/s and decodes at 348 tok/s, 315 after 10,000 tokens, against llama.cpp's 8,679, 223
+  and 209 on the same GGUF; on an RTX 3090, with its experts in host memory, at 5,755, 161 and 140
+  against llama.cpp's 2,553, 80 and 77 with four blocks' experts on the CPU
+  ([Flint](docs/flint.md)).
 - **CPU share of host and disk experts.** With Flash-Next, Gemma 4, Flint or native Qwen3.5/3.6
   MoE experts off the GPU, CPU threads compute a share of each decode call's cache misses from host
   memory while the GPU copies the rest, bit for bit equal to the GPU's products
