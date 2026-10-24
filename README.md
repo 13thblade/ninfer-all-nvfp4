@@ -21,7 +21,7 @@
 
 ### 吞吐
 
-全程同一个制品（`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`，带 proposal 头），RTX 3090 Ti，贪心解码，KV bf16，16,384 token 上下文，`--device-profile calibrate`，prefill 由 4K 的长 prompt 测出，decode 速度来自于多个真实场景下测得的均值。
+全程同一个制品（`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`，带 proposal 头），RTX 3090 Ti，贪心解码，KV bf16，16,384 token 上下文，`--device-profile calibrate`，prefill 由 4K 的长 prompt 测出（三次独立冷启动取峰值），decode 速度来自于多个真实场景下测得的均值。
 
 | 构建与投机解码设置                    | Prefill tok/s | Decode tok/s | 接受率   |
 | ---------------------------- | ------------- | ------------ | ----- |
@@ -29,12 +29,12 @@
 | 接上宽 T SwiGLU、尚未做任何 kernel 优化 | 780           | 16           | —     |
 | 本构建，W4A16，无投机（T1）           | 1288          | 50           | —     |
 | 本构建，W4A16，MTP K=3             | 1282          | 104          | 72%   |
-| 本构建，W4A16，DFlash2 K=5         | 1274          | 118          | 56%   |
-| 本构建，W4A16，DFlash2 K=7         | 1222          | 125          | 47%   |
-| 本构建，W4A8-int，无投机（T1）        | 1662          | 53           | —     |
+| 本构建，W4A16，DFlash2 K=5         | 1279          | 118          | 56%   |
+| 本构建，W4A16，DFlash2 K=7         | 1275          | 125          | 47%   |
+| 本构建，W4A8-int，无投机（T1）        | 1665          | 53           | —     |
 | 本构建，W4A8-int，MTP K=3          | 1652          | 109          | 63%   |
-| 本构建，W4A8-int，DFlash2 K=5      | 1500          | 132          | 58%   |
-| 本构建，W4A8-int，DFlash2 K=7      | 1551          | 126          | 47%   |
+| 本构建，W4A8-int，DFlash2 K=5      | 1646          | 132          | 58%   |
+| 本构建，W4A8-int，DFlash2 K=7      | 1644          | 126          | 47%   |
 
 这张表有一点要说明。**上游会抛异常**，所以那一行是空的：fused NVFP4 SwiGLU 通路只实例化到 `T <= 16`，后面没有宽内核兜底，这里没有"局部状态"可绕 —— 内核在构建里根本不存在，prompt 走不到 decode。
 
@@ -74,7 +74,7 @@ Four changes, in order:
 
 ## Throughput
 
-Same artifact throughout (`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`, proposal head) on an RTX 3090 Ti: greedy decoding, KV bf16, 16,384-token context, `--device-profile calibrate`. Prefill is measured on the 4K long prompt; decode is the mean over several realistic tasks.
+Same artifact throughout (`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`, proposal head) on an RTX 3090 Ti: greedy decoding, KV bf16, 16,384-token context, `--device-profile calibrate`. Prefill is measured on the 4K long prompt (peak of three independent cold starts); decode is the mean over several realistic tasks.
 
 | Build and speculative setting                 | Prefill tok/s | Decode tok/s | Acceptance |
 | --------------------------------------------- | ------------- | ------------ | ---------- |
@@ -82,12 +82,12 @@ Same artifact throughout (`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`, proposal head) on 
 | Wide-T SwiGLU grafted, before any kernel work | 780           | 16           | —          |
 | This build, W4A16, no speculation (T1)        | 1288          | 50           | —          |
 | This build, W4A16, MTP K=3                    | 1282          | 104          | 72%        |
-| This build, W4A16, DFlash2 K=5                | 1274          | 118          | 56%        |
-| This build, W4A16, DFlash2 K=7                | 1222          | 125          | 47%        |
-| This build, W4A8-int, no speculation (T1)     | 1662          | 53           | —          |
+| This build, W4A16, DFlash2 K=5                | 1279          | 118          | 56%        |
+| This build, W4A16, DFlash2 K=7                | 1275          | 125          | 47%        |
+| This build, W4A8-int, no speculation (T1)     | 1665          | 53           | —          |
 | This build, W4A8-int, MTP K=3                 | 1652          | 109          | 63%        |
-| This build, W4A8-int, DFlash2 K=5             | 1500          | 132          | 58%        |
-| This build, W4A8-int, DFlash2 K=7             | 1551          | 126          | 47%        |
+| This build, W4A8-int, DFlash2 K=5             | 1646          | 132          | 58%        |
+| This build, W4A8-int, DFlash2 K=7             | 1644          | 126          | 47%        |
 
 One thing about the table: **upstream throws**, hence the empty row. The fused NVFP4 SwiGLU route is instantiated only to `T <= 16` and there is no wide fallback behind it — the kernel is absent from the build and there is no partial state to patch around, so that prompt never reaches decode.
 
