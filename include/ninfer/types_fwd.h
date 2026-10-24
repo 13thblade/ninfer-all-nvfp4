@@ -98,6 +98,7 @@ struct PromptSummary;
 struct PromptPreparationStats;
 enum class FinishReason : std::uint8_t;
 struct TokenLogprob;
+struct BranchResult;
 struct OutputDelta;
 struct GenerationStart;
 struct PromptProgress;
