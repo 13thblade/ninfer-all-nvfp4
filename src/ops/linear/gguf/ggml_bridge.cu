@@ -741,6 +741,10 @@ bool matrix_activation_f16_sums(GgmlType type) {
     return mmq_get_q8_1_ds_layout(detail::to_ggml(type)) == MMQ_Q8_1_DS_LAYOUT_DS4;
 }
 
+bool vector_activation_f16_sums(GgmlType type) {
+    return type == GgmlType::Q4_K || type == GgmlType::Q5_K || type == GgmlType::IQ1_S;
+}
+
 std::size_t matrix_activation_bytes(int k, int columns) {
     return std::size_t(columns) * (k / QK8_1_MMQ) * sizeof(block_q8_1_mmq) +
            detail::kMatrixActivationSlack;

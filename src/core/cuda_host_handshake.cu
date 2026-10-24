@@ -1,25 +1,15 @@
 #include "core/cuda_host_handshake.h"
 
-#include <cuda/atomic>
+#include "core/cuda_host_handshake.cuh"
 
 #include <new>
 #include <thread>
 
 namespace ninfer {
 namespace {
-struct Mailbox {
-    alignas(64) std::uint32_t requested = 0;
-    std::uint32_t tag = 0, width = 0, flags = 0;
-    alignas(64) std::uint32_t prepared = 0;
-    alignas(64) std::uint32_t completed = 0;
-    alignas(64) std::uint32_t retired = 0;
-    alignas(64) std::uint32_t released = 0;
-};
-
-// Naturally aligned 32-bit loads/stores to mapped host memory are system-atomic even on PCIe
-// devices without hostNativeAtomicSupported. Do not replace these with RMW operations.
-// https://nvidia.github.io/cccl/unstable/libcudacxx/extended_api/memory_model.html
-using Atomic = cuda::atomic_ref<std::uint32_t, cuda::thread_scope_system>;
+using handshake::Atomic;
+using handshake::DeviceMailbox;
+using handshake::Mailbox;
 
 bool capturing(cudaStream_t stream) {
     cudaStreamCaptureStatus status;
@@ -35,29 +25,28 @@ void wait_host(Mailbox& box, bool complete) {
     }
 }
 
-__global__ void publish_request(Mailbox* box, std::uint32_t tag, std::uint32_t width,
+__global__ void publish_request(DeviceMailbox mailbox, std::uint32_t tag, std::uint32_t width,
                                 std::uint32_t flags) {
-    const auto sequence = Atomic(box->requested).load(cuda::memory_order_relaxed) + 1;
-    box->tag = tag;
-    box->width = width;
-    box->flags = flags;
-    Atomic(box->requested).store(sequence, cuda::memory_order_release);
+    handshake::publish(mailbox, tag, width, flags);
 }
 
-__global__ void wait_phase(Mailbox* box, bool complete) {
-    const auto sequence = Atomic(box->requested).load(cuda::memory_order_relaxed);
-    auto& phase = complete ? box->completed : box->prepared;
+__global__ void wait_phase(DeviceMailbox mailbox, bool complete) {
+    const auto sequence = *mailbox.sequence;
+    auto& phase         = complete ? mailbox.box->completed : mailbox.box->prepared;
     while (Atomic(phase).load(cuda::memory_order_acquire) != sequence) { __nanosleep(256); }
 }
 
-__global__ void retire_request(Mailbox* box) {
-    const auto sequence = Atomic(box->requested).load(cuda::memory_order_relaxed);
-    Atomic(box->retired).store(sequence, cuda::memory_order_release);
-    while (Atomic(box->released).load(cuda::memory_order_acquire) != sequence) { __nanosleep(256); }
+__global__ void retire_request(DeviceMailbox mailbox) {
+    const auto sequence = *mailbox.sequence;
+    Atomic(mailbox.box->retired).store(sequence, cuda::memory_order_release);
+    while (Atomic(mailbox.box->released).load(cuda::memory_order_acquire) != sequence) {
+        __nanosleep(256);
+    }
 }
 } // namespace
 
-CudaHostHandshake::CudaHostHandshake(const RankContext& rank) {
+CudaHostHandshake::CudaHostHandshake(const RankContext& rank, std::uint32_t* sequence)
+    : sequence_(sequence) {
     DeviceBinding bind(rank.device);
     CUDA_CHECK(cudaHostAlloc(&host_, sizeof(Mailbox), cudaHostAllocMapped | cudaHostAllocPortable));
     try {
@@ -70,9 +59,19 @@ CudaHostHandshake::CudaHostHandshake(const RankContext& rank) {
 }
 CudaHostHandshake::~CudaHostHandshake() { if (host_) { cudaFreeHost(host_); } }
 
+handshake::DeviceMailbox CudaHostHandshake::device() const noexcept {
+    return {static_cast<Mailbox*>(device_), sequence_};
+}
+
+void CudaHostHandshake::resume() {
+    const auto sequence =
+        Atomic(static_cast<Mailbox*>(host_)->requested).load(cuda::memory_order_acquire);
+    CUDA_CHECK(cudaMemcpy(sequence_, &sequence, sizeof(sequence), cudaMemcpyHostToDevice));
+}
+
 void CudaHostHandshake::publish(std::uint32_t tag, std::uint32_t width, std::uint32_t flags,
                                cudaStream_t stream) {
-    publish_request<<<1, 1, 0, stream>>>(static_cast<Mailbox*>(device_), tag, width, flags);
+    publish_request<<<1, 1, 0, stream>>>(device(), tag, width, flags);
     CUDA_CHECK(cudaGetLastError());
 }
 void CudaHostHandshake::wait_prepared(cudaStream_t stream) {
@@ -85,7 +84,7 @@ void CudaHostHandshake::wait_prepared(cudaStream_t stream) {
         wait_host(*static_cast<Mailbox*>(host_), false);
         return;
     }
-    wait_phase<<<1, 1, 0, stream>>>(static_cast<Mailbox*>(device_), false);
+    wait_phase<<<1, 1, 0, stream>>>(device(), false);
     CUDA_CHECK(cudaGetLastError());
 }
 void CudaHostHandshake::wait_completed(cudaStream_t stream) {
@@ -93,12 +92,12 @@ void CudaHostHandshake::wait_completed(cudaStream_t stream) {
         wait_host(*static_cast<Mailbox*>(host_), true);
         return;
     }
-    wait_phase<<<1, 1, 0, stream>>>(static_cast<Mailbox*>(device_), true);
+    wait_phase<<<1, 1, 0, stream>>>(device(), true);
     CUDA_CHECK(cudaGetLastError());
 }
 void CudaHostHandshake::retire(cudaStream_t stream) {
     const bool captured = capturing(stream);
-    retire_request<<<1, 1, 0, stream>>>(static_cast<Mailbox*>(device_));
+    retire_request<<<1, 1, 0, stream>>>(device());
     CUDA_CHECK(cudaGetLastError());
     // No eager GPU wait may remain when the caller first launches another layer's kernels.
     if (!captured) { CUDA_CHECK(cudaStreamSynchronize(stream)); }

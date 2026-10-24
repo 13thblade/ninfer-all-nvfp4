@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 using namespace ninfer;
@@ -105,6 +106,202 @@ void tier_admission() {
     require(shared.end_pass().empty(), "a pass ends");
     const auto other = shared.admission_victim(0, 3, 2, std::vector<unsigned char>(4, 0));
     require(other.layer == 1 && other.expert == 2, "a shared pool's coldest expert may be another layer's");
+}
+
+// The tier as a plain whole sort states it: held experts coldest first as the pass ended (lower
+// entry first among equals), candidates hottest first, every pool's swaps until the first one that
+// does not gain, the best `swaps` of them over all pools.
+struct WholeSortTier {
+    std::vector<std::uint32_t> pool_of; // by entry
+    std::vector<float> counts;
+    std::vector<ExpertTier::State> states;
+    std::vector<std::uint32_t> free;
+    std::vector<std::vector<std::size_t>> cold;
+    std::vector<std::size_t> next;
+    ExpertTierOptions options;
+    std::uint32_t passes = 0;
+
+    void refresh() {
+        for (auto& list : cold) { list.clear(); }
+        for (std::size_t i = 0; i < counts.size(); ++i) {
+            if (states[i] == ExpertTier::State::Held) { cold[pool_of[i]].push_back(i); }
+        }
+        for (auto& list : cold) {
+            std::stable_sort(list.begin(), list.end(),
+                             [&](std::size_t a, std::size_t b) { return counts[a] < counts[b]; });
+        }
+        std::fill(next.begin(), next.end(), 0);
+    }
+
+    std::int64_t victim(std::size_t entry, float pairs, const std::vector<unsigned char>& busy) {
+        const float candidate = counts[entry] + pairs;
+        auto& list            = cold[pool_of[entry]];
+        auto& first           = next[pool_of[entry]];
+        while (first < list.size() && states[list[first]] != ExpertTier::State::Held) { ++first; }
+        std::size_t held = 0;
+        for (std::size_t at = first; at < list.size() && held < 32; ++at) {
+            const std::size_t i = list[at];
+            if (states[i] != ExpertTier::State::Held) { continue; }
+            ++held;
+            if (busy[i] != 0) { continue; }
+            if (candidate >= counts[i] + options.min_gain) { return std::int64_t(i); }
+        }
+        return -1;
+    }
+
+    std::vector<std::tuple<std::size_t, std::int64_t, float>> end_pass() {
+        std::vector<std::tuple<std::size_t, std::int64_t, float>> swaps;
+        if (++passes >= options.every) {
+            passes = 0;
+            for (std::uint32_t pool = 0; pool < cold.size(); ++pool) {
+                std::vector<std::size_t> in, out;
+                for (std::size_t i = 0; i < counts.size(); ++i) {
+                    if (pool_of[i] != pool) { continue; }
+                    if (states[i] == ExpertTier::State::Held) {
+                        out.push_back(i);
+                    } else if (states[i] == ExpertTier::State::Out &&
+                               counts[i] >= options.min_count) {
+                        in.push_back(i);
+                    }
+                }
+                std::stable_sort(in.begin(), in.end(), [&](std::size_t a, std::size_t b) {
+                    return counts[a] > counts[b];
+                });
+                std::stable_sort(out.begin(), out.end(), [&](std::size_t a, std::size_t b) {
+                    return counts[a] < counts[b];
+                });
+                std::size_t n = 0;
+                for (std::size_t c = 0; c < in.size(); ++c) {
+                    if (c < free[pool]) {
+                        swaps.emplace_back(in[c], -1, counts[in[c]]);
+                        continue;
+                    }
+                    if (n == out.size()) { break; }
+                    const float gain = counts[in[c]] - counts[out[n]];
+                    if (gain < options.min_gain) { break; }
+                    swaps.emplace_back(in[c], std::int64_t(out[n++]), gain);
+                }
+            }
+            std::stable_sort(swaps.begin(), swaps.end(), [](const auto& a, const auto& b) {
+                return std::get<2>(a) > std::get<2>(b);
+            });
+            if (swaps.size() > options.swaps) { swaps.resize(options.swaps); }
+            for (auto& count : counts) { count *= options.decay; }
+        }
+        refresh();
+        return swaps;
+    }
+};
+
+// Thousands of held experts: a pass orders only the coldest few hundred, the scans of a pass may
+// pass all of them, and a round pairs a few hundred candidates with victims. Every victim and
+// every round must be those of the whole sort, many passes in a row, with counts that tie.
+void tier_matches_whole_sort() {
+    using State                     = ExpertTier::State;
+    constexpr std::uint32_t kLayers = 3, kExperts = 700;
+    // Layers 0 and 1 share pool 0 (1,400 entries), layer 2 owns pool 1.
+    const ExpertTierOptions options{.every = 2, .swaps = 96};
+    ExpertTier tier(std::vector<std::uint32_t>(kLayers, kExperts), {0, 0, 1}, options);
+    WholeSortTier whole;
+    whole.options = options;
+    for (std::uint32_t l = 0; l < kLayers; ++l) {
+        for (std::uint32_t e = 0; e < kExperts; ++e) { whole.pool_of.push_back(l < 2 ? 0 : 1); }
+    }
+    const std::size_t entries = whole.pool_of.size();
+    whole.counts.assign(entries, 0);
+    whole.states.assign(entries, State::Out);
+    whole.free.assign(2, 0);
+    whole.cold.resize(2);
+    whole.next.assign(2, 0);
+    const auto at = [](std::size_t i) {
+        return std::pair{std::uint32_t(i / kExperts), std::int32_t(i % kExperts)};
+    };
+    const auto set = [&](std::size_t i, State state) {
+        const auto [l, e] = at(i);
+        tier.set(l, e, state);
+        whole.states[i] = state;
+    };
+    std::uint64_t seed = 12345;
+    const auto random  = [&](std::uint64_t n) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        return (seed >> 33) % n;
+    };
+    for (std::size_t i = 0; i < entries; ++i) {
+        if (random(10) < 8) { set(i, State::Held); }
+    }
+    std::size_t victims = 0, swapped = 0;
+    for (int pass = 0; pass < 40; ++pass) {
+        // Routes: small integer counts, so many experts tie.
+        for (int r = 0; r < 3000; ++r) {
+            const std::size_t i = random(4) == 0 ? random(60) : random(entries);
+            const auto [l, e]   = at(i);
+            const float pairs   = float(1 + random(3));
+            tier.route(l, e, pairs);
+            whole.counts[i] += pairs;
+        }
+        // Misses: admissions take victims; on some passes the 600 coldest of pool 0 leave first,
+        // so its scans reach past the experts a pass orders.
+        if (pass % 3 == 1) {
+            const auto coldest = whole.cold[0];
+            for (std::size_t c = 0; c < coldest.size() && c < 600; ++c) {
+                set(coldest[c], State::Out);
+            }
+        }
+        for (int m = 0; m < 40; ++m) {
+            const std::size_t miss = random(entries);
+            if (whole.states[miss] != State::Out) { continue; }
+            const auto [l, e] = at(miss);
+            std::vector<unsigned char> busy(entries, 0), layer_busy(kExperts, 0);
+            for (int b = 0; b < 6; ++b) {
+                const std::size_t routed      = l * kExperts + random(kExperts);
+                busy[routed]                  = 1;
+                layer_busy[routed % kExperts] = 1;
+            }
+            const float pairs   = float(random(40));
+            const auto expected = whole.victim(miss, pairs, busy);
+            const auto got      = tier.admission_victim(l, e, pairs, layer_busy);
+            const std::int64_t got_entry =
+                got.expert < 0 ? -1 : std::int64_t(got.layer) * kExperts + got.expert;
+            require(got_entry == expected, "pass " + std::to_string(pass) + ": admission victim " +
+                                               std::to_string(got_entry) + " instead of " +
+                                               std::to_string(expected));
+            if (expected >= 0) {
+                set(std::size_t(expected), State::Out);
+                set(miss, State::Held);
+                ++victims;
+            }
+        }
+        const std::uint32_t free0 = std::uint32_t(random(150)), free1 = std::uint32_t(random(3));
+        tier.set_free(0, free0);
+        tier.set_free(1, free1);
+        whole.free          = {free0, free1};
+        const auto swaps    = tier.end_pass();
+        const auto expected = whole.end_pass();
+        require(swaps.size() == expected.size(),
+                "pass " + std::to_string(pass) + ": " + std::to_string(swaps.size()) +
+                    " swaps instead of " + std::to_string(expected.size()));
+        for (std::size_t s = 0; s < swaps.size(); ++s) {
+            const auto& [in, out, gain] = expected[s];
+            const bool same =
+                std::size_t(swaps[s].layer) * kExperts + std::size_t(swaps[s].in) == in &&
+                (out < 0 ? swaps[s].out < 0
+                         : std::size_t(swaps[s].out_layer) * kExperts + std::size_t(swaps[s].out) ==
+                               std::size_t(out)) &&
+                swaps[s].gain == gain;
+            require(same,
+                    "pass " + std::to_string(pass) + ": swap " + std::to_string(s) + " differs");
+        }
+        for (const auto& [in, out, gain] : expected) {
+            if (out >= 0) { set(std::size_t(out), State::Out); }
+            set(in, State::Held);
+            ++swapped;
+        }
+        require(std::fabs(tier.count(0, 0) - whole.counts[0]) <= 1e-6F * (1 + whole.counts[0]),
+                "counts decay alike");
+    }
+    require(victims > 50 && swapped > 100,
+            "the scenario admits and swaps: " + std::to_string(victims) + " victims, " +
+                std::to_string(swapped) + " swaps");
 }
 
 void split() {
@@ -245,6 +442,7 @@ int main() {
     try {
         tier_rounds();
         tier_admission();
+        tier_matches_whole_sort();
         split();
         pool();
         rows();

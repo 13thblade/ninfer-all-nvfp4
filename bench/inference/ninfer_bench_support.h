@@ -73,6 +73,7 @@ struct BenchOptions {
     SpeculativeOptions speculative;
     ExpertResidency expert_residency = ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
+    HybridExpertOptions hybrid_experts; // --expert-dma-share, --expert-cpu-threads
     int device            = 0;
     bool use_cuda_graph   = true;
     bool prefill_a8       = true;

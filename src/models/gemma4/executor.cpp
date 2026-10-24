@@ -1178,8 +1178,6 @@ struct Executor::Impl {
             out.weighted = fixed;
             out.weights = weights;
             const auto compute = [&](const gguf::MoeRouting& part) {
-                // Quantization reads every pair. Clear absent pairs before each disjoint stage.
-                if (call) { CUDA_CHECK(cudaMemsetAsync(middle, 0, std::size_t(pairs) * width * 2, stream)); }
                 gguf::moe_vector_swiglu(p.gate_up_type, gate, up, part, max_active, k, act, t,
                                         middle, chunk, stream, gguf::GateActivation::GeluTanh);
                 gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, stream);
@@ -1187,12 +1185,20 @@ struct Executor::Impl {
                                          out, chunk, stream);
             };
             if (call) {
-                // Both stages add to the same exact fixed-point sum, zeroed once above.
-                auto cached = gguf::moe_sort_routes(call->cached_ids, pairs, e, routing_space, stream);
-                compute(cached);
+                // Both stages add to the same exact fixed-point sum, zeroed once above, each over
+                // its experts of the call's sorted routes. Quantization reads every pair: the
+                // cached stage finds the other pairs cleared, the missing stage the cached pairs'
+                // middles.
+                const auto stage = [&](const std::int32_t* set) {
+                    gguf::MoeRouting part = routing;
+                    part.active_count     = set;
+                    part.active           = set + 1;
+                    return part;
+                };
+                CUDA_CHECK(cudaMemsetAsync(middle, 0, std::size_t(pairs) * width * 2, stream));
+                compute(stage(call->cached_experts));
                 delivery->await(stream);
-                auto missing = gguf::moe_sort_routes(call->missing_ids, pairs, e, routing_space, stream);
-                compute(missing);
+                compute(stage(call->missing_experts));
                 if (call->cpu != nullptr) {
                     kernels::add_fixed(fixed, call->products, call->cpu, std::int64_t(t) * hidden, stream);
                 }

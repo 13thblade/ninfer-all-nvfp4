@@ -1,4 +1,5 @@
 #include "ninfer_bench_support.h"
+#include "product/hybrid_expert_options.h"
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
 
@@ -315,6 +316,9 @@ std::string usage_text(std::string_view program) {
         << "  --expert-residency <device|host|disk>  routed MoE experts on the GPU (default), in "
            "pinned host memory, or in the artifact files\n"
         << "  --expert-cache-mib <N|auto> persistent device expert cache (default: auto)\n"
+        << "  --expert-dma-share <F|auto> host or disk experts: the GPU's share of a decode call's\n"
+           "                              cache misses, the CPU computing the rest (default: auto)\n"
+        << "  --expert-cpu-threads <N>    host or disk experts: CPU workers (default: automatic)\n"
         << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4>  KV cache storage "
            "(default: bf16)\n"
         << "  --fast-prefill-kernel       fast INT8-KV prompt kernel, wave-aligned chunks\n"
@@ -404,6 +408,9 @@ BenchOptions parse_args(int argc, char** argv) {
                 options.expert_cache_bytes = std::uint64_t(parse_u32(mib, "expert-cache-mib", true))
                                              << 20;
             }
+        } else if ((arg == "--expert-dma-share" || arg == "--expert-cpu-threads") &&
+                   product::parse_hybrid_expert_option(arg, options.hybrid_experts,
+                                                       [&] { return value(argv[i]); })) {
         } else if (arg == "--fast-prefill-kernel") {
             options.fast_prefill_kernel = true;
         } else if (arg == "--spec") {

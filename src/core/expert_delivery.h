@@ -105,7 +105,7 @@ struct ExpertDeliveryOptions {
     // can give slots back to memory that grows (shrink_cache) and take them again (grow_cache).
     // Needs CUDA virtual memory management.
     bool elastic = false;
-    // Which experts the cache holds once it is full (core/expert_tier.h), one pool for all layers.
+    // Which experts the cache holds once it is full (core/expert_tier.h), a pool per slot size.
     ExpertTierOptions tier{};
     ExpertCpuOptions cpu{};
 };
@@ -178,6 +178,10 @@ struct ExpertDeliveryMemory {
 // One Program, rank and serial compute stream. Sources outlive this object. All device addresses
 // stay fixed until destruction. The caller drains graph users before destroying their graphs.
 //
+// The cache's slots form pools, one for the layers whose experts need the same room (each blob's
+// largest bytes and tail): every layer holds about as many slots as any other whatever its
+// experts' size, and an expert enters only a slot of its own pool.
+//
 // Each call splits its routes into experts the persistent cache holds and the rest. A narrow call
 // (decode, verification) leaves a share of its missing experts to the CPU when the family computes
 // them there (ExpertCpuOptions): those cross no bus and take no slot. Its other misses enter a free
@@ -203,9 +207,13 @@ public:
     ExpertDelivery(const ExpertDelivery&) = delete;
     ExpertDelivery& operator=(const ExpertDelivery&) = delete;
 
+    // The call's cached and missing sets on the device: per pair, its expert or -1 when the pair
+    // lies in the other set, and as lists of experts (their count, then the experts ascending).
     struct Call {
-        const std::int32_t* cached_ids = nullptr;
-        const std::int32_t* missing_ids = nullptr;
+        const std::int32_t* cached_ids      = nullptr;
+        const std::int32_t* missing_ids     = nullptr;
+        const std::int32_t* cached_experts  = nullptr;
+        const std::int32_t* missing_experts = nullptr;
         // With a CPU share, after await(): the CPU's products (ExpertCpuOptions::product_bytes),
         // valid when *cpu is nonzero.
         const void* products = nullptr;
@@ -215,10 +223,11 @@ public:
         const void* data = nullptr;
         std::size_t bytes = 0;
     };
+
     // Capturable. The next begin must follow every consumer of the preceding call on stream, and
     // every begin needs its await. Cached pairs can run immediately. Missing pairs run only after
     // await(); with a CPU share they exclude the CPU's pairs, whose products the family adds then.
-    // Neither set drops or renormalizes routes. -1 denotes a pair absent from that set. `inputs`
+    // Neither set drops or renormalizes routes; an expert's pairs all fall in one set. `inputs`
     // (device ranges, ExpertCpuOptions::input_bytes in all) reach the CPU's products; a call
     // without them leaves nothing to the CPU (call.products and call.cpu stay null).
     [[nodiscard]] Call begin(std::size_t layer, const std::int32_t* ids, std::uint32_t pairs,
@@ -246,9 +255,11 @@ public:
 
     // An elastic cache (ExpertDeliveryOptions::elastic), after the compute stream's last call:
     // shrink_cache gives at least `bytes` of whole granules back to the device, or every slot when
-    // the cache has fewer, keeping the most routed experts it held (moved into the remaining slots
-    // when they sat past them); grow_cache takes free device memory, beyond keep_free_bytes, for
-    // empty slots. Both return the device bytes they freed or took. Graphs stay valid.
+    // the cache has fewer, from the pools whose layers hold the most slots each, keeping each
+    // pool's most routed experts (moved into its remaining slots when they sat past them);
+    // grow_cache takes free device memory, beyond keep_free_bytes, for empty slots, to the pools
+    // whose layers hold the fewest. Both return the device bytes they freed or took. Graphs stay
+    // valid.
     std::uint64_t shrink_cache(std::uint64_t bytes);
     std::uint64_t grow_cache();
     // The free device memory grow_cache leaves (ExpertDeliveryOptions::keep_free_bytes).

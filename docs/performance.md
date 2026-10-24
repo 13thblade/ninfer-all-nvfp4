@@ -25,9 +25,9 @@ drafts with the tokens committed per verify round in brackets.
 | Card | Memory | Build | Power limit | Measured on |
 |---|---:|---|---|---|
 | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | `120a` | 600 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements) |
-| RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements) |
+| RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements) |
 | RTX 5070 Ti | 16 GB | `120a` | 300 W | [field report](performance/field-reports.md#rtx-5070-ti-windows-11) |
-| RTX 4090 | 24 GB | `89` | 450 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [field reports](performance/field-reports.md) |
+| RTX 4090 | 24 GB | `89` | 450 W; 500 W boards for Flint | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [field reports](performance/field-reports.md) |
 | L40S | 48 GB | | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | RTX 3090 Ti, two | 24 GB each | `86` | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | A40 | 48 GB | `86` | 300 W | [Flint](flint.md#measurements) |
@@ -863,6 +863,31 @@ On the Tesla V100 (window 28,672 tokens), short chat decodes 164.3 tok/s without
 226.3 with MTP 2 (0.70, 2.40); after 1,024 and 8,192 tokens 155.6 and 149.5, with MTP 2 187.7 and
 167.0. Prompt time is 0.36 s at 1,024 tokens and 2.9 s at 8,192.
 
+## Flint
+
+Recursive's Flint from Unsloth's
+[UD-Q4_K_XL GGUF](https://huggingface.co/WaveCut/Flint-UD-Q4_K_XL-NInfer-v3), F16 KV, one sequence.
+
+### Engine rates
+
+Prompt and decode in tok/s; llama.cpp b11804 on the same GGUF with flash attention. The 23.4 GiB of
+weights fit only the RTX 5090, where both engines keep every expert on the GPU. On the 24 GB cards
+NInfer keeps the experts in pinned host memory with the device cache it sizes itself (19 GiB), and
+llama.cpp keeps the experts of its first four blocks on the CPU (`-ncmoe 4`, the fewest that run a
+10,000-token prompt):
+
+| Card | Engine | Prompt 2,048 | Prompt 10,000 | Decode | after 10,000 |
+|---|---|---:|---:|---:|---:|
+| RTX 5090 (575 W) | NInfer | 15,670 | 14,656 | 347.7 | 314.6 |
+| RTX 5090 (575 W) | llama.cpp | 8,702 | 8,679 | 222.7 | 209.2 |
+| RTX 4090 (500 W) | NInfer, host experts | 12,423 | 11,466 | 210.2 | 188.0 |
+| RTX 4090 (500 W) | llama.cpp, `-ncmoe 4` | 4,868 | 4,725 | 165.7 | 149.4 |
+| RTX 3090 (370 W) | NInfer, host experts | 6,225 | 5,755 | 161.4 | 140.2 |
+| RTX 3090 (370 W) | llama.cpp, `-ncmoe 4` | 2,633 | 2,553 | 79.9 | 77.1 |
+
+[Flint's measurements](flint.md#measurements) name the hosts and add disk experts and context
+lookup.
+
 ## Measurement pages
 
 | Page | What it measures | Hardware |
@@ -874,6 +899,7 @@ On the Tesla V100 (window 28,672 tokens), short chat decodes 164.3 tok/s without
 | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#measurements) | every expert placement of the GSQ-RCO releases, MTP, perplexity against llama.cpp, AIME and GPQA | RTX 3090, 3090 Ti, 4090, 5090, PRO 6000, L40S |
 | [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
 | [Gemma 4 26B-A4B](gemma4.md#measurements) | against llama.cpp, KV formats, the assistant's drafts, parallel streams | RTX 3090 |
+| [Flint](flint.md#measurements) | against llama.cpp, host and disk experts, context lookup, typed decisions | RTX 3090, 4090, 5090, A40 |
 | [Field reports](performance/field-reports.md) | users' own measurements: Qwen3.8-27B IQ3_S and its Swift 1.5 fine-tune against llama.cpp, long Qwen Code and agent sessions with DFlash2 and MTP, prefix-cache hits and the time to the first token | RTX 5070 Ti, 4090, 4080 |
 | [Quality trades](maintainer/quality-trade-experiments.md) | what each precision option costs in perplexity and buys in memory or speed | RTX 3090 |
 | [Configuration calculator](config-calculator.html) | which context, KV format and speculation fit an RTX 3090, from measured sizes | RTX 3090 |

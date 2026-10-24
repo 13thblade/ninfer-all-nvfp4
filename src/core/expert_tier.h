@@ -12,10 +12,10 @@
 // of the misses moves no expert bytes across the bus.
 //
 // Slots of one pool are interchangeable: a candidate replaces a victim of its own pool (one pool
-// per layer when every layer owns its slots, one for all when they share them). The tier keeps no
-// slots and copies nothing; the cache that owns the slots reports each expert's state and carries
-// the swaps out: a victim leaves at once (the CPU or a copy serves it from then on), a candidate is
-// pending until its copy has landed.
+// per layer when every layer owns its slots, as Flash-Next's cache does; one for each slot size in
+// ExpertDelivery's). The tier keeps no slots and copies nothing; the cache that owns the slots
+// reports each expert's state and carries the swaps out: a victim leaves at once (the CPU or a copy
+// serves it from then on), a candidate is pending until its copy has landed.
 //
 // Strata (github.com/Niko1221/Strata, MIT) measured this tier and its constants on
 // Qwen3.8-Flash-Next: a round every four verification windows, up to 96 swaps, decay 0.7, gain 1.5.
@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace ninfer {
@@ -94,10 +95,15 @@ private:
     std::vector<std::size_t> offset_; // first entry of each layer
     std::vector<Entry> entries_;
     std::vector<std::uint32_t> free_; // by pool
-    // By pool: held entries, coldest first as of the last pass, and the first one still held.
-    std::vector<std::vector<std::size_t>> cold_;
-    std::vector<std::size_t> cold_next_;
-    static constexpr std::size_t kScan = 32;
+    // By pool: held entries with their counts as the last pass ended, coldest first (lower entry
+    // first among equal counts), and the first one still held. A pass orders only the first
+    // kColdOrdered of them; a scan that reaches past the ordered ones orders the rest by the same
+    // counts (cold_ordered_), so the order is a whole sort's at the cost of a selection.
+    std::vector<std::vector<std::pair<float, std::size_t>>> cold_;
+    std::vector<std::size_t> cold_next_, cold_ordered_;
+    static constexpr std::size_t kScan        = 32;
+    static constexpr std::size_t kColdOrdered = 512;
+    void order_cold(std::uint32_t pool, std::size_t at);
     std::vector<std::uint32_t> layer_of_; // by entry
     std::uint32_t passes_ = 0;
 };
