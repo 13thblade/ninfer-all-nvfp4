@@ -1,11 +1,119 @@
+# W4(NVFP4) A16(BF16) support for sm_75/80/86/89/120 and A8(int8) support for sm_70/75/80/86/89/120 on ninfer, delivered on the Qwen3.8 27B (English version below)
+
+## 中文
+
+上游只把 fused NVFP4 SwiGLU 通路实例化到 `T <= 16`，A16 域的解析是 `T <= 16 -> SmallTFusedA16`、`T <= 64 -> Materialized`、`T > 64 -> throw`：所以长 prompt 不是"prefill 很慢"，而是**直接抛异常**。本 fork 补上缺失的宽 T 内核，然后把整条通路做快：在 RTX 3090 Ti 上 **T1 的 decode 大约是上游 16 tok/s 的 3.0 倍**（50 对 16.1，同一 prompt 基准）；prefill 不再抛异常，同一段 4202 token prompt 上跑到 1293 tok/s（W4A16）、1669 tok/s（W4A8-int），而最初把宽 T 内核接上去时只有约 780 tok/s。
+
+对于支持 BF16 和 int8 的 GPUs（sm_75/80/86/89，其中 sm_75 通过 FP16 模拟实现），默认走 W4A16 通路支持 NVFP4，可通过 --nvfp4-w4a8-int 开启 W4A8-int 通路；在原生 FP4 的卡上使用 --nvfp4-w4a16 改用 BF16 路径（其它架构上是空操作），开启 --nvfp4-w4a8-int 用 W4A8-int 替换默认的 W4A4。对于 sm_70 默认走上游提供的 FP16 路线，可开启 --nvfp4-w4a8-int 替换为 W4A8-int。--nvfp4-w4a8-int 与 --nvfp4-w4a16 都是布尔开关，不需要取值。
+
+对包括 RTX 3090/4090/5090 在内的所有 GPU，都强烈建议启用 --device-profile calibrate 进行校准：上游仓库中尚未完成的预设校准键值并不符合最佳性能状态，且本人没有对应 GPU 可以测试。
+
+注：NVFP4 并不代表更高质量（那只是英伟达的营销宣传），各种不同的量化精度均可通过缩放因子提高保真度，只是 W4A4 在原生 NVFP4 路径的 GPU 上具有更快速度。本仓库只是为 pre-Blackwell 的 GPU 提供更多选择，例如 Qwen3.8-27B-QUASAR-NVFP4 是相对原生 BF16 模型进行了 quantization-aware training（QAT）的版本。Blackwell 也可通过启用 W4A16 或 W4A8-int 以速度为代价获得更高质量。
+
+本仓库未改变上游已经支持的模型范围，仅新增。
+
+按时间顺序，一共四处改动：
+
+1. **新增宽 T fused SwiGLU 内核**，让宽的 prompt 段落能 prefill 而不是抛异常。
+2. **整条通路的 kernel 性能优化工作。**
+3. **把 W4A16 和 W4A8-int 通路的开关接进 `ninfer-calibrate`**，最优化性能校准可在目标设备上首次启动时实测得出。
+4. 顺带优化了无原生 FP4 路径的 KV NVFP4 和 k8v4 的性能。
+
+### 吞吐
+
+全程同一个制品（`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`，带 proposal 头），RTX 3090 Ti，贪心解码，KV bf16，16,384 token 上下文，`--device-profile calibrate`，prefill 由 4K 的长 prompt 测出，decode 速度来自于多个真实场景下测得的均值。
+
+| 构建与投机解码设置                    | Prefill tok/s | Decode tok/s | 接受率   |
+| ---------------------------- | ------------- | ------------ | ----- |
+| 上游原样（宽 T 路由之前）               | throws        | throws       | —     |
+| 接上宽 T SwiGLU、尚未做任何 kernel 优化 | 780           | 16           | —     |
+| 本构建，W4A16，无投机（T1）           | 1288          | 50           | —     |
+| 本构建，W4A16，MTP K=3             | 1282          | 104          | 72%   |
+| 本构建，W4A16，DFlash2 K=5         | 1274          | 118          | 56%   |
+| 本构建，W4A16，DFlash2 K=7         | 1222          | 125          | 47%   |
+| 本构建，W4A8-int，无投机（T1）        | 1662          | 53           | —     |
+| 本构建，W4A8-int，MTP K=3          | 1652          | 109          | 63%   |
+| 本构建，W4A8-int，DFlash2 K=5      | 1500          | 132          | 58%   |
+| 本构建，W4A8-int，DFlash2 K=7      | 1551          | 126          | 47%   |
+
+这张表有一点要说明。**上游会抛异常**，所以那一行是空的：fused NVFP4 SwiGLU 通路只实例化到 `T <= 16`，后面没有宽内核兜底，这里没有"局部状态"可绕 —— 内核在构建里根本不存在，prompt 走不到 decode。
+
+### 精度
+
+生产档（`--device-profile calibrate`）下的语料困惑度，同一制品、`perplexity-1m` 语料 `--quick`、16,384 token 窗口、打分 token 数 261,167、KV bf16：
+
+| 通路       | PPL      |
+| ---------- | -------- |
+| W4A16      | 4.158481 |
+| W4A8-int   | 4.157095 |
+
+### 下一步
+
+W4A16 与 W4A8-int 两条通路的内核均已完成，目前进入广泛测试阶段。
+
+---
+
+## English
+
+Upstream instantiates the fused NVFP4 SwiGLU route only to `T <= 16`, and resolves the A16 domain as `T <= 16 -> SmallTFusedA16`, `T <= 64 -> Materialized`, `T > 64 -> throw`, so a long prompt does not prefill slowly — it throws. This fork adds the missing wide-T kernel, then makes the route faster: **on the RTX 3090 Ti, at T1, decode is about 3.0x upstream's 16 tok/s** (50 against 16.1, same prompt basis), and prefill stops throwing — 1293 tok/s on the 4202-token prompt (W4A16) and 1669 tok/s (W4A8-int), against the roughly 780 tok/s the first graft of the wide-T kernel managed.
+
+For GPUs that support both BF16 and int8 (sm_75/80/86/89, where sm_75 runs the BF16 forms through FP16 emulation), W4A16 is the default route for NVFP4 and the W4A8-int route can be turned on with `--nvfp4-w4a8-int`; on a card with a native FP4 path, `--nvfp4-w4a16` switches to the BF16 route instead (a no-op on other architectures), and `--nvfp4-w4a8-int` replaces the default W4A4 with W4A8-int. On sm_70 the default is the FP16 route upstream provides, and `--nvfp4-w4a8-int` replaces it with W4A8-int. Both flags are boolean switches and take no value.
+
+For every GPU, including the RTX 3090/4090/5090, turning on `--device-profile calibrate` is strongly recommended: the preset calibration keys upstream leaves unfinished do not describe the best-performance state, and I have no matching GPUs to test them.
+
+Note: NVFP4 does not mean higher quality (that is NVIDIA marketing); any quantisation precision can gain fidelity through its scaling factors — W4A4 is simply faster on GPUs with a native FP4 path. This repository only adds choices for pre-Blackwell GPUs; Qwen3.8-27B-QUASAR-NVFP4, for example, is a quantization-aware-training (QAT) version of the native BF16 model. Blackwell can also gain quality at the cost of speed by enabling W4A16 or W4A8-int.
+
+This repository does not change the model scope upstream already supports; it only adds to it.
+
+Four changes, in order:
+
+1. **A wide-T fused SwiGLU kernel**, so a wide span prefills instead of throwing.
+2. **Kernel work across the route.**
+3. **The W4A16 and W4A8-int route switches wired into `ninfer-calibrate`**, so the optimal performance calibration is measured on first start on the target device.
+4. Alongside them, **KV-cache performance for NVFP4 and k8v4 on cards without a native FP4 path** was improved as well.
+
+## Throughput
+
+Same artifact throughout (`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`, proposal head) on an RTX 3090 Ti: greedy decoding, KV bf16, 16,384-token context, `--device-profile calibrate`. Prefill is measured on the 4K long prompt; decode is the mean over several realistic tasks.
+
+| Build and speculative setting                 | Prefill tok/s | Decode tok/s | Acceptance |
+| --------------------------------------------- | ------------- | ------------ | ---------- |
+| Upstream as shipped, before the wide-T route  | throws        | throws       | —          |
+| Wide-T SwiGLU grafted, before any kernel work | 780           | 16           | —          |
+| This build, W4A16, no speculation (T1)        | 1288          | 50           | —          |
+| This build, W4A16, MTP K=3                    | 1282          | 104          | 72%        |
+| This build, W4A16, DFlash2 K=5                | 1274          | 118          | 56%        |
+| This build, W4A16, DFlash2 K=7                | 1222          | 125          | 47%        |
+| This build, W4A8-int, no speculation (T1)     | 1662          | 53           | —          |
+| This build, W4A8-int, MTP K=3                 | 1652          | 109          | 63%        |
+| This build, W4A8-int, DFlash2 K=5             | 1500          | 132          | 58%        |
+| This build, W4A8-int, DFlash2 K=7             | 1551          | 126          | 47%        |
+
+One thing about the table: **upstream throws**, hence the empty row. The fused NVFP4 SwiGLU route is instantiated only to `T <= 16` and there is no wide fallback behind it — the kernel is absent from the build and there is no partial state to patch around, so that prompt never reaches decode.
+
+## Perplexity
+
+Corpus perplexity on the production profile (`--device-profile calibrate`): same artifact, the `--quick` stream set of the `perplexity-1m` corpus, 16,384-token window, 261,167 scored tokens, KV bf16.
+
+| Route      | PPL      |
+| ---------- | -------- |
+| W4A16      | 4.158481 |
+| W4A8-int   | 4.157095 |
+
+## Next steps
+
+The kernels for both the W4A16 and W4A8-int routes are complete, and broad testing is now underway.
+
+---
+
+**This is the upstream original documentation.**
+
 # NInfer-all
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
-their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next, Gemma 4 26B-A4B and Recursive's Flint,
-on NVIDIA GPUs from Volta to consumer Blackwell, from 8 GB of memory. It serves the OpenAI, Anthropic
-and llama.cpp APIs from one GPU, or from up to eight as pipeline stages on Linux. The same chat model
-answers [typed decisions](docs/serving.md#typed-decisions): choice, yes/no and score questions about
-a state, each option with its probability, through TypeSafe's System One and OpenAI's Decisions APIs.
+their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next and Gemma 4 26B-A4B, on NVIDIA GPUs from
+Volta to consumer Blackwell, from 8 GB of memory. It serves the OpenAI, Anthropic and llama.cpp APIs
+from one GPU, or from up to eight as pipeline stages on Linux.
 
 [Quick start](#quick-start) · [Supported GPUs](#supported-gpus) · [Models](#artifacts) ·
 [Highlights](#highlights) · [Features](#features) · [Docker](#docker) · [Building](#building) ·
@@ -17,31 +125,21 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 ## Quick start
 
 Download an artifact ([all models](#artifacts)) and serve it from the [Docker image](#docker). The server
-speaks the OpenAI and Anthropic APIs on http://localhost:8080/v1, answers typed decisions there, and
-each card picks up its device profile on its own.
+speaks the OpenAI and Anthropic APIs on http://localhost:8080/v1, and each card picks up its device
+profile on its own.
 
 ```bash
 hf download WaveCut/Ternary-Bonsai-2-27B-NInfer-v3 Ternary-Bonsai-2-27B-ninfer-v3.ninfer --local-dir models
 
 docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
   -v "$PWD/models:/models" -v ninfer-cache:/cache \
-  ghcr.io/iamwavecut/ninfer-all:cuda13.4 serve /models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer \
+  ghcr.io/iamwavecut/ninfer-all serve /models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer \
   --model-id bonsai2-27b --max-context 262144 --kv-capacity 262144 --kv-dtype rk8v4 \
   --gdn-state-fp16 --spec dflash2 --draft-tokens 5
 
 curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"bonsai2-27b","messages":[{"role":"user","content":"Hello"}]}'
-
-curl http://localhost:8080/v1/systemone -H 'Content-Type: application/json' -d '{
-  "state": {"ticket": "My card was charged twice for one order."},
-  "questions": {
-    "team": {"type": "choice", "instructions": "Which team should handle this?",
-             "criteria": {"billing": "payments and refunds", "shipping": "deliveries"}},
-    "urgent": {"type": "noul", "instructions": "Does the customer need a reply within the hour?"}}}'
 ```
-
-The second request is a [typed decision](docs/serving.md#typed-decisions): each answer comes with the
-probability of every option, read from the model's first-token log probabilities of the labels.
 
 Flags for every model and memory size, from an 8 GB card to the largest context: [launch recipes](docs/recipes.md).
 
@@ -63,32 +161,23 @@ how to make one.
 
 NVIDIA GPUs from Volta (compute capability 7.0) to consumer Blackwell (12.0), from 8 GB of memory:
 Ternary Bonsai 2 27B runs on an 8 GB RTX 3060 Ti, and Qwen3.8-Flash-Next streams its experts from
-host memory or disk through 8 GB. The two [Docker images](#docker) each contain all NInfer targets
-for their CUDA version in a shared runtime: CUDA 12.9 includes Volta, and CUDA 13.4 includes Blackwell.
-The native release pipeline also assembles a portable Windows or Linux package with **both** CUDA
-backends: `ninfer-<os>-x64-cuda12.9-13.4-<commit12>`. Its small command executables share one
-runtime per CUDA family. The launcher selects CUDA 12 for Volta, CUDA 13 for consumer Blackwell,
-and prefers CUDA 13 on overlapping targets when the driver supports it. All selected `--devices`
-must fit one backend. Use `--cuda-backend auto|12|13` to select it explicitly. No CUDA Toolkit
-installation is needed. Keep `backends/` and `help/` beside the executables. Linux also needs the
-recorded Debian system libraries. `--help` and `--version` do not load CUDA.
-
-Every card by name, with what has run on it:
+host memory or disk through 8 GB. The [Docker image](#docker) carries the `75`, `86` and `120a` builds
+and starts the one that matches the GPU. Every card by name, with what has run on it:
 [Supported GPUs](docs/gpus.md).
 
 *Click a section to expand it.*
 
 <details>
-<summary><b>Architectures and builds</b> — six architectures, two CUDA variants</summary>
+<summary><b>Architectures and builds</b> — six architectures, one build each</summary>
 
-| Architecture | Compute capability | Build | CUDA | Docker tags | Status |
+| Architecture | Compute capability | Build | CUDA | In the image | Status |
 |---|---|---|---|---|---|
-| Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer | `cuda13.4` | measured; built-in device profiles |
-| Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | both, native `89` | measured; built-in device profiles |
-| Ampere | 8.6 | `86` (the default) | 12.8 or newer | both | measured (the reference card); built-in device profiles |
-| Ampere, A100 class | 8.0 | `80` | 12.8 or newer | both | built-in device profiles; not benchmarked |
-| Turing | 7.5 | `75` | 12.8 or newer | both | measured; built-in device profiles |
-| Volta | 7.0 | `70` | 12.8 or 12.9 | `cuda12.9` | measured; built-in device profiles |
+| Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer | yes | measured; built-in device profiles |
+| Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | the `86` build | measured; built-in device profiles |
+| Ampere | 8.6 | `86` (the default) | 12.8 or newer | yes | measured (the reference card); built-in device profiles |
+| Ampere, A100 class | 8.0 | `80` | 12.8 or newer | no | built-in device profiles; not benchmarked |
+| Turing | 7.5 | `75` | 12.8 or newer | yes | measured; built-in device profiles |
+| Volta | 7.0 | `70` | 12.8 or 12.9 | no: [source build](docs/build-linux.md#tesla-v100-sm_70) | measured; built-in device profiles |
 | Hopper; data-center Blackwell; GB10; Pascal and older | | none | | | no build |
 
 </details>
@@ -112,7 +201,7 @@ Every card by name, with what has run on it:
 <summary><b>Device profiles and limits</b> — how a card gets its kernel routes</summary>
 
 - **Device profiles.** A profile picks the kernel route of every operation and width. The binary
-  carries profiles measured on 48 GPU models, from the Tesla V100 and RTX 2060 Super to the RTX PRO
+  carries profiles measured on 47 GPU models, from the Tesla V100 and RTX 2060 Super to the RTX PRO
   6000 (the Profile column of [supported GPUs](docs/gpus.md#cards)); a built-in profile applies to
   the same GPU name, compute capability and SM count. Any other card is calibrated once at first
   start, which takes about half a minute to three and a half minutes, and the result is stored for
@@ -132,8 +221,7 @@ Every card by name, with what has run on it:
 ## Artifacts
 
 Each name links to its Hugging Face card; `hf download REPO FILE.ninfer --local-dir models` fetches the
-file. The Bonsai, GSQ-RCO, Flash-Next, Gemma 4 and Flint artifacts use formats that only this engine
-reads.
+file. The Bonsai, GSQ-RCO, Flash-Next and Gemma 4 artifacts use formats that only this engine reads.
 ✓ means the artifact carries the component, — that it does not.
 
 | Model | Size, GiB | Weights | Vision | MTP | DFlash2 | Proposal head | Notes |
@@ -149,7 +237,6 @@ reads.
 | [Qwen3.8-Flash-Next GSQ-RCO IQ3_S](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-NInfer-v3) | 54.50 | GGUF blocks, 3.5 bits | ✓ | ✓ | — | — | shared-Q8_0 MTP; reads the n-gram table |
 | [Qwen3.8-Flash-Next Coder GSQ-RCO IQ1_M](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 31.02 | GGUF blocks | ✓ | ✓ | — | — | expert-pruned coding build, 256 experts per layer; shared-Q8_0 MTP; reads the n-gram table |
 | [Gemma 4 26B-A4B it QAT](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3) | 14.75 | GGUF Q4_0 blocks | ✓ | ✓ | — | — | Google's QAT GGUF byte for byte; the MTP column is Google's QAT assistant |
-| [Flint UD-Q4_K_XL](https://huggingface.co/WaveCut/Flint-UD-Q4_K_XL-NInfer-v3) | 23.38 | GGUF blocks, Q8_0 to IQ3_S | — | — | — | — | Unsloth's UD-Q4_K_XL GGUF byte for byte; drafts by context lookup |
 
 The three Flash-Next releases read one shared n-gram table, which the model names by digest: the
 [n-gram table](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3) (26.92 GiB,
@@ -248,7 +335,7 @@ Prefill of a 4,463-token prompt, in tok/s:
 *Click a section to expand it.*
 
 <details>
-<summary><b>Models and weight formats</b> — Qwen3.5 family, GGUF block formats, Ternary Bonsai 2, Flash-Next, Gemma 4, Flint</summary>
+<summary><b>Models and weight formats</b> — Qwen3.5 family, GGUF block formats, Ternary Bonsai 2, Flash-Next, Gemma 4</summary>
 
 - **Qwen3.5 family.** Dense and MoE (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`) with MTP,
   DFlash (35B-A3B) and DFlash2 (Qwen3.8-27B) drafters, Vision for images and video, and
@@ -281,18 +368,8 @@ Prefill of a 4,463-token prompt, in tok/s:
   for speculative decoding. On an RTX 3090 it prefills a 10,000-token prompt at 6,045 tok/s and decodes at 215
   tok/s, 190 after 10,000 tokens, against llama.cpp's 4,697, 169 and 152 on the same GGUF; with two
   drafts a round chat answers decode at 291 tok/s instead of 209 ([Gemma 4](docs/gemma4.md)).
-- **Flint.** Recursive's 39.8B coding MoE (2.5B active), from a llama.cpp GGUF such as Unsloth's
-  UD-Q4_K_XL, imported block for block (23.4 GiB): sliding-window and position-free full-attention
-  blocks with learned sinks, 256 routed experts beside a shared one, up to eight concurrent
-  requests with prefix reuse through host memory, the model's own reasoning, GLM-4.7 tool calls,
-  structured output, typed decisions, context-lookup drafting, and experts on the GPU, in pinned
-  host memory or in the artifact's files. On an RTX 5090 it prefills a 10,000-token prompt at
-  14,656 tok/s and decodes at 348 tok/s, 315 after 10,000 tokens, against llama.cpp's 8,679, 223
-  and 209 on the same GGUF; on an RTX 3090, with its experts in host memory, at 5,755, 161 and 140
-  against llama.cpp's 2,553, 80 and 77 with four blocks' experts on the CPU
-  ([Flint](docs/flint.md)).
-- **CPU share of host and disk experts.** With Flash-Next, Gemma 4, Flint or native Qwen3.5/3.6
-  MoE experts off the GPU, CPU threads compute a share of each decode call's cache misses from host
+- **CPU share of host and disk experts.** With Flash-Next, Gemma 4 or native Qwen3.5/3.6 MoE
+  experts off the GPU, CPU threads compute a share of each decode call's cache misses from host
   memory while the GPU copies the rest, bit for bit equal to the GPU's products
   (`--expert-dma-share auto`). The pool takes `min(physical cores, usable CPUs / 2)` threads by
   default, where usable CPUs are the affinity mask bounded by a container's CPU quota (15 threads
@@ -302,7 +379,7 @@ Prefill of a 4,463-token prompt, in tok/s:
 </details>
 
 <details>
-<summary><b>Speculative decoding</b> — MTP, DFlash, DFlash2, n-gram copying and context lookup</summary>
+<summary><b>Speculative decoding</b> — MTP, DFlash, DFlash2 and n-gram copying</summary>
 
 - MTP, DFlash and DFlash2 with 1 to 15 drafts; the artifact's proposal head drafts by default when it
   stores one. Under MTP and DFlash a sampled request keeps a draft only while it equals the model's
@@ -311,8 +388,6 @@ Prefill of a 4,463-token prompt, in tok/s:
 - Gemma 4 drafts with Google's multi-token-prediction assistant (`--spec mtp`, 1 to 7 drafts), four
   blocks that read the model's own KV cache; its verification rows are bit for bit plain decode rows,
   so the output is the one plain decoding gives.
-- Flint, which has no published drafter, drafts by context lookup (`--lookup-ngram N`, 1 to 7
-  drafts): what followed the last N tokens' earlier occurrence, verified in one pass of decode rows.
 - `--adaptive-mtp` picks each round's width from measured draft survival and round cost.
 - N-gram copy drafting beside the neural drafter (on with `--spec`) verifies up to 15 tokens copied
   from earlier prompt, tool-result or output text ([ngram copy proposals](docs/ngram.md)).
@@ -326,8 +401,7 @@ Prefill of a 4,463-token prompt, in tok/s:
   all-round choice and `rk4v4` holds the native 262,144-token window of Qwen3.8-27B on a 24 GB card
   ([context and memory](docs/cli.md#context-and-memory)).
 - Up to 1,048,576 tokens of context, four times the native window, with plain RoPE or YaRN
-  (`--rope-yarn`, for Qwen3.5, Qwen3.8-Flash-Next and Gemma 4; Flint's full-attention blocks carry
-  no rotation and take no scaling).
+  (`--rope-yarn`).
 - A hybrid prefix cache by default, which shares content-addressed KV blocks and sparse state
   snapshots across requests on the device and in pinned host memory; or a checkpoint catalog
   (`--use-original-prefix-caching`) with an optional disk tier that survives restarts
@@ -339,7 +413,7 @@ Prefill of a 4,463-token prompt, in tok/s:
 </details>
 
 <details>
-<summary><b>Serving</b> — OpenAI, Anthropic and llama.cpp APIs, typed decisions, model suspend, several models behind one server</summary>
+<summary><b>Serving</b> — OpenAI, Anthropic and llama.cpp APIs, model suspend, several models behind one server</summary>
 
 - OpenAI Responses and Chat Completions, Anthropic Messages, llama.cpp's `/completion`,
   `/tokenize`, `/detokenize`, `/apply-template`, `/v1/rerank`, `/metrics`, `/slots` and `/props`,
@@ -348,10 +422,8 @@ Prefill of a 4,463-token prompt, in tok/s:
 - **Typed decisions.** `/v1/systemone` (TypeSafe's System One API, as llama.cpp, vLLM and Ollama
   serve it) and `/v1/decisions` (OpenAI's Decisions API) answer choice, yes/no and score questions
   about a state with the served chat model: one prompt per question, the answer read from the
-  first token's exact label log probabilities, the state prefilled once and every question run
-  after it as a branch of one read; up to 200 questions, 255 options, Runoff's order-independent
-  choices, a conversation as the state, images and video as data URLs (with `--vision`), and a
-  margin by which a client escalates near ties ([typed decisions](docs/serving.md#typed-decisions)).
+  first token's exact label log probabilities, the state prefilled once
+  ([typed decisions](docs/serving.md#typed-decisions)).
 - **Model suspend.** `--model-suspend` lets an idle server give its device memory back without
   exiting and take it again on the next request, retained conversations included. Ternary Bonsai 2
   27B on an RTX 3090: 7.9 GiB down to 0.3 GiB in 0.33 s, back in 1.1 s
@@ -381,39 +453,23 @@ Prefill of a 4,463-token prompt, in tok/s:
 
 ## Docker
 
-The release pipeline packages two Debian 13 / Linux x64 images from the native Linux archives.
-Each image contains one executable with all NInfer architectures supported by its CUDA variant.
-The image build does not compile NInfer again.
-
-| Image tag | Toolkit | Embedded GPU architectures |
-|---|---|---|
-| `ghcr.io/iamwavecut/ninfer-all:cuda12.9` | CUDA 12.9.2 | `sm_70`, `sm_75`, `sm_80`, `sm_86`, `sm_89` |
-| `ghcr.io/iamwavecut/ninfer-all:cuda13.4` | CUDA 13.4.3 | `sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_120a` |
-
-Choose `cuda12.9` for Volta and `cuda13.4` for Blackwell. Both cover Turing, Ampere and Ada.
-Both support a layer pipeline (`--devices`) across different architectures included in that image.
-The host needs a compatible NVIDIA driver and the
+`ghcr.io/iamwavecut/ninfer-all:latest` is built from the newest `master` commit that passes CI, on CUDA 13.4
+and Ubuntu 26.04, and is 1.6 GB compressed. It carries the `sm_75`, `sm_86` and `sm_120a` builds and starts
+the one that matches the GPUs. It needs an NVIDIA driver of the CUDA 13 branch (580 or newer) and the
 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-Windows archives, Linux archives and Docker images use the same two architecture sets:
-
-![GPU architectures included in NInfer's CUDA 12.9.2 and CUDA 13.4.3 builds](docs/assets/cuda-architectures.svg)
-
-Each archive and image contains all device images inside its outline. These are the project's build targets,
-not the complete list of architectures supported by NVIDIA's Toolkits.
-See the [release process](docs/maintainer/release-process.md) for build and verification status.
+`ghcr.io/iamwavecut/ninfer-all:multi` carries one build of all three architectures instead, for a
+layer pipeline (`--devices`) across cards of different architectures, where each card runs its own
+kernels; given such cards, `latest` runs the oldest card's build on all of them.
 
 <details>
 <summary><b>Commands, volumes and tags</b> — what the container runs</summary>
 
-- **Tags.** `cuda12.9` and `cuda13.4` update after both Linux CUDA builds and both Docker jobs succeed for the
-  current `master`. Windows builds do not block them.
-  Pin a build with `cuda12.9-<commit12>` or `cuda13.4-<commit12>`, where `commit12` is the first
-  12 hexadecimal characters of its commit SHA. Both images must build before either floating tag
-  moves. The pipeline no longer updates `latest`, `multi` or `VERSION` tags.
+- **Tags.** `latest`, `sha-<commit>` and the `VERSION`. A commit that changes only documentation or
+  tooling the image does not carry keeps the image before it. `multi` and `sha-<commit>-multi` are
+  the multi-architecture image, published apart from CI after each `master` push.
 - **Volumes.** `/models` holds artifacts, `/cache` the device profile measured on first start, and
   `/grafts/<model>/` optional [prompt grafts](docs/serving.md#prompt-grafts).
-- **Verification.** The new image variants still need a complete build and GPU inference checks.
-  Earlier image tests on RTX 3090 and RTX 5090 do not establish these variants' runtime behavior.
+- **Checked** on an RTX 3090 and an RTX 5090 with driver 580.159.03.
 
 The container's command chooses what runs:
 
@@ -426,17 +482,16 @@ The container's command chooses what runs:
 The official Qwen3.8-27B with the measured `tuned` profile, on http://localhost:8080/v1:
 
 ```bash
-docker run --rm -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all:cuda13.4 download qwen38-27b
+docker run --rm -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all download qwen38-27b
 docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
   -v "$PWD/models:/models" -v ninfer-cache:/cache \
-  ghcr.io/iamwavecut/ninfer-all:cuda13.4 run qwen38-27b
+  ghcr.io/iamwavecut/ninfer-all run qwen38-27b
 ```
 
 [compose.yaml](compose.yaml) wires the GPU, the port and the volumes for the same:
 `docker compose run --rm ninfer download qwen38-27b`, then `docker compose up -d`.
-`NINFER_CUDA_TAG=cuda12.9 docker compose up -d` selects the Volta-capable image; Compose defaults
-to `cuda13.4`. The published images use their multiarch binary automatically.
-`docker build -t ninfer .` builds a separate Ubuntu image from source (`--build-arg ARCHS=86` for one architecture,
+`NINFER_IMAGE_ARCH=sm75|sm86|sm120a|multi` overrides the GPU detection, and `docker build -t ninfer .`
+builds the image from source (`--build-arg ARCHS=86` for one architecture,
 `--build-arg 'ARCHS=75;86;120a'` for the multi-architecture build).
 
 </details>
