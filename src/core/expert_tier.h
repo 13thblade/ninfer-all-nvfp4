@@ -12,10 +12,10 @@
 // of the misses moves no expert bytes across the bus.
 //
 // Slots of one pool are interchangeable: a candidate replaces a victim of its own pool (one pool
-// per layer when every layer owns its slots, one for all when they share them). The tier keeps no
-// slots and copies nothing; the cache that owns the slots reports each expert's state and carries
-// the swaps out: a victim leaves at once (the CPU or a copy serves it from then on), a candidate is
-// pending until its copy has landed.
+// per layer when every layer owns its slots, as Flash-Next's cache does; one for each slot size in
+// ExpertDelivery's). The tier keeps no slots and copies nothing; the cache that owns the slots
+// reports each expert's state and carries the swaps out: a victim leaves at once (the CPU or a copy
+// serves it from then on), a candidate is pending until its copy has landed.
 //
 // Strata (github.com/Niko1221/Strata, MIT) measured this tier and its constants on
 // Qwen3.8-Flash-Next: a round every four verification windows, up to 96 swaps, decay 0.7, gain 1.5.

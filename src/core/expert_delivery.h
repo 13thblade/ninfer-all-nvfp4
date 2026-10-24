@@ -105,7 +105,7 @@ struct ExpertDeliveryOptions {
     // can give slots back to memory that grows (shrink_cache) and take them again (grow_cache).
     // Needs CUDA virtual memory management.
     bool elastic = false;
-    // Which experts the cache holds once it is full (core/expert_tier.h), one pool for all layers.
+    // Which experts the cache holds once it is full (core/expert_tier.h), a pool per slot size.
     ExpertTierOptions tier{};
     ExpertCpuOptions cpu{};
 };
@@ -177,6 +177,10 @@ struct ExpertDeliveryMemory {
 
 // One Program, rank and serial compute stream. Sources outlive this object. All device addresses
 // stay fixed until destruction. The caller drains graph users before destroying their graphs.
+//
+// The cache's slots form pools, one for the layers whose experts need the same room (each blob's
+// largest bytes and tail): every layer holds about as many slots as any other whatever its
+// experts' size, and an expert enters only a slot of its own pool.
 //
 // Each call splits its routes into experts the persistent cache holds and the rest. A narrow call
 // (decode, verification) leaves a share of its missing experts to the CPU when the family computes
@@ -251,9 +255,11 @@ public:
 
     // An elastic cache (ExpertDeliveryOptions::elastic), after the compute stream's last call:
     // shrink_cache gives at least `bytes` of whole granules back to the device, or every slot when
-    // the cache has fewer, keeping the most routed experts it held (moved into the remaining slots
-    // when they sat past them); grow_cache takes free device memory, beyond keep_free_bytes, for
-    // empty slots. Both return the device bytes they freed or took. Graphs stay valid.
+    // the cache has fewer, from the pools whose layers hold the most slots each, keeping each
+    // pool's most routed experts (moved into its remaining slots when they sat past them);
+    // grow_cache takes free device memory, beyond keep_free_bytes, for empty slots, to the pools
+    // whose layers hold the fewest. Both return the device bytes they freed or took. Graphs stay
+    // valid.
     std::uint64_t shrink_cache(std::uint64_t bytes);
     std::uint64_t grow_cache();
     // The free device memory grow_cache leaves (ExpertDeliveryOptions::keep_free_bytes).

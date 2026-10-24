@@ -30,8 +30,10 @@ __host__ __device__ unsigned char signature(int layer, int expert, int blob, std
     return static_cast<unsigned char>(x);
 }
 
+// Layer l's down blobs are `step` bytes shorter than layer l - 1's (Fixture).
 __global__ void inspect(const void* const* table, const std::int32_t* ids, int pairs, int layer,
-                        unsigned long long* failures, unsigned long long* visited) {
+                        unsigned long long* failures, unsigned long long* visited,
+                        std::uint64_t step = 256) {
     const int p = blockIdx.x;
     if (p >= pairs || ids[p] < 0) { return; }
     const int expert = ids[p];
@@ -39,7 +41,7 @@ __global__ void inspect(const void* const* table, const std::int32_t* ids, int p
     for (int b = 0; b < 2; ++b) {
         const auto* data = static_cast<const unsigned char*>(table[(b ? 3 : 2) * kExperts + expert]);
         if (!data) { if (!threadIdx.x) { atomicAdd(failures, 1ull); } continue; }
-        const auto bytes = b ? kDown - std::uint64_t(layer) * 256 : kGu;
+        const auto bytes = b ? kDown - std::uint64_t(layer) * step : kGu;
         // Every represented byte, its last byte, and every tail byte.
         for (std::uint64_t at = threadIdx.x; at < bytes; at += blockDim.x) {
             if (data[at] != signature(layer, expert, b, at)) { atomicAdd(failures, 1ull); }
@@ -86,11 +88,14 @@ __global__ void listed(const std::int32_t* set, int pairs, const std::int32_t* l
     if (count != list[0]) { atomicAdd(failures, 1ull); }
 }
 
+// Four layers of sixteen experts, each a [gate; up] blob and a down blob whose layer l is `step`
+// bytes shorter than layer l - 1's: with the default step every layer's slots need their own room.
 struct Fixture {
     std::vector<std::unique_ptr<PinnedHostBuffer>> pinned;
     std::vector<ExpertDeliveryLayer> layers;
     std::vector<std::filesystem::path> paths;
-    explicit Fixture(bool disk, const std::filesystem::path& directory) {
+
+    explicit Fixture(bool disk, const std::filesystem::path& directory, std::uint64_t step = 256) {
         std::array<std::ofstream, 2> output;
         if (disk) {
             for (int i = 0; i < 2; ++i) {
@@ -109,7 +114,7 @@ struct Fixture {
             if (!disk) {
                 for (int b = 0; b < 2; ++b) {
                     pinned.push_back(std::make_unique<PinnedHostBuffer>(
-                        kExperts * (b ? kDown - std::uint64_t(l) * 256 : kGu)));
+                        kExperts * (b ? kDown - std::uint64_t(l) * step : kGu)));
                     host[b] = static_cast<std::byte*>(pinned.back()->data());
                 }
             }
@@ -117,7 +122,7 @@ struct Fixture {
                 std::vector<ExpertBlob> expert;
                 for (int b = 0; b < 2; ++b) {
                     ExpertBlob blob;
-                    blob.bytes = b ? kDown - std::uint64_t(l) * 256 : kGu;
+                    blob.bytes     = b ? kDown - std::uint64_t(l) * step : kGu;
                     blob.zero_tail = kTail;
                     std::vector<unsigned char> data(blob.bytes);
                     for (std::uint64_t i = 0; i < blob.bytes; ++i) { data[i] = signature(l, e, b, i); }
@@ -537,12 +542,13 @@ int cpu_share(DeviceContext& device, bool disk, double share, const std::filesys
     return ok ? 0 : 1;
 }
 
-// An elastic cache under a graph captured before it changes: narrow passes over experts 0..4 of
-// every layer (four times) and 5..7 (once) fill it; giving back all but two granules keeps the most
-// routed experts that fit; giving back everything leaves every expert to the banks; growing takes
-// the slots back. Every replay reads every pair's bytes.
+// An elastic cache of one pool under a graph captured before it changes: narrow passes over
+// experts 0..4 of every layer (four times) and 5..7 (once) fill it; giving back all but two
+// granules keeps the most routed experts that fit; giving back everything leaves every expert to
+// the banks; growing takes the slots back. Every replay reads every pair's bytes.
 int elastic_cache(DeviceContext& device, bool disk, const std::filesystem::path& path) {
-    Fixture fixture(disk, path);
+    // Every layer's slots alike, so the cache is one pool of interchangeable slots.
+    Fixture fixture(disk, path, 0);
     ExpertDeliveryOptions options;
     options.pair_capacity = kPairs;
     options.cache_bytes   = 64ULL << 20; // every expert
@@ -559,13 +565,17 @@ int elastic_cache(DeviceContext& device, bool disk, const std::filesystem::path&
     const auto pass = [&] {
         for (int l = 0; l < kLayers; ++l) {
             const auto call = delivery.begin(l, static_cast<const std::int32_t*>(ids.p), kPairs, device.stream);
-            inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.cached_ids, kPairs, l,
-                static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            inspect<<<kPairs, 32, 0, device.stream>>>(
+                delivery.tables(l), call.cached_ids, kPairs, l,
+                static_cast<unsigned long long*>(failures.p),
+                static_cast<unsigned long long*>(visited.p), 0);
             listed<<<1, 256, 0, device.stream>>>(call.cached_ids, kPairs, call.cached_experts,
                                                  static_cast<unsigned long long*>(failures.p));
             delivery.await(device.stream);
-            inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.missing_ids, kPairs, l,
-                static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+            inspect<<<kPairs, 32, 0, device.stream>>>(
+                delivery.tables(l), call.missing_ids, kPairs, l,
+                static_cast<unsigned long long*>(failures.p),
+                static_cast<unsigned long long*>(visited.p), 0);
             listed<<<1, 256, 0, device.stream>>>(call.missing_ids, kPairs, call.missing_experts,
                                                  static_cast<unsigned long long*>(failures.p));
             CUDA_CHECK(cudaGetLastError());
@@ -742,6 +752,136 @@ int lent_banks(DeviceContext& device, bool disk, const std::filesystem::path& pa
     return ok ? 0 : 1;
 }
 
+// Every pair's expert at its table entry: its first, middle and last byte of blob 0.
+__global__ void sampled(const void* const* table, const std::int32_t* ids, int pairs, int layer,
+                        std::uint64_t bytes, unsigned long long* failures) {
+    const int p = int(blockIdx.x * blockDim.x + threadIdx.x);
+    if (p >= pairs || ids[p] < 0) { return; }
+    const auto* data = static_cast<const unsigned char*>(table[ids[p]]);
+    if (!data) {
+        atomicAdd(failures, 1ull);
+        return;
+    }
+    const std::uint64_t at[3]{0, bytes / 2, bytes - 1};
+    for (const auto a : at) {
+        if (data[a] != signature(layer, ids[p], 0, a)) { atomicAdd(failures, 1ull); }
+    }
+}
+
+// Layers of two sizes, 64 KiB experts in layers 0 and 1 and 32 KiB ones in layers 2 and 3, 64
+// each: the cache gives every layer as many slots, each its own size, and an expert enters only a
+// slot of its size. An explicit cache of eight slots per layer holds 32 slots where slots of the
+// largest expert would hold 24; once every layer's eight experts fill them, a strong miss of layer
+// 2 takes a slot of its own pool and layers 0 and 1 keep theirs. An elastic cache of every expert
+// gives back at least what is asked and keeps each layer's routed experts; it gives back
+// everything and takes it again. Every pair reads its expert's bytes.
+int slot_pools(DeviceContext& device) {
+    constexpr int layer_count = 4, experts = 64;
+    const auto size = [](int layer) { return std::uint64_t(layer < 2 ? 65536 : 32768); };
+    std::vector<std::unique_ptr<PinnedHostBuffer>> sources;
+    std::vector<ExpertDeliveryLayer> layers(layer_count);
+    for (int l = 0; l < layer_count; ++l) {
+        auto& layer   = layers[std::size_t(l)];
+        layer.aliases = {{0, 0}};
+        sources.push_back(std::make_unique<PinnedHostBuffer>(std::size_t(experts * size(l))));
+        auto* base = static_cast<std::byte*>(sources.back()->data());
+        for (int e = 0; e < experts; ++e) {
+            auto* data = base + std::uint64_t(e) * size(l);
+            for (std::uint64_t at = 0; at < size(l); ++at) {
+                data[at] = std::byte(signature(l, e, 0, at));
+            }
+            layer.experts.push_back(
+                {ExpertBlob{.pinned        = data,
+                            .pinned_region = reinterpret_cast<std::uintptr_t>(base),
+                            .bytes         = size(l)}});
+        }
+    }
+    int failures      = 0;
+    const auto expect = [&](bool condition, const char* what) {
+        if (!condition) {
+            std::printf("slot pools: %s\n", what);
+            ++failures;
+        }
+    };
+    DeviceBuffer ids(64 * 4), bad(8);
+    bad.fill();
+    const auto run_call = [&](ExpertDelivery& delivery, int layer,
+                              const std::vector<std::int32_t>& routed) {
+        ids.copy_from_host(routed.data(), routed.size() * 4);
+        const auto before = delivery.stats();
+        const auto call =
+            delivery.begin(std::size_t(layer), static_cast<const std::int32_t*>(ids.p),
+                           std::uint32_t(routed.size()), device.stream);
+        sampled<<<1, 64, 0, device.stream>>>(delivery.tables(std::size_t(layer)), call.cached_ids,
+                                             int(routed.size()), layer, size(layer),
+                                             static_cast<unsigned long long*>(bad.p));
+        delivery.await(device.stream);
+        sampled<<<1, 64, 0, device.stream>>>(delivery.tables(std::size_t(layer)), call.missing_ids,
+                                             int(routed.size()), layer, size(layer),
+                                             static_cast<unsigned long long*>(bad.p));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        delivery.drain();
+        return delivery.stats() - before;
+    };
+    const std::vector<std::int32_t> eight{0, 1, 2, 3, 4, 5, 6, 7};
+    const auto pass = [&](ExpertDelivery& delivery) {
+        ExpertDeliveryStats total;
+        for (int l = 0; l < layer_count; ++l) { total = total + run_call(delivery, l, eight); }
+        return total;
+    };
+    {
+        ExpertDeliveryOptions options;
+        options.pair_capacity = 64;
+        options.cache_bytes   = 2 * 8 * size(0) + 2 * 8 * size(2);
+        options.lend_banks    = false;
+        options.tier.every    = 0; // admissions only
+        ExpertDelivery delivery(device.rank(0), {}, layers, options);
+        expect(delivery.memory().cache_slots == 32, "eight slots of its own size for every layer");
+        expect(pass(delivery).admissions == 32, "every layer's eight experts enter free slots");
+        expect(pass(delivery).hits == 32, "and hit");
+        const auto strong = run_call(delivery, 2, std::vector<std::int32_t>(20, 9));
+        expect(strong.admissions == 1 && strong.evictions == 1, "a strong miss takes a slot");
+        const auto rest = pass(delivery);
+        expect(rest.hits == 31 && rest.misses == 1, "it took one of its own size");
+    }
+    {
+        ExpertDeliveryOptions options;
+        options.pair_capacity = 64;
+        options.cache_bytes   = 64ULL << 20; // every expert
+        options.suspendable   = true;
+        options.elastic       = true;
+        options.lend_banks    = false;
+        ExpertDelivery delivery(device.rank(0), {}, layers, options);
+        delivery.prime(nullptr);
+        const auto full = delivery.memory();
+        expect(full.cache_slots == layer_count * experts, "the elastic cache holds every expert");
+        pass(delivery);
+        expect(pass(delivery).hits == 32, "the routed experts hit");
+        const std::uint64_t ask = 4ULL << 20;
+        const auto freed        = delivery.shrink_cache(ask);
+        const auto kept         = delivery.memory();
+        expect(freed >= ask && kept.cache_bytes == full.cache_bytes - freed &&
+                   kept.cache_slots < full.cache_slots,
+               "shrinking gives back what is asked");
+        expect(pass(delivery).hits == 32, "every layer keeps its routed experts");
+        delivery.shrink_cache(std::uint64_t(1) << 40);
+        expect(delivery.memory().cache_slots == 0 && delivery.memory().cache_bytes == 0,
+               "everything goes back");
+        expect(pass(delivery).hits == 0, "an empty cache serves from the banks");
+        expect(delivery.grow_cache() == full.cache_bytes &&
+                   delivery.memory().cache_slots == full.cache_slots,
+               "growing takes it back");
+        pass(delivery);
+        expect(pass(delivery).hits == 32, "the grown slots fill and hit");
+    }
+    unsigned long long wrong = 0;
+    bad.copy_to_host(&wrong, 8);
+    expect(wrong == 0, "every pair reads its expert");
+    std::printf("slot pools bad=%llu %s\n", wrong, failures ? "FAIL" : "PASS");
+    return failures ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -762,6 +902,7 @@ int main(int argc, char** argv) {
         }
         int failures = admission_boundaries(device);
         failures += tier_policy(device);
+        failures += slot_pools(device);
         for (bool disk : {false, true}) {
             for (auto cache : {0ULL, 6ULL << 20, 64ULL << 20}) {
                 failures += run(device, disk, cache, path);

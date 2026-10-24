@@ -549,12 +549,14 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   takes back the bank it fills.
 - **Cache.** `--expert-cache-mib` (default: what is free after startup) holds the experts decode and
   verification route most, by the expert tier every MoE family with host or disk experts shares
-  ([the expert cache](qwen3-8-flash-next.md#the-expert-cache)), one pool of slots for all layers: a
-  miss the GPU copies takes a free slot, or the slot of the coldest expert the call does not route
-  when its routes beat that expert's, and every four decode passes a round swaps the most routed
-  missing experts in, copied behind the calls. A prompt chunk evicts nothing; it promotes its most
-  routed experts from the bank into free slots by device copies, up to each layer's share of the
-  cache, so a long prompt does not flush decode's working set. A routing profile
+  ([the expert cache](qwen3-8-flash-next.md#the-expert-cache)). Its slots form a pool for each size
+  of expert: the layers whose experts need the same room share one, each layer about as many slots
+  as any other, so a model of mixed formats spends no slot bytes on room its experts lack. A miss
+  the GPU copies takes a free slot of its pool, or the slot of the coldest expert of that pool the
+  call does not route when its routes beat that expert's, and every four decode passes a round
+  swaps the most routed missing experts in, copied behind the calls. A prompt chunk evicts nothing;
+  it promotes its most routed experts from the bank into free slots by device copies, up to each
+  layer's share of its pool, so a long prompt does not flush decode's working set. A routing profile
   (`--expert-profile`, else the built-in one of the model family where the build has one) fills the
   slots at startup. `0` keeps the banks only.
 - **CPU share.** Of a decode or verification call's misses that neither the cache nor the layer's
