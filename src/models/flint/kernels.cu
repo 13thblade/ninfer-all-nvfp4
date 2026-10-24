@@ -70,15 +70,6 @@ __device__ float block_max(float v) {
     return total;
 }
 
-// k of the least power of two 2^k with largest * 2^-k under kF16SumLimit; 0 when `largest` is
-// within the limit or not finite.
-__device__ __forceinline__ int sum_exponent(float largest) {
-    if (!(largest > kF16SumLimit) || !isfinite(largest)) { return 0; }
-    int k = 0;
-    frexpf(largest / kF16SumLimit, &k);
-    return k;
-}
-
 // Row kernels hold one float4 of a [hidden] row per thread (hidden % 4 == 0, hidden / 4 <= 1024).
 __device__ __forceinline__ void store_bf16x4(__nv_bfloat16* p, float4 v) {
     const __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y);
@@ -666,7 +657,7 @@ __global__ void swiglu_rows_kernel(const float* __restrict__ x, int width,
         if (weights != nullptr) { largest = fmaxf(largest, fabsf(warp_sum(__bfloat162float(v)))); }
     }
     if (weights == nullptr) { return; }
-    const int k = sum_exponent(block_max(largest));
+    const int k = f16_sum_exponent(block_max(largest));
     if (k == 0) { return; }
     const float down = ldexpf(1.0f, -k);
     for (int r = threadIdx.x; r < width; r += blockDim.x) {
@@ -684,7 +675,7 @@ __global__ void scale_columns_kernel(__nv_bfloat16* __restrict__ x, int rows,
     for (int r = threadIdx.x; r < rows; r += blockDim.x) {
         largest = fmaxf(largest, fabsf(warp_sum(__bfloat162float(column[r]))));
     }
-    const int k = sum_exponent(block_max(largest));
+    const int k = f16_sum_exponent(block_max(largest));
     if (threadIdx.x == 0) { scale[c] = ldexpf(1.0f, k); }
     if (k == 0) { return; }
     const float down = ldexpf(1.0f, -k);
@@ -693,6 +684,39 @@ __global__ void scale_columns_kernel(__nv_bfloat16* __restrict__ x, int rows,
     }
     float* hc = h + c * h_rows;
     for (int r = threadIdx.x; r < h_rows; r += blockDim.x) { hc[r] *= down; }
+}
+
+// One block of `width` threads per pair: each warp's 32 values are one F16 sum's.
+__global__ void quantize_pairs_kernel(__nv_bfloat16* __restrict__ middle, int width,
+                                      float* __restrict__ weights, Q8Rows out) {
+    __shared__ float largest[32];
+    __shared__ int exponent;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const std::int64_t at = std::int64_t(blockIdx.x) * width + threadIdx.x;
+    float x               = __bfloat162float(middle[at]);
+    float sum             = warp_sum(x);
+    if (lane == 0) { largest[warp] = fabsf(sum); }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = 0.0f;
+        for (int w = 0; w < int(blockDim.x >> 5); ++w) { m = fmaxf(m, largest[w]); }
+        exponent = f16_sum_exponent(m);
+        if (exponent != 0) { weights[blockIdx.x] = ldexpf(weights[blockIdx.x], exponent); }
+    }
+    __syncthreads();
+    if (exponent != 0) {
+        const __nv_bfloat16 v = __float2bfloat16(ldexpf(x, -exponent));
+        middle[at]            = v;
+        x                     = __bfloat162float(v);
+        sum                   = warp_sum(x);
+    }
+    // quantize_vector_kernel's numbers: its warp's maximum and butterfly sum.
+    float amax = fabsf(x);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) { amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, o)); }
+    const float d = amax / 127.0f;
+    out.qs[at]    = amax == 0.0f ? 0 : static_cast<std::int8_t>(roundf(x / d));
+    if (lane == 0) { out.ds[at / 32] = __floats2half2_rn(d, sum); }
 }
 
 __global__ void unscale_columns_kernel(float* __restrict__ h, int h_rows,
@@ -839,6 +863,16 @@ void scale_columns(__nv_bfloat16* x, int rows, int columns, float* h, int h_rows
     if (columns <= 0) { return; }
     scale_columns_kernel<<<columns, kGuardThreads, 0, stream>>>(x, rows, h, h_rows, scale);
     check_launch("scale_columns");
+}
+
+void quantize_pairs(__nv_bfloat16* middle, int pairs, int width, float* weights, Q8Rows out,
+                    cudaStream_t stream) {
+    if (width % 32 != 0 || width > 1024) {
+        throw std::invalid_argument("flint quantize_pairs: whole 32-value groups, at most 1024");
+    }
+    if (pairs <= 0) { return; }
+    quantize_pairs_kernel<<<pairs, width, 0, stream>>>(middle, width, weights, out);
+    check_launch("quantize_pairs");
 }
 
 void unscale_columns(float* h, int h_rows, int columns, const float* scale, cudaStream_t stream) {

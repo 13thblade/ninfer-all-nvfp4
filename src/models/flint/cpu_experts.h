@@ -4,7 +4,8 @@
 // stored GGUF blocks of host or disk experts: ExpertDelivery's CPU share of a call's misses. For
 // each pair, SwiGLU over the expert's [gate; up] rows, the BF16 middle quantized as q8_1, its down
 // rows, and each row weighted by the pair's route into its token's 2^-32 fixed-point sums, as the
-// GPU's vector kernels compute them (gguf_expert_cpu, fixed_point.cuh). The products are the
+// GPU's vector kernels compute them (gguf_expert_cpu, fixed_point.cuh), with the GPU's guard of
+// middles whose F16 sums would overflow (kernels::quantize_pairs). The products are the
 // GPU's bit for bit and integer sums do not depend on order, so no split of a call's misses
 // changes a bit of the layer's output.
 
@@ -55,6 +56,7 @@ private:
         ops::GgufCpuActivation input, middle;
         std::vector<float> gate, up, rows;
         std::vector<std::uint16_t> middle_bf16;
+        std::vector<int> exponent; // per column: the guard's power of two
     };
 
     std::vector<CpuExpertLayer> layers_;

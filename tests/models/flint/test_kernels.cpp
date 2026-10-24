@@ -15,6 +15,9 @@
 //  - swiglu_rows, alone and with the route weights taking the power of two of a row whose 32-value
 //    sums pass the F16 limit; scale_columns and unscale_columns: the scaled values are the exact
 //    multiples, the limit holds after them, and h returns bit for bit.
+//  - quantize_pairs: the decode middles' guard (the same powers of two, the rows within the limit
+//    and their weights untouched, a second stage's pass changing nothing) and q8_1 rows equal to
+//    ggml's quantization of the rows it leaves, F16 sums finite.
 
 #include "core/arena.h"
 #include "models/flint/kernels.h"
@@ -672,6 +675,96 @@ void swiglu_guard(std::mt19937& rng) {
            "swiglu_rows guard " + std::to_string(scaled) + " rows scaled, " + std::to_string(wrong) + " wrong");
 }
 
+// ggml's q8_1 of one 32-value group of BF16 values: the codes, d and the warp butterfly's sum, both
+// rounded to F16.
+void q8_group(const __nv_bfloat16* v, std::int8_t* codes, half2& ds) {
+    float lanes[32], amax = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+        lanes[i] = __bfloat162float(v[i]);
+        amax     = std::max(amax, std::fabs(lanes[i]));
+    }
+    const float d = amax / 127.0f;
+    for (int i = 0; i < 32; ++i) {
+        codes[i] = amax == 0.0f ? 0 : static_cast<std::int8_t>(std::round(lanes[i] / d));
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        for (int l = 0; l < o; ++l) { lanes[l] += lanes[l + o]; }
+    }
+    ds = __floats2half2_rn(d, lanes[0]);
+}
+
+// Decode middles at Flint's width (512), a third of them past the F16 sum limit, quantized with the
+// guard twice (the two stages of a call with experts in transit).
+void pair_guard(std::mt19937& rng) {
+    constexpr int pairs = 30, width = 512, groups = width / 32;
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<__nv_bfloat16> middle(std::size_t(pairs) * width);
+    std::vector<float> weights(pairs);
+    for (int p = 0; p < pairs; ++p) {
+        const float spread = p % 3 == 0 ? 6000.0f : p % 3 == 1 ? 300.0f : 1.0f;
+        for (int r = 0; r < width; ++r) {
+            middle[std::size_t(p) * width + r] =
+                __float2bfloat16(spread * std::fabs(normal(rng)) * (r % 5 == 0 ? -1 : 1));
+        }
+        weights[p] = 0.05f + 0.9f * std::fabs(normal(rng)) / 3.0f;
+    }
+    const std::size_t qs_bytes = std::size_t(pairs) * width,
+                      ds_bytes = std::size_t(pairs) * groups * 4;
+    DeviceBuffer dm(middle.size() * 2), dw(pairs * 4), dq(qs_bytes), dd(ds_bytes), dq2(qs_bytes),
+        dd2(ds_bytes);
+    dm.copy_from_host(middle.data(), middle.size() * 2);
+    dw.copy_from_host(weights.data(), pairs * 4);
+    const k::Q8Rows first{static_cast<std::int8_t*>(dq.p), static_cast<half2*>(dd.p)};
+    const k::Q8Rows second{static_cast<std::int8_t*>(dq2.p), static_cast<half2*>(dd2.p)};
+    k::quantize_pairs(static_cast<__nv_bfloat16*>(dm.p), pairs, width, static_cast<float*>(dw.p),
+                      first, nullptr);
+    std::vector<__nv_bfloat16> once(middle.size()), twice(middle.size());
+    std::vector<float> w_once(pairs), w_twice(pairs);
+    check(cudaDeviceSynchronize(), "quantize_pairs");
+    dm.copy_to_host(once.data(), once.size() * 2);
+    dw.copy_to_host(w_once.data(), pairs * 4);
+    k::quantize_pairs(static_cast<__nv_bfloat16*>(dm.p), pairs, width, static_cast<float*>(dw.p),
+                      second, nullptr);
+    check(cudaDeviceSynchronize(), "quantize_pairs again");
+    dm.copy_to_host(twice.data(), twice.size() * 2);
+    dw.copy_to_host(w_twice.data(), pairs * 4);
+    std::vector<std::int8_t> q(qs_bytes), q2(qs_bytes);
+    std::vector<half2> d(std::size_t(pairs) * groups), d2(d.size());
+    dq.copy_to_host(q.data(), qs_bytes);
+    dd.copy_to_host(d.data(), ds_bytes);
+    dq2.copy_to_host(q2.data(), qs_bytes);
+    dd2.copy_to_host(d2.data(), ds_bytes);
+    int wrong = 0, scaled = 0;
+    for (int p = 0; p < pairs; ++p) {
+        const __nv_bfloat16* before = middle.data() + std::size_t(p) * width;
+        const __nv_bfloat16* after  = once.data() + std::size_t(p) * width;
+        const int e                 = exact_exponent(after, before, width);
+        bool ok = e >= 0 && w_once[p] == std::ldexp(weights[p], e) && w_twice[p] == w_once[p] &&
+                  largest_sum(after, width) <= k::kF16SumLimit &&
+                  (largest_sum(before, width) > k::kF16SumLimit / 2 || e == 0);
+        for (int r = 0; r < width && ok; ++r) {
+            const std::size_t i = std::size_t(p) * width + r;
+            ok = __bfloat162float(twice[i]) == __bfloat162float(once[i]) && q2[i] == q[i];
+        }
+        for (int g = 0; g < groups && ok; ++g) {
+            std::int8_t codes[32];
+            half2 ds;
+            q8_group(after + 32 * g, codes, ds);
+            const std::size_t at = std::size_t(p) * groups + g;
+            ok = std::equal(codes, codes + 32, q.begin() + std::ptrdiff_t(at * 32)) &&
+                 __half2float(__low2half(d[at])) == __half2float(__low2half(ds)) &&
+                 __half2float(__high2half(d[at])) == __half2float(__high2half(ds)) &&
+                 std::isfinite(__half2float(__high2half(d[at]))) &&
+                 __half2float(__high2half(d2[at])) == __half2float(__high2half(d[at]));
+        }
+        wrong += ok ? 0 : 1;
+        scaled += e > 0 ? 1 : 0;
+    }
+    report(wrong == 0 && scaled >= pairs / 3, "quantize_pairs " + std::to_string(scaled) +
+                                                  " rows scaled, " + std::to_string(wrong) +
+                                                  " wrong");
+}
+
 // Columns of a prompt product's activation, some past the F16 sum limit, with their residual columns.
 void column_guard(std::mt19937& rng) {
     constexpr int columns = 37, rows = 1024;
@@ -780,6 +873,7 @@ int main() {
         ring_copy(rng);
         swiglu(rng);
         swiglu_guard(rng);
+        pair_guard(rng);
         column_guard(rng);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Flint kernels\n";
         return failures == 0 ? 0 : 1;

@@ -707,13 +707,14 @@ struct Executor::Impl {
         ops::detail::gguf_project(x, {&product, 1}, *workspace, stream);
     }
 
-    // h[:, c] += W x_c for BF16 rows x [K, T]. A prompt chunk's x goes through the matrix kernels'
-    // q8_1 rows, which keep each 32 values' sum in F16 for some types (Q5_K among Flint's): there
-    // the columns whose sums could pass F16's range are scaled by a power of two, with their h
-    // columns, and h's columns restored after the product (kernels::scale_columns).
+    // h[:, c] += W x_c for BF16 rows x [K, T]. The vector and the matrix kernels' q8_1 rows keep
+    // each 32 values' sum in F16 for some types (Q5_K among Flint's): there the columns whose sums
+    // could pass F16's range are scaled by a power of two, with their h columns, and h's columns
+    // restored after the product (kernels::scale_columns).
     void project_residual(const Tensor& x, const Weight& w, float* h, int t) {
-        if (t <= gguf::kMaxVectorColumns ||
-            !gguf::matrix_activation_f16_sums(ops::detail::gguf_type(w.qtype))) {
+        const auto type = ops::detail::gguf_type(w.qtype);
+        if (!(t <= gguf::kMaxVectorColumns ? gguf::vector_activation_f16_sums(type)
+                                           : gguf::matrix_activation_f16_sums(type))) {
             project_f32(x, w, h, hidden, 0, true);
             return;
         }
@@ -896,12 +897,23 @@ struct Executor::Impl {
             gguf::MoeOutput out;
             out.weighted = fixed;
             out.weights  = weights;
+            // Down rows whose dot reads the activation's F16 sums take the middles' guard, which
+            // may scale a pair's weight by a power of two.
+            const bool guard = gguf::vector_activation_f16_sums(p.down_type);
+            const kernels::Q8Rows middle_q{
+                static_cast<std::int8_t*>(act2),
+                reinterpret_cast<half2*>(static_cast<std::byte*>(act2) +
+                                         gguf::vector_activation_scales_offset(width, pairs))};
             const auto compute = [&](const gguf::MoeRouting& part) {
                 // Quantization reads every pair. Clear absent pairs before each disjoint stage.
                 if (call) { CUDA_CHECK(cudaMemsetAsync(middle, 0, std::size_t(pairs) * width * 2, stream)); }
                 gguf::moe_vector_swiglu(p.gate_up_type, gate, up, part, max_active, k, act, t,
                                         middle, chunk, stream);
-                gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, stream);
+                if (guard) {
+                    kernels::quantize_pairs(middle, pairs, width, weights, middle_q, stream);
+                } else {
+                    gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, stream);
+                }
                 gguf::moe_vector_product(p.down_type, down, part, max_active, 1, k, act2, pairs,
                                          out, chunk, stream);
             };

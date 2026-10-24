@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -123,6 +124,15 @@ void route_select(const float* x, int hidden, int tokens, const float* router, i
 // SwiGLU rows reach sums near 90,000, past F16's 65504.
 inline constexpr float kF16SumLimit = 16384.0f;
 
+// k of the least power of two 2^k with largest * 2^-k under kF16SumLimit; 0 when `largest` is
+// within the limit or not finite. The guards below and Flint's CPU expert products decide alike.
+__host__ __device__ inline int f16_sum_exponent(float largest) {
+    if (!(largest > kF16SumLimit) || !(largest <= 3.40282347e38f)) { return 0; }
+    int k = 0;
+    frexpf(largest / kF16SumLimit, &k);
+    return k;
+}
+
 // out[p][r] = bf16(silu(x[p][r]) * x[p][width + r]) for pairs p of [2 * width] FP32 rows
 // (width % 32 == 0). With `weights` [pairs], a row whose largest sum of 32 values (r = 32i to
 // 32i + 31) passes kF16SumLimit is written times 2^-k, the least power of two that brings it under
@@ -130,6 +140,16 @@ inline constexpr float kF16SumLimit = 16384.0f;
 // product is unchanged and its activation's F16 sums stay finite.
 void swiglu_rows(const float* x, int pairs, int width, __nv_bfloat16* out, float* weights,
                  cudaStream_t stream);
+
+// The vector activation (Q8Rows of [pairs][width]) of a decode or verification call's BF16 middle
+// rows [pairs][width] for a down product whose vector dot reads the F16 sums
+// (gguf::vector_activation_f16_sums), with the same guard: a row whose largest sum of 32 values
+// passes kF16SumLimit is first multiplied in place by 2^-k (f16_sum_exponent) and weights[p] by
+// 2^k. A row within the limit (one an earlier stage of the call scaled among them) keeps its values
+// and weight. The codes and (d, sum) pairs are gguf::quantize_vector_activation's of the rows it
+// leaves (width % 32 == 0, width <= 1024).
+void quantize_pairs(__nv_bfloat16* middle, int pairs, int width, float* weights, Q8Rows out,
+                    cudaStream_t stream);
 
 // The same guard for a product of the BF16 rows x [columns][rows] (rows % 32 == 0) accumulated into
 // h [columns][h_rows]: each column c of x whose largest sum of 32 values passes kF16SumLimit, and

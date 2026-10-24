@@ -214,11 +214,15 @@ scales such rows by a power of two before quantizing them:
   shared expert's Q5_K down rows of 12 blocks and the Q5_K attention output of 7), the
   activation's columns are scaled the same way together with the residual's columns, and the
   residual's columns are multiplied back after the product: the residual receives the same sum.
+- **Decode and verification rows.** The vector kernels' q8_1 rows keep each 32 values' sum in F16
+  too, and their Q4_K, Q5_K and IQ1_S products read it (`gguf::vector_activation_f16_sums`). A
+  call of at most eight tokens therefore quantizes its routed SwiGLU rows with the same guard
+  (`quantize_pairs`), scales the columns of the Q5_K products into the residual as above, and the
+  CPU share of host and disk experts applies the same factors, so its products stay the GPU's bit
+  for bit. Unguarded, such a sum turned a decode step's logits to NaN and its text to garbage.
 - **Not needed elsewhere.** The other activations are RMS-normed rows; their 32-value sums are at
   most sqrt(2048) times the norm weights' largest 32-value L2 norm, which is 1,744 for the
-  attention inputs, 7,603 for the FFN inputs and 209 for the head in UD-Q4_K_XL. Decode and
-  verification rows go through the vector kernels, whose K-quant products use the integer sums of
-  the quantized values instead of the stored sum.
+  attention inputs, 7,603 for the FFN inputs and 209 for the head in UD-Q4_K_XL.
 
 ## Expert residency
 

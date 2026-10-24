@@ -2,12 +2,16 @@
 
 #include "core/cpu_spin_pool.h"
 #include "core/expert_split.h"
+#include "models/flint/kernels.h"
 #include "ops/linear/gguf/ggml_bridge.h"
+#include "ops/linear/gguf/gguf_linear.h"
 // After the bridge, which brings the CUDA host definitions fixed_point.cuh's qualifiers need.
 #include "ops/common/fixed_point.cuh"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -32,6 +36,27 @@ void run(CpuSpinPool* pool, std::size_t count, Job&& job, Side&& side) {
 template <class Job>
 void run(CpuSpinPool* pool, std::size_t count, Job&& job) {
     run(pool, count, job, [] {});
+}
+
+// kernels::quantize_pairs' guard of one BF16 middle row: its largest sum of 32 values, added as a
+// warp adds them, past kF16SumLimit scales the row by 2^-k. Returns k.
+int guard_middle(std::uint16_t* row, int width) {
+    float largest = 0;
+    float lanes[32];
+    for (int g = 0; g < width / 32; ++g) {
+        for (int i = 0; i < 32; ++i) {
+            lanes[i] = std::bit_cast<float>(std::uint32_t(row[32 * g + i]) << 16);
+        }
+        largest = std::max(largest, std::abs(ops::gguf_cpu_detail::butterfly(lanes)));
+    }
+    const int k = kernels::f16_sum_exponent(largest);
+    if (k != 0) {
+        for (int i = 0; i < width; ++i) {
+            const float value = std::bit_cast<float>(std::uint32_t(row[i]) << 16);
+            row[i]            = ops::gguf_cpu_detail::float_to_bf16(std::ldexp(value, -k));
+        }
+    }
+    return k;
 }
 
 } // namespace
@@ -106,6 +131,7 @@ ExpertCpuProducts::Done CpuExperts::compute(const Work& work) {
         job.gate.resize(n * width_);
         job.up.resize(n * width_);
         job.middle_bf16.resize(n * width_);
+        job.exponent.assign(n, 0);
         job.rows.resize(n * hidden_);
     }
 
@@ -141,6 +167,7 @@ ExpertCpuProducts::Done CpuExperts::compute(const Work& work) {
     const auto rows_done = work.pool ? work.pool->finished() : Clock::now();
     const auto middle    = Clock::now();
     // The BF16 middle, as the GPU stores it before quantizing it for the down rows, a pair a task.
+    const bool guard = gguf::vector_activation_f16_sums(ops::detail::gguf_type(layer.down));
     std::vector<std::pair<std::uint32_t, int>> columns;
     for (std::size_t i = 0; i < count; ++i) {
         for (int j = 0; j < int(jobs_[i].pairs.size()); ++j) { columns.emplace_back(i, j); }
@@ -151,6 +178,9 @@ ExpertCpuProducts::Done CpuExperts::compute(const Work& work) {
         const std::size_t at = std::size_t(j) * width_;
         ops::gguf_cpu_swiglu_bf16(job.gate.data() + at, job.up.data() + at, std::size_t(width_),
                                  job.middle_bf16.data() + at, backend_);
+        if (guard) {
+            job.exponent[std::size_t(j)] = guard_middle(job.middle_bf16.data() + at, width_);
+        }
         job.middle.quantize_bf16(j, job.middle_bf16.data() + at, 0, job.middle.groups());
     });
     const RowPart down{hidden_, cost};
@@ -163,7 +193,7 @@ ExpertCpuProducts::Done CpuExperts::compute(const Work& work) {
             const ops::GgufCpuMatrix w{layer.down, job.down, layer.down_row_bytes, hidden_, width_};
             ops::gguf_cpu_rows(w, job.middle, begin, end, job.rows.data(), std::size_t(hidden_), backend_);
             for (std::size_t j = 0; j < job.pairs.size(); ++j) {
-                const float weight = weights[job.pairs[j]];
+                const float weight = std::ldexp(weights[job.pairs[j]], job.exponent[j]);
                 const float* row   = job.rows.data() + j * hidden_;
                 std::uint64_t* sum = sums + std::size_t(job.tokens[j]) * hidden_;
                 // Two's complement: the GPU's unsigned atomic additions, modulo 2^64.
