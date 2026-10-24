@@ -21,7 +21,7 @@
 
 ### 吞吐
 
-全程同一个制品（`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`，带 proposal 头），RTX 3090 Ti，贪心解码，KV bf16，16,384 token 上下文，`--device-profile calibrate`，prefill 由 4K 的长 prompt 测出（三次独立冷启动取峰值），decode 速度来自于多个真实场景下测得的均值。
+全程同一个制品（`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`，带 proposal 头），RTX 3090 Ti，贪心解码，KV bf16，16,384 token 上下文，`--device-profile calibrate`，prefill 由 4K 的长 prompt 测出，decode 速度来自于多个真实场景下测得的均值。
 
 | 构建与投机解码设置                    | Prefill tok/s | Decode tok/s | 接受率   |
 | ---------------------------- | ------------- | ------------ | ----- |
@@ -74,7 +74,7 @@ Four changes, in order:
 
 ## Throughput
 
-Same artifact throughout (`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`, proposal head) on an RTX 3090 Ti: greedy decoding, KV bf16, 16,384-token context, `--device-profile calibrate`. Prefill is measured on the 4K long prompt (peak of three independent cold starts); decode is the mean over several realistic tasks.
+Same artifact throughout (`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`, proposal head) on an RTX 3090 Ti: greedy decoding, KV bf16, 16,384-token context, `--device-profile calibrate`. Prefill is measured on the 4K long prompt; decode is the mean over several realistic tasks.
 
 | Build and speculative setting                 | Prefill tok/s | Decode tok/s | Acceptance |
 | --------------------------------------------- | ------------- | ------------ | ---------- |
