@@ -258,10 +258,19 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     instance->free_after_weights = free_after_weights;
     instance->free_after_startup = free_bytes();
     const auto memory = instance->executor->memory();
+    std::string spans;
+    if (instance->executor->prompt_step() > executor.prefill_chunk) {
+        spans = " block by block in spans of " + std::to_string(instance->executor->prompt_step()) +
+                " tokens";
+        if (memory.span_borrow_bytes != 0) {
+            spans += " (" + std::to_string(memory.span_borrow_bytes >> 20) +
+                     " MiB borrowed from the expert cache while one runs)";
+        }
+    }
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                       "DeepSeek-V4.1: %u sequence(s), prompt chunks of %u tokens, BF16 latent "
+                       "DeepSeek-V4.1: %u sequence(s), prompt chunks of %u tokens%s, BF16 latent "
                        "caches %.0f MiB%s, workspace %.0f MiB",
-                       executor.sequences, executor.prefill_chunk,
+                       executor.sequences, executor.prefill_chunk, spans.c_str(),
                        double(memory.kv_bytes) / 1048576.0,
                        memory.kv_grows
                            ? " at most, growing with the sequences beside an elastic expert cache"
@@ -1161,7 +1170,7 @@ struct DeepSeekV41Core::Impl {
                 break;
             }
         }
-        return std::min(instance.executor->options().prefill_chunk, until - r.prefilled);
+        return std::min(instance.executor->prompt_step(), until - r.prefilled);
     }
 
     // Decode rounds that run before a prefill step while other requests generate: the configured
@@ -1432,10 +1441,11 @@ struct DeepSeekV41Core::Impl {
         if (n == 0) { throw std::logic_error("deepseek_v41: an empty prefill step"); }
         const auto chunk = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
         // A branched read's last chunk takes the first branches into its pass when the first fits
-        // beside it: the sequence keeps the chunk's rows and the branches run from its end.
+        // beside it: the sequence keeps the chunk's rows and the branches run from its end. A
+        // span's branches run in the steps after it.
         std::vector<TokenId> branch_tokens;
         std::vector<std::uint32_t> lengths;
-        if (r.branches && r.prefilled + n == prompt_n) {
+        if (r.branches && r.prefilled + n == prompt_n && n < executor.options().prefill_chunk) {
             next_branches(r, executor.options().prefill_chunk - n, branch_tokens, lengths);
         }
         if (lengths.empty()) {

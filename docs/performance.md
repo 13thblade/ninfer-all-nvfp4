@@ -892,16 +892,24 @@ lookup.
 
 ISTA-DASLab's GSQ-RCO IQ1_M GGUF with its Engram table
 ([artifact](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3)), BF16
-caches, `ninfer-serve` with one request, greedy, thinking off. Strata 0.1.50 (`strata-dsv41`) on the
-same GGUF and prompt tokens, all 6 experts. One host: RTX 3090s at 350 and 390 W, a Threadripper
-3960X and 251 GB of RAM:
+caches, one request, greedy, thinking off, the same prompt tokens in both engines. One rented host:
+an RTX 4090 (450 W, PCIe 4.0 x16), two 32-core AMD EPYC engineering samples and 409 GiB of RAM.
+NInfer: `ninfer-serve` with host experts. Strata: 0.2.6, its latest release (`strata-dsv41` 0.1.51),
+all 6 experts, the flags its app starts the engine with and the four settings its tuner tries:
 
-| Engine and placement | Decode, short answer | after 8,086 tokens | Prefill of 8,086 tokens |
+| Engine and settings | Decode, short answer | after 8,086 tokens | Prefill of 8,086 tokens |
 |---|---:|---:|---:|
-| NInfer, 1 GPU, host experts | 21.8 | 18.9 | 410 |
-| NInfer, 1 GPU, disk experts, page cache warm | 7.4 | 7.4 | 117 |
-| Strata, 1 GPU | 3.9 | 3.9 | 380 |
-| Strata, 2 GPUs | 6.6 | 8.0 | 333 |
+| NInfer | 26.0 | 22.0 | 925 |
+| NInfer `b3402a6fd` (prompts chunk by chunk) | 25.8 | 22.1 | 498 |
+| Strata, `--dspark auto --dspark-conf 0.65` (its app) | 36.0 | 38.4 | 635 |
+| Strata, `--dspark on` | 34.3 | 38.7 | 690 |
+| Strata, `--dspark on --dspark-block 3` | 39.9 | 37.1 | 660 |
+| Strata, `--cpu-threads 64` | 38.0 | 38.6 | 659 |
+| Strata, `--mmap-experts off --ssd-cache 0` | 39.4 | 38.3 | 658 |
+
+Strata computes 53 to 61% of the routed experts on its CPU threads beside the GPU; NInfer copies
+every expert its cache lacks to the GPU. With `--experts 5` (5 of the 6 experts, another model's
+output) Strata decodes 44.8 and 42.1 tok/s.
 
 NInfer's native release build of `b3402a6fd` on one GPU of a rented host per card, the same prompts:
 
@@ -913,6 +921,10 @@ NInfer's native release build of `b3402a6fd` on one GPU of a rented host per car
 | RTX 5090 (575 W) | disk, page cache warm | 12.5 | 10.5 | 181 |
 | RTX 4090 (450 W) | host | 25.9 | 22.2 | 490 |
 | RTX 4090 (450 W) | disk, page cache warm | 8.5 | 7.3 | 123 |
+
+That build ran prompts chunk by chunk. [Prompt spans](deepseek-v41.md#prompt-spans) prefill the
+8,086 tokens at 906 tok/s with host experts and 390 with disk experts on an RTX 4090 host of the
+same type (EPYC 7K62), with the same decode rates.
 
 DeepSeek-V4.1-Flash runs on one GPU only; it has no pipeline stages or tensor parallelism.
 [DeepSeek-V4.1-Flash's measurements](deepseek-v41.md#measurements) add the hosts, the device

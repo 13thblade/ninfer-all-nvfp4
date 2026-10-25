@@ -175,10 +175,12 @@ struct GraphEntry {
     bool warmed = false; // ran once eagerly, so every kernel is loaded before the capture
 };
 
-// The rows of a pass: a prompt chunk of one sequence, or decode rows of one sequence each.
+// The rows of a pass: a prompt chunk of one sequence, or decode rows of one sequence each. A
+// chunk of a prompt span reads its staged rows from `row` of the span's `staged` rows.
 struct Pass {
     int t     = 0;
     bool chunk = false;
+    int row = 0, staged = 0; // staged 0: the pass's own t rows
     std::uint32_t sequence = 0, first = 0;
     // The rows whose logits the pass keeps (the last ones), and the logit column of the first.
     int logit_rows = 0, logit_column = 0;
@@ -218,6 +220,15 @@ struct Executor::Impl {
     DeviceBuffer logits_bf16;
     std::unique_ptr<WorkspaceArena> workspace;
     std::size_t workspace_bytes = 0;
+    // Layer-major prompt spans (forward_span): with host or disk experts, every chunk of a span
+    // passes a block before any passes the next, so the block's wide calls copy the experts the
+    // cache lacks once per span instead of once per chunk. span_tokens is 0 when spans are off.
+    // Beside an elastic expert cache a span borrows its streams, coefficients and selections from
+    // the cache (span_buffers) and gives them back after it, so decode keeps the whole cache; a
+    // fixed cache leaves them in the workspace.
+    static constexpr std::uint32_t kSpanChunks = 8;
+    std::uint32_t span_tokens = 0;
+    std::size_t span_borrow_bytes = 0;
     std::map<std::uint32_t, GraphEntry> graphs;
     std::uint32_t verify_width = 0;
     int capacity_rows = 0;   // the largest compressed cache, a decode pass's score width
@@ -453,7 +464,8 @@ struct Executor::Impl {
         for (int b = 1; b <= gguf::kMaxVectorColumns; ++b) {
             decode_splits[b] = std::clamp(2 * sms / (heads / 16 * b), 1, 40);
         }
-        const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, sequences);
+        span_tokens = plan_span();
+        const std::size_t rows = staging_rows();
         d_tokens    = DeviceBuffer(rows * 4);
         d_positions = DeviceBuffer(rows * 4);
         d_sequences = DeviceBuffer(rows * 4);
@@ -470,7 +482,8 @@ struct Executor::Impl {
             engram_copied = std::make_unique<CudaCompletionEvent>(device);
             engram_scratch.resize(engram_rows);
         }
-        workspace_bytes = plan_workspace();
+        span_borrow_bytes = growing && span_tokens != 0 ? span_buffers(span_tokens) : 0;
+        workspace_bytes   = plan_workspace(growing ? 0 : span_tokens);
         {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
@@ -487,11 +500,10 @@ struct Executor::Impl {
         if (!model.expert_banks().empty()) { plan_delivery(); }
     }
 
-    void plan_delivery() {
-        std::vector<ExpertDeliveryLayer> sources;
+    // A whole-layer bank of the routed experts, each blob at its largest aligned size.
+    [[nodiscard]] std::uint64_t bank_bytes() const {
         std::vector<std::uint64_t> sizes;
         for (const auto& bank : model.expert_banks()) {
-            sources.push_back(bank.delivery);
             for (const auto& expert : bank.delivery.experts) {
                 sizes.resize(std::max(sizes.size(), expert.size()), 0);
                 for (std::size_t b = 0; b < expert.size(); ++b) {
@@ -500,13 +512,22 @@ struct Executor::Impl {
                 }
             }
         }
-        // One whole-layer bank at least (the transport adds a second where memory allows).
         std::uint64_t slot = 0;
         for (auto bytes : sizes) { slot += bytes; }
-        const auto bank     = slot * config.num_experts;
-        const auto metadata = std::uint64_t(options.prefill_chunk) * config.top_k_experts * 8 +
-            std::uint64_t(config.num_hidden_layers) * config.num_experts * 4 * sizeof(void*) +
-            config.num_experts * 4;
+        return slot * config.num_experts;
+    }
+    [[nodiscard]] std::uint64_t delivery_metadata() const {
+        return std::uint64_t(options.prefill_chunk) * config.top_k_experts * 8 +
+               std::uint64_t(config.num_hidden_layers) * config.num_experts * 4 * sizeof(void*) +
+               config.num_experts * 4;
+    }
+
+    void plan_delivery() {
+        std::vector<ExpertDeliveryLayer> sources;
+        for (const auto& bank : model.expert_banks()) { sources.push_back(bank.delivery); }
+        // One whole-layer bank at least (the transport adds a second where memory allows).
+        const auto bank     = bank_bytes();
+        const auto metadata = delivery_metadata();
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         const auto cache = options.expert_cache_bytes.value_or(0);
@@ -530,6 +551,38 @@ struct Executor::Impl {
 
     std::size_t start_reserve() const {
         return options.prefill_chunk >= 2048 ? std::size_t(2048) << 20 : std::size_t(768) << 20;
+    }
+
+    // Rows the staging buffers hold: a prompt step's tokens or one row per sequence.
+    [[nodiscard]] std::size_t staging_rows() const {
+        return std::max<std::size_t>(std::max(options.prefill_chunk, span_tokens), options.sequences);
+    }
+
+    // The tokens of a prompt span (0: spans off): with host or disk experts on this device, the
+    // most chunks (kSpanChunks, 4 or 2, within max_context) whose span buffers (in the workspace,
+    // or borrowed from an elastic cache for each span) and staging take no more than the memory
+    // the expert cache would get beside two layer banks, and at most an eighth of that memory and
+    // the banks together, so the cache keeps most of its slots while a span runs.
+    [[nodiscard]] std::uint32_t plan_span() const {
+        if (model.expert_banks().empty()) { return 0; }
+        const std::uint64_t chunk = plan_workspace(0), bank = bank_bytes();
+        std::size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        const std::uint64_t fixed = chunk + kGraphReserve + unbacked() + (growing ? kKvHeadroom : 0) +
+                                    delivery_metadata() + options.expert_cache_bytes.value_or(0);
+        if (free <= fixed + 2 * bank) { return 0; }
+        const std::uint64_t room = free - fixed - 2 * bank;
+        const std::uint64_t row  = 12 + (options.engram_table ? std::uint64_t(hasher.rows_per_token()) *
+                                                                    kEngramRowBytes : 0);
+        for (std::uint32_t chunks = kSpanChunks; chunks >= 2; chunks /= 2) {
+            const auto tokens = std::uint32_t(std::min<std::uint64_t>(
+                options.max_context, std::uint64_t(chunks) * options.prefill_chunk));
+            if (tokens <= options.prefill_chunk) { continue; }
+            const std::uint64_t extra =
+                plan_workspace(tokens) - chunk + std::uint64_t(tokens - options.prefill_chunk) * row;
+            if (extra <= room && 8 * extra <= room + 2 * bank) { return tokens; }
+        }
+        return 0;
     }
 
     // ---- Growing caches -------------------------------------------------------------------------
@@ -616,6 +669,33 @@ struct Executor::Impl {
         count_backed();
     }
 
+    // Beside an elastic expert cache, before a span of `n` tokens: its span_buffers, the cache
+    // giving memory back when the device keeps less than them and the CUDA Graph reserve. Empty
+    // when the cache has no more to give. Outside capture.
+    DeviceBuffer borrow_span(std::uint32_t n) {
+        const std::size_t bytes = span_buffers(n), need = bytes + kGraphReserve;
+        std::size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        while (free < need) {
+            if (delivery->shrink_cache(std::max(need - free, std::size_t(64) << 20)) == 0) { return {}; }
+            CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        }
+        try {
+            return DeviceBuffer(bytes);
+        } catch (const std::runtime_error&) {
+            (void)cudaGetLastError(); // the failed allocation's error
+            return {};
+        }
+    }
+
+    // After the span: its buffers back to the expert cache, once the span's work is done.
+    void give_back(DeviceBuffer& borrowed) {
+        if (!borrowed.p) { return; }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        borrowed = DeviceBuffer();
+        delivery->grow_cache();
+    }
+
     void release(std::uint32_t sequence) {
         if (!growing || sequence_areas.empty() || sequence_areas.front()->backed[sequence] == 0) { return; }
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -639,8 +719,19 @@ struct Executor::Impl {
                              int(options.sequences) * (int(options.draft_tokens) + 1));
     }
 
-    std::size_t plan_workspace() const {
-        const std::size_t t = options.prefill_chunk, h = hidden, s = streams;
+    // A span of `n` tokens' residual streams, both coefficient sites and index selections, as
+    // forward_span allocates them.
+    [[nodiscard]] std::size_t span_buffers(std::size_t n) const {
+        const std::size_t s = streams, site = (2 * s + s * s) * 4;
+        return round_up(n * s * hidden * 4, kAlign) + 2 * round_up(n * site, kAlign) +
+               round_up(n * std::size_t(index_topk) * 4, kAlign) +
+               (candidate_words > 0 ? round_up(n * std::size_t(candidate_words) * 4, kAlign) : 0);
+    }
+
+    // The workspace of a prompt chunk's pass, and with `span` tokens a span's residual streams,
+    // coefficients and index selections beside one chunk's temporaries.
+    std::size_t plan_workspace(std::uint32_t span) const {
+        const std::size_t t = options.prefill_chunk, n = span, h = hidden, s = streams;
         const std::size_t latent_rows = std::size_t(heads) * kLatent;
         const std::size_t pairs = t * top_k, w = width;
         std::size_t gguf_scratch = 0;
@@ -676,8 +767,10 @@ struct Executor::Impl {
             return bytes;
         };
         const std::size_t mixes = config.hc_mixes();
-        const std::size_t pass = sum({t * s * h * 4, 2 * t * (2 * s + s * s) * 4, t * mixes * 4,
-                                      t * std::size_t(index_topk) * 4, t * std::size_t(candidate_words) * 4});
+        const std::size_t sites = 2 * (2 * s + s * s) * 4;
+        std::size_t pass = sum({t * s * h * 4, t * sites, t * mixes * 4, t * std::size_t(index_topk) * 4,
+                                t * std::size_t(candidate_words) * 4});
+        if (n > t) { pass = std::max(pass, span_buffers(n) + sum({t * mixes * 4})); }
         const std::size_t columns = std::size_t(config.engram.columns()) * config.engram.head_dim;
         const std::size_t engram_bytes = sum({t * columns * 2, t * 4, t * (s + 1) * h * 4});
         const std::size_t decode_width = std::size_t(decode_rows()) * std::size_t(capacity_rows) * 4;
@@ -776,7 +869,7 @@ struct Executor::Impl {
                std::span<const std::int32_t> c) {
         staged->synchronize();
         auto* host = static_cast<std::int32_t*>(h_staging->data());
-        const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, options.sequences);
+        const std::size_t rows = staging_rows();
         if (a.size() > rows || b.size() > rows || c.size() > rows) {
             throw std::invalid_argument("deepseek_v41 executor: staging overflow");
         }
@@ -866,14 +959,16 @@ struct Executor::Impl {
         kernels::hc_split(a, stream);
     }
 
-    void engram_block(const LayerPlan& p, float* h, int t) {
+    void engram_block(const LayerPlan& p, float* h, int t, const Pass& s) {
         if (!engram) { return; }
         auto scope        = workspace->scope();
         const int columns = int(hasher.columns());
         const int rows    = t * columns;
+        const std::size_t block = std::size_t(s.staged ? s.staged : t) * columns;
         Tensor e          = alloc_bf16(columns * int(config.engram.head_dim), t);
         kernels::engram_rows(static_cast<const std::uint8_t*>(d_engram.p) +
-                                 std::size_t(p.engram) * rows * kEngramRowBytes,
+                                 (std::size_t(p.engram) * block + std::size_t(s.row) * columns) *
+                                     kEngramRowBytes,
                              rows, static_cast<__nv_bfloat16*>(e.data), stream);
         const int kv_rows = (streams + 1) * hidden;
         auto* kv          = alloc<float>(std::size_t(t) * kv_rows);
@@ -885,7 +980,7 @@ struct Executor::Impl {
     void attention(const LayerPlan& p, float* h, const float* pre, int t, const Pass& s,
                    std::int32_t* topk, std::uint32_t* candidates, const Coefficients& c) {
         auto scope      = workspace->scope();
-        const auto* pos = static_cast<const std::int32_t*>(d_positions.p);
+        const auto* pos = static_cast<const std::int32_t*>(d_positions.p) + s.row;
         const auto* seq = s.chunk ? nullptr : static_cast<const std::int32_t*>(d_sequences.p);
         Tensor x        = alloc_bf16(hidden, t);
         auto* x32       = alloc<float>(std::size_t(t) * hidden);
@@ -987,7 +1082,7 @@ struct Executor::Impl {
     // indexer keys, into its caches.
     void compress_block(const LayerPlan& p, const float* x32, int t, const Pass& s) {
         auto scope      = workspace->scope();
-        const auto* pos = static_cast<const std::int32_t*>(d_positions.p);
+        const auto* pos = static_cast<const std::int32_t*>(d_positions.p) + s.row;
         const auto* seq = s.chunk ? nullptr : static_cast<const std::int32_t*>(d_sequences.p);
         auto* kv        = alloc<float>(std::size_t(t) * kLatent);
         kernels::gemm_f32(kLatent, t, hidden, p.compressor_kv, x32, kv, stream);
@@ -1041,7 +1136,7 @@ struct Executor::Impl {
                      const float* x32, int t, const Pass& s, std::int32_t* topk,
                      std::uint32_t* candidates) {
         auto scope      = workspace->scope();
-        const auto* pos = static_cast<const std::int32_t*>(d_positions.p);
+        const auto* pos = static_cast<const std::int32_t*>(d_positions.p) + s.row;
         const auto* seq = s.chunk ? nullptr : static_cast<const std::int32_t*>(d_sequences.p);
         const int q_rows = index_heads * kIndexDim;
         auto* q32        = alloc<float>(std::size_t(t) * q_rows);
@@ -1280,7 +1375,7 @@ struct Executor::Impl {
                                                 : nullptr;
         const float* pre = nullptr; // the first block reads stream 0
         for (const LayerPlan& p : layers) {
-            if (p.engram >= 0) { engram_block(p, h, t); }
+            if (p.engram >= 0) { engram_block(p, h, t, s); }
             mixes(p.hc_attention, h, t, mix_scratch, attention_site);
             attention(p, h, pre, t, s, topk, candidates, attention_site);
             mixes(p.hc_ffn, h, t, mix_scratch, ffn_site);
@@ -1298,9 +1393,17 @@ struct Executor::Impl {
 
     // ---- Calls -----------------------------------------------------------------------------------
 
+    [[nodiscard]] std::uint32_t prompt_step() const noexcept {
+        return span_tokens != 0 ? span_tokens : options.prefill_chunk;
+    }
+
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::uint32_t logit_column = 0) {
         const int t = int(tokens.size());
+        if (std::uint32_t(t) > options.prefill_chunk && logit_column == 0) {
+            forward_span(sequence, tokens, logit_rows);
+            return;
+        }
         if (sequence >= options.sequences || t <= 0 || std::uint32_t(t) > options.prefill_chunk ||
             logit_rows > std::min<std::uint32_t>(t, kMaxLogitRows) ||
             logit_column + logit_rows > kMaxLogitRows) {
@@ -1324,6 +1427,105 @@ struct Executor::Impl {
         s.logit_column = int(logit_column);
         run(s);
         positions[sequence] = first + std::uint32_t(t);
+    }
+
+    // A prompt span of several chunks, layer by layer: every chunk passes a block before any
+    // passes the next, so the block's wide calls bring the experts the cache lacks into one layer
+    // bank for every chunk of the span while the delivery prefetches the next block's bank. The
+    // span's residual streams, its blocks' coefficients and its index selections stay between
+    // blocks in memory borrowed from an elastic expert cache (borrow_span), else in the workspace;
+    // each chunk's arithmetic is forward()'s, and the logits are the span's last rows.
+    void forward_span(std::uint32_t sequence, std::span<const std::int32_t> tokens,
+                      std::uint32_t logit_rows) {
+        const int n = int(tokens.size()), c = int(options.prefill_chunk);
+        if (sequence >= options.sequences || std::uint32_t(n) > span_tokens ||
+            logit_rows > std::min<std::uint32_t>(n, kMaxLogitRows)) {
+            throw std::invalid_argument("deepseek_v41 forward: invalid prompt span");
+        }
+        const std::uint32_t first = positions[sequence];
+        if (first + std::uint32_t(n) > options.max_context) {
+            throw std::invalid_argument("deepseek_v41 forward: context capacity exceeded");
+        }
+        back(sequence, first + std::uint32_t(n));
+        DeviceBuffer borrowed;
+        if (span_borrow_bytes != 0) {
+            borrowed = borrow_span(std::uint32_t(n));
+            if (!borrowed.p) {
+                // The cache cannot lend the span's buffers now: its chunks one by one.
+                for (int row = 0; row < n; row += c) {
+                    const int t = std::min(c, n - row);
+                    forward(sequence, tokens.subspan(std::size_t(row), std::size_t(t)),
+                            row + t == n ? logit_rows : 0);
+                }
+                return;
+            }
+        }
+        std::size_t taken = 0;
+        // The span's buffers: from the borrowed memory (in span_buffers' order), else the workspace.
+        const auto span_alloc = [&](std::size_t bytes) -> void* {
+            if (!borrowed.p) { return workspace->alloc_bytes(bytes).data; }
+            void* p = static_cast<std::byte*>(borrowed.p) + taken;
+            taken += round_up(bytes, kAlign);
+            return p;
+        };
+        std::vector<std::int32_t> pos(n);
+        for (int i = 0; i < n; ++i) { pos[i] = std::int32_t(first) + i; }
+        stage(tokens, pos, {});
+        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(n), sequence), true);
+        workspace->reset();
+        auto scope = workspace->scope();
+        auto* h    = static_cast<float*>(span_alloc(std::size_t(n) * streams * hidden * 4));
+        embed(n, h);
+        const int site = 2 * streams + streams * streams;
+        Coefficients attention_site, ffn_site;
+        for (Coefficients* co : {&attention_site, &ffn_site}) {
+            auto* base = static_cast<float*>(span_alloc(std::size_t(n) * site * 4));
+            co->pre    = base;
+            co->post   = base + std::size_t(n) * streams;
+            co->comb   = base + std::size_t(n) * 2 * streams;
+        }
+        auto* topk       = static_cast<std::int32_t*>(span_alloc(std::size_t(n) * index_topk * 4));
+        auto* candidates = candidate_words > 0
+                               ? static_cast<std::uint32_t*>(span_alloc(std::size_t(n) * candidate_words * 4))
+                               : nullptr;
+        auto* mix_scratch = alloc<float>(std::size_t(c) * config.hc_mixes());
+        const auto rows_of = [&](const Coefficients& co, int row) {
+            return Coefficients{co.pre + std::size_t(row) * streams, co.post + std::size_t(row) * streams,
+                                co.comb + std::size_t(row) * streams * streams};
+        };
+        for (std::size_t l = 0; l < layers.size(); ++l) {
+            const LayerPlan& p = layers[l];
+            for (int row = 0; row < n; row += c) {
+                Pass s;
+                s.t        = std::min(c, n - row);
+                s.chunk    = true;
+                s.row      = row;
+                s.staged   = n;
+                s.sequence = sequence;
+                s.first    = first + std::uint32_t(row);
+                float* hc  = h + std::size_t(row) * streams * hidden;
+                const Coefficients a = rows_of(attention_site, row), f = rows_of(ffn_site, row);
+                if (p.engram >= 0) { engram_block(p, hc, s.t, s); }
+                mixes(p.hc_attention, hc, s.t, mix_scratch, a);
+                // The first block reads stream 0; a later one the previous block's ffn site.
+                attention(p, hc, l == 0 ? nullptr : f.pre, s.t, s,
+                          topk + std::size_t(row) * index_topk,
+                          candidates ? candidates + std::size_t(row) * candidate_words : nullptr, a);
+                mixes(p.hc_ffn, hc, s.t, mix_scratch, f);
+                ffn(p, hc, a.pre, s.t, f);
+            }
+        }
+        if (logit_rows > 0) {
+            const int last = n - int(logit_rows);
+            Tensor x       = alloc_bf16(hidden, int(logit_rows));
+            kernels::hc_pre_norm(h + std::int64_t(last) * streams * hidden,
+                                 ffn_site.pre + std::int64_t(last) * streams, final_norm,
+                                 int(logit_rows), streams, hidden, eps,
+                                 static_cast<__nv_bfloat16*>(x.data), nullptr, stream);
+            head_logits(static_cast<const __nv_bfloat16*>(x.data), int(logit_rows), 0);
+        }
+        give_back(borrowed);
+        positions[sequence] = first + std::uint32_t(n);
     }
 
     // The Engram rows of a pass whose row r belongs to owners[r], from that sequence's history.
@@ -1653,6 +1855,7 @@ ExecutorMemory Executor::memory() const noexcept {
                           .kv_backed_bytes = impl_->kv_backed.load(std::memory_order_relaxed),
                           .kv_grows        = impl_->growing,
                           .workspace_bytes = impl_->workspace_bytes,
+                          .span_borrow_bytes = impl_->span_borrow_bytes,
                           .engram_resident_bytes = impl_->engram ? impl_->engram->resident_bytes() : 0,
                           .experts = impl_->delivery ? impl_->delivery->memory() : ExpertDeliveryMemory{}};
 }
@@ -1702,6 +1905,8 @@ std::string Executor::engram_description() const {
     if (!impl_->engram) { return {}; }
     return impl_->engram->io_backend();
 }
+
+std::uint32_t Executor::prompt_step() const noexcept { return impl_->prompt_step(); }
 
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                        std::uint32_t logit_rows) {
