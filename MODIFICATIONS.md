@@ -12,8 +12,8 @@ the fork's git history remains the authoritative record.
 | --- | --- |
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
-| Base commit | `b3402a6fd6b69cafad394d2213721be16cb2a90d` (upstream master) |
-| Upstream sync | `f2675499` merged upstream `63428ac2`; `63b68fdc` merged upstream `b3402a6f`. The fork was cut at `e1f2d961` and has since taken `9456cb7a`, `230ef895`, `63428ac2`, `6826ac0e`, `d3b2475c`, `63b2b236` and `b3402a6f` |
+| Base commit | `a53a4f3342c06f7977a045d54b372a7c1253afb3` (upstream master) |
+| Upstream sync | `f2675499` merged upstream `63428ac2`; `63b68fdc` merged `b3402a6f`; `121f8283` merged `a53a4f33`. The fork was cut at `e1f2d961` and has since taken `9456cb7a`, `230ef895`, `63428ac2`, `6826ac0e`, `d3b2475c`, `63b2b236`, `b3402a6f`, `7cf5b2ae`, `9d99efe7`, `710df200`, `8508dfd6`, `9b60d333`, `7c80f155`, `3f2b59ca`, `6ab3e660`, `e58e7279` and `a53a4f33` |
 | Fork repository | https://github.com/13thblade/ninfer-all-nvfp4 |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
 
@@ -34,19 +34,26 @@ the fork's git history remains the authoritative record.
 | `c02c7692` | 2026-10-25 | docs(readme): drop the misread bands from the A16 domain sentence |
 | `63b68fdc` | 2026-10-25 | Merge upstream master b3402a6f into the fork |
 | `03b78d67` | 2026-10-26 | fix(deepseek_v41): take pi from a local constant, as the RoPE schedule does |
+| `ae484558` | 2026-10-26 | docs(license): rebase the modification record onto upstream b3402a6f |
+| `121f8283` | 2026-10-26 | Merge upstream master a53a4f33 into the fork |
+
+`03b78d67` no longer shows in the file lists below: upstream `7cf5b2ae` fixed
+the same defect and the merge `121f8283` took upstream's side, so the fork keeps
+no change to that file.
 
 The two nvfp4 commits above are master's own history. The branches carried for
 review against upstream are rebased equivalents of them on top of the current
-base: `pr/nvfp4-w4a16` = `091cc390` and `pr/nvfp4-w4a8-int` = `05c47ff8`.
-`091cc390` has the identical patch-id to `7b084383`; `05c47ff8` differs from
-`c45859ff` only in the three `ffn()` files named below, and there by the same
-bytes master already carried.
+base: `pr/nvfp4-w4a16` = `b76d912e` and `pr/nvfp4-w4a8-int` = `5dc9e11d`.
+Neither rebase changed a patch-id: `b76d912e` still hashes to the same patch-id
+as `7b084383`, and `5dc9e11d` to the same one as `05c47ff8`, which itself differs
+from `c45859ff` only in the three `ffn()` files named below, and there by the
+same bytes master already carried.
 
 ## Change summary
 
 Relative to the fork base this fork:
 
-- modifies 107 existing upstream files;
+- modifies 106 existing upstream files;
 - adds 29 new files;
 - deletes no upstream files.
 
@@ -66,21 +73,24 @@ top of upstream's hoisted `layer_config()` buffer. A tensor-parallel share that
 is handed a deferred norm is refused by an explicit throw in both the callee and
 the caller, because only the composed path folds the norm. The same three files
 were the only conflicts when `pr/nvfp4-w4a16` and `pr/nvfp4-w4a8-int` were
-rebased onto `b3402a6f`, and they took the resolution above byte for byte.
+rebased onto `b3402a6f`, and they took the resolution above byte for byte; both
+later rebases onto `a53a4f33` were clean with no conflict at all.
 
-One upstream file needed a Windows portability fix to compile at all:
-`src/models/deepseek_v41/executor.cpp`, added by upstream `d3b2475c`, computed
-its YaRN frequency ramp from `M_PI` with only `<cmath>` included. MSVC does not
-define `M_PI` there and CUDA 13.4 no longer leaks it from its own headers, so
-that single edge failed the build. It now takes a local `constexpr double kPi`,
-which is what `src/ops/launcher/rope.cu` already does for the same expression;
-the value is identical, so the arithmetic does not change.
+`src/models/deepseek_v41/executor.cpp` is listed as modified by no one but
+upstream. When `d3b2475c` landed it, its YaRN frequency ramp used `M_PI` with
+only `<cmath>` included: MSVC does not define `M_PI` there and CUDA 13.4 no
+longer leaks it from its headers, so that single edge broke a Windows build. The
+fork patched it with a local `constexpr double kPi` (`03b78d67`); upstream fixed
+the same defect in `7cf5b2ae` with the C++20 `std::numbers::pi` and its include,
+which is both the standard spelling and already the convention in this repo's
+tests. The merge `121f8283` therefore takes upstream's side and retires the
+fork's patch, so the file is no longer a fork modification.
 
 The lists below are generated from `git diff --name-status upstream/master..HEAD`
-with `upstream/master` at `b3402a6f`. Files marked as modified are upstream
+with `upstream/master` at `a53a4f33`. Files marked as modified are upstream
 files changed by this fork; files marked as added are new in this fork.
 
-## Modified files (107)
+## Modified files (106)
 
 ### Root, build and documentation (4)
 
@@ -115,9 +125,8 @@ files changed by this fork; files marked as added are new in this fork.
 - `src/calibration/device_calibration.h`
 - `src/calibration/route_catalog.cpp`
 
-### src/models (6)
+### src/models (5)
 
-- `src/models/deepseek_v41/executor.cpp`
 - `src/models/load_options.h`
 - `src/models/qwen3_5/execution/ffn.cpp`
 - `src/models/qwen3_5/execution/ffn.h`
