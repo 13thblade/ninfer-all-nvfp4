@@ -2,7 +2,7 @@
 
 ## 中文
 
-上游只把 fused NVFP4 SwiGLU 通路实例化到 `T <= 16`，A16 域的解析是 `T <= 16 -> SmallTFusedA16`、`T <= 64 -> Materialized`、`T > 64 -> throw`：所以长 prompt 不是"prefill 很慢"，而是**直接抛异常**。本 fork 补上缺失的宽 T 内核，然后把整条通路做快：在 RTX 3090 Ti 上 **T1 的 decode 大约是上游 16 tok/s 的 3.0 倍**（50 对 16.1，同一 prompt 基准）；prefill 不再抛异常，同一段 4202 token prompt 上跑到 1293 tok/s（W4A16）、1669 tok/s（W4A8-int），而最初把宽 T 内核接上去时只有约 780 tok/s。
+上游只把 fused NVFP4 SwiGLU 通路实例化到 `T <= 16`，A16 域的解析是 `T <= 16 -> SmallTFusedA16`：所以长 prompt 不是"prefill 很慢"，而是**直接抛异常**。本 fork 补上缺失的宽 T 内核，然后把整条通路做快：在 RTX 3090 Ti 上 **T1 的 decode 大约是上游 16 tok/s 的 3.0 倍**（50 对 16.1，同一 prompt 基准）；prefill 不再抛异常，同一段 4202 token prompt 上跑到 1293 tok/s（W4A16）、1669 tok/s（W4A8-int），而最初把宽 T 内核接上去时只有约 780 tok/s。
 
 对于支持 BF16 和 int8 的 GPUs（sm_75/80/86/89，其中 sm_75 通过 FP16 模拟实现），默认走 W4A16 通路支持 NVFP4，可通过 --nvfp4-w4a8-int 开启 W4A8-int 通路；在原生 FP4 的卡上使用 --nvfp4-w4a16 改用 BF16 路径（其它架构上是空操作），开启 --nvfp4-w4a8-int 用 W4A8-int 替换默认的 W4A4。对于 sm_70 默认走上游提供的 FP16 路线，可开启 --nvfp4-w4a8-int 替换为 W4A8-int。--nvfp4-w4a8-int 与 --nvfp4-w4a16 都是布尔开关，不需要取值。
 
@@ -57,7 +57,7 @@ W4A16 与 W4A8-int 两条通路的内核均已完成，目前进入广泛测试�
 
 ## English
 
-Upstream instantiates the fused NVFP4 SwiGLU route only to `T <= 16`, and resolves the A16 domain as `T <= 16 -> SmallTFusedA16`, `T <= 64 -> Materialized`, `T > 64 -> throw`, so a long prompt does not prefill slowly — it throws. This fork adds the missing wide-T kernel, then makes the route faster: **on the RTX 3090 Ti, at T1, decode is about 3.0x upstream's 16 tok/s** (50 against 16.1, same prompt basis), and prefill stops throwing — 1293 tok/s on the 4202-token prompt (W4A16) and 1669 tok/s (W4A8-int), against the roughly 780 tok/s the first graft of the wide-T kernel managed.
+Upstream instantiates the fused NVFP4 SwiGLU route only to `T <= 16`, and resolves the A16 domain as `T <= 16 -> SmallTFusedA16`, so a long prompt does not prefill slowly — it throws. This fork adds the missing wide-T kernel, then makes the route faster: **on the RTX 3090 Ti, at T1, decode is about 3.0x upstream's 16 tok/s** (50 against 16.1, same prompt basis), and prefill stops throwing — 1293 tok/s on the 4202-token prompt (W4A16) and 1669 tok/s (W4A8-int), against the roughly 780 tok/s the first graft of the wide-T kernel managed.
 
 For GPUs that support both BF16 and int8 (sm_75/80/86/89, where sm_75 runs the BF16 forms through FP16 emulation), W4A16 is the default route for NVFP4 and the W4A8-int route can be turned on with `--nvfp4-w4a8-int`; on a card with a native FP4 path, `--nvfp4-w4a16` switches to the BF16 route instead (a no-op on other architectures), and `--nvfp4-w4a8-int` replaces the default W4A4 with W4A8-int. On sm_70 the default is the FP16 route upstream provides, and `--nvfp4-w4a8-int` replaces it with W4A8-int. Both flags are boolean switches and take no value.
 
