@@ -235,8 +235,8 @@ struct ExpertDelivery::Impl {
         // Bank stride of each blob: the blob's bytes when every expert's are equal (the resident
         // layout, one copy per run of experts), else its aligned maximum.
         std::vector<std::uint64_t> stride;
+        // The other layer whose wide call followed this layer's last wide call (-1: none yet).
         std::int64_t successor = -1;
-        bool successor_wide    = false;
         std::vector<std::uint64_t> total; // the narrow calls' routes of each expert
         bool cpu = false;                 // the family computes its experts on the CPU
         // Where each expert's entries point besides a cache slot: the lent slot holding it, and
@@ -375,6 +375,7 @@ struct ExpertDelivery::Impl {
     // next split, then that call's cached pairs), so post work writes only free slots. Cached
     // experts are replaced only while a request is served, never one it routes.
     std::int64_t previous_layer = -1;
+    bool previous_wide          = false;
     std::size_t call_layer      = 0;
     int call_bank               = 0;
     bool call_wide              = false;
@@ -1189,9 +1190,17 @@ struct ExpertDelivery::Impl {
 
     // Promotions of an earlier wide call (their copies precede the next table upload on
     // `copies`) and round candidates whose copies have landed: their entries move to their slots.
-    void land() {
+    // With `keep_hits`, an expert the served narrow call routes from a lent slot stays there until
+    // a later call: the call's cached pairs may still be reading that slot, which a miss of the
+    // call would otherwise take once its expert left.
+    void land(bool keep_hits = false) {
         std::vector<cudaEvent_t> done;
         for (auto it = deferred.begin(); it != deferred.end();) {
+            if (keep_hits && it->layer == call_layer && call_routed[std::size_t(it->expert)] &&
+                layers[it->layer].lent_of[std::size_t(it->expert)] >= 0) {
+                ++it;
+                continue;
+            }
             if (it->landed) {
                 const cudaError_t status = cudaEventQuery(it->landed);
                 if (status == cudaErrorNotReady) {
@@ -1501,7 +1510,6 @@ struct ExpertDelivery::Impl {
     void serve(const CudaHostHandshake::Request& request) {
         const auto started = std::chrono::steady_clock::now();
         ExpertDeliveryStats delta;
-        land();
         const std::size_t li = request.tag;
         auto& layer = layers.at(li);
         call_layer = li;
@@ -1525,16 +1533,19 @@ struct ExpertDelivery::Impl {
         }
         delta.routes = routes;
         const bool wide = 2 * routes >= std::uint32_t(experts);
+        land(!wide);
         ++stamp;
         for (int e = 0; e < experts; ++e) {
             const auto l = layer.lent_of[std::size_t(e)];
             if (call_routed[std::size_t(e)] && l >= 0) { lent_slots[std::size_t(l)].used = stamp; }
         }
-        if (previous_layer >= 0) {
+        // Only wide calls in a row to two layers set a successor: the narrow calls between prompts
+        // and a prompt span's repeated calls to one layer leave the order of its passes.
+        if (wide && previous_wide && previous_layer >= 0 && previous_layer != std::int64_t(li)) {
             layers[std::size_t(previous_layer)].successor = std::int64_t(li);
-            layers[std::size_t(previous_layer)].successor_wide = wide;
         }
         previous_layer = std::int64_t(li);
+        previous_wide  = wide;
         const bool new_pass = !wide && last_narrow >= 0 && std::int64_t(li) < last_narrow;
         if (wide) { quiet_passes = 0; }
         if (per_bank && new_pass && ++quiet_passes >= 2) {
@@ -1696,7 +1707,7 @@ struct ExpertDelivery::Impl {
                 deferred.push_back({li, e, s});
             }
         }
-        if (bank_state.size() == 2 && layer.successor >= 0 && layer.successor_wide) {
+        if (bank_state.size() == 2 && layer.successor >= 0) {
             const auto next = std::size_t(layer.successor);
             const bool held = std::any_of(bank_state.begin(), bank_state.end(),
                                           [&](const Bank& b) { return b.layer == std::int64_t(next); });
@@ -2028,6 +2039,7 @@ void ExpertDelivery::invalidate() {
     }
     p.set_free();
     p.previous_layer = -1;
+    p.previous_wide  = false;
     p.last_narrow = -1;
     if (p.host_flag) {
         *static_cast<std::int32_t*>(p.host_flag->data()) = 0;

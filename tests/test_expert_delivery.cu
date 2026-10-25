@@ -243,6 +243,139 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
     return ok ? 0 : 1;
 }
 
+// Prompt spans (each layer's wide calls one after another, layer by layer) with a decode pass of
+// narrow calls between them, no cache: the second span prefetches every layer after the first
+// while the layer before it runs, through the decode pass, and a layer's repeated calls and its
+// prefetched bank serve every miss.
+int span_prefetch(DeviceContext& device, bool disk, const std::filesystem::path& path) {
+    Fixture fixture(disk, path);
+    ExpertDeliveryOptions options;
+    options.pair_capacity = kPairs;
+    options.cache_bytes   = 0;
+    options.staging_bytes = 4096;
+    ExpertDelivery delivery(device.rank(0), fixture.paths, std::move(fixture.layers), options);
+    DeviceBuffer wide(kPairs * 4), narrow(kPairs * 4), failures(8), visited(8);
+    failures.fill();
+    visited.fill();
+    std::vector<std::int32_t> routes(kPairs);
+    for (int p = 0; p < kPairs; ++p) { routes[p] = p % kExperts; }
+    wide.copy_from_host(routes.data(), wide.bytes);
+    for (int p = 0; p < kPairs; ++p) { routes[p] = p % 5; }
+    narrow.copy_from_host(routes.data(), narrow.bytes);
+    const auto call = [&](int l, const DeviceBuffer& ids) {
+        const auto* pairs = static_cast<const std::int32_t*>(ids.p);
+        const auto c      = delivery.begin(l, pairs, kPairs, device.stream);
+        inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), c.cached_ids, kPairs, l,
+            static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+        delivery.await(device.stream);
+        inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), c.missing_ids, kPairs, l,
+            static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+        CUDA_CHECK(cudaGetLastError());
+    };
+    const auto span = [&] {
+        for (int l = 0; l < kLayers; ++l) {
+            for (int chunk = 0; chunk < 2; ++chunk) { call(l, wide); }
+        }
+    };
+    const auto decode = [&] {
+        for (int l = 0; l < kLayers; ++l) { call(l, narrow); }
+    };
+    span();
+    decode();
+    delivery.drain();
+    const auto before = delivery.stats();
+    span();
+    delivery.drain();
+    const auto after = delivery.stats();
+    unsigned long long bad = 0, count = 0;
+    failures.copy_to_host(&bad, 8);
+    visited.copy_to_host(&count, 8);
+    const auto prefetched = after.prefetched_layers - before.prefetched_layers;
+    const auto reuses     = after.bank_reuses - before.bank_reuses;
+    const bool ok = !bad && count == std::uint64_t(5) * kLayers * kPairs &&
+                    prefetched == kLayers - 1 && reuses == std::uint64_t(2 * kLayers - 1) * kExperts;
+    std::printf("%s span prefetch bad=%llu pairs=%llu prefetched=%llu bank_reuses=%llu %s\n",
+                disk ? "disk" : "host", bad, count, (unsigned long long)prefetched,
+                (unsigned long long)reuses, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// A round swaps an expert that a lent slot holds into the full cache while narrow calls keep
+// routing it beside a new miss each pass. A call's cached pairs read the table as its split found
+// it, so the expert's lent slot keeps its bytes for the whole call that routes it, whenever its
+// copy lands; a wide call then finds it in the cache.
+int lent_landing(DeviceContext& device, bool disk, const std::filesystem::path& path) {
+    Fixture fixture(disk, path);
+    ExpertDeliveryOptions options;
+    options.pair_capacity = kPairs;
+    options.cache_bytes   = 3 * kLayers * (kGu + kDown + 2 * kTail + 512);
+    options.staging_bytes = 4096;
+    options.tier.every    = 1; // a round at every pass
+    ExpertDelivery delivery(device.rank(0), fixture.paths, std::move(fixture.layers), options);
+    const int slots = int(delivery.memory().cache_slots) / kLayers;
+    DeviceBuffer ids(kPairs * 4), failures(8), visited(8), split_table(4 * kExperts * sizeof(void*));
+    failures.fill();
+    visited.fill();
+    const auto* pairs = static_cast<const std::int32_t*>(ids.p);
+    std::vector<std::int32_t> routes;
+    // One call of `layer` over `experts`, a pair each; its cached pairs are inspected through the
+    // table as the call's split read it (the table the preceding drained call left).
+    const auto call = [&](int layer, std::vector<std::int32_t> experts) {
+        routes = std::move(experts);
+        ids.copy_from_host(routes.data(), routes.size() * 4);
+        const int n = int(routes.size());
+        CUDA_CHECK(cudaMemcpyAsync(split_table.p, delivery.tables(layer), split_table.bytes,
+                                   cudaMemcpyDeviceToDevice, device.stream));
+        const auto c = delivery.begin(layer, pairs, std::uint32_t(n), device.stream);
+        delivery.await(device.stream);
+        inspect<<<n, 32, 0, device.stream>>>(static_cast<const void* const*>(split_table.p),
+            c.cached_ids, n, layer, static_cast<unsigned long long*>(failures.p),
+            static_cast<unsigned long long*>(visited.p));
+        inspect<<<n, 32, 0, device.stream>>>(delivery.tables(layer), c.missing_ids, n, layer,
+            static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+        CUDA_CHECK(cudaGetLastError());
+        delivery.drain();
+        std::vector<std::int32_t> cached(kExperts + 1);
+        CUDA_CHECK(cudaMemcpy(cached.data(), c.cached_experts, cached.size() * 4, cudaMemcpyDeviceToHost));
+        return cached;
+    };
+    std::vector<std::int32_t> held(slots);
+    for (int e = 0; e < slots; ++e) { held[e] = e; }
+    // Two passes fill both layers' slots; from the third the banks are lent, and layer 1's expert
+    // x, which the tier does not admit against experts its call routes, takes a lent slot.
+    const int x = slots;
+    for (int pass = 0; pass < 2; ++pass) {
+        call(0, held);
+        call(1, held);
+    }
+    call(0, held);
+    call(1, {x});
+    const auto before = delivery.stats();
+    // Then x and a new miss y each pass, while the held experts cool: a round swaps x in.
+    int bad_steps = 0;
+    for (int y = x + 1; y < kExperts; ++y) {
+        call(0, held);
+        call(1, {x, y});
+    }
+    const auto rounds = delivery.stats() - before;
+    std::vector<std::int32_t> wide(kExperts);
+    for (int e = 0; e < kExperts; ++e) { wide[e] = e; }
+    const auto cached = call(1, wide);
+    const bool in_cache = std::find(cached.begin() + 1, cached.begin() + 1 + cached[0], x) !=
+                          cached.begin() + 1 + cached[0];
+    if (slots < 1 || 2 * (slots + 1) > kExperts) { ++bad_steps; }
+    unsigned long long bad = 0, count = 0;
+    failures.copy_to_host(&bad, 8);
+    visited.copy_to_host(&count, 8);
+    const bool ok = !bad_steps && !bad && rounds.admissions != 0 && rounds.lent_admissions != 0 &&
+                    in_cache;
+    std::printf("%s lent landing slots=%d bad=%llu pairs=%llu round_admissions=%llu "
+                "lent_admissions=%llu x_cached=%d %s\n", disk ? "disk" : "host", slots, bad, count,
+                (unsigned long long)rounds.admissions, (unsigned long long)rounds.lent_admissions,
+                int(in_cache), ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int failure_control(DeviceContext& device, const std::filesystem::path& path, bool omit_wait) {
     Fixture fixture(true, path);
     ExpertDeliveryOptions options;
@@ -911,6 +1044,8 @@ int main(int argc, char** argv) {
             for (const double share : {0.5, 1.0}) { failures += cpu_share(device, disk, share, path); }
             failures += elastic_cache(device, disk, path);
             failures += lent_banks(device, disk, path);
+            failures += span_prefetch(device, disk, path);
+            failures += lent_landing(device, disk, path);
         }
         failures += failure_control(device, path, false);
         return failures ? 1 : 0;
