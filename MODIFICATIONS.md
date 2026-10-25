@@ -12,8 +12,8 @@ the fork's git history remains the authoritative record.
 | --- | --- |
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
-| Base commit | `63428ac249da8a6c5d891b508d7e483d8c7def6c` (upstream master) |
-| Upstream sync | `f2675499` merges upstream master into the fork. The fork was cut at `e1f2d961` and later took `9456cb7a`, `230ef895` and `63428ac2` |
+| Base commit | `b3402a6fd6b69cafad394d2213721be16cb2a90d` (upstream master) |
+| Upstream sync | `f2675499` merged upstream `63428ac2`; `63b68fdc` merged upstream `b3402a6f`. The fork was cut at `e1f2d961` and has since taken `9456cb7a`, `230ef895`, `63428ac2`, `6826ac0e`, `d3b2475c`, `63b2b236` and `b3402a6f` |
 | Fork repository | https://github.com/13thblade/ninfer-all-nvfp4 |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
 
@@ -29,12 +29,24 @@ the fork's git history remains the authoritative record.
 | `b0cc1d6b` | 2026-10-25 | docs(license): record the fork's modifications and where its notices live |
 | `3350dc11` | 2026-10-25 | docs(readme): name the W4A16 route in the first change and record the W4A8-int kernel |
 | `0b3b62b0` | 2026-10-25 | docs(readme): bold all four change lines and pluralize the W4A8-int kernels |
+| `f2675499` | 2026-10-25 | Merge upstream master 63428ac2 into the fork |
+| `8c04b9c6` | 2026-10-25 | docs(license): rebase the modification record onto upstream 63428ac2 |
+| `c02c7692` | 2026-10-25 | docs(readme): drop the misread bands from the A16 domain sentence |
+| `63b68fdc` | 2026-10-25 | Merge upstream master b3402a6f into the fork |
+| `03b78d67` | 2026-10-26 | fix(deepseek_v41): take pi from a local constant, as the RoPE schedule does |
+
+The two nvfp4 commits above are master's own history. The branches carried for
+review against upstream are rebased equivalents of them on top of the current
+base: `pr/nvfp4-w4a16` = `091cc390` and `pr/nvfp4-w4a8-int` = `05c47ff8`.
+`091cc390` has the identical patch-id to `7b084383`; `05c47ff8` differs from
+`c45859ff` only in the three `ffn()` files named below, and there by the same
+bytes master already carried.
 
 ## Change summary
 
 Relative to the fork base this fork:
 
-- modifies 106 existing upstream files;
+- modifies 107 existing upstream files;
 - adds 29 new files;
 - deletes no upstream files.
 
@@ -52,13 +64,23 @@ guards stay as separate checks in `src/models/qwen3_5/execution/ffn.cpp`; and
 `src/models/qwen3_5/execution/text.cpp` keeps the fork's fused int8 branch on
 top of upstream's hoisted `layer_config()` buffer. A tensor-parallel share that
 is handed a deferred norm is refused by an explicit throw in both the callee and
-the caller, because only the composed path folds the norm.
+the caller, because only the composed path folds the norm. The same three files
+were the only conflicts when `pr/nvfp4-w4a16` and `pr/nvfp4-w4a8-int` were
+rebased onto `b3402a6f`, and they took the resolution above byte for byte.
+
+One upstream file needed a Windows portability fix to compile at all:
+`src/models/deepseek_v41/executor.cpp`, added by upstream `d3b2475c`, computed
+its YaRN frequency ramp from `M_PI` with only `<cmath>` included. MSVC does not
+define `M_PI` there and CUDA 13.4 no longer leaks it from its own headers, so
+that single edge failed the build. It now takes a local `constexpr double kPi`,
+which is what `src/ops/launcher/rope.cu` already does for the same expression;
+the value is identical, so the arithmetic does not change.
 
 The lists below are generated from `git diff --name-status upstream/master..HEAD`
-with `upstream/master` at `63428ac2`. Files marked as modified are upstream
+with `upstream/master` at `b3402a6f`. Files marked as modified are upstream
 files changed by this fork; files marked as added are new in this fork.
 
-## Modified files (106)
+## Modified files (107)
 
 ### Root, build and documentation (4)
 
@@ -93,8 +115,9 @@ files changed by this fork; files marked as added are new in this fork.
 - `src/calibration/device_calibration.h`
 - `src/calibration/route_catalog.cpp`
 
-### src/models (5)
+### src/models (6)
 
+- `src/models/deepseek_v41/executor.cpp`
 - `src/models/load_options.h`
 - `src/models/qwen3_5/execution/ffn.cpp`
 - `src/models/qwen3_5/execution/ffn.h`
