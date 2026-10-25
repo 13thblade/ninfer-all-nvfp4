@@ -14,7 +14,7 @@
 
 按时间顺序，一共四处改动：
 
-1. **新增宽 T fused SwiGLU 内核**，让宽的 prompt 段落能 prefill 而不是抛异常。
+1. **新增 W4A16 宽 T fused SwiGLU 内核**，让宽的 prompt 段落能 prefill 而不是抛异常；另外新增了 W4A8-int 内核。
 2. **整条通路的 kernel 性能优化工作。**
 3. **把 W4A16 和 W4A8-int 通路的开关接进 `ninfer-calibrate`**，最优化性能校准可在目标设备上首次启动时实测得出。
 4. 顺带优化了无原生 FP4 路径的 KV NVFP4 和 k8v4 的性能。
@@ -69,7 +69,7 @@ This repository does not change the model scope upstream already supports; it on
 
 Four changes, in order:
 
-1. **A wide-T fused SwiGLU kernel**, so a wide span prefills instead of throwing.
+1. **A W4A16 wide-T fused SwiGLU kernel**, so a wide span prefills instead of throwing; a W4A8-int kernel was added as well.
 2. **Kernel work across the route.**
 3. **The W4A16 and W4A8-int route switches wired into `ninfer-calibrate`**, so the optimal performance calibration is measured on first start on the target device.
 4. Alongside them, **KV-cache performance for NVFP4 and k8v4 on cards without a native FP4 path** was improved as well.
