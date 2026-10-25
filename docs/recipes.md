@@ -36,8 +36,8 @@ on 0.0.0.0:8080.
 | `--vision`, `--vision-residency`, `--vision-max-merged` | image and video input, where the tower lives (`overlay` borrows device memory per image), and the merged-token budget of one item |
 | `--max-concurrency` | requests admitted at once, 1 to 8 |
 | `--devices` | one pipeline stage per listed GPU (Linux) |
-| `--expert-residency`, `--expert-cache-mib` | native Qwen MoE, Gemma 4 and Qwen3.8-Flash-Next: where the routed experts live and their persistent device cache budget ([expert residency](cli.md#common-options)) |
-| `--ngram-table`, `--ngram-residency` | Qwen3.8-Flash-Next: where the n-gram rows live and the table's file |
+| `--expert-residency`, `--expert-cache-mib` | native Qwen MoE, Gemma 4, Qwen3.8-Flash-Next, Flint and DeepSeek-V4.1-Flash: where the routed experts live and their persistent device cache budget ([expert residency](cli.md#common-options)) |
+| `--ngram-table`, `--ngram-residency` | Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash: the n-gram (Engram) table's file and where its rows live |
 | `--disk-kv-path`, `--disk-kv-gib`, `--disk-kv-restore` | the disk tier of the context cache |
 
 ## Ternary Bonsai 2 27B
@@ -190,6 +190,28 @@ python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf --componen
 # stays off unless a request asks.
 ninfer-serve models/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer --model-id gemma4 \
   --max-context 40960 --max-concurrency 4 --spec mtp --draft-tokens 2 --vision
+```
+
+## DeepSeek-V4.1-Flash
+
+The model and its Engram table are two artifacts; the routed experts (106.7 GiB) never fit one card,
+so they live in pinned host memory or stay in the file ([DeepSeek-V4.1-Flash](deepseek-v41.md)).
+
+```bash
+hf download WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3 \
+  DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer --local-dir models
+hf download WaveCut/DeepSeek-V4.1-Flash-Engram-IQ4_NL-NInfer-v3 \
+  DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer --local-dir models
+M=models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer
+T=models/DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer
+
+# One GPU and room to pin 106.7 GiB of host memory: the experts in RAM, the most used cached on the GPU.
+ninfer-serve $M --ngram-table $T --model-id deepseek-v4.1-flash \
+  --max-context 32768 --max-concurrency 2 --expert-residency host
+
+# Less RAM: the experts stay in the file and reach the GPU through the page cache.
+ninfer-serve $M --ngram-table $T --model-id deepseek-v4.1-flash \
+  --max-context 32768 --expert-residency disk
 ```
 
 ## Qwen3.6-35B-A3B NVFP4

@@ -46,7 +46,7 @@ Measured, one request; context in tokens is the largest `--max-context` the serv
 | 11 GB | Ternary Bonsai 2 27B (200,704 tokens with `rk4v4`; 143,360 with MTP) | RTX 2080 Ti |
 | 12 GB | Ternary Bonsai 2 27B (266,240 tokens); Qwen3.8-27B GSQ-RCO IQ3_S (8,192 tokens, no MTP) | RTX 3060 |
 | 16 GB | Gemma 4 26B-A4B Q4_0 (61,440 tokens); Qwen3.8-27B IQ3_S (241,664 tokens; 122,880 with `rk4v4-e8` and 98,304 with MTP on a card that also drives a desktop); the official Qwen3.8-27B with `--embedding-q4 --lm-head-q4` | Tesla V100-SXM2-16GB, RTX 5070 Ti ([field report](performance/field-reports.md#rtx-5070-ti-windows-11)) |
-| 24 GB | the official Qwen3.8-27B (20 GiB) and its MXFP8 tune (17 GiB); Qwen3.6-35B-A3B `groupwise-int` (19.6 GiB of weights) on an RTX 3090, over two cards on the TITAN RTX; Flash-Next with every expert on the GPU over two cards | RTX 3090, RTX 4090, TITAN RTX |
+| 24 GB | the official Qwen3.8-27B (20 GiB) and its MXFP8 tune (17 GiB); Qwen3.6-35B-A3B `groupwise-int` (19.6 GiB of weights) on an RTX 3090, over two cards on the TITAN RTX; Flash-Next with every expert on the GPU over two cards; DeepSeek-V4.1-Flash (6.0 GiB of dense weights) with its 106.7 GiB of experts in host memory or on disk | RTX 3090, RTX 4090, TITAN RTX |
 | 32 GB | Qwen3.6-35B-A3B NVFP4 (Blackwell only) | RTX 5090 |
 | 48 GB | Flash-Next Q2_0 with every expert on one card | L40S, RTX PRO 6000 |
 
@@ -114,7 +114,7 @@ means the card calibrates once at its first start.
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
 | ✅ | RTX 3090 Ti | 24 GB | GeForce | | Flash-Next over two cards |
-| ✅ | RTX 3090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, 35B-A3B, Flash-Next, Gemma 4, Flint (experts in host memory, on disk; the reference card) |
+| ✅ | RTX 3090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, 35B-A3B, Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk; the reference card) |
 | ⬜ | RTX 3080 Ti | 12 GB | GeForce | ✓ | |
 | ⬜ | RTX 3080 | 12 / 10 GB | GeForce | 10 GB (68 SMs) | |
 | ⬜ | RTX 3070 Ti | 8 GB | GeForce | | |

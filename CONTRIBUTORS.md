@@ -75,6 +75,10 @@ two-stage GDN prefill, parallel query tiles, MX FP8 MMA and Minnnn's column-band
   (`core/expert_tier`: frequency counts, rounds and their measured constants) and the residency map
   of streamed sparse-attention KV (`ops/kv_stream`: block claims and the clock sweep) follow
   Strata's designs.
+- The DeepSeek-V4.1-Flash artifacts import ISTA-DASLab's GSQ-RCO IQ1_M GGUF and its Engram table
+  GGUF, under the model's MIT license. Its support follows DeepSeek's release code
+  (`inference/model.py`, `kernel.py` and `encoding/encoding.py`) and was measured against Strata's
+  `strata-dsv41`.
 - The SiLU shared by the GPU's GGUF expert kernels and the CPU's expert products evaluates e^x with
   the single-precision polynomial of Stephen L. Moshier's Cephes Math Library.
 - llama.cpp's GGUF block kernels are vendored unmodified in `third_party/ggml-quants` under their
