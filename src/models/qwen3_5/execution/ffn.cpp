@@ -161,7 +161,7 @@ const Tensor* ffn_input_signs(const FfnParameters& parameters) {
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, cudaStream_t stream, bool mtp,
          bool verify, InputBasis basis, bool wide_verification, NativeExpertRuntime* experts,
-         const InputNorm* input_norm) {
+         const InputNorm* input_norm, Tensor* partial) {
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
     if (input_norm != nullptr) {
@@ -173,6 +173,33 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
             !dense->up.has_value() && !is_gguf(dense->gate_up.weight.qtype) &&
             dense->gate_up.weight.qtype != QType::Q6_G64_FP16 && experts == nullptr;
         if (!fusable) { throw std::invalid_argument("FFN: this path cannot fold its input norm"); }
+    }
+    if (partial != nullptr) {
+        // The share reads the row it is handed, so it cannot take a caller that deferred its norm.
+        if (input_norm != nullptr) {
+            throw std::invalid_argument("FFN: a tensor-parallel share cannot fold its input norm");
+        }
+        const auto* dense = std::get_if<DenseParameters>(&parameters);
+        if (dense == nullptr || mtp || rotated_dense(*dense)) {
+            throw std::logic_error("a tensor-parallel FFN share is an unrotated dense FFN");
+        }
+        const auto& gu    = dense->gate_up.weight;
+        Tensor activation = workspace.alloc(DType::BF16, {dense->up ? gu.n : gu.n / 2, columns});
+        {
+            auto call = workspace.scope();
+            if (dense->up) {
+                ops::linear_swiglu(hidden, gu, dense->up->weight, activation,
+                                   dense->gate_up.policy, workspace, stream);
+            } else {
+                ops::linear_swiglu(hidden, gu, activation,
+                                   verify && !is_gguf(gu.qtype) ? dense->verify_gate_up_policy
+                                                                : dense->gate_up.policy,
+                                   workspace, stream);
+            }
+        }
+        ops::linear(activation, dense->down.weight, *partial,
+                    residual_projection_policy(dense->down, wide_verification), workspace, stream);
+        return;
     }
     if (const auto* moe = std::get_if<StreamedMoeParameters>(&parameters)) {
         if (experts == nullptr) { throw std::logic_error("streamed SparseMoe has no Program delivery service"); }

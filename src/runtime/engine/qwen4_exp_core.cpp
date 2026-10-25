@@ -205,6 +205,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     inspect.complete();
     install_device_route_profile_for(options, device);
+    if (options.tensor_parallel) {
+        throw std::invalid_argument("--tensor-parallel supports dense Qwen3.5-core models");
+    }
     models::qwen4_exp::LoadOptions load;
     load.artifact     = options.artifact_path;
     load.ranks        = device.size();

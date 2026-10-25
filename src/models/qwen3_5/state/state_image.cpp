@@ -164,13 +164,25 @@ StateImageDeviceLayout plan_state_image_device_pool(std::span<LayoutBuilder* con
         throw std::invalid_argument("StateImage hidden width must be positive");
     }
     if (shards.empty()) { throw std::invalid_argument("StateImage needs at least one shard"); }
+    const std::uint32_t parts = shards.front().parts;
+    if (parts == 0 || spec.linear.conv_channels % parts != 0 ||
+        spec.linear.value_heads % parts != 0) {
+        throw std::invalid_argument("StateImage parts must divide the state's channels and heads");
+    }
     std::uint32_t next_layer = 0;
-    for (const StateImageShard& shard : shards) {
-        if (shard.first_layer != next_layer || shard.layers == 0 || shard.rank >= builders.size() ||
-            builders[shard.rank] == nullptr) {
+    for (std::size_t index = 0; index < shards.size(); ++index) {
+        const StateImageShard& shard = shards[index];
+        const bool run_start         = shard.part == 0;
+        const bool follows           = run_start || (shards[index - 1].part + 1 == shard.part &&
+                                           shards[index - 1].first_layer == shard.first_layer &&
+                                           shards[index - 1].layers == shard.layers);
+        const bool run_end = index + 1 == shards.size() || shards[index + 1].part == 0;
+        if (shard.parts != parts || shard.part >= parts || !follows ||
+            (run_end && shard.part + 1 != parts) || (run_start && shard.first_layer != next_layer) ||
+            shard.layers == 0 || shard.rank >= builders.size() || builders[shard.rank] == nullptr) {
             throw std::invalid_argument("StateImage shards must cover the layers in order");
         }
-        next_layer += shard.layers;
+        if (run_start) { next_layer += shard.layers; }
     }
     if (next_layer != spec.linear.layers) {
         throw std::invalid_argument("StateImage shards do not cover every Linear Attention layer");
@@ -181,6 +193,8 @@ StateImageDeviceLayout plan_state_image_device_pool(std::span<LayoutBuilder* con
     for (const StateImageShard& shard : shards) {
         LinearAttentionStatePoolSpec shard_spec = spec.linear;
         shard_spec.layers                       = shard.layers;
+        shard_spec.conv_channels /= static_cast<std::int32_t>(parts);
+        shard_spec.value_heads /= static_cast<std::int32_t>(parts);
         out.linear.push_back(plan_linear_attention_state_pool(*builders[shard.rank], shard_spec));
     }
     // The continuation hidden and DFlash local state are read by the head and the draft, which run
@@ -343,8 +357,13 @@ StateImageDevicePool::StateImageDevicePool(std::span<const DeviceSpan> backings,
     // The device components must add up to the host image's geometry: rebuild the whole-model spec
     // from the shards and compare.
     LinearAttentionStatePoolSpec whole = layout.linear.front().spec;
+    const auto parts                   = static_cast<std::int32_t>(layout.shards.front().parts);
     whole.layers                       = 0;
-    for (const auto& shard_layout : layout.linear) { whole.layers += shard_layout.spec.layers; }
+    whole.conv_channels *= parts;
+    whole.value_heads *= parts;
+    for (std::size_t index = 0; index < layout.linear.size(); ++index) {
+        if (layout.shards[index].part == 0) { whole.layers += layout.linear[index].spec.layers; }
+    }
     StateImageSpec device_spec{.linear = whole, .hidden = continuation_hidden_.ne[0]};
     if (layout.dflash_local) {
         device_spec.dflash_local = DFlashLocalStateSpec{
@@ -475,9 +494,7 @@ void StateImageDevicePool::validate_host_layout(const StateImageHostLayout* layo
 // every Linear Attention layer from the shard that holds it, then the rest on rank 0.
 template <class Visit>
 void StateImageDevicePool::for_each_host_component(std::int32_t slot, Visit&& visit) const {
-    std::uint32_t layers = 0;
-    for (const auto& shard : linear_) { layers += shard->layer_count(); }
-    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+    for (std::uint32_t layer = 0; layer < host_layout_.spec.linear.layers; ++layer) {
         for_each_host_component(
             slot, StateImagePart{.kind = StateImagePart::Kind::LinearLayer, .layer = layer}, visit);
     }
@@ -488,6 +505,7 @@ template <class Visit>
 void StateImageDevicePool::for_each_host_component(std::int32_t slot, StateImagePart part,
                                                    Visit&& visit) const {
     if (part.kind == StateImagePart::Kind::LinearLayer) {
+        bool found = false;
         for (std::size_t index = 0; index < linear_.size(); ++index) {
             const std::uint32_t first = shards_[index].first_layer;
             if (part.layer < first || part.layer >= first + linear_[index]->layer_count()) {
@@ -498,16 +516,19 @@ void StateImageDevicePool::for_each_host_component(std::int32_t slot, StateImage
             const Tensor conv         = linear_[index]->conv_slot(local, slot);
             visit(rank, conv.data,
                   host_layout_.linear_conv.offset +
-                      part.layer * host_layout_.linear_conv_layer_bytes,
+                      part.layer * host_layout_.linear_conv_layer_bytes +
+                      shards_[index].part * conv.bytes(),
                   conv.bytes());
             const Tensor recurrent = linear_[index]->recurrent_slot(local, slot);
             visit(rank, recurrent.data,
                   host_layout_.linear_recurrent.offset +
-                      part.layer * host_layout_.linear_recurrent_layer_bytes,
+                      part.layer * host_layout_.linear_recurrent_layer_bytes +
+                      shards_[index].part * recurrent.bytes(),
                   recurrent.bytes());
-            return;
+            found = true;
         }
-        throw std::out_of_range("StateImage linear layer is out of range");
+        if (!found) { throw std::out_of_range("StateImage linear layer is out of range"); }
+        return;
     }
     const Tensor hidden = continuation_hidden_slot(slot);
     visit(std::size_t{0}, hidden.data, host_layout_.continuation_hidden.offset, hidden.bytes());
@@ -541,13 +562,15 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
             const Tensor conv       = linear_[index]->conv_slot(local, source);
             CUDA_CHECK(cudaMemcpyAsync(
                 byte_offset(destination.data, host_layout_.linear_conv.offset +
-                                                  layer * host_layout_.linear_conv_layer_bytes),
+                                                  layer * host_layout_.linear_conv_layer_bytes +
+                                                  shards_[index].part * conv.bytes()),
                 conv.data, conv.bytes(), cudaMemcpyDeviceToHost, shard_stream));
             const Tensor recurrent = linear_[index]->recurrent_slot(local, source);
             CUDA_CHECK(cudaMemcpyAsync(
                 byte_offset(destination.data,
                             host_layout_.linear_recurrent.offset +
-                                layer * host_layout_.linear_recurrent_layer_bytes),
+                                layer * host_layout_.linear_recurrent_layer_bytes +
+                                shards_[index].part * recurrent.bytes()),
                 recurrent.data, recurrent.bytes(), cudaMemcpyDeviceToHost, shard_stream));
         }
     }
@@ -588,13 +611,15 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
             CUDA_CHECK(cudaMemcpyAsync(
                 conv.data,
                 byte_offset(source.data, host_layout_.linear_conv.offset +
-                                             layer * host_layout_.linear_conv_layer_bytes),
+                                             layer * host_layout_.linear_conv_layer_bytes +
+                                             shards_[index].part * conv.bytes()),
                 conv.bytes(), cudaMemcpyHostToDevice, shard_stream));
             const Tensor recurrent = linear_[index]->recurrent_slot(local, destination);
             CUDA_CHECK(cudaMemcpyAsync(
                 recurrent.data,
                 byte_offset(source.data, host_layout_.linear_recurrent.offset +
-                                             layer * host_layout_.linear_recurrent_layer_bytes),
+                                             layer * host_layout_.linear_recurrent_layer_bytes +
+                                             shards_[index].part * recurrent.bytes()),
                 recurrent.bytes(), cudaMemcpyHostToDevice, shard_stream));
         }
     }
@@ -673,9 +698,7 @@ void StateImageDevicePool::copy_to_host_segments(std::int32_t source,
 void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
                                                    std::size_t segment_bytes,
                                                    std::int32_t destination, RankStreams streams) {
-    std::uint32_t layers = 0;
-    for (const auto& shard : linear_) { layers += shard->layer_count(); }
-    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+    for (std::uint32_t layer = 0; layer < host_layout_.spec.linear.layers; ++layer) {
         copy_from_host_segments(
             segments, segment_bytes, destination,
             StateImagePart{.kind = StateImagePart::Kind::LinearLayer, .layer = layer}, streams);

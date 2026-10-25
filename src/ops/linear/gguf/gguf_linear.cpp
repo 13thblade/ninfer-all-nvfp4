@@ -386,7 +386,14 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
 
 void gguf_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
                  cudaStream_t stream) {
-    const GgufProduct product{&w, &out, 0, GgufEpilogue::Store};
+    GgufProduct product{&w, &out, 0, GgufEpilogue::Store};
+    if (out.dtype == DType::FP32) {
+        if (!out.is_contiguous() || out.ne[0] != w.n || out.ne[1] != x.ne[1]) {
+            throw std::invalid_argument("gguf linear: an FP32 out must be contiguous [N,T]");
+        }
+        product.f32      = static_cast<float*>(out.data);
+        product.f32_rows = out.ne[0];
+    }
     gguf_project(x, {&product, 1}, workspace, stream);
 }
 

@@ -13,7 +13,7 @@ about as fast as one GPU, minus the boundary hops. Splitting the batch into micr
 each stage read its weights once per micro-batch and win nothing.
 
 **It is not tensor parallelism.** No layer is divided across devices, so no collective runs inside a
-layer.
+layer. `--tensor-parallel` divides them instead; see [Tensor parallelism](#tensor-parallelism).
 
 **Linux and Windows.** Repeating one device id (`--devices 0,0`) exercises the whole stage path on
 a single card, which is how the path is tested without a second GPU. Under Windows a GeForce card
@@ -231,9 +231,66 @@ split showed the kernels themselves running longer (the MoE path kernel +21%, th
 other (the two sit on different sockets of that host); GPU clock metrics are not permitted in the
 container, so the cause is not confirmed.
 
-## Tensor parallelism: status
+## Tensor parallelism
 
-Not built. What was established, so the next attempt starts from evidence rather than from the plan:
+`--devices A,B,... --tensor-parallel` divides every layer of a dense Qwen3.5-core model over the
+devices instead of dealing layers out. It targets decode: each card reads only its share of the
+weights for every token.
+
+- **The shares.** Rank r holds GDN key heads `[r*Hk/N, (r+1)*Hk/N)` with the value heads that read
+  them (the value-to-key head map is contiguous), their q/k/v/z projection rows, convolution
+  channels, recurrent and convolution state, and the matching input columns of the GDN output
+  projection; and rows `[r*I/N, (r+1)*I/N)` of the dense FFN's gate and up projections with those
+  input columns of down. The gating projection, `A_log`, `dt_bias`, the gated norm and the layer
+  norms are small, so every rank holds all of them: it gates every head and keeps its own.
+  Attention, the KV cache, the embedding, the final norm, the head and MTP stay on rank 0.
+- **Loading.** A share is a piece of a stored object: a row range and column ranges
+  (`artifact/selection.h`), gathered from the file as byte runs at upload. Contiguous matrices and
+  ggml blocks cut this way when column bounds fall on whole blocks; the stored objects themselves get
+  no device demand. `tensor_parallel_share` (`models/qwen3_5/config.h`) states a rank's geometry.
+- **The pass** (`TextContext::run_tensor_parallel`). Rank 0 sends the residual and the control
+  tensors to every rank over the stage links; each rank then keeps a replica of the residual. Each
+  layer has two exchanges (`core/tensor_parallel.h`): after the mixer (attention: rank 0 alone;
+  GDN: every rank) and after the FFN. A contributor writes its output projection as FP32 partials;
+  every rank then adds all partials to its replica in rank order and rounds once to BF16, so the
+  replicas stay identical. Peer reads where every pair of cards has peer access, mapped pinned host
+  memory otherwise; both capture into the decode graphs.
+- **Numerics.** Against one device the only difference is the order of the FP32 additions of a
+  projection's output: the shares' partial sums are added, then rounded once, where one device
+  rounds the full sum. Logits are close, not identical, so greedy text can diverge where two tokens
+  tie closely.
+- **Coverage.** GGUF weights (the GDN input projection's fused GGUF route), the 27B geometry (16 key
+  and 48 value heads, hidden 5120) on two or four ranks, MTP. Refused: MoE models, a masked drafter
+  (DFlash, DFlash2), `--stage-layers`, Hadamard-rotated weights, Vision overlay, Flash-Next, Gemma 4
+  and Flint. Native Q4/Q5/Q8/T2, NVFP4 and FP8 GDN projections have kernels registered only for the
+  whole layer and are refused at preparation. Ranks may share a device (`--devices 0,0`), which is
+  how the path is tested on one card.
+- **Kernels at the share shapes**, registered next to the whole-layer ones and qualified by the op
+  tests: the convolution split (`Rows1024x1024x3072`, `Rows512x512x1536`), the projected
+  convolution (5120 and 2560 channels), the replay record and fold (8x24 and 4x12 heads).
+
+Measured on Qwen3.8-27B GSQ-RCO IQ3_S (2026-10-25, `scripts/pods/serve_ab.py`, greedy, four short
+prompts of 256 tokens, two passes and two server starts per configuration, plus one 7,014-token
+prompt). Every run gave one device's answers.
+
+- **2x RTX 3090** (Vast, PCIe 4.0 x8 links, no peer access, so the mapped host transport). Decode
+  72.9-75.2 tok/s against 57.0-57.3 on one card (+27% to +31%) and 58.4-58.5 with two pipeline
+  stages; 70.2 against 54.2 after the long prompt (+29%; the second server start, as the first
+  overlapped a compile job). With `--spec mtp --draft-tokens 3` 105.5-160.3 against 89.0-134.6
+  (+13% to +28%; between server starts the rate moved by up to 9%, and MTP acceptance shifts by a
+  few drafts per answer because the hidden states round differently). Prefill pays for it: the
+  7,014-token prompt runs at 1,187-1,292 tok/s against 1,495-1,643 (-21%), and a 40-token prompt's
+  TTFT is 83-116 ms against 53-57 ms, since every layer of a chunk crosses the bus twice. Four
+  ranks on the two cards (`--devices 0,1,0,1`) decode at 71-72 tok/s, and at 80.5-116.3 with MTP,
+  below one card's 89-134: a check of the four-rank shares, not a four-card measurement.
+- **2x Tesla V100-SXM2-32GB** (Vast, NVLink, so peer reads; the sm_70 routes). Decode 60.2-60.4
+  tok/s against 43.9 on one card (+37%); with `NINFER_FORCE_STAGED_LINKS=1` the mapped host
+  transport gives 54.6-55.0 (+25%). With MTP 83.4-122.3 against 58.1-87.1 (+29% to +44%). Over
+  NVLink prefill gains as well: the 7,014-token prompt runs at 1,300 tok/s against 865-867 (+50%),
+  decode after it at 58.3 against 42.9 (+36%), and a 40-token prompt's TTFT is 113-135 ms against
+  129-130 ms.
+
+What the transport costs was measured before this was built:
 
 - **Transport** (`tools/tp_probe.cu`, rented boxes, 2026-09-21): neither a 2x RTX 3090 box (one slot
   PCIe 3.0 x4), a second 2x RTX 3090 box with both slots x16, nor a 2x RTX A4000 box had peer access
@@ -242,25 +299,5 @@ Not built. What was established, so the next attempt starts from evidence rather
   prefill chunk, half the x4 box's time at every size. An all-reduce of one decode column
   (20 KB, FP32) costs 17-33 us whether done by a host-mapped kernel, a staged pinned-host copy or
   NCCL; at 640 KB it is 190-440 us and at 20 MB 5-13 ms. The transports are within about 20% of each
-  other at every size, so a first TP should reuse `StageLink`-style staged copies (they already
-  capture into graphs) and a local reduce, not write spin-wait kernels.
-- **Where it pays.** Projected against this pipeline on two A4000s: 1.6-1.7x at one decode column,
-  about 1.5x at four, roughly break-even at sixteen, a loss at thirty-two (MTP3 with eight lanes).
-  TP prefill is bound by the link (~840 ms of all-reduce per 1,024-token chunk), so prefill speed
-  belongs to the micro-chunk overlap above, not TP. Link width is per machine and decides
-  everything; run the probe on the target box first. On the x16 3090 pair the 21 ms decode step
-  would become about 16 ms with MLP-only TP (64 collectives at ~27 us against half the MLP bytes)
-  and about 14 ms with full TP (128 collectives), i.e. roughly 1.3x and 1.5x at one column.
-- **Smallest useful first step: MLP-only TP on the dense 27B** (about 64% of the weight bytes;
-  projected ~1.35x decode). Each rank keeps attention and GDN whole and replicated (weights and KV),
-  and takes half the MLP: `gate_up` split by rows (gate rows then up rows, so the SwiGLU pairing
-  holds) and `down` split along K. A rank's down projection can reuse `linear_add`: rank 0 adds its
-  partial into the real residual, the other rank into zeros, and one BF16 exchange plus an add gives
-  every rank the same new residual (one extra rounding against the single-device path, so the oracle
-  is a tolerance on logits and perplexity, not byte equality).
-- **What it needs before any speed can be claimed:** loader-time slicing of row-split quantized
-  parents (contiguous row ranges for `gate_up`, per-plane column ranges for `down`, group-aligned);
-  the `linear_swiglu` Q4 kernel at 17,408 rows and `linear_add` Q5 at K=8,704, each registered for
-  those exact shapes and qualified against the FP64 oracle and tuned on the target card (routes
-  inherited from the full-width shapes are hypotheses); per-rank replicas of the KV pool and state
-  pool with fan-out in the transactions; and the exchange itself. The decisive measurement is the probe on the machine that will run it.
+  other at every size, which is why the exchange is a fenced copy (or a peer read) and a local
+  reduce that captures into graphs, not a spin-wait kernel.

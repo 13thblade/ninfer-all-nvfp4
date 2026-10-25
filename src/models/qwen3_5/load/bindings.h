@@ -23,6 +23,15 @@ struct PendingWeight {
     std::size_t rank = 0; // see BoundWeight::rank
 };
 
+// The piece of a parameter one tensor-parallel rank holds: one range of a matrix's rows, or the
+// given ranges of its columns (a vector's elements), side by side. A replica is the one range that
+// covers every column.
+struct ParameterPiece {
+    enum class Cut : std::uint8_t { Rows, Columns };
+    Cut cut = Cut::Rows;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+};
+
 class Bindings {
 public:
     explicit Bindings(artifact::Binder& binder, const LoadOptions& options = {})
@@ -36,6 +45,13 @@ public:
     [[nodiscard]] WeightId direct(std::string name, artifact::Shape shape,
                                   QType format                  = QType::BF16,
                                   artifact::Residency residency = artifact::Residency::Device);
+
+    // Binds `piece` of a parameter as a device weight of its own on `rank`, named `name@rank`.
+    // The stored objects behind the parameter get no device demand from this.
+    [[nodiscard]] WeightId piece(const std::string& name, const artifact::Shape& shape,
+                                 const std::vector<std::string>& inputs,
+                                 std::optional<QType> exact_format, std::size_t rank,
+                                 const ParameterPiece& piece);
 
     [[nodiscard]] const PendingWeight& at(WeightId id) const { return weights.at(id.index); }
 
@@ -58,16 +74,25 @@ public:
     std::vector<PendingWeight> weights;
 
 private:
+    // `whole_gathers` false leaves an input gather out, for a piece that binds its own.
+    void add_uses(PendingWeight& pending, const std::string& name,
+                  const std::vector<std::string>& inputs, bool whole_gathers = true);
     // One device weight per distinct sign binding, however many Uses name it.
     WeightId hadamard_signs(const artifact::Binding& binding, std::uint64_t width,
                             const std::string& use);
     // One device weight per distinct input-gather binding, the same way.
     WeightId input_columns(const artifact::Binding& binding, std::uint64_t width,
                            const std::string& use);
+    // A tensor-parallel piece's gather: the entries of `gather` at the stored `columns`, less
+    // `base`, on `rank`.
+    WeightId gather_piece(const artifact::Binding& gather,
+                          const std::vector<std::pair<std::uint64_t, std::uint64_t>>& columns,
+                          std::uint64_t base, std::size_t rank, const std::string& use);
 
     std::map<std::string, WeightId, std::less<>> parameters_;
     std::map<std::string, WeightId, std::less<>> signs_;
     std::map<std::string, WeightId, std::less<>> columns_;
+    std::map<std::string, WeightId, std::less<>> gather_pieces_;
 };
 
 [[nodiscard]] AttentionWeights bind_attention(Bindings& bindings, const TextConfig& config,

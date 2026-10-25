@@ -71,7 +71,7 @@ other references own narrower contracts:
 | [Storage layouts](maintainer/storage-layouts.md) | packing, plane offsets, padding, encoded sizes and view addressing |
 | [Qwen3.5 model](maintainer/qwen3_5-model.md) | Dense/MoE mathematics, instance config, logical parameters, MTP, Vision and state semantics |
 | [Qwen4Exp model](maintainer/qwen4-exp-model.md) | Flash-Next mathematics, byte census, state sizes, the n-gram table's storage and the implementation status |
-| [Pipeline stages](maintainer/pipeline-stages.md) | `--devices`: whole-layer stages over several GPUs, what they cover, verification, measurements and the tensor-parallelism evidence |
+| [Pipeline stages](maintainer/pipeline-stages.md) | `--devices`: whole-layer stages over several GPUs, and `--tensor-parallel`: every layer divided over them; what each covers, verification and measurements |
 | [Quality trades](maintainer/quality-trade-experiments.md) | the precision options and what each costs and buys |
 | [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
 | [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | candidate selection, retention, materialization and Device/Host checkpoint policy |

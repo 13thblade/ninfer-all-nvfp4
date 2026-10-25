@@ -512,6 +512,8 @@ struct SequenceState {
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
+    // The initial drafts are still on their way from the device (settle_initial_drafts).
+    bool mtp_drafts_pending       = false;
     bool tail_hidden_valid        = false;
     bool endpoint_valid           = false;
     RewriteCheckpoint rewrite_checkpoint;
@@ -1053,6 +1055,12 @@ public:
     std::optional<bool> logprobs_armed;
     // The host copy of a prefill's typed readout (io.readout_values).
     std::optional<PinnedHostBuffer> readout_host;
+    // A prompt's first token leaves the device ahead of the drafter's work on the prompt's end:
+    // `first_token_ready` follows its copies, and each lane's initial drafts land in its row of
+    // `initial_drafts_host` behind `initial_drafts_ready[lane]`. Made on first use.
+    std::optional<CudaCompletionEvent> first_token_ready;
+    std::vector<CudaCompletionEvent> initial_drafts_ready;
+    std::optional<PinnedHostBuffer> initial_drafts_host;
     // A batched prefill's outputs (execution::PrefillBatchHost), kMaximumPrefillSegments rows.
     std::optional<PinnedHostBuffer> prefill_batch_host;
     // A completed branched read's records; its returned round's branches span points here until
@@ -1773,6 +1781,9 @@ private:
                         std::int32_t row = 0) const;
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
+    void make_early_token_resources();
+    // Waits for a lane's initial drafts if they are still landing and takes them.
+    void settle_initial_drafts(SequenceState& sequence);
     void
     commit_generated_prefix_identity(SequenceState& sequence, std::uint32_t base_ledger_frontier,
                                      std::span<const TokenId> accepted_tokens,
@@ -1801,7 +1812,7 @@ private:
     complete_prefill_step(SequenceState& sequence, RequestControl& request,
                           const runtime::BeginSummary& summary,
                           std::uint32_t processed_prompt_tokens,
-                          std::span<const TokenId> initial_drafts,
+                          std::span<const TokenId> initial_drafts, bool drafts_pending,
                           runtime::ExecutionTimingRecorder& timing);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,

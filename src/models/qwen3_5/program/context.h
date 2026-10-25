@@ -94,6 +94,9 @@ struct PrefillContext {
     // False runs the chunk without the drafter's prompt work (MTP KV, DFlash features), past a
     // request's drafter frontier.
     bool drafter = true;
+    // Enqueues the first token's copies to the host as soon as a text chunk samples it; the chunk
+    // then returns without waiting for the drafter's work behind them. Empty waits for everything.
+    std::function<void()> first_token;
 };
 
 struct OrdinaryBatchContext {

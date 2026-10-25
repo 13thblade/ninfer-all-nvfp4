@@ -1068,6 +1068,22 @@ int main() {
     } catch (const std::invalid_argument&) { zero_stage_rejected = true; }
     failures += check(zero_stage_rejected, "a stage with no layers was accepted");
 
+    // --tensor-parallel shares every layer over the --devices, so it needs more than one.
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--devices", "0,1", "--tensor-parallel"})
+                          .tensor_parallel,
+                      "--tensor-parallel did not reach serving options");
+    failures += check(!pair.tensor_parallel, "tensor parallelism is not off by default");
+    for (const std::vector<std::string>& devices :
+         {std::vector<std::string>{}, std::vector<std::string>{"--devices", "1"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--tensor-parallel"};
+        args.insert(args.end(), devices.begin(), devices.end());
+        bool rejected = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--tensor-parallel without several devices was accepted");
+    }
+
     bool exclusive_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--device", "0", "--devices", "0,1"});

@@ -279,6 +279,24 @@ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
         const auto plain = product(0, t, false);
         failures += run_check("linear T=" + std::to_string(t), to_float(host), plain);
 
+        // An FP32 out is the same accumulation unrounded: rounding it gives the BF16 out exactly.
+        DeviceBuffer wide_device(std::size_t(kRows) * t * sizeof(float));
+        Tensor wide(wide_device.p, DType::FP32, {kRows, t});
+        ops::linear(x, gate, wide, ops::LinearPolicy::A16Only, workspace, nullptr);
+        check(cudaDeviceSynchronize(), "fp32 linear");
+        std::vector<float> wide_host(std::size_t(kRows) * t);
+        wide_device.copy_to_host(wide_host.data(), wide_host.size() * sizeof(float));
+        failures += run_check("fp32 linear T=" + std::to_string(t), wide_host, plain);
+        for (std::size_t i = 0; i < wide_host.size(); ++i) {
+            if (__bfloat162float(__float2bfloat16(wide_host[i])) != __bfloat162float(host[i])) {
+                std::cerr << "FAIL " << c.name << " fp32 linear T=" << t << " element " << i
+                          << " rounds to " << __bfloat162float(__float2bfloat16(wide_host[i]))
+                          << ", the BF16 out holds " << __bfloat162float(host[i]) << '\n';
+                ++failures;
+                break;
+            }
+        }
+
         ops::linear(x, gathered, out, ops::LinearPolicy::A16Only, workspace, nullptr);
         check(cudaDeviceSynchronize(), "gathered linear");
         out_device.copy_to_host(host.data(), host.size() * sizeof(__nv_bfloat16));

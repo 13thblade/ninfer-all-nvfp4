@@ -127,7 +127,7 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
             continue;
         }
         for (const auto& part : parameter.reference.binding.parts) {
-            const auto& geometry = bindings.binder.reader().geometry(part.object);
+            const auto geometry = bindings.binder.geometry(part.object);
             const bool format =
                 geometry.format == QType::T2_G128_FP16 || geometry.format == QType::Q2_G64_FP16 ||
                 geometry.format == QType::Q4_G64_FP16 || geometry.format == QType::Q5_G64_FP16 ||

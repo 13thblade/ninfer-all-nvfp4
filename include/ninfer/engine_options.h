@@ -425,6 +425,10 @@ struct EngineOptions {
     // Layers per stage, one count per entry of `devices`. Empty lets the engine choose from each
     // device's free memory.
     std::vector<std::uint32_t> stage_layers;
+    // The devices share every layer instead of dealing layers out: tensor parallelism over the GDN
+    // heads and the dense FFN rows, with attention, the KV cache, the embedding, the head and MTP
+    // on the first device. Needs identical devices and a dense Qwen3.5-core model.
+    bool tensor_parallel = false;
     // Native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4 MoE and Flint.
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Host/disk experts: device memory lent to the persistent cache, split

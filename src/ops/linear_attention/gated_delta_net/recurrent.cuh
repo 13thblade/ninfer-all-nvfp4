@@ -480,6 +480,9 @@ struct FoldGeometry {
 
 using FoldGeometry16x48 = FoldGeometry<16, 48, 10240>;
 using FoldGeometry16x32 = FoldGeometry<16, 32, 8192>;
+// A 27B layer's share on each of two and four tensor-parallel ranks.
+using FoldGeometry8x24 = FoldGeometry<8, 24, 5120>;
+using FoldGeometry4x12 = FoldGeometry<4, 12, 2560>;
 
 template <class Geometry, class StateT = float>
 struct FoldAccess {

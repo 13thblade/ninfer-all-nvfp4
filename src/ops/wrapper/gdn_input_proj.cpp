@@ -1453,11 +1453,15 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
 
 namespace {
 
-constexpr std::int32_t kGgufHidden   = 5120;
-constexpr std::int32_t kGgufQkvRows  = 10240;
-constexpr std::int32_t kGgufZRows    = 6144;
-constexpr std::int32_t kGgufQueryKey = 2048;
-constexpr std::int32_t kGgufValue    = 6144;
+// The rows a GGUF projection's parts cover: q, k and value into the convolution input (output 0),
+// z beside it (output 1). Value and z have the same rows, so q and k split the rest evenly.
+struct GgufGdnGeometry {
+    std::int32_t hidden    = 0;
+    std::int32_t qkv       = 0;
+    std::int32_t z         = 0;
+    std::int32_t query_key = 0;
+    std::int32_t value     = 0;
+};
 
 std::vector<detail::GgufShape> gguf_shapes(const GgufProjectionWeights& weights) {
     std::vector<detail::GgufShape> shapes;
@@ -1467,21 +1471,31 @@ std::vector<detail::GgufShape> gguf_shapes(const GgufProjectionWeights& weights)
     return shapes;
 }
 
-// The z rows and the q/k/value channels the parts write, checked once against the fixed profile.
-void require_gguf_gdn(const GgufProjectionWeights& weights) {
-    std::int64_t qkv = 0;
-    std::int64_t z   = 0;
+// Checks that the parts tile q/k/v and z without gaps or overlaps and returns their geometry.
+GgufGdnGeometry require_gguf_gdn(const GgufProjectionWeights& weights) {
+    if (weights.parts.empty()) {
+        throw std::invalid_argument("gdn_input_proj: a GGUF projection needs parts");
+    }
+    GgufGdnGeometry geometry;
+    geometry.hidden = weights.parts.front().weight.k;
+    std::int64_t covered[2] = {0, 0};
     for (const auto& part : weights.parts) {
         detail::require_gguf(part.weight, "gdn_input_proj GGUF part");
-        if (part.weight.k != kGgufHidden || part.output < 0 || part.output > 1 || part.row < 0 ||
-            part.row + part.weight.n > (part.output == 0 ? kGgufQkvRows : kGgufZRows)) {
-            throw std::invalid_argument("gdn_input_proj: GGUF part outside the q/k/v/z profile");
+        if (part.weight.k != geometry.hidden || part.output < 0 || part.output > 1 ||
+            part.row != covered[part.output]) {
+            throw std::invalid_argument("gdn_input_proj: GGUF parts do not tile q/k/v and z");
         }
-        (part.output == 0 ? qkv : z) += part.weight.n;
+        covered[part.output] += part.weight.n;
     }
-    if (qkv != kGgufQkvRows || z != kGgufZRows) {
+    geometry.qkv       = static_cast<std::int32_t>(covered[0]);
+    geometry.z         = static_cast<std::int32_t>(covered[1]);
+    geometry.value     = geometry.z;
+    geometry.query_key = (geometry.qkv - geometry.z) / 2;
+    if (geometry.z <= 0 || geometry.query_key <= 0 ||
+        2 * geometry.query_key + geometry.value != geometry.qkv) {
         throw std::invalid_argument("gdn_input_proj: GGUF parts do not cover q/k/v and z");
     }
+    return geometry;
 }
 
 void gguf_gdn_project(const Tensor& x, const GgufProjectionWeights& weights, Tensor& qkv,
@@ -1503,32 +1517,32 @@ void gguf_gdn_project(const Tensor& x, const GgufProjectionWeights& weights, Ten
 std::size_t gdn_input_proj_workspace_capacity_bytes(const GgufProjectionWeights& weights,
                                                     std::int32_t min_tokens,
                                                     std::int32_t max_tokens) {
-    require_gguf_gdn(weights);
+    (void)require_gguf_gdn(weights);
     const auto shapes = gguf_shapes(weights);
     return detail::gguf_project_workspace_bytes(shapes, min_tokens, max_tokens);
 }
 
 void gdn_input_proj(const Tensor& x, const GgufProjectionWeights& weights, Tensor& qkv, Tensor& z,
                     WorkspaceArena& workspace, cudaStream_t stream) {
-    require_gguf_gdn(weights);
-    const std::int32_t cols = x.ne[1];
+    const GgufGdnGeometry rows = require_gguf_gdn(weights);
+    const std::int32_t cols    = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
-    require_matrix(x, kGgufHidden, cols, "x");
-    require_matrix(qkv, kGgufQkvRows, cols, "qkv");
-    require_matrix(z, kGgufZRows, cols, "z");
+    require_matrix(x, rows.hidden, cols, "x");
+    require_matrix(qkv, rows.qkv, cols, "qkv");
+    require_matrix(z, rows.z, cols, "z");
     gguf_gdn_project(x, weights, qkv, z, workspace, stream);
 }
 
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     const GgufProjectionWeights& weights, std::int32_t batch_size, std::int32_t min_width,
     std::int32_t max_width) {
-    require_gguf_gdn(weights);
+    const GgufGdnGeometry rows = require_gguf_gdn(weights);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     const auto shapes          = gguf_shapes(weights);
     const std::int32_t batch   = std::max(batch_size, 1);
     const std::size_t project  = detail::gguf_project_workspace_bytes(
         shapes, batch * min_width, batch * max_width);
-    return composed_snapshot_capacity(kGgufQkvRows, batch * max_width, project);
+    return composed_snapshot_capacity(rows.qkv, batch * max_width, project);
 }
 
 void gdn_input_proj_conv_snapshot(const Tensor& x, const GgufProjectionWeights& weights,
@@ -1537,21 +1551,21 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const GgufProjectionWeights& 
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, WorkspaceArena& ws,
                                   cudaStream_t stream) {
-    require_gguf_gdn(weights);
-    const ConvGeometry geometry = require_snapshot_input(x, kGgufHidden);
+    const GgufGdnGeometry rows  = require_gguf_gdn(weights);
+    const ConvGeometry geometry = require_snapshot_input(x, rows.hidden);
     require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
-                              snapshot_base_slots, kGgufQkvRows, geometry);
-    require_conv_tensor(query, kGgufQueryKey, geometry.width, geometry.batch,
+                              snapshot_base_slots, rows.qkv, geometry);
+    require_conv_tensor(query, rows.query_key, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_snapshot", "query");
-    require_conv_tensor(key, kGgufQueryKey, geometry.width, geometry.batch,
+    require_conv_tensor(key, rows.query_key, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_snapshot", "key");
-    require_conv_tensor(value, kGgufValue, geometry.width, geometry.batch,
+    require_conv_tensor(value, rows.value, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_snapshot", "value");
-    require_conv_tensor(z, kGgufZRows, geometry.width, geometry.batch,
+    require_conv_tensor(z, rows.z, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_snapshot", "z");
     compose_batched_snapshot(x, conv_weight, conv_states, valid_columns, initial_state_slots,
-                             snapshot_base_slots, query, key, value, z, kGgufQueryKey,
-                             kGgufQueryKey, kGgufValue, geometry, ws, stream,
+                             snapshot_base_slots, query, key, value, z, rows.query_key,
+                             rows.query_key, rows.value, geometry, ws, stream,
                              [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
                                  gguf_gdn_project(x_flat, weights, projected, z_flat, ws, stream);
                              });
@@ -1560,7 +1574,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const GgufProjectionWeights& 
 std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     const GgufProjectionWeights& weights, std::int32_t batch_size, std::int32_t min_width,
     std::int32_t max_width) {
-    require_gguf_gdn(weights);
+    (void)require_gguf_gdn(weights);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     const auto shapes        = gguf_shapes(weights);
     const std::int32_t batch = std::max(batch_size, 1);
@@ -1572,19 +1586,19 @@ void gdn_input_proj_conv_record(const Tensor& x, const GgufProjectionWeights& we
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
-    require_gguf_gdn(weights);
-    const ConvGeometry geometry = require_record_input(x, kGgufHidden);
+    const GgufGdnGeometry rows  = require_gguf_gdn(weights);
+    const ConvGeometry geometry = require_record_input(x, rows.hidden);
     require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
-                            kGgufQkvRows, geometry);
-    require_conv_tensor(conv_record, kGgufQkvRows, geometry.width, geometry.batch,
+                            rows.qkv, geometry);
+    require_conv_tensor(conv_record, rows.qkv, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_record", "conv record");
-    require_conv_tensor(query, kGgufQueryKey, geometry.width, geometry.batch,
+    require_conv_tensor(query, rows.query_key, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_record", "query");
-    require_conv_tensor(key, kGgufQueryKey, geometry.width, geometry.batch,
+    require_conv_tensor(key, rows.query_key, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_record", "key");
-    require_conv_tensor(value, kGgufValue, geometry.width, geometry.batch,
+    require_conv_tensor(value, rows.value, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_record", "value");
-    require_conv_tensor(z, kGgufZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_record",
+    require_conv_tensor(z, rows.z, geometry.width, geometry.batch, "gdn_input_proj_conv_record",
                         "z");
     require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                               conv_record, query, key, value, z, workspace);

@@ -361,6 +361,30 @@ public:
         return out;
     }
 
+    // A tensor-parallel rank's share of a layer. An attention layer's share has no mixer.
+    BlockParameters rank_block(const RankLayerWeights& w) const {
+        BlockParameters out;
+        out.input_norm          = tensor(w.input_norm);
+        out.post_attention_norm = tensor(w.post_attention_norm);
+        out.ffn                 = dense(w.ffn);
+        if (w.gdn) {
+            const GdnWeights& g = *w.gdn;
+            out.mixer           = GdnParameters{
+                ops::prepare_gdn_input_proj_weights(model_.rotated_input(g.query),
+                                                    model_.rotated_input(g.key),
+                                                    model_.rotated_input(g.value),
+                                                    model_.rotated_input(g.z)),
+                ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
+                                                     model_.input(g.b_projection)),
+                tensor(g.a_log),
+                tensor(g.dt_bias),
+                tensor(g.convolution),
+                tensor(g.norm),
+                rotated_linear(g.output)};
+        }
+        return out;
+    }
+
     ops::SparseMoeHints prefetch(const ops::ProjectionWeights& projection, WeightId query) const {
         const Weight& weight = std::visit(
             [](const auto& p) -> const Weight& {
@@ -553,6 +577,19 @@ Parameters::Parameters(const Model& source) : model(source) {
         text.layers.push_back(with_context("text/layers/" + std::to_string(i),
                                            [&] { return prepare.block(w.text.layers[i]); }));
         text.layers.back().rank = w.text.stages.placement(static_cast<std::uint32_t>(i)).stage;
+    }
+    if (!w.text.rank_layers.empty()) {
+        text.rank_count = w.text.rank_layers.size() + 1;
+        text.rank_layers.resize(w.text.rank_layers.size());
+        for (std::size_t r = 0; r < w.text.rank_layers.size(); ++r) {
+            text.rank_layers[r].reserve(w.text.rank_layers[r].size());
+            for (std::size_t i = 0; i < w.text.rank_layers[r].size(); ++i) {
+                text.rank_layers[r].push_back(
+                    with_context("text/layers/" + std::to_string(i) + "@" + std::to_string(r + 1),
+                                 [&] { return prepare.rank_block(w.text.rank_layers[r][i]); }));
+                text.rank_layers[r].back().rank = r + 1;
+            }
+        }
     }
     if (w.mtp) {
         mtp = with_context("mtp", [&] { return prepare.mtp(*w.mtp); });

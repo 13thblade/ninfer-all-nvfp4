@@ -2,6 +2,7 @@ add_library(ninfer_core STATIC
   arena.cu
   device.cu
   stage_link.cu
+  tensor_parallel.cu
   dtype.cpp
   gpu_clock_floor.cpp
   host_worker_pool.cpp

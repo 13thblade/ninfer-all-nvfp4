@@ -177,6 +177,9 @@ std::string usage_text(const char* argv0) {
            "                                exercises the path on one GPU\n"
            "  --stage-layers A,B,...        layers per stage (default: split by each GPU's\n"
            "                                free memory)\n"
+           "  --tensor-parallel             the --devices share every layer: GDN heads and\n"
+           "                                dense FFN rows; attention, KV, head and MTP on\n"
+           "                                the first (dense Qwen3.5-core GGUF models)\n"
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
            "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
@@ -387,6 +390,8 @@ Options parse_options(int argc, char** argv) {
             options.devices = parse_device_list(value(arg));
         } else if (arg == "--stage-layers") {
             options.stage_layers = parse_stage_layers(value(arg));
+        } else if (arg == "--tensor-parallel") {
+            options.tensor_parallel = true;
         } else if (arg == "--expert-residency") {
             const std::string residency = value(arg);
             if (residency == "device") {
@@ -605,6 +610,9 @@ Options parse_options(int argc, char** argv) {
     }
     if (!options.stage_layers.empty() && options.devices.size() < 2) {
         throw std::invalid_argument("--stage-layers needs --devices naming more than one device");
+    }
+    if (options.tensor_parallel && options.devices.size() < 2) {
+        throw std::invalid_argument("--tensor-parallel needs --devices naming more than one device");
     }
     if (kv_headroom_mib.has_value()) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {

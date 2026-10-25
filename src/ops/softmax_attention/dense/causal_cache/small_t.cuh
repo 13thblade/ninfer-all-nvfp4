@@ -242,6 +242,34 @@ causal_merge_split_statistics(const float* partial_m, const float* partial_l, in
     return total;
 }
 
+// One column's split partials weighted and summed in split order. Eight splits' partials are read
+// before any of them is added, so the reads overlap; the adds keep the original order and a split of
+// zero weight is still skipped, so the sum is the one the plain loop gives.
+template <class Geometry>
+__device__ __forceinline__ float causal_weighted_split_sum(const float* partial_acc,
+                                                           const float* weights, int q_head, int d,
+                                                           int token, int tokens, int splits) {
+    constexpr int kBatch = 8;
+    float numerator      = 0.0f;
+    for (int first = 0; first < splits; first += kBatch) {
+        float value[kBatch];
+#pragma unroll
+        for (int j = 0; j < kBatch; ++j) {
+            const int split = first + j;
+            value[j]        = split < splits && weights[split] != 0.0f
+                                  ? partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token,
+                                                                                   split, tokens)]
+                                  : 0.0f;
+        }
+#pragma unroll
+        for (int j = 0; j < kBatch; ++j) {
+            const int split = first + j;
+            if (split < splits && weights[split] != 0.0f) numerator += value[j] * weights[split];
+        }
+    }
+    return numerator;
+}
+
 template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
 __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_kernel(
     const float* partial_acc, const float* partial_m, const float* partial_l,
@@ -309,13 +337,8 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
                                                 active_split_count, weights, warp_sums, scalars);
     const int d = d_start + tid;
     if (tid >= DChunk || d >= kCausalHeadDim) return;
-    float numerator = 0.0f;
-    for (int split = 0; split < active_split_count; ++split) {
-        if (weights[split] != 0.0f)
-            numerator +=
-                partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] *
-                weights[split];
-    }
+    const float numerator = causal_weighted_split_sum<Geometry>(partial_acc, weights, q_head, d, token,
+                                                                tokens, active_split_count);
 
     const float value    = (head_l > 0.0f) ? numerator / head_l : 0.0f;
     const auto out_index = causal_q_index<Geometry>(q_head, d, output_column);

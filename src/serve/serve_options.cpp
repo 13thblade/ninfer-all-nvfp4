@@ -110,6 +110,9 @@ std::string serve_usage_text(const char* argv0) {
            "                                excludes --device\n"
            "  --stage-layers A,B,...        layers per stage in --devices order (default:\n"
            "                                split by free memory)\n"
+           "  --tensor-parallel             the --devices share every layer: GDN heads and\n"
+           "                                dense FFN rows; attention, KV, head and MTP on\n"
+           "                                the first (dense Qwen3.5-core GGUF models)\n"
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
            "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
@@ -1107,6 +1110,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.stage_layers = parse_stage_layers(require_value("--stage-layers"));
             continue;
         }
+        if (arg == "--tensor-parallel") {
+            options.tensor_parallel = true;
+            continue;
+        }
         if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
             continue;
@@ -1690,6 +1697,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (!options.stage_layers.empty() && options.devices.size() < 2) {
         throw std::invalid_argument("--stage-layers needs --devices naming more than one device");
+    }
+    if (options.tensor_parallel && options.devices.size() < 2) {
+        throw std::invalid_argument("--tensor-parallel needs --devices naming more than one device");
     }
     if (options.request_log_max_mib != 0 && options.request_log_jsonl.empty()) {
         throw std::invalid_argument("--request-log-max-mib requires --request-log-jsonl");

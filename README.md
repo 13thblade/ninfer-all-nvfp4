@@ -450,6 +450,9 @@ Prefill of a 4,463-token prompt, in tok/s:
 - **Pipeline stages.** `--devices 0,1,...` splits the layers over up to eight GPUs on Linux, each
   stage owning its weights, KV and state; the cards may differ where the build runs on each, such as
   RTX 30 with RTX 40 cards on the `86` build ([pipeline stages](docs/maintainer/pipeline-stages.md)).
+  `--tensor-parallel` divides every layer over the devices instead: each holds a share of the GDN
+  heads and dense FFN rows of a dense GGUF model and reads only those per token
+  ([tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism)).
 - FP8 A8 and NVFP4 W4A4 tensor-core routes on every `120a` build, an FP4 tensor-core prompt kernel
   for an NVFP4 KV cache, and programmatic dependent launches on Blackwell.
 
