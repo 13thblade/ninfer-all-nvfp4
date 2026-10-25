@@ -132,7 +132,9 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
                                     "host or disk experts (--expert-residency host|disk)");
     }
-    if (device.size() != 1) { throw std::invalid_argument("Gemma 4 runs on one device"); }
+    if (device.size() != 1 || options.tensor_parallel) {
+        throw std::invalid_argument("Gemma 4 runs on one device");
+    }
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     const artifact::Reader reader(options.artifact_path);
     inspect.complete();

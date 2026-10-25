@@ -13,6 +13,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <vector>
 #include <string>
@@ -149,6 +150,7 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
     const std::size_t rank_count = bases.size();
     std::vector<std::vector<CopyRange>> ranges_by_rank(rank_count);
     std::vector<const DevicePlacement*> transcoded;
+    std::vector<const DevicePlacement*> rebased;
     for (const auto& placement : placements) {
         if (placement.rank >= rank_count || bases[placement.rank] == nullptr) {
             throw ArtifactError("device placement names a rank the plan has no arena for");
@@ -161,6 +163,24 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
         }
         if (placement.transcode) {
             transcoded.push_back(&placement);
+            continue;
+        }
+        if (placement.selection && placement.selection->rebase != 0) {
+            rebased.push_back(&placement);
+            continue;
+        }
+        if (placement.selection) {
+            const auto& descriptor = reader.directory().tensor(*placement.source);
+            for (const SelectedRun& run :
+                 selected_runs(reader.geometry(*placement.source), *placement.selection)) {
+                for (const auto& segment : reader.segments(
+                         checked_add(descriptor.offset, run.source, "selected run"), run.bytes)) {
+                    ranges_by_rank[placement.rank].push_back(
+                        {segment.file_index, segment.file_offset,
+                         checked_add(segment.file_offset, segment.bytes, "copy range"),
+                         destination + run.destination + segment.destination_offset});
+                }
+            }
             continue;
         }
         const auto& descriptor = reader.directory().tensor(placement.object);
@@ -187,6 +207,27 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
                    "upload transcoded weight bytes");
         transcoded_bytes = checked_add(transcoded_bytes, encoded.size(), "transcoded bytes");
         phase.progress(transcoded_bytes, total);
+    }
+    // Rebased index pieces are a few KiB each: gathered and shifted on the host.
+    for (const DevicePlacement* placement : rebased) {
+        const auto source = reader.read_object(*placement->source);
+        totals.read_bytes = checked_add(totals.read_bytes, source.size(), "rebased read bytes");
+        std::vector<std::byte> bytes(static_cast<std::size_t>(placement->bytes));
+        for (const SelectedRun& run :
+             selected_runs(reader.geometry(*placement->source), *placement->selection)) {
+            std::memcpy(bytes.data() + run.destination, source.data() + run.source, run.bytes);
+        }
+        for (std::size_t at = 0; at + sizeof(std::int32_t) <= bytes.size(); at += sizeof(std::int32_t)) {
+            std::int32_t value;
+            std::memcpy(&value, bytes.data() + at, sizeof(value));
+            value -= placement->selection->rebase;
+            std::memcpy(bytes.data() + at, &value, sizeof(value));
+        }
+        const ScopedRank bound(device, placement->rank);
+        check_cuda(cudaMemcpy(bases[placement->rank] + placement->offset, bytes.data(), bytes.size(),
+                              cudaMemcpyHostToDevice),
+                   "upload rebased index bytes");
+        transcoded_bytes = checked_add(transcoded_bytes, bytes.size(), "rebased bytes");
     }
     totals.h2d_bytes     = transcoded_bytes;
     std::uint64_t copied = 0;
@@ -298,8 +339,12 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
     return totals;
 }
 
-// The geometry a device placement's bytes take: the transcode target's, or the stored one.
+// The geometry a device placement's bytes take: the selected piece's, the transcode target's, or
+// the stored one.
 WeightGeometry placement_geometry(const Reader& reader, const DevicePlacement& placement) {
+    if (placement.selection) {
+        return selected_geometry(reader.geometry(*placement.source), *placement.selection);
+    }
     return placement.transcode ? weight_geometry(*placement.transcode, QuantLayout::RowSplit,
                                                  reader.directory().tensor(placement.object).shape)
                                : reader.geometry(placement.object);
@@ -383,7 +428,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     StartupPhaseScope phase(observer, StartupPhase::WeightsMaterialize, StartupProgressUnit::Bytes,
                             total);
     MaterializedArtifact out;
-    out.objects_.resize(plan.object_count);
+    out.objects_.resize(plan.object_count + plan.selected_count);
     out.stats_.file_bytes            = reader.file_bytes();
     out.stats_.read_bytes            = plan.prior_read_bytes;
     out.stats_.owned_value_bytes     = plan.owned_value_bytes;
@@ -495,7 +540,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     }
     std::vector<std::uint64_t> previous_device_end(rank_count, 0);
     for (const auto& placement : plan.device_objects) {
-        const auto& stored_geometry = reader.geometry(placement.object);
+        if (placement.selection.has_value() != placement.source.has_value() ||
+            (placement.selection && (placement.object.index < plan.object_count ||
+                                     placement.transcode || placement.panel))) {
+            throw ArtifactError("a selected device placement is malformed");
+        }
+        const ObjectHandle stored   = placement.source.value_or(placement.object);
+        const auto& stored_geometry = reader.geometry(stored);
         auto geometry               = placement_geometry(reader, placement);
         if (placement.panel) {
             if (!row_split_panel_supported(geometry)) {
@@ -524,7 +575,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                                  static_cast<std::size_t>(placement.bytes)};
         const auto divisor = object.host
                                  ? object.host->weight_scale_divisor
-                                 : read_divisor(reader, placement.object, geometry, {}, out.stats_);
+                                 : read_divisor(reader, stored, geometry, {}, out.stats_);
         object.device = WeightParent{geometry, static_cast<const std::byte*>(storage.data),
                                      divisor, stored_geometry.format};
     }

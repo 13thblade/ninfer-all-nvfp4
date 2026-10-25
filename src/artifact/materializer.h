@@ -1,6 +1,7 @@
 #pragma once
 
 #include "artifact/schema.h"
+#include "artifact/selection.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
@@ -33,6 +34,10 @@ struct DevicePlacement {
     // Set when the row-split object is permuted into the panel layout after every upload
     // (Binder::panel_device); the device parent then carries QuantLayout::RowSplitPanel.
     bool panel = false;
+    // Set for a piece of a stored object (Binder::select_device): `object` is then a handle past
+    // the artifact's objects, and the bytes are `selection` of `source`.
+    std::optional<ObjectHandle> source;
+    std::optional<ObjectSelection> selection;
 };
 
 // Offset inside the one page-locked Host block (Residency::Pinned).
@@ -53,6 +58,8 @@ struct HostPlacement {
 struct MaterializationPlan {
     const Reader* source            = nullptr;
     std::size_t object_count        = 0;
+    // Pieces of stored objects, handles [object_count, object_count + selected_count).
+    std::size_t selected_count      = 0;
     std::uint64_t prior_read_bytes  = 0;
     std::uint64_t owned_value_bytes = 0;
     // One device arena per pipeline rank. Entry 0 is the primary device and always exists, so a

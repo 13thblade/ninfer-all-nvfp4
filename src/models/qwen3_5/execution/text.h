@@ -15,6 +15,7 @@
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
+#include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/stage_runtime.h"
 
 #include <array>
@@ -265,6 +266,20 @@ private:
     // sees all of its layers on rank 0; a later stage's tapped outputs cross after the residual.
     template <class Tap>
     void run_staged(Tensor& x, Phase phase, Tap& tap);
+    // The whole layer stack with every rank running its share of each layer; the residual ends on
+    // rank 0 as on one device.
+    template <class Tap>
+    void run_tensor_parallel(Tensor& x, Phase phase, Tap& tap);
+    // The GDN and FFN geometry of the rank a pass is issuing: a tensor-parallel share, or the model.
+    [[nodiscard]] const TextConfig& layer_config() const noexcept {
+        return stage_runtime_ != nullptr && stage_runtime_->tensor_parallel
+                   ? stage_runtime_->tensor_parallel->shard
+                   : config_;
+    }
+    // A mixer's output projection: added to the residual, or in a tensor-parallel pass written to
+    // the rank's FP32 partial, which the exchange adds.
+    void project_residual(const Tensor& input, const LinearParameters& p, Tensor& x,
+                          InputBasis basis, bool wide_verification);
     // The Linear Attention state pool holding GDN layer `layer`, and its index within that pool.
     struct GdnStateRef {
         LinearAttentionStatePool* pool;
@@ -385,6 +400,10 @@ private:
     std::uint32_t mtp_attention_window_         = 0;
     const MtpParameters* mtp_                   = nullptr;
     StageRuntime* stage_runtime_                = nullptr;
+    // A tensor-parallel pass: the rank whose share is being issued, and where its output
+    // projections write their FP32 partial instead of adding to the residual.
+    std::size_t tensor_rank_  = 0;
+    Tensor* residual_partial_ = nullptr;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

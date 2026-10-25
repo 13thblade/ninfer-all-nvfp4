@@ -158,13 +158,26 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
     const StageLinkOptions control{.slot_bytes   = stage_control_bytes(columns),
                                    .slots        = 2,
                                    .force_staged = force_staged};
+    for (std::size_t stage = 1; stage < stages; ++stage) {
+        runtime->control.emplace_back(device, 0, stage, control);
+    }
+    if (text.tensor_parallel()) {
+        // Rank 0 hands every rank the pass's residual; the layers' sums keep the replicas equal.
+        for (std::size_t rank = 1; rank < stages; ++rank) {
+            runtime->forward.emplace_back(device, 0, rank, residual);
+        }
+        auto& tp = runtime->tensor_parallel.emplace();
+        tp.shard = qwen3_5::tensor_parallel_share(parameters.model.config().text, stages);
+        tp.exchange = std::make_unique<TensorParallelExchange>(
+            device, TensorParallelExchangeOptions{.slot_bytes   = columns * hidden * sizeof(float),
+                                                  .force_staged = force_staged});
+        for (std::size_t rank = 1; rank < stages; ++rank) { tp.joined.emplace_back(device.rank(rank)); }
+        return runtime;
+    }
     for (std::size_t stage = 0; stage + 1 < stages; ++stage) {
         runtime->forward.emplace_back(device, stage, stage + 1, residual);
     }
     runtime->back.emplace(device, stages - 1, 0, residual);
-    for (std::size_t stage = 1; stage < stages; ++stage) {
-        runtime->control.emplace_back(device, 0, stage, control);
-    }
     // A masked drafter reads target features from layers that may sit on later stages; such a stage
     // sends each tapped layer's output to rank 0 as soon as the layer has run, on a stream of its
     // own, so the transfer overlaps the stage's later layers.

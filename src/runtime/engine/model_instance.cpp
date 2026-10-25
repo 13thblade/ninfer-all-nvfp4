@@ -656,7 +656,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                             reader.directory().component("text").proposal.has_value();
         options.speculative.proposal_head = stored ? ProposalHead::Optimized : ProposalHead::Full;
     }
-    if (options.devices.size() > 1 && options.stage_layers.empty()) {
+    if (options.devices.size() > 1 && options.stage_layers.empty() && !options.tensor_parallel) {
         const std::vector<std::size_t> free_now = free_bytes_by_rank(device);
         const std::vector<std::uint64_t> free_bytes(free_now.begin(), free_now.end());
         const models::qwen3_5::StageSizing sizing{

@@ -480,6 +480,23 @@ int run_tests() {
                                        "--devices", "0,0", "--stage-layers", "0,64"});
                       }),
                       "a stage with no layers was accepted");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1",
+                             "--tensor-parallel"})
+                          .tensor_parallel,
+                      "--tensor-parallel did not reach the options");
+    failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1"})
+                           .tensor_parallel,
+                      "tensor parallelism is not off by default");
+    for (const std::vector<std::string>& devices :
+         {std::vector<std::string>{}, std::vector<std::string>{"--devices", "1"}}) {
+        failures += check(rejects([&] {
+                              std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt",
+                                                            "hello", "--tensor-parallel"};
+                              args.insert(args.end(), devices.begin(), devices.end());
+                              (void)parse(args);
+                          }),
+                          "--tensor-parallel without several devices was accepted");
+    }
     failures += check(parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
                              "--draft-tokens", "3", "--mtp-attention-window", "2048"})
                               .speculative.mtp_attention_window == 2048,
