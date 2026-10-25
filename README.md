@@ -16,23 +16,25 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 ## What's New
 
-- **2026-10-25:** DeepSeek-V4.1-Flash-1017, the fifth model family, from ISTA-DASLab's GSQ-RCO IQ1_M GGUF and its Engram table. Its 106.7 GiB of routed experts stay in pinned host memory or in the file and are copied to the GPU as layers route to them: 48 tok/s on one RTX PRO 6000 and 21.8 on one RTX 3090, where Strata decodes 3.9 on one GPU and 6.6 on two ([model](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3), [docs](docs/deepseek-v41.md), [#138](https://github.com/iamwavecut/ninfer-all/pull/138)). Every model now pins its host memory with parallel direct reads.
-- **2026-10-25:** Tensor parallelism: `--tensor-parallel` divides the Gated DeltaNet heads and dense FFN rows of a dense Qwen3.5-core model over several GPUs ([pipeline stages](docs/maintainer/pipeline-stages.md), [#136](https://github.com/iamwavecut/ninfer-all/pull/136)).
-- **2026-10-24:** Flint decodes 348 tok/s on an RTX 5090 (llama.cpp: 223) and 210 tok/s on an RTX 4090 with its experts in host memory (llama.cpp: 166) ([measurements](docs/flint.md#measurements), [#135](https://github.com/iamwavecut/ninfer-all/pull/135)).
-- **2026-10-23:** Flint, the fourth model family: Recursive's `FlintForCausalLM` from Unsloth's UD-Q4_K_XL GGUF, block for block, with GLM-4.7 tool calls and context-lookup drafts ([model](https://huggingface.co/WaveCut/Flint-UD-Q4_K_XL-NInfer-v3), [docs](docs/flint.md), [#132](https://github.com/iamwavecut/ninfer-all/pull/132)).
-- **2026-10-23:** Native releases: Windows and Debian 13 archives with CUDA 12.9 and 13.4 backends, universal packages that carry both, and two multi-architecture Docker images, published under date tags ([releases](https://github.com/iamwavecut/ninfer-all/releases), [Docker](#docker)).
-- **2026-10-22:** Typed decisions: the served chat model answers choice, yes/no and score questions about a state with each option's probability, through `/v1/decisions` and `/v1/systemone`. Within a day reads resumed from the cached state, shared their prompt passes, branched in one pass and took images ([docs](docs/serving.md#typed-decisions), [#119](https://github.com/iamwavecut/ninfer-all/pull/119), [#125](https://github.com/iamwavecut/ninfer-all/pull/125), [#126](https://github.com/iamwavecut/ninfer-all/pull/126), [#128](https://github.com/iamwavecut/ninfer-all/pull/128), [#130](https://github.com/iamwavecut/ninfer-all/pull/130)).
-- **2026-10-22:** YaRN for every model family from one rope-scaling resolver; Flash-Next runs past its native window ([#122](https://github.com/iamwavecut/ninfer-all/pull/122), [#123](https://github.com/iamwavecut/ninfer-all/pull/123)).
-- **2026-10-20:** CPU and GPU compute one layer's experts at once: CPU threads multiply a share of the experts the GPU cache lacks, bit for bit with the GPU's kernels, while the GPU copies and runs the rest. Strata's expert tier, routing profiles and KV memory lending reach every MoE family ([CPU share](docs/qwen3-8-flash-next.md#the-cpu-share), [#103](https://github.com/iamwavecut/ninfer-all/pull/103), [#108](https://github.com/iamwavecut/ninfer-all/pull/108), [#110](https://github.com/iamwavecut/ninfer-all/pull/110), [#112](https://github.com/iamwavecut/ninfer-all/pull/112), [#116](https://github.com/iamwavecut/ninfer-all/pull/116)).
-- **2026-10-18:** The hybrid prefix cache is the server default: in an agent session at 131K tokens of context the mean time to the first token fell from 98 to 56 s. Ports from the upstream review speed up prefill and experts ([#98](https://github.com/iamwavecut/ninfer-all/pull/98), [#99](https://github.com/iamwavecut/ninfer-all/pull/99), [#100](https://github.com/iamwavecut/ninfer-all/pull/100), [#101](https://github.com/iamwavecut/ninfer-all/pull/101), [#102](https://github.com/iamwavecut/ninfer-all/pull/102)).
-- **2026-10-17:** Pipelines across GPU architectures: one build carries the code of several architectures and runs every card on its own, so the pipeline stages of one model can mix, for example, a Tesla V100, a TITAN RTX and RTX 30 or 40 series cards ([several architectures](docs/build-linux.md#cards-of-several-architectures-in-one-pipeline), [#92](https://github.com/iamwavecut/ninfer-all/pull/92), [#93](https://github.com/iamwavecut/ninfer-all/pull/93)).
-- **2026-10-16:** Built-in device profiles for 36 more GPU models; a card without one calibrates itself at the first start ([supported GPUs](docs/gpus.md), [#88](https://github.com/iamwavecut/ninfer-all/pull/88)). Gemma 4 and native Qwen MoE experts stream from host memory and disk ([#80](https://github.com/iamwavecut/ninfer-all/pull/80), [#81](https://github.com/iamwavecut/ninfer-all/pull/81)); the engine holds a GPU clock floor while it runs ([#69](https://github.com/iamwavecut/ninfer-all/pull/69)).
-- **2026-10-14:** Turing (`sm_75`): the TITAN RTX and the RTX 20 series ([TITAN RTX](docs/performance/titan-rtx-2026-10.md), [#68](https://github.com/iamwavecut/ninfer-all/pull/68), [#71](https://github.com/iamwavecut/ninfer-all/pull/71)).
-- **2026-10-12:** Volta (`sm_70`): the Tesla V100, where Gemma 4 decodes 168 tok/s against llama.cpp's 120 ([Tesla V100](docs/performance/tesla-v100-2026-10.md), [#58](https://github.com/iamwavecut/ninfer-all/pull/58), [#60](https://github.com/iamwavecut/ninfer-all/pull/60), [announcement](https://t.me/WaveCut_Vibin/587)).
-- **2026-10-11:** Gemma 4 26B-A4B, the third model family: Google's QAT GGUF block for block, with its MTP assistant, images and video, every KV format and up to eight requests; 291 tok/s in chat on an RTX 3090, against llama.cpp's 202 with the same drafter ([model](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3), [docs](docs/gemma4.md), [#45](https://github.com/iamwavecut/ninfer-all/pull/45), [#47](https://github.com/iamwavecut/ninfer-all/pull/47), [#50](https://github.com/iamwavecut/ninfer-all/pull/50), [#52](https://github.com/iamwavecut/ninfer-all/pull/52)).
-- **2026-10-06:** Qwen3.8-Flash-Next (the Qwen4 preview), the second model family: the GSQ-RCO GGUF releases with their experts on the GPUs, in pinned host memory or streamed from disk, measured on RTX 3090, 4090, 5090 and PRO 6000; MTP, context lookup and faster host decode followed within four days ([docs](docs/qwen3-8-flash-next.md), [#14](https://github.com/iamwavecut/ninfer-all/pull/14), [#17](https://github.com/iamwavecut/ninfer-all/pull/17), [#22](https://github.com/iamwavecut/ninfer-all/pull/22), [#29](https://github.com/iamwavecut/ninfer-all/pull/29), [announcement](https://t.me/WaveCut_Vibin/569)).
-- **2026-09-26:** NInfer-all: the fork takes its name and runs ISTA-DASLab's Qwen3.8-27B GSQ-RCO IQ3_S GGUF in its own blocks; one runtime for the RTX 30, 40 and 50 series with measured device profiles, YaRN to 1,048,576 tokens, the `rk4v4`, `rk4v4-e8` and `rk2v4-e8` KV formats, a context cache in host memory and on disk that survives restarts, up to 15 MTP drafts and a built-in WebUI ([model](https://huggingface.co/WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3), [announcement](https://t.me/WaveCut_Vibin/558)).
-- **2026-09-23:** Ternary Bonsai 2 27B on one RTX 3090: up to 237 tok/s in chat and 295 on GSM8K, with the whole 262,144-token context in 24 GB, from a 2-bit ternary format and Bonsai-trained MTP and DFlash2 heads ([model](https://huggingface.co/WaveCut/Ternary-Bonsai-2-27B-NInfer-v3), [announcement](https://t.me/WaveCut_Vibin/556)).
+- **2026-10-25:** Fixed a race in the expert cache of host and disk experts: a decode miss could overwrite a lent slot its own call still read, which [changed DeepSeek-V4.1-Flash's log probabilities by up to 0.024](docs/deepseek-v41.md#prompt-spans) after an earlier request.
+- **2026-10-25:** DeepSeek-V4.1-Flash prefills in [spans of up to 16,384 tokens](docs/deepseek-v41.md#prompt-spans): 925 tok/s for 8,086 tokens on an RTX 4090, from 498.
+- **2026-10-25:** [DeepSeek-V4.1-Flash](docs/deepseek-v41.md) from ISTA-DASLab's GSQ-RCO IQ1_M GGUF, experts in host memory or on disk: [48 tok/s on one RTX PRO 6000, 26 on one RTX 4090](docs/performance.md#deepseek-v41-flash).
+- **2026-10-25:** `--tensor-parallel` for dense Qwen3.5-core models.
+- **2026-10-24:** [Flint](docs/flint.md#measurements) decodes 348 tok/s on an RTX 5090 and 210 on an RTX 4090 with host experts.
+- **2026-10-23:** [Flint](docs/flint.md) from Unsloth's UD-Q4_K_XL GGUF.
+- **2026-10-23:** [Native releases](https://github.com/iamwavecut/ninfer-all/releases) for Windows and Debian 13 with CUDA 12.9 and 13.4.
+- **2026-10-22:** [Typed decisions](docs/serving.md#typed-decisions): `/v1/decisions` and `/v1/systemone`.
+- **2026-10-22:** YaRN for every model family.
+- **2026-10-20:** [CPU threads compute a share of host experts](docs/qwen3-8-flash-next.md#the-cpu-share) beside the GPU.
+- **2026-10-18:** The hybrid prefix cache is the server default.
+- **2026-10-17:** [Pipeline stages across GPU architectures](docs/build-linux.md#cards-of-several-architectures-in-one-pipeline) in one build.
+- **2026-10-16:** [Device profiles](docs/gpus.md) for 36 more GPUs; Gemma 4 and Qwen MoE experts in host memory or on disk.
+- **2026-10-14:** Turing (`sm_75`): the [TITAN RTX](docs/performance/titan-rtx-2026-10.md) and RTX 20 series.
+- **2026-10-12:** Volta (`sm_70`): the [Tesla V100](docs/performance/tesla-v100-2026-10.md).
+- **2026-10-11:** [Gemma 4 26B-A4B](docs/gemma4.md) with MTP, images and video.
+- **2026-10-06:** [Qwen3.8-Flash-Next](docs/qwen3-8-flash-next.md), experts on the GPU, in host memory or on disk.
+- **2026-09-26:** NInfer-all and [Qwen3.8-27B GSQ-RCO IQ3_S](https://huggingface.co/WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3).
+- **2026-09-23:** [Ternary Bonsai 2 27B](https://huggingface.co/WaveCut/Ternary-Bonsai-2-27B-NInfer-v3) on one RTX 3090.
 
 ## Quick start
 
@@ -282,8 +284,11 @@ the card caches as many as fit:
 | RTX 4090 | 7% | 25.9 | 22.2 | 490 | 8.5 |
 | RTX 3090 | | 21.8 | 18.9 | 410 | 7.4 |
 
-On the RTX 3090's host Strata decodes the same GGUF at 3.9 tok/s on one GPU and 6.6 on two
-([measurements](docs/deepseek-v41.md#measurements)). With host experts the server peaks at 116 GiB of host memory.
+These ran prompts chunk by chunk; prompt spans now prefill the 8,086 tokens at 906 tok/s on the
+RTX 4090. On one RTX 4090 host, Strata 0.2.6 decodes the same GGUF at 34 to 40 tok/s, computing
+about half the experts on its CPU threads, against NInfer's 22 to 26, and prefills at 635 to 690
+tok/s against NInfer's 925 ([measurements](docs/deepseek-v41.md#measurements)). With host experts
+the server peaks at 116 GiB of host memory.
 
 </details>
 
@@ -342,9 +347,10 @@ On the RTX 3090's host Strata decodes the same GGUF at 3.9 tok/s on one GPU and 
   RAM, up to eight concurrent requests with prefix reuse through host memory, reasoning, DSML
   tool calls, structured output, typed decisions and context-lookup drafting. Its 106.7 GiB of
   routed experts stay in pinned host memory or in the artifact's files, read into bounded
-  buffers rather than mapped. On one RTX 3090 with its experts in host memory it decodes at 21.8
-  tok/s, 18.9 after an 8,086-token prompt that it prefills at 410 tok/s, against Strata's 3.9, 3.9
-  and 380 on the same host (6.6, 8.0 and 333 on two GPUs)
+  buffers rather than mapped. Prompts run block by block in spans of up to 16,384 tokens, so each
+  block's experts cross the bus once per span. On one RTX 4090 with its experts in host memory it
+  decodes at 22 to 26 tok/s and prefills 8,086 tokens at 925 tok/s; on the same host Strata 0.2.6
+  decodes at 34 to 40 tok/s and prefills at 635 to 690
   ([DeepSeek-V4.1-Flash](docs/deepseek-v41.md)).
 - **CPU share of host and disk experts.** With Flash-Next, Gemma 4, Flint or native Qwen3.5/3.6
   MoE experts off the GPU, CPU threads compute a share of each decode call's cache misses from host
