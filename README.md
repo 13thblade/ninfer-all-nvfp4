@@ -19,6 +19,8 @@
 3. **把 W4A16 和 W4A8-int 通路的开关接进 `ninfer-calibrate`**，最优化性能校准可在目标设备上首次启动时实测得出。
 4. 顺带优化了无原生 FP4 路径的 KV NVFP4 和 k8v4 的性能。
 
+本 fork 改动的上游文件不逐个在源码里标注，完整清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
+
 ### 吞吐
 
 全程同一个制品（`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`，带 proposal 头），RTX 3090 Ti，贪心解码，KV bf16，16,384 token 上下文，`--device-profile calibrate`，prefill 由 4K 的长 prompt 测出，decode 速度来自于多个真实场景下测得的均值。
@@ -72,6 +74,8 @@ Four changes, in order:
 3. **The W4A16 and W4A8-int route switches wired into `ninfer-calibrate`**, so the optimal performance calibration is measured on first start on the target device.
 4. Alongside them, **KV-cache performance for NVFP4 and k8v4 on cards without a native FP4 path** was improved as well.
 
+The upstream files this fork modifies are not marked one by one in the sources; the full list is in [MODIFICATIONS.md](MODIFICATIONS.md). Untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git log. This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license.
+
 ## Throughput
 
 Same artifact throughout (`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`, proposal head) on an RTX 3090 Ti: greedy decoding, KV bf16, 16,384-token context, `--device-profile calibrate`. Prefill is measured on the 4K long prompt; decode is the mean over several realistic tasks.
@@ -106,7 +110,7 @@ The kernels for both the W4A16 and W4A8-int routes are complete, and broad testi
 
 ---
 
-**This is the upstream original documentation.**
+# This is the upstream original documentation.
 
 # NInfer-all
 
