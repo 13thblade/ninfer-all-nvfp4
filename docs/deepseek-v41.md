@@ -206,7 +206,7 @@ for a 24 GB card (all 6 experts, its DSpark drafter left unloaded), on one GPU a
 |---|---:|---:|---:|---:|
 | NInfer, experts in pinned RAM | 21.8 tok/s | 18.9 tok/s | 410 tok/s | 33 s |
 | NInfer, experts in pinned RAM, `--lookup-ngram 4` | 22.1 tok/s | 18.0 tok/s | 416 tok/s | |
-| NInfer, experts on disk, page cache warm | 7.4 tok/s | 7.4 tok/s | 117 tok/s | 20 s |
+| NInfer, experts on disk, page cache warm | 7.4 tok/s | 7.4 tok/s | 117 tok/s | 13 s |
 | Strata, 1 GPU | 3.9 tok/s | 3.9 tok/s | 380 tok/s | about 34 s |
 | Strata, 2 GPUs | 6.6 tok/s | 8.0 tok/s | 333 tok/s | about 34 s |
 
@@ -221,11 +221,13 @@ for a 24 GB card (all 6 experts, its DSpark drafter left unloaded), on one GPU a
   the same greedy tokens for both prompts.
 - **Context lookup.** On the long prompt 1 of 6 drafts was accepted: a summary repeats little of
   its source.
-- **Startup.** With host experts the weights took 26.0 s (4.3 GiB/s: eight threads reading past
-  the page cache into ordinary pages, pinned once read), and the server was ready 33 s after it
-  started, its expert cache filled from the built-in routing profile; stopping it took 15 s. That
-  run produced the host row's tokens for both prompts, at 22.2 and 19.3 tok/s of decode and 419
-  tok/s of prefill.
+- **Startup.** The ready times come from the current build, whose expert cache starts from the
+  built-in routing profile. With host experts the weights took 26.0 s (4.3 GiB/s: eight threads
+  reading past the page cache into ordinary pages, pinned once read), the server was ready 33 s
+  after it started, and stopping it took 15 s; that run produced the host row's tokens for both
+  prompts, at 22.2 and 19.3 tok/s of decode and 419 tok/s of prefill. With disk experts the server
+  was ready in 13 s and produced the same tokens, at 8.7 and 7.4 tok/s of decode and 120 tok/s of
+  prefill. Host and disk experts score the WikiText slice to the same perplexity, 3.067.
 
 Each row is one run; no spread is measured.
 
