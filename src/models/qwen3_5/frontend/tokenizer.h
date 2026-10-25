@@ -132,9 +132,9 @@ struct BoundaryEncodedText {
 
 class OrdinaryRunCache;
 
-// The pre-tokenizer of a byte-level tokenizer: Qwen's one split, or Flint's three (digits in
-// groups of up to three, CJK runs, o200k's words).
-enum class ByteLevelSplit : std::uint8_t { Qwen, Flint };
+// The pre-tokenizer of a byte-level tokenizer: Qwen's one split, or Flint's or DeepSeek's three
+// (digits in groups of up to three, CJK runs, then o200k's words or DeepSeek's).
+enum class ByteLevelSplit : std::uint8_t { Qwen, Flint, DeepSeek };
 
 class Tokenizer {
 public:

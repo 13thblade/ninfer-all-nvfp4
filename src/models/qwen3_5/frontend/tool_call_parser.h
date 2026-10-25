@@ -108,6 +108,11 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
 
 [[nodiscard]] bool has_strict_tools(const ToolCallOutputContract& contract) noexcept;
 
+// A strict tool's parameters' JSON Schema, normalized, under which its arguments are generated. A
+// schema strict arguments cannot honor (unsupported, not an object, or uniqueItems, which only the
+// final-response path enforces) throws std::invalid_argument.
+[[nodiscard]] std::string strict_tool_parameters_schema(const ToolCallOutputContract::Tool& tool);
+
 // For a response without a structured final format: free text in which every tool call follows
 // the envelope above, starting inside the forced call when the prompt opened one. An XGrammar
 // structural-tag format. A strict tool's schema that strict arguments cannot honor (unsupported,

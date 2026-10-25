@@ -64,6 +64,17 @@ role-marker chat template, reasoning the model opens itself, GLM-4.7 tool calls)
 sequences in prompt chunks of 2048 tokens with an F16 KV cache, drafts by context lookup only
 (`--lookup-ngram`; Recursive publishes no draft model), and has no vision, rotation scaling or
 pipeline stages.
+DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`; `src/models/deepseek_v41`,
+`runtime/engine/deepseek_v41_core`) is a fifth explicit family converted from ISTA-DASLab's
+GSQ-RCO GGUF (IQ1_M) and its Engram table GGUF with the ggml blocks kept as stored. It shares the
+Qwen3.5 frontend in a DeepSeek dialect (the converter's transcription of the release's encoder as
+its chat template, DSML tool calls, reasoning opened by the prompt), runs one to eight sequences in
+prompt chunks of 2048 tokens with BF16 caches, keeps the release's FP8/FP4 attention roundings,
+drafts by context lookup only (the GGUF has no draft blocks), and keeps its routed experts in pinned
+host memory or in the artifact's files (read into bounded buffers, never mapped), every miss copied
+to the GPU: its IQ1/IQ2 blocks have no CPU kernels. Its Engram table is embedded or a separate
+table artifact (`--ngram-table`), read a row at a time or held in RAM. No vision, rotation scaling,
+pipeline stages or tensor parallelism.
 Flash-Next's dense and attention arithmetic runs on the GPU. Of a decode or verification call's
 routed experts that the device cache lacks, CPU threads may compute a share from the host copy
 while the GPU copies and runs the rest (hybrid execution, `--expert-dma-share`), including a share

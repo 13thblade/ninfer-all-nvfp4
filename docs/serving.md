@@ -224,11 +224,11 @@ that needs them: the next token's mask, or in a speculative round one mask per d
 filled in parallel. Speculation is automatic: a constrained request verifies drafts (MTP,
 DFlash/DFlash2, a context lookup) while its masks take at most 4 ms, which the verification
 hides, and decodes without drafts while they cost more, resuming once they are cheap again.
-A costly mask holds only its own request. Gemma 4, Flint and Qwen3.8-Flash-Next run the decode step
+A costly mask holds only its own request. Gemma 4, Flint, DeepSeek-V4.1 and Qwen3.8-Flash-Next run the decode step
 without it: the row keeps its logits and samples once the mask is ready, while the other requests
 go on. The Qwen3.5 family computes such a request's next mask after each of its tokens and leaves
 the request out of decode rounds until the mask is ready. A mask over 5 s fails its request with
-an explicit error, and so does a Gemma 4, Flint or Flash-Next decoding request without a token for 120 s
+an explicit error, and so does a Gemma 4, Flint, DeepSeek-V4.1 or Flash-Next decoding request without a token for 120 s
 ([Gemma 4](gemma4.md#structured-output)). A generated token the grammar does not admit, which the
 masks should have excluded, fails its own request with an internal error (HTTP 500) and leaves
 the others running; in the Qwen3.5 family it still fails the whole engine when it arrives while
@@ -387,9 +387,11 @@ shows (`<parameter=NAME>`, a newline, the value, a newline, `</parameter>`): a s
 text and any other value JSON, required parameters appear, undeclared ones cannot, and the schema
 rules above apply. The schema must describe an object and cannot use `uniqueItems`. This holds
 with or without a response format; without one, text around the calls stays free and only the
-calls are constrained, starting inside the opened call when `tool_choice` forced it. Gemma 4
-and Flint refuse strict tools with HTTP 400, as their own tool-call markup has no grammar here;
-Flint also refuses a response format beside tools. Without
+calls are constrained, starting inside the opened call when `tool_choice` forced it. DeepSeek-V4.1's
+strict calls follow the same rules in its DSML form (`<｜DSML｜ parameter name="NAME"
+string="true">` for a string value, `string="false">` and the JSON for any other). Gemma 4 and
+Flint refuse strict tools with HTTP 400, as their own tool-call markup has no grammar here; Flint
+also refuses a response format beside tools. Without
 `--structured-output`, Chat Completions treats `strict` as the advisory flag OpenAI-compatible
 servers commonly do and runs the tool non-strict; Responses and Anthropic Messages refuse it with
 HTTP 400 `strict_tools_not_supported`, unless `--unconstrained-response-format` lets it run
@@ -999,8 +1001,8 @@ closed, when the turn published any content, when it ended at the output limit, 
 a stop string or a cancellation, or when prose, a quoted marker or a cut call follows the last
 call; the recovery pass for broken calls does not apply to thinking. Under strict tools the grammar
 admits the stop token only after the thinking closes, so a constrained turn never ends inside it.
-Gemma 4's and Flint's tool calls are read by their own decoders and are not recovered from their
-reasoning.
+Gemma 4's, Flint's and DeepSeek-V4.1's tool calls are read by their own decoders and are not
+recovered from their reasoning.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions. With `--assistant-prefill` a final assistant
@@ -1075,7 +1077,8 @@ Logs report the requested budget, and the effective budget when it differs. A re
 enforce its budget reports the requested value only. The server does not promise that the model will
 emit nonempty content or a tool call after the marker. `model_thinking_tokens` in the request log
 counts the model's thinking tokens for every Qwen thinking request, with or without a budget.
-Gemma 4 and Flint take no thinking budget and report 0.
+Gemma 4 and Flint take no thinking budget and report 0. DeepSeek-V4.1 counts its thinking tokens,
+and a reached budget closes its reasoning with the guidance and its `</think>` token, as Qwen's does.
 
 `--reasoning-loop off|stop|conclude` (default `off`) guards thinking-enabled requests against a
 model that keeps rewriting the same passages in its thinking, which token penalties do not catch
@@ -1096,7 +1099,8 @@ because every pass varies a little.
   thinking budget could not be enforced (early close unavailable, above), it stops instead.
 - **Gemma 4 and Flint.** The guard reads the thought channel (Flint: the `<think>` block) the
   model opens and counts its tokens. Neither has an early-close control, so `conclude` stops there
-  as `stop` does.
+  as `stop` does. DeepSeek-V4.1 concludes as Qwen does, with the same guidance and its own
+  `</think>` token.
 - It applies to constrained requests too (tool constraints, `response_format`): the control span
   goes through the same grammar-checked path as a thinking budget, so a constrained request can
   still answer or call a tool after `conclude`. With `stop`, a constrained request ends as an
@@ -1493,6 +1497,8 @@ passes, up to 64 blocks and `--prefill-chunk` tokens a pass. On Gemma 4 and Flin
 to 256 branches and 2048 tokens, each branch continuing the state in cache slots of its own; on
 Flint the state's last chunk runs in the first of these passes, ahead of the branches, when the
 first branch fits beside it, so a question about a new short state costs one pass. On
+DeepSeek-V4.1 the branches run one after another, each from a copy of the state, the state's last
+chunk first. On
 Flash-Next a pass holds up to `--prefill-chunk` tokens: each branch's recurrent layers start from
 the state at its end, and each layer's routed experts run over every branch's tokens at once, so a
 routed expert the device cache lacks crosses the bus once a pass. The state's last chunk runs in
@@ -1515,7 +1521,7 @@ keeps the drafter's state for generation requests, and over no question; Flash-N
 block over a read's prompt at all, and its cache images of such prompts serve only requests that
 do not draft. The reads are disposable: a read supersedes nothing it resumed from, keeps no cache
 tap or image past the state, the checkpoint catalog evicts the reads' own continuations first, and
-they start no session lineage under `--derive-session-keys`. Gemma 4, Flint and Flash-Next keep an image
+they start no session lineage under `--derive-session-keys`. Gemma 4, Flint, DeepSeek-V4.1 and Flash-Next keep an image
 of the state at its boundary in their host store when copying it back costs less than computing it
 again, and requests submitted as one group are admitted together, so the first to reach the
 boundary stores the state and the others resume from it.
@@ -1734,7 +1740,8 @@ A forced selection names one function: `tool_choice` naming it directly, `requir
 generation prompt with that call's opener in the model's own call syntax, so the answer can only
 continue inside the call: `<tool_call>\n<function=NAME>\n` for Qwen, `<|tool_call>call:NAME{` for
 Gemma 4, where `<|tool_call>` is the special token the chat template writes for an earlier call,
-and `<tool_call>NAME` for Flint. It
+`<tool_call>NAME` for Flint, and `\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="NAME">\n` for
+DeepSeek-V4.1. It
 therefore requires a fresh answer position and a prompt without a thinking block: reasoning that
 the request itself enables is rejected with `tool_choice_not_supported`, while reasoning that only a
 default turns on, the server's or the chat template's, is switched off for that request. `required`

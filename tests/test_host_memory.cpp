@@ -9,8 +9,8 @@
 namespace {
 
 using ninfer::ContextCacheOptions;
-using ninfer::runtime::cgroup_limit_bytes;
-using ninfer::runtime::cgroup_remaining_bytes;
+using ninfer::cgroup_limit_bytes;
+using ninfer::cgroup_remaining_bytes;
 using ninfer::runtime::resolve_auto_host_cache;
 
 constexpr std::uint64_t kMiB = 1ULL << 20;

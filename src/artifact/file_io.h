@@ -3,12 +3,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
 #include <span>
 
 namespace ninfer::artifact {
 
 // Direct reads require aligned offsets and buffers. A short final direct block is allowed;
-// read_exact always requires the complete requested byte range.
+// read_exact always requires the complete requested byte range. Both may run on several threads
+// at once.
 class InputFile {
 public:
     explicit InputFile(std::filesystem::path path);
@@ -24,6 +26,7 @@ public:
 
 private:
     std::filesystem::path path_;
+    mutable std::mutex direct_open_; // the direct handle opens on the first direct read
 #ifdef _WIN32
     // Win32 HANDLEs, kept opaque so this header does not pull in <windows.h>.
     void* file_                = nullptr;

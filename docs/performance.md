@@ -888,6 +888,24 @@ llama.cpp keeps the experts of its first four blocks on the CPU (`-ncmoe 4`, the
 [Flint's measurements](flint.md#measurements) name the hosts and add disk experts and context
 lookup.
 
+## DeepSeek-V4.1-Flash
+
+ISTA-DASLab's GSQ-RCO IQ1_M GGUF with its Engram table
+([artifact](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3)), BF16
+caches, `ninfer-serve` with one request, greedy, thinking off. Strata 0.1.50 (`strata-dsv41`) on the
+same GGUF and prompt tokens, all 6 experts. One host: RTX 3090s at 350 and 390 W, a Threadripper
+3960X and 251 GB of RAM:
+
+| Engine and placement | Decode, short answer | after 8,086 tokens | Prefill of 8,086 tokens |
+|---|---:|---:|---:|
+| NInfer, 1 GPU, host experts | 21.8 | 18.9 | 410 |
+| NInfer, 1 GPU, disk experts, page cache warm | 7.4 | 7.4 | 117 |
+| Strata, 1 GPU | 3.9 | 3.9 | 380 |
+| Strata, 2 GPUs | 6.6 | 8.0 | 333 |
+
+[DeepSeek-V4.1-Flash's measurements](deepseek-v41.md#measurements) add context lookup, startup
+and what limits each engine.
+
 ## Measurement pages
 
 | Page | What it measures | Hardware |

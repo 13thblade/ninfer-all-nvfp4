@@ -25,7 +25,7 @@ namespace ninfer::test {
 // space and competes with it.
 [[nodiscard]] inline bool is_capacity_shortfall(std::string_view message) noexcept {
     return message.find("available for runtime capacity") != std::string_view::npos ||
-           message.find("cudaMallocHost failed to pin") != std::string_view::npos ||
+           message.find("failed to pin") != std::string_view::npos ||
            message.find("failed to reserve the host KV cache") != std::string_view::npos;
 }
 

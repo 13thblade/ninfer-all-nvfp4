@@ -124,6 +124,7 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
         throw ArtifactError(path_.string() + ": unaligned direct read");
     }
     if (destination.empty()) { return 0; }
+    std::unique_lock lock(direct_open_);
     if (direct_file_ == nullptr) {
         // FILE_FLAG_NO_BUFFERING is the Windows O_DIRECT: sector-aligned offsets, sizes and
         // buffers, which the checks above already guarantee for the 4096-byte payload alignment.
@@ -135,6 +136,7 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
         if (file == INVALID_HANDLE_VALUE) { fail(path_, "CreateFileW direct", ::GetLastError()); }
         direct_file_ = file;
     }
+    lock.unlock();
     // ReadFile takes a DWORD count; stay a whole number of aligned blocks below 4 GiB.
     constexpr std::size_t kMaximumRequest = 1ULL << 30U;
     std::size_t total                     = 0;
@@ -202,9 +204,13 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
         throw ArtifactError(path_.string() + ": unaligned or oversized direct read");
     }
     if (destination.empty()) { return 0; }
-    if (direct_fd_ < 0) {
-        direct_fd_ = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-        if (direct_fd_ < 0) { fail(path_, "open direct"); }
+    {
+        const std::lock_guard lock(direct_open_);
+        if (direct_fd_ < 0) {
+            const int fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+            if (fd < 0) { fail(path_, "open direct"); }
+            direct_fd_ = fd;
+        }
     }
     ssize_t read;
     do {

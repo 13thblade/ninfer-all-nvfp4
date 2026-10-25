@@ -1,8 +1,8 @@
 # NInfer-all
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
-their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next, Gemma 4 26B-A4B and Recursive's Flint,
-on NVIDIA GPUs from Volta to consumer Blackwell, from 8 GB of memory. It serves the OpenAI, Anthropic
+their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next, Gemma 4 26B-A4B, Recursive's Flint and
+DeepSeek-V4.1-Flash, on NVIDIA GPUs from Volta to consumer Blackwell, from 8 GB of memory. It serves the OpenAI, Anthropic
 and llama.cpp APIs from one GPU, or from up to eight as pipeline stages on Linux. The same chat model
 answers [typed decisions](docs/serving.md#typed-decisions): choice, yes/no and score questions about
 a state, each option with its probability, through TypeSafe's System One and OpenAI's Decisions APIs.
@@ -248,7 +248,7 @@ Prefill of a 4,463-token prompt, in tok/s:
 *Click a section to expand it.*
 
 <details>
-<summary><b>Models and weight formats</b> — Qwen3.5 family, GGUF block formats, Ternary Bonsai 2, Flash-Next, Gemma 4, Flint</summary>
+<summary><b>Models and weight formats</b> — Qwen3.5 family, GGUF block formats, Ternary Bonsai 2, Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash</summary>
 
 - **Qwen3.5 family.** Dense and MoE (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`) with MTP,
   DFlash (35B-A3B) and DFlash2 (Qwen3.8-27B) drafters, Vision for images and video, and
@@ -291,6 +291,17 @@ Prefill of a 4,463-token prompt, in tok/s:
   and 209 on the same GGUF; on an RTX 3090, with its experts in host memory, at 5,755, 161 and 140
   against llama.cpp's 2,553, 80 and 77 with four blocks' experts on the CPU
   ([Flint](docs/flint.md)).
+- **DeepSeek-V4.1-Flash.** DeepSeek's 40-block MoE (384 routed experts, 6 per token) from
+  ISTA-DASLab's GSQ-RCO IQ1_M GGUF, imported block for block, with its Engram table: four-stream
+  hyper-connections, latent attention over a 128-position window and indexer-selected compressed
+  latents with the release's FP8 and FP4 roundings, Engram rows read from the table's file or
+  RAM, up to eight concurrent requests with prefix reuse through host memory, reasoning, DSML
+  tool calls, structured output, typed decisions and context-lookup drafting. Its 106.7 GiB of
+  routed experts stay in pinned host memory or in the artifact's files, read into bounded
+  buffers rather than mapped. On one RTX 3090 with its experts in host memory it decodes at 21.8
+  tok/s, 18.9 after an 8,086-token prompt that it prefills at 410 tok/s, against Strata's 3.9, 3.9
+  and 380 on the same host (6.6, 8.0 and 333 on two GPUs)
+  ([DeepSeek-V4.1-Flash](docs/deepseek-v41.md)).
 - **CPU share of host and disk experts.** With Flash-Next, Gemma 4, Flint or native Qwen3.5/3.6
   MoE experts off the GPU, CPU threads compute a share of each decode call's cache misses from host
   memory while the GPU copies the rest, bit for bit equal to the GPU's products
@@ -311,8 +322,8 @@ Prefill of a 4,463-token prompt, in tok/s:
 - Gemma 4 drafts with Google's multi-token-prediction assistant (`--spec mtp`, 1 to 7 drafts), four
   blocks that read the model's own KV cache; its verification rows are bit for bit plain decode rows,
   so the output is the one plain decoding gives.
-- Flint, which has no published drafter, drafts by context lookup (`--lookup-ngram N`, 1 to 7
-  drafts): what followed the last N tokens' earlier occurrence, verified in one pass of decode rows.
+- Flint and DeepSeek-V4.1-Flash, which have no drafter, draft by context lookup (`--lookup-ngram N`,
+  1 to 7 drafts): what followed the last N tokens' earlier occurrence, verified in one pass of decode rows.
 - `--adaptive-mtp` picks each round's width from measured draft survival and round cost.
 - N-gram copy drafting beside the neural drafter (on with `--spec`) verifies up to 15 tokens copied
   from earlier prompt, tool-result or output text ([ngram copy proposals](docs/ngram.md)).
@@ -327,7 +338,8 @@ Prefill of a 4,463-token prompt, in tok/s:
   ([context and memory](docs/cli.md#context-and-memory)).
 - Up to 1,048,576 tokens of context, four times the native window, with plain RoPE or YaRN
   (`--rope-yarn`, for Qwen3.5, Qwen3.8-Flash-Next and Gemma 4; Flint's full-attention blocks carry
-  no rotation and take no scaling).
+  no rotation and DeepSeek-V4.1's compressed blocks the release's own YaRN, so neither takes
+  scaling).
 - A hybrid prefix cache by default, which shares content-addressed KV blocks and sparse state
   snapshots across requests on the device and in pinned host memory; or a checkpoint catalog
   (`--use-original-prefix-caching`) with an optional disk tier that survives restarts

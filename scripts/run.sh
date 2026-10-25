@@ -352,7 +352,7 @@ wait "$tee_pid"
 set -e
 trap - TERM INT
 if (( status != 0 && rung < 5 )) &&
-   grep -q -E 'runtime reservation requires|cudaMallocHost failed' "$server_log"; then
+   grep -q -E 'runtime reservation requires|failed to pin' "$server_log"; then
   next=$((rung + 1))
   next_context=$(( base_context * (8 - next) / 8 / 1024 * 1024 ))
   # The first step trims context only: an eighth of it frees more than a card that just misses

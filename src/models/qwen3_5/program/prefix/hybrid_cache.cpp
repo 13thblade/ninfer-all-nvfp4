@@ -73,7 +73,8 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
             const std::uint32_t slabs = std::min(slabs_per_chunk_, config.host_slabs - first);
             const std::size_t bytes   = static_cast<std::size_t>(slabs) * host.slab_bytes;
             try {
-                host_chunks_.emplace_back(bytes);
+                host_chunks_.push_back(std::make_unique<HostPages>(bytes));
+                host_chunks_.back()->pin();
             } catch (const std::exception& error) {
                 throw std::runtime_error("pinning the hybrid prefix cache Host tier failed after " +
                                          std::to_string(pinned >> 20U) + " of " +
@@ -263,7 +264,7 @@ StateImageHandle HybridPrefixCache::image(SnapshotRef snapshot) const {
 // ---- transfers ---------------------------------------------------------------------------------
 
 std::byte* HybridPrefixCache::slab(std::uint32_t id) const noexcept {
-    return static_cast<std::byte*>(host_chunks_[id / slabs_per_chunk_].data()) +
+    return static_cast<std::byte*>(host_chunks_[id / slabs_per_chunk_]->data()) +
            static_cast<std::size_t>(id % slabs_per_chunk_) * host_layout_.slab_bytes;
 }
 

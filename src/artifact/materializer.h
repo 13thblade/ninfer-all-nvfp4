@@ -3,6 +3,7 @@
 #include "artifact/schema.h"
 #include "artifact/selection.h"
 #include "core/arena.h"
+#include "core/host_pages.h"
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
 #include "core/vmm.h"
@@ -181,7 +182,7 @@ private:
     // a single-device load holds exactly one entry, which is the only one an offload-free model
     // ever touches.
     std::vector<std::unique_ptr<DeviceArena>> arenas_;
-    std::unique_ptr<PinnedHostBuffer> pinned_;
+    std::unique_ptr<HostPages> pinned_;
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;
 };
