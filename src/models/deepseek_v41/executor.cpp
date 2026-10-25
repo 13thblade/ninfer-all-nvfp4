@@ -20,6 +20,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <numbers>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -91,7 +92,8 @@ std::vector<float> rope_freq(int dim, float base, std::uint32_t original, float 
     }
     if (original == 0) { return f; }
     const auto corrected = [&](double rotations) {
-        return dim * std::log(double(original) / (rotations * 2 * M_PI)) / (2 * std::log(double(base)));
+        return dim * std::log(double(original) / (rotations * 2 * std::numbers::pi)) /
+               (2 * std::log(double(base)));
     };
     const double low  = std::max(std::floor(corrected(beta_fast)), 0.0);
     const double high = std::min(std::ceil(corrected(beta_slow)), double(dim - 1));
