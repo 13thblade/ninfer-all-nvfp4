@@ -605,7 +605,9 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                                      static_cast<std::uint64_t>(T));
     if (proposal_head_ != nullptr) {
-        Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
+        Tensor proposal_logits =
+            work_.alloc(fp32_proposal_logits(*proposal_head_) ? DType::FP32 : DType::BF16,
+                        {proposal_head_n_, T});
         project(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
         ops::argmax(proposal_logits, proposal_tokens,
                     proposal_head_ids_
@@ -617,7 +619,9 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
                                           ctx_.stream);
         }
     } else {
-        Tensor output_logits = matrix_window(logits, T);
+        Tensor output_logits = fp32_proposal_logits(mtp_->output_head)
+                                   ? work_.alloc(DType::FP32, {dimension(config_.vocab_size), T})
+                                   : matrix_window(logits, T);
         project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
         ops::argmax(output_logits, proposal_tokens,
                     dimension(parameters_.model.resources().public_token_count), ctx_.stream);
@@ -1577,7 +1581,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         mtp_proposal_extent_ > static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
         throw std::logic_error("MTP proposal extent exceeds the configured draft window");
     }
-    int t0 = 0;
+    int t0          = 0;
+    bool token_left = false;
     for (; t0 < T;) {
         int len = std::min(chunk, T - t0);
         if (split_rel > 0 && t0 < split_rel && t0 + len > split_rel) { len = split_rel - t0; }
@@ -1727,6 +1732,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     ops::argmax(logits, io_.token,
                                 dimension(parameters_.model.resources().public_token_count), s);
                 }
+                if (first_token_hook_) {
+                    first_token_hook_();
+                    token_left = true;
+                }
             }
 
             if (prepare_mtp_prompt) {
@@ -1839,9 +1848,12 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
     prefill_split_frontier_ = -1;
 
-    timing.begin_wait();
-    ctx_.synchronize();
-    timing.end_wait();
+    // A token that has left is waited for by the caller; the drafter's work behind it is not.
+    if (!token_left) {
+        timing.begin_wait();
+        ctx_.synchronize();
+        timing.end_wait();
+    }
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T,

@@ -1051,6 +1051,7 @@ ContinuationHandle ProgramImpl::restore_continuation(std::span<const std::uint8_
         sequence.dflash_context_frontier = 0;
         sequence.rope_delta              = session.rope_delta;
         sequence.mtp_draft_count         = 0;
+        sequence.mtp_drafts_pending      = false;
         sequence.tail_hidden_valid       = session.tail_hidden_valid != 0;
         sequence.endpoint_valid          = true;
         sequence.rewrite_checkpoint      = {};

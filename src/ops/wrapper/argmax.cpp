@@ -33,7 +33,9 @@ std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
 }
 
 bool validate(const Tensor& logits, const Tensor& out, std::int32_t valid_rows) {
-    if (logits.dtype != DType::BF16) { throw std::invalid_argument("argmax: logits must be BF16"); }
+    if (logits.dtype != DType::BF16 && logits.dtype != DType::FP32) {
+        throw std::invalid_argument("argmax: logits must be BF16 or FP32");
+    }
     if (out.dtype != DType::I32) { throw std::invalid_argument("argmax: out must be I32"); }
 
     const std::int64_t logits_n = numel_allow_zero(logits, "logits");
@@ -77,6 +79,7 @@ void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStre
 void argmax_top2(const Tensor& logits, Tensor& first, Tensor& second,
                  std::int32_t valid_rows, cudaStream_t stream) {
     if (valid_rows < 2) { throw std::invalid_argument("argmax_top2 needs at least two tokens"); }
+    if (logits.dtype != DType::BF16) { throw std::invalid_argument("argmax_top2: logits must be BF16"); }
     const bool populated = validate(logits, first, valid_rows);
     (void)validate(logits, second, valid_rows);
     if (!populated) { return; }

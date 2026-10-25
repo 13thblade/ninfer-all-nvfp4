@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
+#include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
@@ -516,9 +517,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {
-            matrix(layout, DType::BF16, dimension(parameters.proposal->rows), columns);
-            linear_scratch(layout, parameters.proposal->head, columns, columns);
+            const auto& head = parameters.proposal->head;
+            matrix(layout, execution::fp32_proposal_logits(head) ? DType::FP32 : DType::BF16,
+                   dimension(parameters.proposal->rows), columns);
+            linear_scratch(layout, head, columns, columns);
         } else {
+            if (execution::fp32_proposal_logits(parameters.mtp->output_head)) {
+                matrix(layout, DType::FP32, dimension(config.vocab_size), columns);
+            }
             linear_scratch(layout, parameters.mtp->output_head, columns, columns);
         }
     };

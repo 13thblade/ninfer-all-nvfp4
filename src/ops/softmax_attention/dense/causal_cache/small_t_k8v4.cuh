@@ -670,13 +670,8 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
     const float head_l = causal_merge_split_statistics<Geometry>(
         partial_m, partial_l, q_head, token, tokens, active_splits, weights, warp_sums, scalars);
 
-    float numerator = 0.0F;
-    for (int split = 0; split < active_splits; ++split) {
-        if (weights[split] != 0.0f)
-            numerator +=
-                partial_acc[causal_partial_acc_index<Geometry>(q_head, tid, token, split, tokens)] *
-                weights[split];
-    }
+    const float numerator = causal_weighted_split_sum<Geometry>(partial_acc, weights, q_head, tid,
+                                                                token, tokens, active_splits);
     normalized[tid] = head_l > 0.0F ? numerator / head_l : 0.0F;
     __syncthreads();
 

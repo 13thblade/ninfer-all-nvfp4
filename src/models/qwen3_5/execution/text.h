@@ -140,6 +140,11 @@ public:
     // `count` ids of io.readout_ids, read into io.readout_values; zero reads nothing.
     void set_readout(std::int32_t count) noexcept { readout_count_ = count; }
 
+    // Runs right after a finalizing chunk samples its token, before the drafter's work on the
+    // chunk: it enqueues the token's copies to the host. The chunk then returns without waiting for
+    // that work, which the stream orders before anything later.
+    void set_first_token_hook(std::function<void()> hook) { first_token_hook_ = std::move(hook); }
+
     void set_rope_yarn(const ops::RopeYarn& yarn) noexcept { rope_yarn_ = yarn; }
 
     // Keys before its first query that the MTP draft attention reads past its one-page sink;
@@ -375,6 +380,7 @@ private:
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
     std::int32_t readout_count_                 = 0;
+    std::function<void()> first_token_hook_;
     ops::RopeYarn rope_yarn_;
     std::uint32_t mtp_attention_window_         = 0;
     const MtpParameters* mtp_                   = nullptr;
