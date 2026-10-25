@@ -151,10 +151,9 @@ on `PATH` and `NINFER_SHARED_RUNTIME=ON` in the build. It packages all six comma
 licences and launchers into `.7z.001` volumes of at most 1900 MiB. Download every volume of one
 package into the same folder and extract the first with 7-Zip. Keep the backend subdirectories intact.
 
-`BUILD-INFO.json` records the source revision, source modifications, CUDA version and device images.
-Archive names use the platform, CUDA version, GPU architectures and 12-character source commit,
+`BUILD-INFO.json` records the version, source revision, source modifications, CUDA version and device
+images. Archive names use the platform, CUDA version, GPU architectures and 12-character source commit,
 for example `ninfer-windows-x64-cuda13.4-sm75-80-86-89-120a-0123456789ab.7z.001`.
-`VERSION` is retained inside the package as source metadata; it is not part of the archive name.
 
 The previous static-EXE layout produced CUDA 13.4 executables of about 1.95 GB each, plus a 313 MB
 GGML DLL. Its package was 6.73 GB unpacked and 6.37 GB archived. The shared-runtime layout removes

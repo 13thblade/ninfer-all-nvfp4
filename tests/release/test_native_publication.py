@@ -20,7 +20,7 @@ with open(os.environ['GH_CALLS'], 'a') as log:
     log.write(json.dumps(args) + '\n')
 mode = os.environ.get('MODE', '')
 created_path = pathlib.Path(os.environ['GH_NOTES'] + '.created')
-tag = created_path.read_text() if created_path.exists() else 'native-' + os.environ['GITHUB_SHA'][:12]
+tag = created_path.read_text() if created_path.exists() else os.environ.get('EXISTING_TAG', os.environ['NINFER_VERSION'])
 if '--notes-file' in args:
     pathlib.Path(os.environ['GH_NOTES']).write_text(pathlib.Path(args[args.index('--notes-file')+1]).read_text())
 if args[0] == 'api':
@@ -32,7 +32,7 @@ if args[0] == 'api':
         stale = mode == 'superseded' or (mode == 'superseded-upload' and '"upload"' in calls)
         print('b' * 40 if stale else os.environ['GITHUB_SHA'])
     elif route.endswith('/git/matching-refs/tags/'):
-        print('[[]]')
+        print(json.dumps([[dict(ref='refs/tags/' + os.environ['NINFER_VERSION'])]] if mode == 'taken' else [[]]))
     elif route.endswith('/releases') and '--method' in args:
         data = json.loads(pathlib.Path(args[args.index('--input')+1]).read_text())
         created_path.write_text(data['tag_name'])
@@ -78,7 +78,8 @@ class NativePublicationTest(unittest.TestCase):
         self.notes = self.root / 'notes.md'
         self.env = dict(os.environ, PATH=f'{bindir}:{os.environ["PATH"]}',
                         GITHUB_SHA=SHA, GITHUB_REPOSITORY='test/ninfer',
-                        GITHUB_REF='refs/heads/master', GH_CALLS=str(self.calls), GH_NOTES=str(self.notes))
+                        GITHUB_REF='refs/heads/master', GH_CALLS=str(self.calls), GH_NOTES=str(self.notes),
+                        NINFER_VERSION='2026-10-23.1')
         for variant in VARIANTS:
             stem = f'ninfer-{variant}-{SHA[:12]}'
             extension = '7z' if variant.startswith('windows-') else 'tar.gz'
@@ -137,6 +138,19 @@ class NativePublicationTest(unittest.TestCase):
         self.assertFalse(any('--method' in c and 'POST' in c for c in calls))
         self.assertTrue(any(c[:2] == ['release', 'edit'] for c in calls))
 
+    def test_tag_taken_since_the_build_cannot_publish(self):
+        calls = self.run_publish('taken', success=False)
+        self.assertFalse(any(c[0] == 'release' or '--method' in c for c in calls))
+
+    def test_retry_under_another_tag_than_the_binaries_report_cannot_publish(self):
+        self.env['EXISTING_TAG'] = '2026-10-22.4'
+        calls = self.run_publish('draft', success=False)
+        self.assertFalse(any(c[0] == 'release' or '--method' in c for c in calls))
+
+    def test_publication_requires_the_tag_the_binaries_report(self):
+        del self.env['NINFER_VERSION']
+        self.assertEqual(self.run_publish(success=False), [])
+
     def test_notes_list_every_package_and_its_actual_volumes(self):
         stem = f'ninfer-linux-x64-cuda12.9-13.4-{SHA[:12]}'
         part = self.dist / f'{stem}.tar.gz.002'
@@ -149,7 +163,7 @@ class NativePublicationTest(unittest.TestCase):
         self.assertIn('Windows x64', notes)
         self.assertIn('Debian 13 x64', notes)
         tag = Path(str(self.notes) + '.created').read_text()
-        self.assertRegex(tag, r'^\d{4}-\d{2}-\d{2}\.1$')
+        self.assertEqual(tag, '2026-10-23.1')
         for variant in VARIANTS:
             name = f'ninfer-{variant}-{SHA[:12]}'
             extension = '7z' if variant.startswith('windows-') else 'tar.gz'

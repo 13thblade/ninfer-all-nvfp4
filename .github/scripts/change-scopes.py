@@ -4,7 +4,7 @@ import sys
 
 SCOPES = ('changed', 'native', 'calculator', 'host', 'includes', 'linux_scripts', 'linux_runtime', 'python', 'docker', 'release_tools')
 COMPILER_INPUTS = {
-    'CMakeLists.txt', 'CMakePresets.json', '.gitmodules', 'VERSION',
+    'CMakeLists.txt', 'CMakePresets.json', '.gitmodules',
     '.github/scripts/configure-linux-build.sh', '.github/scripts/patch-cuda12-glibc.py',
     '.github/scripts/install-linux-release-tools.sh',
     '.github/workflows/native-linux.yml', '.github/workflows/native-windows.yml',

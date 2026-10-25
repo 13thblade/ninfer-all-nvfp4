@@ -35,6 +35,18 @@ class ReleaseTagTest(unittest.TestCase):
                     dict(tag_name='2026-10-23.1', target_commitish=SHA, id=1, draft=False)]
         self.assertEqual(TAG.select(releases, [], SHA, '2026-10-23'), ('2026-10-23.1', 1, False))
 
+    def test_publication_keeps_the_tag_the_build_reports(self):
+        refs = [{'ref': 'refs/tags/2026-10-23.1'}]
+        self.assertEqual(TAG.check([], refs, SHA, '2026-10-23.2'), ('2026-10-23.2', 0, True))
+        releases = [dict(tag_name='2026-10-23.2', target_commitish=SHA, id=5, draft=True)]
+        self.assertEqual(TAG.check(releases, refs, SHA, '2026-10-23.2'), ('2026-10-23.2', 5, True))
+        with self.assertRaisesRegex(SystemExit, 'released as 2026-10-23.2'):
+            TAG.check(releases, refs, SHA, '2026-10-24.1')
+        with self.assertRaisesRegex(SystemExit, 'taken by another release'):
+            TAG.check([], refs, SHA, '2026-10-23.1')
+        with self.assertRaisesRegex(SystemExit, 'Not a release tag'):
+            TAG.check([], refs, SHA, '')
+
 
 class ReleaseRetentionTest(unittest.TestCase):
     def setUp(self):

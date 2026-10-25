@@ -142,7 +142,7 @@ and its rounds):
 - **Host.** The experts are read from the artifact once at startup into pinned host memory, and a
   layer's misses are copied from there. The host needs that memory beside the Engram table's page
   cache (or its RAM copy) and the rest of the system: 106.7 GiB pinned, so a host with 128 GB
-  keeps about 12 GiB for everything else (not tested; the measurements below ran with 251 GB).
+  keeps about 12 GiB for everything else (not tested; the measurements below ran with 251 GB or more).
   The startup reads the experts with direct I/O, past the page cache, on eight threads into
   ordinary pages and pins them once read.
 - **Disk.** The experts stay in the artifact's files. A layer's misses are read with ordinary file
@@ -228,6 +228,33 @@ for a 24 GB card (all 6 experts, its DSpark drafter left unloaded), on one GPU a
   prompts, at 22.2 and 19.3 tok/s of decode and 419 tok/s of prefill. With disk experts the server
   was ready in 13 s and produced the same tokens, at 8.7 and 7.4 tok/s of decode and 120 tok/s of
   prefill. Host and disk experts score the WikiText slice to the same perplexity, 3.067.
+
+The same day, one rented host per card ran the native release build of `b3402a6fd` (the CUDA 13.4
+Linux archive; on the hosts' Ubuntu 26.04 with FFmpeg 7.1 from Debian 13) with the same prompts and
+server flags on one GPU: host experts first, then disk experts with the model file in the page
+cache. The server sizes the device expert cache to the card; the model has 15,360 routed experts:
+
+| card | host | experts | device cache | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens | ready to serve |
+|---|---|---|---:|---:|---:|---:|---:|
+| RTX PRO 6000 (600 W) | EPYC 9B14, PCIe 5.0 x16 | pinned RAM | 11,401 (74%) | 48.0 tok/s | 45.3 tok/s | 1,310 tok/s | 64 s |
+| | | disk, page cache warm | 11,431 | 37.4 tok/s | 33.4 tok/s | 431 tok/s | 29 s |
+| RTX 5090 (575 W) | EPYC 7B13, PCIe 4.0 x16 | pinned RAM | 2,251 (15%) | 29.2 tok/s | 22.5 tok/s | 499 tok/s | 34 s |
+| | | disk, page cache warm | 2,282 | 12.5 tok/s | 10.5 tok/s | 181 tok/s | 15 s |
+| RTX 4090 (450 W) | EPYC 7K62, PCIe 4.0 x16 | pinned RAM | 1,139 (7%) | 25.9 tok/s | 22.2 tok/s | 490 tok/s | 41 s |
+| | | disk, page cache warm | 1,169 | 8.5 tok/s | 7.3 tok/s | 123 tok/s | 14 s |
+
+- **The cache sets decode.** The RTX PRO 6000 keeps three quarters of the experts on the card and
+  copies the rest; the 24 and 32 GB cards keep 7 and 15% and copy every other routed expert over
+  PCIe 4.0, so they decode at 22 to 29 tok/s with host experts, 7 to 13 with disk experts.
+- **Placements agree on each card.** Host and disk experts produced the same tokens for both
+  prompts on every card. The short answer is 72 tokens on the RTX PRO 6000, 81 on the RTX 5090, 78
+  on the RTX 4090 and 82 on the RTX 3090: each card's device profile selects its own kernel routes,
+  which round differently.
+- **Memory.** The server peaked at 115.4 to 115.8 GiB of resident host memory with host experts
+  and 8.9 to 9.2 GiB with disk experts, and it fills the card in both placements.
+- **Startup.** With host experts the weights took 33.7 s on the RTX 4090 (3.34 GiB/s) and 53.6 s on
+  the RTX PRO 6000, whose read paused for 22 s at 95% on a host with 898 GB of its 1.5 TB in use
+  and its swap full.
 
 Each row is one run; no spread is measured.
 

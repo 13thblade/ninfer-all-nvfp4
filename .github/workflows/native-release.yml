@@ -66,9 +66,12 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Listing draft releases, whose tags reserve daily numbers, needs write access.
     permissions:
-      contents: read
+      contents: write
       actions: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -87,6 +90,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3.11 .github/scripts/wait-previous-builds.py
+      # The binaries report the tag they will be published under; publish checks it again.
+      - name: Allocate the release tag
+        id: version
+        if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || inputs.publish)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > releases.json
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/" > release-refs.json
+          read -r tag _ < <(python3.11 .github/scripts/native-release-tag.py \
+            --releases releases.json --refs release-refs.json --revision "$GITHUB_SHA")
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
 
   windows-objects:
     needs: validate
@@ -110,6 +125,7 @@ jobs:
       packages: ${{ matrix.toolkit.packages }}
       phase: objects
       shard: ${{ matrix.shard }}
+      version: ${{ needs.validate.outputs.version }}
     secrets:
       HF_BUILD_CACHE_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
 
@@ -136,6 +152,7 @@ jobs:
       archs: ${{ matrix.toolkit.archs }}
       packages: ${{ matrix.toolkit.packages }}
       phase: package
+      version: ${{ needs.validate.outputs.version }}
     secrets:
       HF_BUILD_CACHE_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
 
@@ -157,6 +174,7 @@ jobs:
       archs: ${{ matrix.archs }}
       runner: ${{ inputs.linux_runner == 'ninfer-native-debian13' && 'ninfer-native-debian13' || 'ubuntu-24.04' }}
       jobs: ${{ inputs.linux_runner == 'ninfer-native-debian13' && 32 || 4 }}
+      version: ${{ needs.validate.outputs.version }}
     secrets: inherit
 
   universal-linux:
@@ -262,7 +280,7 @@ jobs:
       publish: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || inputs.publish) }}
 
   publish:
-    needs: [windows, linux, universal-windows, universal-linux]
+    needs: [validate, windows, linux, universal-windows, universal-linux]
     if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || inputs.publish)
     runs-on: ubuntu-24.04
     permissions:
@@ -280,4 +298,5 @@ jobs:
       - name: Publish verified assets from this commit
         env:
           GH_TOKEN: ${{ github.token }}
+          NINFER_VERSION: ${{ needs.validate.outputs.version }}
         run: .github/scripts/publish-native-release.sh

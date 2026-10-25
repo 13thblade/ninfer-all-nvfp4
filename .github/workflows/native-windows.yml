@@ -21,6 +21,10 @@ on:
       count:
         type: number
         default: 8
+      version:
+        description: Release tag the binaries report; empty outside publication
+        type: string
+        default: ''
     secrets:
       HF_BUILD_CACHE_TOKEN:
         required: true
@@ -36,6 +40,7 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
       HF_BUILD_CACHE_SEED_REF: ${{ vars.HF_BUILD_CACHE_SEED_REF }}
       HF_HUB_DISABLE_TELEMETRY: '1'
+      NINFER_VERSION: ${{ inputs.version }}
       HF_CACHE_FAMILY: native-windows-cuda-${{ inputs.cuda }}-host-v2${{ inputs.phase == 'objects' && format('-shard-{0}', inputs.shard) || '' }}
       CCACHE_DIR: ${{ github.workspace }}/.cache/objects
       CCACHE_MAXSIZE: 8Gi

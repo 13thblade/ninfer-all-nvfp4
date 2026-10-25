@@ -7,12 +7,32 @@ and llama.cpp APIs from one GPU, or from up to eight as pipeline stages on Linux
 answers [typed decisions](docs/serving.md#typed-decisions): choice, yes/no and score questions about
 a state, each option with its probability, through TypeSafe's System One and OpenAI's Decisions APIs.
 
-[Quick start](#quick-start) · [Supported GPUs](#supported-gpus) · [Models](#artifacts) ·
+[What's New](#whats-new) · [Quick start](#quick-start) · [Supported GPUs](#supported-gpus) · [Models](#artifacts) ·
 [Highlights](#highlights) · [Features](#features) · [Docker](#docker) · [Building](#building) ·
 [Documentation](docs/README.md)
 
 NInfer-all continues [NInfer](https://github.com/Neroued/ninfer) through the NInfer-3090 line and
 carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits each of them.
+
+## What's New
+
+- **2026-10-25:** DeepSeek-V4.1-Flash-1017, the fifth model family, from ISTA-DASLab's GSQ-RCO IQ1_M GGUF and its Engram table. Its 106.7 GiB of routed experts stay in pinned host memory or in the file and are copied to the GPU as layers route to them: 48 tok/s on one RTX PRO 6000 and 21.8 on one RTX 3090, where Strata decodes 3.9 on one GPU and 6.6 on two ([model](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3), [docs](docs/deepseek-v41.md), [#138](https://github.com/iamwavecut/ninfer-all/pull/138)). Every model now pins its host memory with parallel direct reads.
+- **2026-10-25:** Tensor parallelism: `--tensor-parallel` divides the Gated DeltaNet heads and dense FFN rows of a dense Qwen3.5-core model over several GPUs ([pipeline stages](docs/maintainer/pipeline-stages.md), [#136](https://github.com/iamwavecut/ninfer-all/pull/136)).
+- **2026-10-24:** Flint decodes 348 tok/s on an RTX 5090 (llama.cpp: 223) and 210 tok/s on an RTX 4090 with its experts in host memory (llama.cpp: 166) ([measurements](docs/flint.md#measurements), [#135](https://github.com/iamwavecut/ninfer-all/pull/135)).
+- **2026-10-23:** Flint, the fourth model family: Recursive's `FlintForCausalLM` from Unsloth's UD-Q4_K_XL GGUF, block for block, with GLM-4.7 tool calls and context-lookup drafts ([model](https://huggingface.co/WaveCut/Flint-UD-Q4_K_XL-NInfer-v3), [docs](docs/flint.md), [#132](https://github.com/iamwavecut/ninfer-all/pull/132)).
+- **2026-10-23:** Native releases: Windows and Debian 13 archives with CUDA 12.9 and 13.4 backends, universal packages that carry both, and two multi-architecture Docker images, published under date tags ([releases](https://github.com/iamwavecut/ninfer-all/releases), [Docker](#docker)).
+- **2026-10-22:** Typed decisions: the served chat model answers choice, yes/no and score questions about a state with each option's probability, through `/v1/decisions` and `/v1/systemone`. Within a day reads resumed from the cached state, shared their prompt passes, branched in one pass and took images ([docs](docs/serving.md#typed-decisions), [#119](https://github.com/iamwavecut/ninfer-all/pull/119), [#125](https://github.com/iamwavecut/ninfer-all/pull/125), [#126](https://github.com/iamwavecut/ninfer-all/pull/126), [#128](https://github.com/iamwavecut/ninfer-all/pull/128), [#130](https://github.com/iamwavecut/ninfer-all/pull/130)).
+- **2026-10-22:** YaRN for every model family from one rope-scaling resolver; Flash-Next runs past its native window ([#122](https://github.com/iamwavecut/ninfer-all/pull/122), [#123](https://github.com/iamwavecut/ninfer-all/pull/123)).
+- **2026-10-20:** CPU and GPU compute one layer's experts at once: CPU threads multiply a share of the experts the GPU cache lacks, bit for bit with the GPU's kernels, while the GPU copies and runs the rest. Strata's expert tier, routing profiles and KV memory lending reach every MoE family ([CPU share](docs/qwen3-8-flash-next.md#the-cpu-share), [#103](https://github.com/iamwavecut/ninfer-all/pull/103), [#108](https://github.com/iamwavecut/ninfer-all/pull/108), [#110](https://github.com/iamwavecut/ninfer-all/pull/110), [#112](https://github.com/iamwavecut/ninfer-all/pull/112), [#116](https://github.com/iamwavecut/ninfer-all/pull/116)).
+- **2026-10-18:** The hybrid prefix cache is the server default: in an agent session at 131K tokens of context the mean time to the first token fell from 98 to 56 s. Ports from the upstream review speed up prefill and experts ([#98](https://github.com/iamwavecut/ninfer-all/pull/98), [#99](https://github.com/iamwavecut/ninfer-all/pull/99), [#100](https://github.com/iamwavecut/ninfer-all/pull/100), [#101](https://github.com/iamwavecut/ninfer-all/pull/101), [#102](https://github.com/iamwavecut/ninfer-all/pull/102)).
+- **2026-10-17:** Pipelines across GPU architectures: one build carries the code of several architectures and runs every card on its own, so the pipeline stages of one model can mix, for example, a Tesla V100, a TITAN RTX and RTX 30 or 40 series cards ([several architectures](docs/build-linux.md#cards-of-several-architectures-in-one-pipeline), [#92](https://github.com/iamwavecut/ninfer-all/pull/92), [#93](https://github.com/iamwavecut/ninfer-all/pull/93)).
+- **2026-10-16:** Built-in device profiles for 36 more GPU models; a card without one calibrates itself at the first start ([supported GPUs](docs/gpus.md), [#88](https://github.com/iamwavecut/ninfer-all/pull/88)). Gemma 4 and native Qwen MoE experts stream from host memory and disk ([#80](https://github.com/iamwavecut/ninfer-all/pull/80), [#81](https://github.com/iamwavecut/ninfer-all/pull/81)); the engine holds a GPU clock floor while it runs ([#69](https://github.com/iamwavecut/ninfer-all/pull/69)).
+- **2026-10-14:** Turing (`sm_75`): the TITAN RTX and the RTX 20 series ([TITAN RTX](docs/performance/titan-rtx-2026-10.md), [#68](https://github.com/iamwavecut/ninfer-all/pull/68), [#71](https://github.com/iamwavecut/ninfer-all/pull/71)).
+- **2026-10-12:** Volta (`sm_70`): the Tesla V100, where Gemma 4 decodes 168 tok/s against llama.cpp's 120 ([Tesla V100](docs/performance/tesla-v100-2026-10.md), [#58](https://github.com/iamwavecut/ninfer-all/pull/58), [#60](https://github.com/iamwavecut/ninfer-all/pull/60), [announcement](https://t.me/WaveCut_Vibin/587)).
+- **2026-10-11:** Gemma 4 26B-A4B, the third model family: Google's QAT GGUF block for block, with its MTP assistant, images and video, every KV format and up to eight requests; 291 tok/s in chat on an RTX 3090, against llama.cpp's 202 with the same drafter ([model](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3), [docs](docs/gemma4.md), [#45](https://github.com/iamwavecut/ninfer-all/pull/45), [#47](https://github.com/iamwavecut/ninfer-all/pull/47), [#50](https://github.com/iamwavecut/ninfer-all/pull/50), [#52](https://github.com/iamwavecut/ninfer-all/pull/52)).
+- **2026-10-06:** Qwen3.8-Flash-Next (the Qwen4 preview), the second model family: the GSQ-RCO GGUF releases with their experts on the GPUs, in pinned host memory or streamed from disk, measured on RTX 3090, 4090, 5090 and PRO 6000; MTP, context lookup and faster host decode followed within four days ([docs](docs/qwen3-8-flash-next.md), [#14](https://github.com/iamwavecut/ninfer-all/pull/14), [#17](https://github.com/iamwavecut/ninfer-all/pull/17), [#22](https://github.com/iamwavecut/ninfer-all/pull/22), [#29](https://github.com/iamwavecut/ninfer-all/pull/29), [announcement](https://t.me/WaveCut_Vibin/569)).
+- **2026-09-26:** NInfer-all: the fork takes its name and runs ISTA-DASLab's Qwen3.8-27B GSQ-RCO IQ3_S GGUF in its own blocks; one runtime for the RTX 30, 40 and 50 series with measured device profiles, YaRN to 1,048,576 tokens, the `rk4v4`, `rk4v4-e8` and `rk2v4-e8` KV formats, a context cache in host memory and on disk that survives restarts, up to 15 MTP drafts and a built-in WebUI ([model](https://huggingface.co/WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3), [announcement](https://t.me/WaveCut_Vibin/558)).
+- **2026-09-23:** Ternary Bonsai 2 27B on one RTX 3090: up to 237 tok/s in chat and 295 on GSM8K, with the whole 262,144-token context in 24 GB, from a 2-bit ternary format and Bonsai-trained MTP and DFlash2 heads ([model](https://huggingface.co/WaveCut/Ternary-Bonsai-2-27B-NInfer-v3), [announcement](https://t.me/WaveCut_Vibin/556)).
 
 ## Quick start
 
@@ -102,7 +122,7 @@ Every card by name, with what has run on it:
 | 11 GB | Ternary Bonsai 2 27B (200,704 tokens with `rk4v4`; 143,360 with MTP) | RTX 2080 Ti |
 | 12 GB | Ternary Bonsai 2 27B (266,240 tokens); Qwen3.8-27B GSQ-RCO IQ3_S (8,192 tokens, no MTP) | RTX 3060 |
 | 16 GB | Gemma 4 26B-A4B Q4_0 (61,440 tokens); Qwen3.8-27B IQ3_S (241,664 tokens); the official Qwen3.8-27B with `--embedding-q4 --lm-head-q4` | Tesla V100-SXM2-16GB |
-| 24 GB | the official Qwen3.8-27B and its MXFP8 tune; Qwen3.6-35B-A3B `groupwise-int` on an RTX 3090; Flash-Next with every expert on the GPU over two cards | RTX 3090, RTX 4090, TITAN RTX |
+| 24 GB | the official Qwen3.8-27B and its MXFP8 tune; Qwen3.6-35B-A3B `groupwise-int` on an RTX 3090; Flash-Next with every expert on the GPU over two cards; DeepSeek-V4.1-Flash with its experts in host memory or on disk | RTX 3090, RTX 4090, TITAN RTX |
 | 32 GB | Qwen3.6-35B-A3B NVFP4 (Blackwell only) | RTX 5090 |
 | 48 GB | Flash-Next Q2_0 with every expert on one card | L40S, RTX PRO 6000 |
 
@@ -132,8 +152,8 @@ Every card by name, with what has run on it:
 ## Artifacts
 
 Each name links to its Hugging Face card; `hf download REPO FILE.ninfer --local-dir models` fetches the
-file. The Bonsai, GSQ-RCO, Flash-Next, Gemma 4 and Flint artifacts use formats that only this engine
-reads.
+file. The Bonsai, GSQ-RCO, Flash-Next, Gemma 4, Flint and DeepSeek-V4.1-Flash artifacts use formats
+that only this engine reads.
 ✓ means the artifact carries the component, — that it does not.
 
 | Model | Size, GiB | Weights | Vision | MTP | DFlash2 | Proposal head | Notes |
@@ -150,10 +170,14 @@ reads.
 | [Qwen3.8-Flash-Next Coder GSQ-RCO IQ1_M](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 31.02 | GGUF blocks | ✓ | ✓ | — | — | expert-pruned coding build, 256 experts per layer; shared-Q8_0 MTP; reads the n-gram table |
 | [Gemma 4 26B-A4B it QAT](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3) | 14.75 | GGUF Q4_0 blocks | ✓ | ✓ | — | — | Google's QAT GGUF byte for byte; the MTP column is Google's QAT assistant |
 | [Flint UD-Q4_K_XL](https://huggingface.co/WaveCut/Flint-UD-Q4_K_XL-NInfer-v3) | 23.38 | GGUF blocks, Q8_0 to IQ3_S | — | — | — | — | Unsloth's UD-Q4_K_XL GGUF byte for byte; drafts by context lookup |
+| [DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ1_M](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3) | 112.69 | GGUF blocks, IQ1_S to IQ2_S experts | — | — | — | — | ISTA-DASLab's GGUF byte for byte; experts in host memory or on disk; reads the Engram table; drafts by context lookup |
 
 The three Flash-Next releases read one shared n-gram table, which the model names by digest: the
 [n-gram table](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3) (26.92 GiB,
 unchanged IQ4_NL rows plus an optional broad hot-row profile), passed with `--ngram-table`.
+DeepSeek-V4.1-Flash reads its own
+[Engram table](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-Engram-IQ4_NL-NInfer-v3) (103.00 GiB,
+the release's IQ4_NL rows) the same way.
 
 The official NInfer artifacts (Qwen3.6-27B, Qwen3.6-35B-A3B and Qwen3.8-27B, `groupwise-int` and
 `nvfp4`) load too; the [documentation map](docs/README.md#model-artifacts) links them. Weight
@@ -164,8 +188,9 @@ conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b
 
 Ternary Bonsai 2 27B decodes 397 tok/s on an RTX 5090 with DFlash2 and holds a 978,944-token context with
 every planted code found. Qwen3.8-Flash-Next decodes 138 tok/s with every expert on one RTX PRO 6000, and
-74 tok/s with its experts in host memory on one RTX 5090. Every table of every card is on the
-[performance page](docs/performance.md).
+74 tok/s with its experts in host memory on one RTX 5090. DeepSeek-V4.1-Flash decodes 48 tok/s on one
+RTX PRO 6000 and 26 tok/s on one RTX 4090 with its 106.7 GiB of experts in host memory. Every table of
+every card is on the [performance page](docs/performance.md).
 
 *Click a section to expand it.*
 
@@ -240,6 +265,25 @@ Prefill of a 4,463-token prompt, in tok/s:
 - **Other releases and cards.** IQ3_S, the Coder IQ1_M build and the 8 and 12 GB cards are in the
   [expert placements](docs/performance.md#expert-placements). Six reasoning requests at once on two
   RTX 5090s produced 193 tok/s of output with Q2_0.
+
+</details>
+
+<details>
+<summary><b>DeepSeek-V4.1-Flash</b> — 48 tok/s on one RTX PRO 6000, 22 to 29 tok/s on 24 and 32 GB cards</summary>
+
+ISTA-DASLab's GSQ-RCO IQ1_M GGUF (112.7 GiB, and its 103.0 GiB Engram table), one request, greedy,
+thinking off, one GPU, October 2026. The routed experts stay in pinned host memory or in the file, and
+the card caches as many as fit:
+
+| Card | Experts cached on the card | Host experts: short answer (tok/s) | after 8,086 tokens (tok/s) | prefill of 8,086 tokens (tok/s) | Disk experts, page cache warm: short answer (tok/s) |
+|---|---:|---:|---:|---:|---:|
+| RTX PRO 6000 | 74% | 48.0 | 45.3 | 1,310 | 37.4 |
+| RTX 5090 | 15% | 29.2 | 22.5 | 499 | 12.5 |
+| RTX 4090 | 7% | 25.9 | 22.2 | 490 | 8.5 |
+| RTX 3090 | | 21.8 | 18.9 | 410 | 7.4 |
+
+On the RTX 3090's host Strata decodes the same GGUF at 3.9 tok/s on one GPU and 6.6 on two
+([measurements](docs/deepseek-v41.md#measurements)). With host experts the server peaks at 116 GiB of host memory.
 
 </details>
 
@@ -424,7 +468,7 @@ See the [release process](docs/maintainer/release-process.md) for build and veri
   current `master`. Windows builds do not block them.
   Pin a build with `cuda12.9-<commit12>` or `cuda13.4-<commit12>`, where `commit12` is the first
   12 hexadecimal characters of its commit SHA. Both images must build before either floating tag
-  moves. The pipeline no longer updates `latest`, `multi` or `VERSION` tags.
+  moves. The pipeline no longer updates `latest` or `multi` tags.
 - **Volumes.** `/models` holds artifacts, `/cache` the device profile measured on first start, and
   `/grafts/<model>/` optional [prompt grafts](docs/serving.md#prompt-grafts).
 - **Verification.** The new image variants still need a complete build and GPU inference checks.

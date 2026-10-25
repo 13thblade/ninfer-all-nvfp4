@@ -297,7 +297,7 @@ Set `NINFER_SERVER` to select another executable. Profiles and the measurements 
 
 `scripts/package-release.sh` creates split Linux `tar.gz` volumes; `scripts/package-release.ps1`
 creates Windows 7-Zip volumes. Names contain the platform, CUDA minor version, architecture list
-and source commit, without the product `VERSION`. `build.sh --package` and `build.ps1 -Package`
+and source commit; `BUILD-INFO.json` records the version. `build.sh --package` and `build.ps1 -Package`
 run the packagers after a build. The Native release workflow builds Debian 13 and Windows packages
 with CUDA 12.9.2 and 13.4.3. See [cutting a release](maintainer/release-process.md).
 

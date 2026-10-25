@@ -261,8 +261,8 @@ weights for every token.
   tie closely.
 - **Coverage.** GGUF weights (the GDN input projection's fused GGUF route), the 27B geometry (16 key
   and 48 value heads, hidden 5120) on two or four ranks, MTP. Refused: MoE models, a masked drafter
-  (DFlash, DFlash2), `--stage-layers`, Hadamard-rotated weights, Vision overlay, Flash-Next, Gemma 4
-  and Flint. Native Q4/Q5/Q8/T2, NVFP4 and FP8 GDN projections have kernels registered only for the
+  (DFlash, DFlash2), `--stage-layers`, Hadamard-rotated weights, Vision overlay, Flash-Next, Gemma 4,
+  Flint and DeepSeek-V4.1-Flash. Native Q4/Q5/Q8/T2, NVFP4 and FP8 GDN projections have kernels registered only for the
   whole layer and are refused at preparation. Ranks may share a device (`--devices 0,0`), which is
   how the path is tested on one card.
 - **Kernels at the share shapes**, registered next to the whole-layer ones and qualified by the op

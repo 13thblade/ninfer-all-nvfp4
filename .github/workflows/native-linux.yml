@@ -15,6 +15,10 @@ on:
       jobs:
         type: number
         default: 4
+      version:
+        description: Release tag the binaries report; empty outside publication
+        type: string
+        default: ''
     secrets:
       HF_BUILD_CACHE_TOKEN:
         required: true
@@ -39,6 +43,7 @@ jobs:
       HF_BUILD_CACHE_SEED_REF: ${{ vars.HF_BUILD_CACHE_SEED_REF }}
       HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
       HF_HUB_DISABLE_TELEMETRY: '1'
+      NINFER_VERSION: ${{ inputs.version }}
       HF_CACHE_FAMILY: native-linux-cuda-${{ inputs.cuda }}-shared-v1
       CCACHE_DIR: ${{ github.workspace }}/.cache/objects
       CCACHE_MAXSIZE: 8Gi
