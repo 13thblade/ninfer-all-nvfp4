@@ -34,7 +34,8 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   attention output in FP8 before its projection, each scale computed in FP32 as the release does.
   The caches hold those values in BF16.
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
-  tokens (1024 or 512 on a card without room for them), prefix reuse across turns and requests with
+  tokens (1024 or 512 on a card without room for them) run block by block in spans of up to eight
+  chunks ([below](#prompt-spans)), prefix reuse across turns and requests with
   host-memory images ([below](#prefix-reuse)), branched reads for
   [typed decisions](serving.md#typed-decisions), structured output, streaming, log probabilities,
   causal scoring (`ninfer-perplexity`; a window that does not start with `<｜begin▁of▁sentence｜>`
@@ -126,10 +127,11 @@ ninfer-serve $M --ngram-table $T --model-id deepseek-v4.1-flash \
 ninfer $M --ngram-table $T --expert-residency host --prompt "Explain how a heat pump works."
 ```
 
-On a 24 GB RTX 3090 with host experts the GPU holds the 6.0 GiB of dense weights, two layer banks
-(7.1 GiB), a 1.3 GiB workspace, the latent caches (83 MiB at 16,384 tokens of context) and an
-expert cache that takes the rest (8.1 GiB); the host pins 106.7 GiB of experts. With disk experts
-the host pins 138 MiB of transfer buffers and the experts' pages sit in the OS page cache.
+On a 24 GB card with host experts the GPU holds the 6.0 GiB of dense weights, two layer banks
+(7.1 GiB), a 1.3 GiB workspace, the latent caches (133 MiB at 32,768 tokens of context) and an
+expert cache that takes the rest (7.8 GiB on an RTX 4090, of which a prompt span borrows up to
+1.3 GiB while it runs); the host pins 106.7 GiB of experts. With disk experts the host pins 138 MiB
+of transfer buffers and the experts' pages sit in the OS page cache.
 
 ## Expert residency
 
@@ -142,7 +144,7 @@ and its rounds):
 - **Host.** The experts are read from the artifact once at startup into pinned host memory, and a
   layer's misses are copied from there. The host needs that memory beside the Engram table's page
   cache (or its RAM copy) and the rest of the system: 106.7 GiB pinned, so a host with 128 GB
-  keeps about 12 GiB for everything else (not tested; the measurements below ran with 251 GB).
+  keeps about 12 GiB for everything else (not tested; the measurements below ran with 251 GB or more).
   The startup reads the experts with direct I/O, past the page cache, on eight threads into
   ordinary pages and pins them once read.
 - **Disk.** The experts stay in the artifact's files. A layer's misses are read with ordinary file
@@ -157,6 +159,28 @@ and its rounds):
   requests).
 - **Every miss is copied.** There is no CPU share: `--expert-dma-share` and `--expert-cpu-threads`
   are refused.
+
+## Prompt spans
+
+A 2048-token chunk routes to nearly every expert of every block, so a prompt run chunk by chunk
+copies nearly all the experts the cache lacks once per chunk: about 100 GiB a chunk with host
+experts. With host or disk experts the executor runs a prompt's chunks block by block instead:
+
+- **One sweep per span.** Every chunk of a span passes a block before any passes the next, so the
+  block's bank is filled once for all of them, and the delivery fills the next block's bank while
+  the chunks compute. A chunk's arithmetic is the same as chunk by chunk, so the outputs are the
+  same ([below](#numerical-checks)).
+- **Span length.** Eight chunks (16,384 tokens), four or two, within `--max-context`: the longest
+  whose buffers fit in the memory the expert cache would get and take no more than an eighth of
+  that memory and the two banks together. The startup log names it (`prompt chunks of 2048 tokens
+  block by block in spans of 16384 tokens`); a card without room for two chunks runs chunk by
+  chunk.
+- **Memory.** A span keeps its residual streams, coefficients and index selections between blocks:
+  1,323 MiB for 16,384 tokens. Beside the default elastic expert cache, the span borrows them from
+  the cache while it runs and gives them back after it, so decode keeps the whole cache; a span
+  the cache cannot lend them to at that moment runs chunk by chunk. With a fixed
+  `--expert-cache-mib` they stay in the workspace. The Engram rows of a span's tokens are staged
+  on the card (about 95 MiB more than for one chunk).
 
 ## The Engram table
 
@@ -194,42 +218,160 @@ arbitrary common prefix.
 
 ## Measurements
 
+### Against Strata on one host
+
+October 25, 2026, one rented host: an RTX 4090 (450 W, PCIe 4.0 x16), two 32-core AMD EPYC
+engineering samples (128 threads) and 409 GiB of RAM, NVIDIA driver 615.71. One sequence, greedy
+decoding, thinking off, the same prompt tokens in both engines: a 14-token question and an
+8,086-token summary request (32 tokens of answer).
+
+- **NInfer** served the model with `ninfer-serve --max-context 16384 --max-concurrency 1
+  --expert-residency host`: the current build and the native release build of `b3402a6fd`, which
+  ran prompts chunk by chunk.
+- **Strata** 0.2.6, its latest release (its DeepSeek engine `strata-dsv41` 0.1.51, build
+  `562a0c2ed`, from the release's Linux CUDA 13 package), ran the same GGUF shards and Engram GGUF
+  through its `pack_gguf.py` index, with the DSpark drafter from Unsloth's
+  `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` and Strata's routing profile, as
+  `strata-dsv41 --max-context 16384 --eos 1 --temperature 0` over the prompt's token ids. The first
+  Strata row has the flags Strata's app starts the engine with; the next four are the settings its
+  tuner tries. `--experts 5` keeps 5 of each token's 6 experts, so it computes another model.
+
+| engine and settings | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens |
+|---|---:|---:|---:|
+| NInfer, host experts | 26.0 tok/s | 22.0 tok/s | 925 tok/s |
+| NInfer `b3402a6fd`, host experts | 25.8 tok/s | 22.1 tok/s | 498 tok/s |
+| Strata, `--dspark auto --dspark-conf 0.65` | 36.0 tok/s | 38.4 tok/s | 635 tok/s |
+| Strata, `--dspark on --dspark-conf 0.65` | 34.3 tok/s | 38.7 tok/s | 690 tok/s |
+| Strata, `--dspark on --dspark-conf 0.65 --dspark-block 3` | 39.9 tok/s | 37.1 tok/s | 660 tok/s |
+| Strata, `--dspark auto --dspark-conf 0.65 --cpu-threads 64` | 38.0 tok/s | 38.6 tok/s | 659 tok/s |
+| Strata, `--dspark auto --dspark-conf 0.65 --mmap-experts off --ssd-cache 0` | 39.4 tok/s | 38.3 tok/s | 658 tok/s |
+| Strata, `--dspark auto --dspark-conf 0.65 --experts 5` (5 of 6 experts) | 44.8 tok/s | 42.1 tok/s | 644 tok/s |
+
+- **Decode.** Strata computes the experts its VRAM cache misses on CPU threads beside the GPU:
+  12,396 of the 20,400 expert products of its first short answer (61%) and 3,921 of 7,440 after
+  the long prompt (53%). NInfer copies every expert its cache lacks to the GPU: the IQ1_S, IQ1_M and
+  IQ2_XXS blocks have no CPU kernels in NInfer. With all six experts Strata decodes 1.3 to 1.8 times as
+  fast.
+- **Prefill.** Strata prefills in windows of 16,384 tokens; NInfer runs the 8,086 tokens as one
+  [prompt span](#prompt-spans), 1.9 times the release's rate.
+- **Drafts.** With `--dspark on`, 22 of 30 drafts were accepted on the short answer and 10 of 12
+  on the long one; `--dspark auto` offered none.
+- **Repeatability.** Strata's greedy answers to the short prompt ran 74 to 119 tokens over its six
+  runs. NInfer's greedy tokens were the same in every run, in both builds, and so were the current
+  build's log probabilities. The release's log probabilities after the long prompt, which followed
+  the short one on each server, differed between servers by up to 0.024 at answer tokens 28 and
+  29: a race in the expert cache that the current build fixes ([outputs](#prompt-spans)).
+- **Memory.** Strata peaked at 95.6 to 103.3 GiB of resident host memory, NInfer at 115.6 to 115.7 GiB.
+
+### Prompt spans
+
+On the same host, two fresh servers of each build (`--max-context 32768`) took the two requests and
+a third, a 24,252-token prompt that resumes from the 8,084-token state of the second and prefills
+16,168 new tokens:
+
+| build, host experts | decode, short answer | after 8,086 tokens | prefill of 8,086 tokens | prefill of 16,168 more tokens | decode after them |
+|---|---:|---:|---:|---:|---:|
+| NInfer, spans of 16,384 tokens | 26.0, 25.9 tok/s | 22.2, 22.1 tok/s | 926, 925 tok/s | 1,200, 1,200 tok/s | 22.5, 22.5 tok/s |
+| NInfer `b3402a6fd`, chunk by chunk | 26.0, 26.1 tok/s | 22.2, 22.2 tok/s | 499, 499 tok/s | 505, 505 tok/s | 23.0, 22.8 tok/s |
+
+- **Prefill.** One span sweeps the experts once where four or eight chunks swept them four or eight
+  times: 1.86 times the rate for 8,086 tokens, 2.4 times for 16,168.
+- **Decode.** Equal after the short and the 8,086-token prompts. After the 16,384-token span the
+  first 32 tokens decode 2% slower: the span borrowed 1,323 MiB of the cache, which comes back
+  empty and refills with the experts decode misses. Spans keep 94 MiB of Engram staging, so the
+  cache starts 1.1% smaller (8,094 against 8,188 MiB).
+- **Outputs.** Both builds produced the same tokens in every run. In the release, and in the span
+  build with a fixed `--expert-cache-mib 8150` (spans of 4,096 tokens), the long prompt's log
+  probabilities after the short request differed between servers by up to 0.024 at answer tokens
+  28 and 29. A decode call that read an expert from a lent bank slot could move that expert to its
+  cache slot while the call was served; a miss of the same call then took the lent slot and
+  overwrote it before the call's cached experts had read it. The current build moves such an
+  expert only at a later call: four servers with the fixed cache then gave a fresh server's log
+  probabilities exactly, and the default cache's spans gave the same log probabilities in every
+  run before and after the change.
+
+A second RTX 4090 host (450 W, PCIe 4.0 x16, a 48-core EPYC 7K62, 503 GiB of RAM) ran the span
+build too: with host experts it prefilled 8,086 tokens at 906 tok/s, and with disk experts and the
+model file in the page cache at 390 tok/s and 16,168 more at 610 tok/s, decoding at 9.1 and 7.2
+tok/s. The release build prefilled 8,086 tokens at 490 tok/s with host experts and 123 with disk
+experts on a host of the same type ([per card](#per-card)).
+
+### Per card
+
+The same day, one rented host per card ran the native release build of `b3402a6fd` (the CUDA 13.4
+Linux archive; on the hosts' Ubuntu 26.04 with FFmpeg 7.1 from Debian 13), which runs prompts
+chunk by chunk, with the same prompts and `ninfer-serve --max-concurrency 1` on one GPU: host experts first, then disk experts with the model file in the page
+cache. The server sizes the device expert cache to the card; the model has 15,360 routed experts:
+
+| card | host | experts | device cache | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens | ready to serve |
+|---|---|---|---:|---:|---:|---:|---:|
+| RTX PRO 6000 (600 W) | EPYC 9B14, PCIe 5.0 x16 | pinned RAM | 11,401 (74%) | 48.0 tok/s | 45.3 tok/s | 1,310 tok/s | 64 s |
+| | | disk, page cache warm | 11,431 | 37.4 tok/s | 33.4 tok/s | 431 tok/s | 29 s |
+| RTX 5090 (575 W) | EPYC 7B13, PCIe 4.0 x16 | pinned RAM | 2,251 (15%) | 29.2 tok/s | 22.5 tok/s | 499 tok/s | 34 s |
+| | | disk, page cache warm | 2,282 | 12.5 tok/s | 10.5 tok/s | 181 tok/s | 15 s |
+| RTX 4090 (450 W) | EPYC 7K62, PCIe 4.0 x16 | pinned RAM | 1,139 (7%) | 25.9 tok/s | 22.2 tok/s | 490 tok/s | 41 s |
+| | | disk, page cache warm | 1,169 | 8.5 tok/s | 7.3 tok/s | 123 tok/s | 14 s |
+
+- **The cache sets decode.** The RTX PRO 6000 keeps three quarters of the experts on the card and
+  copies the rest; the 24 and 32 GB cards keep 7 and 15% and copy every other routed expert over
+  PCIe 4.0, so they decode at 22 to 29 tok/s with host experts, 7 to 13 with disk experts.
+- **Placements agree on each card.** Host and disk experts produced the same tokens for both
+  prompts on every card. The short answer is 72 tokens on the RTX PRO 6000, 81 on the RTX 5090, 78
+  on the RTX 4090 and 82 on the RTX 3090: each card's device profile selects its own kernel routes,
+  which round differently.
+- **Memory.** The server peaked at 115.4 to 115.8 GiB of resident host memory with host experts
+  and 8.9 to 9.2 GiB with disk experts, and it fills the card in both placements.
+- **Startup.** With host experts the weights took 33.7 s on the RTX 4090 (3.34 GiB/s) and 53.6 s on
+  the RTX PRO 6000, whose read paused for 22 s at 95% on a host with 898 GB of its 1.5 TB in use
+  and its swap full.
+
+### RTX 3090 host
+
 October 25, 2026, one host with two RTX 3090s (350 and 390 W, PCIe 4.0 x16), a 24-core
-Threadripper 3960X and 251 GB of RAM, CUDA 12.8: one sequence, greedy decoding, the same prompt
-tokens in both engines. The short prompt is a 14-token question (an answer of 82 tokens), the long
-one an 8,086-token summary request (32 tokens). NInfer served the model with
-`ninfer-serve --max-concurrency 1` on one GPU; [Strata](https://github.com/Niko1221/Strata) 0.1.50
-(`strata-dsv41`, commit `41cf05a0`) ran the GGUF shards through its pack index with its defaults
-for a 24 GB card (all 6 experts, its DSpark drafter left unloaded), on one GPU and on both:
+Threadripper 3960X and 251 GB of RAM, CUDA 12.8, a build that ran prompts chunk by chunk: one
+sequence, greedy decoding, `ninfer-serve --max-concurrency 1` on one GPU, the same two requests
+(an answer of 82 tokens to the short one):
 
-| engine and placement | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens | ready to serve |
+| placement | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens | ready to serve |
 |---|---:|---:|---:|---:|
-| NInfer, experts in pinned RAM | 21.8 tok/s | 18.9 tok/s | 410 tok/s | 33 s |
-| NInfer, experts in pinned RAM, `--lookup-ngram 4` | 22.1 tok/s | 18.0 tok/s | 416 tok/s | |
-| NInfer, experts on disk, page cache warm | 7.4 tok/s | 7.4 tok/s | 117 tok/s | 13 s |
-| Strata, 1 GPU | 3.9 tok/s | 3.9 tok/s | 380 tok/s | about 34 s |
-| Strata, 2 GPUs | 6.6 tok/s | 8.0 tok/s | 333 tok/s | about 34 s |
+| experts in pinned RAM | 21.8 tok/s | 18.9 tok/s | 410 tok/s | 33 s |
+| experts in pinned RAM, `--lookup-ngram 4` | 22.1 tok/s | 18.0 tok/s | 416 tok/s | |
+| experts on disk, page cache warm | 7.4 tok/s | 7.4 tok/s | 117 tok/s | 13 s |
 
-- **Decode.** Strata computes the experts its VRAM cache misses on its CPU lane, 107 to 242 ms of
-  each token on this CPU; NInfer copies every miss to the GPU (a layer's misses in one bank) and
-  computes it there.
-- **Prefill.** A 2048-token chunk routes to nearly every expert of every block, so each chunk
-  copies nearly all the experts the cache lacks over PCIe (four sweeps of about 100 GiB for 8,086
-  tokens with host experts) or reads them through the page cache with disk experts. Strata
-  prefills in windows of 16,384.
 - **Placements agree.** Host experts, disk experts and host experts with context lookup produced
   the same greedy tokens for both prompts.
 - **Context lookup.** On the long prompt 1 of 6 drafts was accepted: a summary repeats little of
   its source.
-- **Startup.** The ready times come from the current build, whose expert cache starts from the
-  built-in routing profile. With host experts the weights took 26.0 s (4.3 GiB/s: eight threads
+- **Startup.** The ready times come from a build whose expert cache starts from the built-in
+  routing profile. With host experts the weights took 26.0 s (4.3 GiB/s: eight threads
   reading past the page cache into ordinary pages, pinned once read), the server was ready 33 s
   after it started, and stopping it took 15 s; that run produced the host row's tokens for both
   prompts, at 22.2 and 19.3 tok/s of decode and 419 tok/s of prefill. With disk experts the server
   was ready in 13 s and produced the same tokens, at 8.7 and 7.4 tok/s of decode and 120 tok/s of
   prefill. Host and disk experts score the WikiText slice to the same perplexity, 3.067.
 
-Each row is one run; no spread is measured.
+### 16 GB
+
+The model runs with 16 GB of free GPU memory. A process held the rest of the RTX 4090 of the
+[prompt spans](#prompt-spans) disk run (16,375 MiB left free) and of a Tesla V100-SXM2-32GB
+(16,158 MiB left free; a 32-core Xeon Gold 6130, 376 GiB of RAM, PCIe 3.0 x16, the CUDA 12.9
+release archive). Beside the two layer banks (7.1 GiB) the expert cache keeps 38 to 86 of the
+15,360 experts, so nearly every routed expert is copied:
+
+| card | build | experts | device cache | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens |
+|---|---|---|---:|---:|---:|---:|
+| RTX 4090 | current, spans of 4,096 tokens | pinned RAM | 54 | 21.4 tok/s | 20.0 tok/s | 679 tok/s |
+| RTX 4090 | `b3402a6fd` | pinned RAM | 57 | 21.3 tok/s | 20.0 to 20.1 tok/s | 457 tok/s |
+| RTX 4090 | `b3402a6fd` | disk, page cache warm | 86 | 5.9 to 6.3 tok/s | 5.9 to 6.0 tok/s | 113 to 119 tok/s |
+| Tesla V100 | `b3402a6fd` | pinned RAM | 38 | 10.5 to 10.6 tok/s | 9.3 to 9.4 tok/s | 198 to 199 tok/s |
+| Tesla V100 | `b3402a6fd` | disk, page cache warm | 68 | 3.9 to 4.0 tok/s | 3.5 tok/s | 73.5 to 73.6 tok/s |
+
+- **A real 16 GB card** keeps a few hundred MiB less free after its own CUDA context than these
+  caps, and that memory comes out of the expert cache and the spans; no 16 GB card was measured.
+- **The V100** copies over PCIe 3.0 and decodes at half the RTX 4090's rate.
+- **Placements agree.** Host and disk experts produced the same tokens on each card.
+
+Rows give one run, or the range of two; no spread is measured.
 
 ## Numerical checks
 

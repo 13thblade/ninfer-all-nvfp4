@@ -1,8 +1,8 @@
 # NInfer Linux archive
 
 This archive contains prebuilt x64 binaries. Single-CUDA names record the Toolkit, GPU architectures and source commit.
-Universal names use `cuda12.9-13.4-<commit12>` and contain both backends. `BUILD-INFO.json` records the complete revision, compiler, build
-system and runtime requirements. `VERSION` is source metadata, not the archive identifier.
+Universal names use `cuda12.9-13.4-<commit12>` and contain both backends. `BUILD-INFO.json` records the version (the release
+tag), complete revision, compiler, build system and runtime requirements.
 
 ## Extract and verify
 

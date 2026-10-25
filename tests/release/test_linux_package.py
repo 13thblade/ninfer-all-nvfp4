@@ -126,10 +126,11 @@ class LinuxPackageTest(unittest.TestCase):
         (self.build / 'CMakeCache.txt').write_text(
             f'CMAKE_CUDA_COMPILER:FILEPATH={self.cuda}/bin/nvcc\n'
             'CMAKE_CUDA_ARCHITECTURES:STRING=75;120a\nNINFER_SHARED_RUNTIME:BOOL=ON\n')
-        for name in ('LICENSE', 'RELEASE_NOTES_0.0.md', 'docs/release-archive-linux.md',
-                     'scripts/run.sh', 'scripts/download-model.sh'):
+        for name in ('LICENSE', 'docs/release-archive-linux.md', 'scripts/run.sh', 'scripts/download-model.sh'):
             (self.repo / name).write_text('fixture')
-        (self.repo / 'VERSION').write_text('0.0-undefined')
+        (self.build / 'generated').mkdir()
+        (self.build / 'generated/ninfer_build_id.h').write_text(
+            '#define NINFER_BUILD_ID "aaaaaaaaa"\n#define NINFER_VERSION "2026-10-23.2"\n')
         shutil.copy2(ROOT / 'docker/entrypoint.sh', self.repo / 'docker/entrypoint.sh')
         shutil.copy2(ROOT / 'docker/release.Dockerfile', self.repo / 'docker/release.Dockerfile')
         self.images = 'ELF file: sm_75.cubin\nELF file: sm_120a.cubin'
@@ -148,6 +149,7 @@ class LinuxPackageTest(unittest.TestCase):
         for item in self.stack:
             item.start()
             self.addCleanup(item.stop)
+        os.environ.pop('NINFER_VERSION', None)
 
     def output(self, *args, **kwargs):
         if args[0] == 'readelf':
@@ -195,21 +197,19 @@ class LinuxPackageTest(unittest.TestCase):
             self.assertIn(prefix + '/Dockerfile', names)
             info = json.load(archive.extractfile(prefix + '/BUILD-INFO.json'))
             self.assertEqual(info['architectures'], ['75', '120a'])
+            self.assertEqual(info['version'], '2026-10-23.2')
+
+    def test_build_reporting_another_release_tag_is_refused(self):
+        with patch.dict(os.environ, NINFER_VERSION='2026-10-23.3'):
+            with self.assertRaisesRegex(RuntimeError, 'reports 2026-10-23.2, not the release tag 2026-10-23.3'):
+                PACKAGE.main()
+        self.assertFalse(list((self.repo / 'dist').glob('SHA256SUMS-*')))
 
     def test_missing_device_image_cannot_produce_manifest(self):
         self.images = 'ELF file: sm_75.cubin'
         with self.assertRaisesRegex(RuntimeError, 'lacks sm_120a'):
             PACKAGE.main()
         self.assertFalse(list((self.repo / 'dist').glob('SHA256SUMS-*')))
-
-    def test_commit_archive_does_not_require_release_notes(self):
-        (self.repo / 'RELEASE_NOTES_0.0.md').unlink()
-        PACKAGE.main()
-        volume = next((self.repo / 'dist').glob('*.tar.gz.001'))
-        with tarfile.open(volume, 'r:gz') as archive:
-            names = archive.getnames()
-            self.assertFalse(any('RELEASE_NOTES_' in name for name in names))
-            self.assertTrue(any(name.endswith('/BUILD-INFO.json') for name in names))
 
     def test_failed_startup_removes_old_manifest(self):
         PACKAGE.main()

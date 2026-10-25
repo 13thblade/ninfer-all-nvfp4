@@ -143,8 +143,13 @@ def main():
             raise RuntimeError(f'Missing release product: {source}')
     if products[str(config)].read_text().split() != arches:
         raise RuntimeError('Backend architecture metadata differs from the build')
-    version = (repo / 'VERSION').read_text().strip()
-    notes = repo / f"RELEASE_NOTES_{version.split('-')[0]}.md"
+    # The release tag the binaries report, from the header the build stamped into them.
+    stamp = re.search(r'#define NINFER_VERSION "([^"]*)"', (build / 'generated/ninfer_build_id.h').read_text())
+    if not stamp:
+        raise RuntimeError('The build id header records no version')
+    version = stamp[1]
+    if os.environ.get('NINFER_VERSION') and version != os.environ['NINFER_VERSION']:
+        raise RuntimeError(f"The build reports {version}, not the release tag {os.environ['NINFER_VERSION']}")
     dist = repo / 'dist'
     dist.mkdir(exist_ok=True)
     package = dist / name
@@ -205,13 +210,11 @@ def main():
     (package / 'packages').mkdir()
     (package / 'packages/multi.txt').write_text(''.join(f'{p}\n' for p in sorted(packages)))
     for source, destination in (
-        (repo / 'LICENSE', 'LICENSE'), (repo / 'VERSION', 'VERSION'),
+        (repo / 'LICENSE', 'LICENSE'),
         (repo / 'docs/release-archive-linux.md', 'README.md'),
         (repo / 'scripts/run.sh', 'run.sh'), (repo / 'scripts/download-model.sh', 'download-model.sh'),
     ):
         shutil.copy2(source, package / destination)
-    if notes.is_file():
-        shutil.copy2(notes, package / notes.name)
     distro = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
                   if '=' in line)
     if distro.get('ID', '').strip('"') == 'debian' and distro.get('VERSION_ID', '').strip('"') == '13':

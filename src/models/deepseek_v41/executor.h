@@ -4,7 +4,8 @@
 // ring of its last window of attention latents (and a round's drafts), and per kv source block
 // the compressed latents and the indexer's keys of every compressed position, with the ratio-2
 // compressor's incomplete group in a small tail. Prompt chunks attend through a staging ring that
-// every sequence's chunks share; decode steps run one token of each of several sequences at once,
+// every sequence's chunks share, a span of several chunks block by block when experts stay off
+// the device; decode steps run one token of each of several sequences at once,
 // replayed from a CUDA graph per batch size. The Engram rows a pass addresses are read before it
 // from the table's files (or RAM) and copied to the device.
 //
@@ -67,6 +68,8 @@ struct ExecutorMemory {
     std::uint64_t kv_backed_bytes = 0;
     bool kv_grows                 = false;
     std::uint64_t workspace_bytes = 0;
+    // The most a prompt span borrows from an elastic expert cache while it runs (0: none).
+    std::uint64_t span_borrow_bytes = 0;
     // Engram rows held in RAM (a table read whole, or the reader's row cache).
     std::uint64_t engram_resident_bytes = 0;
     ExpertDeliveryMemory experts;
@@ -113,8 +116,12 @@ public:
     // The Engram reader's counters, or empty without the Engram.
     [[nodiscard]] std::optional<NgramTableStats> engram_stats() const;
     [[nodiscard]] std::string engram_description() const;
-    // Runs up to prefill_chunk tokens at the sequence's next positions and leaves the logits of the
-    // last `logit_rows` (at most kMaxLogitRows) in logits().
+    // Prompt tokens one forward() may take: prefill_chunk, or with host or disk experts a span of
+    // several chunks (as many as memory allows beside the expert cache), which forward() runs
+    // layer by layer so that each block's missing experts cross the bus once for all of them.
+    [[nodiscard]] std::uint32_t prompt_step() const noexcept;
+    // Runs up to prompt_step() tokens at the sequence's next positions and leaves the logits of
+    // the last `logit_rows` (at most kMaxLogitRows) in logits().
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows);
     // Branches of a prompt, each continuing the sequence from its position: branch b runs

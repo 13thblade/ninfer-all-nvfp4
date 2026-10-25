@@ -5,8 +5,8 @@ under `scripts/`, and
 [docs/build-windows.md](https://github.com/iamwavecut/ninfer-all/blob/master/docs/build-windows.md)
 is the fuller guide. Links here are absolute on purpose: the archive ships no `docs/` directory.
 
-Check `BUILD-INFO.json` for the exact source commit, CUDA version and device images.
-`VERSION` records the source snapshot's version field. Matching `RELEASE_NOTES_*.md` are included when present.
+Check `BUILD-INFO.json` for the version (the release tag), exact source commit, CUDA version and
+device images.
 
 Download **all** `.7z.*` volumes for one package into the same directory. Use 7-Zip to extract
 `.7z.001`. The `cuda12.9-13.4` package contains both backends. Do not flatten or merge their subdirectories. The outer `SHA256SUMS-*.txt`

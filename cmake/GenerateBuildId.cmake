@@ -30,12 +30,12 @@
 
 set(NINFER_PRODUCT_ROOTS src include apps cmake third_party)
 
+find_program(_git_executable git)
 if(DEFINED ENV{NINFER_BUILD_ID} AND NOT "$ENV{NINFER_BUILD_ID}" STREQUAL "")
   set(_id "$ENV{NINFER_BUILD_ID}")
 else()
   set(_id "")
   set(_dirty "")
-  find_program(_git_executable git)
   if(_git_executable)
     execute_process(
       COMMAND "${_git_executable}" describe --always --tags
@@ -79,12 +79,27 @@ else()
   endif()
 endif()
 
-# The release the tree belongs to: the first line of VERSION. Products report it with the build id
-# as `<VERSION>+<build id>` (ninfer-serve --version, GET /health, X-NInfer-Version).
-set(_version "unknown")
-if(EXISTS "${SRC_DIR}/VERSION")
-  file(STRINGS "${SRC_DIR}/VERSION" _version LIMIT_COUNT 1)
-  string(STRIP "${_version}" _version)
+# The version is the build's release tag. Products report it with the build id as
+# `<version>+<build id>` (ninfer-serve --version, GET /health, X-NInfer-Version). The release
+# pipeline passes the tag it publishes the build under in $NINFER_VERSION, before that tag exists;
+# any other build takes the release tag (YYYY-MM-DD.N) at HEAD or nearest before it, or `untagged`
+# when the checkout has none (a shallow CI checkout fetches no tags).
+if(DEFINED ENV{NINFER_VERSION} AND NOT "$ENV{NINFER_VERSION}" STREQUAL "")
+  set(_version "$ENV{NINFER_VERSION}")
+else()
+  set(_version "")
+  if(_git_executable)
+    execute_process(
+      COMMAND "${_git_executable}" describe --tags --abbrev=0
+              --match "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].*"
+      WORKING_DIRECTORY "${SRC_DIR}"
+      OUTPUT_VARIABLE _version
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+  endif()
+  if(NOT _version)
+    set(_version "untagged")
+  endif()
 endif()
 
 string(REPLACE "\"" "\\\"" _id_escaped "${_id}")

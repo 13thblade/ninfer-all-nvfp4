@@ -24,9 +24,13 @@ if ($LASTEXITCODE -ne 0 -or $CudaVersionText -notmatch 'release (\d+\.\d+),') {
 }
 $CudaVersion = $Matches[1]
 $CudaMajor = $CudaVersion.Split('.')[0]
-$Version = (Get-Content -LiteralPath (Join-Path $RepoRoot 'VERSION') -Raw).Trim()
-if ($Version -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw 'VERSION is not a valid release-notes identifier' }
-$ReleaseNotes = Join-Path $RepoRoot "RELEASE_NOTES_$($Version.Split('-')[0]).md"
+# The release tag the binaries report, from the header the build stamped into them.
+$Stamp = Get-Content -LiteralPath (Join-Path $BuildRoot 'generated\ninfer_build_id.h') -Raw
+if ($Stamp -notmatch '#define NINFER_VERSION "([^"]*)"') { throw 'The build id header records no version' }
+$Version = $Matches[1]
+if ($env:NINFER_VERSION -and $Version -ne $env:NINFER_VERSION) {
+    throw "The build reports $Version, not the release tag $env:NINFER_VERSION"
+}
 $Revision = (& git -C $RepoRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the source revision' }
 $SourceState = @(& git -C $RepoRoot status --porcelain --untracked-files=no)
@@ -84,10 +88,7 @@ foreach ($name in "cublas64_$CudaMajor.dll", "cublasLt64_$CudaMajor.dll") {
     Copy-Item -LiteralPath $found[0] -Destination $BackendRoot
 }
 Copy-Item -LiteralPath $Eula -Destination (Join-Path $BackendRoot 'NVIDIA-CUDA-EULA.txt')
-foreach ($file in 'VERSION', 'LICENSE') { Copy-Item -LiteralPath (Join-Path $RepoRoot $file) -Destination $ProductRoot }
-if (Test-Path -LiteralPath $ReleaseNotes) {
-    Copy-Item -LiteralPath $ReleaseNotes -Destination $ProductRoot
-}
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'LICENSE') -Destination $ProductRoot
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'docs\release-archive-windows.md') -Destination (Join-Path $ProductRoot 'README.md')
 foreach ($script in 'run.bat', 'download-model.bat') {
     Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\$script") -Destination $ProductRoot
