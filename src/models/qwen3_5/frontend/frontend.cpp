@@ -4,6 +4,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/frontend/chat_template.h"
+#include "models/qwen3_5/frontend/deepseek_output.h"
 #include "models/qwen3_5/frontend/flint_output.h"
 #include "models/qwen3_5/frontend/gemma_output.h"
 #include "models/qwen3_5/frontend/media_cache.h"
@@ -49,6 +50,10 @@ constexpr std::string_view kThinkingControl =
     "\n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n</think>\n\n";
 static_assert(kThinkingControl.ends_with(fi::kCanonicalReasoningCloseSerialization));
+// DeepSeek-V4.1's early-close guidance, which its </think> token follows.
+constexpr std::string_view kDeepSeekThinkingGuidance =
+    "\n\nConsidering the limited time by the user, I have to give the solution based on the "
+    "thinking directly now.";
 constexpr double kRescaleFactor = 1.0 / 255.0;
 constexpr double kVideoFps      = 2.0;
 constexpr int kVideoMinFrames   = 4;
@@ -869,6 +874,19 @@ ModelSamplingDefaults default_sampling(Architecture architecture) {
         sampling.post_thinking = sampling.thinking;
         return sampling;
     }
+    if (architecture == Architecture::DeepSeekV41) {
+        // DeepSeek-V4.1's recommended sampling (temperature 1.0, top_p 1.0), thinking or not,
+        // with top_k held at the 20 candidates the sampler keeps.
+        sampling.thinking      = {.temperature       = 1.0F,
+                                  .top_k             = 20,
+                                  .top_p             = 1.0F,
+                                  .min_p             = 0.0F,
+                                  .presence_penalty  = 0.0F,
+                                  .frequency_penalty = 0.0F};
+        sampling.non_thinking  = sampling.thinking;
+        sampling.post_thinking = sampling.thinking;
+        return sampling;
+    }
     if (architecture == Architecture::Gemma4) {
         // generation_config.json of the Gemma 4 releases (top_k 64), thinking or not, with
         // top_k held at the 20 candidates the sampler keeps.
@@ -902,9 +920,11 @@ ModelSamplingDefaults default_sampling(Architecture architecture) {
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, FrontendOptions options)
-        : chat_template(compile_chat_template(resources, options.chat_template_path,
-                                              options.architecture != Architecture::Gemma4 &&
-                                                  options.architecture != Architecture::Flint)),
+        : chat_template(
+              compile_chat_template(resources, options.chat_template_path,
+                                    options.architecture != Architecture::Gemma4 &&
+                                        options.architecture != Architecture::Flint &&
+                                        options.architecture != Architecture::DeepSeekV41)),
           tokenizer(resources.tokenizer),
           processor(!options.vision_enabled                        ? fi::ProcessorOptions{}
                     : options.architecture == Architecture::Gemma4 ? fi::ProcessorOptions{}
@@ -990,6 +1010,36 @@ public:
             }
             return;
         }
+        if (options.architecture == Architecture::DeepSeekV41) {
+            // DeepSeek-V4.1's prompt opens its reasoning as Qwen's does, and its tool calls are
+            // DSML. A reached thinking budget closes the reasoning with Qwen's guidance (or
+            // --thinking-budget-message) and DeepSeek's </think> token, and the model answers.
+            deepseek =
+                std::make_shared<const fi::DeepSeekMarkers>(fi::DeepSeekMarkers::from(*tokenizer));
+            if (deepseek->think_close < 0) {
+                throw std::invalid_argument("DeepSeek-V4.1's tokenizer lacks its </think> marker");
+            }
+            std::string guidance(kDeepSeekThinkingGuidance);
+            if (!options.thinking_budget_message.empty()) {
+                guidance = options.thinking_budget_message;
+                // The close is the token appended below, not the message's own spelling of it.
+                if (const auto close = guidance.find(kThinkClose); close != std::string::npos) {
+                    guidance.erase(close);
+                }
+            }
+            std::vector<TokenId> encoded = tokenizer->encode(guidance);
+            encoded.push_back(deepseek->think_close);
+            for (const TokenId token : encoded) {
+                if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), token) !=
+                    defaults.token_ids.end()) {
+                    throw std::invalid_argument("thinking budget message contains a default "
+                                                "terminal token");
+                }
+            }
+            thinking_control_tokens =
+                std::make_shared<const std::vector<TokenId>>(std::move(encoded));
+            return;
+        }
         std::string control_suffix(kThinkingControl);
         const char* control_name = "canonical thinking control suffix";
         if (!options.thinking_budget_message.empty()) {
@@ -1037,9 +1087,10 @@ public:
 
     // The syntax the model writes its calls in, which a forced call's opener has to match.
     [[nodiscard]] fi::ToolCallSyntax tool_call_syntax() const noexcept {
-        return gemma   ? fi::ToolCallSyntax::Gemma
-               : flint ? fi::ToolCallSyntax::Flint
-                       : fi::ToolCallSyntax::Qwen;
+        return gemma      ? fi::ToolCallSyntax::Gemma
+               : flint    ? fi::ToolCallSyntax::Flint
+               : deepseek ? fi::ToolCallSyntax::DeepSeek
+                          : fi::ToolCallSyntax::Qwen;
     }
 
     // The graft a request names, or null for none.
@@ -1062,6 +1113,7 @@ public:
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     std::shared_ptr<const fi::GemmaMarkers> gemma; // the Gemma 4 dialect, null for Qwen
     std::shared_ptr<const fi::FlintMarkers> flint; // the Flint dialect, null for Qwen
+    std::shared_ptr<const fi::DeepSeekMarkers> deepseek; // the DeepSeek dialect, null for Qwen
     bool ngram_sources_enabled = false;
     bool ngram_archive_enabled = false;
     std::vector<TokenId> ngram_think_open, ngram_think_close;
@@ -1622,14 +1674,14 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     const auto& tools       = prompt.data_->tool_call_output;
     const bool strict_tools = tools && fi::has_strict_tools(*tools);
     if (strict_tools && (impl_->gemma || impl_->flint)) {
-        throw std::invalid_argument("strict tool arguments need Qwen's tool-call syntax, which " +
+        throw std::invalid_argument("strict tool arguments need Qwen's or DeepSeek's tool-call "
+                                    "syntax, which " +
                                     std::string(impl_->gemma ? "Gemma 4" : "Flint") +
                                     " does not use");
     }
     if (structured.kind != StructuredOutputKind::None && tools && impl_->flint) {
-        throw std::invalid_argument(
-            "structured output beside tool calls needs Qwen's tool-call syntax, which Flint does "
-            "not use");
+        throw std::invalid_argument("structured output beside tool calls needs Qwen's or "
+                                    "DeepSeek's tool-call syntax, which Flint does not use");
     }
     if (structured.kind != StructuredOutputKind::None || strict_tools) {
         if (structured.kind != StructuredOutputKind::None &&
@@ -1642,7 +1694,9 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
         text::StructuredOutputEnvelope envelope;
         if (prompt.data_->starts_in_reasoning) { envelope.reasoning_close = "</think>"; }
         if (structured.kind != StructuredOutputKind::None && tools) {
-            envelope.alternative_format = fi::structured_tool_call_format(*tools);
+            envelope.alternative_format = impl_->deepseek
+                                              ? fi::deepseek_structured_tool_call_format(*tools)
+                                              : fi::structured_tool_call_format(*tools);
         }
         std::lock_guard lock(impl_->grammar_mutex);
         if (!impl_->grammar_compiler) {
@@ -1659,14 +1713,16 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
         }
         grammar = structured.kind != StructuredOutputKind::None
                       ? impl_->grammar_compiler->compile(structured, envelope)
-                      : impl_->grammar_compiler->compile_format(fi::tool_call_text_format(*tools),
-                                                                envelope);
+                      : impl_->grammar_compiler->compile_format(
+                            impl_->deepseek ? fi::deepseek_tool_call_text_format(*tools)
+                                            : fi::tool_call_text_format(*tools),
+                            envelope);
     }
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(impl_->tokenizer, std::move(policy), output,
                          prompt.data_->starts_in_reasoning, thinking,
                          impl_->thinking_control_tokens, prompt.data_->tool_call_output,
-                         std::move(grammar), impl_->gemma, impl_->flint);
+                         std::move(grammar), impl_->gemma, impl_->flint, impl_->deepseek);
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

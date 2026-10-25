@@ -18,13 +18,15 @@ namespace ninfer::product {
 
 // The help lines of the options, in the 32-column layout of ninfer's and ninfer-serve's help.
 inline constexpr const char* kNgramTableHelp =
-    "  --ngram-table PATH            Qwen3.8-Flash-Next: the n-gram table artifact,\n"
-    "                                for a model published without its table\n"
+    "  --ngram-table PATH            Qwen3.8-Flash-Next's n-gram table or DeepSeek-V4.1's\n"
+    "                                Engram table artifact, for a model published\n"
+    "                                without its table\n"
     "  --ngram-residency disk|ram|ram-hot\n"
     "                                where the table's rows come from: its file, 16\n"
-    "                                rows per token (default); all of it in RAM; or\n"
-    "                                the rows a hot-row profile ranks first in RAM\n"
-    "                                and the rest from the file\n"
+    "                                rows per token (default; DeepSeek-V4.1: 48); all\n"
+    "                                of it in RAM; or (Flash-Next) the rows a hot-row\n"
+    "                                profile ranks first in RAM and the rest from the\n"
+    "                                file\n"
     "  --ngram-io buffered|direct|mmap  how rows are read from the file: through the\n"
     "                                page cache (default), past it, or mapped\n"
     "  --ngram-io-depth N            row reads in flight, 1..1024 (default 64)\n"
@@ -33,10 +35,12 @@ inline constexpr const char* kNgramTableHelp =
     "  --ngram-ram-mib N             disk, ram-hot: RAM for rows and their index\n"
     "                                (disk default 0/off; ram-hot default 4096)\n"
     "  --ngram-lock                  ram, ram-hot: lock the rows in physical memory\n"
-    "  --no-ngram-table              Qwen3.8-Flash-Next: run without the n-gram table.\n"
+    "  --no-ngram-table              run Qwen3.8-Flash-Next without its n-gram table,\n"
+    "                                DeepSeek-V4.1 without its Engram table.\n"
     "                                Non-standard experimental mode: the model was\n"
     "                                trained with the table and degrades badly\n"
-    "                                without it (WikiText-2 perplexity 2.66 -> 5.01)\n";
+    "                                without it (Flash-Next WikiText-2 perplexity\n"
+    "                                2.66 -> 5.01)\n";
 
 namespace detail {
 

@@ -1,5 +1,6 @@
 #include "models/qwen3_5/frontend/chat_template.h"
 
+#include "models/qwen3_5/frontend/deepseek_output.h"
 #include "models/qwen3_5/frontend/flint_output.h"
 #include "models/qwen3_5/frontend/gemma_output.h"
 #include "models/qwen3_5/frontend/media_cache.h"
@@ -54,6 +55,12 @@ ForcedCallOpener forced_call_opener(ToolCallSyntax syntax) {
     case ToolCallSyntax::Flint:
         // <tool_call> is a token of Flint's vocabulary; the arguments follow the name directly.
         return {.head = std::string(kFlintCallOpen), .tail = {}};
+    case ToolCallSyntax::DeepSeek:
+        // The calls block after the closed reasoning, then the call's invoke tag; its parameters
+        // follow on the next line.
+        return {.head = std::string(kDeepSeekCallsSeparator) + std::string(kDeepSeekCallsOpen) +
+                        "\n" + std::string(kDeepSeekInvokeOpen),
+                .tail = "\">\n"};
     }
     throw std::invalid_argument("invalid tool call syntax");
 }

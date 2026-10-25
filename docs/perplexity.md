@@ -21,17 +21,20 @@ English reference text, English long-form text, Chinese reference text, and NInf
 The default evaluation uses a 4,096-token context and a 2,048-token stride. Use `--context` and
 `--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. The available Main
 KV representations are the server's nine: `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`,
-`rk2v4-e8`, `nvfp4`, and `k8v4`. Flint keeps its cache in F16 and is scored with `--kv-dtype bf16`.
+`rk2v4-e8`, `nvfp4`, and `k8v4`. Flint keeps its cache in F16 and DeepSeek-V4.1 in BF16; both are
+scored with `--kv-dtype bf16`. DeepSeek-V4.1 reads every window from `<｜begin▁of▁sentence｜>`, which
+it puts in front of a window that lacks it; the scored tokens stay the window's own.
 
 Seven of them were measured on this corpus with Qwen3.8-27B on an RTX 3090; the results, alongside
 each format's size and decode speed, are in [`docs/config-calculator.html`](config-calculator.html).
 `--fast-prefill-kernel` scores an `int8` or `rk*` cache with the fast prompt-attention kernel (as
 `ninfer-serve --fast-prefill-kernel` prefills); `report.json` records it as `fast_prefill_kernel`.
 The evaluator also takes the server's `--devices` (one pipeline stage per GPU), its
-MoE residency options (`--expert-residency`, `--expert-cache-mib`) for native Qwen, Gemma 4, Flint
-and Qwen3.8-Flash-Next, its Qwen3.8-Flash-Next n-gram options (`--ngram-table`,
+MoE residency options (`--expert-residency`, `--expert-cache-mib`) for native Qwen, Gemma 4, Flint,
+DeepSeek-V4.1 and Qwen3.8-Flash-Next, its Qwen3.8-Flash-Next n-gram options (`--ngram-table`,
 `--ngram-residency`, `--ngram-io`, `--ngram-io-depth`, `--ngram-hot-profile`, `--ngram-ram-mib`,
-`--ngram-lock`, `--no-ngram-table`) and `--kv-resident` (streamed sparse-attention KV), and its
+`--ngram-lock`, `--no-ngram-table`; DeepSeek-V4.1's Engram table takes all but `ram-hot` and
+`--ngram-hot-profile`) and `--kv-resident` (streamed sparse-attention KV), and its
 precision options (`--prefill-cublas`, `--lm-head-q4/q6`, `--embedding-q4/q6`, `--gdn-state-fp16`,
 `--mlp-a8-decode`, `--no-prefill-a8`).
 
