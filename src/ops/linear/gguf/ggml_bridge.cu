@@ -109,6 +109,8 @@ MoeLaunch moe_launcher(GgmlType type) {
         return moe_launch<GGML_TYPE_IQ4_NL>;
     case GgmlType::IQ4_XS:
         return moe_launch<GGML_TYPE_IQ4_XS>;
+    case GgmlType::MXFP4:
+        return moe_launch<GGML_TYPE_MXFP4>;
     }
     throw std::invalid_argument("gguf moe product: unsupported block type");
 }
@@ -137,6 +139,7 @@ Fn decode_launcher(GgmlType type) {
     case GgmlType::IQ1_M: return Pick<GGML_TYPE_IQ1_M>::launch;
     case GgmlType::IQ4_NL: return Pick<GGML_TYPE_IQ4_NL>::launch;
     case GgmlType::IQ4_XS: return Pick<GGML_TYPE_IQ4_XS>::launch;
+    case GgmlType::MXFP4: return Pick<GGML_TYPE_MXFP4>::launch;
     }
     throw std::invalid_argument("gguf moe decode: unsupported block type");
 }
@@ -256,6 +259,7 @@ VectorLaunch vector_launch(GgmlType type) {
     case GgmlType::IQ1_M: return vec_launch<GGML_TYPE_IQ1_M>;
     case GgmlType::IQ4_NL: return vec_launch<GGML_TYPE_IQ4_NL>;
     case GgmlType::IQ4_XS: return vec_launch<GGML_TYPE_IQ4_XS>;
+    case GgmlType::MXFP4: return vec_launch<GGML_TYPE_MXFP4>;
     }
     throw std::invalid_argument("gguf vector product: unsupported block type");
 }
@@ -392,7 +396,7 @@ cublasHandle_t blas_handle() {
 template <ggml_type type>
 inline constexpr bool kSmallBlocks =
     type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 ||
-    type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ4_NL;
+    type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_MXFP4;
 
 template <ggml_type type, int threads, typename dst_t>
 __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int64_t row_bytes,
@@ -472,6 +476,14 @@ __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int
         }
     } else if constexpr (type == GGML_TYPE_IQ4_XS) {
         dequantize_iq4_xs(x, blockIdx.x, y, threadIdx.x);
+    } else if constexpr (type == GGML_TYPE_MXFP4) {
+        const block_mxfp4* blocks = static_cast<const block_mxfp4*>(x) + blockIdx.x * (QK_K / QK_MXFP4);
+        for (int i = threadIdx.x; i < count; i += threads) {
+            const block_mxfp4& b = blocks[i / QK_MXFP4];
+            const int j          = i % QK_MXFP4;
+            const int code       = j < QK_MXFP4 / 2 ? (b.qs[j] & 0xF) : (b.qs[j - QK_MXFP4 / 2] >> 4);
+            y[i] = ggml_cuda_cast<dst_t>(ggml_cuda_e8m0_to_fp32(b.e) * 0.5f * float(kvalues_mxfp4[code]));
+        }
     }
 }
 
@@ -525,6 +537,7 @@ void dispatch_dequantize(GgmlType type, const void* weight, std::int64_t row_byt
     case GgmlType::IQ1_M: return launch_dequantize<GGML_TYPE_IQ1_M, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
     case GgmlType::IQ4_NL: return launch_dequantize<GGML_TYPE_IQ4_NL, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
     case GgmlType::IQ4_XS: return launch_dequantize<GGML_TYPE_IQ4_XS, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
+    case GgmlType::MXFP4: return launch_dequantize<GGML_TYPE_MXFP4, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
     }
     throw std::invalid_argument("gguf dequantize: unsupported block type");
 }
@@ -555,11 +568,12 @@ BlockShape block_shape(GgmlType type) {
     case GgmlType::IQ2_S: return {256, 82};
     case GgmlType::IQ4_XS: return {256, 136};
     case GgmlType::IQ1_M: return {256, 56};
+    case GgmlType::MXFP4: return {32, 17};
     }
     throw std::invalid_argument("gguf: unsupported block type");
 }
 
-bool has_matrix_kernel(GgmlType type) { return type != GgmlType::IQ1_M; }
+bool has_matrix_kernel(GgmlType type) { return type != GgmlType::IQ1_M && type != GgmlType::MXFP4; }
 
 int multiprocessor_count() { return detail::device_facts().sm_count; }
 
@@ -847,7 +861,8 @@ std::size_t matrix_fixup_bytes(GgmlType type, int rows, int columns) {
     case GgmlType::IQ1_S: return detail::matrix_fixup_bytes_impl<GGML_TYPE_IQ1_S>(rows, columns);
     case GgmlType::IQ4_NL: return detail::matrix_fixup_bytes_impl<GGML_TYPE_IQ4_NL>(rows, columns);
     case GgmlType::IQ4_XS: return detail::matrix_fixup_bytes_impl<GGML_TYPE_IQ4_XS>(rows, columns);
-    case GgmlType::IQ1_M: break;
+    case GgmlType::IQ1_M:
+    case GgmlType::MXFP4: break;
     }
     throw std::invalid_argument("gguf matrix product: no integer kernel for this block type");
 }
@@ -880,6 +895,7 @@ void matrix_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
         NINFER_GGUF_MATRIX_CASE(IQ4_NL);
         NINFER_GGUF_MATRIX_CASE(IQ4_XS);
     case GgmlType::IQ1_M:
+    case GgmlType::MXFP4:
         break;
     }
 #undef NINFER_GGUF_MATRIX_CASE
@@ -921,6 +937,7 @@ void matrix_product_bf16(GgmlType type, const void* weight, std::int64_t row_byt
         NINFER_GGUF_MATRIX_CASE(IQ4_NL);
         NINFER_GGUF_MATRIX_CASE(IQ4_XS);
     case GgmlType::IQ1_M:
+    case GgmlType::MXFP4:
         break;
     }
 #undef NINFER_GGUF_MATRIX_CASE
@@ -950,6 +967,7 @@ bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail) {
         NINFER_GGUF_MOE_FITS_CASE(IQ4_NL);
         NINFER_GGUF_MOE_FITS_CASE(IQ4_XS);
     case GgmlType::IQ1_M:
+    case GgmlType::MXFP4:
         return false;
     }
 #undef NINFER_GGUF_MOE_FITS_CASE
@@ -989,6 +1007,7 @@ void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& 
         NINFER_GGUF_MOE_MATRIX_CASE(IQ4_NL);
         NINFER_GGUF_MOE_MATRIX_CASE(IQ4_XS);
     case GgmlType::IQ1_M:
+    case GgmlType::MXFP4:
         break;
     }
 #undef NINFER_GGUF_MOE_MATRIX_CASE

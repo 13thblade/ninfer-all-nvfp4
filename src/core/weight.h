@@ -45,10 +45,13 @@ enum class QType : std::uint16_t {
     Q2_G64_FP16 = 28,
     // E4M3FN row codes followed by one binary16 multiplier (RowInterleaved only).
     FP8_E4M3FN_ROW_FP16 = 29,
+    // ggml's MXFP4 blocks (GgufBlocks): an E8M0 exponent byte, then 32 E2M1 codes, value j < 16 the
+    // low nibble of byte j, value j + 16 its high nibble.
+    GGUF_MXFP4 = 30,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
-    return format >= QType::GGUF_Q8_0 && format <= QType::GGUF_Q2_0;
+    return (format >= QType::GGUF_Q8_0 && format <= QType::GGUF_Q2_0) || format == QType::GGUF_MXFP4;
 }
 
 struct GgufBlockShape {
@@ -80,6 +83,7 @@ struct GgufBlockShape {
         return {32, 22};
     case QType::GGUF_Q2_0:
         return {64, 18};
+    case QType::GGUF_MXFP4: return {32, 17};
     default: return {};
     }
 }

@@ -4,8 +4,8 @@
 // quantize their activations to q8_1 as llama.cpp does, so they are held to that arithmetic's
 // error. Up to eight tokens take the vector kernel; wider calls over device-resident banks (each
 // matrix followed by 256 zero bytes, which the matrix kernel's last K step of a 640-value down row
-// reads) take the matrix kernel wherever the block type has one (IQ1_M stays on the vector
-// kernel), with one or several column tiles per expert, and the same calls over banks that are not
+// reads) take the matrix kernel wherever the block type has one (IQ1_M and MXFP4 stay on the
+// vector kernel), with one or several column tiles per expert, and the same calls over banks that are not
 // declared device resident take the vector kernel. Where the CPU has the bank's block types, the
 // decode form's second stage also comes from CPU products (gguf_expert_cpu, its automatically
 // selected backend), as a miss service with a CPU share supplies it, and the sum must equal the
@@ -78,6 +78,7 @@ std::vector<int> half_fields(QType q) {
     case QType::GGUF_Q6_K:
         return {208};
     case QType::GGUF_IQ1_M:
+    case QType::GGUF_MXFP4:
         return {};
     default:
         return {0};
@@ -106,6 +107,8 @@ std::vector<std::uint8_t> random_blocks(QType q, std::int32_t rows, std::int32_t
                     static_cast<std::uint16_t>((sc[j] & 0x0fff) | (((d >> (4 * j)) & 0xf) << 12));
             }
         }
+        // MXFP4's exponent byte: scales 2^-12 .. 2^-7.
+        if (q == QType::GGUF_MXFP4) { base[0] = static_cast<std::uint8_t>(115 + byte(rng) % 6); }
     }
     return bytes;
 }
@@ -522,6 +525,18 @@ int main() {
              2,
              {3, 24, 160},
              12},
+            // DeepSeek-V4.1's DSpark drafter: MXFP4 experts beside a Q8_0 shared expert, on the
+            // vector kernel (no matrix kernel takes MXFP4).
+            {"mxfp4 bank",
+             Q::GGUF_MXFP4,
+             Q::GGUF_MXFP4,
+             Q::GGUF_MXFP4,
+             Q::GGUF_Q8_0,
+             Q::GGUF_Q8_0,
+             Q::GGUF_Q8_0,
+             4,
+             {1, 3, 5, 8, 9},
+             kExperts},
             {"iq4_xs dense routing",
              Q::GGUF_IQ4_XS,
              Q::GGUF_IQ4_XS,

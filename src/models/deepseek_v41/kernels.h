@@ -183,7 +183,8 @@ void select_topk(const float* scores, int width, int tokens, const std::int32_t*
                  int ratio, int k, std::int32_t* out, cudaStream_t stream);
 
 // Sparse attention of each row's heads over its window (positions p - window_size + 1 .. p, from
-// slot position % ring of the window cache) and its selected compressed latents
+// slot position % ring of the window cache, window_size at most the ring and, beside k selected
+// latents, 1152 - k) and its selected compressed latents
 // (compressed[topk[t][i]] for the leading entries that are not negative), every latent its own key
 // and value; each head's sink logit joins the softmax denominator:
 //   out = sum_j e^(s_j - m) v_j / (sum_j e^(s_j - m) + e^(sink - m)),  s_j = scale q . k_j.
@@ -276,6 +277,28 @@ void ring_copy(const __nv_bfloat16* src, int src_ring, __nv_bfloat16* dst, int d
                int end, cudaStream_t stream);
 
 void f32_to_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, cudaStream_t stream);
+
+// The DSpark drafter's taps: out[t][i] = sum_s h[t][s][i] / streams for rows of h [T][S][H], out
+// rows `out_stride` apart.
+void stream_mean(const float* h, int tokens, int streams, int hidden, float* out,
+                 std::int64_t out_stride, cudaStream_t stream);
+
+// The rank of the drafter's Markov tables.
+inline constexpr int kMarkovRank = 256;
+
+// One greedy step of the drafter's Markov chain: ids[step + 1] = the token v < domain with the
+// highest logits[v] + sum_r head[v][r] embed[ids[step]][r] (lower v first among equal values),
+// logits FP32 [domain or more], head and embed BF16 [vocab][kMarkovRank]. `scratch` holds
+// markov_scratch_bytes().
+[[nodiscard]] std::size_t markov_scratch_bytes();
+void markov_step(const float* logits, const __nv_bfloat16* head, const __nv_bfloat16* embed,
+                 int domain, std::int32_t* ids, int step, void* scratch, cudaStream_t stream);
+
+// The drafter's confidence of each row t: sigmoid(sum_i x[i] w[i] + sum_r embed[ids[t]][r]
+// w[hidden + r]) for the FP32 collapse x = sum_s pre[t][s] h[t][s] (h [T][S][H], pre [T][S]).
+void dspark_confidence(const float* h, const float* pre, int tokens, int streams, int hidden,
+                       const float* w, const __nv_bfloat16* embed, const std::int32_t* ids,
+                       float* out, cudaStream_t stream);
 
 // The reference roundings, for tests: one value to E4M3 (|x| <= 448) and to E2M1 (|x| <= 6), to
 // nearest with ties to even.

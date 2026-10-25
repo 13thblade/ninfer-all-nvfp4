@@ -16,6 +16,8 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 ## What's New
 
+- **2026-10-26:** DeepSeek-V4.1-Flash drafts with the release's [DSpark drafter](docs/deepseek-v41.md#the-dspark-drafter) (`--spec dspark`): 83 tok/s on one RTX PRO 6000, from 51; on 24 GB cards it decodes slower than plain decoding.
+- **2026-10-26:** Token log probabilities of verification rows and of concurrent requests have the bits of a lone decode row's: the reduction over the vocabulary splits every row the same way.
 - **2026-10-25:** Fixed a race in the expert cache of host and disk experts: a decode miss could overwrite a lent slot its own call still read, which [changed DeepSeek-V4.1-Flash's log probabilities by up to 0.024](docs/deepseek-v41.md#prompt-spans) after an earlier request.
 - **2026-10-25:** DeepSeek-V4.1-Flash prefills in [spans of up to 16,384 tokens](docs/deepseek-v41.md#prompt-spans): 925 tok/s for 8,086 tokens on an RTX 4090, from 498.
 - **2026-10-25:** [DeepSeek-V4.1-Flash](docs/deepseek-v41.md) from ISTA-DASLab's GSQ-RCO IQ1_M GGUF, experts in host memory or on disk: [48 tok/s on one RTX PRO 6000, 26 on one RTX 4090](docs/performance.md#deepseek-v41-flash).
@@ -172,7 +174,7 @@ that only this engine reads.
 | [Qwen3.8-Flash-Next Coder GSQ-RCO IQ1_M](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 31.02 | GGUF blocks | ✓ | ✓ | — | — | expert-pruned coding build, 256 experts per layer; shared-Q8_0 MTP; reads the n-gram table |
 | [Gemma 4 26B-A4B it QAT](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3) | 14.75 | GGUF Q4_0 blocks | ✓ | ✓ | — | — | Google's QAT GGUF byte for byte; the MTP column is Google's QAT assistant |
 | [Flint UD-Q4_K_XL](https://huggingface.co/WaveCut/Flint-UD-Q4_K_XL-NInfer-v3) | 23.38 | GGUF blocks, Q8_0 to IQ3_S | — | — | — | — | Unsloth's UD-Q4_K_XL GGUF byte for byte; drafts by context lookup |
-| [DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ1_M](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3) | 112.69 | GGUF blocks, IQ1_S to IQ2_S experts | — | — | — | — | ISTA-DASLab's GGUF byte for byte; experts in host memory or on disk; reads the Engram table; drafts by context lookup |
+| [DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ1_M](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3) | 120.12 | GGUF blocks, IQ1_S to IQ2_S experts | — | — | — | — | ISTA-DASLab's GGUF byte for byte; experts in host memory or on disk; reads the Engram table; the release's DSpark drafter from Unsloth's Q8_0 GGUF (`--spec dspark`), or context lookup |
 
 The three Flash-Next releases read one shared n-gram table, which the model names by digest: the
 [n-gram table](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3) (26.92 GiB,
@@ -271,7 +273,7 @@ Prefill of a 4,463-token prompt, in tok/s:
 </details>
 
 <details>
-<summary><b>DeepSeek-V4.1-Flash</b> — 48 tok/s on one RTX PRO 6000, 22 to 29 tok/s on 24 and 32 GB cards</summary>
+<summary><b>DeepSeek-V4.1-Flash</b> — 48 tok/s on one RTX PRO 6000, 83 with DSpark, 22 to 29 tok/s on 24 and 32 GB cards</summary>
 
 ISTA-DASLab's GSQ-RCO IQ1_M GGUF (112.7 GiB, and its 103.0 GiB Engram table), one request, greedy,
 thinking off, one GPU, October 2026. The routed experts stay in pinned host memory or in the file, and
@@ -288,7 +290,10 @@ These ran prompts chunk by chunk; prompt spans now prefill the 8,086 tokens at 9
 RTX 4090. On one RTX 4090 host, Strata 0.2.6 decodes the same GGUF at 34 to 40 tok/s, computing
 about half the experts on its CPU threads, against NInfer's 22 to 26, and prefills at 635 to 690
 tok/s against NInfer's 925 ([measurements](docs/deepseek-v41.md#measurements)). With host experts
-the server peaks at 116 GiB of host memory.
+the server peaks at 116 GiB of host memory. With the release's DSpark drafter (`--spec dspark`) the
+RTX PRO 6000 decodes at 83.1 and 75.0 tok/s, against 50.8 and 48.3 for the same build without it;
+on the RTX 4090 the drafter's 7.4 GiB shrink the expert cache, and it decodes at 23.6 and 19.4
+tok/s against 25.9 and 22.3 ([the drafter](docs/deepseek-v41.md#the-dspark-drafter)).
 
 </details>
 
@@ -345,7 +350,8 @@ the server peaks at 116 GiB of host memory.
   hyper-connections, latent attention over a 128-position window and indexer-selected compressed
   latents with the release's FP8 and FP4 roundings, Engram rows read from the table's file or
   RAM, up to eight concurrent requests with prefix reuse through host memory, reasoning, DSML
-  tool calls, structured output, typed decisions and context-lookup drafting. Its 106.7 GiB of
+  tool calls, structured output, typed decisions, the release's DSpark drafter and context-lookup
+  drafting. Its 106.7 GiB of
   routed experts stay in pinned host memory or in the artifact's files, read into bounded
   buffers rather than mapped. Prompts run block by block in spans of up to 16,384 tokens, so each
   block's experts cross the bus once per span. On one RTX 4090 with its experts in host memory it
@@ -363,7 +369,7 @@ the server peaks at 116 GiB of host memory.
 </details>
 
 <details>
-<summary><b>Speculative decoding</b> — MTP, DFlash, DFlash2, n-gram copying and context lookup</summary>
+<summary><b>Speculative decoding</b> — MTP, DFlash, DFlash2, DSpark, n-gram copying and context lookup</summary>
 
 - MTP, DFlash and DFlash2 with 1 to 15 drafts; the artifact's proposal head drafts by default when it
   stores one. Under MTP and DFlash a sampled request keeps a draft only while it equals the model's
@@ -372,8 +378,13 @@ the server peaks at 116 GiB of host memory.
 - Gemma 4 drafts with Google's multi-token-prediction assistant (`--spec mtp`, 1 to 7 drafts), four
   blocks that read the model's own KV cache; its verification rows are bit for bit plain decode rows,
   so the output is the one plain decoding gives.
-- Flint and DeepSeek-V4.1-Flash, which have no drafter, draft by context lookup (`--lookup-ngram N`,
-  1 to 7 drafts): what followed the last N tokens' earlier occurrence, verified in one pass of decode rows.
+- DeepSeek-V4.1-Flash drafts with the release's DSpark drafter (`--spec dspark`, 1 to 5 drafts kept
+  while its confidence holds): three blocks that read the backbone's last three blocks' streams. Its
+  verification rows are bit for bit plain decode rows. It decodes 1.6 times as fast on an RTX PRO
+  6000 and slower than plain decoding on a 24 GB card, whose expert cache it shrinks.
+- Flint, which has no drafter, and DeepSeek-V4.1-Flash without `--spec` draft by context lookup
+  (`--lookup-ngram N`, 1 to 7 drafts): what followed the last N tokens' earlier occurrence, verified
+  in one pass of decode rows.
 - `--adaptive-mtp` picks each round's width from measured draft survival and round cost.
 - N-gram copy drafting beside the neural drafter (on with `--spec`) verifies up to 15 tokens copied
   from earlier prompt, tool-result or output text ([ngram copy proposals](docs/ngram.md)).

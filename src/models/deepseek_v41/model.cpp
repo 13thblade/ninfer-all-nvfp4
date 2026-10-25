@@ -125,6 +125,10 @@ ops::WeightInput Model::input(WeightId id) const {
     return ops::WeightInput{parameter.view, use.policy, use.activation_input_divisor};
 }
 
+bool has_dspark(const artifact::Reader& reader) {
+    return reader.directory().components.contains("dspark");
+}
+
 bool is_deepseek_v41(const artifact::Reader& reader) {
     const auto& components = reader.directory().components;
     const auto text        = components.find("text");
@@ -161,8 +165,9 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     const std::uint64_t groups = config.o_groups, o_rank = config.o_lora_rank;
     const std::uint64_t ih = config.index_heads, idim = config.index_head_dim;
     const std::uint64_t e = config.num_experts, w = config.moe_intermediate_size;
-    for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
-        const std::string p = "text/layers/" + std::to_string(i) + "/";
+    // What every block binds, the backbone's and the drafter's: hyper-connections, norms, the
+    // window attention, the router and the shared expert.
+    const auto block = [&](const std::string& p, std::uint64_t experts) {
         const std::string a = p + "attention/";
         LayerWeights layer;
         for (auto [site, prefix] : {std::pair{&layer.hc_attention, p + "hc_attention/"},
@@ -186,6 +191,30 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         for (const WeightId id : {at.query_a, at.kv, at.query_b, at.output_a, at.output_b}) {
             tail(b, id);
         }
+        const std::string m = p + "moe/";
+        MoeWeights& moe     = layer.moe;
+        moe.router          = b.direct(m + "router", {experts, h}, QType::FP32);
+        moe.router_bias     = b.direct(m + "router_bias", {experts}, QType::FP32);
+        moe.shared_gate     = b.parameter(m + "shared_gate", {w, h}, {m + "input"});
+        moe.shared_up       = b.parameter(m + "shared_up", {w, h}, {m + "input"});
+        moe.shared_down     = b.parameter(m + "shared_down", {h, w}, {m + "shared_product"});
+        tail(b, moe.shared_down);
+        tail(b, moe.shared_gate);
+        return layer;
+    };
+    const auto resident_experts = [&](LayerWeights& layer, const std::string& p,
+                                      std::uint64_t experts) {
+        const std::string m = p + "moe/";
+        layer.moe.gate_up = b.parameter(m + "gate_up", {experts * 2 * w, h}, {m + "input"});
+        layer.moe.down    = b.parameter(m + "down", {experts * h, w}, {m + "product"});
+        tail(b, *layer.moe.down);
+        tail(b, *layer.moe.gate_up);
+    };
+    for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
+        const std::string p = "text/layers/" + std::to_string(i) + "/";
+        const std::string a = p + "attention/";
+        LayerWeights layer = block(p, e);
+        auto& at           = layer.attention;
         if (config.kv_source[i]) {
             at.compressor_kv = b.direct(a + "compressor/kv", {d, h}, QType::FP32);
             if (config.compress_ratios[i] > 1) {
@@ -200,14 +229,6 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             at.index_weights = b.direct(a + "indexer/weights", {ih, h}, QType::FP32);
         }
         const std::string m = p + "moe/";
-        MoeWeights& moe     = layer.moe;
-        moe.router          = b.direct(m + "router", {e, h}, QType::FP32);
-        moe.router_bias     = b.direct(m + "router_bias", {e}, QType::FP32);
-        moe.shared_gate     = b.parameter(m + "shared_gate", {w, h}, {m + "input"});
-        moe.shared_up       = b.parameter(m + "shared_up", {w, h}, {m + "input"});
-        moe.shared_down     = b.parameter(m + "shared_down", {h, w}, {m + "shared_product"});
-        tail(b, moe.shared_down);
-        tail(b, moe.shared_gate);
         if (offload) {
             const auto residency = options.experts == ExpertResidency::Host
                                        ? artifact::Residency::Pinned : artifact::Residency::Values;
@@ -224,10 +245,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                 }
             }
         } else {
-            moe.gate_up = b.parameter(m + "gate_up", {e * 2 * w, h}, {m + "input"});
-            moe.down    = b.parameter(m + "down", {e * h, w}, {m + "product"});
-            tail(b, *moe.down);
-            tail(b, *moe.gate_up);
+            resident_experts(layer, p, e);
         }
         if (config.engram.index(i) >= 0) {
             const std::string n = p + "engram/";
@@ -240,6 +258,31 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             layer.engram = engram;
         }
         weights.layers.push_back(std::move(layer));
+    }
+    std::optional<DSparkConfig> dspark_config;
+    std::optional<DSparkWeights> dspark;
+    if (options.dspark) {
+        if (!has_dspark(reader)) {
+            throw artifact::ArtifactError("the artifact carries no DSpark drafter (convert with "
+                                          "--components text,dspark)");
+        }
+        dspark_config = parse_dspark_config(reader.directory().component("dspark").config, config);
+        const std::uint64_t taps = dspark_config->target_layers.size();
+        const std::uint64_t rank = dspark_config->markov_rank;
+        DSparkWeights& drafter   = dspark.emplace();
+        drafter.fc               = b.parameter("dspark/fc", {h, taps * h}, {"dspark/taps"});
+        drafter.tap_norm         = b.direct("dspark/tap_norm", {h}, QType::FP32);
+        drafter.final_norm       = b.direct("dspark/final_norm", {h}, QType::FP32);
+        drafter.markov_embed     = b.direct("dspark/markov_embed", {config.vocab_size, rank});
+        drafter.markov_head      = b.direct("dspark/markov_head", {config.vocab_size, rank});
+        drafter.confidence       = b.direct("dspark/confidence", {h + rank}, QType::FP32);
+        tail(b, drafter.fc);
+        for (std::uint32_t i = 0; i < dspark_config->layers; ++i) {
+            const std::string p = "dspark/layers/" + std::to_string(i) + "/";
+            LayerWeights layer  = block(p, dspark_config->experts);
+            resident_experts(layer, p, dspark_config->experts);
+            drafter.layers.push_back(std::move(layer));
+        }
     }
     InstanceInfo info;
     info.name            = reader.directory().metadata.value("name", std::string("DeepSeek-V4.1-Flash"));
@@ -268,6 +311,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                                                   std::move(bound), std::move(resources),
                                                   std::move(info), std::move(backing)));
     model->engram_token_map_ = std::move(token_map);
+    model->dspark_config_    = std::move(dspark_config);
+    model->dspark_           = std::move(dspark);
     model->expert_residency_ = options.experts;
     model->expert_banks_     = std::move(expert_banks);
     if (options.experts == ExpertResidency::Disk) {

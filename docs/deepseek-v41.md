@@ -63,27 +63,32 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   and the model answers from what it has thought.
 - **Sampling defaults.** The release's: temperature 1.0, top-p 1.0 (top-k 20, the candidates the
   sampler keeps).
-- **Speculative decoding by context lookup.** The GGUF carries none of the release's draft blocks.
-  `--lookup-ngram N` proposes what followed the last N tokens' earlier occurrence in the sequence
-  (up to `--draft-tokens`, 3 by default, at most 7), and the target verifies the proposal in one
-  pass of decode rows; the output is the one plain decoding gives.
+- **Speculative decoding with the DSpark drafter.** An artifact converted with the release's drafter
+  (the `dspark` component, [below](#the-dspark-drafter)) drafts with `--spec dspark`: up to 5
+  tokens a round (`--draft-tokens`, 1 to 5), kept while the drafter's confidence is at least 0.5,
+  verified by the target in one pass of decode rows. Its tokens and log probabilities are plain
+  decoding's.
+- **Speculative decoding by context lookup.** Without `--spec`, `--lookup-ngram N` proposes what
+  followed the last N tokens' earlier occurrence in the sequence (up to `--draft-tokens`, 3 by
+  default, at most 7), and the target verifies the proposal in one pass of decode rows; the output
+  is the one plain decoding gives.
 - **Expert residency.** The routed experts stay on the GPU, in pinned host memory or in the
   artifact's files ([below](#expert-residency)); host memory is the residency to use.
 - **The Engram table.** Stored in the model's artifact or in a table artifact of its own, read row
   by row from its file or held in RAM ([below](#the-engram-table)).
 
-Not built for this family: the quantized `--kv-dtype` formats (the caches are BF16), the release's
-draft blocks, MTP, DFlash and n-gram copy drafts, a CPU share of the expert misses (the IQ1_S, IQ1_M
-and IQ2 blocks have no CPU kernels), rotation scaling (`--rope-yarn`, `--rope-scaling-factor`: the
-compressed blocks carry the release's own YaRN), images and video (the GGUF has no vision tower),
-pipeline stages and tensor parallelism, and of the context cache the shared paged KV pool, the disk
-tier and session slots.
+Not built for this family: the quantized `--kv-dtype` formats (the caches are BF16), MTP, DFlash
+and n-gram copy drafts, DSpark drafts while several requests decode, a CPU share of the expert
+misses (the IQ1_S, IQ1_M and IQ2 blocks have no CPU kernels), rotation scaling (`--rope-yarn`,
+`--rope-scaling-factor`: the compressed blocks carry the release's own YaRN), images and video (the
+GGUF has no vision tower), pipeline stages and tensor parallelism, and of the context cache the
+shared paged KV pool, the disk tier and session slots.
 
 ## Converting
 
-The converter reads the weights from the GGUF shards and the Engram GGUF, and the tokenizer and
-configuration from the base release. The release ships no Jinja chat template; the converter stores
-its own transcription of the release's encoder (`tools/convert/templates/deepseek_v41`).
+The converter reads the weights from the GGUF shards, the Engram GGUF and the drafter GGUF, and the
+tokenizer and configuration from the base release. The release ships no Jinja chat template; the
+converter stores its own transcription of the release's encoder (`tools/convert/templates/deepseek_v41`).
 
 ```bash
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 config.json tokenizer.json tokenizer_config.json \
@@ -91,11 +96,14 @@ hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 config.json tokenizer.json toke
 hf download ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF \
   --include 'DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-*.gguf' \
   --include 'DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf' --local-dir models/deepseek-v4.1
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
+  --local-dir models/deepseek-v4.1
 
-# The model, which names its Engram table by the SHA-256 of the table's rows.
-python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf --components text \
+# The model with its DSpark drafter; it names its Engram table by the SHA-256 of the table's rows.
+python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf --components text,dspark \
   --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf \
   --source engram=models/deepseek-v4.1/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
+  --source dspark=models/deepseek-v4.1/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
   --name DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M \
   --out models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer --device cpu
 # The Engram table, one artifact for every DeepSeek-V4.1-Flash-1017 conversion.
@@ -105,9 +113,11 @@ python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gg
   --out models/DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer --device cpu
 ```
 
-The model reads the Engram GGUF only for the table's digest. The model is one file of
-121,003,660,288 bytes (112.7 GiB), the table one of 110,595,294,496 bytes (103.0 GiB); on 24 cores
-of a Threadripper 3960X the conversions took 7 min 19 s and 3 min 29 s.
+The model reads the Engram GGUF only for the table's digest. `--components text` leaves the drafter
+out (121,003,660,288 bytes); its other objects are the same bytes either way. The model with its
+drafter is one file of 128,975,327,488 bytes (120.1 GiB), the table one of 110,595,294,496 bytes
+(103.0 GiB). On the 128 threads of two 32-core EPYC engineering samples the model took 3 min 54 s;
+on 24 cores of a Threadripper 3960X the table took 3 min 29 s.
 
 ## Running
 
@@ -178,7 +188,8 @@ experts. With host or disk experts the executor runs a prompt's chunks block by 
 - **Memory.** A span keeps its residual streams, coefficients and index selections between blocks:
   1,323 MiB for 16,384 tokens. Beside the default elastic expert cache, the span borrows them from
   the cache while it runs and gives them back after it, so decode keeps the whole cache; a span
-  the cache cannot lend them to at that moment runs chunk by chunk. With a fixed
+  the cache cannot lend them to at that moment runs as two halves of whole chunks, each a span the
+  cache may lend to, down to chunk by chunk. With a fixed
   `--expert-cache-mib` they stay in the workspace. The Engram rows of a span's tokens are staged
   on the card (about 95 MiB more than for one chunk).
 
@@ -196,6 +207,68 @@ addresses and copies them to the device:
   (`--ngram-io`, `--ngram-io-depth`, `--ngram-ram-mib` for a row cache), and `ram` holds the whole
   table in RAM (`--ngram-lock` pins it). The table is 103.0 GiB, so `ram` and host experts together
   need about 210 GiB of RAM.
+
+## The DSpark drafter
+
+DeepSeek-V4.1-Flash-1017 ships DSpark, a drafter of three blocks of the backbone's shape;
+Unsloth's `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` stores it in Q8_0 with MXFP4 routed experts,
+and the converter stores those blocks as they are in the artifact's `dspark` component. With
+`--spec dspark` the executor loads it beside the model:
+
+- **What it reads.** At every position the backbone computes, the mean of the four streams entering
+  blocks 37, 38 and 39, projected (`fc`) and normalized into a key and value latent of each drafter
+  block, written to that block's window ring: the prompt's last 128 rows, every decode row and the
+  rows a verification keeps.
+- **A round.** The drafter runs the last accepted token and four noise tokens through its three
+  blocks in one pass (each row attends over the ring and over all five rows; the MoE routes each
+  row to 3 of 128 experts beside a shared expert), adds a rank-256 Markov term of the previous token
+  to the backbone's head logits and takes each row's greedy token, so five rows give five drafts.
+  A confidence head scores each draft; the round keeps the drafts up to the first scored below 0.5
+  (Strata's default for this drafter), at most `--draft-tokens`, and with none decodes one token.
+- **Exactness.** The target verifies the drafts in one pass of decode rows. Its attention splits a
+  row's keys the same way however many rows a pass has, and the log probabilities split a row's
+  vocabulary the same way however many rows they reduce, so a verified token and its log
+  probability are bit for bit those of plain decoding: greedy runs with and without the drafter
+  gave the same tokens and log probabilities with host and disk experts on an RTX 4090 and with
+  host experts on an RTX PRO 6000. A sampled request keeps a draft only while it equals the
+  target's own draw, as context-lookup drafts are kept.
+- **One request.** The drafter drafts while one request decodes; with more, each round decodes one
+  token per request.
+- **Memory.** The drafter's weights take 7.4 GiB of device memory, almost all of it its 384 MXFP4
+  experts; its rings take 0.75 MiB per sequence (twice that with prefix checkpoints) and the tapped
+  streams 7.5 MiB. The expert cache gives up that memory: on an RTX 4090 with host experts it keeps
+  73 experts instead of 1,137, and prompt spans shorten to 8,192 tokens.
+
+On October 26, 2026, two rented hosts ran the drafter on the prompts of the
+[Strata comparison](#against-strata-on-one-host) (one request, greedy, thinking off, host experts):
+that comparison's RTX 4090 host, and an RTX PRO 6000 (600 W, PCIe 5.0 x16) with a 24-core
+Threadripper PRO 7965WX and 188 GiB of RAM, NVIDIA driver 595.99:
+
+| card | drafts | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens | drafts accepted, short and long |
+|---|---|---:|---:|---:|---:|
+| RTX PRO 6000 | none | 50.8 tok/s | 48.3 tok/s | 1,210 tok/s | |
+| | `--spec dspark` | 83.1 tok/s | 75.0 tok/s | 1,290 tok/s | 38 of 58, 16 of 26 |
+| | `--spec dspark --draft-tokens 3` | 83.3 tok/s | 77.0 tok/s | 1,290 tok/s | 37 of 53, 16 of 24 |
+| RTX 4090 | none | 25.9 tok/s | 22.3 tok/s | 927 tok/s | |
+| | `--spec dspark` | 23.6 tok/s | 19.4 tok/s | 686 tok/s | 39 of 51, 16 of 28 |
+
+- **A card that caches most experts gains.** With the drafter the RTX PRO 6000 keeps 10,317 of the
+  15,360 experts on the card (11,387 without) and decodes 1.6 times as fast after the short prompt
+  and 1.55 times after the long one; three drafts a round decode as fast as five.
+- **A 24 GB card loses.** With the drafter the RTX 4090 keeps 73 experts (1,137 without), so nearly
+  every expert a round's rows route to is copied, beside the drafter's own pass: decode slows by 9%
+  and 13%, and prefill by 26%, in spans of 8,192 tokens. Run such cards without `--spec dspark`. On
+  the same host Strata's `--dspark on` decodes at 34.3 and 38.7 tok/s
+  ([above](#against-strata-on-one-host)).
+- **Strata on the RTX PRO 6000.** Strata 0.2.6 exited with `router picked expert 2147483647` in
+  each of its ten runs on that host: the flags its app starts the engine with, `--dspark on` and
+  `--dspark on --dspark-block 3`, each on both prompts; the app's flags with `--reserve-mib 4096`
+  and `16384`, which left 4 and 16 GiB of the card free; `--dspark off`; and `--dspark off
+  --vram-experts 0.5`. That host has no Strata numbers.
+- **Memory.** On the RTX PRO 6000 the server peaked at 116.2 GiB of resident host memory with the
+  drafter and 116.0 GiB without it.
+
+One run per row; no spread is measured.
 
 ## Prefix reuse
 
@@ -240,6 +313,7 @@ decoding, thinking off, the same prompt tokens in both engines: a 14-token quest
 |---|---:|---:|---:|
 | NInfer, host experts | 26.0 tok/s | 22.0 tok/s | 925 tok/s |
 | NInfer `b3402a6fd`, host experts | 25.8 tok/s | 22.1 tok/s | 498 tok/s |
+| NInfer, host experts, `--spec dspark` | 23.6 tok/s | 19.4 tok/s | 686 tok/s |
 | Strata, `--dspark auto --dspark-conf 0.65` | 36.0 tok/s | 38.4 tok/s | 635 tok/s |
 | Strata, `--dspark on --dspark-conf 0.65` | 34.3 tok/s | 38.7 tok/s | 690 tok/s |
 | Strata, `--dspark on --dspark-conf 0.65 --dspark-block 3` | 39.9 tok/s | 37.1 tok/s | 660 tok/s |
@@ -254,8 +328,10 @@ decoding, thinking off, the same prompt tokens in both engines: a 14-token quest
   fast.
 - **Prefill.** Strata prefills in windows of 16,384 tokens; NInfer runs the 8,086 tokens as one
   [prompt span](#prompt-spans), 1.9 times the release's rate.
-- **Drafts.** With `--dspark on`, 22 of 30 drafts were accepted on the short answer and 10 of 12
-  on the long one; `--dspark auto` offered none.
+- **Drafts.** With `--dspark on`, Strata accepted 22 of 30 drafts on the short answer and 10 of 12
+  on the long one; `--dspark auto` offered none. NInfer's `--spec dspark` row ran on October 26
+  and accepted 39 of 51 and 16 of 28 ([the drafter](#the-dspark-drafter)); on this card it decodes
+  slower than without drafts.
 - **Repeatability.** Strata's greedy answers to the short prompt ran 74 to 119 tokens over its six
   runs. NInfer's greedy tokens were the same in every run, in both builds, and so were the current
   build's log probabilities. The release's log probabilities after the long prompt, which followed

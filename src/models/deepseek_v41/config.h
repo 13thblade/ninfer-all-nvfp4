@@ -82,8 +82,22 @@ struct TextConfig {
     [[nodiscard]] std::uint32_t hc_mixes() const noexcept { return (2 + hc_mult) * hc_mult; }
 };
 
+// The DSpark drafter (the `dspark` component): `layers` blocks of the backbone's shape (window
+// attention only) whose rings hold the backbone's streams entering target_layers, averaged, through
+// a projection and its norm. A draft runs a block of block_size rows, the anchor token then the
+// noise token, at the positions after the ring's; each row's logits are the backbone's head over
+// the final norm of its collapsed streams plus a Markov bias of the token before it (rank
+// markov_rank), and a confidence head reads the collapsed row and that token's Markov embedding.
+// Its MoE routes to top_k of `experts`.
+struct DSparkConfig {
+    std::uint32_t layers = 0, block_size = 0, markov_rank = 0, experts = 0, top_k = 0;
+    std::int32_t noise_token = 0;
+    std::vector<std::uint32_t> target_layers;
+};
+
 // Throws artifact::ArtifactError naming the field that is missing, malformed or outside the
 // implemented geometry.
 [[nodiscard]] TextConfig parse_text_config(const artifact::Json& value);
+[[nodiscard]] DSparkConfig parse_dspark_config(const artifact::Json& value, const TextConfig& text);
 
 } // namespace ninfer::models::deepseek_v41

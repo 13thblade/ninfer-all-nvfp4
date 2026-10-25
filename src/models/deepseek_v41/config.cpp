@@ -178,4 +178,38 @@ TextConfig parse_text_config(const Json& value) {
     return out;
 }
 
+DSparkConfig parse_dspark_config(const Json& value, const TextConfig& text) {
+    const auto& architectures = value.at("architectures");
+    if (!architectures.is_array() || architectures.size() != 1 ||
+        architectures[0] != "DeepseekV41DSpark" ||
+        value.value("model_type", "") != "deepseek_v41_dspark") {
+        throw ArtifactError("DeepSeek-V4.1 DSpark config: architecture/model_type mismatch");
+    }
+    DSparkConfig out;
+    out.layers      = integer(value, "num_hidden_layers");
+    out.block_size  = integer(value, "block_size");
+    out.markov_rank = integer(value, "markov_rank");
+    out.experts     = integer(value, "n_routed_experts");
+    out.top_k       = integer(value, "num_experts_per_tok");
+    out.noise_token = static_cast<std::int32_t>(integer(value, "noise_token_id", false));
+    for (const auto id : u64_list(member(value, "target_layer_ids"), "target_layer_ids")) {
+        if (id >= text.num_hidden_layers ||
+            (!out.target_layers.empty() && id <= out.target_layers.back())) {
+            throw ArtifactError("DeepSeek-V4.1 DSpark config: target_layer_ids must name backbone "
+                                "blocks in order");
+        }
+        out.target_layers.push_back(static_cast<std::uint32_t>(id));
+    }
+    // A draft's rows are one decode pass of the vector kernels (at most eight), its Markov rank
+    // a warp's eight values per lane.
+    const bool ok = out.block_size >= 1 && out.block_size <= 8 && out.markov_rank == 256 &&
+                    out.experts <= 512 && out.top_k >= 1 && out.top_k <= 8 &&
+                    out.top_k <= out.experts && !out.target_layers.empty() &&
+                    std::uint32_t(out.noise_token) < text.vocab_size;
+    if (!ok) {
+        throw ArtifactError("DeepSeek-V4.1 DSpark config: geometry outside the implemented kernels");
+    }
+    return out;
+}
+
 } // namespace ninfer::models::deepseek_v41

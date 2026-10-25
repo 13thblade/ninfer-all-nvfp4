@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <random>
@@ -283,6 +284,75 @@ int run_inactive_case() {
     return 0;
 }
 
+struct Outputs {
+    std::vector<std::int32_t> ids;
+    std::vector<float> values, lse;
+};
+
+// The outputs of `batch` one-column rows of `physical` BF16-represented logits each, under
+// default sampling configs.
+Outputs compute_rows(const std::vector<float>& logits, std::int32_t physical, std::int32_t domain,
+                     std::int32_t batch) {
+    std::vector<std::uint16_t> packed(logits.size());
+    for (std::size_t i = 0; i < packed.size(); ++i) { packed[i] = f32_to_bf16(logits[i]); }
+    DeviceBuffer device_logits(packed.size() * sizeof(std::uint16_t));
+    device_logits.copy_from_host(packed.data(), device_logits.bytes);
+    const std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch));
+    DeviceBuffer config_buffer(configs.size() * sizeof(ops::SamplingConfig));
+    config_buffer.copy_from_host(configs.data(), config_buffer.bytes);
+    const auto rows = static_cast<std::size_t>(batch);
+    DeviceBuffer ids(rows * K * sizeof(std::int32_t)), values(rows * K * sizeof(float)),
+        lse(rows * sizeof(float)), active(sizeof(std::int32_t));
+    const std::int32_t on = 1;
+    active.copy_from_host(&on, sizeof(on));
+    Tensor ids_tensor(ids.p, DType::I32, {K, 1, batch});
+    Tensor values_tensor(values.p, DType::FP32, {K, 1, batch});
+    Tensor lse_tensor(lse.p, DType::FP32, {1, batch});
+    WorkspaceArena workspace(ops::logprob_topk_workspace_capacity_bytes(domain, batch));
+    ops::logprob_topk(Tensor(device_logits.p, DType::BF16, {physical, 1, batch}),
+                      static_cast<const ops::SamplingConfig*>(config_buffer.p), nullptr, domain,
+                      ids_tensor, values_tensor, lse_tensor, Tensor(active.p, DType::I32, {1}),
+                      workspace, nullptr);
+    cuda_synchronize();
+    return {from_device<std::int32_t>(ids.p, rows * K), from_device<float>(values.p, rows * K),
+            from_device<float>(lse.p, rows)};
+}
+
+// A row's top set, logprobs and log-sum-exp have the same bits alone (one decoding request) and
+// beside other rows (a verification's columns, several requests' rows), so that a verified token's
+// logprob is plain decoding's. One token of each row is 0 and the others lie in [-13, -11]: together
+// they add about 2 to a sum of about 3, so a sum reduced in another order rounds differently and
+// the log-sum-exp, near 1, shows it.
+int run_row_independence_case() {
+    const CaseSpec spec{.batch = 16};
+    Inputs in = make_inputs(spec, 22u);
+    for (std::size_t i = 0; i < in.logits.size(); ++i) {
+        const std::size_t row = i / static_cast<std::size_t>(spec.physical_rows);
+        const bool top        = i % static_cast<std::size_t>(spec.physical_rows) == 17 * row;
+        in.logits[i] = top ? 0.0f : bf16_to_f32(f32_to_bf16(-12.0f + in.logits[i] / 6.0f));
+    }
+    const Outputs together =
+        compute_rows(in.logits, spec.physical_rows, spec.token_domain, spec.batch);
+    std::size_t differ = 0;
+    for (std::int32_t b = 0; b < spec.batch; ++b) {
+        const auto first = in.logits.begin() + static_cast<std::ptrdiff_t>(b) * spec.physical_rows;
+        const Outputs alone = compute_rows(std::vector<float>(first, first + spec.physical_rows),
+                                           spec.physical_rows, spec.token_domain, 1);
+        const auto at = static_cast<std::size_t>(b);
+        differ += std::memcmp(&alone.lse[0], &together.lse[at], sizeof(float)) != 0 ? 1 : 0;
+        for (int k = 0; k < K; ++k) {
+            const std::size_t slot = at * K + static_cast<std::size_t>(k);
+            differ += alone.ids[static_cast<std::size_t>(k)] != together.ids[slot] ? 1 : 0;
+            differ += std::memcmp(&alone.values[static_cast<std::size_t>(k)], &together.values[slot],
+                                  sizeof(float)) != 0
+                          ? 1
+                          : 0;
+        }
+    }
+    std::cout << "rows alone and beside others: " << differ << " outputs differ\n";
+    return differ == 0 ? 0 : 1;
+}
+
 template <class Function>
 int expect_invalid(const char* label, Function&& function) {
     try {
@@ -377,6 +447,7 @@ int main() {
                          20u);
     failures += run_case("widest ngram verification",
                          {.columns = 64, .batch = 8, .presence = 0.3f, .counts = true}, 21u);
+    failures += run_row_independence_case();
     failures += run_inactive_case();
     failures += run_validation_cases();
     std::cout << (failures != 0 ? "FAIL" : "OK") << " logprob_topk\n";
