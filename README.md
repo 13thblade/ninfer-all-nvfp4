@@ -16,7 +16,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 ## What's New
 
-- **2026-10-25:** DeepSeek-V4.1-Flash-1017, the fifth model family, from ISTA-DASLab's GSQ-RCO IQ1_M GGUF and its Engram table. Its 106.7 GiB of routed experts stay in pinned host memory or in the file and are copied to the GPU as layers route to them: 21.8 tok/s on one RTX 3090, where Strata decodes 3.9 on one GPU and 6.6 on two ([model](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3), [docs](docs/deepseek-v41.md), [#138](https://github.com/iamwavecut/ninfer-all/pull/138)). Every model now pins its host memory with parallel direct reads.
+- **2026-10-25:** DeepSeek-V4.1-Flash-1017, the fifth model family, from ISTA-DASLab's GSQ-RCO IQ1_M GGUF and its Engram table. Its 106.7 GiB of routed experts stay in pinned host memory or in the file and are copied to the GPU as layers route to them: 48 tok/s on one RTX PRO 6000 and 21.8 on one RTX 3090, where Strata decodes 3.9 on one GPU and 6.6 on two ([model](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3), [docs](docs/deepseek-v41.md), [#138](https://github.com/iamwavecut/ninfer-all/pull/138)). Every model now pins its host memory with parallel direct reads.
 - **2026-10-25:** Tensor parallelism: `--tensor-parallel` divides the Gated DeltaNet heads and dense FFN rows of a dense Qwen3.5-core model over several GPUs ([pipeline stages](docs/maintainer/pipeline-stages.md), [#136](https://github.com/iamwavecut/ninfer-all/pull/136)).
 - **2026-10-24:** Flint decodes 348 tok/s on an RTX 5090 (llama.cpp: 223) and 210 tok/s on an RTX 4090 with its experts in host memory (llama.cpp: 166) ([measurements](docs/flint.md#measurements), [#135](https://github.com/iamwavecut/ninfer-all/pull/135)).
 - **2026-10-23:** Flint, the fourth model family: Recursive's `FlintForCausalLM` from Unsloth's UD-Q4_K_XL GGUF, block for block, with GLM-4.7 tool calls and context-lookup drafts ([model](https://huggingface.co/WaveCut/Flint-UD-Q4_K_XL-NInfer-v3), [docs](docs/flint.md), [#132](https://github.com/iamwavecut/ninfer-all/pull/132)).
@@ -188,8 +188,9 @@ conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b
 
 Ternary Bonsai 2 27B decodes 397 tok/s on an RTX 5090 with DFlash2 and holds a 978,944-token context with
 every planted code found. Qwen3.8-Flash-Next decodes 138 tok/s with every expert on one RTX PRO 6000, and
-74 tok/s with its experts in host memory on one RTX 5090. Every table of every card is on the
-[performance page](docs/performance.md).
+74 tok/s with its experts in host memory on one RTX 5090. DeepSeek-V4.1-Flash decodes 48 tok/s on one
+RTX PRO 6000 and 26 tok/s on one RTX 4090 with its 106.7 GiB of experts in host memory. Every table of
+every card is on the [performance page](docs/performance.md).
 
 *Click a section to expand it.*
 
@@ -264,6 +265,25 @@ Prefill of a 4,463-token prompt, in tok/s:
 - **Other releases and cards.** IQ3_S, the Coder IQ1_M build and the 8 and 12 GB cards are in the
   [expert placements](docs/performance.md#expert-placements). Six reasoning requests at once on two
   RTX 5090s produced 193 tok/s of output with Q2_0.
+
+</details>
+
+<details>
+<summary><b>DeepSeek-V4.1-Flash</b> — 48 tok/s on one RTX PRO 6000, 22 to 29 tok/s on 24 and 32 GB cards</summary>
+
+ISTA-DASLab's GSQ-RCO IQ1_M GGUF (112.7 GiB, and its 103.0 GiB Engram table), one request, greedy,
+thinking off, one GPU, October 2026. The routed experts stay in pinned host memory or in the file, and
+the card caches as many as fit:
+
+| Card | Experts cached on the card | Host experts: short answer (tok/s) | after 8,086 tokens (tok/s) | prefill of 8,086 tokens (tok/s) | Disk experts, page cache warm: short answer (tok/s) |
+|---|---:|---:|---:|---:|---:|
+| RTX PRO 6000 | 74% | 48.0 | 45.3 | 1,310 | 37.4 |
+| RTX 5090 | 15% | 29.2 | 22.5 | 499 | 12.5 |
+| RTX 4090 | 7% | 25.9 | 22.2 | 490 | 8.5 |
+| RTX 3090 | | 21.8 | 18.9 | 410 | 7.4 |
+
+On the RTX 3090's host Strata decodes the same GGUF at 3.9 tok/s on one GPU and 6.6 on two
+([measurements](docs/deepseek-v41.md#measurements)). With host experts the server peaks at 116 GiB of host memory.
 
 </details>
 

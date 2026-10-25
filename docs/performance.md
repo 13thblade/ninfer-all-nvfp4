@@ -24,10 +24,10 @@ drafts with the tokens committed per verify round in brackets.
 
 | Card | Memory | Build | Power limit | Measured on |
 |---|---:|---|---|---|
-| RTX PRO 6000 Blackwell Workstation Edition | 96 GB | `120a` | 600 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements) |
-| RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements) |
+| RTX PRO 6000 Blackwell Workstation Edition | 96 GB | `120a` | 600 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [DeepSeek](deepseek-v41.md#measurements) |
+| RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements) |
 | RTX 5070 Ti | 16 GB | `120a` | 300 W | [field report](performance/field-reports.md#rtx-5070-ti-windows-11) |
-| RTX 4090 | 24 GB | `89` | 450 W; 500 W boards for Flint | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [field reports](performance/field-reports.md) |
+| RTX 4090 | 24 GB | `89` | 450 W; 500 W boards for Flint | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [field reports](performance/field-reports.md) |
 | L40S | 48 GB | | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | RTX 3090 Ti, two | 24 GB each | `86` | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | A40 | 48 GB | `86` | 300 W | [Flint](flint.md#measurements) |
@@ -903,8 +903,20 @@ same GGUF and prompt tokens, all 6 experts. One host: RTX 3090s at 350 and 390 W
 | Strata, 1 GPU | 3.9 | 3.9 | 380 |
 | Strata, 2 GPUs | 6.6 | 8.0 | 333 |
 
-[DeepSeek-V4.1-Flash's measurements](deepseek-v41.md#measurements) add context lookup, startup
-and what limits each engine.
+NInfer's native release build of `b3402a6fd` on one GPU of a rented host per card, the same prompts:
+
+| Card | Experts | Decode, short answer | after 8,086 tokens | Prefill of 8,086 tokens |
+|---|---|---:|---:|---:|
+| RTX PRO 6000 (600 W) | host | 48.0 | 45.3 | 1,310 |
+| RTX PRO 6000 (600 W) | disk, page cache warm | 37.4 | 33.4 | 431 |
+| RTX 5090 (575 W) | host | 29.2 | 22.5 | 499 |
+| RTX 5090 (575 W) | disk, page cache warm | 12.5 | 10.5 | 181 |
+| RTX 4090 (450 W) | host | 25.9 | 22.2 | 490 |
+| RTX 4090 (450 W) | disk, page cache warm | 8.5 | 7.3 | 123 |
+
+DeepSeek-V4.1-Flash runs on one GPU only; it has no pipeline stages or tensor parallelism.
+[DeepSeek-V4.1-Flash's measurements](deepseek-v41.md#measurements) add the hosts, the device
+cache each card holds, context lookup, startup and what limits each engine.
 
 ## Measurement pages
 

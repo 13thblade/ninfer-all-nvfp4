@@ -192,6 +192,21 @@ ninfer-serve models/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer --model-id 
   --max-context 40960 --max-concurrency 4 --spec mtp --draft-tokens 2 --vision
 ```
 
+## Flint
+
+Unsloth's UD-Q4_K_XL GGUF as one artifact ([Flint](flint.md)); 23.4 GiB of weights fit a 32 GB card.
+
+```bash
+hf download WaveCut/Flint-UD-Q4_K_XL-NInfer-v3 flint-UD-Q4_K_XL-ninfer-v3.ninfer --local-dir models
+
+# Every expert on a 32 GB GPU: about 25.5 GiB for one 32K-token sequence.
+ninfer-serve models/flint-UD-Q4_K_XL-ninfer-v3.ninfer --model-id flint --max-context 32768
+
+# A 16 or 24 GB GPU: the experts in pinned host memory (21.5 GiB), the most used cached on the GPU.
+ninfer-serve models/flint-UD-Q4_K_XL-ninfer-v3.ninfer --model-id flint \
+  --max-context 65536 --expert-residency host
+```
+
 ## DeepSeek-V4.1-Flash
 
 The model and its Engram table are two artifacts; the routed experts (106.7 GiB) never fit one card,

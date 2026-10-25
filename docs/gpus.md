@@ -64,7 +64,7 @@ means the card calibrates once at its first start.
 
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
-| ✅ | RTX 5090 | 32 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, 35B-A3B NVFP4, Flint |
+| ✅ | RTX 5090 | 32 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, 35B-A3B NVFP4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk) |
 | ⬜ | RTX 5090 D | 32 GB | GeForce | | |
 | ⬜ | RTX 5090 D V2 | 24 GB | GeForce | ✓ | |
 | ⬜ | RTX 5080 | 16 GB | GeForce | ✓ | |
@@ -73,7 +73,7 @@ means the card calibrates once at its first start.
 | ⬜ | RTX 5060 Ti | 16 / 8 GB | GeForce | ✓ | |
 | ⬜ | RTX 5060 | 8 GB | GeForce | | |
 | ⬜ | RTX 5050 | 8 GB | GeForce | | |
-| ✅ | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | Workstation | ✓ | Bonsai 2, Qwen3.8-27B, Flash-Next |
+| ✅ | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | Workstation | ✓ | Bonsai 2, Qwen3.8-27B, Flash-Next, DeepSeek-V4.1-Flash (experts in host memory, on disk) |
 | ⬜ | RTX PRO 6000 Blackwell Max-Q | 96 GB | Workstation | ✓ | |
 | ⬜ | RTX PRO 5000 Blackwell | 72 / 48 GB | Workstation | 48 GB | |
 | ⬜ | RTX PRO 4500 Blackwell | 32 GB | Workstation | ✓ | |
@@ -87,7 +87,7 @@ means the card calibrates once at its first start.
 
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
-| ✅ | RTX 4090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, Flint (experts in host memory); Swift 1.5 IQ3_S ([field reports](performance/field-reports.md#rtx-4090-qwen-code-with-dflash2)) |
+| ✅ | RTX 4090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, Flint (experts in host memory), DeepSeek-V4.1-Flash (experts in host memory, on disk); Swift 1.5 IQ3_S ([field reports](performance/field-reports.md#rtx-4090-qwen-code-with-dflash2)) |
 | ⬜ | RTX 4090 D | 24 GB | GeForce | | |
 | ⬜ | RTX 4080 Super | 16 GB | GeForce | ✓ | |
 | ✅ | RTX 4080 | 16 GB | GeForce | ✓ | IQ3_S ([field report](performance/field-reports.md#rtx-4080-and-rtx-4090-windows-11)) |
