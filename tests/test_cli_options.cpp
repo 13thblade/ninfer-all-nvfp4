@@ -69,6 +69,26 @@ int run_tests() {
         (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--draft-min-p", "0.3"});
     }), "CLI accepted draft confidence without MTP");
     {
+        // DeepSeek's DSpark drafter: its whole block without --draft-tokens, no copy drafts beside
+        // it unless asked, and neither a proposal head nor MTP's confidence floor.
+        const auto block = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dspark"});
+        const auto three = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dspark",
+                                  "--draft-tokens", "3"});
+        failures += check(block.speculative.backend == ninfer::SpeculativeBackend::DSpark &&
+                              block.speculative.draft_tokens == 0 &&
+                              block.speculative.ngram_draft_tokens == 0 &&
+                              three.speculative.draft_tokens == 3,
+                          "CLI did not preserve --spec dspark");
+        for (const std::vector<std::string> tail :
+             {std::vector<std::string>{"--lm-head-draft"}, {"--draft-min-p", "0.3"},
+              {"--draft-tokens", "16"}}) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dspark"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            failures += check(rejects([&] { (void)parse(args); }),
+                              ("CLI accepted " + tail.front() + " beside --spec dspark").c_str());
+        }
+    }
+    {
         // Without --spec the Engine chooses; --spec none and every backend are explicit.
         const auto unset = parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).speculative;
         const auto none  = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "none"}).speculative;

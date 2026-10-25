@@ -10,8 +10,14 @@
 // from the table's files (or RAM) and copied to the device.
 //
 // With draft_tokens, verify() runs a sequence's next token (its anchor) and up to draft_tokens
-// proposed tokens after it (a context lookup's) as decode rows, and commit() keeps the first ones.
-// Branches (forward_branches) run one after another from a copy of the sequence's state.
+// proposed tokens after it (a context lookup's or the drafter's) as decode rows, and commit() keeps
+// the first ones. Branches (forward_branches) run one after another from a copy of the sequence's
+// state.
+//
+// With the model's DSpark drafter, every pass taps the streams entering the drafter's target
+// blocks for its last rows (a window at most), and those rows seed each sequence's drafter rings
+// (a verification's at commit(), the rows kept). draft() runs the drafter's block after a
+// sequence's anchor at its next positions, from a CUDA graph.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -141,6 +147,13 @@ public:
     [[nodiscard]] Tensor logits(std::uint32_t rows) const;
 
     [[nodiscard]] std::uint32_t draft_tokens() const noexcept;
+    // The DSpark drafter's block, the drafts a draft() proposes; 0 without the drafter.
+    [[nodiscard]] std::uint32_t dspark_block() const noexcept;
+    // The drafter's greedy drafts of the dspark_block() positions after the sequence's next token
+    // `anchor` (not yet run), and the confidence of each. The sequence's position and backbone
+    // state do not change.
+    void draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
+               std::span<float> confidence);
     // tokens.size() / sequences.size() tokens of each sequence (its anchor, then its drafts) at its
     // next positions, as decode rows: logits one column each, sequence by sequence. The positions
     // advance only with commit().

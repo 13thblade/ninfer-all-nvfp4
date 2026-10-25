@@ -42,7 +42,8 @@ add_library(ninfer_ggml_quants ${_ninfer_ggml_library_type}
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq1_s.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq1_m.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq4_nl.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq4_xs.cu")
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq4_xs.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_mxfp4.cu")
 if(WIN32)
   # STATIC defaults to this name, but OBJECT defaults to a bare /Fd directory. Keep cache keys equal.
   set_target_properties(ninfer_ggml_quants PROPERTIES

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <climits>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -1130,6 +1131,120 @@ __global__ void f32_to_bf16_kernel(const float* in, __nv_bfloat16* out, std::int
     if (i < n) { out[i] = __float2bfloat16(in[i]); }
 }
 
+__global__ void stream_mean_kernel(const float* __restrict__ h, int streams, int hidden,
+                                   float* __restrict__ out, std::int64_t out_stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hidden) { return; }
+    const float* row = h + std::int64_t(blockIdx.y) * streams * hidden + i;
+    float sum        = 0.0f;
+    for (int s = 0; s < streams; ++s) { sum += row[std::int64_t(s) * hidden]; }
+    out[std::int64_t(blockIdx.y) * out_stride + i] = sum / float(streams);
+}
+
+// A Markov step: each warp a vocabulary row at a time (its lanes eight values of the rank each), each
+// block its best (value, index); markov_pick_kernel the best of the blocks.
+constexpr int kMarkovThreads = 256, kMarkovBlocks = 512;
+
+struct Best {
+    float value;
+    int index;
+};
+
+__device__ __forceinline__ bool better(float v, int i, float bv, int bi) {
+    return v > bv || (v == bv && i < bi);
+}
+
+__device__ Best block_best(float v, int i) {
+    __shared__ float values[32];
+    __shared__ int indices[32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xFFFFFFFFu, v, o);
+        const int oi   = __shfl_xor_sync(0xFFFFFFFFu, i, o);
+        if (better(ov, oi, v, i)) {
+            v = ov;
+            i = oi;
+        }
+    }
+    __syncthreads();
+    if (lane == 0) {
+        values[warp]  = v;
+        indices[warp] = i;
+    }
+    __syncthreads();
+    Best best{-INFINITY, INT_MAX};
+    if (threadIdx.x == 0) {
+        for (int w = 0; w < int(blockDim.x >> 5); ++w) {
+            if (better(values[w], indices[w], best.value, best.index)) { best = {values[w], indices[w]}; }
+        }
+    }
+    return best;
+}
+
+__global__ void __launch_bounds__(kMarkovThreads)
+    markov_best_kernel(const float* __restrict__ logits, const __nv_bfloat16* __restrict__ head,
+                       const __nv_bfloat16* __restrict__ embed, const std::int32_t* __restrict__ ids,
+                       int step, int domain, Best* __restrict__ out) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = kMarkovThreads / 32;
+    const __nv_bfloat16* e_row = embed + std::int64_t(ids[step]) * kMarkovRank + lane * 8;
+    float e[8];
+    {
+        const float4 a = ld_bf16x4(e_row), b = ld_bf16x4(e_row + 4);
+        e[0] = a.x, e[1] = a.y, e[2] = a.z, e[3] = a.w, e[4] = b.x, e[5] = b.y, e[6] = b.z, e[7] = b.w;
+    }
+    float bv = -INFINITY;
+    int bi   = INT_MAX;
+    for (int v = blockIdx.x * warps + warp; v < domain; v += gridDim.x * warps) {
+        const __nv_bfloat16* h_row = head + std::int64_t(v) * kMarkovRank + lane * 8;
+        const float4 a = ld_bf16x4(h_row), b = ld_bf16x4(h_row + 4);
+        float dot = a.x * e[0] + a.y * e[1] + a.z * e[2] + a.w * e[3] + b.x * e[4] + b.y * e[5] +
+                    b.z * e[6] + b.w * e[7];
+        dot           = warp_sum(dot);
+        const float x = logits[v] + dot;
+        if (better(x, v, bv, bi)) {
+            bv = x;
+            bi = v;
+        }
+    }
+    const Best best = block_best(bv, bi);
+    if (threadIdx.x == 0) { out[blockIdx.x] = best; }
+}
+
+__global__ void __launch_bounds__(kMarkovThreads)
+    markov_pick_kernel(const Best* __restrict__ blocks, std::int32_t* __restrict__ ids, int step) {
+    float bv = -INFINITY;
+    int bi   = INT_MAX;
+    for (int b = threadIdx.x; b < kMarkovBlocks; b += blockDim.x) {
+        if (better(blocks[b].value, blocks[b].index, bv, bi)) {
+            bv = blocks[b].value;
+            bi = blocks[b].index;
+        }
+    }
+    const Best best = block_best(bv, bi);
+    if (threadIdx.x == 0) { ids[step + 1] = best.index == INT_MAX ? 0 : best.index; }
+}
+
+__global__ void dspark_confidence_kernel(const float* __restrict__ h, const float* __restrict__ pre,
+                                         int streams, int hidden, const float* __restrict__ w,
+                                         const __nv_bfloat16* __restrict__ embed,
+                                         const std::int32_t* __restrict__ ids, float* __restrict__ out) {
+    const int t      = blockIdx.x;
+    const float* row = h + std::int64_t(t) * streams * hidden;
+    float sum        = 0.0f;
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float x = 0.0f;
+        for (int s = 0; s < streams; ++s) { x += pre[t * streams + s] * row[std::int64_t(s) * hidden + i]; }
+        sum += x * w[i];
+    }
+    const __nv_bfloat16* e = embed + std::int64_t(ids[t]) * kMarkovRank;
+    for (int r = threadIdx.x; r < kMarkovRank; r += blockDim.x) {
+        sum += __bfloat162float(e[r]) * w[hidden + r];
+    }
+    sum = block_sum(sum);
+    if (threadIdx.x == 0) { out[t] = 1.0f / (1.0f + expf(-sum)); }
+}
+
 } // namespace
 
 void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, cudaStream_t stream) {
@@ -1270,10 +1385,11 @@ std::size_t sparse_attention_workspace_floats(int tokens, int heads, int splits)
 }
 
 void sparse_attention(const AttentionArgs& args, cudaStream_t stream) {
-    if (args.heads % kAttnHeads != 0 || args.splits < 1 || args.splits > 64 ||
-        args.window_size > 128 || (args.compressed != nullptr && args.k > kMaxKeys - 128)) {
+    const int selected = args.compressed != nullptr ? args.k : 0;
+    if (args.heads % kAttnHeads != 0 || args.splits < 1 || args.splits > 64 || args.window_size < 1 ||
+        args.window_size > args.ring || selected < 0 || args.window_size + selected > kMaxKeys) {
         throw std::invalid_argument("deepseek_v41 sparse_attention: heads in groups of 16, 1..64 "
-                                    "splits, a window of at most 128 and 1024 selected latents");
+                                    "splits, a window within the ring and at most 1152 keys");
     }
     if (args.tokens <= 0) { return; }
     const dim3 grid(args.tokens, args.heads / kAttnHeads, args.splits);
@@ -1368,6 +1484,35 @@ void f32_to_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, cudaStream
     if (n <= 0) { return; }
     f32_to_bf16_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(in, out, n);
     check_launch("f32_to_bf16");
+}
+
+void stream_mean(const float* h, int tokens, int streams, int hidden, float* out,
+                 std::int64_t out_stride, cudaStream_t stream) {
+    if (tokens <= 0) { return; }
+    stream_mean_kernel<<<dim3(blocks_for(hidden, 256), tokens), 256, 0, stream>>>(h, streams, hidden,
+                                                                                 out, out_stride);
+    check_launch("stream_mean");
+}
+
+std::size_t markov_scratch_bytes() { return std::size_t(kMarkovBlocks) * sizeof(Best); }
+
+void markov_step(const float* logits, const __nv_bfloat16* head, const __nv_bfloat16* embed,
+                 int domain, std::int32_t* ids, int step, void* scratch, cudaStream_t stream) {
+    if (domain <= 0) { throw std::invalid_argument("deepseek_v41 markov_step: an empty domain"); }
+    auto* blocks = static_cast<Best*>(scratch);
+    markov_best_kernel<<<kMarkovBlocks, kMarkovThreads, 0, stream>>>(logits, head, embed, ids, step,
+                                                                     domain, blocks);
+    check_launch("markov_best");
+    markov_pick_kernel<<<1, kMarkovThreads, 0, stream>>>(blocks, ids, step);
+    check_launch("markov_pick");
+}
+
+void dspark_confidence(const float* h, const float* pre, int tokens, int streams, int hidden,
+                       const float* w, const __nv_bfloat16* embed, const std::int32_t* ids,
+                       float* out, cudaStream_t stream) {
+    if (tokens <= 0) { return; }
+    dspark_confidence_kernel<<<tokens, 256, 0, stream>>>(h, pre, streams, hidden, w, embed, ids, out);
+    check_launch("dspark_confidence");
 }
 
 } // namespace ninfer::models::deepseek_v41::kernels

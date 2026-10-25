@@ -320,6 +320,36 @@ struct Decoder<GGML_TYPE_IQ4_NL> {
     }
 };
 
+// MXFP4: an E8M0 exponent byte e, then value j < 16 the low nibble of byte j + 1 and value j + 16
+// its high nibble, each an E2M1 code's value (kvalues_mxfp4 holds them doubled) times 2^(e - 127).
+// The 17-byte block starts at any byte: five aligned words cover its codes, the last reaching at
+// most three bytes past the block (into the next block or the bound device tail).
+template <>
+struct Decoder<GGML_TYPE_MXFP4> {
+    static constexpr int kBlockElems = 32, kBlockBytes = 17, kTableWords = 0;
+    __device__ static const std::uint32_t* table() { return nullptr; }
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int, const std::uint32_t*,
+                                                  Slice& s) {
+        s.f[0]              = ggml_cuda_e8m0_to_fp32(b[0]) * 0.5f;
+        const auto at       = reinterpret_cast<std::uintptr_t>(b + 1);
+        const auto* w       = reinterpret_cast<const std::uint32_t*>(at & ~std::uintptr_t(3));
+        const unsigned skew = unsigned(at & 3) * 8;
+        std::uint32_t word[5];
+#pragma unroll
+        for (int i = 0; i < 5; ++i) { word[i] = w[i]; }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int2 v = get_int_from_table_16(int(__funnelshift_r(word[j], word[j + 1], skew)),
+                                                 kvalues_mxfp4);
+            s.w[j]       = v.x;
+            s.w[j + 4]   = v.y;
+        }
+    }
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+    }
+};
+
 template <>
 struct Decoder<GGML_TYPE_IQ4_XS> {
     static constexpr int kBlockElems = 256, kBlockBytes = 136, kTableWords = 0;

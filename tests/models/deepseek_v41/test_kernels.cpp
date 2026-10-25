@@ -23,6 +23,8 @@
 //    scaled per token), moe_combine (weighted rows and 2^-32 fixed-point sums).
 //  - engram_rows (IQ4_NL), engram_gate.
 //  - guard_columns and unscale_columns, ring_copy, f32_to_bf16.
+//  - the DSpark drafter's: sparse_attention of a draft block (the window and the block's own
+//    rows), stream_mean, markov_step (a chain, ties, the domain) and dspark_confidence.
 // A rounded output (BF16, fp8, fp4) is compared with the oracle's rounding of its exact value. The
 // two may differ where the FP32 arithmetic lands on the other side of a rounding boundary: rarely,
 // and by at most one or two steps of the format there. Values that pass through without arithmetic
@@ -1046,6 +1048,7 @@ struct AttentionCase {
         {}; // empty: a chunk, one staging ring and the latents of `sequence`
     int sequence = 0, ring = kRing, topk = 0, ratio = 2, splits = 1;
     float sink_offset = 0.0f;
+    int window = kWindow; // a draft block's rows see the window and the block
 };
 
 void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
@@ -1089,7 +1092,7 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
     a.window                = as<bf16>(dw);
     a.window_seq_stride     = chunk ? 0 : std::int64_t(c.ring) * kLatent;
     a.ring                  = c.ring;
-    a.window_size           = kWindow;
+    a.window_size           = c.window;
     a.compressed            = c.topk > 0 ? as<bf16>(dc) : nullptr;
     a.compressed_seq_stride = std::int64_t(rows) * kLatent;
     a.topk                  = as<std::int32_t>(dt);
@@ -1106,7 +1109,7 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
     for (int r = 0; r < t; ++r) {
         const int p  = c.positions[std::size_t(r)];
         const int s  = chunk ? c.sequence : c.sequences[std::size_t(r)];
-        const int lo = std::max(0, p - kWindow + 1);
+        const int lo = std::max(0, p - c.window + 1);
         std::vector<const bf16*> keys;
         for (int j = lo; j <= p; ++j) {
             keys.push_back(window.data() +
@@ -1148,6 +1151,124 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
     const double rms = std::sqrt(num2 / den2);
     report(rms <= 3e-3, "sparse_attention " + c.name + ", " + std::to_string(c.splits) +
                             " splits: rms " + num(rms));
+}
+
+// The DSpark drafter's kernels: the taps' stream means into one target's columns, the Markov
+// steps' argmax (a chain of two, ties to the lower token, nothing past the domain), and the
+// confidence head.
+void drafter(std::mt19937& rng) {
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    {
+        const int t = 5, targets = 3, j = 1;
+        std::vector<float> h(std::size_t(t) * kStreams * kHidden);
+        for (auto& v : h) { v = 4.0f * normal(rng); }
+        DeviceBuffer dh = upload(h), out(std::size_t(t) * targets * kHidden * 4);
+        out.fill(0xFF);
+        k::stream_mean(as<float>(dh), t, kStreams, kHidden, as<float>(out) + j * kHidden,
+                       std::int64_t(targets) * kHidden, nullptr);
+        sync("stream_mean");
+        const auto got = download<float>(out, std::size_t(t) * targets * kHidden);
+        double worst = 0.0;
+        bool kept    = true;
+        for (int r = 0; r < t; ++r) {
+            for (int c = 0; c < targets; ++c) {
+                for (int i = 0; i < kHidden; ++i) {
+                    const float g = got[(std::size_t(r) * targets + c) * kHidden + i];
+                    if (c != j) {
+                        kept = kept && std::isnan(g);
+                        continue;
+                    }
+                    // FP32 sums carry an error of a few steps of the summands' magnitude, not of
+                    // their (possibly cancelling) mean.
+                    double want = 0.0, scale = 0.0;
+                    for (int s = 0; s < kStreams; ++s) {
+                        const double v = h[(std::size_t(r) * kStreams + s) * kHidden + i];
+                        want += v;
+                        scale += std::fabs(v);
+                    }
+                    want /= kStreams;
+                    scale /= kStreams;
+                    worse(worst, std::fabs(g - want) / (scale + 1e-30));
+                }
+            }
+        }
+        report(worst <= 1e-6 && kept, "stream_mean: worst " + num(worst) +
+                                          (kept ? "" : ", other columns written"));
+    }
+    constexpr int kRank = k::kMarkovRank;
+    const int vocab = 20000, domain = 19000;
+    const auto head  = random_bf16(std::size_t(vocab) * kRank, 0.05f, rng);
+    const auto embed = random_bf16(std::size_t(vocab) * kRank, 1.0f, rng);
+    {
+        std::vector<float> logits(2 * std::size_t(vocab));
+        for (auto& v : logits) { v = 3.0f * normal(rng); }
+        // Row 1: two equal leaders (same logit and head row) and a higher one past the domain.
+        auto tied = head;
+        float* second = logits.data() + vocab;
+        const int a = 777, b = 15000;
+        std::copy_n(tied.begin() + std::ptrdiff_t(a) * kRank, kRank, tied.begin() + std::ptrdiff_t(b) * kRank);
+        second[a] = second[b] = 60.0f;
+        second[domain + 5]    = 90.0f;
+        const auto value = [&](const float* row, int prev, int v) {
+            double dot = 0.0;
+            for (int r = 0; r < kRank; ++r) {
+                dot += double(val(tied[std::size_t(v) * kRank + r])) * val(embed[std::size_t(prev) * kRank + r]);
+            }
+            return double(row[v]) + dot;
+        };
+        DeviceBuffer dl = upload(logits), dh = upload(tied), de = upload(embed),
+                     ids = upload(std::vector<std::int32_t>{4242, -1, -1}),
+                     scratch(k::markov_scratch_bytes());
+        k::markov_step(as<float>(dl), as<bf16>(dh), as<bf16>(de), domain, as<std::int32_t>(ids), 0,
+                       scratch.p, nullptr);
+        k::markov_step(as<float>(dl) + vocab, as<bf16>(dh), as<bf16>(de), domain,
+                       as<std::int32_t>(ids), 1, scratch.p, nullptr);
+        sync("markov_step");
+        const auto got = download<std::int32_t>(ids, 3);
+        // Step 0 against the oracle's best: the same token, or one within FP32's reach of it.
+        int best = 0;
+        for (int v = 1; v < domain; ++v) {
+            if (value(logits.data(), 4242, v) > value(logits.data(), 4242, best)) { best = v; }
+        }
+        const bool first = got[1] == best || (got[1] >= 0 && got[1] < domain &&
+                                               value(logits.data(), 4242, best) -
+                                                       value(logits.data(), 4242, got[1]) <= 1e-4);
+        report(first && got[2] == a, "markov_step: chain " + std::to_string(got[1]) + " (oracle " +
+                                         std::to_string(best) + "), then " + std::to_string(got[2]) +
+                                         " (the lower of two equal leaders, " + std::to_string(a) + ")");
+    }
+    {
+        const int t = 5;
+        std::vector<float> h(std::size_t(t) * kStreams * kHidden), pre(std::size_t(t) * kStreams),
+            w(std::size_t(kHidden) + kRank);
+        for (auto& v : h) { v = 2.0f * normal(rng); }
+        for (auto& v : pre) { v = std::fabs(normal(rng)); }
+        for (auto& v : w) { v = 0.01f * normal(rng); }
+        const std::vector<std::int32_t> prev = {4242, 3, 19999, 0, 777};
+        DeviceBuffer dh = upload(h), dp = upload(pre), dw = upload(w), de = upload(embed),
+                     di = upload(prev), out(std::size_t(t) * 4);
+        k::dspark_confidence(as<float>(dh), as<float>(dp), t, kStreams, kHidden, as<float>(dw),
+                             as<bf16>(de), as<std::int32_t>(di), as<float>(out), nullptr);
+        sync("dspark_confidence");
+        const auto got = download<float>(out, t);
+        double worst   = 0.0;
+        for (int r = 0; r < t; ++r) {
+            double z = 0.0;
+            for (int i = 0; i < kHidden; ++i) {
+                double x = 0.0;
+                for (int s = 0; s < kStreams; ++s) {
+                    x += double(pre[std::size_t(r) * kStreams + s]) *
+                         h[(std::size_t(r) * kStreams + s) * kHidden + i];
+                }
+                z += x * w[std::size_t(i)];
+            }
+            for (int q = 0; q < kRank; ++q) {
+                z += double(val(embed[std::size_t(prev[std::size_t(r)]) * kRank + q])) * w[kHidden + q];
+            }
+            worse(worst, std::fabs(got[std::size_t(r)] - 1.0 / (1.0 + std::exp(-z))));
+        }
+        report(worst <= 1e-5, "dspark_confidence: worst " + num(worst));
+    }
 }
 
 void attention_output(std::mt19937& rng) {
@@ -1652,7 +1773,14 @@ int main() {
         sparse_attention({"1024 latents, empty splits", {9000}, {0}, 0, kRing, 1024, 2, 40}, rng);
         sparse_attention({"sinks far below", {5000, 77}, {0, 1}, 0, kRing, 512, 2, 4, -40.0f}, rng);
         sparse_attention({"sinks above", {5000, 77}, {0, 1}, 0, kRing, 512, 2, 1, 8.0f}, rng);
+        sparse_attention(
+            {"a draft block", {304, 304, 304, 304, 304}, {1, 1, 1, 1, 1}, 0, kRing, 0, 2, 3, 0.0f, 133},
+            rng);
+        sparse_attention({"a draft block at the start", {6, 6, 6, 6, 6}, {0, 0, 0, 0, 0}, 0, kRing, 0,
+                          2, 1, 0.0f, 133},
+                         rng);
         attention_output(rng);
+        drafter(rng);
 
         route(1, false, rng);
         route(40, false, rng);

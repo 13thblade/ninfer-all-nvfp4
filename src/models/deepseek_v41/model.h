@@ -5,7 +5,8 @@
 // of the router, compressor, indexer and hyper-connections are FP32. The routed experts sit on the
 // device, in pinned host memory or in the artifact's files (ExpertResidency); the Engram table
 // stays where the artifact (or a table artifact) stores it. The frontend resources are DeepSeek's
-// tokenizer and chat template, which the shared frontend serves in its DeepSeek dialect.
+// tokenizer and chat template, which the shared frontend serves in its DeepSeek dialect. With
+// LoadOptions::dspark the DSpark drafter's blocks bind too, all on the device.
 
 #include "artifact/materializer.h"
 #include "core/device.h"
@@ -73,6 +74,14 @@ struct TextWeights {
     std::vector<LayerWeights> layers;
 };
 
+// The drafter: the taps' projection and its norm, the final norm, the Markov tables ([vocab][rank]
+// BF16: the embedding of the token before a row, and the bias head), the confidence head
+// ([hidden + rank] FP32), and blocks whose routed experts are resident.
+struct DSparkWeights {
+    WeightId fc, tap_norm, final_norm, markov_embed, markov_head, confidence;
+    std::vector<LayerWeights> layers;
+};
+
 struct ExpertBanks {
     QType gate_up_type{}, down_type{};
     std::uint64_t gate_up_row_bytes = 0, down_row_bytes = 0;
@@ -82,6 +91,7 @@ struct ExpertBanks {
 struct LoadOptions {
     std::filesystem::path artifact;
     ExpertResidency experts = ExpertResidency::Device;
+    bool dspark             = false; // bind the artifact's DSpark drafter
 };
 
 class Model {
@@ -92,6 +102,11 @@ public:
 
     [[nodiscard]] const TextConfig& config() const noexcept { return config_; }
     [[nodiscard]] const TextWeights& weights() const noexcept { return weights_; }
+    // The drafter, when loaded.
+    [[nodiscard]] const std::optional<DSparkConfig>& dspark_config() const noexcept {
+        return dspark_config_;
+    }
+    [[nodiscard]] const std::optional<DSparkWeights>& dspark() const noexcept { return dspark_; }
     [[nodiscard]] ExpertResidency expert_residency() const noexcept { return expert_residency_; }
     // Host or disk experts: one bank per block, in block order.
     [[nodiscard]] std::span<const ExpertBanks> expert_banks() const noexcept { return expert_banks_; }
@@ -129,6 +144,8 @@ private:
     artifact::MaterializedArtifact backing_;
     TextConfig config_;
     TextWeights weights_;
+    std::optional<DSparkConfig> dspark_config_;
+    std::optional<DSparkWeights> dspark_;
     std::vector<BoundWeight> bound_;
     FrontendResources resources_;
     InstanceInfo info_;
@@ -138,8 +155,9 @@ private:
     std::vector<std::filesystem::path> expert_files_;
 };
 
-// Whether the artifact's text component is DeepSeek-V4.1.
+// Whether the artifact's text component is DeepSeek-V4.1, and whether it carries the DSpark drafter.
 [[nodiscard]] bool is_deepseek_v41(const artifact::Reader& reader);
+[[nodiscard]] bool has_dspark(const artifact::Reader& reader);
 
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader,
                                                 const LoadOptions& options, DeviceContext& device,

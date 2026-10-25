@@ -911,6 +911,19 @@ Strata computes 53 to 61% of the routed experts on its CPU threads beside the GP
 every expert its cache lacks to the GPU. With `--experts 5` (5 of the 6 experts, another model's
 output) Strata decodes 44.8 and 42.1 tok/s.
 
+With the release's DSpark drafter, October 26, the same prompts and host experts, on that host and
+on an RTX PRO 6000 host (Threadripper PRO 7965WX):
+
+| Card | Drafts | Decode, short answer | after 8,086 tokens | Prefill of 8,086 tokens |
+|---|---|---:|---:|---:|
+| RTX PRO 6000 (600 W) | none | 50.8 | 48.3 | 1,210 |
+| RTX PRO 6000 (600 W) | `--spec dspark` | 83.1 | 75.0 | 1,290 |
+| RTX 4090 (450 W) | none | 25.9 | 22.3 | 927 |
+| RTX 4090 (450 W) | `--spec dspark` | 23.6 | 19.4 | 686 |
+
+Strata 0.2.6 exited with an error in every configuration tried on the RTX PRO 6000 host
+([the drafter](deepseek-v41.md#the-dspark-drafter)).
+
 NInfer's native release build of `b3402a6fd` on one GPU of a rented host per card, the same prompts:
 
 | Card | Experts | Decode, short answer | after 8,086 tokens | Prefill of 8,086 tokens |
