@@ -394,7 +394,7 @@ if "%RUNG%"=="0" (
 )
 set "SERVER_LOG=%TEMP%\ninfer-run-%RANDOM%%RANDOM%.log"
 "%SERVER%" "%MODEL%" --host %HOST% --port %PORT% %PROFILE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS% 2>&1 | powershell -NoProfile -Command "$input | ForEach-Object { $_; Add-Content -LiteralPath '%SERVER_LOG%' -Value $_ -Encoding Ascii }"
-findstr /c:"runtime reservation requires" /c:"cudaMallocHost failed" "%SERVER_LOG%" >nul 2>&1
+findstr /c:"runtime reservation requires" /c:"failed to pin" "%SERVER_LOG%" >nul 2>&1
 if errorlevel 1 goto :server_done
 if %RUNG% GEQ 5 goto :server_done
 set /a NEXT=RUNG+1

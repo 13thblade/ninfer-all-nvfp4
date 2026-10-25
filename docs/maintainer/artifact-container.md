@@ -575,6 +575,11 @@ I/O 层可将这些段继续切成传输块，按原偏移写入同一个目标�
 不参与复制；跨文件数据通过上述范围映射交给 materializer。
 
 Materializer 按实际使用的 parent 去重，安排 device/host backing，再取得 typed view。
+留在 host 的字节（pinned 块中的对象，以及尚未读取的 Host/Registered 对象）先于 device 对象读取：
+各段合并为 4096-byte 对齐的区间，切成 16 MiB 的块，由 8 个线程各自用对齐的 staging 做 direct
+I/O 读取，再复制到目标位置，不经过 page cache。Pinned 块是普通匿名页（`HostPages`），由这些
+复制在多个线程上缺页分配，读完后整体注册一次；`cudaHostAlloc` 在单线程上清零并锁定同样大小的
+内存要慢数倍。Device 对象经 pinned staging 以 direct I/O 上传。
 辅助 scalar、索引等需要 owning Host 值的用途可以按 Binding 读取对应元素区间，保持其数值类型。
 Reader 的 JSON 与符号索引用于冷加载，运行时使用解析后的引用与直接调用。
 

@@ -1,11 +1,13 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/host_pages.h"
 #include "core/paged_kv_cache.h"
 #include "core/transfer_work.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -265,7 +267,7 @@ private:
     [[nodiscard]] std::byte* allocation_data(const Descriptor& descriptor) const noexcept;
     void bump_revision() noexcept;
 
-    std::optional<PinnedHostBuffer> backing_;
+    std::unique_ptr<HostPages> backing_;
     std::size_t capacity_bytes_ = 0;
     std::size_t occupied_bytes_ = 0;
     std::vector<HostKVPageLayout> layouts_;

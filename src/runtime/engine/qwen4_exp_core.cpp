@@ -3,6 +3,7 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/host_pages.h"
 #include "core/file_read_error.h"
 #include "core/startup.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -583,7 +584,7 @@ struct Qwen4ExpCore::Impl {
     // in as slowly, and huge pages took minutes), so later images reuse the pages of those the
     // store let go. host_used counts the pages images hold, within host_budget.
     static constexpr std::size_t kHostPageBytes = std::size_t(8) << 20;
-    std::vector<std::unique_ptr<PinnedHostBuffer>> host_chunks;
+    std::vector<std::unique_ptr<HostPages>> host_chunks;
     std::vector<std::byte*> free_pages;
     std::uint64_t host_budget = 0, host_used = 0;
     std::filesystem::path disk_dir;
@@ -1134,7 +1135,8 @@ struct Qwen4ExpCore::Impl {
     // Pins `count` more free pages in one allocation.
     void pin_pages(std::size_t count) {
         if (count == 0) { return; }
-        auto chunk = std::make_unique<PinnedHostBuffer>(count * kHostPageBytes);
+        auto chunk = std::make_unique<HostPages>(count * kHostPageBytes);
+        chunk->pin();
         auto* base = static_cast<std::byte*>(chunk->data());
         for (std::size_t i = count; i-- > 0;) { free_pages.push_back(base + i * kHostPageBytes); }
         host_chunks.push_back(std::move(chunk));

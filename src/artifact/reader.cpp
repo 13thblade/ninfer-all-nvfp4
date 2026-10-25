@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <mutex>
 
 namespace ninfer::artifact {
 
@@ -16,6 +17,8 @@ struct Reader::Impl {
     ArtifactId id{};
     std::uint64_t entry_payload_start = 0;
     std::uint64_t file_bytes          = 0;
+    // Continuation files open on first use, which may come from several reading threads at once.
+    mutable std::mutex files_mutex;
     mutable std::vector<std::unique_ptr<InputFile>> files;
     mutable std::vector<std::optional<WeightGeometry>> geometries;
 
@@ -62,6 +65,7 @@ struct Reader::Impl {
 
     InputFile& file(std::size_t index) const {
         if (index >= files.size()) { throw ArtifactError("invalid continuation index"); }
+        const std::lock_guard lock(files_mutex);
         if (!files[index]) {
             const auto& record = directory.files[index];
             auto input         = std::make_unique<InputFile>(entry.parent_path() / *record.path);
