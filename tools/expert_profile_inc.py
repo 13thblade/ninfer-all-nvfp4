@@ -3,10 +3,10 @@
 --expert-profile-out.
 
 Each --profile FAMILY=PATH names a model family ("qwen3.8-flash-next", "gemma4", "qwen3.5-moe",
-"flint") and a recorded profile of one of its releases. The built-in profile keeps the counts and
-the layers' bank widths, not the artifact identity: it serves every artifact of that family and
-geometry (models/expert_profile.h). Counts above 2^32 - 1 are scaled down together, which keeps
-their order.
+"flint", "deepseek-v4.1") and a recorded profile of one of its releases. The built-in profile keeps
+the counts and the layers' bank widths, not the artifact identity: it serves every artifact of that
+family and geometry (models/expert_profile.h). Counts above 2^32 - 1 are scaled down together, which
+keeps their order.
 """
 
 import argparse

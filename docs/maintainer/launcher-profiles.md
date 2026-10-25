@@ -72,7 +72,7 @@ Eight and more drafts add a second CUDA Graph topology class on the 27B, about 6
 **When the card is busy.** A desktop or another job holding device memory can leave too little for
 the default context, and on Windows WDDM charges pinned host memory against the card as well. When
 the `tuned` profile is refused at startup for either reason (the engine's `runtime reservation
-requires` or `cudaMallocHost failed`), the launcher steps down: an eighth of the context at a time,
+requires` or `failed to pin`), the launcher steps down: an eighth of the context at a time,
 at most five times, from the second step with the prefill chunk capped at 2048 and the host state
 slots halved. `--kv-capacity auto` does not help here, because the engine still reserves room for
 one full `--max-context` sequence. Values the caller sets (`NINFER_CONTEXT`, `NINFER_PREFILL_CHUNK`,
@@ -80,7 +80,7 @@ one full `--max-context` sequence. Values the caller sets (`NINFER_CONTEXT`, `NI
 disables the step-down, and the `int8` and `c8` profiles never step down.
 
 `--host-kv-mib 8192` pins 8 GiB of host RAM on Linux. On Windows the runtime clamps a pinned host
-allocation to (free device memory - 1 GiB) / 2 before the first `cudaMallocHost`, since one failed
+allocation to (free device memory - 1 GiB) / 2 before the first pin, since one failed
 pin poisons later attempts in the process; prefix reuse falls back to device pages when it gets
 nothing.
 

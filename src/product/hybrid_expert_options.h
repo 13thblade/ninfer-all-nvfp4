@@ -17,6 +17,7 @@ inline constexpr const char* kHybridExpertHelp =
     "                                Qwen3.5/3.6 MoE experts: the GPU's results bit for bit).\n"
     "                                auto (default): those split each call by measured CPU\n"
     "                                and bus times, Flash-Next native experts copy every miss.\n"
+    "                                DeepSeek-V4.1's IQ1/IQ2 experts copy every miss.\n"
     "                                Flash-Next, Gemma 4 and Flint calls of more than 8\n"
     "                                tokens, and Qwen3.5/3.6 calls routed to half the experts\n"
     "                                or more, always use the GPU\n"

@@ -1,6 +1,7 @@
 #include "models/qwen3_5/frontend/prompt_layout.h"
 
 #include <algorithm>
+#include <span>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::frontend {
@@ -11,16 +12,23 @@ constexpr std::string_view kQwenEnd     = "<|im_end|>";
 // Gemma 4's turns: <|turn>role\n ... <turn|>, the assistant's role named "model".
 constexpr std::string_view kGemmaStart  = "<|turn>";
 constexpr std::string_view kGemmaEnd    = "<turn|>";
-// Flint's turns: a role marker and the turn's text up to the next one; no marker closes a turn.
-struct FlintRole {
+
+// Flint's and DeepSeek's turns: a role marker and the turn's text up to the next one; no marker
+// closes a turn (DeepSeek's assistant turns end with <｜end▁of▁sentence｜>, inside the turn).
+struct RoleMarker {
     std::string_view marker;
     ChatRole role;
 };
-constexpr FlintRole kFlintRoles[] = {{"<|system|>", ChatRole::System},
-                                     {"<|developer|>", ChatRole::Developer},
-                                     {"<|user|>", ChatRole::User},
-                                     {"<|assistant|>", ChatRole::Assistant},
-                                     {"<|observation|>", ChatRole::Tool}};
+
+constexpr RoleMarker kFlintRoles[] = {{"<|system|>", ChatRole::System},
+                                      {"<|developer|>", ChatRole::Developer},
+                                      {"<|user|>", ChatRole::User},
+                                      {"<|assistant|>", ChatRole::Assistant},
+                                      {"<|observation|>", ChatRole::Tool}};
+// DeepSeek's tool results are part of the user turn they follow.
+constexpr RoleMarker kDeepSeekRoles[]   = {{"<｜System｜>", ChatRole::System},
+                                           {"<｜User｜>", ChatRole::User},
+                                           {"<｜Assistant｜>", ChatRole::Assistant}};
 constexpr std::string_view kVisionStart = "<|vision_start|>";
 constexpr std::string_view kVisionEnd   = "<|vision_end|>";
 
@@ -37,12 +45,12 @@ std::size_t find_marker(const text::TemplateOutput& output, std::string_view mar
     return std::string::npos;
 }
 
-// The first Flint role marker at or after `begin`; null where none follows.
-const FlintRole* find_flint_role(const text::TemplateOutput& output, std::size_t begin,
-                                 std::size_t& at) {
-    const FlintRole* found = nullptr;
-    at                     = std::string::npos;
-    for (const FlintRole& role : kFlintRoles) {
+// The first of `roles`' markers at or after `begin`; null where none follows.
+const RoleMarker* find_role(const text::TemplateOutput& output, std::span<const RoleMarker> roles,
+                            std::size_t begin, std::size_t& at) {
+    const RoleMarker* found = nullptr;
+    at                      = std::string::npos;
+    for (const RoleMarker& role : roles) {
         const std::size_t pos = find_marker(output, role.marker, begin);
         if (pos < at) {
             at    = pos;
@@ -52,19 +60,20 @@ const FlintRole* find_flint_role(const text::TemplateOutput& output, std::size_t
     return found;
 }
 
-// Flint's layout: each turn ends where the next begins, which closes it, since a role marker is a
-// special token a turn's text cannot run into. Its template writes no media.
-PromptLayout inspect_flint_layout(const text::TemplateOutput& output,
-                                  std::span<const Modality> media) {
-    if (!media.empty()) { throw std::invalid_argument("Flint's chat template takes no media"); }
+// Flint's and DeepSeek's layout: each turn ends where the next begins, which closes it, since a
+// role marker is a token a turn's text cannot run into. Their templates write no media.
+PromptLayout inspect_marker_layout(const text::TemplateOutput& output,
+                                   std::span<const Modality> media,
+                                   std::span<const RoleMarker> roles) {
+    if (!media.empty()) { throw std::invalid_argument("this chat template takes no media"); }
     PromptLayout result;
     const std::string_view source = output.text;
     std::size_t pos               = 0;
-    const FlintRole* role         = find_flint_role(output, 0, pos);
+    const RoleMarker* role        = find_role(output, roles, 0, pos);
     while (role != nullptr) {
         const std::size_t content_begin = pos + role->marker.size();
         std::size_t next                = std::string::npos;
-        const FlintRole* following      = find_flint_role(output, content_begin, next);
+        const RoleMarker* following     = find_role(output, roles, content_begin, next);
         const bool closed               = following != nullptr;
         const std::size_t content_end   = closed ? next : source.size();
         result.messages.push_back(
@@ -121,11 +130,15 @@ std::optional<std::size_t> source_boundary(const text::TemplateOutput& output, s
 
 PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
                                    std::span<const Modality> media) {
-    std::size_t flint_at = std::string::npos;
+    std::size_t role_at = std::string::npos;
     if (find_marker(output, kQwenStart, 0) == std::string::npos &&
-        find_marker(output, kGemmaStart, 0) == std::string::npos &&
-        find_flint_role(output, 0, flint_at) != nullptr) {
-        return inspect_flint_layout(output, media);
+        find_marker(output, kGemmaStart, 0) == std::string::npos) {
+        if (find_role(output, kFlintRoles, 0, role_at) != nullptr) {
+            return inspect_marker_layout(output, media, kFlintRoles);
+        }
+        if (find_role(output, kDeepSeekRoles, 0, role_at) != nullptr) {
+            return inspect_marker_layout(output, media, kDeepSeekRoles);
+        }
     }
     PromptLayout result;
     const std::string_view source = output.text;

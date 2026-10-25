@@ -32,6 +32,9 @@ DEFAULT_ALIGNMENT = 32
 TYPE_F32 = 0
 TYPE_F16 = 1
 TYPE_BF16 = 30
+# Integer tensors (llama.cpp's metadata carried as tensors, such as a hash's constants).
+TYPE_I32 = 26
+TYPE_I64 = 27
 TYPE_PQ2_0 = 142
 TYPE_PTQ1_0 = 143
 
@@ -44,6 +47,8 @@ TYPE_NAMES = {
     TYPE_F32: "F32",
     TYPE_F16: "F16",
     TYPE_BF16: "BF16",
+    TYPE_I32: "I32",
+    TYPE_I64: "I64",
     TYPE_PQ2_0: "PQ2_0",
     TYPE_PTQ1_0: "PTQ1_0",
     **{
@@ -58,6 +63,8 @@ BLOCK_GEOMETRY = {
     TYPE_F32: (1, 4),
     TYPE_F16: (1, 2),
     TYPE_BF16: (1, 2),
+    TYPE_I32: (1, 4),
+    TYPE_I64: (1, 8),
     TYPE_PQ2_0: (128, 34),
     TYPE_PTQ1_0: (128, 28),
     **{

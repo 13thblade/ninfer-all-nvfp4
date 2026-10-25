@@ -154,6 +154,9 @@ void overlay_placement(DeviceContext& device) {
         require(std::equal(backing.pinned_block().begin(), backing.pinned_block().end(),
                            fixture.payload.begin() + 256),
                 "pinned block content differs from the artifact payload");
+        cudaPointerAttributes attributes{};
+        CUDA_CHECK(cudaPointerGetAttributes(&attributes, backing.pinned_block().data()));
+        require(attributes.type == cudaMemoryTypeHost, "the pinned block was not page-locked");
     }
     {
         Reader reader(fixture.entry);

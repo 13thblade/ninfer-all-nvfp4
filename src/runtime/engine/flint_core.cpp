@@ -3,6 +3,7 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/host_pages.h"
 #include "core/startup.h"
 #include "models/expert_profile.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -421,7 +422,7 @@ struct FlintCore::Impl {
     // would stall every sequence, and since nothing is freed, the copies need no host wait (the
     // executor's stream orders a page's reuse after the copies before it).
     static constexpr std::size_t kHostPageBytes = std::size_t(8) << 20;
-    std::unique_ptr<PinnedHostBuffer> host_pages;
+    std::unique_ptr<HostPages> host_pages;
     std::vector<std::byte*> free_pages;
     // An image holds the sliding rings whatever its length (53 MiB in F16), which copy back in a
     // few milliseconds against about 0.2 ms of prefill per token: the bound is the budget. A
@@ -480,7 +481,8 @@ struct FlintCore::Impl {
             const std::size_t pages = static_cast<std::size_t>(budget / kHostPageBytes);
             host_budget             = std::uint64_t(pages) * kHostPageBytes;
             if (pages > 0) {
-                host_pages = std::make_unique<PinnedHostBuffer>(host_budget);
+                host_pages = std::make_unique<HostPages>(host_budget);
+                host_pages->pin();
                 auto* base = static_cast<std::byte*>(host_pages->data());
                 free_pages.reserve(pages);
                 for (std::size_t i = pages; i-- > 0;) { free_pages.push_back(base + i * kHostPageBytes); }

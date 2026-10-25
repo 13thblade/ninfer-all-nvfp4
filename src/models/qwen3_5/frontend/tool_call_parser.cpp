@@ -1021,25 +1021,8 @@ bool declares_unique_items(const Json& schema) {
 
 // A strict tool's arguments: its parameters, as the chat template frames them, under its schema.
 Json strict_arguments_format(const Contract::Tool& tool) {
-    StructuredOutputOptions schema;
-    schema.kind   = StructuredOutputKind::JsonSchema;
-    schema.schema = tool.schema_json;
-    schema.strict = true;
-    try {
-        text::validate_structured_output(schema);
-    } catch (const std::invalid_argument& error) {
-        throw std::invalid_argument("strict tool " + tool.name + ": " + error.what());
-    }
-    const Json parameters = Json::parse(text::normalize_json_schema(tool.schema_json));
-    if (!parameters.is_object() || parameters.value("type", std::string("object")) != "object") {
-        throw std::invalid_argument("strict tool " + tool.name +
-                                    ": parameters must be an object schema");
-    }
-    if (declares_unique_items(parameters)) {
-        throw std::invalid_argument("strict tool " + tool.name +
-                                    ": uniqueItems is not supported in strict tool arguments");
-    }
-    return Json{{"type", "qwen_xml_parameter"}, {"json_schema", parameters}};
+    return Json{{"type", "qwen_xml_parameter"},
+                {"json_schema", Json::parse(strict_tool_parameters_schema(tool))}};
 }
 
 // What one call to `tool` holds after its function opener `<function=NAME>`: its parameters, the
@@ -1087,6 +1070,28 @@ Json call_format(const Contract::Tool& tool) {
 }
 
 } // namespace
+
+std::string strict_tool_parameters_schema(const ToolCallOutputContract::Tool& tool) {
+    StructuredOutputOptions schema;
+    schema.kind   = StructuredOutputKind::JsonSchema;
+    schema.schema = tool.schema_json;
+    schema.strict = true;
+    try {
+        text::validate_structured_output(schema);
+    } catch (const std::invalid_argument& error) {
+        throw std::invalid_argument("strict tool " + tool.name + ": " + error.what());
+    }
+    const Json parameters = Json::parse(text::normalize_json_schema(tool.schema_json));
+    if (!parameters.is_object() || parameters.value("type", std::string("object")) != "object") {
+        throw std::invalid_argument("strict tool " + tool.name +
+                                    ": parameters must be an object schema");
+    }
+    if (declares_unique_items(parameters)) {
+        throw std::invalid_argument("strict tool " + tool.name +
+                                    ": uniqueItems is not supported in strict tool arguments");
+    }
+    return parameters.dump();
+}
 
 std::string structured_tool_call_format(const ToolCallOutputContract& contract) {
     Json alternatives = Json::array();

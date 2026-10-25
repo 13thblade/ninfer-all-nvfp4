@@ -358,7 +358,8 @@ GenerationService::GenerationService(
     // think unless told not to; Gemma 4's chat template keeps thinking off unless enable_thinking
     // asks for it, so without --no-thinking or a request flag a Gemma 4 server answers directly.
     // Flint's template has no switch: thinking on, the default, leaves reasoning to the model, and
-    // thinking off closes an empty reasoning block, after which it answers at once.
+    // thinking off closes an empty reasoning block, after which it answers at once. DeepSeek-V4.1's
+    // template thinks unless told not to, as Qwen's do.
     if (!options_.enable_thinking && engine_->load_summary().architecture == "Gemma4ForCausalLM") {
         options_.enable_thinking = false;
     }
