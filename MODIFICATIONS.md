@@ -12,7 +12,8 @@ the fork's git history remains the authoritative record.
 | --- | --- |
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
-| Base commit | `e1f2d961e35843659cc2d964c6993bd5ebbe90ec` (upstream master) |
+| Base commit | `63428ac249da8a6c5d891b508d7e483d8c7def6c` (upstream master) |
+| Upstream sync | `f2675499` merges upstream master into the fork. The fork was cut at `e1f2d961` and later took `9456cb7a`, `230ef895` and `63428ac2` |
 | Fork repository | https://github.com/13thblade/ninfer-all-nvfp4 |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
 
@@ -25,13 +26,16 @@ the fork's git history remains the authoritative record.
 | `40d05d15` | 2026-10-24 | docs(readme): restore the fork README and refresh its measured numbers |
 | `6b64e762` | 2026-10-24 | docs(readme): take the prefill column as the peak of three cold starts |
 | `0e2d49b4` | 2026-10-24 | Update README.md |
+| `b0cc1d6b` | 2026-10-25 | docs(license): record the fork's modifications and where its notices live |
+| `3350dc11` | 2026-10-25 | docs(readme): name the W4A16 route in the first change and record the W4A8-int kernel |
+| `0b3b62b0` | 2026-10-25 | docs(readme): bold all four change lines and pluralize the W4A8-int kernels |
 
 ## Change summary
 
 Relative to the fork base this fork:
 
 - modifies 106 existing upstream files;
-- adds 28 new files;
+- adds 29 new files;
 - deletes no upstream files.
 
 The functional changes add the NVFP4 W4A16 (BF16) route for pre-Blackwell GPUs,
@@ -41,9 +45,18 @@ the KV dequant path they share, the route selection and command-line switches
 real-data tests, benchmarks, build entries and documentation. The README
 contains the measured results and their basis.
 
-The lists below are generated from `git diff --name-status e1f2d961..HEAD`.
-Files marked as modified are upstream files changed by this fork; files marked
-as added are new in this fork.
+The upstream sync merge `f2675499` touched three files where both sides grew
+the `ffn()` parameter list. The fork's `input_norm` and upstream's `partial`
+were both kept, in that order, in `src/models/qwen3_5/execution/ffn.h`; the two
+guards stay as separate checks in `src/models/qwen3_5/execution/ffn.cpp`; and
+`src/models/qwen3_5/execution/text.cpp` keeps the fork's fused int8 branch on
+top of upstream's hoisted `layer_config()` buffer. A tensor-parallel share that
+is handed a deferred norm is refused by an explicit throw in both the callee and
+the caller, because only the composed path folds the norm.
+
+The lists below are generated from `git diff --name-status upstream/master..HEAD`
+with `upstream/master` at `63428ac2`. Files marked as modified are upstream
+files changed by this fork; files marked as added are new in this fork.
 
 ## Modified files (106)
 
@@ -201,7 +214,11 @@ as added are new in this fork.
 
 - `tools/w4a8_inner_loop_probe.cu`
 
-## Added files (28)
+## Added files (29)
+
+### root (1)
+
+- `MODIFICATIONS.md`
 
 ### src/ops/attn_input_proj (1)
 
