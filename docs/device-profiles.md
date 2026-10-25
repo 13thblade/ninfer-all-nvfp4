@@ -39,8 +39,9 @@ the compiled route best is stored with an empty schedule, which overrides a buil
 A GPU with neither a file entry nor a built-in one is calibrated once when the engine starts, before
 the weights are loaded. For the built-in table this took 35 to 75 seconds on most Ampere, Ada and
 Blackwell cards with 46 or more SMs, 75 to 132 seconds on smaller ones and 94 to 204 seconds on
-Turing cards, and the result is written to the profile file for later starts. A `70` build runs its own native projection and attention routes. It calibrates the two-stage GDN switch and the
-GGUF vector/MoE schedules; the earlier nine-second V100 figure covered the GDN switch alone.
+Turing cards, and the result is written to the profile file for later starts. A `70` build runs its
+own native projection and attention routes, which no profile key steers, so it calibrates the
+two-stage GDN switch and the GGUF vector and MoE load schedules alone.
 
 An entry applies only to the same hardware class (the GPU name and compute capability) and the same
 SM count, so a laptop part that shares a desktop part's name but not its SM count is calibrated on its

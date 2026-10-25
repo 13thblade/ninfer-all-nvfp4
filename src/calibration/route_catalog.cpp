@@ -33,7 +33,8 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
     if (!volta) {
         // A Volta card runs its own projection, decode-attention and single-row prompt routes
         // (ops/linear/sm70, small_t_sm70.cuh, prompt_sm70.cu), which consult none of the projection
-        // and attention keys below; it calibrates the GDN prefill switch alone.
+        // and attention keys below; besides the GGUF load schedules above it calibrates the GDN
+        // prefill switch alone.
 
         // Ternary Bonsai 2 projections: the small-T kernel's row and column tiles per shape, and
         // the small-T kernel against the prefill GEMM per width.
