@@ -16,6 +16,7 @@ ninfer_add_test(ninfer_multi_gpu_test
           "${CMAKE_CURRENT_LIST_DIR}/../test_stage_plan.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/../test_kv_cache_ranks.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/../test_stage_link.cu"
+          "${CMAKE_CURRENT_LIST_DIR}/../test_tensor_parallel.cu"
   LIBRARIES ninfer_core)
 
 ninfer_add_test(ninfer_arena_ranks_test

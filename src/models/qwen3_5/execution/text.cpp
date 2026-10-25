@@ -42,6 +42,7 @@
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
 
+#include <optional>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -605,7 +606,9 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                                      static_cast<std::uint64_t>(T));
     if (proposal_head_ != nullptr) {
-        Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
+        Tensor proposal_logits =
+            work_.alloc(fp32_proposal_logits(*proposal_head_) ? DType::FP32 : DType::BF16,
+                        {proposal_head_n_, T});
         project(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
         ops::argmax(proposal_logits, proposal_tokens,
                     proposal_head_ids_
@@ -617,7 +620,9 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
                                           ctx_.stream);
         }
     } else {
-        Tensor output_logits = matrix_window(logits, T);
+        Tensor output_logits = fp32_proposal_logits(mtp_->output_head)
+                                   ? work_.alloc(DType::FP32, {dimension(config_.vocab_size), T})
+                                   : matrix_window(logits, T);
         project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
         ops::argmax(output_logits, proposal_tokens,
                     dimension(parameters_.model.resources().public_token_count), ctx_.stream);
@@ -1005,27 +1010,55 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor gated    = a.view({dimension(config_.attention->query_width()), T});
     if (rotated_output) {
         ops::sigmoid_mul_hadamard(gate, a, p.output.hadamard_signs, gated, s);
-        project_add(gated, p.output, x, work_, s, InputBasis::Rotated, wide);
+        project_residual(gated, p.output, x, InputBasis::Rotated, wide);
         return;
     }
-    project_add(gated, p.output, x, work_, s, InputBasis::Primal, wide);
+    project_residual(gated, p.output, x, InputBasis::Primal, wide);
+}
+
+void TextContext::project_residual(const Tensor& input, const LinearParameters& p, Tensor& x,
+                                   InputBasis basis, bool wide_verification) {
+    if (residual_partial_ == nullptr) {
+        project_add(input, p, x, work_, ctx_.stream, basis, wide_verification);
+        return;
+    }
+    auto scope     = work_.scope();
+    const Tensor v = rotated_input(input, p.hadamard_signs, work_, ctx_.stream, basis);
+    ops::linear(v, p.weight, *residual_partial_, residual_projection_policy(p, wide_verification),
+                work_, ctx_.stream);
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
-    const auto& p  = std::get<GdnParameters>(w.mixer);
-    cudaStream_t s = ctx_.stream;
-    const int T    = x.ne[1];
+    const auto& p                = std::get<GdnParameters>(w.mixer);
+    cudaStream_t s               = ctx_.stream;
+    const int T                  = x.ne[1];
+    const TextConfig& config     = layer_config();
 
+    // A tensor-parallel rank gates every head, as one device would, and keeps its own.
     const auto control = workspace::gdn_control(work_, config_, T);
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
-    const InputBasis projection_basis = gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p,
+    const InputBasis projection_basis = gdn_norm_control(x, w.input_norm, config.rms_norm_eps, p,
                                                          h, g, beta, work_, ctx_.execution_view());
+    if (&config != &config_) {
+        const auto heads       = static_cast<std::size_t>(config.gdn->linear_num_value_heads);
+        const auto all_heads   = static_cast<std::size_t>(config_.gdn->linear_num_value_heads);
+        const auto own_gates   = [&](const Tensor& all) {
+            Tensor own = work_.alloc(DType::FP32, {static_cast<std::int32_t>(heads), T});
+            CUDA_CHECK(cudaMemcpy2DAsync(own.data, heads * sizeof(float),
+                                         static_cast<const float*>(all.data) + tensor_rank_ * heads,
+                                         all_heads * sizeof(float), heads * sizeof(float),
+                                         static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
+            return own;
+        };
+        g    = own_gates(g);
+        beta = own_gates(beta);
+    }
 
-    const auto projection = workspace::gdn_projection(work_, config_, T);
-    Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
-                                             dimension(config_.gdn->linear_num_value_heads), T});
+    const auto projection = workspace::gdn_projection(work_, config, T);
+    Tensor z  = projection.output_gate.view({dimension(config.gdn->linear_value_head_dim),
+                                             dimension(config.gdn->linear_num_value_heads), T});
     Tensor qc = projection.query;
     Tensor kc = projection.key;
     Tensor vc = projection.value;
@@ -1042,15 +1075,15 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             throw std::logic_error("In-place batched GDN update requires width one");
         }
         Tensor projection_input =
-            h.view({dimension(config_.hidden_size), width, active_sequence_batch_});
+            h.view({dimension(config.hidden_size), width, active_sequence_batch_});
         Tensor query_output =
-            qc.view({dimension(config_.gdn->key_width()), width, active_sequence_batch_});
+            qc.view({dimension(config.gdn->key_width()), width, active_sequence_batch_});
         Tensor key_output =
-            kc.view({dimension(config_.gdn->key_width()), width, active_sequence_batch_});
+            kc.view({dimension(config.gdn->key_width()), width, active_sequence_batch_});
         Tensor value_output =
-            vc.view({dimension(config_.gdn->value_width()), width, active_sequence_batch_});
+            vc.view({dimension(config.gdn->value_width()), width, active_sequence_batch_});
         Tensor gate_output =
-            z.view({dimension(config_.gdn->value_width()), width, active_sequence_batch_});
+            z.view({dimension(config.gdn->value_width()), width, active_sequence_batch_});
         const GdnStateRef gdn_pool = gdn_state(static_cast<std::uint32_t>(gidx));
         Tensor conv_states         = gdn_pool.pool->layer_view(gdn_pool.local).conv;
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
@@ -1060,19 +1093,19 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             }
             GdnReplayRecordLayer records =
                 replay_layer(static_cast<std::uint32_t>(gidx), active_sequence_batch_, width);
-            gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
+            gdn_projection_record(projection_input, p, *config.gdn, conv_states, valid,
                                   *active_linear_state_source_slots_, records.conv, query_output,
                                   key_output, value_output, gate_output, work_, s,
                                   projection_basis);
         } else {
             gdn_projection_snapshot(
-                projection_input, p, *config_.gdn, conv_states, valid,
+                projection_input, p, *config.gdn, conv_states, valid,
                 *active_linear_state_source_slots_, *active_linear_state_destination_slots_,
                 query_output, key_output, value_output, gate_output, work_, s, projection_basis);
         }
     } else {
-        Tensor qkv    = workspace::gdn_prefill_conv(work_, config_, T);
-        Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
+        Tensor qkv    = workspace::gdn_prefill_conv(work_, config, T);
+        Tensor z_flat = z.view({dimension(config.gdn->value_width()), T});
         gdn_projection(h, p, qkv, z_flat, work_, s, projection_basis);
         const GdnStateRef gdn_pool = gdn_state(static_cast<std::uint32_t>(gidx));
         if (!active_segments_.empty()) {
@@ -1103,36 +1136,36 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         }
     }
 
-    Tensor q_recurrent = qc.view({dimension(config_.gdn->linear_key_head_dim),
-                                  dimension(config_.gdn->linear_num_key_heads), T});
-    Tensor k_recurrent = kc.view({dimension(config_.gdn->linear_key_head_dim),
-                                  dimension(config_.gdn->linear_num_key_heads), T});
+    Tensor q_recurrent = qc.view({dimension(config.gdn->linear_key_head_dim),
+                                  dimension(config.gdn->linear_num_key_heads), T});
+    Tensor k_recurrent = kc.view({dimension(config.gdn->linear_key_head_dim),
+                                  dimension(config.gdn->linear_num_key_heads), T});
 
-    Tensor vv = vc.view({dimension(config_.gdn->linear_value_head_dim),
-                         dimension(config_.gdn->linear_num_value_heads), T});
-    Tensor o  = workspace::gdn_recurrent_output(work_, config_, T)
-                   .view({dimension(config_.gdn->linear_value_head_dim),
-                          dimension(config_.gdn->linear_num_value_heads), T});
+    Tensor vv = vc.view({dimension(config.gdn->linear_value_head_dim),
+                         dimension(config.gdn->linear_num_value_heads), T});
+    Tensor o  = workspace::gdn_recurrent_output(work_, config, T)
+                   .view({dimension(config.gdn->linear_value_head_dim),
+                          dimension(config.gdn->linear_num_value_heads), T});
     if (ph == Phase::Verify) {
         const GdnStateRef recurrent_pool = gdn_state(static_cast<std::uint32_t>(gidx));
         Tensor recurrent_states  = recurrent_pool.pool->layer_view(recurrent_pool.local).recurrent;
         const std::int32_t width = active_sequence_width_;
-        Tensor q_batch           = q_recurrent.view({dimension(config_.gdn->linear_key_head_dim),
-                                                     dimension(config_.gdn->linear_num_key_heads), width,
+        Tensor q_batch           = q_recurrent.view({dimension(config.gdn->linear_key_head_dim),
+                                                     dimension(config.gdn->linear_num_key_heads), width,
                                                      active_sequence_batch_});
-        Tensor k_batch           = k_recurrent.view({dimension(config_.gdn->linear_key_head_dim),
-                                                     dimension(config_.gdn->linear_num_key_heads), width,
+        Tensor k_batch           = k_recurrent.view({dimension(config.gdn->linear_key_head_dim),
+                                                     dimension(config.gdn->linear_num_key_heads), width,
                                                      active_sequence_batch_});
-        Tensor v_batch           = vv.view({dimension(config_.gdn->linear_value_head_dim),
-                                            dimension(config_.gdn->linear_num_value_heads), width,
+        Tensor v_batch           = vv.view({dimension(config.gdn->linear_value_head_dim),
+                                            dimension(config.gdn->linear_num_value_heads), width,
                                             active_sequence_batch_});
         Tensor g_batch =
-            g.view({dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
+            g.view({dimension(config.gdn->linear_num_value_heads), width, active_sequence_batch_});
         Tensor beta_batch = beta.view(
-            {dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
+            {dimension(config.gdn->linear_num_value_heads), width, active_sequence_batch_});
         Tensor out_batch =
-            o.view({dimension(config_.gdn->linear_value_head_dim),
-                    dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
+            o.view({dimension(config.gdn->linear_value_head_dim),
+                    dimension(config.gdn->linear_num_value_heads), width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             GdnReplayRecordLayer records =
@@ -1140,14 +1173,14 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             ops::gated_delta_net_replay_record(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
                 static_cast<float>(
-                    1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
+                    1.0 / std::sqrt(static_cast<double>(config.gdn->linear_key_head_dim))),
                 recurrent_states, valid, *active_linear_state_source_slots_, records.key,
                 records.value, records.gate, out_batch, s);
         } else {
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
                 static_cast<float>(
-                    1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
+                    1.0 / std::sqrt(static_cast<double>(config.gdn->linear_key_head_dim))),
                 /*normalize_qk=*/true, recurrent_states, *active_linear_state_source_slots_,
                 *active_linear_state_destination_slots_, out_batch, s);
         }
@@ -1173,7 +1206,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 g.slice(1, segment.column, segment.columns),
                 beta.slice(1, segment.column, segment.columns),
                 static_cast<float>(
-                    1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
+                    1.0 / std::sqrt(static_cast<double>(config.gdn->linear_key_head_dim))),
                 /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o_segment,
                 s);
         }
@@ -1186,23 +1219,23 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         ops::gated_delta_net(
             q_recurrent, k_recurrent, vv, g, beta,
             static_cast<float>(1.0 /
-                               std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
+                               std::sqrt(static_cast<double>(config.gdn->linear_key_head_dim))),
             /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o, s);
     }
 
-    Tensor on = workspace::gdn_normalized_output(work_, config_, T)
-                    .view({dimension(config_.gdn->linear_value_head_dim),
-                           dimension(config_.gdn->linear_num_value_heads), T});
-    Tensor normalized = on.view({dimension(config_.gdn->value_width()), T});
+    Tensor on = workspace::gdn_normalized_output(work_, config, T)
+                    .view({dimension(config.gdn->linear_value_head_dim),
+                           dimension(config.gdn->linear_num_value_heads), T});
+    Tensor normalized = on.view({dimension(config.gdn->value_width()), T});
     if (rotated(p.output.hadamard_signs)) {
-        ops::gated_rmsnorm_hadamard(o, p.norm, z, config_.rms_norm_eps, p.output.hadamard_signs,
+        ops::gated_rmsnorm_hadamard(o, p.norm, z, config.rms_norm_eps, p.output.hadamard_signs,
                                     normalized, s);
-        project_add(normalized, p.output, x, work_, s, InputBasis::Rotated);
+        project_residual(normalized, p.output, x, InputBasis::Rotated, false);
         return;
     }
-    ops::gated_rmsnorm(o, p.norm, z, ops::GateActivation::Silu, config_.rms_norm_eps, on, s);
-    project_add(normalized, p.output, x, work_, s, InputBasis::Primal,
-                wide_residual_verification(ph, row_width(T), row_width(T)));
+    ops::gated_rmsnorm(o, p.norm, z, ops::GateActivation::Silu, config.rms_norm_eps, on, s);
+    project_residual(normalized, p.output, x, InputBasis::Primal,
+                     wide_residual_verification(ph, row_width(T), row_width(T)));
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1213,22 +1246,26 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                            const ops::SparseMoeHints& hints) {
-    Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
+    const TextConfig& config = layer_config();
+    Tensor h                 = workspace::post_mixer_hidden(work_, config, x.ne[1]);
     if (const Tensor* signs = ffn_input_signs(weights.ffn)) {
-        ops::rmsnorm_hadamard(x, weights.post_attention_norm, config_.rms_norm_eps, true, *signs, h,
+        ops::rmsnorm_hadamard(x, weights.post_attention_norm, config.rms_norm_eps, true, *signs, h,
                               ctx_.stream);
         ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
-            InputBasis::Rotated, false, experts_);
+            InputBasis::Rotated, false, experts_, residual_partial_);
         return;
     }
-    ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
+    ops::rmsnorm(x, weights.post_attention_norm, config.rms_norm_eps, true, h, ctx_.stream);
     ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
         InputBasis::Primal,
-        wide_residual_verification(phase, row_width(x.ne[1]), row_width(x.ne[1])), experts_);
+        wide_residual_verification(phase, row_width(x.ne[1]), row_width(x.ne[1])), experts_,
+        residual_partial_);
 }
 
 TextContext::GdnShard TextContext::gdn_shard(std::uint32_t layer) const {
     if (stage_runtime_ == nullptr) { return {0, layer}; }
+    // Every rank holds its share of every layer.
+    if (stage_runtime_->tensor_parallel) { return {tensor_rank_, layer}; }
     // The shard holding a layer is the last one that starts at or before it.
     for (std::size_t shard = stage_runtime_->state.size(); shard-- > 0;) {
         if (stage_runtime_->state_first_layer[shard] <= layer) {
@@ -1506,6 +1543,193 @@ void TextContext::run_staged(Tensor& x, Phase ph, Tap& tap) {
     runtime.back->recv(x.data, x.bytes(), slot, entry_stream);
 }
 
+// Runs every layer with each rank issuing its share of it. Rank 0 sends the residual and the
+// control tensors to the other ranks once, and each holds a replica of the residual from then on.
+// A GDN mixer or an FFN is one exchange: every rank projects its share into an FP32 partial and
+// every replica adds the sum of the partials. Attention runs on rank 0 alone, an exchange with one
+// contributor. The replicas stay equal, and rank 0's ends the pass where one device's would.
+template <class Tap>
+void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
+    if constexpr (Tap::enabled) {
+        (void)tap;
+        throw std::logic_error("layer feature taps are not available with tensor parallelism");
+    }
+    StageRuntime& runtime            = *stage_runtime_;
+    auto& tp                         = *runtime.tensor_parallel;
+    TensorParallelExchange& exchange = *tp.exchange;
+    const std::size_t ranks          = exchange.ranks();
+    if (runtime.forward.size() + 1 != ranks || runtime.control.size() + 1 != ranks ||
+        tp.joined.size() + 1 != ranks || parameters_.text.rank_layers.size() + 1 != ranks ||
+        ctx_.active_rank() != 0) {
+        throw std::logic_error("tensor-parallel runtime does not match the model's ranks");
+    }
+    const std::uint32_t slot = runtime.next_slot;
+    runtime.next_slot = (slot + 1U) % static_cast<std::uint32_t>(runtime.forward.front().slots());
+
+    // The control tensors, packed as for pipeline stages.
+    const std::array<const Tensor**, kControlTensors> slots = {
+        &active_cache_positions_,           &active_rope_positions_,
+        &active_kv_table_rows_,             &active_valid_columns_,
+        &active_linear_state_source_slots_, &active_linear_state_destination_slots_};
+    const std::array<const Tensor*, kControlTensors> fallback = {
+        &io_.pos, &io_.rope_pos, &io_.text_kv_table_row, nullptr, nullptr, nullptr};
+    std::array<const Tensor*, kControlTensors> current{};
+    std::array<const Tensor*, kControlTensors> sources{};
+    std::array<std::int64_t, kControlTensors> offset{};
+    std::int64_t total = 0;
+    for (std::size_t i = 0; i < kControlTensors; ++i) {
+        current[i] = *slots[i];
+        sources[i] = *slots[i] != nullptr ? *slots[i] : fallback[i];
+        if (sources[i] == nullptr || sources[i]->data == nullptr) {
+            offset[i] = -1;
+            continue;
+        }
+        if (sources[i]->dtype != DType::I32 || !sources[i]->is_contiguous()) {
+            throw std::logic_error("a tensor-parallel control tensor is not contiguous int32");
+        }
+        offset[i] = total;
+        total += sources[i]->numel();
+    }
+    total                           = std::max<std::int64_t>((total + 3) & ~std::int64_t{3}, 4);
+    const std::size_t control_bytes = static_cast<std::size_t>(total) * sizeof(std::int32_t);
+    const std::int64_t values = static_cast<std::int64_t>(x.ne[0]) * x.ne[1];
+    const std::size_t partial_bytes = static_cast<std::size_t>(values) * sizeof(float);
+    if (control_bytes > runtime.control.front().slot_bytes() ||
+        x.bytes() > runtime.forward.front().slot_bytes() || partial_bytes > exchange.slot_bytes()) {
+        throw std::runtime_error("a tensor-parallel pass exceeds its links");
+    }
+
+    const cudaStream_t entry_stream = ctx_.stream_for_rank(0);
+    auto entry_scope                = work_.scope();
+    Tensor pack = work_.alloc(DType::I32, {static_cast<std::int32_t>(total)});
+    for (std::size_t i = 0; i < kControlTensors; ++i) {
+        if (offset[i] < 0) { continue; }
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(pack.data) + offset[i],
+                                   sources[i]->data, sources[i]->bytes(),
+                                   cudaMemcpyDeviceToDevice, entry_stream));
+    }
+    for (std::size_t rank = 1; rank < ranks; ++rank) {
+        runtime.control[rank - 1].send(pack.data, control_bytes, slot, entry_stream);
+        runtime.forward[rank - 1].send(x.data, x.bytes(), slot, entry_stream);
+    }
+
+    // Each rank's replica and control copies, held in its own scratch for the whole pass.
+    struct Replica {
+        Tensor x;
+        std::array<Tensor, kControlTensors> local{};
+        std::array<const Tensor*, kControlTensors> control{};
+    };
+    std::vector<Replica> replicas(ranks);
+    std::vector<WorkspaceArena::Scope> pass_scopes;
+    pass_scopes.reserve(ranks);
+    replicas[0].x = x;
+    for (std::size_t rank = 1; rank < ranks; ++rank) {
+        ScopedDeviceRank rank_guard(ctx_, rank);
+        ScopedArenaRank arena_guard(work_, rank);
+        pass_scopes.push_back(work_.scope());
+        Replica& replica = replicas[rank];
+        replica.x        = work_.alloc(x.dtype, {x.ne[0], x.ne[1]});
+        runtime.forward[rank - 1].recv(replica.x.data, replica.x.bytes(), slot, ctx_.stream);
+        Tensor control = work_.alloc(DType::I32, {static_cast<std::int32_t>(total)});
+        runtime.control[rank - 1].recv(control.data, control_bytes, slot, ctx_.stream);
+        for (std::size_t i = 0; i < kControlTensors; ++i) {
+            if (offset[i] < 0) { continue; }
+            replica.local[i]      = *sources[i];
+            replica.local[i].data = static_cast<std::int32_t*>(control.data) + offset[i];
+            replica.control[i]    = &replica.local[i];
+        }
+    }
+
+    // Issues `share` for rank `rank` on its device, against its scratch, control and replica.
+    const auto on_rank = [&](std::size_t rank, const auto& share) {
+        std::optional<ScopedDeviceRank> device_guard;
+        std::optional<ScopedArenaRank> arena_guard;
+        std::optional<ScopedControl> control_guard;
+        if (rank != 0) {
+            device_guard.emplace(ctx_, rank);
+            arena_guard.emplace(work_, rank);
+            control_guard.emplace(current, replicas[rank].control, slots);
+        }
+        tensor_rank_ = rank;
+        try {
+            auto scope = work_.scope();
+            share(replicas[rank].x);
+        } catch (...) {
+            tensor_rank_      = 0;
+            residual_partial_ = nullptr;
+            throw;
+        }
+        tensor_rank_ = 0;
+    };
+    // One exchange: ranks [0, contributors) project into their partials, every replica adds them.
+    std::size_t next_exchange = 0;
+    const auto exchange_step  = [&](std::size_t contributors, const auto& share) {
+        const std::size_t exchange_slot = next_exchange;
+        next_exchange ^= 1U;
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            on_rank(rank, [&](Tensor& replica) {
+                const bool contributes = rank < contributors;
+                if (contributes) {
+                    Tensor partial(exchange.partial(rank, exchange_slot), DType::FP32,
+                                   {x.ne[0], x.ne[1]});
+                    residual_partial_ = &partial;
+                    share(rank, replica);
+                    residual_partial_ = nullptr;
+                }
+                exchange.publish(rank, exchange_slot, contributes ? partial_bytes : 0,
+                                 ctx_.stream);
+            });
+        }
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            on_rank(rank, [&](Tensor& replica) {
+                exchange.reduce(rank, exchange_slot, static_cast<__nv_bfloat16*>(replica.data),
+                                values, contributors, ctx_.stream);
+            });
+        }
+    };
+
+    const auto layers = static_cast<std::uint32_t>(parameters_.text.layers.size());
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const auto block = [&](std::size_t rank) -> const BlockParameters& {
+            return rank == 0 ? parameters_.text.layers[layer]
+                             : parameters_.text.rank_layers[rank - 1][layer];
+        };
+        const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
+        const auto compact = dimension(config_.compact_layer_indices[layer]);
+        try {
+            if (layer < layer_ready_.size()) {
+                CUDA_CHECK(cudaStreamWaitEvent(entry_stream, layer_ready_[layer], 0));
+            }
+            if (full) {
+                exchange_step(1, [&](std::size_t, Tensor& replica) {
+                    attn_mix(block(0), replica, compact, ph);
+                });
+            } else {
+                exchange_step(ranks, [&](std::size_t rank, Tensor& replica) {
+                    gdn_mix(block(rank), replica, compact, ph);
+                });
+            }
+            exchange_step(ranks, [&](std::size_t rank, Tensor& replica) {
+                mlp_tail(block(rank), replica, ph,
+                         rank == 0 && layer + 1 < layers
+                             ? next_projection_hints(static_cast<int>(layer))
+                             : ops::SparseMoeHints{});
+            });
+        } catch (const std::exception& error) {
+            throw std::runtime_error("text/layers/" + std::to_string(layer) +
+                                     (ph == Phase::Prefill ? " prefill" : " verify") +
+                                     " tensor-parallel columns=" + std::to_string(x.ne[1]) + ": " +
+                                     error.what());
+        }
+    }
+    // A captured pass ends with every rank joined back into rank 0's stream.
+    for (std::size_t rank = 1; rank < ranks; ++rank) {
+        tp.joined[rank - 1].record(ctx_.stream_for_rank(rank));
+        tp.joined[rank - 1].wait(entry_stream);
+    }
+    layer_ready_ = {};
+}
+
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     if (!parameters_.text.split_execution()) {
@@ -1514,6 +1738,10 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     }
     if (stage_runtime_ == nullptr) {
         throw std::logic_error("a split model needs its stage runtime");
+    }
+    if (stage_runtime_->tensor_parallel) {
+        run_tensor_parallel(x, ph, tap);
+        return;
     }
     run_staged(x, ph, tap);
 }
@@ -1577,7 +1805,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         mtp_proposal_extent_ > static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
         throw std::logic_error("MTP proposal extent exceeds the configured draft window");
     }
-    int t0 = 0;
+    int t0          = 0;
+    bool token_left = false;
     for (; t0 < T;) {
         int len = std::min(chunk, T - t0);
         if (split_rel > 0 && t0 < split_rel && t0 + len > split_rel) { len = split_rel - t0; }
@@ -1727,6 +1956,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     ops::argmax(logits, io_.token,
                                 dimension(parameters_.model.resources().public_token_count), s);
                 }
+                if (first_token_hook_) {
+                    first_token_hook_();
+                    token_left = true;
+                }
             }
 
             if (prepare_mtp_prompt) {
@@ -1839,9 +2072,12 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
     prefill_split_frontier_ = -1;
 
-    timing.begin_wait();
-    ctx_.synchronize();
-    timing.end_wait();
+    // A token that has left is waited for by the caller; the drafter's work behind it is not.
+    if (!token_left) {
+        timing.begin_wait();
+        ctx_.synchronize();
+        timing.end_wait();
+    }
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T,

@@ -51,6 +51,11 @@ struct StateImageShard {
     std::size_t rank          = 0;
     std::uint32_t first_layer = 0;
     std::uint32_t layers      = 0;
+    // Tensor parallelism: the shard holds the `part`-th of `parts` equal head groups of each of its
+    // layers' state, and the shards of one run of layers follow each other in part order. A host
+    // image keeps a layer's parts side by side, in part order.
+    std::uint32_t part  = 0;
+    std::uint32_t parts = 1;
 };
 
 struct StateImageDeviceLayout {
@@ -69,7 +74,8 @@ struct StateImageDeviceLayout {
 // Every Linear Attention layer in one shard on rank 0.
 [[nodiscard]] StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
                                                                   const StateImageSpec& spec);
-// `shards` must cover spec.linear.layers exactly, in order; each is laid out in its rank's builder.
+// `shards` must cover spec.linear.layers exactly, in order, every run of layers in all of its parts;
+// each is laid out in its rank's builder.
 [[nodiscard]] StateImageDeviceLayout
 plan_state_image_device_pool(std::span<LayoutBuilder* const> builders,
                              std::span<const StateImageShard> shards, const StateImageSpec& spec);

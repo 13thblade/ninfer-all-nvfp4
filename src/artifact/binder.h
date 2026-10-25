@@ -73,6 +73,18 @@ public:
     // so the artifact is still validated in full and every consumer keeps reading one
     // MaterializedArtifact. Rank 0 is the default and the only rank a single-device load uses.
     void device_rank(ObjectHandle object, std::size_t rank);
+    // Materializes `selection` of a stored object as a device object of its own on `rank`, and
+    // returns its handle, which lies past the artifact's objects. The stored object gets no device
+    // demand from this. A tensor-parallel rank holds its pieces of the projections this way.
+    [[nodiscard]] ObjectHandle select_device(ObjectHandle source, ObjectSelection selection,
+                                             std::size_t rank);
+    [[nodiscard]] bool selected(ObjectHandle object) const noexcept {
+        return object.index >= demands_.size();
+    }
+    // The stored object's geometry, or a selected piece's.
+    [[nodiscard]] WeightGeometry geometry(ObjectHandle object) const;
+    // A stored object's id, or a selected piece's: its source's with the selection appended.
+    [[nodiscard]] std::string object_id(ObjectHandle object) const;
     // Places an object in the pinned Host block, in first-request order so a caller's logical
     // groups stay contiguous. It excludes device and Host placements of the same object.
     void require_pinned(ObjectHandle object);
@@ -98,8 +110,20 @@ private:
         std::vector<std::byte> host_data;
     };
 
+    struct Selected {
+        ObjectHandle source;
+        ObjectSelection selection;
+        WeightGeometry geometry;
+        std::size_t rank        = 0;
+        std::uint64_t alignment = 256;
+        std::uint64_t tail      = 0;
+    };
+
+    [[nodiscard]] Selected& selected_entry(ObjectHandle object);
+
     const Reader& reader_;
     std::vector<Demand> demands_;
+    std::vector<Selected> selected_;
     std::uint64_t read_bytes_        = 0;
     std::uint64_t owned_value_bytes_ = 0;
     std::uint64_t next_pinned_order_ = 0;

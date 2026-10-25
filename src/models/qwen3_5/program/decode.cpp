@@ -296,6 +296,26 @@ void ProgramImpl::copy_round_token() {
                                device.stream));
 }
 
+void ProgramImpl::make_early_token_resources() {
+    if (first_token_ready) { return; }
+    first_token_ready.emplace(device);
+    initial_drafts_ready.reserve(max_concurrency);
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        initial_drafts_ready.emplace_back(device);
+    }
+    initial_drafts_host.emplace(static_cast<std::size_t>(max_concurrency) *
+                                qwen3_5::kMtpDecodeMaximumDrafts * sizeof(TokenId));
+}
+
+void ProgramImpl::settle_initial_drafts(SequenceState& sequence) {
+    if (!sequence.mtp_drafts_pending) { return; }
+    initial_drafts_ready.at(sequence.lane).synchronize();
+    const auto* row = static_cast<const TokenId*>(initial_drafts_host->data()) +
+                      static_cast<std::size_t>(sequence.lane) * qwen3_5::kMtpDecodeMaximumDrafts;
+    std::copy_n(row, sequence.mtp_draft_count, sequence.mtp_drafts.begin());
+    sequence.mtp_drafts_pending = false;
+}
+
 void ProgramImpl::mark_workspace_usage(std::size_t phase_bytes) noexcept {
     workspace_logical_peak_bytes = std::max(workspace_logical_peak_bytes, phase_bytes);
 }
@@ -723,6 +743,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
             throw std::invalid_argument("MTP batch contains an invalid or duplicate lane");
         }
+        settle_initial_drafts(active_sequence(lane));
         const SequenceState& sequence = active_sequence(lane);
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||

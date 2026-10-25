@@ -50,8 +50,14 @@ struct LoadOptions {
     std::size_t ranks = 1;
     // Layers per stage (`--stage-layers`), one count per device. Empty lets the engine choose.
     std::vector<std::uint32_t> stage_layers;
+    // The `ranks` devices share every layer instead (`--tensor-parallel`): each holds a share of
+    // the GDN heads and dense FFN rows, and the first one the rest.
+    bool tensor_parallel = false;
 
     bool operator==(const LoadOptions&) const = default;
+
+    // The tensor-parallel group size, one without tensor parallelism.
+    [[nodiscard]] std::size_t tensor_ranks() const noexcept { return tensor_parallel ? ranks : 1; }
 
     [[nodiscard]] bool speculative_enabled() const noexcept {
         return speculative != SpeculativeBackend::None;
@@ -130,7 +136,8 @@ struct LoadOptions {
             .vision_residency         = options.enable_vision ? options.vision_residency
                                                               : VisionResidency::Resident,
             .ranks = std::max<std::size_t>(options.devices.size(), 1),
-            .stage_layers = options.stage_layers};
+            .stage_layers = options.stage_layers,
+            .tensor_parallel = options.tensor_parallel};
 }
 
 } // namespace ninfer::models

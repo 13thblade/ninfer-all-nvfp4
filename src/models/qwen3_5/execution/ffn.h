@@ -12,11 +12,14 @@ class NativeExpertRuntime;
                                               std::int32_t last, bool mtp = false,
                                               bool verify = false, bool wide_verification = false);
 // `wide_verification` keeps the neural path's residual activation precision in a wide single-row
-// copy verification (see residual_projection_policy).
+// copy verification (see residual_projection_policy). With `partial`, a dense FFN writes its down
+// projection to that FP32 [hidden, T] matrix instead of adding it to `residual` (a tensor-parallel
+// rank's share, which the exchange adds).
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, cudaStream_t stream,
          bool mtp = false, bool verify = false, InputBasis basis = InputBasis::Primal,
-         bool wide_verification = false, NativeExpertRuntime* experts = nullptr);
+         bool wide_verification = false, NativeExpertRuntime* experts = nullptr,
+         Tensor* partial = nullptr);
 // The sign vector of a rotated Dense FFN's input projection, or null.
 [[nodiscard]] const Tensor* ffn_input_signs(const FfnParameters& parameters);
 

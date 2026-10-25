@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
+#include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
@@ -162,6 +163,21 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     std::vector<qwen3_5::StateImageShard> state_shards;
     if (ranks == 1) {
         state_shards.push_back({.rank = 0, .first_layer = 0, .layers = config.linear_attention_layers});
+    } else if (parameters.text.tensor_parallel()) {
+        // Attention and its KV stay on rank 0; every rank holds its heads' share of every GDN
+        // layer's state.
+        for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
+            if (config.layer_types[layer] == MixerKind::FullAttention) {
+                attention_layer_rank.push_back(0);
+            }
+        }
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            state_shards.push_back({.rank        = rank,
+                                    .first_layer = 0,
+                                    .layers      = config.linear_attention_layers,
+                                    .part        = static_cast<std::uint32_t>(rank),
+                                    .parts       = static_cast<std::uint32_t>(ranks)});
+        }
     } else {
         std::uint32_t gdn_index = 0;
         for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
@@ -229,17 +245,22 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.state_images =
         qwen3_5::plan_state_image_device_pool(builder_pointers, state_shards, state_image_spec);
     if (plan.speculative_backend != SpeculativeBackend::None) {
-        // A stage records only the GDN layers it holds, in its own device's memory.
+        // A stage records only the GDN layers it holds, in its own device's memory; a
+        // tensor-parallel rank only its heads.
         for (std::size_t shard = 0; shard < state_shards.size(); ++shard) {
+            const auto parts              = static_cast<std::int32_t>(state_shards[shard].parts);
             GdnReplayRecordLayout records = plan_gdn_replay_records(
                 *builder_pointers[state_shards[shard].rank],
                 GdnReplayRecordSpec{
                     .layers          = static_cast<std::int32_t>(state_shards[shard].layers),
                     .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
                     .width           = static_cast<std::int32_t>(widest_verify_window(plan) + 1U),
-                    .conv_channels   = (config.gdn ? dimension(config.gdn->conv_channels()) : 0),
-                    .qk_heads    = (config.gdn ? dimension(config.gdn->linear_num_key_heads) : 0),
-                    .value_heads = (config.gdn ? dimension(config.gdn->linear_num_value_heads) : 0),
+                    .conv_channels =
+                        (config.gdn ? dimension(config.gdn->conv_channels()) / parts : 0),
+                    .qk_heads =
+                        (config.gdn ? dimension(config.gdn->linear_num_key_heads) / parts : 0),
+                    .value_heads =
+                        (config.gdn ? dimension(config.gdn->linear_num_value_heads) / parts : 0),
                     .key_dim     = (config.gdn ? dimension(config.gdn->linear_key_head_dim) : 0),
                     .value_dim   = (config.gdn ? dimension(config.gdn->linear_value_head_dim) : 0),
                 });
@@ -516,9 +537,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {
-            matrix(layout, DType::BF16, dimension(parameters.proposal->rows), columns);
-            linear_scratch(layout, parameters.proposal->head, columns, columns);
+            const auto& head = parameters.proposal->head;
+            matrix(layout, execution::fp32_proposal_logits(head) ? DType::FP32 : DType::BF16,
+                   dimension(parameters.proposal->rows), columns);
+            linear_scratch(layout, head, columns, columns);
         } else {
+            if (execution::fp32_proposal_logits(parameters.mtp->output_head)) {
+                matrix(layout, DType::FP32, dimension(config.vocab_size), columns);
+            }
             linear_scratch(layout, parameters.mtp->output_head, columns, columns);
         }
     };
@@ -1021,9 +1047,11 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
                       static_cast<std::uint32_t>(ops::kCublasPrefillFloorTokens),
                   "the widest decode/verify round must stay below the cuBLAS prefill width gate");
     if (parameters.text.rank_count != device.size()) {
-        throw std::invalid_argument("the model is split into " +
+        throw std::invalid_argument("the model is split over " +
                                     std::to_string(parameters.text.rank_count) +
-                                    " pipeline stages but " + std::to_string(device.size()) +
+                                    (parameters.text.tensor_parallel() ? " tensor-parallel ranks"
+                                                                       : " pipeline stages") +
+                                    " but " + std::to_string(device.size()) +
                                     " devices are attached");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
@@ -1080,6 +1108,9 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 15) {
             throw std::invalid_argument("masked draft window must be in [1,15]");
+        }
+        if (parameters.text.tensor_parallel()) {
+            throw std::invalid_argument("--tensor-parallel does not run a masked drafter");
         }
         break;
     }
@@ -1293,14 +1324,26 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     // persistent state. Its graph allowance is the primary device's scaled by the share of layers
     // it runs; the primary keeps the whole figure, which only over-reserves it a little.
     const auto& text = impl->parameters->text;
+    // A tensor-parallel exchange holds two FP32 partials of the widest pass on every rank.
+    const std::size_t exchange_bytes =
+        text.tensor_parallel()
+            ? checked_mul(stage_boundary_columns(*impl) * 2U * sizeof(float),
+                          static_cast<std::size_t>(impl->parameters->model.config().text.hidden_size),
+                          "tensor-parallel exchange")
+            : 0U;
+    impl->device_reservation_bytes =
+        checked_add(impl->device_reservation_bytes, exchange_bytes, "tensor-parallel exchange");
     for (std::size_t rank = 1; rank < text.rank_count; ++rank) {
-        const std::uint64_t layers_here = text.stage_end(rank) - text.stage_begin[rank];
+        const std::uint64_t layers_here =
+            text.tensor_parallel() ? text.layers.size()
+                                   : text.stage_end(rank) - text.stage_begin[rank];
         const std::size_t graph_share   = static_cast<std::size_t>(
             (static_cast<std::uint64_t>(impl->graph_allowance_bytes) * layers_here) /
             std::max<std::size_t>(text.layers.size(), 1));
         impl->extra_rank_reservation_bytes.push_back(checked_add(
-            checked_add(impl->persistent.extra_rank_bytes[rank - 1],
-                        impl->workspace.general_capacity, "further device memory plan"),
+            checked_add(checked_add(impl->persistent.extra_rank_bytes[rank - 1],
+                                    impl->workspace.general_capacity, "further device memory plan"),
+                        exchange_bytes, "tensor-parallel exchange"),
             graph_share, "further device graph allowance"));
     }
     return impl;
