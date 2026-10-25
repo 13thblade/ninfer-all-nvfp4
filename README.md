@@ -14,10 +14,10 @@
 
 按时间顺序，一共四处改动：
 
-1. **新增 W4A16 宽 T fused SwiGLU 内核**，让宽的 prompt 段落能 prefill 而不是抛异常；另外新增了 W4A8-int 内核。
+1. **新增 W4A16 宽 T fused SwiGLU 内核，让宽的 prompt 段落能 prefill 而不是抛异常；另外新增了 W4A8-int 内核。**
 2. **整条通路的 kernel 性能优化工作。**
-3. **把 W4A16 和 W4A8-int 通路的开关接进 `ninfer-calibrate`**，最优化性能校准可在目标设备上首次启动时实测得出。
-4. 顺带优化了无原生 FP4 路径的 KV NVFP4 和 k8v4 的性能。
+3. **把 W4A16 和 W4A8-int 通路的开关接进 `ninfer-calibrate`，最优化性能校准可在目标设备上首次启动时实测得出。**
+4. **顺带优化了无原生 FP4 路径的 KV NVFP4 和 k8v4 的性能。**
 
 本 fork 改动的上游文件不逐个在源码里标注，完整清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
 
@@ -69,10 +69,10 @@ This repository does not change the model scope upstream already supports; it on
 
 Four changes, in order:
 
-1. **A W4A16 wide-T fused SwiGLU kernel**, so a wide span prefills instead of throwing; a W4A8-int kernel was added as well.
+1. **A W4A16 wide-T fused SwiGLU kernel, so a wide span prefills instead of throwing; W4A8-int kernels were added as well.**
 2. **Kernel work across the route.**
-3. **The W4A16 and W4A8-int route switches wired into `ninfer-calibrate`**, so the optimal performance calibration is measured on first start on the target device.
-4. Alongside them, **KV-cache performance for NVFP4 and k8v4 on cards without a native FP4 path** was improved as well.
+3. **The W4A16 and W4A8-int route switches wired into `ninfer-calibrate`, so the optimal performance calibration is measured on first start on the target device.**
+4. **Alongside them, KV-cache performance for NVFP4 and k8v4 on cards without a native FP4 path was improved as well.**
 
 The upstream files this fork modifies are not marked one by one in the sources; the full list is in [MODIFICATIONS.md](MODIFICATIONS.md). Untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git log. This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license.
 
