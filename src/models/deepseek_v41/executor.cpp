@@ -90,8 +90,9 @@ std::vector<float> rope_freq(int dim, float base, std::uint32_t original, float 
         f[i] = 1.0f / std::pow(base, float(2 * i) / float(dim));
     }
     if (original == 0) { return f; }
+    constexpr double kPi = 3.14159265358979323846;
     const auto corrected = [&](double rotations) {
-        return dim * std::log(double(original) / (rotations * 2 * M_PI)) / (2 * std::log(double(base)));
+        return dim * std::log(double(original) / (rotations * 2 * kPi)) / (2 * std::log(double(base)));
     };
     const double low  = std::max(std::floor(corrected(beta_fast)), 0.0);
     const double high = std::min(std::ceil(corrected(beta_slow)), double(dim - 1));
