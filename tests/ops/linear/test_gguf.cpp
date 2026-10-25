@@ -1,6 +1,7 @@
 // GGUF block matrices through the public linear, linear_add and linear_swiglu Ops and the embedding
 // gather, against an FP64 product of the exactly dequantized weights. The products quantize the
 // activation to q8_1 as llama.cpp does, so they are held to that arithmetic's error, not to A16's.
+// Q4_K and Q6_K run once with each vector load schedule a device profile can name.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -9,6 +10,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ops/common/device_route.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
 
@@ -22,8 +24,10 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -356,12 +360,21 @@ int main() {
         int failures      = 0;
         std::uint32_t seed = 9001;
         for (const auto& c : cases()) {
-            for (const std::int32_t k : {1536, 2560, 2816, 2112, 704}) {
-                if (k % gguf_block_shape(c.qtype).elements != 0) { continue; }
-                const int f = run_type(c, seed++, k);
-                std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
-                          << '\n';
-                failures += f;
+            const bool cooperative = c.qtype == QType::GGUF_Q4_K || c.qtype == QType::GGUF_Q6_K;
+            for (const std::string_view schedule :
+                 cooperative ? std::vector<std::string_view>{"scalar", "cooperative"}
+                             : std::vector<std::string_view>{""}) {
+                std::optional<ops::DeviceRouteForce> force;
+                if (!schedule.empty()) {
+                    force.emplace("gguf_vector/" + std::string(c.name), std::string(schedule));
+                }
+                for (const std::int32_t k : {1536, 2560, 2816, 2112, 704}) {
+                    if (k % gguf_block_shape(c.qtype).elements != 0) { continue; }
+                    const int f = run_type(c, seed++, k);
+                    std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
+                              << (schedule.empty() ? "" : " ") << schedule << '\n';
+                    failures += f;
+                }
             }
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " GGUF Linear\n";

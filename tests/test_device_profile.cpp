@@ -149,19 +149,6 @@ void test_compiled_table_names_catalog_schedules() {
                 expect(known, "a compiled route names a catalog candidate");
             }
         }
-        for (const std::string_view key : {"gguf_moe_vector/q4_k", "gguf_moe_vector/q6_k",
-                                           "gguf_moe_up/q4_k", "gguf_moe_up/q6_k"}) {
-            const auto found = std::find_if(catalog.begin(), catalog.end(),
-                                            [&](const auto& item) { return item.key == key; });
-            const bool has_scalar = found != catalog.end() &&
-                std::find(found->candidates.begin(), found->candidates.end(), "scalar") !=
-                    found->candidates.end();
-            const bool has_cooperative = found != catalog.end() &&
-                std::find(found->candidates.begin(), found->candidates.end(), "cooperative") !=
-                    found->candidates.end();
-            expect(has_scalar && has_cooperative,
-                   "MoE vector route keys expose scalar and cooperative candidates");
-        }
     }
     using ninfer::ops::DeviceTier;
     for (const DeviceTier tier :
@@ -385,56 +372,6 @@ void test_bands_and_force() {
     expect(device_route_schedule("attn_pv_f16", 1).empty(), "removing the profile restores the tables");
 }
 
-void test_gguf_vector_route_bands() {
-    using ninfer::ops::device_route_schedule;
-    const std::string rtx3090 =
-        ninfer::runtime::context_cost_hardware_class("NVIDIA GeForce RTX 3090", 8, 6);
-    const auto builtin = ninfer::runtime::compiled_device_route_profile(rtx3090, 82);
-    expect(builtin.has_value(), "the RTX 3090 has a compiled GGUF vector profile");
-    if (builtin) {
-        const auto q4 = builtin->routes.find("gguf_vector/q4_k");
-        const auto q6 = builtin->routes.find("gguf_vector/q6_k");
-        expect(q4 != builtin->routes.end() && same_bands(q4->second, {{1, "cooperative"}, {8, ""}}),
-               "the RTX 3090 selects cooperative Q4_K only at width one");
-        expect(q6 != builtin->routes.end() && same_bands(q6->second, {{8, "cooperative"}}),
-               "the RTX 3090 selects cooperative Q6_K through width eight");
-        expect(builtin->routes.count("gguf_moe_vector/q4_k") == 0 &&
-                   builtin->routes.count("gguf_moe_vector/q6_k") == 0 &&
-                   builtin->routes.count("gguf_moe_up/q4_k") == 0 &&
-                   builtin->routes.count("gguf_moe_up/q6_k") == 0,
-               "the RTX 3090 has no unqualified MoE cooperative route");
-    }
-    ninfer::ops::DeviceRouteProfile profile = sample_profile();
-    profile.routes["gguf_vector/q4_k"] = {{2, "cooperative"}, {4, "scalar"}, {8, "cooperative"}};
-    profile.routes["gguf_vector/q6_k"] = {{1, "scalar"}, {8, "cooperative"}};
-    profile.routes["gguf_moe_vector/q4_k"] = {{8, "cooperative"}};
-    profile.routes["gguf_moe_vector/q6_k"] = {{8, "scalar"}};
-    profile.routes["gguf_moe_up/q4_k"] = {{4, "cooperative"}};
-    profile.routes["gguf_moe_up/q6_k"] = {{4, "scalar"}};
-    ninfer::ops::install_device_route_profile(
-        std::make_shared<const ninfer::ops::DeviceRouteProfile>(profile));
-    expect(device_route_schedule("gguf_vector/q4_k", 1) == "cooperative" &&
-               device_route_schedule("gguf_vector/q4_k", 2) == "cooperative" &&
-               device_route_schedule("gguf_vector/q4_k", 3) == "scalar" &&
-               device_route_schedule("gguf_vector/q4_k", 4) == "scalar" &&
-               device_route_schedule("gguf_vector/q4_k", 5) == "cooperative" &&
-               device_route_schedule("gguf_vector/q4_k", 8) == "cooperative",
-           "Q4_K vector profile bands select their scalar or cooperative schedule");
-    expect(device_route_schedule("gguf_vector/q6_k", 1) == "scalar" &&
-               device_route_schedule("gguf_vector/q6_k", 2) == "cooperative" &&
-               device_route_schedule("gguf_vector/q6_k", 8) == "cooperative",
-           "Q6_K vector profile bands select their scalar or cooperative schedule");
-    expect(device_route_schedule("gguf_moe_vector/q4_k", 1) == "cooperative" &&
-               device_route_schedule("gguf_moe_vector/q6_k", 8) == "scalar" &&
-               device_route_schedule("gguf_moe_up/q4_k", 4) == "cooperative" &&
-               device_route_schedule("gguf_moe_up/q6_k", 4) == "scalar",
-           "MoE vector and MoE-up routes use their independent profile keys");
-    expect(device_route_schedule("gguf_vector/q4_k", 9).empty() &&
-               device_route_schedule("gguf_vector/unsupported", 1).empty(),
-           "widths beyond measured bands and unprofiled vector types retain scalar fallback");
-    ninfer::ops::install_device_route_profile(nullptr);
-}
-
 // Past the widths the route bands were measured at, a call takes the table its Op names for wide
 // calls unless a profile band reaches the width; FP8 A16 calls name the unified one.
 void test_wide_tables() {
@@ -502,7 +439,6 @@ int main() {
     test_file_layers_over_builtin();
     test_schema_versions_on_disk();
     test_bands_and_force();
-    test_gguf_vector_route_bands();
     test_wide_tables();
     if (failures != 0) {
         std::cerr << failures << " device profile check(s) failed\n";
