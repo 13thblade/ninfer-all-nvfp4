@@ -1162,7 +1162,9 @@ for greedy decoding) and normalized over the whole vocabulary. `top_k`, `top_p` 
 change them. A token the mask excludes never appears among the alternatives, so a constrained
 position can report fewer than asked, and a sampled token outside its position's 20 most likely
 tokens reports OpenAI's `-9999.0`. Under speculative decoding a verified position's penalties count
-the drafts before it, as its sampling does.
+the drafts before it, as its sampling does. The reduction over the vocabulary splits every row the
+same way, so a position's values have the same bits whether its logits are reduced alone, in a
+verification pass or beside other requests' rows.
 
 Records cover the content channel: every generated token after the reasoning block and the
 whitespace that closes it, the markup of a tool call included; reasoning tokens and the stop token
