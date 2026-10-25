@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Publish an immutable source snapshot only after all Windows and Linux packages pass their checks.
 set -euo pipefail
-: "${GITHUB_REPOSITORY:?}" "${GITHUB_SHA:?}" "${GITHUB_REF:?}"
+: "${GITHUB_REPOSITORY:?}" "${GITHUB_SHA:?}" "${GITHUB_REF:?}" "${NINFER_VERSION:?the release tag the binaries report}"
 [[ "$GITHUB_REF" == refs/heads/master ]] || { echo 'Publication requires master' >&2; exit 1; }
 [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid source revision' >&2; exit 1; }
 repo="$GITHUB_REPOSITORY"
@@ -49,11 +49,12 @@ if [[ "$head" != "$GITHUB_SHA" ]]; then
   echo 'Source was superseded on master; packages remain in Actions artifacts.'
   exit 0
 fi
-# Resolve retries by full source revision; reserve daily numbers across releases and Git tags.
+# The binaries report the tag allocated before the build. A retry resolves this revision's release;
+# a number another release or Git tag has taken since stops publication.
 gh api --paginate --slurp "repos/$repo/releases?per_page=100" > releases.json
 gh api --paginate --slurp "repos/$repo/git/matching-refs/tags/" > release-refs.json
 read -r tag release_id draft < <(python3.11 "$script_dir/native-release-tag.py" \
-  --releases releases.json --refs release-refs.json --revision "$GITHUB_SHA")
+  --releases releases.json --refs release-refs.json --revision "$GITHUB_SHA" --tag "$NINFER_VERSION")
 published=false
 if [[ "$release_id" != 0 ]]; then
   [[ "$(gh api "repos/$repo/releases/$release_id" --jq .target_commitish)" == "$GITHUB_SHA" ]] || {

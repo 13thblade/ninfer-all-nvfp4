@@ -20,7 +20,7 @@ no dispatch token or separate workflow-completion event. The parent workflow's c
 cancels obsolete builds and their Docker jobs together.
 The handoff verifies volume checksums, packaged files, full source revision, CUDA version and the
 complete architecture list. Each image keeps its device images in the shared backend runtime.
-`commit12` is the first 12 hexadecimal characters of the source SHA; `VERSION` is not a tag.
+`commit12` is the first 12 hexadecimal characters of the source SHA.
 
 The matrix publishes commit tags first. Only after both jobs succeed does promotion update the
 floating CUDA tags, checking the current master SHA before each update. Registry tag updates are
@@ -59,6 +59,12 @@ function bodies. `BUILD-INFO.json` records the patch. The pre-build probe compil
 through both host C++ and nvcc before testing cache reuse.
 Compilation needs no GPU. Driver installation is not part of either build.
 
+Before any compilation, a run that will publish allocates its release tag `YYYY-MM-DD.N` (UTC date
+and daily build number; a retry of an already released revision gets that release's tag) and passes
+it to every build as `NINFER_VERSION`. The binaries report it as their version (`ninfer-serve
+--version`, [server version](../serving.md#server-version)), and the packagers refuse a build that
+reports another tag. A run that will not publish builds `untagged` binaries.
+
 1. Compile release products with `NINFER_SHARED_RUNTIME=ON`. Six small command executables load
    one private runtime per CUDA family. Windows also keeps GGML in its existing kernel DLL.
    Component archives remain the compile owners. Linux compiles them as PIC for the shared runtime.
@@ -70,12 +76,13 @@ Compilation needs no GPU. Driver installation is not part of either build.
    and includes a Dockerfile that installs those packages and copies the prebuilt binaries.
 4. Test the archives and split them into volumes no larger than 1900 MiB. Keep Actions artifacts
    for seven days. Names are `ninfer-<os>-x64-cuda<major.minor>-sm<arches>-<commit12>`;
-   `VERSION` remains metadata inside the archive and does not affect its name.
+   `BUILD-INFO.json` records the version, which is not part of the name.
 5. Assemble one universal package per OS from the two verified single-CUDA archives. Require matching
    source revisions, command sets, metadata and checksums. No compilation occurs in these jobs.
    Universal names are `ninfer-<os>-x64-cuda12.9-13.4-<commit12>`. Docker continues to use single-CUDA archives.
-6. After all four builds and both assembly jobs pass, validate all six manifests, create a draft tagged `YYYY-MM-DD.N` (UTC date and daily build number),
-   upload assets, and compare their remote SHA-256 digests and sizes.
+6. After all four builds and both assembly jobs pass, validate all six manifests, check that the
+   tag the binaries report is still this revision's (its draft, or a number no release or Git tag
+   has taken since), create a draft under that tag, upload assets, and compare their remote SHA-256 digests and sizes.
    The publisher generates the release description with `.github/scripts/render-native-release-notes.py`.
    It lists all six package choices, their platforms and CUDA backends, exact part filenames and links,
    checksum manifests, part counts, compressed download totals and extraction commands. Counts and sizes
@@ -379,8 +386,8 @@ Both packagers read CUDA and architecture labels from the configured build tree.
 `NINFER_BUILD_ROOT` to that tree. Build release products with benchmarks enabled. Linux accepts
 separate CLI/server binaries or `NINFER_MULTICALL=ON`; CI uses the latter. Run
 `scripts/package-release.sh` on the Linux build host, or `scripts\package-release.ps1` on Windows.
-The repository's `VERSION` is included as source metadata, with matching release notes when present. Neither
-packager uses `VERSION` in the archive name. Modified local sources add `-dirty`; CI rejects them.
+`BUILD-INFO.json` records the version the build's binaries report, which is not part of the archive
+name. Modified local sources add `-dirty`; CI rejects them.
 Linux packaging needs Python 3.11, `strip`, `patchelf`, `ldd`, `dpkg-query`, `tar` and the build's CUDA Toolkit.
 The runtime Dockerfile is included only when packaging a Debian 13 build.
 

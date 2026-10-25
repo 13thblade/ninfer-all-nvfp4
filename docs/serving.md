@@ -513,7 +513,7 @@ read-only and fills only the llama.cpp fields NInfer can state truthfully:
    "params": {"n_predict": -1, "max_tokens": -1, "temperature": 1.0, "top_k": 20, "top_p": 0.95,
               "min_p": 0.0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "seed": -1}},
  "total_slots": 1, "model_alias": "qwen3.8-27b", "model_path": "models/qwen3_8_27b.ninfer",
- "modalities": {"vision": false, "audio": false}, "build_info": "ninfer 0.12.0-rtx3090+v0.12.0-rtx3090-57-ge1debb451",
+ "modalities": {"vision": false, "audio": false}, "build_info": "ninfer 2026-10-25.1+2026-10-25.1-5-gb3402a6fd",
  "endpoint_slots": true, "endpoint_props": true, "endpoint_metrics": true,
  "cors_proxy_enabled": false}
 ```
@@ -531,12 +531,14 @@ public model id and `model_path` the artifact path the server was started with.
 
 ### Server version
 
-The running build is reported from one string, `<VERSION>+<build id>`: `ninfer-serve --version`
+The running build is reported from one string, `<version>+<build id>`: `ninfer-serve --version`
 and `ninfer --version` print it and exit without loading a model; `GET /health` returns it as
-`{"status": "ok", "version": "0.12.0-rtx3090+v0.12.0-rtx3090-57-ge1debb451"}`; every response,
+`{"status": "ok", "version": "2026-10-25.1+2026-10-25.1-5-gb3402a6fd"}`; every response,
 the `503` during model load and `401` failures included, carries it in an `X-NInfer-Version`
 header; and the startup log, the `server_start` record and `/props` `build_info` include it.
-`VERSION` is the repository's file of that name. The build id is `git describe --always --tags` of
+The version is the build's release tag (`YYYY-MM-DD.N`): a published release reports the tag it is
+released under; any other build reports the release tag at or before its commit, or `untagged` when
+its checkout has no tags. The build id is `git describe --always --tags` of
 the compiled tree with `-dirty` when its product sources differ from `HEAD`, or the
 `NINFER_BUILD_ID` environment variable of the build when it is set, as on rented build hosts that
 compile a snapshot without git metadata.
