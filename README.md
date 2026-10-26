@@ -25,6 +25,8 @@
 
 全程同一个制品（`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`，带 proposal 头），RTX 3090 Ti，贪心解码，KV bf16，16,384 token 上下文，`--device-profile calibrate`，prefill 由 4K 的长 prompt 测出，decode 速度来自于多个真实场景下测得的均值。
 
+模型卡：[Hugging Face](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4) · [魔搭 ModelScope](https://www.modelscope.cn/models/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)。上面的制品是用 ninfer 自带的格式转换器把该模型打包成 ninfer 格式得到的。
+
 | 构建与投机解码设置                    | Prefill tok/s | Decode tok/s | 接受率   |
 | ---------------------------- | ------------- | ------------ | ----- |
 | 上游原样（宽 T 路由之前）               | throws        | throws       | —     |
@@ -79,6 +81,8 @@ The upstream files this fork modifies are not marked one by one in the sources; 
 ## Throughput
 
 Same artifact throughout (`Qwen3.8-27B-QUASAR-NVFP4-DFlash2`, proposal head) on an RTX 3090 Ti: greedy decoding, KV bf16, 16,384-token context, `--device-profile calibrate`. Prefill is measured on the 4K long prompt; decode is the mean over several realistic tasks.
+
+Model cards: [Hugging Face](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4) · [ModelScope](https://www.modelscope.cn/models/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4). The artifact named above was packaged into the ninfer format with ninfer's own format converter.
 
 | Build and speculative setting                 | Prefill tok/s | Decode tok/s | Acceptance |
 | --------------------------------------------- | ------------- | ------------ | ---------- |
