@@ -61,6 +61,11 @@ struct ExecutorOptions {
     // Host or disk experts: the cache's first contents, the most routed of these counts
     // ([expert layer][expert]) once warm-up is done; none leaves the cache empty then.
     std::optional<ExpertRouteCounts> expert_profile;
+    // The share 0..1 of a decode or verification call's missing experts the GPU copies; the CPU
+    // computes the rest (cpu_experts.h). Unset: each call splits its misses by measured CPU and
+    // bus times. CPU threads: 0 for one per physical core.
+    std::optional<float> expert_dma_share;
+    std::uint32_t expert_cpu_threads = 0;
     // The Engram table's rows and how they are read; none runs the model without its Engram (a
     // non-standard mode that degrades the output).
     std::optional<qwen4_exp::NgramTableLayout> engram_table;
@@ -122,6 +127,9 @@ public:
     // The Engram reader's counters, or empty without the Engram.
     [[nodiscard]] std::optional<NgramTableStats> engram_stats() const;
     [[nodiscard]] std::string engram_description() const;
+    // The CPU's share of missing experts (its threads and kernels), or empty when the GPU copies
+    // every miss.
+    [[nodiscard]] std::string expert_cpu_description() const;
     // Prompt tokens one forward() may take: prefill_chunk, or with host or disk experts a span of
     // several chunks (as many as memory allows beside the expert cache), which forward() runs
     // layer by layer so that each block's missing experts cross the bus once for all of them.

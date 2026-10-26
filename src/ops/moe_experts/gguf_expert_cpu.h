@@ -1,7 +1,8 @@
 #pragma once
 
 // Host-resident GGUF routed experts computed on the CPU, from the same stored blocks the GPU reads:
-// Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS. The Program
+// Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S
+// and IQ4_XS. The Program
 // splits a layer's missing experts between copies to the GPU and these products; it owns the
 // threads, the activations and the weighted merge.
 //
@@ -10,11 +11,13 @@
 // away from zero) and the scale used is d rounded to binary16. A row's 32-value slice s gives the
 // exact integer dot of its stored codes with the activation's, and its product is
 // (factor * scale) * dot, each step rounded, where the factor is the block's binary16 multiplier
-// times the slice's integer scale and an i-quant's constant (exact); IQ2_S's is
-// scale * fma(factor0, dot0, factor1 * dot1) over its two halves, Q6_K's
-// scale * (factor0 * dot0 + factor1 * dot1), and Q4_K's and Q5_K's (factor * scale) * dot less
-// minimum * sum, the sum being the slice's activation values added as a warp adds them and rounded
-// to binary16 (q8_1's s). The products of slices s, s + 32,
+// times the slice's integer scale and an i-quant's constant (exact); IQ2_S's and IQ1_M's are
+// scale * fma(factor0, dot0, factor1 * dot1) over their two halves (IQ1_M's weights eight times its
+// values, whose eighth its factors carry), Q6_K's scale * (factor0 * dot0 + factor1 * dot1),
+// Q4_K's and Q5_K's (factor * scale) * dot less minimum * sum, and IQ1_S's
+// factor0 * fma(scale, dot, factor1 * sum) over its codes 0..2 (factor1 its delta less one), the
+// sum being the slice's activation values added as a warp adds them and rounded to binary16
+// (q8_1's s). The products of slices s, s + 32,
 // ... are added in turn to the partial sum of lane s mod 32, and the 32 partial sums meet as in a
 // warp's butterfly (lane l with l + 16, then + 8, + 4, + 2, + 1). The middle
 // silu(gate . x) * (up . x) (or gelu_tanh) uses ops/common/silu.h and is rounded to BF16 before it
@@ -107,6 +110,10 @@ void gguf_cpu_swiglu_bf16(const float* gate, const float* up, std::size_t count,
 // out[i] = BF16(gelu_tanh(gate[i]) * up[i]), Gemma 4's middle.
 void gguf_cpu_geglu_bf16(const float* gate, const float* up, std::size_t count, std::uint16_t* out,
                          GgufCpuBackend backend);
+// out[i] = BF16(silu(min(g, limit)) * min(max(u, -limit), limit)) with g = BF16(gate[i] * scale)
+// and u = BF16(up[i] * scale): DeepSeek-V4.1's middle, its input's guard factor `scale` taken back.
+void gguf_cpu_clamped_swiglu_bf16(const float* gate, const float* up, std::size_t count, float scale,
+                                  float limit, std::uint16_t* out, GgufCpuBackend backend);
 
 namespace gguf_cpu_detail {
 using Rows = void (*)(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*,
@@ -114,10 +121,12 @@ using Rows = void (*)(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, 
 void rows_scalar(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
 void swiglu_scalar(const float*, const float*, std::size_t, std::uint16_t*);
 void geglu_scalar(const float*, const float*, std::size_t, std::uint16_t*);
+void clamped_swiglu_scalar(const float*, const float*, std::size_t, float, float, std::uint16_t*);
 #if defined(NINFER_CPU_EXPERT_X86)
 void rows_avx2(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
 void swiglu_avx2(const float*, const float*, std::size_t, std::uint16_t*);
 void geglu_avx2(const float*, const float*, std::size_t, std::uint16_t*);
+void clamped_swiglu_avx2(const float*, const float*, std::size_t, float, float, std::uint16_t*);
 #endif
 // Q2_0 activations are stored in the lane order of the vector decoders: within each 64-value
 // block, position L * 16 + i holds value 4 * i + L, so a lane's first 8 positions belong to the
@@ -130,8 +139,8 @@ float round_to_half(float value) noexcept;
 std::uint16_t float_to_bf16(float value) noexcept;
 
 // One 32-value slice of a stored row as the GPU's decoder forms it: signed weights and the slice
-// factors, each exact. factor[1] is IQ2_S's and Q6_K's for the second 16 values (the others use
-// factor[0] for all 32), or Q4_K's and Q5_K's minimum.
+// factors, each exact. factor[1] is IQ2_S's, IQ1_M's and Q6_K's for the second 16 values (the
+// others use factor[0] for all 32), Q4_K's and Q5_K's minimum, or IQ1_S's delta less one.
 struct GgufCpuSlice {
     std::int8_t weights[32];
     float factor[2];

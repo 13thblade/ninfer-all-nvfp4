@@ -25,13 +25,21 @@
 //  - guard_columns and unscale_columns, ring_copy, f32_to_bf16.
 //  - the DSpark drafter's: sparse_attention of a draft block (the window and the block's own
 //    rows), stream_mean, markov_step (a chain, ties, the domain) and dspark_confidence.
+//  - the routed experts of a call on the CPU (CpuExperts) against the GPU's vector kernels over
+//    IQ1_S, IQ1_M, IQ2_XXS and IQ2_S banks: the same 2^-32 fixed-point sums bit for bit, all on
+//    the CPU and half on each (add_fixed).
 // A rounded output (BF16, fp8, fp4) is compared with the oracle's rounding of its exact value. The
 // two may differ where the FP32 arithmetic lands on the other side of a rounding boundary: rarely,
 // and by at most one or two steps of the format there. Values that pass through without arithmetic
 // before an exact rounding must match exactly.
 
 #include "core/arena.h"
+#include "core/weight.h"
+#include "models/deepseek_v41/cpu_experts.h"
 #include "models/deepseek_v41/kernels.h"
+#include "ops/linear/gguf/ggml_bridge.h"
+#include "ops/linear/gguf/gguf_linear.h"
+#include "ops/moe_experts/gguf_expert_cpu.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -54,7 +62,9 @@
 namespace {
 
 using namespace ninfer;
-namespace k = ninfer::models::deepseek_v41::kernels;
+namespace k    = ninfer::models::deepseek_v41::kernels;
+namespace md   = ninfer::models::deepseek_v41;
+namespace gguf = ninfer::ops::gguf;
 using bf16  = __nv_bfloat16;
 
 constexpr int kHidden = 5120, kStreams = 4, kLatent = 512, kRope = 64, kIndex = 128;
@@ -1685,6 +1695,195 @@ void copies(std::mt19937& rng) {
     report(converted_wrong == 0, "f32_to_bf16: " + std::to_string(converted_wrong) + " wrong");
 }
 
+// ---- Routed experts on the CPU ------------------------------------------------------------------
+
+// Random blocks of an expert type, their binary16 multipliers finite.
+std::vector<std::uint8_t> expert_blocks(QType q, int rows, int depth, std::mt19937& rng) {
+    const auto block = gguf_block_shape(q);
+    std::vector<std::uint8_t> bytes(std::size_t(rows) * (depth / block.elements) * block.bytes);
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_real_distribution<float> scale(0.002f, 0.02f);
+    for (auto& b : bytes) { b = static_cast<std::uint8_t>(byte(rng)); }
+    for (std::size_t at = 0; at < bytes.size(); at += block.bytes) {
+        const __half h = __float2half(scale(rng));
+        std::uint16_t d = 0;
+        std::memcpy(&d, &h, 2);
+        if (q != QType::GGUF_IQ1_M) {
+            std::memcpy(&bytes[at], &d, 2);
+            continue;
+        }
+        // IQ1_M keeps its multiplier's four nibbles in the top of its four scale words.
+        for (int j = 0; j < 4; ++j) {
+            std::uint16_t w = 0;
+            std::memcpy(&w, &bytes[at + 48 + 2 * j], 2);
+            w = static_cast<std::uint16_t>((w & 0x0FFF) | (((d >> (4 * j)) & 0xF) << 12));
+            std::memcpy(&bytes[at + 48 + 2 * j], &w, 2);
+        }
+    }
+    return bytes;
+}
+
+// A call's routed experts as the executor runs them on the GPU (the vector kernels over the
+// guarded input's q8_1 activation, the clamped SwiGLU, the middle's activation, the weighted down
+// rows) and on the CPU from the inputs ExpertDelivery copies (CpuExperts): their 2^-32 fixed-point
+// sums must be the same bits, with every expert on the CPU and with the GPU's experts of a half
+// added to the CPU's of the other.
+void cpu_experts(const char* name, QType gate_up_type, QType down_type, int tokens,
+                 std::mt19937& rng) {
+    constexpr int distinct = 3, pool_size = 14;
+    constexpr float limit  = 10.0f;
+    const int pairs        = tokens * kTopK;
+    const auto gu_block = gguf_block_shape(gate_up_type), down_block = gguf_block_shape(down_type);
+    const std::int64_t gu_row   = std::int64_t(kHidden / gu_block.elements) * gu_block.bytes;
+    const std::int64_t down_row = std::int64_t(kWidth / down_block.elements) * down_block.bytes;
+    std::vector<std::vector<std::uint8_t>> gate_up, down;
+    std::vector<DeviceBuffer> banks;
+    for (int i = 0; i < distinct; ++i) {
+        gate_up.push_back(expert_blocks(gate_up_type, 2 * kWidth, kHidden, rng));
+        down.push_back(expert_blocks(down_type, kHidden, kWidth, rng));
+        banks.push_back(upload(gate_up.back()));
+        banks.push_back(upload(down.back()));
+    }
+    // Expert e's matrices are bank e % distinct's: [gate; up] pointers, then down.
+    std::vector<const void*> table(2 * std::size_t(kExperts));
+    for (int e = 0; e < kExperts; ++e) {
+        table[std::size_t(e)]            = banks[2 * std::size_t(e % distinct)].p;
+        table[std::size_t(kExperts + e)] = banks[2 * std::size_t(e % distinct) + 1].p;
+    }
+    DeviceBuffer d_table = upload(table);
+    const auto* tables   = static_cast<const void* const*>(d_table.p);
+    const gguf::MoeTable gu_table{tables, gu_row, 2 * kWidth, kHidden};
+    const gguf::MoeTable down_table{tables + kExperts, down_row, kHidden, kWidth};
+
+    // The last token large enough that the guard scales it.
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<bf16> x(std::size_t(tokens) * kHidden);
+    for (int t = 0; t < tokens; ++t) {
+        const float magnitude = t == tokens - 1 && tokens > 1 ? 3e4f : 1.0f;
+        for (int i = 0; i < kHidden; ++i) {
+            x[std::size_t(t) * kHidden + i] = __float2bfloat16(magnitude * normal(rng));
+        }
+    }
+    // Each token's six experts from a small pool, so that tokens share experts.
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(pairs));
+    std::vector<float> weights(ids.size());
+    std::uniform_real_distribution<float> unit(0.05f, 2.5f);
+    std::vector<int> pool(pool_size);
+    std::iota(pool.begin(), pool.end(), 37);
+    for (int t = 0; t < tokens; ++t) {
+        std::shuffle(pool.begin(), pool.end(), rng);
+        for (int j = 0; j < kTopK; ++j) {
+            ids[std::size_t(t) * kTopK + j]     = pool[std::size_t(j)];
+            weights[std::size_t(t) * kTopK + j] = unit(rng);
+        }
+    }
+    DeviceBuffer d_x = upload(x), d_scale(std::size_t(tokens) * 4), d_ids = upload(ids),
+                 d_w = upload(weights);
+    k::guard_columns(as<bf16>(d_x), kHidden, tokens, as<float>(d_scale), nullptr);
+    DeviceBuffer d_xq(gguf::vector_activation_bytes(kHidden, tokens));
+    gguf::quantize_vector_activation(as<bf16>(d_x), kHidden, tokens, nullptr, d_xq.p, nullptr);
+    DeviceBuffer d_routing(gguf::moe_routing_bytes(kExperts, pairs));
+    const gguf::MoeRouting routing =
+        gguf::moe_sort_routes(as<std::int32_t>(d_ids), pairs, kExperts, d_routing.p, nullptr);
+
+    const std::size_t sums = std::size_t(tokens) * kHidden;
+    DeviceBuffer d_gu(std::size_t(pairs) * 2 * kWidth * 4), d_middle(std::size_t(pairs) * kWidth * 2),
+        d_act(gguf::vector_activation_bytes(kWidth, pairs)), d_fixed(sums * 8);
+    const int chunk = tokens <= 1 ? 1 : tokens <= 2 ? 2 : tokens <= 4 ? 4 : 8;
+    const auto gpu  = [&](const gguf::MoeRouting& part) {
+        check(cudaMemset(d_fixed.p, 0, sums * 8), "zero the sums");
+        check(cudaMemset(d_gu.p, 0, std::size_t(pairs) * 2 * kWidth * 4), "zero the rows");
+        gguf::MoeOutput rows;
+        rows.f32 = as<float>(d_gu);
+        gguf::MoeOutput out;
+        out.weighted = as<unsigned long long>(d_fixed);
+        out.weights  = as<float>(d_w);
+        const int max_active = std::min(pairs, kExperts);
+        gguf::moe_vector_product(ops::detail::gguf_type(gate_up_type), gu_table, part, max_active,
+                                 kTopK, kTopK, d_xq.p, tokens, rows, chunk, nullptr);
+        k::clamped_swiglu(as<float>(d_gu), 2 * kWidth, pairs, kWidth, limit, as<float>(d_scale),
+                          kTopK, as<bf16>(d_middle), kWidth, nullptr);
+        gguf::quantize_vector_activation(as<bf16>(d_middle), kWidth, pairs, nullptr, d_act.p,
+                                         nullptr);
+        gguf::moe_vector_product(ops::detail::gguf_type(down_type), down_table, part, max_active, 1,
+                                 kTopK, d_act.p, pairs, out, chunk, nullptr);
+    };
+    gpu(routing);
+    sync("routed experts");
+    const auto whole = download<unsigned long long>(d_fixed, sums);
+
+    md::CpuExperts cpu({md::CpuExpertLayer{gate_up_type, down_type, gu_row, down_row}}, kHidden,
+                       kWidth, kTopK, limit);
+    std::vector<std::byte> inputs(cpu.input_bytes()), products(cpu.product_bytes());
+    d_xq.copy_to_host(inputs.data(), cpu.activation_bytes(tokens));
+    d_w.copy_to_host(inputs.data() + cpu.activation_bytes(tokens), cpu.weight_bytes(tokens));
+    d_scale.copy_to_host(inputs.data() + cpu.activation_bytes(tokens) + cpu.weight_bytes(tokens),
+                         md::CpuExperts::scale_bytes(tokens));
+    std::size_t done_bytes = 0;
+    const auto on_cpu      = [&](const std::vector<std::int32_t>& experts) {
+        std::vector<std::vector<const std::byte*>> blobs;
+        for (const std::int32_t e : experts) {
+            const auto b = std::size_t(e % distinct);
+            blobs.push_back({reinterpret_cast<const std::byte*>(gate_up[b].data()),
+                             reinterpret_cast<const std::byte*>(down[b].data())});
+        }
+        ExpertCpuProducts::Work work;
+        work.experts  = experts;
+        work.blobs    = blobs;
+        work.ids      = ids;
+        work.inputs   = inputs.data();
+        work.products = products.data();
+        done_bytes    = cpu.compute(work).bytes;
+        std::vector<unsigned long long> out(sums);
+        std::memcpy(out.data(), products.data(), sums * 8);
+        return out;
+    };
+    std::vector<std::int32_t> active(ids.begin(), ids.end()), even, odd;
+    std::sort(active.begin(), active.end());
+    active.erase(std::unique(active.begin(), active.end()), active.end());
+    for (const std::int32_t e : active) { (e % 2 == 0 ? even : odd).push_back(e); }
+    const auto all_cpu = on_cpu(active);
+    std::size_t wrong = 0, zero = 0;
+    for (std::size_t i = 0; i < sums; ++i) {
+        wrong += all_cpu[i] != whole[i] ? 1 : 0;
+        zero += whole[i] == 0 ? 1 : 0;
+    }
+    // The even experts on the GPU (an active set as a stage of the call passes it), the odd ones
+    // on the CPU, their sums added unless the flag is zero.
+    std::vector<std::int32_t> set{std::int32_t(even.size())};
+    set.insert(set.end(), even.begin(), even.end());
+    DeviceBuffer d_set = upload(set), d_products = upload(on_cpu(odd));
+    gguf::MoeRouting part = routing;
+    part.active_count     = as<std::int32_t>(d_set);
+    part.active           = as<std::int32_t>(d_set) + 1;
+    gpu(part);
+    sync("the even experts");
+    const auto gpu_half = download<unsigned long long>(d_fixed, sums);
+    const std::int32_t off = 0, on = 1;
+    DeviceBuffer d_off = upload(std::vector<std::int32_t>{off}),
+                 d_on  = upload(std::vector<std::int32_t>{on});
+    k::add_fixed(as<unsigned long long>(d_fixed), d_products.p, as<std::int32_t>(d_off),
+                 std::int64_t(sums), nullptr);
+    sync("add_fixed off");
+    const auto unchanged = download<unsigned long long>(d_fixed, sums);
+    k::add_fixed(as<unsigned long long>(d_fixed), d_products.p, as<std::int32_t>(d_on),
+                 std::int64_t(sums), nullptr);
+    sync("add_fixed");
+    const auto split    = download<unsigned long long>(d_fixed, sums);
+    std::size_t split_wrong = 0, moved = 0;
+    for (std::size_t i = 0; i < sums; ++i) {
+        split_wrong += split[i] != whole[i] || unchanged[i] != gpu_half[i] ? 1 : 0;
+        moved += gpu_half[i] != whole[i] ? 1 : 0;
+    }
+    report(wrong == 0 && split_wrong == 0 && zero * 100 < sums && moved * 2 > sums &&
+               done_bytes == sums * 8 && !even.empty() && !odd.empty(),
+           std::string("CPU experts ") + name + " T=" + std::to_string(tokens) + " (" +
+               ops::gguf_cpu_backend_name(ops::GgufCpuBackend::Automatic) + "): " +
+               std::to_string(active.size()) + " experts, " + std::to_string(wrong) +
+               " sums differ all on the CPU, " + std::to_string(split_wrong) + " split, " +
+               std::to_string(zero) + " zero");
+}
+
 std::vector<int> range(int first, int count) {
     std::vector<int> v(static_cast<std::size_t>(count));
     std::iota(v.begin(), v.end(), first);
@@ -1795,6 +1994,11 @@ int main() {
 
         column_guard(rng);
         copies(rng);
+
+        cpu_experts("IQ1_S/IQ1_M", QType::GGUF_IQ1_S, QType::GGUF_IQ1_M, 1, rng);
+        cpu_experts("IQ2_XXS/IQ1_S", QType::GGUF_IQ2_XXS, QType::GGUF_IQ1_S, 3, rng);
+        cpu_experts("IQ1_M/IQ2_S", QType::GGUF_IQ1_M, QType::GGUF_IQ2_S, 8, rng);
+        cpu_experts("IQ2_S/IQ2_XXS", QType::GGUF_IQ2_S, QType::GGUF_IQ2_XXS, 5, rng);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " DeepSeek-V4.1 kernels\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

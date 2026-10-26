@@ -110,11 +110,13 @@ struct Storage {
     }
 };
 
-// Device ranges a call hands the host service (the CPU's operands), into mapped host memory.
+// Device ranges a call hands the host service (the CPU's operands), into mapped host memory: the
+// pairs' expert ids, then up to kCpuInputs inputs of the family's.
+constexpr int kCpuInputs = 3;
 struct HostCopies {
-    const std::byte* source[3]{};
-    std::byte* target[3]{};
-    std::uint32_t bytes[3]{};
+    const std::byte* source[1 + kCpuInputs]{};
+    std::byte* target[1 + kCpuInputs]{};
+    std::uint32_t bytes[1 + kCpuInputs]{};
 };
 
 // One block: a shared histogram of the call's experts, then each pair's cached/missing id and each
@@ -201,7 +203,7 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
         }
         __syncthreads();
     }
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < 1 + kCpuInputs; ++c) {
         for (std::uint32_t i = threadIdx.x; i < copies.bytes[c]; i += blockDim.x) {
             copies.target[c][i] = copies.source[c][i];
         }
@@ -1951,8 +1953,8 @@ ExpertDelivery::Call ExpertDelivery::begin(std::size_t index, const std::int32_t
     HostCopies copies;
     if (cpu) {
         // The CPU's operands: the pairs' experts and the family's inputs.
-        if (inputs.size() > 2) {
-            throw std::invalid_argument("expert delivery: more than two CPU inputs");
+        if (inputs.size() > std::size_t(kCpuInputs)) {
+            throw std::invalid_argument("expert delivery: more than three CPU inputs");
         }
         copies.source[0] = reinterpret_cast<const std::byte*>(ids);
         copies.target[0] = static_cast<std::byte*>(p.host_ids_mapped);

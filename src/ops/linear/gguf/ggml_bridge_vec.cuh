@@ -112,9 +112,9 @@ __device__ __forceinline__ void scale_min_k4(const std::uint8_t* s, int j, int& 
 }
 
 // The product of one slice of a type the CPU also computes (Q2_0, Q4_0, Q5_0, Q8_0, IQ4_NL,
-// IQ4_XS, IQ3_XXS, IQ3_S; IQ2_S, the K-quants with a minimum and Q6_K spell out their forms): the
-// slice factor times the activation scale, rounded, times the integer dot, rounded, never fused
-// with the sum it joins, so that gguf_expert_cpu reproduces every bit.
+// IQ4_XS, IQ3_XXS, IQ3_S, IQ2_XXS; IQ2_S, IQ1_S, IQ1_M, the K-quants with a minimum and Q6_K spell
+// out their forms): the slice factor times the activation scale, rounded, times the integer dot,
+// rounded, never fused with the sum it joins, so that gguf_expert_cpu reproduces every bit.
 __device__ __forceinline__ float cpu_product(float factor, float d, int dot) {
     return __fmul_rn(__fmul_rn(factor, d), float(dot));
 }
@@ -574,7 +574,7 @@ struct Decoder<GGML_TYPE_IQ2_XXS> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -699,8 +699,10 @@ struct Decoder<GGML_TYPE_IQ1_S> {
             s.w[2 * l + 1]        = int((g >> 4) & 0x0F0F0F0Fu);
         }
     }
+    // Spelled out as the CPU's product computes it (gguf_expert_cpu).
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float sum) {
-        return s.f[0] * (d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0))) + s.f[1] * sum);
+        return __fmul_rn(s.f[0], __fmaf_rn(d, float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0))),
+                                           __fmul_rn(s.f[1], sum)));
     }
 };
 
@@ -708,6 +710,10 @@ template <>
 struct Decoder<GGML_TYPE_IQ1_M> {
     static constexpr int kBlockElems = 256, kBlockBytes = 56, kTableWords = 2048;
     __device__ static const std::uint32_t* table() { return iq1s_grid_gpu; }
+    // A value is d (2 s + 1) (g + delta) with g in -1..1 and delta +-1/8 per eight values. Eight
+    // times g + delta is the integer 8 c - 7 (delta 1/8) or 8 c - 9 (delta -1/8) for the grid's
+    // code c = g + 1, so the words hold those integers and the factors d (2 s + 1) / 8, both exact:
+    // each half's dot is ggml's exactly, and the product is IQ2_S's.
     __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
                                                   const std::uint32_t* grid, Slice& s) {
         const auto* sc = reinterpret_cast<const std::uint16_t*>(b + 48);
@@ -715,23 +721,22 @@ struct Decoder<GGML_TYPE_IQ1_M> {
         scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
         const float d          = __half2float(scale.f16);
         const int tmp          = sc[u / 2] >> (6 * (u % 2));
-        s.f[0]                 = d * float(2 * (tmp & 7) + 1);
-        s.f[1]                 = d * float(2 * ((tmp >> 3) & 7) + 1);
+        s.f[0]                 = d * float(2 * (tmp & 7) + 1) * 0.125f;
+        s.f[1]                 = d * float(2 * ((tmp >> 3) & 7) + 1) * 0.125f;
         const std::uint32_t qs = u32_a4(b + 4 * u);
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const std::uint32_t qhl = b[32 + 2 * u + l / 2] >> (4 * (l % 2));
-            const std::uint32_t g   = grid[((qs >> (8 * l)) & 0xFF) | ((qhl & 7) << 8)];
-            s.w[2 * l]              = int(g & 0x0F0F0F0Fu);
-            s.w[2 * l + 1]          = int((g >> 4) & 0x0F0F0F0Fu);
-            s.f[2 + l] = -1.0f + IQ1M_DELTA - float(qhl & 0x08) * (2.0f * IQ1M_DELTA / 0x08);
+            const std::uint32_t qhl    = b[32 + 2 * u + l / 2] >> (4 * (l % 2));
+            const std::uint32_t g      = grid[((qs >> (8 * l)) & 0xFF) | ((qhl & 7) << 8)];
+            const std::uint32_t offset = (qhl & 0x08) ? 0x09090909u : 0x07070707u;
+            s.w[2 * l]                 = int(__vsub4((g & 0x0F0F0F0Fu) << 3, offset));
+            s.w[2 * l + 1]             = int(__vsub4(((g >> 4) & 0x0F0F0F0Fu) << 3, offset));
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        const float lo = float(dot4(s.w, a, 0)) + s.f[2] * float(sum2(a)) + s.f[3] * float(sum2(a + 2));
-        const float hi =
-            float(dot4(s.w + 4, a + 4, 0)) + s.f[4] * float(sum2(a + 4)) + s.f[5] * float(sum2(a + 6));
-        return d * (s.f[0] * lo + s.f[1] * hi);
+        // Spelled out as the CPU's product computes it (gguf_expert_cpu).
+        return __fmul_rn(d, __fmaf_rn(s.f[0], float(dot4(s.w, a, 0)),
+                                      __fmul_rn(s.f[1], float(dot4(s.w + 4, a + 4, 0)))));
     }
 };
 

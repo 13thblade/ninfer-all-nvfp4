@@ -122,9 +122,10 @@ inline __m256i live_ints(const std::int32_t* from, int live) {
 constexpr int kMaxTokens = 16;
 
 // A slice's product from its dots (decode_slice's factors f0, f1 and the activation's scale a):
-// Whole (f0 a) dot; Halves IQ2_S's a fma(f0, dot0, f1 dot1); SixK Q6_K's a (f0 dot0 + f1 dot1);
-// Minimum the K-quants' (f0 a) dot - f1 s, s the activation's value sum.
-enum class Form { Whole, Halves, SixK, Minimum };
+// Whole (f0 a) dot; Halves IQ2_S's and IQ1_M's a fma(f0, dot0, f1 dot1); SixK Q6_K's
+// a (f0 dot0 + f1 dot1); Minimum the K-quants' (f0 a) dot - f1 s and Delta IQ1_S's
+// f0 fma(a, dot, f1 s), s the activation's value sum.
+enum class Form { Whole, Halves, SixK, Minimum, Delta };
 
 // Every format's rows: `decode(row, g, live, group)` fills group g's slices (live of them) and
 // `dot(t, g, live, group)` gives token t's integer dots of them (Dots for the halves' forms, else
@@ -156,6 +157,11 @@ void rows_in_lane_order(const GgufCpuMatrix& w, const GgufCpuActivation& x, int 
                         factor0, _mm256_cvtepi32_ps(d.first),
                         _mm256_mul_ps(_mm256_load_ps(group.factor[1]), _mm256_cvtepi32_ps(d.second)));
                     product = _mm256_mul_ps(a, inner);
+                } else if constexpr (kForm == Form::Delta) {
+                    const __m256 sums = live_floats(x.value_sums(t) + 8 * g, live);
+                    product           = _mm256_mul_ps(
+                        factor0, _mm256_fmadd_ps(a, _mm256_cvtepi32_ps(dot(t, g, live, group)),
+                                                 _mm256_mul_ps(_mm256_load_ps(group.factor[1]), sums)));
                 } else if constexpr (kForm == Form::SixK) {
                     const Dots d      = dot(t, g, live, group);
                     const __m256 low  = _mm256_mul_ps(factor0, _mm256_cvtepi32_ps(d.first));
@@ -176,12 +182,71 @@ void rows_in_lane_order(const GgufCpuMatrix& w, const GgufCpuActivation& x, int 
     }
 }
 
+// Four IQ1 grid rows' 32 values (-1..1) plus one: the codes 0..2 in value order.
+inline __m256i iq1_codes(std::uint64_t g0, std::uint64_t g1, std::uint64_t g2, std::uint64_t g3) {
+    return _mm256_add_epi8(_mm256_set_epi64x(static_cast<long long>(g3), static_cast<long long>(g2),
+                                             static_cast<long long>(g1), static_cast<long long>(g0)),
+                           _mm256_set1_epi8(1));
+}
+
+// IQ1_M's block multiplier: a nibble of each of its four scale words.
+inline float iq1m_multiplier(const std::uint8_t* block) {
+    std::uint16_t sc[4];
+    std::memcpy(sc, block + 48, 8);
+    const auto bits = std::uint16_t((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0U) | ((sc[2] >> 4) & 0x0F00U) |
+                                    (sc[3] & 0xF000U));
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)));
+}
+
 // An i-quant group is one 256-value block.
 template <QType F>
 inline void decode_iq(const std::uint8_t* block, Group& out) {
-    const float d = half_at(block);
+    const float d = F == QType::GGUF_IQ1_M ? iq1m_multiplier(block) : half_at(block);
     for (int sub = 0; sub < 8; ++sub) {
-        if constexpr (F == QType::GGUF_IQ2_S) {
+        if constexpr (F == QType::GGUF_IQ1_S) {
+            const std::uint8_t* qs = block + 2 + 4 * sub;
+            std::uint16_t qh;
+            std::memcpy(&qh, block + 34 + 2 * sub, 2);
+            out.magnitude[sub] = iq1_codes(iq1s_grid[qs[0] | ((unsigned(qh) << 8) & 0x700U)],
+                                           iq1s_grid[qs[1] | ((unsigned(qh) << 5) & 0x700U)],
+                                           iq1s_grid[qs[2] | ((unsigned(qh) << 2) & 0x700U)],
+                                           iq1s_grid[qs[3] | ((unsigned(qh) >> 1) & 0x700U)]);
+            out.factor[0][sub] = d * float(2 * ((qh >> 12) & 7U) + 1);
+            out.factor[1][sub] = (qh & 0x8000U) != 0 ? -1.125F : -0.875F;
+        } else if constexpr (F == QType::GGUF_IQ1_M) {
+            const std::uint8_t* qs = block + 4 * sub;
+            std::uint16_t sc;
+            std::memcpy(&sc, block + 48 + 2 * (sub / 2), 2);
+            const unsigned tmp = unsigned(sc) >> (6 * (sub % 2));
+            std::uint64_t grid[4];
+            long long offsets[4];
+            for (int l = 0; l < 4; ++l) {
+                const unsigned qhl = unsigned(block[32 + 2 * sub + l / 2]) >> (4 * (l % 2));
+                grid[l]    = iq1s_grid[qs[l] | ((qhl & 7U) << 8)];
+                offsets[l] = (qhl & 8U) != 0 ? 0x0909090909090909LL : 0x0707070707070707LL;
+            }
+            // Eight times each code (at most 16: no bit leaves its byte) less 7 or 9.
+            const __m256i value = _mm256_sub_epi8(
+                _mm256_slli_epi16(iq1_codes(grid[0], grid[1], grid[2], grid[3]), 3),
+                _mm256_set_epi64x(offsets[3], offsets[2], offsets[1], offsets[0]));
+            out.magnitude[sub] = _mm256_sign_epi8(value, value);
+            out.sign[sub]      = value; // never zero
+            out.factor[0][sub] = d * float(2 * (tmp & 7U) + 1) * 0.125F;
+            out.factor[1][sub] = d * float(2 * ((tmp >> 3) & 7U) + 1) * 0.125F;
+        } else if constexpr (F == QType::GGUF_IQ2_XXS) {
+            const std::uint8_t* qs  = block + 2 + 8 * sub;
+            const std::uint32_t aux = load32(block + 6 + 8 * sub);
+            out.magnitude[sub]      = _mm256_set_epi64x(
+                static_cast<long long>(iq2xxs_grid[qs[3]]), static_cast<long long>(iq2xxs_grid[qs[2]]),
+                static_cast<long long>(iq2xxs_grid[qs[1]]), static_cast<long long>(iq2xxs_grid[qs[0]]));
+            const std::uint32_t bits = std::uint32_t(ksigns_iq2xs[aux & 127U]) |
+                                       std::uint32_t(ksigns_iq2xs[(aux >> 7) & 127U]) << 8 |
+                                       std::uint32_t(ksigns_iq2xs[(aux >> 14) & 127U]) << 16 |
+                                       std::uint32_t(ksigns_iq2xs[(aux >> 21) & 127U]) << 24;
+            out.sign[sub]      = sign_bytes(bits);
+            out.factor[0][sub] = d * float(2 * (aux >> 28) + 1) * 0.125F;
+            out.factor[1][sub] = 0.0F;
+        } else if constexpr (F == QType::GGUF_IQ2_S) {
             const std::uint8_t* qs = block + 2 + 4 * sub;
             const unsigned qh      = block[66 + sub];
             const unsigned scale   = block[74 + sub];
@@ -242,7 +307,8 @@ template <QType F>
 void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, int row_end,
              float* y, std::size_t y_stride) {
     constexpr int bytes   = gguf_block_shape(F).bytes;
-    constexpr bool halves = F == QType::GGUF_IQ2_S;
+    constexpr bool halves = F == QType::GGUF_IQ2_S || F == QType::GGUF_IQ1_M;
+    constexpr bool delta  = F == QType::GGUF_IQ1_S; // unsigned codes
     const auto decode     = [](const std::uint8_t* row, int g, int, Group& group) {
         decode_iq<F>(row + std::size_t(g) * bytes, group);
     };
@@ -251,7 +317,7 @@ void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
         __m256i u[8];
         for (int i = 0; i < 8; ++i) {
             const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 32 * i));
-            u[i]            = dot_u8s8(group.magnitude[i], _mm256_sign_epi8(v, group.sign[i]));
+            u[i] = dot_u8s8(group.magnitude[i], delta ? v : _mm256_sign_epi8(v, group.sign[i]));
         }
         const Dots d = halves8(u);
         if constexpr (halves) {
@@ -260,8 +326,8 @@ void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
             return _mm256_add_epi32(d.first, d.second);
         }
     };
-    rows_in_lane_order<halves ? Form::Halves : Form::Whole>(w, x, row_begin, row_end, y, y_stride,
-                                                             decode, dot);
+    constexpr Form form = halves ? Form::Halves : delta ? Form::Delta : Form::Whole;
+    rows_in_lane_order<form>(w, x, row_begin, row_end, y, y_stride, decode, dot);
 }
 
 // Q2_0: a 64-value block is two slices, so a group is four blocks. Its 16 code bytes hold values
@@ -464,6 +530,10 @@ void rows_avx2(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin
                float* y, std::size_t y_stride) {
     if (x.tokens() > kMaxTokens) { return rows_scalar(w, x, row_begin, row_end, y, y_stride); }
     switch (w.format) {
+    case QType::GGUF_IQ1_S: return iq_rows<QType::GGUF_IQ1_S>(w, x, row_begin, row_end, y, y_stride);
+    case QType::GGUF_IQ1_M: return iq_rows<QType::GGUF_IQ1_M>(w, x, row_begin, row_end, y, y_stride);
+    case QType::GGUF_IQ2_XXS:
+        return iq_rows<QType::GGUF_IQ2_XXS>(w, x, row_begin, row_end, y, y_stride);
     case QType::GGUF_IQ2_S: return iq_rows<QType::GGUF_IQ2_S>(w, x, row_begin, row_end, y, y_stride);
     case QType::GGUF_IQ3_XXS:
         return iq_rows<QType::GGUF_IQ3_XXS>(w, x, row_begin, row_end, y, y_stride);
@@ -511,6 +581,30 @@ void geglu_avx2(const float* gate, const float* up, std::size_t count, std::uint
         for (int j = 0; j < 8; ++j) { out[i + j] = float_to_bf16(products[j]); }
     }
     for (; i < count; ++i) { out[i] = float_to_bf16(ops::gelu_tanh(gate[i]) * up[i]); }
+}
+
+// DeepSeek-V4.1's clamped middle (clamped_swiglu_scalar) eight values at a time: BF16 rounding to
+// nearest even by the word's carry, min and max of finite values, silu.h's SiLU.
+void clamped_swiglu_avx2(const float* gate, const float* up, std::size_t count, float scale,
+                         float limit, std::uint16_t* out) {
+    const __m256 one = _mm256_set1_ps(1.0F), s = _mm256_set1_ps(scale);
+    const __m256 high = _mm256_set1_ps(limit), low = _mm256_set1_ps(-limit);
+    const auto bf16r = [](__m256 v) {
+        const __m256i bits = _mm256_castps_si256(v);
+        const __m256i odd  = _mm256_and_si256(_mm256_srli_epi32(bits, 16), _mm256_set1_epi32(1));
+        const __m256i up16 = _mm256_add_epi32(_mm256_add_epi32(bits, _mm256_set1_epi32(0x7FFF)), odd);
+        return _mm256_castsi256_ps(_mm256_and_si256(up16, _mm256_set1_epi32(static_cast<int>(0xFFFF0000U))));
+    };
+    std::size_t i = 0;
+    alignas(32) float products[8];
+    for (; i + 8 <= count; i += 8) {
+        const __m256 g    = _mm256_min_ps(bf16r(_mm256_mul_ps(_mm256_loadu_ps(gate + i), s)), high);
+        const __m256 u    = _mm256_min_ps(_mm256_max_ps(bf16r(_mm256_mul_ps(_mm256_loadu_ps(up + i), s)), low), high);
+        const __m256 silu = _mm256_div_ps(g, _mm256_add_ps(one, exp_ps(negated(g))));
+        _mm256_store_ps(products, _mm256_mul_ps(silu, u));
+        for (int j = 0; j < 8; ++j) { out[i + j] = float_to_bf16(products[j]); }
+    }
+    clamped_swiglu_scalar(gate + i, up + i, count - i, scale, limit, out + i);
 }
 
 } // namespace ninfer::ops::gguf_cpu_detail

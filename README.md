@@ -16,7 +16,8 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 ## What's New
 
-- **2026-10-26:** DeepSeek-V4.1-Flash drafts with the release's [DSpark drafter](docs/deepseek-v41.md#the-dspark-drafter) (`--spec dspark`): 83 tok/s on one RTX PRO 6000, from 51; on 24 GB cards it decodes slower than plain decoding.
+- **2026-10-26:** DeepSeek-V4.1-Flash's CPU threads compute a [share of each decode call's missing experts](docs/deepseek-v41.md#the-cpu-share) in host memory, bit for bit the GPU's products: 30.7 tok/s on one RTX 4090, from 27.0, and 34.1 with DSpark. The GPU's IQ1_S, IQ1_M and IQ2_XXS vector products now round as the CPU's do, which changes those models' outputs.
+- **2026-10-26:** DeepSeek-V4.1-Flash drafts with the release's [DSpark drafter](docs/deepseek-v41.md#the-dspark-drafter) (`--spec dspark`): 83 tok/s on one RTX PRO 6000, from 51, and 34 on one RTX 4090 with the CPU share, from 31.
 - **2026-10-26:** Token log probabilities of verification rows and of concurrent requests have the bits of a lone decode row's: the reduction over the vocabulary splits every row the same way.
 - **2026-10-25:** Fixed a race in the expert cache of host and disk experts: a decode miss could overwrite a lent slot its own call still read, which [changed DeepSeek-V4.1-Flash's log probabilities by up to 0.024](docs/deepseek-v41.md#prompt-spans) after an earlier request.
 - **2026-10-25:** DeepSeek-V4.1-Flash prefills in [spans of up to 16,384 tokens](docs/deepseek-v41.md#prompt-spans): 925 tok/s for 8,086 tokens on an RTX 4090, from 498.
@@ -193,7 +194,7 @@ conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b
 Ternary Bonsai 2 27B decodes 397 tok/s on an RTX 5090 with DFlash2 and holds a 978,944-token context with
 every planted code found. Qwen3.8-Flash-Next decodes 138 tok/s with every expert on one RTX PRO 6000, and
 74 tok/s with its experts in host memory on one RTX 5090. DeepSeek-V4.1-Flash decodes 48 tok/s on one
-RTX PRO 6000 and 26 tok/s on one RTX 4090 with its 106.7 GiB of experts in host memory. Every table of
+RTX PRO 6000 and 31 tok/s on one RTX 4090 with its 106.7 GiB of experts in host memory. Every table of
 every card is on the [performance page](docs/performance.md).
 
 *Click a section to expand it.*
@@ -286,14 +287,17 @@ the card caches as many as fit:
 | RTX 4090 | 7% | 25.9 | 22.2 | 490 | 8.5 |
 | RTX 3090 | | 21.8 | 18.9 | 410 | 7.4 |
 
-These ran prompts chunk by chunk; prompt spans now prefill the 8,086 tokens at 906 tok/s on the
-RTX 4090. On one RTX 4090 host, Strata 0.2.6 decodes the same GGUF at 34 to 40 tok/s, computing
-about half the experts on its CPU threads, against NInfer's 22 to 26, and prefills at 635 to 690
-tok/s against NInfer's 925 ([measurements](docs/deepseek-v41.md#measurements)). With host experts
-the server peaks at 116 GiB of host memory. With the release's DSpark drafter (`--spec dspark`) the
-RTX PRO 6000 decodes at 83.1 and 75.0 tok/s, against 50.8 and 48.3 for the same build without it;
-on the RTX 4090 the drafter's 7.4 GiB shrink the expert cache, and it decodes at 23.6 and 19.4
-tok/s against 25.9 and 22.3 ([the drafter](docs/deepseek-v41.md#the-dspark-drafter)).
+These ran prompts chunk by chunk and copied every missing expert to the card. The current build
+prefills the 8,086 tokens in one span at 931 tok/s on the RTX 4090 and has CPU threads compute a
+share of each decode call's missing host experts: 30.7 and 25.6 tok/s there, against 27.0 and 22.7
+when it copies every miss ([the CPU share](docs/deepseek-v41.md#the-cpu-share)). On that RTX 4090
+host Strata 0.2.6 decodes the same GGUF at 34 to 40 tok/s, computing about half the experts on its
+CPU threads, and prefills at 635 to 690 tok/s ([measurements](docs/deepseek-v41.md#measurements)).
+With host experts the server peaks at 116 GiB of host memory. With the release's DSpark drafter
+(`--spec dspark`) the RTX PRO 6000 decodes at 83.1 and 75.0 tok/s, against 50.8 and 48.3 for the
+same build without it (both copying every miss), and the RTX 4090 with the CPU share at 34.1 and
+29.6 tok/s; the drafter's 7.4 GiB shrink the 4090's expert cache, so copying every miss it decodes
+at 22.7 and 18.7 ([the drafter](docs/deepseek-v41.md#the-dspark-drafter)).
 
 </details>
 
@@ -353,15 +357,16 @@ tok/s against 25.9 and 22.3 ([the drafter](docs/deepseek-v41.md#the-dspark-draft
   tool calls, structured output, typed decisions, the release's DSpark drafter and context-lookup
   drafting. Its 106.7 GiB of
   routed experts stay in pinned host memory or in the artifact's files, read into bounded
-  buffers rather than mapped. Prompts run block by block in spans of up to 16,384 tokens, so each
-  block's experts cross the bus once per span. On one RTX 4090 with its experts in host memory it
-  decodes at 22 to 26 tok/s and prefills 8,086 tokens at 925 tok/s; on the same host Strata 0.2.6
-  decodes at 34 to 40 tok/s and prefills at 635 to 690
+  buffers rather than mapped, and CPU threads compute a share of each decode call's missing host
+  experts. Prompts run block by block in spans of up to 16,384 tokens, so each block's experts
+  cross the bus once per span. On one RTX 4090 with its experts in host memory it decodes at 25.6
+  to 30.7 tok/s (29.6 to 34.1 with DSpark) and prefills 8,086 tokens at 931 tok/s; on the same host
+  Strata 0.2.6 decodes at 34 to 40 tok/s and prefills at 635 to 690
   ([DeepSeek-V4.1-Flash](docs/deepseek-v41.md)).
 - **CPU share of host and disk experts.** With Flash-Next, Gemma 4, Flint or native Qwen3.5/3.6
-  MoE experts off the GPU, CPU threads compute a share of each decode call's cache misses from host
-  memory while the GPU copies the rest, bit for bit equal to the GPU's products
-  (`--expert-dma-share auto`). The pool takes `min(physical cores, usable CPUs / 2)` threads by
+  MoE experts off the GPU, or DeepSeek-V4.1-Flash's experts in host memory, CPU threads compute a
+  share of each decode call's cache misses from host memory while the GPU copies the rest, bit for
+  bit equal to the GPU's products (`--expert-dma-share auto`). The pool takes `min(physical cores, usable CPUs / 2)` threads by
   default, where usable CPUs are the affinity mask bounded by a container's CPU quota (15 threads
   on a 30-CPU quota); `--expert-cpu-threads N` sets another count
   ([common options](docs/cli.md#common-options)).

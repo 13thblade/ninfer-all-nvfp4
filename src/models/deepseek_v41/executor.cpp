@@ -4,6 +4,7 @@
 #include "core/growable_region.h"
 #include "core/vmm.h"
 #include "core/weight_view.h"
+#include "models/deepseek_v41/cpu_experts.h"
 #include "models/deepseek_v41/kernels.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/weight_input.h"
@@ -222,6 +223,8 @@ struct Executor::Impl {
     std::atomic<std::uint64_t> kv_backed{0};
     std::uint64_t kv_fixed = 0, kv_bytes = 0;
     std::vector<LayerPlan> layers;
+    // The CPU's share of missing experts; it outlives the delivery that calls it.
+    std::unique_ptr<CpuExperts> cpu_experts;
     std::unique_ptr<ExpertDelivery> delivery;
     mutable std::mutex expert_stats_mutex;
     ExpertDeliveryStats expert_startup_stats;
@@ -648,6 +651,33 @@ struct Executor::Impl {
         transport.cache_bytes     = options.expert_cache_bytes;
         transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
         transport.elastic         = growing;
+        const float dma_share     = options.expert_dma_share.value_or(0.0F);
+        if (!(dma_share >= 0 && dma_share <= 1) || options.expert_cpu_threads > 256) {
+            throw std::invalid_argument("DeepSeek-V4.1: the DMA share must be 0..1 and CPU threads 0..256");
+        }
+        std::vector<CpuExpertLayer> cpu_layers;
+        bool computes = false;
+        for (const auto& b : model.expert_banks()) {
+            cpu_layers.push_back({b.gate_up_type, b.down_type, std::int64_t(b.gate_up_row_bytes),
+                                  std::int64_t(b.down_row_bytes)});
+            computes = computes || CpuExperts::computes(cpu_layers.back(), hidden, width);
+        }
+        // A disk expert the CPU computes needs the same file read as a copied one; on an RTX 4090
+        // host every split of disk experts decoded slower than copying every miss, so the CPU
+        // computes disk experts only at an explicit share.
+        const bool cpu_share = options.expert_dma_share
+                                   ? dma_share < 1
+                                   : model.expert_residency() == ExpertResidency::Host;
+        if (computes && cpu_share) {
+            cpu_experts = std::make_unique<CpuExperts>(std::move(cpu_layers), hidden, width,
+                int(config.top_k_experts), config.swiglu_limit);
+            transport.cpu.products      = cpu_experts.get();
+            transport.cpu.input_bytes   = cpu_experts->input_bytes();
+            transport.cpu.product_bytes = cpu_experts->product_bytes();
+            transport.cpu.share         = 1.0 - double(dma_share);
+            transport.cpu.balance       = !options.expert_dma_share;
+            transport.cpu.threads       = options.expert_cpu_threads;
+        }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
     }
@@ -1352,28 +1382,41 @@ struct Executor::Impl {
                        stream);
         void* routing_space = workspace->alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data;
         const gguf::MoeRouting routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
+        const auto* xb   = static_cast<const __nv_bfloat16*>(x.data);
+        const bool vector = t <= gguf::kMaxVectorColumns;
+        void* xq          = nullptr; // the vector kernels' activation of x
+        if (vector) {
+            xq = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
+            gguf::quantize_vector_activation(xb, hidden, t, nullptr, xq, stream);
+        }
+        // A decode or verification call may leave misses to the CPU, which reads the quantized
+        // activation, the route weights and the guard's factors.
+        const bool cpu = cpu_experts && vector && t <= CpuExperts::kMaxTokens;
         std::optional<ExpertDelivery::Call> call;
         if (p.delivery_layer >= 0) {
-            call = delivery->begin(std::size_t(p.delivery_layer), ids, std::uint32_t(pairs), stream);
+            const std::array<ExpertDelivery::Input, 3> inputs{
+                ExpertDelivery::Input{xq, cpu ? cpu_experts->activation_bytes(t) : 0},
+                ExpertDelivery::Input{weights, cpu ? cpu_experts->weight_bytes(t) : 0},
+                ExpertDelivery::Input{scale, cpu ? CpuExperts::scale_bytes(t) : 0}};
+            call = delivery->begin(std::size_t(p.delivery_layer), ids, std::uint32_t(pairs), stream,
+                                   cpu ? std::span<const ExpertDelivery::Input>(inputs)
+                                       : std::span<const ExpertDelivery::Input>());
         }
         const auto* tables = p.delivery_layer >= 0 ? delivery->tables(std::size_t(p.delivery_layer))
                                                    : static_cast<const void* const*>(p.tables.p);
         const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * w, hidden};
         const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, w};
         const int max_active = std::min(pairs, e);
-        const auto* xb       = static_cast<const __nv_bfloat16*>(x.data);
         auto* gu             = alloc<float>(std::size_t(pairs) * 2 * w);
         auto* middle         = alloc<__nv_bfloat16>(std::size_t(pairs) * w);
         kernels::MoeCombineArgs combine;
         combine.y      = y;
         combine.tokens = t;
         combine.hidden = hidden;
-        if (t <= gguf::kMaxVectorColumns) {
+        if (vector) {
             const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
-            void* act  = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
             void* act2 = workspace->alloc_bytes(gguf::vector_activation_bytes(w, pairs)).data;
             auto* fixed = alloc<unsigned long long>(std::size_t(t) * hidden);
-            gguf::quantize_vector_activation(xb, hidden, t, nullptr, act, stream);
             CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, stream));
             CUDA_CHECK(cudaMemsetAsync(gu, 0, std::size_t(pairs) * 2 * w * 4, stream));
             gguf::MoeOutput rows;
@@ -1382,7 +1425,7 @@ struct Executor::Impl {
             out.weighted = fixed;
             out.weights  = weights;
             const auto compute = [&](const gguf::MoeRouting& part) {
-                gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, act, t,
+                gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, xq, t,
                                          rows, chunk, stream);
                 kernels::clamped_swiglu(gu, 2 * w, pairs, w, config.swiglu_limit, scale, k, middle,
                                         w, stream);
@@ -1405,6 +1448,9 @@ struct Executor::Impl {
                 shared();
                 delivery->await(stream);
                 compute(stage(call->missing_experts));
+                if (call->cpu != nullptr) {
+                    kernels::add_fixed(fixed, call->products, call->cpu, std::int64_t(t) * hidden, stream);
+                }
             } else {
                 compute(routing);
                 shared();
@@ -2186,6 +2232,10 @@ std::optional<NgramTableStats> Executor::engram_stats() const {
 std::string Executor::engram_description() const {
     if (!impl_->engram) { return {}; }
     return impl_->engram->io_backend();
+}
+
+std::string Executor::expert_cpu_description() const {
+    return impl_->delivery ? impl_->delivery->cpu_description() : std::string();
 }
 
 std::uint32_t Executor::prompt_step() const noexcept { return impl_->prompt_step(); }
