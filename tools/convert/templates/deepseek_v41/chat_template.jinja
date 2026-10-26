@@ -4,7 +4,24 @@
     closed by <｜end▁of▁sentence｜>, and DSML tool calls. enable_thinking (default true) selects the
     thinking mode, reasoning_effort low, high (the default) or max its budget, and
     preserve_thinking keeps the reasoning of turns before the last user message, which a
-    conversation with tools always keeps. -#}
+    conversation with tools always keeps. A message's image is the release's placeholder
+    <｜deepseek_image｜>, a block of its own joined to the message's other blocks by a blank line. -#}
+{%- macro render_content(content) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- elif content is iterable and content is not mapping -%}
+        {%- for block in content -%}
+            {%- if not loop.first -%}{{- '\n\n' -}}{%- endif -%}
+            {%- if block.type == 'image' -%}
+                {{- '<｜deepseek_image｜>' -}}
+            {%- elif block.type == 'text' -%}
+                {{- block.text -}}
+            {%- else -%}
+                {{- raise_exception('DeepSeek-V4.1 reads text and images, not ' ~ block.type) -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
 {%- set thinking = enable_thinking is not defined or enable_thinking is none or enable_thinking -%}
 {%- set budgets = {'low': 50, 'high': 75, 'max': 100} -%}
 {#- The effort sets the budget of the thinking mode only (`none` comes with thinking off). -#}
@@ -60,9 +77,9 @@
             {{- '<｜User｜>' -}}
         {%- endif -%}
         {%- if message.role == 'tool' -%}
-            {{- '<tool_result>' -}}{{- message.content -}}{{- '</tool_result>' -}}
+            {{- '<tool_result>' -}}{{- render_content(message.content) -}}{{- '</tool_result>' -}}
         {%- else -%}
-            {{- message.content -}}
+            {{- render_content(message.content) -}}
         {%- endif -%}
     {%- elif message.role == 'assistant' -%}
         {%- if thinking and (not drop_thinking or i > ns.last_user) -%}
@@ -71,7 +88,7 @@
             {%- endif -%}
             {{- '</think>' -}}
         {%- endif -%}
-        {%- if message.content is not none -%}{{- message.content -}}{%- endif -%}
+        {%- if message.content is not none -%}{{- render_content(message.content) -}}{%- endif -%}
         {%- if message.tool_calls is defined and message.tool_calls -%}
             {{- '\n\n<｜DSML｜ calls>\n' -}}
             {%- for call in message.tool_calls -%}

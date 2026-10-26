@@ -6,7 +6,9 @@
 // device, in pinned host memory or in the artifact's files (ExpertResidency); the Engram table
 // stays where the artifact (or a table artifact) stores it. The frontend resources are DeepSeek's
 // tokenizer and chat template, which the shared frontend serves in its DeepSeek dialect. With
-// LoadOptions::dspark the DSpark drafter's blocks bind too, all on the device.
+// LoadOptions::dspark the DSpark drafter's blocks bind too, all on the device; with
+// LoadOptions::vision the vision tower, and the image routing bias the MoE routers select image
+// positions with.
 
 #include "artifact/materializer.h"
 #include "core/device.h"
@@ -82,6 +84,29 @@ struct DSparkWeights {
     std::vector<LayerWeights> layers;
 };
 
+// The vision tower: BF16 matrices (a block's gate and up one parent), FP32 vectors; the learned
+// rows of an image span's start, row ends and end, and per backbone block the routing bias of
+// image positions ([layers][experts]), FP32.
+struct VisionLayerWeights {
+    WeightId attention_norm, qkv, qkv_bias, output, output_bias, mlp_norm, gate, up, down;
+};
+
+struct VisionWeights {
+    WeightId patch_embedding, patch_bias, final_norm;
+    WeightId aligner_up, aligner_up_bias, aligner_out, aligner_out_bias;
+    WeightId image_start, image_newline, image_end, image_router_bias;
+    std::vector<VisionLayerWeights> layers;
+};
+
+// Where the tower's matrices live: on the device, or in pinned host memory, streamed block by
+// block through a two-block device window as the tower runs. Its vectors, span rows and routing
+// bias are on the device either way.
+enum class VisionPlacement : std::uint8_t {
+    None,
+    Device,
+    Pinned,
+};
+
 struct ExpertBanks {
     QType gate_up_type{}, down_type{};
     std::uint64_t gate_up_row_bytes = 0, down_row_bytes = 0;
@@ -92,6 +117,8 @@ struct LoadOptions {
     std::filesystem::path artifact;
     ExpertResidency experts = ExpertResidency::Device;
     bool dspark             = false; // bind the artifact's DSpark drafter
+    // Binds the artifact's `vision` component, which must then exist, in this placement.
+    VisionPlacement vision = VisionPlacement::None;
 };
 
 class Model {
@@ -107,6 +134,12 @@ public:
         return dspark_config_;
     }
     [[nodiscard]] const std::optional<DSparkWeights>& dspark() const noexcept { return dspark_; }
+    // The vision tower, when loaded.
+    [[nodiscard]] const std::optional<VisionConfig>& vision_config() const noexcept {
+        return vision_config_;
+    }
+    [[nodiscard]] const std::optional<VisionWeights>& vision() const noexcept { return vision_; }
+    [[nodiscard]] VisionPlacement vision_placement() const noexcept { return vision_placement_; }
     [[nodiscard]] ExpertResidency expert_residency() const noexcept { return expert_residency_; }
     // Host or disk experts: one bank per block, in block order.
     [[nodiscard]] std::span<const ExpertBanks> expert_banks() const noexcept { return expert_banks_; }
@@ -146,6 +179,9 @@ private:
     TextWeights weights_;
     std::optional<DSparkConfig> dspark_config_;
     std::optional<DSparkWeights> dspark_;
+    std::optional<VisionConfig> vision_config_;
+    std::optional<VisionWeights> vision_;
+    VisionPlacement vision_placement_ = VisionPlacement::None;
     std::vector<BoundWeight> bound_;
     FrontendResources resources_;
     InstanceInfo info_;
@@ -155,9 +191,11 @@ private:
     std::vector<std::filesystem::path> expert_files_;
 };
 
-// Whether the artifact's text component is DeepSeek-V4.1, and whether it carries the DSpark drafter.
+// Whether the artifact's text component is DeepSeek-V4.1, and whether it carries the DSpark drafter
+// and the vision tower.
 [[nodiscard]] bool is_deepseek_v41(const artifact::Reader& reader);
 [[nodiscard]] bool has_dspark(const artifact::Reader& reader);
+[[nodiscard]] bool has_vision(const artifact::Reader& reader);
 
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader,
                                                 const LoadOptions& options, DeviceContext& device,

@@ -6,6 +6,7 @@
 #include "core/weight_view.h"
 #include "models/deepseek_v41/cpu_experts.h"
 #include "models/deepseek_v41/kernels.h"
+#include "models/deepseek_v41/vision.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
@@ -161,6 +162,7 @@ struct LayerPlan {
                 *index_key = nullptr, *index_key_norm = nullptr, *index_query = nullptr,
                 *index_weights = nullptr;
     const float *router = nullptr, *router_bias = nullptr;
+    const float* image_bias = nullptr; // with the vision tower: the router's bias of image tokens
     gguf::GgmlType gate_up_type{}, down_type{};
     std::int64_t gate_up_row_bytes = 0, down_row_bytes = 0;
     DeviceBuffer tables; // device experts: [E] gate, [E] up, [E] gate_up, [E] down
@@ -268,6 +270,17 @@ struct Executor::Impl {
     std::vector<std::uint64_t> engram_scratch;
     // One sequence's rings and tails, the state a branch pass returns to.
     DeviceBuffer branch_state;
+    // The vision tower, and a prompt step's images: their rows' flags (pinned, then on the
+    // device, one byte per staged row), the pieces of their span rows a step places, the device
+    // rows a piece passes through (one image span at most, also the tower's output), the patches
+    // of an image being encoded; the current pass's flags (null without image rows).
+    std::unique_ptr<VisionTower> tower;
+    std::unique_ptr<PinnedHostBuffer> h_image;
+    std::unique_ptr<CudaCompletionEvent> image_staged;
+    DeviceBuffer d_image, d_image_rows, d_patches;
+    std::vector<ImageRows> step_images;
+    std::vector<std::uint8_t> step_dead;
+    const std::uint8_t* image_mask = nullptr;
     // Decode attention splits: one count for every row count, so a row sums its keys in the same
     // order however many rows its pass decodes (a verified draft's values are plain decoding's).
     int decode_splits = 1;
@@ -506,8 +519,10 @@ struct Executor::Impl {
             engram_copied = std::make_unique<CudaCompletionEvent>(device);
             engram_scratch.resize(engram_rows);
         }
+        if (options.vision_max_patches > 0) { plan_vision(rows); }
         span_borrow_bytes = growing && span_tokens != 0 ? span_buffers(span_tokens) : 0;
         workspace_bytes   = plan_workspace(growing ? 0 : span_tokens);
+        if (tower) { workspace_bytes = std::max(workspace_bytes, tower->workspace_bytes()); }
         {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
@@ -522,6 +537,30 @@ struct Executor::Impl {
         }
         workspace = std::make_unique<WorkspaceArena>(workspace_bytes);
         if (!model.expert_banks().empty()) { plan_delivery(); }
+    }
+
+    // The vision tower and the image buffers: a step's flags, a span's rows, an image's patches.
+    void plan_vision(std::size_t rows) {
+        if (!model.vision()) {
+            throw std::invalid_argument("deepseek_v41 executor: images need the model's vision tower");
+        }
+        tower = std::make_unique<VisionTower>(model, options.vision_max_patches);
+        const VisionConfig& vc = tower->config();
+        const float* bias = fp32(model, model.vision()->image_router_bias,
+                                 std::int64_t(config.num_hidden_layers) * experts);
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            layers[i].image_bias = bias + i * std::size_t(experts);
+        }
+        h_image      = std::make_unique<PinnedHostBuffer>(rows);
+        image_staged = std::make_unique<CudaCompletionEvent>(device);
+        d_image      = DeviceBuffer(rows);
+        d_image_rows = DeviceBuffer(std::size_t(vc.max_image_tokens) * hidden * 2);
+        d_patches    = DeviceBuffer(std::size_t(options.vision_max_patches) * vc.patch_features() * 2);
+    }
+
+    [[nodiscard]] std::uint64_t vision_owned_bytes() const noexcept {
+        if (!tower) { return 0; }
+        return tower->owned_bytes() + d_image.bytes + d_image_rows.bytes + d_patches.bytes;
     }
 
     // What every block plans, the backbone's and the drafter's: hyper-connections, the window
@@ -1051,6 +1090,28 @@ struct Executor::Impl {
         }
     }
 
+    void encode_image(std::span<const std::uint16_t> patches, int grid_w, int grid_h,
+                      std::span<std::uint16_t> rows) {
+        if (!tower) { throw std::invalid_argument("deepseek_v41 encode_image: no vision tower"); }
+        const VisionConfig& vc = tower->config();
+        const std::size_t span =
+            VisionConfig::span_tokens(tower->aligner_rows(grid_h), tower->aligner_columns(grid_w));
+        if (grid_w <= 0 || grid_h <= 0 ||
+            std::uint64_t(grid_w) * std::uint64_t(grid_h) > options.vision_max_patches ||
+            patches.size() != std::size_t(grid_w) * grid_h * vc.patch_features() ||
+            span > vc.max_image_tokens || rows.size() != span * std::size_t(hidden)) {
+            throw std::invalid_argument("deepseek_v41 encode_image: invalid image");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(d_patches.p, patches.data(), patches.size() * 2,
+                                   cudaMemcpyHostToDevice, stream));
+        workspace->reset();
+        tower->encode(static_cast<const __nv_bfloat16*>(d_patches.p), grid_w, grid_h,
+                      static_cast<__nv_bfloat16*>(d_image_rows.p), *workspace, stream);
+        CUDA_CHECK(cudaMemcpyAsync(rows.data(), d_image_rows.p, rows.size() * 2,
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
     // Tokens, positions, and when given sequences, to the device.
     void stage(std::span<const std::int32_t> a, std::span<const std::int32_t> b,
                std::span<const std::int32_t> c) {
@@ -1078,7 +1139,8 @@ struct Executor::Impl {
     // The table rows of a pass's rows to the device, block-major: rows[r] is (sequence, token)
     // after the sequence's `history` (advanced when `advance`).
     void read_engram(std::span<const std::int32_t> tokens, std::span<const std::uint32_t> owners,
-                     std::span<EngramHasher::History> history_of, bool advance) {
+                     std::span<EngramHasher::History> history_of, bool advance,
+                     std::span<const std::uint8_t> dead = {}) {
         if (!engram) { return; }
         const std::size_t t = tokens.size();
         const std::uint32_t per = hasher.rows_per_token(), columns = hasher.columns();
@@ -1088,7 +1150,7 @@ struct Executor::Impl {
             std::size_t end = r + 1;
             while (end < t && owners[end] == owners[r]) { ++end; }
             hasher.rows(history_of[r], tokens.subspan(r, end - r), engram_scratch.data() + r * per,
-                        advance);
+                        advance, dead.empty() ? dead : dead.subspan(r, end - r));
             r = end;
         }
         engram_copied->synchronize();
@@ -1106,9 +1168,12 @@ struct Executor::Impl {
         engram_copied->record(stream);
     }
 
-    void advance_history(std::uint32_t sequence, std::span<const std::int32_t> tokens) {
-        for (const std::int32_t token : tokens) {
-            histories[sequence].push(hasher.compressed(token), hasher.hash().ngram_size - 1);
+    void advance_history(std::uint32_t sequence, std::span<const std::int32_t> tokens,
+                         std::span<const std::uint8_t> dead = {}) {
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+            histories[sequence].push(!dead.empty() && dead[i] ? EngramHasher::kDead
+                                                              : hasher.compressed(tokens[i]),
+                                     hasher.hash().ngram_size - 1);
         }
     }
 
@@ -1119,6 +1184,16 @@ struct Executor::Impl {
                               row_bytes(embedding), hidden,
                               static_cast<const std::int32_t*>(d_tokens.p), t, h,
                               std::int64_t(streams) * hidden, stream);
+        // The step's image rows replace their embeddings, a piece at a time through the device
+        // rows (each copy ordered after the placement before it).
+        const std::int64_t stride = std::int64_t(streams) * hidden;
+        for (const ImageRows& piece : step_images) {
+            const int count = int(piece.embeddings.size() / std::size_t(hidden));
+            CUDA_CHECK(cudaMemcpyAsync(d_image_rows.p, piece.embeddings.data(),
+                                       piece.embeddings.size() * 2, cudaMemcpyHostToDevice, stream));
+            kernels::place_rows(static_cast<const __nv_bfloat16*>(d_image_rows.p), count, hidden,
+                                h + std::int64_t(piece.row) * stride, stride, stream);
+        }
         kernels::expand_streams(h, t, streams, hidden, stream);
     }
 
@@ -1160,7 +1235,7 @@ struct Executor::Impl {
         const int kv_rows = (streams + 1) * hidden;
         auto* kv          = alloc<float>(std::size_t(t) * kv_rows);
         project(e, p.engram_projection, kv, kv_rows);
-        kernels::engram_gate(h, kv, p.engram_gate, t, streams, hidden, eps, stream);
+        kernels::engram_gate(h, kv, p.engram_gate, t, streams, hidden, eps, stream, image_mask);
     }
 
     // The block's attention: its output y added to the streams through `post` and `comb`.
@@ -1447,7 +1522,7 @@ struct Executor::Impl {
         auto* ids     = alloc<std::int32_t>(pairs);
         auto* weights = alloc<float>(pairs);
         kernels::route(logits, p.router_bias, t, e, k, config.routed_scaling_factor, ids, weights,
-                       stream);
+                       stream, p.image_bias, p.image_bias != nullptr ? image_mask : nullptr);
         void* routing_space = workspace->alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data;
         const gguf::MoeRouting routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
         const auto* xb   = static_cast<const __nv_bfloat16*>(x.data);
@@ -1714,6 +1789,7 @@ struct Executor::Impl {
     // Engram rows copied).
     void run(const Pass& s) {
         const int t = s.t;
+        image_mask  = step_images.empty() ? nullptr : static_cast<const std::uint8_t*>(d_image.p) + s.row;
         workspace->reset();
         auto scope = workspace->scope();
         auto* h    = alloc<float>(std::size_t(t) * streams * hidden);
@@ -1763,11 +1839,62 @@ struct Executor::Impl {
         return span_tokens != 0 ? span_tokens : options.prefill_chunk;
     }
 
+    // A step's images, kept while it runs.
+    struct StepImages {
+        Impl& impl;
+        ~StepImages() {
+            impl.step_images.clear();
+            impl.step_dead.clear();
+            impl.image_mask = nullptr;
+        }
+    };
+
+    // Checks a step's images against its t rows and stages their flags.
+    void stage_images(std::span<const ImageRows> images, int t) {
+        if (images.empty()) { return; }
+        if (!tower) { throw std::invalid_argument("deepseek_v41 forward: images need the vision tower"); }
+        step_dead.assign(std::size_t(t), 0);
+        std::size_t next = 0;
+        for (const ImageRows& piece : images) {
+            const std::size_t count = piece.embeddings.size() / std::size_t(hidden);
+            if (count == 0 || piece.embeddings.size() % std::size_t(hidden) != 0 || piece.row < next ||
+                piece.row + count > std::size_t(t) || count > tower->config().max_image_tokens) {
+                throw std::invalid_argument("deepseek_v41 forward: image rows outside the call or "
+                                            "out of order");
+            }
+            std::fill_n(step_dead.begin() + piece.row, count, std::uint8_t(1));
+            next = piece.row + count;
+        }
+        step_images.assign(images.begin(), images.end());
+        image_staged->synchronize();
+        std::memcpy(h_image->data(), step_dead.data(), step_dead.size());
+        CUDA_CHECK(cudaMemcpyAsync(d_image.p, h_image->data(), step_dead.size(),
+                                   cudaMemcpyHostToDevice, stream));
+        image_staged->record(stream);
+    }
+
+    // The pieces of `images` within rows [begin, end), rows counted from begin.
+    std::vector<ImageRows> slice_images(std::span<const ImageRows> images, std::size_t begin,
+                                        std::size_t end) const {
+        std::vector<ImageRows> out;
+        for (const ImageRows& piece : images) {
+            const std::size_t count = piece.embeddings.size() / std::size_t(hidden);
+            const std::size_t from = std::max<std::size_t>(piece.row, begin);
+            const std::size_t to   = std::min<std::size_t>(piece.row + count, end);
+            if (from >= to) { continue; }
+            out.push_back({std::uint32_t(from - begin),
+                           piece.embeddings.subspan((from - piece.row) * std::size_t(hidden),
+                                                    (to - from) * std::size_t(hidden))});
+        }
+        return out;
+    }
+
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                 std::uint32_t logit_rows, std::uint32_t logit_column = 0) {
+                 std::uint32_t logit_rows, std::uint32_t logit_column = 0,
+                 std::span<const ImageRows> images = {}) {
         const int t = int(tokens.size());
         if (std::uint32_t(t) > options.prefill_chunk && logit_column == 0) {
-            forward_span(sequence, tokens, logit_rows);
+            forward_span(sequence, tokens, logit_rows, images);
             return;
         }
         if (sequence >= options.sequences || t <= 0 || std::uint32_t(t) > options.prefill_chunk ||
@@ -1782,8 +1909,10 @@ struct Executor::Impl {
         back(sequence, first + std::uint32_t(t));
         std::vector<std::int32_t> pos(t);
         for (int i = 0; i < t; ++i) { pos[i] = std::int32_t(first) + i; }
+        StepImages kept{*this};
         stage(tokens, pos, {});
-        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(t), sequence), true);
+        stage_images(images, t);
+        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(t), sequence), true, step_dead);
         Pass s;
         s.t            = t;
         s.chunk        = true;
@@ -1802,7 +1931,7 @@ struct Executor::Impl {
     // blocks in memory borrowed from an elastic expert cache (borrow_span), else in the workspace;
     // each chunk's arithmetic is forward()'s, and the logits are the span's last rows.
     void forward_span(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                      std::uint32_t logit_rows) {
+                      std::uint32_t logit_rows, std::span<const ImageRows> images = {}) {
         const int n = int(tokens.size()), c = int(options.prefill_chunk);
         if (sequence >= options.sequences || std::uint32_t(n) > span_tokens ||
             logit_rows > std::min<std::uint32_t>(n, kMaxLogitRows)) {
@@ -1820,8 +1949,10 @@ struct Executor::Impl {
                 // The cache cannot lend the span's buffers now: its halves (whole chunks) as spans
                 // whose buffers it may lend, down to chunk by chunk.
                 const int half = (n / 2 + c - 1) / c * c;
-                forward(sequence, tokens.first(std::size_t(half)), 0);
-                forward(sequence, tokens.subspan(std::size_t(half)), logit_rows);
+                const auto first_images = slice_images(images, 0, std::size_t(half));
+                const auto last_images  = slice_images(images, std::size_t(half), std::size_t(n));
+                forward(sequence, tokens.first(std::size_t(half)), 0, 0, first_images);
+                forward(sequence, tokens.subspan(std::size_t(half)), logit_rows, 0, last_images);
                 return;
             }
         }
@@ -1835,8 +1966,10 @@ struct Executor::Impl {
         };
         std::vector<std::int32_t> pos(n);
         for (int i = 0; i < n; ++i) { pos[i] = std::int32_t(first) + i; }
+        StepImages kept{*this};
         stage(tokens, pos, {});
-        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(n), sequence), true);
+        stage_images(images, n);
+        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(n), sequence), true, step_dead);
         workspace->reset();
         auto scope = workspace->scope();
         auto* h    = static_cast<float*>(span_alloc(std::size_t(n) * streams * hidden * 4));
@@ -1874,6 +2007,9 @@ struct Executor::Impl {
                     tap(l, h + std::size_t(lo) * streams * hidden, row + s.t - lo, lo - (n - tapped));
                 }
                 const Coefficients a = rows_of(attention_site, row), f = rows_of(ffn_site, row);
+                image_mask = step_images.empty()
+                                 ? nullptr
+                                 : static_cast<const std::uint8_t*>(d_image.p) + row;
                 if (p.engram >= 0) { engram_block(p, hc, s.t, s); }
                 mixes(p.hc_attention, hc, s.t, mix_scratch, a);
                 // The first block reads stream 0; a later one the previous block's ffn site.
@@ -1903,7 +2039,7 @@ struct Executor::Impl {
 
     // The Engram rows of a pass whose row r belongs to owners[r], from that sequence's history.
     void read_engram_rows(std::span<const std::int32_t> tokens, std::span<const std::uint32_t> owners,
-                          bool advance) {
+                          bool advance, std::span<const std::uint8_t> dead = {}) {
         if (!engram) { return; }
         std::vector<EngramHasher::History> view(tokens.size());
         // Each run of rows of one sequence continues that sequence's history; a verification's
@@ -1915,9 +2051,12 @@ struct Executor::Impl {
             view[r] = histories[owners[r]];
             r       = end;
         }
-        read_engram(tokens, owners, view, false);
+        read_engram(tokens, owners, view, false, dead);
         if (advance) {
-            for (std::size_t i = 0; i < tokens.size(); ++i) { advance_history(owners[i], tokens.subspan(i, 1)); }
+            for (std::size_t i = 0; i < tokens.size(); ++i) {
+                advance_history(owners[i], tokens.subspan(i, 1),
+                                dead.empty() ? dead : dead.subspan(i, 1));
+            }
         }
     }
 
@@ -2253,6 +2392,8 @@ ExecutorMemory Executor::memory() const noexcept {
                           .workspace_bytes = impl_->workspace_bytes,
                           .span_borrow_bytes = impl_->span_borrow_bytes,
                           .engram_resident_bytes = impl_->engram ? impl_->engram->resident_bytes() : 0,
+                          .vision_encode_bytes = impl_->tower ? impl_->tower->workspace_bytes() : 0,
+                          .vision_owned_bytes  = impl_->vision_owned_bytes(),
                           .experts = impl_->delivery ? impl_->delivery->memory() : ExpertDeliveryMemory{}};
 }
 
@@ -2309,9 +2450,16 @@ std::string Executor::expert_cpu_description() const {
 std::uint32_t Executor::prompt_step() const noexcept { return impl_->prompt_step(); }
 
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                       std::uint32_t logit_rows) {
+                       std::uint32_t logit_rows, std::span<const ImageRows> images) {
     if (logit_rows == 0) { throw std::invalid_argument("deepseek_v41 forward: no logit rows"); }
-    impl_->forward(sequence, tokens, logit_rows);
+    impl_->forward(sequence, tokens, logit_rows, 0, images);
+}
+
+bool Executor::vision() const noexcept { return impl_->tower != nullptr; }
+
+void Executor::encode_image(std::span<const std::uint16_t> patches, int grid_w, int grid_h,
+                            std::span<std::uint16_t> rows) {
+    impl_->encode_image(patches, grid_w, grid_h, rows);
 }
 
 void Executor::forward_branches(std::uint32_t sequence, std::span<const std::int32_t> tokens,

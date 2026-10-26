@@ -10,12 +10,19 @@
 // Chat template: tools/convert/templates/deepseek_v41/chat_template.jinja renders every
 // conversation of tests/fixtures/deepseek_v41/chat_cases.json as the release's
 // encoding/encoding.py encodes it (the fixture's `expected`, written by that script), thinking or
-// not, at each reasoning effort, with and without preserved reasoning; a thinking prompt opens
+// not, at each reasoning effort, with and without preserved reasoning, with images between text
+// blocks; a thinking prompt opens
 // reasoning, and a forced call opens its DSML invoke after a closed reasoning block.
 //
 // Prompt and output: a Frontend over a byte vocabulary with DeepSeek's marker tokens tokenizes the
 // prompt with those tokens, routes the text before the model's </think> token to reasoning and
 // the rest to content, and returns DSML calls as structured calls.
+//
+// Images: the processor plans an image's grid, resizes it and writes its patches as the release's
+// image_processor.py does (tests/fixtures/deepseek_v41/image_cases.json, written from that file and
+// Pillow: plans, Pillow's bicubic resize and ImageOps.pad of a synthetic picture, and the patches
+// of examples/cli/media/natural_scene.png as tools/reference/deepseek_v41_vision.py derives them),
+// and a prompt's image becomes its span of <｜deepseek_image｜> tokens.
 //
 // Tool calls: DeepSeekToolCallDecoder pulls DSML blocks out of streamed content (markers split at
 // every byte), types values by their string flag, returns an unreadable or incomplete block to
@@ -23,9 +30,12 @@
 
 #include "models/qwen3_5/frontend/chat_template.h"
 #include "models/qwen3_5/frontend/deepseek_output.h"
+#include "models/qwen3_5/frontend/digest.h"
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/output_session.h"
+#include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/resources.h"
+#include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "models/registry.h"
@@ -86,6 +96,7 @@ constexpr std::string_view kEos = "<｜end▁of▁sentence｜>";
 struct Marker {
     std::string_view content;
     bool special;
+    bool normalized = !special;
 };
 
 constexpr Marker kMarkers[] = {{kBos, true},
@@ -94,9 +105,10 @@ constexpr Marker kMarkers[] = {{kBos, true},
                                {"<｜User｜>", false},
                                {"<｜Assistant｜>", false},
                                {"<think>", false},
-                               {"</think>", false}};
+                               {"</think>", false},
+                               {"<｜deepseek_image｜>", false, false}};
 constexpr int kBosId = 256, kEosId = 257, kSystemId = 258, kUserId = 259, kAssistantId = 260,
-              kThinkOpenId = 261, kThinkCloseId = 262;
+              kThinkOpenId = 261, kThinkCloseId = 262, kImageId = 263;
 
 // GPT-2's byte-to-symbol table, which byte-level BPE vocabularies are written in.
 std::string byte_level_symbol(std::uint8_t byte) {
@@ -142,7 +154,7 @@ TokenizerFiles byte_tokenizer_files(bool markers) {
                                 {"single_word", false},
                                 {"lstrip", false},
                                 {"rstrip", false},
-                                {"normalized", !marker.special},
+                                {"normalized", marker.normalized},
                                 {"special", marker.special}};
             Json token       = entry;
             token["id"]      = id;
@@ -280,8 +292,16 @@ std::vector<fi::ChatMessage> messages_of(const OrderedJson& item) {
                                     : role == "user"      ? ninfer::ChatRole::User
                                     : role == "assistant" ? ninfer::ChatRole::Assistant
                                                           : ninfer::ChatRole::Tool;
-        const std::string content = source.value("content", "");
-        if (!content.empty()) { message.parts.push_back(fi::ChatPart::text_part(content)); }
+        const OrderedJson content = source.value("content", OrderedJson(""));
+        if (content.is_array()) { // text and image blocks
+            for (const OrderedJson& block : content) {
+                message.parts.push_back(block.at("type") == "image"
+                                            ? fi::ChatPart::image(fi::MediaData{})
+                                            : fi::ChatPart::text_part(block.at("text")));
+            }
+        } else if (!content.get<std::string>().empty()) {
+            message.parts.push_back(fi::ChatPart::text_part(content.get<std::string>()));
+        }
         message.reasoning_content = source.value("reasoning_content", "");
         message.tool_call_id      = source.value("tool_call_id", "");
         for (const OrderedJson& call : source.value("tool_calls", OrderedJson::array())) {
@@ -475,7 +495,13 @@ void test_tool_calls() {
     }
 }
 
-ninfer::models::qwen3_5::Frontend deepseek_frontend() {
+// The converter's processor_config.json of the release's image processing.
+const std::string kProcessorConfig =
+    R"({"image_processor":{"patch_size":14,"downsample_ratio":3,"min_pixels":295936,)"
+    R"("max_image_tokens":1024,"max_wh_ratio":null,"resample":3,"pad_color":[127,127,127],)"
+    R"("image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"image_token":"<｜deepseek_image｜>"}})";
+
+ninfer::models::qwen3_5::Frontend deepseek_frontend(bool vision = false) {
     // The resources are views the Frontend may keep.
     static const TokenizerFiles files = byte_tokenizer_files(true);
     static const std::string chat     = chat_template();
@@ -484,12 +510,13 @@ ninfer::models::qwen3_5::Frontend deepseek_frontend() {
         .tokenizer_config_json  = files.tokenizer_config_json,
         .chat_template_jinja    = chat,
         .generation_config_json = files.generation_config_json};
+    if (vision) { resources.processor_config_json = kProcessorConfig; }
     resources.tokenizer          = std::make_shared<const fi::Tokenizer>(fi::TokenizerResources{
         files.tokenizer_json, files.tokenizer_config_json, files.generation_config_json});
     resources.public_token_count = static_cast<std::uint32_t>(resources.tokenizer->vocab_size());
     ninfer::models::qwen3_5::FrontendOptions options;
     options.architecture   = ninfer::models::Architecture::DeepSeekV41;
-    options.vision_enabled = false;
+    options.vision_enabled = vision;
     options.max_context    = std::numeric_limits<std::uint32_t>::max();
     return ninfer::models::qwen3_5::make_frontend(resources, options);
 }
@@ -804,6 +831,91 @@ void test_prompt_and_output() {
     }
 }
 
+std::vector<std::uint8_t> synthetic_image(int width, int height) {
+    std::vector<std::uint8_t> rgb(std::size_t(width) * height * 3);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            for (int c = 0; c < 3; ++c) {
+                rgb[(std::size_t(y) * width + x) * 3 + c] =
+                    std::uint8_t((x * 7 + y * 13 + c * 101 + (x * y) % 17 * 5) % 256);
+            }
+        }
+    }
+    return rgb;
+}
+
+void test_image_processing() {
+    const OrderedJson cases = OrderedJson::parse(read_fixture("image_cases.json"));
+    fi::DeepSeekMediaOptions options;
+    for (const OrderedJson& c : cases.at("plans")) {
+        const auto plan = fi::deepseek_image_plan(c[0], c[1], options, c[2]);
+        expect(plan.height == c[3] && plan.width == c[4] && plan.rows == c[5] &&
+                   plan.columns == c[6] && plan.span_tokens() <= c[2].get<std::uint32_t>(),
+               "image plan of " + c.dump());
+    }
+    const int width = cases["synthetic"]["width"], height = cases["synthetic"]["height"];
+    const std::vector<std::uint8_t> rgb = synthetic_image(width, height);
+    const auto digest = [](const std::vector<std::uint8_t>& bytes) {
+        return fi::sha256_hex(fi::sha256(std::span<const std::uint8_t>(bytes)));
+    };
+    for (const OrderedJson& c : cases.at("resizes")) {
+        expect(digest(fi::pil_bicubic_resize(rgb, width, height, c["out"][0], c["out"][1])) ==
+                   c["sha256"].get<std::string>(),
+               "Pillow's bicubic resize to " + c["out"].dump());
+    }
+    for (const OrderedJson& c : cases.at("pads")) {
+        expect(digest(fi::deepseek_pad(rgb, width, height, c["out"][0], c["out"][1])) ==
+                   c["sha256"].get<std::string>(),
+               "ImageOps.pad to " + c["out"].dump());
+    }
+}
+
+// A picture between two texts: its patches as the reference derives them, its span of image
+// tokens where the template wrote its placeholder.
+void test_image_prompt() {
+    const OrderedJson cases = OrderedJson::parse(read_fixture("image_cases.json"));
+    const OrderedJson& image = cases.at("image");
+    std::ifstream file(std::string(NINFER_SOURCE_DIR) + "/" + image["path"].get<std::string>(),
+                       std::ios::binary);
+    std::vector<std::uint8_t> png((std::istreambuf_iterator<char>(file)),
+                                  std::istreambuf_iterator<char>());
+    expect(!png.empty(), "the example picture reads");
+    const auto frontend = deepseek_frontend(true);
+    ninfer::PromptInput input;
+    ninfer::MessagePart picture;
+    picture.kind             = ninfer::MessagePartKind::Media;
+    picture.media.kind       = ninfer::MediaKind::Image;
+    picture.media.bytes      = std::move(png);
+    picture.media.media_type = "image/png";
+    input.messages.push_back(
+        {.role  = ninfer::ChatRole::User,
+         .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "A"},
+                   std::move(picture),
+                   {.kind = ninfer::MessagePartKind::Text, .text = "B"}}});
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = false;
+    const auto prompt = frontend.prepare(std::move(input));
+    const auto& data  = ninfer::models::qwen3_5::FrontendTestAccess::inspect(prompt);
+    const int gw = image["grid"][0], gh = image["grid"][1];
+    const std::size_t span = std::size_t((gh + 2) / 3) * ((gw + 2) / 3 + 1) + 2;
+    expect(data.vision_items.size() == 1 && data.media_payloads.size() == 1, "one image");
+    const auto& item = data.vision_items.front();
+    expect(item.grid.height == gh && item.grid.width == gw && item.token_spans.size() == 1 &&
+               item.token_spans.front().count == span,
+           "the image's grid and span");
+    const auto words = data.media_payloads.front()->span();
+    const auto patches = fi::sha256_hex(fi::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(words.data()), words.size() * 2)));
+    expect(patches == image["patches_sha256"].get<std::string>(), "the image's patches");
+    std::vector<ninfer::TokenId> expected = joined({{kBosId, kUserId}, bytes("A\n\n")});
+    const std::size_t begin = expected.size();
+    expected.insert(expected.end(), span, kImageId);
+    const auto tail = joined({bytes("\n\nB"), {kAssistantId, kThinkCloseId}});
+    expected.insert(expected.end(), tail.begin(), tail.end());
+    expect(data.token_ids == expected, "the image's span among the prompt's tokens");
+    expect(item.token_spans.front().begin == begin, "the span starts after the first text block");
+}
+
 } // namespace
 
 int main() {
@@ -812,6 +924,8 @@ int main() {
         test_pretokenizer();
         test_run_reuse();
         test_chat_template();
+        test_image_processing();
+        test_image_prompt();
         test_efforts_and_forced_call();
         test_tool_calls();
         test_prompt_and_output();

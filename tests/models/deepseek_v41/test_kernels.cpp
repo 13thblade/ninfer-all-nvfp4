@@ -21,9 +21,12 @@
 //    1024 latents, sinks far below and above the scores; attention_output in both layouts.
 //  - the grouped output projection of one to eight tokens as one vector product over the groups:
 //    every value the bits of its group's own vector product (Q5_K).
-//  - route (ties to the lower id, the softplus branch past 20), clamped_swiglu (the clamps, rows
-//    scaled per token), moe_combine (weighted rows and 2^-32 fixed-point sums).
-//  - engram_rows (IQ4_NL), engram_gate.
+//  - route (ties to the lower id, the softplus branch past 20, image rows by the image routing
+//    bias), clamped_swiglu (the clamps, rows scaled per token), moe_combine (weighted rows and
+//    2^-32 fixed-point sums).
+//  - engram_rows (IQ4_NL), engram_gate (image rows passed through); the Engram hash ids of dead
+//    (image) positions and of the positions after them, in one call and across calls.
+//  - place_rows: an image's BF16 rows into stream 0 of their positions, nothing else written.
 //  - guard_columns (in one call and in calls of six columns) and unscale_columns, ring_copy,
 //    f32_to_bf16.
 //  - the DSpark drafter's: sparse_attention of a draft block (the window and the block's own
@@ -39,6 +42,7 @@
 #include "core/arena.h"
 #include "core/weight.h"
 #include "models/deepseek_v41/cpu_experts.h"
+#include "models/deepseek_v41/engram.h"
 #include "models/deepseek_v41/kernels.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
@@ -1327,21 +1331,27 @@ void attention_output(bool token_major, std::mt19937& rng) {
 // ---- Routing and experts ------------------------------------------------------------------------
 
 // The router of `tokens` rows; with `ties`, every logit equal and no bias: the lowest ids.
-void route(int tokens, bool ties, std::mt19937& rng) {
+// With `images`, every third row is an image's, which selects by the image routing bias.
+void route(int tokens, bool ties, std::mt19937& rng, bool images = false) {
     std::normal_distribution<float> normal(0.0f, 2.0f);
     std::uniform_real_distribution<float> uniform(-0.1f, 0.1f);
-    std::vector<float> logits(std::size_t(tokens) * kExperts), bias(kExperts);
+    std::vector<float> logits(std::size_t(tokens) * kExperts), bias(kExperts), image_bias(kExperts);
+    std::vector<std::uint8_t> image(static_cast<std::size_t>(tokens));
     for (auto& v : logits) { v = ties ? 0.5f : normal(rng); }
     for (auto& v : bias) { v = ties ? 0.0f : uniform(rng); }
+    for (auto& v : image_bias) { v = 4.0f * uniform(rng); }
+    for (int t = 0; images && t < tokens; ++t) { image[std::size_t(t)] = t % 3 == 1; }
     // The softplus's linear branch (past 20).
     for (int t = 0; !ties && t < tokens; ++t) {
         logits[std::size_t(t) * kExperts + (t * 37) % kExperts] = 25.0f;
     }
     const float scale = 1.5f;
-    DeviceBuffer dl = upload(logits), db = upload(bias), ids(std::size_t(tokens) * kTopK * 4),
+    DeviceBuffer dl = upload(logits), db = upload(bias), di = upload(image_bias),
+                 dm = upload(image), ids(std::size_t(tokens) * kTopK * 4),
                  weights(std::size_t(tokens) * kTopK * 4);
     k::route(as<float>(dl), as<float>(db), tokens, kExperts, kTopK, scale, as<std::int32_t>(ids),
-             as<float>(weights), nullptr);
+             as<float>(weights), nullptr, images ? as<float>(di) : nullptr,
+             images ? as<std::uint8_t>(dm) : nullptr);
     sync("route");
     const auto got_ids = download<std::int32_t>(ids, std::size_t(tokens) * kTopK);
     const auto got_w   = download<float>(weights, std::size_t(tokens) * kTopK);
@@ -1352,7 +1362,8 @@ void route(int tokens, bool ties, std::mt19937& rng) {
         for (int e = 0; e < kExperts; ++e) {
             s[std::size_t(e)] =
                 std::sqrt(std::log1p(std::exp(double(logits[std::size_t(t) * kExperts + e]))));
-            sel[std::size_t(e)] = s[std::size_t(e)] + bias[std::size_t(e)];
+            sel[std::size_t(e)] =
+                s[std::size_t(e)] + (image[std::size_t(t)] ? image_bias : bias)[std::size_t(e)];
         }
         std::vector<int> order(kExperts);
         std::iota(order.begin(), order.end(), 0);
@@ -1377,7 +1388,8 @@ void route(int tokens, bool ties, std::mt19937& rng) {
         }
     }
     report(wrong == 0 && worst <= 1e-5 && (tokens < 4 || close * 4 <= std::size_t(tokens)),
-           std::string("route ") + (ties ? "ties" : std::to_string(tokens) + " rows") + ": " +
+           std::string("route ") + (ties ? "ties" : std::to_string(tokens) + " rows") +
+               (images ? " with image rows" : "") + ": " +
                std::to_string(wrong) + " wrong ids, weights " + num(worst) + ", " +
                std::to_string(close) + " rows too close to judge");
 }
@@ -1513,7 +1525,8 @@ void engram_rows(std::mt19937& rng) {
     report(wrong == 0, "engram_rows IQ4_NL: " + std::to_string(wrong) + " wrong");
 }
 
-void engram_gate(int tokens, std::mt19937& rng) {
+// With `images`, odd rows are an image's, which the Engram leaves as they are.
+void engram_gate(int tokens, std::mt19937& rng, bool images = false) {
     constexpr int S = kStreams, H = kHidden;
     std::normal_distribution<float> normal(0.0f, 1.0f);
     std::vector<float> h(std::size_t(tokens) * S * H), kv(std::size_t(tokens) * (S + 1) * H),
@@ -1532,12 +1545,22 @@ void engram_gate(int tokens, std::mt19937& rng) {
         kv[std::size_t(0) * H + i] = 3.0f * h[i] * w[std::size_t(i)];
         kv[std::size_t(1) * H + i] = -2.0f * h[std::size_t(H) + i] * w[std::size_t(H) + i];
     }
-    DeviceBuffer dh = upload(h), dkv = upload(kv), dw = upload(w);
-    k::engram_gate(as<float>(dh), as<float>(dkv), as<float>(dw), tokens, S, H, kEps, nullptr);
+    std::vector<std::uint8_t> image(static_cast<std::size_t>(tokens));
+    for (int t = 0; images && t < tokens; ++t) { image[std::size_t(t)] = t % 2; }
+    DeviceBuffer dh = upload(h), dkv = upload(kv), dw = upload(w), dm = upload(image);
+    k::engram_gate(as<float>(dh), as<float>(dkv), as<float>(dw), tokens, S, H, kEps, nullptr,
+                   images ? as<std::uint8_t>(dm) : nullptr);
     sync("engram_gate");
     const auto got = download<float>(dh, h.size());
     double worst = 0.0, low = 1.0, high = 0.0;
+    std::size_t moved = 0;
     for (int t = 0; t < tokens; ++t) {
+        if (image[std::size_t(t)]) {
+            for (std::size_t i = 0; i < std::size_t(S) * H; ++i) {
+                moved += got[std::size_t(t) * S * H + i] != h[std::size_t(t) * S * H + i];
+            }
+            continue;
+        }
         const float* kt = kv.data() + std::size_t(t) * (S + 1) * H;
         for (int s = 0; s < S; ++s) {
             const float* hs = h.data() + (std::size_t(t) * S + s) * H;
@@ -1561,8 +1584,91 @@ void engram_gate(int tokens, std::mt19937& rng) {
             }
         }
     }
-    report(worst <= 1e-5, "engram_gate " + std::to_string(tokens) + " rows: worst " + num(worst) +
-                              ", gates " + num(low) + " .. " + num(high));
+    report(worst <= 1e-5 && moved == 0,
+           "engram_gate " + std::to_string(tokens) + " rows" + (images ? " with image rows" : "") +
+               ": worst " + num(worst) + ", gates " + num(low) + " .. " + num(high) +
+               (images ? ", image values changed " + std::to_string(moved) : ""));
+}
+
+// The hash ids of a sequence with an image span (dead positions) in it, against an oracle that
+// builds each position's n-gram window by the release's rule: the compressed ids of the token and
+// the n - 1 before it, the pad id from the first dead position back and before the sequence; the
+// same ids again when the sequence arrives in two calls split inside the span.
+void engram_dead() {
+    md::EngramHash hash;
+    hash.layers     = {1, 3};
+    hash.layer_rows = {100000, 200000};
+    hash.ngram_size = 3;
+    hash.heads      = 2;
+    hash.pad_id     = 7;
+    hash.multipliers = {{3, 1000003, 2000029}, {5, 1500007, 999983}};
+    hash.primes      = {{9973, 9967, 9949, 9941}, {19997, 19993, 19991, 19979}};
+    hash.offsets     = {{0, 9973, 19940, 29889}, {0, 19997, 39990, 59981}};
+    std::vector<std::int32_t> token_map(64);
+    for (std::size_t i = 0; i < token_map.size(); ++i) { token_map[i] = std::int32_t(i * 5 % 61 + 11); }
+    const md::EngramHasher hasher(hash, token_map);
+    const std::vector<std::int32_t> tokens = {5, 9, 40, 40, 40, 40, 12, 13, 14, 40, 15};
+    const std::vector<std::uint8_t> dead   = {0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0};
+    const std::size_t n = tokens.size(), per = hasher.rows_per_token();
+    std::vector<std::uint64_t> want(n * per);
+    for (std::size_t t = 0; t < n; ++t) {
+        std::uint64_t window[3];
+        bool blocked = false;
+        for (std::size_t s = 0; s < 3; ++s) {
+            blocked   = blocked || s > t || dead[t - s];
+            window[s] = blocked ? std::uint64_t(hash.pad_id) : std::uint64_t(token_map[tokens[t - s]]);
+        }
+        std::uint64_t base = 0;
+        for (std::size_t l = 0; l < 2; ++l) {
+            for (std::uint32_t c = 0; c < hash.columns(); ++c) {
+                const std::uint32_t order = c / hash.heads + 1; // n-gram of order + 1 tokens
+                std::uint64_t mixed = window[0] * hash.multipliers[l][0];
+                for (std::uint32_t i = 1; i <= order; ++i) { mixed ^= window[i] * hash.multipliers[l][i]; }
+                want[t * per + l * hash.columns() + c] =
+                    base + hash.offsets[l][c] + mixed % hash.primes[l][c];
+            }
+            base += hash.layer_rows[l];
+        }
+    }
+    std::vector<std::uint64_t> whole(n * per), parts(n * per);
+    md::EngramHasher::History history, split;
+    hasher.rows(history, tokens, whole.data(), true, dead);
+    const std::size_t cut = 4; // inside the span
+    hasher.rows(split, std::span(tokens).first(cut), parts.data(), true, std::span(dead).first(cut));
+    hasher.rows(split, std::span(tokens).subspan(cut), parts.data() + cut * per, true,
+                std::span(dead).subspan(cut));
+    std::size_t wrong = 0, wrong_parts = 0;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        wrong += whole[i] != want[i];
+        wrong_parts += parts[i] != want[i];
+    }
+    report(wrong == 0 && wrong_parts == 0,
+           "engram dead positions: " + std::to_string(wrong) + " ids wrong in one call, " +
+               std::to_string(wrong_parts) + " in two");
+}
+
+// An image's rows land in stream 0 of their positions (stride: the four streams of a position);
+// the other streams and positions keep their values.
+void place_rows(std::mt19937& rng) {
+    constexpr int positions = 6, first = 2, count = 3;
+    const std::int64_t stride = std::int64_t(kStreams) * kHidden;
+    std::vector<float> h(std::size_t(positions) * stride, 1234.5f);
+    const auto rows = random_bf16(std::size_t(count) * kHidden, 1.0f, rng);
+    DeviceBuffer dh = upload(h), dr = upload(rows);
+    k::place_rows(static_cast<const bf16*>(dr.p), count, kHidden, as<float>(dh) + first * stride,
+                  stride, nullptr);
+    sync("place_rows");
+    const auto got = download<float>(dh, h.size());
+    std::size_t wrong = 0;
+    for (int t = 0; t < positions; ++t) {
+        for (std::int64_t i = 0; i < stride; ++i) {
+            const bool placed = t >= first && t < first + count && i < kHidden;
+            const float want =
+                placed ? val(rows[std::size_t(t - first) * kHidden + std::size_t(i)]) : 1234.5f;
+            wrong += got[std::size_t(t * stride + i)] != want;
+        }
+    }
+    report(wrong == 0, "place_rows: " + std::to_string(wrong) + " values wrong");
 }
 
 // ---- Guards and copies --------------------------------------------------------------------------
@@ -2088,6 +2194,7 @@ int main() {
         route(1, false, rng);
         route(40, false, rng);
         route(1, true, rng);
+        route(9, false, rng, true);
         swiglu(5, true, rng);
         swiglu(3, false, rng);
         moe_combine(1, rng);
@@ -2095,6 +2202,9 @@ int main() {
 
         engram_rows(rng);
         engram_gate(3, rng);
+        engram_gate(4, rng, true);
+        engram_dead();
+        place_rows(rng);
 
         column_guard(rng);
         copies(rng);

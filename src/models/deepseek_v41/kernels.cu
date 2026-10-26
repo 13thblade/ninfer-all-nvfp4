@@ -264,6 +264,13 @@ cublasHandle_t blas_handle() {
 
 // ---- Hyper-connections ------------------------------------------------------------------------
 
+__global__ void place_rows_kernel(const __nv_bfloat16* __restrict__ rows, std::int64_t n,
+                                  int hidden, float* __restrict__ h, std::int64_t stride) {
+    const std::int64_t k = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (k >= n) { return; }
+    h[k / hidden * stride + k % hidden] = __bfloat162float(rows[k]);
+}
+
 __global__ void expand_streams_kernel(float* h, int streams, int hidden) {
     const std::int64_t row = std::int64_t(blockIdx.x) * streams * hidden;
     const int s            = blockIdx.y + 1;
@@ -1026,11 +1033,13 @@ constexpr int kMaxTopK    = 8;
 
 __global__ void route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                              int experts, int top_k, float scale, std::int32_t* __restrict__ ids,
-                             float* __restrict__ weights) {
+                             float* __restrict__ weights, const float* __restrict__ image_bias,
+                             const std::uint8_t* __restrict__ image) {
     __shared__ float sel[kMaxExperts];
     __shared__ float chosen_s[kMaxTopK];
     __shared__ int chosen_id[kMaxTopK];
     const int t = blockIdx.x, e = threadIdx.x;
+    if (image != nullptr && image[t]) { bias = image_bias; }
     float s = 0.0f;
     if (e < experts) {
         const float x  = logits[std::int64_t(t) * experts + e];
@@ -1119,8 +1128,10 @@ __global__ void engram_rows_kernel(const std::uint8_t* __restrict__ rows, std::i
 
 // Block (t, s).
 __global__ void engram_gate_kernel(float* __restrict__ h, const float* __restrict__ kv,
-                                   const float* __restrict__ w, int streams, int hidden, float eps) {
+                                   const float* __restrict__ w, int streams, int hidden, float eps,
+                                   const std::uint8_t* __restrict__ image) {
     const int t = blockIdx.x, s = blockIdx.y;
+    if (image != nullptr && image[t]) { return; }
     float* hs       = h + (std::int64_t(t) * streams + s) * hidden;
     const float* kt = kv + std::int64_t(t) * (streams + 1) * hidden;
     const float* key = kt + std::int64_t(s) * hidden;
@@ -1329,6 +1340,14 @@ void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, c
                "SGEMM");
 }
 
+void place_rows(const __nv_bfloat16* rows, int count, int hidden, float* h, std::int64_t stride,
+                cudaStream_t stream) {
+    const std::int64_t n = std::int64_t(count) * hidden;
+    if (n <= 0) { return; }
+    place_rows_kernel<<<int((n + 255) / 256), 256, 0, stream>>>(rows, n, hidden, h, stride);
+    check_launch("place_rows");
+}
+
 void expand_streams(float* h, int tokens, int streams, int hidden, cudaStream_t stream) {
     if (tokens <= 0 || streams <= 1) { return; }
     expand_streams_kernel<<<dim3(tokens, streams - 1), 256, 0, stream>>>(h, streams, hidden);
@@ -1484,13 +1503,17 @@ void attention_output(const __nv_bfloat16* o, int tokens, int heads, int groups,
 }
 
 void route(const float* logits, const float* bias, int tokens, int experts, int top_k, float scale,
-           std::int32_t* ids, float* weights, cudaStream_t stream) {
+           std::int32_t* ids, float* weights, cudaStream_t stream, const float* image_bias,
+           const std::uint8_t* image) {
     if (experts > kMaxExperts || top_k > kMaxTopK || top_k > experts) {
         throw std::invalid_argument("deepseek_v41 route: at most 8 of 512 experts");
     }
+    if (image != nullptr && image_bias == nullptr) {
+        throw std::invalid_argument("deepseek_v41 route: image tokens need the image bias");
+    }
     if (tokens <= 0) { return; }
     route_kernel<<<tokens, (experts + 31) / 32 * 32, 0, stream>>>(logits, bias, experts, top_k, scale,
-                                                                  ids, weights);
+                                                                  ids, weights, image_bias, image);
     check_launch("route");
 }
 
@@ -1525,9 +1548,10 @@ void engram_rows(const std::uint8_t* rows, int count, __nv_bfloat16* out, cudaSt
 }
 
 void engram_gate(float* h, const float* kv, const float* w, int tokens, int streams, int hidden,
-                 float eps, cudaStream_t stream) {
+                 float eps, cudaStream_t stream, const std::uint8_t* image) {
     if (tokens <= 0) { return; }
-    engram_gate_kernel<<<dim3(tokens, streams), 256, 0, stream>>>(h, kv, w, streams, hidden, eps);
+    engram_gate_kernel<<<dim3(tokens, streams), 256, 0, stream>>>(h, kv, w, streams, hidden, eps,
+                                                                  image);
     check_launch("engram_gate");
 }
 

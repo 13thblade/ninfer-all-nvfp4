@@ -60,12 +60,20 @@ const RoleMarker* find_role(const text::TemplateOutput& output, std::span<const 
     return found;
 }
 
+// DeepSeek's template writes one <｜deepseek_image｜> per image, in input order; the processor
+// expands it into the image's span of the same token.
+constexpr std::string_view kDeepSeekImage = "<｜deepseek_image｜>";
+
 // Flint's and DeepSeek's layout: each turn ends where the next begins, which closes it, since a
-// role marker is a token a turn's text cannot run into. Their templates write no media.
+// role marker is a token a turn's text cannot run into. Flint's template writes no media;
+// DeepSeek's writes `image_placeholder` for each image.
 PromptLayout inspect_marker_layout(const text::TemplateOutput& output,
                                    std::span<const Modality> media,
-                                   std::span<const RoleMarker> roles) {
-    if (!media.empty()) { throw std::invalid_argument("this chat template takes no media"); }
+                                   std::span<const RoleMarker> roles,
+                                   std::string_view image_placeholder) {
+    if (!media.empty() && image_placeholder.empty()) {
+        throw std::invalid_argument("this chat template takes no media");
+    }
     PromptLayout result;
     const std::string_view source = output.text;
     std::size_t pos               = 0;
@@ -91,6 +99,20 @@ PromptLayout inspect_marker_layout(const text::TemplateOutput& output,
         }
         role = following;
         pos  = next;
+    }
+    if (image_placeholder.empty()) return result;
+    for (auto at = find_marker(output, image_placeholder, 0); at != std::string::npos;
+         at      = find_marker(output, image_placeholder, at + image_placeholder.size())) {
+        const auto index = result.media_placeholders.size();
+        if (index >= media.size() || media[index] != Modality::Image) {
+            throw std::invalid_argument(
+                "chat template media placeholders must match input count, type and order");
+        }
+        result.media_placeholders.push_back(
+            {{at, at + image_placeholder.size()}, Modality::Image, index});
+    }
+    if (result.media_placeholders.size() != media.size()) {
+        throw std::invalid_argument("chat template omitted an input media placeholder");
     }
     return result;
 }
@@ -134,10 +156,10 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
     if (find_marker(output, kQwenStart, 0) == std::string::npos &&
         find_marker(output, kGemmaStart, 0) == std::string::npos) {
         if (find_role(output, kFlintRoles, 0, role_at) != nullptr) {
-            return inspect_marker_layout(output, media, kFlintRoles);
+            return inspect_marker_layout(output, media, kFlintRoles, {});
         }
         if (find_role(output, kDeepSeekRoles, 0, role_at) != nullptr) {
-            return inspect_marker_layout(output, media, kDeepSeekRoles);
+            return inspect_marker_layout(output, media, kDeepSeekRoles, kDeepSeekImage);
         }
     }
     PromptLayout result;

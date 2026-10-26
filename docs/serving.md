@@ -142,6 +142,9 @@ Gemma 4 places its tower the same three ways with its own mechanics: `overlay` k
 blocks' matrices in pinned host memory and streams them through a two-block device window during
 each encode (about 0.14 GiB of device memory instead of 1.07 GiB), and `cpu` runs an FP32 tower
 with AVX2/FMA kernels. Its budgets, layout and measurements are in [Gemma 4](gemma4.md#images-and-video).
+DeepSeek-V4.1 keeps its tower `resident` or `overlay`, which streams the 32 blocks' matrices
+through a two-block device window as Gemma 4's does, and refuses `cpu`
+([DeepSeek-V4.1](deepseek-v41.md#images)).
 
 ### Image detail
 
@@ -153,7 +156,8 @@ for a cheaper and coarser look. The same bytes at both details are prepared, cac
 two different images. Any other value is refused with `image_detail_not_supported`, or read as
 `auto` when the server runs with `--lenient-image-detail`. Gemma 4 maps the three to its budgets:
 `low` 70 soft tokens, `auto` the release's 280, `high` the `--vision-max-merged` bound (1120 by
-default).
+default). DeepSeek-V4.1 gives an image's span at most the release's 1024 prompt positions (fewer
+with `--vision-max-merged`) at `auto` and `high`, and a quarter of that at `low`.
 
 ## Several models (router)
 

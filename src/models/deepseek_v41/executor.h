@@ -18,6 +18,10 @@
 // blocks for its last rows (a window at most), and those rows seed each sequence's drafter rings
 // (a verification's at commit(), the rows kept). draft() runs the drafter's block after a
 // sequence's anchor at its next positions, from a CUDA graph.
+//
+// With the model's vision tower (vision_max_patches), encode_image() turns an image's patches into
+// its span's rows, and a prompt call's image rows take the place of their tokens' embeddings: they
+// route with the image routing bias, and the Engram neither adds to them nor looks back past them.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -70,6 +74,16 @@ struct ExecutorOptions {
     // non-standard mode that degrades the output).
     std::optional<qwen4_exp::NgramTableLayout> engram_table;
     qwen4_exp::NgramReadOptions engram_read;
+    // Prompt calls may carry images (a model loaded with its vision tower): the most patches an
+    // image has, which sizes the tower's scratch. 0: text only.
+    std::uint32_t vision_max_patches = 0;
+};
+
+// An image's rows in a prompt call: the call's rows from `row` on, as many as `embeddings` holds
+// (BF16 [rows][hidden] in host memory, a slice of the span encode_image() wrote).
+struct ImageRows {
+    std::uint32_t row = 0;
+    std::span<const std::uint16_t> embeddings;
 };
 
 struct ExecutorMemory {
@@ -83,6 +97,10 @@ struct ExecutorMemory {
     std::uint64_t span_borrow_bytes = 0;
     // Engram rows held in RAM (a table read whole, or the reader's row cache).
     std::uint64_t engram_resident_bytes = 0;
+    // The vision tower: the scratch of one encode within workspace_bytes, and the device bytes the
+    // tower and its image buffers own beside the model's weights.
+    std::uint64_t vision_encode_bytes = 0;
+    std::uint64_t vision_owned_bytes  = 0;
     ExpertDeliveryMemory experts;
 };
 
@@ -135,9 +153,17 @@ public:
     // layer by layer so that each block's missing experts cross the bus once for all of them.
     [[nodiscard]] std::uint32_t prompt_step() const noexcept;
     // Runs up to prompt_step() tokens at the sequence's next positions and leaves the logits of
-    // the last `logit_rows` (at most kMaxLogitRows) in logits().
+    // the last `logit_rows` (at most kMaxLogitRows) in logits(). `images` (in row order, apart)
+    // replace their rows' embeddings.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                 std::uint32_t logit_rows);
+                 std::uint32_t logit_rows, std::span<const ImageRows> images = {});
+    // Whether prompt calls may carry images.
+    [[nodiscard]] bool vision() const noexcept;
+    // The span rows of an image of grid_w x grid_h patches (BF16 [grid_h * grid_w][patch features]
+    // in host memory, row by row) into `rows` (BF16 [span tokens][hidden]); returns once they are
+    // there.
+    void encode_image(std::span<const std::uint16_t> patches, int grid_w, int grid_h,
+                      std::span<std::uint16_t> rows);
     // Branches of a prompt, each continuing the sequence from its position: branch b runs
     // `lengths[b]` of `tokens` (in branch order, each at most prefill_chunk, at most kMaxLogitRows
     // branches). Leaves the logits of each branch's last token in logits(), one column per branch

@@ -169,17 +169,23 @@ std::int32_t EngramHasher::compressed(std::int32_t token) const {
 }
 
 void EngramHasher::rows(History& history, std::span<const std::int32_t> tokens,
-                        std::uint64_t* out, bool advance) const {
+                        std::uint64_t* out, bool advance, std::span<const std::uint8_t> dead) const {
     const std::uint32_t n = hash_.ngram_size, heads = hash_.heads, columns = hash_.columns();
     const std::uint32_t keep = n - 1;
+    if (!dead.empty() && dead.size() != tokens.size()) {
+        throw std::invalid_argument("Engram: a dead mark per token");
+    }
     History h = history;
     std::uint64_t window[9];
     for (std::size_t t = 0; t < tokens.size(); ++t) {
-        // window[s]: the compressed id s tokens back (s = 0: the token), the pad id before the
-        // sequence's first token.
-        window[0] = std::uint64_t(compressed(tokens[t]));
+        // window[s]: the compressed id s tokens back (s = 0: the token), the pad id from the first
+        // dead position back and before the sequence's first token.
+        const std::int32_t own = !dead.empty() && dead[t] ? kDead : compressed(tokens[t]);
+        bool blocked = own == kDead;
+        window[0]    = blocked ? std::uint64_t(hash_.pad_id) : std::uint64_t(own);
         for (std::uint32_t s = 1; s < n; ++s) {
-            window[s] = s <= h.count ? std::uint64_t(h.ids[h.count - s]) : std::uint64_t(hash_.pad_id);
+            blocked   = blocked || s > h.count || h.ids[h.count - s] == kDead;
+            window[s] = blocked ? std::uint64_t(hash_.pad_id) : std::uint64_t(h.ids[h.count - s]);
         }
         std::uint64_t* row = out + t * rows_per_token();
         for (std::size_t l = 0; l < hash_.layers.size(); ++l) {
@@ -195,7 +201,7 @@ void EngramHasher::rows(History& history, std::span<const std::int32_t> tokens,
                 }
             }
         }
-        h.push(std::int32_t(window[0]), keep);
+        h.push(own, keep);
     }
     if (advance) { history = h; }
 }

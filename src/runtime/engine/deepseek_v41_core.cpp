@@ -93,8 +93,22 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    // The release's vision tower (the artifact's `vision` component, --vision): its matrices on the
+    // device, or in pinned host memory through a window of two device slots (--vision-residency
+    // overlay).
+    auto vision = models::deepseek_v41::VisionPlacement::None;
     if (options.enable_vision) {
-        throw std::invalid_argument("DeepSeek-V4.1: the GGUF release carries no vision tower");
+        switch (options.vision_residency) {
+        case VisionResidency::Resident:
+            vision = models::deepseek_v41::VisionPlacement::Device;
+            break;
+        case VisionResidency::Overlay:
+            vision = models::deepseek_v41::VisionPlacement::Pinned;
+            break;
+        case VisionResidency::Cpu:
+            throw std::invalid_argument("DeepSeek-V4.1's vision tower runs on the GPU "
+                                        "(--vision-residency resident|overlay)");
+        }
     }
     // A speculative round verifies what the release's DSpark drafter proposes (--spec dspark, an
     // artifact converted with it) or what a context lookup does (--lookup-ngram).
@@ -174,6 +188,10 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         throw std::invalid_argument("DeepSeek-V4.1: --spec dspark needs an artifact converted with "
                                     "the DSpark drafter (--components text,dspark)");
     }
+    if (options.enable_vision && !models::deepseek_v41::has_vision(reader)) {
+        throw std::invalid_argument("--vision: the artifact holds no DeepSeek-V4.1 vision tower "
+                                    "(convert with --components text,dspark,vision)");
+    }
     // The Engram table is located before anything loads, so a model without it fails at once.
     std::optional<models::qwen4_exp::NgramTableLayout> engram;
     if (!table.disabled) {
@@ -186,8 +204,21 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     install_device_route_profile_for(options, device);
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
     auto model = models::deepseek_v41::load_model(
-        reader, {.artifact = options.artifact_path, .experts = options.expert_residency, .dspark = dspark},
+        reader,
+        {.artifact = options.artifact_path,
+         .experts  = options.expert_residency,
+         .dspark   = dspark,
+         .vision   = vision},
         device, &options.startup_observer);
+    // An image's span takes the release's 1024 prompt positions at most, fewer with
+    // --vision-max-merged.
+    std::uint32_t vision_budget = 0;
+    if (vision != models::deepseek_v41::VisionPlacement::None) {
+        vision_budget = model->vision_config()->max_image_tokens;
+        if (options.vision_max_merged_tokens != 0) {
+            vision_budget = std::min(vision_budget, options.vision_max_merged_tokens);
+        }
+    }
     // The drafter proposes its block's drafts a round, or fewer with --draft-tokens.
     std::uint32_t drafts = lookup_drafts;
     if (dspark) {
@@ -212,10 +243,15 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     auto instance = std::make_unique<DeepSeekV41Instance>(DeepSeekV41Instance{
         .model    = nullptr,
         .frontend = models::qwen3_5::make_frontend(
-            model->resources(), {.chat_template_path = options.chat_template_path,
-                                 .architecture       = models::Architecture::DeepSeekV41,
-                                 .vision_enabled     = false,
-                                 .max_context        = options.max_context}),
+            model->resources(),
+            {.chat_template_path       = options.chat_template_path,
+             .architecture             = models::Architecture::DeepSeekV41,
+             .vision_enabled           = options.enable_vision,
+             .max_context              = options.max_context,
+             .media_cache_bytes        = options.media_cache_bytes,
+             .media_live_bytes         = options.media_live_bytes,
+             .media_preprocess_threads = options.media_preprocess_threads,
+             .vision_max_merged_tokens = options.vision_max_merged_tokens}),
         .executor = nullptr,
         .capacity = options.max_context});
     frontend_phase.complete();
@@ -235,6 +271,12 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                                    .budget_bytes = table.ram_budget_bytes.value_or(0),
                                    .lock         = table.lock,
                                    .depth        = table.io_depth};
+    // A span of `budget` positions holds rows x (columns + 1) + 2 of them, so its rows x columns
+    // aligner cells, of r x r patches each, are at most budget - 3.
+    if (vision_budget >= 4) {
+        const std::uint32_t r       = model->vision_config()->downsample_ratio;
+        executor.vision_max_patches = r * r * (vision_budget - 3);
+    }
     runtime::RopeScalingPlan rope;
     rope.summary.native_context = model->config().max_position_embeddings;
     if (options.max_context > model->config().max_position_embeddings) {
@@ -278,6 +320,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     }
     instance->free_after_weights = free_after_weights;
     instance->free_after_startup = free_bytes();
+    instance->vision_budget      = vision_budget;
     const auto memory = instance->executor->memory();
     std::string spans;
     if (instance->executor->prompt_step() > executor.prefill_chunk) {
@@ -341,6 +384,17 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                                                                       : "from --expert-profile")
                                     : "by the first requests");
     }
+    if (vision_budget != 0) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "DeepSeek-V4.1: vision tower %s (%.0f MiB of device memory beside the "
+                           "weights, %.0f MiB of workspace an image), up to %u prompt positions "
+                           "per image",
+                           vision == models::deepseek_v41::VisionPlacement::Pinned
+                               ? "in pinned host memory through a window of two device slots"
+                               : "on the device",
+                           double(memory.vision_owned_bytes) / 1048576.0,
+                           double(memory.vision_encode_bytes) / 1048576.0, vision_budget);
+    }
     instance->record_profile = hybrid.record_profile;
     if (lookup_drafts != 0) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
@@ -400,6 +454,30 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     return out;
 }
 
+// A prompt's image: its span [begin, begin + count) and a key of its content (its item's digest
+// and grid).
+struct DeepSeekV41MediaMark {
+    std::uint32_t begin = 0, count = 0;
+    std::uint64_t key   = 0;
+
+    friend bool operator==(const DeepSeekV41MediaMark&, const DeepSeekV41MediaMark&) = default;
+};
+using MediaMark = DeepSeekV41MediaMark;
+
+static std::uint64_t image_key(const models::qwen3_5::VisionItem& item) {
+    std::uint64_t key = 1469598103934665603ULL; // FNV-1a over the digest and grid
+    const auto mix    = [&](std::uint64_t value) {
+        for (int i = 0; i < 8; ++i) {
+            key ^= (value >> (8 * i)) & 0xFFu;
+            key *= 1099511628211ULL;
+        }
+    };
+    for (const std::uint8_t byte : item.content_digest) { mix(byte); }
+    mix(std::uint64_t(item.grid.height));
+    mix(std::uint64_t(item.grid.width));
+    return key;
+}
+
 struct DeepSeekV41Core::Request {
     std::uint64_t id = 0;
     models::qwen3_5::PreparedPrompt prompt;
@@ -427,6 +505,11 @@ struct DeepSeekV41Core::Request {
 
     std::uint32_t anchor_at = 0;
     bool reusable           = true;
+    // The prompt's images in prompt order, and each image's span rows (BF16 [span][hidden], by
+    // vision item), encoded once when a prompt chunk first reaches the image.
+    std::vector<MediaMark> media;
+    std::vector<std::vector<std::uint16_t>> image_rows;
+    double vision_seconds = 0.0;
     // CacheRetentionHint::Disposable: no request continues where this one ends (a decision read),
     // so the store keeps no image of its end.
     bool disposable = false;
@@ -476,6 +559,8 @@ struct DeepSeekV41Core::Impl {
         std::shared_ptr<Request> request;
         std::vector<TokenId> fed;
         std::vector<TokenId> anchor;
+        // The pictures among fed and anchor (an image token does not tell one from another).
+        std::vector<MediaMark> media, anchor_media;
         models::deepseek_v41::SequenceSnapshot snapshot;
         std::uint64_t last_used = 0;
         bool disposable         = false; // its last request's
@@ -526,6 +611,7 @@ struct DeepSeekV41Core::Impl {
     // prefix when no free sequence serves more of it.
     struct Stored {
         std::vector<TokenId> tokens;
+        std::vector<MediaMark> media;
         models::deepseek_v41::SequenceImage header;
         PrefixReusePath path = PrefixReusePath::PrivateEndpoint;
         std::vector<std::byte*> pages; // slices of host_pages
@@ -913,18 +999,29 @@ struct DeepSeekV41Core::Impl {
             slot.request = nullptr;
             slot.fed.clear();
             slot.anchor.clear();
+            slot.media.clear();
+            slot.anchor_media.clear();
         }
         complete(request, std::move(error));
     }
 
-    // The tokens `held` the prompt starts with.
-    static std::uint32_t prefix_reuse(const std::vector<TokenId>& held, const Request& prompt) {
+    // The tokens `held` the prompt starts with, when its images among them are exactly
+    // `held_media`.
+    static std::uint32_t prefix_reuse(const std::vector<TokenId>& held,
+                                      const std::vector<MediaMark>& held_media,
+                                      const Request& prompt) {
         // A prompt's last token is fed, since its first sample needs the logits there; a
         // branched read's branches bring their own, so it can resume at its prompt's end.
         const auto& tokens     = prompt.prompt_tokens;
         const std::size_t most = prompt.branches ? tokens.size() : tokens.size() - 1;
         if (held.empty() || tokens.empty() || held.size() > most ||
             !std::equal(held.begin(), held.end(), tokens.begin())) {
+            return 0;
+        }
+        std::size_t marks = 0;
+        while (marks < prompt.media.size() && prompt.media[marks].begin < held.size()) { ++marks; }
+        if (marks != held_media.size() ||
+            !std::equal(held_media.begin(), held_media.end(), prompt.media.begin())) {
             return 0;
         }
         return static_cast<std::uint32_t>(held.size());
@@ -947,9 +1044,10 @@ struct DeepSeekV41Core::Impl {
         return true;
     }
 
-    [[nodiscard]] std::optional<std::size_t> stored_index(const std::vector<TokenId>& tokens) const {
+    [[nodiscard]] std::optional<std::size_t> stored_index(const std::vector<TokenId>& tokens,
+                                                          const std::vector<MediaMark>& media) const {
         for (std::size_t i = 0; i < stored.size(); ++i) {
-            if (stored[i].tokens == tokens) { return i; }
+            if (stored[i].tokens == tokens && stored[i].media == media) { return i; }
         }
         return std::nullopt;
     }
@@ -958,7 +1056,7 @@ struct DeepSeekV41Core::Impl {
     [[nodiscard]] std::pair<std::size_t, std::uint32_t> find_stored(const Request& prompt) const {
         std::pair<std::size_t, std::uint32_t> best{0, 0};
         for (std::size_t i = 0; i < stored.size(); ++i) {
-            const std::uint32_t length = prefix_reuse(stored[i].tokens, prompt);
+            const std::uint32_t length = prefix_reuse(stored[i].tokens, stored[i].media, prompt);
             if (length > best.second) { best = {i, length}; }
         }
         return best;
@@ -977,6 +1075,7 @@ struct DeepSeekV41Core::Impl {
     // Keeps the state of sequence `s` up to `tokens` (its live state, or its checkpoint `at`) in
     // the store, unless the store already holds that prefix or it is too short to be worth it.
     void store_image(std::uint32_t s, const std::vector<TokenId>& tokens,
+                     const std::vector<MediaMark>& media,
                      const models::deepseek_v41::SequenceSnapshot* at, PrefixReusePath path) {
         if (host_budget == 0) { return; }
         if (path == PrefixReusePath::SharedStablePrefix
@@ -984,7 +1083,7 @@ struct DeepSeekV41Core::Impl {
                 : tokens.size() < kMinStoredTokens) {
             return;
         }
-        if (const auto known = stored_index(tokens)) {
+        if (const auto known = stored_index(tokens, media)) {
             stored[*known].last_used = ++use_clock;
             return;
         }
@@ -995,6 +1094,7 @@ struct DeepSeekV41Core::Impl {
         if (!make_host_room(bytes)) { return; }
         Stored image;
         image.tokens = tokens;
+        image.media  = media;
         image.path   = path;
         image.bytes  = bytes;
         const auto count = static_cast<std::ptrdiff_t>((bytes + kHostPageBytes - 1) / kHostPageBytes);
@@ -1017,10 +1117,11 @@ struct DeepSeekV41Core::Impl {
         const bool anchored = !slot.anchor.empty() && slot.anchor.size() <= slot.fed.size() &&
                               std::equal(slot.anchor.begin(), slot.anchor.end(), slot.fed.begin());
         if (anchored) {
-            store_image(s, slot.anchor, &slot.snapshot, PrefixReusePath::PrivateTurnClosure);
+            store_image(s, slot.anchor, slot.anchor_media, &slot.snapshot,
+                        PrefixReusePath::PrivateTurnClosure);
         }
         if (slot.fed != slot.anchor && !slot.disposable) {
-            store_image(s, slot.fed, nullptr, PrefixReusePath::PrivateEndpoint);
+            store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
         }
     }
 
@@ -1036,7 +1137,8 @@ struct DeepSeekV41Core::Impl {
 
     [[nodiscard]] std::uint32_t reuse(const Slot& slot, const Request& prompt) const {
         if (!reuse_prefixes) { return 0; }
-        return std::max(prefix_reuse(slot.fed, prompt), prefix_reuse(slot.anchor, prompt));
+        return std::max(prefix_reuse(slot.fed, slot.media, prompt),
+                        prefix_reuse(slot.anchor, slot.anchor_media, prompt));
     }
 
     void admit() {
@@ -1093,18 +1195,21 @@ struct DeepSeekV41Core::Impl {
         // longest prefix the store keeps; what the sequence held goes to the store first.
         std::uint32_t reused = 0;
         if (reuse_prefixes && r.reusable) {
-            const std::uint32_t live       = prefix_reuse(slot.fed, r);
-            const std::uint32_t anchored   = prefix_reuse(slot.anchor, r);
+            const std::uint32_t live       = prefix_reuse(slot.fed, slot.media, r);
+            const std::uint32_t anchored   = prefix_reuse(slot.anchor, slot.anchor_media, r);
             const auto [image, from_store] = find_stored(r);
             if (from_store > std::max(live, anchored)) {
-                std::vector<TokenId> tokens = stored[image].tokens;
-                const PrefixReusePath path  = stored[image].path;
+                std::vector<TokenId> tokens  = stored[image].tokens;
+                std::vector<MediaMark> media = stored[image].media;
+                const PrefixReusePath path   = stored[image].path;
                 retire(s);
                 // Retiring may have dropped or moved the image: find it again.
-                if (const auto index = stored_index(tokens)) {
+                if (const auto index = stored_index(tokens, media)) {
                     restore_stored(s, *index);
-                    slot.fed = std::move(tokens);
+                    slot.fed   = std::move(tokens);
+                    slot.media = std::move(media);
                     slot.anchor.clear();
+                    slot.anchor_media.clear();
                     reused       = from_store;
                     r.reuse_path = path;
                 }
@@ -1112,6 +1217,7 @@ struct DeepSeekV41Core::Impl {
                 retire(s);
                 executor.restore(s, slot.snapshot);
                 slot.fed     = slot.anchor;
+                slot.media   = slot.anchor_media;
                 reused       = anchored;
                 r.reuse_path = PrefixReusePath::PrivateTurnClosure;
             } else if (live > 0) {
@@ -1124,6 +1230,8 @@ struct DeepSeekV41Core::Impl {
             executor.reset(s);
             slot.fed.clear();
             slot.anchor.clear();
+            slot.media.clear();
+            slot.anchor_media.clear();
         }
         slot.request    = request;
         slot.last_used  = ++use_clock;
@@ -1430,7 +1538,8 @@ struct DeepSeekV41Core::Impl {
         result.branches                        = std::move(r.branch_results);
         if (drafts > 0) { result.speculative = r.speculative; }
         result.timings.prepare_seconds         = r.prepare_seconds;
-        result.timings.prefill_seconds         = seconds(r.prefill_start, r.prefill_end);
+        result.timings.vision_seconds          = r.vision_seconds;
+        result.timings.prefill_seconds = seconds(r.prefill_start, r.prefill_end) - r.vision_seconds;
         result.timings.decode_seconds          = seconds(r.prefill_end, r.last_token);
         result.timings.first_token_seconds = r.prepare_seconds + seconds(r.submitted, r.first_token);
         if (r.observation.phase_timings) {
@@ -1464,6 +1573,7 @@ struct DeepSeekV41Core::Impl {
             if (from_store > 0) {
                 restore_stored(r.slot, image);
                 slot.fed     = stored[image].tokens;
+                slot.media   = stored[image].media;
                 r.reuse_path = stored[image].path;
                 r.reused = r.prefilled = from_store;
                 std::lock_guard lock(stats_mutex);
@@ -1486,20 +1596,26 @@ struct DeepSeekV41Core::Impl {
             next_branches(r, executor.options().prefill_chunk - n, branch_tokens, lengths);
         }
         if (lengths.empty()) {
-            executor.forward(r.slot, chunk, 1);
+            executor.forward(r.slot, chunk, 1, chunk_images(r, r.prefilled, r.prefilled + n));
         } else {
             executor.forward_prompt_branches(r.slot, chunk, branch_tokens, lengths);
         }
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
+        for (const MediaMark& mark : r.media) {
+            if (mark.begin >= r.prefilled && mark.begin < r.prefilled + n) {
+                slot.media.push_back(mark);
+            }
+        }
         r.prefilled += n;
         r.progress = Clock::now();
         if (reuse_prefixes && r.reusable &&
             std::binary_search(r.shared_at.begin(), r.shared_at.end(), r.prefilled)) {
-            store_image(r.slot, slot.fed, nullptr, PrefixReusePath::SharedStablePrefix);
+            store_image(r.slot, slot.fed, slot.media, nullptr, PrefixReusePath::SharedStablePrefix);
         }
         if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at && r.prefilled < prompt_n) {
             executor.snapshot(r.slot, slot.snapshot);
-            slot.anchor = slot.fed;
+            slot.anchor       = slot.fed;
+            slot.anchor_media = slot.media;
         }
         if (r.observation.prompt_progress) {
             CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
@@ -1515,12 +1631,47 @@ struct DeepSeekV41Core::Impl {
             r.cv.notify_all();
         }
         if (r.prefilled < prompt_n) { return; }
+        r.image_rows.clear();
         if (!lengths.empty()) {
             read_branches(request, lengths);
             return;
         }
         if (r.branches) { return; } // the next steps run the branches
         finish_prompt(request);
+    }
+
+    // The image rows of prompt tokens [begin, end) in row order: each image's span, encoded once
+    // when a chunk first reaches it, in pieces where chunks or spans divide it.
+    std::vector<models::deepseek_v41::ImageRows> chunk_images(Request& r, std::uint32_t begin,
+                                                              std::uint32_t end) {
+        std::vector<models::deepseek_v41::ImageRows> out;
+        if (r.media.empty()) { return out; }
+        const auto& data         = models::qwen3_5::PreparedPromptAccess::view(r.prompt);
+        const std::size_t hidden = instance.model->config().hidden_size;
+        r.image_rows.resize(data.vision_items.size());
+        for (std::size_t i = 0; i < data.vision_items.size(); ++i) {
+            const auto& item = data.vision_items[i];
+            if (item.token_spans.size() != 1) {
+                throw std::logic_error("deepseek_v41: an image without one span");
+            }
+            const auto& span        = item.token_spans.front();
+            const std::size_t first = std::max<std::size_t>(span.begin, begin);
+            const std::size_t last  = std::min<std::size_t>(span.begin + span.count, end);
+            if (first >= last) { continue; }
+            std::vector<std::uint16_t>& rows = r.image_rows[i];
+            if (rows.empty()) {
+                const auto start = Clock::now();
+                rows.resize(span.count * hidden);
+                instance.executor->encode_image(data.media_payloads.at(i)->span(),
+                                                item.grid.width, item.grid.height, rows);
+                r.vision_seconds += seconds(start, Clock::now());
+            }
+            out.push_back({.row        = static_cast<std::uint32_t>(first - begin),
+                           .embeddings = std::span<const std::uint16_t>(rows).subspan(
+                               (first - span.begin) * hidden, (last - first) * hidden)});
+        }
+        std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.row < b.row; });
+        return out;
     }
 
     // One step of a branched read: the current branch's next tokens, from the snapshot at the
@@ -1543,7 +1694,8 @@ struct DeepSeekV41Core::Impl {
                     throw std::logic_error("a branched read lost the state at its prompt's end");
                 }
                 executor.restore(r.slot, slot.snapshot);
-                slot.fed = slot.anchor;
+                slot.fed   = slot.anchor;
+                slot.media = slot.anchor_media;
             }
             branch_pass(request);
             return;
@@ -1554,14 +1706,16 @@ struct DeepSeekV41Core::Impl {
             if (slot.fed == r.prompt_tokens) {
                 if (slot.anchor != slot.fed) {
                     executor.snapshot(r.slot, slot.snapshot);
-                    slot.anchor = slot.fed;
+                    slot.anchor       = slot.fed;
+                    slot.anchor_media = slot.media;
                 }
             } else {
                 if (slot.anchor != r.prompt_tokens) {
                     throw std::logic_error("a branched read lost the state at its prompt's end");
                 }
                 executor.restore(r.slot, slot.snapshot);
-                slot.fed = slot.anchor;
+                slot.fed   = slot.anchor;
+                slot.media = slot.anchor_media;
             }
         }
         const std::uint32_t n = prefill_step_tokens(r);
@@ -2295,6 +2449,8 @@ struct DeepSeekV41Core::Impl {
         executor.reset(0);
         slots[0].fed.clear();
         slots[0].anchor.clear();
+        slots[0].media.clear();
+        slots[0].anchor_media.clear();
         std::vector<float> out;
         out.reserve(n - first_target);
         for (std::uint32_t at = 0; at + 1 < n; at += chunk) {
@@ -2478,7 +2634,21 @@ DeepSeekV41Core::make_request(GroupMember& member, std::optional<std::uint32_t>&
     {
         const auto& data     = models::qwen3_5::PreparedPromptAccess::view(prompt);
         const auto& identity = data.identity;
-        if (data.has_media()) { throw std::invalid_argument("DeepSeek-V4.1 reads text prompts only"); }
+        if (options.execution.branches && data.has_media()) {
+            throw std::invalid_argument("a branched read needs a text prompt");
+        }
+        if (data.has_media() && !impl_->instance.executor->vision()) {
+            throw std::invalid_argument("Vision is disabled for this Engine");
+        }
+        for (const auto& item : data.vision_items) {
+            for (const auto& span : item.token_spans) {
+                request->media.push_back(MediaMark{.begin = std::uint32_t(span.begin),
+                                                   .count = std::uint32_t(span.count),
+                                                   .key   = image_key(item)});
+            }
+        }
+        std::sort(request->media.begin(), request->media.end(),
+                  [](const MediaMark& a, const MediaMark& b) { return a.begin < b.begin; });
         const auto prompt_n  = static_cast<std::uint32_t>(request->prompt_tokens.size());
         request->reusable   = identity.reusable;
         request->disposable = data.tap_hints.disposable;
@@ -2636,6 +2806,20 @@ MemorySummary DeepSeekV41Core::memory_summary() const {
         memory.experts.cache_bytes + memory.experts.bank_bytes + memory.experts.metadata_bytes;
     out.available_after_weights_bytes = impl_->instance.free_after_weights;
     out.available_after_startup_bytes = impl_->instance.free_after_startup;
+    if (impl_->instance.vision_budget > 0) {
+        const bool pinned = impl_->instance.model->vision_placement() ==
+                            models::deepseek_v41::VisionPlacement::Pinned;
+        VisionWorkspaceMemorySummary vision{
+            .aggregate_prompt_tokens = impl_->max_context,
+            .max_item_tokens         = impl_->instance.vision_budget,
+            .encode_peak_bytes       = memory.vision_encode_bytes,
+            .residency = pinned ? VisionResidency::Overlay : VisionResidency::Resident};
+        if (pinned) {
+            vision.window_capacity_bytes = memory.vision_owned_bytes;
+            vision.pinned_weight_bytes   = stats.pinned_bytes - impl_->instance.model->expert_pinned_bytes();
+        }
+        out.vision_workspace = vision;
+    }
     return out;
 }
 

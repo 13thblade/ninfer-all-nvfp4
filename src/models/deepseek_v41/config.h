@@ -95,9 +95,34 @@ struct DSparkConfig {
     std::vector<std::uint32_t> target_layers;
 };
 
+// The vision tower (the `vision` component): a ViT of num_hidden_layers blocks of hidden_size over
+// patches of patch_size pixels (2D-rotated heads of hidden_size / num_attention_heads values, a
+// SiLU-gated MLP of intermediate_size), then an aligner over downsample_ratio x downsample_ratio
+// cells of the patch grid into the text model's width. An image of n_h x n_w aligner rows takes
+// span_tokens(n_h, n_w) prompt positions: the start row, each grid row's rows and a newline row,
+// the end row, every one carrying image_token_id. max_image_tokens bounds a span and min_pixels
+// the image's area before planning (image_processor.py).
+struct VisionConfig {
+    std::uint32_t num_hidden_layers = 0, hidden_size = 0, num_attention_heads = 0,
+                  intermediate_size = 0, patch_size = 0, downsample_ratio = 0,
+                  max_image_tokens = 0, min_pixels = 0, projection_dim = 0;
+    float rope_theta = 0, rms_norm_eps = 0;
+    std::int32_t image_token_id = 0;
+
+    [[nodiscard]] std::uint32_t head_dim() const noexcept { return hidden_size / num_attention_heads; }
+    [[nodiscard]] std::uint32_t patch_features() const noexcept { return 3 * patch_size * patch_size; }
+    [[nodiscard]] std::uint32_t merged_features() const noexcept {
+        return hidden_size * downsample_ratio * downsample_ratio;
+    }
+    [[nodiscard]] static std::uint32_t span_tokens(std::uint32_t rows, std::uint32_t columns) noexcept {
+        return rows * (columns + 1) + 2;
+    }
+};
+
 // Throws artifact::ArtifactError naming the field that is missing, malformed or outside the
 // implemented geometry.
 [[nodiscard]] TextConfig parse_text_config(const artifact::Json& value);
 [[nodiscard]] DSparkConfig parse_dspark_config(const artifact::Json& value, const TextConfig& text);
+[[nodiscard]] VisionConfig parse_vision_config(const artifact::Json& value, const TextConfig& text);
 
 } // namespace ninfer::models::deepseek_v41
