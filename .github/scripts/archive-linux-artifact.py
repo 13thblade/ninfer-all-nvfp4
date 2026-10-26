@@ -55,6 +55,23 @@ def archive(api, manifest, revision, run_id):
     print(json.dumps({"state": "verified", "prefix": base}), flush=True)
 
 
+def failure(error):
+    """Describe a failed backup by its HTTP status and the Hub's message, without signed URLs."""
+    text = type(error).__name__
+    response = getattr(error, "response", None)
+    if response is None:
+        return text
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    message = body.get("error") if isinstance(body, dict) else None
+    text += f", HTTP {response.status_code}"
+    if isinstance(message, str):
+        text += ": " + re.sub(r"https?://\S+", "<url>", message)[:300]
+    return text
+
+
 def main():
     workflow = os.environ.get("GITHUB_WORKFLOW_REF", "").split("@", 1)
     allowed = ("iamwavecut/ninfer-all/.github/workflows/native-release.yml",
@@ -79,8 +96,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        # Storage errors may contain signed URLs.
-        print(f"::error::Linux artifact backup failed ({type(error).__name__})", flush=True)
+        print(f"::error::Linux artifact backup failed ({failure(error)})", flush=True)
         sys.exit(1)
     finally:
         done.set()

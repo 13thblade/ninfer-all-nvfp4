@@ -142,9 +142,10 @@ to `nvprune`, which accepts static archives and relocatable objects, so it retai
 Compilation uses an object library with the static build's target name and flags; a separate
 target links those objects into the DLL. DLL export definitions therefore do not affect the
 CUDA compilation target.
-The DLL also owns the device-tier probe and its cache, compiled as a separate object library.
-Both the GGML bridge and static Ops call its exported functions, so there is one cache and no
-circular library dependency. With the DLL option off, the probe remains in the Ops archive.
+The DLL also owns the device-tier probe with its cache and the installed device route profiles,
+each compiled as a separate object library. Both the GGML bridge and static Ops call their exported
+functions, so there is one tier cache, one profile store and no circular library dependency. With
+the DLL option off, both remain in the Ops archive.
 The compile PDB is fixed to `CMakeFiles/ninfer_ggml_quants.dir/ninfer_ggml_quants.pdb` in both modes:
 CMake otherwise changes `/Fd`
 from the static library's named PDB to a directory for object libraries, changing the cache key.
