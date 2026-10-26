@@ -169,6 +169,46 @@ void overlay_placement(DeviceContext& device) {
     {
         Reader reader(fixture.entry);
         Binder binder(reader);
+        const auto row  = binder.parameter("row", {1, 130}, Residency::Mapped);
+        const auto plan = std::move(binder).finish();
+        require(plan.device_capacity(0) == 0 && plan.pinned_objects.empty() &&
+                    plan.mapped_objects.size() == 1 && plan.mapped_capacity_bytes == 528,
+                "mapped residency did not plan the mapped block");
+        auto backing = materialize(reader, MaterializationPlan(plan), device);
+        require(backing.stats().mapped_bytes == 528 && backing.stats().pinned_bytes == 528 &&
+                    backing.pinned_block().empty() && !backing.has_device(reader.find("q5")),
+                "mapped object received other backing or was not accounted");
+        const auto view   = bind_view(row, backing);
+        const auto* alias = view.parts.front().parent->data;
+        cudaPointerAttributes attributes{};
+        CUDA_CHECK(cudaPointerGetAttributes(&attributes, alias));
+        require(attributes.type == cudaMemoryTypeHost && attributes.devicePointer == alias,
+                "the mapped view does not address the device's mapping of page-locked memory");
+        // Read the bytes back through the device address the kernels use.
+        std::vector<std::byte> read(528);
+        CUDA_CHECK(cudaMemcpy(read.data(), alias, read.size(), cudaMemcpyDeviceToHost));
+        require(std::equal(read.begin(), read.end(), fixture.payload.begin() + 256),
+                "mapped block content differs from the artifact payload");
+    }
+    {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        (void)binder.parameter("matrix", {2, 130});
+        binder.require_mapped(reader.find("q5"));
+        rejects([&] { (void)std::move(binder).finish(); },
+                "an object with both device and mapped placement was accepted");
+    }
+    {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        binder.require_pinned(reader.find("q5"));
+        binder.require_mapped(reader.find("q5"));
+        rejects([&] { (void)std::move(binder).finish(); },
+                "an object with both pinned and mapped placement was accepted");
+    }
+    {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
         const auto row = binder.parameter("row", {1, 130}, Residency::Registered);
         (void)binder.parameter("matrix", {2, 130}, Residency::Registered);
         const auto* original = binder.host_object(reader.find("q5")).data();

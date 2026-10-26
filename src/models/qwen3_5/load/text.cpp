@@ -377,8 +377,12 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
         out.tensor_shares = plan_tensor_shares(b, config, options);
         out.rank_layers.resize(options.ranks - 1);
     }
-    out.token_embedding =
-        b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
+    // The table is only gathered, a row per token, so a host table costs each step's rows over
+    // the bus and nothing else; every reader (prefill, decode, MTP, drafters) shares this one.
+    out.token_embedding = b.parameter(
+        "text/token_embedding", {config.vocab_size, config.hidden_size}, {}, {},
+        options.embedding_residency == EmbeddingResidency::Host ? artifact::Residency::Mapped
+                                                                : artifact::Residency::Device);
     std::vector<std::string> head_inputs{"text/final_hidden"};
     if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled()) {
         head_inputs.push_back(std::string(options.speculative_component()) + "/final_hidden");

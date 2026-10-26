@@ -56,6 +56,7 @@ struct Options {
     bool lm_head_q6     = false;
     bool embedding_q4   = false;
     bool embedding_q6   = false;
+    ninfer::EmbeddingResidency embedding_residency = ninfer::EmbeddingResidency::Device;
     bool mtp_experts_q4 = false;
     bool gdn_state_fp16 = false;
     bool rope_yarn      = false;

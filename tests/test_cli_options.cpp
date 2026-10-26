@@ -148,6 +148,17 @@ int run_tests() {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-cpu-threads", threads});
         }), "CLI accepted an invalid hybrid CPU worker count");
     }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).embedding_residency ==
+                              ninfer::EmbeddingResidency::Device &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--embedding-residency", "host"})
+                                  .embedding_residency == ninfer::EmbeddingResidency::Host,
+                      "CLI did not default the embedding to the device or keep a host one");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                       "--embedding-residency", "disk"});
+                      }),
+                      "CLI accepted an invalid embedding residency");
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-residency",
                              "host"}).hybrid_experts.tail_skip_rank == 0 &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
@@ -362,6 +373,7 @@ int run_tests() {
                                         "--draft-tokens",
                                         "--embedding-q4",
                                         "--embedding-q6",
+                                        "--embedding-residency",
                                         "--frequency-penalty",
                                         "--full-draft-head",
                                         "--gdn-state-fp16",

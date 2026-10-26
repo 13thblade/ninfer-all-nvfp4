@@ -54,6 +54,18 @@ int main() {
         try { (void)parse(full); } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "server accepted invalid draft confidence");
     }
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).embedding_residency ==
+                              ninfer::EmbeddingResidency::Device &&
+                          parse({"ninfer-serve", "model.ninfer", "--embedding-residency", "host"})
+                                  .embedding_residency == ninfer::EmbeddingResidency::Host,
+                      "server did not default the embedding to the device or keep a host one");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--embedding-residency", "ram"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted an invalid embedding residency");
+    }
     failures += check(!parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host"})
                                .hybrid_experts.dma_share.has_value(),
                       "server must default the expert DMA share to automatic");
@@ -1142,6 +1154,7 @@ int main() {
                                         "--draft-tokens",
                                         "--embedding-q4",
                                         "--embedding-q6",
+                                        "--embedding-residency",
                                         "--fast-prefill-kernel",
                                         "--frequency-penalty",
                                         "--full-draft-head",

@@ -160,9 +160,11 @@ private:
 
 // Registers an existing host allocation without moving its bytes. The allocation must outlive
 // the registration and every queued transfer; portable registration serves every device rank.
+// `mapped` also maps it into the device address space, for kernels that read it in place
+// (cudaHostGetDevicePointer gives the address they use).
 class HostMemoryRegistration {
 public:
-    HostMemoryRegistration(void* data, std::size_t bytes);
+    HostMemoryRegistration(void* data, std::size_t bytes, bool mapped = false);
     ~HostMemoryRegistration();
     HostMemoryRegistration(const HostMemoryRegistration&) = delete;
     HostMemoryRegistration& operator=(const HostMemoryRegistration&) = delete;
