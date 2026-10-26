@@ -191,9 +191,15 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
                              fourth == third &&
                              third.size() == 2 && third[1] == q[1] && q[0] > 0 &&
                              q[0] % 128 == 0 && third[0] % q[0] == 0;
-    require(dense || moe || dense_share, "input projection: unsupported logical projection geometry");
-    if (std::any_of(inputs.begin(), inputs.end(), gguf_parent) || dense_share) {
-        require(dense || dense_share, "input projection: GGUF parts need the dense geometry");
+    // A rank's share of an attention projection: whole KV heads of 256 rows and their query heads,
+    // a whole multiple of the KV rows.
+    const bool attention_share = attention && !dense && !moe && q.size() == 2 && k.size() == 2 &&
+                                 third == q && fourth == k && k[1] == q[1] && k[0] > 0 &&
+                                 k[0] % 256 == 0 && q[0] % k[0] == 0;
+    const bool share = dense_share || attention_share;
+    require(dense || moe || share, "input projection: unsupported logical projection geometry");
+    if (std::any_of(inputs.begin(), inputs.end(), gguf_parent) || share) {
+        require(dense || share, "input projection: GGUF parts need the dense geometry");
         const auto q = static_cast<std::int32_t>(matrix(inputs[0])[0]);
         const auto k = static_cast<std::int32_t>(matrix(inputs[1])[0]);
         if (attention) {
