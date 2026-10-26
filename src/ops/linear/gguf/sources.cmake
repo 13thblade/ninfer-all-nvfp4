@@ -64,7 +64,8 @@ if(NINFER_WINDOWS_KERNEL_DLL)
   # Compile independently of DLL-only definitions, preserving the static archive's cache identity.
   # Only linking changes. The bridge imports no global data or virtual tables.
   add_library(ninfer_ggml_quants_dll SHARED
-    $<TARGET_OBJECTS:ninfer_ggml_quants> $<TARGET_OBJECTS:ninfer_device_tier>)
+    $<TARGET_OBJECTS:ninfer_ggml_quants> $<TARGET_OBJECTS:ninfer_device_tier>
+    $<TARGET_OBJECTS:ninfer_device_route>)
   set_target_properties(ninfer_ggml_quants_dll PROPERTIES
     OUTPUT_NAME ninfer_ggml_quants WINDOWS_EXPORT_ALL_SYMBOLS ON
     LINKER_LANGUAGE CUDA CUDA_RUNTIME_LIBRARY Static
