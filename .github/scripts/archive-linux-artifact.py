@@ -1,4 +1,8 @@
-"""Preserve verified Linux release volumes in the private HF bucket before runner cleanup."""
+"""Preserve verified Linux release volumes in the private HF bucket before runner cleanup.
+
+Each branch keeps the newest complete backup of each artifact kind; hf-build-cache.py prune
+removes a branch's backups after it is merged or deleted.
+"""
 import hashlib
 import json
 import os
@@ -10,6 +14,7 @@ import threading
 import time
 
 BUCKET = "WaveCut/ninfer-cache"
+ROOT = "native-artifacts/v2/iamwavecut/ninfer-all"
 
 
 def digest(path):
@@ -17,9 +22,25 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def archive(api, manifest, revision, run_id):
+def retire_older(api, kind):
+    """Delete every backup of this kind older than its newest complete one."""
+    runs = {}
+    for entry in api.list_bucket_tree(BUCKET, prefix=kind + "/", recursive=True):
+        if entry.type == "file":
+            runs.setdefault(entry.path[len(kind) + 1:].partition("/")[0], []).append(entry.path)
+    complete = [int(run) for run, paths in runs.items()
+                if run.isdecimal() and f"{kind}/{run}/COMPLETE.json" in paths]
+    stale = [path for run, paths in runs.items() if complete and
+             (not run.isdecimal() or int(run) < max(complete)) for path in paths]
+    if stale:
+        api.batch_bucket_files(BUCKET, delete=stale)
+    return stale
+
+
+def archive(api, manifest, revision, run_id, ref):
     name = manifest.name.removeprefix("SHA256SUMS-").removesuffix(".txt")
-    if not re.fullmatch(r"ninfer-linux-x64-cuda(?:[0-9.]+-sm[0-9a-]+|12\.9-13\.4)-[0-9a-f]{12}", name):
+    match = re.fullmatch(r"(ninfer-linux-x64-cuda(?:[0-9.]+-sm[0-9a-]+|12\.9-13\.4))-[0-9a-f]{12}", name)
+    if not match:
         raise ValueError("Unexpected Linux artifact name")
     metadata = manifest.parent / name / "BUILD-INFO.json"
     info = json.loads(metadata.read_text())
@@ -36,7 +57,8 @@ def archive(api, manifest, revision, run_id):
         files.append((path, filename))
     if len(files) < 3:
         raise ValueError("Artifact contains no archive volumes")
-    base = f"native-artifacts/v1/iamwavecut/ninfer-all/{run_id}/{name}"
+    kind = f"{ROOT}/{hashlib.sha256(ref.encode()).hexdigest()[:20]}/{match[1]}"
+    base = f"{kind}/{run_id}"
     records = [{"name": name, "bytes": path.stat().st_size, "sha256": digest(path)}
                for path, name in files]
     api.batch_bucket_files(BUCKET, add=[(path, f"{base}/{name}") for path, name in files])
@@ -49,10 +71,15 @@ def archive(api, manifest, revision, run_id):
                 raise ValueError("HF artifact round-trip checksum mismatch")
             check.unlink()
     receipt = manifest.parent / f"HF-{name}.json"
-    receipt.write_text(json.dumps({"schema": 1, "run_id": run_id, "bucket": BUCKET,
+    receipt.write_text(json.dumps({"schema": 2, "run_id": run_id, "ref": ref, "bucket": BUCKET,
                                   "prefix": base, "verified_at": time.time(), "files": records}, indent=2) + "\n")
     api.batch_bucket_files(BUCKET, add=[(receipt, f"{base}/COMPLETE.json")])
     print(json.dumps({"state": "verified", "prefix": base}), flush=True)
+    try:
+        print(json.dumps({"state": "retired", "files": len(retire_older(api, kind))}), flush=True)
+    except Exception as error:
+        # The next complete backup of this kind retires these too.
+        print(f"::warning::Older Linux artifact backups remain ({type(error).__name__})", flush=True)
 
 
 def failure(error):
@@ -84,7 +111,7 @@ def main():
     if not api.bucket_info(BUCKET).private:
         raise ValueError("Artifact bucket must be private")
     manifest, = Path("dist").glob("SHA256SUMS-ninfer-linux-*.txt")
-    archive(api, manifest, os.environ["GITHUB_SHA"], os.environ["GITHUB_RUN_ID"])
+    archive(api, manifest, os.environ["GITHUB_SHA"], os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_REF"])
 
 
 if __name__ == "__main__":
