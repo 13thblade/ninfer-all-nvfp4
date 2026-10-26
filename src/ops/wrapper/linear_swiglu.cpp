@@ -287,12 +287,8 @@ namespace {
 // Two parents of a format whose Linear writes FP32 at any shape (a tensor-parallel rank's rows of
 // gate and up): each product unrounded, then SwiGLU rounds once, as the one-parent routes do.
 bool fp32_pair(QType gate, QType up) {
-    const auto row_split = [](QType format) {
-        return format == QType::Q4_G64_FP16 || format == QType::Q5_G64_FP16 ||
-               format == QType::Q6_G64_FP16 || format == QType::Q8_G32_FP16 ||
-               format == QType::BF16;
-    };
-    return row_split(gate) && row_split(up);
+    const auto packed = [](QType format) { return !is_gguf(format) && linear_writes_fp32(format); };
+    return packed(gate) && packed(up);
 }
 
 } // namespace
@@ -306,12 +302,20 @@ void linear_swiglu(const Tensor& x, const Weight& gate_weight, const Weight& up_
     }
     if (!fp32_pair(gate_weight.qtype, up_weight.qtype)) {
         throw std::invalid_argument(
-            "linear_swiglu: the two-parent form takes GGUF, BF16 or row-split Q4/Q5/Q6/Q8 parents");
+            "linear_swiglu: the two-parent form takes GGUF, BF16, row-split Q4/Q5/Q6/Q8/T2, FP8 or "
+            "NVFP4 parents");
     }
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16 || gate_weight.n != up_weight.n ||
         gate_weight.k != up_weight.k || x.ne[0] != gate_weight.k || out.ne[0] != gate_weight.n ||
         out.ne[1] != x.ne[1]) {
         throw std::invalid_argument("linear_swiglu: invalid two-parent shapes");
+    }
+    // One column through Q4 parents: both rows of a pair in one pass, as the one-parent GEMV.
+    if (x.ne[1] == 1 && !detail::sm70::covers(gate_weight, 1) &&
+        detail::q4_linear_swiglu_two_parent_gemv_supported(gate_weight, up_weight) &&
+        x.is_contiguous() && out.is_contiguous() && aligned_to(x.data, 16)) {
+        detail::q4_linear_swiglu_two_parent_gemv_launch(x, gate_weight, up_weight, out, stream);
+        return;
     }
     auto scope  = ws.scope();
     Tensor gate = ws.alloc(DType::FP32, {gate_weight.n, x.ne[1]});

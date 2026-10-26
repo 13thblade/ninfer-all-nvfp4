@@ -45,7 +45,7 @@ void mma(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
 template <class Output>
 Q5Launch select(std::int32_t tokens) {
     using namespace q5_instances;
-    if (tokens <= 1) return direct<DirectR1T1W4, Output>;
+    if (tokens <= 1) return direct<DirectR1T1W2U8, Output>;
     if (tokens <= 2) return direct<DirectR1T2W2, Output>;
     if (tokens <= 3) return direct<DirectR1T3W2, Output>;
     if (tokens <= 4) return direct<DirectR1T4W2, Output>;

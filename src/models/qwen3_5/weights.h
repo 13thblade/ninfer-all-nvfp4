@@ -29,8 +29,11 @@ struct WeightUse {
     std::string input;
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
     std::optional<float> activation_input_divisor;
-    // BF16 [K] sign vector of a Hadamard-rotated matrix, bound as its own device weight.
+    // BF16 sign vector of a Hadamard-rotated matrix, bound as its own device weight. The Use reads
+    // its K elements from `hadamard_begin`: a tensor-parallel piece of a matrix's columns turns its
+    // own whole 1024-column blocks of the input.
     std::optional<WeightId> hadamard_signs;
+    std::uint64_t hadamard_begin = 0;
     // INT32 [K] input gather of a GGUF matrix stored over permuted input columns.
     std::optional<WeightId> input_columns;
 };

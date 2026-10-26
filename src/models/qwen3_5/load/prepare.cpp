@@ -3,10 +3,12 @@
 #include "artifact/selection.h"
 #include "artifact/transcode.h"
 #include "artifact/views.h"
+#include "ninfer/ops/linear.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -210,11 +212,22 @@ WeightId Bindings::piece(const std::string& name, const artifact::Shape& shape,
     PendingWeight pending;
     pending.reference = {name + "@" + std::to_string(rank), std::move(piece_shape),
                          std::move(binding), artifact::Residency::Device};
-    add_uses(pending, name, inputs, piece.cut == ParameterPiece::Cut::Rows);
+    add_uses(pending, name, inputs, piece.cut == ParameterPiece::Cut::Rows, false);
     for (WeightUse& use : pending.uses) {
-        if (use.hadamard_signs) {
-            throw std::invalid_argument(name + "@" + use.input +
-                                        ": tensor parallelism cannot split a rotated input");
+        // A rotated input turns in blocks of 1024 columns: a row piece reads the whole input and a
+        // column piece whole blocks of it, each with its own slice of the whole sign vector, which
+        // the model copies to every rank that reads it (AuxiliaryReplicas).
+        for (const auto& [role, signs] : binder.use(name, use.input).auxiliaries) {
+            if (role != "hadamard_signs") { continue; }
+            const auto [begin, end] = piece.cut == ParameterPiece::Cut::Rows
+                                          ? std::pair<std::uint64_t, std::uint64_t>{0, columns}
+                                          : piece.ranges.front();
+            if (!matrix || piece.ranges.size() != 1 || begin % 1024 != 0 || end % 1024 != 0) {
+                throw std::invalid_argument(name + "@" + use.input +
+                                            ": a rotated input splits at whole 1024-column blocks");
+            }
+            use.hadamard_signs = hadamard_signs(signs, columns, name + "@" + use.input);
+            use.hadamard_begin = begin;
         }
         // A row piece reads the whole input and keeps the whole gather.
         if (gather && piece.cut == ParameterPiece::Cut::Columns) {
@@ -239,15 +252,19 @@ std::vector<bool> Bindings::column_ends(const std::string& name, const artifact:
     }
     if (shape.size() != 2) { throw std::invalid_argument(name + ": column ends need a matrix"); }
     const std::uint64_t columns = shape[1];
-    // Columns per indivisible run of stored bytes in every part.
+    // Columns per indivisible run of stored bytes in every part, per K step of the share's route,
+    // and per block of a rotated input's Hadamard transform.
     std::uint64_t unit = 1;
     for (const auto& part : found->second.parts) {
-        unit = std::max(unit, artifact::selection_column_unit(binder.reader().geometry(part.object)));
+        const auto stored = binder.reader().geometry(part.object);
+        unit = std::lcm(unit, artifact::selection_column_unit(stored));
+        unit = std::lcm(unit, ops::linear_share_units(stored.format).columns);
     }
     std::optional<artifact::Binding> gather;
     for (const auto& input : inputs) {
         for (const auto& [role, binding] : binder.use(name, input).auxiliaries) {
             if (role == "input_columns") { gather = binding; }
+            if (role == "hadamard_signs") { unit = std::lcm<std::uint64_t>(unit, 1024); }
         }
     }
     std::vector<bool> out(columns + 1, false);
@@ -300,7 +317,8 @@ std::vector<bool> Bindings::row_ends(const std::string& name, const artifact::Sh
         }
         const std::uint64_t first = part.begin / columns;
         const std::uint64_t count = (part.end - part.begin) / columns;
-        const std::uint64_t unit  = artifact::selection_row_unit(stored);
+        const std::uint64_t unit  = std::lcm(artifact::selection_row_unit(stored),
+                                             ops::linear_share_units(stored.format).rows);
         if (logical + count > shape[0]) {
             throw artifact::ArtifactError(name + ": parts exceed the parameter's rows");
         }
@@ -317,7 +335,8 @@ std::vector<bool> Bindings::row_ends(const std::string& name, const artifact::Sh
 }
 
 void Bindings::add_uses(PendingWeight& pending, const std::string& name,
-                        const std::vector<std::string>& inputs, bool whole_gathers) {
+                        const std::vector<std::string>& inputs, bool whole_gathers,
+                        bool whole_signs) {
     for (const auto& input : inputs) {
         const auto& use = binder.use(name, input);
         if (!use.activation_policy) {
@@ -347,6 +366,7 @@ void Bindings::add_uses(PendingWeight& pending, const std::string& name,
 #endif
         for (const auto& [role, binding] : use.auxiliaries) {
             if (role == "hadamard_signs") {
+                if (!whole_signs) { continue; }
                 if (pending.reference.shape.size() != 2) {
                     throw artifact::ArtifactError(name + "@" + input +
                                                   ": Hadamard signs require a matrix");

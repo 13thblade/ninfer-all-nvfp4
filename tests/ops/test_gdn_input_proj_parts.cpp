@@ -71,14 +71,15 @@ int main() {
     }
     try {
         // A rank's 4 key heads of 128 (q and k 512 rows), 12 value heads (1536 rows, split in two
-        // parts of different formats) and z.
+        // parts of different formats) and z (two parts, one ternary).
         std::vector<Part> parts;
-        parts.reserve(5);
+        parts.reserve(6);
         parts.emplace_back(QType::Q4_G64_FP16, 512, 11U, 0, 0);
         parts.emplace_back(QType::Q5_G64_FP16, 512, 13U, 0, 512);
         parts.emplace_back(QType::BF16, 768, 17U, 0, 1024);
         parts.emplace_back(QType::Q6_G64_FP16, 768, 19U, 0, 1792);
-        parts.emplace_back(QType::Q8_G32_FP16, 1536, 23U, 1, 0);
+        parts.emplace_back(QType::Q8_G32_FP16, 768, 23U, 1, 0);
+        parts.emplace_back(QType::T2_G128_FP16, 768, 29U, 1, 768);
         constexpr std::int32_t kQkv = 2560;
         constexpr std::int32_t kZ   = 1536;
         ops::PartProjectionWeights weights;

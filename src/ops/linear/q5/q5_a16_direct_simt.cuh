@@ -43,7 +43,8 @@ q5_a16_direct_simt_kernel(
     const int iterations    = (logical_k + BK - 1) / BK;
     const auto group0       = std::int64_t(R == 1 || row < rows ? row : 0) * (padded_k / 64);
     float acc[T]            = {};
-    constexpr int kUnroll   = Schedule::kStaticK ? (Schedule::kStaticK + BK - 1) / BK : 1;
+    constexpr int kUnroll   = Schedule::kStaticK ? (Schedule::kStaticK + BK - 1) / BK
+                                                   : Schedule::kRuntimeUnroll;
 #pragma unroll kUnroll
     for (int iteration = 0; iteration < iterations; ++iteration) {
 #pragma unroll

@@ -12,11 +12,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
-bool linear_part(QType format) {
-    return format == QType::BF16 || format == QType::Q4_G64_FP16 ||
-           format == QType::Q5_G64_FP16 || format == QType::Q6_G64_FP16 ||
-           format == QType::Q8_G32_FP16;
-}
+bool linear_part(QType format) { return !is_gguf(format) && linear_writes_fp32(format); }
 
 // Whether a part's rows of its output are one contiguous block: one column, or the whole output.
 bool contiguous_rows(const Tensor& out, const ProjectionPart& part) {
@@ -30,8 +26,8 @@ bool gguf_parts(const PartProjectionWeights& weights) {
     const bool gguf = is_gguf(weights.parts.front().weight.qtype);
     for (const auto& part : weights.parts) {
         if (is_gguf(part.weight.qtype) != gguf || (!gguf && !linear_part(part.weight.qtype))) {
-            throw std::invalid_argument("a part projection takes all GGUF parts, or all BF16 and "
-                                        "row-split Q4/Q5/Q6/Q8 parts");
+            throw std::invalid_argument("a part projection takes all GGUF parts, or all BF16, "
+                                        "row-split, FP8 and NVFP4 parts");
         }
     }
     return gguf;

@@ -41,7 +41,7 @@ struct PairedProjectionWeights {
 
 // An input projection over parts that no single native route reads as one parent: GGUF matrices,
 // which may sit in different parents of different block types, or a tensor-parallel rank's pieces
-// of BF16 or row-split Q4/Q5/Q6/Q8 projections. Each part is rows of one parent landing at `row` of
+// of BF16, row-split, FP8 or NVFP4 projections. Each part is rows of one parent landing at `row` of
 // output `output`: for a GDN projection 0 = q/k/v and 1 = z; for an attention projection 0 = query,
 // 1 = gate, 2 = key and 3 = value. The parts are all GGUF or all of the other formats.
 struct ProjectionPart {

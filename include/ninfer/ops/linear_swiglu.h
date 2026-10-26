@@ -88,8 +88,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
  * Two-parent form: out[:,t] = silu(gate_weight * x[:,t]) * (up_weight * x[:,t]) for gate and up
  * matrices of one shape [N,K] stored as separate parents. Registered for GGUF block matrices, whose
  * two halves may use different block types; their products quantize the activation to q8_1 as
- * llama.cpp does, whatever the policy. BF16 and RowSplit Q4/Q5/Q6/Q8 parents (a tensor-parallel
- * rank's rows of gate and up, any N, K a multiple of 128) take Linear's FP32 results and SwiGLU
+ * llama.cpp does, whatever the policy. BF16, RowSplit, FP8 and NVFP4 parents (a tensor-parallel
+ * rank's rows of gate and up, at Linear's runtime shapes) take Linear's FP32 results and SwiGLU
  * rounds once, under Linear's criterion for each product. Size the workspace with
  * linear_swiglu_pair_workspace_capacity_bytes().
  */

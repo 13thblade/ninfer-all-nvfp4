@@ -1,7 +1,9 @@
-// The row-split formats' runtime-shape routes: a tensor-parallel rank's share of a projection, whose
+// The packed formats' runtime-shape routes: a tensor-parallel rank's share of a projection, whose
 // rows (and, for an output projection, K) depend on the split, in BF16 and as an FP32 partial sum.
 // The shapes are Qwen3.8-27B's at a 3:1 split: GDN key heads 12/4 (q and k 1536/512 rows, v and z
-// 4608/1536, the output projection's K the same), FFN rows 13056/4352.
+// 4608/1536, the output projection's K the same), FFN rows 13056/4352. T2, FP8 and NVFP4 shares are
+// whole K slabs of 512 or 256 columns (ops::linear_share_units), and a rotated input's whole
+// 1024-column blocks: their FFN rows split 13312/4096.
 
 #include "ops/linear/linear_test_common.h"
 
@@ -55,6 +57,29 @@ int conformance(const char* label, WeightGenerator generator, std::uint32_t seed
     return failures;
 }
 
+int slab_conformance(const char* label, WeightGenerator generator, std::uint32_t seed) {
+    int failures = 0;
+    failures += run_shape(label, ActivationCompute::A16, generator,
+                          {13312, 5120, seed, Comparison::SampledRows, false, kWidths,
+                           ActivationSigns::Centered, DType::FP32});
+    failures += run_shape(label, ActivationCompute::A16, generator,
+                          {5120, 4096, seed + 1, Comparison::SampledRows, false, kWidths,
+                           ActivationSigns::Biased, DType::FP32});
+    failures += run_shape(label, ActivationCompute::A16, generator,
+                          {5120, 1536, seed + 2, Comparison::SampledRows, true, kWidths,
+                           ActivationSigns::Centered, DType::FP32});
+    failures += run_shape(label, ActivationCompute::A16, generator,
+                          {4608, 5120, seed + 3, Comparison::SampledRows, false, kWidths});
+    failures += run_shape(label, ActivationCompute::A16, generator,
+                          {512, 5120, seed + 4, Comparison::SampledRows, false, kWidths});
+    for (const DType out : {DType::BF16, DType::FP32}) {
+        failures += run_shape(label, ActivationCompute::A16, generator,
+                              {384, 1024, seed + 5, Comparison::Full, true, kSmall,
+                               ActivationSigns::Centered, out});
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -76,6 +101,20 @@ int main() {
         };
         for (const auto& format : formats) {
             const int format_failures = conformance(format.label, format.generator, format.seed);
+            std::cout << (format_failures == 0 ? "OK " : "FAIL ") << format.label << '\n';
+            failures += format_failures;
+        }
+        const struct {
+            const char* label;
+            WeightGenerator generator;
+            std::uint32_t seed;
+        } slab_formats[] = {
+            {"T2_A16 runtime shape", make_t2_g128_fp16_weight, 911U},
+            {"FP8_A16 runtime shape", make_fp8_weight, 1013U},
+            {"NVFP4_A16 runtime shape", make_nvfp4_weight, 1117U},
+        };
+        for (const auto& format : slab_formats) {
+            const int format_failures = slab_conformance(format.label, format.generator, format.seed);
             std::cout << (format_failures == 0 ? "OK " : "FAIL ") << format.label << '\n';
             failures += format_failures;
         }

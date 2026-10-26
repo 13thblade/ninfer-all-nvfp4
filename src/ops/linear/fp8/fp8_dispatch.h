@@ -18,6 +18,12 @@ namespace ninfer::ops::detail {
                                                               std::int32_t min_tokens,
                                                               std::int32_t max_tokens);
 
+// Whether a table names [N,K]. Every other shape, and every FP32 result, runs the runtime-shape A16
+// route (fp8_general.cu): whole tiles of `kFp8ShareUnits`, the policy's other routes unused.
+[[nodiscard]] bool fp8_registered(std::int32_t output_rows, std::int32_t input_rows);
+inline constexpr LinearShareUnits kFp8ShareUnits{64, 512};
+void fp8_general_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
+
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                   WorkspaceArena* workspace, cudaStream_t stream);
 

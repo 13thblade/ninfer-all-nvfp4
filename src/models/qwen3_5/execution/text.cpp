@@ -1554,10 +1554,6 @@ void TextContext::run_staged(Tensor& x, Phase ph, Tap& tap) {
 // contributor. The replicas stay equal, and rank 0's ends the pass where one device's would.
 template <class Tap>
 void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
-    if constexpr (Tap::enabled) {
-        (void)tap;
-        throw std::logic_error("layer feature taps are not available with tensor parallelism");
-    }
     StageRuntime& runtime            = *stage_runtime_;
     auto& tp                         = *runtime.tensor_parallel;
     TensorParallelExchange& exchange = *tp.exchange;
@@ -1719,6 +1715,11 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                              ? next_projection_hints(static_cast<int>(layer))
                              : ops::SparseMoeHints{});
             });
+            // Rank 0's replica is one device's residual after the layer: a masked drafter's
+            // target features are tapped from it.
+            if constexpr (Tap::enabled) {
+                tap.capture_layer(static_cast<int>(layer), x, entry_stream);
+            }
         } catch (const std::exception& error) {
             throw std::runtime_error("text/layers/" + std::to_string(layer) +
                                      (ph == Phase::Prefill ? " prefill" : " verify") +

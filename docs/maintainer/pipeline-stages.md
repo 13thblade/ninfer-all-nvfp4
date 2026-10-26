@@ -250,8 +250,11 @@ weights for every token.
   piece of a stored object: a row range and column ranges (`artifact/selection.h`), gathered from
   the file as byte runs at upload, so its bounds must fall on whole stored blocks (columns: one for
   a contiguous or row-scaled matrix, the group for ggml blocks, 128 for row-split groups, 64 for
-  NVFP4; rows: NVFP4's 128-row scale tiles and its divisor rows), and a projection whose stored
-  columns are gathered (GSQ-RCO) must not cut a block the gather reads. `Bindings::column_ends` and
+  NVFP4; rows: NVFP4's 128-row scale tiles and its divisor rows), on whole tiles of the share's
+  Linear route (`ops::linear_share_units`: T2 32 rows and 512 columns, FP8 64 and 512, NVFP4 128 and
+  256) and, for a Hadamard-rotated input, on whole 1024-column blocks of the rotation, and a
+  projection whose stored columns are gathered (GSQ-RCO) must not cut a block the gather reads.
+  `Bindings::column_ends` and
   `Bindings::row_ends` list those positions per tensor; the head ends every layer's GDN projections
   allow and the row ends every FFN allows are the candidates, and `split_shares` (`core/tensor_split.h`)
   places each rank's end at the candidate nearest its weight's cumulative target. The stored
@@ -275,16 +278,21 @@ weights for every token.
   projection's output: the shares' partial sums are added, then rounded once, where one device
   rounds the full sum. Logits are close, not identical, so greedy text can diverge where two tokens
   tie closely.
-- **Coverage.** GGUF weights, BF16 and row-split Q4/Q5/Q6/Q8 weights, any split the stored blocks
-  allow on two to eight ranks, cards of different models where the build runs on each, MTP. A
-  share's projections have no tuned shapes, so they take Linear's runtime-shape routes (the
-  whole-layer kernel templates with the rows and K read from the operands; K a multiple of 128):
-  the GDN input projection as parts, one Linear per piece into the q/k/v and z planes; gate and up as
-  two FP32 products that SwiGLU rounds once; the output and down projections as FP32 partials.
-  Refused: MoE models, a masked drafter (DFlash, DFlash2), `--stage-layers`, Hadamard-rotated
-  weights, T2, NVFP4 and FP8 weights, Vision overlay, Flash-Next, Gemma 4, Flint and
-  DeepSeek-V4.1-Flash. Ranks may share a device (`--devices 0,0`), which is how the path is tested
-  on one card.
+- **Coverage.** Every weight format of a dense Qwen3.5-core model: GGUF, BF16, row-split
+  Q4/Q5/Q6/Q8 and T2, FP8 and NVFP4, Hadamard-rotated or not; any split the stored blocks allow on
+  two to eight ranks, cards of different models where the build runs on each; MTP, the masked
+  drafters (DFlash, DFlash2: rank 0's replica after each layer is the residual one device taps) and
+  Vision (on rank 0). A share's projections have no tuned shapes, so they take Linear's
+  runtime-shape routes (the shape tables' kernel templates with the rows and K read from the
+  operands; FP8 and NVFP4 with A16 compute whatever the policy): the GDN input projection as parts,
+  one Linear per piece into the q/k/v and z planes; gate and up as two FP32 products that SwiGLU
+  rounds once; the output and down projections as FP32 partials. A rotated share turns its whole
+  input, or its own 1024-column blocks of it, with its slice of the sign vector
+  (`WeightUse::hadamard_begin`) in its own device's copy (`AuxiliaryReplicas`), so a rank reads no
+  other card's memory. Refused: MoE models,
+  `--stage-layers`, `--vision-residency overlay` (as for pipeline stages), Flash-Next, Gemma 4, Flint
+  and DeepSeek-V4.1-Flash. Ranks may share a device (`--devices 0,0`), which is how the path is
+  tested on one card.
 - **Kernels at the share shapes.** The convolution split, the projected convolution and the replay
   record and fold keep the whole-layer geometries as template constants and take any other share's
   rows and heads at run time (`CausalConvSplitGeometry`, `ProjectedConvRows`, `FoldGeometryDynamic`);

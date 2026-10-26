@@ -86,9 +86,11 @@ public:
     std::vector<PendingWeight> weights;
 
 private:
-    // `whole_gathers` false leaves an input gather out, for a piece that binds its own.
+    // `whole_gathers` false leaves an input gather out, and `whole_signs` false the Hadamard signs,
+    // for a piece that binds its own.
     void add_uses(PendingWeight& pending, const std::string& name,
-                  const std::vector<std::string>& inputs, bool whole_gathers = true);
+                  const std::vector<std::string>& inputs, bool whole_gathers = true,
+                  bool whole_signs = true);
     // One device weight per distinct sign binding, however many Uses name it.
     WeightId hadamard_signs(const artifact::Binding& binding, std::uint64_t width,
                             const std::string& use);

@@ -101,13 +101,13 @@ inline constexpr std::int32_t kCublasPrefillFloorTokens = 128;
  * @f]
  *
  * `out` stores a BF16 approximation of this ideal result under the named numerical criterion for
- * the selected private activation-compute path; with a BF16, GGUF or RowSplit Q4/Q5/Q6/Q8 weight it
- * may instead be FP32, the unrounded FP32 accumulation.
+ * the selected private activation-compute path; with a weight linear_writes_fp32() names it may
+ * instead be FP32, the unrounded FP32 accumulation.
  *
  * @par Logical tensors and layout
  * `x` is contiguous, non-null, 16-byte-aligned BF16 `[K,T]`, `w` has logical shape `[N,K]`, and
- * `out` is contiguous, non-null, 16-byte-aligned BF16 `[N,T]` (FP32 `[N,T]` is accepted for a BF16,
- * GGUF or RowSplit Q4/Q5/Q6/Q8 `w` only). Every logical extent is positive;
+ * `out` is contiguous, non-null, 16-byte-aligned BF16 `[N,T]` (FP32 `[N,T]` is accepted for the
+ * formats linear_writes_fp32() names only). Every logical extent is positive;
  * in particular, `T=0` is invalid rather than a no-op. Dimension zero is stored fastest. The Op has
  * no bias, activation, residual addition, or transpose mode.
  *
@@ -115,10 +115,11 @@ inline constexpr std::int32_t kCublasPrefillFloorTokens = 128;
  * Registered execution uses RowSplit Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, or Q8_G32_FP16 weights
  * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16 weights, plus
  * registered contiguous BF16 problems. Each format owns a finite registry of exact physical
- * weight problems and selects its kernel internally; FP8 and NVFP4 accept only those problems. A
- * RowSplit Q4/Q5/Q6/Q8 problem no registry names, and every one with an FP32 `out`, runs a
- * runtime-shape route over the same templates (any N, K a multiple of 128): a tensor-parallel
- * rank's share of a projection, for instance. FP8 currently registers `[N,K]` in `{[14336,5120], [16384,5120],
+ * weight problems and selects its kernel internally. A RowSplit Q4/Q5/Q6/Q8 problem no registry
+ * names, and every one with an FP32 `out`, runs a runtime-shape route over the same templates (any
+ * N, K a multiple of 128): a tensor-parallel rank's share of a projection, for instance. So does a
+ * T2, FP8 or NVFP4 problem, in whole tiles of linear_share_units() and with A16 compute whatever
+ * the policy. FP8 currently registers `[N,K]` in `{[14336,5120], [16384,5120],
  * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4
  * problems register the five non-vocabulary FP8 geometries and accept every positive T. Q8 also
  * registers `[5120,25600]` at every positive T. BF16 registers `[14336,5120]`,
@@ -178,5 +179,19 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  * @param[in] stream CUDA stream on which execution is enqueued.
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+
+// Whether Linear writes an FP32 `out` for `format` and takes it at runtime shapes: BF16, GGUF and
+// the RowSplit, FP8 and NVFP4 formats; a tensor-parallel rank's piece of a projection is one.
+[[nodiscard]] bool linear_writes_fp32(QType format) noexcept;
+
+// The rows and K columns that a share of a `format` matrix (a tensor-parallel rank's piece) is a
+// whole number of, so that a runtime-shape route takes it, beyond the stored layout's own units:
+// T2 runs 32-row tiles over 512-column K slabs, FP8 64 rows over 512 and NVFP4 128 over 256; every
+// other format adds none.
+struct LinearShareUnits {
+    std::uint64_t rows    = 1;
+    std::uint64_t columns = 1;
+};
+[[nodiscard]] LinearShareUnits linear_share_units(QType format) noexcept;
 
 } // namespace ninfer::ops

@@ -998,9 +998,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         "stage boundary workspace");
         // With a masked drafter a later stage also keeps a copy of each tapped layer's output until
         // it has crossed, and rank 0 receives them one at a time into one residual's room; the
-        // stage with the most taps sets the size.
+        // stage with the most taps sets the size. Tensor-parallel ranks tap rank 0's replica.
         const auto& draft = parameters.model.config().draft;
-        if (plan.features.masked_draft() && draft) {
+        if (plan.features.masked_draft() && draft && !parameters.text.tensor_parallel()) {
             std::size_t widest = 0;
             for (std::size_t stage = 1; stage < parameters.text.rank_count; ++stage) {
                 widest = std::max(
@@ -1139,9 +1139,6 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 15) {
             throw std::invalid_argument("masked draft window must be in [1,15]");
-        }
-        if (parameters.text.tensor_parallel()) {
-            throw std::invalid_argument("--tensor-parallel does not run a masked drafter");
         }
         break;
     case SpeculativeBackend::DSpark:

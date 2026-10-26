@@ -80,6 +80,8 @@ const char* format(QType qtype) {
         return "Q6";
     case QType::Q8_G32_FP16:
         return "Q8";
+    case QType::T2_G128_FP16:
+        return "T2";
     default:
         return "?";
     }
@@ -176,12 +178,14 @@ int main() {
     try {
         int failures = 0;
         for (const QType qtype : {QType::BF16, QType::Q4_G64_FP16, QType::Q5_G64_FP16,
-                                  QType::Q6_G64_FP16, QType::Q8_G32_FP16}) {
+                                  QType::Q6_G64_FP16, QType::Q8_G32_FP16, QType::T2_G128_FP16}) {
             failures += run_pair(qtype, qtype, 640, 5120, 701U);
         }
         // A recipe may store the two halves in different formats; and a small K.
         failures += run_pair(QType::Q4_G64_FP16, QType::Q8_G32_FP16, 384, 1536, 709U);
         failures += run_pair(QType::Q6_G64_FP16, QType::BF16, 384, 1536, 719U);
+        // Q4's one-column kernel at a row count that leaves its last block part empty.
+        failures += run_pair(QType::Q4_G64_FP16, QType::Q4_G64_FP16, 330, 3072, 727U);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "LinearSwiGLU pair: " << error.what() << '\n';

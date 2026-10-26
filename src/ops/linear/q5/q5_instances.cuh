@@ -23,8 +23,10 @@ using DirectR1T2W2K17408 = Q5A16DirectSimtSchedule<1, 2, 2, 8, 16, 17408, true>;
 using DirectR1T3W2K17408 = Q5A16DirectSimtSchedule<1, 3, 2, 8, 16, 17408, true>;
 using DirectR1T4W2K17408 = Q5A16DirectSimtSchedule<1, 4, 2, 8, 16, 17408, true>;
 
-// The tables' decode schedules with K read from the operands, for runtime shapes.
-using DirectR1T1W4 = Q5A16DirectSimtSchedule<1, 1, 4, 4, 10, 0, true>;
+// The tables' decode schedules with K read from the operands, for runtime shapes such as a
+// tensor-parallel rank's share of a projection. One column takes the split2 decode kernel's shape
+// (two warps per row, 1024-column steps), eight steps unrolled.
+using DirectR1T1W2U8 = Q5A16DirectSimtSchedule<1, 1, 2, 8, 16, 0, true, 8>;
 using DirectR1T2W2 = Q5A16DirectSimtSchedule<1, 2, 2, 8, 16, 0, true>;
 using DirectR1T3W2 = Q5A16DirectSimtSchedule<1, 3, 2, 8, 16, 0, true>;
 using DirectR1T4W2 = Q5A16DirectSimtSchedule<1, 4, 2, 8, 16, 0, true>;
