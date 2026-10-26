@@ -140,7 +140,7 @@ ninfer $M --ngram-table $T --expert-residency host --prompt "Explain how a heat 
 
 On a 24 GB card with host experts the GPU holds the 6.0 GiB of dense weights, two layer banks
 (7.1 GiB), a 1.3 GiB workspace, the latent caches (133 MiB at 32,768 tokens of context) and an
-expert cache that takes the rest (7.8 GiB on an RTX 4090, of which a prompt span borrows up to
+expert cache that takes the rest (7.9 GiB on an RTX 4090, of which a prompt span borrows up to
 1.3 GiB while it runs); the host pins 106.7 GiB of experts. With disk experts the host pins 138 MiB
 of transfer buffers and the experts' pages sit in the OS page cache.
 
@@ -155,7 +155,7 @@ cache and its rounds):
 - **Host.** The experts are read from the artifact once at startup into pinned host memory, and a
   layer's misses are copied from there. The host needs that memory beside the Engram table's page
   cache (or its RAM copy) and the rest of the system: 106.7 GiB pinned, so a host with 128 GB
-  keeps about 12 GiB for everything else (not tested; the measurements below ran with 251 GB or more).
+  keeps about 12 GiB for everything else (not tested; the measurements below ran with 188 GiB or more).
   The startup reads the experts with direct I/O, past the page cache, on eight threads into
   ordinary pages and pins them once read.
 - **Disk.** The experts stay in the artifact's files. A layer's misses are read with ordinary file
@@ -228,7 +228,8 @@ addresses and copies them to the device:
 - **Where it is stored.** In its own artifact: the model names the table by digest, and
   `--ngram-table PATH` supplies it (NInfer refuses a table with another digest). A model run without
   its table is refused unless `--no-ngram-table` runs it without the Engram, which degrades the
-  output: on a 1,112-token WikiText slice the perplexity rises from 3.07 to 9.68.
+  output: on a 1,112-token WikiText slice the perplexity rose from 3.07 to 9.68 with the build that
+  added the model ([numerical checks](#numerical-checks)).
 - **How it is read.** `--ngram-residency disk` (the default) reads each pass's rows from the file
   (`--ngram-io`, `--ngram-io-depth`, `--ngram-ram-mib` for a row cache), and `ram` holds the whole
   table in RAM (`--ngram-lock` pins it). The table is 103.0 GiB, so `ram` and host experts together
@@ -363,7 +364,9 @@ decoding, thinking off, the same prompt tokens in both engines: a 14-token quest
   decodes 1.00 and 1.17 times as fast as `--spec dspark`
   ([the decode step](#the-decode-step-on-one-rtx-4090) shows where NInfer's time goes).
 - **Prefill.** Strata prefills in windows of 16,384 tokens; NInfer runs the 8,086 tokens as one
-  [prompt span](#prompt-spans), 1.9 times the release's rate.
+  [prompt span](#prompt-spans), 1.9 times the release's rate and 1.36 to 1.48 times Strata's. With
+  the drafter NInfer's spans shorten to 8,192 tokens and it prefills at 693 tok/s, against Strata's
+  635 to 690.
 - **Drafts.** With `--dspark on`, Strata accepted 22 of 30 drafts on the short answer and 10 of 12
   on the long one; `--dspark auto` offered none. NInfer's `--spec dspark` accepted 43 of 68 and
   16 of 31 ([the drafter](#the-dspark-drafter)) and decodes 1.03 and 1.06 times as fast as without
@@ -463,13 +466,13 @@ steps:
 
 ### Prompt spans
 
-On the same host, two fresh servers of each build (`--max-context 32768`) took the two requests and
-a third, a 24,252-token prompt that resumes from the 8,084-token state of the second and prefills
-16,168 new tokens:
+On the same host, two fresh servers of each build (`--max-context 32768`; the span build of October
+25, before the CPU share, and the release) took the two requests and a third, a 24,252-token prompt
+that resumes from the 8,084-token state of the second and prefills 16,168 new tokens:
 
 | build, host experts | decode, short answer | after 8,086 tokens | prefill of 8,086 tokens | prefill of 16,168 more tokens | decode after them |
 |---|---:|---:|---:|---:|---:|
-| NInfer, spans of 16,384 tokens | 26.0, 25.9 tok/s | 22.2, 22.1 tok/s | 926, 925 tok/s | 1,200, 1,200 tok/s | 22.5, 22.5 tok/s |
+| NInfer span build, spans of 16,384 tokens | 26.0, 25.9 tok/s | 22.2, 22.1 tok/s | 926, 925 tok/s | 1,200, 1,200 tok/s | 22.5, 22.5 tok/s |
 | NInfer `b3402a6fd`, chunk by chunk | 26.0, 26.1 tok/s | 22.2, 22.2 tok/s | 499, 499 tok/s | 505, 505 tok/s | 23.0, 22.8 tok/s |
 
 - **Prefill.** One span sweeps the experts once where four or eight chunks swept them four or eight
@@ -558,7 +561,7 @@ release archive). Beside the two layer banks (7.1 GiB) the expert cache keeps 38
 
 | card | build | experts | device cache | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens |
 |---|---|---|---:|---:|---:|---:|
-| RTX 4090 | current, spans of 4,096 tokens | pinned RAM | 54 | 21.4 tok/s | 20.0 tok/s | 679 tok/s |
+| RTX 4090 | span build of October 25, spans of 4,096 tokens | pinned RAM | 54 | 21.4 tok/s | 20.0 tok/s | 679 tok/s |
 | RTX 4090 | `b3402a6fd` | pinned RAM | 57 | 21.3 tok/s | 20.0 to 20.1 tok/s | 457 tok/s |
 | RTX 4090 | `b3402a6fd` | disk, page cache warm | 86 | 5.9 to 6.3 tok/s | 5.9 to 6.0 tok/s | 113 to 119 tok/s |
 | Tesla V100 | `b3402a6fd` | pinned RAM | 38 | 10.5 to 10.6 tok/s | 9.3 to 9.4 tok/s | 198 to 199 tok/s |
@@ -582,9 +585,11 @@ Rows give one run, or the range of two; no spread is measured.
 - **Against an FP64 forward.** `tools/reference/deepseek_v41.py` runs the model in FP64 over the
   GGUF's exactly decoded blocks and the Engram GGUF's rows, with the release's attention roundings.
   Over the 1,112 scored tokens of the WikiText slice above, its negative log-likelihood sums to
-  1238.7 against NInfer's 1246.3 (perplexity 3.046 against 3.067, 0.7% higher in NInfer, whose
-  matrix kernels take BF16 activations rounded to ggml's q8_1 blocks, as llama.cpp's do). NInfer's
+  1238.7 against 1246.3 for the build that added the model on October 25 (perplexity 3.046 against
+  3.067, 0.7% higher in NInfer, whose matrix kernels take BF16 activations rounded to ggml's q8_1
+  blocks, as llama.cpp's do). NInfer's
   greedy next token matched the reference's argmax at 21 of 22 positions spread over the slice (the
   exception has a top-two logit gap of 0.32) and at 6 of the 10 positions where the reference's top
   two logits are closest (gaps of 0.01 to 0.04). The FP64 forward took 2 h 53 min on the
-  Threadripper 3960X.
+  Threadripper 3960X. Since then the GPU's IQ1_S, IQ1_M and IQ2_XXS products round step by step as
+  the [CPU share](#the-cpu-share) does, which changes the outputs; this check was not rerun.
