@@ -60,6 +60,18 @@ paged_kv_element_offset(std::int32_t physical_page, std::int32_t head, std::int3
            static_cast<std::int64_t>(LeadingExtent) * page_offset + leading;
 }
 
+// The same offset in a plane of `head_extent` heads known only at run time: a tensor-parallel
+// rank's run of a layer's KV heads.
+template <int LeadingExtent>
+__device__ __forceinline__ std::int64_t
+paged_kv_element_offset(std::int32_t physical_page, std::int32_t head, std::int32_t page_offset,
+                        std::int32_t leading, std::int32_t head_extent) {
+    return static_cast<std::int64_t>(LeadingExtent) * kPagedKVPageSize *
+               (static_cast<std::int64_t>(head) +
+                static_cast<std::int64_t>(head_extent) * physical_page) +
+           static_cast<std::int64_t>(LeadingExtent) * page_offset + leading;
+}
+
 template <int LeadingExtent, int HeadExtent>
 __device__ __forceinline__ std::int64_t
 paged_kv_element_offset(const std::int32_t* block_table, std::int32_t head, std::int32_t position,

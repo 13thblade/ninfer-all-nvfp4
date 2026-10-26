@@ -5,6 +5,7 @@
 #include "core/tensor.h"
 #include "ninfer/ops/sparse_moe.h"
 #include "ops/sparse_moe/candidate.h"
+#include "ops/sparse_moe/share.h"
 
 #include <cuda_runtime.h>
 
@@ -161,6 +162,10 @@ allocate_sparse_moe_prefill_workspace(Arena& arena, std::int32_t capacity_tokens
                                            QType routed_down) noexcept;
 [[nodiscard]] std::int32_t sparse_moe_prefill_min_tokens(QType routed_gate_up,
                                                         QType routed_down) noexcept;
+// The first prefill T of the codec profile without a device profile's frontier: the same on every
+// card.
+[[nodiscard]] std::int32_t sparse_moe_prefill_builtin_min_tokens(QType routed_gate_up,
+                                                                 QType routed_down) noexcept;
 [[nodiscard]] SparseMoeCandidate sparse_moe_prefill_tile_candidate(
     std::int32_t slice_tokens, QType gate, QType down, SparseMoeCandidate requested);
 [[nodiscard]] std::size_t sparse_moe_prefill_workspace_bytes(std::int32_t max_tokens, bool nvfp4);
@@ -170,6 +175,7 @@ resolve_sparse_moe_prefill_plan(std::int32_t tokens, QType routed_gate_up, QType
 
 void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
-                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream);
+                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
+                               const SparseMoeShareArgs& share = {});
 
 } // namespace ninfer::ops::detail

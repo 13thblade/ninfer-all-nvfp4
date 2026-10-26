@@ -88,15 +88,15 @@ struct StageRuntime {
     std::uint32_t next_slot = 0;
 
     // Tensor parallelism (`--tensor-parallel`) instead of stages: every rank runs a share of each
-    // layer's GDN heads and dense FFN rows, and the ranks add their output projections' FP32
-    // partials into identical replicas of the residual through `exchange`. Attention, the KV cache,
-    // the embedding, the head and MTP stay on rank 0, whose attention output reaches the other
-    // replicas through the same exchange. `state[r]` and `replay[r]` are rank r's shares of every
-    // GDN layer, `control[r - 1]` and `forward[r - 1]` carry the control tensors and the incoming
-    // residual from rank 0 to rank r, and `back` is absent.
+    // layer's GDN heads and dense FFN rows or experts, and the ranks add their output projections'
+    // FP32 partials into identical replicas of the residual through `exchange`. Attention, the KV
+    // cache, the embedding, the head, the shared expert and MTP stay on rank 0, whose attention
+    // output reaches the other replicas through the same exchange. `state[r]` and `replay[r]` are
+    // rank r's shares of every GDN layer, `control[r - 1]` and `forward[r - 1]` carry the control
+    // tensors and the incoming residual from rank 0 to rank r, and `back` is absent.
     struct TensorParallel {
-        // shares[r] is rank r's GDN heads and dense FFN rows, and shards[r] the model as that share
-        // sees it.
+        // shares[r] is rank r's GDN heads, KV heads and dense FFN rows or experts, and shards[r]
+        // the model as that share sees it.
         std::vector<TensorShare> shares;
         std::vector<TextConfig> shards;
         std::unique_ptr<TensorParallelExchange> exchange;

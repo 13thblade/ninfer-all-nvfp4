@@ -19,6 +19,7 @@ int run_softmax_attention_context_tests();
 int run_softmax_attention_wide_tests();
 int run_softmax_attention_parallel_tile_tests();
 int run_softmax_attention_quantized_depth_tests();
+int run_softmax_attention_tensor_share_tests();
 
 namespace {
 
@@ -88,12 +89,16 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--rk2v4-e8-only") {
         return run_guarded("rk2v4-e8", run_softmax_attention_rk2v4_e8_tests);
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--tensor-shares-only") {
+        return run_guarded("tensor shares", run_softmax_attention_tensor_share_tests);
+    }
     if (argc != 1) {
         std::cerr
             << "usage: ninfer_softmax_attention_test "
                "[--dflash2-only|--nvfp4-only|--k8v4-only|--rk4v4-e8-only|--rk2v4-e8-only|"
                "--int8-prompt-only|--prompt-splits-only|--small-t-pipelined-only|--fp8-prompt-only|"
-               "--pack-gqa-only|--wide-only|--parallel-tiles-only|--quantized-depth-only]\n";
+               "--pack-gqa-only|--wide-only|--parallel-tiles-only|--quantized-depth-only|"
+               "--tensor-shares-only]\n";
         return 2;
     }
     const int causal = run_guarded("causal cache", run_softmax_attention_causal_cache_tests);

@@ -10,6 +10,7 @@
 #include "ops/common/device_tier.h"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/kv_cache/d256_profile.h"
+#include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast_plan.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_sm70.h"
@@ -42,7 +43,7 @@ constexpr std::uint32_t kSmallPrefillKeysPerRow16 = 80;
 std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t width,
                                            std::int32_t batch_size, KvCacheStorage storage,
                                            CausalAttentionExecutionEnvelope envelope) {
-    if (q_heads == 16) return 6;
+    if (causal_attention_model_query_heads(q_heads) == 16) return 6;
     // Balance the two narrow BF16 chunks; INT8 benefits from 5+4/5 at long contexts.
     if (batch_size == 1 && ((storage == KvCacheStorage::BFloat16 && width >= 9 && width <= 12) ||
                             (storage == KvCacheStorage::Int8Group64 && width >= 9 && width <= 10 &&
@@ -53,8 +54,7 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t wi
 
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
-        !((geometry.query_heads == 24 && geometry.kv_heads == 4) ||
-          (geometry.query_heads == 16 && geometry.kv_heads == 2))) {
+        !causal_attention_geometry_supported(geometry.query_heads, geometry.kv_heads)) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
 }
@@ -419,9 +419,11 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
 
 namespace detail {
 
-CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
+CausalAttentionRoute causal_attention_resolve_route(std::int32_t call_q_heads, std::int32_t width,
                                                     std::int32_t batch_size, KvCacheStorage storage,
                                                     CausalAttentionExecutionEnvelope envelope) {
+    // A tensor-parallel share takes the routes measured for its model.
+    const std::int32_t q_heads = causal_attention_model_query_heads(call_q_heads);
     if (envelope.small_prefill && batch_size == 1 && width > kMaximumVerifyTokens &&
         width <= kMaximumSingleRowVerifyTokens) {
         const std::uint32_t keys_per_row =

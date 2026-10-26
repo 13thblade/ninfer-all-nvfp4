@@ -26,22 +26,30 @@ inline constexpr int kCausalPromptSmemBytes = (kCausalPromptBr + 2 * kCausalProm
                                               static_cast<int>(sizeof(__nv_bfloat16));
 
 template <typename Geometry>
-__device__ __forceinline__ std::int64_t causal_prompt_q_index(int q_head, int d, int token) {
-    return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kCausalPromptHeadDim) *
-                                              (static_cast<std::int64_t>(q_head) +
-                                               static_cast<std::int64_t>(Geometry::QHeads) * token);
+__device__ __forceinline__ std::int64_t causal_prompt_q_index(int q_head, int d, int token,
+                                                              int q_heads) {
+    return static_cast<std::int64_t>(d) +
+           static_cast<std::int64_t>(kCausalPromptHeadDim) *
+               (static_cast<std::int64_t>(q_head) + static_cast<std::int64_t>(q_heads) * token);
+}
+
+// The query heads of a prompt launch: its grid's y extent spans them, or their KV heads when the
+// kernel packs a KV head's query heads into one CTA (PackGqa).
+template <typename Geometry, bool PackGqa = false>
+__device__ __forceinline__ int causal_prompt_q_heads() {
+    return static_cast<int>(gridDim.y) * (PackGqa ? Geometry::GroupSize : 1);
 }
 
 template <typename Geometry>
 __device__ __forceinline__ void causal_prompt_zero_output_rows(__nv_bfloat16* out, int q_head,
                                                                int row_begin, int row_end, int tid,
-                                                               int threads) {
+                                                               int threads, int q_heads) {
     if (row_begin >= row_end) { return; }
     const int elements = (row_end - row_begin) * kCausalPromptHeadDim;
     for (int element = tid; element < elements; element += threads) {
         const int row = row_begin + element / kCausalPromptHeadDim;
         const int d   = element - (row - row_begin) * kCausalPromptHeadDim;
-        out[causal_prompt_q_index<Geometry>(q_head, d, row)] = __float2bfloat16(0.0f);
+        out[causal_prompt_q_index<Geometry>(q_head, d, row, q_heads)] = __float2bfloat16(0.0f);
     }
 }
 

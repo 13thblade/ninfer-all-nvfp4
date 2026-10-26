@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/host_pages.h"
 #include "core/startup.h"
+#include "core/tensor_split.h"
 #include "models/expert_profile.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/frontend/processor.h"
@@ -153,8 +154,16 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
                                     "host or disk experts (--expert-residency host|disk)");
     }
-    if (device.size() != 1 || options.tensor_parallel) {
-        throw std::invalid_argument("DeepSeek-V4.1 runs on one device");
+    if (options.tensor_parallel ? device.size() < 2 : device.size() != 1) {
+        throw std::invalid_argument("DeepSeek-V4.1 runs on one device, or divides its routed "
+                                    "experts over several with --tensor-parallel");
+    }
+    if (options.tensor_parallel && (options.expert_residency == ExpertResidency::Device ||
+                                    hybrid.dma_share || hybrid.cpu_threads != 0)) {
+        throw std::invalid_argument("--tensor-parallel divides DeepSeek-V4.1's experts over the "
+                                    "devices from host memory or the files "
+                                    "(--expert-residency host|disk), every device copying its "
+                                    "misses (no --expert-dma-share or --expert-cpu-threads)");
     }
     if (options.rope_yarn || options.rope_yarn_factor > 1.0F || options.rope_scaling_factor > 1.0F) {
         throw std::invalid_argument("DeepSeek-V4.1 takes no rotation scaling: its compressed "
@@ -265,6 +274,13 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
+    // Expert parallelism: every device serves a share of the routed experts from host memory or
+    // the files over its own bus; without --tensor-split the shares are equal.
+    if (options.tensor_parallel) {
+        executor.expert_split = options.tensor_split.empty()
+                                    ? std::vector<double>(device.size(), 1.0)
+                                    : options.tensor_split;
+    }
     executor.engram_table       = std::move(engram);
     executor.engram_read        = {.residency    = table.residency,
                                    .io           = table.io,
@@ -340,6 +356,19 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                            ? " at most, growing with the sequences beside an elastic expert cache"
                            : "",
                        double(memory.workspace_bytes) / 1048576.0);
+    if (!executor.expert_split.empty()) {
+        const std::uint32_t experts = model->config().num_experts;
+        const auto ends = split_shares(experts, unit_positions(experts, 1), executor.expert_split);
+        std::string ranges;
+        for (std::size_t rank = 0; rank + 1 < ends.size(); ++rank) {
+            ranges += (rank == 0 ? "" : ", ") + std::to_string(ends[rank]) + "-" +
+                      std::to_string(ends[rank + 1] - 1);
+        }
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "DeepSeek-V4.1: expert parallelism, routed experts by device %s, each "
+                           "served by its own delivery and cache",
+                           ranges.c_str());
+    }
     if (table.disabled) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
                            "DeepSeek-V4.1 runs WITHOUT its Engram table (--no-ngram-table): a "

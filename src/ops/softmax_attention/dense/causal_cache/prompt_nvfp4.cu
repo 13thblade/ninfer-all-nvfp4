@@ -29,7 +29,7 @@ void causal_attention_prompt_nvfp4_attention_launch_for(const Tensor& q, const T
                      decltype(v_scale_ptr)>();
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     const dim3 grid(static_cast<unsigned>(div_up(tokens, kCausalPromptNvfp4Br)),
-                    static_cast<unsigned>(Geometry::QHeads), 1u);
+                    static_cast<unsigned>(q.ne[1]), 1u);
     causal_attention_prompt_nvfp4_kernel<Geometry, Metadata>
         <<<grid, kCausalPromptNvfp4Threads, kCausalPromptNvfp4SmemBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), cache_k_ptr, cache_v_ptr, k_scale_ptr,
@@ -43,13 +43,10 @@ void causal_attention_prompt_nvfp4_attention_dispatch(const Tensor& q, const Ten
                                                       float scale, const CacheView& cache,
                                                       Metadata metadata, Tensor& out,
                                                       cudaStream_t stream) {
-    if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        causal_attention_prompt_nvfp4_attention_launch_for<CausalD256H24Kv4>(
-            q, positions, scale, cache, metadata, out, stream);
-        return;
-    }
-    causal_attention_prompt_nvfp4_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,
-                                                                         metadata, out, stream);
+    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+        causal_attention_prompt_nvfp4_attention_launch_for<Geometry>(q, positions, scale, cache,
+                                                                     metadata, out, stream);
+    });
 }
 
 } // namespace

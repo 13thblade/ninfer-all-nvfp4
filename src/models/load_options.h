@@ -53,7 +53,7 @@ struct LoadOptions {
     // Layers per stage (`--stage-layers`), one count per device. Empty lets the engine choose.
     std::vector<std::uint32_t> stage_layers;
     // The `ranks` devices share every layer instead (`--tensor-parallel`): each holds a share of
-    // the GDN heads and dense FFN rows, and the first one the rest.
+    // the GDN heads and dense FFN rows or MoE experts, and the first one the rest.
     bool tensor_parallel = false;
     // The relative size of each rank's share (`--tensor-split`), one positive weight per device.
     // Empty divides evenly; the engine fills it from each card's speed and free memory.

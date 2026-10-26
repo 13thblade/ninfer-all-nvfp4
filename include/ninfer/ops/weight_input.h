@@ -87,5 +87,12 @@ prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_
                            std::span<const WeightInput> expert_gate_up,
                            std::span<const WeightInput> expert_down, const WeightInput& shared_gate,
                            const WeightInput& shared_up, const WeightInput& shared_down);
+// One device's expert-parallel share of SparseMoe (sparse_moe_share): its experts' gate/up and
+// down inputs in expert order, each list joining into one bank; the shared expert's three inputs
+// only on the device that holds it (all null elsewhere).
+[[nodiscard]] SparseMoeWeights prepare_sparse_moe_share_weights(
+    const WeightInput& router, const WeightInput& shared_score,
+    std::span<const WeightInput> expert_gate_up, std::span<const WeightInput> expert_down,
+    const WeightInput* shared_gate, const WeightInput* shared_up, const WeightInput* shared_down);
 
 } // namespace ninfer::ops

@@ -54,7 +54,9 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   top-k held at the sampler's 20 candidates.
 
 Not built for this family: DFlash and ngram copy drafts, pipeline stages over several GPUs, and of
-the context cache the shared paged KV pool, the disk tier and session slots.
+the context cache the shared paged KV pool, the disk tier and session slots. Several GPUs divide
+the routed experts of the MoE model instead (`--devices 0,1 --tensor-parallel`, experts on the
+devices; [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
 ## Converting
 

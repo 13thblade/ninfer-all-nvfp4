@@ -82,6 +82,9 @@ add_test(NAME ninfer_softmax_attention_rk4v4_e8_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --rk4v4-e8-only)
 add_test(NAME ninfer_softmax_attention_rk2v4_e8_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --rk2v4-e8-only)
+# Tensor-parallel shares of the two model geometries, over every KV storage.
+add_test(NAME ninfer_softmax_attention_tensor_share_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --tensor-shares-only)
 
 # Upstream's DFlash2 verification sweep. ~460 s: six storage families (five upstream, plus this
 # fork's rk8v4) over every narrow width, batch and base offset, so it gets a timeout well clear of
@@ -163,6 +166,9 @@ ninfer_add_op_test(ninfer_sparse_moe_test
 add_test(NAME ninfer_sparse_moe_streaming_test
   COMMAND ninfer_tests ninfer_sparse_moe_test --streaming)
 set_tests_properties(ninfer_sparse_moe_streaming_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_sparse_moe_shares_test
+  COMMAND ninfer_tests ninfer_sparse_moe_test --shares)
+set_tests_properties(ninfer_sparse_moe_shares_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_op_test(ninfer_sparse_moe_candidates_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_sparse_moe_candidates.cpp"

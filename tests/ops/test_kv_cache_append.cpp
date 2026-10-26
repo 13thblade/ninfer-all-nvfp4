@@ -2094,8 +2094,9 @@ int main(int argc, char** argv) {
     if (nvfp4_only || k8v4_only) {
         const KvCacheStorage storage =
             nvfp4_only ? KvCacheStorage::Nvfp4Group16 : KvCacheStorage::Fp8KeyNvfp4Value;
-        for (const int kv_heads : {4, 2}) { failures += full_append_case(kv_heads, storage); }
+        for (const int kv_heads : {4, 3, 2, 1}) { failures += full_append_case(kv_heads, storage); }
         failures += full_append_case(2, storage, 129);
+        failures += full_append_case(1, storage, 129);
         if (failures != 0) {
             std::cerr << (nvfp4_only ? "nvfp4" : "k8v4") << " kv_cache_append failures=" << failures
                       << '\n';
@@ -2105,7 +2106,8 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    for (const int kv_heads : {4, 2}) {
+    // Four and two KV heads are the models'; three and one are tensor-parallel ranks' shares.
+    for (const int kv_heads : {4, 3, 2, 1}) {
         failures += full_append_case(kv_heads, KvCacheStorage::BFloat16);
         failures += full_append_case(kv_heads, KvCacheStorage::Int8Group64);
         failures += full_append_case(kv_heads, KvCacheStorage::Fp8E4M3Row256);
@@ -2115,18 +2117,18 @@ int main(int argc, char** argv) {
     // rk8v4 exercises both append kernels: the general one, and at T>=128 with Hkv==2
     // the tiled page kernel. It packs two signed 4-bit codes per byte, which the generic
     // KvCacheStorage sweep above does not model, so it runs through its own oracle.
-    for (const int kv_heads : {2, 4}) {
-        failures += full_append_case_rk8v4(kv_heads);
-    }
+    for (const int kv_heads : {1, 2, 3, 4}) { failures += full_append_case_rk8v4(kv_heads); }
     failures += full_append_case_rk8v4(2, 129);
-    for (const int kv_heads : {2, 4}) {
+    failures += full_append_case_rk8v4(1, 129);
+    for (const int kv_heads : {1, 2, 3, 4}) {
         failures += full_append_case_rk4v4(kv_heads);
         failures += full_append_case_e8(kv_heads);
     }
     failures += full_append_case_rk4v4(2, 129);
     failures += full_append_case_e8(2, 129);
     failures += full_append_case_e8(4, 129);
-    for (const int kv_heads : {2, 4}) {
+    failures += full_append_case_e8(3, 129);
+    for (const int kv_heads : {1, 2, 3, 4}) {
         failures += full_append_case_e8_root(kv_heads);
         failures += full_append_case_e8_root(kv_heads, 129);
     }
@@ -2134,6 +2136,8 @@ int main(int argc, char** argv) {
     failures += full_append_case(2, KvCacheStorage::Fp8E4M3Row256, 129);
     failures += full_append_case(2, KvCacheStorage::Nvfp4Group16, 129);
     failures += full_append_case(2, KvCacheStorage::Fp8KeyNvfp4Value, 129);
+    failures += full_append_case(1, KvCacheStorage::Int8Group64, 129);
+    failures += full_append_case(3, KvCacheStorage::BFloat16, 129);
     failures += run_case(1, 0, 0, false, {0, 1, 2});
     failures += run_case(1, 1, 63, false, {2, 3, 4});
     failures += run_case(16, 7, 60, false, {5, 1, 4}, 5);

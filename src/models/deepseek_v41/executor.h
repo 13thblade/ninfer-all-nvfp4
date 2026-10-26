@@ -77,6 +77,10 @@ struct ExecutorOptions {
     // Prompt calls may carry images (a model loaded with its vision tower): the most patches an
     // image has, which sizes the tower's scratch. 0: text only.
     std::uint32_t vision_max_patches = 0;
+    // Expert parallelism (two or more device ranks): each rank's relative share of every block's
+    // routed experts, which it serves from host memory or the files through a delivery and device
+    // cache of its own; everything else stays on rank 0. Empty for one device.
+    std::vector<double> expert_split;
 };
 
 // An image's rows in a prompt call: the call's rows from `row` on, as many as `embeddings` holds

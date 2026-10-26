@@ -41,8 +41,9 @@ namespace ninfer::models::qwen3_5::detail {
 namespace {
 
 constexpr char kSessionSnapshotMagic[8]         = {'N', 'I', 'N', 'F', 'S', 'E', 'S', '1'};
-// Version 2 binds the RoPE scaling profile in the configuration block.
-constexpr std::uint32_t kSessionSnapshotVersion = 2;
+// Version 3 binds the RoPE scaling profile and the text KV planes' sizes in the configuration
+// block.
+constexpr std::uint32_t kSessionSnapshotVersion = 3;
 constexpr std::size_t kMaximumModelBindingBytes = 4096;
 constexpr std::uint32_t kMaximumSnapshotAnchors = 64;
 
@@ -191,6 +192,7 @@ struct SnapshotConfig {
     std::uint64_t state_image_bytes   = 0;
     std::uint32_t text_plane_count    = 0;
     std::uint64_t text_page_stride    = 0;
+    std::uint64_t text_plane_digest   = 0;
     std::uint32_t backend_plane_count = 0;
     std::uint64_t backend_page_stride = 0;
     // RoPE scaling, floats as their bit patterns so equality is exact.
@@ -212,12 +214,23 @@ void write_config(SnapshotWriter& writer, const SnapshotConfig& config) {
     writer.pod(config.state_image_bytes);
     writer.pod(config.text_plane_count);
     writer.pod(config.text_page_stride);
+    writer.pod(config.text_plane_digest);
     writer.pod(config.backend_plane_count);
     writer.pod(config.backend_page_stride);
     writer.pod(config.yarn_factor_bits);
     writer.pod(config.yarn_native_context);
     writer.pod(config.interpolation_factor_bits);
     writer.pod(config.interpolation_threshold);
+}
+
+// The planes' payload sizes: two divisions of the KV heads over tensor-parallel ranks can have the
+// same plane count and page stride.
+std::uint64_t plane_digest(const HostKVPageLayout& layout) {
+    std::uint64_t digest = 14695981039346656037ULL;
+    for (const HostKVPlaneLayout& plane : layout.planes) {
+        digest = (digest ^ plane.page_payload_bytes) * 1099511628211ULL;
+    }
+    return digest;
 }
 
 SnapshotConfig read_config(SnapshotReader& reader) {
@@ -230,6 +243,7 @@ SnapshotConfig read_config(SnapshotReader& reader) {
     config.state_image_bytes   = reader.pod<std::uint64_t>();
     config.text_plane_count    = reader.pod<std::uint32_t>();
     config.text_page_stride    = reader.pod<std::uint64_t>();
+    config.text_plane_digest         = reader.pod<std::uint64_t>();
     config.backend_plane_count = reader.pod<std::uint32_t>();
     config.backend_page_stride       = reader.pod<std::uint64_t>();
     config.yarn_factor_bits          = reader.pod<std::uint32_t>();
@@ -543,6 +557,7 @@ SessionSnapshot ProgramImpl::save_continuation(const ContinuationHandle& continu
     config.state_image_bytes   = state_layout.image_bytes;
     config.text_plane_count    = static_cast<std::uint32_t>(text_layout.planes.size());
     config.text_page_stride    = text_layout.page_stride;
+    config.text_plane_digest   = plane_digest(text_layout);
     if (backend_layout) {
         config.backend_plane_count = static_cast<std::uint32_t>(backend_layout->planes.size());
         config.backend_page_stride = backend_layout->page_stride;
@@ -751,6 +766,7 @@ ContinuationHandle ProgramImpl::restore_continuation(std::span<const std::uint8_
     expected.state_image_bytes   = state_layout.image_bytes;
     expected.text_plane_count    = static_cast<std::uint32_t>(text_layout.planes.size());
     expected.text_page_stride    = text_layout.page_stride;
+    expected.text_plane_digest   = plane_digest(text_layout);
     if (backend_layout) {
         expected.backend_plane_count = static_cast<std::uint32_t>(backend_layout->planes.size());
         expected.backend_page_stride = backend_layout->page_stride;
@@ -759,7 +775,8 @@ ContinuationHandle ProgramImpl::restore_continuation(std::span<const std::uint8_
     const SnapshotConfig config = read_config(reader);
     if (config.kv_storage != expected.kv_storage || config.page_tokens != expected.page_tokens ||
         config.text_plane_count != expected.text_plane_count ||
-        config.text_page_stride != expected.text_page_stride) {
+        config.text_page_stride != expected.text_page_stride ||
+        config.text_plane_digest != expected.text_plane_digest) {
         throw std::invalid_argument("session snapshot KV configuration does not match the server");
     }
     if (config.speculative_backend != expected.speculative_backend ||

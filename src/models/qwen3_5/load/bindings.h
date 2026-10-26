@@ -53,6 +53,21 @@ public:
                                  std::optional<QType> exact_format, std::size_t rank,
                                  const ParameterPiece& piece);
 
+    // A parameter that joint_piece binds on a rank.
+    struct JointPart {
+        std::string name;
+        artifact::Shape shape;
+        std::vector<std::string> inputs;
+    };
+
+    // Binds the matrix parameters `parts` on `rank`, each named `name@rank`, as views into one
+    // device selection of the stored object behind them all: the run of its rows they cover
+    // together, which they must cover exactly. Views stay side by side as the object holds them,
+    // so an Op that reads several parameters as one bank (a rank's experts, or a replica of the
+    // router and shared score) reads them there.
+    [[nodiscard]] std::vector<WeightId> joint_piece(std::span<const JointPart> parts,
+                                                    std::size_t rank);
+
     // Where a column piece of matrix parameter `name` (`shape`, read through `inputs`) may end:
     // out[c] for c in [0, columns] says whether the columns [0, c) are whole runs of its stored
     // bytes (artifact::selection_column_unit); with an input gather (`input_columns`), a run is

@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sparse_moe.h"
+#include "ops/sparse_moe/share.h"
 
 #include <cuda_runtime.h>
 
@@ -62,6 +63,7 @@ resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType routed_gate_up, QType
 
 void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoeSmallTPlan& plan,
-                               const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream);
+                               const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
+                               const SparseMoeShareArgs& share = {});
 
 } // namespace ninfer::ops::detail

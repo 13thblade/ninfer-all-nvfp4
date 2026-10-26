@@ -4,7 +4,8 @@
 // tower's parameters are bound as the artifact stores them (GGUF blocks, BF16 or NInfer's own
 // formats); the frontend resources are the Qwen3.5 tokenizer and chat template, which this family
 // shares. Expert banks live on the device of their layer's pipeline stage, or in the pinned Host
-// block where the GPU reads them across the bus.
+// block where the GPU reads them across the bus. Under expert parallelism every device holds a
+// contiguous range of each MoE layer's routed experts and rank 0 everything else.
 
 #include "artifact/materializer.h"
 #include "core/arena.h"
@@ -29,6 +30,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -107,6 +109,10 @@ struct LoadOptions {
     // Loads the MTP block the artifact carries (its `mtp` component) onto the last stage's device,
     // beside the head it shares; its experts take the text layers' residency.
     bool mtp = false;
+    // Expert parallelism (`--tensor-parallel`): each rank's relative share of every MoE layer's
+    // routed experts, one positive weight per rank; empty for none. The layers, the router and the
+    // shared expert stay on rank 0, in one stage; the experts must be device resident.
+    std::vector<double> expert_split;
 };
 
 class Model {
@@ -126,6 +132,13 @@ public:
     // The stage that holds the embedding (the first) and the one that holds the final mixer and
     // the output head (the last).
     [[nodiscard]] std::size_t head_rank() const noexcept { return stages_.stages() - 1; }
+
+    // Expert parallelism: whether the routed experts are divided over the ranks, and the routed
+    // experts [first, second) rank `rank` holds of a MoE layer with `experts` of them.
+    [[nodiscard]] bool expert_parallel() const noexcept { return !options_.expert_split.empty(); }
+
+    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> expert_range(std::uint32_t experts,
+                                                                       std::size_t rank) const;
 
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
 
@@ -197,5 +210,18 @@ private:
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader,
                                                 const LoadOptions& options, DeviceContext& device,
                                                 const StartupObserver* observer = nullptr);
+
+// The routed experts [out[r], out[r + 1]) of `experts` each rank holds under `split`.
+[[nodiscard]] std::vector<std::uint64_t> expert_ends(std::uint32_t experts,
+                                                     std::span<const double> split);
+
+// An expert split for ranks with `free_bytes` of device memory and `speed`: in proportion to
+// speed, except that a rank takes no more experts than it has room for once rank 0 holds
+// everything else `options` loads (the stored bytes of the components it names) and every rank
+// keeps a margin for state and workspace.
+[[nodiscard]] std::vector<double> default_expert_split(const artifact::Reader& reader,
+                                                       const LoadOptions& options,
+                                                       std::span<const std::uint64_t> free_bytes,
+                                                       std::span<const double> speed);
 
 } // namespace ninfer::models::qwen4_exp

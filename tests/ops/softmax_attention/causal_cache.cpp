@@ -214,6 +214,15 @@ constexpr Geometry kGeometries[] = {
     {"d256-h16-kv2", 16, 2},
 };
 
+// Tensor-parallel shares of those two: one rank's run of KV heads with the query heads that read
+// them.
+constexpr Geometry kShareGeometries[] = {
+    {"d256-h18-kv3", 18, 3},
+    {"d256-h12-kv2", 12, 2},
+    {"d256-h6-kv1", 6, 1},
+    {"d256-h8-kv1", 8, 1},
+};
+
 ops::AttentionHeadGeometry op_geometry(const Geometry& geometry) {
     return {kHeadDim, geometry.q_heads, geometry.kv_heads};
 }
@@ -4808,6 +4817,83 @@ int run_softmax_attention_causal_cache_tests() {
     failures += run_masked_prefix_invariance_tests();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention public-contract correctness\n";
+    return failures == 0 ? 0 : 1;
+}
+
+// The share geometries through a storage's decode routes (one and six columns, single requests and
+// batches, short and split-key windows) and its verification and prompt routes (8 to 65 columns).
+template <class Cache>
+int run_share_decode_cases(const Cache& cache, std::uint32_t seed) {
+    int failures = 0;
+    for (const Geometry& geometry : kShareGeometries) {
+        failures += run_a1_case(geometry, cache, {1, 0, 1, seed}, MappingPattern::Identity);
+        failures +=
+            run_a3_case(geometry, cache, {1, 128, 192, seed + 1u}, MappingPattern::Fragmented);
+        failures +=
+            run_a1_case(geometry, cache, {6, 61, 192, seed + 2u}, MappingPattern::Fragmented);
+        failures +=
+            run_a3_case(geometry, cache, {1, 8191, 8192, seed + 3u}, MappingPattern::Fragmented);
+        failures += run_batch_case(
+            geometry, cache, {6, {61, 127}, {6, 3}, {1, 0}, MappingPattern::Fragmented, seed + 4u});
+        failures += run_batch_case(geometry, cache,
+                                   {1,
+                                    {0, 63, 127, 2048},
+                                    {1, 1, 1, 1},
+                                    {2, 0, 3, 1},
+                                    MappingPattern::Fragmented,
+                                    seed + 5u});
+    }
+    return failures;
+}
+
+template <class Cache>
+int run_share_prompt_cases(const Cache& cache, std::uint32_t seed) {
+    int failures = 0;
+    for (const Geometry& geometry : kShareGeometries) {
+        failures += run_a1_case(geometry, cache, {8, 61, 192, seed}, MappingPattern::Identity);
+        failures += run_a1_case(geometry, cache, {17, 31, 48, seed + 1u}, MappingPattern::Identity);
+        failures +=
+            run_a1_case(geometry, cache, {65, 63, 192, seed + 2u}, MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, cache, {65, 63, 192, seed + 3u}, MappingPattern::Offset);
+    }
+    return failures;
+}
+
+int run_softmax_attention_tensor_share_tests() {
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    int failures       = 0;
+    std::uint32_t seed = 5000u;
+    for (const CachePlan& plan : {kPlanBf16, kPlanInt8, kPlanRk8v4, kPlanRk4v4}) {
+        failures += run_share_decode_cases(plan, seed);
+        failures += run_share_prompt_cases(plan, seed + 10u);
+        seed += 20u;
+    }
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::RotatedInt4KeyInt4ValueE8, KvCacheStorage::RotatedE8RootKeyInt4Value}) {
+        failures += run_share_decode_cases(storage, seed);
+        failures += run_share_prompt_cases(storage, seed + 10u);
+        seed += 20u;
+    }
+    // FP8, NVFP4 and k8v4 decode and prompt separately: a prompt route an architecture lacks must
+    // not skip the decode cases.
+    failures += run_case_allowing_arch_skip("tensor-share FP8 KV cache (decode)",
+                                            [] { return run_share_decode_cases(kPlanFp8, 5200u); });
+    failures += run_case_allowing_arch_skip("tensor-share FP8 KV cache (prompt)",
+                                            [] { return run_share_prompt_cases(kPlanFp8, 5210u); });
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        const std::uint32_t base = storage == KvCacheStorage::Nvfp4Group16 ? 5220u : 5240u;
+        failures += run_case_allowing_arch_skip("tensor-share narrow-float KV cache (decode)", [&] {
+            return run_share_decode_cases(storage, base);
+        });
+        failures += run_case_allowing_arch_skip("tensor-share narrow-float KV cache (prompt)", [&] {
+            return run_share_prompt_cases(storage, base + 10u);
+        });
+    }
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " tensor-parallel share geometries\n";
     return failures == 0 ? 0 : 1;
 }
 

@@ -21,11 +21,11 @@ namespace ninfer::ops {
 
 inline constexpr int kKVCacheE8RootRowBytes = 64;
 
-template <typename Geometry>
 __device__ __forceinline__ std::int64_t kv_cache_e8_root_code_index(int physical_page, int kv_head,
-                                                                    int byte, int page_offset) {
-    return paged_kv_element_offset<kKVCacheE8RootRowBytes, Geometry::KVHeads>(
-        physical_page, kv_head, page_offset, byte);
+                                                                    int byte, int page_offset,
+                                                                    int kv_heads) {
+    return paged_kv_element_offset<kKVCacheE8RootRowBytes>(physical_page, kv_head, page_offset,
+                                                           byte, kv_heads);
 }
 
 // Root code r < 112 is the pair r/4 of (i<j) in lexicographic order with the signs of i and j in

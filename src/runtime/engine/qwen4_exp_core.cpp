@@ -6,6 +6,7 @@
 #include "core/host_pages.h"
 #include "core/file_read_error.h"
 #include "core/startup.h"
+#include "core/tensor_parallel.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen4_exp/ngram_component.h"
@@ -207,9 +208,6 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     inspect.complete();
     install_device_route_profile_for(options, device);
-    if (options.tensor_parallel) {
-        throw std::invalid_argument("--tensor-parallel supports dense Qwen3.5-core models");
-    }
     models::qwen4_exp::LoadOptions load;
     load.artifact     = options.artifact_path;
     load.ranks        = device.size();
@@ -217,6 +215,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     load.experts      = options.expert_residency;
     load.vision       = options.enable_vision;
     load.mtp          = mtp;
+    // Expert parallelism: the routed experts divided over the devices, everything else on the
+    // first. Without --tensor-split each device takes a share of its speed that fits beside what
+    // it holds.
+    if (options.tensor_parallel) {
+        load.expert_split = options.tensor_split;
+        if (load.expert_split.empty()) {
+            load.expert_split = models::qwen4_exp::default_expert_split(
+                reader, load, rank_free_bytes(device), rank_copy_bandwidth(device));
+        }
+    }
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
     auto model = models::qwen4_exp::load_model(reader, load, device, &options.startup_observer);
     device.synchronize();
@@ -317,6 +325,17 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0);
+    if (model->expert_parallel()) {
+        std::string ranges;
+        for (std::size_t rank = 0; rank < device.size(); ++rank) {
+            const auto [begin, end] = model->expert_range(text.num_experts, rank);
+            ranges +=
+                (rank == 0 ? "" : ", ") + std::to_string(begin) + "-" + std::to_string(end - 1);
+        }
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Qwen3.8-Flash-Next: expert parallelism, routed experts by device %s",
+                           ranges.c_str());
+    }
     if (const auto memory = instance->executor->memory(); memory.streamed_kv) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "Qwen3.8-Flash-Next: sparse-attention KV in pinned host memory "

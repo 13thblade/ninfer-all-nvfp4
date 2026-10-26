@@ -3,6 +3,8 @@
 
 #include "ggml_bridge_internal.cuh"
 
+#include "../../common/fixed_point.cuh"
+
 #include "ggml-cuda/dequantize.cuh"
 
 #include <cub/block/block_scan.cuh>
@@ -234,6 +236,9 @@ __launch_bounds__(kSortThreads) __global__
         const int e = ids[p];
         if (e >= 0 && e < experts) { sorted[atomicAdd(cursor + e, 1)] = p; }
     }
+    // Positions past the kept pairs name pair 0, so a consumer that reads every position (the
+    // matrix activation's gather) reads a real column.
+    for (int p = bounds[experts] + threadIdx.x; p < pairs; p += blockDim.x) { sorted[p] = 0; }
 }
 
 VectorLaunch vector_launch(GgmlType type) {
@@ -652,6 +657,95 @@ MoeRouting moe_sort_routes(const std::int32_t* ids, int pairs, int experts, void
         ids, pairs, experts, bounds, sorted, active, active_count, tile_count, tiles, capacity);
     detail::check(cudaGetLastError(), "moe routing launch");
     return MoeRouting{bounds, sorted, active, active_count, tile_count, tiles, capacity};
+}
+
+namespace {
+
+constexpr int kMaxFixedParts = 8;
+
+struct FixedParts {
+    const unsigned long long* part[kMaxFixedParts];
+    int count;
+};
+
+__global__ void keep_experts_kernel(const std::int32_t* __restrict__ ids, int pairs, int begin,
+                                    int end, int shift, std::int32_t* __restrict__ out) {
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= pairs) { return; }
+    const int e = ids[p];
+    out[p]      = e >= begin && e < end ? e - shift : -1;
+}
+
+// Block x takes token x; each thread a run of its values over every pair of the token.
+__global__ void weighted_rows_kernel(const float* __restrict__ rows,
+                                     const std::int32_t* __restrict__ ids,
+                                     const float* __restrict__ weights, int per_token,
+                                     int row_values, unsigned long long* __restrict__ fixed) {
+    const std::int64_t first = std::int64_t(blockIdx.x) * per_token;
+    for (int r = threadIdx.x; r < row_values; r += blockDim.x) {
+        unsigned long long sum = 0;
+        for (int k = 0; k < per_token; ++k) {
+            const std::int64_t p = first + k;
+            if (ids[p] < 0) { continue; }
+            sum += static_cast<unsigned long long>(
+                fixed_product(rows[p * row_values + r], weights[p]));
+        }
+        fixed[std::int64_t(blockIdx.x) * row_values + r] = sum;
+    }
+}
+
+__global__ void add_fixed_parts_kernel(unsigned long long* __restrict__ sums, FixedParts parts,
+                                       std::int64_t n) {
+    const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) { return; }
+    unsigned long long sum = sums[i];
+    for (int j = 0; j < parts.count; ++j) { sum += parts.part[j][i]; }
+    sums[i] = sum;
+}
+
+} // namespace
+
+void moe_keep_experts(const std::int32_t* ids, int pairs, int begin, int end, std::int32_t* out,
+                      cudaStream_t stream) {
+    if (pairs <= 0 || begin < 0 || end < begin) {
+        throw std::invalid_argument("gguf moe_keep_experts: invalid pairs or range");
+    }
+    keep_experts_kernel<<<(pairs + 255) / 256, 256, 0, stream>>>(ids, pairs, begin, end, 0, out);
+    detail::check(cudaGetLastError(), "moe_keep_experts launch");
+}
+
+void moe_local_experts(const std::int32_t* ids, int pairs, int begin, int end, std::int32_t* out,
+                       cudaStream_t stream) {
+    if (pairs <= 0 || begin < 0 || end < begin) {
+        throw std::invalid_argument("gguf moe_local_experts: invalid pairs or range");
+    }
+    keep_experts_kernel<<<(pairs + 255) / 256, 256, 0, stream>>>(ids, pairs, begin, end, begin,
+                                                                 out);
+    detail::check(cudaGetLastError(), "moe_local_experts launch");
+}
+
+void moe_weighted_rows(const float* rows, const std::int32_t* ids, const float* weights, int tokens,
+                       int per_token, int row_values, unsigned long long* fixed,
+                       cudaStream_t stream) {
+    if (tokens <= 0 || per_token <= 0 || row_values <= 0) {
+        throw std::invalid_argument("gguf moe_weighted_rows: invalid shape");
+    }
+    weighted_rows_kernel<<<tokens, 256, 0, stream>>>(rows, ids, weights, per_token, row_values,
+                                                     fixed);
+    detail::check(cudaGetLastError(), "moe_weighted_rows launch");
+}
+
+void add_fixed_parts(unsigned long long* sums, const unsigned long long* const* parts, int count,
+                     std::int64_t n, cudaStream_t stream) {
+    if (count < 0 || count > kMaxFixedParts || n < 0) {
+        throw std::invalid_argument("gguf add_fixed_parts: 0..8 parts");
+    }
+    if (count == 0 || n == 0) { return; }
+    FixedParts packed{};
+    packed.count = count;
+    for (int j = 0; j < count; ++j) { packed.part[j] = parts[j]; }
+    add_fixed_parts_kernel<<<unsigned((n + 255) / 256), 256, 0, stream>>>(sums, packed, n);
+    detail::check(cudaGetLastError(), "add_fixed_parts launch");
 }
 
 namespace {

@@ -302,9 +302,10 @@ std::vector<double> default_tensor_split(const artifact::Reader& reader, LoadOpt
         loading::bind_text(bindings, text, options, StagePlan(text.num_hidden_layers));
     const auto bytes = [&](WeightId id) { return parameter_bytes(reader, bindings, id); };
 
-    std::uint64_t divided   = 0; // GDN heads and FFN rows with their state
-    std::uint64_t every     = 0; // what each rank holds whole: norms and GDN gating
-    std::uint64_t first     = 0; // rank 0 alone: attention, its KV cache, embedding, head
+    // GDN and KV heads and FFN rows or experts, with their state and KV cache
+    std::uint64_t divided = 0;
+    std::uint64_t every   = 0; // what each rank holds whole: norms, GDN gating, the router
+    std::uint64_t first   = 0; // rank 0 alone: embedding, head, shared expert
     for (std::size_t layer = 0; layer < weights.layers.size(); ++layer) {
         const BlockWeights& block = weights.layers[layer];
         every += bytes(block.input_norm) + bytes(block.post_attention_norm);
@@ -314,15 +315,26 @@ std::vector<double> default_tensor_split(const artifact::Reader& reader, LoadOpt
             every += bytes(gdn->a_projection) + bytes(gdn->b_projection) + bytes(gdn->a_log) +
                      bytes(gdn->dt_bias) + bytes(gdn->norm);
         } else {
-            for (const WeightId id : loading::layer_weights(block)) { first += bytes(id); }
-            first -= bytes(block.input_norm) + bytes(block.post_attention_norm);
+            const auto& attention = std::get<AttentionWeights>(block.mixer);
+            divided += bytes(attention.query) + bytes(attention.key) + bytes(attention.gate) +
+                       bytes(attention.value) + bytes(attention.output);
+            every += bytes(attention.query_norm) + bytes(attention.key_norm);
         }
         if (const auto* dense = std::get_if<DenseWeights>(&block.ffn)) {
             divided += bytes(dense->gate) + bytes(dense->up) + bytes(dense->down);
-            if (std::holds_alternative<AttentionWeights>(block.mixer)) {
-                first -= bytes(dense->gate) + bytes(dense->up) + bytes(dense->down);
-            }
+            continue;
         }
+        // Expert parallelism: every rank routes, rank 0 holds the shared expert.
+        const auto& moe   = std::get<MoeWeights>(block.ffn);
+        const auto expert = [&](const DenseWeights& e) {
+            return bytes(e.gate) + bytes(e.up) + bytes(e.down);
+        };
+        const std::uint64_t router = bytes(moe.router) + bytes(moe.shared_score);
+        std::uint64_t experts      = 0;
+        for (const DenseWeights& e : moe.experts) { experts += expert(e); }
+        every += router;
+        first += expert(moe.shared);
+        divided += experts;
     }
     if (text.gdn) {
         const auto& gdn = *text.gdn;
@@ -338,8 +350,8 @@ std::vector<double> default_tensor_split(const artifact::Reader& reader, LoadOpt
     if (text.attention) {
         const PagedKVStorageLayout storage = paged_kv_storage_layout(
             sizing.kv_storage, static_cast<std::int32_t>(text.attention->head_dim));
-        first += sizing.kv_tokens * text.full_attention_layers *
-                 text.attention->num_key_value_heads * storage.physical_bytes_per_token_head();
+        divided += sizing.kv_tokens * text.full_attention_layers *
+                   text.attention->num_key_value_heads * storage.physical_bytes_per_token_head();
     }
     first += parameter_bytes(reader, bindings, weights.token_embedding) +
              parameter_bytes(reader, bindings, weights.output_head) +

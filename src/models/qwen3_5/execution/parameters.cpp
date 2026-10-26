@@ -171,9 +171,9 @@ public:
         return out;
     }
 
-    FfnParameters ffn(const BlockWeights& w) const {
-        if (const auto* d = std::get_if<DenseWeights>(&w.ffn)) { return dense(*d); }
-        const auto& moe = std::get<MoeWeights>(w.ffn);
+    FfnParameters ffn(const std::variant<DenseWeights, MoeWeights>& w) const {
+        if (const auto* d = std::get_if<DenseWeights>(&w)) { return dense(*d); }
+        const auto& moe = std::get<MoeWeights>(w);
         if (std::get<MoeConfig>(model_.config().text.ffn).num_experts_per_tok != 8) {
             throw std::invalid_argument("SparseMoe implements top-8 routing");
         }
@@ -247,6 +247,27 @@ public:
             gate_up.push_back(model_.input(expert.up));
             down.push_back(model_.input(expert.down));
         }
+        if (moe.share) {
+            return with_context(model_.weight(moe.router).name, [&]() -> FfnParameters {
+                std::vector<ops::WeightInput> shared;
+                if (moe.share->shared_expert) {
+                    for (const WeightId id : {moe.shared.gate, moe.shared.up, moe.shared.down}) {
+                        shared.push_back(model_.input(id));
+                    }
+                }
+                const auto held = [&](std::size_t i) {
+                    return shared.empty() ? nullptr : &shared[i];
+                };
+                MoeShareParameters out;
+                out.weights = ops::prepare_sparse_moe_share_weights(
+                    model_.input(moe.router), model_.input(moe.shared_score), gate_up, down,
+                    held(0), held(1), held(2));
+                out.share = {.expert_begin  = static_cast<std::int32_t>(moe.share->expert_begin),
+                             .expert_count  = static_cast<std::int32_t>(moe.experts.size()),
+                             .shared_expert = moe.share->shared_expert};
+                return out;
+            });
+        }
         return with_context(model_.weight(moe.router).name, [&] {
             return ops::prepare_sparse_moe_weights(
                 model_.input(moe.router), model_.input(moe.shared_score), gate_up, down,
@@ -259,7 +280,7 @@ public:
         BlockParameters out;
         out.input_norm          = tensor(w.input_norm);
         out.post_attention_norm = tensor(w.post_attention_norm);
-        out.ffn                 = ffn(w);
+        out.ffn                 = ffn(w.ffn);
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
             LinearParameters attention_output = rotated_linear(a->output);
             integer_route(attention_output, QType::Q4_G64_FP16, 5120, 6144);
@@ -304,12 +325,21 @@ public:
         return out;
     }
 
-    // A tensor-parallel rank's share of a layer. An attention layer's share has no mixer.
+    // A tensor-parallel rank's share of a layer. An attention layer's share has no mixer when the
+    // rank holds no KV heads.
     BlockParameters rank_block(const RankLayerWeights& w) const {
         BlockParameters out;
         out.input_norm          = tensor(w.input_norm);
         out.post_attention_norm = tensor(w.post_attention_norm);
-        out.ffn                 = dense(w.ffn);
+        out.ffn                 = ffn(w.ffn);
+        if (w.attention) {
+            const AttentionWeights& a = *w.attention;
+            out.mixer                 = AttentionParameters{
+                ops::prepare_attn_input_proj_weights(
+                    model_.rotated_input(a.query), model_.rotated_input(a.key),
+                    model_.rotated_input(a.gate), model_.rotated_input(a.value)),
+                tensor(a.query_norm), tensor(a.key_norm), rotated_linear(a.output)};
+        }
         if (w.gdn) {
             const GdnWeights& g = *w.gdn;
             out.mixer           = GdnParameters{
@@ -375,7 +405,7 @@ public:
         out.query_norm  = tensor(a.query_norm);
         out.key_norm    = tensor(a.key_norm);
         out.output      = linear(a.output);
-        out.ffn         = ffn(w.layer);
+        out.ffn         = ffn(w.layer.ffn);
         out.output_head = head(w.output_head_use);
         return out;
     }

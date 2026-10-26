@@ -30,7 +30,7 @@ void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Ten
         const auto kernel = causal_attention_prompt_fp8_kernel<Geometry, Metadata, TuringShapes>;
         raise_dynamic_shared_memory(kernel, Shape::SmemBytes);
         const dim3 grid(static_cast<unsigned>(div_up(tokens, Shape::Br)),
-                        static_cast<unsigned>(Geometry::QHeads), 1u);
+                        static_cast<unsigned>(q.ne[1]), 1u);
         kernel<<<grid, kCausalPromptFp8Threads, Shape::SmemBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), cache_k_ptr, cache_v_ptr, k_scale_ptr,
             v_scale_ptr, metadata, static_cast<const std::int32_t*>(positions.data), scale,
@@ -44,13 +44,10 @@ void causal_attention_prompt_fp8_attention_dispatch(const Tensor& q, const Tenso
                                                     float scale, const CacheView& cache,
                                                     Metadata metadata, Tensor& out,
                                                     cudaStream_t stream) {
-    if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        causal_attention_prompt_fp8_attention_launch_for<CausalD256H24Kv4>(
-            q, positions, scale, cache, metadata, out, stream);
-        return;
-    }
-    causal_attention_prompt_fp8_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,
-                                                                       metadata, out, stream);
+    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+        causal_attention_prompt_fp8_attention_launch_for<Geometry>(q, positions, scale, cache,
+                                                                   metadata, out, stream);
+    });
 }
 
 } // namespace

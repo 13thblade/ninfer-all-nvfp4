@@ -951,7 +951,8 @@ That build ran prompts chunk by chunk. [Prompt spans](deepseek-v41.md#prompt-spa
 8,086 tokens at 906 tok/s with host experts and 390 with disk experts on an RTX 4090 host of the
 same type (EPYC 7K62), with the same decode rates.
 
-DeepSeek-V4.1-Flash runs on one GPU only; it has no pipeline stages or tensor parallelism.
+DeepSeek-V4.1-Flash has no pipeline stages; several GPUs divide only its routed experts
+([expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 [DeepSeek-V4.1-Flash's measurements](deepseek-v41.md#measurements) add the hosts, the device
 cache each card holds, context lookup, startup and what limits each engine.
 

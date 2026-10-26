@@ -54,6 +54,11 @@ SparseMoeCandidate sparse_moe_prefill_tile_candidate(std::int32_t tokens, QType 
     return requested;
 }
 
+std::int32_t sparse_moe_prefill_builtin_min_tokens(QType routed_gate_up,
+                                                   QType routed_down) noexcept {
+    return codec_prefill_policy(routed_gate_up, routed_down).minimum;
+}
+
 bool sparse_moe_uses_prefill(std::int32_t tokens, QType routed_gate_up,
                              QType routed_down) noexcept {
     const std::int32_t minimum = sparse_moe_prefill_min_tokens(routed_gate_up, routed_down);

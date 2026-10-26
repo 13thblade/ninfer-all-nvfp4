@@ -5,11 +5,12 @@
 // error. Up to eight tokens take the vector kernel; wider calls over device-resident banks (each
 // matrix followed by 256 zero bytes, which the matrix kernel's last K step of a 640-value down row
 // reads) take the matrix kernel wherever the block type has one (IQ1_M and MXFP4 stay on the
-// vector kernel), with one or several column tiles per expert, and the same calls over banks that are not
-// declared device resident take the vector kernel. Where the CPU has the bank's block types, the
-// decode form's second stage also comes from CPU products (gguf_expert_cpu, its automatically
-// selected backend), as a miss service with a CPU share supplies it, and the sum must equal the
-// GPU's bit for bit.
+// vector kernel), with one or several column tiles per expert, and the same calls over banks that
+// are not declared device resident take the vector kernel. Where the CPU has the bank's block
+// types, the decode form's second stage also comes from CPU products (gguf_expert_cpu, its
+// automatically selected backend), as a miss service with a CPU share supplies it, and the sum must
+// equal the GPU's bit for bit. Expert-parallel parts over tables that hold only their own experts
+// (the others null) combine to the whole call's y bit for bit.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -125,13 +126,14 @@ struct Bank {
     DeviceBuffer table;
     std::vector<std::vector<float>> exact; // [distinct][rows * k]
     std::vector<std::vector<std::uint8_t>> host; // [distinct] stored blocks
+    std::vector<const void*> pointers;           // the table's entries
     int distinct = 1;
 
     Bank(QType q, int rows, int k, int count, int experts, std::mt19937& rng)
         : format(q), table(std::size_t(experts) * sizeof(void*)), distinct(count) {
         const auto block = gguf_block_shape(q);
         row_bytes        = std::int64_t(k / block.elements) * block.bytes;
-        std::vector<const void*> pointers(experts);
+        pointers.assign(experts, nullptr);
         for (int i = 0; i < count; ++i) {
             const auto bytes = random_blocks(q, rows, k, rng);
             matrices.emplace_back(bytes.size() + kTail);
@@ -161,6 +163,15 @@ struct Bank {
     }
 
     [[nodiscard]] const float* rows_of(int expert) const { return exact[expert % distinct].data(); }
+
+    // A device's table under expert parallelism: experts [begin, end), the other entries null.
+    [[nodiscard]] DeviceBuffer range_table(int begin, int end) const {
+        std::vector<const void*> entries(pointers.size(), nullptr);
+        for (int e = begin; e < end; ++e) { entries[e] = pointers[e]; }
+        DeviceBuffer out(entries.size() * sizeof(void*));
+        out.copy_from_host(entries.data(), entries.size() * sizeof(void*));
+        return out;
+    }
 };
 
 double silu(double x) { return x / (1.0 + std::exp(-x)); }
@@ -278,6 +289,55 @@ int run_case(const Case& c, std::uint32_t seed) {
             std::cerr << "FAIL " << c.name << " T=" << tokens
                       << (device_resident ? " matrix" : " vector") << ": a repeat differs\n";
             ++failures;
+        }
+        {
+            // Expert parallelism: parts over range tables, the shared expert in the first, or in
+            // a later one, combine to the whole call's y bit for bit.
+            const std::vector<std::vector<int>> splits = {{0, 200, 512}, {0, 1, 300, 511, 512}};
+            for (std::size_t s = 0; s < splits.size(); ++s) {
+                const auto& ends     = splits[s];
+                const std::size_t n  = ends.size() - 1;
+                const std::size_t at = s == 0 ? 0 : n - 1; // the part with the shared expert
+                std::vector<DeviceBuffer> tables, fixed;
+                std::vector<Tensor> parts;
+                WorkspaceArena part_workspace(ops::moe_experts_gguf_part_workspace_bytes(tokens));
+                for (std::size_t p = 0; p < n; ++p) {
+                    const int begin = ends[p], end = ends[p + 1];
+                    tables.push_back(gate.range_table(begin, end));
+                    tables.push_back(up.range_table(begin, end));
+                    tables.push_back(down.range_table(begin, end));
+                    const auto view = [&](const Bank& bank, std::size_t i) {
+                        return ops::GgufExpertTable{bank.format,
+                                                    static_cast<const void* const*>(tables[i].p),
+                                                    bank.row_bytes};
+                    };
+                    const std::size_t base = tables.size() - 3;
+                    const ops::GgufMoeWeights part_banks{
+                        view(gate, base), view(up, base + 1), view(down, base + 2),
+                        sgate.view(),     sup.view(),         sdown.view(),
+                        kExperts,         device_resident};
+                    fixed.emplace_back(std::size_t(kHidden) * tokens * 8);
+                    parts.push_back(Tensor(fixed.back().p, DType::I64, {kHidden, tokens}));
+                    ops::moe_experts_gguf_part(t_m, t_ids, t_w, p == at ? &t_s : nullptr,
+                                               part_banks, begin, end, part_workspace, parts.back(),
+                                               nullptr);
+                    if (part_workspace.used() != 0) {
+                        std::cerr << "FAIL " << c.name << " T=" << tokens
+                                  << ": a part's workspace scope leaked\n";
+                        ++failures;
+                    }
+                }
+                ops::moe_experts_gguf_combine(parts, t_y, nullptr);
+                check(cudaDeviceSynchronize(), "expert-parallel parts");
+                std::vector<float> combined(got.size());
+                d_y.copy_to_host(combined.data(), combined.size() * 4);
+                const bool same = std::memcmp(got.data(), combined.data(), got.size() * 4) == 0;
+                std::cout << (same ? "OK   " : "FAIL ") << c.name << " T=" << tokens
+                          << (tokens > 8 ? (device_resident ? " matrix" : " vector") : "") << ": "
+                          << n << " expert-parallel parts " << (same ? "equal" : "differ from")
+                          << " the whole call\n";
+                failures += same ? 0 : 1;
+            }
         }
         if (ops::moe_experts_gguf_decode_supported(banks, tokens)) {
             // The decode form must equal the separate kernels bit for bit, whole and split into a

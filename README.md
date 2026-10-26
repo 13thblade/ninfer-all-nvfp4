@@ -17,7 +17,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 ## What's New
 
 - **2026-10-26:** Qwen3.8-Flash-Next with [disk experts](docs/qwen3-8-flash-next.md#expert-placements) prefills a long prompt 3.1 to 4.1 times as fast and decodes the answer 1.8 to 3.6 times as fast (Q2_0, RTX 3090 to 5090).
-- **2026-10-26:** [Tensor-parallel](docs/maintainer/pipeline-stages.md#tensor-parallelism) shares sized to each card (`--tensor-split`, or each card's measured bandwidth capped by its free memory), for every weight format of a dense model (groupwise-int, BF16, ternary, FP8, NVFP4, Hadamard-rotated) and with DFlash drafters.
+- **2026-10-26:** [Tensor-parallel](docs/maintainer/pipeline-stages.md#tensor-parallelism) shares sized to each card (`--tensor-split`, or each card's measured bandwidth capped by its free memory), for every weight format of a dense model (groupwise-int, BF16, ternary, FP8, NVFP4, Hadamard-rotated) and with DFlash drafters, attention divided by KV heads; [expert parallelism](docs/maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families) divides the routed experts of every MoE family (native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash) over the GPUs.
 - **2026-10-26:** DeepSeek-V4.1-Flash decodes [39 tok/s on one RTX 4090](docs/deepseek-v41.md#the-decode-step-on-one-rtx-4090), with CPU threads [computing part of the missing experts](docs/deepseek-v41.md#the-cpu-share), and 83 tok/s on one RTX PRO 6000 with the release's [DSpark drafter](docs/deepseek-v41.md#the-dspark-drafter); it reads [images](docs/deepseek-v41.md#images) with the release's vision tower.
 - **2026-10-25:** [DeepSeek-V4.1-Flash](docs/deepseek-v41.md) from ISTA-DASLab's GSQ-RCO IQ1_M GGUF, experts in host memory or on disk: [48 tok/s on one RTX PRO 6000, 26 on one RTX 4090](docs/performance.md#deepseek-v41-flash), [prefill 925 tok/s](docs/deepseek-v41.md#prompt-spans) on the RTX 4090.
 - **2026-10-25:** `--tensor-parallel` for dense Qwen3.5-core models.
@@ -459,9 +459,10 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
   stage owning its weights, KV and state; the cards may differ where the build runs on each, such as
   RTX 30 with RTX 40 cards on the `86` build ([pipeline stages](docs/maintainer/pipeline-stages.md)).
   `--tensor-parallel` divides every layer over the devices instead: each holds a share of the GDN
-  heads and dense FFN rows of a dense model in any weight format, sized to the card, and reads
-  only those per token
-  ([tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism)).
+  heads, of the attention's KV heads with their cache and of the dense FFN rows or MoE experts in
+  any weight format, sized to the card, and reads only those per token
+  ([tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism)). Qwen3.8-Flash-Next,
+  Gemma 4, Flint and DeepSeek-V4.1-Flash divide only their routed experts this way.
 - FP8 A8 and NVFP4 W4A4 tensor-core routes on every `120a` build, an FP4 tensor-core prompt kernel
   for an NVFP4 KV cache, and programmatic dependent launches on Blackwell.
 

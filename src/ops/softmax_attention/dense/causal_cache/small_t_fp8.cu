@@ -56,7 +56,7 @@ void launch_fp8_partial(const Tensor& q, CacheInput input, const Tensor& positio
             static_assert(kCausalSmallTQuantizedFixedBytes<RowTiles, KeyBlock> + DynamicBytes <=
                           shape_max_shared_bytes_per_block(TuringShapes));
             using KernelInput = CacheInput;
-            const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+            const dim3 grid(q.ne[1] / Geometry::GroupSize, splits, invocation.batch_size);
             const auto launch = [&]() {
                 auto kernel =
                     causal_attention_small_t_fp8_tiled_kernel<Geometry, TokenTile, Warps, MinBlocks,
@@ -107,11 +107,11 @@ void launch_fp8_reduce(const Tensor& positions, const CausalSmallTInvocation& in
                        Tensor& out, cudaStream_t stream) {
     constexpr int Block = 256;
 
-    constexpr int DChunk = Geometry::QHeads == 24 ? 256 : 64;
+    constexpr int DChunk = Geometry::GroupSize == 6 ? 256 : 64;
     // The shared reducer: its non-INT8 split tier is the quantized one, and a window of zero keys
     // yields zeros through either count.
     const auto launch = [&]<bool Offset>() {
-        const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, DChunk),
+        const dim3 grid(out.ne[1], div_up(kCausalHeadDim, DChunk),
                         invocation.width * invocation.batch_size);
         causal_attention_small_t_reduce_output_kernel<Geometry, DChunk, false, MultiBatch, Masked,
                                                       Offset><<<grid, Block, 0, stream>>>(
@@ -140,8 +140,8 @@ void causal_attention_small_t_fp8_launch_for(const Tensor& q, CacheInput input,
                                              Tensor& partial_acc, Tensor& partial_m,
                                              Tensor& partial_l, Tensor& out, cudaStream_t stream) {
     const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto splits           = causal_attention_split_capacity(
-        Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
+    const auto splits = causal_attention_split_capacity(q.ne[1], invocation.width, cache.storage,
+                                                        envelope, invocation.batch_size);
 
     const auto launch_partial = [&]<int Tokens, bool MultiBatch, bool Masked>() {
         launch_fp8_partial<Geometry, Tokens, MultiBatch, Masked>(
@@ -183,13 +183,13 @@ void causal_attention_small_t_fp8_launch_for(const Tensor& q, CacheInput input,
         dispatch_metadata.template operator()<6>();
         break;
     case 7:
-        if constexpr (Geometry::QHeads == 24) {
+        if constexpr (Geometry::GroupSize == 6) {
             dispatch_metadata.template operator()<7>();
             break;
         }
         throw std::invalid_argument("unsupported query-row tile");
     case 8:
-        if constexpr (Geometry::QHeads == 24) {
+        if constexpr (Geometry::GroupSize == 6) {
             dispatch_metadata.template operator()<8>();
             break;
         }
@@ -235,15 +235,11 @@ void causal_attention_small_t_fp8_launch(
         .width         = width,
         .batch_size    = q.ne[3],
     };
-    if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        causal_attention_small_t_fp8_launch_for<CausalD256H24Kv4>(
-            q, input, positions, scale, cache, invocation, envelope, partial_acc, partial_m,
-            partial_l, out, stream);
-        return;
-    }
-    causal_attention_small_t_fp8_launch_for<CausalD256H16Kv2>(q, input, positions, scale, cache,
-                                                              invocation, envelope, partial_acc,
-                                                              partial_m, partial_l, out, stream);
+    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+        causal_attention_small_t_fp8_launch_for<Geometry>(q, input, positions, scale, cache,
+                                                          invocation, envelope, partial_acc,
+                                                          partial_m, partial_l, out, stream);
+    });
 }
 
 void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& positions,
@@ -262,15 +258,11 @@ void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& p
         .batch_size    = 1,
     };
     PagedKVBatchLayerView batch_cache = single_row_paged_kv_batch_view(cache);
-    if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        causal_attention_small_t_fp8_launch_for<CausalD256H24Kv4>(
-            q, input, positions, scale, batch_cache, invocation, envelope, partial_acc, partial_m,
-            partial_l, out, stream);
-        return;
-    }
-    causal_attention_small_t_fp8_launch_for<CausalD256H16Kv2>(
-        q, input, positions, scale, batch_cache, invocation, envelope, partial_acc, partial_m,
-        partial_l, out, stream);
+    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+        causal_attention_small_t_fp8_launch_for<Geometry>(q, input, positions, scale, batch_cache,
+                                                          invocation, envelope, partial_acc,
+                                                          partial_m, partial_l, out, stream);
+    });
 }
 
 } // namespace ninfer::ops::detail
