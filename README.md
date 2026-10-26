@@ -16,7 +16,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 ## What's New
 
-- **2026-10-26:** DeepSeek-V4.1-Flash decodes [39 tok/s on one RTX 4090](docs/deepseek-v41.md#the-decode-step-on-one-rtx-4090), with CPU threads [computing part of the missing experts](docs/deepseek-v41.md#the-cpu-share), and 83 tok/s on one RTX PRO 6000 with the release's [DSpark drafter](docs/deepseek-v41.md#the-dspark-drafter).
+- **2026-10-26:** DeepSeek-V4.1-Flash decodes [39 tok/s on one RTX 4090](docs/deepseek-v41.md#the-decode-step-on-one-rtx-4090), with CPU threads [computing part of the missing experts](docs/deepseek-v41.md#the-cpu-share), and 83 tok/s on one RTX PRO 6000 with the release's [DSpark drafter](docs/deepseek-v41.md#the-dspark-drafter); it reads [images](docs/deepseek-v41.md#images) with the release's vision tower.
 - **2026-10-25:** [DeepSeek-V4.1-Flash](docs/deepseek-v41.md) from ISTA-DASLab's GSQ-RCO IQ1_M GGUF, experts in host memory or on disk: [48 tok/s on one RTX PRO 6000, 26 on one RTX 4090](docs/performance.md#deepseek-v41-flash), [prefill 925 tok/s](docs/deepseek-v41.md#prompt-spans) on the RTX 4090.
 - **2026-10-25:** `--tensor-parallel` for dense Qwen3.5-core models.
 - **2026-10-24:** [Flint](docs/flint.md#measurements) decodes 348 tok/s on an RTX 5090 and 210 on an RTX 4090 with host experts.
@@ -171,7 +171,7 @@ that only this engine reads.
 | [Qwen3.8-Flash-Next Coder GSQ-RCO IQ1_M](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 31.02 | GGUF blocks | ✓ | ✓ | — | — | expert-pruned coding build, 256 experts per layer; shared-Q8_0 MTP; reads the n-gram table |
 | [Gemma 4 26B-A4B it QAT](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3) | 14.75 | GGUF Q4_0 blocks | ✓ | ✓ | — | — | Google's QAT GGUF byte for byte; the MTP column is Google's QAT assistant |
 | [Flint UD-Q4_K_XL](https://huggingface.co/WaveCut/Flint-UD-Q4_K_XL-NInfer-v3) | 23.38 | GGUF blocks, Q8_0 to IQ3_S | — | — | — | — | Unsloth's UD-Q4_K_XL GGUF byte for byte; drafts by context lookup |
-| [DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ1_M](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3) | 120.12 | GGUF blocks, IQ1_S to IQ2_S experts | — | — | — | — | ISTA-DASLab's GGUF byte for byte; experts in host memory or on disk; reads the Engram table; the release's DSpark drafter from Unsloth's Q8_0 GGUF (`--spec dspark`), or context lookup |
+| [DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ1_M](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3) | 121.02 | GGUF blocks, IQ1_S to IQ2_S experts | ✓ | — | — | — | ISTA-DASLab's GGUF byte for byte; experts in host memory or on disk; reads the Engram table; the release's vision tower (images); the release's DSpark drafter from Unsloth's Q8_0 GGUF (`--spec dspark`), or context lookup |
 
 The three Flash-Next releases read one shared n-gram table, which the model names by digest: the
 [n-gram table](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3) (26.92 GiB,
@@ -189,8 +189,8 @@ conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b
 
 Ternary Bonsai 2 27B decodes 397 tok/s on an RTX 5090 with DFlash2 and holds a 978,944-token context with
 every planted code found. Qwen3.8-Flash-Next decodes 138 tok/s with every expert on one RTX PRO 6000, and
-74 tok/s with its experts in host memory on one RTX 5090. DeepSeek-V4.1-Flash decodes 48 tok/s on one
-RTX PRO 6000 and 39 tok/s on one RTX 4090 with its 106.7 GiB of experts in host memory. Every table of
+96 tok/s with its experts in host memory on one RTX 5090. DeepSeek-V4.1-Flash decodes 52 tok/s on one
+RTX 5090, 48 on one RTX PRO 6000 and 39 on one RTX 4090 with its 106.7 GiB of experts in host memory. Every table of
 every card is on the [performance page](docs/performance.md).
 
 *Click a section to expand it.*
@@ -236,7 +236,7 @@ The official `groupwise-int` artifact, measured in September 2026, one card each
 </details>
 
 <details>
-<summary><b>Qwen3.8-Flash-Next</b> — 138 tok/s with the experts on a GPU, 74 tok/s from host memory</summary>
+<summary><b>Qwen3.8-Flash-Next</b> — 138 tok/s with the experts on a GPU, 96 tok/s from host memory</summary>
 
 The Q2_0 release (35.9 GiB model and 26.8 GiB n-gram table), one request, greedy, October 2026. Decode of
 a short answer, in tok/s:
@@ -244,25 +244,26 @@ a short answer, in tok/s:
 | Card | Every expert on the GPUs | Experts in host memory | Experts on disk, in the page cache | Experts on disk, cold |
 |---|---:|---:|---:|---:|
 | RTX PRO 6000 | 138 (one card) | 55 | 76 | 35 |
-| RTX 5090 | 136 (two cards) | 74 | 68 | 25 |
-| RTX 4090 | 97 (two cards) | 53 | 42 | 18 |
-| RTX 3090 | 90 (two RTX 3090 Ti) | 49 | 47 | 17 |
+| RTX 5090 | 136 (two cards) | 96 | 71 | 23 |
+| RTX 4090 | 97 (two cards) | 66 | 46 | 23 |
+| RTX 3090 | 90 (two RTX 3090 Ti) | 55 | 47 | 22 |
 
 Prefill of a 4,463-token prompt, in tok/s:
 
 | Card | Every expert on the GPUs | Experts in host memory | Experts on disk, in the page cache | Experts on disk, cold |
 |---|---:|---:|---:|---:|
 | RTX PRO 6000 | 2,939 | 1,297 | 2,024 | 1,000 |
-| RTX 5090 | 3,809 | 1,677 | 1,739 | 694 |
-| RTX 4090 | 3,608 | 1,138 | 723 | 160 |
-| RTX 3090 | 1,504 | 842 | 630 | 195 |
+| RTX 5090 | 3,809 | 669 | 2,099 | 732 |
+| RTX 4090 | 3,608 | 430 | 808 | 347 |
+| RTX 3090 | 1,504 | 209 | 625 | 282 |
 
 - **The host matters.** Host and disk rows depend on the host as much as on the card. The RTX 5090
-  host had PCIe 5.0 x16; the others had PCIe 4.0 x16. The RTX 4090 rows ran pinned to the GPUs' NUMA
-  node in a two-socket VM; unpinned, host experts decode there at 40 tok/s and disk experts at 32 to 33.
-- **Older host and disk rows.** They were measured before the October 9 decode work. Host experts on
-  an RTX 3090 now decode 87-94 tok/s in a different workload, 98-100 with a repeated prompt
-  ([host experts on one RTX 3090](docs/qwen3-8-flash-next.md#host-experts-on-one-rtx-3090)).
+  host had PCIe 5.0 x16, the RTX PRO 6000 and RTX 4090 hosts PCIe 4.0 x16, and the RTX 3090 host
+  PCIe 3.0 x16 and two sockets (the test ran pinned to the GPU's node). The host, disk and cold
+  columns of the three GeForce cards were measured on October 26, the rest on October 5 and 6.
+- **Prefill chunk.** The rows prefill in 512-token chunks, and host experts copy each chunk's
+  missing experts again: in 4,096-token chunks the RTX 5090 prefills at 2,759 tok/s with host
+  experts, and `ninfer-serve` with its defaults at 5,140 to 5,180.
 - **Other releases and cards.** IQ3_S, the Coder IQ1_M build and the 8 and 12 GB cards are in the
   [expert placements](docs/performance.md#expert-placements). Six reasoning requests at once on two
   RTX 5090s produced 193 tok/s of output with Q2_0.
@@ -270,30 +271,33 @@ Prefill of a 4,463-token prompt, in tok/s:
 </details>
 
 <details>
-<summary><b>DeepSeek-V4.1-Flash</b> — 48 tok/s on one RTX PRO 6000, 83 with DSpark, 31 to 39 tok/s on one RTX 4090</summary>
+<summary><b>DeepSeek-V4.1-Flash</b> — 52 tok/s on one RTX 5090, 48 on one RTX PRO 6000 (83 with DSpark), 34 to 39 on one RTX 4090</summary>
 
 ISTA-DASLab's GSQ-RCO IQ1_M GGUF (112.7 GiB, and its 103.0 GiB Engram table), one request, greedy,
-thinking off, one GPU, October 2026. The routed experts stay in pinned host memory or in the file, and
-the card caches as many as fit:
+thinking off, one GPU, October 2026. The routed experts stay in pinned host memory or in the file,
+the card caches as many as fit, and CPU threads compute a share of each decode call's missing host
+experts:
 
 | Card | Experts cached on the card | Host experts: short answer (tok/s) | after 8,086 tokens (tok/s) | prefill of 8,086 tokens (tok/s) | Disk experts, page cache warm: short answer (tok/s) |
 |---|---:|---:|---:|---:|---:|
 | RTX PRO 6000 | 74% | 48.0 | 45.3 | 1,310 | 37.4 |
-| RTX 5090 | 15% | 29.2 | 22.5 | 499 | 12.5 |
-| RTX 4090 | 7% | 25.9 | 22.2 | 490 | 8.5 |
-| RTX 3090 | | 21.8 | 18.9 | 410 | 7.4 |
+| RTX 5090 | 15% | 51.5 | 42.2 | 912 | 16.7 |
+| RTX 4090 | 7% | 33.8 | 27.5 | 915 | 9.5 |
+| RTX 3090 | 7% | 19.8 | 15.2 | 416 | 6.0 |
 
-These ran prompts chunk by chunk and copied every missing expert to the card. The current build
-prefills the 8,086 tokens in one span at 938 tok/s on the RTX 4090 and has CPU threads compute a
-share of each decode call's missing host experts: 38.9 and 31.4 tok/s there, against 33.5 and 26.6
-when it copies every miss ([the CPU share](docs/deepseek-v41.md#the-cpu-share)). On that RTX 4090
-host Strata 0.2.6 decodes the same GGUF at 34 to 40 tok/s, computing about half the experts on its
-CPU threads, and prefills at 635 to 690 tok/s ([measurements](docs/deepseek-v41.md#measurements)).
-With host experts the server peaks at 116 GiB of host memory. With the release's DSpark drafter
-(`--spec dspark`) the RTX PRO 6000 decodes at 83.1 and 75.0 tok/s, against 50.8 and 48.3 for the
-same build without it (both copying every miss), and the RTX 4090 with the CPU share at 39.9 and
-33.2 tok/s; the drafter's 7.4 GiB shrink the 4090's expert cache, so copying every miss it decodes
-at 25.1 and 20.2 ([the drafter](docs/deepseek-v41.md#the-dspark-drafter)).
+The RTX PRO 6000 row is an earlier build that ran prompts chunk by chunk and copied every missing
+expert; the others ran on October 26 on hosts with PCIe 5.0 (RTX 5090), 4.0 (RTX 4090) and 3.0
+(RTX 3090) links ([per card](docs/deepseek-v41.md#per-card)). On an RTX 4090 host with 64 CPU cores
+the build decodes at 38.9 and 31.4 tok/s, against 33.5 and 26.6 when it copies every miss
+([the CPU share](docs/deepseek-v41.md#the-cpu-share)); there Strata 0.2.6 decodes the same GGUF at
+34 to 40 tok/s, computing about half the experts on its CPU threads, and prefills at 635 to 690
+tok/s ([measurements](docs/deepseek-v41.md#measurements)). With host experts the server peaks at 116
+GiB of host memory. With the release's DSpark drafter (`--spec dspark`) the RTX PRO 6000 decodes at
+83.1 and 75.0 tok/s, against 50.8 and 48.3 for the same build without it (both copying every miss),
+and the RTX 4090 with the CPU share at 39.9 and 33.2 tok/s; the drafter's 7.4 GiB shrink the 4090's
+expert cache, so copying every miss it decodes at 25.1 and 20.2
+([the drafter](docs/deepseek-v41.md#the-dspark-drafter)). With `--vision` it reads images through
+the release's vision tower ([images](docs/deepseek-v41.md#images)).
 
 </details>
 
@@ -350,8 +354,8 @@ at 25.1 and 20.2 ([the drafter](docs/deepseek-v41.md#the-dspark-drafter)).
   hyper-connections, latent attention over a 128-position window and indexer-selected compressed
   latents with the release's FP8 and FP4 roundings, Engram rows read from the table's file or
   RAM, up to eight concurrent requests with prefix reuse through host memory, reasoning, DSML
-  tool calls, structured output, typed decisions, the release's DSpark drafter and context-lookup
-  drafting. Its 106.7 GiB of
+  tool calls, structured output, typed decisions, images through the release's vision tower, the
+  release's DSpark drafter and context-lookup drafting. Its 106.7 GiB of
   routed experts stay in pinned host memory or in the artifact's files, read into bounded
   buffers rather than mapped, and CPU threads compute a share of each decode call's missing host
   experts. Prompts run block by block in spans of up to 16,384 tokens, so each block's experts

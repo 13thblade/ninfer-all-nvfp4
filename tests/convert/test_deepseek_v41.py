@@ -22,6 +22,8 @@ ENGRAM_ROWS = sum(PRIMES)
 COMPRESSED_VOCAB = 100
 # The drafter: one block over the streams entering blocks 1 and 2, two experts, one a token.
 DRAFT_TARGETS, DRAFT_EXPERTS, DRAFT_RANK, NOISE = [1, 2], 2, 16, 5
+# The vision tower: two blocks of width 32 (two heads of 16), patches of 2 pixels merged 3 x 3.
+V_LAYERS, V_HIDDEN, V_HEADS, V_WIDTH, V_PATCH, V_MERGE, IMAGE_TOKEN = 2, 32, 2, 48, 2, 3, 500
 
 
 def _hf_config(**overrides):
@@ -48,8 +50,13 @@ def _hf_config(**overrides):
         dspark_markov_rank=DRAFT_RANK, dspark_n_routed_experts=DRAFT_EXPERTS,
         dspark_num_experts_per_tok=1)
     text.update(overrides)
+    vision = dict(model_type="deepseek_v41_vision", num_hidden_layers=V_LAYERS,
+                  hidden_size=V_HIDDEN, num_attention_heads=V_HEADS, intermediate_size=V_WIDTH,
+                  patch_size=V_PATCH, rope_theta=10000, downsample_ratio=V_MERGE,
+                  max_image_tokens=1024, min_pixels=64, max_wh_ratio=None)
     return {"architectures": ["DeepseekV41ForCausalLM"], "model_type": "deepseek_v41",
-            "bos_token_id": 0, "eos_token_id": 1, "text_config": text}
+            "bos_token_id": 0, "eos_token_id": 1, "image_token_id": IMAGE_TOKEN,
+            "text_config": text, "vision_config": vision}
 
 
 def _gguf_kv(**overrides):
@@ -279,7 +286,76 @@ def _drafter(tmp_path, kv=None):
     return path, stored
 
 
-def _convert(tmp_path, hf, first, table, components=("text", "engram"), drafter=None):
+def _mmproj(tmp_path, projector="deepseek4v"):
+    """A two-block DeepSeek-V4.1 vision tower as llama.cpp's clip GGUF: BF16 matrices, the patch
+    convolution, norms, biases and span rows as F32 holding BF16 values."""
+
+    generator = np.random.default_rng(31)
+    tensors, stored = [], {}
+
+    def bf16_values(shape):
+        values = generator.normal(size=shape).astype(np.float32)
+        return ((values.view(np.uint32) >> 16) << 16).view(np.float32)
+
+    def put(name, shape, kind=TYPE_F32):
+        values = bf16_values(shape)
+        stored[name] = values
+        if kind == TYPE_BF16:
+            words = (values.view(np.uint32) >> 16).astype(np.uint16)
+            tensors.append((name, shape, kind, words.tobytes()))
+        else:
+            tensors.append((name, shape, kind, values.tobytes()))
+
+    put("v.patch_embd.weight", (V_HIDDEN, 3, V_PATCH, V_PATCH))
+    put("v.patch_embd.bias", (V_HIDDEN,))
+    for i in range(V_LAYERS):
+        g = f"v.blk.{i}."
+        put(g + "ln1.weight", (V_HIDDEN,))
+        put(g + "ln2.weight", (V_HIDDEN,))
+        put(g + "attn_qkv.weight", (3 * V_HIDDEN, V_HIDDEN), TYPE_BF16)
+        put(g + "attn_qkv.bias", (3 * V_HIDDEN,))
+        put(g + "attn_out.weight", (V_HIDDEN, V_HIDDEN), TYPE_BF16)
+        put(g + "attn_out.bias", (V_HIDDEN,))
+        put(g + "ffn_gate.weight", (V_WIDTH, V_HIDDEN), TYPE_BF16)
+        put(g + "ffn_up.weight", (V_WIDTH, V_HIDDEN), TYPE_BF16)
+        put(g + "ffn_down.weight", (V_HIDDEN, V_WIDTH), TYPE_BF16)
+    put("v.post_ln.weight", (V_HIDDEN,))
+    put("mm.1.weight", (HIDDEN, V_HIDDEN * V_MERGE * V_MERGE), TYPE_BF16)
+    put("mm.1.bias", (HIDDEN,))
+    put("mm.2.weight", (HIDDEN, HIDDEN), TYPE_BF16)
+    put("mm.2.bias", (HIDDEN,))
+    for name in ("v.token_embd.img_start", "v.image_newline", "v.token_embd.img_end"):
+        put(name, (HIDDEN,))
+    v = "clip.vision."
+    kv = {"general.architecture": "clip", "clip.has_vision_encoder": True,
+          "clip.projector_type": projector, "clip.use_silu": True,
+          v + "block_count": V_LAYERS, v + "embedding_length": V_HIDDEN,
+          v + "attention.head_count": V_HEADS, v + "feed_forward_length": V_WIDTH,
+          v + "patch_size": V_PATCH, v + "projection_dim": HIDDEN,
+          v + "projector.scale_factor": V_MERGE, v + "image_min_pixels": 64,
+          v + "image_mean": [0.5] * 3, v + "image_std": [0.5] * 3,
+          v + "attention.layer_norm_epsilon": 1e-6}
+    path = tmp_path / "mmproj.gguf"
+    write_gguf(path, kv, tensors)
+    return path, stored
+
+
+def _bias_vl(tmp_path, layers=3):
+    """The release's bias_vl tensors as tools/convert/fetch_tensors.py writes them."""
+
+    from tools.convert.fetch_tensors import write_safetensors
+
+    generator = np.random.default_rng(37)
+    values = {f"layers.{i}.ffn.gate.bias_vl": generator.normal(size=EXPERTS).astype(np.float32)
+              for i in range(layers)}
+    path = tmp_path / "bias_vl.safetensors"
+    write_safetensors(path, {name: ({"dtype": "F32", "shape": [EXPERTS]}, v.tobytes())
+                             for name, v in values.items()}, {})
+    return path, values
+
+
+def _convert(tmp_path, hf, first, table, components=("text", "engram"), drafter=None,
+             mmproj=None, bias_vl=None):
     from tools.convert.pipeline import convert
     from tools.convert.recipe import Recipe
     from tools.convert.sources.safetensors import SafetensorsSource
@@ -288,15 +364,20 @@ def _convert(tmp_path, hf, first, table, components=("text", "engram"), drafter=
     with SafetensorsSource(hf) as base, GGUFFile(table) as engram:
         gguf = deepseek_v41.GGUFShards(first) if "text" in components else None
         dspark = deepseek_v41.GGUFShards(drafter) if drafter else None
-        model = deepseek_v41.build_model(base, gguf, components=components, dspark=dspark)
+        vision = GGUFFile(mmproj) if mmproj else None
+        bias = SafetensorsSource(bias_vl) if bias_vl else None
+        model = deepseek_v41.build_model(base, gguf, components=components, dspark=dspark,
+                                         vision=vision, bias_vl=bias)
         recipe = Recipe(model)
         sources = ({"base": base, "engram": engram} | ({"gguf": gguf} if gguf else {})
                    | ({"dspark": dspark} if dspark else {}))
         deepseek_v41.deepseek_v41_gguf(model, recipe, sources)
         convert(model, recipe, output, device="cpu", rows_per_chunk=96)
-        for source in (gguf, dspark):
+        for source in (gguf, dspark, vision):
             if source is not None:
                 source.__exit__()
+        if bias is not None:
+            bias.close()
     return output
 
 
@@ -470,3 +551,130 @@ def test_the_drafter_metadata_must_match_the_config(tmp_path, bad):
         with pytest.raises(ValueError):
             deepseek_v41.build_model(base, gguf, components=("text", "engram", "dspark"),
                                      dspark=dspark)
+
+
+def test_the_vision_tower_keeps_the_release_values(tmp_path):
+    from tools.artifact.reader import Artifact
+
+    hf, first, table, _ = _release(tmp_path)
+    mmproj, stored = _mmproj(tmp_path)
+    bias_vl, bias = _bias_vl(tmp_path)
+    output = _convert(tmp_path, hf, first, table, ("text", "engram", "vision"), mmproj=mmproj,
+                      bias_vl=bias_vl)
+    with Artifact(output) as artifact:
+        directory = artifact.directory
+        config = directory.components["vision"]["config"]
+        assert config == {"architectures": ["DeepseekV41VisionModel"],
+                          "model_type": "deepseek_v41_vision", "num_hidden_layers": V_LAYERS,
+                          "hidden_size": V_HIDDEN, "num_attention_heads": V_HEADS,
+                          "intermediate_size": V_WIDTH, "patch_size": V_PATCH,
+                          "downsample_ratio": V_MERGE, "max_image_tokens": 1024,
+                          "min_pixels": 64, "rope_theta": 10000.0, "max_wh_ratio": None,
+                          "image_token_id": IMAGE_TOKEN, "projection_dim": HIDDEN,
+                          "rms_norm_eps": 1e-6}
+        # The release's preprocessing, which the frontend reads.
+        resource = directory.components["vision"]["resources"]["processor_config.json"]
+        processor = json.loads(artifact.read_object(resource))["image_processor"]
+        assert processor == {"patch_size": V_PATCH, "downsample_ratio": V_MERGE, "min_pixels": 64,
+                             "max_image_tokens": 1024, "max_wh_ratio": None, "resample": 3,
+                             "pad_color": [127] * 3, "image_mean": [0.5] * 3,
+                             "image_std": [0.5] * 3, "image_token": "<｜deepseek_image｜>"}
+        bindings = directory.bindings
+
+        def values(name):
+            binding = bindings[name]
+            data = artifact.read_object(binding["object"])
+            if artifact.by_id[binding["object"]].format == "bf16":
+                words = np.frombuffer(data, dtype=np.uint16)
+                return (words.astype(np.uint32) << 16).view(np.float32)
+            return np.frombuffer(data, dtype=np.float32)
+
+        # The convolution as the Linear over (channel, y, x); matrices BF16, vectors FP32, exactly.
+        assert artifact.by_id[bindings["vision/patch_embedding"]["object"]].format == "bf16"
+        assert np.array_equal(values("vision/patch_embedding"),
+                              stored["v.patch_embd.weight"].reshape(-1))
+        for i in range(V_LAYERS):
+            g, p = f"v.blk.{i}.", f"vision/layers/{i}/"
+            for name, tensor in (("attention/qkv", "attn_qkv.weight"),
+                                 ("attention/qkv_bias", "attn_qkv.bias"),
+                                 ("attention/output", "attn_out.weight"),
+                                 ("attention_norm", "ln1.weight"), ("mlp_norm", "ln2.weight"),
+                                 ("mlp/down", "ffn_down.weight")):
+                assert np.array_equal(values(p + name), stored[g + tensor].reshape(-1)), name
+            # Gate and up share one parent, the gate's rows first.
+            parent = lambda name: [part["object"] for part in bindings[name]["parts"]]
+            assert parent(p + "mlp/gate") == parent(p + "mlp/up")
+            words = np.frombuffer(artifact.read_object(parent(p + "mlp/gate")[0]), np.uint16)
+            both = (words.astype(np.uint32) << 16).view(np.float32)
+            assert np.array_equal(both, np.concatenate([stored[g + "ffn_gate.weight"].reshape(-1),
+                                                        stored[g + "ffn_up.weight"].reshape(-1)]))
+        for name, tensor in (("vision/aligner/up", "mm.1.weight"),
+                             ("vision/aligner/out_bias", "mm.2.bias"),
+                             ("vision/final_norm", "v.post_ln.weight"),
+                             ("vision/image_start", "v.token_embd.img_start"),
+                             ("vision/image_newline", "v.image_newline"),
+                             ("vision/image_end", "v.token_embd.img_end")):
+            assert np.array_equal(values(name), stored[tensor].reshape(-1)), name
+        assert np.array_equal(values("vision/image_router_bias"),
+                              np.concatenate([bias[f"layers.{i}.ffn.gate.bias_vl"]
+                                              for i in range(3)]))
+
+
+def test_the_vision_tower_needs_its_sources(tmp_path):
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    hf, first, _, _ = _release(tmp_path)
+    mmproj, _ = _mmproj(tmp_path)
+    short, _ = _bias_vl(tmp_path, layers=2)
+    with SafetensorsSource(hf) as base, deepseek_v41.GGUFShards(first) as gguf, \
+            GGUFFile(mmproj) as vision, SafetensorsSource(short) as bias:
+        with pytest.raises(ValueError, match="bias_vl"):
+            deepseek_v41.build_model(base, gguf, components=("text", "vision"), vision=vision)
+        with pytest.raises(ValueError, match="lacks layers.2"):
+            deepseek_v41.build_model(base, gguf, components=("text", "vision"), vision=vision,
+                                     bias_vl=bias)
+    other, _ = _mmproj(tmp_path, projector="gemma4v")
+    with SafetensorsSource(hf) as base, deepseek_v41.GGUFShards(first) as gguf, \
+            GGUFFile(other) as vision, SafetensorsSource(short) as bias:
+        with pytest.raises(ValueError, match="projector"):
+            deepseek_v41.build_model(base, gguf, components=("text", "vision"), vision=vision,
+                                     bias_vl=bias)
+
+
+def test_fetch_tensors_reads_only_the_matching_tensors(tmp_path):
+    from tools.convert import fetch_tensors
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    generator = np.random.default_rng(41)
+    shards = {"a.safetensors": {"layers.0.ffn.gate.bias_vl": np.float32,
+                                "layers.0.ffn.gate.weight": np.float32},
+              "b.safetensors": {"layers.1.ffn.gate.bias_vl": np.float32,
+                                "embed.weight": np.float32}}
+    expected, weight_map = {}, {}
+    for file, names in shards.items():
+        tensors = {}
+        for name in names:
+            values = generator.normal(size=(5,)).astype(np.float32)
+            expected[name] = values
+            tensors[name] = ({"dtype": "F32", "shape": [5]}, values.tobytes())
+            weight_map[name] = file
+        fetch_tensors.write_safetensors(tmp_path / file, tensors, {})
+    reads = []
+
+    def read(file, begin, end):
+        reads.append((file, begin, end))
+        with open(tmp_path / file, "rb") as stream:
+            stream.seek(begin)
+            return stream.read(end - begin)
+
+    got = fetch_tensors.fetch(read, {"weight_map": weight_map}, ["layers.*.ffn.gate.bias_vl"])
+    assert list(got) == ["layers.0.ffn.gate.bias_vl", "layers.1.ffn.gate.bias_vl"]
+    # Two header reads per shard and one data read per tensor, nothing else.
+    assert len(reads) == 2 * 2 + 2
+    out = tmp_path / "bias.safetensors"
+    fetch_tensors.write_safetensors(out, got, {"repo": "r"})
+    with SafetensorsSource(out) as source:
+        for name, values in got.items():
+            assert np.array_equal(source.read_flat(name).numpy(), expected[name])
+    with pytest.raises(ValueError, match="matches"):
+        fetch_tensors.fetch(read, {"weight_map": weight_map}, ["nothing.*"])

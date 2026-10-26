@@ -42,7 +42,9 @@ python3 -m examples.cli.send_to_serve \
 
 Start `ninfer-serve` with `--vision` for media fixtures. Relative media paths use the current
 working directory by default; pass `--media-root` when invoking the command elsewhere. `--dry-run`
-prints the exact converted request without contacting a server.
+prints the exact converted request without contacting a server. DeepSeek-V4.1-Flash reads images
+only: the server refuses the cases with video (`video_temporal`, `mixed_image_video`,
+`mixed_multiturn`, `thinking_multimodal_checksum`).
 
 ## Text and multimodal cases
 

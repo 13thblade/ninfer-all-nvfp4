@@ -75,7 +75,9 @@ drafts with the release's DSpark drafter (the artifact's `dspark` component from
 artifact's files (read into bounded buffers, never mapped), CPU threads computing a share of a
 decode call's misses from the stored IQ1/IQ2 blocks while the GPU copies the rest. Its Engram
 table is embedded or a separate table artifact (`--ngram-table`), read a row at a time or held in
-RAM. No vision, rotation scaling, pipeline stages or tensor parallelism.
+RAM. It encodes images with the release's vision tower (the artifact's `vision` component, from the
+release's mmproj and its routing bias of image positions; resident or streamed from pinned memory).
+No video, rotation scaling, pipeline stages or tensor parallelism.
 Flash-Next's dense and attention arithmetic runs on the GPU. Of a decode or verification call's
 routed experts that the device cache lacks, CPU threads may compute a share from the host copy
 while the GPU copies and runs the rest (hybrid execution, `--expert-dma-share`), including a share

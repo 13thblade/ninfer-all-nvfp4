@@ -1122,5 +1122,129 @@
   ],
   "thinking": false,
   "expected": "<｜begin▁of▁sentence｜><｜User｜>a<｜Assistant｜></think>b<｜end▁of▁sentence｜>"
+ },
+ {
+  "name": "image_1",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image"
+     },
+     {
+      "type": "text",
+      "text": "What is in this picture?"
+     }
+    ]
+   }
+  ],
+  "thinking": true,
+  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜><｜deepseek_image｜>\n\nWhat is in this picture?<｜Assistant｜><think>"
+ },
+ {
+  "name": "image_1",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image"
+     },
+     {
+      "type": "text",
+      "text": "What is in this picture?"
+     }
+    ]
+   }
+  ],
+  "thinking": false,
+  "expected": "<｜begin▁of▁sentence｜><｜User｜><｜deepseek_image｜>\n\nWhat is in this picture?<｜Assistant｜></think>"
+ },
+ {
+  "name": "image_2",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You describe pictures."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Compare"
+     },
+     {
+      "type": "image"
+     },
+     {
+      "type": "text",
+      "text": "and"
+     },
+     {
+      "type": "image"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": "The first is brighter.",
+    "reasoning_content": "Look at both."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image"
+     }
+    ]
+   }
+  ],
+  "thinking": true,
+  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou describe pictures.<｜User｜>Compare\n\n<｜deepseek_image｜>\n\nand\n\n<｜deepseek_image｜><｜Assistant｜></think>The first is brighter.<｜end▁of▁sentence｜><｜User｜><｜deepseek_image｜><｜Assistant｜><think>"
+ },
+ {
+  "name": "image_2",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You describe pictures."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Compare"
+     },
+     {
+      "type": "image"
+     },
+     {
+      "type": "text",
+      "text": "and"
+     },
+     {
+      "type": "image"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": "The first is brighter.",
+    "reasoning_content": "Look at both."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image"
+     }
+    ]
+   }
+  ],
+  "thinking": false,
+  "expected": "<｜begin▁of▁sentence｜><｜System｜>You describe pictures.<｜User｜>Compare\n\n<｜deepseek_image｜>\n\nand\n\n<｜deepseek_image｜><｜Assistant｜></think>The first is brighter.<｜end▁of▁sentence｜><｜User｜><｜deepseek_image｜><｜Assistant｜></think>"
  }
 ]
