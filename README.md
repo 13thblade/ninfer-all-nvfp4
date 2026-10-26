@@ -276,7 +276,7 @@ Prefill of a 4,463-token prompt, in tok/s:
 </details>
 
 <details>
-<summary><b>DeepSeek-V4.1-Flash</b> — 48 tok/s on one RTX PRO 6000, 83 with DSpark, 22 to 29 tok/s on 24 and 32 GB cards</summary>
+<summary><b>DeepSeek-V4.1-Flash</b> — 48 tok/s on one RTX PRO 6000, 83 with DSpark, 31 to 39 tok/s on one RTX 4090</summary>
 
 ISTA-DASLab's GSQ-RCO IQ1_M GGUF (112.7 GiB, and its 103.0 GiB Engram table), one request, greedy,
 thinking off, one GPU, October 2026. The routed experts stay in pinned host memory or in the file, and
