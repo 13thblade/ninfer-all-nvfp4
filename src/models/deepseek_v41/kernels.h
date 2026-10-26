@@ -213,10 +213,10 @@ void sparse_attention(const AttentionArgs& args, cudaStream_t stream);
 
 // The attention output for the grouped output projection: its last 64 values of each head turned
 // back at the row's position, rounded to BF16, fp8-rounded per 32 values, into
-// out[g][t][heads / groups * 512] for group g of the heads.
+// out[g][t][heads / groups * 512] for group g of the heads, or with `token_major` out[t][heads * 512].
 void attention_output(const __nv_bfloat16* o, int tokens, int heads, int groups,
-                      const std::int32_t* positions, const float* freq, __nv_bfloat16* out,
-                      cudaStream_t stream);
+                      const std::int32_t* positions, const float* freq, bool token_major,
+                      __nv_bfloat16* out, cudaStream_t stream);
 
 // The router: scores s = sqrt(softplus(logits)), the top_k experts by s + bias (lower id first on
 // equal values), each weighted s / (sum of the chosen s + 1e-20) * scale. ids/weights [T][top_k].
