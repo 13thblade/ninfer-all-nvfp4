@@ -37,8 +37,9 @@ causal_prompt_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* cache, int kv_he
     const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
     // Block base pointer computed once (int64); per-element offsets stay 32-bit.
     const __nv_bfloat16* cache_block =
-        cache + paged_kv_element_offset<kCausalPromptHeadDim, Geometry::KVHeads>(
-                    physical_page, kv_head, k0 & kPagedKVPageMask, 0);
+        cache + paged_kv_element_offset<kCausalPromptHeadDim>(
+                    physical_page, kv_head, k0 & kPagedKVPageMask, 0,
+                    causal_prompt_q_heads<Geometry>() / Geometry::GroupSize);
     if (full_tile) {
 #pragma unroll
         for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
@@ -315,6 +316,7 @@ __device__ __forceinline__ void causal_prompt_store(float (&acc)[kCausalPromptPV
                                                     int q_head, int q0, int tokens, int width,
                                                     int warp_row0, int lane, int tid) {
     constexpr unsigned FullMask = 0xffffffffu;
+    const int q_heads           = causal_prompt_q_heads<Geometry>();
     const int gid               = lane >> 2;
     const int lid               = lane & 3;
     l0                          = warp_sum<4>(l0, FullMask);
@@ -327,16 +329,18 @@ __device__ __forceinline__ void causal_prompt_store(float (&acc)[kCausalPromptPV
         const int qrow0 = q0 + warp_row0 + gid;
         const int qrow1 = q0 + warp_row0 + gid + 8;
         if (qrow0 < tokens) {
-            *reinterpret_cast<unsigned*>(&out[causal_prompt_q_index<Geometry>(q_head, d0, qrow0)]) =
+            *reinterpret_cast<unsigned*>(
+                &out[causal_prompt_q_index<Geometry>(q_head, d0, qrow0, q_heads)]) =
                 pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
         }
         if (qrow1 < tokens) {
-            *reinterpret_cast<unsigned*>(&out[causal_prompt_q_index<Geometry>(q_head, d0, qrow1)]) =
+            *reinterpret_cast<unsigned*>(
+                &out[causal_prompt_q_index<Geometry>(q_head, d0, qrow1, q_heads)]) =
                 pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
         }
     }
     causal_prompt_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + kCausalPromptBr, width),
-                                             tid, kCausalPromptThreads);
+                                             tid, kCausalPromptThreads, q_heads);
 }
 
 inline constexpr int kCausalPromptBf16SmemBytes = kCausalPromptSmemBytes;
@@ -369,6 +373,7 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
+    const int q_heads = causal_prompt_q_heads<Geometry>();
     const int tid     = static_cast<int>(threadIdx.x);
     const int warp    = tid >> 5;
     const int lane    = tid & 31;
@@ -376,10 +381,10 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
     const int kv_head = q_head / Geometry::GroupSize;
     const int tokens  = metadata.valid_tokens(width);
 
-    if (q_head >= Geometry::QHeads || q0 >= width) { return; }
+    if (q_head >= q_heads || q0 >= width) { return; }
     if (q0 >= tokens) {
-        causal_prompt_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
-                                                 Threads);
+        causal_prompt_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid, Threads,
+                                                 q_heads);
         return;
     }
     const int base_pos              = positions[0];
@@ -393,18 +398,18 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
 
     // Stage Q into smem once via cp.async (overlaps with the K(0) prologue load
     // below); it stays resident for the whole key loop. Global Q rows are 256 bf16
-    // contiguous, with a token stride of 256*QHeads.
+    // contiguous, with a token stride of 256 * q_heads.
     {
         constexpr int VecPerRow      = D / 8;
-        constexpr int QRowStride     = D * Geometry::QHeads; // global stride between tokens
-        const __nv_bfloat16* q_block = q + causal_prompt_q_index<Geometry>(q_head, 0, q0);
+        const int q_row_stride       = D * q_heads; // global stride between tokens
+        const __nv_bfloat16* q_block = q + causal_prompt_q_index<Geometry>(q_head, 0, q0, q_heads);
         if (q0 + Br <= tokens) {
 #    pragma unroll
             for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
                 const int row    = chunk >> 5;
                 const int d      = (chunk & 31) << 3;
                 __nv_bfloat16* p = &q_s[row * D + causal_prompt_swz(row, d)];
-                cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
+                cp_async<16, Cache::cg>(p, &q_block[row * q_row_stride + d]);
             }
         } else {
 #    pragma unroll
@@ -413,7 +418,7 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
                 const int d      = (chunk & 31) << 3;
                 __nv_bfloat16* p = &q_s[row * D + causal_prompt_swz(row, d)];
                 if (q0 + row < tokens) {
-                    cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
+                    cp_async<16, Cache::cg>(p, &q_block[row * q_row_stride + d]);
                 } else {
                     store_vec(p, make_int4(0, 0, 0, 0));
                 }

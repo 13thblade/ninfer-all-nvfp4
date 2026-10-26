@@ -8,6 +8,7 @@
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
 #include "product/kv_resident_options.h"
+#include "product/tensor_split_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/rope_yarn_options.h"
@@ -57,6 +58,9 @@ struct Options {
     // Qwen3.8-Flash-Next: a pipeline over several devices, host-resident experts and their
     // device cache, and where the n-gram table comes from.
     std::vector<int> devices;
+    // The devices share every layer (`--tensor-parallel`), each its `--tensor-split` share.
+    bool tensor_parallel = false;
+    std::vector<double> tensor_split;
     ninfer::ExpertResidency expert_residency = ninfer::ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
     ninfer::HybridExpertOptions hybrid_experts;
@@ -92,6 +96,7 @@ std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N | --disjoint] [--device N | --devices A,B,...]\n"
+           "       [--tensor-parallel] [--tensor-split A,B,...]\n"
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
            "       [--expert-dma-share F] [--expert-cpu-threads N] [--expert-cache-adaptive]\n"
            "       [--expert-misses staged|mapped] [--expert-tail-skip N]\n"
@@ -209,6 +214,10 @@ Options parse_options(int argc, char** argv) {
                     parse_integer<int>(list.substr(begin, end - begin), "devices"));
                 begin = end + 1;
             }
+        } else if (option == "--tensor-parallel") {
+            out.tensor_parallel = true;
+        } else if (option == "--tensor-split") {
+            out.tensor_split = ninfer::product::parse_tensor_split(value("--tensor-split"));
         } else if (option == "--expert-residency") {
             const std::string residency(value("--expert-residency"));
             if (residency == "device") {
@@ -268,6 +277,10 @@ Options parse_options(int argc, char** argv) {
         (!out.disjoint && (out.stride == 0 || out.stride >= out.context))) {
         usage_error("context/stride must satisfy context>=2 and 1<=stride<context");
     }
+    if (out.tensor_parallel && out.devices.size() < 2) {
+        usage_error("--tensor-parallel needs --devices naming more than one device");
+    }
+    ninfer::product::check_tensor_split(out.tensor_split, out.devices.size(), out.tensor_parallel);
     return out;
 }
 
@@ -370,6 +383,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.purpose          = ninfer::EnginePurpose::CausalScoring;
     engine_options.device           = options.device;
     engine_options.devices                       = options.devices;
+    engine_options.tensor_parallel               = options.tensor_parallel;
+    engine_options.tensor_split                  = options.tensor_split;
     engine_options.expert_residency              = options.expert_residency;
     engine_options.expert_cache_bytes            = options.expert_cache_bytes;
     engine_options.hybrid_experts                = options.hybrid_experts;

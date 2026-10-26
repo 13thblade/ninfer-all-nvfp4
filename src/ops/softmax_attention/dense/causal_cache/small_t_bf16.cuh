@@ -59,6 +59,9 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
     constexpr unsigned FullMask = 0xffffffffu;
 
     const int kv_head     = static_cast<int>(blockIdx.x);
+    // The grid spans the call's KV heads.
+    const int kv_heads    = static_cast<int>(gridDim.x);
+    const int q_heads     = kv_heads * Geometry::GroupSize;
     const int split       = static_cast<int>(blockIdx.y);
     const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
     const int split_count = static_cast<int>(gridDim.y);
@@ -72,20 +75,20 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
 
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
-    q += static_cast<std::int64_t>(kCausalHeadDim) * Geometry::QHeads * column_base;
+    q += static_cast<std::int64_t>(kCausalHeadDim) * q_heads * column_base;
     pos += column_base;
     if constexpr (CacheInput::writes_cache) {
-        input.k += static_cast<std::int64_t>(kCausalHeadDim) * Geometry::KVHeads * column_base;
-        input.v += static_cast<std::int64_t>(kCausalHeadDim) * Geometry::KVHeads * column_base;
+        input.k += static_cast<std::int64_t>(kCausalHeadDim) * kv_heads * column_base;
+        input.v += static_cast<std::int64_t>(kCausalHeadDim) * kv_heads * column_base;
     }
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
-        partial_acc += static_cast<std::int64_t>(batch) * kCausalHeadDim * Geometry::QHeads *
-                       tokens * split_count;
-        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
-        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+        partial_acc +=
+            static_cast<std::int64_t>(batch) * kCausalHeadDim * q_heads * tokens * split_count;
+        partial_m += static_cast<std::int64_t>(batch) * q_heads * tokens * split_count;
+        partial_l += static_cast<std::int64_t>(batch) * q_heads * tokens * split_count;
     }
 
     auto write_neutral = [&]() {
@@ -93,10 +96,10 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
             int q_head = 0;
             int token  = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] =
+            if (causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                partial_m[causal_partial_stat_index(q_head, token, split, tokens, q_heads)] =
                     -CUDART_INF_F;
-                partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = 0.0f;
+                partial_l[causal_partial_stat_index(q_head, token, split, tokens, q_heads)] = 0.0f;
             }
         }
         for (int idx = tid; idx < row_count * D; idx += Threads) {
@@ -105,15 +108,15 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
             int q_head    = 0;
             int token     = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] =
+            if (causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                partial_acc[causal_partial_acc_index(q_head, d, token, split, tokens, q_heads)] =
                     0.0f;
             }
         }
     };
 
-    if (kv_head < 0 || kv_head >= Geometry::KVHeads || tokens < 1 || tokens > TokenTile ||
-        row_count > Br || split_count <= 0) {
+    if (kv_head < 0 || kv_head >= kv_heads || tokens < 1 || tokens > TokenTile || row_count > Br ||
+        split_count <= 0) {
         return;
     }
     if (valid_tokens == 0) {
@@ -154,12 +157,12 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
             const int p_tok = pos[token];
             if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 &&
                 p_tok < logical_capacity) {
-                const std::int64_t new_off = kv_cache_int8_new_index<Geometry>(kv_head, d, token);
+                const std::int64_t new_off   = kv_cache_int8_new_index(kv_head, d, token, kv_heads);
                 const int lane             = tid & 31;
                 int physical_page = lane == 0 ? paged_kv_physical_page(block_table, p_tok) : 0;
                 physical_page     = __shfl_sync(FullMask, physical_page, 0);
-                const std::int64_t cache_off = causal_cache_index<Geometry>(
-                    physical_page, kv_head, d, p_tok & kPagedKVPageMask);
+                const std::int64_t cache_off = causal_cache_index(
+                    physical_page, kv_head, d, p_tok & kPagedKVPageMask, kv_heads);
                 store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
                 store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
             }
@@ -180,9 +183,11 @@ template <typename Geometry, class CacheInput, int PVNt>
 __device__ __forceinline__ void
 causal_small_t_bf16_store(const CausalSmallTBf16Split<CacheInput>& s, const float (&acc)[PVNt][4],
                           float m0, float m1, float l0, float l1, int warp_row0, int lane) {
-    const int gid  = lane >> 2;
-    const int lid  = lane & 3;
-    const int row0 = warp_row0 + gid;
+    // The grid spans the call's KV heads.
+    const int q_heads = static_cast<int>(gridDim.x) * Geometry::GroupSize;
+    const int gid     = lane >> 2;
+    const int lid     = lane & 3;
+    const int row0    = warp_row0 + gid;
     const int row1 = row0 + 8;
     int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
     causal_small_t_tc_row_to_qt<Geometry>(row0, s.tokens, s.kv_head, q_head0, token0);
@@ -190,13 +195,13 @@ causal_small_t_bf16_store(const CausalSmallTBf16Split<CacheInput>& s, const floa
     if (lid == 0) {
         if (row0 < s.row_count) {
             const std::int64_t at =
-                causal_partial_stat_index<Geometry>(q_head0, token0, s.split, s.tokens);
+                causal_partial_stat_index(q_head0, token0, s.split, s.tokens, q_heads);
             s.partial_m[at] = m0;
             s.partial_l[at] = l0;
         }
         if (row1 < s.row_count) {
             const std::int64_t at =
-                causal_partial_stat_index<Geometry>(q_head1, token1, s.split, s.tokens);
+                causal_partial_stat_index(q_head1, token1, s.split, s.tokens, q_heads);
             s.partial_m[at] = m1;
             s.partial_l[at] = l1;
         }
@@ -206,12 +211,12 @@ causal_small_t_bf16_store(const CausalSmallTBf16Split<CacheInput>& s, const floa
         const int d0 = n * 8 + 2 * lid;
         if (row0 < s.row_count) {
             const std::int64_t dst =
-                causal_partial_acc_index<Geometry>(q_head0, d0, token0, s.split, s.tokens);
+                causal_partial_acc_index(q_head0, d0, token0, s.split, s.tokens, q_heads);
             *reinterpret_cast<float2*>(&s.partial_acc[dst]) = make_float2(acc[n][0], acc[n][1]);
         }
         if (row1 < s.row_count) {
             const std::int64_t dst =
-                causal_partial_acc_index<Geometry>(q_head1, d0, token1, s.split, s.tokens);
+                causal_partial_acc_index(q_head1, d0, token1, s.split, s.tokens, q_heads);
             *reinterpret_cast<float2*>(&s.partial_acc[dst]) = make_float2(acc[n][2], acc[n][3]);
         }
     }
@@ -263,6 +268,9 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
+    // The grid spans the call's KV heads.
+    const int kv_heads = static_cast<int>(gridDim.x);
+    const int q_heads  = kv_heads * Geometry::GroupSize;
     causal_small_t_bf16_split<Geometry, TokenTile, Br, Bc, Threads, MultiBatch, Masked>(
         q, input, pos, cache_k, cache_v, block_tables, valid_columns, table_rows, table_stride,
         tokens, full_width, column_begin, logical_capacity, partial_acc, partial_m, partial_l,
@@ -300,8 +308,8 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                 int token     = 0;
                 causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
                 __nv_bfloat16 value = __float2bfloat16(0.0f);
-                if (row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                    value = q[causal_q_index<Geometry>(q_head, d, token)];
+                if (row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                    value = q[causal_q_index(q_head, d, token, q_heads)];
                 }
                 qkv_s[row * D + causal_small_t_tc_swz(row, d)] = value;
             }
@@ -357,18 +365,18 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                                 new_token >= 0 && new_token < valid_tokens && key >= first_pos;
                             if (from_new) {
                                 const std::int64_t off =
-                                    kv_cache_int8_new_index<Geometry>(kv_head, d, new_token);
+                                    kv_cache_int8_new_index(kv_head, d, new_token, kv_heads);
                                 ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
                                 ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
                             } else {
-                                const std::int64_t off = causal_cache_index<Geometry>(
-                                    physical_page, kv_head, d, key & kPagedKVPageMask);
+                                const std::int64_t off = causal_cache_index(
+                                    physical_page, kv_head, d, key & kPagedKVPageMask, kv_heads);
                                 ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
                                 ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
                             }
                         } else {
-                            const std::int64_t off = causal_cache_index<Geometry>(
-                                physical_page, kv_head, d, key & kPagedKVPageMask);
+                            const std::int64_t off = causal_cache_index(
+                                physical_page, kv_head, d, key & kPagedKVPageMask, kv_heads);
                             ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
                             ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
                         }

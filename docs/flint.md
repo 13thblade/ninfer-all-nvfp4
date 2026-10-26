@@ -58,7 +58,9 @@ Not built for this family: the quantized `--kv-dtype` formats (the KV cache is F
 and n-gram copy drafts, rotation scaling (`--rope-yarn`, `--rope-scaling-factor`: the
 full-attention blocks have no rotation to scale), strict tool arguments and structured output beside
 tools (Flint's tool markup has no grammar here), images and video (Flint reads text only), pipeline
-stages, and of the context cache the shared paged KV pool, the disk tier and session slots.
+stages, and of the context cache the shared paged KV pool, the disk tier and session slots. Several
+GPUs divide the routed experts instead (`--devices 0,1 --tensor-parallel`, experts on the devices;
+[expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
 ## Converting
 

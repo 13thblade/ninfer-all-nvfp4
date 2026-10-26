@@ -116,6 +116,33 @@ __global__ void store_fixed_kernel(const unsigned long long* __restrict__ fixed,
                               (1.0 / 4294967296.0));
 }
 
+// out[p] = ids[p] when it lies in [begin, end), else -1: the pairs of one device's experts.
+__global__ void keep_range_kernel(const std::int32_t* __restrict__ ids, std::int32_t count,
+                                  std::int32_t begin, std::int32_t end,
+                                  std::int32_t* __restrict__ out) {
+    const std::int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) { return; }
+    const std::int32_t id = ids[i];
+    out[i]                = id >= begin && id < end ? id : -1;
+}
+
+constexpr int kMaxParts = 8;
+
+struct PartSet {
+    const unsigned long long* part[kMaxParts];
+    int count;
+};
+
+// y[i] = the parts' fixed-point sum, stored as store_fixed_kernel stores one sum.
+__global__ void combine_fixed_kernel(PartSet parts, float* __restrict__ y, std::int64_t count) {
+    const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) { return; }
+    unsigned long long sum = 0;
+    for (int p = 0; p < parts.count; ++p) { sum += parts.part[p][i]; }
+    y[i] =
+        static_cast<float>(static_cast<double>(static_cast<long long>(sum)) * (1.0 / 4294967296.0));
+}
+
 // fixed[pair's token][r] += weights[pair] * values[i][r] for the listed pairs, rounded per pair
 // as the vector products round theirs. One block row per listed pair.
 __global__ void add_products_kernel(const float* __restrict__ values,
@@ -195,6 +222,8 @@ void run_bank(const Tensor& routing_ids, std::int32_t pairs, std::int32_t expert
         gguf::moe_vector_swiglu(detail::gguf_type(gate.format), gate_table, up_table, routing,
                                 active, per_token, activation, tokens, middle_p, chunk, stream);
     } else {
+        // Released before the down product's input, as moe_experts_gguf_workspace_bytes counts it.
+        auto planes       = workspace.scope();
         Tensor gate_plane = workspace.alloc(DType::FP32, {kWidth, pairs});
         auto* gate_p      = static_cast<float*>(gate_plane.data);
         gguf::moe_vector_product(detail::gguf_type(gate.format), gate_table, routing, active,
@@ -501,15 +530,18 @@ void run_shared(const Tensor& m, const Tensor& shared, const GgufMoeWeights& ban
 }
 } // namespace
 
-GgufMoeDecode moe_experts_gguf_decode_begin(const Tensor& m, const Tensor& ids,
-                                            const Tensor& shared, const GgufMoeWeights& banks,
-                                            WorkspaceArena& workspace, cudaStream_t stream,
-                                            const GgufMoeSide* side) {
+namespace {
+
+// The decode form's begin, with the shared expert when `shared` is given.
+GgufMoeDecode decode_begin(const Tensor& m, const Tensor& ids, const Tensor* shared,
+                           const GgufMoeWeights& banks, WorkspaceArena& workspace,
+                           cudaStream_t stream, const GgufMoeSide* side) {
     const std::int32_t tokens = m.ne[1];
     require(shaped(m, DType::BF16, kHidden, tokens) && moe_experts_gguf_decode_supported(banks, tokens),
             "decode form: m must be BF16 [2560, 1..8] over fusable banks");
     require(shaped(ids, DType::I32, kTopK, tokens), "ids must be I32 [10, tokens]");
-    require(shared.dtype == DType::FP32 && shared.numel() == tokens, "shared must be FP32 [tokens]");
+    require(shared == nullptr || (shared->dtype == DType::FP32 && shared->numel() == tokens),
+            "shared must be FP32 [tokens]");
     GgufMoeDecode out;
     out.tokens = tokens;
     out.middle        = workspace.alloc(DType::BF16, {kWidth, tokens * kTopK}).data;
@@ -555,17 +587,28 @@ GgufMoeDecode moe_experts_gguf_decode_begin(const Tensor& m, const Tensor& ids,
     up.middle_transposed = gguf::moe_decode_transposed(detail::gguf_type(banks.down.format));
     // The shared expert after the preparation has zeroed the sum, on the side stream when given:
     // it reads only the inputs and adds into the sum, whose integer additions commute.
-    cudaStream_t shared_stream = stream;
-    if (side != nullptr) {
-        CUDA_CHECK(cudaEventRecord(side->fork, stream));
-        CUDA_CHECK(cudaStreamWaitEvent(side->stream, side->fork, 0));
-        shared_stream = side->stream;
-        out.join      = side->join;
+    if (shared != nullptr) {
+        cudaStream_t shared_stream = stream;
+        if (side != nullptr) {
+            CUDA_CHECK(cudaEventRecord(side->fork, stream));
+            CUDA_CHECK(cudaStreamWaitEvent(side->stream, side->fork, 0));
+            shared_stream = side->stream;
+            out.join      = side->join;
+        }
+        run_shared(m, *shared, banks, workspace, out, chunk, shared_stream);
+        if (side != nullptr) { CUDA_CHECK(cudaEventRecord(side->join, side->stream)); }
     }
-    run_shared(m, shared, banks, workspace, out, chunk, shared_stream);
-    if (side != nullptr) { CUDA_CHECK(cudaEventRecord(side->join, side->stream)); }
     gguf::moe_decode_up(detail::gguf_type(banks.gate.format), up, chunk, stream);
     return out;
+}
+
+} // namespace
+
+GgufMoeDecode moe_experts_gguf_decode_begin(const Tensor& m, const Tensor& ids,
+                                            const Tensor& shared, const GgufMoeWeights& banks,
+                                            WorkspaceArena& workspace, cudaStream_t stream,
+                                            const GgufMoeSide* side) {
+    return decode_begin(m, ids, &shared, banks, workspace, stream, side);
 }
 
 
@@ -597,14 +640,13 @@ void moe_experts_gguf_decode_missing(const GgufMoeDecode& state, const Tensor& m
     gguf::moe_decode_up(detail::gguf_type(banks.gate.format), up, decode_chunk(state.tokens), stream);
 }
 
-void moe_experts_gguf_decode_finish(const GgufMoeDecode& state, const Tensor& ids,
-                                    const Tensor* missing_ids, const Tensor& weights,
-                                    const GgufMoeWeights& banks, const GgufMoeWeights* missing_banks,
-                                    const float* products, const std::int32_t* product_pairs,
-                                    const std::int32_t* product_count, Tensor& y,
-                                    cudaStream_t stream) {
-    require(state.fixed != nullptr && shaped(y, DType::FP32, kHidden, state.tokens),
-            "y must be FP32 [2560, tokens]");
+namespace {
+
+// The decode form's down rows into the fixed-point sum, joined with the shared expert's stream.
+void decode_down(const GgufMoeDecode& state, const Tensor& ids, const Tensor* missing_ids,
+                 const Tensor& weights, const GgufMoeWeights& banks,
+                 const GgufMoeWeights* missing_banks, cudaStream_t stream) {
+    require(state.fixed != nullptr, "the decode form has not begun");
     require(shaped(weights, DType::FP32, kTopK, state.tokens), "weights must be FP32 [10, tokens]");
     require((missing_ids == nullptr) == (missing_banks == nullptr), "missing ids need their banks");
     // The up launches listed every slot and quantized its pairs' middles.
@@ -630,6 +672,20 @@ void moe_experts_gguf_decode_finish(const GgufMoeDecode& state, const Tensor& id
     gguf::moe_decode_down(detail::gguf_type(banks.down.format), down, decode_chunk(state.tokens),
                           stream);
     if (state.join != nullptr) { CUDA_CHECK(cudaStreamWaitEvent(stream, state.join, 0)); }
+}
+
+} // namespace
+
+void moe_experts_gguf_decode_finish(const GgufMoeDecode& state, const Tensor& ids,
+                                    const Tensor* missing_ids, const Tensor& weights,
+                                    const GgufMoeWeights& banks,
+                                    const GgufMoeWeights* missing_banks, const float* products,
+                                    const std::int32_t* product_pairs,
+                                    const std::int32_t* product_count, Tensor& y,
+                                    cudaStream_t stream) {
+    require(state.fixed != nullptr && shaped(y, DType::FP32, kHidden, state.tokens),
+            "y must be FP32 [2560, tokens]");
+    decode_down(state, ids, missing_ids, weights, banks, missing_banks, stream);
     const std::int64_t count = std::int64_t(kHidden) * state.tokens;
     decode_store_kernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(
         state.fixed, products, product_pairs, product_count, static_cast<const float*>(weights.data),
@@ -652,6 +708,66 @@ void moe_experts_gguf(const Tensor& m, const Tensor& ids, const Tensor& weights,
     const auto stage  = moe_experts_gguf_begin(m, workspace, stream);
     moe_experts_gguf_add(stage, m, ids, weights, &shared, banks, workspace, stream);
     moe_experts_gguf_finish(stage, y, stream);
+}
+
+std::size_t moe_experts_gguf_part_workspace_bytes(std::int32_t tokens) {
+    require(tokens > 0, "tokens must be positive");
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::I32, {kTopK, tokens});
+    (void)layout.alloc(DType::U8, {static_cast<std::int32_t>(
+                                      std::max(moe_experts_gguf_workspace_bytes(tokens),
+                                               moe_experts_gguf_decode_workspace_bytes(tokens)))});
+    return layout.peak_bytes(1);
+}
+
+void moe_experts_gguf_part(const Tensor& m, const Tensor& ids, const Tensor& weights,
+                           const Tensor* shared, const GgufMoeWeights& banks,
+                           std::int32_t expert_begin, std::int32_t expert_end,
+                           WorkspaceArena& workspace, Tensor& fixed, cudaStream_t stream,
+                           const GgufMoeSide* side) {
+    check_stage_inputs(m, ids, weights);
+    const std::int32_t tokens = m.ne[1];
+    require(fixed.dtype == DType::I64 && fixed.is_contiguous() && fixed.data != nullptr &&
+                fixed.numel() == std::int64_t(kHidden) * tokens,
+            "fixed must be I64 [2560, tokens]");
+    require(expert_begin >= 0 && expert_begin <= expert_end && expert_end <= banks.experts,
+            "the expert range must lie in the bank");
+    auto scope               = workspace.scope();
+    Tensor kept              = workspace.alloc(DType::I32, {kTopK, tokens});
+    const std::int32_t pairs = kTopK * tokens;
+    keep_range_kernel<<<static_cast<unsigned>((pairs + 255) / 256), 256, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), pairs, expert_begin, expert_end,
+        static_cast<std::int32_t*>(kept.data));
+    CUDA_CHECK(cudaGetLastError());
+    const std::size_t bytes = std::size_t(kHidden) * tokens * sizeof(unsigned long long);
+    if (moe_experts_gguf_decode_supported(banks, tokens)) {
+        const auto state = decode_begin(m, kept, shared, banks, workspace, stream, side);
+        decode_down(state, kept, nullptr, weights, banks, nullptr, stream);
+        CUDA_CHECK(
+            cudaMemcpyAsync(fixed.data, state.fixed, bytes, cudaMemcpyDeviceToDevice, stream));
+        return;
+    }
+    const auto stage = moe_experts_gguf_begin(m, workspace, stream);
+    moe_experts_gguf_add(stage, m, kept, weights, shared, banks, workspace, stream);
+    CUDA_CHECK(cudaMemcpyAsync(fixed.data, stage.fixed, bytes, cudaMemcpyDeviceToDevice, stream));
+}
+
+void moe_experts_gguf_combine(std::span<const Tensor> parts, Tensor& y, cudaStream_t stream) {
+    require(!parts.empty() && parts.size() <= std::size_t(kMaxParts), "one to eight parts");
+    const std::int32_t tokens = y.ne[1];
+    require(tokens > 0 && shaped(y, DType::FP32, kHidden, tokens), "y must be FP32 [2560, tokens]");
+    PartSet set{};
+    for (std::size_t p = 0; p < parts.size(); ++p) {
+        require(parts[p].dtype == DType::I64 && parts[p].is_contiguous() &&
+                    parts[p].data != nullptr && parts[p].numel() == std::int64_t(kHidden) * tokens,
+                "a part must be I64 [2560, tokens]");
+        set.part[p] = static_cast<const unsigned long long*>(parts[p].data);
+    }
+    set.count                = static_cast<int>(parts.size());
+    const std::int64_t count = std::int64_t(kHidden) * tokens;
+    combine_fixed_kernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(
+        set, static_cast<float*>(y.data), count);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops

@@ -30,11 +30,11 @@ void launch_fast_for(const Tensor& q, const Tensor& positions, const Tensor* val
     const auto* value_scales =
         static_cast<const KvValueScaleT<kStorage>*>(cache.v_scale_pages.data);
     const auto width = static_cast<std::int32_t>(q.ne[2]);
-    const RotatedFastPromptPlan plan = rotated_fast_prompt_plan(G::QHeads, width, max_visible_keys);
+    const RotatedFastPromptPlan plan = rotated_fast_prompt_plan(q.ne[1], width, max_visible_keys);
     auto scope                       = workspace.scope();
     RotatedFastPromptPartials partials{};
     if (plan.splits > 1)
-        partials = allocate_rotated_fast_prompt_partials(workspace, G::QHeads, width, plan.splits);
+        partials = allocate_rotated_fast_prompt_partials(workspace, q.ne[1], width, plan.splits);
     const auto* q_data  = static_cast<const __nv_bfloat16*>(q.data);
     const auto* pos     = static_cast<const std::int32_t*>(positions.data);
     auto* out_data      = static_cast<__nv_bfloat16*>(out.data);
@@ -48,7 +48,7 @@ void launch_fast_for(const Tensor& q, const Tensor& positions, const Tensor* val
             raise_dynamic_shared_memory(
                 causal_attention_prompt_rotated_fast_kernel<G, Metadata, Warps, Split>,
                 Shape::SmemBytes);
-            const dim3 grid(div_up(width, Shape::Br), G::QHeads, plan.splits);
+            const dim3 grid(div_up(width, Shape::Br), q.ne[1], plan.splits);
             kernel<<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
                 q_data, keys, values, key_scales, value_scales, metadata, pos, scale, out_data,
                 width, static_cast<float*>(partials.rows.data),
@@ -68,7 +68,7 @@ void launch_fast_for(const Tensor& q, const Tensor& positions, const Tensor* val
         dispatch.template operator()<true>();
         constexpr float Log2E = 1.4426950408889634074f;
         causal_attention_prompt_rotated_fast_merge_kernel<G>
-            <<<dim3(width, G::QHeads), kCausalPromptHeadDim, 0, stream>>>(
+            <<<dim3(width, q.ne[1]), kCausalPromptHeadDim, 0, stream>>>(
                 static_cast<const float*>(partials.rows.data),
                 static_cast<const float2*>(partials.stats.data), valid, width, plan.splits,
                 scale * Log2E, out_data);
@@ -98,13 +98,10 @@ void causal_attention_prompt_nvfp4_fast_launch(const Tensor& q, const Tensor& po
                                                std::uint32_t max_visible_keys,
                                                WorkspaceArena& workspace, Tensor& out,
                                                cudaStream_t stream) {
-    if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        launch_fast_for<CausalD256H24Kv4>(q, positions, valid_columns, table_rows, scale, cache,
-                                          max_visible_keys, workspace, out, stream);
-        return;
-    }
-    launch_fast_for<CausalD256H16Kv2>(q, positions, valid_columns, table_rows, scale, cache,
-                                      max_visible_keys, workspace, out, stream);
+    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+        launch_fast_for<Geometry>(q, positions, valid_columns, table_rows, scale, cache,
+                                  max_visible_keys, workspace, out, stream);
+    });
 }
 
 } // namespace ninfer::ops::detail

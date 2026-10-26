@@ -87,8 +87,10 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
 Not built for this family: the quantized `--kv-dtype` formats (the caches are BF16), MTP, DFlash
 and n-gram copy drafts, DSpark drafts while several requests decode, rotation scaling
 (`--rope-yarn`, `--rope-scaling-factor`: the compressed blocks carry the release's own YaRN), video
-and the CPU vision tower, pipeline stages and tensor parallelism, and of the context cache the shared
-paged KV pool, the disk tier and session slots.
+and the CPU vision tower, pipeline stages, and of the context cache the shared paged KV pool, the
+disk tier and session slots. Several GPUs divide the routed experts instead (`--devices 0,1
+--tensor-parallel` with host or disk experts: each device its own banks, cache and copies, no CPU
+share; [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
 ## Converting
 

@@ -38,8 +38,9 @@ __device__ __forceinline__ bool stage_kv_half(__nv_bfloat16* dst, const __nv_bfl
     constexpr int Threads   = kCausalPromptThreads;
     constexpr int VecPerRow = D / 8;
     const __nv_bfloat16* cache_block =
-        cache + paged_kv_element_offset<kCausalPromptHeadDim, Geometry::KVHeads>(
-                    physical_page, kv_head, k0 & kPagedKVPageMask, 0);
+        cache + paged_kv_element_offset<kCausalPromptHeadDim>(
+                    physical_page, kv_head, k0 & kPagedKVPageMask, 0,
+                    causal_prompt_q_heads<Geometry>() / Geometry::GroupSize);
     bool fits = true;
 #pragma unroll
     for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
@@ -64,8 +65,9 @@ __device__ __forceinline__ bool stage_q(__nv_bfloat16* q_s, const __nv_bfloat16*
     constexpr int Br             = kCausalPromptBr;
     constexpr int Threads        = kCausalPromptThreads;
     constexpr int VecPerRow      = D / 8;
-    constexpr int QRowStride     = D * Geometry::QHeads;
-    const __nv_bfloat16* q_block = q + causal_prompt_q_index<Geometry>(q_head, 0, q0);
+    const int q_heads            = causal_prompt_q_heads<Geometry>();
+    const int q_row_stride       = D * q_heads;
+    const __nv_bfloat16* q_block = q + causal_prompt_q_index<Geometry>(q_head, 0, q0, q_heads);
     bool fits                    = true;
 #pragma unroll
     for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
@@ -74,9 +76,9 @@ __device__ __forceinline__ bool stage_q(__nv_bfloat16* q_s, const __nv_bfloat16*
         __nv_bfloat16* p = &q_s[row * D + causal_prompt_swz(row, d)];
         if (q0 + row < tokens) {
             if constexpr (Half) {
-                fits = copy_bf16x8_as_half(p, &q_block[row * QRowStride + d]) && fits;
+                fits = copy_bf16x8_as_half(p, &q_block[row * q_row_stride + d]) && fits;
             } else {
-                cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
+                cp_async<16, Cache::cg>(p, &q_block[row * q_row_stride + d]);
             }
         } else {
             store_vec(p, make_int4(0, 0, 0, 0));
@@ -220,14 +222,15 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
+    const int q_heads = causal_prompt_q_heads<Geometry>();
     const int tid     = static_cast<int>(threadIdx.x);
     const int q0      = q_block * Br;
     const int tokens  = metadata.valid_tokens(width);
 
-    if (q_head >= Geometry::QHeads || q0 >= width) { return; }
+    if (q_head >= q_heads || q0 >= width) { return; }
     if (q0 >= tokens) {
-        causal_prompt_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
-                                                 Threads);
+        causal_prompt_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid, Threads,
+                                                 q_heads);
         return;
     }
     const int base_pos              = positions[0];

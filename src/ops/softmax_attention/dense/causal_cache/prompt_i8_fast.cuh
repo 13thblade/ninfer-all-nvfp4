@@ -125,11 +125,10 @@ static_assert(CausalPromptI8FastShape<4>::Launchable &&
               CausalPromptI8FastShape<8, true, true>::Launchable);
 
 // Split partial layout for key split s, column c and query head h: the D256 row at
-// ((s * width + c) * QHeads + h) * 256 and its (max, sum) pair at that row index.
-template <typename Geometry>
+// ((s * width + c) * q_heads + h) * 256 and its (max, sum) pair at that row index.
 __host__ __device__ __forceinline__ std::int64_t
-causal_prompt_i8_fast_partial_row(int split, int column, int q_head, int width) {
-    return (static_cast<std::int64_t>(split) * width + column) * Geometry::QHeads + q_head;
+causal_prompt_i8_fast_partial_row(int split, int column, int q_head, int width, int q_heads) {
+    return (static_cast<std::int64_t>(split) * width + column) * q_heads + q_head;
 }
 
 __device__ __forceinline__ void causal_prompt_i8_fast_mma_f16_acc(unsigned& c0, unsigned& c1,
@@ -192,11 +191,13 @@ __global__ __launch_bounds__(
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
 
-    // Longest-first issue order: the first QHeads CTAs take the last row block of every head.
+    // Longest-first issue order: the first q_heads CTAs take the last row block of every head.
     const int row_blocks = static_cast<int>(gridDim.x);
+    const int q_heads    = causal_prompt_q_heads<Geometry>();
+    const int kv_heads   = q_heads / Geometry::GroupSize;
     const int linear     = static_cast<int>(blockIdx.x + blockIdx.y * gridDim.x);
-    const int q_head     = linear % Geometry::QHeads;
-    const int q0         = (row_blocks - 1 - linear / Geometry::QHeads) * Br;
+    const int q_head     = linear % q_heads;
+    const int q0         = (row_blocks - 1 - linear / q_heads) * Br;
     const int kv_head    = q_head / Geometry::GroupSize;
     const int tokens     = metadata.valid_tokens(width);
 
@@ -207,7 +208,7 @@ __global__ __launch_bounds__(
         const bool valid   = token < tokens;
         const uint2 packed = make_uint2(pack_bf16x2(valid ? v0 : 0.0f, valid ? v1 : 0.0f),
                                         pack_bf16x2(valid ? v2 : 0.0f, valid ? v3 : 0.0f));
-        store_vec(&out[causal_prompt_q_index<Geometry>(q_head, d0, token)], packed);
+        store_vec(&out[causal_prompt_q_index<Geometry>(q_head, d0, token, q_heads)], packed);
     };
 
     if (q0 >= tokens) {
@@ -245,9 +246,10 @@ __global__ __launch_bounds__(
 #pragma unroll
         for (int k = 0; k < 8; ++k) {
             q_values[k] =
-                valid ? __bfloat162float(
-                            q[causal_prompt_q_index<Geometry>(q_head, lane + 32 * k, token)])
-                      : 0.0f;
+                valid
+                    ? __bfloat162float(
+                          q[causal_prompt_q_index<Geometry>(q_head, lane + 32 * k, token, q_heads)])
+                    : 0.0f;
         }
         normalized_hadamard_d256_inplace(q_values, lane);
 #pragma unroll
@@ -308,15 +310,15 @@ __global__ __launch_bounds__(
                 const int key   = chunk >> 4;
                 k_packed[i]     = KeyChunk{};
                 if (key < valid) {
-                    k_packed[i] = load_vec<KeyChunk>(
-                        reinterpret_cast<const std::uint8_t*>(cache_k) +
-                        kv_cache_packed_key_chunk_index<Geometry, Keys>(page, kv_head,
-                                                                        (chunk & 15) * 16, key));
+                    k_packed[i] =
+                        load_vec<KeyChunk>(reinterpret_cast<const std::uint8_t*>(cache_k) +
+                                           kv_cache_packed_key_chunk_index<Keys>(
+                                               page, kv_head, (chunk & 15) * 16, key, kv_heads));
                 }
             }
         } else {
             const std::int64_t code_base =
-                kv_cache_int8_quant_code_index<Geometry>(page, kv_head, 0, 0);
+                kv_cache_int8_quant_code_index(page, kv_head, 0, 0, kv_heads);
 #pragma unroll
             for (int i = 0; i < kCausalPromptI8FastTileBytes / 16 / Threads; ++i) {
                 const int chunk        = tid + i * Threads;
@@ -333,7 +335,7 @@ __global__ __launch_bounds__(
         }
         if constexpr (PackedValues) {
             const std::int64_t value_base =
-                kv_cache_int4_value_code_index<Geometry>(page, kv_head, 0, 0);
+                kv_cache_int4_value_code_index(page, kv_head, 0, 0, kv_heads);
 #pragma unroll
             for (int i = 0; i < Stage::VTileBytes / 16 / Threads; ++i) {
                 const int chunk = tid + i * Threads;
@@ -347,19 +349,19 @@ __global__ __launch_bounds__(
         if (tid < Bc) {
             cp_async_zfill<8>(ks_s + tid * Groups,
                               cache_k_scale +
-                                  kv_cache_int8_quant_scale_index<Geometry>(page, kv_head, 0, tid),
+                                  kv_cache_int8_quant_scale_index(page, kv_head, 0, tid, kv_heads),
                               tid < valid ? 8 : 0);
         } else if (tid < 2 * Bc) {
             const int key = tid - Bc;
             if constexpr (PackedValues) {
                 cp_async_zfill<16>(vs_s + key * VGroups,
-                                   cache_v_scale + kv_cache_int4_value_scale_index<Geometry>(
-                                                       page, kv_head, 0, key),
+                                   cache_v_scale + kv_cache_int4_value_scale_index(page, kv_head, 0,
+                                                                                   key, kv_heads),
                                    key < valid ? 16 : 0);
             } else {
                 cp_async_zfill<8>(vs_s + key * VGroups,
-                                  cache_v_scale +
-                                      kv_cache_int8_quant_scale_index<Geometry>(page, kv_head, 0, key),
+                                  cache_v_scale + kv_cache_int8_quant_scale_index(page, kv_head, 0,
+                                                                                  key, kv_heads),
                                   key < valid ? 8 : 0);
             }
         }
@@ -721,7 +723,7 @@ __global__ __launch_bounds__(
         const auto publish = [&](int row, float maximum, float sum, float inverse, int e0) {
             if (row >= rows) { return; }
             const std::int64_t index =
-                causal_prompt_i8_fast_partial_row<Geometry>(split, q0 + row, q_head, width);
+                causal_prompt_i8_fast_partial_row(split, q0 + row, q_head, width, q_heads);
             if (lid == 0) { partial_stats[index] = make_float2(maximum, sum); }
             float* target = partial_rows + index * D;
             if constexpr (PackedValues) {
@@ -788,26 +790,27 @@ __launch_bounds__(kCausalPromptHeadDim) void causal_attention_prompt_i8_fast_mer
     const float* __restrict__ partial_rows, const float2* __restrict__ partial_stats,
     const std::int32_t* __restrict__ valid_columns, std::int32_t width, std::int32_t splits,
     float scale_l2, __nv_bfloat16* __restrict__ out) {
-    const int column = static_cast<int>(blockIdx.x);
-    const int q_head = static_cast<int>(blockIdx.y);
-    const int d      = static_cast<int>(threadIdx.x);
-    const int tokens = valid_columns == nullptr ? width : max(0, min(width, valid_columns[0]));
-    const auto index = causal_prompt_q_index<Geometry>(q_head, d, column);
+    const int column  = static_cast<int>(blockIdx.x);
+    const int q_head  = static_cast<int>(blockIdx.y);
+    const int q_heads = causal_prompt_q_heads<Geometry>();
+    const int d       = static_cast<int>(threadIdx.x);
+    const int tokens  = valid_columns == nullptr ? width : max(0, min(width, valid_columns[0]));
+    const auto index  = causal_prompt_q_index<Geometry>(q_head, d, column, q_heads);
     if (column >= tokens) {
         out[index] = __float2bfloat16(0.0f);
         return;
     }
     float maximum = -CUDART_INF_F;
     for (int split = 0; split < splits; ++split) {
-        const float2 stats = partial_stats[causal_prompt_i8_fast_partial_row<Geometry>(
-            split, column, q_head, width)];
+        const float2 stats =
+            partial_stats[causal_prompt_i8_fast_partial_row(split, column, q_head, width, q_heads)];
         if (stats.y > 0.0f) { maximum = fmaxf(maximum, stats.x); }
     }
     float numerator   = 0.0f;
     float denominator = 0.0f;
     for (int split = 0; split < splits; ++split) {
         const std::int64_t row =
-            causal_prompt_i8_fast_partial_row<Geometry>(split, column, q_head, width);
+            causal_prompt_i8_fast_partial_row(split, column, q_head, width, q_heads);
         const float2 stats = partial_stats[row];
         if (stats.y > 0.0f) {
             const float weight = stats.y * exp2f((stats.x - maximum) * scale_l2);

@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/host_pages.h"
 #include "core/startup.h"
+#include "core/tensor_parallel.h"
 #include "models/expert_profile.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/frontend/processor.h"
@@ -133,8 +134,9 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
                                     "host or disk experts (--expert-residency host|disk)");
     }
-    if (device.size() != 1 || options.tensor_parallel) {
-        throw std::invalid_argument("Gemma 4 runs on one device");
+    if (options.tensor_parallel ? device.size() < 2 : device.size() != 1) {
+        throw std::invalid_argument("Gemma 4 runs on one device, or divides its routed experts "
+                                    "over several with --tensor-parallel");
     }
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     const artifact::Reader reader(options.artifact_path);
@@ -149,10 +151,21 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         throw std::invalid_argument("--vision: the artifact holds no Gemma 4 vision tower "
                                     "(convert with --components text,vision)");
     }
-    auto model = models::gemma4::load_model(
-        reader, {.artifact = options.artifact_path, .assistant = mtp, .vision = vision,
-                 .experts = options.expert_residency}, device,
-        &options.startup_observer);
+    models::gemma4::LoadOptions load{.artifact  = options.artifact_path,
+                                     .assistant = mtp,
+                                     .vision    = vision,
+                                     .experts   = options.expert_residency};
+    // Expert parallelism: the routed experts divided over the devices, everything else on the
+    // first. Without --tensor-split each device takes a share of its speed that fits beside what
+    // it holds.
+    if (options.tensor_parallel) {
+        load.expert_split = options.tensor_split;
+        if (load.expert_split.empty()) {
+            load.expert_split = models::gemma4::default_expert_split(
+                reader, load, rank_free_bytes(device), rank_copy_bandwidth(device));
+        }
+    }
+    auto model = models::gemma4::load_model(reader, load, device, &options.startup_observer);
     device.synchronize();
     materialize.complete();
     const auto free_bytes = [&] {
@@ -250,6 +263,17 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                            ? " at most, growing with the sequences beside an elastic expert cache"
                            : "",
                        double(instance->executor->memory().workspace_bytes) / 1048576.0);
+    if (model->expert_parallel()) {
+        std::string ranges;
+        for (std::size_t rank = 0; rank < device.size(); ++rank) {
+            const auto [begin, end] = model->expert_range(rank);
+            ranges +=
+                (rank == 0 ? "" : ", ") + std::to_string(begin) + "-" + std::to_string(end - 1);
+        }
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Gemma 4: expert parallelism, routed experts by device %s",
+                           ranges.c_str());
+    }
     if (options.expert_residency != ExpertResidency::Device) {
         const auto memory = instance->executor->memory().experts;
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,

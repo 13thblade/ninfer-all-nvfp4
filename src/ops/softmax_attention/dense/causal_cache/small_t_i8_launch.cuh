@@ -51,7 +51,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         // active splits and partial outputs. The tiled kernels below are the other tiers'; a build
         // of Volta alone does not compile them.
         const auto run = [&]<bool PackedValues, KvKeyCoding Keys>() {
-            const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+            const dim3 grid(q.ne[1] / Geometry::GroupSize, splits, invocation.batch_size);
             constexpr int kBlock =
                 32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::kWarps;
             causal_attention_small_t_sm70_i8_kernel<Geometry, TokenTile, MultiBatch, Masked,
@@ -92,7 +92,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     if constexpr (kBuildPostVolta) {
         auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena,
                           int QkSplit = 1, bool EarlyFetch = false>() {
-            const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+            const dim3 grid(q.ne[1] / Geometry::GroupSize, splits, invocation.batch_size);
             constexpr std::size_t kDynamicBytes =
                 DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kCausalHeadDim) : 0u;
             auto issue_pv = [&]<bool PackedValues, KvKeyCoding Keys, bool PvF16>() {
@@ -147,9 +147,9 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         // A device profile names the tier per window: "<warps>x<CTAs per SM>x<key block>", with a
         // trailing "d" for the dynamic-arena variant, "q" for split QK, "e" for EarlyFetch and
         // "p" for the pipelined kernel (small_t_i8_pipelined.cuh, INT8 keys and values only).
-        const std::string_view routed =
-            device_route_schedule(small_t_i8_route_key(Geometry::QHeads, cache.storage, TokenTile),
-                                  implementation_window);
+        const std::string_view routed = device_route_schedule(
+            small_t_i8_route_key(Geometry::ModelQHeads, cache.storage, TokenTile),
+            implementation_window);
         if (routed == "8x2x32p" && cache.storage == KvCacheStorage::Int8Group64) {
             const auto issue = [&]<bool PvF16>() {
                 constexpr auto kernel =
@@ -157,7 +157,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                                                                  Masked, CacheInput, PvF16>;
                 constexpr int kArena = CausalSmallTI8PipelinedShape::kArenaBytes;
                 raise_dynamic_shared_memory(kernel, kArena);
-                const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+                const dim3 grid(q.ne[1] / Geometry::GroupSize, splits, invocation.batch_size);
                 kernel<<<grid, CausalSmallTI8PipelinedShape::kThreads, kArena, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data), input,
                     static_cast<const std::int32_t*>(pos.data),

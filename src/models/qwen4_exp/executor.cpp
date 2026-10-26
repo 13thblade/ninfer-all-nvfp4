@@ -8,6 +8,7 @@
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
+#include "core/expert_parallel.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/target_logprobs.h"
 #include "models/qwen4_exp/ngram_hash.h"
@@ -294,6 +295,35 @@ ExpertTable make_table(const Model& model, std::span<const WeightId> ids) {
     return out;
 }
 
+// Expert parallelism: the table of the experts `rank` holds, the other entries null (never read).
+ExpertTable make_rank_table(const Model& model, std::span<const WeightId> ids, std::size_t rank) {
+    ExpertTable out;
+    std::vector<const void*> pointers(ids.size(), nullptr);
+    for (std::size_t e = 0; e < ids.size(); ++e) {
+        const auto& bound = model.weight(ids[e]);
+        if (bound.rank != rank) { continue; }
+        const Weight w = native_weight(bound.view);
+        if (!is_gguf(w.qtype)) {
+            throw std::invalid_argument(bound.name + ": expert parallelism takes GGUF block banks");
+        }
+        const auto block       = gguf_block_shape(w.qtype);
+        const std::int64_t row = std::int64_t(w.k / block.elements) * block.bytes;
+        if (out.row_bytes == 0) {
+            out.format    = w.qtype;
+            out.row_bytes = row;
+        } else if (w.qtype != out.format || row != out.row_bytes) {
+            throw std::invalid_argument(bound.name +
+                                        ": every expert of a bank must share its block type");
+        }
+        pointers[e] = w.qdata;
+        out.rows    = w.n;
+    }
+    out.table = DeviceBuffer(pointers.size() * sizeof(void*));
+    out.table.copy_from_host(pointers.data(), pointers.size() * sizeof(void*));
+    out.pointers = std::move(pointers);
+    return out;
+}
+
 // A layer's table for experts that stay in the artifact's files: every entry null until the
 // expert stream makes the expert resident.
 ExpertTable make_located_table(std::span<const ExpertLocation> locations) {
@@ -358,6 +388,13 @@ struct NativeMoePlan {
     }
 };
 
+// Expert parallelism: the routed experts [begin, end) of a layer one rank holds, and its tables of
+// them on its device (rank 0's are the plan's own).
+struct ExpertShare {
+    std::uint32_t begin = 0, end = 0;
+    ExpertTable gate, up, down;
+};
+
 struct MoePlan {
     Tensor router, shared_gate;
     ExpertTable gate, up, down, shared_gate_table, shared_up_table, shared_down_table;
@@ -365,6 +402,22 @@ struct MoePlan {
     // Device banks or disk experts' device slots, with zeros after the down banks; host experts
     // are read across the bus.
     bool device_resident = false;
+    // Expert parallelism, by rank; empty without it.
+    std::vector<ExpertShare> shares;
+
+    // Rank r's routed banks under expert parallelism, without a shared expert after rank 0.
+    [[nodiscard]] ops::GgufMoeWeights share_banks(std::size_t r) const {
+        if (r == 0) { return banks(); }
+        const ExpertShare& s = shares.at(r);
+        return {s.gate.view(),
+                s.up.view(),
+                s.down.view(),
+                {},
+                {},
+                {},
+                static_cast<std::int32_t>(gate.pointers.size()),
+                device_resident};
+    }
 
     [[nodiscard]] ops::GgufMoeWeights banks() const {
         return {gate.view(),
@@ -658,6 +711,13 @@ struct Executor::Impl {
     std::unique_ptr<PinnedHostBuffer> route_host;
     std::uint32_t pending_routes = 0;
 
+    // Expert parallelism (Model::expert_parallel()): rank 0 runs every layer and routes it, and
+    // each rank holds a range of every MoE layer's routed experts. A MoE call sends its input (m,
+    // ids and weights, packed) to every other rank, which returns the 2^-32 fixed-point part of the
+    // experts it holds; rank 0 adds the parts to its own, with the shared expert, and stores y.
+    std::unique_ptr<ExpertParallelExchange> expert_exchange;
+    DeviceBuffer expert_pack, expert_own; // on rank 0
+
     // Host-resident experts, wide calls: a layer's routed experts that the cache does not hold are
     // copied into device slots and the matrix kernel reads them there; one pool and one set of
     // tables per rank, whose layers run one at a time.
@@ -830,6 +890,7 @@ struct Executor::Impl {
         }
         plan_segments();
         allocate_ranks();
+        allocate_expert_peers();
         allocate_vision();
         allocate_sequences();
         allocate_staging();
@@ -1007,6 +1068,27 @@ struct Executor::Impl {
         const auto h    = static_cast<std::int32_t>(config.hidden_size);
         plan.moe.router = direct(model, lw.moe.router, {h, static_cast<std::int32_t>(experts)});
         plan.moe.shared_gate = direct(model, lw.moe.shared_score, {h});
+        if (model.expert_parallel()) {
+            plan.moe.gate              = make_rank_table(model, lw.moe.gate, 0);
+            plan.moe.up                = make_rank_table(model, lw.moe.up, 0);
+            plan.moe.down              = make_rank_table(model, lw.moe.down, 0);
+            plan.moe.device_resident   = true;
+            plan.moe.shared_gate_table = make_table(model, std::span(&lw.moe.shared_gate, 1));
+            plan.moe.shared_up_table   = make_table(model, std::span(&lw.moe.shared_up, 1));
+            plan.moe.shared_down_table = make_table(model, std::span(&lw.moe.shared_down, 1));
+            for (std::size_t r = 0; r < device.size(); ++r) {
+                ExpertShare share;
+                std::tie(share.begin, share.end) = model.expert_range(experts, r);
+                if (r > 0) {
+                    RankBinding peer(device, r);
+                    share.gate = make_rank_table(model, lw.moe.gate, r);
+                    share.up   = make_rank_table(model, lw.moe.up, r);
+                    share.down = make_rank_table(model, lw.moe.down, r);
+                }
+                plan.moe.shares.push_back(std::move(share));
+            }
+            return plan;
+        }
         if (!lw.moe.gate.empty() &&
             !is_gguf(native_weight(model.weight(lw.moe.gate.front()).view).qtype)) {
             const auto width = static_cast<std::int32_t>(config.moe_intermediate_size);
@@ -1090,6 +1172,9 @@ struct Executor::Impl {
         bytes = std::max(
             {bytes, ops::moe_experts_gguf_workspace_bytes(t),
              ops::moe_route_workspace_bytes(t, static_cast<std::int32_t>(config.num_experts))});
+        if (model.expert_parallel()) {
+            bytes = std::max(bytes, ops::moe_experts_gguf_part_workspace_bytes(t));
+        }
         if (const std::uint32_t group = planned_group_chunks(); group > 1 && rank == 0) {
             bytes = std::max(bytes, ops::moe_experts_gguf_workspace_bytes(
                                         static_cast<std::int32_t>(group) * t));
@@ -1220,6 +1305,89 @@ struct Executor::Impl {
             memory.ranks[r].workspace_bytes += total + rank.workspace->capacity();
             ranks.push_back(std::move(rank));
         }
+    }
+
+    // The byte layout of a MoE call's packed input: m, then ids and weights, each 256-aligned.
+    struct ExpertInput {
+        std::size_t ids = 0, weights = 0, bytes = 0;
+    };
+
+    [[nodiscard]] ExpertInput expert_input(std::int32_t t) const {
+        const std::size_t m = std::size_t(config.hidden_size) * t * 2;
+        const std::size_t r = std::size_t(config.num_experts_per_tok) * t * 4;
+        ExpertInput out;
+        out.ids     = round_up(m);
+        out.weights = out.ids + round_up(r);
+        out.bytes   = out.weights + r;
+        return out;
+    }
+
+    void allocate_expert_peers() {
+        if (!model.expert_parallel()) { return; }
+        const auto t                 = static_cast<std::int32_t>(options.prefill_chunk);
+        const std::size_t input      = expert_input(t).bytes;
+        const std::size_t part_bytes = std::size_t(config.hidden_size) * t * 8;
+        {
+            RankBinding bind(device, 0);
+            expert_pack = DeviceBuffer(input);
+            expert_own  = DeviceBuffer(part_bytes);
+        }
+        expert_exchange = std::make_unique<ExpertParallelExchange>(device, input, part_bytes);
+        memory.ranks[0].workspace_bytes += input + part_bytes;
+        for (std::size_t r = 0; r < device.size(); ++r) {
+            memory.ranks[r].workspace_bytes += expert_exchange->device_bytes(r);
+        }
+    }
+
+    // Expert parallelism's MoE call after rank 0 has routed it: every other rank receives the
+    // input and runs the routed pairs of its experts into a fixed-point part while rank 0 runs its
+    // own with the shared expert; the parts' sum is the y one device stores, bit for bit.
+    void run_moe_parallel(const MoePlan& m, RankState& rank, std::int32_t t, const Tensor& mixed,
+                          const Tensor& ids, const Tensor& weights, const Tensor& shared) {
+        const auto h             = static_cast<std::int32_t>(config.hidden_size);
+        const auto top           = static_cast<std::int32_t>(config.num_experts_per_tok);
+        const ExpertInput layout = expert_input(t);
+        const std::size_t routes = std::size_t(top) * t * 4;
+        const std::size_t part   = std::size_t(h) * t * 8;
+        auto* pack               = static_cast<std::byte*>(expert_pack.p);
+        CUDA_CHECK(cudaMemcpyAsync(pack, mixed.data, std::size_t(h) * t * 2,
+                                   cudaMemcpyDeviceToDevice, rank.stream));
+        CUDA_CHECK(cudaMemcpyAsync(pack + layout.ids, ids.data, routes, cudaMemcpyDeviceToDevice,
+                                   rank.stream));
+        CUDA_CHECK(cudaMemcpyAsync(pack + layout.weights, weights.data, routes,
+                                   cudaMemcpyDeviceToDevice, rank.stream));
+        const std::size_t slot = expert_exchange->send(pack, layout.bytes, rank.stream);
+        for (std::size_t r = 1; r < device.size(); ++r) {
+            RankBinding bind(device, r);
+            RankState& on_peer = ranks[r];
+            auto* input        = static_cast<std::byte*>(
+                expert_exchange->receive(r, layout.bytes, slot, on_peer.stream));
+            const Tensor peer_m(input, DType::BF16, {h, t});
+            const Tensor peer_ids(input + layout.ids, DType::I32, {top, t});
+            const Tensor peer_weights(input + layout.weights, DType::FP32, {top, t});
+            Tensor peer_part(expert_exchange->part(r), DType::I64, {h, t});
+            const ExpertShare& share = m.shares.at(r);
+            {
+                auto scope = on_peer.workspace->scope();
+                ops::moe_experts_gguf_part(peer_m, peer_ids, peer_weights, nullptr,
+                                           m.share_banks(r), std::int32_t(share.begin),
+                                           std::int32_t(share.end), *on_peer.workspace, peer_part,
+                                           on_peer.stream);
+            }
+            expert_exchange->reply(r, part, slot, on_peer.stream);
+        }
+        std::vector<Tensor> parts{Tensor(expert_own.p, DType::I64, {h, t})};
+        {
+            auto scope = rank.workspace->scope();
+            ops::moe_experts_gguf_part(
+                mixed, ids, weights, &shared, m.banks(), std::int32_t(m.shares[0].begin),
+                std::int32_t(m.shares[0].end), *rank.workspace, parts[0], rank.stream, &rank.side);
+        }
+        for (void* received : expert_exchange->collect(part, slot, rank.stream)) {
+            parts.push_back(Tensor(received, DType::I64, {h, t}));
+        }
+        Tensor y(rank.y, DType::FP32, {h, t});
+        ops::moe_experts_gguf_combine(parts, y, rank.stream);
     }
 
     void allocate_vision() {
@@ -2686,6 +2854,10 @@ struct Executor::Impl {
             auto scope = ws.scope();
             ops::moe_route(mixed, m.router, m.shared_gate, ws, ids, weights, shared, s);
         }
+        if (!m.shares.empty()) {
+            run_moe_parallel(m, rank, t, mixed, ids, weights, shared);
+            return;
+        }
         if (m.native) {
             Tensor y(rank.y, DType::FP32, {h, t});
             if (hybrid) {
@@ -3904,7 +4076,9 @@ struct Executor::Impl {
         // Tokens and positions stay in the staged buffers. Native hybrid experts use the same
         // captured exchange as text decode; GGUF host experts replay too, without counting the
         // draft steps' routes. A graph is captured at its second use.
-        const bool graph = options.cuda_graphs && b == 1 && device.size() == 1 && !stream;
+        // Expert parallelism's exchange is legal inside the capture as well.
+        const bool graph  = options.cuda_graphs && b == 1 &&
+                            (device.size() == 1 || model.expert_parallel()) && !stream;
         const auto replay = [&](SequenceState::DraftGraph& slot, const auto& body) {
             if (graph && !slot.chain.ready() && slot.runs++ > 0) {
                 DecodeGraphDefinition definition;

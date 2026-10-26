@@ -91,6 +91,10 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         return ops::sparse_moe_workspace_capacity_bytes(moe->routed_gate_up.qtype,
                                                         moe->routed_down.qtype, first, last);
     }
+    if (const auto* share = std::get_if<MoeShareParameters>(&parameters)) {
+        return ops::sparse_moe_share_workspace_capacity_bytes(
+            share->weights.routed_gate_up.qtype, share->weights.routed_down.qtype, first, last);
+    }
     const auto& p    = std::get<DenseParameters>(parameters);
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
@@ -173,9 +177,16 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
     if (partial != nullptr) {
+        if (const auto* share = std::get_if<MoeShareParameters>(&parameters); share && !mtp) {
+            const auto storage =
+                workspace.alloc_bytes(ffn_workspace_bytes(parameters, columns, columns));
+            WorkspaceArena scratch(storage);
+            ops::sparse_moe_share(hidden, share->weights, share->share, *partial, scratch, stream);
+            return;
+        }
         const auto* dense = std::get_if<DenseParameters>(&parameters);
         if (dense == nullptr || mtp) {
-            throw std::logic_error("a tensor-parallel FFN share is a dense FFN");
+            throw std::logic_error("a tensor-parallel FFN share is dense FFN rows or experts");
         }
         // A rotated share turns its whole input with its own copy of the signs, and its SwiGLU
         // rows, whole 1024-blocks of the intermediate, with theirs: the blocks one device turns.
@@ -220,6 +231,9 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         ops::sparse_moe(hidden, *moe, ops::SparseMoeEpilogue::AddResidual, residual, hints, scratch,
                         stream);
         return;
+    }
+    if (std::holds_alternative<MoeShareParameters>(parameters)) {
+        throw std::logic_error("an expert share writes a tensor-parallel partial");
     }
     const auto& p = std::get<DenseParameters>(parameters);
     if (rotated_dense(p)) {

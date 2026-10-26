@@ -106,18 +106,20 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
     float* partial_l_s      = partial_m_s + 2 * Br;
     float* alpha_s          = partial_l_s + 2 * Br;
 
-    const int q_block = static_cast<int>(blockIdx.x);
-    const int q_head  = static_cast<int>(blockIdx.y);
-    const int tid     = static_cast<int>(threadIdx.x);
-    const int warp    = tid >> 5;
-    const int lane    = tid & 31;
-    const int q0      = q_block * Br;
-    const int kv_head = q_head / Geometry::GroupSize;
-    const int tokens  = metadata.valid_tokens(width);
-    if (q_head >= Geometry::QHeads || q0 >= width) return;
+    const int q_block  = static_cast<int>(blockIdx.x);
+    const int q_head   = static_cast<int>(blockIdx.y);
+    const int q_heads  = causal_prompt_q_heads<Geometry>();
+    const int kv_heads = q_heads / Geometry::GroupSize;
+    const int tid      = static_cast<int>(threadIdx.x);
+    const int warp     = tid >> 5;
+    const int lane     = tid & 31;
+    const int q0       = q_block * Br;
+    const int kv_head  = q_head / Geometry::GroupSize;
+    const int tokens   = metadata.valid_tokens(width);
+    if (q_head >= q_heads || q0 >= width) return;
     if (q0 >= tokens) {
         causal_prompt_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
-                                                 kCausalPromptK8V4Threads);
+                                                 kCausalPromptK8V4Threads, q_heads);
         return;
     }
     const int base_pos              = positions[0];
@@ -134,10 +136,10 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int d = lane + 32 * r;
-            values[r] =
-                row < tile_rows
-                    ? __bfloat162float(q[causal_prompt_q_index<Geometry>(q_head, d, q0 + row)])
-                    : 0.0F;
+            values[r]   = row < tile_rows
+                              ? __bfloat162float(
+                                    q[causal_prompt_q_index<Geometry>(q_head, d, q0 + row, q_heads)])
+                              : 0.0F;
         }
         normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
@@ -167,10 +169,10 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
         for (int key_l = cooperative_tid; key_l < Bc; key_l += cooperative_threads) {
             const int key = tile_k0 + key_l;
             if (key <= max_query_abs) {
-                const std::int64_t k_off = kv_cache_fp8_scale_index<Geometry>(
-                    physical_page, kv_head, page_offset0 + key_l);
-                const std::int64_t v_off = kv_cache_nvfp4_scale_index<Geometry>(
-                    physical_page, kv_head, 0, page_offset0 + key_l);
+                const std::int64_t k_off = kv_cache_fp8_scale_index(physical_page, kv_head,
+                                                                    page_offset0 + key_l, kv_heads);
+                const std::int64_t v_off = kv_cache_nvfp4_scale_index(
+                    physical_page, kv_head, 0, page_offset0 + key_l, kv_heads);
                 k_scale_s[key_l] = cache_k_scale[k_off];
                 cp_async<16>(v_scale_s + key_l * kKVCacheNvfp4Groups, cache_v_scale + v_off);
             } else {
@@ -191,8 +193,8 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
             const int key    = tile_k0 + key_l;
             std::uint8_t* kd = &k_fp8[key_l * D + d];
             if (key <= max_query_abs) {
-                const std::int64_t off = kv_cache_fp8_code_index<Geometry>(physical_page, kv_head,
-                                                                           d, page_offset0 + key_l);
+                const std::int64_t off = kv_cache_fp8_code_index(physical_page, kv_head, d,
+                                                                 page_offset0 + key_l, kv_heads);
                 cp_async<16, Cache::cg>(kd, &cache_k[off]);
             } else {
                 store_vec(kd, make_int4(0, 0, 0, 0));
@@ -206,8 +208,8 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
             const int key    = tile_k0 + key_l;
             std::uint8_t* vd = &v_nvfp4[key_l * (D / 2) + d / 2];
             if (key <= max_query_abs) {
-                const std::int64_t off = kv_cache_nvfp4_code_index<Geometry>(
-                    physical_page, kv_head, d, page_offset0 + key_l);
+                const std::int64_t off = kv_cache_nvfp4_code_index(physical_page, kv_head, d,
+                                                                   page_offset0 + key_l, kv_heads);
                 cp_async<16, Cache::cg>(vd, &cache_v[off]);
             } else {
                 store_vec(vd, make_int4(0, 0, 0, 0));
@@ -464,13 +466,14 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int d                                               = lane + 32 * r;
-            out[causal_prompt_q_index<Geometry>(q_head, d, q0 + row)] = __float2bfloat16(values[r]);
+            out[causal_prompt_q_index<Geometry>(q_head, d, q0 + row, q_heads)] =
+                __float2bfloat16(values[r]);
         }
     }
     __syncthreads();
 
     causal_prompt_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid,
-                                             kCausalPromptK8V4Threads);
+                                             kCausalPromptK8V4Threads, q_heads);
 }
 
 } // namespace ninfer::ops
