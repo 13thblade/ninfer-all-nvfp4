@@ -326,6 +326,19 @@ prompt). Every run gave one device's answers.
   NVLink prefill gains as well: the 7,014-token prompt runs at 1,300 tok/s against 865-867 (+50%),
   decode after it at 58.3 against 42.9 (+36%), and a 40-token prompt's TTFT is 113-135 ms against
   129-130 ms.
+- **Other weight formats on 2x RTX 3090** (Vast, PCIe 4.0 x16 on one NUMA node, no peer access, so
+  the mapped host transport; 2026-10-26; the four short prompts and a 7,054-token one, one pass per
+  configuration). The official Qwen3.8-27B (row-split Q4/Q5) with `--tensor-split 1,1` decodes at
+  59.7-60.0 tok/s against 46.9-47.4 on one card (+26% to +27%), and at 56.6 against 45.3 after the
+  long prompt (+25%). Prefill loses: the long prompt runs at 1,219 tok/s against 1,572 (-22%), and a
+  short prompt's TTFT is 105-140 ms against 82-95 ms. With `--spec dflash2 --draft-tokens 7` the
+  pair is slower than one card, 56.9-181.0 tok/s against 63.2-197.9 (-8% to -10%): a verify round
+  is a narrow prefill. Ternary Bonsai 2 27B (T2) does not gain: 87.9-88.8 tok/s against 90.1-91.0
+  (-2% to -3%), 119.5-330.2 against 131.1-356.6 with DFlash2 (-4% to -11%), and the long prompt
+  prefills at 1,373 tok/s against 2,737 (-50%). One card runs Bonsai's projections on the A8
+  integer route of their tuned shapes, where a share takes the A16 runtime-shape route. The 27B
+  pair gave one card's answer on one prompt of five and Bonsai's pair on three of five; the others
+  part after 260-510 characters into different, coherent text.
 
 What the transport costs was measured before this was built:
 
