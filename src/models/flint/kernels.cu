@@ -139,10 +139,12 @@ __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __rest
     const int q      = hidden >> 2, i = threadIdx.x;
     const std::int64_t row = std::int64_t(blockIdx.x) * hidden;
     const float4 v   = i < q ? ld4(x + row, i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    // The weight is loaded before the reduction, whose barriers would hold the load behind it.
+    const float4 wv  = i < q ? ld4(w, i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     const float inv  = rsqrtf(block_sum(dot4(v, v)) / float(hidden) + eps);
     float4 y         = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (i < q) {
-        y = mul4(scale4(v, inv), ld4(w, i));
+        y = mul4(scale4(v, inv), wv);
         if (out != nullptr) { store_bf16x4(out + row + 4 * i, y); }
         if (f32 != nullptr) { reinterpret_cast<float4*>(f32 + row)[i] = y; }
     }
@@ -786,6 +788,8 @@ __global__ void ffn_combine_kernel(FfnCombineArgs a) {
     const int q = a.hidden >> 2, i = threadIdx.x;
     const std::int64_t row = std::int64_t(blockIdx.x) * a.hidden;
     const float4 zero      = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    // The norm's weight is loaded before the reduction, whose barriers would hold the load.
+    const float4 w_next    = i < q ? ld4(a.next_norm, i) : zero;
     float4 h               = zero;
     if (i < q) {
         h = ld4(a.h + row, i);
@@ -800,7 +804,7 @@ __global__ void ffn_combine_kernel(FfnCombineArgs a) {
         reinterpret_cast<float4*>(a.h + row)[i] = h;
     }
     const float inv  = rsqrtf(block_sum(dot4(h, h)) / float(a.hidden) + a.eps);
-    const float4 nxt = i < q ? mul4(scale4(h, inv), ld4(a.next_norm, i)) : zero;
+    const float4 nxt = i < q ? mul4(scale4(h, inv), w_next) : zero;
     if (i < q && a.next_out != nullptr) { store_bf16x4(a.next_out + row + 4 * i, nxt); }
     if (a.next_q.qs != nullptr) { store_q8x4(a.next_q, a.hidden, blockIdx.x, i, nxt, i < q); }
 }

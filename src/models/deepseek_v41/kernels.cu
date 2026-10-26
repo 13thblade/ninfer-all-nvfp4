@@ -13,6 +13,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace ninfer::models::deepseek_v41::kernels {
 namespace {
@@ -172,41 +173,64 @@ __device__ __forceinline__ float4 rope4(float4 v, int at, int dim, float positio
 
 constexpr int kGemvThreads = 256;
 constexpr int kGemvRows    = 8;
+constexpr int kGemvAhead   = 4; // float4 steps whose loads a thread issues before their products
 
-// Block m: output row m of up to kGemvRows tokens, its k values split over the block.
-__global__ void gemv_kernel(const float* __restrict__ w, const float* __restrict__ x, int m, int n,
-                            int k, float* __restrict__ out) {
-    __shared__ float part[kGemvThreads / 32][kGemvRows];
+// Block m: output row m of N tokens (at most kGemvRows), its k values split over the block. A
+// thread loads kGemvAhead steps of the row and the tokens before it multiplies them, in its own
+// order: with one step in flight a block read a hyper-connection row of 20,480 values at about
+// 8 GB/s, so the 24 rows of a mix took 10.4 us on an RTX 4090.
+template <int N>
+__global__ void gemv_kernel(const float* __restrict__ w, const float* __restrict__ x, int m, int k,
+                            float* __restrict__ out) {
+    __shared__ float part[kGemvThreads / 32][N];
     const int row = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const float* wr = w + std::int64_t(row) * k;
-    float dot[kGemvRows] = {};
+    float dot[N] = {};
     if (k % 4 == 0) {
         const int quads = k / 4;
-        for (int i = threadIdx.x; i < quads; i += kGemvThreads) {
-            const float4 wv = reinterpret_cast<const float4*>(wr)[i];
+        const auto* w4  = reinterpret_cast<const float4*>(wr);
+        int i           = threadIdx.x;
+        for (; i + (kGemvAhead - 1) * kGemvThreads < quads; i += kGemvAhead * kGemvThreads) {
+            float4 wv[kGemvAhead], xv[kGemvAhead][N];
 #pragma unroll
-            for (int t = 0; t < kGemvRows; ++t) {
-                if (t < n) {
-                    const float4 xv = reinterpret_cast<const float4*>(x + std::int64_t(t) * k)[i];
-                    dot[t] += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
+            for (int a = 0; a < kGemvAhead; ++a) {
+                wv[a] = w4[i + a * kGemvThreads];
+#pragma unroll
+                for (int t = 0; t < N; ++t) {
+                    xv[a][t] =
+                        reinterpret_cast<const float4*>(x + std::int64_t(t) * k)[i + a * kGemvThreads];
                 }
+            }
+#pragma unroll
+            for (int a = 0; a < kGemvAhead; ++a) {
+#pragma unroll
+                for (int t = 0; t < N; ++t) {
+                    dot[t] += wv[a].x * xv[a][t].x + wv[a].y * xv[a][t].y + wv[a].z * xv[a][t].z +
+                              wv[a].w * xv[a][t].w;
+                }
+            }
+        }
+        for (; i < quads; i += kGemvThreads) {
+            const float4 wv = w4[i];
+#pragma unroll
+            for (int t = 0; t < N; ++t) {
+                const float4 xv = reinterpret_cast<const float4*>(x + std::int64_t(t) * k)[i];
+                dot[t] += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
             }
         }
     } else {
         for (int i = threadIdx.x; i < k; i += kGemvThreads) {
 #pragma unroll
-            for (int t = 0; t < kGemvRows; ++t) {
-                if (t < n) { dot[t] += wr[i] * x[std::int64_t(t) * k + i]; }
-            }
+            for (int t = 0; t < N; ++t) { dot[t] += wr[i] * x[std::int64_t(t) * k + i]; }
         }
     }
 #pragma unroll
-    for (int t = 0; t < kGemvRows; ++t) {
+    for (int t = 0; t < N; ++t) {
         const float v = warp_sum(dot[t]);
         if (lane == 0) { part[warp][t] = v; }
     }
     __syncthreads();
-    if (threadIdx.x < n) {
+    if (threadIdx.x < N) {
         float v = 0.0f;
 #pragma unroll
         for (int w8 = 0; w8 < kGemvThreads / 32; ++w8) { v += part[w8][threadIdx.x]; }
@@ -256,8 +280,20 @@ __global__ void hc_split_kernel(HcSplitArgs a) {
     const int t = blockIdx.x, S = a.streams;
     const std::int64_t width = std::int64_t(S) * a.hidden;
     const float* h           = a.h + t * width;
+    const std::int64_t quads = width / 4, step = blockDim.x;
     float ss                 = 0.0f;
-    for (std::int64_t i = threadIdx.x; i < width / 4; i += blockDim.x) {
+    // kGemvAhead steps loaded before they are added, in the thread's order (see gemv_kernel).
+    std::int64_t i = threadIdx.x;
+    for (; i + (kGemvAhead - 1) * step < quads; i += kGemvAhead * step) {
+        float4 v[kGemvAhead];
+#pragma unroll
+        for (int u = 0; u < kGemvAhead; ++u) { v[u] = ld4(h + 4 * (i + u * step)); }
+#pragma unroll
+        for (int u = 0; u < kGemvAhead; ++u) {
+            ss += v[u].x * v[u].x + v[u].y * v[u].y + v[u].z * v[u].z + v[u].w * v[u].w;
+        }
+    }
+    for (; i < quads; i += step) {
         const float4 v = ld4(h + 4 * i);
         ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
@@ -316,23 +352,36 @@ __device__ __forceinline__ float4 mix_streams(const float* h, const float* mix, 
     return bf16r4(y);
 }
 
+// The mixed row (up to kPreNormThreads * kPreNormSteps float4s) stays in registers between the
+// sum and the output, its weights loaded before the sum: one block per token re-reading every
+// stream's row after the sum took 5.7 us at 5,120 values and four streams on an RTX 4090.
+constexpr int kPreNormThreads = 256, kPreNormSteps = 8;
+
 __global__ void hc_pre_norm_kernel(const float* __restrict__ h, const float* __restrict__ mix,
                                    const float* __restrict__ w, int streams, int hidden, float eps,
                                    __nv_bfloat16* __restrict__ out, float* __restrict__ out_f32) {
     const int t     = blockIdx.x;
     const float* ht = h + std::int64_t(t) * streams * hidden;
     const float* mt = mix != nullptr ? mix + std::int64_t(t) * streams : nullptr;
-    float ss        = 0.0f;
-    for (int i = threadIdx.x; i < hidden / 4; i += blockDim.x) {
-        const float4 y = mix_streams(ht, mt, streams, hidden, i);
-        ss += y.x * y.x + y.y * y.y + y.z * y.z + y.w * y.w;
+    const int quads = hidden / 4;
+    float4 y[kPreNormSteps], wv[kPreNormSteps];
+    float ss = 0.0f;
+#pragma unroll
+    for (int s = 0; s < kPreNormSteps; ++s) {
+        const int i = threadIdx.x + s * kPreNormThreads;
+        if (i < quads) {
+            y[s]  = mix_streams(ht, mt, streams, hidden, i);
+            wv[s] = ld4(w + 4 * i);
+            ss += y[s].x * y[s].x + y[s].y * y[s].y + y[s].z * y[s].z + y[s].w * y[s].w;
+        }
     }
     const float inv = rsqrtf(block_sum(ss) / float(hidden) + eps);
-    for (int i = threadIdx.x; i < hidden / 4; i += blockDim.x) {
-        const float4 y  = mix_streams(ht, mt, streams, hidden, i);
-        const float4 wv = ld4(w + 4 * i);
-        const float4 o =
-            bf16r4(make_float4(y.x * inv * wv.x, y.y * inv * wv.y, y.z * inv * wv.z, y.w * inv * wv.w));
+#pragma unroll
+    for (int s = 0; s < kPreNormSteps; ++s) {
+        const int i = threadIdx.x + s * kPreNormThreads;
+        if (i >= quads) { continue; }
+        const float4 o = bf16r4(make_float4(y[s].x * inv * wv[s].x, y[s].y * inv * wv[s].y,
+                                            y[s].z * inv * wv[s].z, y[s].w * inv * wv[s].w));
         if (out != nullptr) { st_bf16x4(out + std::int64_t(t) * hidden + 4 * i, o); }
         if (out_f32 != nullptr) {
             *reinterpret_cast<float4*>(out_f32 + std::int64_t(t) * hidden + 4 * i) = o;
@@ -955,12 +1004,16 @@ __global__ void attention_combine_kernel(AttentionArgs a) {
 // Block (t, head) of 128 threads.
 __global__ void attention_output_kernel(const __nv_bfloat16* __restrict__ o, int heads, int groups,
                                         const std::int32_t* __restrict__ positions,
-                                        const float* __restrict__ freq, int tokens,
+                                        const float* __restrict__ freq, int tokens, bool token_major,
                                         __nv_bfloat16* __restrict__ out) {
     const int t = blockIdx.x, head = blockIdx.y, at = 4 * threadIdx.x;
     float4 v = ld_bf16x4(o + (std::int64_t(t) * heads + head) * kLatent + at);
     v        = bf16r4(rope4(v, at, kLatent, float(positions[t]), freq, true));
     v        = fp8_group(v);
+    if (token_major) {
+        st_bf16x4(out + (std::int64_t(t) * heads + head) * kLatent + at, v);
+        return;
+    }
     const int per = heads / groups;
     const int g = head / per, in_group = head % per;
     st_bf16x4(out + (std::int64_t(g) * tokens + t) * per * kLatent + in_group * kLatent + at, v);
@@ -1253,7 +1306,19 @@ __global__ void dspark_confidence_kernel(const float* __restrict__ h, const floa
 void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, cudaStream_t stream) {
     if (m <= 0 || n <= 0) { return; }
     if (n <= kGemvRows) {
-        gemv_kernel<<<m, kGemvThreads, 0, stream>>>(w, x, m, n, k, out);
+        const auto gemv = [&](auto tokens) {
+            gemv_kernel<decltype(tokens)::value><<<m, kGemvThreads, 0, stream>>>(w, x, m, k, out);
+        };
+        switch (n) {
+        case 1: gemv(std::integral_constant<int, 1>{}); break;
+        case 2: gemv(std::integral_constant<int, 2>{}); break;
+        case 3: gemv(std::integral_constant<int, 3>{}); break;
+        case 4: gemv(std::integral_constant<int, 4>{}); break;
+        case 5: gemv(std::integral_constant<int, 5>{}); break;
+        case 6: gemv(std::integral_constant<int, 6>{}); break;
+        case 7: gemv(std::integral_constant<int, 7>{}); break;
+        default: gemv(std::integral_constant<int, 8>{}); break;
+        }
         check_launch("gemv");
         return;
     }
@@ -1281,8 +1346,12 @@ void hc_split(const HcSplitArgs& args, cudaStream_t stream) {
 
 void hc_pre_norm(const float* h, const float* mix, const float* w, int tokens, int streams,
                  int hidden, float eps, __nv_bfloat16* out, float* out_f32, cudaStream_t stream) {
+    if (hidden % 4 != 0 || hidden / 4 > kPreNormThreads * kPreNormSteps) {
+        throw std::invalid_argument("deepseek_v41 hc_pre_norm: at most 8192 values in whole float4s");
+    }
     if (tokens <= 0) { return; }
-    hc_pre_norm_kernel<<<tokens, 256, 0, stream>>>(h, mix, w, streams, hidden, eps, out, out_f32);
+    hc_pre_norm_kernel<<<tokens, kPreNormThreads, 0, stream>>>(h, mix, w, streams, hidden, eps, out,
+                                                               out_f32);
     check_launch("hc_pre_norm");
 }
 
@@ -1405,12 +1474,12 @@ void sparse_attention(const AttentionArgs& args, cudaStream_t stream) {
 }
 
 void attention_output(const __nv_bfloat16* o, int tokens, int heads, int groups,
-                      const std::int32_t* positions, const float* freq, __nv_bfloat16* out,
-                      cudaStream_t stream) {
+                      const std::int32_t* positions, const float* freq, bool token_major,
+                      __nv_bfloat16* out, cudaStream_t stream) {
     if (tokens <= 0) { return; }
     if (groups <= 0 || heads % groups != 0) { throw std::invalid_argument("deepseek_v41 attention_output: groups"); }
-    attention_output_kernel<<<dim3(tokens, heads), kLatentThreads, 0, stream>>>(o, heads, groups,
-                                                                               positions, freq, tokens, out);
+    attention_output_kernel<<<dim3(tokens, heads), kLatentThreads, 0, stream>>>(
+        o, heads, groups, positions, freq, tokens, token_major, out);
     check_launch("attention_output");
 }
 

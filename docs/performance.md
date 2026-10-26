@@ -900,8 +900,8 @@ experts, the flags its app starts the engine with and the four settings its tune
 
 | Engine and settings | Decode, short answer | after 8,086 tokens | Prefill of 8,086 tokens |
 |---|---:|---:|---:|
-| NInfer | 35.4 | 29.0 | 935 |
-| NInfer, `--expert-dma-share 1` (every miss copied) | 30.7 | 24.9 | 927 |
+| NInfer | 38.9 | 31.4 | 938 |
+| NInfer, `--expert-dma-share 1` (every miss copied) | 33.5 | 26.6 | 929 |
 | NInfer `b3402a6fd` (prompts chunk by chunk, every miss copied) | 25.8 | 22.1 | 498 |
 | Strata, `--dspark auto --dspark-conf 0.65` (its app) | 36.0 | 38.4 | 635 |
 | Strata, `--dspark on` | 34.3 | 38.7 | 690 |
@@ -909,8 +909,9 @@ experts, the flags its app starts the engine with and the four settings its tune
 | Strata, `--cpu-threads 64` | 38.0 | 38.6 | 659 |
 | Strata, `--mmap-experts off --ssd-cache 0` | 39.4 | 38.3 | 658 |
 
-Strata computes 53 to 61% of the routed experts on its CPU threads beside the GPU. NInfer's device
-cache serves 62 to 72% of the decode routes, its CPU share 16 to 22%, and the GPU copies the rest
+Strata computes 53 to 61% of the routed experts on its CPU threads beside the GPU. With the build
+`7731f3d30` NInfer's device cache served 62 to 72% of the decode routes, its CPU share 16 to 22%,
+and the GPU copied the rest
 ([the CPU share](deepseek-v41.md#the-cpu-share-on-one-rtx-4090)). With `--experts 5` (5 of the 6
 experts, another model's output) Strata decodes 44.8 and 42.1 tok/s.
 
@@ -922,9 +923,9 @@ miss:
 |---|---|---:|---:|---:|
 | RTX PRO 6000 (600 W) | none | 50.8 | 48.3 | 1,210 |
 | RTX PRO 6000 (600 W) | `--spec dspark` | 83.1 | 75.0 | 1,290 |
-| RTX 4090 (450 W) | none | 35.4 | 29.0 | 935 |
-| RTX 4090 (450 W) | `--spec dspark` | 36.9 | 31.5 | 692 |
-| RTX 4090 (450 W), `--expert-dma-share 1` | `--spec dspark` | 24.2 | 19.6 | 688 |
+| RTX 4090 (450 W) | none | 38.9 | 31.4 | 938 |
+| RTX 4090 (450 W) | `--spec dspark` | 39.9 | 33.2 | 693 |
+| RTX 4090 (450 W), `--expert-dma-share 1` | `--spec dspark` | 25.1 | 20.2 | 688 |
 
 Strata 0.2.6 exited with an error in every configuration tried on the RTX PRO 6000 host
 ([the drafter](deepseek-v41.md#the-dspark-drafter)).

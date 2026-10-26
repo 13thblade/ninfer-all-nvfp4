@@ -18,7 +18,9 @@
 //    fewer selectable positions or blocks than chosen, and rows over several 1024-value chunks.
 //  - sparse_attention over the window rings and the selected latents: window-only blocks, one to
 //    40 splits (empty ones among them), a round's rows of one sequence, a chunk's staging ring,
-//    1024 latents, sinks far below and above the scores; attention_output.
+//    1024 latents, sinks far below and above the scores; attention_output in both layouts.
+//  - the grouped output projection of one to eight tokens as one vector product over the groups:
+//    every value the bits of its group's own vector product (Q5_K).
 //  - route (ties to the lower id, the softplus branch past 20), clamped_swiglu (the clamps, rows
 //    scaled per token), moe_combine (weighted rows and 2^-32 fixed-point sums).
 //  - engram_rows (IQ4_NL), engram_gate.
@@ -1282,7 +1284,8 @@ void drafter(std::mt19937& rng) {
     }
 }
 
-void attention_output(std::mt19937& rng) {
+// Group-major (out[g][t][heads / groups * 512]) and token-major (out[t][heads * 512]) layouts.
+void attention_output(bool token_major, std::mt19937& rng) {
     const std::vector<int> positions = {0, 7, 300, 77777};
     const int t                      = int(positions.size());
     const int per                    = kHeads / kGroups;
@@ -1292,7 +1295,7 @@ void attention_output(std::mt19937& rng) {
                  out(std::size_t(t) * kHeads * kLatent * 2);
     out.fill(0xFF);
     k::attention_output(as<bf16>(d), t, kHeads, kGroups, as<std::int32_t>(dp), as<float>(df),
-                        as<bf16>(out), nullptr);
+                        token_major, as<bf16>(out), nullptr);
     sync("attention_output");
     const auto got = download<bf16>(out, o.size());
     Tally plain, turned;
@@ -1308,7 +1311,8 @@ void attention_output(std::mt19937& rng) {
                 fp8_round(v.data() + 32 * g, step.data() + 32 * g);
             }
             const std::size_t at =
-                (std::size_t(h / per) * t + r) * per * kLatent + std::size_t(h % per) * kLatent;
+                token_major ? (std::size_t(r) * kHeads + h) * kLatent
+                            : (std::size_t(h / per) * t + r) * per * kLatent + std::size_t(h % per) * kLatent;
             for (int i = 0; i < kLatent; ++i) {
                 (i < kLatent - kRope ? plain : turned)
                     .add(val(got[at + i]), v[std::size_t(i)], step[std::size_t(i)]);
@@ -1316,7 +1320,8 @@ void attention_output(std::mt19937& rng) {
         }
     }
     report(plain.off == 0 && turned.within(1e-3, 2.0),
-           "attention_output: unturned " + plain.str() + ", turned " + turned.str());
+           std::string("attention_output ") + (token_major ? "token-major" : "group-major") +
+               ": unturned " + plain.str() + ", turned " + turned.str());
 }
 
 // ---- Routing and experts ------------------------------------------------------------------------
@@ -1743,6 +1748,77 @@ std::vector<std::uint8_t> expert_blocks(QType q, int rows, int depth, std::mt199
     return bytes;
 }
 
+// The grouped output projection of a decode or verification call as the executor runs it: the
+// groups the experts of one vector product over the token-major activation, group g of token j
+// pair j * groups + g. Each pair's rows must be the bits of its group's own vector product.
+void grouped_output(int tokens, std::mt19937& rng) {
+    constexpr int groups = kGroups, rows = 96, depth = 1024;
+    const auto block       = gguf_block_shape(QType::GGUF_Q5_K);
+    const std::int64_t row = std::int64_t(depth / block.elements) * block.bytes;
+    auto weight            = expert_blocks(QType::GGUF_Q5_K, groups * rows, depth, rng);
+    for (std::size_t at = 0; at < weight.size(); at += block.bytes) { // a finite minimum's factor
+        std::memcpy(&weight[at + 2], &weight[at], 2);
+    }
+    const int pairs        = tokens * groups;
+    const auto x           = random_bf16(std::size_t(pairs) * depth, 1.0f, rng);
+    DeviceBuffer d_w = upload(weight), d_x = upload(x);
+    std::vector<const void*> parts(groups);
+    for (int g = 0; g < groups; ++g) {
+        parts[std::size_t(g)] = static_cast<const std::uint8_t*>(d_w.p) + std::int64_t(g) * rows * row;
+    }
+    std::vector<std::int32_t> words;
+    for (int g = 0; g <= groups; ++g) { words.push_back(g * tokens); }
+    for (int g = 0; g < groups; ++g) {
+        for (int j = 0; j < tokens; ++j) { words.push_back(j * groups + g); }
+    }
+    for (int g = 0; g < groups; ++g) { words.push_back(g); }
+    words.push_back(groups);
+    DeviceBuffer d_parts = upload(parts), d_words = upload(words);
+    gguf::MoeRouting routing;
+    routing.bounds       = as<std::int32_t>(d_words);
+    routing.sorted       = routing.bounds + groups + 1;
+    routing.active       = routing.sorted + pairs;
+    routing.active_count = routing.active + groups;
+    DeviceBuffer d_act(gguf::vector_activation_bytes(depth, pairs));
+    gguf::quantize_vector_activation(as<bf16>(d_x), depth, pairs, nullptr, d_act.p, nullptr);
+    DeviceBuffer grouped(std::size_t(pairs) * rows * 4);
+    gguf::MoeOutput out;
+    out.f32         = as<float>(grouped);
+    const int chunk = tokens <= 1 ? 1 : tokens <= 2 ? 2 : tokens <= 4 ? 4 : 8;
+    gguf::moe_vector_product(gguf::GgmlType::Q5_K,
+                             {static_cast<const void* const*>(d_parts.p), row, rows, depth},
+                             routing, groups, 1, 1, d_act.p, pairs, out, chunk, nullptr);
+    // Each group alone: its tokens' columns gathered, as the per-group products read them.
+    std::vector<bf16> xg(std::size_t(tokens) * depth);
+    DeviceBuffer d_xg(xg.size() * 2), d_gact(gguf::vector_activation_bytes(depth, tokens)),
+        single(std::size_t(tokens) * rows * 4);
+    std::size_t differ = 0;
+    const auto got = download<float>(grouped, std::size_t(pairs) * rows);
+    for (int g = 0; g < groups; ++g) {
+        for (int j = 0; j < tokens; ++j) {
+            std::copy_n(x.begin() + (std::int64_t(j) * groups + g) * depth, depth,
+                        xg.begin() + std::int64_t(j) * depth);
+        }
+        d_xg.copy_from_host(xg.data(), xg.size() * 2);
+        gguf::quantize_vector_activation(as<bf16>(d_xg), depth, tokens, nullptr, d_gact.p, nullptr);
+        gguf::VectorOutput one;
+        one.f32           = as<float>(single);
+        one.column_stride = rows;
+        gguf::vector_product(gguf::GgmlType::Q5_K, parts[std::size_t(g)], row, rows, depth,
+                             d_gact.p, tokens, one, nullptr);
+        const auto want = download<float>(single, std::size_t(tokens) * rows);
+        for (int j = 0; j < tokens; ++j) {
+            for (int r = 0; r < rows; ++r) {
+                const float a = got[(std::size_t(j) * groups + g) * rows + r];
+                const float b = want[std::size_t(j) * rows + r];
+                differ += std::memcmp(&a, &b, 4) != 0 ? 1 : 0;
+            }
+        }
+    }
+    report(differ == 0, "grouped output, " + std::to_string(tokens) + " token(s): " +
+                            std::to_string(differ) + " values differ from the groups' own products");
+}
+
 // A call's routed experts as the executor runs them on the GPU (the vector kernels over the
 // guarded input's q8_1 activation, the clamped SwiGLU, the middle's activation, the weighted down
 // rows) and on the CPU from the inputs ExpertDelivery copies (CpuExperts): their 2^-32 fixed-point
@@ -1925,6 +2001,10 @@ int main() {
         for (const int rows : {1, 3, 8, 9}) { gemm(24, rows, kStreams * kHidden, rng); }
         gemm(512, 40, kHidden, rng);
         gemm(7, 5, 130, rng);
+        {
+            std::mt19937 own(5200); // a tail past the loads ahead, beside the other inputs
+            gemm(24, 2, 5200, own);
+        }
 
         hyper_connections(3, 20, rng);
         hyper_connections(1, 1, rng);
@@ -1998,7 +2078,11 @@ int main() {
         sparse_attention({"a draft block at the start", {6, 6, 6, 6, 6}, {0, 0, 0, 0, 0}, 0, kRing, 0,
                           2, 1, 0.0f, 133},
                          rng);
-        attention_output(rng);
+        attention_output(false, rng);
+        attention_output(true, rng);
+        grouped_output(1, rng);
+        grouped_output(3, rng);
+        grouped_output(8, rng);
         drafter(rng);
 
         route(1, false, rng);

@@ -152,6 +152,7 @@ struct LayerPlan {
     Site hc_attention, hc_ffn;
     std::vector<Weight> query_kv; // [query_a; kv] as one parent, or the two
     Weight query_b, output_a, output_b, shared_down;
+    DeviceBuffer output_groups; // output_a's row groups: the experts of the grouped decode product
     std::vector<Weight> shared_gate_up;
     const float *attention_norm = nullptr, *ffn_norm = nullptr, *query_norm = nullptr,
                 *kv_norm = nullptr, *sinks = nullptr, *freq = nullptr;
@@ -231,6 +232,9 @@ struct Executor::Impl {
     Weight embedding, head;
     const float* final_norm = nullptr;
     DeviceBuffer freq_window, freq_compressed;
+    // The grouped output projection's routing for each decode width t (group_routing(t)).
+    DeviceBuffer group_routes;
+    std::vector<std::size_t> group_routes_at;
     std::vector<std::uint32_t> positions;
     DeviceBuffer d_tokens, d_positions, d_sequences;
     std::unique_ptr<PinnedHostBuffer> h_staging;
@@ -335,6 +339,22 @@ struct Executor::Impl {
             freq_compressed = DeviceBuffer(yarn_freq.size() * 4);
             freq_window.copy_from_host(window_freq.data(), window_freq.size() * 4);
             freq_compressed.copy_from_host(yarn_freq.data(), yarn_freq.size() * 4);
+        }
+        {
+            // Per width t: bounds, sorted pairs, active groups and their count (see group_routing).
+            std::vector<std::int32_t> words;
+            group_routes_at.assign(std::size_t(gguf::kMaxVectorColumns) + 1, 0);
+            for (int t = 1; t <= gguf::kMaxVectorColumns; ++t) {
+                group_routes_at[std::size_t(t)] = words.size();
+                for (int g = 0; g <= groups; ++g) { words.push_back(g * t); }
+                for (int g = 0; g < groups; ++g) {
+                    for (int j = 0; j < t; ++j) { words.push_back(j * groups + g); }
+                }
+                for (int g = 0; g < groups; ++g) { words.push_back(g); }
+                words.push_back(groups);
+            }
+            group_routes = DeviceBuffer(words.size() * sizeof(std::int32_t));
+            group_routes.copy_from_host(words.data(), words.size() * sizeof(std::int32_t));
         }
         const int sequences = int(options.sequences);
         {
@@ -521,6 +541,15 @@ struct Executor::Impl {
         p.query_b        = matrix(model, at.query_b);
         p.output_a       = matrix(model, at.output_a);
         p.output_b       = matrix(model, at.output_b);
+        {
+            std::vector<const void*> parts(static_cast<std::size_t>(groups));
+            for (int g = 0; g < groups; ++g) {
+                parts[std::size_t(g)] = static_cast<const std::byte*>(p.output_a.qdata) +
+                                        std::int64_t(g) * output_rank * row_bytes(p.output_a);
+            }
+            p.output_groups = DeviceBuffer(parts.size() * sizeof(void*));
+            p.output_groups.copy_from_host(parts.data(), parts.size() * sizeof(void*));
+        }
         p.attention_norm = fp32(model, lw.attention_norm, hidden);
         p.ffn_norm       = fp32(model, lw.ffn_norm, hidden);
         p.query_norm     = fp32(model, at.query_a_norm, query_rank);
@@ -923,7 +952,8 @@ struct Executor::Impl {
             t * std::size_t(query_rank) * 4, t * 4, t * 4, 8 * t * 4,
             t * latent_rows * 2, t * latent_rows * 2,
             t * std::size_t(groups) * output_rank * 4, t * std::size_t(groups) * output_rank * 2,
-            t * h * 4,
+            gguf::vector_activation_bytes(heads / groups * kLatent, groups * gguf::kMaxVectorColumns),
+            std::size_t(groups) * gguf::kMaxVectorColumns * 4, t * h * 4,
             // compressor
             t * kLatent * 4, t * kLatent * 4, t * kLatent * 4, t * kIndexDim * 4,
             // indexer
@@ -951,6 +981,18 @@ struct Executor::Impl {
     }
 
     // ---- Shared pieces ---------------------------------------------------------------------------
+
+    // A call of t <= kMaxVectorColumns tokens through the grouped output projection: group g of
+    // token j is pair j * groups + g, the groups the experts.
+    [[nodiscard]] gguf::MoeRouting group_routing(int t) const {
+        const auto* base = static_cast<const std::int32_t*>(group_routes.p) + group_routes_at.at(std::size_t(t));
+        gguf::MoeRouting routing;
+        routing.bounds       = base;
+        routing.sorted       = base + groups + 1;
+        routing.active       = routing.sorted + std::int64_t(groups) * t;
+        routing.active_count = routing.active + groups;
+        return routing;
+    }
 
     template <typename T>
     T* alloc(std::size_t count) {
@@ -1200,14 +1242,40 @@ struct Executor::Impl {
                                stream);
         }
         // The grouped output projection: group g's heads (rounded as the reference rounds them)
-        // through rows [g * o_rank, (g + 1) * o_rank) of output_a, into the latent's rows there.
-        auto* grouped = static_cast<__nv_bfloat16*>(q.data); // q is spent
+        // through rows [g * o_rank, (g + 1) * o_rank) of output_a, into the latent's rows there. A
+        // decode or verification call runs the groups as the experts of one vector product, its
+        // pairs token by token (group_routing), so one guard, quantization, product and unscale
+        // serve every group: each pair's arithmetic is that of its group's own product, whose eight
+        // launches of 1,024 rows read output_a at about 470 GB/s on an RTX 4090.
+        auto* grouped         = static_cast<__nv_bfloat16*>(q.data); // q is spent
+        const bool vector     = t <= gguf::kMaxVectorColumns;
         kernels::attention_output(static_cast<const __nv_bfloat16*>(o.data), t, heads, groups, pos,
-                                  p.freq, grouped, stream);
+                                  p.freq, vector, grouped, stream);
         const int latent_rows = groups * output_rank;
         const int group_k     = heads / groups * kLatent;
         auto* latent          = alloc<float>(std::size_t(t) * latent_rows);
-        for (int g = 0; g < groups; ++g) {
+        if (vector) {
+            const int pairs = t * groups;
+            const auto type = ops::detail::gguf_type(p.output_a.qtype);
+            float* scale    = nullptr;
+            if (gguf::vector_activation_f16_sums(type)) {
+                scale = alloc<float>(pairs);
+                kernels::guard_columns(grouped, group_k, pairs, scale, stream);
+            }
+            void* act = workspace->alloc_bytes(gguf::vector_activation_bytes(group_k, pairs)).data;
+            gguf::quantize_vector_activation(grouped, group_k, pairs, nullptr, act, stream);
+            const gguf::MoeTable table{static_cast<const void* const*>(p.output_groups.p),
+                                       row_bytes(p.output_a), output_rank, group_k};
+            gguf::MoeOutput out;
+            out.f32         = latent;
+            const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
+            gguf::moe_vector_product(type, table, group_routing(t), groups, 1, 1, act, pairs, out,
+                                     chunk, stream);
+            if (scale != nullptr) {
+                kernels::unscale_columns(latent, output_rank, output_rank, pairs, scale, stream);
+            }
+        }
+        for (int g = 0; g < groups && !vector; ++g) {
             Weight part = p.output_a;
             part.qdata  = static_cast<const std::byte*>(p.output_a.qdata) +
                          std::int64_t(g) * output_rank * row_bytes(p.output_a);

@@ -38,6 +38,8 @@ constexpr std::uint32_t kCountMask = (1u << 30) - 1;
 constexpr std::uint32_t kCpuCall = 1;
 constexpr std::uint32_t kHit     = 1u << 30;
 constexpr std::uint32_t kMiss    = 1u << 31;
+// The split's shared count of an expert whose table entry hits.
+constexpr std::uint32_t kInCache = 1u << 31;
 
 std::uint64_t aligned(std::uint64_t n) {
     if (n > std::numeric_limits<std::uint64_t>::max() - 255) {
@@ -158,14 +160,8 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
         return !wide && ((address >= lent_low[0] && address < lent_high[0]) ||
                          (address >= lent_low[1] && address < lent_high[1]));
     };
-    for (std::uint32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
-        const int e       = ids[p];
-        const bool valid  = e >= 0 && e < experts;
-        const bool cached_pair = valid && hit(tables[e]);
-        cached[p]  = cached_pair ? e : -1;
-        missing[p] = valid && !cached_pair ? e : -1;
-    }
     // Each warp ballots its experts of a block-wide pass; earlier warps and passes place them.
+    // A routed expert's count keeps its hit in the top bit for the pairs below.
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (int first = 0; first < experts; first += blockDim.x) {
         const int e               = first + threadIdx.x;
@@ -175,6 +171,7 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
         const unsigned misses     = __ballot_sync(~0u, count != 0 && !in_cache);
         if (e < experts) {
             needed[e] = count == 0 ? 0u : (count & kCountMask) | (in_cache ? kHit : kMiss);
+            if (in_cache) { counts[e] = count | kInCache; }
         }
         if (lane == 0) {
             sets[0][warp] = __popc(hits);
@@ -203,9 +200,32 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
         }
         __syncthreads();
     }
+    for (std::uint32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
+        const int e            = ids[p];
+        const bool valid       = e >= 0 && e < experts;
+        const bool cached_pair = valid && (counts[e] & kInCache) != 0;
+        cached[p]  = cached_pair ? e : -1;
+        missing[p] = valid && !cached_pair ? e : -1;
+    }
+    // 16-byte words where both ends and the length allow, else 4-byte words or bytes: a warp's
+    // writes into mapped memory cross the bus as fewer, wider writes.
     for (int c = 0; c < 1 + kCpuInputs; ++c) {
-        for (std::uint32_t i = threadIdx.x; i < copies.bytes[c]; i += blockDim.x) {
-            copies.target[c][i] = copies.source[c][i];
+        const std::byte* source = copies.source[c];
+        std::byte* target       = copies.target[c];
+        const std::uint32_t n   = copies.bytes[c];
+        const auto ends = reinterpret_cast<std::uintptr_t>(source) |
+                          reinterpret_cast<std::uintptr_t>(target) | n;
+        if ((ends & 15) == 0) {
+            for (std::uint32_t i = threadIdx.x; i < n / 16; i += blockDim.x) {
+                reinterpret_cast<uint4*>(target)[i] = reinterpret_cast<const uint4*>(source)[i];
+            }
+        } else if ((ends & 3) == 0) {
+            for (std::uint32_t i = threadIdx.x; i < n / 4; i += blockDim.x) {
+                reinterpret_cast<std::uint32_t*>(target)[i] =
+                    reinterpret_cast<const std::uint32_t*>(source)[i];
+            }
+        } else {
+            for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) { target[i] = source[i]; }
         }
     }
     // The host reads the mask and the copies once it sees the request.
@@ -1417,9 +1437,10 @@ struct ExpertDelivery::Impl {
         return bytes / 1e6;
     }
 
-    // The CPU's products of `cpu` for the served call of `pairs` pairs while this thread issues
-    // the call's copies (`issue`; before a disk expert's reads, which they would wait behind),
-    // then its missing ids without the CPU's pairs, its products and flag for the device.
+    // The CPU's products of `cpu` for the served call of `pairs` pairs after this thread issues
+    // the call's copies (`issue`): the products' setup (the activation's repacking, the jobs'
+    // buffers) and a disk expert's reads would otherwise delay every copy of the call. Then its
+    // missing ids without the CPU's pairs, its products and flag for the device.
     void compute_cpu(std::size_t li, const std::vector<std::int32_t>& cpu, std::uint32_t pairs,
                      const std::uint32_t* needed, ExpertDeliveryStats& delta,
                      const std::function<void()>& issue) {
@@ -1458,10 +1479,8 @@ struct ExpertDelivery::Impl {
                 }
             }
         }
-        if (!reads.empty()) {
-            issue();
-            read_now(reads);
-        }
+        issue();
+        if (!reads.empty()) { read_now(reads); }
         const auto* ids = static_cast<const std::int32_t*>(host_ids->data());
         ExpertCpuProducts::Work work;
         work.layer    = li;
@@ -1471,7 +1490,6 @@ struct ExpertDelivery::Impl {
         work.inputs   = static_cast<const std::byte*>(host_inputs->data());
         work.products = static_cast<std::byte*>(host_products->data());
         work.pool     = pool.get();
-        if (reads.empty()) { work.side = issue; }
         const auto [used, microseconds] = options.cpu.products->compute(work);
         if (used > options.cpu.product_bytes) {
             throw std::logic_error("expert delivery: CPU products exceed their buffer");
