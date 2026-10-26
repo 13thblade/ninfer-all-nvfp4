@@ -3,6 +3,7 @@ add_library(ninfer_core STATIC
   device.cu
   stage_link.cu
   tensor_parallel.cu
+  tensor_split.cpp
   dtype.cpp
   gpu_clock_floor.cpp
   host_memory.cpp

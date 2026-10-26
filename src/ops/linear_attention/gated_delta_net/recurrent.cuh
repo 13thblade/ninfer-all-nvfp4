@@ -471,6 +471,7 @@ struct RecordAccess {
 // into pipeline stages fold each stage's layers with the same kernel.
 template <int QkHeads, int ValueHeads, int ConvChannels>
 struct FoldGeometry {
+    static constexpr bool kDynamic     = false;
     static constexpr int kQkHeads      = QkHeads;
     static constexpr int kValueHeads   = ValueHeads;
     static constexpr int kConvChannels = ConvChannels;
@@ -480,9 +481,11 @@ struct FoldGeometry {
 
 using FoldGeometry16x48 = FoldGeometry<16, 48, 10240>;
 using FoldGeometry16x32 = FoldGeometry<16, 32, 8192>;
-// A 27B layer's share on each of two and four tensor-parallel ranks.
-using FoldGeometry8x24 = FoldGeometry<8, 24, 5120>;
-using FoldGeometry4x12 = FoldGeometry<4, 12, 2560>;
+// Any other shape, such as a tensor-parallel rank's share of a layer: FoldAccess carries the heads
+// and channels.
+struct FoldGeometryDynamic {
+    static constexpr bool kDynamic = true;
+};
 
 template <class Geometry, class StateT = float>
 struct FoldAccess {
@@ -497,6 +500,32 @@ struct FoldAccess {
     std::int32_t layer_stride_columns;
     std::int32_t width;
     GdnReplayFoldKernelRows rows;
+    // FoldGeometryDynamic's shape; the fixed geometries ignore them.
+    std::int32_t dynamic_qk_heads      = 0;
+    std::int32_t dynamic_value_heads   = 0;
+    std::int32_t dynamic_conv_channels = 0;
+
+    __device__ __forceinline__ std::int32_t qk_heads() const {
+        if constexpr (Geometry::kDynamic) {
+            return dynamic_qk_heads;
+        } else {
+            return Geometry::kQkHeads;
+        }
+    }
+    __device__ __forceinline__ std::int32_t value_heads() const {
+        if constexpr (Geometry::kDynamic) {
+            return dynamic_value_heads;
+        } else {
+            return Geometry::kValueHeads;
+        }
+    }
+    __device__ __forceinline__ std::int32_t conv_channels() const {
+        if constexpr (Geometry::kDynamic) {
+            return dynamic_conv_channels;
+        } else {
+            return Geometry::kConvChannels;
+        }
+    }
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         const std::int32_t batch       = static_cast<std::int32_t>(blockIdx.y);
@@ -505,8 +534,8 @@ struct FoldAccess {
         const int warp                 = threadIdx.y;
         const std::int32_t state_tile  = layer_tile & 7;
         const std::uint32_t value_head = static_cast<std::uint32_t>(blockIdx.x);
-        constexpr std::uint32_t kGroup = Geometry::kValueHeads / Geometry::kQkHeads;
-        const std::uint32_t qk_head    = value_head / kGroup;
+        const auto group            = static_cast<std::uint32_t>(value_heads() / qk_heads());
+        const std::uint32_t qk_head = value_head / group;
         const std::uint32_t dv_base =
             static_cast<std::uint32_t>(state_tile * kBlockDv + warp * kDvPerWarp);
         return {lane,
@@ -534,7 +563,7 @@ struct FoldAccess {
     __device__ __forceinline__ const StateT*
     state_read_base(const RecurrentCoordinates& coord) const {
         const std::int64_t slot_stride =
-            static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim * kStateDim;
+            static_cast<std::int64_t>(value_heads()) * kStateDim * kStateDim;
         return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
                static_cast<std::int64_t>(rows.row[coord.batch].source_state_slot) * slot_stride +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
@@ -542,7 +571,7 @@ struct FoldAccess {
 
     __device__ __forceinline__ StateT* state_write_base(const RecurrentCoordinates& coord) const {
         const std::int64_t slot_stride =
-            static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim * kStateDim;
+            static_cast<std::int64_t>(value_heads()) * kStateDim * kStateDim;
         return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
                static_cast<std::int64_t>(rows.row[coord.batch].destination_state_slot) *
                    slot_stride +
@@ -552,19 +581,19 @@ struct FoldAccess {
     __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates& coord,
                                                             std::int32_t token) const {
         const std::int64_t column = record_column(coord, token);
-        return key_record + (column * Geometry::kQkHeads + coord.qk_head) * kStateDim;
+        return key_record + (column * qk_heads() + coord.qk_head) * kStateDim;
     }
 
     __device__ __forceinline__ const __nv_bfloat16* value_ptr(const RecurrentCoordinates& coord,
                                                               std::int32_t token) const {
         const std::int64_t column = record_column(coord, token);
-        return value_record + (column * Geometry::kValueHeads + coord.value_head) * kStateDim;
+        return value_record + (column * value_heads() + coord.value_head) * kStateDim;
     }
 
     __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates& coord,
                                                      std::int32_t token) const {
         const std::int64_t column = record_column(coord, token);
-        return load_record_gate(gate_record, column * Geometry::kValueHeads + coord.value_head);
+        return load_record_gate(gate_record, column * value_heads() + coord.value_head);
     }
 
     __device__ __forceinline__ void
@@ -583,42 +612,42 @@ struct FoldAccess {
                                                                std::int32_t commit) const {
         const std::int32_t tile_block =
             static_cast<std::int32_t>(coord.value_head) * 8 + coord.state_tile;
-        if (tile_block >= Geometry::kConvChannels / 128) { return; }
+        if (tile_block >= conv_channels() / 128) { return; }
 
         const std::int32_t tid     = coord.warp * kWarpSize + coord.lane;
         const std::int32_t channel = tile_block * 128 + tid;
         const __nv_bfloat16* source_history =
             conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
             static_cast<std::int64_t>(rows.row[coord.batch].source_state_slot) *
-                (3LL * Geometry::kConvChannels) +
+                (3LL * conv_channels()) +
             channel;
         __nv_bfloat16* destination_history =
             conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
             static_cast<std::int64_t>(rows.row[coord.batch].destination_state_slot) *
-                (3LL * Geometry::kConvChannels) +
+                (3LL * conv_channels()) +
             channel;
         const __nv_bfloat16* record =
-            conv_record + record_column(coord, 0) * Geometry::kConvChannels + channel;
+            conv_record + record_column(coord, 0) * conv_channels() + channel;
 
         __nv_bfloat16 h0;
         __nv_bfloat16 h1;
         __nv_bfloat16 h2;
         if (commit == 1) {
-            h0 = source_history[Geometry::kConvChannels];
-            h1 = source_history[2LL * Geometry::kConvChannels];
+            h0 = source_history[conv_channels()];
+            h1 = source_history[2LL * conv_channels()];
             h2 = record[0];
         } else if (commit == 2) {
-            h0 = source_history[2LL * Geometry::kConvChannels];
+            h0 = source_history[2LL * conv_channels()];
             h1 = record[0];
-            h2 = record[Geometry::kConvChannels];
+            h2 = record[conv_channels()];
         } else {
-            h0 = record[static_cast<std::int64_t>(commit - 3) * Geometry::kConvChannels];
-            h1 = record[static_cast<std::int64_t>(commit - 2) * Geometry::kConvChannels];
-            h2 = record[static_cast<std::int64_t>(commit - 1) * Geometry::kConvChannels];
+            h0 = record[static_cast<std::int64_t>(commit - 3) * conv_channels()];
+            h1 = record[static_cast<std::int64_t>(commit - 2) * conv_channels()];
+            h2 = record[static_cast<std::int64_t>(commit - 1) * conv_channels()];
         }
         destination_history[0]                             = h0;
-        destination_history[Geometry::kConvChannels]       = h1;
-        destination_history[2LL * Geometry::kConvChannels] = h2;
+        destination_history[conv_channels()]       = h1;
+        destination_history[2LL * conv_channels()] = h2;
     }
 };
 

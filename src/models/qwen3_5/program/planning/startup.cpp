@@ -172,11 +172,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             }
         }
         for (std::size_t rank = 0; rank < ranks; ++rank) {
-            state_shards.push_back({.rank        = rank,
-                                    .first_layer = 0,
-                                    .layers      = config.linear_attention_layers,
-                                    .part        = static_cast<std::uint32_t>(rank),
-                                    .parts       = static_cast<std::uint32_t>(ranks)});
+            const TextConfig share =
+                qwen3_5::tensor_parallel_share(config, parameters.text.tensor_shares.at(rank));
+            state_shards.push_back(
+                {.rank          = rank,
+                 .first_layer   = 0,
+                 .layers        = config.linear_attention_layers,
+                 .part          = static_cast<std::uint32_t>(rank),
+                 .value_heads   = dimension(share.gdn->linear_num_value_heads),
+                 .conv_channels = dimension(share.gdn->conv_channels())});
         }
     } else {
         std::uint32_t gdn_index = 0;
@@ -248,19 +252,28 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         // A stage records only the GDN layers it holds, in its own device's memory; a
         // tensor-parallel rank only its heads.
         for (std::size_t shard = 0; shard < state_shards.size(); ++shard) {
-            const auto parts              = static_cast<std::int32_t>(state_shards[shard].parts);
+            // A tensor-parallel shard's own heads and channels, else the whole layer's.
+            const StateImageShard& part = state_shards[shard];
+            const std::int32_t value_heads =
+                part.value_heads != 0
+                    ? part.value_heads
+                    : (config.gdn ? dimension(config.gdn->linear_num_value_heads) : 0);
+            const std::int32_t ratio =
+                config.gdn ? dimension(config.gdn->linear_num_value_heads /
+                                       config.gdn->linear_num_key_heads)
+                           : 1;
             GdnReplayRecordLayout records = plan_gdn_replay_records(
-                *builder_pointers[state_shards[shard].rank],
+                *builder_pointers[part.rank],
                 GdnReplayRecordSpec{
-                    .layers          = static_cast<std::int32_t>(state_shards[shard].layers),
+                    .layers          = static_cast<std::int32_t>(part.layers),
                     .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
                     .width           = static_cast<std::int32_t>(widest_verify_window(plan) + 1U),
                     .conv_channels =
-                        (config.gdn ? dimension(config.gdn->conv_channels()) / parts : 0),
-                    .qk_heads =
-                        (config.gdn ? dimension(config.gdn->linear_num_key_heads) / parts : 0),
-                    .value_heads =
-                        (config.gdn ? dimension(config.gdn->linear_num_value_heads) / parts : 0),
+                        part.conv_channels != 0
+                            ? part.conv_channels
+                            : (config.gdn ? dimension(config.gdn->conv_channels()) : 0),
+                    .qk_heads    = value_heads / ratio,
+                    .value_heads = value_heads,
                     .key_dim     = (config.gdn ? dimension(config.gdn->linear_key_head_dim) : 0),
                     .value_dim   = (config.gdn ? dimension(config.gdn->linear_value_head_dim) : 0),
                 });
@@ -468,8 +481,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t max_width,
                                  ops::CausalAttentionExecutionEnvelope envelope) {
         const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
-        for (const auto& block : parameters.text.layers) {
-            {
+        // A tensor-parallel rank's share of a layer has no attention (rank 0 runs it alone).
+        const auto plan_block = [&](const execution::BlockParameters& block, bool attention_runs) {
+            if (attention_runs || std::holds_alternative<execution::GdnParameters>(block.mixer)) {
                 auto stage = layout.scope();
                 if (const auto* attention =
                         std::get_if<execution::AttentionParameters>(&block.mixer)) {
@@ -522,6 +536,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                                     verify, wide_verification),
                                      execution::ffn_workspace_bytes(block.ffn, first, last, false,
                                                                     verify, false)));
+        };
+        for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
+            plan_block(parameters.text.layers[layer], true);
+            // Every rank's scratch has rank 0's size, so it holds the largest share's needs.
+            for (const auto& rank_layers : parameters.text.rank_layers) {
+                plan_block(rank_layers[layer], false);
+            }
         }
         // A prompt chunk projects only its last column through the head; a verify round projects
         // every column.

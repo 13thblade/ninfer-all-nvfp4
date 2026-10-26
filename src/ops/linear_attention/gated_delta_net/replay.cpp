@@ -104,10 +104,8 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t value_heads = v.ne[1];
     const std::int32_t width       = q.ne[2];
     const std::int32_t rows        = q.ne[3];
-    const bool registered_heads    = (qk_heads == 16 && (value_heads == 48 || value_heads == 32)) ||
-                                  (qk_heads == 8 && value_heads == 24) ||
-                                  (qk_heads == 4 && value_heads == 12);
-    if (!registered_heads || width < 2 || width > 64 || rows <= 0 || rows > kMaximumRows ||
+    const bool whole_heads = qk_heads > 0 && value_heads >= qk_heads && value_heads % qk_heads == 0;
+    if (!whole_heads || width < 2 || width > 64 || rows <= 0 || rows > kMaximumRows ||
         (width > 16 && rows != 1)) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
@@ -155,16 +153,17 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
 }
 
 bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
-    // Any number of layers: a pipeline stage folds only the layers it holds.
-    const bool geometry_48 =
-        spec.qk_heads == 16 && spec.value_heads == 48 && spec.conv_channels == 10240;
-    const bool geometry_32 =
-        spec.qk_heads == 16 && spec.value_heads == 32 && spec.conv_channels == 8192;
-    // A 27B layer's share on each of two and four tensor-parallel ranks.
-    const bool geometry_shard =
-        (spec.qk_heads == 8 && spec.value_heads == 24 && spec.conv_channels == 5120) ||
-        (spec.qk_heads == 4 && spec.value_heads == 12 && spec.conv_channels == 2560);
-    return spec.layers > 0 && (geometry_48 || geometry_32 || geometry_shard);
+    // Any number of layers: a pipeline stage folds only the layers it holds. Whole key heads with
+    // their value heads, and the convolution channels of their q, k and v (a tensor-parallel rank
+    // folds its share). The fold publishes the channels in tiles of 128 from eight tiles per value
+    // head, so the value heads must reach every channel tile.
+    if (spec.layers <= 0 || spec.qk_heads <= 0 || spec.value_heads < spec.qk_heads ||
+        spec.value_heads % spec.qk_heads != 0) {
+        return false;
+    }
+    const std::int64_t channels = 2LL * spec.qk_heads * kStateDim +
+                                  static_cast<std::int64_t>(spec.value_heads) * kStateDim;
+    return spec.conv_channels == channels && channels / 128 <= 8LL * spec.value_heads;
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {

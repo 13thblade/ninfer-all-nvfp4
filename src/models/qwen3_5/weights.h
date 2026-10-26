@@ -2,6 +2,7 @@
 
 #include "core/stage_plan.h"
 #include "core/weight_view.h"
+#include "models/qwen3_5/config.h"
 #include "ninfer/ops/linear.h"
 
 #include <cstddef>
@@ -105,6 +106,9 @@ struct TextWeights {
     std::vector<BlockWeights> layers;
     // Tensor parallelism: rank_layers[r - 1][layer] is rank r's share of a layer. Empty otherwise.
     std::vector<std::vector<RankLayerWeights>> rank_layers;
+    // Tensor parallelism: each rank's GDN heads and FFN rows, the same in every layer. Empty
+    // otherwise.
+    std::vector<TensorShare> tensor_shares;
     // Which stage's device holds each whole layer. The identity mapping for one device, which is
     // what keeps every consumer a no-op there; `--devices` adds stages.
     StagePlan stages{1};

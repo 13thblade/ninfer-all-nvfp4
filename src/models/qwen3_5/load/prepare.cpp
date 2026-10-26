@@ -230,6 +230,63 @@ WeightId Bindings::piece(const std::string& name, const artifact::Shape& shape,
     return id;
 }
 
+std::vector<bool> Bindings::column_ends(const std::string& name, const artifact::Shape& shape,
+                                        const std::vector<std::string>& inputs) {
+    const auto found = binder.reader().directory().bindings.find(name);
+    if (found == binder.reader().directory().bindings.end()) {
+        throw artifact::ArtifactError("missing logical parameter " + name);
+    }
+    if (shape.size() != 2) { throw std::invalid_argument(name + ": column ends need a matrix"); }
+    const std::uint64_t columns = shape[1];
+    // Columns per indivisible run of stored bytes: one in a contiguous matrix, a block in ggml
+    // blocks; other layouts are not cut.
+    std::uint64_t unit = 1;
+    for (const auto& part : found->second.parts) {
+        const auto stored = binder.reader().geometry(part.object);
+        if (stored.layout == QuantLayout::GgufBlocks) {
+            unit = std::max<std::uint64_t>(unit, stored.group_size);
+        } else if (stored.layout != QuantLayout::Contiguous) {
+            unit = columns;
+        }
+    }
+    std::optional<artifact::Binding> gather;
+    for (const auto& input : inputs) {
+        for (const auto& [role, binding] : binder.use(name, input).auxiliaries) {
+            if (role == "input_columns") { gather = binding; }
+        }
+    }
+    std::vector<bool> out(columns + 1, false);
+    out.front() = true;
+    out.back()  = true;
+    if (columns % unit != 0) { return out; }
+    if (!gather) {
+        for (std::uint64_t end = unit; end < columns; end += unit) { out[end] = true; }
+        return out;
+    }
+    // A block of stored columns reading logical columns lo..hi forbids every end in (lo, hi].
+    const auto order = binder.values(*gather, QType::INT32).integers();
+    if (order.size() != columns) {
+        throw artifact::ArtifactError(name + ": the input gather does not cover the columns");
+    }
+    std::vector<std::int64_t> forbidden(columns + 2, 0);
+    for (std::uint64_t block = 0; block < columns; block += unit) {
+        std::int64_t lo = order[block];
+        std::int64_t hi = order[block];
+        for (std::uint64_t column = block + 1; column < block + unit; ++column) {
+            lo = std::min<std::int64_t>(lo, order[column]);
+            hi = std::max<std::int64_t>(hi, order[column]);
+        }
+        ++forbidden[static_cast<std::size_t>(lo + 1)];
+        --forbidden[static_cast<std::size_t>(hi + 1)];
+    }
+    std::int64_t open = 0;
+    for (std::uint64_t end = 1; end < columns; ++end) {
+        open += forbidden[end];
+        out[end] = open == 0;
+    }
+    return out;
+}
+
 void Bindings::add_uses(PendingWeight& pending, const std::string& name,
                         const std::vector<std::string>& inputs, bool whole_gathers) {
     for (const auto& input : inputs) {

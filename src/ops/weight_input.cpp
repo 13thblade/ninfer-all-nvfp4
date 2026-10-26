@@ -181,12 +181,13 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
                         k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k
                   : q == std::vector<std::uint64_t>{2048, 2048} && k == q &&
                         third == std::vector<std::uint64_t>{4096, 2048} && fourth == third;
-    // A tensor-parallel rank's share of the dense GDN geometry: whole key and value heads, the
-    // three value rows of each key row kept together.
-    const bool dense_share =
-        !attention && !dense && q.size() == 2 && q[1] == 5120 && k == q && fourth == third &&
-        q[0] > 0 && 2048 % q[0] == 0 && q[0] % 128 == 0 &&
-        third == std::vector<std::uint64_t>{3 * q[0], 5120};
+    // A tensor-parallel rank's share of a GDN projection: whole key heads of 128 rows and the
+    // value heads that read them, a whole multiple of the key rows. A whole MoE layer keeps its
+    // fused route.
+    const bool dense_share = !attention && !dense && !moe && q.size() == 2 && k == q &&
+                             fourth == third &&
+                             third.size() == 2 && third[1] == q[1] && q[0] > 0 &&
+                             q[0] % 128 == 0 && third[0] % q[0] == 0;
     require(dense || moe || dense_share, "input projection: unsupported logical projection geometry");
     if (std::any_of(inputs.begin(), inputs.end(), gguf_parent)) {
         require(dense || dense_share, "input projection: GGUF parts need the dense geometry");

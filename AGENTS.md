@@ -114,7 +114,8 @@ round state and sampling stay on the first device; design in
 requests, bounded FIFO ingress (whose one-token reads trade places by remaining work), no
 active-request preemption, and one compact decode batch per
 round. Tensor parallelism (`--tensor-parallel`) divides the GDN heads and dense FFN rows of a dense
-Qwen3.5-core model over the devices, with attention, KV, head and MTP on the first.
+Qwen3.5-core model over the devices in shares sized to each card (`--tensor-split`, or measured
+bandwidth and free memory), with attention, KV, head and MTP on the first.
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale/preemptive continuous

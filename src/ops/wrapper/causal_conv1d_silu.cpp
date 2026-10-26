@@ -159,19 +159,14 @@ detail::CausalConvSplitGeometry resolve_split_geometry(const Tensor& x, const Te
         throw std::invalid_argument("causal_conv1d: split destinations must match the x column "
                                     "count");
     }
-    if (x.ne[0] == 8192 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 4096) {
-        return detail::CausalConvSplitGeometry::Rows2048x2048x4096;
+    const detail::CausalConvSplitGeometry rows{out0.ne[0], out1.ne[0], out2.ne[0]};
+    if (rows.rows0 <= 0 || rows.rows1 <= 0 || rows.rows2 <= 0 || rows.rows0 % 2 != 0 ||
+        rows.rows1 % 2 != 0 || rows.rows2 % 2 != 0 ||
+        static_cast<std::int64_t>(rows.rows0) + rows.rows1 + rows.rows2 != x.ne[0]) {
+        throw std::invalid_argument(
+            "causal_conv1d: split destinations must have positive even rows covering x");
     }
-    if (x.ne[0] == 10240 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 6144) {
-        return detail::CausalConvSplitGeometry::Rows2048x2048x6144;
-    }
-    if (x.ne[0] == 5120 && out0.ne[0] == 1024 && out1.ne[0] == 1024 && out2.ne[0] == 3072) {
-        return detail::CausalConvSplitGeometry::Rows1024x1024x3072;
-    }
-    if (x.ne[0] == 2560 && out0.ne[0] == 512 && out1.ne[0] == 512 && out2.ne[0] == 1536) {
-        return detail::CausalConvSplitGeometry::Rows512x512x1536;
-    }
-    throw std::invalid_argument("causal_conv1d: split received an unregistered row profile");
+    return rows;
 }
 
 // The prefill split route reads and writes __nv_bfloat162. The requirement is stated uniformly for

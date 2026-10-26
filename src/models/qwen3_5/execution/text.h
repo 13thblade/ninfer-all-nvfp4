@@ -273,7 +273,7 @@ private:
     // The GDN and FFN geometry of the rank a pass is issuing: a tensor-parallel share, or the model.
     [[nodiscard]] const TextConfig& layer_config() const noexcept {
         return stage_runtime_ != nullptr && stage_runtime_->tensor_parallel
-                   ? stage_runtime_->tensor_parallel->shard
+                   ? stage_runtime_->tensor_parallel->shards[tensor_rank_]
                    : config_;
     }
     // A mixer's output projection: added to the residual, or in a tensor-parallel pass written to

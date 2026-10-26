@@ -242,8 +242,9 @@ void test_segmented_roundtrip(bool dflash, ninfer::DeviceContext& device, bool d
     (void)contiguous.release(*handle);
 }
 
-// Tensor parallelism: two shards hold one half of every layer's channels and heads each. A host
-// image keeps each layer's halves side by side in part order and restores each half to its shard.
+// Tensor parallelism: two shards hold unequal parts of every layer's channels and heads (one value
+// head and four channels, two and six). A host image keeps each layer's parts side by side in part
+// order and restores each part to its shard.
 void test_parted_roundtrip() {
     const int ids[] = {0, 0};
     ninfer::DeviceContext device(std::span<const int>(ids, 2));
@@ -251,9 +252,9 @@ void test_parted_roundtrip() {
         .linear =
             {
                 .layers         = 3,
-                .conv_channels  = 6,
+                .conv_channels  = 10,
                 .conv_width     = 3,
-                .value_heads    = 2,
+                .value_heads    = 3,
                 .value_head_dim = 4,
                 .key_head_dim   = 3,
                 .slot_count     = 2,
@@ -264,8 +265,8 @@ void test_parted_roundtrip() {
     ninfer::LayoutBuilder first, second;
     ninfer::LayoutBuilder* builders[] = {&first, &second};
     const q36::StateImageShard shards[] = {
-        {.rank = 0, .first_layer = 0, .layers = 3, .part = 0, .parts = 2},
-        {.rank = 1, .first_layer = 0, .layers = 3, .part = 1, .parts = 2}};
+        {.rank = 0, .first_layer = 0, .layers = 3, .part = 0, .value_heads = 1, .conv_channels = 4},
+        {.rank = 1, .first_layer = 0, .layers = 3, .part = 1, .value_heads = 2, .conv_channels = 6}};
     const q36::StateImageDeviceLayout layout =
         q36::plan_state_image_device_pool(builders, shards, spec);
     ninfer::DeviceArena arena0(first.finish(256)), arena1(second.finish(256));
@@ -273,8 +274,9 @@ void test_parted_roundtrip() {
                                            {arena1.base(), arena1.capacity()}};
     q36::StateImageDevicePool pool(backings, layout);
     expect(pool.shard_count() == 2 && pool.linear(0).layer_count() == 3 &&
-               pool.linear(1).conv_slot(0, 0).ne[0] == 3,
-           "each part holds every layer with half of its channels");
+               pool.linear(0).conv_slot(0, 0).ne[0] == 4 &&
+               pool.linear(1).conv_slot(0, 0).ne[0] == 6,
+           "each part holds every layer with its own channels");
     const auto fill = [&](std::int32_t slot, unsigned char base) {
         for (std::size_t part = 0; part < 2; ++part) {
             for (std::uint32_t layer = 0; layer < 3; ++layer) {
@@ -294,19 +296,29 @@ void test_parted_roundtrip() {
     pool.copy_to_host(0, host.writable_view(*handle), streams);
     device.synchronize();
     const std::byte* image = host.view(*handle).data;
-    const std::size_t conv = pool.linear(0).conv_slot(0, 0).bytes();
-    bool laid_out          = true;
+    const std::size_t conv[]      = {pool.linear(0).conv_slot(0, 0).bytes(),
+                                     pool.linear(1).conv_slot(0, 0).bytes()};
+    const std::size_t recurrent[] = {pool.linear(0).recurrent_slot(0, 0).bytes(),
+                                     pool.linear(1).recurrent_slot(0, 0).bytes()};
+    bool laid_out = true;
     for (std::uint32_t layer = 0; layer < 3; ++layer) {
         for (std::size_t part = 0; part < 2; ++part) {
-            const std::size_t offset =
-                layout.host.linear_conv.offset + layer * layout.host.linear_conv_layer_bytes +
-                part * conv;
-            laid_out = laid_out &&
-                       image[offset] == std::byte(0x01 + 0x10 * part + layer) &&
-                       image[offset + conv - 1] == std::byte(0x01 + 0x10 * part + layer);
+            const auto mark = std::byte(0x01 + 0x10 * part + layer);
+            const std::size_t conv_offset = layout.host.linear_conv.offset +
+                                            layer * layout.host.linear_conv_layer_bytes +
+                                            (part == 0 ? 0 : conv[0]);
+            const std::size_t recurrent_offset =
+                layout.host.linear_recurrent.offset +
+                layer * layout.host.linear_recurrent_layer_bytes + (part == 0 ? 0 : recurrent[0]);
+            laid_out = laid_out && image[conv_offset] == mark &&
+                       image[conv_offset + conv[part] - 1] == mark &&
+                       image[recurrent_offset] == std::byte(0x41 + 0x10 * part + layer) &&
+                       image[recurrent_offset + recurrent[part] - 1] ==
+                           std::byte(0x41 + 0x10 * part + layer);
         }
     }
-    expect(laid_out && 2 * conv == layout.host.linear_conv_layer_bytes,
+    expect(laid_out && conv[0] + conv[1] == layout.host.linear_conv_layer_bytes &&
+               recurrent[0] + recurrent[1] == layout.host.linear_recurrent_layer_bytes,
            "a host image keeps a layer's parts side by side");
     pool.copy_from_host(host.view(*handle), 1, streams);
     device.synchronize();
@@ -318,15 +330,25 @@ void test_parted_roundtrip() {
                          static_cast<unsigned char>(mark + 0x40), "parted recurrent restore");
         }
     }
+    ninfer::LayoutBuilder unused, unused2;
+    ninfer::LayoutBuilder* two[] = {&unused, &unused2};
+    const auto refused = [&](std::span<const q36::StateImageShard> bad) {
+        try {
+            (void)q36::plan_state_image_device_pool(two, bad, spec);
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
     const q36::StateImageShard incomplete[] = {
-        {.rank = 0, .first_layer = 0, .layers = 3, .part = 0, .parts = 2}};
-    ninfer::LayoutBuilder unused;
-    ninfer::LayoutBuilder* one[] = {&unused};
-    bool refused                 = false;
-    try {
-        (void)q36::plan_state_image_device_pool(one, incomplete, spec);
-    } catch (const std::invalid_argument&) { refused = true; }
-    expect(refused, "a run of layers missing a part was accepted");
+        {.rank = 0, .first_layer = 0, .layers = 3, .part = 0, .value_heads = 1, .conv_channels = 4}};
+    expect(refused(incomplete), "a run of layers missing a part was accepted");
+    const q36::StateImageShard overfull[] = {
+        {.rank = 0, .first_layer = 0, .layers = 3, .part = 0, .value_heads = 2, .conv_channels = 6},
+        {.rank = 1, .first_layer = 0, .layers = 3, .part = 1, .value_heads = 2, .conv_channels = 6}};
+    expect(refused(overfull), "parts holding more heads than a layer has were accepted");
+    const q36::StateImageShard mixed[] = {
+        {.rank = 0, .first_layer = 0, .layers = 3, .part = 0},
+        {.rank = 1, .first_layer = 0, .layers = 3, .part = 1, .value_heads = 2, .conv_channels = 6}};
+    expect(refused(mixed), "a whole shard beside a part was accepted");
     (void)host.release(*handle);
 }
 

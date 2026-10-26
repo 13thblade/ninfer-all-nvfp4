@@ -95,8 +95,10 @@ struct StageRuntime {
     // GDN layer, `control[r - 1]` and `forward[r - 1]` carry the control tensors and the incoming
     // residual from rank 0 to rank r, and `back` is absent.
     struct TensorParallel {
-        // A rank's share of the model: the GDN heads and dense FFN rows divided by the ranks.
-        TextConfig shard;
+        // shares[r] is rank r's GDN heads and dense FFN rows, and shards[r] the model as that share
+        // sees it.
+        std::vector<TensorShare> shares;
+        std::vector<TextConfig> shards;
         std::unique_ptr<TensorParallelExchange> exchange;
         // joined[r - 1] joins rank r's stream back into rank 0's at the end of a pass.
         std::vector<CudaCompletionEvent> joined;

@@ -310,6 +310,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.devices                  = options.devices;
     engine_options.stage_layers             = options.stage_layers;
     engine_options.tensor_parallel          = options.tensor_parallel;
+    engine_options.tensor_split             = options.tensor_split;
     engine_options.expert_residency           = options.expert_residency;
     engine_options.ngram_table                = options.ngram_table;
     engine_options.kv_resident_positions      = options.kv_resident_positions;

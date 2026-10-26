@@ -520,7 +520,8 @@ Parameters::Parameters(const Model& source) : model(source) {
         text.layers.back().rank = w.text.stages.placement(static_cast<std::uint32_t>(i)).stage;
     }
     if (!w.text.rank_layers.empty()) {
-        text.rank_count = w.text.rank_layers.size() + 1;
+        text.rank_count    = w.text.rank_layers.size() + 1;
+        text.tensor_shares = w.text.tensor_shares;
         text.rank_layers.resize(w.text.rank_layers.size());
         for (std::size_t r = 0; r < w.text.rank_layers.size(); ++r) {
             text.rank_layers[r].reserve(w.text.rank_layers[r].size());

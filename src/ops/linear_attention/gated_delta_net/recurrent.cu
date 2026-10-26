@@ -175,8 +175,11 @@ void launch_replay_fold_typed(const GdnReplayRecords& records,
         records.spec.record_capacity * records.spec.width,
         active_width,
         rows,
+        records.spec.qk_heads,
+        records.spec.value_heads,
+        records.spec.conv_channels,
     };
-    const dim3 grid(static_cast<unsigned>(Geometry::kValueHeads),
+    const dim3 grid(static_cast<unsigned>(records.spec.value_heads),
                     static_cast<unsigned>(active_rows),
                     static_cast<unsigned>(records.spec.layers * (kStateDim / kBlockDv)));
     const dim3 block(kWarpSize, kNumWarps, 1);
@@ -274,10 +277,9 @@ void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAll
     };
     attempt(FoldGeometry16x48{});
     attempt(FoldGeometry16x32{});
-    attempt(FoldGeometry8x24{});
-    attempt(FoldGeometry4x12{});
     if (!launched) {
-        throw std::invalid_argument("GDN replay fold launcher received an unregistered geometry");
+        launch_replay_fold_fixed<FoldGeometryDynamic>(records, states, rows, active_rows,
+                                                      active_width, stream);
     }
 }
 

@@ -6,6 +6,7 @@
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
 #include "core/stage_plan.h"
+#include "core/tensor_split.h"
 #include "models/qwen3_5/load/bindings.h"
 #include "models/qwen3_5/load/vision_cpu.h"
 
@@ -279,6 +280,81 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
         counts.push_back(plan.stage_layers(stage));
     }
     return counts;
+}
+
+std::vector<double> default_tensor_split(const artifact::Reader& reader, LoadOptions options,
+                                         const StageSizing& sizing,
+                                         std::span<const std::uint64_t> free_bytes,
+                                         std::span<const double> speed) {
+    if (free_bytes.size() < 2 || speed.size() != free_bytes.size()) {
+        throw std::invalid_argument("a tensor split needs the free bytes and speed of each rank");
+    }
+    // Bind the text model whole on one device purely to size its parts.
+    options.ranks = 1;
+    options.tensor_parallel = false;
+    options.tensor_split.clear();
+    options.stage_layers.clear();
+    const Config config = parse_config(reader.directory(), options);
+    const auto& text    = config.text;
+    artifact::Binder binder(reader);
+    loading::Bindings bindings(binder, options);
+    const TextWeights weights =
+        loading::bind_text(bindings, text, options, StagePlan(text.num_hidden_layers));
+    const auto bytes = [&](WeightId id) { return parameter_bytes(reader, bindings, id); };
+
+    std::uint64_t divided   = 0; // GDN heads and FFN rows with their state
+    std::uint64_t every     = 0; // what each rank holds whole: norms and GDN gating
+    std::uint64_t first     = 0; // rank 0 alone: attention, its KV cache, embedding, head
+    for (std::size_t layer = 0; layer < weights.layers.size(); ++layer) {
+        const BlockWeights& block = weights.layers[layer];
+        every += bytes(block.input_norm) + bytes(block.post_attention_norm);
+        if (const auto* gdn = std::get_if<GdnWeights>(&block.mixer)) {
+            divided += bytes(gdn->query) + bytes(gdn->key) + bytes(gdn->value) + bytes(gdn->z) +
+                       bytes(gdn->convolution) + bytes(gdn->output);
+            every += bytes(gdn->a_projection) + bytes(gdn->b_projection) + bytes(gdn->a_log) +
+                     bytes(gdn->dt_bias) + bytes(gdn->norm);
+        } else {
+            for (const WeightId id : loading::layer_weights(block)) { first += bytes(id); }
+            first -= bytes(block.input_norm) + bytes(block.post_attention_norm);
+        }
+        if (const auto* dense = std::get_if<DenseWeights>(&block.ffn)) {
+            divided += bytes(dense->gate) + bytes(dense->up) + bytes(dense->down);
+            if (std::holds_alternative<AttentionWeights>(block.mixer)) {
+                first -= bytes(dense->gate) + bytes(dense->up) + bytes(dense->down);
+            }
+        }
+    }
+    if (text.gdn) {
+        const auto& gdn = *text.gdn;
+        const std::uint64_t conv_bytes =
+            gdn.conv_channels() * (gdn.linear_conv_kernel_dim - 1) * dtype_size(DType::BF16);
+        const std::uint64_t recurrent_bytes =
+            static_cast<std::uint64_t>(gdn.linear_key_head_dim) * gdn.linear_value_head_dim *
+            gdn.linear_num_value_heads *
+            dtype_size(options.gdn_state_fp16 ? DType::FP16 : DType::FP32);
+        divided += std::uint64_t(text.linear_attention_layers) * sizing.state_slots *
+                   (conv_bytes + recurrent_bytes);
+    }
+    if (text.attention) {
+        const PagedKVStorageLayout storage = paged_kv_storage_layout(
+            sizing.kv_storage, static_cast<std::int32_t>(text.attention->head_dim));
+        first += sizing.kv_tokens * text.full_attention_layers *
+                 text.attention->num_key_value_heads * storage.physical_bytes_per_token_head();
+    }
+    first += parameter_bytes(reader, bindings, weights.token_embedding) +
+             parameter_bytes(reader, bindings, weights.output_head) +
+             parameter_bytes(reader, bindings, weights.final_norm) + kHeadStageFixedBytes;
+    if (divided == 0) { return std::vector<double>(speed.begin(), speed.end()); }
+
+    std::vector<double> capacity(free_bytes.size());
+    for (std::size_t rank = 0; rank < free_bytes.size(); ++rank) {
+        const std::uint64_t whole = kStageFixedBytes + every + (rank == 0 ? first : 0);
+        capacity[rank] = free_bytes[rank] > whole
+                             ? static_cast<double>(free_bytes[rank] - whole) /
+                                   static_cast<double>(divided)
+                             : 0.0;
+    }
+    return fill_shares(speed, capacity);
 }
 
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,

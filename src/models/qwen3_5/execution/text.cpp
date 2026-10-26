@@ -1042,12 +1042,16 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     const InputBasis projection_basis = gdn_norm_control(x, w.input_norm, config.rms_norm_eps, p,
                                                          h, g, beta, work_, ctx_.execution_view());
     if (&config != &config_) {
-        const auto heads       = static_cast<std::size_t>(config.gdn->linear_num_value_heads);
-        const auto all_heads   = static_cast<std::size_t>(config_.gdn->linear_num_value_heads);
-        const auto own_gates   = [&](const Tensor& all) {
+        const auto heads     = static_cast<std::size_t>(config.gdn->linear_num_value_heads);
+        const auto all_heads = static_cast<std::size_t>(config_.gdn->linear_num_value_heads);
+        // The rank's value heads follow its first key head's.
+        const auto first = static_cast<std::size_t>(
+                               stage_runtime_->tensor_parallel->shares[tensor_rank_].key_head_begin) *
+                           (all_heads / config_.gdn->linear_num_key_heads);
+        const auto own_gates = [&](const Tensor& all) {
             Tensor own = work_.alloc(DType::FP32, {static_cast<std::int32_t>(heads), T});
             CUDA_CHECK(cudaMemcpy2DAsync(own.data, heads * sizeof(float),
-                                         static_cast<const float*>(all.data) + tensor_rank_ * heads,
+                                         static_cast<const float*>(all.data) + first,
                                          all_heads * sizeof(float), heads * sizeof(float),
                                          static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
             return own;

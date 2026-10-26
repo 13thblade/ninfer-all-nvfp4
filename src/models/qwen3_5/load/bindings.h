@@ -53,6 +53,13 @@ public:
                                  std::optional<QType> exact_format, std::size_t rank,
                                  const ParameterPiece& piece);
 
+    // Where a column piece of matrix parameter `name` (`shape`, read through `inputs`) may end:
+    // out[c] for c in [0, columns] says whether the columns [0, c) are whole runs of its stored
+    // bytes. A ggml block is one run; with an input gather (`input_columns`), a block is whole when
+    // all or none of the logical columns its stored columns read lie below c.
+    [[nodiscard]] std::vector<bool> column_ends(const std::string& name, const artifact::Shape& shape,
+                                                const std::vector<std::string>& inputs);
+
     [[nodiscard]] const PendingWeight& at(WeightId id) const { return weights.at(id.index); }
 
     [[nodiscard]] WeightUseId use(WeightId id, std::string_view input) const;

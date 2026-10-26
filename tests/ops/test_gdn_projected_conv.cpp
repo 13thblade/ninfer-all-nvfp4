@@ -1,6 +1,7 @@
 // The GDN convolution over projected rows (gdn_projected_conv.h), the step the fused input
-// projections run between their GEMM and the recurrence, at every registered channel profile:
-// the 27B and 35B layers and a 27B layer's share on each of two and four tensor-parallel ranks.
+// projections run between their GEMM and the recurrence: the 27B and 35B layers, whose rows are
+// template constants, and tensor-parallel shares passed at run time (a 27B layer's half and
+// quarter, three key heads with nine value heads, and five with ten).
 //
 // The oracle is the definition in FP64 on the BF16 inputs: out = silu(w0*s0 + w1*s1 + w2*s2 + w3*p)
 // per channel and column, from the window the row's initial slot names, rounded once to BF16 and
@@ -205,8 +206,8 @@ int main() {
     }
     int failures = 0;
     try {
-        const Profile profiles[] = {
-            {2048, 2048, 6144}, {2048, 2048, 4096}, {1024, 1024, 3072}, {512, 512, 1536}};
+        const Profile profiles[] = {{2048, 2048, 6144}, {2048, 2048, 4096}, {1024, 1024, 3072},
+                                    {512, 512, 1536},   {384, 384, 1152},   {640, 640, 1280}};
         std::uint32_t seed = 3100;
         for (const Profile& profile : profiles) {
             for (const bool snapshot : {true, false}) {
@@ -219,10 +220,6 @@ int main() {
                 failures += run_case(profile, 2, 8, false, snapshot, ++seed);
             }
         }
-        try {
-            failures += run_case({1024, 1024, 2048}, 2, 1, false, true, ++seed) == 0;
-            std::cerr << "an unregistered profile was accepted\n";
-        } catch (const std::invalid_argument&) {}
     } catch (const std::exception& error) {
         std::cerr << "unexpected exception: " << error.what() << '\n';
         return 1;
