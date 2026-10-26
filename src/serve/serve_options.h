@@ -74,6 +74,8 @@ struct ServeOptions {
     std::vector<std::uint32_t> stage_layers;
     // The `devices` share every layer instead (tensor parallelism).
     bool tensor_parallel = false;
+    // The relative size of each device's tensor-parallel share. Empty lets the engine choose.
+    std::vector<double> tensor_split;
     // Qwen3.8-Flash-Next: where the expert banks live, and where its n-gram table comes from.
     ExpertResidency expert_residency = ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;

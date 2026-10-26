@@ -139,16 +139,19 @@ bool gguf_parent(const WeightInput& input) {
            is_gguf(input.weight.parts.front().parent->geometry.format);
 }
 
-// GGUF parts of a fused input projection, merged where consecutive logical inputs continue one
-// parent's rows into one output's rows.
-GgufProjectionWeights gguf_projection(std::span<const WeightInput> inputs,
+// The parts of an input projection, one per logical input: GGUF parts, merged where consecutive
+// logical inputs continue one parent's rows into one output's rows, or a tensor-parallel rank's
+// pieces of another format, each its own device object.
+PartProjectionWeights part_projection(std::span<const WeightInput> inputs,
                                       std::span<const std::int32_t> outputs,
                                       std::span<const std::int32_t> rows) {
-    GgufProjectionWeights result;
+    PartProjectionWeights result;
+    const bool gguf = gguf_parent(inputs.front());
     for (std::size_t i = 0; i < inputs.size(); ++i) {
-        require(gguf_parent(inputs[i]), "input projection: GGUF parts cannot mix formats");
+        require(gguf_parent(inputs[i]) == gguf, "input projection: parts cannot mix formats");
         auto part = single(inputs.subspan(i, 1));
-        if (!result.parts.empty()) {
+        if (!gguf) { result.policy = part.policy; }
+        if (gguf && !result.parts.empty()) {
             auto& last = result.parts.back();
             const auto block = gguf_block_shape(last.weight.qtype);
             const std::int64_t row_bytes = std::int64_t(last.weight.k / block.elements) * block.bytes;
@@ -181,27 +184,27 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
                         k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k
                   : q == std::vector<std::uint64_t>{2048, 2048} && k == q &&
                         third == std::vector<std::uint64_t>{4096, 2048} && fourth == third;
-    // A tensor-parallel rank's share of the dense GDN geometry: whole key and value heads, the
-    // three value rows of each key row kept together.
-    const bool dense_share =
-        !attention && !dense && q.size() == 2 && q[1] == 5120 && k == q && fourth == third &&
-        q[0] > 0 && 2048 % q[0] == 0 && q[0] % 128 == 0 &&
-        third == std::vector<std::uint64_t>{3 * q[0], 5120};
+    // A tensor-parallel rank's share of a GDN projection: whole key heads of 128 rows and the
+    // value heads that read them, a whole multiple of the key rows. A whole MoE layer keeps its
+    // fused route.
+    const bool dense_share = !attention && !dense && !moe && q.size() == 2 && k == q &&
+                             fourth == third &&
+                             third.size() == 2 && third[1] == q[1] && q[0] > 0 &&
+                             q[0] % 128 == 0 && third[0] % q[0] == 0;
     require(dense || moe || dense_share, "input projection: unsupported logical projection geometry");
-    if (std::any_of(inputs.begin(), inputs.end(), gguf_parent)) {
+    if (std::any_of(inputs.begin(), inputs.end(), gguf_parent) || dense_share) {
         require(dense || dense_share, "input projection: GGUF parts need the dense geometry");
         const auto q = static_cast<std::int32_t>(matrix(inputs[0])[0]);
         const auto k = static_cast<std::int32_t>(matrix(inputs[1])[0]);
         if (attention) {
             const std::array<std::int32_t, 4> outputs{0, 2, 1, 3};
             const std::array<std::int32_t, 4> rows{0, 0, 0, 0};
-            return gguf_projection(inputs, outputs, rows);
+            return part_projection(inputs, outputs, rows);
         }
         const std::array<std::int32_t, 4> outputs{0, 0, 0, 1};
         const std::array<std::int32_t, 4> rows{0, q, q + k, 0};
-        return gguf_projection(inputs, outputs, rows);
+        return part_projection(inputs, outputs, rows);
     }
-    require(!dense_share, "input projection: a tensor-parallel share needs GGUF parts");
     const auto joined = concatenate_rows(inputs);
     if (contiguous(joined)) {
         auto result       = single(inputs);

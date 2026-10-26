@@ -100,74 +100,85 @@ void causal_conv1d_smallt_launch(const Tensor& x, const Tensor& weight, const Te
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <std::int32_t Rows0, std::int32_t Rows1, std::int32_t Rows2>
-void smallt_split_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
-                         Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
-                         cudaStream_t stream) {
-    const std::int32_t C = x.ne[0];
-    const std::int32_t T = x.ne[1];
-    if (Rows0 + Rows1 + Rows2 != C) {
+namespace {
+
+// The three destinations' map: compile-time rows for the whole-layer profiles, run-time otherwise.
+template <class Element, class Launch>
+void with_split_output(Element* out0, Element* out1, Element* out2,
+                       const CausalConvSplitGeometry& rows, std::int32_t divisor,
+                       const Launch& launch) {
+    if (rows == CausalConvSplitGeometry{2048, 2048, 4096}) {
+        if (divisor == 1) {
+            launch(CausalConvSplitOutput3<Element, 2048, 2048, 4096>{out0, out1, out2});
+        } else {
+            launch(CausalConvSplitOutput3<Element, 1024, 1024, 2048>{out0, out1, out2});
+        }
+        return;
+    }
+    if (rows == CausalConvSplitGeometry{2048, 2048, 6144}) {
+        if (divisor == 1) {
+            launch(CausalConvSplitOutput3<Element, 2048, 2048, 6144>{out0, out1, out2});
+        } else {
+            launch(CausalConvSplitOutput3<Element, 1024, 1024, 3072>{out0, out1, out2});
+        }
+        return;
+    }
+    launch(CausalConvSplitOutput3Dynamic<Element>{out0, out1, out2, rows.rows0 / divisor,
+                                                  rows.rows1 / divisor, rows.rows2 / divisor});
+}
+
+void require_split_cover(const CausalConvSplitGeometry& rows, std::int32_t channels) {
+    if (rows.rows0 + rows.rows1 + rows.rows2 != channels) {
         throw std::invalid_argument("causal_conv1d: split geometry does not cover the channels");
     }
-    const dim3 block(kCausalConvChannelTile, static_cast<unsigned int>(T));
-    const int grid = grid_for(C, kCausalConvChannelTile, "small-T");
-
-    const CausalConvSplitOutput3<__nv_bfloat16, Rows0, Rows1, Rows2> out_map{
-        static_cast<__nv_bfloat16*>(out0.data), static_cast<__nv_bfloat16*>(out1.data),
-        static_cast<__nv_bfloat16*>(out2.data)};
-    causal_conv1d_smallt_kernel<<<grid, block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
-        static_cast<const __nv_bfloat16*>(conv_state_in.data),
-        static_cast<__nv_bfloat16*>(conv_state_out.data), out_map, C, T);
-    CUDA_CHECK(cudaGetLastError());
 }
+
+} // namespace
 
 void causal_conv1d_smallt_split_launch(const Tensor& x, const Tensor& weight,
                                        const Tensor& conv_state_in, Tensor& conv_state_out,
                                        Tensor& out0, Tensor& out1, Tensor& out2,
                                        CausalConvSplitGeometry geometry, cudaStream_t stream) {
-    switch (geometry) {
-    case CausalConvSplitGeometry::Rows2048x2048x4096:
-        smallt_split_launch<2048, 2048, 4096>(x, weight, conv_state_in, conv_state_out, out0, out1,
-                                              out2, stream);
-        return;
-    case CausalConvSplitGeometry::Rows2048x2048x6144:
-        smallt_split_launch<2048, 2048, 6144>(x, weight, conv_state_in, conv_state_out, out0, out1,
-                                              out2, stream);
-        return;
-    case CausalConvSplitGeometry::Rows1024x1024x3072:
-        smallt_split_launch<1024, 1024, 3072>(x, weight, conv_state_in, conv_state_out, out0, out1,
-                                              out2, stream);
-        return;
-    case CausalConvSplitGeometry::Rows512x512x1536:
-        smallt_split_launch<512, 512, 1536>(x, weight, conv_state_in, conv_state_out, out0, out1,
-                                            out2, stream);
-        return;
-    }
-    throw std::logic_error("causal_conv1d: unhandled split geometry");
+    const std::int32_t C = x.ne[0];
+    const std::int32_t T = x.ne[1];
+    require_split_cover(geometry, C);
+    const dim3 block(kCausalConvChannelTile, static_cast<unsigned int>(T));
+    const int grid = grid_for(C, kCausalConvChannelTile, "small-T");
+    with_split_output(static_cast<__nv_bfloat16*>(out0.data),
+                      static_cast<__nv_bfloat16*>(out1.data),
+                      static_cast<__nv_bfloat16*>(out2.data), geometry, 1, [&](auto out_map) {
+                          causal_conv1d_smallt_kernel<<<grid, block, 0, stream>>>(
+                              static_cast<const __nv_bfloat16*>(x.data),
+                              static_cast<const __nv_bfloat16*>(weight.data),
+                              static_cast<const __nv_bfloat16*>(conv_state_in.data),
+                              static_cast<__nv_bfloat16*>(conv_state_out.data), out_map, C, T);
+                      });
+    CUDA_CHECK(cudaGetLastError());
 }
 
-template <std::int32_t Rows0, std::int32_t Rows1, std::int32_t Rows2>
-void prefill_split_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
-                          Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
-                          cudaStream_t stream) {
-    static_assert((Rows0 % 2) == 0 && (Rows1 % 2) == 0 && (Rows2 % 2) == 0,
-                  "a pair must not straddle two destinations");
+void causal_conv1d_prefill_split_launch(const Tensor& x, const Tensor& weight,
+                                        const Tensor& conv_state_in, Tensor& conv_state_out,
+                                        Tensor& out0, Tensor& out1, Tensor& out2,
+                                        CausalConvSplitGeometry geometry, cudaStream_t stream) {
     constexpr int kChannelBlock = 256;
     constexpr int kPairBlock    = 256;
     const std::int32_t C        = x.ne[0];
     const std::int32_t T        = x.ne[1];
-    if (Rows0 + Rows1 + Rows2 != C) {
-        throw std::invalid_argument("causal_conv1d: split geometry does not cover the channels");
+    require_split_cover(geometry, C);
+    if (geometry.rows0 % 2 != 0 || geometry.rows1 % 2 != 0 || geometry.rows2 % 2 != 0) {
+        throw std::invalid_argument("causal_conv1d: a pair must not straddle two destinations");
     }
-
-    const CausalConvSplitOutput3<__nv_bfloat162, Rows0 / 2, Rows1 / 2, Rows2 / 2> out_map{
-        reinterpret_cast<__nv_bfloat162*>(out0.data), reinterpret_cast<__nv_bfloat162*>(out1.data),
-        reinterpret_cast<__nv_bfloat162*>(out2.data)};
-    causal_conv1d_prefill_pairs_kernel<<<prefill_output_grid_for(C / 2, T, kPairBlock), kPairBlock,
-                                         0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
-        static_cast<const __nv_bfloat16*>(conv_state_in.data), out_map, C, T);
+    // Pairs: the map counts rows in pairs.
+    with_split_output(reinterpret_cast<__nv_bfloat162*>(out0.data),
+                      reinterpret_cast<__nv_bfloat162*>(out1.data),
+                      reinterpret_cast<__nv_bfloat162*>(out2.data), geometry, 2, [&](auto out_map) {
+                          causal_conv1d_prefill_pairs_kernel<<<
+                              prefill_output_grid_for(C / 2, T, kPairBlock), kPairBlock, 0,
+                              stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+                                        static_cast<const __nv_bfloat16*>(weight.data),
+                                        static_cast<const __nv_bfloat16*>(conv_state_in.data),
+                                        out_map, C, T);
+                      });
     CUDA_CHECK(cudaGetLastError());
 
     causal_conv1d_prefill_state_kernel<<<grid_for(C, kChannelBlock, "prefill state"), kChannelBlock,
@@ -176,31 +187,6 @@ void prefill_split_launch(const Tensor& x, const Tensor& weight, const Tensor& c
         static_cast<const __nv_bfloat16*>(conv_state_in.data),
         static_cast<__nv_bfloat16*>(conv_state_out.data), C, T);
     CUDA_CHECK(cudaGetLastError());
-}
-
-void causal_conv1d_prefill_split_launch(const Tensor& x, const Tensor& weight,
-                                        const Tensor& conv_state_in, Tensor& conv_state_out,
-                                        Tensor& out0, Tensor& out1, Tensor& out2,
-                                        CausalConvSplitGeometry geometry, cudaStream_t stream) {
-    switch (geometry) {
-    case CausalConvSplitGeometry::Rows2048x2048x4096:
-        prefill_split_launch<2048, 2048, 4096>(x, weight, conv_state_in, conv_state_out, out0, out1,
-                                               out2, stream);
-        return;
-    case CausalConvSplitGeometry::Rows2048x2048x6144:
-        prefill_split_launch<2048, 2048, 6144>(x, weight, conv_state_in, conv_state_out, out0, out1,
-                                               out2, stream);
-        return;
-    case CausalConvSplitGeometry::Rows1024x1024x3072:
-        prefill_split_launch<1024, 1024, 3072>(x, weight, conv_state_in, conv_state_out, out0, out1,
-                                               out2, stream);
-        return;
-    case CausalConvSplitGeometry::Rows512x512x1536:
-        prefill_split_launch<512, 512, 1536>(x, weight, conv_state_in, conv_state_out, out0, out1,
-                                             out2, stream);
-        return;
-    }
-    throw std::logic_error("causal_conv1d: unhandled split geometry");
 }
 
 void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,

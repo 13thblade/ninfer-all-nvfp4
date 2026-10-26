@@ -54,7 +54,7 @@ Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         return entry.select(t);
     }
-    throw std::invalid_argument("q8 linear: unsupported shape");
+    return select_q8_general_launch(t, DType::BF16);
 }
 
 Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
@@ -64,7 +64,10 @@ Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 
 void q8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream) {
-    select_q8_launch(w.n, w.k, x.ne[1], policy)(x, w, out, stream);
+    const Q8Launch launch = out.dtype == DType::FP32
+                                ? select_q8_general_launch(x.ne[1], DType::FP32)
+                                : select_q8_launch(w.n, w.k, x.ne[1], policy);
+    launch(x, w, out, stream);
 }
 
 } // namespace ninfer::ops::detail

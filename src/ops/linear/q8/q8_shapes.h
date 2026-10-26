@@ -25,6 +25,9 @@ using Q8N34816K5120  = Q8LinearGeometry<34816, 5120>;
 using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
 
 // The dispatcher admits N/K and positive T; each shape owns its complete T selection.
+// Any shape no table below names, writing BF16 or FP32 (q8_general.cu).
+[[nodiscard]] Q8Launch select_q8_general_launch(std::int32_t tokens, DType out);
+
 [[nodiscard]] Q8Launch select_q8_n1024_k2048(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n1024_k5120(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n2048_k4096(std::int32_t tokens);

@@ -53,6 +53,18 @@ public:
                                  std::optional<QType> exact_format, std::size_t rank,
                                  const ParameterPiece& piece);
 
+    // Where a column piece of matrix parameter `name` (`shape`, read through `inputs`) may end:
+    // out[c] for c in [0, columns] says whether the columns [0, c) are whole runs of its stored
+    // bytes (artifact::selection_column_unit); with an input gather (`input_columns`), a run is
+    // whole when all or none of the logical columns its stored columns read lie below c.
+    [[nodiscard]] std::vector<bool> column_ends(const std::string& name, const artifact::Shape& shape,
+                                                const std::vector<std::string>& inputs);
+
+    // Where a row piece of matrix parameter `name` may end: out[r] for r in [0, rows] says whether
+    // rows [0, r) end on a row bound of the stored object holding row r
+    // (artifact::selection_row_unit; NVFP4 scale tiles), or at a stored object's end.
+    [[nodiscard]] std::vector<bool> row_ends(const std::string& name, const artifact::Shape& shape);
+
     [[nodiscard]] const PendingWeight& at(WeightId id) const { return weights.at(id.index); }
 
     [[nodiscard]] WeightUseId use(WeightId id, std::string_view input) const;
@@ -74,9 +86,11 @@ public:
     std::vector<PendingWeight> weights;
 
 private:
-    // `whole_gathers` false leaves an input gather out, for a piece that binds its own.
+    // `whole_gathers` false leaves an input gather out, and `whole_signs` false the Hadamard signs,
+    // for a piece that binds its own.
     void add_uses(PendingWeight& pending, const std::string& name,
-                  const std::vector<std::string>& inputs, bool whole_gathers = true);
+                  const std::vector<std::string>& inputs, bool whole_gathers = true,
+                  bool whole_signs = true);
     // One device weight per distinct sign binding, however many Uses name it.
     WeightId hadamard_signs(const artifact::Binding& binding, std::uint64_t width,
                             const std::string& use);

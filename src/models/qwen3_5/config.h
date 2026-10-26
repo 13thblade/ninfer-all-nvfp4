@@ -149,9 +149,20 @@ struct Config {
 // The config of an artifact's `vision` component, which another family that reuses this tower
 // parses too.
 [[nodiscard]] VisionConfig parse_vision_config(const artifact::Directory& directory);
-// Tensor parallelism: the share of the text model one of `ranks` ranks runs. The GDN key and value
-// heads and the dense FFN's intermediate rows are divided by `ranks`; attention and every other
-// width stay whole. Throws std::invalid_argument unless they divide and the FFN is dense.
-[[nodiscard]] TextConfig tensor_parallel_share(const TextConfig& text, std::size_t ranks);
+// Tensor parallelism: the part of every layer one rank runs. GDN key heads [key_head_begin,
+// key_head_end) with the value heads that read them, and dense FFN rows [ffn_begin, ffn_end). The
+// ranks' shares are contiguous, in rank order, and together cover every head and row.
+struct TensorShare {
+    std::uint32_t key_head_begin = 0;
+    std::uint32_t key_head_end   = 0;
+    std::uint32_t ffn_begin      = 0;
+    std::uint32_t ffn_end        = 0;
+
+    bool operator==(const TensorShare&) const = default;
+};
+// The text model as `share` sees it: its key and value heads and FFN rows; attention and every other
+// width stay whole. Throws std::invalid_argument unless the model has GDN layers and a dense FFN
+// and the share lies inside them.
+[[nodiscard]] TextConfig tensor_parallel_share(const TextConfig& text, const TensorShare& share);
 
 } // namespace ninfer::models::qwen3_5

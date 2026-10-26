@@ -65,8 +65,8 @@ std::size_t checked_elements(std::int32_t first, std::int32_t second, const char
 
 class GuardedOutput {
 public:
-    explicit GuardedOutput(std::size_t words)
-        : storage_(words * sizeof(std::uint16_t), kOutputGuardBytes, kOutputGuardByte) {
+    GuardedOutput(std::size_t elements, std::size_t element_bytes)
+        : storage_(elements * element_bytes, kOutputGuardBytes, kOutputGuardByte) {
         poison();
     }
 
@@ -165,9 +165,23 @@ struct OutputRead {
     std::vector<double> selected;
 };
 
+// A BF16 or FP32 output; every element of the poison pattern is NaN in either.
+template <class Bits>
 OutputRead read_output(const void* device, std::int32_t n, std::int32_t t,
                        std::span<const std::int32_t> rows, std::span<const std::int32_t> columns,
                        std::string_view label) {
+    constexpr bool kWide           = sizeof(Bits) == sizeof(std::uint32_t);
+    constexpr Bits kPoison         = static_cast<Bits>(~Bits{0});
+    constexpr Bits kExponent       = kWide ? Bits(0x7f800000U) : Bits(0x7f80U);
+    const auto value               = [](Bits bits) {
+        if constexpr (kWide) {
+            float wide;
+            std::memcpy(&wide, &bits, sizeof(wide));
+            return static_cast<double>(wide);
+        } else {
+            return static_cast<double>(test::bf16_to_f32(bits));
+        }
+    };
     const std::size_t total_words = checked_elements(n, t, "output");
     std::vector<std::size_t> wanted;
     wanted.reserve(rows.size() * columns.size());
@@ -179,25 +193,23 @@ OutputRead read_output(const void* device, std::int32_t n, std::int32_t t,
 
     OutputRead result;
     result.selected.resize(wanted.size());
-    std::vector<std::uint16_t> chunk(std::min(kOutputScanWords, total_words));
+    std::vector<Bits> chunk(std::min(kOutputScanWords, total_words));
     std::size_t wanted_index    = 0;
     std::size_t poison_count    = 0;
     std::size_t nonfinite_count = 0;
     for (std::size_t begin = 0; begin < total_words; begin += chunk.size()) {
         const std::size_t count = std::min(chunk.size(), total_words - begin);
-        cuda_check(
-            cudaMemcpy(chunk.data(),
-                       static_cast<const std::uint8_t*>(device) + begin * sizeof(std::uint16_t),
-                       count * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
-            "copy linear output");
+        cuda_check(cudaMemcpy(chunk.data(),
+                              static_cast<const std::uint8_t*>(device) + begin * sizeof(Bits),
+                              count * sizeof(Bits), cudaMemcpyDeviceToHost),
+                   "copy linear output");
         for (std::size_t index = 0; index < count; ++index) {
-            const std::uint16_t bits = chunk[index];
-            if (bits == 0xffffU) { ++poison_count; }
-            if ((bits & 0x7f80U) == 0x7f80U) { ++nonfinite_count; }
+            const Bits bits = chunk[index];
+            if (bits == kPoison) { ++poison_count; }
+            if ((bits & kExponent) == kExponent) { ++nonfinite_count; }
         }
         while (wanted_index < wanted.size() && wanted[wanted_index] < begin + count) {
-            result.selected[wanted_index] =
-                static_cast<double>(test::bf16_to_f32(chunk[wanted[wanted_index] - begin]));
+            result.selected[wanted_index] = value(chunk[wanted[wanted_index] - begin]);
             ++wanted_index;
         }
     }
@@ -356,10 +368,13 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     for (const Invocation& invocation : shape.invocations) {
         const std::string case_label = std::string(label) + " [" + std::to_string(shape.n) + "," +
                                        std::to_string(shape.k) +
-                                       "] T=" + std::to_string(invocation.t);
-        GuardedOutput output(checked_elements(shape.n, invocation.t, "guarded output"));
+                                       "] T=" + std::to_string(invocation.t) +
+                                       (shape.out == DType::FP32 ? " FP32" : "");
+        const bool wide = shape.out == DType::FP32;
+        GuardedOutput output(checked_elements(shape.n, invocation.t, "guarded output"),
+                             wide ? sizeof(float) : sizeof(std::uint16_t));
         Tensor input(device_activation.p, DType::BF16, {shape.k, invocation.t});
-        Tensor destination(output.data(), DType::BF16, {shape.n, invocation.t});
+        Tensor destination(output.data(), shape.out, {shape.n, invocation.t});
         const std::size_t capacity = ops::linear_workspace_capacity_bytes(
             weight.qtype, shape.n, shape.k, invocation.policy, invocation.t, invocation.t);
         DeviceArena workspace(std::max<std::size_t>(capacity, 256));
@@ -403,8 +418,11 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                 failures += output.verify_guards(case_label);
                 const std::span<const std::int32_t> columns(oracle_columns.data(),
                                                             static_cast<std::size_t>(invocation.t));
-                OutputRead actual = read_output(output.data(), shape.n, invocation.t, oracle_rows,
-                                                columns, case_label);
+                OutputRead actual =
+                    wide ? read_output<std::uint32_t>(output.data(), shape.n, invocation.t,
+                                                      oracle_rows, columns, case_label)
+                         : read_output<std::uint16_t>(output.data(), shape.n, invocation.t,
+                                                      oracle_rows, columns, case_label);
                 failures += actual.failures;
 
                 std::span<const double> reference(

@@ -68,6 +68,24 @@ struct CausalConvSplitOutput3 {
     }
 };
 
+// The same map with the partition passed at run time, for partitions no instance fixes.
+template <class Element>
+struct CausalConvSplitOutput3Dynamic {
+    Element* __restrict__ out0;
+    Element* __restrict__ out1;
+    Element* __restrict__ out2;
+    std::int32_t rows0;
+    std::int32_t rows1;
+    std::int32_t rows2;
+
+    __device__ __forceinline__ CausalConvOutputColumn<Element> column(std::int64_t row) const {
+        const std::int32_t split2 = rows0 + rows1;
+        if (row < rows0) { return {out0 + row, rows0}; }
+        if (row < split2) { return {out1 + (row - rows0), rows1}; }
+        return {out2 + (row - split2), rows2};
+    }
+};
+
 } // namespace detail
 
 template <class Output>

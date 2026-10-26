@@ -1083,6 +1083,22 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "--tensor-parallel without several devices was accepted");
     }
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--devices", "0,1", "--tensor-parallel",
+                             "--tensor-split", "2,1"})
+                              .tensor_split == std::vector<double>{2.0, 1.0},
+                      "--tensor-split did not reach serving options");
+    for (const std::vector<std::string>& split :
+         {std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1"},
+          std::vector<std::string>{"--tensor-split", "1,1"},
+          std::vector<std::string>{"--tensor-parallel", "--tensor-split", "-1,1"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--devices", "0,1"};
+        args.insert(args.end(), split.begin(), split.end());
+        bool rejected = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "a malformed or misplaced --tensor-split was accepted");
+    }
 
     bool exclusive_rejected = false;
     try {

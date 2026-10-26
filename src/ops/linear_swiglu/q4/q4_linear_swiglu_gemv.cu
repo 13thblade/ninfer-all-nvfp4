@@ -35,6 +35,10 @@ constexpr int kBlockThreads      = kWarpsPerBlock * 32;
 constexpr int kPairsPerBlock     = kWarpsPerBlock;
 constexpr int kXVecs             = kK / 8; // x as uint4 (8 bf16 each)
 constexpr int kTiles             = kGroups / kGroupsPerWarpTile;
+constexpr int kPairStages        = 3;
+// The two-parent kernel stages its activation beside 13 KiB of tiles, within the 48 KiB a block
+// gets without opting in.
+constexpr int kTwoParentMaxK     = 16384;
 static_assert(kIntermediate % kPairsPerBlock == 0);
 static_assert(kBytesPerGroup == 2 * kVecBytes);
 static_assert(kGroups % kGroupsPerWarpTile == 0);
@@ -214,42 +218,22 @@ __device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[
     pipe_commit();
 }
 
-__global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restrict__ x,
-                                                  const std::uint8_t* __restrict__ codes,
-                                                  const std::uint8_t* __restrict__ scales,
-                                                  __nv_bfloat16* __restrict__ out) {
-    constexpr int kStages   = 3;
+// One warp's gate and up dot products of a row pair over `tiles` 1024-column tiles: three-stage
+// cp.async tiles of both rows' codes and scales against the activation staged in shared memory.
+__device__ __forceinline__ void q4_pair_row_dot(
+    const __nv_bfloat162* __restrict__ x2, uint4 (*__restrict__ code_tile)[2][kVecsPerWarpTile],
+    uint4 (*__restrict__ scale_tile)[2][2], const std::uint8_t* __restrict__ gate_code_row,
+    const std::uint8_t* __restrict__ gate_scale_row, const std::uint8_t* __restrict__ up_code_row,
+    const std::uint8_t* __restrict__ up_scale_row, int tiles, int lane, float& gate_sum,
+    float& up_sum) {
+    constexpr int kStages   = kPairStages;
     constexpr int kPrefetch = kStages - 1;
-    __shared__ __align__(16) __nv_bfloat16 x_sh[kK];
-    __shared__ uint4 code_tile[kWarpsPerBlock][kStages][2][kVecsPerWarpTile];
-    __shared__ uint4 scale_tile[kWarpsPerBlock][kStages][2][2];
-
-    auto* x_sh_v    = reinterpret_cast<uint4*>(x_sh);
-    const auto* x_g = reinterpret_cast<const uint4*>(x);
-    for (int i = static_cast<int>(threadIdx.x); i < kXVecs; i += static_cast<int>(blockDim.x)) {
-        x_sh_v[i] = x_g[i];
-    }
-    __syncthreads();
-
-    const int lane    = static_cast<int>(threadIdx.x) & 31;
-    const int warp    = static_cast<int>(threadIdx.x) >> 5;
-    const int out_row = static_cast<int>(blockIdx.x) * kPairsPerBlock + warp;
-
-    const std::uint8_t* gate_code_row =
-        codes + static_cast<std::int64_t>(out_row) * kGroups * kBytesPerGroup;
-    const std::uint8_t* gate_scale_row = scales + static_cast<std::int64_t>(out_row) * kGroups * 2;
-    const std::uint8_t* up_code_row =
-        codes + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * kBytesPerGroup;
-    const std::uint8_t* up_scale_row =
-        scales + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * 2;
-    const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x_sh);
-
     float gate_acc = 0.0f;
     float up_acc   = 0.0f;
 #pragma unroll
     for (int p = 0; p < kPrefetch; ++p) {
-        if (p < kTiles) {
-            q4_issue_pair_tile(code_tile[warp][p], scale_tile[warp][p], gate_code_row,
+        if (p < tiles) {
+            q4_issue_pair_tile(code_tile[p], scale_tile[p], gate_code_row,
                                gate_scale_row, up_code_row, up_scale_row, p, lane);
         } else {
             pipe_commit();
@@ -257,11 +241,11 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
     }
 
 #pragma unroll 1
-    for (int tile = 0; tile < kTiles; ++tile) {
+    for (int tile = 0; tile < tiles; ++tile) {
         const int fetch = tile + kPrefetch;
-        if (fetch < kTiles) {
+        if (fetch < tiles) {
             const int buf = fetch % kStages;
-            q4_issue_pair_tile(code_tile[warp][buf], scale_tile[warp][buf], gate_code_row,
+            q4_issue_pair_tile(code_tile[buf], scale_tile[buf], gate_code_row,
                                gate_scale_row, up_code_row, up_scale_row, fetch, lane);
         } else {
             pipe_commit();
@@ -270,10 +254,10 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
         __syncwarp();
 
         const int buf           = tile % kStages;
-        const auto* gate_codes  = reinterpret_cast<const std::uint8_t*>(code_tile[warp][buf][0]);
-        const auto* up_codes    = reinterpret_cast<const std::uint8_t*>(code_tile[warp][buf][1]);
-        const auto* gate_scales = reinterpret_cast<const std::uint16_t*>(scale_tile[warp][buf][0]);
-        const auto* up_scales   = reinterpret_cast<const std::uint16_t*>(scale_tile[warp][buf][1]);
+        const auto* gate_codes  = reinterpret_cast<const std::uint8_t*>(code_tile[buf][0]);
+        const auto* up_codes    = reinterpret_cast<const std::uint8_t*>(code_tile[buf][1]);
+        const auto* gate_scales = reinterpret_cast<const std::uint16_t*>(scale_tile[buf][0]);
+        const auto* up_scales   = reinterpret_cast<const std::uint16_t*>(scale_tile[buf][1]);
         // Eight weights per lane per step, not two. Same change, same reason, and the same 4x as
         // q5_rowsplit_gemv's consume loop -- see the long note there for the measurement that
         // motivated it (DRAM at 50% while Mem Pipes Busy sat at 81%).
@@ -328,8 +312,76 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
         __syncwarp();
     }
 
-    gate_acc = warp_reduce_sum(gate_acc);
-    up_acc   = warp_reduce_sum(up_acc);
+    gate_sum = warp_reduce_sum(gate_acc);
+    up_sum   = warp_reduce_sum(up_acc);
+}
+
+__global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restrict__ x,
+                                                  const std::uint8_t* __restrict__ codes,
+                                                  const std::uint8_t* __restrict__ scales,
+                                                  __nv_bfloat16* __restrict__ out) {
+    __shared__ __align__(16) __nv_bfloat16 x_sh[kK];
+    __shared__ uint4 code_tile[kWarpsPerBlock][kPairStages][2][kVecsPerWarpTile];
+    __shared__ uint4 scale_tile[kWarpsPerBlock][kPairStages][2][2];
+
+    auto* x_sh_v    = reinterpret_cast<uint4*>(x_sh);
+    const auto* x_g = reinterpret_cast<const uint4*>(x);
+    for (int i = static_cast<int>(threadIdx.x); i < kXVecs; i += static_cast<int>(blockDim.x)) {
+        x_sh_v[i] = x_g[i];
+    }
+    __syncthreads();
+
+    const int lane    = static_cast<int>(threadIdx.x) & 31;
+    const int warp    = static_cast<int>(threadIdx.x) >> 5;
+    const int out_row = static_cast<int>(blockIdx.x) * kPairsPerBlock + warp;
+
+    const std::uint8_t* gate_code_row =
+        codes + static_cast<std::int64_t>(out_row) * kGroups * kBytesPerGroup;
+    const std::uint8_t* gate_scale_row = scales + static_cast<std::int64_t>(out_row) * kGroups * 2;
+    const std::uint8_t* up_code_row =
+        codes + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * kBytesPerGroup;
+    const std::uint8_t* up_scale_row =
+        scales + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * 2;
+    const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x_sh);
+
+    float gate_acc = 0.0f;
+    float up_acc   = 0.0f;
+    q4_pair_row_dot(x2, code_tile[warp], scale_tile[warp], gate_code_row, gate_scale_row,
+                    up_code_row, up_scale_row, kTiles, lane, gate_acc, up_acc);
+    if (lane == 0) { out[out_row] = __float2bfloat16(silu(gate_acc) * up_acc); }
+}
+
+// Two parents of one runtime shape, such as a tensor-parallel rank's rows of gate and up: the pair
+// kernel's dataflow with the rows, K and row stride read from the weights, the activation staged in
+// dynamic shared memory. K is whole 1024-column tiles.
+__global__ void q4_linear_swiglu_gemv_two_parent_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ gate_codes,
+    const std::uint8_t* __restrict__ gate_scales, const std::uint8_t* __restrict__ up_codes,
+    const std::uint8_t* __restrict__ up_scales, __nv_bfloat16* __restrict__ out, int rows, int k,
+    int padded_k) {
+    extern __shared__ uint4 x_sh_v[];
+    __shared__ uint4 code_tile[kWarpsPerBlock][kPairStages][2][kVecsPerWarpTile];
+    __shared__ uint4 scale_tile[kWarpsPerBlock][kPairStages][2][2];
+
+    const auto* x_g = reinterpret_cast<const uint4*>(x);
+    for (int i = static_cast<int>(threadIdx.x); i < k / 8; i += static_cast<int>(blockDim.x)) {
+        x_sh_v[i] = x_g[i];
+    }
+    __syncthreads();
+
+    const int lane    = static_cast<int>(threadIdx.x) & 31;
+    const int warp    = static_cast<int>(threadIdx.x) >> 5;
+    const int out_row = static_cast<int>(blockIdx.x) * kPairsPerBlock + warp;
+    if (out_row >= rows) { return; }
+
+    const std::int64_t groups = padded_k / kGroupK;
+    float gate_acc            = 0.0f;
+    float up_acc              = 0.0f;
+    q4_pair_row_dot(reinterpret_cast<const __nv_bfloat162*>(x_sh_v), code_tile[warp],
+                    scale_tile[warp], gate_codes + out_row * groups * kBytesPerGroup,
+                    gate_scales + out_row * groups * 2, up_codes + out_row * groups * kBytesPerGroup,
+                    up_scales + out_row * groups * 2, k / (kGroupsPerWarpTile * kGroupK), lane,
+                    gate_acc, up_acc);
     if (lane == 0) { out[out_row] = __float2bfloat16(silu(gate_acc) * up_acc); }
 }
 
@@ -344,6 +396,29 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
     q4_linear_swiglu_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool q4_linear_swiglu_two_parent_gemv_supported(const Weight& gate, const Weight& up) noexcept {
+    return gate.qtype == QType::Q4_G64_FP16 && up.qtype == QType::Q4_G64_FP16 &&
+           gate.n == up.n && gate.k == up.k && gate.padded_shape[1] == up.padded_shape[1] &&
+           gate.n > 0 && gate.k > 0 && gate.k % (kGroupsPerWarpTile * kGroupK) == 0 &&
+           gate.k <= kTwoParentMaxK;
+}
+
+void q4_linear_swiglu_two_parent_gemv_launch(const Tensor& x, const Weight& gate, const Weight& up,
+                                             Tensor& out, cudaStream_t stream) {
+    if (!q4_linear_swiglu_two_parent_gemv_supported(gate, up) || x.ne[1] != 1 ||
+        x.ne[0] != gate.k || out.ne[0] != gate.n) {
+        throw std::invalid_argument("q4 linear_swiglu two-parent GEMV: unsupported operands");
+    }
+    const int grid           = (gate.n + kPairsPerBlock - 1) / kPairsPerBlock;
+    const std::size_t shared = static_cast<std::size_t>(gate.k) * sizeof(__nv_bfloat16);
+    q4_linear_swiglu_gemv_two_parent_kernel<<<grid, kBlockThreads, shared, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(gate.qdata),
+        static_cast<const std::uint8_t*>(gate.scales), static_cast<const std::uint8_t*>(up.qdata),
+        static_cast<const std::uint8_t*>(up.scales), static_cast<__nv_bfloat16*>(out.data), gate.n,
+        gate.k, gate.padded_shape[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 

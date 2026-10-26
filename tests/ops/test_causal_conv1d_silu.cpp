@@ -20,9 +20,11 @@ using namespace ninfer::test;
 namespace {
 
 // CausalConv1dSiLU has one A16 convolution-reduction profile. Decode, small-T, sequence, prefill,
-// snapshot, and state-alias choices all qualify against this single normwise criterion.
+// snapshot, and state-alias choices all qualify against this single normwise criterion. The
+// relative L2 bound sits just above BF16 storage: the correctly rounded output of the 640-row q
+// slice of the uneven 640/640/1280 split at T = 1 measures 1.87e-3 against the FP64 oracle.
 constexpr ReductionCriterion kCausalConvA16Criterion{
-    /*relative_l2*/ 1.85e-3,
+    /*relative_l2*/ 2.0e-3,
     /*gross_absolute*/ 1.0e-3,
     /*gross_relative_to_max_reference*/ kBf16GrossRelativeFloor,
 };
@@ -749,11 +751,16 @@ int main() {
                                6000U + static_cast<std::uint32_t>(T));
         failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, false, false,
                                7000U + static_cast<std::uint32_t>(T));
-        // A 27B layer's share on each of two and four tensor-parallel ranks.
+        // Tensor-parallel shares, with the rows passed at run time: a 27B layer's half and quarter,
+        // and uneven shares of three key heads with nine value heads and of five with ten.
         failures += split_case(5120, 1024, 1024, 3072, T, false, false,
                                8000U + static_cast<std::uint32_t>(T));
         failures += split_case(2560, 512, 512, 1536, T, false, false,
                                9000U + static_cast<std::uint32_t>(T));
+        failures += split_case(1920, 384, 384, 1152, T, false, false,
+                               10000U + static_cast<std::uint32_t>(T));
+        failures += split_case(2560, 640, 640, 1280, T, false, false,
+                               11000U + static_cast<std::uint32_t>(T));
     }
 
     // The exact-alias state form, on both geometries, across every route boundary.

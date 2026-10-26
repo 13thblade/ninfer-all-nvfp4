@@ -1,5 +1,6 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/linear.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/part_projection.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/common/route_table.cpp"
 )
 

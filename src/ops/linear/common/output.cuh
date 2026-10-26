@@ -26,6 +26,17 @@ struct LinearBf16Output {
     }
 };
 
+// An FP32 result rounded nowhere, such as a tensor-parallel rank's partial sum of a projection
+// (core/tensor_parallel.h), which the ranks add before the one rounding to BF16.
+struct LinearFp32Output {
+    float* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(int row, int token, float value) const {
+        data[static_cast<std::int64_t>(token) * rows + row] = value;
+    }
+};
+
 struct LinearBf16StridedOutput {
     __nv_bfloat16* data;
     std::int64_t leading_dim;

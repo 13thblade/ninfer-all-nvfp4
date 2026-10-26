@@ -427,8 +427,12 @@ struct EngineOptions {
     std::vector<std::uint32_t> stage_layers;
     // The devices share every layer instead of dealing layers out: tensor parallelism over the GDN
     // heads and the dense FFN rows, with attention, the KV cache, the embedding, the head and MTP
-    // on the first device. Needs identical devices and a dense Qwen3.5-core model.
+    // on the first device. Needs a dense Qwen3.5-core model. The cards may differ.
     bool tensor_parallel = false;
+    // With tensor parallelism, the relative size of each device's share, one positive weight per
+    // entry of `devices` ({3, 2}: the first takes three fifths). Empty sizes the shares from each
+    // card's measured copy bandwidth, capped by its free memory.
+    std::vector<double> tensor_split;
     // Native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4 MoE and Flint.
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Host/disk experts: device memory lent to the persistent cache, split

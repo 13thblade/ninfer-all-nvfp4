@@ -68,7 +68,8 @@ void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& r
 } // namespace
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
-                                std::int32_t last, bool mtp, bool verify, bool wide_verification) {
+                                std::int32_t last, bool mtp, bool verify, bool wide_verification,
+                                bool partial) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
     if (const auto* streamed = std::get_if<StreamedMoeParameters>(&parameters)) {
         std::size_t bytes = 0;
@@ -90,28 +91,35 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         return ops::sparse_moe_workspace_capacity_bytes(moe->routed_gate_up.qtype,
                                                         moe->routed_down.qtype, first, last);
     }
-    const auto& p = std::get<DenseParameters>(parameters);
-    if (rotated_dense(p)) {
-        return rotated_dense_workspace_bytes(p, first, last, wide_verification);
-    }
+    const auto& p    = std::get<DenseParameters>(parameters);
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
-    if (is_gguf(gu.qtype)) {
+    if (rotated_dense(p) && !partial) {
+        return rotated_dense_workspace_bytes(p, first, last, wide_verification);
+    }
+    if (is_gguf(gu.qtype) || partial) {
+        // A share rotates its input and its SwiGLU output when its parameters are rotated.
         WorkspaceLayoutBuilder layout;
         const std::int32_t rows = p.up ? gu.n : gu.n / 2;
         (void)layout.alloc(DType::BF16, {rows, last});
         {
             auto scope = layout.scope();
-            (void)layout.alloc_bytes(
+            (void)layout.alloc_bytes(rotated_workspace_bytes(
+                p.gate_up.hadamard_signs, gu.k, last,
                 p.up ? ops::linear_swiglu_pair_workspace_capacity_bytes(
                            gu.qtype, p.up->weight.qtype, gu.n, gu.k, p.gate_up.policy, first, last)
                      : ops::linear_swiglu_workspace_capacity_bytes(gu.qtype, gu.n, gu.k,
-                                                                   p.gate_up.policy, first, last));
+                                                                   p.gate_up.policy, first, last)));
         }
         {
             auto scope = layout.scope();
-            (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-                down.qtype, down.n, down.k, p.down.policy, first, last));
+            const auto policy = residual_projection_policy(p.down, wide_verification);
+            (void)layout.alloc_bytes(rotated_workspace_bytes(
+                p.down.hadamard_signs, down.k, last,
+                partial ? ops::linear_workspace_capacity_bytes(down.qtype, down.n, down.k, policy,
+                                                               first, last)
+                        : ops::linear_add_workspace_capacity_bytes(down.qtype, down.n, down.k,
+                                                                   p.down.policy, first, last)));
         }
         return layout.peak_bytes(1);
     }
@@ -166,24 +174,29 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     const auto columns = hidden.ne[1];
     if (partial != nullptr) {
         const auto* dense = std::get_if<DenseParameters>(&parameters);
-        if (dense == nullptr || mtp || rotated_dense(*dense)) {
-            throw std::logic_error("a tensor-parallel FFN share is an unrotated dense FFN");
+        if (dense == nullptr || mtp) {
+            throw std::logic_error("a tensor-parallel FFN share is a dense FFN");
         }
+        // A rotated share turns its whole input with its own copy of the signs, and its SwiGLU
+        // rows, whole 1024-blocks of the intermediate, with theirs: the blocks one device turns.
         const auto& gu    = dense->gate_up.weight;
         Tensor activation = workspace.alloc(DType::BF16, {dense->up ? gu.n : gu.n / 2, columns});
         {
-            auto call = workspace.scope();
+            auto call      = workspace.scope();
+            const Tensor x = rotated_input(hidden, dense->gate_up.hadamard_signs, workspace, stream,
+                                           basis);
             if (dense->up) {
-                ops::linear_swiglu(hidden, gu, dense->up->weight, activation,
-                                   dense->gate_up.policy, workspace, stream);
+                ops::linear_swiglu(x, gu, dense->up->weight, activation, dense->gate_up.policy,
+                                   workspace, stream);
             } else {
-                ops::linear_swiglu(hidden, gu, activation,
+                ops::linear_swiglu(x, gu, activation,
                                    verify && !is_gguf(gu.qtype) ? dense->verify_gate_up_policy
                                                                 : dense->gate_up.policy,
                                    workspace, stream);
             }
         }
-        ops::linear(activation, dense->down.weight, *partial,
+        const Tensor v = rotated_input(activation, dense->down.hadamard_signs, workspace, stream);
+        ops::linear(v, dense->down.weight, *partial,
                     residual_projection_policy(dense->down, wide_verification), workspace, stream);
         return;
     }

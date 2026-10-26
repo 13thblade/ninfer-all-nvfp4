@@ -1042,12 +1042,16 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     const InputBasis projection_basis = gdn_norm_control(x, w.input_norm, config.rms_norm_eps, p,
                                                          h, g, beta, work_, ctx_.execution_view());
     if (&config != &config_) {
-        const auto heads       = static_cast<std::size_t>(config.gdn->linear_num_value_heads);
-        const auto all_heads   = static_cast<std::size_t>(config_.gdn->linear_num_value_heads);
-        const auto own_gates   = [&](const Tensor& all) {
+        const auto heads     = static_cast<std::size_t>(config.gdn->linear_num_value_heads);
+        const auto all_heads = static_cast<std::size_t>(config_.gdn->linear_num_value_heads);
+        // The rank's value heads follow its first key head's.
+        const auto first = static_cast<std::size_t>(
+                               stage_runtime_->tensor_parallel->shares[tensor_rank_].key_head_begin) *
+                           (all_heads / config_.gdn->linear_num_key_heads);
+        const auto own_gates = [&](const Tensor& all) {
             Tensor own = work_.alloc(DType::FP32, {static_cast<std::int32_t>(heads), T});
             CUDA_CHECK(cudaMemcpy2DAsync(own.data, heads * sizeof(float),
-                                         static_cast<const float*>(all.data) + tensor_rank_ * heads,
+                                         static_cast<const float*>(all.data) + first,
                                          all_heads * sizeof(float), heads * sizeof(float),
                                          static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
             return own;
@@ -1550,10 +1554,6 @@ void TextContext::run_staged(Tensor& x, Phase ph, Tap& tap) {
 // contributor. The replicas stay equal, and rank 0's ends the pass where one device's would.
 template <class Tap>
 void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
-    if constexpr (Tap::enabled) {
-        (void)tap;
-        throw std::logic_error("layer feature taps are not available with tensor parallelism");
-    }
     StageRuntime& runtime            = *stage_runtime_;
     auto& tp                         = *runtime.tensor_parallel;
     TensorParallelExchange& exchange = *tp.exchange;
@@ -1715,6 +1715,11 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                              ? next_projection_hints(static_cast<int>(layer))
                              : ops::SparseMoeHints{});
             });
+            // Rank 0's replica is one device's residual after the layer: a masked drafter's
+            // target features are tapped from it.
+            if constexpr (Tap::enabled) {
+                tap.capture_layer(static_cast<int>(layer), x, entry_stream);
+            }
         } catch (const std::exception& error) {
             throw std::runtime_error("text/layers/" + std::to_string(layer) +
                                      (ph == Phase::Prefill ? " prefill" : " verify") +

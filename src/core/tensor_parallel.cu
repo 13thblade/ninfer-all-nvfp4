@@ -52,6 +52,74 @@ void tensor_parallel_reduce(__nv_bfloat16* residual, const float* const* parts, 
 
 } // namespace detail
 
+std::vector<double> rank_copy_bandwidth(const DeviceContext& context) {
+    // Large enough to stream past the L2 of every supported card, small enough to fit beside a
+    // CUDA context on any of them.
+    constexpr std::size_t kBytes  = 128ULL << 20;
+    constexpr int kTimedCopies    = 3;
+    std::vector<double> out(context.size(), 0.0);
+    for (std::size_t rank = 0; rank < context.size(); ++rank) {
+        std::size_t first = rank;
+        for (std::size_t other = 0; other < rank; ++other) {
+            if (context.same_physical_device(rank, other)) {
+                first = other;
+                break;
+            }
+        }
+        if (first != rank) {
+            out[rank] = out[first];
+            continue;
+        }
+        DeviceBinding bind(context.rank(rank).device);
+        void* source      = nullptr;
+        void* destination = nullptr;
+        cudaEvent_t start = nullptr;
+        cudaEvent_t stop  = nullptr;
+        cudaStream_t stream = nullptr;
+        const auto release = [&] {
+            if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
+            if (start != nullptr) { (void)cudaEventDestroy(start); }
+            if (stop != nullptr) { (void)cudaEventDestroy(stop); }
+            if (source != nullptr) { (void)cudaFree(source); }
+            if (destination != nullptr) { (void)cudaFree(destination); }
+        };
+        try {
+            check(cudaMalloc(&source, kBytes), "bandwidth cudaMalloc");
+            check(cudaMalloc(&destination, kBytes), "bandwidth cudaMalloc");
+            check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "bandwidth stream");
+            check(cudaEventCreate(&start), "bandwidth event");
+            check(cudaEventCreate(&stop), "bandwidth event");
+            check(cudaMemsetAsync(source, 0, kBytes, stream), "bandwidth memset");
+            check(cudaMemcpyAsync(destination, source, kBytes, cudaMemcpyDeviceToDevice, stream),
+                  "bandwidth warm-up");
+            check(cudaEventRecord(start, stream), "bandwidth record");
+            for (int copy = 0; copy < kTimedCopies; ++copy) {
+                check(cudaMemcpyAsync(destination, source, kBytes, cudaMemcpyDeviceToDevice, stream),
+                      "bandwidth copy");
+            }
+            check(cudaEventRecord(stop, stream), "bandwidth record");
+            check(cudaEventSynchronize(stop), "bandwidth synchronize");
+            float milliseconds = 0.0F;
+            check(cudaEventElapsedTime(&milliseconds, start, stop), "bandwidth elapsed");
+            // A copy reads and writes every byte.
+            const double moved = 2.0 * static_cast<double>(kBytes) * kTimedCopies;
+            out[rank] = moved / (std::max(static_cast<double>(milliseconds), 1e-3) * 1e-3);
+        } catch (...) {
+            release();
+            throw;
+        }
+        release();
+    }
+    for (std::size_t rank = 0; rank < context.size(); ++rank) {
+        std::size_t sharing = 0;
+        for (std::size_t other = 0; other < context.size(); ++other) {
+            if (context.same_physical_device(rank, other)) { ++sharing; }
+        }
+        out[rank] /= static_cast<double>(sharing);
+    }
+    return out;
+}
+
 TensorParallelExchange::TensorParallelExchange(const DeviceContext& context,
                                                TensorParallelExchangeOptions options)
     : slot_bytes_(options.slot_bytes) {

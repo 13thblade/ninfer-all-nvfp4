@@ -5,6 +5,7 @@
 #include "product/post_thinking_options.h"
 #include "product/reasoning_loop_options.h"
 #include "product/rope_yarn_options.h"
+#include "product/tensor_split_options.h"
 #include "product/speculative_options.h"
 
 #include <algorithm>
@@ -113,6 +114,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --tensor-parallel             the --devices share every layer: GDN heads and\n"
            "                                dense FFN rows; attention, KV, head and MTP on\n"
            "                                the first (dense Qwen3.5-core GGUF models)\n"
+           "  --tensor-split A,B,...        relative share of each --devices entry (default:\n"
+           "                                by each card's measured bandwidth and free memory)\n"
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
            "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
@@ -1114,6 +1117,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.tensor_parallel = true;
             continue;
         }
+        if (arg == "--tensor-split") {
+            options.tensor_split = product::parse_tensor_split(require_value("--tensor-split"));
+            continue;
+        }
         if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
             continue;
@@ -1693,6 +1700,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.tensor_parallel && options.devices.size() < 2) {
         throw std::invalid_argument("--tensor-parallel needs --devices naming more than one device");
     }
+    product::check_tensor_split(options.tensor_split, options.devices.size(),
+                                options.tensor_parallel);
     if (options.request_log_max_mib != 0 && options.request_log_jsonl.empty()) {
         throw std::invalid_argument("--request-log-max-mib requires --request-log-jsonl");
     }

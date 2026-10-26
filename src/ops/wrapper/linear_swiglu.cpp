@@ -282,13 +282,47 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
     linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, stream);
 }
 
+namespace {
+
+// Two parents of a format whose Linear writes FP32 at any shape (a tensor-parallel rank's rows of
+// gate and up): each product unrounded, then SwiGLU rounds once, as the one-parent routes do.
+bool fp32_pair(QType gate, QType up) {
+    const auto packed = [](QType format) { return !is_gguf(format) && linear_writes_fp32(format); };
+    return packed(gate) && packed(up);
+}
+
+} // namespace
+
 void linear_swiglu(const Tensor& x, const Weight& gate_weight, const Weight& up_weight, Tensor& out,
                    LinearPolicy policy, WorkspaceArena& ws, cudaStream_t stream) {
     validate_policy(policy);
-    if (!is_gguf(gate_weight.qtype) || !is_gguf(up_weight.qtype)) {
-        throw std::invalid_argument("linear_swiglu: the two-parent form is registered for GGUF");
+    if (is_gguf(gate_weight.qtype) && is_gguf(up_weight.qtype)) {
+        detail::gguf_swiglu(x, gate_weight, &up_weight, out, ws, stream);
+        return;
     }
-    detail::gguf_swiglu(x, gate_weight, &up_weight, out, ws, stream);
+    if (!fp32_pair(gate_weight.qtype, up_weight.qtype)) {
+        throw std::invalid_argument(
+            "linear_swiglu: the two-parent form takes GGUF, BF16, row-split Q4/Q5/Q6/Q8/T2, FP8 or "
+            "NVFP4 parents");
+    }
+    if (x.dtype != DType::BF16 || out.dtype != DType::BF16 || gate_weight.n != up_weight.n ||
+        gate_weight.k != up_weight.k || x.ne[0] != gate_weight.k || out.ne[0] != gate_weight.n ||
+        out.ne[1] != x.ne[1]) {
+        throw std::invalid_argument("linear_swiglu: invalid two-parent shapes");
+    }
+    // One column through Q4 parents: both rows of a pair in one pass, as the one-parent GEMV.
+    if (x.ne[1] == 1 && !detail::sm70::covers(gate_weight, 1) &&
+        detail::q4_linear_swiglu_two_parent_gemv_supported(gate_weight, up_weight) &&
+        x.is_contiguous() && out.is_contiguous() && aligned_to(x.data, 16)) {
+        detail::q4_linear_swiglu_two_parent_gemv_launch(x, gate_weight, up_weight, out, stream);
+        return;
+    }
+    auto scope  = ws.scope();
+    Tensor gate = ws.alloc(DType::FP32, {gate_weight.n, x.ne[1]});
+    Tensor up   = ws.alloc(DType::FP32, {up_weight.n, x.ne[1]});
+    linear(x, gate_weight, gate, policy, ws, stream);
+    linear(x, up_weight, up, policy, ws, stream);
+    silu_mul(gate, up, out, stream);
 }
 
 std::size_t linear_swiglu_pair_workspace_capacity_bytes(QType gate_qtype, QType up_qtype,
@@ -299,7 +333,18 @@ std::size_t linear_swiglu_pair_workspace_capacity_bytes(QType gate_qtype, QType 
                                                         std::int32_t max_tokens) {
     validate_policy(policy);
     if (!is_gguf(gate_qtype) || !is_gguf(up_qtype)) {
-        throw std::invalid_argument("linear_swiglu workspace: the two-parent form is GGUF only");
+        if (!fp32_pair(gate_qtype, up_qtype) || min_tokens <= 0 || max_tokens < min_tokens) {
+            throw std::invalid_argument("linear_swiglu workspace: unsupported two-parent form");
+        }
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::FP32, {rows, max_tokens});
+        (void)layout.alloc(DType::FP32, {rows, max_tokens});
+        (void)layout.alloc_bytes(std::max(
+            linear_workspace_capacity_bytes(gate_qtype, rows, input_rows, policy, min_tokens,
+                                            max_tokens),
+            linear_workspace_capacity_bytes(up_qtype, rows, input_rows, policy, min_tokens,
+                                            max_tokens)));
+        return layout.peak_bytes(1);
     }
     const detail::GgufShape gate{gate_qtype, rows, input_rows};
     const detail::GgufShape up{up_qtype, rows, input_rows};

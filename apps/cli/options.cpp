@@ -5,6 +5,7 @@
 #include "product/post_thinking_options.h"
 #include "product/reasoning_loop_options.h"
 #include "product/rope_yarn_options.h"
+#include "product/tensor_split_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -180,6 +181,8 @@ std::string usage_text(const char* argv0) {
            "  --tensor-parallel             the --devices share every layer: GDN heads and\n"
            "                                dense FFN rows; attention, KV, head and MTP on\n"
            "                                the first (dense Qwen3.5-core GGUF models)\n"
+           "  --tensor-split A,B,...        relative share of each --devices entry (default:\n"
+           "                                by each card's measured bandwidth and free memory)\n"
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
            "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
@@ -388,6 +391,8 @@ Options parse_options(int argc, char** argv) {
             options.stage_layers = parse_stage_layers(value(arg));
         } else if (arg == "--tensor-parallel") {
             options.tensor_parallel = true;
+        } else if (arg == "--tensor-split") {
+            options.tensor_split = ninfer::product::parse_tensor_split(value(arg));
         } else if (arg == "--expert-residency") {
             const std::string residency = value(arg);
             if (residency == "device") {
@@ -606,6 +611,8 @@ Options parse_options(int argc, char** argv) {
     if (options.tensor_parallel && options.devices.size() < 2) {
         throw std::invalid_argument("--tensor-parallel needs --devices naming more than one device");
     }
+    ninfer::product::check_tensor_split(options.tensor_split, options.devices.size(),
+                                        options.tensor_parallel);
     if (kv_headroom_mib.has_value()) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
             throw std::invalid_argument("--kv-headroom-mib requires --kv-capacity auto");

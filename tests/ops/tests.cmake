@@ -215,6 +215,11 @@ ninfer_add_op_test(ninfer_gdn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj.cpp"
   LIBRARIES ninfer_ops)
 
+# The part form over BF16 and row-split parts (a tensor-parallel rank's q/k/value and z rows).
+ninfer_add_op_test(ninfer_gdn_input_proj_parts_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj_parts.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_gdn_input_small_t_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_small_t.cpp"
   LIBRARIES ninfer_ops)

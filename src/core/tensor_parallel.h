@@ -88,6 +88,12 @@ private:
     std::size_t slot_bytes_            = 0;
 };
 
+// Each rank's speed for dividing work by: the device-to-device copy bandwidth of its card in bytes
+// per second, shared evenly by the ranks one card holds (`--devices 0,0`). A decode step reads every
+// weight once, so a rank's share of the weights takes time in proportion to this. Measured with a
+// short copy on each card.
+[[nodiscard]] std::vector<double> rank_copy_bandwidth(const DeviceContext& context);
+
 namespace detail {
 
 // One rank's reduction: residual[i] <- bf16(float(residual[i]) + ((part[0][i] + part[1][i]) + ...)).

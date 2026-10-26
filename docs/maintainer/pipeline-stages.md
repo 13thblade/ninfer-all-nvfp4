@@ -237,17 +237,36 @@ container, so the cause is not confirmed.
 devices instead of dealing layers out. It targets decode: each card reads only its share of the
 weights for every token.
 
-- **The shares.** Rank r holds GDN key heads `[r*Hk/N, (r+1)*Hk/N)` with the value heads that read
+- **The shares.** Rank r holds a contiguous range of GDN key heads with the value heads that read
   them (the value-to-key head map is contiguous), their q/k/v/z projection rows, convolution
   channels, recurrent and convolution state, and the matching input columns of the GDN output
-  projection; and rows `[r*I/N, (r+1)*I/N)` of the dense FFN's gate and up projections with those
-  input columns of down. The gating projection, `A_log`, `dt_bias`, the gated norm and the layer
-  norms are small, so every rank holds all of them: it gates every head and keeps its own.
-  Attention, the KV cache, the embedding, the final norm, the head and MTP stay on rank 0.
-- **Loading.** A share is a piece of a stored object: a row range and column ranges
-  (`artifact/selection.h`), gathered from the file as byte runs at upload. Contiguous matrices and
-  ggml blocks cut this way when column bounds fall on whole blocks; the stored objects themselves get
-  no device demand. `tensor_parallel_share` (`models/qwen3_5/config.h`) states a rank's geometry.
+  projection; and a contiguous range of the dense FFN's gate and up rows with those input columns
+  of down. The ranges differ in size when the cards do. The gating projection, `A_log`, `dt_bias`,
+  the gated norm and the layer norms are small, so every rank holds all of them: it gates every
+  head and keeps its own. Attention, the KV cache, the embedding, the final norm, the head and MTP
+  stay on rank 0. `TensorShare` and `tensor_parallel_share` (`models/qwen3_5/config.h`) state a
+  rank's ranges and geometry.
+- **Where the shares end** (`plan_tensor_shares`, `models/qwen3_5/load/text.cpp`). A share is a
+  piece of a stored object: a row range and column ranges (`artifact/selection.h`), gathered from
+  the file as byte runs at upload, so its bounds must fall on whole stored blocks (columns: one for
+  a contiguous or row-scaled matrix, the group for ggml blocks, 128 for row-split groups, 64 for
+  NVFP4; rows: NVFP4's 128-row scale tiles and its divisor rows), on whole tiles of the share's
+  Linear route (`ops::linear_share_units`: T2 32 rows and 512 columns, FP8 64 and 512, NVFP4 128 and
+  256) and, for a Hadamard-rotated input, on whole 1024-column blocks of the rotation, and a
+  projection whose stored columns are gathered (GSQ-RCO) must not cut a block the gather reads.
+  `Bindings::column_ends` and
+  `Bindings::row_ends` list those positions per tensor; the head ends every layer's GDN projections
+  allow and the row ends every FFN allows are the candidates, and `split_shares` (`core/tensor_split.h`)
+  places each rank's end at the candidate nearest its weight's cumulative target. The stored
+  objects themselves get no device demand.
+- **The weights.** `--tensor-split A,B,...` gives them, one per device. Without it the engine
+  measures each card's device-to-device copy bandwidth (`rank_copy_bandwidth`, 128 MiB; ranks on one
+  card divide its figure) as its speed, works out how much of the divided weights and GDN state each
+  card can hold beside what every rank holds and, on rank 0, attention, the KV cache for the
+  configured context and concurrency, and the head (`default_tensor_split`,
+  `models/qwen3_5/load.cpp`), and fills the cards in proportion to speed, capping a card at its room
+  and passing the excess to the others (`fill_shares`). Decode reads every weight once per token, so
+  bandwidth sets each rank's time.
 - **The pass** (`TextContext::run_tensor_parallel`). Rank 0 sends the residual and the control
   tensors to every rank over the stage links; each rank then keeps a replica of the residual. Each
   layer has two exchanges (`core/tensor_parallel.h`): after the mixer (attention: rank 0 alone;
@@ -259,15 +278,26 @@ weights for every token.
   projection's output: the shares' partial sums are added, then rounded once, where one device
   rounds the full sum. Logits are close, not identical, so greedy text can diverge where two tokens
   tie closely.
-- **Coverage.** GGUF weights (the GDN input projection's fused GGUF route), the 27B geometry (16 key
-  and 48 value heads, hidden 5120) on two or four ranks, MTP. Refused: MoE models, a masked drafter
-  (DFlash, DFlash2), `--stage-layers`, Hadamard-rotated weights, Vision overlay, Flash-Next, Gemma 4,
-  Flint and DeepSeek-V4.1-Flash. Native Q4/Q5/Q8/T2, NVFP4 and FP8 GDN projections have kernels registered only for the
-  whole layer and are refused at preparation. Ranks may share a device (`--devices 0,0`), which is
-  how the path is tested on one card.
-- **Kernels at the share shapes**, registered next to the whole-layer ones and qualified by the op
-  tests: the convolution split (`Rows1024x1024x3072`, `Rows512x512x1536`), the projected
-  convolution (5120 and 2560 channels), the replay record and fold (8x24 and 4x12 heads).
+- **Coverage.** Every weight format of a dense Qwen3.5-core model: GGUF, BF16, row-split
+  Q4/Q5/Q6/Q8 and T2, FP8 and NVFP4, Hadamard-rotated or not; any split the stored blocks allow on
+  two to eight ranks, cards of different models where the build runs on each; MTP, the masked
+  drafters (DFlash, DFlash2: rank 0's replica after each layer is the residual one device taps) and
+  Vision (on rank 0). A share's projections have no tuned shapes, so they take Linear's
+  runtime-shape routes (the shape tables' kernel templates with the rows and K read from the
+  operands; FP8 and NVFP4 with A16 compute whatever the policy): the GDN input projection as parts,
+  one Linear per piece into the q/k/v and z planes; gate and up as two FP32 products that SwiGLU
+  rounds once; the output and down projections as FP32 partials. A rotated share turns its whole
+  input, or its own 1024-column blocks of it, with its slice of the sign vector
+  (`WeightUse::hadamard_begin`) in its own device's copy (`AuxiliaryReplicas`), so a rank reads no
+  other card's memory. Refused: MoE models,
+  `--stage-layers`, `--vision-residency overlay` (as for pipeline stages), Flash-Next, Gemma 4, Flint
+  and DeepSeek-V4.1-Flash. Ranks may share a device (`--devices 0,0`), which is how the path is
+  tested on one card.
+- **Kernels at the share shapes.** The convolution split, the projected convolution and the replay
+  record and fold keep the whole-layer geometries as template constants and take any other share's
+  rows and heads at run time (`CausalConvSplitGeometry`, `ProjectedConvRows`, `FoldGeometryDynamic`);
+  the op tests qualify halves, quarters and uneven shares (three key heads with nine value heads,
+  five with ten).
 
 Measured on Qwen3.8-27B GSQ-RCO IQ3_S (2026-10-25, `scripts/pods/serve_ab.py`, greedy, four short
 prompts of 256 tokens, two passes and two server starts per configuration, plus one 7,014-token
@@ -283,12 +313,32 @@ prompt). Every run gave one device's answers.
   TTFT is 83-116 ms against 53-57 ms, since every layer of a chunk crosses the bus twice. Four
   ranks on the two cards (`--devices 0,1,0,1`) decode at 71-72 tok/s, and at 80.5-116.3 with MTP,
   below one card's 89-134: a check of the four-rank shares, not a four-card measurement.
+- **Uneven shares on the same kind of pair** (Vast 2x RTX 3090, mapped host transport, 2026-10-26;
+  the same four prompts and a 7,054-token one, two passes per configuration). One card 56.5-57.3
+  tok/s. The automatic split put 6.35 GiB on rank 0 (which also holds attention and the head) and
+  4.64 GiB on rank 1 and decoded at 72.7-75.6, as the equal `--tensor-split 1,1` (70.8-75.4).
+  `--tensor-split 3,1` decodes at 59.5-61.2 (+5% to +7%): the larger share sets the pace.
+  `--devices 0,0,1` with the automatic split (two ranks on one card) decodes at 70.8-73.2, and
+  prefills the long prompt at 799-904 tok/s against 1,550-1,574. Every answer matched one card's.
 - **2x Tesla V100-SXM2-32GB** (Vast, NVLink, so peer reads; the sm_70 routes). Decode 60.2-60.4
   tok/s against 43.9 on one card (+37%); with `NINFER_FORCE_STAGED_LINKS=1` the mapped host
   transport gives 54.6-55.0 (+25%). With MTP 83.4-122.3 against 58.1-87.1 (+29% to +44%). Over
   NVLink prefill gains as well: the 7,014-token prompt runs at 1,300 tok/s against 865-867 (+50%),
   decode after it at 58.3 against 42.9 (+36%), and a 40-token prompt's TTFT is 113-135 ms against
   129-130 ms.
+- **Other weight formats on 2x RTX 3090** (Vast, PCIe 4.0 x16 on one NUMA node, no peer access, so
+  the mapped host transport; 2026-10-26; the four short prompts and a 7,054-token one, one pass per
+  configuration). The official Qwen3.8-27B (row-split Q4/Q5) with `--tensor-split 1,1` decodes at
+  59.7-60.0 tok/s against 46.9-47.4 on one card (+26% to +27%), and at 56.6 against 45.3 after the
+  long prompt (+25%). Prefill loses: the long prompt runs at 1,219 tok/s against 1,572 (-22%), and a
+  short prompt's TTFT is 105-140 ms against 82-95 ms. With `--spec dflash2 --draft-tokens 7` the
+  pair is slower than one card, 56.9-181.0 tok/s against 63.2-197.9 (-8% to -10%): a verify round
+  is a narrow prefill. Ternary Bonsai 2 27B (T2) does not gain: 87.9-88.8 tok/s against 90.1-91.0
+  (-2% to -3%), 119.5-330.2 against 131.1-356.6 with DFlash2 (-4% to -11%), and the long prompt
+  prefills at 1,373 tok/s against 2,737 (-50%). One card runs Bonsai's projections on the A8
+  integer route of their tuned shapes, where a share takes the A16 runtime-shape route. The 27B
+  pair gave one card's answer on one prompt of five and Bonsai's pair on three of five; the others
+  part after 260-510 characters into different, coherent text.
 
 What the transport costs was measured before this was built:
 

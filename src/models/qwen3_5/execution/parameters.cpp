@@ -130,11 +130,13 @@ public:
                is_gguf(input.weight.parts.front().parent->geometry.format);
     }
 
+    // GGUF gate and up, joined or two parents; or a tensor-parallel rank's rows of gate and up,
+    // two device objects of any format (ops::linear_swiglu's two-parent form).
     DenseParameters dense(const DenseWeights& w) const {
-        if (const auto gate = model_.rotated_input(w.gate); gguf(gate)) {
+        const auto gate = model_.rotated_input(w.gate);
+        const auto up   = model_.rotated_input(w.up);
+        if (const std::array inputs{gate, up}; gguf(gate) || !ops::joins(inputs)) {
             return with_context(model_.weight(w.gate).name, [&] {
-                const auto up = model_.rotated_input(w.up);
-                const std::array inputs{gate, up};
                 DenseParameters out;
                 if (ops::joins(inputs)) {
                     out.gate_up = ops::prepare_linear_swiglu_weight(gate, up);
@@ -148,11 +150,7 @@ public:
             });
         }
         DenseParameters out{with_context(model_.weight(w.gate).name,
-                                         [&] {
-                                             return ops::prepare_linear_swiglu_weight(
-                                                 model_.rotated_input(w.gate),
-                                                 model_.rotated_input(w.up));
-                                         }),
+                                         [&] { return ops::prepare_linear_swiglu_weight(gate, up); }),
                             rotated_linear(w.down)};
         integer_route(out.gate_up, QType::Q4_G64_FP16, 34816, 5120);
         // The Q4 down projection (Q4 imatrix recipes) reaches the same A8 add route as Q5.
@@ -520,7 +518,8 @@ Parameters::Parameters(const Model& source) : model(source) {
         text.layers.back().rank = w.text.stages.placement(static_cast<std::uint32_t>(i)).stage;
     }
     if (!w.text.rank_layers.empty()) {
-        text.rank_count = w.text.rank_layers.size() + 1;
+        text.rank_count    = w.text.rank_layers.size() + 1;
+        text.tensor_shares = w.text.tensor_shares;
         text.rank_layers.resize(w.text.rank_layers.size());
         for (std::size_t r = 0; r < w.text.rank_layers.size(); ++r) {
             text.rank_layers[r].reserve(w.text.rank_layers[r].size());

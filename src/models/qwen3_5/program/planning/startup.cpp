@@ -172,11 +172,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             }
         }
         for (std::size_t rank = 0; rank < ranks; ++rank) {
-            state_shards.push_back({.rank        = rank,
-                                    .first_layer = 0,
-                                    .layers      = config.linear_attention_layers,
-                                    .part        = static_cast<std::uint32_t>(rank),
-                                    .parts       = static_cast<std::uint32_t>(ranks)});
+            const TextConfig share =
+                qwen3_5::tensor_parallel_share(config, parameters.text.tensor_shares.at(rank));
+            state_shards.push_back(
+                {.rank          = rank,
+                 .first_layer   = 0,
+                 .layers        = config.linear_attention_layers,
+                 .part          = static_cast<std::uint32_t>(rank),
+                 .value_heads   = dimension(share.gdn->linear_num_value_heads),
+                 .conv_channels = dimension(share.gdn->conv_channels())});
         }
     } else {
         std::uint32_t gdn_index = 0;
@@ -248,19 +252,28 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         // A stage records only the GDN layers it holds, in its own device's memory; a
         // tensor-parallel rank only its heads.
         for (std::size_t shard = 0; shard < state_shards.size(); ++shard) {
-            const auto parts              = static_cast<std::int32_t>(state_shards[shard].parts);
+            // A tensor-parallel shard's own heads and channels, else the whole layer's.
+            const StateImageShard& part = state_shards[shard];
+            const std::int32_t value_heads =
+                part.value_heads != 0
+                    ? part.value_heads
+                    : (config.gdn ? dimension(config.gdn->linear_num_value_heads) : 0);
+            const std::int32_t ratio =
+                config.gdn ? dimension(config.gdn->linear_num_value_heads /
+                                       config.gdn->linear_num_key_heads)
+                           : 1;
             GdnReplayRecordLayout records = plan_gdn_replay_records(
-                *builder_pointers[state_shards[shard].rank],
+                *builder_pointers[part.rank],
                 GdnReplayRecordSpec{
-                    .layers          = static_cast<std::int32_t>(state_shards[shard].layers),
+                    .layers          = static_cast<std::int32_t>(part.layers),
                     .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
                     .width           = static_cast<std::int32_t>(widest_verify_window(plan) + 1U),
                     .conv_channels =
-                        (config.gdn ? dimension(config.gdn->conv_channels()) / parts : 0),
-                    .qk_heads =
-                        (config.gdn ? dimension(config.gdn->linear_num_key_heads) / parts : 0),
-                    .value_heads =
-                        (config.gdn ? dimension(config.gdn->linear_num_value_heads) / parts : 0),
+                        part.conv_channels != 0
+                            ? part.conv_channels
+                            : (config.gdn ? dimension(config.gdn->conv_channels()) : 0),
+                    .qk_heads    = value_heads / ratio,
+                    .value_heads = value_heads,
                     .key_dim     = (config.gdn ? dimension(config.gdn->linear_key_head_dim) : 0),
                     .value_dim   = (config.gdn ? dimension(config.gdn->linear_value_head_dim) : 0),
                 });
@@ -468,8 +481,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t max_width,
                                  ops::CausalAttentionExecutionEnvelope envelope) {
         const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
-        for (const auto& block : parameters.text.layers) {
-            {
+        // A tensor-parallel rank's share of a layer has no attention (rank 0 runs it alone), and its
+        // GDN and FFN output projections write FP32 partials instead of adding to the residual.
+        const bool partial = parameters.text.tensor_parallel();
+        const auto residual_scratch = [&](const execution::LinearParameters& p) {
+            if (partial) {
+                linear_scratch(layout, p, first, last);
+            } else {
+                add_scratch(layout, p, first, last, wide_verification);
+            }
+        };
+        const auto plan_block = [&](const execution::BlockParameters& block, bool attention_runs) {
+            if (attention_runs || std::holds_alternative<execution::GdnParameters>(block.mixer)) {
                 auto stage = layout.scope();
                 if (const auto* attention =
                         std::get_if<execution::AttentionParameters>(&block.mixer)) {
@@ -512,16 +535,24 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                             first, last));
                     }
                     (void)workspace::gdn_normalized_output(layout, config, last);
-                    add_scratch(layout, gdn.output, first, last, wide_verification);
+                    residual_scratch(gdn.output);
                 }
             }
             auto stage = layout.scope();
             (void)workspace::post_mixer_hidden(layout, config, last);
             const bool verify = phase == TextPhase::Verify;
-            scratch(layout, std::max(execution::ffn_workspace_bytes(block.ffn, first, last, false,
-                                                                    verify, wide_verification),
-                                     execution::ffn_workspace_bytes(block.ffn, first, last, false,
-                                                                    verify, false)));
+            scratch(layout,
+                    std::max(execution::ffn_workspace_bytes(block.ffn, first, last, false, verify,
+                                                            wide_verification, partial),
+                             execution::ffn_workspace_bytes(block.ffn, first, last, false, verify,
+                                                            false, partial)));
+        };
+        for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
+            plan_block(parameters.text.layers[layer], true);
+            // Every rank's scratch has rank 0's size, so it holds the largest share's needs.
+            for (const auto& rank_layers : parameters.text.rank_layers) {
+                plan_block(rank_layers[layer], false);
+            }
         }
         // A prompt chunk projects only its last column through the head; a verify round projects
         // every column.
@@ -967,9 +998,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         "stage boundary workspace");
         // With a masked drafter a later stage also keeps a copy of each tapped layer's output until
         // it has crossed, and rank 0 receives them one at a time into one residual's room; the
-        // stage with the most taps sets the size.
+        // stage with the most taps sets the size. Tensor-parallel ranks tap rank 0's replica.
         const auto& draft = parameters.model.config().draft;
-        if (plan.features.masked_draft() && draft) {
+        if (plan.features.masked_draft() && draft && !parameters.text.tensor_parallel()) {
             std::size_t widest = 0;
             for (std::size_t stage = 1; stage < parameters.text.rank_count; ++stage) {
                 widest = std::max(
@@ -1108,9 +1139,6 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 15) {
             throw std::invalid_argument("masked draft window must be in [1,15]");
-        }
-        if (parameters.text.tensor_parallel()) {
-            throw std::invalid_argument("--tensor-parallel does not run a masked drafter");
         }
         break;
     case SpeculativeBackend::DSpark:

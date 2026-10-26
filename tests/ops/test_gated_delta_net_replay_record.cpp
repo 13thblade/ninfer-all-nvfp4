@@ -333,9 +333,12 @@ int main() {
         failures += run_case(48, width, 8, valid, 1760U + width);
     }
     failures += run_case(48, 5, 3, {5, 3, 1}, 1791U);
-    // A 27B layer's share on each of two and four tensor-parallel ranks.
+    // Tensor-parallel shares: a 27B layer's half and quarter, three key heads with nine value
+    // heads, and five with ten.
     failures += run_case(24, 6, 4, {6, 2, 5, 1}, 1793U, 8);
     failures += run_case(12, 16, 2, {16, 9}, 1795U, 4);
+    failures += run_case(9, 6, 3, {6, 1, 4}, 1797U, 3);
+    failures += run_case(10, 16, 2, {11, 16}, 1799U, 5);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";
     return failures == 0 ? 0 : 1;
 }

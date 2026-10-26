@@ -294,21 +294,21 @@ std::uint64_t GdnConfig::conv_channels() const {
                                  value_width(), "GDN convolution channels");
 }
 
-TextConfig tensor_parallel_share(const TextConfig& text, std::size_t ranks) {
-    if (ranks < 2) { throw std::invalid_argument("tensor parallelism needs two or more devices"); }
+TextConfig tensor_parallel_share(const TextConfig& text, const TensorShare& share) {
     const auto* dense = std::get_if<DenseConfig>(&text.ffn);
-    if (dense == nullptr) {
-        throw std::invalid_argument("tensor parallelism supports models with a dense FFN");
+    if (dense == nullptr || !text.gdn) {
+        throw std::invalid_argument("tensor parallelism supports GDN models with a dense FFN");
     }
-    if (!text.gdn || text.gdn->linear_num_key_heads % ranks != 0 ||
-        text.gdn->linear_num_value_heads % ranks != 0 || dense->intermediate_size % ranks != 0) {
-        throw std::invalid_argument("--tensor-parallel " + std::to_string(ranks) +
-                                    " does not divide the GDN heads and FFN rows");
+    if (share.key_head_begin >= share.key_head_end ||
+        share.key_head_end > text.gdn->linear_num_key_heads || share.ffn_begin >= share.ffn_end ||
+        share.ffn_end > dense->intermediate_size) {
+        throw std::invalid_argument("a tensor-parallel share lies outside the GDN heads or FFN rows");
     }
-    TextConfig out = text;
-    out.gdn->linear_num_key_heads /= static_cast<std::uint32_t>(ranks);
-    out.gdn->linear_num_value_heads /= static_cast<std::uint32_t>(ranks);
-    std::get<DenseConfig>(out.ffn).intermediate_size /= static_cast<std::uint32_t>(ranks);
+    const std::uint32_t ratio = text.gdn->linear_num_value_heads / text.gdn->linear_num_key_heads;
+    TextConfig out            = text;
+    out.gdn->linear_num_key_heads   = share.key_head_end - share.key_head_begin;
+    out.gdn->linear_num_value_heads = out.gdn->linear_num_key_heads * ratio;
+    std::get<DenseConfig>(out.ffn).intermediate_size = share.ffn_end - share.ffn_begin;
     return out;
 }
 

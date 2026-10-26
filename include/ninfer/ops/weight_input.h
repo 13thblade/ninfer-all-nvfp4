@@ -39,24 +39,25 @@ struct PairedProjectionWeights {
     Tensor hadamard_signs{};
 };
 
-// A fused input projection over GGUF matrices, whose logical parts may sit in different parents
-// of different block types. Each part is rows of one parent landing at `row` of output `output`:
-// for a GDN projection 0 = q/k/v and 1 = z; for an attention projection 0 = query, 1 = gate,
-// 2 = key and 3 = value.
-struct GgufProjectionPart {
+// An input projection over parts that no single native route reads as one parent: GGUF matrices,
+// which may sit in different parents of different block types, or a tensor-parallel rank's pieces
+// of BF16, row-split, FP8 or NVFP4 projections. Each part is rows of one parent landing at `row` of
+// output `output`: for a GDN projection 0 = q/k/v and 1 = z; for an attention projection 0 = query,
+// 1 = gate, 2 = key and 3 = value. The parts are all GGUF or all of the other formats.
+struct ProjectionPart {
     Weight weight;
     std::int32_t output = 0;
     std::int32_t row    = 0;
 };
 
-struct GgufProjectionWeights {
-    std::vector<GgufProjectionPart> parts;
+struct PartProjectionWeights {
+    std::vector<ProjectionPart> parts;
     LinearPolicy policy = LinearPolicy::A16Only;
     Tensor hadamard_signs{};
 };
 
 using ProjectionWeights =
-    std::variant<SingleProjectionWeight, PairedProjectionWeights, GgufProjectionWeights>;
+    std::variant<SingleProjectionWeight, PairedProjectionWeights, PartProjectionWeights>;
 
 // Whether the rows of `inputs`, in order, are one contiguous region of one parent.
 [[nodiscard]] bool joins(std::span<const WeightInput> inputs);

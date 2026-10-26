@@ -7,10 +7,12 @@ namespace ninfer::models::qwen3_5::execution {
 
 class NativeExpertRuntime;
 
-// `verify` selects the Verify-phase gate_up policy (DenseParameters::verify_gate_up_policy).
+// `verify` selects the Verify-phase gate_up policy (DenseParameters::verify_gate_up_policy);
+// `partial`, a tensor-parallel share writing its down projection as an FP32 partial (ffn below).
 [[nodiscard]] std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
                                               std::int32_t last, bool mtp = false,
-                                              bool verify = false, bool wide_verification = false);
+                                              bool verify = false, bool wide_verification = false,
+                                              bool partial = false);
 // `wide_verification` keeps the neural path's residual activation precision in a wide single-row
 // copy verification (see residual_projection_policy). With `partial`, a dense FFN writes its down
 // projection to that FP32 [hidden, T] matrix instead of adding it to `residual` (a tensor-parallel

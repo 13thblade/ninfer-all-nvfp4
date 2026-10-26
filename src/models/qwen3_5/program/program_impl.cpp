@@ -166,8 +166,12 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
         for (std::size_t rank = 1; rank < stages; ++rank) {
             runtime->forward.emplace_back(device, 0, rank, residual);
         }
-        auto& tp = runtime->tensor_parallel.emplace();
-        tp.shard = qwen3_5::tensor_parallel_share(parameters.model.config().text, stages);
+        auto& tp  = runtime->tensor_parallel.emplace();
+        tp.shares = text.tensor_shares;
+        for (const TensorShare& share : tp.shares) {
+            tp.shards.push_back(
+                qwen3_5::tensor_parallel_share(parameters.model.config().text, share));
+        }
         tp.exchange = std::make_unique<TensorParallelExchange>(
             device, TensorParallelExchangeOptions{.slot_bytes   = columns * hidden * sizeof(float),
                                                   .force_staged = force_staged});

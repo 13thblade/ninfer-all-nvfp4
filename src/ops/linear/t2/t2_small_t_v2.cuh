@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -107,12 +108,22 @@ __device__ __forceinline__ void t2_v2_b_fragment(const uint4& xa, const uint4& x
     b1                      = __byte_perm(source.z, source.w, sel);
 }
 
-template <class Schedule>
+template <class Out>
+__device__ __forceinline__ Out t2_small_t_v2_store(float value) {
+    if constexpr (std::is_same_v<Out, float>) {
+        return value;
+    } else {
+        return __float2bfloat16_rn(value);
+    }
+}
+
+// `Out` is BF16, or FP32 for a tensor-parallel rank's partial sum.
+template <class Schedule, class Out = __nv_bfloat16>
 __global__ __launch_bounds__(Schedule::kThreads,
                              resident_ctas_bound(Schedule::kThreads, Schedule::kMinBlocks)) void
 t2_small_t_v2_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out, std::int32_t rows,
+    const std::uint8_t* __restrict__ scales, Out* __restrict__ out, std::int32_t rows,
     std::int32_t k, std::int32_t cols) {
     constexpr int kTpw    = Schedule::kTilesPerWarp;
     constexpr int kNt     = Schedule::kColumnTiles;
@@ -319,15 +330,15 @@ t2_small_t_v2_kernel(
                 }
                 const int col = nt * 8 + 2 * lid;
                 if (col < cols) {
-                    out[static_cast<std::int64_t>(col) * rows + row] = __float2bfloat16_rn(sum.x);
+                    out[static_cast<std::int64_t>(col) * rows + row] = t2_small_t_v2_store<Out>(sum.x);
                     out[static_cast<std::int64_t>(col) * rows + row + 8] =
-                        __float2bfloat16_rn(sum.z);
+                        t2_small_t_v2_store<Out>(sum.z);
                 }
                 if (col + 1 < cols) {
                     out[static_cast<std::int64_t>(col + 1) * rows + row] =
-                        __float2bfloat16_rn(sum.y);
+                        t2_small_t_v2_store<Out>(sum.y);
                     out[static_cast<std::int64_t>(col + 1) * rows + row + 8] =
-                        __float2bfloat16_rn(sum.w);
+                        t2_small_t_v2_store<Out>(sum.w);
                 }
             }
         }

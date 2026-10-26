@@ -841,11 +841,14 @@ int main(int argc, char** argv) {
     failures += run_case({48, 48, 10240}, 8, 2, {8, 3}, 1871U, false, 16);
     failures += run_case({48, 48, 10240}, 8, 8, {0, 1, 2, 3, 4, 5, 7, 8}, 1873U, true, 16);
     failures += run_case({30, 32, 8192}, 8, 2, {5, 8}, 1875U, false, 16);
-    // A 27B layer's share on each of two and four tensor-parallel ranks.
+    // Tensor-parallel shares, folded with the geometry passed at run time: a 27B layer's half and
+    // quarter, three key heads with nine value heads, and five with ten.
     failures += run_case({4, 24, 5120, 8}, 6, 4, {0, 2, 5, 6}, 1881U, true);
     failures += run_case({4, 24, 5120, 8}, 16, 2, {16, 7}, 1883U);
     failures += run_case({4, 12, 2560, 4}, 6, 4, {6, 1, 3, 0}, 1885U, true);
     failures += run_case({4, 12, 2560, 4}, 16, 2, {9, 16}, 1887U);
+    failures += run_case({3, 9, 1920, 3}, 6, 3, {6, 2, 4}, 1889U, true);
+    failures += run_case({3, 10, 2560, 5}, 16, 2, {13, 16}, 1891U);
     failures += run_record_fold_rounds<16>();
     failures += run_record_fold_rounds<32>();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";

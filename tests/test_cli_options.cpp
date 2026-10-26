@@ -517,6 +517,24 @@ int run_tests() {
                           }),
                           "--tensor-parallel without several devices was accepted");
     }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1",
+                             "--tensor-parallel", "--tensor-split", "3,1.5"})
+                              .tensor_split == std::vector<double>{3.0, 1.5},
+                      "--tensor-split did not reach the options");
+    for (const std::vector<std::string>& split :
+         {std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1,2,3"},
+          std::vector<std::string>{"--tensor-split", "1,1"},
+          std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1,0"},
+          std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1,"},
+          std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1,x"}}) {
+        failures += check(rejects([&] {
+                              std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt",
+                                                            "hello", "--devices", "0,1"};
+                              args.insert(args.end(), split.begin(), split.end());
+                              (void)parse(args);
+                          }),
+                          "a malformed or misplaced --tensor-split was accepted");
+    }
     failures += check(parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
                              "--draft-tokens", "3", "--mtp-attention-window", "2048"})
                               .speculative.mtp_attention_window == 2048,

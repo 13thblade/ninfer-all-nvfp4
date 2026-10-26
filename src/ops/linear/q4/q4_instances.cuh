@@ -6,6 +6,11 @@ using GemvR4W1 =
     Q4A16GemvSchedule<4, 1, 16, 1, Q4GemvActivationAccess::Direct, Q4GemvLaneMapping::PackedWord8,
                       Q4GemvDecodeMode::Fp16Mantissa, Q4GemvCodeTransfer::AsyncVector16,
                       Q4GemvScaleAccess::SharedPair32, Cache::ca, 0, 1>;
+// GemvR1W8K5120 with K read from the operands: the decode GEMV of a runtime shape.
+using GemvR1W8 =
+    Q4A16GemvSchedule<1, 8, 16, 1, Q4GemvActivationAccess::Direct, Q4GemvLaneMapping::PackedByte2,
+                      Q4GemvDecodeMode::ScalarInteger, Q4GemvCodeTransfer::SyncVector16,
+                      Q4GemvScaleAccess::Scalar16Shuffle, Cache::ca, 0, 1>;
 using GemvR1W8K5120 =
     Q4A16GemvSchedule<1, 8, 16, 1, Q4GemvActivationAccess::Direct, Q4GemvLaneMapping::PackedByte2,
                       Q4GemvDecodeMode::ScalarInteger, Q4GemvCodeTransfer::SyncVector16,
