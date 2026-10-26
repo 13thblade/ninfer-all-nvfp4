@@ -12,8 +12,8 @@ the fork's git history remains the authoritative record.
 | --- | --- |
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
-| Base commit | `a53a4f3342c06f7977a045d54b372a7c1253afb3` (upstream master) |
-| Upstream sync | `f2675499` merged upstream `63428ac2`; `63b68fdc` merged `b3402a6f`; `121f8283` merged `a53a4f33`. The fork was cut at `e1f2d961` and has since taken `9456cb7a`, `230ef895`, `63428ac2`, `6826ac0e`, `d3b2475c`, `63b2b236`, `b3402a6f`, `7cf5b2ae`, `9d99efe7`, `710df200`, `8508dfd6`, `9b60d333`, `7c80f155`, `3f2b59ca`, `6ab3e660`, `e58e7279` and `a53a4f33` |
+| Base commit | `3d882fc116941d9233c40bf30f4d66dbaa3d24bd` (upstream master) |
+| Upstream sync | four merges: `f2675499` took `63428ac2`, `63b68fdc` took `b3402a6f`, `121f8283` took `a53a4f33`, `78a5bbc9` took `3d882fc1`. The fork was cut at `e1f2d961`; the commits between those bases are recorded by the merge commits themselves |
 | Fork repository | https://github.com/13thblade/ninfer-all-nvfp4 |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
 
@@ -36,6 +36,8 @@ the fork's git history remains the authoritative record.
 | `03b78d67` | 2026-10-26 | fix(deepseek_v41): take pi from a local constant, as the RoPE schedule does |
 | `ae484558` | 2026-10-26 | docs(license): rebase the modification record onto upstream b3402a6f |
 | `121f8283` | 2026-10-26 | Merge upstream master a53a4f33 into the fork |
+| `78a5bbc9` | 2026-10-26 | Merge upstream master 3d882fc1 into the fork |
+| `9b3614e7` | 2026-10-26 | docs(readme): point the throughput table at its source model cards |
 
 `03b78d67` no longer shows in the file lists below: upstream `7cf5b2ae` fixed
 the same defect and the merge `121f8283` took upstream's side, so the fork keeps
@@ -43,11 +45,10 @@ no change to that file.
 
 The two nvfp4 commits above are master's own history. The branches carried for
 review against upstream are rebased equivalents of them on top of the current
-base: `pr/nvfp4-w4a16` = `b76d912e` and `pr/nvfp4-w4a8-int` = `5dc9e11d`.
-Neither rebase changed a patch-id: `b76d912e` still hashes to the same patch-id
-as `7b084383`, and `5dc9e11d` to the same one as `05c47ff8`, which itself differs
-from `c45859ff` only in the three `ffn()` files named below, and there by the
-same bytes master already carried.
+base: `pr/nvfp4-w4a16` = `18491bed` and `pr/nvfp4-w4a8-int` = `220dbfb1`.
+Neither branch is in master's ancestry; their content is. `220dbfb1` carries the
+same patch-id as `05c47ff8` across both later rebases, and `18491bed` differs
+from `b76d912e` only by the `gguf_only` gate named below.
 
 ## Change summary
 
@@ -86,8 +87,18 @@ which is both the standard spelling and already the convention in this repo's
 tests. The merge `121f8283` therefore takes upstream's side and retires the
 fork's patch, so the file is no longer a fork modification.
 
+The merge `78a5bbc9` conflicted once, on the calibration driver
+`src/calibration/device_calibration.cu`, which is where the nvfp4 keys enter the
+device route profile. Upstream wrapped the groupwise family into a block that
+also runs its new `gguf_vector`, `gguf_moe_vector` and `gguf_moe_up`
+calibrations and gated `linear_attention` on the run's `gguf_only` filter. The
+resolution keeps upstream's block whole, re-adds the fork's nvfp4 line after it
+and gates that line the same way as its siblings. One behaviour follows from
+that: a calibration run restricted with `--only gguf_*` no longer also measures
+the nvfp4 family, which the fork's line had previously done by oversight.
+
 The lists below are generated from `git diff --name-status upstream/master..HEAD`
-with `upstream/master` at `a53a4f33`. Files marked as modified are upstream
+with `upstream/master` at `3d882fc1`. Files marked as modified are upstream
 files changed by this fork; files marked as added are new in this fork.
 
 ## Modified files (106)
