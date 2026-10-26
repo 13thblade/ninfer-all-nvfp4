@@ -16,14 +16,8 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 ## What's New
 
-- **2026-10-26:** DeepSeek-V4.1-Flash's decode runs the attention output's eight head groups as one grouped product and reads the hyper-connections' rows with loads ahead ([the decode step](docs/deepseek-v41.md#the-decode-step-on-one-rtx-4090)): 38.9 tok/s on one RTX 4090, from 35.4, and 39.9 with DSpark, from 36.9, with the same tokens and log probabilities.
-- **2026-10-26:** DeepSeek-V4.1-Flash's decode spreads two kernels that ran on a few SMs over the whole card ([the decode step](docs/deepseek-v41.md#the-decode-step-on-one-rtx-4090)): 35.4 tok/s on one RTX 4090, from 30.7, and 36.9 with DSpark, from 34.1, with the same tokens and log probabilities.
-- **2026-10-26:** DeepSeek-V4.1-Flash's CPU threads compute a [share of each decode call's missing experts](docs/deepseek-v41.md#the-cpu-share) in host memory, bit for bit the GPU's products: 30.7 tok/s on one RTX 4090, from 27.0, and 34.1 with DSpark. The GPU's IQ1_S, IQ1_M and IQ2_XXS vector products now round as the CPU's do, which changes those models' outputs.
-- **2026-10-26:** DeepSeek-V4.1-Flash drafts with the release's [DSpark drafter](docs/deepseek-v41.md#the-dspark-drafter) (`--spec dspark`): 83 tok/s on one RTX PRO 6000, from 51, and 34 on one RTX 4090 with the CPU share, from 31.
-- **2026-10-26:** Token log probabilities of verification rows and of concurrent requests have the bits of a lone decode row's: the reduction over the vocabulary splits every row the same way.
-- **2026-10-25:** Fixed a race in the expert cache of host and disk experts: a decode miss could overwrite a lent slot its own call still read, which [changed DeepSeek-V4.1-Flash's log probabilities by up to 0.024](docs/deepseek-v41.md#prompt-spans) after an earlier request.
-- **2026-10-25:** DeepSeek-V4.1-Flash prefills in [spans of up to 16,384 tokens](docs/deepseek-v41.md#prompt-spans): 925 tok/s for 8,086 tokens on an RTX 4090, from 498.
-- **2026-10-25:** [DeepSeek-V4.1-Flash](docs/deepseek-v41.md) from ISTA-DASLab's GSQ-RCO IQ1_M GGUF, experts in host memory or on disk: [48 tok/s on one RTX PRO 6000, 26 on one RTX 4090](docs/performance.md#deepseek-v41-flash).
+- **2026-10-26:** DeepSeek-V4.1-Flash decodes [39 tok/s on one RTX 4090](docs/deepseek-v41.md#the-decode-step-on-one-rtx-4090), with CPU threads [computing part of the missing experts](docs/deepseek-v41.md#the-cpu-share), and 83 tok/s on one RTX PRO 6000 with the release's [DSpark drafter](docs/deepseek-v41.md#the-dspark-drafter).
+- **2026-10-25:** [DeepSeek-V4.1-Flash](docs/deepseek-v41.md) from ISTA-DASLab's GSQ-RCO IQ1_M GGUF, experts in host memory or on disk: [48 tok/s on one RTX PRO 6000, 26 on one RTX 4090](docs/performance.md#deepseek-v41-flash), [prefill 925 tok/s](docs/deepseek-v41.md#prompt-spans) on the RTX 4090.
 - **2026-10-25:** `--tensor-parallel` for dense Qwen3.5-core models.
 - **2026-10-24:** [Flint](docs/flint.md#measurements) decodes 348 tok/s on an RTX 5090 and 210 on an RTX 4090 with host experts.
 - **2026-10-23:** [Flint](docs/flint.md) from Unsloth's UD-Q4_K_XL GGUF.
