@@ -67,6 +67,20 @@ class ArtifactBackupTest(unittest.TestCase):
             BACKUP.archive(api, self.manifest, self.revision, "123")
         self.assertFalse(any(key.endswith("/COMPLETE.json") for key in api.files))
 
+    def test_failure_reports_hub_status_without_urls(self):
+        class Response:
+            status_code = 403
+            def __init__(self, body): self.body = body
+            def json(self):
+                if self.body is None: raise ValueError("not JSON")
+                return self.body
+        class HubError(Exception):
+            def __init__(self, body): self.response = Response(body)
+        quota = HubError({"error": "Storage limit reached, see https://hub.example/x?sig=secret"})
+        self.assertEqual(BACKUP.failure(quota), "HubError, HTTP 403: Storage limit reached, see <url>")
+        self.assertEqual(BACKUP.failure(HubError(None)), "HubError, HTTP 403")
+        self.assertEqual(BACKUP.failure(ValueError("https://hub.example/x")), "ValueError")
+
     def test_wrong_revision_and_local_corruption_are_not_uploaded(self):
         api = Bucket()
         with self.assertRaises(ValueError):
