@@ -162,15 +162,15 @@ public:
     [[nodiscard]] std::uint32_t position(std::uint32_t sequence) const;
 
     // Prompt tokens one forward() may take: prefill_chunk, or with layer-major spans (one stage,
-    // GGUF host experts) several chunks, which forward() runs layer by layer so that each layer's
-    // uncached experts cross the bus once for all of them.
+    // GGUF host or disk experts) several chunks, which forward() runs layer by layer so that each
+    // layer's uncached experts cross the bus once for all of them, a media prompt's as a text
+    // prompt's.
     [[nodiscard]] std::uint32_t prompt_step() const noexcept;
-    // Runs `tokens` (at most prompt_step(); beyond prefill_chunk not a media prompt's) at the
-    // sequence's next positions and leaves the logits of the last `logit_rows` of them in
-    // logits(), BF16 [vocab, logit_rows] on the head device. Work is queued on the device
-    // streams; logits() is ready on head_stream(). Once the table rows of `tokens` are read, the
-    // rows of `next` (the known tokens that follow, at most prompt_step()) are hinted, to be
-    // read while the device runs `tokens`.
+    // Runs `tokens` (at most prompt_step()) at the sequence's next positions and leaves the
+    // logits of the last `logit_rows` of them in logits(), BF16 [vocab, logit_rows] on the head
+    // device. Work is queued on the device streams; logits() is ready on head_stream(). Once the
+    // table rows of `tokens` are read, the rows of `next` (the known tokens that follow, at most
+    // prompt_step()) are hinted, to be read while the device runs `tokens`.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::span<const std::int32_t> next = {});
     // Branches of a sequence in one pass, each from the state `at` (a snapshot of the sequence):

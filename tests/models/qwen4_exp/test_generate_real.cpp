@@ -16,7 +16,9 @@
 //   NINFER_QWEN4_EXP_NGRAM_RESIDENCY  disk | ram | ram-hot (default disk); ram-hot takes the
 //                                     profile NINFER_QWEN4_EXP_NGRAM_PROFILE and 4 GiB of RAM
 //   NINFER_QWEN4_EXP_NGRAM_IO  buffered | direct | mmap (default buffered)
-//   NINFER_QWEN4_EXP_PREFILL_CHUNK  tokens per prefill call (default 512)
+//   NINFER_QWEN4_EXP_PREFILL_CHUNK  the prefill chunk (default 512); a prompt goes in calls of the
+//                                   executor's prompt_step(), as the Engine feeds it: spans of up
+//                                   to eight chunks with host experts on one device
 //   NINFER_QWEN4_EXP_EXPERT_CACHE_MIB  host or disk experts: the device expert cache (default: what
 //                                      the devices have free)
 #include "artifact/reader.h"
@@ -111,8 +113,9 @@ std::vector<std::vector<int>> generate(const Model& model, DeviceContext& device
         const auto ids = tokenizer.encode(prompt.text, {.parse_added_tokens = true});
         std::vector<std::int32_t> tokens(ids.begin(), ids.end());
         const auto prefill_start = Clock::now();
-        for (std::size_t at = 0; at < tokens.size(); at += options.prefill_chunk) {
-            const std::size_t n = std::min<std::size_t>(options.prefill_chunk, tokens.size() - at);
+        const std::size_t step = executor.prompt_step();
+        for (std::size_t at = 0; at < tokens.size(); at += step) {
+            const std::size_t n = std::min<std::size_t>(step, tokens.size() - at);
             executor.forward(0, std::span(tokens).subspan(at, n), 1);
         }
         read_logits(executor, logits);
@@ -163,13 +166,15 @@ std::vector<std::vector<int>> generate(const Model& model, DeviceContext& device
     return out;
 }
 
-// Prefills `text` into `sequence` and returns its first greedy token.
+// Prefills `text` into `sequence`, prompt_step() tokens a call as the Engine feeds a prompt, and
+// returns its first greedy token.
 int prefill(Executor& executor, const Model& model, std::uint32_t sequence, const std::string& text,
-            std::uint32_t chunk, std::vector<__nv_bfloat16>& logits) {
+            std::vector<__nv_bfloat16>& logits) {
     const auto ids = model.resources().tokenizer->encode(text, {.parse_added_tokens = true});
     const std::vector<std::int32_t> tokens(ids.begin(), ids.end());
-    for (std::size_t at = 0; at < tokens.size(); at += chunk) {
-        const std::size_t n = std::min<std::size_t>(chunk, tokens.size() - at);
+    const std::size_t step = executor.prompt_step();
+    for (std::size_t at = 0; at < tokens.size(); at += step) {
+        const std::size_t n = std::min<std::size_t>(step, tokens.size() - at);
         executor.forward(sequence, std::span(tokens).subspan(at, n), 1);
     }
     read_logits(executor, logits);
@@ -207,16 +212,15 @@ int check_batch_and_snapshot(const Model& model, DeviceContext& device, Executor
     for (std::uint32_t s = 0; s < texts.size(); ++s) {
         executor.reset(s);
         alone.push_back(decode_alone(executor, model, s,
-                                     prefill(executor, model, s, texts[s], options.prefill_chunk,
-                                             logits),
-                                     kSteps, logits));
+                                     prefill(executor, model, s, texts[s], logits), kSteps,
+                                     logits));
     }
     std::vector<std::vector<int>> together(texts.size()), first_batch;
     for (int repetition = 0; repetition < 2; ++repetition) {
         together.assign(texts.size(), {});
         for (std::uint32_t s = 0; s < texts.size(); ++s) {
             executor.reset(s);
-            together[s].push_back(prefill(executor, model, s, texts[s], options.prefill_chunk, logits));
+            together[s].push_back(prefill(executor, model, s, texts[s], logits));
         }
         const std::size_t domain = model.resources().public_token_count;
         std::vector<__nv_bfloat16> batch_logits(logits.size() * texts.size());
@@ -252,7 +256,7 @@ int check_batch_and_snapshot(const Model& model, DeviceContext& device, Executor
     // A snapshot after the prompt, a detour of decode steps, then the restored sequence.
     SequenceSnapshot snapshot;
     executor.reset(0);
-    const int first = prefill(executor, model, 0, texts[0], options.prefill_chunk, logits);
+    const int first = prefill(executor, model, 0, texts[0], logits);
     executor.snapshot(0, snapshot);
     const auto before = decode_alone(executor, model, 0, first, kSteps, logits);
     executor.restore(0, snapshot);
@@ -349,8 +353,7 @@ int check_speculative(const Model& model, DeviceContext& device, ExecutorOptions
     for (std::size_t i = 0; i < prompts.size(); ++i) {
         const auto prompt_start = Clock::now();
         executor.reset(0);
-        std::vector<std::vector<int>> rows{
-            {prefill(executor, model, 0, prompts[i].text, options.prefill_chunk, logits)}};
+        std::vector<std::vector<int>> rows{{prefill(executor, model, 0, prompts[i].text, logits)}};
         const std::uint32_t sequence = 0;
         std::uint64_t prompt_drafted = 0, prompt_accepted = 0;
         decode_speculative(executor, model, std::span(&sequence, 1), rows, int(plain[i].size()),
@@ -367,8 +370,8 @@ int check_speculative(const Model& model, DeviceContext& device, ExecutorOptions
                           std::string::npos;
         speculative.push_back(rows[0]);
         executor.reset(0);
-        std::vector<std::vector<int>> repeated{{prefill(executor, model, 0, prompts[i].text,
-                                                       options.prefill_chunk, logits)}};
+        std::vector<std::vector<int>> repeated{
+            {prefill(executor, model, 0, prompts[i].text, logits)}};
         std::uint64_t ignored = 0, kept = 0;
         decode_speculative(executor, model, std::span(&sequence, 1), repeated, int(plain[i].size()),
                            ignored, kept);
@@ -385,8 +388,7 @@ int check_speculative(const Model& model, DeviceContext& device, ExecutorOptions
     {
         std::uint64_t ignored = 0, kept = 0;
         executor.reset(0);
-        const int first =
-            prefill(executor, model, 0, prompts[0].text, options.prefill_chunk, logits);
+        const int first = prefill(executor, model, 0, prompts[0].text, logits);
         SequenceSnapshot snapshot;
         executor.snapshot(0, snapshot);
         const std::uint32_t sequence = 0;
@@ -414,8 +416,7 @@ int check_speculative(const Model& model, DeviceContext& device, ExecutorOptions
     std::vector<std::vector<int>> rows;
     for (std::uint32_t s = 0; s < 2; ++s) {
         executor.reset(s);
-        rows.push_back(
-            {prefill(executor, model, s, prompts[s].text, options.prefill_chunk, logits)});
+        rows.push_back({prefill(executor, model, s, prompts[s].text, logits)});
     }
     const std::vector<std::uint32_t> both{0, 1};
     std::array<SequenceSnapshot, 2> snapshots;
@@ -454,7 +455,7 @@ int check_images(const Model& model, DeviceContext& device, ExecutorOptions opti
     std::vector<__nv_bfloat16> logits(model.config().vocab_size);
     int failures = 0;
     executor.reset(0);
-    const int first = prefill(executor, model, 0, prompts[0].text, options.prefill_chunk, logits);
+    const int first = prefill(executor, model, 0, prompts[0].text, logits);
     SequenceSnapshot snapshot;
     executor.snapshot(0, snapshot);
     const std::uint32_t position = executor.position(0);

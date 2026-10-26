@@ -714,6 +714,8 @@ struct Executor::Impl {
     static constexpr std::uint32_t kSpanChunks = 8;
     std::uint32_t span_tokens = 0;
     DeviceBuffer span_stack, span_positions, span_rope, span_rows;
+    // With the Vision tower: a media prompt's three-axis positions, [3, chunk] per chunk.
+    DeviceBuffer span_mrope;
     // A span's n-gram rows, read in one batch while its layers before the first PLE layer run.
     std::unique_ptr<PinnedHostBuffer> span_host_rows;
     std::vector<std::uint64_t> span_row_ids;
@@ -728,6 +730,9 @@ struct Executor::Impl {
     DeviceBuffer span_ids, span_weights, span_shared, span_y;
     // A span's chunk before its last runs a layer's experts: the pool keeps that layer's experts.
     bool span_hold = false;
+    // A span's last chunk runs a layer's experts: the disk cache releases the layer's experts the
+    // span's earlier chunks read and this one does not route to.
+    bool span_last = false;
 
     // Vision (a model loaded with its tower), on rank 0 beside the token embedding: the encoder's
     // workspace, whose handoff region receives one item at a time, and the merged embeddings of
@@ -1654,14 +1659,20 @@ struct Executor::Impl {
             if (options.expert_cache_bytes == 0) {
                 throw std::invalid_argument("disk-resident experts need a device expert cache");
             }
+            // One call routes at most a chunk's tokens: a span's chunks prepare one by one.
+            const std::size_t widest_call =
+                std::size_t(config.num_experts_per_tok) * options.prefill_chunk;
             std::vector<ExpertStreamLayer> stream_layers;
-            for (const auto& [plan, moe] : expert) {
+            for (std::size_t i = 0; i < expert.size(); ++i) {
+                const auto& [plan, moe] = expert[i];
                 stream_layers.push_back(ExpertStreamLayer{
-                    .rank    = plan->rank,
-                    .stream  = ranks[plan->rank].stream,
-                    .experts = {moe->located_gate, moe->located_up, moe->located_down},
-                    .tables  = {plan->moe.gate.table.p, plan->moe.up.table.p,
-                                plan->moe.down.table.p}});
+                    .rank        = plan->rank,
+                    .stream      = ranks[plan->rank].stream,
+                    .experts     = {moe->located_gate, moe->located_up, moe->located_down},
+                    .tables      = {plan->moe.gate.table.p, plan->moe.up.table.p,
+                                    plan->moe.down.table.p},
+                    .widest_call = widest_call,
+                    .own_pool    = i >= layers.size()});
             }
             stream = std::make_unique<ExpertStream>(device, model.files(), std::move(stream_layers),
                                                     bytes);
@@ -1741,7 +1752,7 @@ struct Executor::Impl {
             if (cache) {
                 layer.resident = cache->storage(i);
             } else if (stream) {
-                layer.resident[0] = stream->storage(plan->rank);
+                layer.resident[0] = stream->storage(i);
             }
             out.push_back(std::move(layer));
         }
@@ -2752,11 +2763,26 @@ struct Executor::Impl {
             CUDA_CHECK(cudaMemcpyAsync(host, ids.data, std::size_t(top) * t * 4,
                                        cudaMemcpyDeviceToHost, s));
             CUDA_CHECK(cudaStreamSynchronize(s));
-            stream->prepare(index, std::span<const std::int32_t>(host, std::size_t(top) * t));
+            stream->prepare(index, std::span<const std::int32_t>(host, std::size_t(top) * t),
+                            span_last);
         }
         Tensor y(rank.y, DType::FP32, {h, t});
         auto scope = ws.scope();
         ops::moe_experts_gguf(mixed, ids, weights, shared, m.banks(), ws, y, s);
+    }
+
+    // The staged tokens' embeddings into `mixed` [hidden, t]: a media prompt's image and video
+    // tokens take the tower's merged embeddings (media_runs, as stage_inputs() left them).
+    void embed(RankState& rank, std::int32_t t, Tensor& mixed) {
+        const auto h = static_cast<std::int32_t>(config.hidden_size);
+        ops::embedding(Tensor(rank.ids, DType::I32, {t}), embedding_table, mixed, rank.stream);
+        for (const MediaRun& run : media_runs) {
+            const Tensor source(static_cast<std::byte*>(vision_embeddings.p) +
+                                    std::size_t(run.source) * std::size_t(h) * 2,
+                                DType::BF16, {h, run.count});
+            const Tensor columns(rank.scatter + run.offset, DType::I32, {run.count});
+            ops::scatter(source, columns, mixed, rank.stream);
+        }
     }
 
     // Queues one segment of the pass for the parts' `t` tokens on its rank's stream; with `head`,
@@ -2769,16 +2795,7 @@ struct Executor::Impl {
         Tensor stack(rank.stack, DType::FP32, {h, hc, t});
         Tensor mixed(rank.mixed, DType::BF16, {h, t});
         if (segment.embed) {
-            const Tensor ids(rank.ids, DType::I32, {t});
-            ops::embedding(ids, embedding_table, mixed, rank.stream);
-            // A media prompt's image and video tokens take the tower's merged embeddings.
-            for (const MediaRun& run : media_runs) {
-                const Tensor source(static_cast<std::byte*>(vision_embeddings.p) +
-                                        std::size_t(run.source) * std::size_t(h) * 2,
-                                    DType::BF16, {h, run.count});
-                const Tensor columns(rank.scatter + run.offset, DType::I32, {run.count});
-                ops::scatter(source, columns, mixed, rank.stream);
-            }
+            embed(rank, t, mixed);
             ops::hyper_connection_expand(mixed, stack, rank.stream);
         }
         // A layer's MoE output is written into the stack by the next layer's read, which takes
@@ -2969,24 +2986,28 @@ struct Executor::Impl {
         }
     }
 
-    // The tokens a prompt span takes, 0 without spans. Spans need one device and GGUF host
-    // experts, whose wide calls copy every uncached expert of a layer into the pool: per span
-    // instead of per chunk.
+    // The tokens a prompt span takes, 0 without spans. Spans need one device and GGUF experts off
+    // the GPU: a host layer's wide calls copy every uncached expert of the layer into the pool,
+    // and a disk layer's read the ones its slots lack, which the chunks before them in the span
+    // left there; per span instead of per chunk.
     [[nodiscard]] std::uint32_t planned_span_tokens() const {
         const bool native = std::any_of(layers.begin(), layers.end(),
                                         [](const LayerPlan& plan) { return plan.moe.native.has_value(); });
         // One device: its segments split only where the PLE layer's rows arrive.
         const bool one_rank = std::all_of(segments.begin(), segments.end(),
                                           [](const Segment& segment) { return segment.rank == 0; });
-        if (model.options().experts != ExpertResidency::Host || native || !one_rank) { return 0; }
+        if (model.options().experts == ExpertResidency::Device || native || !one_rank) { return 0; }
         const std::uint32_t tokens =
             std::min<std::uint32_t>(options.max_context, kSpanChunks * options.prefill_chunk);
         return tokens > options.prefill_chunk ? tokens : 0;
     }
 
-    // The chunks one expert call of a span's expert phase takes: as many as kGroupTokens holds.
+    // The chunks one expert call of a span's expert phase takes: as many as kGroupTokens holds,
+    // with host experts, whose groups run from the pool.
     [[nodiscard]] std::uint32_t planned_group_chunks() const {
-        if (planned_span_tokens() == 0) { return 1; }
+        if (planned_span_tokens() == 0 || model.options().experts != ExpertResidency::Host) {
+            return 1;
+        }
         return std::clamp<std::uint32_t>(kGroupTokens / options.prefill_chunk, 1, kSpanChunks);
     }
 
@@ -3003,6 +3024,10 @@ struct Executor::Impl {
         span_inject    = DeviceBuffer(std::size_t(tokens) * config.hc_count * 4);
         std::uint64_t bytes = span_stack.bytes + span_positions.bytes + span_rope.bytes +
                               span_mixed.bytes + span_inject.bytes;
+        if (vision_context) {
+            span_mrope = DeviceBuffer(std::size_t(tokens) * 3 * 4);
+            bytes += span_mrope.bytes;
+        }
         if (table) {
             span_row_bytes = std::size_t(config.ngram_heads()) *
                              ops::ngram_row_bytes(options.ngram->format);
@@ -3094,10 +3119,6 @@ struct Executor::Impl {
         if (start + n > options.max_context) {
             throw std::invalid_argument("qwen4_exp forward: the sequence exceeds max_context");
         }
-        const std::size_t prompt = sequence.media_rope.size() / 3;
-        if (prompt != 0 && start < prompt) {
-            throw std::invalid_argument("qwen4_exp forward: a media prompt prefills chunk by chunk");
-        }
         const std::size_t chunks = (n + c - 1) / c;
         const auto last_count    = static_cast<std::uint32_t>(n - (chunks - 1) * c);
         check_tokens(tokens.subspan((chunks - 1) * c), logit_rows);
@@ -3126,6 +3147,8 @@ struct Executor::Impl {
                                  [](const Segment& segment) { return segment.rows; });
         const std::size_t heads = config.ngram_heads();
         if (reads_rows) { span_row_ids.resize(n * heads); }
+        // Which chunks of a media prompt rotate at its three-axis positions (span_mrope).
+        std::vector<char> chunk_mrope(chunks, 0);
         for (std::size_t k = 0; k < chunks; ++k) {
             const std::int32_t t = count_of(k);
             const Part part{.sequence = &sequence, .column = 0, .count = t};
@@ -3135,7 +3158,7 @@ struct Executor::Impl {
                           span_row_ids.begin() + std::ptrdiff_t(k * c * heads));
             }
             Tensor mixed(rank.mixed, DType::BF16, {h, t});
-            ops::embedding(Tensor(rank.ids, DType::I32, {t}), embedding_table, mixed, st);
+            embed(rank, t, mixed);
             Tensor stack(chunk_stack(k), DType::FP32, {h, hc, t});
             ops::hyper_connection_expand(mixed, stack, st);
             CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_positions.p) + k * c,
@@ -3143,6 +3166,12 @@ struct Executor::Impl {
                                        cudaMemcpyDeviceToDevice, st));
             CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_rope.p) + k * c, rank.rope,
                                        std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
+            if (mrope) {
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_mrope.p) + 3 * k * c,
+                                           rank.mrope, 3 * std::size_t(t) * 4,
+                                           cudaMemcpyDeviceToDevice, st));
+                chunk_mrope[k] = 1;
+            }
             sequence.position += std::uint32_t(t);
         }
         sequence.position = start;
@@ -3182,6 +3211,12 @@ struct Executor::Impl {
                     CUDA_CHECK(cudaMemcpyAsync(rank.rope,
                                                static_cast<std::int32_t*>(span_rope.p) + k * c,
                                                std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
+                    mrope = chunk_mrope[k] != 0;
+                    if (mrope) {
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            rank.mrope, static_cast<std::int32_t*>(span_mrope.p) + 3 * k * c,
+                            3 * std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
+                    }
                     if (plan.ple) {
                         CUDA_CHECK(cudaMemcpyAsync(rank.rows,
                                                    static_cast<std::byte*>(span_rows.p) +
@@ -3223,6 +3258,7 @@ struct Executor::Impl {
                     rank.stack = chunk_stack(k);
                     chunk_planes(k);
                     span_hold = last < chunks;
+                    span_last = last == chunks;
                     Tensor stack(rank.stack, DType::FP32, {h, hc, t});
                     Tensor inject(rank.inject, DType::FP32, {hc, t});
                     if (last == k + 1) {
@@ -3248,6 +3284,7 @@ struct Executor::Impl {
                 }
             }
             span_hold   = false;
+            span_last   = false;
             rank.mixed  = own_mixed;
             rank.inject = own_inject;
             // The head reads the last chunk's last rows.
@@ -3282,6 +3319,7 @@ struct Executor::Impl {
             rank.mixed  = own_mixed;
             rank.inject = own_inject;
             span_hold   = false;
+            span_last   = false;
             throw;
         }
         rank.stack = own_stack;
