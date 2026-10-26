@@ -277,18 +277,18 @@ that comparison's RTX 4090 host, with and without [the CPU share](#the-cpu-share
 | RTX PRO 6000 | none | 50.8 tok/s | 48.3 tok/s | 1,210 tok/s | |
 | | `--spec dspark` | 83.1 tok/s | 75.0 tok/s | 1,290 tok/s | 38 of 58, 16 of 26 |
 | | `--spec dspark --draft-tokens 3` | 83.3 tok/s | 77.0 tok/s | 1,290 tok/s | 37 of 53, 16 of 24 |
-| RTX 4090, CPU share | none | 30.7 tok/s | 25.6 tok/s | 931 tok/s | |
-| | `--spec dspark` | 34.1 tok/s | 29.6 tok/s | 691 tok/s | 43 of 68, 16 of 31 |
-| RTX 4090, `--expert-dma-share 1` | none | 27.0 tok/s | 22.7 tok/s | 925 tok/s | |
-| | `--spec dspark` | 22.7 tok/s | 18.7 tok/s | 686 tok/s | 43 of 68, 16 of 31 |
+| RTX 4090, CPU share | none | 35.4 tok/s | 29.0 tok/s | 935 tok/s | |
+| | `--spec dspark` | 36.9 tok/s | 31.5 tok/s | 692 tok/s | 43 of 68, 16 of 31 |
+| RTX 4090, `--expert-dma-share 1` | none | 30.7 tok/s | 24.9 tok/s | 927 tok/s | |
+| | `--spec dspark` | 24.2 tok/s | 19.6 tok/s | 688 tok/s | 43 of 68, 16 of 31 |
 
 - **A card that caches most experts gains.** With the drafter the RTX PRO 6000 keeps 10,317 of the
   15,360 experts on the card (11,387 without) and decodes 1.6 times as fast after the short prompt
   and 1.55 times after the long one; three drafts a round decode as fast as five.
 - **A 24 GB card gains with the CPU share.** With the drafter the RTX 4090 keeps 73 experts on the
   card (1,137 without), so nearly every expert a round's rows route to is missing. With the CPU
-  share the drafter decodes 1.11 and 1.16 times as fast as plain decoding; copying every miss it
-  decodes 16% and 18% slower. Either way prefill slows by 26%, in spans of 8,192 tokens. On the
+  share the drafter decodes 1.04 and 1.09 times as fast as plain decoding; copying every miss it
+  decodes 21% slower. Either way prefill slows by 26%, in spans of 8,192 tokens. On the
   same host Strata's `--dspark on` decodes at 34.3 and 38.7 tok/s
   ([above](#against-strata-on-one-host)).
 - **Strata on the RTX PRO 6000.** Strata 0.2.6 exited with `router picked expert 2147483647` in
@@ -342,10 +342,10 @@ decoding, thinking off, the same prompt tokens in both engines: a 14-token quest
 
 | engine and settings | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens |
 |---|---:|---:|---:|
-| NInfer, host experts | 30.7 tok/s | 25.6 tok/s | 931 tok/s |
-| NInfer, host experts, `--expert-dma-share 1` | 27.0 tok/s | 22.7 tok/s | 925 tok/s |
+| NInfer, host experts | 35.4 tok/s | 29.0 tok/s | 935 tok/s |
+| NInfer, host experts, `--expert-dma-share 1` | 30.7 tok/s | 24.9 tok/s | 927 tok/s |
 | NInfer `b3402a6fd`, host experts | 25.8 tok/s | 22.1 tok/s | 498 tok/s |
-| NInfer, host experts, `--spec dspark` | 34.1 tok/s | 29.6 tok/s | 691 tok/s |
+| NInfer, host experts, `--spec dspark` | 36.9 tok/s | 31.5 tok/s | 692 tok/s |
 | Strata, `--dspark auto --dspark-conf 0.65` | 36.0 tok/s | 38.4 tok/s | 635 tok/s |
 | Strata, `--dspark on --dspark-conf 0.65` | 34.3 tok/s | 38.7 tok/s | 690 tok/s |
 | Strata, `--dspark on --dspark-conf 0.65 --dspark-block 3` | 39.9 tok/s | 37.1 tok/s | 660 tok/s |
@@ -355,15 +355,17 @@ decoding, thinking off, the same prompt tokens in both engines: a 14-token quest
 
 - **Decode.** Strata computes the experts its VRAM cache misses on CPU threads beside the GPU:
   12,396 of the 20,400 expert products of its first short answer (61%) and 3,921 of 7,440 after
-  the long prompt (53%). NInfer's device cache serves 65 to 74% of the decode routes; its CPU share
-  computes 15 to 21% and the GPU copies the rest ([the CPU share](#the-cpu-share-on-one-rtx-4090)).
-  With all six experts and no drafts Strata decodes 1.17 times as fast after the short prompt and
-  1.50 times after the long one; with both engines' drafters, 1.17 and 1.31 times.
+  the long prompt (53%). NInfer's device cache serves 62 to 72% of the decode routes; its CPU share
+  computes 16 to 22% and the GPU copies the rest ([the CPU share](#the-cpu-share-on-one-rtx-4090)).
+  With all six experts and no drafts Strata decodes 1.02 times as fast after the short prompt and
+  1.32 times after the long one; with both engines' drafters, Strata's fastest setting for each
+  prompt decodes 1.08 and 1.23 times as fast as `--spec dspark`
+  ([the decode step](#the-decode-step-on-one-rtx-4090) shows where NInfer's time goes).
 - **Prefill.** Strata prefills in windows of 16,384 tokens; NInfer runs the 8,086 tokens as one
   [prompt span](#prompt-spans), 1.9 times the release's rate.
 - **Drafts.** With `--dspark on`, Strata accepted 22 of 30 drafts on the short answer and 10 of 12
   on the long one; `--dspark auto` offered none. NInfer's `--spec dspark` accepted 43 of 68 and
-  16 of 31 ([the drafter](#the-dspark-drafter)) and decodes 1.11 and 1.16 times as fast as without
+  16 of 31 ([the drafter](#the-dspark-drafter)) and decodes 1.04 and 1.09 times as fast as without
   drafts.
 - **Repeatability.** Strata's greedy answers to the short prompt ran 74 to 119 tokens over its six
   runs. NInfer's greedy tokens were the same in every run, in both builds, and so were the current
@@ -383,26 +385,27 @@ model file in the page cache:
 
 | experts | `--expert-dma-share` | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens |
 |---|---|---:|---:|---:|
-| host | `auto` | 30.7 tok/s | 25.6 tok/s | 931 tok/s |
-| host | `1` (every miss copied) | 27.0 tok/s | 22.7 tok/s | 925 tok/s |
-| host | `0` (every miss on the CPU) | 25.3 tok/s | 20.7 tok/s | 928 tok/s |
-| disk | `auto` (every miss copied) | 16.0 tok/s | 12.2 tok/s | 625 tok/s |
-| disk | `0` | 2.8 tok/s | 1.9 tok/s | |
-| disk | `0`, `--expert-cpu-threads 8` | 6.2 tok/s | | |
+| host | `auto` | 35.4 tok/s | 29.0 tok/s | 935 tok/s |
+| host | `1` (every miss copied) | 30.7 tok/s | 24.9 tok/s | 927 tok/s |
+| host | `0` (every miss on the CPU) | 28.1 tok/s | 21.8 tok/s | 933 tok/s |
+| disk | `auto` (every miss copied) | 16.8 tok/s | 12.8 tok/s | 625 tok/s |
+| disk | `0` | 2.9 tok/s | 1.9 tok/s | 523 tok/s |
+| disk | `0`, `--expert-cpu-threads 8` | 6.3 tok/s | | |
 
-- **Host experts.** The split by measured speeds decodes 1.14 and 1.13 times as fast as copying
-  every miss; with every miss on the CPU decode is 6 to 9% slower than copying. Prefill does not
-  use the CPU.
+- **Host experts.** The split by measured speeds decodes 1.15 and 1.16 times as fast as copying
+  every miss; with every miss on the CPU decode is 8% and 12% slower than copying. Prefill does
+  not use the CPU.
 - **Where the routes go.** Two servers with a request log decoded 400 tokens after each prompt
-  (`ignore_eos`), at 28.1 and 22.9 tok/s copying every miss and 31.7 and 27.4 tok/s with `auto`.
+  (`ignore_eos`), at 32.0 and 25.5 tok/s copying every miss and 36.9 and 31.0 tok/s with `auto`.
   Over the decode intervals the device cache served 72 to 74% of the routes after the short prompt
-  and 67 to 73% after the long one, and the GPU copied 0.49 and 0.61 to 0.67 GB per token; with
-  `auto` the cache served 69 to 72% and 65 to 73%, the CPU computed 15 to 17% and 20 to 21%, and
-  the GPU copied 0.25 and 0.35 GB per token.
+  and 69 to 75% after the long one, and the GPU copied 0.53 to 0.54 and 0.53 to 0.68 GB per token;
+  with `auto` the cache served 69 to 72% and 62 to 69%, the CPU computed 16 to 18% and 19 to 22%,
+  and the GPU copied 0.25 to 0.31 and 0.29 to 0.39 GB per token.
 - **Disk experts.** A build that split disk experts by measured speeds decoded at 3.4 and 2.3 tok/s
-  with 61 threads and 13.0 and 8.5 with 8, against 16.0 and 12.2 copying every miss; with every
-  miss on the CPU, more threads were slower too. The cause of the larger pool's cost is not
-  established. `auto` therefore copies every miss of disk experts.
+  with 61 threads and 13.0 and 8.5 with 8, against 16.0 and 12.2 when that build copied every miss;
+  with every miss on the CPU, more threads were slower too. Prefill, which the CPU share does not
+  compute, ran at 523 tok/s beside the 61-thread pool and 625 tok/s without a pool. The cause of
+  the larger pool's cost is not established. `auto` therefore copies every miss of disk experts.
 - **Outputs.** Every run with a CPU share, host and disk, with and without `--spec dspark`, gave
   the tokens and log probabilities of copying every miss: the 94 tokens of the short answer and the
   32 after the long prompt.
@@ -410,6 +413,38 @@ model file in the page cache:
   with disk experts, with and without the CPU share.
 
 One run per row; no spread is measured.
+
+### The decode step on one RTX 4090
+
+On October 26, Nsight Systems (`nsys profile --trace=cuda --cuda-graph-trace=node`) traced one
+request decoding 200 tokens after the short prompt on the host of the Strata comparison, host
+experts, `auto`, with the build before the two kernels below were spread over the card and with
+the current one. Medians over 190 decode steps:
+
+| | before | current |
+|---|---:|---:|
+| decode step | 36.8 ms | 32.6 ms |
+| waits for missing experts (40 a step) | 12.3 ms | 13.5 ms |
+| other kernels | 19.5 ms | 14.1 ms |
+| GPU idle | 4.8 ms | 5.0 ms |
+| copied to the GPU | 261 MB | 214 MB |
+| `guard_columns`, 483 a step | 6.8 µs each | 2.0 µs each |
+| `hc_split`, 80 a step | 35.2 µs each | 6.8 µs each |
+
+- **Two kernels ran on a few SMs.** `guard_columns` scales each activation column by a power of two
+  before the GGUF products, with a block of 128 threads per column; `hc_split` ran the
+  hyper-connections' 4 × 4 Sinkhorn normalization on one thread. A decode call has one to eight
+  columns, so both left nearly all of the card's 128 SMs idle. A call of up to eight columns now
+  guards each column with one block of up to 1,024 threads, and the Sinkhorn matrix sits on 16
+  lanes of one warp, each lane adding its row or column in the serial loop's order, so every value
+  keeps its bits: greedy tokens and log probabilities equal the previous build's with host and disk
+  experts, with and without the CPU share and `--spec dspark`.
+- **Where the rest goes.** The waits for missing experts take 41% of the step: each of the 40 MoE
+  layers waits for the copies and the CPU share of its misses. The GGUF vector products take
+  7.1 ms (523 a step, 13.5 µs each), the routed expert products 2.5 ms (160 a step), and many small
+  kernels remain: 643 activation quantizations at 1.1 µs and 443 column unscalings at 0.9 µs.
+- **The profiler** slows decode: the two builds decoded at 26.3 and 28.6 tok/s under it, against
+  30.7 and 35.4 without it.
 
 ### Prompt spans
 

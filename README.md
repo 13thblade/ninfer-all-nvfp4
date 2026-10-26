@@ -16,6 +16,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 ## What's New
 
+- **2026-10-26:** DeepSeek-V4.1-Flash's decode spreads two kernels that ran on a few SMs over the whole card ([the decode step](docs/deepseek-v41.md#the-decode-step-on-one-rtx-4090)): 35.4 tok/s on one RTX 4090, from 30.7, and 36.9 with DSpark, from 34.1, with the same tokens and log probabilities.
 - **2026-10-26:** DeepSeek-V4.1-Flash's CPU threads compute a [share of each decode call's missing experts](docs/deepseek-v41.md#the-cpu-share) in host memory, bit for bit the GPU's products: 30.7 tok/s on one RTX 4090, from 27.0, and 34.1 with DSpark. The GPU's IQ1_S, IQ1_M and IQ2_XXS vector products now round as the CPU's do, which changes those models' outputs.
 - **2026-10-26:** DeepSeek-V4.1-Flash drafts with the release's [DSpark drafter](docs/deepseek-v41.md#the-dspark-drafter) (`--spec dspark`): 83 tok/s on one RTX PRO 6000, from 51, and 34 on one RTX 4090 with the CPU share, from 31.
 - **2026-10-26:** Token log probabilities of verification rows and of concurrent requests have the bits of a lone decode row's: the reduction over the vocabulary splits every row the same way.
@@ -194,7 +195,7 @@ conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b
 Ternary Bonsai 2 27B decodes 397 tok/s on an RTX 5090 with DFlash2 and holds a 978,944-token context with
 every planted code found. Qwen3.8-Flash-Next decodes 138 tok/s with every expert on one RTX PRO 6000, and
 74 tok/s with its experts in host memory on one RTX 5090. DeepSeek-V4.1-Flash decodes 48 tok/s on one
-RTX PRO 6000 and 31 tok/s on one RTX 4090 with its 106.7 GiB of experts in host memory. Every table of
+RTX PRO 6000 and 35 tok/s on one RTX 4090 with its 106.7 GiB of experts in host memory. Every table of
 every card is on the [performance page](docs/performance.md).
 
 *Click a section to expand it.*
@@ -288,16 +289,16 @@ the card caches as many as fit:
 | RTX 3090 | | 21.8 | 18.9 | 410 | 7.4 |
 
 These ran prompts chunk by chunk and copied every missing expert to the card. The current build
-prefills the 8,086 tokens in one span at 931 tok/s on the RTX 4090 and has CPU threads compute a
-share of each decode call's missing host experts: 30.7 and 25.6 tok/s there, against 27.0 and 22.7
+prefills the 8,086 tokens in one span at 935 tok/s on the RTX 4090 and has CPU threads compute a
+share of each decode call's missing host experts: 35.4 and 29.0 tok/s there, against 30.7 and 24.9
 when it copies every miss ([the CPU share](docs/deepseek-v41.md#the-cpu-share)). On that RTX 4090
 host Strata 0.2.6 decodes the same GGUF at 34 to 40 tok/s, computing about half the experts on its
 CPU threads, and prefills at 635 to 690 tok/s ([measurements](docs/deepseek-v41.md#measurements)).
 With host experts the server peaks at 116 GiB of host memory. With the release's DSpark drafter
 (`--spec dspark`) the RTX PRO 6000 decodes at 83.1 and 75.0 tok/s, against 50.8 and 48.3 for the
-same build without it (both copying every miss), and the RTX 4090 with the CPU share at 34.1 and
-29.6 tok/s; the drafter's 7.4 GiB shrink the 4090's expert cache, so copying every miss it decodes
-at 22.7 and 18.7 ([the drafter](docs/deepseek-v41.md#the-dspark-drafter)).
+same build without it (both copying every miss), and the RTX 4090 with the CPU share at 36.9 and
+31.5 tok/s; the drafter's 7.4 GiB shrink the 4090's expert cache, so copying every miss it decodes
+at 24.2 and 19.6 ([the drafter](docs/deepseek-v41.md#the-dspark-drafter)).
 
 </details>
 
@@ -359,8 +360,8 @@ at 22.7 and 18.7 ([the drafter](docs/deepseek-v41.md#the-dspark-drafter)).
   routed experts stay in pinned host memory or in the artifact's files, read into bounded
   buffers rather than mapped, and CPU threads compute a share of each decode call's missing host
   experts. Prompts run block by block in spans of up to 16,384 tokens, so each block's experts
-  cross the bus once per span. On one RTX 4090 with its experts in host memory it decodes at 25.6
-  to 30.7 tok/s (29.6 to 34.1 with DSpark) and prefills 8,086 tokens at 931 tok/s; on the same host
+  cross the bus once per span. On one RTX 4090 with its experts in host memory it decodes at 29.0
+  to 35.4 tok/s (31.5 to 36.9 with DSpark) and prefills 8,086 tokens at 935 tok/s; on the same host
   Strata 0.2.6 decodes at 34 to 40 tok/s and prefills at 635 to 690
   ([DeepSeek-V4.1-Flash](docs/deepseek-v41.md)).
 - **CPU share of host and disk experts.** With Flash-Next, Gemma 4, Flint or native Qwen3.5/3.6

@@ -262,47 +262,43 @@ __global__ void hc_split_kernel(HcSplitArgs a) {
         ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
     const float total = block_sum(ss);
-    if (threadIdx.x != 0) { return; }
+    if (threadIdx.x >= 32) { return; }
+    // Warp 0: lane s < S writes pre[s] and post[s], and lane j * S + k holds entry (j, k) of the
+    // Sinkhorn matrix. A lane adds its row's or column's entries in index order, from zero, as one
+    // thread looping over the matrix would, so every entry has that loop's bits.
+    const int lane = int(threadIdx.x);
     const float r  = rsqrtf(total / float(width) + a.norm_eps);
     const int M    = (2 + S) * S;
     const float* m = a.mixes + std::int64_t(t) * M;
-    for (int s = 0; s < S; ++s) {
-        a.pre[t * S + s]  = sigmoid(m[s] * r * a.scale[0] + a.base[s]) + a.hc_eps;
-        a.post[t * S + s] = 2.0f * sigmoid(m[S + s] * r * a.scale[1] + a.base[S + s]);
+    if (lane < S) {
+        a.pre[t * S + lane]  = sigmoid(m[lane] * r * a.scale[0] + a.base[lane]) + a.hc_eps;
+        a.post[t * S + lane] = 2.0f * sigmoid(m[S + lane] * r * a.scale[1] + a.base[S + lane]);
     }
-    float c[kMaxStreams][kMaxStreams];
-    for (int j = 0; j < S; ++j) {
-        float mx = -INFINITY;
-        for (int k = 0; k < S; ++k) {
-            c[j][k] = m[2 * S + j * S + k] * r * a.scale[2] + a.base[2 * S + j * S + k];
-            mx      = fmaxf(mx, c[j][k]);
-        }
-        float sum = 0.0f;
-        for (int k = 0; k < S; ++k) {
-            c[j][k] = expf(c[j][k] - mx);
-            sum += c[j][k];
-        }
-        for (int k = 0; k < S; ++k) { c[j][k] = c[j][k] / sum + a.hc_eps; }
-    }
+    const bool entry = lane < S * S;
+    const int j = entry ? lane / S : 0, k = entry ? lane % S : 0;
+    const auto at = [&](float v, int row, int column) {
+        return __shfl_sync(0xFFFFFFFFu, v, row * S + column);
+    };
+    float c  = entry ? m[2 * S + lane] * r * a.scale[2] + a.base[2 * S + lane] : 0.0f;
+    float mx = -INFINITY;
+    for (int q = 0; q < S; ++q) { mx = fmaxf(mx, at(c, j, q)); }
+    c         = expf(c - mx);
+    float sum = 0.0f;
+    for (int q = 0; q < S; ++q) { sum += at(c, j, q); }
+    c = c / sum + a.hc_eps;
     const auto columns = [&] {
-        for (int k = 0; k < S; ++k) {
-            float sum = 0.0f;
-            for (int j = 0; j < S; ++j) { sum += c[j][k]; }
-            for (int j = 0; j < S; ++j) { c[j][k] = c[j][k] / (sum + a.hc_eps); }
-        }
+        float column = 0.0f;
+        for (int q = 0; q < S; ++q) { column += at(c, q, k); }
+        c = c / (column + a.hc_eps);
     };
     columns();
     for (int it = 1; it < a.iterations; ++it) {
-        for (int j = 0; j < S; ++j) {
-            float sum = 0.0f;
-            for (int k = 0; k < S; ++k) { sum += c[j][k]; }
-            for (int k = 0; k < S; ++k) { c[j][k] = c[j][k] / (sum + a.hc_eps); }
-        }
+        float row = 0.0f;
+        for (int q = 0; q < S; ++q) { row += at(c, j, q); }
+        c = c / (row + a.hc_eps);
         columns();
     }
-    for (int j = 0; j < S; ++j) {
-        for (int k = 0; k < S; ++k) { a.comb[(std::int64_t(t) * S + j) * S + k] = c[j][k]; }
-    }
+    if (entry) { a.comb[std::int64_t(t) * S * S + lane] = c; }
 }
 
 __device__ __forceinline__ float4 mix_streams(const float* h, const float* mix, int streams,
@@ -1095,7 +1091,7 @@ __global__ void engram_gate_kernel(float* __restrict__ h, const float* __restric
 
 // ---- Guards and copies --------------------------------------------------------------------------
 
-constexpr int kGuardThreads = 128;
+constexpr int kGuardThreads = 128, kGuardWideThreads = 1024, kGuardNarrowColumns = 8;
 
 __global__ void guard_columns_kernel(__nv_bfloat16* __restrict__ x, int rows, float* __restrict__ scale) {
     __nv_bfloat16* column = x + std::int64_t(blockIdx.x) * rows;
@@ -1469,7 +1465,11 @@ void engram_gate(float* h, const float* kv, const float* w, int tokens, int stre
 void guard_columns(__nv_bfloat16* x, int rows, int columns, float* scale, cudaStream_t stream) {
     if (rows % 32 != 0) { throw std::invalid_argument("deepseek_v41 guard_columns: rows % 32 != 0"); }
     if (columns <= 0) { return; }
-    guard_columns_kernel<<<columns, kGuardThreads, 0, stream>>>(x, rows, scale);
+    // A decode or verification call's few columns would leave all but a few SMs idle: one wide
+    // block per column instead. A slice's sum and the maximum do not depend on the block's width.
+    const int threads =
+        columns <= kGuardNarrowColumns ? std::min(rows, kGuardWideThreads) : kGuardThreads;
+    guard_columns_kernel<<<columns, threads, 0, stream>>>(x, rows, scale);
     check_launch("guard_columns");
 }
 

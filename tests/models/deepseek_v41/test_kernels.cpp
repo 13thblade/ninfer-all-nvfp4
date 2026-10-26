@@ -22,7 +22,8 @@
 //  - route (ties to the lower id, the softplus branch past 20), clamped_swiglu (the clamps, rows
 //    scaled per token), moe_combine (weighted rows and 2^-32 fixed-point sums).
 //  - engram_rows (IQ4_NL), engram_gate.
-//  - guard_columns and unscale_columns, ring_copy, f32_to_bf16.
+//  - guard_columns (in one call and in calls of six columns) and unscale_columns, ring_copy,
+//    f32_to_bf16.
 //  - the DSpark drafter's: sparse_attention of a draft block (the window and the block's own
 //    rows), stream_mean, markov_step (a chain, ties, the domain) and dspark_confidence.
 //  - the routed experts of a call on the CPU (CpuExperts) against the GPU's vector kernels over
@@ -1587,9 +1588,26 @@ void column_guard(std::mt19937& rng) {
     }
     DeviceBuffer dx = upload(x), ds(std::size_t(columns) * 4);
     k::guard_columns(as<bf16>(dx), rows, columns, as<float>(ds), nullptr);
+    // The same columns in calls of at most six, as decode and verification calls guard theirs
+    // (one wide block per column): the same scales and values.
+    constexpr int narrow = 6;
+    DeviceBuffer nx = upload(x), ns(std::size_t(columns) * 4);
+    for (int c = 0; c < columns; c += narrow) {
+        k::guard_columns(as<bf16>(nx) + std::size_t(c) * rows, rows, std::min(narrow, columns - c),
+                         as<float>(ns) + c, nullptr);
+    }
     sync("guard_columns");
-    const auto got    = download<bf16>(dx, x.size());
-    const auto scale  = download<float>(ds, std::size_t(columns));
+    const auto got          = download<bf16>(dx, x.size());
+    const auto scale        = download<float>(ds, std::size_t(columns));
+    const auto narrow_got   = download<bf16>(nx, x.size());
+    const auto narrow_scale = download<float>(ns, std::size_t(columns));
+    std::size_t narrow_differ = 0;
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        narrow_differ += std::memcmp(&got[i], &narrow_got[i], sizeof(bf16)) != 0 ? 1 : 0;
+    }
+    for (int c = 0; c < columns; ++c) {
+        narrow_differ += scale[std::size_t(c)] != narrow_scale[std::size_t(c)] ? 1 : 0;
+    }
     std::size_t wrong = 0, scaled = 0, judged = 0;
     double after = 0.0;
     for (int c = 0; c < columns; ++c) {
@@ -1631,11 +1649,13 @@ void column_guard(std::mt19937& rng) {
             unscaled_wrong += val(back16[at]) != val(out16[at]) * s ? 1 : 0;
         }
     }
-    report(wrong == 0 && unscaled_wrong == 0 && scaled >= 4 && judged + 2 >= std::size_t(columns) &&
-               after <= double(k::kF16SumLimit),
+    report(wrong == 0 && unscaled_wrong == 0 && narrow_differ == 0 && scaled >= 4 &&
+               judged + 2 >= std::size_t(columns) && after <= double(k::kF16SumLimit),
            "guard_columns " + std::to_string(scaled) + " of " + std::to_string(judged) +
                " judged columns scaled, " + std::to_string(wrong) + " wrong, largest sum after " +
-               num(after) + "; unscale_columns " + std::to_string(unscaled_wrong) + " wrong");
+               num(after) + ", calls of " + std::to_string(narrow) + " columns " +
+               std::to_string(narrow_differ) + " differ; unscale_columns " +
+               std::to_string(unscaled_wrong) + " wrong");
 }
 
 void copies(std::mt19937& rng) {
