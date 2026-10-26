@@ -98,6 +98,19 @@ struct CausalPromptI8FastShape {
 // int4 code is at most 8 in magnitude, so the packed coding allows scales up to 64.
 inline constexpr float kCausalPromptI8FastF16PartialScaleLimit       = 8.0f;
 inline constexpr float kCausalPromptI8FastPackedF16PartialScaleLimit = 64.0f;
+// The rescale that brings the largest finite FP16 scale (65504) under each limit. An infinite V
+// scale (a V value past 127 * 65504, 7 * 65504 for int4 codes, or an infinite one) takes it too and
+// leaves the tile's partials non-finite, as the oracle's are, instead of rescaling forever.
+inline constexpr int kCausalPromptI8FastF16PartialMaxShift       = 13;
+inline constexpr int kCausalPromptI8FastPackedF16PartialMaxShift = 10;
+static_assert(65504.0f / (1 << kCausalPromptI8FastF16PartialMaxShift) <=
+                  kCausalPromptI8FastF16PartialScaleLimit &&
+              65504.0f / (1 << (kCausalPromptI8FastF16PartialMaxShift - 1)) >
+                  kCausalPromptI8FastF16PartialScaleLimit);
+static_assert(65504.0f / (1 << kCausalPromptI8FastPackedF16PartialMaxShift) <=
+                  kCausalPromptI8FastPackedF16PartialScaleLimit &&
+              65504.0f / (1 << (kCausalPromptI8FastPackedF16PartialMaxShift - 1)) >
+                  kCausalPromptI8FastPackedF16PartialScaleLimit);
 
 static_assert(kCausalPromptI8FastBc == kPagedKVPageSize);
 static_assert(kCausalPromptI8FastGroups == 4);
@@ -513,9 +526,11 @@ __global__ __launch_bounds__(
         const float vmax = warp_max(fmaxf(__low2float(vmax2), __high2float(vmax2)), FullMask);
         constexpr float limit = PackedValues ? kCausalPromptI8FastPackedF16PartialScaleLimit
                                              : kCausalPromptI8FastF16PartialScaleLimit;
+        constexpr int max_shift = PackedValues ? kCausalPromptI8FastPackedF16PartialMaxShift
+                                               : kCausalPromptI8FastF16PartialMaxShift;
         tile_shift = 0;
         if (vmax > limit) {
-            while (ldexpf(vmax, -tile_shift) > limit) { ++tile_shift; }
+            while (tile_shift < max_shift && ldexpf(vmax, -tile_shift) > limit) { ++tile_shift; }
         }
         tile_live = true;
     };

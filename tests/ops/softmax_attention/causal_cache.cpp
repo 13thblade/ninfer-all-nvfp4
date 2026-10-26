@@ -47,6 +47,9 @@ constexpr std::int32_t kRk8ValueGroup  = 32;
 constexpr std::int32_t kRk8ValueGroups = kHeadDim / kRk8ValueGroup;
 constexpr float kAttentionScale        = 0.0625f;
 constexpr std::uint16_t kOutputCanary  = 0x7fc1u;
+// BF16 50.0: a canary for cases whose expected outputs are non-finite, which the NaN canary is too.
+constexpr std::uint16_t kFiniteOutputCanary = 0x4248u;
+constexpr std::uint16_t kF16Infinity        = 0x7c00u;
 
 // The Op contract pairs the family/key-plane dtype with the value plane's code dtype
 // (D256KVCacheProfile); the harness names the pair. A DType::U8 value code selects the rk8v4
@@ -3782,6 +3785,126 @@ int run_int8_prompt_cases(bool fast) {
     return failures;
 }
 
+// A V value past the FP16 scale range (|V| above 127 * 65504, 7 * 65504 for int4 codes, or an
+// infinite one, which a fault upstream can leave) stores an infinite group scale. Here every V
+// group scale of kv head 0 at one cached position is infinite, and every query row sees that
+// position, so the oracle's outputs of kv head 0's query heads are non-finite. The kernel must
+// return (the fast prompt kernel once rescaled such a tile forever), write those outputs non-finite
+// and the other heads as the oracle. The output canary is finite, so an unwritten output fails.
+int run_infinite_value_scale_case(const Geometry& geometry, KvCacheStorage storage,
+                                  const AttentionCase& test_case, MappingPattern mapping) {
+    const std::int32_t total       = test_case.base + test_case.tokens;
+    const std::int32_t max_context = static_cast<std::int32_t>(
+        std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
+    const std::size_t q_elements = static_cast<std::size_t>(kHeadDim) *
+                                   static_cast<std::size_t>(geometry.q_heads) *
+                                   static_cast<std::size_t>(test_case.tokens);
+    const std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
+    for (std::int32_t token = 0; token < test_case.tokens; ++token) {
+        positions[static_cast<std::size_t>(token)] = test_case.base + token;
+    }
+    const ops::CausalAttentionExecutionEnvelope envelope{
+        static_cast<std::uint32_t>(total), test_case.envelope_max, test_case.fast_prompt_kernel,
+        test_case.wide_verification, test_case.small_prefill};
+
+    HostCache cache_host = make_cache(geometry, storage, max_context, test_case.seed + 10u);
+    const std::int32_t poisoned = test_case.base / 2;
+    if (cache_host.packed_values()) {
+        for (std::int32_t group = 0; group < kRk8ValueGroups; ++group) {
+            cache_host.v_scale[plane_scale_index(geometry, cache_host.logical_capacity, 0, poisoned,
+                                                 group, cache_host.v_scale_extent())] =
+                kF16Infinity;
+        }
+    } else {
+        for (std::int32_t group = 0; group < kQuantGroups; ++group) {
+            cache_host.v_scale[scale_index(geometry, cache_host.logical_capacity, 0, poisoned,
+                                           group)] = kF16Infinity;
+        }
+    }
+    const std::vector<double> reference = ideal_attention(q, cache_host, positions);
+    DeviceCache cache(cache_host, mapping);
+
+    const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+    GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dp(positions.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer dout(q_bits.size() * sizeof(std::uint16_t));
+    dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+    dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+    std::vector<std::uint16_t> output_canary(q_bits.size(), kFiniteOutputCanary);
+    dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
+
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+    Tensor tp(dp.data(), DType::I32, {test_case.tokens});
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+    const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens);
+    GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+
+    ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry), kAttentionScale,
+                                         cache.view(), envelope, workspace, tout, nullptr);
+    cuda_synchronize();
+
+    const std::string label = case_label("causal_softmax_attention_cached infinite V scale",
+                                         geometry, storage, test_case, mapping);
+    const std::vector<double> output =
+        bf16_bits_to_double(copy_from_guarded<std::uint16_t>(dout, q_bits.size()));
+    std::vector<double> other_output;
+    std::vector<double> other_reference;
+    std::size_t finite        = 0;
+    std::size_t oracle_finite = 0;
+    for (std::int32_t token = 0; token < test_case.tokens; ++token) {
+        for (std::int32_t head = 0; head < geometry.q_heads; ++head) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                const std::size_t index = q_index(geometry, head, d, token);
+                if (head < geometry.query_group()) {
+                    finite += std::isfinite(output[index]) ? 1 : 0;
+                    oracle_finite += std::isfinite(reference[index]) ? 1 : 0;
+                } else {
+                    other_output.push_back(output[index]);
+                    other_reference.push_back(reference[index]);
+                }
+            }
+        }
+    }
+    int failures = 0;
+    if (oracle_finite != 0) {
+        std::cerr << label << ": " << oracle_finite << " oracle outputs of kv head 0 are finite\n";
+        ++failures;
+    }
+    if (finite != 0) {
+        std::cerr << label << ": " << finite << " outputs of kv head 0 are finite\n";
+        ++failures;
+    }
+    failures += verify_attention(label + " other kv heads", other_output, other_reference,
+                                 attention_criterion(storage));
+    failures += dout.verify_guards((label + " output").c_str());
+    failures += workspace_buffer.verify_guards((label + " workspace").c_str());
+    failures += cache.verify_guards(label);
+    return failures;
+}
+
+// Infinite V group scales for one INT8-family prompt kernel: INT8 and packed INT4 values, over a
+// wide launch and a narrow one past a deeper cache.
+int run_infinite_value_scale_cases(bool fast) {
+    const auto with = [fast](AttentionCase test_case) {
+        test_case.fast_prompt_kernel = fast;
+        return test_case;
+    };
+    int failures = 0;
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::Int8Group64, KvCacheStorage::RotatedInt4KeyInt4ValueE8}) {
+        failures += run_infinite_value_scale_case(kGeometries[0], storage,
+                                                  with({300, 700, 1000, 961u}),
+                                                  MappingPattern::Fragmented);
+        failures += run_infinite_value_scale_case(kGeometries[1], storage,
+                                                  with({129, 2000, 2129, 962u}),
+                                                  MappingPattern::Identity);
+    }
+    return failures;
+}
+
 // BF16 values beyond FP16's range. Turing builds run BF16-cache attention on FP16 MMA and stage a
 // tile that holds such a value as BF16 for the exact emulation (common/bf16_attention.cuh): values
 // of up to 2^17 send every tile there, one key of 2^17 its own tile only. Decode, verification and
@@ -4516,7 +4639,9 @@ int run_batch_profile_validation_cases() {
 
 int run_softmax_attention_int8_prompt_tests() {
     if (cuda_unavailable()) return 77;
-    const int failures = run_int8_prompt_cases(false) + run_int8_prompt_cases(true);
+    const int failures = run_int8_prompt_cases(false) + run_int8_prompt_cases(true) +
+                         run_infinite_value_scale_cases(false) +
+                         run_infinite_value_scale_cases(true);
     std::cout << (failures ? "FAIL" : "PASS") << " INT8 prompt-scale causal attention\n";
     return failures ? 1 : 0;
 }
@@ -4525,10 +4650,11 @@ int run_softmax_attention_int8_prompt_tests() {
 // CTAs per row block (main sets NINFER_PROMPT_SPLITS=3 before the first launch), against the FP64
 // oracle: the INT8 prompt cases, rk8v4 and rk4v4 over partial and full row blocks, launches whose
 // early row blocks see fewer key pages than splits (their late splits own no visible key), an
-// envelope far past the populated keys, and masked columns through the batched entry.
+// envelope far past the populated keys, masked columns through the batched entry, and infinite V
+// scales.
 int run_softmax_attention_prompt_split_tests() {
     if (cuda_unavailable()) return 77;
-    int failures    = run_int8_prompt_cases(true);
+    int failures    = run_int8_prompt_cases(true) + run_infinite_value_scale_cases(true);
     const auto fast = [](AttentionCase test_case) {
         test_case.fast_prompt_kernel = true;
         return test_case;
