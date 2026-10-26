@@ -2,9 +2,10 @@
 
 NInfer runs DeepSeek's [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
 (`DeepseekV41ForCausalLM`) from IST Austria's
-[GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) (IQ1_M)
-and its Engram table GGUF (IQ4_NL). It is its own model family next to Qwen3.5, Flash-Next, Gemma 4
-and Flint: its own executor (`src/models/deepseek_v41`) and Engine core
+[GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) (IQ1_M),
+its Engram table GGUF (IQ4_NL) and its vision tower (the repository's BF16 mmproj). It is its own
+model family next to Qwen3.5, Flash-Next, Gemma 4 and Flint: its own executor
+(`src/models/deepseek_v41`) and Engine core
 (`src/runtime/engine/deepseek_v41_core`), sharing the Qwen3.5 frontend for tokenization, chat
 templates, output parsing and the serving protocols in a DeepSeek dialect.
 
@@ -78,33 +79,48 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   rest ([the CPU share](#the-cpu-share)).
 - **The Engram table.** Stored in the model's artifact or in a table artifact of its own, read row
   by row from its file or held in RAM ([below](#the-engram-table)).
+- **Images.** With `--vision`, the release's vision tower turns each picture into a span of prompt
+  positions, prepared as the release's image processor prepares it; the text model routes those
+  positions with the release's image routing bias and leaves them out of the Engram
+  ([below](#images)).
 
 Not built for this family: the quantized `--kv-dtype` formats (the caches are BF16), MTP, DFlash
 and n-gram copy drafts, DSpark drafts while several requests decode, rotation scaling
-(`--rope-yarn`, `--rope-scaling-factor`: the compressed blocks carry the release's own YaRN), images
-and video (the GGUF has no vision tower), pipeline stages and tensor parallelism, and of the context
-cache the shared paged KV pool, the disk tier and session slots.
+(`--rope-yarn`, `--rope-scaling-factor`: the compressed blocks carry the release's own YaRN), video
+and the CPU vision tower, pipeline stages and tensor parallelism, and of the context cache the shared
+paged KV pool, the disk tier and session slots.
 
 ## Converting
 
-The converter reads the weights from the GGUF shards, the Engram GGUF and the drafter GGUF, and the
-tokenizer and configuration from the base release. The release ships no Jinja chat template; the
-converter stores its own transcription of the release's encoder (`tools/convert/templates/deepseek_v41`).
+The converter reads the weights from the GGUF shards, the Engram GGUF, the drafter GGUF and the
+vision tower's mmproj, the tokenizer and configuration from the base release, and the release's
+routing bias of image positions (`layers.N.ffn.gate.bias_vl`, which the GGUF lacks) by byte range
+from the release's safetensors shards (`tools/convert/fetch_tensors.py`, 65 KB of its 48 shards).
+The release ships no Jinja chat template; the converter stores its own transcription of the
+release's encoder (`tools/convert/templates/deepseek_v41`).
 
 ```bash
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 config.json tokenizer.json tokenizer_config.json \
   --local-dir models/deepseek-v4.1/hf
 hf download ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF \
   --include 'DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-*.gguf' \
-  --include 'DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf' --local-dir models/deepseek-v4.1
+  --include 'DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf' \
+  --include 'mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf' --local-dir models/deepseek-v4.1
 hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
   --local-dir models/deepseek-v4.1
+python -m tools.convert.fetch_tensors deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+  --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
+  --match 'layers.*.ffn.gate.bias_vl' --out models/deepseek-v4.1/bias_vl.safetensors
 
-# The model with its DSpark drafter; it names its Engram table by the SHA-256 of the table's rows.
-python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf --components text,dspark \
+# The model with its DSpark drafter and vision tower; it names its Engram table by the SHA-256 of
+# the table's rows.
+python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf \
+  --components text,dspark,vision \
   --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf \
   --source engram=models/deepseek-v4.1/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
   --source dspark=models/deepseek-v4.1/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
+  --source vision=models/deepseek-v4.1/mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf \
+  --source bias_vl=models/deepseek-v4.1/bias_vl.safetensors \
   --name DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M \
   --out models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer --device cpu
 # The Engram table, one artifact for every DeepSeek-V4.1-Flash-1017 conversion.
@@ -114,11 +130,12 @@ python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gg
   --out models/DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer --device cpu
 ```
 
-The model reads the Engram GGUF only for the table's digest. `--components text` leaves the drafter
-out (121,003,660,288 bytes); its other objects are the same bytes either way. The model with its
-drafter is one file of 128,975,327,488 bytes (120.1 GiB), the table one of 110,595,294,496 bytes
-(103.0 GiB). On the 128 threads of two 32-core EPYC engineering samples the model took 3 min 54 s;
-on 24 cores of a Threadripper 3960X the table took 3 min 29 s.
+The model reads the Engram GGUF only for the table's digest. `--components text,dspark` leaves the
+vision tower out and `--components text` the drafter too; the objects they keep are the same bytes
+either way. The model with its drafter and tower is one file of 129,946,453,248 bytes (121.0 GiB),
+of which the tower takes 0.90 GiB; the table is one of 110,595,294,496 bytes (103.0 GiB). On the 96
+threads of a 48-core EPYC 7K62, with a build sharing its CPUs, the model took 9 min 1 s; on 24
+cores of a Threadripper 3960X the table took 3 min 29 s.
 
 ## Running
 
@@ -133,6 +150,9 @@ T=models/DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer
 # A chat server for two concurrent requests over 32K-token contexts, experts in pinned host memory.
 ninfer-serve $M --ngram-table $T --model-id deepseek-v4.1-flash \
   --max-context 32768 --max-concurrency 2 --expert-residency host
+# The same server reading images (OpenAI image_url parts, Anthropic image blocks).
+ninfer-serve $M --ngram-table $T --model-id deepseek-v4.1-flash \
+  --max-context 32768 --max-concurrency 2 --expert-residency host --vision
 
 # One answer from the CLI.
 ninfer $M --ngram-table $T --expert-residency host --prompt "Explain how a heat pump works."
@@ -302,6 +322,43 @@ that comparison's RTX 4090 host, with and without [the CPU share](#the-cpu-share
 
 One run per row; no spread is measured.
 
+## Images
+
+An artifact converted with the release's vision tower (the `vision` component: the mmproj's BF16
+tower and aligner, its preprocessing configuration and the text model's routing bias of image
+positions) reads images with `--vision`:
+
+- **Preprocessing.** As the release's `image_processor.py`: an image of fewer than 295,936 pixels
+  is first scaled up to that area, then sized to whole 14-pixel patches; when its span would
+  take more prompt positions than the budget, it shrinks to the largest grid of 3 × 3-patch cells
+  within it. The image is resized to fit that size with its aspect kept (Pillow's bicubic filter,
+  reproduced bit for bit), centered on gray (127) and scaled to (x / 255 - 0.5) / 0.5.
+- **The prompt.** An image takes a span of `<｜deepseek_image｜>` positions where the user's turn
+  places it: a learned start row, the aligner's cells grid row by grid row, each followed by a
+  learned newline row, and a learned end row, rows × (columns + 1) + 2 positions. The release's
+  budget is 1,024 positions (a 31 × 31-cell grid at most for a square image);
+  `--vision-max-merged N` lowers it, and an image part with `detail: "low"` takes at most a
+  quarter of it.
+- **The tower.** 32 blocks of width 1,024 (16 heads of 64, a SwiGLU MLP of width 2,816, a 2D RoPE
+  over the patch grid) attend over all of an image's patches; after the final norm the aligner
+  projects each 3 × 3 cell of patches through a GELU into the text model's width of 5,120. The
+  matrices multiply BF16 inputs into FP32 sums.
+- **The text model.** The span's rows take the place of the tokens' embeddings. The router adds the
+  release's image routing bias at those positions, and the Engram neither adds rows there nor
+  looks back past them: an n-gram that would reach into an image starts after it.
+- **When it runs.** Each image is encoded once per request, when a prompt chunk first reaches its
+  span, and its rows stay in host memory until the prompt is done. Prefix reuse keys an image by
+  its content and grid, so a cached prompt with another picture at the same place is not reused.
+- **Residency.** `--vision-residency resident` (the default) keeps the tower's 0.90 GiB of BF16
+  matrices on the GPU; `overlay` keeps the 32 blocks' 0.77 GiB in pinned host memory and copies
+  each block's matrices into one of two device slots while the block before computes, the patch
+  projection and the aligner (0.14 GiB) staying on the GPU. Both give the same rows bit for bit.
+  `cpu` is refused: this family's tower runs on the GPU. The device memory either takes comes out
+  of the expert cache (on an RTX 4090 with host experts, 135 of its 1,126 expert slots resident and
+  32 with `overlay`); an encode's 365 MiB of scratch fits in the prompt chunks' workspace.
+
+Not supported with images: video, branched reads and causal scoring.
+
 ## Prefix reuse
 
 With the context cache on (the default), a prompt resumes from a state a sequence or the host store
@@ -371,6 +428,15 @@ decoding, thinking off, the same prompt tokens in both engines: a 14-token quest
   on the long one; `--dspark auto` offered none. NInfer's `--spec dspark` accepted 43 of 68 and
   16 of 31 ([the drafter](#the-dspark-drafter)) and decodes 1.03 and 1.06 times as fast as without
   drafts.
+- **After a long prompt.** NInfer's slower decode after the 8,086 tokens follows the answer's
+  routes, not the context's length. On another RTX 4090 host (EPYC 7K62, PCIe 4.0 x16) with host
+  experts, one server answered in turn a short question (256 tokens), a question about one
+  paragraph of the document (a 250-token prompt), the summary request (400 tokens) and the short
+  question again: 31.0, 28.7, 28.1 and 31.7 tok/s. In every 5-second window of those answers the GPU
+  copied about 78 GB of experts (15.6 GB/s), 516 MB a token for the short answer and 545 to 623 MB
+  for the document's: a summary routes to more experts the device cache lacks. On an RTX 5090 host
+  (PCIe 5.0 x16, a cache of 15% of the experts) the same four answers decoded at 48.5 to 49.6
+  tok/s. Strata copies no missing expert: its CPU threads compute them.
 - **Repeatability.** Strata's greedy answers to the short prompt ran 74 to 119 tokens over its six
   runs. NInfer's greedy tokens were the same in every run, in both builds, and so were the current
   build's log probabilities, with and without the CPU share. The current build's short answer is 94
@@ -494,37 +560,47 @@ that resumes from the 8,084-token state of the second and prefills 16,168 new to
 A second RTX 4090 host (450 W, PCIe 4.0 x16, a 48-core EPYC 7K62, 503 GiB of RAM) ran the span
 build too: with host experts it prefilled 8,086 tokens at 906 tok/s, and with disk experts and the
 model file in the page cache at 390 tok/s and 16,168 more at 610 tok/s, decoding at 9.1 and 7.2
-tok/s. The release build prefilled 8,086 tokens at 490 tok/s with host experts and 123 with disk
-experts on a host of the same type ([per card](#per-card)).
+tok/s. On a host of the same type the release build of `ed8338c52` prefills 8,086 tokens at 915
+tok/s with host experts and 341 with disk experts ([per card](#per-card)).
 
 ### Per card
 
-The same day, one rented host per card ran the native release build of `b3402a6fd` (the CUDA 13.4
-Linux archive; on the hosts' Ubuntu 26.04 with FFmpeg 7.1 from Debian 13), which runs prompts
-chunk by chunk, with the same prompts and `ninfer-serve --max-concurrency 1` on one GPU: host experts first, then disk experts with the model file in the page
-cache. The server sizes the device expert cache to the card; the model has 15,360 routed experts:
+October 26, 2026, one rented host per card ran the native release build of `ed8338c52` (the CUDA
+13.4 Linux archive) with the same prompts and `ninfer-serve --max-context 16384 --max-concurrency 1`
+on one GPU: host experts first, then disk experts with the model file read into the page cache. The
+RTX PRO 6000 row is the release build of `b3402a6fd` on October 25, which ran prompts chunk by chunk
+and copied every miss. The server sizes the device expert cache to the card; the model has 15,360
+routed experts:
 
 | card | host | experts | device cache | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens | ready to serve |
 |---|---|---|---:|---:|---:|---:|---:|
-| RTX PRO 6000 (600 W) | EPYC 9B14, PCIe 5.0 x16 | pinned RAM | 11,401 (74%) | 48.0 tok/s | 45.3 tok/s | 1,310 tok/s | 64 s |
+| RTX 5090 (600 W) | Core Ultra 7 265K, PCIe 5.0 x16 | pinned RAM | 2,236 (15%) | 51.5 tok/s | 42.2 tok/s | 912 tok/s | 25 s |
+| | | disk, page cache warm | 2,266 | 16.7 tok/s | 12.0 tok/s | 440 tok/s | 9 s |
+| RTX 4090 (450 W) | EPYC 7K62, PCIe 4.0 x16 | pinned RAM | 1,126 (7%) | 33.8 tok/s | 27.5 tok/s | 915 tok/s | 34 s |
+| | | disk, page cache warm | 1,156 | 9.5 tok/s | 7.8 tok/s | 341 tok/s | 16 s |
+| RTX 3090 (300 W) | two Xeon E5-2690 v4, PCIe 3.0 x16 | pinned RAM | 1,150 (7%) | 19.8 tok/s | 15.2 tok/s | 416 tok/s | 50 s |
+| | | disk, page cache warm | 1,181 | 6.0 tok/s | 5.0 tok/s | 157 tok/s | 20 s |
+| RTX PRO 6000 (600 W), `b3402a6fd` | EPYC 9B14, PCIe 5.0 x16 | pinned RAM | 11,401 (74%) | 48.0 tok/s | 45.3 tok/s | 1,310 tok/s | 64 s |
 | | | disk, page cache warm | 11,431 | 37.4 tok/s | 33.4 tok/s | 431 tok/s | 29 s |
-| RTX 5090 (575 W) | EPYC 7B13, PCIe 4.0 x16 | pinned RAM | 2,251 (15%) | 29.2 tok/s | 22.5 tok/s | 499 tok/s | 34 s |
-| | | disk, page cache warm | 2,282 | 12.5 tok/s | 10.5 tok/s | 181 tok/s | 15 s |
-| RTX 4090 (450 W) | EPYC 7K62, PCIe 4.0 x16 | pinned RAM | 1,139 (7%) | 25.9 tok/s | 22.2 tok/s | 490 tok/s | 41 s |
-| | | disk, page cache warm | 1,169 | 8.5 tok/s | 7.3 tok/s | 123 tok/s | 14 s |
 
-- **The cache sets decode.** The RTX PRO 6000 keeps three quarters of the experts on the card and
-  copies the rest; the 24 and 32 GB cards keep 7 and 15% and copy every other routed expert over
-  PCIe 4.0, so they decode at 22 to 29 tok/s with host experts, 7 to 13 with disk experts.
+- **The cache and the host link set decode.** The RTX PRO 6000 keeps three quarters of the experts
+  on the card; the 24 and 32 GB cards keep 7 to 15%, and their CPU threads compute a share of the
+  rest ([the CPU share](#the-cpu-share)) while the GPU copies the others over the host link: PCIe
+  5.0, 4.0 and 3.0 on the RTX 5090, RTX 4090 and RTX 3090 hosts.
 - **Placements agree on each card.** Host and disk experts produced the same tokens for both
-  prompts on every card. The short answer is 72 tokens on the RTX PRO 6000, 81 on the RTX 5090, 78
-  on the RTX 4090 and 82 on the RTX 3090: each card's device profile selects its own kernel routes,
-  which round differently.
-- **Memory.** The server peaked at 115.4 to 115.8 GiB of resident host memory with host experts
-  and 8.9 to 9.2 GiB with disk experts, and it fills the card in both placements.
-- **Startup.** With host experts the weights took 33.7 s on the RTX 4090 (3.34 GiB/s) and 53.6 s on
-  the RTX PRO 6000, whose read paused for 22 s at 95% on a host with 898 GB of its 1.5 TB in use
-  and its swap full.
+  prompts on every card. The short answer is 86 tokens on the RTX 5090, 94 on the RTX 4090, 110 on
+  the RTX 3090 and 72 on the RTX PRO 6000: each card's device profile selects its own kernel
+  routes, which round differently.
+- **The RTX 3090 host** has two sockets; the server ran pinned to the CPUs of the GPU's NUMA node
+  after the model files' pages were evicted, but the 106.7 GiB of pinned experts exceed that node's
+  free memory, so part of them sits on the other node. Unpinned, host experts decoded at 19.4 and
+  15.5 tok/s and prefilled at 410 tok/s.
+- **Memory.** The server peaked at 115.5 to 115.7 GiB of resident host memory with host experts
+  and 9.0 to 9.2 GiB with disk experts, and it fills the card in both placements.
+- **Startup.** Host experts are read past the page cache into pinned memory before the server is
+  ready; the disk rows' times follow reading the model file into the page cache (4 s on the RTX
+  5090 host, whose page cache held it already, 50 s on the RTX 4090 host and 65 s on the RTX 3090
+  host).
 
 ### RTX 3090 host
 
@@ -593,3 +669,17 @@ Rows give one run, or the range of two; no spread is measured.
   two logits are closest (gaps of 0.01 to 0.04). The FP64 forward took 2 h 53 min on the
   Threadripper 3960X. Since then the GPU's IQ1_S, IQ1_M and IQ2_XXS products round step by step as
   the [CPU share](#the-cpu-share) does, which changes the outputs; this check was not rerun.
+- **The vision tower's kernels.** `ninfer_deepseek_v41_vision_kernels_test` qualifies them against
+  FP64 oracles at the tower's widths: the residual with the next projection's RMS norm, the 2D
+  rotation of Q and K (angles past 70 radians), the softmax, SwiGLU, the erf GELU with its bias,
+  the aligner's unfold of whole and padded grids and the span's rows.
+- **Images.** `ninfer_deepseek_frontend_test` checks the grid plans, the bicubic resize and padding
+  of a synthetic picture and the patches and span of `examples/cli/media/natural_scene.png` against
+  values the release's `image_processor.py` and Pillow wrote. `ninfer_deepseek_v41_vision_real_test`
+  encodes that picture (55 × 37 patches, 13 × 19 aligner cells) with the resident and the streamed
+  tower, whose rows are equal bit for bit, and compares them with the FP64 forward of
+  `tools/reference/deepseek_v41_vision.py` over the mmproj's weights: on an RTX 4090 the worst
+  row's cosine was 0.981 and the relative RMS error 2.6%, within the test's bounds of 0.98 and 3%;
+  the tower rounds its matrices' inputs, Q, K, V and the attention probabilities to BF16 and keeps
+  the residual in FP32. Served with `--vision`, the model read the CLI examples `image_chart`,
+  `image_natural` and `multi_image_compare` correctly with either residency, with the same tokens.

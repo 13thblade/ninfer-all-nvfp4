@@ -642,7 +642,10 @@ operations, as the CPU does. Startup took 1.2-1.7 s longer and device memory was
 Greedy, one request. Decode is measured over a short answer (78 tokens for Q2_0, 81 to 87 for
 IQ3_S) and over the first tokens after a 4,463-token prompt; prefill is that prompt. Host memory
 is the process's peak resident set, device memory the most `nvidia-smi` showed. The host-memory
-and disk rows of one card use its free memory as the expert cache. A range is two runs.
+and disk rows of one card use its free memory as the expert cache. The single RTX 5090, RTX 4090
+and RTX 3090 rows are the generate test of October 26 in 512-token prefill chunks, one run each;
+the others come from builds of October 5 and 6, where a range is two runs
+([hosts and builds](qwen3-8-flash-next.md#expert-placements)).
 
 | Card | Release | Experts | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
 |---|---|---|---:|---:|---:|---:|---:|
@@ -656,32 +659,33 @@ and disk rows of one card use its free memory as the expert cache. A range is tw
 | RTX PRO 6000 | IQ3_S | disk, pages evicted every second | 93.5 GiB | 1.2 GiB | 28.7 | 78.6 | 773 |
 | 2× RTX 5090 | Q2_0 | on the GPUs | 18.8 + 19.6 GiB | 0.9 GiB | 136.1-136.3 | 157.0-157.2 | 3,807-3,811 |
 | 2× RTX 5090 | IQ3_S | on the GPUs | 26.5 + 27.8 GiB | 1.0 GiB | 121.6-121.9 | 141.8-142.0 | 3,310-3,341 |
-| RTX 5090 | Q2_0 | pinned host memory | 30.0 GiB | 34.0 GB | 74.1-74.2 | 93.9-94.2 | 1,676-1,678 |
-| RTX 5090 | IQ3_S | pinned host memory | 30.0 GiB | 50.3 GB | 40.7 | 41.0 | 1,100 |
-| RTX 5090 | Q2_0 | disk, in the page cache | 29.9 GiB | 1.0 GiB | 67.5 | 76.7 | 1,739 |
-| RTX 5090 | IQ3_S | disk, in the page cache | 29.9 GiB | 1.1 GiB | 55.3 | 44.3 | 439 |
-| RTX 5090 | Q2_0 | disk, pages evicted every second | 29.9 GiB | 1.0 GiB | 25.3 | 28.7 | 694 |
-| RTX 5090 | IQ3_S | disk, pages evicted every second | 29.9 GiB | 1.1 GiB | 18.8 | 14.9 | 171 |
+| RTX 5090 | Q2_0 | pinned host memory | 30.1 GiB | 33.2 GiB | 95.5 | 71.4 | 669 |
+| RTX 5090 | IQ3_S | pinned host memory | 30.0 GiB | 48.7 GiB | 80.2 | 73.2 | 481 |
+| RTX 5090 | Q2_0 | disk, in the page cache | 30.1 GiB | 1.7 GiB | 70.5 | 118.9 | 2,099 |
+| RTX 5090 | IQ3_S | disk, in the page cache | 30.1 GiB | 1.9 GiB | 51.5 | 38.3 | 318 |
+| RTX 5090 | Q2_0 | disk, pages evicted every second | 30.1 GiB | 1.7 GiB | 23.3 | 50.0 | 732 |
+| RTX 5090 | IQ3_S | disk, pages evicted every second | 30.1 GiB | 1.9 GiB | 15.9 | 9.2 | 65 |
 | 2× RTX 4090 | Q2_0 | on the GPUs | 18.5 + 19.4 GiB | 0.8 GiB | 92.6-100.7 | 116-120 | 3,482-3,734 |
-| RTX 4090 | Q2_0 | pinned host memory | 20.7 GiB | 34.0 GB | 52.6-52.7 | 44.3-44.6 | 1,137-1,139 |
-| RTX 4090 | Q2_0 | disk, in the page cache | 20.7 GiB | 1.0 GiB | 42.0 | 45.6 | 723 |
-| RTX 4090 | Q2_0 | disk, pages evicted every second | 20.5 GiB | 1.0 GiB | 17.7 | 12.2 | 160 |
+| RTX 4090 | Q2_0 | pinned host memory | 22.1 GiB | 33.0 GiB | 65.8 | 58.5 | 430 |
+| RTX 4090 | Q2_0 | disk, in the page cache | 22.1 GiB | 1.4 GiB | 46.3 | 44.6 | 808 |
+| RTX 4090 | Q2_0 | disk, pages evicted every second | 22.1 GiB | 1.4 GiB | 23.3 | 17.8 | 347 |
 | 2× RTX 3090 Ti | Q2_0 | on the GPUs | 18.4 + 19.4 GB | 0.7 GB | 90.2 | 107 | 1,504 |
-| RTX 3090 | Q2_0 | pinned host memory | 22.6 GB | 34 GB | 48.9 | 42.1 | 842 |
-| RTX 3090 | Q2_0 | disk, in the page cache | 22.6 GB | 0.9 GB | 47.0 | 39.1 | 630 |
-| RTX 3090 | Q2_0 | disk, page cache dropped every second | 22.6 GB | 0.9 GB | 17.2 | 11.3 | 195 |
-| RTX 3090 | IQ3_S | pinned host memory | 22.1 GiB | 50.3 GB | 34.4 | 30.2 | 533 |
-| RTX 3090 | IQ3_S | disk, the page cache holding part of the file | 22.1 GiB | | 19.0 | 21.6 | 209 |
-| RTX 3090 | IQ3_S | disk, pages evicted every second | 22.1 GiB | | 10.7 | 5.4 | 47 |
-| RTX 3090 | Q2_0 | pinned host memory | 22.1 GiB | 34.0 GB | 50.2 | 43.7 | 847 |
+| RTX 3090 | Q2_0 | pinned host memory | 22.2 GiB | 33.0 GiB | 55.1 | 50.6 | 209 |
+| RTX 3090 | IQ3_S | pinned host memory | 22.1 GiB | 48.3 GiB | 40.7 | 37.2 | 146 |
+| RTX 3090 | Q2_0 | disk, in the page cache | 22.1 GiB | 1.4 GiB | 46.7 | 39.7 | 625 |
+| RTX 3090 | IQ3_S | disk, in the page cache | 22.1 GiB | 1.5 GiB | 32.4 | 18.8 | 179 |
+| RTX 3090 | Q2_0 | disk, pages evicted every second | 22.1 GiB | 1.4 GiB | 21.7 | 15.9 | 282 |
+| RTX 3090 | IQ3_S | disk, pages evicted every second | 22.1 GiB | 1.5 GiB | 12.9 | 6.7 | 58 |
 | L40S (48 GB) | Coder IQ1_M | pinned host memory | | | 35 | | 1,648 |
 | L40S (48 GB) | Coder IQ1_M | disk, in the page cache | | | 42 | | 1,938 |
 
 The Coder IQ1_M rows are the 28.4 GiB model beside the shared n-gram table on one NVIDIA L40S (48 GB).
-The two RTX 3090 Q2_0 host-memory rows come from two hosts (an earlier build with 512-token prompt
-chunks, and the IQ3_S sitting). The host link carries host and disk experts: PCIe 5.0 x16 on the
-RTX 5090 host, 4.0 x16 on the RTX PRO 6000, RTX 4090 and RTX 3090 hosts. The RTX 4090 rows ran pinned to the GPU's NUMA node; left
-unpinned, host experts decode 40 tok/s and disk experts 32 to 33.
+The host link carries host and disk experts: PCIe 5.0 x16 on the RTX 5090 hosts, 4.0 x16 on the
+RTX PRO 6000 and RTX 4090 hosts, 3.0 x16 on the two-socket RTX 3090 host, whose rows ran pinned to
+the GPU's NUMA node. Host experts copy each prefill chunk's missing experts again, so their prefill
+follows the chunk: the RTX 5090's Q2_0 host row prefills at 669 tok/s in 512-token chunks, 1,942 in
+2,048 and 2,759 in 4,096, and `ninfer-serve` with its defaults prefilled 8,377 tokens at 5,140 to
+5,180 tok/s on that host.
 
 Other cards ran the Q2_0 release from the CLI with other prompts, 128 generated tokens, a cold
 expert cache, the files in the page cache (most or all of them on the 8 and 12 GB cards); prefill /

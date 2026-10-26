@@ -660,63 +660,71 @@ draft-chain graph and each width its own verification graph, captured at their s
 
 ### Expert placements
 
-Greedy decoding, one request. Decode is measured over a short answer (78 tokens for Q2_0) and over
-the first tokens after a 4,463-token prompt; prefill is that prompt. Host memory is the process's
-peak resident set (the pinned bank for host experts); device memory the most `nvidia-smi` showed in
-use.
+Greedy decoding, one request, the generate test (`ninfer_qwen4_exp_generate_real`) without drafts.
+Decode is measured over a short answer (78 tokens for Q2_0, 81 or 82 for IQ3_S) and over the first
+five tokens after a 4,463-token prompt; prefill is that prompt in 512-token chunks. Host memory is
+the process's peak resident set (with host experts, the pinned bank), device memory the most
+`nvidia-smi` showed in use. With host or disk experts the expert cache takes the memory the GPU has
+free and fills while the requests run.
 
-The Q2_0 release on the RTX 30 series, October 5, CUDA 12.8, the table inside the artifact, 512-token
-prefill chunks:
+One GPU, October 26, 2026, a build of `master` with CUDA 13.4 (`120a` on the RTX 5090, `sm_86` on
+the others), the n-gram table as the separate artifact, one run per row:
 
-| Hardware and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
-|---|---:|---:|---:|---:|---:|
-| 2× RTX 3090 Ti (PCIe, no P2P), experts on the GPUs (`--devices 0,1`) | 18.4 + 19.4 GB | 0.7 GB | 90.2 tok/s | 107 tok/s | 1,504 tok/s |
-| RTX 3090, experts in pinned host memory, 17.7 GB expert cache | 22.6 GB | 34 GB pinned | 48.9 tok/s | 42.1 tok/s | 842 tok/s |
-| RTX 3090, experts on disk, artifact in the page cache | 22.6 GB | 0.9 GB + page cache | 47.0 tok/s | 39.1 tok/s | 630 tok/s |
-| RTX 3090, experts on disk, page cache dropped every second (NVMe) | 22.6 GB | 0.9 GB | 17.2 tok/s | 11.3 tok/s | 195 tok/s |
+- RTX 5090: 600 W, PCIe 5.0 x16, a 20-thread Core Ultra 7 265K and 251 GB of RAM.
+- RTX 4090: 450 W, PCIe 4.0 x16, a 48-core EPYC 7K62 and 503 GB of RAM.
+- RTX 3090: 300 W, PCIe 3.0 x16, two 14-core Xeon E5-2690 v4 sockets and 251 GB of RAM. The test
+  ran pinned to the CPUs of the GPU's NUMA node after the model files' pages were evicted, so the
+  pinned bank and the page cache are on that node.
 
-The IQ3_S release on one RTX 3090 (310 W, PCIe 4.0 x16) in a host with 62 GB of RAM, 23 cores of an
-AMD EPYC 7663 and an NVMe drive, October 5, with the Q2_0 release in the same sitting; decode counts
-the 86 tokens of the short answer:
+| Card | Release | Experts | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
+|---|---|---|---:|---:|---:|---:|---:|
+| RTX 5090 | Q2_0 | pinned host memory | 30.1 GiB | 33.2 GiB | 95.5 tok/s | 71.4 tok/s | 669 tok/s |
+| RTX 5090 | Q2_0 | disk, the files in the page cache | 30.1 GiB | 1.7 GiB + page cache | 70.5 tok/s | 118.9 tok/s | 2,099 tok/s |
+| RTX 5090 | Q2_0 | disk, the files' pages evicted every second | 30.1 GiB | 1.7 GiB | 23.3 tok/s | 50.0 tok/s | 732 tok/s |
+| RTX 5090 | IQ3_S | pinned host memory | 30.0 GiB | 48.7 GiB | 80.2 tok/s | 73.2 tok/s | 481 tok/s |
+| RTX 5090 | IQ3_S | disk, the files in the page cache | 30.1 GiB | 1.9 GiB + page cache | 51.5 tok/s | 38.3 tok/s | 318 tok/s |
+| RTX 5090 | IQ3_S | disk, the files' pages evicted every second | 30.1 GiB | 1.9 GiB | 15.9 tok/s | 9.2 tok/s | 65 tok/s |
+| RTX 4090 | Q2_0 | pinned host memory | 22.1 GiB | 33.0 GiB | 65.8 tok/s | 58.5 tok/s | 430 tok/s |
+| RTX 4090 | Q2_0 | disk, the files in the page cache | 22.1 GiB | 1.4 GiB + page cache | 46.3 tok/s | 44.6 tok/s | 808 tok/s |
+| RTX 4090 | Q2_0 | disk, the files' pages evicted every second | 22.1 GiB | 1.4 GiB | 23.3 tok/s | 17.8 tok/s | 347 tok/s |
+| RTX 3090 | Q2_0 | pinned host memory | 22.2 GiB | 33.0 GiB | 55.1 tok/s | 50.6 tok/s | 209 tok/s |
+| RTX 3090 | Q2_0 | disk, the files in the page cache | 22.1 GiB | 1.4 GiB + page cache | 46.7 tok/s | 39.7 tok/s | 625 tok/s |
+| RTX 3090 | Q2_0 | disk, the files' pages evicted every second | 22.1 GiB | 1.4 GiB | 21.7 tok/s | 15.9 tok/s | 282 tok/s |
+| RTX 3090 | IQ3_S | pinned host memory | 22.1 GiB | 48.3 GiB | 40.7 tok/s | 37.2 tok/s | 146 tok/s |
+| RTX 3090 | IQ3_S | disk, the files in the page cache | 22.1 GiB | 1.5 GiB + page cache | 32.4 tok/s | 18.8 tok/s | 179 tok/s |
+| RTX 3090 | IQ3_S | disk, the files' pages evicted every second | 22.1 GiB | 1.5 GiB | 12.9 tok/s | 6.7 tok/s | 58 tok/s |
 
-| Release and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
-|---|---:|---:|---:|---:|---:|
-| IQ3_S, experts in pinned host memory, 16.2 GB expert cache | 22.1 GiB | 50.3 GB pinned | 34.4 tok/s | 30.2 tok/s | 533 tok/s |
-| IQ3_S, experts on disk, the page cache holding what of the 83.6 GB file fits | 22.1 GiB | page cache | 19.0 tok/s | 21.6 tok/s | 209 tok/s |
-| IQ3_S, experts on disk, the file's pages evicted every second | 22.1 GiB | — | 10.7 tok/s | 5.4 tok/s | 47 tok/s |
-| Q2_0, experts in pinned host memory | 22.1 GiB | 34.0 GB pinned | 50.2 tok/s | 43.7 tok/s | 847 tok/s |
+- **Prefill chunk.** A wide call copies the experts its layer routes to that the cache lacks: disk
+  experts into the cache, host experts into the prefill buffers (`--expert-prefill-buffers`), so
+  with host experts each 512-token chunk copies nearly every expert of every layer again. Larger
+  chunks copy less often: the RTX 5090's Q2_0 host row prefills the prompt at 1,942 tok/s in
+  2,048-token chunks and 2,759 in 4,096 (decoding 85.8 and 87.4 tok/s after it), and `ninfer-serve`
+  with its defaults prefilled an 8,377-token prompt with host experts at 5,140 to 5,180 tok/s on the
+  same host and 1,690 to 1,700 on the RTX 3090 host.
+- **NUMA.** Unpinned on the two-socket RTX 3090 host, Q2_0 decodes the short answer at 49.9 tok/s
+  with host experts and 26.5 with disk experts in the page cache, against 55.1 and 46.7 pinned.
+- **The host.** Host and disk experts cross the host link, and disk experts are read by the CPU
+  threads, so these rows measure the host as much as the card.
 
-The Q2_0 release (with the separate table artifact) on RTX 4090s at 450 W (PCIe 4.0 x16, no peer
-access) in a cloud VM with two EPYC 7543 sockets of 60 vCPUs each, both GPUs on NUMA node 0, 694 GB
-of RAM and its container disk, October 6. The single-GPU rows ran pinned to node 0's CPUs
-(`taskset -c 0-59`); the ranges are two runs:
-
-| Hardware and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
-|---|---:|---:|---:|---:|---:|
-| 2× RTX 4090, experts on the GPUs (`--devices 0,1`) | 18.5 + 19.4 GiB | 0.8 GiB | 92.6-100.7 tok/s | 116-120 tok/s | 3,482-3,734 tok/s |
-| RTX 4090, experts in pinned host memory, 15.9 GB expert cache | 20.7 GiB | 34.0 GB pinned | 52.6-52.7 tok/s | 44.3-44.6 tok/s | 1,137-1,139 tok/s |
-| RTX 4090, experts on disk, artifact in the page cache | 20.7 GiB | 1.0 GiB + page cache | 42.0 tok/s | 45.6 tok/s | 723 tok/s |
-| RTX 4090, experts on disk, the artifact's and table's pages evicted every second | 20.5 GiB | 1.0 GiB | 17.7 tok/s | 12.2 tok/s | 160 tok/s |
-
-Left unpinned on that VM, the host-expert row decodes at 39.5-40.1 tok/s and prefills at 775-827
-tok/s, the page-cache row at 31.9-33.0 tok/s and 571-674 tok/s, and the evicted row at 15.7 tok/s
-and 144 tok/s: the copies out of host memory then cross the socket link. CUDA graphs add 1% and 10%
-to the short-answer decode on the two GPUs in the two runs (91.5-91.7 tok/s eager) and 5 to 6% with
-pinned host experts (49.9-50.1 tok/s eager). Host memory is the process's peak resident set, device
-memory the most `nvidia-smi` showed in use.
-
-Both releases on Blackwell, 2026-10-06, a `120a` build with CUDA 13.1, the table as the separate
-artifact, the single-GPU rows pinned to the CPUs of the GPU's NUMA node, two runs where a range is
-given:
+Every expert on the GPUs, and the RTX PRO 6000, October 5 and 6, 2026, earlier builds: CUDA 12.8
+and the table inside the artifact on the two RTX 3090 Ti; CUDA 12.8 and the separate table on two
+RTX 4090s at 450 W (PCIe 4.0 x16, no peer access) in a cloud VM with two EPYC 7543 sockets, both
+GPUs on NUMA node 0, and 694 GB of RAM; on Blackwell a `120a` build with CUDA 13.1 and the separate
+table, single-GPU rows pinned to the CPUs of the GPU's NUMA node:
 
 - RTX PRO 6000 Blackwell Workstation Edition: 600 W, a PCIe 4.0 x16 host link, 64 vCPUs and
-  1.1 TB of RAM.
-- RTX 5090s: boards with a 600 W default limit, PCIe 5.0 x16, 512 threads and 1 TB of RAM.
+  1.1 TB of RAM; short answer 87 tokens for IQ3_S.
+- RTX 5090s: boards with a 600 W default limit, PCIe 5.0 x16, 512 threads and 1 TB of RAM; short
+  answer 81 tokens for IQ3_S.
 
-The short answer is 78 tokens for Q2_0, and 87 (PRO 6000) or 81 (RTX 5090) for IQ3_S.
+The ranges are two runs.
 
 | Hardware and placement | Release | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
 |---|---|---:|---:|---:|---:|---:|
+| 2× RTX 3090 Ti (PCIe, no P2P), experts on the GPUs (`--devices 0,1`) | Q2_0 | 18.4 + 19.4 GB | 0.7 GB | 90.2 tok/s | 107 tok/s | 1,504 tok/s |
+| 2× RTX 4090, experts on the GPUs (`--devices 0,1`) | Q2_0 | 18.5 + 19.4 GiB | 0.8 GiB | 92.6-100.7 tok/s | 116-120 tok/s | 3,482-3,734 tok/s |
+| 2× RTX 5090, experts on the GPUs (`--devices 0,1`) | Q2_0 | 18.8 + 19.6 GiB | 0.9 GiB | 136.1-136.3 tok/s | 157.0-157.2 tok/s | 3,807-3,811 tok/s |
+| 2× RTX 5090, experts on the GPUs (`--devices 0,1`) | IQ3_S | 26.5 + 27.8 GiB | 1.0 GiB | 121.6-121.9 tok/s | 141.8-142.0 tok/s | 3,310-3,341 tok/s |
 | RTX PRO 6000, experts on the GPU | Q2_0 | 37.7 GiB | 0.8 GiB | 136.0-139.7 tok/s | 160.7-162.6 tok/s | 2,925-2,952 tok/s |
 | RTX PRO 6000, experts on the GPU | IQ3_S | 53.7 GiB | 1.0 GiB | 123.8-125.9 tok/s | 146.8-146.9 tok/s | 2,540-2,541 tok/s |
 | RTX PRO 6000, experts in pinned host memory | Q2_0 | 38.5 GiB | 34.0 GB pinned | 54.8-55.0 tok/s | 67.7-70.0 tok/s | 1,296-1,297 tok/s |
@@ -725,26 +733,12 @@ The short answer is 78 tokens for Q2_0, and 87 (PRO 6000) or 81 (RTX 5090) for I
 | RTX PRO 6000, experts on disk, the files in the page cache | IQ3_S | 93.5 GiB | 1.2 GiB + page cache | 65.6 tok/s | 106.0 tok/s | 1,661 tok/s |
 | RTX PRO 6000, experts on disk, the files' pages evicted every second | Q2_0 | 93.5 GiB | 1.0 GiB | 35.1 tok/s | 87.1 tok/s | 1,000 tok/s |
 | RTX PRO 6000, experts on disk, the files' pages evicted every second | IQ3_S | 93.5 GiB | 1.2 GiB | 28.7 tok/s | 78.6 tok/s | 773 tok/s |
-| 2× RTX 5090, experts on the GPUs (`--devices 0,1`) | Q2_0 | 18.8 + 19.6 GiB | 0.9 GiB | 136.1-136.3 tok/s | 157.0-157.2 tok/s | 3,807-3,811 tok/s |
-| 2× RTX 5090, experts on the GPUs (`--devices 0,1`) | IQ3_S | 26.5 + 27.8 GiB | 1.0 GiB | 121.6-121.9 tok/s | 141.8-142.0 tok/s | 3,310-3,341 tok/s |
-| RTX 5090, experts in pinned host memory | Q2_0 | 30.0 GiB | 34.0 GB pinned | 74.1-74.2 tok/s | 93.9-94.2 tok/s | 1,676-1,678 tok/s |
-| RTX 5090, experts in pinned host memory | IQ3_S | 30.0 GiB | 50.3 GB pinned | 40.7 tok/s | 41.0 tok/s | 1,100 tok/s |
-| RTX 5090, experts on disk, the files in the page cache | Q2_0 | 29.9 GiB | 1.0 GiB + page cache | 67.5 tok/s | 76.7 tok/s | 1,739 tok/s |
-| RTX 5090, experts on disk, the files in the page cache | IQ3_S | 29.9 GiB | 1.1 GiB + page cache | 55.3 tok/s | 44.3 tok/s | 439 tok/s |
-| RTX 5090, experts on disk, the files' pages evicted every second | Q2_0 | 29.9 GiB | 1.0 GiB | 25.3 tok/s | 28.7 tok/s | 694 tok/s |
-| RTX 5090, experts on disk, the files' pages evicted every second | IQ3_S | 29.9 GiB | 1.1 GiB | 18.8 tok/s | 14.9 tok/s | 171 tok/s |
 
-- **Device expert cache.** With host or disk experts the cache takes the memory the GPU has free
-  and fills while the requests run: 94 GB of it on the PRO 6000, where nearly every expert ends up
-  resident, and 30 GB on the RTX 5090.
-- **Host link.** Host and disk experts cross the host link: PCIe 5.0 x16 on the RTX 5090 host,
-  PCIe 4.0 x16 on the PRO 6000 host, the likeliest reason the RTX 5090's host-expert row beats the
-  PRO 6000's.
+- **Device expert cache.** On the PRO 6000 the cache takes 94 GB, and nearly every expert ends up
+  resident.
 - **CUDA graphs** add 27% to the short-answer decode on the two RTX 5090s (107.0 tok/s eager), 23
-  to 26% on the PRO 6000 and 11% on the two RTX 3090 Ti; disk experts decode eagerly.
-- **Prefill chunk.** Prefill touches nearly every expert of every layer in each chunk, so with host
-  or disk experts a larger `--prefill-chunk` serves more tokens per copy: on an RTX 3090 Ti the long
-  prompt took 6.05 s in 512-token chunks and 4.58 s in 2,048.
+  to 26% on the PRO 6000, 11% on the two RTX 3090 Ti, and 1% and 10% on the two RTX 4090s in their
+  two runs (91.5-91.7 tok/s eager); disk experts decode eagerly.
 
 Every GSQ-RCO release (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S and the Coder IQ1_M) answers the generate
 test's prompts with disk and host experts, with and without CUDA graphs; with disk experts the
