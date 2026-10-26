@@ -5,9 +5,17 @@
 // products start without a wake-up, and sleep otherwise. run(count, job) executes job(i) for every
 // i < count on the workers and the calling thread and returns when all are done, rethrowing the
 // first failure; run(count, job, side) first runs side() on the calling thread while the workers
-// start the jobs (a call issues its copies there). A claim is one CAS on a ticket holding the
-// run's generation and next index, so a worker still leaving an earlier run can never claim an
-// index of a later one.
+// start the jobs (a call issues its copies there). A claim is one fetch_add on a ticket holding the
+// run's generation and next index; an index past the generation's count, or a generation the run
+// size no longer names, ends the claiming thread's part, so a worker still leaving an earlier run
+// either runs a later run's job in full or none. Each thread adds the jobs it ran to the done count
+// once, when its part ends.
+//
+// The waiting workers, the ticket, the done count, the completion and the run's job each have a
+// cache line of their own, so neither a claim nor a count invalidates the line the waiting workers
+// read. On two 32-core AMD EPYC sockets, spinning pools of 2, 8, 16, 32 and 61 threads took 0.86,
+// 1.43, 2.42, 4.82 and 12.77 us for a run of 1 to 50 empty jobs; with every claim counting on one
+// shared line, 1.09, 1.91, 3.38, 7.67 and 14.63 us.
 //
 // row_tasks() cuts a phase's rows into about three tasks per thread of about equal work, as
 // Strata's pool does: with fixed 64-row tasks one Flash-Next expert's 640 gate rows were ten
@@ -84,7 +92,7 @@ public:
     // before run() returns.
     [[nodiscard]] std::chrono::steady_clock::time_point finished() const noexcept {
         return std::chrono::steady_clock::time_point(
-            std::chrono::steady_clock::duration(finished_.load(std::memory_order_acquire)));
+            std::chrono::steady_clock::duration(complete_.finished.load(std::memory_order_acquire)));
     }
 
     void spin(bool on);
@@ -98,21 +106,22 @@ public:
     void run(std::size_t count, Job&& job, Side&& side) {
         if (count == 0) {
             side();
-            finished_ = std::chrono::steady_clock::now().time_since_epoch().count();
+            complete_.finished = std::chrono::steady_clock::now().time_since_epoch().count();
             return;
         }
         pin_caller();
-        context_ = &job;
-        call_    = [](void* context, std::size_t i) {
+        job_.context = &job;
+        job_.call    = [](void* context, std::size_t i) {
             (*static_cast<std::remove_reference_t<Job>*>(context))(i);
         };
-        const std::uint64_t generation = (ticket_.load(std::memory_order_relaxed) >> 32) + 1;
+        const std::uint64_t generation = wake_line_.posted.load(std::memory_order_relaxed) + 1;
         done_.store(0, std::memory_order_relaxed);
-        // A worker claims only when the ticket's generation matches this one.
-        size_.store(generation << 32 | count, std::memory_order_release);
+        // A claim runs a job only when the run size names the ticket's generation.
+        job_.size.store(generation << 32 | count, std::memory_order_release);
+        ticket_.store(generation << 32, std::memory_order_release);
         {
             std::lock_guard lock(mutex_);
-            ticket_.store(generation << 32, std::memory_order_release);
+            wake_line_.posted.store(generation, std::memory_order_release);
         }
         wake_.notify_all();
         // The jobs reference the caller's frame: a failing side still waits for them.
@@ -121,8 +130,9 @@ public:
             side();
         } catch (...) { side_failure = std::current_exception(); }
         drain();
-        // The last job's thread stamps finished_ and then marks the generation complete.
-        while (complete_.load(std::memory_order_acquire) != generation) { spin_hint(); }
+        // The thread whose part ends the run stamps its end and then marks the generation
+        // complete.
+        while (complete_.generation.load(std::memory_order_acquire) != generation) { spin_hint(); }
         auto failure = std::exchange(failure_, nullptr);
         if (side_failure) { std::rethrow_exception(side_failure); }
         if (failure) { std::rethrow_exception(failure); }
@@ -130,6 +140,8 @@ public:
 
 private:
     void drain();
+    // Adds a part's `ran` jobs of the run `size` names; the part that ends the run stamps it.
+    void finish(std::uint64_t size, std::size_t ran);
     void work(int cpu);
     void pin_caller();
 
@@ -137,15 +149,25 @@ private:
     int caller_cpu_     = -1;
     bool pinned_        = false;
     std::thread::id caller_;
-    void (*call_)(void*, std::size_t) = nullptr;
-    void* context_                    = nullptr;
-    std::atomic<std::uint64_t> ticket_{0}; // generation << 32 | next index
-    std::atomic<std::uint64_t> size_{0};   // generation << 32 | count
-    std::atomic<std::size_t> done_{0};
-    std::atomic<std::uint64_t> complete_{0}; // the generation whose last job has ended
-    std::atomic<std::chrono::steady_clock::rep> finished_{0};
-    std::atomic<bool> spinning_{false}, stop_{false};
-    std::mutex mutex_, failure_mutex_;
+    // What the waiting workers read: written once per run and by spin() and the destructor.
+    struct alignas(64) WakeLine {
+        std::atomic<std::uint64_t> posted{0}; // the latest run's generation
+        std::atomic<bool> spinning{false}, stop{false};
+    } wake_line_;
+    // The run's job, read by every claim.
+    struct alignas(64) JobLine {
+        void (*call)(void*, std::size_t) = nullptr;
+        void* context                    = nullptr;
+        std::atomic<std::uint64_t> size{0}; // generation << 32 | count
+    } job_;
+    alignas(64) std::atomic<std::uint64_t> ticket_{0}; // generation << 32 | next index
+    alignas(64) std::atomic<std::size_t> done_{0};
+    struct alignas(64) CompleteLine {
+        std::atomic<std::uint64_t> generation{0}; // the generation whose last job has ended
+        std::atomic<std::chrono::steady_clock::rep> finished{0};
+    } complete_;
+    alignas(64) std::mutex mutex_;
+    std::mutex failure_mutex_;
     std::condition_variable wake_;
     std::exception_ptr failure_;
 };

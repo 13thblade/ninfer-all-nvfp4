@@ -210,16 +210,10 @@ constexpr int kMaxTokens    = 46; // kSparseMoeSmallTMax: the widest streamed Sm
 // Rows per task are a multiple of 16 (64 bytes of FP32 outputs).
 constexpr int kRowQuantum = 16;
 
-template <class Job, class Side>
-void run(CpuSpinPool* pool, std::size_t count, Job&& job, Side&& side) {
-    if (pool) { return pool->run(count, job, side); }
-    side();
-    for (std::size_t i = 0; i < count; ++i) { job(i); }
-}
-
 template <class Job>
 void run(CpuSpinPool* pool, std::size_t count, Job&& job) {
-    run(pool, count, job, [] {});
+    if (pool) { return pool->run(count, job); }
+    for (std::size_t i = 0; i < count; ++i) { job(i); }
 }
 
 StreamCpuPlane plane(QType format, const std::vector<const std::byte*>& blobs,
@@ -336,8 +330,7 @@ ExpertCpuProducts::Done SparseMoeStreamCpu::compute(const Work& work) {
         job.input.load_bf16(j, x + std::size_t(job.pairs[std::size_t(j)] / kTopK) * kHidden);
     });
 
-    // Gate and up rows (the [gate; up] plane's first and second 512) while the calling thread runs
-    // work.side.
+    // Gate and up rows (the [gate; up] plane's first and second 512).
     std::vector<RowPart> parts;
     for (std::size_t i = 0; i < count; ++i) {
         parts.push_back(
@@ -345,18 +338,12 @@ ExpertCpuProducts::Done SparseMoeStreamCpu::compute(const Work& work) {
     }
     const std::uint32_t threads = work.pool ? work.pool->threads() : 1;
     auto tasks                  = row_tasks(parts, threads, kRowQuantum);
-    const auto side             = [&] {
-        if (work.side) { work.side(); }
-    };
-    run(
-        work.pool, tasks.size(),
-        [&](std::size_t index) {
-            const RowTask& task = tasks[index];
-            Job& job            = jobs_[task.part];
-            stream_cpu_rows(job.gate_up, job.input, task.begin, task.end, nullptr, job.gate_up_out,
-                            backend_);
-        },
-        side);
+    run(work.pool, tasks.size(), [&](std::size_t index) {
+        const RowTask& task = tasks[index];
+        Job& job            = jobs_[task.part];
+        stream_cpu_rows(job.gate_up, job.input, task.begin, task.end, nullptr, job.gate_up_out,
+                        backend_);
+    });
     const auto rows_done = work.pool ? work.pool->finished() : Clock::now();
     const auto middle    = Clock::now();
     // The FP32 middle silu(gate) * up, as the d3 kernel stores it for d4, a pair a task.
