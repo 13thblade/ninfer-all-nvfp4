@@ -148,10 +148,9 @@ to preserve cache compatibility. Remove the runner registrations and rentals aft
 archives and HF snapshots. Native release also accepts `linux_runner: ninfer-native-debian13`;
 its default remains GitHub-hosted runners in Debian 13 containers.
 
-The shared-runtime bootstrap writes `native-linux-cuda-<toolkit>-shared-v1`, leaving any older
-`host-v2` producer running without a conflicting writer. Both artifact workflows serialize writes
-per branch and Toolkit. They restore the existing `host-v2` family when the new family is absent,
-so completed compatible PIC objects remain reusable. This bootstrap does not cancel Windows jobs.
+The bootstrap writes the same `native-linux-cuda-<toolkit>-shared-v1` family as Native release.
+Both artifact workflows serialize writes per branch and Toolkit. This bootstrap does not cancel
+Windows jobs.
 
 Linux native builds and CUDA CI set `LANG`, `LC_ALL` and `LC_CTYPE` to `C.UTF-8`.
 Ccache hashes these variables separately, even when they select the same effective locale.
@@ -168,7 +167,7 @@ Publication requires `platforms: all`. Starting any new native run on the same b
 whole previous run, including its other platform. The cleanup wait preserves its completed caches.
 
 Native Windows, Debian and CUDA CI use pinned ccache 4.14.2. Native release and its Linux artifact bootstrap write compiler
-snapshots. Only Native release writes Windows vcpkg snapshots to the private HF bucket `WaveCut/ninfer-cache`, under `github-actions/`.
+snapshots. Only Native release writes Windows vcpkg snapshots to the private HF bucket `WaveCut/ninfer-cache`, under `github-actions/v2/`.
 `HF_BUILD_CACHE_TOKEN` has read/write access to this bucket only. Native jobs use it for snapshots;
 CI reuses it only in its restore step, by owner decision. The token itself can write, but CI has no
 upload steps, receives no token during compilation, and the save command rejects CI jobs. Existing
@@ -183,26 +182,20 @@ feed back into the production cache. Broader test builds can take longer on a co
 
 Each native or CI variant has an 8 GiB local compiler-cache limit. This is a capacity limit, not a
 measured working-set size; ccache can evict older objects. Each native platform/toolkit has its own
-family, with separate branch prefixes and two rotating snapshots. CI reads the corresponding
+family, with separate branch prefixes and one current snapshot. CI reads the corresponding
 `native-linux-cuda-<toolkit>-shared-v1` family. It takes the latest available verified snapshot without waiting
 for an artifact build to finish. It tries its branch, then master; a PR starts from its target branch.
 Source commits are not cache-family boundaries. Missing credentials, unavailable storage or rejected
 snapshots produce a warning and allow a cold CI build. Fork PRs receive no repository secret.
-The `host-v2` families leave the previous families untouched and can read their entries when
-the new family is absent. Corrected compiler lookup adds the CUDA host compiler's content to
-the cache key. Previous CUDA entries therefore miss once; unchanged C++ entries remain eligible.
-The old snapshots are retained, but retaining them does not make the old CUDA keys compatible.
+A renamed family reads its predecessor through `--fallback-family` until it has a snapshot of its
+own; retention then removes the predecessor, which no longer receives writes.
 
 Windows uses eight object shards per Toolkit, each with a separate
 `native-windows-cuda-<toolkit>-host-v2-shard-<index>` family. The final Windows job merges those
 snapshots, links and packages the same multiarch executables, and saves the aggregate family
 without the shard suffix. Only shard zero and the subsequent final job write the shared vcpkg
-family. The reusable Windows workflow remains part of Native release; CI has no cache writer.
-To bootstrap master from a completed branch build, set repository variable
-`HF_BUILD_CACHE_SEED_REF` to that branch's full ref, such as `refs/heads/build/windows-release`.
-Readers try this explicit seed only after their branch and master have no usable snapshot.
-They verify its checksum and do not write to the seed. After master saves its own snapshot,
-that snapshot takes precedence. This avoids overwriting master's cache from a feature branch.
+family. A shard without a snapshot of its own starts from the aggregate. The reusable Windows
+workflow remains part of Native release; CI has no cache writer.
 
 CI does not upload compiler caches to HF or Actions Cache. Python dependency caches remain in
 Actions Cache, within the repository's free 10 GiB limit. Docker publication downloads the compiled
@@ -211,10 +204,12 @@ architecture set and checksums, and packages it without invoking a compiler or r
 Local source Docker builds retain their BuildKit cache mounts.
 
 Each Linux artifact job also uploads its archive volumes, checksum manifest and build metadata
-to `WaveCut/ninfer-cache/native-artifacts/v1/iamwavecut/ninfer-all/<run>/<artifact>/`.
-It downloads each uploaded file on the runner, checks SHA-256, and publishes `COMPLETE.json`
-only after all checks pass. This step allows sixty minutes for upload and download verification
-of the multi-gigabyte archives. These private backups do not publish a GitHub release.
+to `WaveCut/ninfer-cache/native-artifacts/v2/iamwavecut/ninfer-all/<branch key>/<kind>/<run>/`,
+where the branch key is the first 20 hexadecimal digits of the ref's SHA-256 and the kind is the
+archive name without its commit. It downloads each uploaded file on the runner, checks SHA-256,
+and publishes `COMPLETE.json` only after all checks pass. It then deletes the older backups of that
+kind on that branch. This step allows sixty minutes for upload and download verification of the
+multi-gigabyte archives. These private backups do not publish a GitHub release.
 
 Ccache checks compiler content, source, headers and compilation flags before reusing an entry.
 Depend mode hashes raw source and compiler-reported header dependencies, without falling back to
@@ -226,9 +221,12 @@ Successful compiler invocations commit their entries to local disk. During nativ
 supervisor uploads a snapshot every ten minutes after the previous upload completes. Windows
 configuration also checkpoints completed vcpkg archives. Uploads run while compilation continues;
 an entry that finishes after the snapshot starts is retained by a subsequent snapshot. Temporary
-files and mutable cache statistics are excluded. An upload writes the inactive archive slot,
-then publishes its manifest with size and SHA-256. Readers verify the archive and try the previous
-slot if the latest archive is damaged. A partial upload does not publish a new manifest.
+files and mutable cache statistics are excluded. A family holds one archive, named by its SHA-256,
+and `snapshot.json`, which names the archive with its size and checksum. An upload writes the new
+archive, publishes its manifest and then deletes the replaced archive. An unchanged archive is not
+uploaded again. Readers verify the archive; a reader whose archive was replaced meanwhile follows
+the new manifest. An interrupted upload leaves the previous manifest and archive in place. A
+damaged current archive fails restoration instead of starting a native build cold.
 
 After success, failure or ordinary cancellation, cleanup stops compiler work and saves completed
 objects before packaging. Native builds stop after 300 minutes of compilation, or earlier at a
@@ -257,10 +255,29 @@ compiler process itself cannot resume. Periodic checkpoint failures produce a wa
 final-save failures fail the step. Retention, transfer duration and useful reuse must be measured
 on the complete CUDA working set before claiming that every matrix job will finish.
 
-Migration preserves existing Actions caches under `github-actions/migration/`. Each archive is
-uploaded and downloaded on a GitHub runner, and its manifest is published only after a matching
-SHA-256. Restore can merge these preserved snapshots to seed the new cache family. Existing
-single-architecture Ubuntu pod caches are not assumed compatible with Debian multiarch builds.
+Existing single-architecture Ubuntu pod caches (`ccache/`, [pods](../../scripts/pods/README.md))
+are not assumed compatible with Debian multiarch builds.
+
+### Retention
+
+The bucket keeps the current caches of master and of branches in progress, and the newest Linux
+artifact backup of each kind on each of them.
+[Build cache retention](../../.github/workflows/build-cache-retention.yml) runs
+`hf-build-cache.py prune` after every push to master, after a branch deletion and daily. It lists
+the branches that have commits master lacks and deletes, under `github-actions/` and
+`native-artifacts/`:
+
+- every cache and backup of a branch that master contains or that no longer exists, so a merge
+  removes the branch's state;
+- every cache and backup of a branch without a write for three days;
+- on a kept branch, master included, a family or artifact kind whose last write is three days
+  older than the branch's newest write: a renamed family or retired Toolkit receives no writes;
+- an earlier layout of these areas three days after its last write.
+
+While master receives no builds, its families stay. Squash-merged branches stay until they are
+deleted or idle for three days. Manual dispatch accepts `dry_run` to print the plan. Outside
+GitHub Actions a maintainer can run the same command with a local token; inside it, only this
+workflow on master may delete. Pod caches, model files and other prefixes are not managed.
 
 ## Verification status
 
@@ -287,8 +304,8 @@ from all four cancelled native variants and all three CUDA CI architectures. Eve
 uploaded and downloaded its archive on the runner and verified SHA-256 before publishing metadata.
 The first native-Linux restore missed because its Debian archive compression differed from the
 Ubuntu runner; restoring in the original Debian environment resolved it. The Actions source
-caches were retained. Migration records remain under `github-actions/migration/`; the temporary
-migration workflow was removed after verification.
+caches were retained. The migration records and the temporary migration workflow were removed
+after master saved snapshots of its own.
 
 The HF [timeout producer](https://github.com/iamwavecut/ninfer-all/actions/runs/39584240411)
 saved both periodic and final snapshots. Its [fresh-runner restore](https://github.com/iamwavecut/ninfer-all/actions/runs/39584567971)

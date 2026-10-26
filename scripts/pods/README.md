@@ -114,6 +114,7 @@ retained `model-inputs.json` as job inputs; stage HF authentication first. It om
 `/workspace/ccache` and travels between rentals through the private bucket `WaveCut/ninfer-cache`
 (`ccache/cuda<release>-sm<arch>-<distribution>-<machine>.tar`): `build.sh` pulls it into a new pod
 before the first compile and pushes it after every build (`NINFER_CCACHE_PUSH=0` skips the push).
+A push replaces the key's archive, so the bucket holds one cache per key.
 `NINFER_CUDA_ARCH` selects the build's target and its cache (default `86`), and `NINFER_BUILD_DIR`
 its tree.
 Both steps need the credential `hf_archive.py --stage-auth` leaves at `/run/ninfer-hf/token`;
