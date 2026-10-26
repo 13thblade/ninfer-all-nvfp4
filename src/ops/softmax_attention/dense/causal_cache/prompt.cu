@@ -65,13 +65,13 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
         constexpr bool kWide = CausalPromptI8FastShape<8, PackedValues, TuringShapes>::Launchable;
         const auto tokens    = static_cast<std::int32_t>(q.ne[2]);
         const CausalPromptI8FastPlan plan = causal_prompt_i8_fast_plan(
-            Geometry::QHeads, tokens, max_visible_keys, current_device_multiprocessors(170), kWide,
+            q.ne[1], tokens, max_visible_keys, current_device_multiprocessors(170), kWide,
             causal_attention_prompt_fast_split_policy());
         auto scope = workspace.scope();
         CausalPromptI8FastPartials partials{};
         if (plan.splits > 1) {
-            partials = allocate_causal_prompt_i8_fast_partials(workspace, Geometry::QHeads, tokens,
-                                                               plan.splits);
+            partials =
+                allocate_causal_prompt_i8_fast_partials(workspace, q.ne[1], tokens, plan.splits);
         }
         const auto launch = [&]<int Warps, bool Split>() {
             using Shape = CausalPromptI8FastShape<Warps, PackedValues, TuringShapes>;
@@ -83,8 +83,7 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
                                                        Keys, TuringShapes, Split>,
                 Shape::SmemBytes);
             const dim3 grid(static_cast<unsigned>(div_up(tokens, Shape::Br)),
-                            static_cast<unsigned>(Geometry::QHeads),
-                            static_cast<unsigned>(plan.splits));
+                            static_cast<unsigned>(q.ne[1]), static_cast<unsigned>(plan.splits));
             kernel<<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const std::int8_t*>(cache.k_pages.data),
@@ -110,7 +109,7 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
         CUDA_CHECK(cudaGetLastError());
         constexpr float Log2E = 1.4426950408889634074f;
         causal_attention_prompt_i8_fast_merge_kernel<Geometry>
-            <<<dim3(static_cast<unsigned>(tokens), static_cast<unsigned>(Geometry::QHeads)),
+            <<<dim3(static_cast<unsigned>(tokens), static_cast<unsigned>(q.ne[1])),
                kCausalPromptHeadDim, 0, stream>>>(static_cast<const float*>(partials.rows.data),
                                                   static_cast<const float2*>(partials.stats.data),
                                                   valid, tokens, plan.splits, scale * Log2E,
@@ -193,9 +192,9 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                     const dim3 grid =
                         PackGqa ? dim3(static_cast<unsigned>(
                                            div_up(tokens * Geometry::GroupSize, kCausalPromptI8Br)),
-                                       static_cast<unsigned>(Geometry::KVHeads), 1u)
+                                       static_cast<unsigned>(q.ne[1] / Geometry::GroupSize), 1u)
                                 : dim3(static_cast<unsigned>(div_up(tokens, kCausalPromptI8Br)),
-                                       static_cast<unsigned>(Geometry::QHeads), 1u);
+                                       static_cast<unsigned>(q.ne[1]), 1u);
                     kernel<<<grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
                         static_cast<const __nv_bfloat16*>(q.data),
                         static_cast<const std::int8_t*>(cache_k.data),
@@ -242,7 +241,7 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
         }
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptBr)),
-                                  static_cast<unsigned>(Geometry::QHeads), 1u);
+                                  static_cast<unsigned>(q.ne[1]), 1u);
         // The kernel of the current device's shape set, past the default 48 KiB dynamic-smem
         // ceiling in both.
         const auto launch = [&](auto kernel, int smem) {
@@ -332,15 +331,11 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
         return;
     }
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
-    if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(
-            q, positions, scale, cache, metadata, nullptr, max_visible_keys, workspace, out, fast,
-            stream);
-        return;
-    }
-    causal_attention_prompt_attention_launch_for<CausalD256H16Kv2>(
-        q, positions, scale, cache, metadata, nullptr, max_visible_keys, workspace, out, fast,
-        stream);
+    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+        causal_attention_prompt_attention_launch_for<Geometry>(q, positions, scale, cache, metadata,
+                                                               nullptr, max_visible_keys, workspace,
+                                                               out, fast, stream);
+    });
 }
 
 void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -374,15 +369,11 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
             .table_stride = cache.block_tables.ne[0],
         };
         const std::int32_t* valid = metadata.valid_columns;
-        if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-            causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(
+        with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+            causal_attention_prompt_attention_launch_for<Geometry>(
                 q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out, fast,
                 stream);
-            return;
-        }
-        causal_attention_prompt_attention_launch_for<CausalD256H16Kv2>(
-            q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out, fast,
-            stream);
+        });
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

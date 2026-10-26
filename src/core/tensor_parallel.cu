@@ -52,6 +52,21 @@ void tensor_parallel_reduce(__nv_bfloat16* residual, const float* const* parts, 
 
 } // namespace detail
 
+std::vector<std::uint64_t> rank_free_bytes(const DeviceContext& context) {
+    std::vector<std::uint64_t> out(context.size(), 0);
+    for (std::size_t rank = 0; rank < context.size(); ++rank) {
+        std::size_t sharing = 0;
+        for (std::size_t other = 0; other < context.size(); ++other) {
+            if (context.same_physical_device(rank, other)) { ++sharing; }
+        }
+        DeviceBinding bind(context.rank(rank).device);
+        std::size_t free = 0, total = 0;
+        check(cudaMemGetInfo(&free, &total), "free device memory");
+        out[rank] = free / sharing;
+    }
+    return out;
+}
+
 std::vector<double> rank_copy_bandwidth(const DeviceContext& context) {
     // Large enough to stream past the L2 of every supported card, small enough to fit beside a
     // CUDA context on any of them.

@@ -22,26 +22,24 @@ inline constexpr float kKVCacheNvfp4MaxFinite    = 6.0F;
 inline constexpr float kKVCacheNvfp4ScaleMinimum = 0x1p-9F;
 inline constexpr float kKVCacheNvfp4ScaleMaximum = 448.0F;
 
-template <typename Geometry>
-__device__ __forceinline__ std::int64_t kv_cache_nvfp4_code_index(int physical_page, int kv_head,
-                                                                  int d, int page_offset) {
-    return paged_kv_element_offset<kKVCacheNvfp4CodeBytes, Geometry::KVHeads>(
-        physical_page, kv_head, page_offset, d >> 1);
+__device__ __forceinline__ std::int64_t
+kv_cache_nvfp4_code_index(int physical_page, int kv_head, int d, int page_offset, int kv_heads) {
+    return paged_kv_element_offset<kKVCacheNvfp4CodeBytes>(physical_page, kv_head, page_offset,
+                                                           d >> 1, kv_heads);
 }
 
-template <typename Geometry>
 __device__ __forceinline__ std::int64_t kv_cache_nvfp4_scale_index(int physical_page, int kv_head,
-                                                                   int group, int page_offset) {
-    return paged_kv_element_offset<kKVCacheNvfp4Groups, Geometry::KVHeads>(physical_page, kv_head,
-                                                                           page_offset, group);
+                                                                   int group, int page_offset,
+                                                                   int kv_heads) {
+    return paged_kv_element_offset<kKVCacheNvfp4Groups>(physical_page, kv_head, page_offset, group,
+                                                        kv_heads);
 }
 
-template <typename Geometry>
-__device__ __forceinline__ std::int64_t kv_cache_nvfp4_src_index(int kv_head, int d, int token) {
+__device__ __forceinline__ std::int64_t kv_cache_nvfp4_src_index(int kv_head, int d, int token,
+                                                                 int kv_heads) {
     return static_cast<std::int64_t>(d) +
            static_cast<std::int64_t>(kKVCacheNvfp4HeadDim) *
-               (static_cast<std::int64_t>(kv_head) +
-                static_cast<std::int64_t>(Geometry::KVHeads) * token);
+               (static_cast<std::int64_t>(kv_head) + static_cast<std::int64_t>(kv_heads) * token);
 }
 
 struct KVCacheNvfp4QuantizedGroup16 {

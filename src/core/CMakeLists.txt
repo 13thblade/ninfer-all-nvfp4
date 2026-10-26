@@ -1,6 +1,7 @@
 add_library(ninfer_core STATIC
   arena.cu
   device.cu
+  expert_parallel.cpp
   stage_link.cu
   tensor_parallel.cu
   tensor_split.cpp

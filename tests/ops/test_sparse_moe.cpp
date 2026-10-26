@@ -405,6 +405,31 @@ private:
     DeviceBuffer scales_;
 };
 
+// Rows [first, first + rows) of a row-split bank, read where the bank holds them: an expert share's
+// part of the routed banks.
+Weight bank_rows(Weight whole, std::int32_t first, std::int32_t rows) {
+    const QuantGeometry geometry = quant_geometry(whole.qtype);
+    const std::size_t groups     = static_cast<std::size_t>(whole.k / geometry.group);
+    const auto offset = [&](const void* plane, std::size_t bytes_per_group) -> const void* {
+        return plane == nullptr ? nullptr
+                                : static_cast<const std::uint8_t*>(plane) +
+                                      static_cast<std::size_t>(first) * groups * bytes_per_group;
+    };
+    whole.qdata           = offset(whole.qdata, geometry.code_bytes_per_group);
+    whole.payload         = whole.qdata;
+    whole.qhigh           = offset(whole.qhigh, geometry.high_bytes_per_group);
+    whole.scales          = offset(whole.scales, sizeof(std::uint16_t));
+    whole.n               = rows;
+    whole.shape[0]        = rows;
+    whole.padded_shape[0] = rows;
+    whole.high_plane_bytes =
+        static_cast<std::size_t>(rows) * groups * geometry.high_bytes_per_group;
+    whole.payload_bytes =
+        static_cast<std::size_t>(rows) * groups *
+        (geometry.code_bytes_per_group + geometry.high_bytes_per_group + sizeof(std::uint16_t));
+    return whole;
+}
+
 Weight dense_bf16_weight(void* data, std::int32_t rows, std::int32_t columns) {
     Weight result{};
     result.payload         = data;
@@ -958,6 +983,69 @@ public:
         return failures;
     }
 
+    // Expert parallelism: experts [ends[r], ends[r + 1]) for each share r, the shared expert in the
+    // first, each through sparse_moe_share on its own rows of the banks. The partials are summed in
+    // share order and added to the residual with one BF16 rounding, as the tensor-parallel exchange
+    // does, and the result is held to the whole Op's oracle and criterion.
+    int run_shares(std::int32_t tokens, int first_pattern, std::span<const std::int32_t> ends) {
+        std::string label = std::string(profile_.name) + " T=" + std::to_string(tokens) + " shares";
+        for (const std::int32_t end : ends) { label += " " + std::to_string(end); }
+        const std::size_t values = static_cast<std::size_t>(kHidden) * tokens;
+        std::vector<float> input(values), residual(values);
+        std::vector<double> reference(values);
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            const int pattern = (first_pattern + token) % static_cast<int>(kRoutePatterns.size());
+            const std::size_t at = static_cast<std::size_t>(token) * kHidden;
+            std::copy(inputs_[pattern].begin(), inputs_[pattern].end(), input.begin() + at);
+            std::copy(residuals_[pattern].begin(), residuals_[pattern].end(),
+                      residual.begin() + at);
+            std::copy(references_[pattern].begin(), references_[pattern].end(),
+                      reference.begin() + at);
+        }
+        const std::vector<std::uint16_t> input_bits = bf16_bits(input);
+        DeviceBuffer device_input                   = to_device(input_bits);
+        Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
+        const Weight gate_up = routed_gate_.weight();
+        const Weight down    = routed_down_.weight();
+        std::vector<float> sum(values, 0.0f);
+        int failures = 0;
+        for (std::size_t share = 0; share + 1 < ends.size(); ++share) {
+            const std::int32_t begin = ends[share];
+            const std::int32_t count = ends[share + 1] - begin;
+            const bool shared        = share == 0;
+            ops::SparseMoeWeights weights{
+                dense_bf16_weight(device_router_.p, kExperts + 1, kHidden),
+                bank_rows(gate_up, begin * kExpertGateRows, count * kExpertGateRows),
+                bank_rows(down, begin * kHidden, count * kHidden),
+                shared ? shared_gate_.weight() : Weight{},
+                shared ? shared_down_device_.weight() : Weight{},
+            };
+            DeviceBuffer partial(values * sizeof(float));
+            partial.fill(0xff);
+            Tensor out(partial.p, DType::FP32, {kHidden, tokens});
+            const std::size_t workspace_bytes = ops::sparse_moe_share_workspace_capacity_bytes(
+                gate_up.qtype, down.qtype, tokens, tokens);
+            WorkspaceArena workspace(workspace_bytes);
+            ops::sparse_moe_share(x, weights, {begin, count, shared}, out, workspace, nullptr);
+            cuda_synchronize();
+            const std::vector<float> host = from_device<float>(partial, values);
+            for (std::size_t i = 0; i < values; ++i) { sum[i] += host[i]; }
+            if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+                std::cerr << label << ": share workspace query/execution high-water mismatch\n";
+                ++failures;
+            }
+        }
+        std::vector<double> output(values);
+        for (std::size_t i = 0; i < values; ++i) {
+            output[i] = bf16_to_f32(f32_to_bf16(residual[i] + sum[i]));
+        }
+        failures += verify_reduction(label, output, reference, profile_.criterion(tokens));
+        failures +=
+            verify_exact((label + " input preservation").c_str(),
+                         from_device<std::uint16_t>(device_input, input_bits.size()), input_bits);
+        return failures;
+    }
+
     int verify_persistent_inputs() const {
         int failures = 0;
         failures += verify_exact((std::string(profile_.name) + " router preservation").c_str(),
@@ -1177,14 +1265,36 @@ int run_candidates(const CodecProfile& profile) {
     return failures;
 }
 
+// The groupwise profiles' expert shares: splits that cut between selected experts, one that leaves
+// a share a single selected expert, and one whose middle share holds a single expert, over decode,
+// Small-T and prefill calls including a sliced one.
+int run_shares(const CodecProfile& profile) {
+    SparseMoeFixture fixture(profile);
+    constexpr std::array<std::int32_t, 4> kThree{{0, 97, 200, 256}};
+    constexpr std::array<std::int32_t, 3> kLast{{0, 255, 256}};
+    constexpr std::array<std::int32_t, 4> kOne{{0, 17, 18, 256}};
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 5, 8, 16, 20, 32, 47, 64, 768, 4097}) {
+        failures += fixture.run_shares(tokens, tokens == 1 ? 1 : 0, kThree);
+        if (tokens == 1 || tokens == 8 || tokens == 64) {
+            failures += fixture.run_shares(tokens, 0, kLast);
+            failures += fixture.run_shares(tokens, 2, kOne);
+        }
+    }
+    failures += fixture.verify_persistent_inputs();
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     const bool wide_only = argc == 2 && std::string_view(argv[1]) == "--wide-only";
     const bool streamed = argc == 2 && std::string_view(argv[1]) == "--streaming";
     const bool candidates_only = argc == 2 && std::string_view(argv[1]) == "--candidates-only";
-    if (argc != 1 && !wide_only && !streamed && !candidates_only) {
-        std::cerr << "usage: " << argv[0] << " [--wide-only|--streaming|--candidates-only]\n";
+    const bool shares          = argc == 2 && std::string_view(argv[1]) == "--shares";
+    if (argc != 1 && !wide_only && !streamed && !candidates_only && !shares) {
+        std::cerr << "usage: " << argv[0]
+                  << " [--wide-only|--streaming|--candidates-only|--shares]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -1248,6 +1358,13 @@ int main(int argc, char** argv) {
         }
     }
     int failures = 0;
+    if (shares) {
+        for (const CodecProfile& profile : profiles) {
+            if (profile.routed_gate_up != QType::NVFP4) { failures += run_shares(profile); }
+        }
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe expert shares\n";
+        return failures == 0 ? 0 : 1;
+    }
     if (candidates_only) {
         for (const CodecProfile& profile : profiles) { failures += run_candidates(profile); }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe laboratory candidates\n";

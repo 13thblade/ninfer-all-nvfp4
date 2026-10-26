@@ -94,6 +94,9 @@ private:
 // short copy on each card.
 [[nodiscard]] std::vector<double> rank_copy_bandwidth(const DeviceContext& context);
 
+// Each rank's free device memory now, shared evenly by the ranks one card holds.
+[[nodiscard]] std::vector<std::uint64_t> rank_free_bytes(const DeviceContext& context);
+
 namespace detail {
 
 // One rank's reduction: residual[i] <- bf16(float(residual[i]) + ((part[0][i] + part[1][i]) + ...)).

@@ -31,7 +31,8 @@ __device__ __forceinline__ void kv_cache_append_full_k8v4_row(
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
-        values[r]   = __bfloat162float(k[kv_cache_fp8_src_index<Geometry>(kv_head, d, token)]);
+        values[r] =
+            __bfloat162float(k[kv_cache_fp8_src_index(kv_head, d, token, Geometry::KVHeads)]);
     }
     normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
@@ -40,18 +41,20 @@ __device__ __forceinline__ void kv_cache_append_full_k8v4_row(
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
-        cache_k[kv_cache_fp8_code_index<Geometry>(physical_page, kv_head, d, page_offset)] =
+        cache_k[kv_cache_fp8_code_index(physical_page, kv_head, d, page_offset,
+                                        Geometry::KVHeads)] =
             kv_cache_fp8_quant_code(values[r], k_quant.inverse_scale);
     }
     if (lane == 0) {
-        scale_k[kv_cache_fp8_scale_index<Geometry>(physical_page, kv_head, page_offset)] =
+        scale_k[kv_cache_fp8_scale_index(physical_page, kv_head, page_offset, Geometry::KVHeads)] =
             k_quant.scale;
     }
 
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
-        values[r]   = __bfloat162float(v[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
+        values[r] =
+            __bfloat162float(v[kv_cache_nvfp4_src_index(kv_head, d, token, Geometry::KVHeads)]);
     }
     normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
@@ -59,11 +62,11 @@ __device__ __forceinline__ void kv_cache_append_full_k8v4_row(
     __syncwarp();
     if (lane < kKVCacheNvfp4Groups) {
         const auto quantized = kv_cache_nvfp4_quantize_group16(scratch + lane * kKVCacheNvfp4Group);
-        const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
-            physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset);
+        const std::int64_t code_offset = kv_cache_nvfp4_code_index(
+            physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset, Geometry::KVHeads);
         store_vec(cache_v + code_offset, make_uint2(quantized.codes_lo, quantized.codes_hi));
-        scale_v[kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, lane, page_offset)] =
-            quantized.scale;
+        scale_v[kv_cache_nvfp4_scale_index(physical_page, kv_head, lane, page_offset,
+                                           Geometry::KVHeads)] = quantized.scale;
     }
 }
 

@@ -233,9 +233,11 @@ container, so the cause is not confirmed.
 
 ## Tensor parallelism
 
-`--devices A,B,... --tensor-parallel` divides every layer of a dense Qwen3.5-core model over the
-devices instead of dealing layers out. It targets decode: each card reads only its share of the
-weights for every token.
+`--devices A,B,... --tensor-parallel` divides every layer of a Qwen3.5-core model over the devices
+instead of dealing layers out. It targets decode: each card reads only its share of the weights for
+every token. The other MoE families (Qwen3.8-Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash)
+divide only their routed experts this way ([expert parallelism of the other MoE
+families](#expert-parallelism-of-the-other-moe-families)).
 
 - **The shares.** Rank r holds a contiguous range of GDN key heads with the value heads that read
   them (the value-to-key head map is contiguous), their q/k/v/z projection rows, convolution
@@ -243,9 +245,24 @@ weights for every token.
   projection; and a contiguous range of the dense FFN's gate and up rows with those input columns
   of down. The ranges differ in size when the cards do. The gating projection, `A_log`, `dt_bias`,
   the gated norm and the layer norms are small, so every rank holds all of them: it gates every
-  head and keeps its own. Attention, the KV cache, the embedding, the final norm, the head and MTP
-  stay on rank 0. `TensorShare` and `tensor_parallel_share` (`models/qwen3_5/config.h`) state a
-  rank's ranges and geometry.
+  head and keeps its own. Attention divides by KV heads: a rank holds a contiguous range of them with
+  the query heads that read them (their query, gate, key and value projection rows and the matching
+  input columns of the output projection, the per-dimension query and key norms whole) and those
+  heads' planes of every layer's KV cache. The ranks holding KV heads are a prefix of the ranks;
+  with more ranks than the heads allow, the last ones hold no attention. The embedding, the final
+  norm, the head and MTP stay on rank 0. `TensorShare` and `tensor_parallel_share`
+  (`models/qwen3_5/config.h`) state a rank's ranges and geometry.
+- **Expert parallelism.** In a MoE model a rank holds a contiguous range of the routed experts in
+  place of FFN rows: one device selection of each expert bank, its experts side by side as the bank
+  stores them (`Bindings::joint_piece`). Every rank holds the router (rank 0 its own copy, the
+  others a selection of the router object) and routes every token itself; rank 0 holds the shared
+  expert. `ops::sparse_moe_share` runs the decode, Small-T and prefill routes of SparseMoe over the
+  share: a selected expert of another rank contributes nothing, and the rank writes the FP32 sum of
+  its paths, the shared one on rank 0, as its partial for the FFN exchange. The adaptive prefill
+  band (47 to 52 tokens) takes the plain prefill route under a share. The experts divide at any
+  expert; the automatic split counts the experts as divided weights, the router as held by every
+  rank and the shared expert as rank 0's. Experts in host memory or on disk
+  (`--expert-residency host|disk`) and NVFP4 expert banks have no share and are refused.
 - **Where the shares end** (`plan_tensor_shares`, `models/qwen3_5/load/text.cpp`). A share is a
   piece of a stored object: a row range and column ranges (`artifact/selection.h`), gathered from
   the file as byte runs at upload, so its bounds must fall on whole stored blocks (columns: one for
@@ -257,20 +274,23 @@ weights for every token.
   `Bindings::column_ends` and
   `Bindings::row_ends` list those positions per tensor; the head ends every layer's GDN projections
   allow and the row ends every FFN allows are the candidates, and `split_shares` (`core/tensor_split.h`)
-  places each rank's end at the candidate nearest its weight's cumulative target. The stored
-  objects themselves get no device demand.
+  places each rank's end at the candidate nearest its weight's cumulative target. The KV heads end
+  where every attention layer's projections allow (a rotated output projection: an even KV head of
+  four, whose 1,536-column groups end on 1,024-column blocks only in pairs), split over the first
+  ranks, as many as those ends give a share, by the same weights. The stored objects themselves get
+  no device demand.
 - **The weights.** `--tensor-split A,B,...` gives them, one per device. Without it the engine
   measures each card's device-to-device copy bandwidth (`rank_copy_bandwidth`, 128 MiB; ranks on one
-  card divide its figure) as its speed, works out how much of the divided weights and GDN state each
-  card can hold beside what every rank holds and, on rank 0, attention, the KV cache for the
-  configured context and concurrency, and the head (`default_tensor_split`,
+  card divide its figure) as its speed, works out how much of the divided weights, GDN state and KV
+  cache for the configured context and concurrency each card can hold beside what every rank holds
+  and, on rank 0, the embedding and the head (`default_tensor_split`,
   `models/qwen3_5/load.cpp`), and fills the cards in proportion to speed, capping a card at its room
   and passing the excess to the others (`fill_shares`). Decode reads every weight once per token, so
   bandwidth sets each rank's time.
 - **The pass** (`TextContext::run_tensor_parallel`). Rank 0 sends the residual and the control
   tensors to every rank over the stage links; each rank then keeps a replica of the residual. Each
-  layer has two exchanges (`core/tensor_parallel.h`): after the mixer (attention: rank 0 alone;
-  GDN: every rank) and after the FFN. A contributor writes its output projection as FP32 partials;
+  layer has two exchanges (`core/tensor_parallel.h`): after the mixer (attention: the ranks holding
+  KV heads, each over its own planes and block-table copy; GDN: every rank) and after the FFN. A contributor writes its output projection as FP32 partials;
   every rank then adds all partials to its replica in rank order and rounds once to BF16, so the
   replicas stay identical. Peer reads where every pair of cards has peer access, mapped pinned host
   memory otherwise; both capture into the decode graphs.
@@ -281,27 +301,33 @@ weights for every token.
 - **Coverage.** Every weight format of a dense Qwen3.5-core model: GGUF, BF16, row-split
   Q4/Q5/Q6/Q8 and T2, FP8 and NVFP4, Hadamard-rotated or not; any split the stored blocks allow on
   two to eight ranks, cards of different models where the build runs on each; MTP, the masked
-  drafters (DFlash, DFlash2: rank 0's replica after each layer is the residual one device taps) and
-  Vision (on rank 0). A share's projections have no tuned shapes, so they take Linear's
+  drafters (DFlash, DFlash2: rank 0's replica after each layer is the residual one device taps),
+  grafted prefixes (each rank appends its KV heads) and Vision (on rank 0). A share's projections have no tuned shapes, so they take Linear's
   runtime-shape routes (the shape tables' kernel templates with the rows and K read from the
   operands; FP8 and NVFP4 with A16 compute whatever the policy): the GDN input projection as parts,
   one Linear per piece into the q/k/v and z planes; gate and up as two FP32 products that SwiGLU
   rounds once; the output and down projections as FP32 partials. A rotated share turns its whole
   input, or its own 1024-column blocks of it, with its slice of the sign vector
   (`WeightUse::hadamard_begin`) in its own device's copy (`AuxiliaryReplicas`), so a rank reads no
-  other card's memory. Refused: MoE models,
-  `--stage-layers`, `--vision-residency overlay` (as for pipeline stages), Flash-Next, Gemma 4, Flint
-  and DeepSeek-V4.1-Flash. Ranks may share a device (`--devices 0,0`), which is how the path is
-  tested on one card.
+  other card's memory. The native MoE models take expert parallelism (above). Refused:
+  `--stage-layers` and `--vision-residency overlay` (as for pipeline stages). Ranks may share a
+  device (`--devices 0,0`), which is how the path is tested on one card.
 - **Kernels at the share shapes.** The convolution split, the projected convolution and the replay
   record and fold keep the whole-layer geometries as template constants and take any other share's
   rows and heads at run time (`CausalConvSplitGeometry`, `ProjectedConvRows`, `FoldGeometryDynamic`);
   the op tests qualify halves, quarters and uneven shares (three key heads with nine value heads,
-  five with ten).
+  five with ten). Causal attention keeps the query heads per KV head of its two model geometries
+  (24 query heads over 4 KV heads, 16 over 2) as template constants and reads how many KV heads a
+  call holds from its launch grid, so a share (18/3, 12/2 and 6/1; 8/1) runs the model's kernels
+  without instantiations of its own and takes the routes of its model's device-profile entry
+  (`ModelQHeads`, `geometry.cuh`); KV append takes one to four heads. The op tests
+  (`--tensor-shares-only`) qualify the four shares against the oracle at decode, verification and
+  prompt widths, single and batched, over every storage.
 
 Measured on Qwen3.8-27B GSQ-RCO IQ3_S (2026-10-25, `scripts/pods/serve_ab.py`, greedy, four short
 prompts of 256 tokens, two passes and two server starts per configuration, plus one 7,014-token
-prompt). Every run gave one device's answers.
+prompt; attention then ran on rank 0 alone). The answers were compared between a configuration's
+repeats, not with one device's.
 
 - **2x RTX 3090** (Vast, PCIe 4.0 x8 links, no peer access, so the mapped host transport). Decode
   72.9-75.2 tok/s against 57.0-57.3 on one card (+27% to +31%) and 58.4-58.5 with two pipeline
@@ -315,11 +341,12 @@ prompt). Every run gave one device's answers.
   below one card's 89-134: a check of the four-rank shares, not a four-card measurement.
 - **Uneven shares on the same kind of pair** (Vast 2x RTX 3090, mapped host transport, 2026-10-26;
   the same four prompts and a 7,054-token one, two passes per configuration). One card 56.5-57.3
-  tok/s. The automatic split put 6.35 GiB on rank 0 (which also holds attention and the head) and
+  tok/s. The automatic split put 6.35 GiB on rank 0 (which then also held attention and the head) and
   4.64 GiB on rank 1 and decoded at 72.7-75.6, as the equal `--tensor-split 1,1` (70.8-75.4).
   `--tensor-split 3,1` decodes at 59.5-61.2 (+5% to +7%): the larger share sets the pace.
   `--devices 0,0,1` with the automatic split (two ranks on one card) decodes at 70.8-73.2, and
-  prefills the long prompt at 799-904 tok/s against 1,550-1,574. Every answer matched one card's.
+  prefills the long prompt at 799-904 tok/s against 1,550-1,574. One answer of five matched one
+  card's under every split; the others part from it after 17 to 470 characters.
 - **2x Tesla V100-SXM2-32GB** (Vast, NVLink, so peer reads; the sm_70 routes). Decode 60.2-60.4
   tok/s against 43.9 on one card (+37%); with `NINFER_FORCE_STAGED_LINKS=1` the mapped host
   transport gives 54.6-55.0 (+25%). With MTP 83.4-122.3 against 58.1-87.1 (+29% to +44%). Over
@@ -339,6 +366,79 @@ prompt). Every run gave one device's answers.
   integer route of their tuned shapes, where a share takes the A16 runtime-shape route. The 27B
   pair gave one card's answer on one prompt of five and Bonsai's pair on three of five; the others
   part after 260-510 characters into different, coherent text.
+- **Native MoE expert parallelism on 2x RTX 3090** (the same pair, 2026-10-26; the four short
+  prompts and a 7,054-token one, one pass). Qwen3.6-35B-A3B fits one card, which decodes faster:
+  184.3-185.8 tok/s against 201.7-202.2 (-8%), 173.4 against 186.8 after the long prompt (-7%). With
+  `--spec mtp --draft-tokens 3` the pair gains 4% to 13% on the short prompts (278.5-375.1 against
+  261.1-360.0) and loses 3% after the long one (223.8 against 230.8). The long prompt prefills at
+  5,280 tok/s against 7,424 (-29%), and a short prompt's TTFT is 44.8-66.8 ms against 38.6-43.7 ms.
+  Perplexity over 7,041 tokens of `docs/maintainer/engine-architecture.md` (2,048-token windows,
+  stride 1,024, int8 KV) is 27.138 with `--tensor-split 1,1` and 27.194 with `3,1` against 27.076
+  (+0.23%, +0.44%). No short answer matched one card's (one of five with MTP); they part after 25 to
+  231 characters. One card's own decode is unchanged against master (201.7-202.2 against
+  202.0-202.7 tok/s).
+
+### Expert parallelism of the other MoE families
+
+Qwen3.8-Flash-Next, Gemma 4, Flint and DeepSeek-V4.1-Flash keep every layer on rank 0 and divide
+only the routed experts of each MoE block: rank r holds experts `[e_r, e_{r+1})`, a contiguous range
+of `--tensor-split`'s weights (`split_shares` over single experts). Rank 0 runs attention, the
+router, the shared expert, the head, the drafters and Vision, as one device does.
+
+- **A MoE call** (`ExpertParallelExchange`, `core/expert_parallel.h`). Rank 0 routes the call, then
+  sends what the experts read (Flash-Next: the BF16 input; the GGUF families: the q8_1 activation of
+  a call of up to eight tokens, or the BF16 rows of a wider one; DeepSeek also the guard's factors)
+  with the ids and weights to every other rank over a stage link. Each rank keeps the pairs routed to
+  its own experts (`moe_keep_experts`; ids of other ranks' experts become -1, which
+  `moe_sort_routes` leaves out), runs them on its own stream and workspace, and sends back their
+  weighted sum as a 2^-32 fixed-point part (I64 [T][H]). Rank 0 runs its own part meanwhile, adds the
+  parts as integers and hands the sum to the block's combine. The exchange is a pair of StageLinks
+  per peer (peer copies or mapped pinned host memory), legal eagerly and inside the decode graphs,
+  whose capture the peers' streams join.
+- **Numerics.** Each pair's contribution is computed and rounded exactly as on one device and integer
+  addition commutes, so the sum does not depend on the split. Where one device also sums in this
+  fixed point the result is one device's bit for bit: every Flash-Next call
+  (`moe_experts_gguf_part`, `moe_experts_gguf_combine`), and the decode and verification calls of
+  up to eight tokens of Gemma 4, Flint and DeepSeek. Their prompt chunks on one device weigh the
+  experts' FP32 rows in FP32 in the block's combine; under expert parallelism the same rows are
+  weighted into the fixed-point sum (`moe_weighted_rows`), which rounds differently.
+- **Residency.** Flash-Next (GGUF banks), Gemma 4 and Flint divide device-resident experts: each
+  rank binds its rows of every bank as a piece of its own (with the matrix kernel's zero tail) and
+  builds expert tables whose other entries are null. DeepSeek-V4.1-Flash, whose experts live in
+  pinned host memory or the artifact's files, gives every rank an `ExpertDelivery` of its own over
+  its experts (tables of those alone, local ids from `moe_local_experts`): its own layer banks and
+  device cache, filled over its own bus. Without `--tensor-split` the device families size the
+  shares by each card's copy bandwidth within its free memory (`models::default_expert_split`),
+  DeepSeek equally. Refused: Flash-Next's native banks and host or disk experts, Gemma 4's and
+  Flint's host or disk experts, DeepSeek's device experts and its CPU share
+  (`--expert-dma-share`, `--expert-cpu-threads`); DeepSeek's prompt spans are off.
+
+Measured on 2x RTX 3090 (Vast, PCIe 4.0 x16, no peer access, so the mapped host transport;
+2026-10-26; `scripts/pods/serve_ab.py`, greedy, four short prompts of 256 tokens and a prompt of
+about 7,000 tokens, one pass per configuration). Every MoE call crosses the bus twice, so on this
+pair the exchange costs more decode time than the divided experts save:
+
+- **Qwen3.8-Flash-Next** Q2_0 (`--no-ngram-table`), against two pipeline stages on the same pair:
+  decode 92.0-92.4 tok/s against 108.0-108.2 (-14% to -15%), 90.3 against 105.1 after the long
+  prompt; with `--spec mtp --draft-tokens 3` 110.9-177.1 against 113.0-178.7 and 153.0 against
+  152.8. A short prompt's TTFT is 80.7-90.4 ms against 96.8-100.1 ms; the 7,054-token prompt
+  prefills at 2,109 tok/s against 3,114 (-32%). Every answer, with MTP and without, is the stages'.
+- **Gemma 4** 26B-A4B QAT (fits one card), against one card: decode 164.6-166.2 tok/s against
+  216.3-218.4 (-24%), 155.1 against 195.5 after the long prompt (-21%); with `--spec mtp
+  --draft-tokens 3` 240.4-377.0 against 249.7-398.1 (-6% to +1%) and 199.1 against 197.1. A short
+  prompt's TTFT is 44.3-49.2 ms against 45.1-51.7 ms; the 6,966-token prompt prefills at 4,858
+  tok/s against 5,995 (-19%). Perplexity over 6,952 tokens of the same document (2,048-token
+  windows, stride 1,024, int8 KV) is 1,653.84 against 1,647.85 (+0.36%; the instruction-tuned
+  model scores raw Markdown poorly), the same for `--tensor-split 1,1` and `3,1`. One answer of five
+  matched one card's; the others part after 12 to 452 characters, from prompts the pair prefilled
+  with the fixed-point weighting.
+- **Flint** UD-Q4_K_XL, which does not fit one 24 GB card with its experts, against one card with
+  host experts (98% of decode routes from its device cache): decode 141.5-141.9 tok/s against
+  147.3-150.4 (-4% to -6%), 135.1 against 142.1 after the long prompt (-5%). A short prompt's TTFT
+  is 43.0-45.2 ms against 78.0-99.4 ms and the 6,932-token prompt prefills at 4,593 tok/s against
+  5,042 (-9%). Perplexity over 6,927 tokens (F16 KV) is 45.397 against 45.362 (+0.08%), the same
+  for `--tensor-split 1,1` and `3,1`. No answer matched the host run's; they part after 23 to 923
+  characters.
 
 What the transport costs was measured before this was built:
 

@@ -244,6 +244,75 @@ WeightId Bindings::piece(const std::string& name, const artifact::Shape& shape,
     return id;
 }
 
+std::vector<WeightId> Bindings::joint_piece(std::span<const JointPart> parts, std::size_t rank) {
+    if (parts.empty()) { throw std::invalid_argument("a joint piece needs parameters"); }
+    const auto& bindings = binder.reader().directory().bindings;
+    const auto columns   = parts.front().shape.back();
+    std::optional<artifact::ObjectHandle> object;
+    std::uint64_t first = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t last  = 0;
+    std::uint64_t rows  = 0;
+    for (const JointPart& part : parts) {
+        const auto found = bindings.find(part.name);
+        if (found == bindings.end()) {
+            throw artifact::ArtifactError("missing logical parameter " + part.name);
+        }
+        if (part.shape.size() != 2 || part.shape[1] != columns ||
+            weight_element_count(part.shape) != found->second.elements) {
+            throw artifact::ArtifactError(part.name +
+                                          ": logical shape differs from Binding coverage");
+        }
+        for (const auto& stored : found->second.parts) {
+            if (object && stored.object.index != object->index) {
+                throw artifact::ArtifactError(part.name +
+                                              ": a joint piece needs its parameters in one object");
+            }
+            object              = stored.object;
+            const auto geometry = binder.reader().geometry(stored.object);
+            if (geometry.shape.size() != 2 || geometry.shape[1] != columns ||
+                stored.begin % columns != 0 || stored.end % columns != 0) {
+                throw artifact::ArtifactError(part.name +
+                                              ": a joint piece needs parts of whole rows");
+            }
+            first = std::min(first, stored.begin / columns);
+            last  = std::max(last, stored.end / columns);
+            rows += (stored.end - stored.begin) / columns;
+        }
+    }
+    const auto geometry = binder.reader().geometry(*object);
+    const auto row_unit = artifact::selection_row_unit(geometry);
+    if (rows != last - first || first % row_unit != 0 ||
+        (last % row_unit != 0 && last != geometry.shape[0])) {
+        throw artifact::ArtifactError(
+            parts.front().name + ": a joint piece must cover one whole run of its object's rows");
+    }
+    artifact::ObjectSelection selection;
+    selection.row_begin                 = first;
+    selection.row_end                   = last;
+    selection.columns                   = {{0, columns}};
+    const artifact::ObjectHandle handle = binder.select_device(*object, std::move(selection), rank);
+    std::vector<WeightId> out;
+    out.reserve(parts.size());
+    for (const JointPart& part : parts) {
+        const artifact::Binding& whole = bindings.at(part.name);
+        artifact::Binding binding;
+        binding.elements = whole.elements;
+        for (const auto& stored : whole.parts) {
+            binding.parts.push_back(
+                {handle, stored.begin - first * columns, stored.end - first * columns});
+        }
+        PendingWeight pending;
+        pending.reference = {part.name + "@" + std::to_string(rank), part.shape, std::move(binding),
+                             artifact::Residency::Device};
+        add_uses(pending, part.name, part.inputs);
+        pending.source_objects.push_back(binder.object_id(handle));
+        pending.rank = rank;
+        out.push_back({weights.size()});
+        weights.push_back(std::move(pending));
+    }
+    return out;
+}
+
 std::vector<bool> Bindings::column_ends(const std::string& name, const artifact::Shape& shape,
                                         const std::vector<std::string>& inputs) {
     const auto found = binder.reader().directory().bindings.find(name);

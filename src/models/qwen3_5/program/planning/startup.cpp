@@ -160,15 +160,17 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     LayoutBuilder& builder = builders.front();
 
     std::vector<std::size_t> attention_layer_rank;
+    std::vector<std::int32_t> kv_head_shares;
     std::vector<qwen3_5::StateImageShard> state_shards;
     if (ranks == 1) {
         state_shards.push_back({.rank = 0, .first_layer = 0, .layers = config.linear_attention_layers});
     } else if (parameters.text.tensor_parallel()) {
-        // Attention and its KV stay on rank 0; every rank holds its heads' share of every GDN
-        // layer's state.
-        for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
-            if (config.layer_types[layer] == MixerKind::FullAttention) {
-                attention_layer_rank.push_back(0);
+        // Every rank holds its KV heads' share of every attention layer's cache and its GDN
+        // heads' share of every GDN layer's state.
+        for (const auto& share : parameters.text.tensor_shares) {
+            if (share.kv_head_end > share.kv_head_begin) {
+                kv_head_shares.push_back(
+                    static_cast<std::int32_t>(share.kv_head_end - share.kv_head_begin));
             }
         }
         for (std::size_t rank = 0; rank < ranks; ++rank) {
@@ -201,20 +203,20 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
 
     PersistentLayout out;
     out.decoder = qwen3_5::plan_decoder_state(
-        builder_pointers,
-        qwen3_5::DecoderStateSpec{
-            .full_attention_layers     = config.full_attention_layers,
-            .mtp_layers                = 1,
-            .capacity                  = plan.capacity,
-            .kv_heads                  = dimension(config.attention->num_key_value_heads),
-            .attention_head_dim        = dimension(config.attention->head_dim),
-            .kv_storage                = plan.kv_storage,
-            .enable_mtp                = plan.features.mtp(),
-            .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
-            .text_physical_page_groups = physical_pages,
-            .mtp_physical_page_groups  = mtp_physical_pages,
-            .text_layer_rank           = std::move(attention_layer_rank),
-        });
+        builder_pointers, qwen3_5::DecoderStateSpec{
+                              .full_attention_layers = config.full_attention_layers,
+                              .mtp_layers            = 1,
+                              .capacity              = plan.capacity,
+                              .kv_heads = dimension(config.attention->num_key_value_heads),
+                              .attention_head_dim = dimension(config.attention->head_dim),
+                              .kv_storage         = plan.kv_storage,
+                              .enable_mtp         = plan.features.mtp(),
+                              .kv_table_rows      = static_cast<std::int32_t>(plan.max_concurrency),
+                              .text_physical_page_groups = physical_pages,
+                              .mtp_physical_page_groups  = mtp_physical_pages,
+                              .text_layer_rank           = std::move(attention_layer_rank),
+                              .text_kv_head_shares       = std::move(kv_head_shares),
+                          });
     // The Program binds this pool's own planned geometry, so the Host page cost the RAM budget
     // trades against is priced from the plan rather than recovered from a constructed pool.
     out.host_kv_text_page_stride =
@@ -481,8 +483,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t max_width,
                                  ops::CausalAttentionExecutionEnvelope envelope) {
         const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
-        // A tensor-parallel rank's share of a layer has no attention (rank 0 runs it alone), and its
-        // GDN and FFN output projections write FP32 partials instead of adding to the residual.
+        // A tensor-parallel rank's share of a layer has attention only where the rank holds KV
+        // heads, and its mixer and FFN output projections write FP32 partials instead of adding to
+        // the residual.
         const bool partial = parameters.text.tensor_parallel();
         const auto residual_scratch = [&](const execution::LinearParameters& p) {
             if (partial) {
@@ -491,7 +494,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 add_scratch(layout, p, first, last, wide_verification);
             }
         };
-        const auto plan_block = [&](const execution::BlockParameters& block, bool attention_runs) {
+        const auto plan_block = [&](const execution::BlockParameters& block, bool attention_runs,
+                                    const TextConfig& share) {
             if (attention_runs || std::holds_alternative<execution::GdnParameters>(block.mixer)) {
                 auto stage = layout.scope();
                 if (const auto* attention =
@@ -504,11 +508,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     (void)workspace::text_attention_results(layout, config, last);
                     scratch(layout,
                             ops::causal_softmax_attention_workspace_capacity_bytes(
-                                {dimension(config.attention->head_dim),
-                                 dimension(config.attention->num_attention_heads),
-                                 dimension(config.attention->num_key_value_heads)},
+                                {dimension(share.attention->head_dim),
+                                 dimension(share.attention->num_attention_heads),
+                                 dimension(share.attention->num_key_value_heads)},
                                 plan.kv_storage, envelope, batch_size, min_width, max_width));
-                    add_scratch(layout, attention->output, first, last, wide_verification);
+                    residual_scratch(attention->output);
                 } else {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
                     (void)workspace::gdn_control(layout, config, last);
@@ -547,11 +551,20 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                              execution::ffn_workspace_bytes(block.ffn, first, last, false, verify,
                                                             false, partial)));
         };
+        std::vector<TextConfig> shares;
+        for (const auto& share : parameters.text.tensor_shares) {
+            shares.push_back(qwen3_5::tensor_parallel_share(config, share));
+        }
+        const auto holds_attention = [&](std::size_t rank) {
+            return shares.empty() || shares[rank].attention->num_key_value_heads != 0;
+        };
         for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
-            plan_block(parameters.text.layers[layer], true);
+            plan_block(parameters.text.layers[layer], holds_attention(0),
+                       shares.empty() ? config : shares[0]);
             // Every rank's scratch has rank 0's size, so it holds the largest share's needs.
-            for (const auto& rank_layers : parameters.text.rank_layers) {
-                plan_block(rank_layers[layer], false);
+            for (std::size_t rank = 1; rank <= parameters.text.rank_layers.size(); ++rank) {
+                plan_block(parameters.text.rank_layers[rank - 1][layer], holds_attention(rank),
+                           shares[rank]);
             }
         }
         // A prompt chunk projects only its last column through the head; a verify round projects

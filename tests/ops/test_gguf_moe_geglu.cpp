@@ -4,10 +4,14 @@
 // 256-value steps (its last step reads the next row, then the zero tail after the bank). Up to
 // eight tokens take the vector kernels, wider calls the matrix kernel. Each stage is held against
 // an FP64 product of the weights decoded on the host: the [gate; up] rows, the down rows of the
-// middle the products themselves rounded to BF16, and the routed weighted sum.
+// middle the products themselves rounded to BF16, and the routed weighted sum. Expert-parallel
+// parts (each over the pairs moe_keep_experts keeps and tables that hold only its experts) add up
+// to the whole call's 2^-32 fixed-point sum bit for bit; a matrix call's whole sum is
+// moe_weighted_rows of its rows, held against the same sum taken on the host.
 
 #include "core/arena.h"
 #include "core/expert_delivery.h"
+#include "ops/common/fixed_point.cuh"
 #include "ops/linear/gguf/ggml_bridge.h"
 
 #include <cuda_bf16.h>
@@ -80,10 +84,12 @@ struct Bank {
     [[nodiscard]] const float* row(int expert, int r) const {
         return exact.data() + (std::size_t(expert) * rows + r) * k;
     }
-    // Device table of expert bases, offset by `first_row` rows.
-    [[nodiscard]] DeviceBuffer table(int first_row) const {
-        std::vector<const void*> pointers(kExperts);
-        for (int e = 0; e < kExperts; ++e) {
+
+    // Device table of expert bases, offset by `first_row` rows; entries outside experts
+    // [begin, end) are null.
+    [[nodiscard]] DeviceBuffer table(int first_row, int begin = 0, int end = kExperts) const {
+        std::vector<const void*> pointers(kExperts, nullptr);
+        for (int e = begin; e < end; ++e) {
             pointers[e] = static_cast<const std::uint8_t*>(bytes.p) + e * expert_bytes +
                           first_row * row_bytes;
         }
@@ -117,6 +123,131 @@ int report(const char* what, int tokens, const Error& e, double rms_bound, doubl
     std::cout << (ok ? "OK   " : "FAIL ") << what << " T=" << tokens << " rms=" << e.rms
               << " max=" << e.max << '\n';
     return ok ? 0 : 1;
+}
+
+// Expert parallelism over the call of run(): `rows` are the whole call's down rows (the matrix
+// path's, over `middle`, the BF16 middle of every pair).
+int run_parts(int tokens, const Bank& gate_up, const Bank& down, const DeviceBuffer& d_x,
+              const DeviceBuffer& d_ids, const DeviceBuffer& d_w, const DeviceBuffer& d_middle,
+              const std::vector<float>& rows, const std::vector<float>& weights,
+              const std::vector<std::int32_t>& ids) {
+    const int pairs        = tokens * kTopK;
+    const bool vector      = tokens <= gguf::kMaxVectorColumns;
+    const int chunk        = tokens <= 1 ? 1 : tokens <= 2 ? 2 : tokens <= 4 ? 4 : 8;
+    const std::size_t sums = std::size_t(tokens) * kHidden;
+    const auto* x          = static_cast<const __nv_bfloat16*>(d_x.p);
+    const auto* w          = static_cast<const float*>(d_w.p);
+    DeviceBuffer act(vector ? gguf::vector_activation_bytes(kHidden, tokens)
+                            : gguf::moe_matrix_activation_bytes(kHidden, pairs));
+    if (vector) { gguf::quantize_vector_activation(x, kHidden, tokens, nullptr, act.p, nullptr); }
+    // One part: experts [begin, end) into `fixed`, with `ids` kept as -1 outside them.
+    const auto part = [&](const std::int32_t* routed, int begin, int end, unsigned long long* fixed,
+                          std::vector<float>* part_rows) {
+        DeviceBuffer kept(std::size_t(pairs) * 4), space(gguf::moe_routing_bytes(kExperts, pairs));
+        auto* kept_p = static_cast<std::int32_t*>(kept.p);
+        gguf::moe_keep_experts(routed, pairs, begin, end, kept_p, nullptr);
+        const gguf::MoeRouting routing =
+            gguf::moe_sort_routes(kept_p, pairs, kExperts, space.p, nullptr);
+        const int max_active      = std::max(1, std::min(pairs, end - begin));
+        const DeviceBuffer gate_t = gate_up.table(0, begin, end),
+                           up_t   = gate_up.table(kWidth, begin, end),
+                           down_t = down.table(0, begin, end);
+        const gguf::MoeTable t_gu{static_cast<const void* const*>(gate_t.p), gate_up.row_bytes,
+                                  2 * kWidth, kHidden};
+        const gguf::MoeTable t_gate{static_cast<const void* const*>(gate_t.p), gate_up.row_bytes,
+                                    kWidth, kHidden};
+        const gguf::MoeTable t_up{static_cast<const void* const*>(up_t.p), gate_up.row_bytes,
+                                  kWidth, kHidden};
+        const gguf::MoeTable t_down{static_cast<const void* const*>(down_t.p), down.row_bytes,
+                                    kHidden, kWidth};
+        if (vector) {
+            DeviceBuffer middle(std::size_t(pairs) * kWidth * 2),
+                act2(gguf::vector_activation_bytes(kWidth, pairs));
+            gguf::moe_vector_swiglu(gguf::GgmlType::Q4_0, t_gate, t_up, routing, max_active, kTopK,
+                                    act.p, tokens, static_cast<__nv_bfloat16*>(middle.p), chunk,
+                                    nullptr, gguf::GateActivation::GeluTanh);
+            gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(middle.p), kWidth,
+                                             pairs, nullptr, act2.p, nullptr);
+            check(cudaMemset(fixed, 0, sums * 8), "zero a part");
+            gguf::MoeOutput out;
+            out.weighted = fixed;
+            out.weights  = w;
+            gguf::moe_vector_product(gguf::GgmlType::Q4_0, t_down, routing, max_active, 1, kTopK,
+                                     act2.p, pairs, out, chunk, nullptr);
+            return;
+        }
+        // The [gate; up] rows of the kept pairs, then the down rows of the whole call's middle.
+        gguf::quantize_moe_matrix_activation(gguf::GgmlType::Q4_0, x, kHidden, routing, pairs,
+                                             kTopK, act.p, nullptr);
+        DeviceBuffer d_gu(std::size_t(pairs) * 2 * kWidth * 4);
+        gguf::moe_matrix_product(gguf::GgmlType::Q4_0, t_gu, routing, max_active, pairs, true,
+                                 act.p, static_cast<float*>(d_gu.p), nullptr);
+        DeviceBuffer act2(gguf::moe_matrix_activation_bytes(kWidth, pairs));
+        gguf::quantize_moe_matrix_activation(gguf::GgmlType::Q4_0,
+                                             static_cast<const __nv_bfloat16*>(d_middle.p), kWidth,
+                                             routing, pairs, 1, act2.p, nullptr);
+        DeviceBuffer d_rows(std::size_t(pairs) * kHidden * 4);
+        gguf::moe_matrix_product(gguf::GgmlType::Q4_0, t_down, routing, max_active, pairs, true,
+                                 act2.p, static_cast<float*>(d_rows.p), nullptr);
+        gguf::moe_weighted_rows(static_cast<const float*>(d_rows.p), kept_p, w, tokens, kTopK,
+                                kHidden, fixed, nullptr);
+        check(cudaDeviceSynchronize(), "matrix part");
+        if (part_rows != nullptr) {
+            part_rows->resize(std::size_t(pairs) * kHidden);
+            d_rows.copy_to_host(part_rows->data(), part_rows->size() * 4);
+        }
+    };
+    int failures = 0;
+    // The whole call's sum: every expert in one part.
+    DeviceBuffer d_whole(sums * 8);
+    auto* whole_p = static_cast<unsigned long long*>(d_whole.p);
+    std::vector<float> whole_rows;
+    part(static_cast<const std::int32_t*>(d_ids.p), 0, kExperts, whole_p,
+         vector ? nullptr : &whole_rows);
+    check(cudaDeviceSynchronize(), "whole part");
+    std::vector<std::uint64_t> whole(sums);
+    d_whole.copy_to_host(whole.data(), sums * 8);
+    if (!vector) {
+        // moe_weighted_rows against the host's fixed-point sum of the same rows (an exact oracle),
+        // and the rows of one part over every expert against run()'s.
+        std::vector<std::uint64_t> want(sums, 0);
+        for (int p = 0; p < pairs; ++p) {
+            for (int r = 0; r < kHidden; ++r) {
+                want[std::size_t(p / kTopK) * kHidden + r] += static_cast<std::uint64_t>(
+                    ops::fixed_product(whole_rows[std::size_t(p) * kHidden + r], weights[p]));
+            }
+        }
+        const bool exact =
+            want == whole && std::memcmp(whole_rows.data(), rows.data(), rows.size() * 4) == 0;
+        std::cout << (exact ? "OK   " : "FAIL ") << "matrix weighted rows T=" << tokens
+                  << (exact ? ": exact" : ": differ") << '\n';
+        failures += exact ? 0 : 1;
+    }
+    (void)ids;
+    for (const std::vector<int>& ends :
+         {std::vector<int>{0, 5, 16}, std::vector<int>{0, 1, 9, 16}}) {
+        std::vector<DeviceBuffer> parts;
+        std::vector<const unsigned long long*> received;
+        for (std::size_t r = 0; r + 1 < ends.size(); ++r) {
+            parts.emplace_back(sums * 8);
+            part(static_cast<const std::int32_t*>(d_ids.p), ends[r], ends[r + 1],
+                 static_cast<unsigned long long*>(parts.back().p), nullptr);
+        }
+        for (std::size_t r = 1; r < parts.size(); ++r) {
+            received.push_back(static_cast<const unsigned long long*>(parts[r].p));
+        }
+        gguf::add_fixed_parts(static_cast<unsigned long long*>(parts[0].p), received.data(),
+                              int(received.size()), std::int64_t(sums), nullptr);
+        check(cudaDeviceSynchronize(), "expert-parallel parts");
+        std::vector<std::uint64_t> got(sums);
+        parts[0].copy_to_host(got.data(), sums * 8);
+        const bool same = got == whole;
+        std::cout << (same ? "OK   " : "FAIL ") << (vector ? "vector" : "matrix") << " T=" << tokens
+                  << ": " << ends.size() - 1 << " expert-parallel parts "
+                  << (same ? "equal" : "differ from") << " the whole sum\n";
+        failures += same ? 0 : 1;
+    }
+    return failures;
 }
 
 int run(int tokens, const Bank& gate_up, const Bank& down, std::mt19937& rng,
@@ -281,6 +412,10 @@ int run(int tokens, const Bank& gate_up, const Bank& down, std::mt19937& rng,
                        compare(got_rows, want_rows), 2e-2, 8e-2);
     failures += report((std::string(path) + " weighted sum").c_str(), tokens,
                        compare(got_sum, want_sum), 2e-2, 8e-2);
+    if (delivery == nullptr) {
+        failures +=
+            run_parts(tokens, gate_up, down, d_x, d_ids, d_w, d_middle, got_rows, weights, ids);
+    }
     return failures;
 }
 

@@ -2,10 +2,10 @@
 
 // How tensor-parallel ranks divide a layer's work when the cards differ.
 //
-// Every rank holds a contiguous share of each divided dimension (GDN key heads, dense FFN rows),
-// and the exchange after each projection waits for every rank, so a layer takes as long as its
-// slowest share. Shares in proportion to each card's speed keep the ranks finishing together; the
-// stored blocks of the projections a share cuts decide where a share may end.
+// Every rank holds a contiguous share of each divided dimension (GDN key heads, dense FFN rows or
+// MoE experts), and the exchange after each projection waits for every rank, so a layer takes as
+// long as its slowest share. Shares in proportion to each card's speed keep the ranks finishing
+// together; the stored blocks of the projections a share cuts decide where a share may end.
 
 #include <cstdint>
 #include <span>

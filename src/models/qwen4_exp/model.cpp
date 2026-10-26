@@ -3,6 +3,8 @@
 #include "artifact/binder.h"
 #include "artifact/reader.h"
 #include "artifact/views.h"
+#include "core/tensor_split.h"
+#include "models/expert_parallel.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/load/bindings.h"
 
@@ -139,14 +141,74 @@ ExpertLocation locate(const artifact::Reader& reader, const std::string& name, s
 // Zero bytes after each down bank; see bind_moe.
 constexpr std::uint64_t kExpertTail = 256;
 
+// Whether two parameters are stored in one object.
+bool one_object(const artifact::Reader& reader, const std::string& a, const std::string& b) {
+    const auto& bindings = reader.directory().bindings;
+    const auto first = bindings.find(a), second = bindings.find(b);
+    if (first == bindings.end() || second == bindings.end()) {
+        throw artifact::ArtifactError("missing logical parameter " +
+                                      (first == bindings.end() ? a : b));
+    }
+    return !first->second.parts.empty() && !second->second.parts.empty() &&
+           first->second.parts.front().object.index == second->second.parts.front().object.index;
+}
+
+// Expert parallelism: rank r's experts [ends[r], ends[r + 1]) of one MoE layer as one device
+// selection per stored bank (a [gate; up] bank, or a gate and an up bank, and a down bank), each
+// expert's projections views into it. Fills every expert's gate, up and down.
+void bind_expert_shares(Bindings& b, const TextConfig& c, const std::string& m,
+                        const std::string& input, std::span<const std::uint64_t> ends,
+                        MoeWeights& out) {
+    const std::uint64_t h = c.hidden_size, w = c.moe_intermediate_size;
+    out.gate.resize(c.num_experts);
+    out.up.resize(c.num_experts);
+    out.down.resize(c.num_experts);
+    const auto expert = [&](std::uint64_t e) { return m + "experts/" + std::to_string(e) + "/"; };
+    const bool joint  = one_object(b.binder.reader(), expert(0) + "gate", expert(0) + "up");
+    for (std::size_t rank = 0; rank + 1 < ends.size(); ++rank) {
+        std::vector<Bindings::JointPart> gate_up, gates, ups, downs;
+        for (std::uint64_t e = ends[rank]; e < ends[rank + 1]; ++e) {
+            const std::string x = expert(e);
+            Bindings::JointPart gate{x + "gate", {w, h}, {input}};
+            Bindings::JointPart up{x + "up", {w, h}, {input}};
+            if (joint) {
+                gate_up.push_back(std::move(gate));
+                gate_up.push_back(std::move(up));
+            } else {
+                gates.push_back(std::move(gate));
+                ups.push_back(std::move(up));
+            }
+            downs.push_back({x + "down", {h, w}, {x + "product"}});
+        }
+        if (joint) {
+            const auto ids = b.joint_piece(gate_up, rank);
+            for (std::size_t i = 0; i < ids.size() / 2; ++i) {
+                out.gate[ends[rank] + i] = ids[2 * i];
+                out.up[ends[rank] + i]   = ids[2 * i + 1];
+            }
+        } else {
+            const auto gate_ids = b.joint_piece(gates, rank);
+            const auto up_ids   = b.joint_piece(ups, rank);
+            std::copy(gate_ids.begin(), gate_ids.end(), out.gate.begin() + ends[rank]);
+            std::copy(up_ids.begin(), up_ids.end(), out.up.begin() + ends[rank]);
+        }
+        const auto down_ids = b.joint_piece(downs, rank);
+        std::copy(down_ids.begin(), down_ids.end(), out.down.begin() + ends[rank]);
+    }
+}
+
+// `split` divides the routed experts over the ranks (expert parallelism; device residency only).
 MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
-                    ExpertResidency residency) {
+                    ExpertResidency residency, std::span<const double> split = {}) {
     const std::uint64_t h = c.hidden_size, w = c.moe_intermediate_size;
     const std::string m = p + "moe/", input = p + "ffn_input";
     MoeWeights out;
     out.router       = b.parameter(m + "router", {c.num_experts, h}, {input});
     out.shared_score = b.parameter(m + "shared_score", {1, h}, {input});
-    for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+    if (!split.empty()) {
+        bind_expert_shares(b, c, m, input, expert_ends(c.num_experts, split), out);
+    }
+    for (std::uint32_t e = 0; e < c.num_experts && split.empty(); ++e) {
         const std::string x = m + "experts/" + std::to_string(e) + "/";
         if (residency == ExpertResidency::Disk) {
             const auto& reader = b.binder.reader();
@@ -191,7 +253,7 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
     }
     for (const WeightId id : downs) {
         for (const auto& part : b.at(id).reference.binding.parts) {
-            if (is_gguf(b.binder.reader().geometry(part.object).format)) {
+            if (is_gguf(b.binder.geometry(part.object).format)) {
                 b.binder.device_tail(part.object, kExpertTail);
             }
         }
@@ -213,7 +275,7 @@ PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& p) {
 }
 
 MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const MtpConfig& mtp,
-                    ExpertResidency residency) {
+                    ExpertResidency residency, std::span<const double> split) {
     const std::uint64_t h = c.hidden_size, width = std::uint64_t(c.hc_count) * h;
     MtpWeights out;
     out.embedding_norm  = b.direct("mtp/embedding_norm", {h});
@@ -226,7 +288,7 @@ MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const MtpConfig& mtp,
     out.layer.mixer     = bind_attention(b, c, p);
     TextConfig experts  = c;
     experts.num_experts = mtp.num_experts;
-    out.layer.moe       = bind_moe(b, experts, p, residency);
+    out.layer.moe       = bind_moe(b, experts, p, residency, split);
     out.final_mixer     = bind_hc(b, c, "mtp/final_mixer/", false);
     return out;
 }
@@ -326,6 +388,34 @@ Model::Model(TextConfig config, LoadOptions options, TextWeights weights, StageP
 
 Model::~Model() = default;
 
+std::pair<std::uint32_t, std::uint32_t> Model::expert_range(std::uint32_t experts,
+                                                            std::size_t rank) const {
+    if (!expert_parallel()) {
+        return rank == 0 ? std::pair<std::uint32_t, std::uint32_t>{0, experts}
+                         : std::pair<std::uint32_t, std::uint32_t>{0, 0};
+    }
+    const auto ends = expert_ends(experts, options_.expert_split);
+    return {static_cast<std::uint32_t>(ends.at(rank)),
+            static_cast<std::uint32_t>(ends.at(rank + 1))};
+}
+
+std::vector<std::uint64_t> expert_ends(std::uint32_t experts, std::span<const double> split) {
+    return split_shares(experts, unit_positions(experts, 1), split);
+}
+
+std::vector<double> default_expert_split(const artifact::Reader& reader, const LoadOptions& options,
+                                         std::span<const std::uint64_t> free_bytes,
+                                         std::span<const double> speed) {
+    return models::default_expert_split(
+        reader,
+        [&](std::string_view name) {
+            return name.starts_with("text/") || (options.mtp && name.starts_with("mtp/")) ||
+                   (options.vision && name.starts_with("vision/"));
+        },
+        [](std::string_view name) { return name.find("/moe/experts/") != std::string_view::npos; },
+        free_bytes, speed);
+}
+
 ops::WeightInput Model::input(WeightId id) const {
     const auto& parameter = weight(id);
     if (parameter.uses.size() != 1) {
@@ -370,6 +460,20 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     if (options.ranks == 0 || options.ranks != device.size()) {
         throw std::invalid_argument("Qwen3.8-Flash-Next stages must match the device ranks");
     }
+    if (!options.expert_split.empty()) {
+        if (options.expert_split.size() != options.ranks || options.ranks < 2) {
+            throw std::invalid_argument(
+                "expert parallelism needs one share per device rank and at least two ranks");
+        }
+        if (options.experts != ExpertResidency::Device) {
+            throw std::invalid_argument(
+                "--tensor-parallel divides Qwen3.8-Flash-Next's experts over "
+                "the devices: it needs --expert-residency device");
+        }
+        if (!options.stage_layers.empty()) {
+            throw std::invalid_argument("--tensor-parallel and --stage-layers exclude each other");
+        }
+    }
     TextConfig config = parse_text_config(reader.directory().component("text").config);
     artifact::Binder binder(reader);
     std::optional<qwen3_5::VisionConfig> vision_config;
@@ -413,7 +517,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         } else {
             layer.mixer = bind_attention(b, config, p);
         }
-        layer.moe = bind_moe(b, config, p, options.experts);
+        layer.moe = bind_moe(b, config, p, options.experts, options.expert_split);
         if (std::find(config.ple_layers.begin(), config.ple_layers.end(), i) !=
             config.ple_layers.end()) {
             layer.ple = bind_ple(b, config, p);
@@ -421,7 +525,9 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         weights.layers.push_back(std::move(layer));
     }
     std::optional<MtpWeights> mtp_weights;
-    if (mtp_config) { mtp_weights = bind_mtp(b, config, *mtp_config, options.experts); }
+    if (mtp_config) {
+        mtp_weights = bind_mtp(b, config, *mtp_config, options.experts, options.expert_split);
+    }
     // The tower stays on rank 0, with the token embedding its output joins.
     std::optional<qwen3_5::VisionWeights> vision_weights;
     if (vision_config) {
@@ -432,7 +538,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     // The stage split: what was asked, or the even split of the bytes each device would hold.
     const bool device_experts = options.experts == ExpertResidency::Device;
     StagePlan stages(config.num_hidden_layers);
-    if (options.ranks > 1) {
+    if (options.ranks > 1 && options.expert_split.empty()) {
         if (!options.stage_layers.empty()) {
             if (options.stage_layers.size() != options.ranks) {
                 throw std::invalid_argument("--stage-layers must list one count per device");
@@ -469,7 +575,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             head.insert(head.end(), mtp.begin(), mtp.end());
         }
         for (const WeightId id : head) { b.place(id, stages.stages() - 1); }
-    } else if (!options.stage_layers.empty()) {
+    } else if (options.ranks == 1 && !options.stage_layers.empty()) {
         throw std::invalid_argument("--stage-layers needs --devices naming more than one device");
     }
 

@@ -23,27 +23,27 @@ inline constexpr int kKVCacheInt8HeadDim = 256;
 inline constexpr int kKVCacheInt8Group   = 64;
 inline constexpr int kKVCacheInt8Groups  = kKVCacheInt8HeadDim / kKVCacheInt8Group;
 
-template <typename Geometry>
-__device__ __forceinline__ std::int64_t
-kv_cache_int8_quant_code_index(int physical_page, int kv_head, int d, int page_offset) {
-    return paged_kv_element_offset<kKVCacheInt8HeadDim, Geometry::KVHeads>(physical_page, kv_head,
-                                                                           page_offset, d);
+__device__ __forceinline__ std::int64_t kv_cache_int8_quant_code_index(int physical_page,
+                                                                       int kv_head, int d,
+                                                                       int page_offset,
+                                                                       int kv_heads) {
+    return paged_kv_element_offset<kKVCacheInt8HeadDim>(physical_page, kv_head, page_offset, d,
+                                                        kv_heads);
 }
 
-template <typename Geometry>
-__device__ __forceinline__ std::int64_t
-kv_cache_int8_quant_scale_index(int physical_page, int kv_head, int group, int page_offset) {
-    return paged_kv_element_offset<kKVCacheInt8Groups, Geometry::KVHeads>(physical_page, kv_head,
-                                                                          page_offset, group);
+__device__ __forceinline__ std::int64_t kv_cache_int8_quant_scale_index(int physical_page,
+                                                                        int kv_head, int group,
+                                                                        int page_offset,
+                                                                        int kv_heads) {
+    return paged_kv_element_offset<kKVCacheInt8Groups>(physical_page, kv_head, page_offset, group,
+                                                       kv_heads);
 }
 
-template <typename Geometry>
-__device__ __forceinline__ std::int64_t kv_cache_int8_quant_src_index(int kv_head, int d,
-                                                                      int token) {
+__device__ __forceinline__ std::int64_t kv_cache_int8_quant_src_index(int kv_head, int d, int token,
+                                                                      int kv_heads) {
     return static_cast<std::int64_t>(d) +
            static_cast<std::int64_t>(kKVCacheInt8HeadDim) *
-               (static_cast<std::int64_t>(kv_head) +
-                static_cast<std::int64_t>(Geometry::KVHeads) * token);
+               (static_cast<std::int64_t>(kv_head) + static_cast<std::int64_t>(kv_heads) * token);
 }
 
 struct KVCacheInt8QuantParams {
@@ -83,18 +83,20 @@ inline constexpr int kKVCacheInt4Max = 7;
 inline constexpr int kKVCacheInt4ValueGroup  = 32;
 inline constexpr int kKVCacheInt4ValueGroups = kKVCacheInt8HeadDim / kKVCacheInt4ValueGroup;
 
-template <typename Geometry>
-__device__ __forceinline__ std::int64_t
-kv_cache_int4_value_scale_index(int physical_page, int kv_head, int group, int page_offset) {
-    return paged_kv_element_offset<kKVCacheInt4ValueGroups, Geometry::KVHeads>(
-        physical_page, kv_head, page_offset, group);
+__device__ __forceinline__ std::int64_t kv_cache_int4_value_scale_index(int physical_page,
+                                                                        int kv_head, int group,
+                                                                        int page_offset,
+                                                                        int kv_heads) {
+    return paged_kv_element_offset<kKVCacheInt4ValueGroups>(physical_page, kv_head, page_offset,
+                                                            group, kv_heads);
 }
 
-template <typename Geometry>
-__device__ __forceinline__ std::int64_t
-kv_cache_int4_value_code_index(int physical_page, int kv_head, int packed_d, int page_offset) {
-    return paged_kv_element_offset<kKVCacheInt8HeadDim / 2, Geometry::KVHeads>(
-        physical_page, kv_head, page_offset, packed_d);
+__device__ __forceinline__ std::int64_t kv_cache_int4_value_code_index(int physical_page,
+                                                                       int kv_head, int packed_d,
+                                                                       int page_offset,
+                                                                       int kv_heads) {
+    return paged_kv_element_offset<kKVCacheInt8HeadDim / 2>(physical_page, kv_head, page_offset,
+                                                            packed_d, kv_heads);
 }
 
 // Persistent group-scale boundary for packed int4 values: FP16-RNE(absmax/7). Codes always use
@@ -394,14 +396,15 @@ template <KvKeyCoding Keys>
 using KvPackedKeyChunk = std::conditional_t<Keys == KvKeyCoding::RootE8, std::uint32_t, uint2>;
 
 // Byte offset of the chunk holding key dimensions [d, d+16) of one token and KV head.
-template <typename Geometry, KvKeyCoding Keys>
+template <KvKeyCoding Keys>
 __device__ __forceinline__ std::int64_t
-kv_cache_packed_key_chunk_index(int physical_page, int kv_head, int d, int page_offset) {
+kv_cache_packed_key_chunk_index(int physical_page, int kv_head, int d, int page_offset,
+                                int kv_heads) {
     if constexpr (Keys == KvKeyCoding::RootE8) {
-        return kv_cache_e8_root_code_index<Geometry>(physical_page, kv_head, d >> 2, page_offset);
+        return kv_cache_e8_root_code_index(physical_page, kv_head, d >> 2, page_offset, kv_heads);
     } else {
-        return kv_cache_int4_value_code_index<Geometry>(physical_page, kv_head, d >> 1,
-                                                        page_offset);
+        return kv_cache_int4_value_code_index(physical_page, kv_head, d >> 1, page_offset,
+                                              kv_heads);
     }
 }
 
@@ -425,10 +428,11 @@ __device__ __forceinline__ int4 kv_cache_packed_key_expand16(KvPackedKeyChunk<Ke
 // int4 codes over the absmax/7 scale. rk2v4-e8 stores two bytes per eight dimensions over the same
 // scale (e8_root_codec.cuh). Otherwise the key is INT8 G64. All keep one FP16 scale per group in
 // the same scale plane.
-template <typename Geometry, KvKeyCoding Keys>
+template <KvKeyCoding Keys>
 __device__ __forceinline__ void
 kv_cache_i8_family_store_key_group(std::int8_t* cache_k, __half* scale_k, int page, int kv_head,
-                                   int group, int page_off, int lane, float k0, float k1) {
+                                   int group, int page_off, int lane, float k0, float k1,
+                                   int kv_heads) {
     constexpr unsigned FullMask = 0xffffffffu;
     __half scale;
     if constexpr (Keys == KvKeyCoding::RootE8) {
@@ -436,7 +440,7 @@ kv_cache_i8_family_store_key_group(std::int8_t* cache_k, __half* scale_k, int pa
         const auto k_quant = kv_cache_int4_quant_params(k_abs);
         kv_cache_e8_root_store_key_group(
             reinterpret_cast<std::uint8_t*>(cache_k),
-            kv_cache_e8_root_code_index<Geometry>(page, kv_head, 0, page_off), group, k0, k1,
+            kv_cache_e8_root_code_index(page, kv_head, 0, page_off, kv_heads), group, k0, k1,
             __half2float(k_quant.scale), lane);
         scale = k_quant.scale;
     } else if constexpr (Keys == KvKeyCoding::Int4E8) {
@@ -448,8 +452,8 @@ kv_cache_i8_family_store_key_group(std::int8_t* cache_k, __half* scale_k, int pa
         const int partner1   = __shfl_xor_sync(FullMask, static_cast<int>(c1), 1);
         if ((lane & 1) == 0) {
             auto* packed_k                 = reinterpret_cast<std::uint8_t*>(cache_k);
-            const std::int64_t packed_base = kv_cache_int4_value_code_index<Geometry>(
-                page, kv_head, group * (kKVCacheInt8Group / 2), page_off);
+            const std::int64_t packed_base = kv_cache_int4_value_code_index(
+                page, kv_head, group * (kKVCacheInt8Group / 2), page_off, kv_heads);
             packed_k[packed_base + (lane >> 1)] =
                 kv_cache_int4_pack(c0, static_cast<std::int8_t>(partner0));
             packed_k[packed_base + (lane >> 1) + 16] =
@@ -462,8 +466,8 @@ kv_cache_i8_family_store_key_group(std::int8_t* cache_k, __half* scale_k, int pa
         const int partner1 = __shfl_xor_sync(FullMask, encoded.index1, 1);
         if ((lane & 1) == 0) {
             auto* packed_k                 = reinterpret_cast<std::uint8_t*>(cache_k);
-            const std::int64_t packed_base = kv_cache_int4_value_code_index<Geometry>(
-                page, kv_head, group * (kKVCacheInt8Group / 2), page_off);
+            const std::int64_t packed_base = kv_cache_int4_value_code_index(
+                page, kv_head, group * (kKVCacheInt8Group / 2), page_off, kv_heads);
             packed_k[packed_base + (lane >> 1)] =
                 static_cast<std::uint8_t>(encoded.index0 | (partner0 << 4));
             packed_k[packed_base + (lane >> 1) + 16] =
@@ -473,14 +477,14 @@ kv_cache_i8_family_store_key_group(std::int8_t* cache_k, __half* scale_k, int pa
     } else {
         const float k_abs            = warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
         const auto k_quant           = kv_cache_int8_quant_params(k_abs);
-        const std::int64_t code_base = kv_cache_int8_quant_code_index<Geometry>(
-            page, kv_head, group * kKVCacheInt8Group, page_off);
+        const std::int64_t code_base = kv_cache_int8_quant_code_index(
+            page, kv_head, group * kKVCacheInt8Group, page_off, kv_heads);
         cache_k[code_base + lane]      = kv_cache_int8_quant_code(k0, k_quant.inverse_scale);
         cache_k[code_base + lane + 32] = kv_cache_int8_quant_code(k1, k_quant.inverse_scale);
         scale                          = k_quant.scale;
     }
     if (lane == 0) {
-        scale_k[kv_cache_int8_quant_scale_index<Geometry>(page, kv_head, group, page_off)] = scale;
+        scale_k[kv_cache_int8_quant_scale_index(page, kv_head, group, page_off, kv_heads)] = scale;
     }
 }
 

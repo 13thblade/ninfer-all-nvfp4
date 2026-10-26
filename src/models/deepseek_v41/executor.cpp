@@ -1,7 +1,9 @@
 #include "models/deepseek_v41/executor.h"
 
 #include "core/decode_graph.h"
+#include "core/expert_parallel.h"
 #include "core/growable_region.h"
+#include "core/tensor_split.h"
 #include "core/vmm.h"
 #include "core/weight_view.h"
 #include "models/deepseek_v41/cpu_experts.h"
@@ -229,6 +231,22 @@ struct Executor::Impl {
     // The CPU's share of missing experts; it outlives the delivery that calls it.
     std::unique_ptr<CpuExperts> cpu_experts;
     std::unique_ptr<ExpertDelivery> delivery;
+    // Expert parallelism (options.expert_split): rank r serves experts expert_ranges[r] of every
+    // block through a delivery of its own (rank 0's is `delivery`); every other rank has a stream
+    // and workspace for its part of a MoE call, and the exchange carries a call's input there and
+    // the part back (routed_parallel()).
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> expert_ranges;
+
+    struct ExpertPeer {
+        cudaStream_t stream = nullptr;
+        std::unique_ptr<WorkspaceArena> workspace;
+        std::unique_ptr<ExpertDelivery> delivery;
+        ExpertDeliveryStats startup;
+    };
+
+    std::vector<ExpertPeer> expert_peers; // by rank; rank 0's is unused
+    std::unique_ptr<ExpertParallelExchange> expert_exchange;
+    DeviceBuffer expert_pack; // a call's packed input, on rank 0
     mutable std::mutex expert_stats_mutex;
     ExpertDeliveryStats expert_startup_stats;
     Weight embedding, head;
@@ -311,7 +329,24 @@ struct Executor::Impl {
         if (options.sequences == 0 || options.prefill_chunk == 0 || options.max_context == 0) {
             throw std::invalid_argument("deepseek_v41 executor: invalid options");
         }
-        if (device.size() != 1) { throw std::invalid_argument("DeepSeek-V4.1 runs on one device"); }
+        if (!options.expert_split.empty()) {
+            if (model.expert_banks().empty()) {
+                throw std::invalid_argument("DeepSeek-V4.1 divides its experts over the devices "
+                                            "from host memory or the files "
+                                            "(--expert-residency host|disk)");
+            }
+            if (options.expert_split.size() != device.size() || device.size() < 2) {
+                throw std::invalid_argument("expert parallelism needs one share per device rank");
+            }
+            const auto ends = split_shares(
+                config.num_experts, unit_positions(config.num_experts, 1), options.expert_split);
+            for (std::size_t r = 0; r + 1 < ends.size(); ++r) {
+                expert_ranges.emplace_back(std::uint32_t(ends[r]), std::uint32_t(ends[r + 1]));
+            }
+        } else if (device.size() != 1) {
+            throw std::invalid_argument("DeepSeek-V4.1 runs on one device, or divides its experts "
+                                        "over several");
+        }
         if (options.draft_tokens > std::uint32_t(gguf::kMaxVectorColumns) - 1) {
             throw std::invalid_argument("deepseek_v41 executor: at most 7 drafts a round");
         }
@@ -536,6 +571,7 @@ struct Executor::Impl {
             }
         }
         workspace = std::make_unique<WorkspaceArena>(workspace_bytes);
+        allocate_expert_peers();
         if (!model.expert_banks().empty()) { plan_delivery(); }
     }
 
@@ -677,8 +713,9 @@ struct Executor::Impl {
         kv_bytes += d.taps.bytes;
     }
 
-    // A whole-layer bank of the routed experts, each blob at its largest aligned size.
-    [[nodiscard]] std::uint64_t bank_bytes() const {
+    // A whole-layer bank of the routed experts (`experts` of them: a rank's share under expert
+    // parallelism), each blob at its largest aligned size.
+    [[nodiscard]] std::uint64_t bank_bytes(std::uint32_t experts = 0) const {
         std::vector<std::uint64_t> sizes;
         for (const auto& bank : model.expert_banks()) {
             for (const auto& expert : bank.delivery.experts) {
@@ -691,7 +728,7 @@ struct Executor::Impl {
         }
         std::uint64_t slot = 0;
         for (auto bytes : sizes) { slot += bytes; }
-        return slot * config.num_experts;
+        return slot * (experts != 0 ? experts : config.num_experts);
     }
     [[nodiscard]] std::uint64_t delivery_metadata() const {
         return std::uint64_t(options.prefill_chunk) * config.top_k_experts * 8 +
@@ -699,11 +736,27 @@ struct Executor::Impl {
                config.num_experts * 4;
     }
 
-    void plan_delivery() {
+    // The banks' experts [first, last) of every block: one rank's delivery sources.
+    [[nodiscard]] std::vector<ExpertDeliveryLayer> delivery_sources(std::uint32_t first,
+                                                                    std::uint32_t last) const {
         std::vector<ExpertDeliveryLayer> sources;
-        for (const auto& bank : model.expert_banks()) { sources.push_back(bank.delivery); }
+        for (const auto& bank : model.expert_banks()) {
+            ExpertDeliveryLayer layer;
+            layer.aliases = bank.delivery.aliases;
+            layer.experts.assign(bank.delivery.experts.begin() + first,
+                                 bank.delivery.experts.begin() + last);
+            sources.push_back(std::move(layer));
+        }
+        return sources;
+    }
+
+    void plan_delivery() {
+        const auto [first, last] =
+            expert_ranges.empty() ? std::pair<std::uint32_t, std::uint32_t>{0, config.num_experts}
+                                  : expert_ranges[0];
+        std::vector<ExpertDeliveryLayer> sources = delivery_sources(first, last);
         // One whole-layer bank at least (the transport adds a second where memory allows).
-        const auto bank     = bank_bytes();
+        const auto bank     = bank_bytes(last - first);
         const auto metadata = delivery_metadata();
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
@@ -733,9 +786,11 @@ struct Executor::Impl {
         // A disk expert the CPU computes needs the same file read as a copied one; on an RTX 4090
         // host every split of disk experts decoded slower than copying every miss, so the CPU
         // computes disk experts only at an explicit share.
-        const bool cpu_share = options.expert_dma_share
-                                   ? dma_share < 1
-                                   : model.expert_residency() == ExpertResidency::Host;
+        // Under expert parallelism every rank copies all of its misses.
+        const bool cpu_share =
+            expert_ranges.empty() &&
+            (options.expert_dma_share ? dma_share < 1
+                                      : model.expert_residency() == ExpertResidency::Host);
         if (computes && cpu_share) {
             cpu_experts = std::make_unique<CpuExperts>(std::move(cpu_layers), hidden, width,
                 int(config.top_k_experts), config.swiglu_limit);
@@ -748,6 +803,107 @@ struct Executor::Impl {
         }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
+        for (std::size_t r = 1; r < expert_peers.size(); ++r) {
+            const auto [begin, end] = expert_ranges[r];
+            RankBinding bind(device, r);
+            std::size_t free_r = 0, total_r = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_r, &total_r));
+            if (bank_bytes(end - begin) + metadata + cache + kGraphReserve > free_r) {
+                throw InsufficientMemory(
+                    "DeepSeek-V4.1: expert delivery of device rank " + std::to_string(r) +
+                    " needs " + std::to_string((bank_bytes(end - begin) + metadata + cache) >> 20) +
+                    " MiB beside the CUDA Graph reserve, and " + std::to_string(free_r >> 20) +
+                    " MiB are free");
+            }
+            ExpertDeliveryOptions peer;
+            peer.pair_capacity   = transport.pair_capacity;
+            peer.cache_bytes     = options.expert_cache_bytes;
+            peer.keep_free_bytes = kGraphReserve;
+            // The delivery serves the calls on the rank's expert-parallel stream.
+            RankContext rank         = device.rank(r);
+            rank.stream              = expert_peers[r].stream;
+            expert_peers[r].delivery = std::make_unique<ExpertDelivery>(
+                rank, model.expert_files(), delivery_sources(begin, end), peer);
+        }
+    }
+
+    // A rank's slice [first, last) of a routing profile ([layer][expert]).
+    [[nodiscard]] std::optional<ExpertRouteCounts> profile_slice(std::uint32_t first,
+                                                                 std::uint32_t last) const {
+        if (!options.expert_profile) { return std::nullopt; }
+        ExpertRouteCounts out;
+        for (const auto& layer : *options.expert_profile) {
+            out.emplace_back(layer.begin() + first, layer.begin() + last);
+        }
+        return out;
+    }
+
+    // ---- Expert parallelism
+    // ----------------------------------------------------------------------
+
+    // The byte layout of a MoE call's packed input: the activation the experts read (up to 8
+    // tokens: their q8_1 vector form; wider: BF16 [T][H]), the guard's factors [T], then the ids
+    // and weights, 256-aligned.
+    struct ExpertInput {
+        std::size_t activation = 0, scale = 0, ids = 0, weights = 0, bytes = 0;
+    };
+
+    [[nodiscard]] ExpertInput expert_input(int t) const {
+        const std::size_t pairs = std::size_t(t) * config.top_k_experts;
+        ExpertInput out;
+        out.activation = t <= gguf::kMaxVectorColumns ? gguf::vector_activation_bytes(hidden, t)
+                                                      : std::size_t(t) * hidden * 2;
+        out.scale      = round_up(out.activation, kAlign);
+        out.ids        = out.scale + round_up(std::size_t(t) * 4, kAlign);
+        out.weights    = out.ids + round_up(pairs * 4, kAlign);
+        out.bytes      = out.weights + pairs * 4;
+        return out;
+    }
+
+    // The most tokens one MoE call takes (spans are off under expert parallelism).
+    [[nodiscard]] int max_moe_tokens() const {
+        return std::max<int>(int(options.prefill_chunk), gguf::kMaxVectorColumns);
+    }
+
+    // Workspace of one rank's part of a call of up to `t` tokens (expert_part()).
+    [[nodiscard]] std::size_t expert_part_bytes(int t) const {
+        const std::size_t pairs = std::size_t(t) * config.top_k_experts;
+        const std::size_t vector_pairs =
+            std::size_t(gguf::kMaxVectorColumns) * config.top_k_experts;
+        const std::size_t h = hidden, w = width;
+        const std::size_t bytes =
+            round_up(pairs * 4, kAlign) +
+            round_up(gguf::moe_routing_bytes(int(config.num_experts), int(pairs)), kAlign) +
+            round_up(pairs * 2 * w * 4, kAlign) + round_up(pairs * w * 2, kAlign);
+        const std::size_t vector =
+            round_up(gguf::vector_activation_bytes(int(w), int(vector_pairs)), kAlign);
+        const std::size_t matrix =
+            round_up(std::max(gguf::moe_matrix_activation_bytes(int(h), int(pairs)),
+                              gguf::vector_activation_bytes(int(h), t)),
+                     kAlign) +
+            round_up(std::max(gguf::moe_matrix_activation_bytes(int(w), int(pairs)),
+                              gguf::vector_activation_bytes(int(w), int(pairs))),
+                     kAlign) +
+            round_up(pairs * h * 4, kAlign);
+        return bytes + std::max(vector, matrix) + (std::size_t(1) << 20);
+    }
+
+    // The exchange and every other rank's stream and workspace, before the deliveries take what
+    // memory is left for their caches.
+    void allocate_expert_peers() {
+        if (expert_ranges.empty()) { return; }
+        const int t = max_moe_tokens();
+        const std::size_t input =
+            std::max(expert_input(t).bytes, expert_input(gguf::kMaxVectorColumns).bytes);
+        const std::size_t part = std::size_t(t) * hidden * 8;
+        expert_pack            = DeviceBuffer(input);
+        expert_exchange        = std::make_unique<ExpertParallelExchange>(device, input, part);
+        expert_peers.resize(device.size());
+        for (std::size_t r = 1; r < device.size(); ++r) {
+            RankBinding bind(device, r);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&expert_peers[r].stream, cudaStreamNonBlocking));
+            expert_peers[r].workspace = std::make_unique<WorkspaceArena>(expert_part_bytes(t));
+        }
     }
 
     static constexpr std::size_t kGraphReserve = std::size_t(320) << 20;
@@ -768,7 +924,7 @@ struct Executor::Impl {
     // the expert cache would get beside two layer banks, and at most an eighth of that memory and
     // the banks together, so the cache keeps most of its slots while a span runs.
     [[nodiscard]] std::uint32_t plan_span() const {
-        if (model.expert_banks().empty()) { return 0; }
+        if (model.expert_banks().empty() || !expert_ranges.empty()) { return 0; }
         const std::uint64_t chunk = plan_workspace(0), bank = bank_bytes();
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
@@ -910,6 +1066,14 @@ struct Executor::Impl {
 
     ~Impl() {
         if (delivery || growing) { cudaStreamSynchronize(stream); }
+        for (std::size_t r = 1; r < expert_peers.size(); ++r) {
+            if (expert_peers[r].stream == nullptr) { continue; }
+            RankBinding bind(device, r);
+            cudaStreamSynchronize(expert_peers[r].stream);
+            expert_peers[r].delivery.reset();
+            expert_peers[r].workspace.reset();
+            cudaStreamDestroy(expert_peers[r].stream);
+        }
     }
     Impl(const Impl&)            = delete;
     Impl& operator=(const Impl&) = delete;
@@ -999,14 +1163,16 @@ struct Executor::Impl {
             t * std::size_t(index_heads) * kIndexDim * 4, t * std::size_t(index_heads) * kIndexDim * 2,
             t * std::size_t(index_heads) * 4, scores, scores / 8 + 4096,
             partial});
-        const std::size_t ffn = sum({
-            t * h * 2, t * h * 4, t * 4, t * h * 4, t * std::size_t(experts) * 4, pairs * 4,
-            pairs * 4, gguf::moe_routing_bytes(experts, int(pairs)), pairs * 2 * w * 4,
-            pairs * w * 2, std::max(gguf::moe_matrix_activation_bytes(int(h), int(pairs)),
-                                    gguf::vector_activation_bytes(int(h), int(t))),
-            std::max(gguf::moe_matrix_activation_bytes(int(w), int(pairs)),
-                     gguf::vector_activation_bytes(int(w), int(pairs))),
-            pairs * h * 4, t * h * 8, t * 2 * w * 4, t * w * 2});
+        const std::size_t ffn =
+            sum({t * h * 2, t * h * 4, t * 4, t * h * 4, t * std::size_t(experts) * 4, pairs * 4,
+                 pairs * 4, gguf::moe_routing_bytes(experts, int(pairs)), pairs * 2 * w * 4,
+                 pairs * w * 2,
+                 std::max(gguf::moe_matrix_activation_bytes(int(h), int(pairs)),
+                          gguf::vector_activation_bytes(int(h), int(t))),
+                 std::max(gguf::moe_matrix_activation_bytes(int(w), int(pairs)),
+                          gguf::vector_activation_bytes(int(w), int(pairs))),
+                 pairs * h * 4, t * h * 8, t * 2 * w * 4, t * w * 2,
+                 expert_ranges.empty() ? 0 : pairs * 4}); // expert parallelism: rank 0's own ids
         const std::size_t head_bytes = sum({t * h * 2, std::size_t(kHeadRows) * vocab * 4, kHeadRows * 4});
         // A seed of the drafter's rings from a pass's last rows (at most a window of them).
         std::size_t seed_bytes = 0;
@@ -1511,6 +1677,146 @@ struct Executor::Impl {
         kernels::hc_post(h, y, c.post, c.comb, t, streams, hidden, stream);
     }
 
+    // One rank's part of a MoE call of block `p` under expert parallelism: the call's pairs routed
+    // to the experts `range` the rank serves, through its delivery `from` (whose tables hold those
+    // experts alone), weighted into the 2^-32 fixed-point sum `fixed` ([T][H]). Up to 8 tokens read
+    // the call's q8_1 activation `xq`, wider calls its BF16 rows `xb`; `scale` holds the guard's
+    // factors. Each contribution is the one a single device computes and rounds.
+    void expert_part(const LayerPlan& p, ExpertDelivery& from,
+                     std::pair<std::uint32_t, std::uint32_t> range, const void* xq,
+                     const __nv_bfloat16* xb, const float* scale, const std::int32_t* ids,
+                     const float* weights, int t, unsigned long long* fixed, WorkspaceArena& space,
+                     cudaStream_t on) {
+        auto scope  = space.scope();
+        const int k = p.top_k, w = width, pairs = t * k;
+        const int n     = int(range.second - range.first);
+        const auto take = [&](std::size_t bytes) { return space.alloc_bytes(bytes).data; };
+        auto* mine      = static_cast<std::int32_t*>(take(std::size_t(pairs) * 4));
+        gguf::moe_local_experts(ids, pairs, int(range.first), int(range.second), mine, on);
+        const gguf::MoeRouting routing =
+            gguf::moe_sort_routes(mine, pairs, n, take(gguf::moe_routing_bytes(n, pairs)), on);
+        const ExpertDelivery::Call call =
+            from.begin(std::size_t(p.delivery_layer), mine, std::uint32_t(pairs), on);
+        const auto* tables = from.tables(std::size_t(p.delivery_layer));
+        const gguf::MoeTable gate_up{tables + 2 * n, p.gate_up_row_bytes, 2 * w, hidden};
+        const gguf::MoeTable down{tables + 3 * n, p.down_row_bytes, hidden, w};
+        const int max_active = std::max(1, std::min(pairs, n));
+        auto* gu             = static_cast<float*>(take(std::size_t(pairs) * 2 * w * 4));
+        auto* middle         = static_cast<__nv_bfloat16*>(take(std::size_t(pairs) * w * 2));
+        if (t <= gguf::kMaxVectorColumns) {
+            const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
+            void* act2      = take(gguf::vector_activation_bytes(w, pairs));
+            CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, on));
+            CUDA_CHECK(cudaMemsetAsync(gu, 0, std::size_t(pairs) * 2 * w * 4, on));
+            gguf::MoeOutput rows;
+            rows.f32 = gu;
+            gguf::MoeOutput out;
+            out.weighted       = fixed;
+            out.weights        = weights;
+            const auto compute = [&](const std::int32_t* set) {
+                gguf::MoeRouting part = routing;
+                part.active_count     = set;
+                part.active           = set + 1;
+                gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, xq, t,
+                                         rows, chunk, on);
+                kernels::clamped_swiglu(gu, 2 * w, pairs, w, config.swiglu_limit, scale, k, middle,
+                                        w, on);
+                gguf::quantize_vector_activation(middle, w, pairs, nullptr, act2, on);
+                gguf::moe_vector_product(p.down_type, down, part, max_active, 1, k, act2, pairs,
+                                         out, chunk, on);
+            };
+            compute(call.cached_experts);
+            from.await(on);
+            compute(call.missing_experts);
+            return;
+        }
+        from.await(on);
+        if (gguf::moe_matrix_supported(p.gate_up_type, 2 * w, hidden, true)) {
+            void* act = take(gguf::moe_matrix_activation_bytes(hidden, pairs));
+            gguf::quantize_moe_matrix_activation(p.gate_up_type, xb, hidden, routing, pairs, k, act,
+                                                 on);
+            gguf::moe_matrix_product(p.gate_up_type, gate_up, routing, max_active, pairs, true, act,
+                                     gu, on);
+        } else {
+            void* act = take(gguf::vector_activation_bytes(hidden, t));
+            gguf::quantize_vector_activation(xb, hidden, t, nullptr, act, on);
+            gguf::MoeOutput out;
+            out.f32 = gu;
+            gguf::moe_vector_product(p.gate_up_type, gate_up, routing, max_active, k, k, act, t,
+                                     out, 8, on);
+        }
+        kernels::clamped_swiglu(gu, 2 * w, pairs, w, config.swiglu_limit, scale, k, middle, w, on);
+        auto* rows = static_cast<float*>(take(std::size_t(pairs) * hidden * 4));
+        if (gguf::moe_matrix_supported(p.down_type, hidden, w, true)) {
+            void* act = take(gguf::moe_matrix_activation_bytes(w, pairs));
+            gguf::quantize_moe_matrix_activation(p.down_type, middle, w, routing, pairs, 1, act,
+                                                 on);
+            gguf::moe_matrix_product(p.down_type, down, routing, max_active, pairs, true, act, rows,
+                                     on);
+        } else {
+            void* act = take(gguf::vector_activation_bytes(w, pairs));
+            gguf::quantize_vector_activation(middle, w, pairs, nullptr, act, on);
+            gguf::MoeOutput out;
+            out.f32 = rows;
+            gguf::moe_vector_product(p.down_type, down, routing, max_active, 1, k, act, pairs, out,
+                                     8, on);
+        }
+        gguf::moe_weighted_rows(rows, mine, weights, t, k, hidden, fixed, on);
+    }
+
+    // Expert parallelism's routed experts after rank 0 has routed the call: the input goes to every
+    // other rank, each runs its part while rank 0 runs its own and the shared expert, and the
+    // parts' sum is added to y. Up to 8 tokens this is the sum one device adds, bit for bit; a
+    // wider call sums in the same fixed point where one device weighs FP32 rows in moe_combine.
+    template <typename Shared>
+    void routed_parallel(const LayerPlan& p, const __nv_bfloat16* xb, const void* xq,
+                         const float* scale, const std::int32_t* ids, const float* weights, int t,
+                         float* y, Shared&& shared) {
+        const std::size_t pairs  = std::size_t(t) * p.top_k;
+        const std::size_t part   = std::size_t(t) * hidden * 8;
+        const ExpertInput layout = expert_input(t);
+        auto* pack               = static_cast<std::byte*>(expert_pack.p);
+        CUDA_CHECK(cudaMemcpyAsync(pack, t <= gguf::kMaxVectorColumns ? xq : xb, layout.activation,
+                                   cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(pack + layout.scale, scale, std::size_t(t) * 4,
+                                   cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(pack + layout.ids, ids, pairs * 4, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(pack + layout.weights, weights, pairs * 4,
+                                   cudaMemcpyDeviceToDevice, stream));
+        const std::size_t slot = expert_exchange->send(pack, layout.bytes, stream);
+        for (std::size_t r = 1; r < device.size(); ++r) {
+            RankBinding bind(device, r);
+            ExpertPeer& peer = expert_peers[r];
+            auto* input      = static_cast<std::byte*>(
+                expert_exchange->receive(r, layout.bytes, slot, peer.stream));
+            expert_part(p, *peer.delivery, expert_ranges[r], input,
+                        reinterpret_cast<const __nv_bfloat16*>(input),
+                        reinterpret_cast<const float*>(input + layout.scale),
+                        reinterpret_cast<const std::int32_t*>(input + layout.ids),
+                        reinterpret_cast<const float*>(input + layout.weights), t,
+                        static_cast<unsigned long long*>(expert_exchange->part(r)), *peer.workspace,
+                        peer.stream);
+            expert_exchange->reply(r, part, slot, peer.stream);
+        }
+        auto* fixed = alloc<unsigned long long>(std::size_t(t) * hidden);
+        expert_part(p, *delivery, expert_ranges[0], xq, xb, scale, ids, weights, t, fixed,
+                    *workspace, stream);
+        shared();
+        std::vector<const unsigned long long*> parts;
+        for (void* received : expert_exchange->collect(part, slot, stream)) {
+            parts.push_back(static_cast<const unsigned long long*>(received));
+        }
+        gguf::add_fixed_parts(fixed, parts.data(), int(parts.size()), std::int64_t(t) * hidden,
+                              stream);
+        kernels::MoeCombineArgs combine;
+        combine.y      = y;
+        combine.tokens = t;
+        combine.hidden = hidden;
+        combine.fixed  = fixed;
+        kernels::moe_combine(combine, stream);
+    }
+
     // The routed experts of the block (their output added to y after `shared` stores the shared
     // expert's there), run while missing experts are copied in.
     template <typename Shared>
@@ -1523,8 +1829,6 @@ struct Executor::Impl {
         auto* weights = alloc<float>(pairs);
         kernels::route(logits, p.router_bias, t, e, k, config.routed_scaling_factor, ids, weights,
                        stream, p.image_bias, p.image_bias != nullptr ? image_mask : nullptr);
-        void* routing_space = workspace->alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data;
-        const gguf::MoeRouting routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
         const auto* xb   = static_cast<const __nv_bfloat16*>(x.data);
         const bool vector = t <= gguf::kMaxVectorColumns;
         void* xq          = nullptr; // the vector kernels' activation of x
@@ -1532,6 +1836,13 @@ struct Executor::Impl {
             xq = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
             gguf::quantize_vector_activation(xb, hidden, t, nullptr, xq, stream);
         }
+        if (!expert_ranges.empty() && p.delivery_layer >= 0) {
+            routed_parallel(p, xb, xq, scale, ids, weights, t, y, shared);
+            return;
+        }
+        void* routing_space = workspace->alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data;
+        const gguf::MoeRouting routing =
+            gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
         // A decode or verification call may leave misses to the CPU, which reads the quantized
         // activation, the route weights and the guard's factors.
         const bool cpu = cpu_experts && vector && t <= CpuExperts::kMaxTokens;
@@ -2285,10 +2596,22 @@ struct Executor::Impl {
             }
         }
         if (delivery) {
+            const auto first =
+                profile_slice(expert_ranges.empty() ? 0 : expert_ranges[0].first,
+                              expert_ranges.empty() ? config.num_experts : expert_ranges[0].second);
             delivery->drain();
-            delivery->prime(options.expert_profile ? &*options.expert_profile : nullptr);
+            delivery->prime(first ? &*first : nullptr);
+            for (std::size_t r = 1; r < expert_peers.size(); ++r) {
+                const auto slice = profile_slice(expert_ranges[r].first, expert_ranges[r].second);
+                RankBinding bind(device, r);
+                expert_peers[r].delivery->drain();
+                expert_peers[r].delivery->prime(slice ? &*slice : nullptr);
+            }
             std::lock_guard lock(expert_stats_mutex);
             expert_startup_stats = delivery->stats();
+            for (std::size_t r = 1; r < expert_peers.size(); ++r) {
+                expert_peers[r].startup = expert_peers[r].delivery->stats();
+            }
         }
     }
 
@@ -2423,14 +2746,36 @@ void Executor::warm_up() {
 
 void Executor::check_experts() const {
     if (impl_->delivery) { impl_->delivery->check(); }
+    for (std::size_t r = 1; r < impl_->expert_peers.size(); ++r) {
+        impl_->expert_peers[r].delivery->check();
+    }
 }
 ExpertDeliveryStats Executor::expert_stats() const {
     if (!impl_->delivery) { return {}; }
     std::lock_guard lock(impl_->expert_stats_mutex);
-    return impl_->delivery->stats() - impl_->expert_startup_stats;
+    ExpertDeliveryStats out = impl_->delivery->stats() - impl_->expert_startup_stats;
+    for (std::size_t r = 1; r < impl_->expert_peers.size(); ++r) {
+        const auto& peer = impl_->expert_peers[r];
+        out              = out + (peer.delivery->stats() - peer.startup);
+    }
+    return out;
 }
 ExpertRouteCounts Executor::expert_totals() const {
-    return impl_->delivery ? impl_->delivery->totals() : ExpertRouteCounts{};
+    if (!impl_->delivery) { return {}; }
+    ExpertRouteCounts out = impl_->delivery->totals();
+    // Expert parallelism: every rank's counts at its experts' places.
+    for (std::size_t r = 1; r < impl_->expert_peers.size(); ++r) {
+        const auto first  = impl_->expert_ranges[r].first;
+        const auto counts = impl_->expert_peers[r].delivery->totals();
+        for (std::size_t layer = 0; layer < counts.size(); ++layer) {
+            out[layer].resize(
+                std::max<std::size_t>(out[layer].size(), first + counts[layer].size()), 0);
+            for (std::size_t e = 0; e < counts[layer].size(); ++e) {
+                out[layer][first + e] += counts[layer][e];
+            }
+        }
+    }
+    return out;
 }
 
 std::optional<NgramTableStats> Executor::engram_stats() const {

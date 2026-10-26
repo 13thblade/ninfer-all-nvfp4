@@ -85,6 +85,16 @@ struct MoeWeights {
     DenseWeights shared;
     // Absent for a resident bank, including MTP's explicit load-time Q4 storage trade.
     std::optional<std::size_t> delivery_layer;
+
+    // Expert parallelism, a tensor-parallel rank's share of the layer: its experts are
+    // [expert_begin, expert_begin + experts.size()) of the router's, and only rank 0 holds the
+    // shared expert (`shared` is unbound elsewhere). Absent for a whole layer.
+    struct ExpertShare {
+        std::uint32_t expert_begin = 0;
+        bool shared_expert         = true;
+    };
+
+    std::optional<ExpertShare> share;
 };
 
 struct BlockWeights {
@@ -94,23 +104,25 @@ struct BlockWeights {
 };
 
 // A tensor-parallel rank's share of one layer beyond rank 0: the norms its share reads, its GDN
-// heads (absent in an attention layer, which rank 0 runs alone) and its dense FFN rows.
+// heads or its attention heads (neither in an attention layer when the rank holds no KV heads),
+// and its dense FFN rows or its experts with a replica of the router.
 struct RankLayerWeights {
     WeightId input_norm, post_attention_norm;
     std::optional<GdnWeights> gdn;
-    DenseWeights ffn;
+    std::optional<AttentionWeights> attention;
+    std::variant<DenseWeights, MoeWeights> ffn;
 };
 
 struct TextWeights {
     WeightId token_embedding, output_head, final_norm;
     WeightUseId output_head_use;
-    // With tensor parallelism, rank 0's share of each layer's GDN heads and dense FFN rows beside
-    // its whole attention.
+    // With tensor parallelism, rank 0's share of each layer's GDN or attention heads and dense FFN
+    // rows or experts.
     std::vector<BlockWeights> layers;
     // Tensor parallelism: rank_layers[r - 1][layer] is rank r's share of a layer. Empty otherwise.
     std::vector<std::vector<RankLayerWeights>> rank_layers;
-    // Tensor parallelism: each rank's GDN heads and FFN rows, the same in every layer. Empty
-    // otherwise.
+    // Tensor parallelism: each rank's GDN heads, KV heads and FFN rows or experts, the same in
+    // every layer. Empty otherwise.
     std::vector<TensorShare> tensor_shares;
     // Which stage's device holds each whole layer. The identity mapping for one device, which is
     // what keeps every consumer a no-op there; `--devices` adds stages.

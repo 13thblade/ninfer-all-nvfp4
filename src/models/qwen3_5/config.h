@@ -149,20 +149,31 @@ struct Config {
 // The config of an artifact's `vision` component, which another family that reuses this tower
 // parses too.
 [[nodiscard]] VisionConfig parse_vision_config(const artifact::Directory& directory);
+
 // Tensor parallelism: the part of every layer one rank runs. GDN key heads [key_head_begin,
-// key_head_end) with the value heads that read them, and dense FFN rows [ffn_begin, ffn_end). The
-// ranks' shares are contiguous, in rank order, and together cover every head and row.
+// key_head_end) with the value heads that read them; attention KV heads [kv_head_begin,
+// kv_head_end) with the query heads that read them and their KV cache; a dense FFN's rows
+// [ffn_begin, ffn_end), or a MoE layer's routed experts [expert_begin, expert_end) (expert
+// parallelism: every rank routes, and the shared expert is rank 0's). The ranks' shares are
+// contiguous, in rank order, and together cover every head, row and expert. A model has fewer KV
+// heads than GDN heads, so the ranks past its KV-head count hold no attention.
 struct TensorShare {
     std::uint32_t key_head_begin = 0;
     std::uint32_t key_head_end   = 0;
+    std::uint32_t kv_head_begin  = 0;
+    std::uint32_t kv_head_end    = 0;
     std::uint32_t ffn_begin      = 0;
     std::uint32_t ffn_end        = 0;
+    std::uint32_t expert_begin   = 0;
+    std::uint32_t expert_end     = 0;
 
     bool operator==(const TensorShare&) const = default;
 };
-// The text model as `share` sees it: its key and value heads and FFN rows; attention and every other
-// width stay whole. Throws std::invalid_argument unless the model has GDN layers and a dense FFN
-// and the share lies inside them.
+
+// The text model as `share` sees it: its GDN key and value heads, its attention heads (none for a
+// rank without KV heads) and dense FFN rows; the router and every other width stay whole. Throws
+// std::invalid_argument unless the model has GDN layers and the share lies inside its heads and
+// its FFN rows or experts.
 [[nodiscard]] TextConfig tensor_parallel_share(const TextConfig& text, const TensorShare& share);
 
 } // namespace ninfer::models::qwen3_5

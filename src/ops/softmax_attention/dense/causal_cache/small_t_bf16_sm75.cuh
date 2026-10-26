@@ -43,6 +43,9 @@ __device__ __forceinline__ void load_q(const Split<CacheInput>& s, __nv_bfloat16
     constexpr int Br      = Wc * 16;
     constexpr int Threads = Wc * 32;
     const int tid         = static_cast<int>(threadIdx.x);
+    // The grid spans the call's KV heads.
+    const int kv_heads = static_cast<int>(gridDim.x);
+    const int q_heads  = kv_heads * Geometry::GroupSize;
     for (int idx = tid; idx < Br * D; idx += Threads) {
         const int row = idx / D;
         const int d   = idx - row * D;
@@ -50,8 +53,8 @@ __device__ __forceinline__ void load_q(const Split<CacheInput>& s, __nv_bfloat16
         int token     = 0;
         causal_small_t_tc_row_to_qt<Geometry>(row, s.tokens, s.kv_head, q_head, token);
         __nv_bfloat16 value = __float2bfloat16(0.0f);
-        if (row < s.row_count && causal_valid_q_head<Geometry>(s.kv_head, q_head)) {
-            value = s.q[causal_q_index<Geometry>(q_head, d, token)];
+        if (row < s.row_count && causal_valid_q_head<Geometry>(s.kv_head, q_head, kv_heads)) {
+            value = s.q[causal_q_index(q_head, d, token, q_heads)];
         }
         qkv_s[row * D + causal_small_t_tc_swz(row, d)] = value;
     }
@@ -90,6 +93,8 @@ __device__ __forceinline__ bool sweep(const Split<CacheInput>& s, __nv_bfloat16*
     __nv_bfloat16* k_s = qkv_s;
     __nv_bfloat16* v_s = qkv_s + Bc * D;
     const int tid      = static_cast<int>(threadIdx.x);
+    // The grid spans the call's KV heads.
+    const int kv_heads = static_cast<int>(gridDim.x);
     const int lane     = tid & 31;
     const int gid      = lane >> 2;
     const int lid      = lane & 3;
@@ -135,14 +140,14 @@ __device__ __forceinline__ bool sweep(const Split<CacheInput>& s, __nv_bfloat16*
                 if (key >= s.split_start && key < s.load_end) {
                     const __nv_bfloat16* k_src = s.cache_k;
                     const __nv_bfloat16* v_src = s.cache_v;
-                    std::int64_t off = causal_cache_index<Geometry>(physical_page, s.kv_head, d,
-                                                                    key & kPagedKVPageMask);
+                    std::int64_t off = causal_cache_index(physical_page, s.kv_head, d,
+                                                          key & kPagedKVPageMask, kv_heads);
                     if constexpr (CacheInput::writes_cache) {
                         const int new_token = key - s.first_pos;
                         if (new_token >= 0 && new_token < s.valid_tokens && key >= s.first_pos) {
                             k_src = s.input.k;
                             v_src = s.input.v;
-                            off   = kv_cache_int8_new_index<Geometry>(s.kv_head, d, new_token);
+                            off   = kv_cache_int8_new_index(s.kv_head, d, new_token, kv_heads);
                         }
                     }
                     k_raw[j] = load_vec<int4>(k_src + off);

@@ -126,18 +126,20 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
     float* partial_l_s = partial_m_s + 2 * Br;
     float* alpha_s     = partial_l_s + 2 * Br;
 
-    const int q_block = static_cast<int>(blockIdx.x);
-    const int q_head  = static_cast<int>(blockIdx.y);
-    const int tid     = static_cast<int>(threadIdx.x);
-    const int warp    = tid >> 5;
-    const int lane    = tid & 31;
-    const int q0      = q_block * Br;
-    const int kv_head = q_head / Geometry::GroupSize;
-    const int tokens  = metadata.valid_tokens(width);
-    if (q_head >= Geometry::QHeads || q0 >= width) return;
+    const int q_block  = static_cast<int>(blockIdx.x);
+    const int q_head   = static_cast<int>(blockIdx.y);
+    const int q_heads  = causal_prompt_q_heads<Geometry>();
+    const int kv_heads = q_heads / Geometry::GroupSize;
+    const int tid      = static_cast<int>(threadIdx.x);
+    const int warp     = tid >> 5;
+    const int lane     = tid & 31;
+    const int q0       = q_block * Br;
+    const int kv_head  = q_head / Geometry::GroupSize;
+    const int tokens   = metadata.valid_tokens(width);
+    if (q_head >= q_heads || q0 >= width) return;
     if (q0 >= tokens) {
         causal_prompt_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
-                                                 kCausalPromptFp8Threads);
+                                                 kCausalPromptFp8Threads, q_heads);
         return;
     }
     const int base_pos              = positions[0];
@@ -154,10 +156,10 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int d = lane + 32 * r;
-            values[r] =
-                row < tile_rows
-                    ? __bfloat162float(q[causal_prompt_q_index<Geometry>(q_head, d, q0 + row)])
-                    : 0.0F;
+            values[r]   = row < tile_rows
+                              ? __bfloat162float(
+                                    q[causal_prompt_q_index<Geometry>(q_head, d, q0 + row, q_heads)])
+                              : 0.0F;
         }
         normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
@@ -187,8 +189,8 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
         for (int key_l = cooperative_tid; key_l < Bc; key_l += cooperative_threads) {
             const int key = tile_k0 + key_l;
             if (key <= max_query_abs) {
-                const std::int64_t off = kv_cache_fp8_scale_index<Geometry>(physical_page, kv_head,
-                                                                            page_offset0 + key_l);
+                const std::int64_t off = kv_cache_fp8_scale_index(physical_page, kv_head,
+                                                                  page_offset0 + key_l, kv_heads);
                 k_scale_s[key_l]       = cache_k_scale[off];
                 v_scale_s[key_l]       = cache_v_scale[off];
             } else {
@@ -210,8 +212,8 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
             std::uint8_t* kd = &k_fp8[key_l * D + d];
             std::uint8_t* vd = &v_fp8[key_l * D + d];
             if (key <= max_query_abs) {
-                const std::int64_t off = kv_cache_fp8_code_index<Geometry>(physical_page, kv_head,
-                                                                           d, page_offset0 + key_l);
+                const std::int64_t off = kv_cache_fp8_code_index(physical_page, kv_head, d,
+                                                                 page_offset0 + key_l, kv_heads);
                 cp_async<16, Cache::cg>(kd, &cache_k[off]);
                 cp_async<16, Cache::cg>(vd, &cache_v[off]);
             } else {
@@ -468,18 +470,18 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
         const int d0 = (d_slice * PVNtPerWarp + n) * 8 + 2 * lid;
         if (row0 < tile_rows) {
             *reinterpret_cast<unsigned*>(
-                &out[causal_prompt_q_index<Geometry>(q_head, d0, q0 + row0)]) =
+                &out[causal_prompt_q_index<Geometry>(q_head, d0, q0 + row0, q_heads)]) =
                 pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
         }
         if (row1 < tile_rows) {
             *reinterpret_cast<unsigned*>(
-                &out[causal_prompt_q_index<Geometry>(q_head, d0, q0 + row1)]) =
+                &out[causal_prompt_q_index<Geometry>(q_head, d0, q0 + row1, q_heads)]) =
                 pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
         }
     }
 
     causal_prompt_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid,
-                                             kCausalPromptFp8Threads);
+                                             kCausalPromptFp8Threads, q_heads);
 }
 
 } // namespace ninfer::ops

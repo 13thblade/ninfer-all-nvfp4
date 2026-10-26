@@ -29,7 +29,8 @@ Seven of them were measured on this corpus with Qwen3.8-27B on an RTX 3090; the 
 each format's size and decode speed, are in [`docs/config-calculator.html`](config-calculator.html).
 `--fast-prefill-kernel` scores an `int8` or `rk*` cache with the fast prompt-attention kernel (as
 `ninfer-serve --fast-prefill-kernel` prefills); `report.json` records it as `fast_prefill_kernel`.
-The evaluator also takes the server's `--devices` (one pipeline stage per GPU), its
+The evaluator also takes the server's `--devices` (one pipeline stage per GPU, or with
+`--tensor-parallel` and `--tensor-split` a share of every layer per GPU), its
 MoE residency options (`--expert-residency`, `--expert-cache-mib`) for native Qwen, Gemma 4, Flint,
 DeepSeek-V4.1 and Qwen3.8-Flash-Next, its Qwen3.8-Flash-Next n-gram options (`--ngram-table`,
 `--ngram-residency`, `--ngram-io`, `--ngram-io-depth`, `--ngram-hot-profile`, `--ngram-ram-mib`,

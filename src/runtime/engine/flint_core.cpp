@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/host_pages.h"
 #include "core/startup.h"
+#include "core/tensor_parallel.h"
 #include "models/expert_profile.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/frontend/processor.h"
@@ -119,17 +120,28 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
         throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
                                     "host or disk experts (--expert-residency host|disk)");
     }
-    if (device.size() != 1 || options.tensor_parallel) {
-        throw std::invalid_argument("Flint runs on one device");
+    if (options.tensor_parallel ? device.size() < 2 : device.size() != 1) {
+        throw std::invalid_argument("Flint runs on one device, or divides its routed experts over "
+                                    "several with --tensor-parallel");
     }
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     const artifact::Reader reader(options.artifact_path);
     inspect.complete();
     install_device_route_profile_for(options, device);
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
-    auto model = models::flint::load_model(
-        reader, {.artifact = options.artifact_path, .experts = options.expert_residency}, device,
-        &options.startup_observer);
+    models::flint::LoadOptions load{.artifact = options.artifact_path,
+                                    .experts  = options.expert_residency};
+    // Expert parallelism: the routed experts divided over the devices, everything else on the
+    // first. Without --tensor-split each device takes a share of its speed that fits beside what
+    // it holds.
+    if (options.tensor_parallel) {
+        load.expert_split = options.tensor_split;
+        if (load.expert_split.empty()) {
+            load.expert_split = models::flint::default_expert_split(reader, rank_free_bytes(device),
+                                                                    rank_copy_bandwidth(device));
+        }
+    }
+    auto model = models::flint::load_model(reader, load, device, &options.startup_observer);
     device.synchronize();
     materialize.complete();
     const auto free_bytes = [&] {
@@ -217,6 +229,17 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
                            ? " at most, growing with the sequences beside an elastic expert cache"
                            : "",
                        double(instance->executor->memory().workspace_bytes) / 1048576.0);
+    if (model->expert_parallel()) {
+        std::string ranges;
+        for (std::size_t rank = 0; rank < device.size(); ++rank) {
+            const auto [begin, end] = model->expert_range(rank);
+            ranges +=
+                (rank == 0 ? "" : ", ") + std::to_string(begin) + "-" + std::to_string(end - 1);
+        }
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Flint: expert parallelism, routed experts by device %s",
+                           ranges.c_str());
+    }
     if (options.expert_residency != ExpertResidency::Device) {
         const auto memory = instance->executor->memory().experts;
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,

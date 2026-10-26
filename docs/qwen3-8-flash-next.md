@@ -184,6 +184,10 @@ table artifact whose digest or row format differs from the one the model names.
 ./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
   --devices 0,1 --max-context 32768
 
+# The same GPUs dividing every layer's routed experts instead, the rest on the first (Linux).
+./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
+  --devices 0,1 --tensor-parallel --max-context 32768
+
 # One GPU: the experts in pinned host memory, the most used of them cached on the GPU.
 ./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
   --expert-residency host --max-context 32768
@@ -220,6 +224,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--kv-resident N\|all\|auto` | positions of each sparse-attention layer's KV a sequence keeps in device memory; a longer `--max-context` streams those layers ([streamed KV](#streamed-sparse-attention-kv)). `auto` (default): 32,768 with host or disk experts, all with device experts |
 | `--rope-yarn`, `--rope-yarn-factor F` | YaRN past the native 262,144 positions, as for the Qwen3.5 family: at `--max-context` / 262,144 once the window passes it, or at a fixed factor `F` (`1..4`) for every position. It reaches every rotation the model makes, the sparse-attention layers', their indexer's and the MTP block's, and changes every answer, short ones too. Without it positions past 262,144 rotate unscaled. `--rope-scaling-factor` is not available for this model. The startup log names the factor, and the request log's `server_start` record reports the resolved rotation (`engine.rope`) |
 | `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
+| `--tensor-parallel`, `--tensor-split A,B,...` | with `--devices`: every layer on the first GPU, its routed experts divided over the GPUs (GGUF banks on the devices; [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)) |
 
 With device experts every expert runs on the GPU. With GGUF host and disk experts, by default the
 CPU computes a share of each decode or verification call's missing experts ([the CPU

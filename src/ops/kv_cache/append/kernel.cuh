@@ -29,7 +29,8 @@ kv_cache_append_full_fp8_row(const __nv_bfloat16* __restrict__ k,
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
-        values[r]   = __bfloat162float(k[kv_cache_fp8_src_index<Geometry>(kv_head, d, token)]);
+        values[r] =
+            __bfloat162float(k[kv_cache_fp8_src_index(kv_head, d, token, Geometry::KVHeads)]);
     }
     normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
@@ -38,11 +39,11 @@ kv_cache_append_full_fp8_row(const __nv_bfloat16* __restrict__ k,
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
-        cache_k[kv_cache_fp8_code_index<Geometry>(physical_page, kv_head, d, page_off)] =
+        cache_k[kv_cache_fp8_code_index(physical_page, kv_head, d, page_off, Geometry::KVHeads)] =
             kv_cache_fp8_quant_code(values[r], k_quant.inverse_scale);
     }
     if (lane == 0) {
-        scale_k[kv_cache_fp8_scale_index<Geometry>(physical_page, kv_head, page_off)] =
+        scale_k[kv_cache_fp8_scale_index(physical_page, kv_head, page_off, Geometry::KVHeads)] =
             k_quant.scale;
     }
 
@@ -50,18 +51,19 @@ kv_cache_append_full_fp8_row(const __nv_bfloat16* __restrict__ k,
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d  = lane + 32 * r;
-        values[r]    = __bfloat162float(v[kv_cache_fp8_src_index<Geometry>(kv_head, d, token)]);
+        values[r] =
+            __bfloat162float(v[kv_cache_fp8_src_index(kv_head, d, token, Geometry::KVHeads)]);
         local_absmax = fmaxf(local_absmax, fabsf(values[r]));
     }
     const auto v_quant = kv_cache_fp8_quant_params(warp_max(local_absmax, FullMask));
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
-        cache_v[kv_cache_fp8_code_index<Geometry>(physical_page, kv_head, d, page_off)] =
+        cache_v[kv_cache_fp8_code_index(physical_page, kv_head, d, page_off, Geometry::KVHeads)] =
             kv_cache_fp8_quant_code(values[r], v_quant.inverse_scale);
     }
     if (lane == 0) {
-        scale_v[kv_cache_fp8_scale_index<Geometry>(physical_page, kv_head, page_off)] =
+        scale_v[kv_cache_fp8_scale_index(physical_page, kv_head, page_off, Geometry::KVHeads)] =
             v_quant.scale;
     }
 }
@@ -195,8 +197,8 @@ __launch_bounds__(256) __global__
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
-        k_values[r] =
-            __bfloat162float(k[kv_cache_int8_quant_src_index<Geometry>(kv_head, d, token)]);
+        k_values[r] = __bfloat162float(
+            k[kv_cache_int8_quant_src_index(kv_head, d, token, Geometry::KVHeads)]);
     }
     normalized_hadamard_d256_inplace(k_values, lane);
 
@@ -206,12 +208,14 @@ __launch_bounds__(256) __global__
         const int d1                 = d0 + 32;
         const float k0               = k_values[2 * group];
         const float k1               = k_values[2 * group + 1];
-        const std::int64_t src0      = kv_cache_int8_quant_src_index<Geometry>(kv_head, d0, token);
-        const std::int64_t src1      = kv_cache_int8_quant_src_index<Geometry>(kv_head, d1, token);
+        const std::int64_t src0 =
+            kv_cache_int8_quant_src_index(kv_head, d0, token, Geometry::KVHeads);
+        const std::int64_t src1 =
+            kv_cache_int8_quant_src_index(kv_head, d1, token, Geometry::KVHeads);
         const float v0               = __bfloat162float(v[src0]);
         const float v1               = __bfloat162float(v[src1]);
-        kv_cache_i8_family_store_key_group<Geometry, Keys>(cache_k, scale_k, page, kv_head,
-                                                                  group, page_off, lane, k0, k1);
+        kv_cache_i8_family_store_key_group<Keys>(cache_k, scale_k, page, kv_head, group, page_off,
+                                                 lane, k0, k1, Geometry::KVHeads);
         // See the tiled page kernel: v0 and v1 lanes are the packed coding's two 32-value groups.
         const float v_abs_lo = warp_max(fabsf(v0), FullMask);
         const float v_abs_hi = warp_max(fabsf(v1), FullMask);
@@ -219,8 +223,8 @@ __launch_bounds__(256) __global__
                                             : kv_cache_int8_quant_params(fmaxf(v_abs_lo, v_abs_hi));
         const auto v_quant_hi =
             PackedValues ? kv_cache_int4_quant_params(v_abs_hi) : v_quant;
-        const std::int64_t code_base = kv_cache_int8_quant_code_index<Geometry>(
-            page, kv_head, group * kKVCacheInt8Group, page_off);
+        const std::int64_t code_base = kv_cache_int8_quant_code_index(
+            page, kv_head, group * kKVCacheInt8Group, page_off, Geometry::KVHeads);
         if constexpr (PackedValues) {
             // See the tiled page kernel: a packed byte spans lanes l and l^1.
             const std::int8_t c0 = kv_cache_int4_quant_code(v0, v_quant.inverse_scale);
@@ -229,8 +233,8 @@ __launch_bounds__(256) __global__
             const int partner1   = __shfl_xor_sync(FullMask, static_cast<int>(c1), 1);
             if ((lane & 1) == 0) {
                 auto* packed_v = reinterpret_cast<std::uint8_t*>(cache_v);
-                const std::int64_t packed_base = kv_cache_int4_value_code_index<Geometry>(
-                    page, kv_head, group * (kKVCacheInt8Group / 2), page_off);
+                const std::int64_t packed_base = kv_cache_int4_value_code_index(
+                    page, kv_head, group * (kKVCacheInt8Group / 2), page_off, Geometry::KVHeads);
                 packed_v[packed_base + (lane >> 1)] =
                     kv_cache_int4_pack(c0, static_cast<std::int8_t>(partner0));
                 packed_v[packed_base + (lane >> 1) + 16] =
@@ -242,13 +246,13 @@ __launch_bounds__(256) __global__
         }
         if (lane == 0) {
             if constexpr (PackedValues) {
-                scale_v[kv_cache_int4_value_scale_index<Geometry>(page, kv_head, 2 * group,
-                                                                 page_off)] = v_quant.scale;
-                scale_v[kv_cache_int4_value_scale_index<Geometry>(page, kv_head, 2 * group + 1,
-                                                                 page_off)] = v_quant_hi.scale;
+                scale_v[kv_cache_int4_value_scale_index(page, kv_head, 2 * group, page_off,
+                                                        Geometry::KVHeads)] = v_quant.scale;
+                scale_v[kv_cache_int4_value_scale_index(page, kv_head, 2 * group + 1, page_off,
+                                                        Geometry::KVHeads)] = v_quant_hi.scale;
             } else {
-                scale_v[kv_cache_int8_quant_scale_index<Geometry>(page, kv_head, group,
-                                                                 page_off)] = v_quant.scale;
+                scale_v[kv_cache_int8_quant_scale_index(page, kv_head, group, page_off,
+                                                        Geometry::KVHeads)] = v_quant.scale;
             }
         }
     }
@@ -297,8 +301,8 @@ __launch_bounds__(256) __global__
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
-        k_values[r] =
-            __bfloat162float(k[kv_cache_int8_quant_src_index<Geometry>(kv_head, d, token)]);
+        k_values[r] = __bfloat162float(
+            k[kv_cache_int8_quant_src_index(kv_head, d, token, Geometry::KVHeads)]);
     }
     normalized_hadamard_d256_inplace(k_values, lane);
 
@@ -308,12 +312,14 @@ __launch_bounds__(256) __global__
         const int d1                 = d0 + 32;
         const float k0               = k_values[2 * group];
         const float k1               = k_values[2 * group + 1];
-        const std::int64_t src0      = kv_cache_int8_quant_src_index<Geometry>(kv_head, d0, token);
-        const std::int64_t src1      = kv_cache_int8_quant_src_index<Geometry>(kv_head, d1, token);
+        const std::int64_t src0 =
+            kv_cache_int8_quant_src_index(kv_head, d0, token, Geometry::KVHeads);
+        const std::int64_t src1 =
+            kv_cache_int8_quant_src_index(kv_head, d1, token, Geometry::KVHeads);
         const float v0               = __bfloat162float(v[src0]);
         const float v1               = __bfloat162float(v[src1]);
-        kv_cache_i8_family_store_key_group<Geometry, Keys>(
-            cache_k, scale_k, physical_page, kv_head, group, page_off, lane, k0, k1);
+        kv_cache_i8_family_store_key_group<Keys>(cache_k, scale_k, physical_page, kv_head, group,
+                                                 page_off, lane, k0, k1, Geometry::KVHeads);
         // The v0 lanes span dimensions [64g, 64g+32) and the v1 lanes [64g+32, 64g+64), so the
         // packed coding's two 32-value groups fall out of the existing lane assignment with one
         // warp reduction each. The INT8 coding reduces across both halves for its single G64.
@@ -323,8 +329,8 @@ __launch_bounds__(256) __global__
                                             : kv_cache_int8_quant_params(fmaxf(v_abs_lo, v_abs_hi));
         const auto v_quant_hi =
             PackedValues ? kv_cache_int4_quant_params(v_abs_hi) : v_quant;
-        const std::int64_t code_base = kv_cache_int8_quant_code_index<Geometry>(
-            physical_page, kv_head, group * kKVCacheInt8Group, page_off);
+        const std::int64_t code_base = kv_cache_int8_quant_code_index(
+            physical_page, kv_head, group * kKVCacheInt8Group, page_off, Geometry::KVHeads);
         if constexpr (PackedValues) {
             // A packed byte holds the adjacent pair (2p, 2p+1), but this lane owns d0 = 64g+lane
             // and d1 = d0+32, so each byte spans lanes l and l^1. Exchange the partner's codes and
@@ -335,8 +341,9 @@ __launch_bounds__(256) __global__
             const int partner1   = __shfl_xor_sync(FullMask, static_cast<int>(c1), 1);
             if ((lane & 1) == 0) {
                 auto* packed_v = reinterpret_cast<std::uint8_t*>(cache_v);
-                const std::int64_t packed_base = kv_cache_int4_value_code_index<Geometry>(
-                    physical_page, kv_head, group * (kKVCacheInt8Group / 2), page_off);
+                const std::int64_t packed_base = kv_cache_int4_value_code_index(
+                    physical_page, kv_head, group * (kKVCacheInt8Group / 2), page_off,
+                    Geometry::KVHeads);
                 packed_v[packed_base + (lane >> 1)] =
                     kv_cache_int4_pack(c0, static_cast<std::int8_t>(partner0));
                 packed_v[packed_base + (lane >> 1) + 16] =
@@ -348,15 +355,14 @@ __launch_bounds__(256) __global__
         }
         if (lane == 0) {
             if constexpr (PackedValues) {
-                scale_v[kv_cache_int4_value_scale_index<Geometry>(physical_page, kv_head,
-                                                                 2 * group, page_off)] =
-                    v_quant.scale;
-                scale_v[kv_cache_int4_value_scale_index<Geometry>(physical_page, kv_head,
-                                                                 2 * group + 1, page_off)] =
+                scale_v[kv_cache_int4_value_scale_index(physical_page, kv_head, 2 * group, page_off,
+                                                        Geometry::KVHeads)] = v_quant.scale;
+                scale_v[kv_cache_int4_value_scale_index(physical_page, kv_head, 2 * group + 1,
+                                                        page_off, Geometry::KVHeads)] =
                     v_quant_hi.scale;
             } else {
-                scale_v[kv_cache_int8_quant_scale_index<Geometry>(physical_page, kv_head, group,
-                                                                 page_off)] = v_quant.scale;
+                scale_v[kv_cache_int8_quant_scale_index(physical_page, kv_head, group, page_off,
+                                                        Geometry::KVHeads)] = v_quant.scale;
             }
         }
     }
