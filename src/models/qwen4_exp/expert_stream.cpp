@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -121,6 +122,7 @@ struct Slot {
     std::int32_t expert = -1;
     std::uint64_t call  = 0; // the last prepare() that needed it
     bool referenced     = false;
+    bool released       = false; // in the pool's released queue
     // Bytes from the start of the down region that a down has written: past a smaller down, the
     // tail must be zeroed again.
     std::uint64_t down_written = 0;
@@ -131,7 +133,10 @@ struct Pool {
     std::uint64_t slot_bytes = 0;
     std::array<std::uint64_t, 3> offset{};
     std::vector<Slot> slots;
-    std::size_t hand = 0; // CLOCK
+    std::size_t filled = 0; // slots that have held an expert, from the first
+    std::size_t hand   = 0; // CLOCK
+    // Taken before the hand's slots: a queued slot routed to again since is skipped.
+    std::deque<std::uint32_t> released;
 };
 
 } // namespace
@@ -139,6 +144,7 @@ struct Pool {
 struct ExpertStream::Impl {
     struct Layer {
         ExpertStreamLayer spec;
+        std::size_t pool = 0;
         std::vector<std::int32_t> slot_of;
         std::array<std::vector<const void*>, 3> mirror;
         std::unique_ptr<PinnedHostBuffer> table_staging;
@@ -147,7 +153,7 @@ struct ExpertStream::Impl {
     DeviceContext& device;
     std::vector<std::unique_ptr<File>> files;
     std::vector<Layer> layers;
-    std::map<std::size_t, Pool> pools;
+    std::vector<Pool> pools;
     std::unique_ptr<PinnedHostBuffer> staging;
     std::array<cudaEvent_t, 2> half_done{};
     std::array<std::size_t, 3> half_rank{};
@@ -173,30 +179,6 @@ struct ExpertStream::Impl {
          std::vector<ExpertStreamLayer> specs, std::span<const std::uint64_t> bytes_by_rank)
         : device(d) {
         for (const auto& path : paths) { files.push_back(std::make_unique<File>(path)); }
-        std::map<std::size_t, std::array<std::uint64_t, 3>> widest;
-        for (const auto& spec : specs) {
-            auto& sizes = widest[spec.rank];
-            for (int k = 0; k < 3; ++k) {
-                for (const auto& location : spec.experts[k]) {
-                    sizes[k] = std::max(sizes[k], location.bytes);
-                }
-            }
-        }
-        for (const auto& [rank, sizes] : widest) {
-            Pool pool;
-            pool.offset     = {0, aligned(sizes[0]), aligned(sizes[0]) + aligned(sizes[1])};
-            pool.slot_bytes = aligned(sizes[0]) + aligned(sizes[1]) + aligned(sizes[2] + kTail);
-            const std::uint64_t budget = rank < bytes_by_rank.size() ? bytes_by_rank[rank] : 0;
-            pool.slots.resize(static_cast<std::size_t>(budget / pool.slot_bytes));
-            if (!pool.slots.empty()) {
-                // Zeroed, so each slot's tail stays zero: copies write the matrices only.
-                RankBinding bind(device, rank);
-                pool.storage = DeviceBuffer(pool.slots.size() * pool.slot_bytes);
-                CUDA_CHECK(cudaMemset(pool.storage.p, 0, pool.storage.bytes));
-            }
-            stats.slots += static_cast<std::uint32_t>(pool.slots.size());
-            pools.emplace(rank, std::move(pool));
-        }
         for (auto& spec : specs) {
             Layer layer;
             const std::size_t experts = spec.experts[0].size();
@@ -206,10 +188,82 @@ struct ExpertStream::Impl {
             layer.spec          = std::move(spec);
             layers.push_back(std::move(layer));
         }
+        std::map<std::size_t, std::vector<std::size_t>> on_rank;
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            on_rank[layers[i].spec.rank].push_back(i);
+        }
+        for (const auto& [rank, members] : on_rank) {
+            const std::uint64_t budget = rank < bytes_by_rank.size() ? bytes_by_rank[rank] : 0;
+            // A layer with slots of its own takes as many as its widest call routes to, wider
+            // than the shared slots; the shared slots must still hold the widest call of the
+            // others. Otherwise every layer of the rank shares slots fitting the widest.
+            std::vector<std::size_t> shared, own;
+            for (const std::size_t i : members) {
+                (layers[i].spec.own_pool ? own : shared).push_back(i);
+            }
+            std::uint64_t own_bytes = 0, widest_shared_call = 0;
+            for (const std::size_t i : own) { own_bytes += slot_shape({i}).first * call_slots(i); }
+            for (const std::size_t i : shared) {
+                widest_shared_call = std::max<std::uint64_t>(widest_shared_call, call_slots(i));
+            }
+            const std::uint64_t shared_slot = shared.empty() ? 0 : slot_shape(shared).first;
+            bool split = !own.empty() && !shared.empty() && own_bytes < budget &&
+                         (budget - own_bytes) / shared_slot >= widest_shared_call;
+            for (const std::size_t i : own) {
+                split = split && slot_shape({i}).first > shared_slot;
+            }
+            if (!split) {
+                add_pool(rank, members, budget / slot_shape(members).first);
+                continue;
+            }
+            for (const std::size_t i : own) { add_pool(rank, {i}, call_slots(i)); }
+            add_pool(rank, shared, (budget - own_bytes) / shared_slot);
+        }
         staging = std::make_unique<PinnedHostBuffer>(2 * kStagingHalf);
         for (auto& event : half_done) {
             CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
         }
+    }
+
+    // The most experts one call of layer `i` routes to.
+    [[nodiscard]] std::uint64_t call_slots(std::size_t i) const {
+        const std::size_t experts = layers[i].slot_of.size();
+        const std::size_t widest  = layers[i].spec.widest_call;
+        return widest == 0 ? experts : std::min(widest, experts);
+    }
+
+    // The slot bytes and the offsets of the up and down in a slot that fits every expert of
+    // `members`.
+    [[nodiscard]] std::pair<std::uint64_t, std::array<std::uint64_t, 3>>
+    slot_shape(const std::vector<std::size_t>& members) const {
+        std::array<std::uint64_t, 3> sizes{};
+        for (const std::size_t i : members) {
+            for (int k = 0; k < 3; ++k) {
+                for (const auto& location : layers[i].spec.experts[k]) {
+                    sizes[k] = std::max(sizes[k], location.bytes);
+                }
+            }
+        }
+        const std::array<std::uint64_t, 3> offset = {0, aligned(sizes[0]),
+                                                     aligned(sizes[0]) + aligned(sizes[1])};
+        return {offset[2] + aligned(sizes[2] + kTail), offset};
+    }
+
+    void add_pool(std::size_t rank, const std::vector<std::size_t>& members, std::uint64_t count) {
+        const auto [slot_bytes, offset] = slot_shape(members);
+        Pool pool;
+        pool.slot_bytes = slot_bytes;
+        pool.offset     = offset;
+        pool.slots.resize(static_cast<std::size_t>(count));
+        if (!pool.slots.empty()) {
+            // Zeroed, so each slot's tail stays zero: copies write the matrices only.
+            RankBinding bind(device, rank);
+            pool.storage = DeviceBuffer(pool.slots.size() * pool.slot_bytes);
+            CUDA_CHECK(cudaMemset(pool.storage.p, 0, pool.storage.bytes));
+        }
+        stats.slots += static_cast<std::uint32_t>(pool.slots.size());
+        for (const std::size_t i : members) { layers[i].pool = pools.size(); }
+        pools.push_back(std::move(pool));
     }
 
     ~Impl() {
@@ -234,13 +288,16 @@ struct ExpertStream::Impl {
     // given, and the slots do not record which. Later calls read what they route to again. The
     // half being filled keeps its cursor, so no staged byte a queued copy still reads is reused.
     void forget_residents() {
-        for (auto& [rank, pool] : pools) {
+        for (auto& pool : pools) {
             for (Slot& slot : pool.slots) {
                 slot.layer      = -1;
                 slot.expert     = -1;
                 slot.call       = 0;
                 slot.referenced = false;
+                slot.released   = false;
             }
+            pool.filled = 0;
+            pool.released.clear();
         }
         for (Layer& layer : layers) { std::fill(layer.slot_of.begin(), layer.slot_of.end(), -1); }
         batch_reads.clear();
@@ -287,6 +344,16 @@ struct ExpertStream::Impl {
     }
 
     std::size_t victim(Pool& pool) {
+        if (pool.filled < pool.slots.size()) { return pool.filled++; }
+        // Released slots next: none holds an expert this call needs, whose hit cleared the mark.
+        while (!pool.released.empty()) {
+            const std::size_t index = pool.released.front();
+            pool.released.pop_front();
+            if (pool.slots[index].released) {
+                pool.slots[index].released = false;
+                return index;
+            }
+        }
         // CLOCK: a slot used since the hand last passed gets another round, a slot this call
         // needs is never taken. The caller has checked that the call fits the pool.
         for (;;) {
@@ -302,9 +369,9 @@ struct ExpertStream::Impl {
         }
     }
 
-    void prepare(std::size_t index, std::span<const std::int32_t> ids) {
+    void prepare(std::size_t index, std::span<const std::int32_t> ids, bool release_others) {
         Layer& layer = layers.at(index);
-        Pool& pool   = pools.at(layer.spec.rank);
+        Pool& pool   = pools.at(layer.pool);
         ++call;
         std::vector<std::int32_t> needed;
         needed.reserve(ids.size());
@@ -317,8 +384,7 @@ struct ExpertStream::Impl {
         if (needed.size() > pool.slots.size()) {
             throw std::runtime_error("expert stream: one layer routes to " +
                                      std::to_string(needed.size()) +
-                                     " experts but the device "
-                                     "cache holds " +
+                                     " experts but its device slots hold " +
                                      std::to_string(pool.slots.size()));
         }
         std::vector<std::int32_t> missing;
@@ -329,8 +395,19 @@ struct ExpertStream::Impl {
                 ++stats.hits;
                 pool.slots[slot].call       = call;
                 pool.slots[slot].referenced = true;
+                pool.slots[slot].released   = false;
             } else {
                 missing.push_back(expert);
+            }
+        }
+        if (release_others) {
+            for (const std::int32_t s : layer.slot_of) {
+                if (s < 0) { continue; }
+                Slot& slot = pool.slots[s];
+                if (slot.call == call || slot.released) { continue; }
+                slot.released   = true;
+                slot.referenced = false;
+                pool.released.push_back(static_cast<std::uint32_t>(s));
             }
         }
         if (missing.empty()) { return; }
@@ -391,14 +468,15 @@ ExpertStream::ExpertStream(DeviceContext& device, const std::vector<std::filesys
 
 ExpertStream::~ExpertStream() = default;
 
-void ExpertStream::prepare(std::size_t layer, std::span<const std::int32_t> ids) {
-    impl_->prepare(layer, ids);
+void ExpertStream::prepare(std::size_t layer, std::span<const std::int32_t> ids,
+                           bool release_others) {
+    impl_->prepare(layer, ids, release_others);
 }
 
 ExpertStreamStats ExpertStream::stats() const noexcept { return impl_->stats; }
 
-std::pair<std::uintptr_t, std::uintptr_t> ExpertStream::storage(std::size_t rank) const {
-    const auto& pool = impl_->pools.at(rank);
+std::pair<std::uintptr_t, std::uintptr_t> ExpertStream::storage(std::size_t layer) const {
+    const auto& pool = impl_->pools.at(impl_->layers.at(layer).pool);
     const auto begin = reinterpret_cast<std::uintptr_t>(pool.storage.p);
     return {begin, begin + pool.storage.bytes};
 }

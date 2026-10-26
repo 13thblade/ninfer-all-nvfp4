@@ -453,17 +453,17 @@ measured on this model yet.
 its own KV and recurrent state, so every sequence costs device memory (the KV of `--max-context`
 positions, 24 KiB a position in BF16 and less in a quantized `--kv-dtype`, plus 74 MiB of recurrent
 state). Requests are admitted
-in arrival order. Prompts prefill a step at a time, each step from the prompt with the fewest
-tokens left, so a short or cached request is not held behind a long prompt for its whole prefill
-(a prompt passed over eight times goes next, and a prompt with media, once begun, finishes
-first). A step is one chunk, or with host experts on one GPU a span of up to eight chunks of a text
-prompt (see [Execution](#execution)); while other requests decode, a span is two chunks at most,
+in arrival order. Prompts prefill a step at a time, each step from the prompt with the fewest tokens
+left, so a short or cached request is not held behind a long prompt for its whole prefill (a prompt
+passed over eight times goes next, and a prompt with media, once begun, finishes first). A step is
+one chunk, or with host or disk experts on one GPU a span of up to eight chunks of the prompt, media
+or not (see [Execution](#execution)); while other requests decode, a span is two chunks at most,
 since they wait for the whole step. Before a step, while requests are decoding, they run
 `--decode-rounds-per-prefill` rounds (by default the chunk size over 64, 16 at the default chunk)
 for each chunk's worth of prompt the step computes, at least one, so a short prompt gets in after
-one round and the streams keep their share during a long one; each round is one batched pass
-whose experts read their weights once for the whole batch, so the batch costs little more than one
-token while the experts dominate the step.
+one round and the streams keep their share during a long one; each round is one batched pass whose
+experts read their weights once for the whole batch, so the batch costs little more than one token
+while the experts dominate the step.
 
 With the context cache on (the default), a sequence keeps its state when its request ends, and a
 snapshot of its recurrent state where the prompt's last user turn closes (or at the prompt's end
@@ -640,7 +640,17 @@ draft-chain graph and each width its own verification graph, captured at their s
   every layer with mapped misses, and after a prompt chunk with staged ones. With disk experts the
   cache works per layer instead: once a layer has routed its tokens, the experts it lacks are read
   into the slots least recently used (never one the same call needs), and only then do the
-  layer's experts run.
+  layer's experts run. A prompt longer than a chunk runs in the same spans as with host experts,
+  each chunk's experts on their own: the chunks of a span reach a layer one after another, so the
+  experts the first chunks read are still in their slots for the later ones, and an expert is read
+  once per span rather than once per chunk. At a span's last chunk the layer's residents that chunk
+  does not route to are released: once no slot is empty, later reads take released slots first,
+  oldest release first, before the least recently used, unless a call routes to them again. The
+  span's later layers thus read their experts into the earlier layers' stale ones, and every layer
+  keeps the experts of the prompt's end. Empty slots are always taken first. The MTP block's experts
+  (stored as Q8_0, wider than the text layers') have slots of their own, sized for one chunk's
+  routes, when the rest of the budget still holds a text layer's widest call; the text layers'
+  slots are then sized for their own experts (11,815 Q2_0 slots instead of 3,504 on an RTX 3090).
 - A decode step (one token) replays a CUDA graph per pipeline stage, captured at a sequence's
   second decode step; the token's position reaches the sparse-attention kernels in device memory.
   Disk experts need the host between a layer's routing and its experts, so their steps stay eager.
@@ -667,7 +677,8 @@ draft-chain graph and each width its own verification graph, captured at their s
 
 Greedy decoding, one request, the generate test (`ninfer_qwen4_exp_generate_real`) without drafts.
 Decode is measured over a short answer (78 tokens for Q2_0, 81 or 82 for IQ3_S) and over the first
-five tokens after a 4,463-token prompt; prefill is that prompt in 512-token chunks. Host memory is
+five tokens after a 4,463-token prompt; prefill is that prompt in 512-token chunks, which with host
+or disk experts run as a span of eight chunks and a last chunk of 367 tokens. Host memory is
 the process's peak resident set (with host experts, the pinned bank), device memory the most
 `nvidia-smi` showed in use. With host or disk experts the expert cache takes the memory the GPU has
 free and fills while the requests run.
@@ -675,39 +686,56 @@ free and fills while the requests run.
 One GPU, October 26, 2026, a build of `master` with CUDA 13.4 (`120a` on the RTX 5090, `sm_86` on
 the others), the n-gram table as the separate artifact, one run per row:
 
-- RTX 5090: 600 W, PCIe 5.0 x16, a 20-thread Core Ultra 7 265K and 251 GB of RAM.
+- RTX 5090: 575 W, PCIe 5.0 x16, a 16-core Ryzen 9 7950X and 124 GB of RAM.
 - RTX 4090: 450 W, PCIe 4.0 x16, a 48-core EPYC 7K62 and 503 GB of RAM.
-- RTX 3090: 300 W, PCIe 3.0 x16, two 14-core Xeon E5-2690 v4 sockets and 251 GB of RAM. The test
-  ran pinned to the CPUs of the GPU's NUMA node after the model files' pages were evicted, so the
-  pinned bank and the page cache are on that node.
+- RTX 3090: 370 W, PCIe 3.0 x16, two 26-core Xeon Platinum 8272CL sockets (four NUMA nodes) and
+  1.5 TB of RAM. The test ran pinned to the CPUs of the GPU's NUMA node after the model files'
+  pages were evicted, so the pinned bank and the page cache are on that node.
 
 | Card | Release | Experts | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
 |---|---|---|---:|---:|---:|---:|---:|
-| RTX 5090 | Q2_0 | pinned host memory | 30.1 GiB | 33.2 GiB | 95.5 tok/s | 71.4 tok/s | 669 tok/s |
-| RTX 5090 | Q2_0 | disk, the files in the page cache | 30.1 GiB | 1.7 GiB + page cache | 70.5 tok/s | 118.9 tok/s | 2,099 tok/s |
-| RTX 5090 | Q2_0 | disk, the files' pages evicted every second | 30.1 GiB | 1.7 GiB | 23.3 tok/s | 50.0 tok/s | 732 tok/s |
-| RTX 5090 | IQ3_S | pinned host memory | 30.0 GiB | 48.7 GiB | 80.2 tok/s | 73.2 tok/s | 481 tok/s |
-| RTX 5090 | IQ3_S | disk, the files in the page cache | 30.1 GiB | 1.9 GiB + page cache | 51.5 tok/s | 38.3 tok/s | 318 tok/s |
-| RTX 5090 | IQ3_S | disk, the files' pages evicted every second | 30.1 GiB | 1.9 GiB | 15.9 tok/s | 9.2 tok/s | 65 tok/s |
-| RTX 4090 | Q2_0 | pinned host memory | 22.1 GiB | 33.0 GiB | 65.8 tok/s | 58.5 tok/s | 430 tok/s |
-| RTX 4090 | Q2_0 | disk, the files in the page cache | 22.1 GiB | 1.4 GiB + page cache | 46.3 tok/s | 44.6 tok/s | 808 tok/s |
-| RTX 4090 | Q2_0 | disk, the files' pages evicted every second | 22.1 GiB | 1.4 GiB | 23.3 tok/s | 17.8 tok/s | 347 tok/s |
-| RTX 3090 | Q2_0 | pinned host memory | 22.2 GiB | 33.0 GiB | 55.1 tok/s | 50.6 tok/s | 209 tok/s |
-| RTX 3090 | Q2_0 | disk, the files in the page cache | 22.1 GiB | 1.4 GiB + page cache | 46.7 tok/s | 39.7 tok/s | 625 tok/s |
-| RTX 3090 | Q2_0 | disk, the files' pages evicted every second | 22.1 GiB | 1.4 GiB | 21.7 tok/s | 15.9 tok/s | 282 tok/s |
-| RTX 3090 | IQ3_S | pinned host memory | 22.1 GiB | 48.3 GiB | 40.7 tok/s | 37.2 tok/s | 146 tok/s |
-| RTX 3090 | IQ3_S | disk, the files in the page cache | 22.1 GiB | 1.5 GiB + page cache | 32.4 tok/s | 18.8 tok/s | 179 tok/s |
-| RTX 3090 | IQ3_S | disk, the files' pages evicted every second | 22.1 GiB | 1.5 GiB | 12.9 tok/s | 6.7 tok/s | 58 tok/s |
+| RTX 5090 | Q2_0 | pinned host memory | 30.1 GiB | 33.3 GiB | 97.8 tok/s | 83.2 tok/s | 3,290 tok/s |
+| RTX 5090 | Q2_0 | disk, the files in the page cache | 30.1 GiB | 1.7 GiB + page cache | 72.1 tok/s | 102.9 tok/s | 1,827 tok/s |
+| RTX 5090 | Q2_0 | disk, the files' pages evicted every second | 30.1 GiB | 1.7 GiB | 37.7 tok/s | 66.4 tok/s | 1,108 tok/s |
+| RTX 5090 | IQ3_S | pinned host memory | 30.1 GiB | 48.7 GiB | 82.5 tok/s | 70.7 tok/s | 2,451 tok/s |
+| RTX 5090 | IQ3_S | disk, the files in the page cache | 30.1 GiB | 2.0 GiB + page cache | 56.4 tok/s | 35.5 tok/s | 770 tok/s |
+| RTX 5090 | IQ3_S | disk, the files' pages evicted every second | 30.1 GiB | 2.0 GiB | 28.5 tok/s | 16.7 tok/s | 399 tok/s |
+| RTX 4090 | Q2_0 | pinned host memory | 22.1 GiB | 33.1 GiB | 73.9 tok/s | 66.9 tok/s | 1,801 tok/s |
+| RTX 4090 | Q2_0 | disk, the files in the page cache | 22.1 GiB | 1.5 GiB + page cache | 46.5 tok/s | 42.5 tok/s | 1,144 tok/s |
+| RTX 4090 | Q2_0 | disk, the files' pages evicted every second | 22.1 GiB | 1.5 GiB | 21.0 tok/s | 14.6 tok/s | 558 tok/s |
+| RTX 3090 | Q2_0 | pinned host memory | 22.2 GiB | 33.1 GiB | 39.1 tok/s | 45.7 tok/s | 663 tok/s |
+| RTX 3090 | Q2_0 | disk, the files in the page cache | 22.1 GiB | 1.5 GiB + page cache | 27.8 tok/s | 27.5 tok/s | 503 tok/s |
+| RTX 3090 | Q2_0 | disk, the files' pages evicted every second | 22.1 GiB | 1.5 GiB | 19.7 tok/s | 14.4 tok/s | 474 tok/s |
+| RTX 3090 | IQ3_S | pinned host memory | 22.2 GiB | 48.5 GiB | 27.1 tok/s | 33.1 tok/s | 438 tok/s |
+| RTX 3090 | IQ3_S | disk, the files in the page cache | 22.1 GiB | 1.7 GiB + page cache | 17.4 tok/s | 13.7 tok/s | 256 tok/s |
+| RTX 3090 | IQ3_S | disk, the files' pages evicted every second | 22.1 GiB | 1.7 GiB | 12.3 tok/s | 6.0 tok/s | 179 tok/s |
 
-- **Prefill chunk.** A wide call copies the experts its layer routes to that the cache lacks: disk
-  experts into the cache, host experts into the prefill buffers (`--expert-prefill-buffers`), so
-  with host experts each 512-token chunk copies nearly every expert of every layer again. Larger
-  chunks copy less often: the RTX 5090's Q2_0 host row prefills the prompt at 1,942 tok/s in
-  2,048-token chunks and 2,759 in 4,096 (decoding 85.8 and 87.4 tok/s after it), and `ninfer-serve`
-  with its defaults prefilled an 8,377-token prompt with host experts at 5,140 to 5,180 tok/s on the
-  same host and 1,690 to 1,700 on the RTX 3090 host.
-- **NUMA.** Unpinned on the two-socket RTX 3090 host, Q2_0 decodes the short answer at 49.9 tok/s
-  with host experts and 26.5 with disk experts in the page cache, against 55.1 and 46.7 pinned.
+- **Prompt spans.** With host or disk experts a prompt longer than a chunk prefills in spans of up
+  to eight chunks, so a layer's missing experts cross the host link once per span rather than once
+  per chunk; the chunk still sets each call's width. The CLI with its defaults (1,024-token chunks,
+  MTP drafts) on the 7,680-token needle prompt with Q2_0 disk experts, 16 greedy tokens, this build
+  against one that ran disk experts chunk by chunk with the MTP block's experts in the text layers'
+  slots, interleaved on the same hosts, two runs each:
+
+  | Card | Model files | Prefill, tok/s | Decode after it, tok/s |
+  |---|---|---:|---:|
+  | RTX 5090 | in the page cache | 1,830 against 449-450 | 114.7-114.8 against 31.4-31.9 |
+  | RTX 5090 | pages evicted every second | 970-1,000 against 194-196 | 55.7-58.6 against 15.4 |
+  | RTX 4090 | in the page cache | 1,640-1,670 against 494 | 44.8-44.9 against 23.7-24.0 |
+  | RTX 4090 | pages evicted every second | 532-549 against 131-133 | 12.4-12.7 against 13.6-13.9 |
+  | RTX 3090 | in the page cache | 927-988 against 305-307 | 30.2-31.0 against 17.4 |
+  | RTX 3090 | pages evicted every second | 469-471 against 103-104 | 12.3-12.4 against 6.4-6.5 |
+
+- **Decode after the prompt.** Against the same test chunk by chunk (and without the releases), on
+  the same hosts, the Q2_0 rows prefill 3.9-4.3 times as fast with host experts, 1.0-1.4 times
+  from the page cache and 1.0-2.0 times with the pages evicted. The five tokens after the prompt
+  decode 10-12% slower from disk (2% faster on the RTX 3090 with the pages evicted): the span's last
+  chunk keeps its experts, but this prompt ends in a separate 367-token chunk; without the releases
+  the RTX 5090 decoded them at the rate chunk by chunk. With host experts they decode 1% slower on
+  the RTX 5090, 8% slower on the RTX 4090 and 2% faster on the RTX 3090.
+- **NUMA.** Unpinned on another two-socket RTX 3090 host (Xeon E5-2690 v4), Q2_0 decoded the short
+  answer 9% slower with host experts and 43% slower with disk experts in the page cache than pinned
+  to the GPU's node.
 - **The host.** Host and disk experts cross the host link, and disk experts are read by the CPU
   threads, so these rows measure the host as much as the card.
 

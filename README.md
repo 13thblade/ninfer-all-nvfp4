@@ -16,6 +16,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 ## What's New
 
+- **2026-10-26:** Qwen3.8-Flash-Next with [disk experts](docs/qwen3-8-flash-next.md#expert-placements) prefills a long prompt 3.1 to 4.1 times as fast and decodes the answer 1.8 to 3.6 times as fast (Q2_0, RTX 3090 to 5090).
 - **2026-10-26:** [Tensor-parallel](docs/maintainer/pipeline-stages.md#tensor-parallelism) shares sized to each card (`--tensor-split`, or each card's measured bandwidth capped by its free memory), for every weight format of a dense model (groupwise-int, BF16, ternary, FP8, NVFP4, Hadamard-rotated) and with DFlash drafters, attention divided by KV heads; [expert parallelism](docs/maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families) divides the routed experts of every MoE family (native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash) over the GPUs.
 - **2026-10-26:** DeepSeek-V4.1-Flash decodes [39 tok/s on one RTX 4090](docs/deepseek-v41.md#the-decode-step-on-one-rtx-4090), with CPU threads [computing part of the missing experts](docs/deepseek-v41.md#the-cpu-share), and 83 tok/s on one RTX PRO 6000 with the release's [DSpark drafter](docs/deepseek-v41.md#the-dspark-drafter); it reads [images](docs/deepseek-v41.md#images) with the release's vision tower.
 - **2026-10-25:** [DeepSeek-V4.1-Flash](docs/deepseek-v41.md) from ISTA-DASLab's GSQ-RCO IQ1_M GGUF, experts in host memory or on disk: [48 tok/s on one RTX PRO 6000, 26 on one RTX 4090](docs/performance.md#deepseek-v41-flash), [prefill 925 tok/s](docs/deepseek-v41.md#prompt-spans) on the RTX 4090.
@@ -237,7 +238,7 @@ The official `groupwise-int` artifact, measured in September 2026, one card each
 </details>
 
 <details>
-<summary><b>Qwen3.8-Flash-Next</b> — 138 tok/s with the experts on a GPU, 96 tok/s from host memory</summary>
+<summary><b>Qwen3.8-Flash-Next</b> — 138 tok/s with the experts on a GPU, 98 tok/s from host memory</summary>
 
 The Q2_0 release (35.9 GiB model and 26.8 GiB n-gram table), one request, greedy, October 2026. Decode of
 a short answer, in tok/s:
@@ -245,26 +246,28 @@ a short answer, in tok/s:
 | Card | Every expert on the GPUs | Experts in host memory | Experts on disk, in the page cache | Experts on disk, cold |
 |---|---:|---:|---:|---:|
 | RTX PRO 6000 | 138 (one card) | 55 | 76 | 35 |
-| RTX 5090 | 136 (two cards) | 96 | 71 | 23 |
-| RTX 4090 | 97 (two cards) | 66 | 46 | 23 |
-| RTX 3090 | 90 (two RTX 3090 Ti) | 55 | 47 | 22 |
+| RTX 5090 | 136 (two cards) | 98 | 72 | 38 |
+| RTX 4090 | 97 (two cards) | 74 | 47 | 21 |
+| RTX 3090 | 90 (two RTX 3090 Ti) | 39 | 28 | 20 |
 
 Prefill of a 4,463-token prompt, in tok/s:
 
 | Card | Every expert on the GPUs | Experts in host memory | Experts on disk, in the page cache | Experts on disk, cold |
 |---|---:|---:|---:|---:|
 | RTX PRO 6000 | 2,939 | 1,297 | 2,024 | 1,000 |
-| RTX 5090 | 3,809 | 669 | 2,099 | 732 |
-| RTX 4090 | 3,608 | 430 | 808 | 347 |
-| RTX 3090 | 1,504 | 209 | 625 | 282 |
+| RTX 5090 | 3,809 | 3,290 | 1,827 | 1,108 |
+| RTX 4090 | 3,608 | 1,801 | 1,144 | 558 |
+| RTX 3090 | 1,504 | 663 | 503 | 474 |
 
 - **The host matters.** Host and disk rows depend on the host as much as on the card. The RTX 5090
   host had PCIe 5.0 x16, the RTX PRO 6000 and RTX 4090 hosts PCIe 4.0 x16, and the RTX 3090 host
   PCIe 3.0 x16 and two sockets (the test ran pinned to the GPU's node). The host, disk and cold
   columns of the three GeForce cards were measured on October 26, the rest on October 5 and 6.
-- **Prefill chunk.** The rows prefill in 512-token chunks, and host experts copy each chunk's
-  missing experts again: in 4,096-token chunks the RTX 5090 prefills at 2,759 tok/s with host
-  experts, and `ninfer-serve` with its defaults at 5,140 to 5,180.
+- **Prompt spans.** With host or disk experts a prompt prefills in spans of up to eight chunks, so
+  each layer's missing experts cross the bus once per span. From the CLI with Q2_0 disk experts in
+  the page cache, a 7,680-token prompt prefilled at 1,830 tok/s on the RTX 5090 and the answer
+  decoded at 115 tok/s, against 450 and 32 chunk by chunk
+  ([three cards](docs/qwen3-8-flash-next.md#expert-placements)).
 - **Other releases and cards.** IQ3_S, the Coder IQ1_M build and the 8 and 12 GB cards are in the
   [expert placements](docs/performance.md#expert-placements). Six reasoning requests at once on two
   RTX 5090s produced 193 tok/s of output with Q2_0.
