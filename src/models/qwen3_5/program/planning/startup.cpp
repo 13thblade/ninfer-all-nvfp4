@@ -481,7 +481,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t max_width,
                                  ops::CausalAttentionExecutionEnvelope envelope) {
         const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
-        // A tensor-parallel rank's share of a layer has no attention (rank 0 runs it alone).
+        // A tensor-parallel rank's share of a layer has no attention (rank 0 runs it alone), and its
+        // GDN and FFN output projections write FP32 partials instead of adding to the residual.
+        const bool partial = parameters.text.tensor_parallel();
+        const auto residual_scratch = [&](const execution::LinearParameters& p) {
+            if (partial) {
+                linear_scratch(layout, p, first, last);
+            } else {
+                add_scratch(layout, p, first, last, wide_verification);
+            }
+        };
         const auto plan_block = [&](const execution::BlockParameters& block, bool attention_runs) {
             if (attention_runs || std::holds_alternative<execution::GdnParameters>(block.mixer)) {
                 auto stage = layout.scope();
@@ -526,16 +535,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                             first, last));
                     }
                     (void)workspace::gdn_normalized_output(layout, config, last);
-                    add_scratch(layout, gdn.output, first, last, wide_verification);
+                    residual_scratch(gdn.output);
                 }
             }
             auto stage = layout.scope();
             (void)workspace::post_mixer_hidden(layout, config, last);
             const bool verify = phase == TextPhase::Verify;
-            scratch(layout, std::max(execution::ffn_workspace_bytes(block.ffn, first, last, false,
-                                                                    verify, wide_verification),
-                                     execution::ffn_workspace_bytes(block.ffn, first, last, false,
-                                                                    verify, false)));
+            scratch(layout,
+                    std::max(execution::ffn_workspace_bytes(block.ffn, first, last, false, verify,
+                                                            wide_verification, partial),
+                             execution::ffn_workspace_bytes(block.ffn, first, last, false, verify,
+                                                            false, partial)));
         };
         for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
             plan_block(parameters.text.layers[layer], true);

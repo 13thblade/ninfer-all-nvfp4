@@ -10,8 +10,12 @@
 namespace ninfer::ops {
 
 void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
-    if (gate.dtype != DType::BF16 || up.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument("silu_mul: gate/up/out must be BF16");
+    if ((gate.dtype != DType::BF16 && gate.dtype != DType::FP32) || up.dtype != gate.dtype ||
+        out.dtype != DType::BF16) {
+        throw std::invalid_argument("silu_mul: gate/up must be BF16 or FP32 alike, out BF16");
+    }
+    if (gate.dtype == DType::FP32 && (!gate.is_contiguous() || !up.is_contiguous())) {
+        throw std::invalid_argument("silu_mul: FP32 gate/up must be contiguous");
     }
     for (int d = 0; d < 4; ++d) {
         if (gate.ne[d] != up.ne[d] || gate.ne[d] != out.ne[d]) {

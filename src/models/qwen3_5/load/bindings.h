@@ -55,10 +55,15 @@ public:
 
     // Where a column piece of matrix parameter `name` (`shape`, read through `inputs`) may end:
     // out[c] for c in [0, columns] says whether the columns [0, c) are whole runs of its stored
-    // bytes. A ggml block is one run; with an input gather (`input_columns`), a block is whole when
-    // all or none of the logical columns its stored columns read lie below c.
+    // bytes (artifact::selection_column_unit); with an input gather (`input_columns`), a run is
+    // whole when all or none of the logical columns its stored columns read lie below c.
     [[nodiscard]] std::vector<bool> column_ends(const std::string& name, const artifact::Shape& shape,
                                                 const std::vector<std::string>& inputs);
+
+    // Where a row piece of matrix parameter `name` may end: out[r] for r in [0, rows] says whether
+    // rows [0, r) end on a row bound of the stored object holding row r
+    // (artifact::selection_row_unit; NVFP4 scale tiles), or at a stored object's end.
+    [[nodiscard]] std::vector<bool> row_ends(const std::string& name, const artifact::Shape& shape);
 
     [[nodiscard]] const PendingWeight& at(WeightId id) const { return weights.at(id.index); }
 

@@ -302,8 +302,9 @@ std::vector<std::uint64_t> common_ends(std::uint64_t count, std::uint32_t layers
 }
 
 // Each rank's GDN key heads and FFN rows, in proportion to `options.tensor_split` (evenly without
-// one). A share may end only where every layer's column-cut projections (the GDN output projection
-// over the value heads, the FFN's down projection over its rows) cut whole stored blocks.
+// one). A share may end only where every layer's projections cut whole stored runs: the column-cut
+// ones (the GDN output projection over the value heads, the FFN's down projection over its rows)
+// and the row-cut ones (the GDN key and value projections, the FFN's gate and up).
 std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& config,
                                             const LoadOptions& options) {
     const auto* dense = std::get_if<DenseConfig>(&config.ffn);
@@ -319,25 +320,40 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& confi
     const auto h           = config.hidden_size;
     const auto ratio       = g.linear_num_value_heads / g.linear_num_key_heads;
     const auto layers      = config.num_hidden_layers;
-    std::vector<std::vector<bool>> output_ends(layers);
-    std::vector<std::vector<bool>> down_ends(layers);
+    const auto i = dense->intermediate_size;
+    // Per layer: the value columns of the GDN output projection and the rows of its key and value
+    // projections; the FFN's rows of gate and up and columns of down.
+    struct Ends {
+        std::vector<bool> output, key_rows, value_rows, ffn_rows;
+    };
+    std::vector<Ends> ends(layers);
+    const auto both = [](std::vector<bool> a, const std::vector<bool>& b) {
+        for (std::size_t at = 0; at < a.size(); ++at) { a[at] = a[at] && b[at]; }
+        return a;
+    };
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const std::string p = "text/layers/" + std::to_string(layer) + "/";
+        auto& e             = ends[layer];
         if (config.layer_types[layer] != MixerKind::FullAttention) {
-            output_ends[layer] =
-                b.column_ends(p + "gdn/output", {h, g.value_width()}, {p + "gdn/gated_output"});
+            e.output   = b.column_ends(p + "gdn/output", {h, g.value_width()}, {p + "gdn/gated_output"});
+            e.key_rows = both(b.row_ends(p + "gdn/query", {g.key_width(), h}),
+                              b.row_ends(p + "gdn/key", {g.key_width(), h}));
+            e.value_rows = both(b.row_ends(p + "gdn/value", {g.value_width(), h}),
+                                b.row_ends(p + "gdn/z", {g.value_width(), h}));
         }
-        down_ends[layer] = b.column_ends(p + "mlp/down", {h, dense->intermediate_size},
-                                         {p + "mlp/product"});
+        e.ffn_rows = both(both(b.column_ends(p + "mlp/down", {h, i}, {p + "mlp/product"}),
+                               b.row_ends(p + "mlp/gate", {i, h})),
+                          b.row_ends(p + "mlp/up", {i, h}));
     }
     const auto key_ends = common_ends(
         g.linear_num_key_heads, layers, [&](std::uint32_t layer, std::uint64_t heads) {
-            return output_ends[layer].empty() ||
-                   output_ends[layer][heads * ratio * g.linear_value_head_dim];
+            const auto& e = ends[layer];
+            const auto values = heads * ratio * g.linear_value_head_dim;
+            return e.output.empty() || (e.output[values] && e.value_rows[values] &&
+                                        e.key_rows[heads * g.linear_key_head_dim]);
         });
-    const auto row_ends =
-        common_ends(dense->intermediate_size, layers,
-                    [&](std::uint32_t layer, std::uint64_t rows) { return down_ends[layer][rows]; });
+    const auto row_ends = common_ends(
+        i, layers, [&](std::uint32_t layer, std::uint64_t rows) { return ends[layer].ffn_rows[rows]; });
     const auto heads = split_shares(g.linear_num_key_heads, key_ends, weights);
     const auto rows  = split_shares(dense->intermediate_size, row_ends, weights);
     std::vector<TensorShare> out;

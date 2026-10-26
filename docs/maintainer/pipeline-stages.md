@@ -248,11 +248,12 @@ weights for every token.
   rank's ranges and geometry.
 - **Where the shares end** (`plan_tensor_shares`, `models/qwen3_5/load/text.cpp`). A share is a
   piece of a stored object: a row range and column ranges (`artifact/selection.h`), gathered from
-  the file as byte runs at upload, so its column bounds must fall on whole stored blocks (one column
-  for a contiguous matrix, the group for ggml blocks), and a projection whose stored columns are
-  gathered (GSQ-RCO) must not cut a block the gather reads. `Bindings::column_ends` lists those
-  positions per tensor; the head ends every layer's GDN output projection allows and the row ends
-  every down projection allows are the candidates, and `split_shares` (`core/tensor_split.h`)
+  the file as byte runs at upload, so its bounds must fall on whole stored blocks (columns: one for
+  a contiguous or row-scaled matrix, the group for ggml blocks, 128 for row-split groups, 64 for
+  NVFP4; rows: NVFP4's 128-row scale tiles and its divisor rows), and a projection whose stored
+  columns are gathered (GSQ-RCO) must not cut a block the gather reads. `Bindings::column_ends` and
+  `Bindings::row_ends` list those positions per tensor; the head ends every layer's GDN projections
+  allow and the row ends every FFN allows are the candidates, and `split_shares` (`core/tensor_split.h`)
   places each rank's end at the candidate nearest its weight's cumulative target. The stored
   objects themselves get no device demand.
 - **The weights.** `--tensor-split A,B,...` gives them, one per device. Without it the engine
@@ -274,13 +275,16 @@ weights for every token.
   projection's output: the shares' partial sums are added, then rounded once, where one device
   rounds the full sum. Logits are close, not identical, so greedy text can diverge where two tokens
   tie closely.
-- **Coverage.** GGUF weights (the GDN input projection's fused GGUF route), any split the stored
-  blocks allow on two to eight ranks, cards of different models where the build runs on each, MTP.
-  Refused: MoE models, a masked drafter
-  (DFlash, DFlash2), `--stage-layers`, Hadamard-rotated weights, Vision overlay, Flash-Next, Gemma 4,
-  Flint and DeepSeek-V4.1-Flash. Native Q4/Q5/Q8/T2, NVFP4 and FP8 GDN projections have kernels registered only for the
-  whole layer and are refused at preparation. Ranks may share a device (`--devices 0,0`), which is
-  how the path is tested on one card.
+- **Coverage.** GGUF weights, BF16 and row-split Q4/Q5/Q6/Q8 weights, any split the stored blocks
+  allow on two to eight ranks, cards of different models where the build runs on each, MTP. A
+  share's projections have no tuned shapes, so they take Linear's runtime-shape routes (the
+  whole-layer kernel templates with the rows and K read from the operands; K a multiple of 128):
+  the GDN input projection as parts, one Linear per piece into the q/k/v and z planes; gate and up as
+  two FP32 products that SwiGLU rounds once; the output and down projections as FP32 partials.
+  Refused: MoE models, a masked drafter (DFlash, DFlash2), `--stage-layers`, Hadamard-rotated
+  weights, T2, NVFP4 and FP8 weights, Vision overlay, Flash-Next, Gemma 4, Flint and
+  DeepSeek-V4.1-Flash. Ranks may share a device (`--devices 0,0`), which is how the path is tested
+  on one card.
 - **Kernels at the share shapes.** The convolution split, the projected convolution and the replay
   record and fold keep the whole-layer geometries as template constants and take any other share's
   rows and heads at run time (`CausalConvSplitGeometry`, `ProjectedConvRows`, `FoldGeometryDynamic`);

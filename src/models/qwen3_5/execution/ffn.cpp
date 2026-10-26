@@ -68,7 +68,8 @@ void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& r
 } // namespace
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
-                                std::int32_t last, bool mtp, bool verify, bool wide_verification) {
+                                std::int32_t last, bool mtp, bool verify, bool wide_verification,
+                                bool partial) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
     if (const auto* streamed = std::get_if<StreamedMoeParameters>(&parameters)) {
         std::size_t bytes = 0;
@@ -96,7 +97,7 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
     }
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
-    if (is_gguf(gu.qtype)) {
+    if (is_gguf(gu.qtype) || partial) {
         WorkspaceLayoutBuilder layout;
         const std::int32_t rows = p.up ? gu.n : gu.n / 2;
         (void)layout.alloc(DType::BF16, {rows, last});
@@ -110,8 +111,12 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         }
         {
             auto scope = layout.scope();
-            (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-                down.qtype, down.n, down.k, p.down.policy, first, last));
+            const auto policy = residual_projection_policy(p.down, wide_verification);
+            (void)layout.alloc_bytes(
+                partial ? ops::linear_workspace_capacity_bytes(down.qtype, down.n, down.k, policy,
+                                                               first, last)
+                        : ops::linear_add_workspace_capacity_bytes(down.qtype, down.n, down.k,
+                                                                   p.down.policy, first, last));
         }
         return layout.peak_bytes(1);
     }

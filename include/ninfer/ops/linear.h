@@ -101,13 +101,13 @@ inline constexpr std::int32_t kCublasPrefillFloorTokens = 128;
  * @f]
  *
  * `out` stores a BF16 approximation of this ideal result under the named numerical criterion for
- * the selected private activation-compute path; with a BF16 or GGUF weight it may instead be FP32,
- * the unrounded FP32 accumulation.
+ * the selected private activation-compute path; with a BF16, GGUF or RowSplit Q4/Q5/Q6/Q8 weight it
+ * may instead be FP32, the unrounded FP32 accumulation.
  *
  * @par Logical tensors and layout
  * `x` is contiguous, non-null, 16-byte-aligned BF16 `[K,T]`, `w` has logical shape `[N,K]`, and
- * `out` is contiguous, non-null, 16-byte-aligned BF16 `[N,T]` (FP32 `[N,T]` is accepted for a BF16
- * or GGUF `w` only). Every logical extent is positive;
+ * `out` is contiguous, non-null, 16-byte-aligned BF16 `[N,T]` (FP32 `[N,T]` is accepted for a BF16,
+ * GGUF or RowSplit Q4/Q5/Q6/Q8 `w` only). Every logical extent is positive;
  * in particular, `T=0` is invalid rather than a no-op. Dimension zero is stored fastest. The Op has
  * no bias, activation, residual addition, or transpose mode.
  *
@@ -115,8 +115,10 @@ inline constexpr std::int32_t kCublasPrefillFloorTokens = 128;
  * Registered execution uses RowSplit Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, or Q8_G32_FP16 weights
  * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16 weights, plus
  * registered contiguous BF16 problems. Each format owns a finite registry of exact physical
- * weight problems and selects its kernel internally; a valid encoding and alignment do not imply
- * arbitrary N/K support. FP8 currently registers `[N,K]` in `{[14336,5120], [16384,5120],
+ * weight problems and selects its kernel internally; FP8 and NVFP4 accept only those problems. A
+ * RowSplit Q4/Q5/Q6/Q8 problem no registry names, and every one with an FP32 `out`, runs a
+ * runtime-shape route over the same templates (any N, K a multiple of 128): a tensor-parallel
+ * rank's share of a projection, for instance. FP8 currently registers `[N,K]` in `{[14336,5120], [16384,5120],
  * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4
  * problems register the five non-vocabulary FP8 geometries and accept every positive T. Q8 also
  * registers `[5120,25600]` at every positive T. BF16 registers `[14336,5120]`,
@@ -125,8 +127,7 @@ inline constexpr std::int32_t kCublasPrefillFloorTokens = 128;
  * runtime-shape GEMM, cuBLAS's tensor-core BF16 GEMM with an FP32 accumulator from T=64 on. Text and MTP packed-weight problems accept every positive
  * column extent T. Registered Vision problems accept raw-patch P in
  * `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does not inherently
- * represent a text token. FP32 `x`, and FP32 `out` with a weight neither BF16 nor GGUF, are
- * unsupported.
+ * represent a text token. FP32 `x`, and FP32 `out` with another weight format, are unsupported.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.

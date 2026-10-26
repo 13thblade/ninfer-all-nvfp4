@@ -1,5 +1,6 @@
 #include "models/qwen3_5/load/bindings.h"
 
+#include "artifact/selection.h"
 #include "artifact/transcode.h"
 #include "artifact/views.h"
 
@@ -238,16 +239,10 @@ std::vector<bool> Bindings::column_ends(const std::string& name, const artifact:
     }
     if (shape.size() != 2) { throw std::invalid_argument(name + ": column ends need a matrix"); }
     const std::uint64_t columns = shape[1];
-    // Columns per indivisible run of stored bytes: one in a contiguous matrix, a block in ggml
-    // blocks; other layouts are not cut.
+    // Columns per indivisible run of stored bytes in every part.
     std::uint64_t unit = 1;
     for (const auto& part : found->second.parts) {
-        const auto stored = binder.reader().geometry(part.object);
-        if (stored.layout == QuantLayout::GgufBlocks) {
-            unit = std::max<std::uint64_t>(unit, stored.group_size);
-        } else if (stored.layout != QuantLayout::Contiguous) {
-            unit = columns;
-        }
+        unit = std::max(unit, artifact::selection_column_unit(binder.reader().geometry(part.object)));
     }
     std::optional<artifact::Binding> gather;
     for (const auto& input : inputs) {
@@ -284,6 +279,40 @@ std::vector<bool> Bindings::column_ends(const std::string& name, const artifact:
         open += forbidden[end];
         out[end] = open == 0;
     }
+    return out;
+}
+
+std::vector<bool> Bindings::row_ends(const std::string& name, const artifact::Shape& shape) {
+    const auto found = binder.reader().directory().bindings.find(name);
+    if (found == binder.reader().directory().bindings.end()) {
+        throw artifact::ArtifactError("missing logical parameter " + name);
+    }
+    if (shape.size() != 2) { throw std::invalid_argument(name + ": row ends need a matrix"); }
+    const std::uint64_t columns = shape[1];
+    // A cut at a part's first row begins a piece there; at its last, ends one; inside, both.
+    std::vector<bool> out(shape[0] + 1, true);
+    std::uint64_t logical = 0;
+    for (const auto& part : found->second.parts) {
+        const auto stored = binder.reader().geometry(part.object);
+        if (stored.shape.size() != 2 || stored.shape[1] != columns || part.begin % columns != 0 ||
+            part.end % columns != 0) {
+            throw artifact::ArtifactError(name + ": a tensor-parallel piece needs parts of whole rows");
+        }
+        const std::uint64_t first = part.begin / columns;
+        const std::uint64_t count = (part.end - part.begin) / columns;
+        const std::uint64_t unit  = artifact::selection_row_unit(stored);
+        if (logical + count > shape[0]) {
+            throw artifact::ArtifactError(name + ": parts exceed the parameter's rows");
+        }
+        for (std::uint64_t row = 0; row <= count; ++row) {
+            const std::uint64_t at = first + row;
+            const bool bound       = at % unit == 0 || (row == count && at == stored.shape[0]);
+            out[logical + row]     = out[logical + row] && bound;
+        }
+        logical += count;
+    }
+    out.front() = true;
+    out.back()  = true;
     return out;
 }
 

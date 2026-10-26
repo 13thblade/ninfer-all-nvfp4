@@ -23,6 +23,12 @@ using DirectR1T2W2K17408 = Q5A16DirectSimtSchedule<1, 2, 2, 8, 16, 17408, true>;
 using DirectR1T3W2K17408 = Q5A16DirectSimtSchedule<1, 3, 2, 8, 16, 17408, true>;
 using DirectR1T4W2K17408 = Q5A16DirectSimtSchedule<1, 4, 2, 8, 16, 17408, true>;
 
+// The tables' decode schedules with K read from the operands, for runtime shapes.
+using DirectR1T1W4 = Q5A16DirectSimtSchedule<1, 1, 4, 4, 10, 0, true>;
+using DirectR1T2W2 = Q5A16DirectSimtSchedule<1, 2, 2, 8, 16, 0, true>;
+using DirectR1T3W2 = Q5A16DirectSimtSchedule<1, 3, 2, 8, 16, 0, true>;
+using DirectR1T4W2 = Q5A16DirectSimtSchedule<1, 4, 2, 8, 16, 0, true>;
+
 using DirectR2T4W2G8B4         = Q5A16DirectSimtSchedule<2, 4, 2, 8, 4>;
 using SlicedR16T8W4S2          = Q5A16SlicedKMmaSchedule<16, 8, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR16T16W4S2         = Q5A16SlicedKMmaSchedule<16, 16, 4, 2, Cache::cg, Cache::ca, 2>;

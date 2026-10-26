@@ -12,6 +12,11 @@ ninfer_add_op_test(ninfer_linear_swiglu_q8_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q8_a16.cpp"
   LIBRARIES ninfer_linear_swiglu_test_support)
 
+# The two-parent form over BF16 and row-split parents (a tensor-parallel rank's gate and up rows).
+ninfer_add_op_test(ninfer_linear_swiglu_pair_rowsplit_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_pair_rowsplit.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_linear_swiglu_nvfp4_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4.cpp"
   LIBRARIES ninfer_linear_swiglu_test_support)

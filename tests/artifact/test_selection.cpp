@@ -115,6 +115,163 @@ void ggml_blocks() {
     require(refused, "a column bound inside a block is refused");
 }
 
+// A stored object whose every byte is a function of its offset, and the piece gathered from it.
+struct Gathered {
+    std::vector<std::uint8_t> stored;
+    std::vector<std::uint8_t> piece;
+};
+
+std::uint8_t pattern(std::uint64_t offset) {
+    return static_cast<std::uint8_t>((offset * 2654435761ULL) >> 13);
+}
+
+Gathered gather(const WeightGeometry& whole, const ObjectSelection& selection) {
+    Gathered out;
+    out.stored.resize(whole.bytes);
+    for (std::uint64_t i = 0; i < whole.bytes; ++i) { out.stored[i] = pattern(i); }
+    const auto piece = selected_geometry(whole, selection);
+    out.piece.assign(piece.bytes, 0);
+    std::vector<std::uint8_t> written(piece.bytes, 0);
+    for (const auto& run : selected_runs(whole, selection)) {
+        require(run.source + run.bytes <= whole.bytes && run.destination + run.bytes <= piece.bytes,
+                "a run stays inside both objects");
+        for (std::uint64_t i = 0; i < run.bytes; ++i) {
+            require(written[run.destination + i]++ == 0, "no piece byte is written twice");
+            out.piece[run.destination + i] = out.stored[run.source + i];
+        }
+    }
+    return out;
+}
+
+// The stored column a piece column reads.
+std::uint64_t source_column(const ObjectSelection& selection, std::uint64_t column) {
+    for (const auto& [begin, end] : selection.columns) {
+        if (column < end - begin) { return begin + column; }
+        column -= end - begin;
+    }
+    throw std::runtime_error("a piece column outside the selection");
+}
+
+// Row-split: every code byte, high-bit byte and group scale of the piece is the stored one of its
+// row and group, addressed independently by the planes' definitions.
+void row_split(QType format, std::uint64_t group, std::uint64_t code_bytes, std::uint64_t high_bytes,
+               std::vector<std::uint64_t> shape, const ObjectSelection& selection) {
+    const auto whole = stored(format, QuantLayout::RowSplit, shape);
+    const auto piece = selected_geometry(whole, selection);
+    const auto bytes = gather(whole, selection);
+    const std::uint64_t rows = selection.row_end - selection.row_begin;
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        for (std::uint64_t column = 0; column < piece.shape[1]; column += group) {
+            const std::uint64_t g  = column / group;
+            const std::uint64_t sg = source_column(selection, column) / group;
+            const std::uint64_t sr = selection.row_begin + r;
+            for (std::uint64_t b = 0; b < code_bytes; ++b) {
+                require(bytes.piece[r * piece.code_bytes_per_row + g * code_bytes + b] ==
+                            bytes.stored[sr * whole.code_bytes_per_row + sg * code_bytes + b],
+                        "a row-split code byte holds its source");
+            }
+            for (std::uint64_t b = 0; b < high_bytes; ++b) {
+                require(bytes.piece[piece.high_offset + r * piece.high_bytes_per_row +
+                                    g * high_bytes + b] ==
+                            bytes.stored[whole.high_offset + sr * whole.high_bytes_per_row +
+                                         sg * high_bytes + b],
+                        "a row-split high-bit byte holds its source");
+            }
+            for (std::uint64_t b = 0; b < 2; ++b) {
+                require(bytes.piece[weight_scale_offset(piece, r, g) + b] ==
+                            bytes.stored[weight_scale_offset(whole, sr, sg) + b],
+                        "a row-split group scale holds its source");
+            }
+        }
+    }
+}
+
+void row_split_layouts() {
+    // Q5: codes, high bits and scales; rows 1..5 of 6, the second and third 128 columns.
+    row_split(QType::Q5_G64_FP16, 64, 32, 8, {6, 384},
+              {.row_begin = 1, .row_end = 5, .columns = {{128, 384}}});
+    // Q8 groups of 32, two ranges; T2 groups of 128.
+    row_split(QType::Q8_G32_FP16, 32, 32, 0, {3, 512},
+              {.row_begin = 0, .row_end = 3, .columns = {{0, 128}, {256, 512}}});
+    row_split(QType::T2_G128_FP16, 128, 32, 0, {4, 384},
+              {.row_begin = 2, .row_end = 4, .columns = {{256, 384}}});
+    // Q4 whole rows; a K that is not a multiple of 128 cuts only at its end.
+    row_split(QType::Q4_G64_FP16, 64, 32, 0, {5, 320},
+              {.row_begin = 1, .row_end = 3, .columns = {{0, 320}}});
+    row_split(QType::Q4_G64_FP16, 64, 32, 0, {5, 320},
+              {.row_begin = 0, .row_end = 5, .columns = {{128, 320}}});
+    bool refused = false;
+    try {
+        (void)selected_runs(stored(QType::Q4_G64_FP16, QuantLayout::RowSplit, {2, 256}),
+                            {.row_begin = 0, .row_end = 2, .columns = {{64, 256}}});
+    } catch (const ArtifactError&) { refused = true; }
+    require(refused, "a row-split bound inside 128 columns is refused");
+}
+
+// FP8 with a row scale (a separate plane) or with the scale after each row's codes: a code byte
+// per column, and the row's scale whole.
+void fp8_layouts() {
+    for (const auto layout : {QuantLayout::RowScale, QuantLayout::RowInterleaved}) {
+        const auto format = layout == QuantLayout::RowScale ? QType::FP8_E4M3FN_ROW_BF16
+                                                            : QType::FP8_E4M3FN_ROW_FP16;
+        const auto whole  = stored(format, layout, {4, 100});
+        const ObjectSelection selection{.row_begin = 1, .row_end = 4, .columns = {{10, 50}, {60, 100}}};
+        const auto piece = selected_geometry(whole, selection);
+        const auto bytes = gather(whole, selection);
+        const auto code  = [](const WeightGeometry& g, std::uint64_t row, std::uint64_t column) {
+            return row * (g.row_stride_bytes ? g.row_stride_bytes : g.code_bytes_per_row) + column;
+        };
+        for (std::uint64_t r = 0; r < 3; ++r) {
+            for (std::uint64_t column = 0; column < 80; ++column) {
+                require(bytes.piece[code(piece, r, column)] ==
+                            bytes.stored[code(whole, r + 1, source_column(selection, column))],
+                        "an FP8 code byte holds its source");
+            }
+            for (std::uint64_t b = 0; b < 2; ++b) {
+                require(bytes.piece[weight_scale_offset(piece, r, 0) + b] ==
+                            bytes.stored[weight_scale_offset(whole, r + 1, 0) + b],
+                        "an FP8 row keeps its scale");
+            }
+        }
+    }
+}
+
+// NVFP4: codes by row, swizzled scale tiles of 128 rows and four groups of 16, one divisor per
+// divisor's rows.
+void nvfp4_layout() {
+    const std::uint64_t shape[] = {384, 256};
+    const auto whole = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape, 3);
+    const ObjectSelection selection{.row_begin = 128, .row_end = 384, .columns = {{64, 192}}};
+    const auto piece = selected_geometry(whole, selection);
+    require(piece.shape == std::vector<std::uint64_t>({256, 128}) && piece.divisor_count == 2,
+            "an NVFP4 piece keeps its divisors' rows");
+    const auto bytes = gather(whole, selection);
+    for (std::uint64_t r = 0; r < 256; ++r) {
+        const std::uint64_t sr = r + 128;
+        for (std::uint64_t column = 0; column < 128; column += 2) {
+            require(bytes.piece[r * 64 + column / 2] == bytes.stored[sr * 128 + (column + 64) / 2],
+                    "an NVFP4 code byte holds its source");
+        }
+        for (std::uint64_t g = 0; g < 8; ++g) {
+            require(bytes.piece[weight_scale_offset(piece, r, g)] ==
+                        bytes.stored[weight_scale_offset(whole, sr, g + 4)],
+                    "an NVFP4 scale holds its source");
+        }
+    }
+    for (std::uint64_t d = 0; d < 2; ++d) {
+        for (std::uint64_t b = 0; b < 4; ++b) {
+            require(bytes.piece[piece.divisor_offset + d * 4 + b] ==
+                        bytes.stored[whole.divisor_offset + (d + 1) * 4 + b],
+                    "an NVFP4 piece keeps its rows' divisors");
+        }
+    }
+    bool refused = false;
+    try {
+        (void)selected_geometry(whole, {.row_begin = 64, .row_end = 384, .columns = {{0, 256}}});
+    } catch (const ArtifactError&) { refused = true; }
+    require(refused, "an NVFP4 row bound inside a scale tile is refused");
+}
+
 void refusals() {
     const auto whole = stored(QType::FP32, QuantLayout::Contiguous, {6, 8});
     const ObjectSelection bad[] = {
@@ -150,6 +307,9 @@ int main() {
         contiguous_matrix();
         vector_object();
         ggml_blocks();
+        row_split_layouts();
+        fp8_layouts();
+        nvfp4_layout();
         refusals();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

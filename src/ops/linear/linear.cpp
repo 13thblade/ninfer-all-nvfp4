@@ -52,13 +52,27 @@ void validate_linear_policy(LinearPolicy policy) {
     }
 }
 
+// The weight formats whose routes can write an FP32 result: a tensor-parallel rank's partial sum
+// of a projection, which the ranks add before rounding once.
+bool fp32_result(QType qtype) {
+    switch (qtype) {
+    case QType::BF16:
+    case QType::Q4_G64_FP16:
+    case QType::Q5_G64_FP16:
+    case QType::Q6_G64_FP16:
+    case QType::Q8_G32_FP16:
+        return true;
+    default:
+        return is_gguf(qtype);
+    }
+}
+
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
                                LinearPolicy policy) {
     if (x.dtype != DType::BF16 ||
-        (out.dtype != DType::BF16 &&
-         !(out.dtype == DType::FP32 && (w.qtype == QType::BF16 || is_gguf(w.qtype))))) {
-        throw std::invalid_argument(
-            "linear: x must be BF16 and out BF16 (or FP32 for BF16 and GGUF weights)");
+        (out.dtype != DType::BF16 && !(out.dtype == DType::FP32 && fp32_result(w.qtype)))) {
+        throw std::invalid_argument("linear: x must be BF16 and out BF16 (or FP32 for BF16, GGUF "
+                                    "and row-split Q4/Q5/Q6/Q8 weights)");
     }
     (void)checked_numel(x, "x");
     (void)checked_numel(out, "out");
