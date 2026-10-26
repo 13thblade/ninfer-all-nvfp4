@@ -377,6 +377,22 @@ repeats, not with one device's.
   (+0.23%, +0.44%). No short answer matched one card's (one of five with MTP); they part after 25 to
   231 characters. One card's own decode is unchanged against master (201.7-202.2 against
   202.0-202.7 tok/s).
+- **Attention divided by KV heads on 2x A40** (Vast, PCIe 4.0 x16; 2026-10-26; the four short
+  prompts and a 7,041-token one, one pass per configuration, against one A40). Qwen3.8-27B GSQ-RCO
+  IQ3_S decodes at 61.3-61.8 tok/s against 39.0-39.2 (+57% to +58%) and at 59.8 against 37.5 after
+  the long prompt (+60%); `--tensor-split 3,1` at 46.3-46.6 (+19%) and `--devices 0,0,1` at
+  58.7-59.1 (+50% to +51%); with `--spec mtp --draft-tokens 3` at 93.0-143.4 against 69.8-105.6
+  (+30% to +43%). The long prompt prefills at 2,093 tok/s against 1,576 (+33%); a short prompt's TTFT
+  is 79-84 ms against 58 ms. Qwen3.6-35B-A3B decodes at 170.4-170.9 against 159.2-159.3 (+7%) and
+  164.7 against 147.8 after the long prompt (+11%), and prefills it at 8,356 tok/s against 7,064
+  (+18%). Ternary Bonsai 2 27B decodes at 73.5-74.4 against 64.2-64.6 (+15%) and 71.5 against 60.1
+  (+19%), but prefills at 1,789 tok/s against 2,592 (-31%) with a short TTFT of 93-107 ms against
+  39-45 ms: its shares take the A16 runtime-shape route. Perplexity over the same 7,041 tokens
+  (2,048-token windows, stride 1,024) is 13.958 against 13.950 for the 27B (+0.06%; +0.08% with
+  `3,1`), 27.182 against 27.076 for the 35B-A3B (+0.39%) and 19.636 against 19.618 for Bonsai
+  (+0.09%). The pair gave one card's answer on none of five prompts for the 27B, one for the 35B-A3B
+  and three for Bonsai; the others part after 17 to 504 characters, as one card's own MTP answers
+  part from its plain ones.
 
 ### Expert parallelism of the other MoE families
 
@@ -439,6 +455,16 @@ pair the exchange costs more decode time than the divided experts save:
   5,042 (-9%). Perplexity over 6,927 tokens (F16 KV) is 45.397 against 45.362 (+0.08%), the same
   for `--tensor-split 1,1` and `3,1`. No answer matched the host run's; they part after 23 to 923
   characters.
+- **DeepSeek-V4.1-Flash** GSQ-RCO IQ1_M (`--no-ngram-table`), on 2x A40 (Vast, PCIe 4.0 x16) against
+  one A40, experts in pinned host memory: each card serves 192 experts from its own cache (33 GiB)
+  and bus. Decode 41.9-42.7 tok/s against 34.0-37.9 (+12% to +24%), 39.6 against 32.0 after the
+  6,940-token prompt (+24%); with `--spec dspark` 50.4-77.3 against 46.1-70.2 (+9% to +16%) and
+  71.6 against 57.2 (+25%). A short prompt's TTFT is 197-277 ms against 463-657 ms and the long
+  prompt prefills at 701 tok/s against 561 (+25%). Disk experts on the pair decode at 32.7-35.3
+  (28.7 after the long prompt), within -10% to +1% of one card's host experts. Perplexity over
+  6,940 tokens (BF16 caches) is 16.359 against 16.407 (-0.29%), the same for `--tensor-split 3,1`. The long answer matched one
+  card's; the short ones part after 2 to 88 characters, from prompts the pair prefilled with the
+  fixed-point weighting. Host and disk experts on the pair gave the same five answers.
 
 What the transport costs was measured before this was built:
 
