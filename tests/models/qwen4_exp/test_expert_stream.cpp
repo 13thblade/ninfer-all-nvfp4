@@ -3,8 +3,12 @@
 // straddle the boundary between two files, whatever was evicted to make room, and every down matrix
 // is followed by zero bytes even where a larger down of another layer was before (the expert matrix
 // kernel reads past a down row's end); a call that routes to more experts than the cache holds is
-// refused; experts already resident are not read again; and a read that fails raises FileReadError
-// and leaves no slot taken for an expert it did not finish reading.
+// refused; experts already resident are not read again; a call that releases its layer's other
+// residents gives their slots to later calls before any other resident's but after the empty
+// ones, except a released expert routed to again; a layer with slots of its own (the MTP block's
+// wider experts) evicts only its own, and shares the others' when the budget cannot hold both; and
+// a read that fails raises FileReadError and leaves no slot taken for an expert it did not finish
+// reading.
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/file_read_error.h"
@@ -38,12 +42,13 @@ int run() {
     DeviceContext device;
     std::mt19937 random(9300u);
     const std::string stem = "ninfer_expert_stream_" + std::to_string(std::random_device{}());
-    // Two layers; layer 1's experts are smaller, as mixed block types are. Each projection of each
-    // expert is a distinct random byte run at its own offset of one logical byte stream.
-    const std::int64_t sizes[2][3] = {{3000, 3000, 1500}, {1200, 2400, 900}};
+    // Three layers; layer 1's experts are smaller, as mixed block types are, and layer 2's wider,
+    // as the MTP block's can be. Each projection of each expert is a distinct random byte run at
+    // its own offset of one logical byte stream.
+    const std::int64_t sizes[3][3] = {{3000, 3000, 1500}, {1200, 2400, 900}, {6000, 6000, 3000}};
     std::vector<std::uint8_t> file_bytes;
-    std::vector<std::vector<std::uint64_t>> logical(6);
-    for (int layer = 0; layer < 2; ++layer) {
+    std::vector<std::vector<std::uint64_t>> logical(9);
+    for (int layer = 0; layer < 3; ++layer) {
         for (int k = 0; k < 3; ++k) {
             for (int e = 0; e < kExperts; ++e) {
                 const std::uint64_t offset = file_bytes.size() + 17; // unaligned on purpose
@@ -68,9 +73,9 @@ int run() {
         out.write(reinterpret_cast<const char*>(file_bytes.data() + begin),
                   static_cast<std::streamsize>(cuts[f] - begin));
     }
-    std::vector<std::vector<ExpertLocation>> locations(6);
+    std::vector<std::vector<ExpertLocation>> locations(9);
     int straddling = 0;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 9; ++i) {
         const std::int64_t bytes = sizes[i / 3][i % 3];
         for (const std::uint64_t offset : logical[i]) {
             ExpertLocation location{.runs      = {},
@@ -91,25 +96,37 @@ int run() {
     }
     require(straddling == 2, "two experts straddle a file boundary");
     std::vector<DeviceBuffer> tables;
-    for (int i = 0; i < 6; ++i) { tables.emplace_back(kExperts * sizeof(void*)); }
-    std::vector<ExpertStreamLayer> layers;
-    for (int layer = 0; layer < 2; ++layer) {
-        layers.push_back(ExpertStreamLayer{
-            .rank    = 0,
-            .stream  = device.stream,
-            .experts = {locations[layer * 3], locations[layer * 3 + 1], locations[layer * 3 + 2]},
-            .tables  = {tables[layer * 3].p, tables[layer * 3 + 1].p, tables[layer * 3 + 2].p}});
-    }
-    // Slots are sized for the widest projections and the zeros after the down: 3072 + 3072 + 1792
-    // bytes, ten of them.
-    const std::vector<std::uint64_t> budget = {10 * (3072 + 3072 + 1792)};
+    for (int i = 0; i < 9; ++i) { tables.emplace_back(kExperts * sizeof(void*)); }
+    // Layers 0 and 1 route to at most ten experts a call, layer 2 to four, in slots of its own.
+    const auto stream_layers = [&] {
+        std::vector<ExpertStreamLayer> layers;
+        for (int layer = 0; layer < 3; ++layer) {
+            layers.push_back(ExpertStreamLayer{
+                .rank        = 0,
+                .stream      = device.stream,
+                .experts     = {locations[layer * 3], locations[layer * 3 + 1],
+                                locations[layer * 3 + 2]},
+                .tables      = {tables[layer * 3].p, tables[layer * 3 + 1].p,
+                                tables[layer * 3 + 2].p},
+                .widest_call = std::size_t(layer == 2 ? 4 : 10),
+                .own_pool    = layer == 2});
+        }
+        return layers;
+    };
+    // Slots are sized for the widest projections and the zeros after the down: ten of 3072 + 3072
+    // + 1792 bytes for layers 0 and 1, four of 6144 + 6144 + 3328 for layer 2.
+    constexpr std::uint64_t kShared = 3072 + 3072 + 1792, kOwn = 6144 + 6144 + 3328;
     // Owned so it closes its files before they are removed: Windows cannot delete an open file.
-    auto owner = std::make_unique<ExpertStream>(device, paths, std::move(layers), budget);
+    const std::vector<std::uint64_t> budget = {10 * kShared + 4 * kOwn};
+    auto owner = std::make_unique<ExpertStream>(device, paths, stream_layers(), budget);
     ExpertStream& stream = *owner;
-    require(stream.stats().slots == 10, "ten slots");
+    require(stream.stats().slots == 14, "ten shared slots and four of layer 2's own");
+    require(stream.storage(0) == stream.storage(1) && stream.storage(0) != stream.storage(2),
+            "layer 2 has slots of its own");
 
-    const auto check = [&](int layer, const std::vector<std::int32_t>& ids, const std::string& label) {
-        stream.prepare(layer, ids);
+    const auto check = [&](int layer, const std::vector<std::int32_t>& ids,
+                           const std::string& label, bool release_others = false) {
+        stream.prepare(layer, ids, release_others);
         device.synchronize();
         for (int k = 0; k < 3; ++k) {
             std::vector<const void*> entries(kExperts);
@@ -145,13 +162,67 @@ int run() {
         for (int i = 0; i < 6; ++i) { ids.push_back(std::int32_t(random() % kExperts)); }
         check(round % 2, ids, "churn " + std::to_string(round));
     }
+    // A span: layer 1 fills the ten slots, layer 0's first chunk takes four of them, and its last
+    // chunk (6 and 7) releases 3, 4 and 5; 7 takes one of their slots. Expert 5 is routed to again.
+    // Two later misses take the slot 4 left, then one by the hand: 5, 6 and 7 stay, and five of
+    // layer 1's experts.
+    check(1, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, "layer 1 fills the slots");
+    check(0, {3, 4, 5, 6}, "a span's first chunk");
+    check(0, {6, 7}, "a span's last chunk", true);
+    check(0, {5}, "a released expert routed again");
+    check(1, {20, 21}, "misses after a release");
+    auto before = stream.stats();
+    check(0, {5, 6, 7}, "after the misses");
+    require(stream.stats().hits - before.hits == 3,
+            "the last chunk's experts and a released one routed again stay resident");
+    before = stream.stats();
+    check(1, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, "layer 1 again");
+    require(stream.stats().hits - before.hits == 5,
+            "a release gives its slots to later misses before other residents'");
+    // Layer 2 evicts only its own slots: layer 1's ten experts stay resident.
+    check(2, {0, 1, 2, 3}, "layer 2's own slots");
+    check(2, {4, 30}, "layer 2 evicts its own");
+    before = stream.stats();
+    check(1, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, "layer 1 beside layer 2");
+    require(stream.stats().hits - before.hits == 10, "layer 2 takes none of the shared slots");
     bool refused = false;
     try {
         std::vector<std::int32_t> too_many;
         for (int e = 0; e < 11; ++e) { too_many.push_back(e); }
-        stream.prepare(1, too_many);
+        stream.prepare(1, too_many, false);
     } catch (const std::runtime_error&) { refused = true; }
     require(refused, "a call that needs more experts than slots is refused");
+    refused = false;
+    try {
+        stream.prepare(2, std::vector<std::int32_t>{0, 1, 2, 3, 4}, false);
+    } catch (const std::runtime_error&) { refused = true; }
+    require(refused, "a call that needs more experts than its own slots is refused");
+    {
+        // Empty slots go before released ones: in a fresh pool, layer 0's last chunk releases 0, 1
+        // and 2, and its miss and layer 1's five take empty slots, so all five stay resident.
+        ExpertStream fresh(device, paths, stream_layers(), budget);
+        fresh.prepare(0, std::vector<std::int32_t>{0, 1, 2, 3}, false);
+        fresh.prepare(0, std::vector<std::int32_t>{3, 4}, true);
+        fresh.prepare(1, std::vector<std::int32_t>{0, 1, 2, 3, 4}, false);
+        const auto hits = fresh.stats().hits;
+        fresh.prepare(0, std::vector<std::int32_t>{0, 1, 2, 3, 4}, false);
+        require(fresh.stats().hits - hits == 5,
+                "released experts keep their slots while empty ones remain");
+        device.synchronize();
+    }
+    {
+        // A budget short of four own slots beside ten shared ones: one pool of the wider slots.
+        ExpertStream narrow(device, paths, stream_layers(),
+                            std::vector<std::uint64_t>{10 * kShared + 3 * kOwn});
+        require(narrow.stats().slots == (10 * kShared + 3 * kOwn) / kOwn,
+                "a short budget shares slots fitting the widest expert");
+        require(narrow.storage(0) == narrow.storage(2), "layer 2 shares the slots");
+        narrow.prepare(2, std::vector<std::int32_t>{0, 1, 2, 3}, false);
+        narrow.prepare(0, std::vector<std::int32_t>{3, 7}, false);
+        narrow.prepare(2, std::vector<std::int32_t>{0, 1, 2, 3}, false);
+        require(narrow.stats().hits == 4, "the shared slots hold both layers' experts");
+        device.synchronize();
+    }
 #ifndef _WIN32
     // Layer 1's downs past expert 20 live in the last file. Cut short, it fails a call to experts
     // whose gates and ups read fine; once whole again, the same call reads every byte as stored.
@@ -159,7 +230,7 @@ int run() {
     bool failed = false;
     try {
         const std::vector<std::int32_t> past_cut{25, 26, 27};
-        stream.prepare(1, past_cut);
+        stream.prepare(1, past_cut, false);
     } catch (const FileReadError&) { failed = true; }
     require(failed, "a failed read raises FileReadError");
     {

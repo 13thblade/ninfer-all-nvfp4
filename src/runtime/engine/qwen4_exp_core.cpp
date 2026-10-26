@@ -1492,10 +1492,10 @@ struct Qwen4ExpCore::Impl {
             1, (std::uint64_t(decode_rounds_per_prefill) * tokens + chunk - 1) / chunk));
     }
 
-    // The prompt tokens the request's next prefill step computes. A media prompt goes chunk by
-    // chunk; a text prompt in spans where the executor has them. A span is one step, which with
-    // the experts off the GPU lasts seconds, and the requests that are decoding wait for all of
-    // it: while any decodes, a step is two chunks at most.
+    // The prompt tokens the request's next prefill step computes: a span where the executor has
+    // them, else a chunk. A span is one step, which with the experts off the GPU lasts seconds,
+    // and the requests that are decoding wait for all of it: while any decodes, a step is two
+    // chunks at most.
     [[nodiscard]] std::uint32_t prompt_step_tokens(const Request& r) const {
         const auto& executor             = *instance.executor;
         const auto prompt_n              = static_cast<std::uint32_t>(r.prompt_tokens.size());
@@ -1512,7 +1512,7 @@ struct Qwen4ExpCore::Impl {
             }
         }
         const std::uint32_t chunk_tokens = executor.options().prefill_chunk;
-        std::uint32_t step               = r.media ? chunk_tokens : executor.prompt_step();
+        std::uint32_t step               = executor.prompt_step();
         const bool peers_decoding =
             std::any_of(slots.begin(), slots.end(), [&](const Slot& other) {
                 return other.request && other.request.get() != &r && other.request->decoding;
