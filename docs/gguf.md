@@ -36,8 +36,10 @@ those of `ggml-quants.c`.
 - **Token table** rows are dequantized exactly.
 
 The scales of `IQ2_XXS`, `IQ2_XS`, `IQ2_S` and `IQ3_XXS` are applied in FP32 where llama.cpp's
-vector kernels round an integer rescale, so a decode step's logits can differ from llama.cpp's in the
-last bits; prompts use llama.cpp's own arithmetic.
+vector kernels round an integer rescale, and the vector kernels round each step of the formats the
+CPU share also computes in a fixed order (`IQ1_M` with integer codes eight times its values), so a
+decode step's logits can differ from llama.cpp's in the last bits; prompts use llama.cpp's own
+arithmetic.
 
 ## Serving
 

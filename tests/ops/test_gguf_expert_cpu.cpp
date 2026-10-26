@@ -1,13 +1,14 @@
-// GGUF CPU expert rows (Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S,
-// IQ4_XS) against FP64 from independently decoded stored blocks, at the Flash-Next and Gemma 4
-// expert shapes, for every backend this host supports. Blocks are decoded by ggml's reference
-// dequantizers. Two oracles: the exact product bounds the int8 activation's error, and the q8_1
-// product (the activation quantized per 32 values as the GPU does, d = amax / 127 rounded to
-// binary16, codes round(v / d); a K-quant's minimum times the values' binary16 sum s) must agree
-// to FP32 summation, so the CPU computes the GPU's arithmetic; every vector backend must give the
-// scalar products' bits (test_moe_experts_gguf compares those with the GPU's), and so must the
-// GPU's planar q8_1 activation (load_q8_1). SiLU and the tanh-approximated GELU
-// (ops/common/silu.h) against FP64, and the BF16 middle of every backend.
+// GGUF CPU expert rows (Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS,
+// IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS) against FP64 from independently decoded stored blocks, at the
+// Flash-Next, Gemma 4 and DeepSeek-V4.1 expert shapes, for every backend this host supports.
+// Blocks are decoded by ggml's reference dequantizers. Two oracles: the exact product bounds the
+// int8 activation's error, and the q8_1 product (the activation quantized per 32 values as the GPU
+// does, d = amax / 127 rounded to binary16, codes round(v / d); a K-quant's minimum and IQ1_S's
+// delta times the values' binary16 sum s) must agree to FP32 summation, so the CPU computes the
+// GPU's arithmetic; every vector backend must give the scalar products' bits (test_moe_experts_gguf
+// compares those with the GPU's), and so must the GPU's planar q8_1 activation (load_q8_1). SiLU
+// and the tanh-approximated GELU (ops/common/silu.h) against FP64, and the BF16 middles of every
+// backend, DeepSeek-V4.1's clamped one included.
 #include "ops/common/silu.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
 
@@ -89,7 +90,8 @@ struct Matrix {
     std::int64_t row_bytes;
     std::vector<std::uint8_t> bytes;
     std::vector<double> values; // decoded independently from the stored bytes
-    // Q4_K and Q5_K: each 32-value slice's minimum dmin * m, which its values subtract.
+    // Q4_K and Q5_K: each 32-value slice's minimum dmin * m, which its values subtract; IQ1_S:
+    // dl (1 - delta), so that its values plus it are dl times the codes 0..2 the GPU dots.
     std::vector<double> minimums;
 };
 
@@ -189,11 +191,74 @@ void reference_plain_block(QType format, const std::uint8_t* x, double* y, doubl
     }
 }
 
-bool k_minimum(QType format) { return format == QType::GGUF_Q4_K || format == QType::GGUF_Q5_K; }
+bool k_minimum(QType format) {
+    return format == QType::GGUF_Q4_K || format == QType::GGUF_Q5_K || format == QType::GGUF_IQ1_S;
+}
 
-// ggml-quants.c's dequantize_row_iq2_s, _iq3_xxs, _iq3_s, _iq4_nl and _iq4_xs (llama.cpp
-// a25c9865, MIT), with FP64 output: one stored block of `format` to its values.
-void reference_block(QType format, const std::uint8_t* bytes, double* y) {
+// ggml-quants.c's dequantize_row_iq1_s, _iq1_m, _iq2_xxs, _iq2_s, _iq3_xxs, _iq3_s, _iq4_nl and
+// _iq4_xs (llama.cpp a25c9865, MIT), with FP64 output: one stored block of `format` to its values
+// (and IQ1_S's minimum per 32 values).
+void reference_block(QType format, const std::uint8_t* bytes, double* y, double* minimum) {
+    if (format == QType::GGUF_IQ1_S) {
+        const auto* x          = reinterpret_cast<const block_iq1_s*>(bytes);
+        const double d         = exact_half(x->d);
+        const std::uint8_t* qs = x->qs;
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            const double dl    = d * (2 * ((x->qh[ib] >> 12) & 7) + 1);
+            const double delta = x->qh[ib] & 0x8000 ? -0.125 : 0.125;
+            minimum[ib]        = dl * (1 - delta);
+            for (int l = 0; l < 4; ++l) {
+                const auto* grid = reinterpret_cast<const std::int8_t*>(
+                    iq1s_grid + (qs[l] | (((x->qh[ib] >> 3 * l) & 7) << 8)));
+                for (int j = 0; j < 8; ++j) { y[j] = dl * (grid[j] + delta); }
+                y += 8;
+            }
+            qs += 4;
+        }
+        return;
+    }
+    if (format == QType::GGUF_IQ1_M) {
+        const auto* x  = reinterpret_cast<const block_iq1_m*>(bytes);
+        std::uint16_t sc[4];
+        std::memcpy(sc, x->scales, 8);
+        const double d = exact_half((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) |
+                                    (sc[3] & 0xf000));
+        const std::uint8_t* qs = x->qs;
+        const std::uint8_t* qh = x->qh;
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            const double dl1 = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1);
+            const double dl2 = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1);
+            const int idx[4] = {qs[0] | ((qh[0] << 8) & 0x700), qs[1] | ((qh[0] << 4) & 0x700),
+                                qs[2] | ((qh[1] << 8) & 0x700), qs[3] | ((qh[1] << 4) & 0x700)};
+            const double delta[4] = {qh[0] & 0x08 ? -0.125 : 0.125, qh[0] & 0x80 ? -0.125 : 0.125,
+                                     qh[1] & 0x08 ? -0.125 : 0.125, qh[1] & 0x80 ? -0.125 : 0.125};
+            for (int l = 0; l < 4; ++l) {
+                const auto* grid = reinterpret_cast<const std::int8_t*>(iq1s_grid + idx[l]);
+                for (int j = 0; j < 8; ++j) { y[j] = (l < 2 ? dl1 : dl2) * (grid[j] + delta[l]); }
+                y += 8;
+            }
+            qs += 4;
+            qh += 2;
+        }
+        return;
+    }
+    if (format == QType::GGUF_IQ2_XXS) {
+        const auto* x  = reinterpret_cast<const block_iq2_xxs*>(bytes);
+        const double d = exact_half(x->d);
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            std::uint32_t aux32[2];
+            std::memcpy(aux32, x->qs + 4 * ib32, 2 * sizeof(std::uint32_t));
+            const auto* aux8 = reinterpret_cast<const std::uint8_t*>(aux32);
+            const double db  = d * (0.5 + (aux32[1] >> 28)) * 0.25;
+            for (int l = 0; l < 4; ++l) {
+                const auto* grid = reinterpret_cast<const std::uint8_t*>(iq2xxs_grid + aux8[l]);
+                const std::uint8_t signs = ksigns_iq2xs[(aux32[1] >> 7 * l) & 127];
+                for (int j = 0; j < 8; ++j) { y[j] = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.0 : 1.0); }
+                y += 8;
+            }
+        }
+        return;
+    }
     if (format == QType::GGUF_IQ4_NL) {
         const auto* x  = reinterpret_cast<const block_iq4_nl*>(bytes);
         const double d = exact_half(x->d);
@@ -331,13 +396,24 @@ Matrix make(QType format, int rows, int k, std::mt19937& rng) {
         for (auto& byte : m.bytes) { byte = static_cast<std::uint8_t>(rng()); }
         std::uniform_real_distribution<float> scale(0.0005F, 0.004F);
         m.values.resize(std::size_t(rows) * k);
+        m.minimums.resize(std::size_t(rows) * (k / 32));
         for (int r = 0; r < rows; ++r) {
             for (int b = 0; b < k / group; ++b) {
                 std::uint8_t* p = m.bytes.data() + std::size_t(r) * m.row_bytes + std::size_t(b) * block;
                 const auto d    = half_bits(scale(rng));
                 const std::uint16_t signed_d = (rng() % 4 == 0) ? std::uint16_t(d | 0x8000) : d;
-                std::memcpy(p, &signed_d, 2);
-                reference_block(format, p, m.values.data() + std::size_t(r) * k + std::size_t(b) * group);
+                if (format == QType::GGUF_IQ1_M) {
+                    // The multiplier's four nibbles top the four scale words.
+                    for (int w = 0; w < 4; ++w) {
+                        std::uint16_t word = load16(p + 48 + 2 * w);
+                        word = std::uint16_t((word & 0x0FFF) | (((signed_d >> (4 * w)) & 0xF) << 12));
+                        std::memcpy(p + 48 + 2 * w, &word, 2);
+                    }
+                } else {
+                    std::memcpy(p, &signed_d, 2);
+                }
+                reference_block(format, p, m.values.data() + std::size_t(r) * k + std::size_t(b) * group,
+                                m.minimums.data() + std::size_t(r) * (k / 32) + std::size_t(b) * (group / 32));
             }
         }
         return m;
@@ -580,6 +656,33 @@ void check_silu(std::mt19937& rng) {
         require(y == geglu, "a vector backend's GeGLU middle differs from the scalar one");
         std::cout << gguf_cpu_backend_name(backend) << " GeGLU middle: " << y.size() << " words equal\n";
     }
+    // DeepSeek-V4.1's clamped middle: g and u times the guard's power of two, rounded to BF16, g at
+    // most 10 and u within +-10; FP64's silu(g) u within one BF16 unit.
+    for (const float factor : {1.0F, 4.0F}) {
+        std::vector<float> g(gate.begin(), gate.begin() + 20011), u(g.size());
+        for (std::size_t i = 0; i < g.size(); ++i) {
+            g[i] /= factor;
+            u[i] = 3.0F * up[i];
+        }
+        std::vector<std::uint16_t> clamped(g.size());
+        gguf_cpu_clamped_swiglu_bf16(g.data(), u.data(), g.size(), factor, 10.0F, clamped.data(),
+                                     GgufCpuBackend::Scalar);
+        for (std::size_t i = 0; i < g.size(); ++i) {
+            const double gr = std::min(double(std::bit_cast<float>(std::uint32_t(bf16(g[i] * factor)) << 16)), 10.0);
+            const double ur = std::clamp(double(std::bit_cast<float>(std::uint32_t(bf16(u[i] * factor)) << 16)), -10.0, 10.0);
+            const double exact = silu64(gr) * ur;
+            const double got   = double(std::bit_cast<float>(std::uint32_t(clamped[i]) << 16));
+            const double step  = std::ldexp(1.0, std::ilogb(std::max(std::abs(exact), 1e-38)) - 7);
+            require(std::abs(got - exact) <= step, "the clamped BF16 middle strays from FP64");
+        }
+        for (const auto backend : {GgufCpuBackend::Avx2}) {
+            if (!gguf_cpu_backend_available(backend)) { continue; }
+            std::vector<std::uint16_t> y(g.size());
+            gguf_cpu_clamped_swiglu_bf16(g.data(), u.data(), g.size(), factor, 10.0F, y.data(), backend);
+            require(y == clamped, "a vector backend's clamped middle differs from the scalar one");
+            std::cout << gguf_cpu_backend_name(backend) << " clamped middle: " << y.size() << " words equal\n";
+        }
+    }
 }
 
 } // namespace
@@ -615,6 +718,17 @@ int main() {
                                    QType::GGUF_IQ4_XS}) {
             const Matrix gate = make(format, 640, 2560, rng);
             for (const int tokens : {1, 2, 3, 4, 5, 8, 9}) { check(gate, tokens, rng); }
+            require(gguf_cpu_supported(format), "an i-quant is not supported");
+        }
+        // DeepSeek-V4.1-Flash: [gate; up] rows of 5120 values (20 blocks), down rows of 2304 (9).
+        for (const QType format : {QType::GGUF_IQ1_S, QType::GGUF_IQ1_M, QType::GGUF_IQ2_XXS,
+                                   QType::GGUF_IQ2_S}) {
+            const Matrix gate_up = make(format, 512, 5120, rng);
+            const Matrix down    = make(format, 640, 2304, rng);
+            for (const int tokens : {1, 2, 3, 6, 8, 9}) {
+                check(gate_up, tokens, rng);
+                check(down, tokens, rng);
+            }
             require(gguf_cpu_supported(format), "an i-quant is not supported");
         }
         require(!gguf_cpu_supported(QType::GGUF_IQ2_XS), "an unimplemented format is supported");

@@ -560,7 +560,8 @@ int tier_policy(DeviceContext& device) {
 
 // The CPU's products partition a narrow call with the cache and the copies: every pair is cached,
 // missing or computed on the CPU, which reads each expert's stored bytes (pinned or from the
-// files); and a routing profile seeds the cache, so the first call of its experts hits.
+// files) and the call's inputs, joined in order; and a routing profile seeds the cache, so the
+// first call of its experts hits.
 class PairEcho final : public ExpertCpuProducts {
 public:
     bool supports(std::size_t) const override { return true; }
@@ -635,9 +636,13 @@ int cpu_share(DeviceContext& device, bool disk, double share, const std::filesys
         ids.copy_from_host(routes.data(), ids.bytes);
         for (int l = 0; l < kLayers; ++l) {
             const auto before = delivery.stats();
-            const ExpertDelivery::Input input{ids.p, std::size_t(kPairs) * 4};
-            const auto call = delivery.begin(l, static_cast<const std::int32_t*>(ids.p), kPairs,
-                                             device.stream, {&input, 1});
+            // The ids as three inputs, which the CPU reads joined.
+            const auto* id          = static_cast<const std::int32_t*>(ids.p);
+            const std::size_t third = kPairs / 3;
+            const ExpertDelivery::Input inputs[3]{{id, third * 4},
+                                                  {id + third, third * 4},
+                                                  {id + 2 * third, (kPairs - 2 * third) * 4}};
+            const auto call = delivery.begin(l, id, kPairs, device.stream, {inputs, 3});
             inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), call.cached_ids, kPairs, l,
                 static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
             delivery.await(device.stream);

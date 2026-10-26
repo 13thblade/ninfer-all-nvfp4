@@ -242,6 +242,12 @@ struct MoeCombineArgs {
 };
 void moe_combine(const MoeCombineArgs& args, cudaStream_t stream);
 
+// sums[i] += products[i] for i < n when *flag is nonzero: the 2^-32 fixed-point sums of the
+// routed experts the CPU computed for a call (ExpertDelivery), added as the expert kernels add
+// theirs, modulo 2^64.
+void add_fixed(unsigned long long* sums, const void* products, const std::int32_t* flag,
+               std::int64_t n, cudaStream_t stream);
+
 // IQ4_NL rows of 256 values (144 bytes each) as BF16.
 void engram_rows(const std::uint8_t* rows, int count, __nv_bfloat16* out, cudaStream_t stream);
 

@@ -133,15 +133,11 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         throw std::invalid_argument("DeepSeek-V4.1 has no mapped misses, tail skip, prefill buffers "
                                     "or adaptive expert cache (Qwen3.8-Flash-Next options)");
     }
-    if (hybrid.dma_share || hybrid.cpu_threads != 0) {
-        throw std::invalid_argument("DeepSeek-V4.1 copies every missing expert to the GPU: its "
-                                    "IQ1_S, IQ1_M and IQ2 expert blocks have no CPU kernels "
-                                    "(--expert-dma-share, --expert-cpu-threads)");
-    }
     if (options.expert_residency == ExpertResidency::Device &&
-        (!hybrid.routing_profile.empty() || !hybrid.record_profile.empty())) {
-        throw std::invalid_argument("routing profiles require host or disk experts "
-                                    "(--expert-residency host|disk)");
+        (hybrid.dma_share || hybrid.cpu_threads != 0 || !hybrid.routing_profile.empty() ||
+         !hybrid.record_profile.empty())) {
+        throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
+                                    "host or disk experts (--expert-residency host|disk)");
     }
     if (device.size() != 1 || options.tensor_parallel) {
         throw std::invalid_argument("DeepSeek-V4.1 runs on one device");
@@ -231,6 +227,8 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     executor.cuda_graphs        = options.use_cuda_graph;
     executor.draft_tokens       = drafts;
     executor.expert_cache_bytes = options.expert_cache_bytes;
+    executor.expert_dma_share   = hybrid.dma_share;
+    executor.expert_cpu_threads = hybrid.cpu_threads;
     executor.engram_table       = std::move(engram);
     executor.engram_read        = {.residency    = table.residency,
                                    .io           = table.io,
@@ -331,8 +329,14 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
             double(experts.cache_bytes) / 1048576, experts.cache_slots, experts.banks,
             double(experts.bank_bytes) / 1048576, double(experts.metadata_bytes) / 1048576,
             double(experts.pinned_bytes) / 1048576, double(model->expert_pinned_bytes()) / 1048576);
+        const auto cpu = instance->executor->expert_cpu_description();
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-            "DeepSeek-V4.1: missing experts copied to the GPU; cache seeded %s",
+            "DeepSeek-V4.1: missing experts %s; cache seeded %s",
+            cpu.empty() ? (options.expert_residency == ExpertResidency::Disk && !hybrid.dma_share
+                               ? "copied to the GPU (disk experts: a CPU share needs --expert-dma-share)"
+                               : "copied to the GPU")
+                        : ("split between copies and " + cpu + (hybrid.dma_share
+                               ? " (fixed share)" : " (by measured speeds)")).c_str(),
             executor.expert_profile ? (hybrid.routing_profile.empty() ? "from the built-in profile"
                                                                       : "from --expert-profile")
                                     : "by the first requests");

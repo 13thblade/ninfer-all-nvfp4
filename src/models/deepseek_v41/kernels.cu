@@ -1041,6 +1041,13 @@ __global__ void moe_combine_kernel(MoeCombineArgs a) {
     a.y[at] = v;
 }
 
+__global__ void add_fixed_kernel(unsigned long long* sums, const unsigned long long* products,
+                                 const std::int32_t* flag, std::int64_t n) {
+    const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n || *flag == 0) { return; }
+    sums[i] += products[i];
+}
+
 // ---- Engram -------------------------------------------------------------------------------------
 
 __constant__ signed char kIq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
@@ -1429,6 +1436,14 @@ void clamped_swiglu(const float* x, std::int64_t x_stride, int rows, int width, 
     clamped_swiglu_kernel<<<dim3(blocks_for(width, 256), rows), 256, 0, stream>>>(
         x, x_stride, width, limit, scale, std::max(per_token, 1), out, out_stride);
     check_launch("clamped_swiglu");
+}
+
+void add_fixed(unsigned long long* sums, const void* products, const std::int32_t* flag,
+               std::int64_t n, cudaStream_t stream) {
+    if (n <= 0) { return; }
+    add_fixed_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(
+        sums, static_cast<const unsigned long long*>(products), flag, n);
+    check_launch("add_fixed");
 }
 
 void moe_combine(const MoeCombineArgs& args, cudaStream_t stream) {
