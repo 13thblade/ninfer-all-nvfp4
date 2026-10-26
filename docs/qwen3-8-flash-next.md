@@ -300,16 +300,18 @@ images do not depend on the share, on `auto`'s choices or on the thread count. T
 quantized as the GPU quantizes them (q8_1: per 32 values `d = amax / 127`, codes `round(v / d)`,
 `d` rounded to binary16). A 32-value slice gives the exact integer dot of its codes and the
 activation's, and its product is `(factor * d) * dot`, each step rounded, with the slice's exact
-factor (the block's binary16 multiplier times its integer scale); IQ2_S's is
-`d * fma(factor0, dot0, factor1 * dot1)` over its two halves, Q6_K's
-`d * (factor0 * dot0 + factor1 * dot1)`, and Q4_K's and Q5_K's `(factor * d) * dot` less the
-block's minimum times the slice's activation sum (q8_1's `s`). Slice `s` joins lane `s mod 32` in
+factor (the block's binary16 multiplier times its integer scale); IQ2_S's and IQ1_M's are
+`d * fma(factor0, dot0, factor1 * dot1)` over their two halves (IQ1_M's codes are eight times its
+values, `8c - 7` or `8c - 9`, and its factors `d (2s + 1) / 8` carry the eighth), Q6_K's
+`d * (factor0 * dot0 + factor1 * dot1)`, Q4_K's and Q5_K's `(factor * d) * dot` less the
+block's minimum times the slice's activation sum (q8_1's `s`), and IQ1_S's
+`factor * fma(d, dot, (delta - 1) * s)` over its codes 0 to 2. Slice `s` joins lane `s mod 32` in
 slice order, and the 32 lanes meet as in a warp's butterfly (16, 8, 4, 2, 1 apart). SiLU (and
 Gemma 4's GELU) is `ops/common/silu.h` on both sides, built from correctly rounded operations only,
 and the middle is rounded to BF16 before it is quantized for the down product. No compiler fuses
 these steps on either side: the GPU kernels spell them with `_rn` intrinsics and the CPU sources
-build without floating-point contraction. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ2_S,
-IQ3_XXS, IQ3_S and IQ4_XS have CPU products, in AVX2 (with FMA and F16C) where the CPU has it and
+build without floating-point contraction. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ1_S,
+IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS have CPU products, in AVX2 (with FMA and F16C) where the CPU has it and
 in portable C++ elsewhere, with the same bits.
 
 ### The n-gram rows

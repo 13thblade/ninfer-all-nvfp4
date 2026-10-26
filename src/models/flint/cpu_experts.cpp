@@ -26,16 +26,10 @@ namespace gguf = ops::gguf;
 // to the same sums.
 constexpr int kRowQuantum = 16;
 
-template <class Job, class Side>
-void run(CpuSpinPool* pool, std::size_t count, Job&& job, Side&& side) {
-    if (pool) { return pool->run(count, job, side); }
-    side();
-    for (std::size_t i = 0; i < count; ++i) { job(i); }
-}
-
 template <class Job>
 void run(CpuSpinPool* pool, std::size_t count, Job&& job) {
-    run(pool, count, job, [] {});
+    if (pool) { return pool->run(count, job); }
+    for (std::size_t i = 0; i < count; ++i) { job(i); }
 }
 
 // kernels::quantize_pairs' guard of one BF16 middle row: its largest sum of 32 values, added as a
@@ -135,8 +129,7 @@ ExpertCpuProducts::Done CpuExperts::compute(const Work& work) {
         job.rows.resize(n * hidden_);
     }
 
-    // Gate and up rows: the stored [gate; up] matrix's first and second `width` rows, while the
-    // calling thread runs work.side.
+    // Gate and up rows: the stored [gate; up] matrix's first and second `width` rows.
     std::vector<RowPart> parts;
     double cost = 0;
     for (std::size_t i = 0; i < count; ++i) {
@@ -147,23 +140,17 @@ ExpertCpuProducts::Done CpuExperts::compute(const Work& work) {
     }
     const std::uint32_t threads = work.pool ? work.pool->threads() : 1;
     auto tasks                  = row_tasks(parts, threads, kRowQuantum);
-    const auto side             = [&] {
-        if (work.side) { work.side(); }
-    };
-    run(
-        work.pool, tasks.size(),
-        [&](std::size_t index) {
-            const RowTask& task = tasks[index];
-            Job& job            = jobs_[task.part / 2];
-            const bool is_up    = (task.part & 1U) != 0;
-            const ops::GgufCpuMatrix w{
-                layer.gate_up,
-                job.gate_up + (is_up ? std::size_t(width_) * layer.gate_up_row_bytes : 0),
-                layer.gate_up_row_bytes, width_, hidden_};
-            ops::gguf_cpu_rows(w, job.input, task.begin, task.end,
-                               (is_up ? job.up : job.gate).data(), width_, backend_);
-        },
-        side);
+    run(work.pool, tasks.size(), [&](std::size_t index) {
+        const RowTask& task = tasks[index];
+        Job& job            = jobs_[task.part / 2];
+        const bool is_up    = (task.part & 1U) != 0;
+        const ops::GgufCpuMatrix w{
+            layer.gate_up,
+            job.gate_up + (is_up ? std::size_t(width_) * layer.gate_up_row_bytes : 0),
+            layer.gate_up_row_bytes, width_, hidden_};
+        ops::gguf_cpu_rows(w, job.input, task.begin, task.end,
+                           (is_up ? job.up : job.gate).data(), width_, backend_);
+    });
     const auto rows_done = work.pool ? work.pool->finished() : Clock::now();
     const auto middle    = Clock::now();
     // The BF16 middle, as the GPU stores it before quantizing it for the down rows, a pair a task.

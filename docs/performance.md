@@ -894,22 +894,41 @@ ISTA-DASLab's GSQ-RCO IQ1_M GGUF with its Engram table
 ([artifact](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3)), BF16
 caches, one request, greedy, thinking off, the same prompt tokens in both engines. One rented host:
 an RTX 4090 (450 W, PCIe 4.0 x16), two 32-core AMD EPYC engineering samples and 409 GiB of RAM.
-NInfer: `ninfer-serve` with host experts. Strata: 0.2.6, its latest release (`strata-dsv41` 0.1.51),
-all 6 experts, the flags its app starts the engine with and the four settings its tuner tries:
+NInfer: `ninfer-serve` with host experts, by default with CPU threads computing a share of each
+decode call's missing experts. Strata: 0.2.6, its latest release (`strata-dsv41` 0.1.51), all 6
+experts, the flags its app starts the engine with and the four settings its tuner tries:
 
 | Engine and settings | Decode, short answer | after 8,086 tokens | Prefill of 8,086 tokens |
 |---|---:|---:|---:|
-| NInfer | 26.0 | 22.0 | 925 |
-| NInfer `b3402a6fd` (prompts chunk by chunk) | 25.8 | 22.1 | 498 |
+| NInfer | 38.9 | 31.4 | 938 |
+| NInfer, `--expert-dma-share 1` (every miss copied) | 33.5 | 26.6 | 929 |
+| NInfer `b3402a6fd` (prompts chunk by chunk, every miss copied) | 25.8 | 22.1 | 498 |
 | Strata, `--dspark auto --dspark-conf 0.65` (its app) | 36.0 | 38.4 | 635 |
 | Strata, `--dspark on` | 34.3 | 38.7 | 690 |
 | Strata, `--dspark on --dspark-block 3` | 39.9 | 37.1 | 660 |
 | Strata, `--cpu-threads 64` | 38.0 | 38.6 | 659 |
 | Strata, `--mmap-experts off --ssd-cache 0` | 39.4 | 38.3 | 658 |
 
-Strata computes 53 to 61% of the routed experts on its CPU threads beside the GPU; NInfer copies
-every expert its cache lacks to the GPU. With `--experts 5` (5 of the 6 experts, another model's
-output) Strata decodes 44.8 and 42.1 tok/s.
+Strata computes 53 to 61% of the routed experts on its CPU threads beside the GPU. With the build
+`7731f3d30` NInfer's device cache served 62 to 72% of the decode routes, its CPU share 16 to 22%,
+and the GPU copied the rest
+([the CPU share](deepseek-v41.md#the-cpu-share-on-one-rtx-4090)). With `--experts 5` (5 of the 6
+experts, another model's output) Strata decodes 44.8 and 42.1 tok/s.
+
+With the release's DSpark drafter, October 26, the same prompts and host experts, on that host and
+on an RTX PRO 6000 host (Threadripper PRO 7965WX), where the build before the CPU share copied every
+miss:
+
+| Card | Drafts | Decode, short answer | after 8,086 tokens | Prefill of 8,086 tokens |
+|---|---|---:|---:|---:|
+| RTX PRO 6000 (600 W) | none | 50.8 | 48.3 | 1,210 |
+| RTX PRO 6000 (600 W) | `--spec dspark` | 83.1 | 75.0 | 1,290 |
+| RTX 4090 (450 W) | none | 38.9 | 31.4 | 938 |
+| RTX 4090 (450 W) | `--spec dspark` | 39.9 | 33.2 | 693 |
+| RTX 4090 (450 W), `--expert-dma-share 1` | `--spec dspark` | 25.1 | 20.2 | 688 |
+
+Strata 0.2.6 exited with an error in every configuration tried on the RTX PRO 6000 host
+([the drafter](deepseek-v41.md#the-dspark-drafter)).
 
 NInfer's native release build of `b3402a6fd` on one GPU of a rented host per card, the same prompts:
 

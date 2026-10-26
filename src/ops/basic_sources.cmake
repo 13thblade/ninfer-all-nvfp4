@@ -1,15 +1,20 @@
 if(NINFER_WINDOWS_KERNEL_DLL)
-  # Both the GGML bridge and Ops use one device-tier probe and cache in the DLL.
+  # Both the GGML bridge and Ops use one device-tier probe and cache, and one store of installed
+  # route profiles, in the DLL: the bridge's vector kernels read their schedules from the profiles.
   add_library(ninfer_device_tier OBJECT "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu")
   ninfer_internal_includes(ninfer_device_tier)
   ninfer_cuda_archive(ninfer_device_tier)
+  add_library(ninfer_device_route OBJECT "${CMAKE_CURRENT_LIST_DIR}/common/device_route.cpp")
+  ninfer_internal_includes(ninfer_device_route)
+  target_link_libraries(ninfer_device_route PRIVATE ${NINFER_CUDART_TARGET})
 else()
-  target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu")
+  target_sources(ninfer_ops PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/common/device_route.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu")
 endif()
 
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/weight_input.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/common/device_route.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/add_bias.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/argmax.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/cast.cu"

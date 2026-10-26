@@ -18,9 +18,17 @@ model names by the SHA-256 of its bytes. `--components text,engram` stores the m
 table, `text` the model alone (its table read from a table artifact at run time) and `engram` that
 table artifact.
 
+The release's DSpark drafter (`--source dspark=dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf`, llama.cpp
+architecture `dflash`) forms the `dspark` component beside `text` (`--components text,engram,dspark`):
+three blocks of the backbone's shape whose window rings the trunk's streams entering its last three
+blocks fill (`fc`, its norm), a routed MoE of 128 experts (3 a token) in MXFP4 blocks, the final
+norm, the Markov bias tables (BF16) and the confidence head, imported as stored like the backbone.
+
     python -m tools.convert --model HF_DIR --recipe deepseek_v41_gguf \\
         --source gguf=DeepSeek-V4.1-Flash-1017-IQ1_M-00001-of-00004.gguf \\
-        --source engram=DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf --out deepseek-v4.1-flash.ninfer
+        --source engram=DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \\
+        --source dspark=dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \\
+        --components text,engram,dspark --out deepseek-v4.1-flash.ninfer
 
 `HF_DIR` holds the base release's `config.json`, `tokenizer.json` and `tokenizer_config.json`
 (no weights are read from it). The chat template and the generation defaults come from
@@ -48,6 +56,9 @@ from .ternary import rows
 
 ARCHITECTURES = ("DeepseekV41ForCausalLM",)
 TABLE_ARCHITECTURE = "DeepseekV41EngramTable"
+DSPARK_ARCHITECTURE = "DeepseekV41DSpark"
+# The drafter's Markov tables, kept in BF16 as stored.
+MARKOV_TABLES = ("dspark/markov_embed", "dspark/markov_head")
 RESOURCES = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
              "generation_config.json")
 DEFAULT_RESOURCES = Path(__file__).resolve().parent / "templates" / "deepseek_v41"
@@ -153,7 +164,7 @@ def text_config(source: dict) -> dict:
     ratios = t.get("compress_ratios")
     if not isinstance(ratios, list) or len(ratios) < layers:
         raise ValueError("compress_ratios must name every block")
-    # Entries past the backbone's blocks belong to the DSpark drafter, which is not converted.
+    # Entries past the backbone's blocks belong to the DSpark drafter (dspark_config).
     out["compress_ratios"] = [int(r) for r in ratios[:layers]]
     if any(r not in (0, 1, 2) for r in out["compress_ratios"]):
         raise ValueError("compression ratios other than 0, 1 and 2 are not implemented")
@@ -257,6 +268,77 @@ def validate(gguf: GGUFShards, config: dict) -> None:
     for key in ("swiglu_clamp_exp", "swiglu_clamp_shexp"):
         if any(float(v) != config["swiglu_limit"] for v in kv.get(f + key, [])[:layers]):
             raise ValueError(f"{gguf.path}: {key} differs from swiglu_limit")
+
+
+def dspark_config(source: dict, config: dict, dspark: GGUFShards) -> dict:
+    """The `dspark` component's config from the release's dspark_* keys, checked against the
+    drafter GGUF's metadata: its blocks have the backbone's geometry (config), window attention only,
+    and a MoE of their own width."""
+
+    t = source["text_config"]
+    layers, vocab = config["num_hidden_layers"], config["vocab_size"]
+    count = _int(t.get("num_nextn_predict_layers"), "num_nextn_predict_layers")
+    out = {"architectures": [DSPARK_ARCHITECTURE], "model_type": "deepseek_v41_dspark",
+           "num_hidden_layers": count}
+    for key, name in (("dspark_block_size", "block_size"), ("dspark_markov_rank", "markov_rank"),
+                      ("dspark_n_routed_experts", "n_routed_experts"),
+                      ("dspark_num_experts_per_tok", "num_experts_per_tok")):
+        out[name] = _int(t.get(key), key)
+    noise = t.get("dspark_noise_token_id")
+    if type(noise) is not int or not 0 <= noise < vocab:
+        raise ValueError("dspark_noise_token_id must be a token id")
+    out["noise_token_id"] = noise
+    targets = t.get("dspark_target_layer_ids")
+    if (not isinstance(targets, list) or not targets
+            or any(type(v) is not int or not 0 <= v < layers for v in targets)
+            or targets != sorted(set(targets))):
+        raise ValueError("dspark_target_layer_ids must name backbone blocks in order")
+    out["target_layer_ids"] = list(targets)
+    if out["num_experts_per_tok"] > out["n_routed_experts"]:
+        raise ValueError("the drafter routes to more experts than it has")
+    if list(t.get("compress_ratios", []))[layers:] != [0] * count:
+        raise ValueError("the DSpark blocks attend through their window only (compress ratio 0)")
+
+    kv, f = dspark.kv, "dflash."
+    if kv.get("general.architecture") != "dflash":
+        raise ValueError(f"{dspark.path}: expected the release's DSpark drafter (dflash) GGUF")
+    expected = {
+        "block_count": count, "embedding_length": config["hidden_size"],
+        "attention.head_count": config["num_attention_heads"], "attention.head_count_kv": 1,
+        "attention.key_length": config["head_dim"], "attention.value_length": config["head_dim"],
+        "rope.dimension_count": config["qk_rope_head_dim"],
+        "attention.q_lora_rank": config["q_lora_rank"],
+        "attention.output_group_count": config["o_groups"],
+        "attention.output_lora_rank": config["o_lora_rank"],
+        "attention.sliding_window": config["sliding_window"],
+        "expert_count": out["n_routed_experts"], "expert_used_count": out["num_experts_per_tok"],
+        "expert_feed_forward_length": config["moe_intermediate_size"], "expert_shared_count": 1,
+        "expert_gating_func": SQRT_SOFTPLUS_GATING, "expert_weights_norm": True,
+        "hyper_connection.count": config["hc_mult"],
+        "hyper_connection.sinkhorn_iterations": config["hc_sinkhorn_iters"],
+        "hyper_connection.single_pass": True, "block_size": out["block_size"],
+        "sample_from_anchor": True, "has_confidence_head": True,
+    }
+    for key, value in expected.items():
+        if kv.get(f + key) != value:
+            raise ValueError(f"{dspark.path}: {f + key} is {kv.get(f + key)!r}, expected "
+                             f"{value!r}")
+    if (list(kv.get(f + "target_layers", [])) != out["target_layer_ids"]
+            or list(kv.get(f + "attention.compress_ratios", [])) != [0] * count):
+        raise ValueError(f"{dspark.path}: the target layers or compress ratios differ from the "
+                         "config's")
+    reals = {"expert_weights_scale": config["routed_scaling_factor"],
+             "rope.freq_base": config["rope_theta"],
+             "attention.layer_norm_rms_epsilon": config["rms_norm_eps"],
+             "hyper_connection.epsilon": config["hc_eps"]}
+    for key, value in reals.items():
+        if not np.isclose(float(kv.get(f + key, np.nan)), value, rtol=1e-6, atol=0.0):
+            raise ValueError(f"{dspark.path}: {f + key} differs from the config's {value!r}")
+    for key in ("swiglu_clamp_exp", "swiglu_clamp_shexp"):
+        values = list(kv.get(f + key, []))
+        if len(values) < count or any(float(v) != config["swiglu_limit"] for v in values[:count]):
+            raise ValueError(f"{dspark.path}: {key} differs from swiglu_limit")
+    return out
 
 
 def engram_constants(gguf: GGUFShards, config: dict) -> dict:
@@ -424,17 +506,23 @@ def table_digest(table: GGUFFile, config: dict) -> str:
 
 
 def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
-                resource_overrides=None):
-    """DeepSeek-V4.1-Flash's text component, every parameter's source the GGUF, and the `engram`
-    component that describes (and with `engram` selected, stores) its Engram table."""
+                dspark: GGUFShards | None = None, resource_overrides=None):
+    """DeepSeek-V4.1-Flash's text component, every parameter's source the GGUF, the `engram`
+    component that describes (and with `engram` selected, stores) its Engram table, and with
+    `dspark` selected the DSpark drafter from its own GGUF."""
 
     from .model import Model, Parameter
 
     selected = tuple(components)
-    if len(set(selected)) != len(selected) or set(selected) not in (
-            {"text", "engram"}, {"text"}, {"engram"}):
+    model_parts = set(selected) - {"dspark"}
+    if len(set(selected)) != len(selected) or model_parts not in (
+            {"text", "engram"}, {"text"}, {"engram"}) or (
+            "dspark" in selected and "text" not in selected):
         raise ValueError("DeepSeek-V4.1 converts --components text,engram (the model with its "
-                         "Engram table), text (the model alone) or engram (the table alone)")
+                         "Engram table), text (the model alone) or engram (the table alone), "
+                         "and dspark (its drafter) beside text")
+    if ("dspark" in selected) != (dspark is not None):
+        raise ValueError("the dspark component converts from --source dspark=DRAFTER.gguf")
     config = text_config(base.config)
     records = {"engram": {"config": engram_table_config(config)}}
     if "text" not in selected:
@@ -455,15 +543,18 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
     references["engram_token_map"] = "resource/text/engram_token_map"
     payloads["resource/text/engram_token_map"] = constants["token_map"].tobytes()
     records["text"] = {"config": config, "resources": references}
+    if dspark is not None:
+        records["dspark"] = {"config": dspark_config(base.config, config, dspark),
+                             "target": "text"}
     model = Model(records, resources=payloads, token_count=count, special_token_ids=special)
 
-    def matrix(name, tensor, shape, inputs=(), source=None):
-        model.add(Parameter(name, shape, source or _matrix(gguf, tensor, shape),
+    def matrix(name, tensor, shape, inputs=(), source=None, file=gguf):
+        model.add(Parameter(name, shape, source or _matrix(file, tensor, shape),
                             inputs=tuple(inputs)))
 
-    def vector(name, tensor, shape, source=None):
-        model.add(Parameter(name, shape, source or _direct(gguf, tensor, shape),
-                            direct_format="fp32"))
+    def vector(name, tensor, shape, source=None, file=gguf, stored="fp32"):
+        model.add(Parameter(name, shape, source or _direct(file, tensor, shape),
+                            direct_format=stored))
 
     matrix("text/token_embedding", "token_embd.weight", (vocab, h))
     matrix("text/output_head", "output.weight", (vocab, h), ("text/final_hidden",))
@@ -473,26 +564,49 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
     mixes = (2 + hc) * hc
     q_rank, o_rank, groups = config["q_lora_rank"], config["o_lora_rank"], config["o_groups"]
     ih, idim = config["index_n_heads"], config["index_head_dim"]
-    e, w = config["n_routed_experts"], config["moe_intermediate_size"]
+    w = config["moe_intermediate_size"]
+
+    # The parameters every block has, the backbone's and the drafter's: hyper-connections, norms
+    # and the window attention (attention_block), and the MoE of `e` routed experts beside the shared
+    # one (moe_block). A backbone block's compressor and indexer come between the two.
+    def attention_block(file, index, p):
+        g = f"blk.{index}."
+        for site, prefix in (("attn", "hc_attention/"), ("ffn", "hc_ffn/")):
+            vector(p + prefix + "fn", g + f"hc_{site}_fn.weight", (mixes, hc * h), file=file)
+            vector(p + prefix + "base", g + f"hc_{site}_base.weight", (mixes,), file=file)
+            vector(p + prefix + "scale", g + f"hc_{site}_scale.weight", (3,), file=file)
+        vector(p + "attention_norm", g + "attn_norm.weight", (h,), file=file)
+        vector(p + "ffn_norm", g + "ffn_norm.weight", (h,), file=file)
+        a = p + "attention/"
+        matrix(a + "query_a", g + "attn_q_a.weight", (q_rank, h), (p + "attention_input",),
+               file=file)
+        matrix(a + "kv", g + "attn_kv.weight", (d, h), (p + "attention_input",), file=file)
+        vector(a + "query_a_norm", g + "attn_q_a_norm.weight", (q_rank,), file=file)
+        vector(a + "kv_norm", g + "attn_kv_a_norm.weight", (d,), file=file)
+        matrix(a + "query_b", g + "attn_q_b.weight", (heads * d, q_rank), (a + "query_latent",),
+               file=file)
+        matrix(a + "output_a", g + "attn_output_a.weight", (groups * o_rank, heads * d // groups),
+               (a + "grouped_output",), file=file)
+        matrix(a + "output_b", g + "attn_output_b.weight", (h, groups * o_rank),
+               (a + "output_latent",), file=file)
+        vector(a + "sinks", g + "attn_sinks.weight", (heads,), file=file)
+
+    def moe_block(file, index, p, e):
+        g, m = f"blk.{index}.", p + "moe/"
+        vector(m + "router", g + "ffn_gate_inp.weight", (e, h), file=file)
+        vector(m + "router_bias", g + "exp_probs_b.bias", (e,), file=file)
+        matrix(m + "gate_up", None, (e * 2 * w, h), (m + "input",),
+               expert_gate_up(file, index, e, w, h))
+        matrix(m + "down", g + "ffn_down_exps.weight", (e * h, w), (m + "product",), file=file)
+        matrix(m + "shared_gate", g + "ffn_gate_shexp.weight", (w, h), (m + "input",), file=file)
+        matrix(m + "shared_up", g + "ffn_up_shexp.weight", (w, h), (m + "input",), file=file)
+        matrix(m + "shared_down", g + "ffn_down_shexp.weight", (h, w), (m + "shared_product",),
+               file=file)
+
     for i in range(config["num_hidden_layers"]):
         g, p = f"blk.{i}.", f"text/layers/{i}/"
-        for site, prefix in (("attn", "hc_attention/"), ("ffn", "hc_ffn/")):
-            vector(p + prefix + "fn", g + f"hc_{site}_fn.weight", (mixes, hc * h))
-            vector(p + prefix + "base", g + f"hc_{site}_base.weight", (mixes,))
-            vector(p + prefix + "scale", g + f"hc_{site}_scale.weight", (3,))
-        vector(p + "attention_norm", g + "attn_norm.weight", (h,))
-        vector(p + "ffn_norm", g + "ffn_norm.weight", (h,))
         a = p + "attention/"
-        matrix(a + "query_a", g + "attn_q_a.weight", (q_rank, h), (p + "attention_input",))
-        matrix(a + "kv", g + "attn_kv.weight", (d, h), (p + "attention_input",))
-        vector(a + "query_a_norm", g + "attn_q_a_norm.weight", (q_rank,))
-        vector(a + "kv_norm", g + "attn_kv_a_norm.weight", (d,))
-        matrix(a + "query_b", g + "attn_q_b.weight", (heads * d, q_rank), (a + "query_latent",))
-        matrix(a + "output_a", g + "attn_output_a.weight", (groups * o_rank, heads * d // groups),
-               (a + "grouped_output",))
-        matrix(a + "output_b", g + "attn_output_b.weight", (h, groups * o_rank),
-               (a + "output_latent",))
-        vector(a + "sinks", g + "attn_sinks.weight", (heads,))
+        attention_block(gguf, i, p)
         if i in config["kv_source_layer_ids"]:
             c = a + "compressor/"
             vector(c + "kv", g + "attn_compressor_kv.weight", (d, h))
@@ -504,15 +618,7 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
         if i in config["index_source_layer_ids"]:
             vector(a + "indexer/query", g + "indexer.attn_q_b.weight", (ih * idim, q_rank))
             vector(a + "indexer/weights", g + "indexer.proj.weight", (ih, h))
-        m = p + "moe/"
-        vector(m + "router", g + "ffn_gate_inp.weight", (e, h))
-        vector(m + "router_bias", g + "exp_probs_b.bias", (e,))
-        matrix(m + "gate_up", None, (e * 2 * w, h), (m + "input",),
-               expert_gate_up(gguf, i, e, w, h))
-        matrix(m + "down", g + "ffn_down_exps.weight", (e * h, w), (m + "product",))
-        matrix(m + "shared_gate", g + "ffn_gate_shexp.weight", (w, h), (m + "input",))
-        matrix(m + "shared_up", g + "ffn_up_shexp.weight", (w, h), (m + "input",))
-        matrix(m + "shared_down", g + "ffn_down_shexp.weight", (h, w), (m + "shared_product",))
+        moe_block(gguf, i, p, config["n_routed_experts"])
         if i in config["engram_layer_ids"]:
             n = p + "engram/"
             columns = (config["engram_max_ngram_size"] - 1) * config["engram_n_heads"]
@@ -524,6 +630,20 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
             vector(n + "gate", None, (hc, h),
                    array_source(torch.from_numpy(np.ascontiguousarray(gate)),
                                 g + "engram_q*engram_k"))
+    if dspark is not None:
+        drafter = records["dspark"]["config"]
+        rank, taps = drafter["markov_rank"], len(drafter["target_layer_ids"])
+        matrix("dspark/fc", "fc.weight", (h, taps * h), ("dspark/taps",), file=dspark)
+        vector("dspark/tap_norm", "enc.output_norm.weight", (h,), file=dspark)
+        vector("dspark/final_norm", "output_norm.weight", (h,), file=dspark)
+        vector("dspark/markov_embed", "markov_w1.weight", (vocab, rank), file=dspark,
+               stored="bf16")
+        vector("dspark/markov_head", "markov_w2.weight", (vocab, rank), file=dspark,
+               stored="bf16")
+        vector("dspark/confidence", "conf_proj.weight", (h + rank,), file=dspark)
+        for b in range(drafter["num_hidden_layers"]):
+            attention_block(dspark, b, f"dspark/layers/{b}/")
+            moe_block(dspark, b, f"dspark/layers/{b}/", drafter["n_routed_experts"])
     if "engram" in selected:
         _engram_table(model)
     return model
@@ -563,10 +683,11 @@ def configure_engram(model, recipe, table) -> None:
 
 
 def deepseek_v41_gguf(model, recipe, sources):
-    """Every matrix keeps its GGUF blocks; vectors are FP32. A block's query-latent and key/value
-    projections share one parent when the GGUF stores them in one format, as do the shared expert's
-    gate and up rows. The Engram table keeps its IQ4_NL rows (`--source engram`, always read: the
-    model records the digest of its table even when the rows go into an artifact of their own)."""
+    """Every matrix keeps its GGUF blocks; vectors are FP32 (the drafter's Markov tables BF16, as
+    stored). A block's query-latent and key/value projections share one parent when the GGUF stores
+    them in one format, as do the shared expert's gate and up rows, the drafter's blocks as the
+    backbone's. The Engram table keeps its IQ4_NL rows (`--source engram`, always read: the model
+    records the digest of its table even when the rows go into an artifact of their own)."""
 
     configure_engram(model, recipe, sources["engram"])
     if "text" not in model.components:
@@ -577,15 +698,19 @@ def deepseek_v41_gguf(model, recipe, sources):
     for name, parameter in model.parameters.items():
         if name == "engram/table":
             continue
-        if parameter.direct_format == "fp32" and not parameter.projection:
-            recipe.assign(name, format="fp32", method=cast_direct, source=parameter.source)
+        if (parameter.direct_format == "fp32" or name in MARKOV_TABLES) and not parameter.projection:
+            recipe.assign(name, format=parameter.direct_format, method=cast_direct,
+                          source=parameter.source)
             continue
         fmt = formats[name] = parameter.source.read_encoded(0, 1).format
         recipe.assign(name, format=fmt, method=import_encoded, source=parameter.source,
                       **({"activation_policy": "AllowA8"} if parameter.projection else {}))
     config = model.config
-    for i in range(config["num_hidden_layers"]):
-        p = f"text/layers/{i}/"
+    blocks = [f"text/layers/{i}/" for i in range(config["num_hidden_layers"])]
+    if "dspark" in model.components:
+        blocks += [f"dspark/layers/{b}/" for b in
+                   range(model.components["dspark"]["config"]["num_hidden_layers"])]
+    for p in blocks:
         pair = [p + "attention/query_a", p + "attention/kv"]
         if formats[pair[0]] == formats[pair[1]]:
             recipe.group(pair)

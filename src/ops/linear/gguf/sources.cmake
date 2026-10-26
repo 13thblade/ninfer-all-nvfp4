@@ -42,13 +42,15 @@ add_library(ninfer_ggml_quants ${_ninfer_ggml_library_type}
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq1_s.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq1_m.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq4_nl.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq4_xs.cu")
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq4_xs.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_mxfp4.cu")
 if(WIN32)
   # STATIC defaults to this name, but OBJECT defaults to a bare /Fd directory. Keep cache keys equal.
   set_target_properties(ninfer_ggml_quants PROPERTIES
     COMPILE_PDB_NAME ninfer_ggml_quants
     COMPILE_PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/ninfer_ggml_quants.dir")
 endif()
+
 target_include_directories(ninfer_ggml_quants PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}"
   "${NINFER_GGML_QUANTS_ROOT}/include"
@@ -62,7 +64,8 @@ if(NINFER_WINDOWS_KERNEL_DLL)
   # Compile independently of DLL-only definitions, preserving the static archive's cache identity.
   # Only linking changes. The bridge imports no global data or virtual tables.
   add_library(ninfer_ggml_quants_dll SHARED
-    $<TARGET_OBJECTS:ninfer_ggml_quants> $<TARGET_OBJECTS:ninfer_device_tier>)
+    $<TARGET_OBJECTS:ninfer_ggml_quants> $<TARGET_OBJECTS:ninfer_device_tier>
+    $<TARGET_OBJECTS:ninfer_device_route>)
   set_target_properties(ninfer_ggml_quants_dll PROPERTIES
     OUTPUT_NAME ninfer_ggml_quants WINDOWS_EXPORT_ALL_SYMBOLS ON
     LINKER_LANGUAGE CUDA CUDA_RUNTIME_LIBRARY Static

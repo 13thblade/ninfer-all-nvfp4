@@ -161,7 +161,9 @@ def main(argv=None):
         help="comma-separated text,vision,mtp,dflash,dflash2 (default text); for "
         "Qwen3.8-Flash-Next text,ngram (the default: the model with its n-gram table), text (the "
         "model alone, its table read from a table artifact at run time) or ngram (that table "
-        "artifact), and vision or mtp (from --source mtp=MTP.gguf or an HF safetensors subset) beside text",
+        "artifact), and vision or mtp (from --source mtp=MTP.gguf or an HF safetensors subset) beside text; "
+        "for DeepSeek-V4.1 text,engram (the default), text or engram, and dspark (its drafter, from "
+        "--source dspark=DRAFTER.gguf) beside text",
     )
     parser.add_argument(
         "--resource",
@@ -207,25 +209,31 @@ def main(argv=None):
         if architectures[0] in DEEPSEEK_V41_ARCHITECTURES:
             components = tuple((args.components or "text,engram").split(","))
             if args.layers or "engram" not in paths or (
-                    "text" in components and "gguf" not in paths):
+                    "text" in components and "gguf" not in paths) or (
+                    ("dspark" in components) != ("dspark" in paths)):
                 raise ValueError("DeepSeek-V4.1 converts its text component from --source "
-                                 "gguf=SHARD1.gguf and its Engram table from --source "
-                                 "engram=ENGRAM.gguf")
+                                 "gguf=SHARD1.gguf, its Engram table from --source "
+                                 "engram=ENGRAM.gguf and with --components ...,dspark its "
+                                 "drafter from --source dspark=DRAFTER.gguf")
             gguf = (stack.enter_context(GGUFShards(paths["gguf"]))
                     if "text" in components else None)
             engram = stack.enter_context(GGUFFile(paths["engram"]))
-            model = build_deepseek_v41(base, gguf, components=components,
+            dspark = (stack.enter_context(GGUFShards(paths["dspark"]))
+                      if "dspark" in components else None)
+            model = build_deepseek_v41(base, gguf, components=components, dspark=dspark,
                                        resource_overrides=overrides)
             recipe = Recipe(model)
-            deepseek_sources = {"base": base, "engram": engram} | (
-                {"gguf": gguf} if gguf is not None else {})
+            deepseek_sources = ({"base": base, "engram": engram}
+                                | ({"gguf": gguf} if gguf is not None else {})
+                                | ({"dspark": dspark} if dspark is not None else {}))
             _function(args.recipe)(model, recipe, deepseek_sources)
             if args.override:
                 _function(args.override)(model, recipe, deepseek_sources)
             source_paths = {"base": {"path": str(args.model)},
                             "engram": {"path": str(paths["engram"])}}
-            if gguf is not None:
-                source_paths["gguf"] = {"path": str(paths["gguf"])}
+            for name in ("gguf", "dspark"):
+                if name in paths:
+                    source_paths[name] = {"path": str(paths[name])}
             report = convert(
                 model, recipe, args.out, name=args.name,
                 provenance={"converter": "ninfer-v3", "recipe": args.recipe,

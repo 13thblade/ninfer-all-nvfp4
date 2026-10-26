@@ -32,6 +32,7 @@ enum class GgmlType : int {
     IQ2_S   = 22,
     IQ4_XS  = 23,
     IQ1_M   = 29,
+    MXFP4   = 39,
     Q2_0    = 42,
 };
 
@@ -46,7 +47,7 @@ struct BlockShape {
 [[nodiscard]] int multiprocessor_count();
 
 // Whether the integer tensor-core prefill kernel exists for the type. IQ1_M has none (nor does it in
-// llama.cpp); its wide products dequantize and take a BF16 GEMM.
+// llama.cpp), and MXFP4 none here: their wide products dequantize and take a BF16 GEMM.
 [[nodiscard]] bool has_matrix_kernel(GgmlType type);
 
 // Columns the vector kernel takes in one launch; wider products take the matrix kernel.

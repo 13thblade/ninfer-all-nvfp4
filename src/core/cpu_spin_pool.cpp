@@ -189,7 +189,7 @@ CpuSpinPool::CpuSpinPool(std::uint32_t threads, bool pin) {
 CpuSpinPool::~CpuSpinPool() {
     {
         std::lock_guard lock(mutex_);
-        stop_.store(true);
+        wake_line_.stop.store(true);
     }
     wake_.notify_all();
     for (auto& worker : workers_) { worker.join(); }
@@ -198,7 +198,7 @@ CpuSpinPool::~CpuSpinPool() {
 void CpuSpinPool::spin(bool on) {
     {
         std::lock_guard lock(mutex_);
-        spinning_.store(on);
+        wake_line_.spinning.store(on);
     }
     wake_.notify_all();
 }
@@ -210,27 +210,32 @@ void CpuSpinPool::pin_caller() {
 }
 
 void CpuSpinPool::drain() {
-    std::uint64_t ticket = ticket_.load(std::memory_order_acquire);
+    std::uint64_t size = 0;
+    std::size_t ran    = 0;
     for (;;) {
-        const std::uint64_t size = size_.load(std::memory_order_acquire);
-        const std::size_t i      = std::size_t(ticket & 0xffffffffULL);
-        if ((size >> 32) != (ticket >> 32) || i >= (size & 0xffffffffULL)) { return; }
-        if (!ticket_.compare_exchange_weak(ticket, ticket + 1, std::memory_order_acq_rel,
-                                           std::memory_order_acquire)) {
-            continue;
-        }
+        const std::uint64_t ticket = ticket_.fetch_add(1, std::memory_order_acq_rel);
+        const std::uint64_t now    = job_.size.load(std::memory_order_acquire);
+        const std::size_t i        = std::size_t(ticket & 0xffffffffULL);
+        if ((now >> 32) != (ticket >> 32) || i >= (now & 0xffffffffULL)) { break; }
+        // A later run starts only once this part's jobs are counted, so every job of a part
+        // belongs to one run.
+        size = now;
         try {
-            call_(context_, i);
+            job_.call(job_.context, i);
         } catch (...) {
             std::lock_guard lock(failure_mutex_);
             if (!failure_) { failure_ = std::current_exception(); }
         }
-        if (done_.fetch_add(1, std::memory_order_acq_rel) + 1 == (size & 0xffffffffULL)) {
-            finished_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-                            std::memory_order_relaxed);
-            complete_.store(size >> 32, std::memory_order_release);
-        }
-        ticket = ticket_.load(std::memory_order_acquire);
+        ++ran;
+    }
+    if (ran != 0) { finish(size, ran); }
+}
+
+void CpuSpinPool::finish(std::uint64_t size, std::size_t ran) {
+    if (done_.fetch_add(ran, std::memory_order_acq_rel) + ran == (size & 0xffffffffULL)) {
+        complete_.finished.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                 std::memory_order_relaxed);
+        complete_.generation.store(size >> 32, std::memory_order_release);
     }
 }
 
@@ -238,20 +243,21 @@ void CpuSpinPool::work(int cpu) {
     pin_current(cpu);
     std::uint64_t seen = 0;
     for (;;) {
-        if (stop_.load()) { return; }
-        const std::uint64_t generation = ticket_.load(std::memory_order_acquire) >> 32;
+        if (wake_line_.stop.load()) { return; }
+        const std::uint64_t generation = wake_line_.posted.load(std::memory_order_acquire);
         if (generation != seen) {
             seen = generation;
             drain();
             continue;
         }
-        if (spinning_.load(std::memory_order_relaxed)) {
+        if (wake_line_.spinning.load(std::memory_order_relaxed)) {
             spin_hint();
             continue;
         }
         std::unique_lock lock(mutex_);
         wake_.wait(lock, [&] {
-            return stop_.load() || spinning_.load() || (ticket_.load() >> 32) != seen;
+            return wake_line_.stop.load() || wake_line_.spinning.load() ||
+                   wake_line_.posted.load() != seen;
         });
     }
 }

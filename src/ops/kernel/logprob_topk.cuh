@@ -19,13 +19,10 @@
 namespace ninfer::ops {
 
 inline constexpr int kLogprobTopkBlock = 128;
-// Partial CTAs per row: a lone row spreads over the device, several rows share it.
-inline constexpr int kLogprobTopkSplitSingle = 128;
-inline constexpr int kLogprobTopkSplitMulti  = 64;
-
-[[nodiscard]] constexpr int logprob_topk_split(std::int32_t rows) noexcept {
-    return rows == 1 ? kLogprobTopkSplitSingle : kLogprobTopkSplitMulti;
-}
+// Partial CTAs per row, the same for every row count: a row's sum, its log-sum-exp and its
+// logprobs have the same bits whether it is computed alone (one decoding request) or beside others
+// (a verification's columns, several requests' rows).
+inline constexpr int kLogprobTopkSplit = 128;
 
 struct LogprobCandidate {
     float value;

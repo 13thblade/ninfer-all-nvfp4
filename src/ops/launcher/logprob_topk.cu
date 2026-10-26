@@ -11,7 +11,7 @@ namespace ninfer::ops::detail {
 
 std::size_t logprob_topk_workspace_exact_bytes(std::int32_t rows) {
     const std::size_t partials =
-        static_cast<std::size_t>(rows) * static_cast<std::size_t>(logprob_topk_split(rows));
+        static_cast<std::size_t>(rows) * static_cast<std::size_t>(kLogprobTopkSplit);
     return partials * (2 * sizeof(float) + kLogprobTopK * sizeof(LogprobCandidate));
 }
 
@@ -21,7 +21,7 @@ void logprob_topk_launch(const Tensor& logits, const SamplingConfig* configs,
                          DeviceSpan workspace, cudaStream_t stream) {
     const std::int32_t columns = logits.ne[1];
     const std::int32_t rows    = logits.ne[1] * logits.ne[2];
-    const std::int32_t split   = logprob_topk_split(rows);
+    const std::int32_t split   = kLogprobTopkSplit;
     const std::size_t partials = static_cast<std::size_t>(rows) * static_cast<std::size_t>(split);
 
     auto* maxima = static_cast<float*>(workspace.data);

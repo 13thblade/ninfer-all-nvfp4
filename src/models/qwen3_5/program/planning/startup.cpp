@@ -1113,6 +1113,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument("--tensor-parallel does not run a masked drafter");
         }
         break;
+    case SpeculativeBackend::DSpark:
+        throw std::invalid_argument("--spec dspark drafts for DeepSeek-V4.1 only");
     }
     // 12.0 is admitted alongside the qualified capabilities: consumer Blackwell runs the same
     // warp-level mma.sync schedules this family is written against, with the same 100 KiB of shared

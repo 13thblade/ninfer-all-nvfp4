@@ -143,11 +143,12 @@ __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __rest
     const int q      = hidden >> 2, i = threadIdx.x;
     const float* row = x + std::int64_t(blockIdx.x) * hidden;
     const float4 v   = i < q ? ld4(row, i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    const float inv  = rsqrtf(block_sum(dot4(v, v)) / float(hidden) + eps);
-    float4 y         = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    // The weight is loaded before the reduction, whose barriers would hold the load behind it.
+    const float4 wv = i < q && w != nullptr ? ld4(w, i) : make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+    const float inv = rsqrtf(block_sum(dot4(v, v)) / float(hidden) + eps);
+    float4 y        = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (i < q) {
-        const float4 wv = w != nullptr ? ld4(w, i) : make_float4(1.0f, 1.0f, 1.0f, 1.0f);
-        y               = mul4(scale4(v, inv), wv);
+        y = mul4(scale4(v, inv), wv);
         if (out != nullptr) { store_bf16x4(out + std::int64_t(blockIdx.x) * hidden + 4 * i, y); }
     }
     if (q8.qs != nullptr) { store_q8x4(q8, hidden, blockIdx.x, i, y, i < q); }
@@ -824,32 +825,39 @@ __global__ void decode_combine_kernel(DecodeAttentionArgs a) {
     }
 }
 
-// h += rms_norm(o) * w_post; then the FFN inputs of the new h (see AttnResidualArgs).
+// h += rms_norm(o) * w_post; then the FFN inputs of the new h (see AttnResidualArgs). Every
+// operand is loaded before the first reduction: the reductions' barriers would otherwise hold each
+// load behind the reduction before it.
 __global__ void attn_residual_kernel(AttnResidualArgs a) {
     const int q = a.hidden >> 2, i = threadIdx.x;
     const std::int64_t row = std::int64_t(blockIdx.x) * a.hidden;
-    const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    const float4 o    = i < q ? load_bf16x4(a.o + row + 4 * i) : zero;
+    const float4 zero         = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const bool valid          = i < q;
+    const float4 o            = valid ? load_bf16x4(a.o + row + 4 * i) : zero;
+    const float4 h0           = valid ? ld4(a.h + row, i) : zero;
+    const float4 w_post       = valid ? ld4(a.w_post, i) : zero;
+    const float4 ffn_norm     = valid ? ld4(a.ffn_norm, i) : zero;
+    const float4 pre_norm     = valid && a.pre_norm != nullptr ? ld4(a.pre_norm, i) : zero;
+    const float4 router_scale = valid && a.router_x != nullptr ? ld4(a.router_scale, i) : zero;
     const float inv_o = rsqrtf(block_sum(dot4(o, o)) / float(a.hidden) + a.eps);
     float4 h = zero;
-    if (i < q) {
-        h = add4(ld4(a.h + row, i), mul4(scale4(o, inv_o), ld4(a.w_post, i)));
+    if (valid) {
+        h = add4(h0, mul4(scale4(o, inv_o), w_post));
         reinterpret_cast<float4*>(a.h + row)[i] = h;
     }
-    const float inv = rsqrtf(block_sum(dot4(h, h)) / float(a.hidden) + a.eps);
-    const bool valid = i < q;
+    const float inv  = rsqrtf(block_sum(dot4(h, h)) / float(a.hidden) + a.eps);
     const float4 n   = scale4(h, inv);
-    const float4 mlp = valid ? mul4(n, ld4(a.ffn_norm, i)) : zero;
+    const float4 mlp = valid ? mul4(n, ffn_norm) : zero;
     if (valid && a.mlp_in != nullptr) { store_bf16x4(a.mlp_in + row + 4 * i, mlp); }
     if (a.mlp_q.qs != nullptr) { store_q8x4(a.mlp_q, a.hidden, blockIdx.x, i, mlp, valid); }
     if (a.pre_norm != nullptr) {
-        const float4 moe = valid ? mul4(n, ld4(a.pre_norm, i)) : zero;
+        const float4 moe = valid ? mul4(n, pre_norm) : zero;
         if (valid && a.moe_in != nullptr) { store_bf16x4(a.moe_in + row + 4 * i, moe); }
         if (a.moe_q.qs != nullptr) { store_q8x4(a.moe_q, a.hidden, blockIdx.x, i, moe, valid); }
     }
     if (valid && a.router_x != nullptr) {
         reinterpret_cast<float4*>(a.router_x + row)[i] =
-            scale4(mul4(n, ld4(a.router_scale, i)), rsqrtf(float(a.hidden)));
+            scale4(mul4(n, router_scale), rsqrtf(float(a.hidden)));
     }
 }
 
@@ -1065,15 +1073,23 @@ __global__ void geglu_rows_kernel(const float* __restrict__ x, int pairs, int wi
     out[i]               = __float2bfloat16(gelu_tanh(row[r]) * row[width + r]);
 }
 
+// Every operand is loaded before the first reduction, as in attn_residual_kernel.
 __global__ void ffn_combine_kernel(FfnCombineArgs a) {
     const int q = a.hidden >> 2, i = threadIdx.x;
     const std::int64_t row = std::int64_t(blockIdx.x) * a.hidden;
     const float hidden = float(a.hidden);
     const float4 zero  = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 y = i < q ? load_bf16x4(a.dense + row + 4 * i) : zero;
-    const bool moe = a.moe_rows != nullptr || a.moe_fixed != nullptr;
-    float4 m       = zero;
-    if (moe && i < q) {
+    const bool valid   = i < q;
+    float4 y           = valid ? load_bf16x4(a.dense + row + 4 * i) : zero;
+    const bool moe     = a.moe_rows != nullptr || a.moe_fixed != nullptr;
+    const float4 w_dense = valid && a.w_dense != nullptr ? ld4(a.w_dense, i) : zero;
+    const float4 w_moe   = valid && moe ? ld4(a.w_moe, i) : zero;
+    const float4 h0      = valid ? ld4(a.h + row, i) : zero;
+    const float4 w_post  = valid ? ld4(a.w_post, i) : zero;
+    const float4 w_next  = valid && a.next_norm != nullptr ? ld4(a.next_norm, i) : zero;
+    const float scalar   = a.scalar[0];
+    float4 m             = zero;
+    if (moe && valid) {
         if (a.moe_rows != nullptr) {
             for (int k = 0; k < a.top_k; ++k) {
                 const std::int64_t pair = std::int64_t(blockIdx.x) * a.top_k + k;
@@ -1086,22 +1102,22 @@ __global__ void ffn_combine_kernel(FfnCombineArgs a) {
     if (a.w_dense != nullptr || moe) {
         // The dense and expert norms in one reduction.
         const float2 ss = block_sum2(dot4(y, y), dot4(m, m));
-        if (i < q) {
-            if (a.w_dense != nullptr) { y = mul4(scale4(y, rsqrtf(ss.x / hidden + a.eps)), ld4(a.w_dense, i)); }
-            if (moe) { y = add4(y, mul4(scale4(m, rsqrtf(ss.y / hidden + a.eps)), ld4(a.w_moe, i))); }
+        if (valid) {
+            if (a.w_dense != nullptr) { y = mul4(scale4(y, rsqrtf(ss.x / hidden + a.eps)), w_dense); }
+            if (moe) { y = add4(y, mul4(scale4(m, rsqrtf(ss.y / hidden + a.eps)), w_moe)); }
         }
     }
     const float inv_y = rsqrtf(block_sum(dot4(y, y)) / hidden + a.eps);
     float4 h = zero;
-    if (i < q) {
-        h = scale4(add4(ld4(a.h + row, i), mul4(scale4(y, inv_y), ld4(a.w_post, i))), a.scalar[0]);
+    if (valid) {
+        h = scale4(add4(h0, mul4(scale4(y, inv_y), w_post)), scalar);
         reinterpret_cast<float4*>(a.h + row)[i] = h;
     }
     if (a.next_norm == nullptr) { return; }
     const float inv  = rsqrtf(block_sum(dot4(h, h)) / hidden + a.eps);
-    const float4 nxt = i < q ? mul4(scale4(h, inv), ld4(a.next_norm, i)) : zero;
-    if (i < q && a.next_out != nullptr) { store_bf16x4(a.next_out + row + 4 * i, nxt); }
-    if (a.next_q.qs != nullptr) { store_q8x4(a.next_q, a.hidden, blockIdx.x, i, nxt, i < q); }
+    const float4 nxt = valid ? mul4(scale4(h, inv), w_next) : zero;
+    if (valid && a.next_out != nullptr) { store_bf16x4(a.next_out + row + 4 * i, nxt); }
+    if (a.next_q.qs != nullptr) { store_q8x4(a.next_q, a.hidden, blockIdx.x, i, nxt, valid); }
 }
 
 __global__ void add_fixed_kernel(unsigned long long* sums, const unsigned long long* products,

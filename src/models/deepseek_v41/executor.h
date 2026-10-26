@@ -10,8 +10,14 @@
 // from the table's files (or RAM) and copied to the device.
 //
 // With draft_tokens, verify() runs a sequence's next token (its anchor) and up to draft_tokens
-// proposed tokens after it (a context lookup's) as decode rows, and commit() keeps the first ones.
-// Branches (forward_branches) run one after another from a copy of the sequence's state.
+// proposed tokens after it (a context lookup's or the drafter's) as decode rows, and commit() keeps
+// the first ones. Branches (forward_branches) run one after another from a copy of the sequence's
+// state.
+//
+// With the model's DSpark drafter, every pass taps the streams entering the drafter's target
+// blocks for its last rows (a window at most), and those rows seed each sequence's drafter rings
+// (a verification's at commit(), the rows kept). draft() runs the drafter's block after a
+// sequence's anchor at its next positions, from a CUDA graph.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -55,6 +61,11 @@ struct ExecutorOptions {
     // Host or disk experts: the cache's first contents, the most routed of these counts
     // ([expert layer][expert]) once warm-up is done; none leaves the cache empty then.
     std::optional<ExpertRouteCounts> expert_profile;
+    // The share 0..1 of a decode or verification call's missing experts the GPU copies; the CPU
+    // computes the rest (cpu_experts.h). Unset: each call splits its misses by measured CPU and
+    // bus times. CPU threads: 0 for one per physical core.
+    std::optional<float> expert_dma_share;
+    std::uint32_t expert_cpu_threads = 0;
     // The Engram table's rows and how they are read; none runs the model without its Engram (a
     // non-standard mode that degrades the output).
     std::optional<qwen4_exp::NgramTableLayout> engram_table;
@@ -116,6 +127,9 @@ public:
     // The Engram reader's counters, or empty without the Engram.
     [[nodiscard]] std::optional<NgramTableStats> engram_stats() const;
     [[nodiscard]] std::string engram_description() const;
+    // The CPU's share of missing experts (its threads and kernels), or empty when the GPU copies
+    // every miss.
+    [[nodiscard]] std::string expert_cpu_description() const;
     // Prompt tokens one forward() may take: prefill_chunk, or with host or disk experts a span of
     // several chunks (as many as memory allows beside the expert cache), which forward() runs
     // layer by layer so that each block's missing experts cross the bus once for all of them.
@@ -141,6 +155,13 @@ public:
     [[nodiscard]] Tensor logits(std::uint32_t rows) const;
 
     [[nodiscard]] std::uint32_t draft_tokens() const noexcept;
+    // The DSpark drafter's block, the drafts a draft() proposes; 0 without the drafter.
+    [[nodiscard]] std::uint32_t dspark_block() const noexcept;
+    // The drafter's greedy drafts of the dspark_block() positions after the sequence's next token
+    // `anchor` (not yet run), and the confidence of each. The sequence's position and backbone
+    // state do not change.
+    void draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
+               std::span<float> confidence);
     // tokens.size() / sequences.size() tokens of each sequence (its anchor, then its drafts) at its
     // next positions, as decode rows: logits one column each, sequence by sequence. The positions
     // advance only with commit().

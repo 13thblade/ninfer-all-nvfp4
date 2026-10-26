@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/scripts/**'
       - '.github/workflows/build-workflow-checks.yml'
+      - '.github/workflows/build-cache-retention.yml'
       - '.github/workflows/native-windows.yml'
       - '.github/workflows/native-linux.yml'
       - '.github/workflows/linux-cache-bootstrap.yml'

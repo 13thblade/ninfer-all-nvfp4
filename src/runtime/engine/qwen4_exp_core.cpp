@@ -111,7 +111,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     const SpeculativeOptions& speculative = options.speculative;
     if (speculative.backend == SpeculativeBackend::DFlash ||
-        speculative.backend == SpeculativeBackend::DFlash2) {
+        speculative.backend == SpeculativeBackend::DFlash2 ||
+        speculative.backend == SpeculativeBackend::DSpark) {
         throw std::invalid_argument(
             "Qwen3.8-Flash-Next drafts with its MTP block only (--spec mtp)");
     }

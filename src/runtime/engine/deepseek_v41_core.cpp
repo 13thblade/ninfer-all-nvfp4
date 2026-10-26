@@ -54,6 +54,10 @@ double seconds(Clock::time_point from, Clock::time_point to) {
     return std::chrono::duration<double>(to - from).count();
 }
 
+// A DSpark round verifies the drafts while each one's confidence is at least this (Strata's
+// default for the release's drafter).
+constexpr float kDSparkConfidenceFloor = 0.5F;
+
 bool request_error(const std::exception_ptr& error) {
     try {
         std::rethrow_exception(error);
@@ -92,12 +96,16 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     if (options.enable_vision) {
         throw std::invalid_argument("DeepSeek-V4.1: the GGUF release carries no vision tower");
     }
-    // The GGUF release carries no DSpark draft blocks: a speculative round verifies what a context
-    // lookup proposes.
+    // A speculative round verifies what the release's DSpark drafter proposes (--spec dspark, an
+    // artifact converted with it) or what a context lookup does (--lookup-ngram).
     const SpeculativeOptions& speculative = options.speculative;
-    if (speculative.backend != SpeculativeBackend::None) {
-        throw std::invalid_argument("DeepSeek-V4.1 drafts by context lookup only (--lookup-ngram, "
-                                    "without --spec): the GGUF release has no DSpark blocks");
+    const bool dspark = speculative.backend == SpeculativeBackend::DSpark;
+    if (speculative.backend != SpeculativeBackend::None && !dspark) {
+        throw std::invalid_argument("DeepSeek-V4.1 drafts with its DSpark drafter (--spec dspark) or "
+                                    "by context lookup (--lookup-ngram, without --spec)");
+    }
+    if (dspark && speculative.lookup_ngram != 0) {
+        throw std::invalid_argument("DeepSeek-V4.1: --spec dspark and --lookup-ngram exclude each other");
     }
     const std::uint32_t lookup_drafts =
         speculative.lookup_ngram == 0 ? 0
@@ -125,15 +133,11 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         throw std::invalid_argument("DeepSeek-V4.1 has no mapped misses, tail skip, prefill buffers "
                                     "or adaptive expert cache (Qwen3.8-Flash-Next options)");
     }
-    if (hybrid.dma_share || hybrid.cpu_threads != 0) {
-        throw std::invalid_argument("DeepSeek-V4.1 copies every missing expert to the GPU: its "
-                                    "IQ1_S, IQ1_M and IQ2 expert blocks have no CPU kernels "
-                                    "(--expert-dma-share, --expert-cpu-threads)");
-    }
     if (options.expert_residency == ExpertResidency::Device &&
-        (!hybrid.routing_profile.empty() || !hybrid.record_profile.empty())) {
-        throw std::invalid_argument("routing profiles require host or disk experts "
-                                    "(--expert-residency host|disk)");
+        (hybrid.dma_share || hybrid.cpu_threads != 0 || !hybrid.routing_profile.empty() ||
+         !hybrid.record_profile.empty())) {
+        throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
+                                    "host or disk experts (--expert-residency host|disk)");
     }
     if (device.size() != 1 || options.tensor_parallel) {
         throw std::invalid_argument("DeepSeek-V4.1 runs on one device");
@@ -166,6 +170,10 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     }
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     const artifact::Reader reader(options.artifact_path);
+    if (dspark && !models::deepseek_v41::has_dspark(reader)) {
+        throw std::invalid_argument("DeepSeek-V4.1: --spec dspark needs an artifact converted with "
+                                    "the DSpark drafter (--components text,dspark)");
+    }
     // The Engram table is located before anything loads, so a model without it fails at once.
     std::optional<models::qwen4_exp::NgramTableLayout> engram;
     if (!table.disabled) {
@@ -178,8 +186,19 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     install_device_route_profile_for(options, device);
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
     auto model = models::deepseek_v41::load_model(
-        reader, {.artifact = options.artifact_path, .experts = options.expert_residency}, device,
-        &options.startup_observer);
+        reader, {.artifact = options.artifact_path, .experts = options.expert_residency, .dspark = dspark},
+        device, &options.startup_observer);
+    // The drafter proposes its block's drafts a round, or fewer with --draft-tokens.
+    std::uint32_t drafts = lookup_drafts;
+    if (dspark) {
+        const std::uint32_t block = model->dspark_config()->block_size;
+        drafts = speculative.draft_tokens != 0 ? speculative.draft_tokens : block;
+        if (drafts > std::min<std::uint32_t>(block, 7)) {
+            throw std::invalid_argument("DeepSeek-V4.1: --spec dspark verifies 1 to " +
+                                        std::to_string(std::min<std::uint32_t>(block, 7)) +
+                                        " drafts a round (--draft-tokens), the drafter's block");
+        }
+    }
     device.synchronize();
     materialize.complete();
     const auto free_bytes = [&] {
@@ -206,8 +225,10 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     executor.max_context        = options.max_context + 1;
     executor.sequences          = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
     executor.cuda_graphs        = options.use_cuda_graph;
-    executor.draft_tokens       = lookup_drafts;
+    executor.draft_tokens       = drafts;
     executor.expert_cache_bytes = options.expert_cache_bytes;
+    executor.expert_dma_share   = hybrid.dma_share;
+    executor.expert_cpu_threads = hybrid.cpu_threads;
     executor.engram_table       = std::move(engram);
     executor.engram_read        = {.residency    = table.residency,
                                    .io           = table.io,
@@ -308,8 +329,14 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
             double(experts.cache_bytes) / 1048576, experts.cache_slots, experts.banks,
             double(experts.bank_bytes) / 1048576, double(experts.metadata_bytes) / 1048576,
             double(experts.pinned_bytes) / 1048576, double(model->expert_pinned_bytes()) / 1048576);
+        const auto cpu = instance->executor->expert_cpu_description();
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-            "DeepSeek-V4.1: missing experts copied to the GPU; cache seeded %s",
+            "DeepSeek-V4.1: missing experts %s; cache seeded %s",
+            cpu.empty() ? (options.expert_residency == ExpertResidency::Disk && !hybrid.dma_share
+                               ? "copied to the GPU (disk experts: a CPU share needs --expert-dma-share)"
+                               : "copied to the GPU")
+                        : ("split between copies and " + cpu + (hybrid.dma_share
+                               ? " (fixed share)" : " (by measured speeds)")).c_str(),
             executor.expert_profile ? (hybrid.routing_profile.empty() ? "from the built-in profile"
                                                                       : "from --expert-profile")
                                     : "by the first requests");
@@ -320,6 +347,13 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                            "DeepSeek-V4.1: context-lookup speculative decoding, %u-token match, up "
                            "to %u drafts a round",
                            speculative.lookup_ngram, lookup_drafts);
+    }
+    if (dspark) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "DeepSeek-V4.1: DSpark speculative decoding, up to %u drafts a round "
+                           "while their confidence is at least %.2f, one decoding request at a "
+                           "time",
+                           drafts, double(kDSparkConfidenceFloor));
     }
     ConstructedDeepSeekV41 out;
     const auto& stats         = model->storage_stats();
@@ -434,7 +468,7 @@ struct DeepSeekV41Core::Request {
     std::vector<TokenId> generated;
     std::optional<GenerationBudget> budget;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
-    SpeculativeStats speculative; // an Engine with --lookup-ngram only
+    SpeculativeStats speculative; // an Engine with --spec dspark or --lookup-ngram
 };
 
 struct DeepSeekV41Core::Impl {
@@ -466,8 +500,9 @@ struct DeepSeekV41Core::Impl {
     const std::uint32_t domain;
     const bool structured_output;
     const bool reuse_prefixes;
-    const std::uint32_t drafts;       // a lookup's drafts a round; 0 without speculation
+    const std::uint32_t drafts;       // a round's drafts at most; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
+    const std::uint32_t dspark_block; // --spec dspark: the drafter's block; 0 is off
     const DiagnosticObserver diagnostics;
     static constexpr TokenId kBos = 0; // <｜begin▁of▁sentence｜>
 
@@ -545,7 +580,8 @@ struct DeepSeekV41Core::Impl {
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
           reuse_prefixes(i.executor->options().checkpoints), drafts(i.executor->draft_tokens()),
-          lookup_ngram(options.speculative.lookup_ngram), diagnostics(options.diagnostic_observer),
+          lookup_ngram(options.speculative.lookup_ngram), dspark_block(i.executor->dspark_block()),
+          diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(
               options.decode_rounds_per_prefill != 0
@@ -1097,6 +1133,7 @@ struct DeepSeekV41Core::Impl {
             r.speculative.enabled      = true;
             r.speculative.draft_window = drafts;
             r.speculative.accepted_per_position.assign(drafts, 0);
+            if (dspark_block != 0) { r.speculative.backend = SpeculativeBackend::DSpark; }
         }
         r.prefill_start        = Clock::now();
         r.progress             = r.prefill_start;
@@ -1767,7 +1804,9 @@ struct DeepSeekV41Core::Impl {
     // its own experts, so the rows a round adds cost more as requests join; Gemma 4's measurement of
     // this on an RTX 3090 (two requests gain with one draft each and lose with three, four lose with
     // one) sets the same bounds here.
+    // The drafter drafts for one request at a time.
     [[nodiscard]] std::uint32_t round_drafts(std::size_t decoding) const noexcept {
+        if (dspark_block != 0) { return decoding == 1 ? drafts : 0U; }
         return decoding == 1 ? drafts : decoding <= 3 ? 1U : 0U;
     }
 
@@ -1780,6 +1819,23 @@ struct DeepSeekV41Core::Impl {
         const std::uint32_t found = runtime::lookup_draft(ledger, lookup_ngram, steps, out);
         ledger.pop_back();
         return found;
+    }
+
+    // The drafter's drafts after the request's anchor while their confidence holds (the floor
+    // Strata's DSpark rounds use), at most `steps`; or a context lookup's. The count proposed.
+    std::uint32_t propose(const Request& r, std::uint32_t steps, TokenId* out) {
+        if (dspark_block == 0) { return lookup(r, steps, out); }
+        if (r.position + dspark_block > max_context) { return 0; }
+        std::vector<std::int32_t> drafted(dspark_block);
+        std::vector<float> confidence(dspark_block);
+        instance.executor->draft(r.slot, r.feed.front(), drafted, confidence);
+        std::uint32_t kept = 0;
+        while (kept < steps && confidence[kept] >= kDSparkConfidenceFloor &&
+               drafted[kept] >= 0 && std::uint32_t(drafted[kept]) < domain) {
+            out[kept] = drafted[kept];
+            ++kept;
+        }
+        return kept;
     }
 
     // One step of every decoding request. Those whose context proposes a continuation run one
@@ -1813,7 +1869,7 @@ struct DeepSeekV41Core::Impl {
             }
             if (steps > 0 && speculates(*request)) {
                 std::vector<TokenId> proposal(steps);
-                if (const std::uint32_t found = lookup(*request, steps, proposal.data())) {
+                if (const std::uint32_t found = propose(*request, steps, proposal.data())) {
                     proposal.resize(found);
                     proposals.push_back(std::move(proposal));
                     speculative.push_back(request);
@@ -2162,10 +2218,12 @@ struct DeepSeekV41Core::Impl {
             r.speculative.rounds += 1;
             r.speculative.drafted_tokens += draft_extents[j];
             r.speculative.accepted_tokens += std::uint32_t(drafts_n);
-            // Reported with the n-gram proposals as well: the context, not a model, proposed them.
-            ++r.speculative.ngram_rounds;
-            r.speculative.ngram_drafted_tokens += draft_extents[j];
-            r.speculative.ngram_accepted_tokens += std::uint32_t(drafts_n);
+            if (dspark_block == 0) {
+                // Reported with the n-gram proposals as well: the context, not a model, proposed them.
+                ++r.speculative.ngram_rounds;
+                r.speculative.ngram_drafted_tokens += draft_extents[j];
+                r.speculative.ngram_accepted_tokens += std::uint32_t(drafts_n);
+            }
             for (std::int32_t i = 0; i < drafts_n; ++i) {
                 ++r.speculative.accepted_per_position[i];
             }

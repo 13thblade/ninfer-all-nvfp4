@@ -73,7 +73,7 @@ means the card calibrates once at its first start.
 | ⬜ | RTX 5060 Ti | 16 / 8 GB | GeForce | ✓ | |
 | ⬜ | RTX 5060 | 8 GB | GeForce | | |
 | ⬜ | RTX 5050 | 8 GB | GeForce | | |
-| ✅ | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | Workstation | ✓ | Bonsai 2, Qwen3.8-27B, Flash-Next, DeepSeek-V4.1-Flash (experts in host memory, on disk) |
+| ✅ | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | Workstation | ✓ | Bonsai 2, Qwen3.8-27B, Flash-Next, DeepSeek-V4.1-Flash (experts in host memory, on disk; DSpark drafts) |
 | ⬜ | RTX PRO 6000 Blackwell Max-Q | 96 GB | Workstation | ✓ | |
 | ⬜ | RTX PRO 5000 Blackwell | 72 / 48 GB | Workstation | 48 GB | |
 | ⬜ | RTX PRO 4500 Blackwell | 32 GB | Workstation | ✓ | |

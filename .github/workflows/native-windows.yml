@@ -38,7 +38,6 @@ jobs:
     timeout-minutes: 350
     env:
       HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
-      HF_BUILD_CACHE_SEED_REF: ${{ vars.HF_BUILD_CACHE_SEED_REF }}
       HF_HUB_DISABLE_TELEMETRY: '1'
       NINFER_VERSION: ${{ inputs.version }}
       HF_CACHE_FAMILY: native-windows-cuda-${{ inputs.cuda }}-host-v2${{ inputs.phase == 'objects' && format('-shard-{0}', inputs.shard) || '' }}
@@ -111,9 +110,10 @@ jobs:
         id: object-cache
         timeout-minutes: 30
         run: |
-          $fallback = @('--fallback-family', 'native-windows-cuda-${{ inputs.cuda }}')
+          # A shard without its own snapshot starts from the aggregate of all shards.
+          $fallback = @()
           if ('${{ inputs.phase }}' -eq 'objects') {
-            $fallback = @('--fallback-family', 'native-windows-cuda-${{ inputs.cuda }}-host-v2') + $fallback
+            $fallback = @('--fallback-family', 'native-windows-cuda-${{ inputs.cuda }}-host-v2')
           }
           python .github/scripts/hf-build-cache.py restore --directory .cache/objects --family $env:HF_CACHE_FAMILY @fallback
           if ($LASTEXITCODE -ne 0) { throw 'Object cache restore failed' }
@@ -151,7 +151,6 @@ jobs:
           python .github/scripts/hf-build-cache.py restore
           --directory ~/AppData/Local/vcpkg/archives
           --family vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}-${{ inputs.cuda }}
-          --legacy-prefix windows-release-vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}
       - name: Configure with real FFmpeg and curl libraries
         id: configure
         env:

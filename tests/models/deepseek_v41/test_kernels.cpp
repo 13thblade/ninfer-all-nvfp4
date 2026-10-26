@@ -18,18 +18,31 @@
 //    fewer selectable positions or blocks than chosen, and rows over several 1024-value chunks.
 //  - sparse_attention over the window rings and the selected latents: window-only blocks, one to
 //    40 splits (empty ones among them), a round's rows of one sequence, a chunk's staging ring,
-//    1024 latents, sinks far below and above the scores; attention_output.
+//    1024 latents, sinks far below and above the scores; attention_output in both layouts.
+//  - the grouped output projection of one to eight tokens as one vector product over the groups:
+//    every value the bits of its group's own vector product (Q5_K).
 //  - route (ties to the lower id, the softplus branch past 20), clamped_swiglu (the clamps, rows
 //    scaled per token), moe_combine (weighted rows and 2^-32 fixed-point sums).
 //  - engram_rows (IQ4_NL), engram_gate.
-//  - guard_columns and unscale_columns, ring_copy, f32_to_bf16.
+//  - guard_columns (in one call and in calls of six columns) and unscale_columns, ring_copy,
+//    f32_to_bf16.
+//  - the DSpark drafter's: sparse_attention of a draft block (the window and the block's own
+//    rows), stream_mean, markov_step (a chain, ties, the domain) and dspark_confidence.
+//  - the routed experts of a call on the CPU (CpuExperts) against the GPU's vector kernels over
+//    IQ1_S, IQ1_M, IQ2_XXS and IQ2_S banks: the same 2^-32 fixed-point sums bit for bit, all on
+//    the CPU and half on each (add_fixed).
 // A rounded output (BF16, fp8, fp4) is compared with the oracle's rounding of its exact value. The
 // two may differ where the FP32 arithmetic lands on the other side of a rounding boundary: rarely,
 // and by at most one or two steps of the format there. Values that pass through without arithmetic
 // before an exact rounding must match exactly.
 
 #include "core/arena.h"
+#include "core/weight.h"
+#include "models/deepseek_v41/cpu_experts.h"
 #include "models/deepseek_v41/kernels.h"
+#include "ops/linear/gguf/ggml_bridge.h"
+#include "ops/linear/gguf/gguf_linear.h"
+#include "ops/moe_experts/gguf_expert_cpu.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -52,7 +65,9 @@
 namespace {
 
 using namespace ninfer;
-namespace k = ninfer::models::deepseek_v41::kernels;
+namespace k    = ninfer::models::deepseek_v41::kernels;
+namespace md   = ninfer::models::deepseek_v41;
+namespace gguf = ninfer::ops::gguf;
 using bf16  = __nv_bfloat16;
 
 constexpr int kHidden = 5120, kStreams = 4, kLatent = 512, kRope = 64, kIndex = 128;
@@ -1046,6 +1061,7 @@ struct AttentionCase {
         {}; // empty: a chunk, one staging ring and the latents of `sequence`
     int sequence = 0, ring = kRing, topk = 0, ratio = 2, splits = 1;
     float sink_offset = 0.0f;
+    int window = kWindow; // a draft block's rows see the window and the block
 };
 
 void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
@@ -1089,7 +1105,7 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
     a.window                = as<bf16>(dw);
     a.window_seq_stride     = chunk ? 0 : std::int64_t(c.ring) * kLatent;
     a.ring                  = c.ring;
-    a.window_size           = kWindow;
+    a.window_size           = c.window;
     a.compressed            = c.topk > 0 ? as<bf16>(dc) : nullptr;
     a.compressed_seq_stride = std::int64_t(rows) * kLatent;
     a.topk                  = as<std::int32_t>(dt);
@@ -1106,7 +1122,7 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
     for (int r = 0; r < t; ++r) {
         const int p  = c.positions[std::size_t(r)];
         const int s  = chunk ? c.sequence : c.sequences[std::size_t(r)];
-        const int lo = std::max(0, p - kWindow + 1);
+        const int lo = std::max(0, p - c.window + 1);
         std::vector<const bf16*> keys;
         for (int j = lo; j <= p; ++j) {
             keys.push_back(window.data() +
@@ -1150,7 +1166,126 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
                             " splits: rms " + num(rms));
 }
 
-void attention_output(std::mt19937& rng) {
+// The DSpark drafter's kernels: the taps' stream means into one target's columns, the Markov
+// steps' argmax (a chain of two, ties to the lower token, nothing past the domain), and the
+// confidence head.
+void drafter(std::mt19937& rng) {
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    {
+        const int t = 5, targets = 3, j = 1;
+        std::vector<float> h(std::size_t(t) * kStreams * kHidden);
+        for (auto& v : h) { v = 4.0f * normal(rng); }
+        DeviceBuffer dh = upload(h), out(std::size_t(t) * targets * kHidden * 4);
+        out.fill(0xFF);
+        k::stream_mean(as<float>(dh), t, kStreams, kHidden, as<float>(out) + j * kHidden,
+                       std::int64_t(targets) * kHidden, nullptr);
+        sync("stream_mean");
+        const auto got = download<float>(out, std::size_t(t) * targets * kHidden);
+        double worst = 0.0;
+        bool kept    = true;
+        for (int r = 0; r < t; ++r) {
+            for (int c = 0; c < targets; ++c) {
+                for (int i = 0; i < kHidden; ++i) {
+                    const float g = got[(std::size_t(r) * targets + c) * kHidden + i];
+                    if (c != j) {
+                        kept = kept && std::isnan(g);
+                        continue;
+                    }
+                    // FP32 sums carry an error of a few steps of the summands' magnitude, not of
+                    // their (possibly cancelling) mean.
+                    double want = 0.0, scale = 0.0;
+                    for (int s = 0; s < kStreams; ++s) {
+                        const double v = h[(std::size_t(r) * kStreams + s) * kHidden + i];
+                        want += v;
+                        scale += std::fabs(v);
+                    }
+                    want /= kStreams;
+                    scale /= kStreams;
+                    worse(worst, std::fabs(g - want) / (scale + 1e-30));
+                }
+            }
+        }
+        report(worst <= 1e-6 && kept, "stream_mean: worst " + num(worst) +
+                                          (kept ? "" : ", other columns written"));
+    }
+    constexpr int kRank = k::kMarkovRank;
+    const int vocab = 20000, domain = 19000;
+    const auto head  = random_bf16(std::size_t(vocab) * kRank, 0.05f, rng);
+    const auto embed = random_bf16(std::size_t(vocab) * kRank, 1.0f, rng);
+    {
+        std::vector<float> logits(2 * std::size_t(vocab));
+        for (auto& v : logits) { v = 3.0f * normal(rng); }
+        // Row 1: two equal leaders (same logit and head row) and a higher one past the domain.
+        auto tied = head;
+        float* second = logits.data() + vocab;
+        const int a = 777, b = 15000;
+        std::copy_n(tied.begin() + std::ptrdiff_t(a) * kRank, kRank, tied.begin() + std::ptrdiff_t(b) * kRank);
+        second[a] = second[b] = 60.0f;
+        second[domain + 5]    = 90.0f;
+        const auto value = [&](const float* row, int prev, int v) {
+            double dot = 0.0;
+            for (int r = 0; r < kRank; ++r) {
+                dot += double(val(tied[std::size_t(v) * kRank + r])) * val(embed[std::size_t(prev) * kRank + r]);
+            }
+            return double(row[v]) + dot;
+        };
+        DeviceBuffer dl = upload(logits), dh = upload(tied), de = upload(embed),
+                     ids = upload(std::vector<std::int32_t>{4242, -1, -1}),
+                     scratch(k::markov_scratch_bytes());
+        k::markov_step(as<float>(dl), as<bf16>(dh), as<bf16>(de), domain, as<std::int32_t>(ids), 0,
+                       scratch.p, nullptr);
+        k::markov_step(as<float>(dl) + vocab, as<bf16>(dh), as<bf16>(de), domain,
+                       as<std::int32_t>(ids), 1, scratch.p, nullptr);
+        sync("markov_step");
+        const auto got = download<std::int32_t>(ids, 3);
+        // Step 0 against the oracle's best: the same token, or one within FP32's reach of it.
+        int best = 0;
+        for (int v = 1; v < domain; ++v) {
+            if (value(logits.data(), 4242, v) > value(logits.data(), 4242, best)) { best = v; }
+        }
+        const bool first = got[1] == best || (got[1] >= 0 && got[1] < domain &&
+                                               value(logits.data(), 4242, best) -
+                                                       value(logits.data(), 4242, got[1]) <= 1e-4);
+        report(first && got[2] == a, "markov_step: chain " + std::to_string(got[1]) + " (oracle " +
+                                         std::to_string(best) + "), then " + std::to_string(got[2]) +
+                                         " (the lower of two equal leaders, " + std::to_string(a) + ")");
+    }
+    {
+        const int t = 5;
+        std::vector<float> h(std::size_t(t) * kStreams * kHidden), pre(std::size_t(t) * kStreams),
+            w(std::size_t(kHidden) + kRank);
+        for (auto& v : h) { v = 2.0f * normal(rng); }
+        for (auto& v : pre) { v = std::fabs(normal(rng)); }
+        for (auto& v : w) { v = 0.01f * normal(rng); }
+        const std::vector<std::int32_t> prev = {4242, 3, 19999, 0, 777};
+        DeviceBuffer dh = upload(h), dp = upload(pre), dw = upload(w), de = upload(embed),
+                     di = upload(prev), out(std::size_t(t) * 4);
+        k::dspark_confidence(as<float>(dh), as<float>(dp), t, kStreams, kHidden, as<float>(dw),
+                             as<bf16>(de), as<std::int32_t>(di), as<float>(out), nullptr);
+        sync("dspark_confidence");
+        const auto got = download<float>(out, t);
+        double worst   = 0.0;
+        for (int r = 0; r < t; ++r) {
+            double z = 0.0;
+            for (int i = 0; i < kHidden; ++i) {
+                double x = 0.0;
+                for (int s = 0; s < kStreams; ++s) {
+                    x += double(pre[std::size_t(r) * kStreams + s]) *
+                         h[(std::size_t(r) * kStreams + s) * kHidden + i];
+                }
+                z += x * w[std::size_t(i)];
+            }
+            for (int q = 0; q < kRank; ++q) {
+                z += double(val(embed[std::size_t(prev[std::size_t(r)]) * kRank + q])) * w[kHidden + q];
+            }
+            worse(worst, std::fabs(got[std::size_t(r)] - 1.0 / (1.0 + std::exp(-z))));
+        }
+        report(worst <= 1e-5, "dspark_confidence: worst " + num(worst));
+    }
+}
+
+// Group-major (out[g][t][heads / groups * 512]) and token-major (out[t][heads * 512]) layouts.
+void attention_output(bool token_major, std::mt19937& rng) {
     const std::vector<int> positions = {0, 7, 300, 77777};
     const int t                      = int(positions.size());
     const int per                    = kHeads / kGroups;
@@ -1160,7 +1295,7 @@ void attention_output(std::mt19937& rng) {
                  out(std::size_t(t) * kHeads * kLatent * 2);
     out.fill(0xFF);
     k::attention_output(as<bf16>(d), t, kHeads, kGroups, as<std::int32_t>(dp), as<float>(df),
-                        as<bf16>(out), nullptr);
+                        token_major, as<bf16>(out), nullptr);
     sync("attention_output");
     const auto got = download<bf16>(out, o.size());
     Tally plain, turned;
@@ -1176,7 +1311,8 @@ void attention_output(std::mt19937& rng) {
                 fp8_round(v.data() + 32 * g, step.data() + 32 * g);
             }
             const std::size_t at =
-                (std::size_t(h / per) * t + r) * per * kLatent + std::size_t(h % per) * kLatent;
+                token_major ? (std::size_t(r) * kHeads + h) * kLatent
+                            : (std::size_t(h / per) * t + r) * per * kLatent + std::size_t(h % per) * kLatent;
             for (int i = 0; i < kLatent; ++i) {
                 (i < kLatent - kRope ? plain : turned)
                     .add(val(got[at + i]), v[std::size_t(i)], step[std::size_t(i)]);
@@ -1184,7 +1320,8 @@ void attention_output(std::mt19937& rng) {
         }
     }
     report(plain.off == 0 && turned.within(1e-3, 2.0),
-           "attention_output: unturned " + plain.str() + ", turned " + turned.str());
+           std::string("attention_output ") + (token_major ? "token-major" : "group-major") +
+               ": unturned " + plain.str() + ", turned " + turned.str());
 }
 
 // ---- Routing and experts ------------------------------------------------------------------------
@@ -1456,9 +1593,26 @@ void column_guard(std::mt19937& rng) {
     }
     DeviceBuffer dx = upload(x), ds(std::size_t(columns) * 4);
     k::guard_columns(as<bf16>(dx), rows, columns, as<float>(ds), nullptr);
+    // The same columns in calls of at most six, as decode and verification calls guard theirs
+    // (one wide block per column): the same scales and values.
+    constexpr int narrow = 6;
+    DeviceBuffer nx = upload(x), ns(std::size_t(columns) * 4);
+    for (int c = 0; c < columns; c += narrow) {
+        k::guard_columns(as<bf16>(nx) + std::size_t(c) * rows, rows, std::min(narrow, columns - c),
+                         as<float>(ns) + c, nullptr);
+    }
     sync("guard_columns");
-    const auto got    = download<bf16>(dx, x.size());
-    const auto scale  = download<float>(ds, std::size_t(columns));
+    const auto got          = download<bf16>(dx, x.size());
+    const auto scale        = download<float>(ds, std::size_t(columns));
+    const auto narrow_got   = download<bf16>(nx, x.size());
+    const auto narrow_scale = download<float>(ns, std::size_t(columns));
+    std::size_t narrow_differ = 0;
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        narrow_differ += std::memcmp(&got[i], &narrow_got[i], sizeof(bf16)) != 0 ? 1 : 0;
+    }
+    for (int c = 0; c < columns; ++c) {
+        narrow_differ += scale[std::size_t(c)] != narrow_scale[std::size_t(c)] ? 1 : 0;
+    }
     std::size_t wrong = 0, scaled = 0, judged = 0;
     double after = 0.0;
     for (int c = 0; c < columns; ++c) {
@@ -1500,11 +1654,13 @@ void column_guard(std::mt19937& rng) {
             unscaled_wrong += val(back16[at]) != val(out16[at]) * s ? 1 : 0;
         }
     }
-    report(wrong == 0 && unscaled_wrong == 0 && scaled >= 4 && judged + 2 >= std::size_t(columns) &&
-               after <= double(k::kF16SumLimit),
+    report(wrong == 0 && unscaled_wrong == 0 && narrow_differ == 0 && scaled >= 4 &&
+               judged + 2 >= std::size_t(columns) && after <= double(k::kF16SumLimit),
            "guard_columns " + std::to_string(scaled) + " of " + std::to_string(judged) +
                " judged columns scaled, " + std::to_string(wrong) + " wrong, largest sum after " +
-               num(after) + "; unscale_columns " + std::to_string(unscaled_wrong) + " wrong");
+               num(after) + ", calls of " + std::to_string(narrow) + " columns " +
+               std::to_string(narrow_differ) + " differ; unscale_columns " +
+               std::to_string(unscaled_wrong) + " wrong");
 }
 
 void copies(std::mt19937& rng) {
@@ -1564,6 +1720,266 @@ void copies(std::mt19937& rng) {
     report(converted_wrong == 0, "f32_to_bf16: " + std::to_string(converted_wrong) + " wrong");
 }
 
+// ---- Routed experts on the CPU ------------------------------------------------------------------
+
+// Random blocks of an expert type, their binary16 multipliers finite.
+std::vector<std::uint8_t> expert_blocks(QType q, int rows, int depth, std::mt19937& rng) {
+    const auto block = gguf_block_shape(q);
+    std::vector<std::uint8_t> bytes(std::size_t(rows) * (depth / block.elements) * block.bytes);
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_real_distribution<float> scale(0.002f, 0.02f);
+    for (auto& b : bytes) { b = static_cast<std::uint8_t>(byte(rng)); }
+    for (std::size_t at = 0; at < bytes.size(); at += block.bytes) {
+        const __half h = __float2half(scale(rng));
+        std::uint16_t d = 0;
+        std::memcpy(&d, &h, 2);
+        if (q != QType::GGUF_IQ1_M) {
+            std::memcpy(&bytes[at], &d, 2);
+            continue;
+        }
+        // IQ1_M keeps its multiplier's four nibbles in the top of its four scale words.
+        for (int j = 0; j < 4; ++j) {
+            std::uint16_t w = 0;
+            std::memcpy(&w, &bytes[at + 48 + 2 * j], 2);
+            w = static_cast<std::uint16_t>((w & 0x0FFF) | (((d >> (4 * j)) & 0xF) << 12));
+            std::memcpy(&bytes[at + 48 + 2 * j], &w, 2);
+        }
+    }
+    return bytes;
+}
+
+// The grouped output projection of a decode or verification call as the executor runs it: the
+// groups the experts of one vector product over the token-major activation, group g of token j
+// pair j * groups + g. Each pair's rows must be the bits of its group's own vector product.
+void grouped_output(int tokens, std::mt19937& rng) {
+    constexpr int groups = kGroups, rows = 96, depth = 1024;
+    const auto block       = gguf_block_shape(QType::GGUF_Q5_K);
+    const std::int64_t row = std::int64_t(depth / block.elements) * block.bytes;
+    auto weight            = expert_blocks(QType::GGUF_Q5_K, groups * rows, depth, rng);
+    for (std::size_t at = 0; at < weight.size(); at += block.bytes) { // a finite minimum's factor
+        std::memcpy(&weight[at + 2], &weight[at], 2);
+    }
+    const int pairs        = tokens * groups;
+    const auto x           = random_bf16(std::size_t(pairs) * depth, 1.0f, rng);
+    DeviceBuffer d_w = upload(weight), d_x = upload(x);
+    std::vector<const void*> parts(groups);
+    for (int g = 0; g < groups; ++g) {
+        parts[std::size_t(g)] = static_cast<const std::uint8_t*>(d_w.p) + std::int64_t(g) * rows * row;
+    }
+    std::vector<std::int32_t> words;
+    for (int g = 0; g <= groups; ++g) { words.push_back(g * tokens); }
+    for (int g = 0; g < groups; ++g) {
+        for (int j = 0; j < tokens; ++j) { words.push_back(j * groups + g); }
+    }
+    for (int g = 0; g < groups; ++g) { words.push_back(g); }
+    words.push_back(groups);
+    DeviceBuffer d_parts = upload(parts), d_words = upload(words);
+    gguf::MoeRouting routing;
+    routing.bounds       = as<std::int32_t>(d_words);
+    routing.sorted       = routing.bounds + groups + 1;
+    routing.active       = routing.sorted + pairs;
+    routing.active_count = routing.active + groups;
+    DeviceBuffer d_act(gguf::vector_activation_bytes(depth, pairs));
+    gguf::quantize_vector_activation(as<bf16>(d_x), depth, pairs, nullptr, d_act.p, nullptr);
+    DeviceBuffer grouped(std::size_t(pairs) * rows * 4);
+    gguf::MoeOutput out;
+    out.f32         = as<float>(grouped);
+    const int chunk = tokens <= 1 ? 1 : tokens <= 2 ? 2 : tokens <= 4 ? 4 : 8;
+    gguf::moe_vector_product(gguf::GgmlType::Q5_K,
+                             {static_cast<const void* const*>(d_parts.p), row, rows, depth},
+                             routing, groups, 1, 1, d_act.p, pairs, out, chunk, nullptr);
+    // Each group alone: its tokens' columns gathered, as the per-group products read them.
+    std::vector<bf16> xg(std::size_t(tokens) * depth);
+    DeviceBuffer d_xg(xg.size() * 2), d_gact(gguf::vector_activation_bytes(depth, tokens)),
+        single(std::size_t(tokens) * rows * 4);
+    std::size_t differ = 0;
+    const auto got = download<float>(grouped, std::size_t(pairs) * rows);
+    for (int g = 0; g < groups; ++g) {
+        for (int j = 0; j < tokens; ++j) {
+            std::copy_n(x.begin() + (std::int64_t(j) * groups + g) * depth, depth,
+                        xg.begin() + std::int64_t(j) * depth);
+        }
+        d_xg.copy_from_host(xg.data(), xg.size() * 2);
+        gguf::quantize_vector_activation(as<bf16>(d_xg), depth, tokens, nullptr, d_gact.p, nullptr);
+        gguf::VectorOutput one;
+        one.f32           = as<float>(single);
+        one.column_stride = rows;
+        gguf::vector_product(gguf::GgmlType::Q5_K, parts[std::size_t(g)], row, rows, depth,
+                             d_gact.p, tokens, one, nullptr);
+        const auto want = download<float>(single, std::size_t(tokens) * rows);
+        for (int j = 0; j < tokens; ++j) {
+            for (int r = 0; r < rows; ++r) {
+                const float a = got[(std::size_t(j) * groups + g) * rows + r];
+                const float b = want[std::size_t(j) * rows + r];
+                differ += std::memcmp(&a, &b, 4) != 0 ? 1 : 0;
+            }
+        }
+    }
+    report(differ == 0, "grouped output, " + std::to_string(tokens) + " token(s): " +
+                            std::to_string(differ) + " values differ from the groups' own products");
+}
+
+// A call's routed experts as the executor runs them on the GPU (the vector kernels over the
+// guarded input's q8_1 activation, the clamped SwiGLU, the middle's activation, the weighted down
+// rows) and on the CPU from the inputs ExpertDelivery copies (CpuExperts): their 2^-32 fixed-point
+// sums must be the same bits, with every expert on the CPU and with the GPU's experts of a half
+// added to the CPU's of the other.
+void cpu_experts(const char* name, QType gate_up_type, QType down_type, int tokens,
+                 std::mt19937& rng) {
+    constexpr int distinct = 3, pool_size = 14;
+    constexpr float limit  = 10.0f;
+    const int pairs        = tokens * kTopK;
+    const auto gu_block = gguf_block_shape(gate_up_type), down_block = gguf_block_shape(down_type);
+    const std::int64_t gu_row   = std::int64_t(kHidden / gu_block.elements) * gu_block.bytes;
+    const std::int64_t down_row = std::int64_t(kWidth / down_block.elements) * down_block.bytes;
+    std::vector<std::vector<std::uint8_t>> gate_up, down;
+    std::vector<DeviceBuffer> banks;
+    for (int i = 0; i < distinct; ++i) {
+        gate_up.push_back(expert_blocks(gate_up_type, 2 * kWidth, kHidden, rng));
+        down.push_back(expert_blocks(down_type, kHidden, kWidth, rng));
+        banks.push_back(upload(gate_up.back()));
+        banks.push_back(upload(down.back()));
+    }
+    // Expert e's matrices are bank e % distinct's: [gate; up] pointers, then down.
+    std::vector<const void*> table(2 * std::size_t(kExperts));
+    for (int e = 0; e < kExperts; ++e) {
+        table[std::size_t(e)]            = banks[2 * std::size_t(e % distinct)].p;
+        table[std::size_t(kExperts + e)] = banks[2 * std::size_t(e % distinct) + 1].p;
+    }
+    DeviceBuffer d_table = upload(table);
+    const auto* tables   = static_cast<const void* const*>(d_table.p);
+    const gguf::MoeTable gu_table{tables, gu_row, 2 * kWidth, kHidden};
+    const gguf::MoeTable down_table{tables + kExperts, down_row, kHidden, kWidth};
+
+    // The last token large enough that the guard scales it.
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<bf16> x(std::size_t(tokens) * kHidden);
+    for (int t = 0; t < tokens; ++t) {
+        const float magnitude = t == tokens - 1 && tokens > 1 ? 3e4f : 1.0f;
+        for (int i = 0; i < kHidden; ++i) {
+            x[std::size_t(t) * kHidden + i] = __float2bfloat16(magnitude * normal(rng));
+        }
+    }
+    // Each token's six experts from a small pool, so that tokens share experts.
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(pairs));
+    std::vector<float> weights(ids.size());
+    std::uniform_real_distribution<float> unit(0.05f, 2.5f);
+    std::vector<int> pool(pool_size);
+    std::iota(pool.begin(), pool.end(), 37);
+    for (int t = 0; t < tokens; ++t) {
+        std::shuffle(pool.begin(), pool.end(), rng);
+        for (int j = 0; j < kTopK; ++j) {
+            ids[std::size_t(t) * kTopK + j]     = pool[std::size_t(j)];
+            weights[std::size_t(t) * kTopK + j] = unit(rng);
+        }
+    }
+    DeviceBuffer d_x = upload(x), d_scale(std::size_t(tokens) * 4), d_ids = upload(ids),
+                 d_w = upload(weights);
+    k::guard_columns(as<bf16>(d_x), kHidden, tokens, as<float>(d_scale), nullptr);
+    DeviceBuffer d_xq(gguf::vector_activation_bytes(kHidden, tokens));
+    gguf::quantize_vector_activation(as<bf16>(d_x), kHidden, tokens, nullptr, d_xq.p, nullptr);
+    DeviceBuffer d_routing(gguf::moe_routing_bytes(kExperts, pairs));
+    const gguf::MoeRouting routing =
+        gguf::moe_sort_routes(as<std::int32_t>(d_ids), pairs, kExperts, d_routing.p, nullptr);
+
+    const std::size_t sums = std::size_t(tokens) * kHidden;
+    DeviceBuffer d_gu(std::size_t(pairs) * 2 * kWidth * 4), d_middle(std::size_t(pairs) * kWidth * 2),
+        d_act(gguf::vector_activation_bytes(kWidth, pairs)), d_fixed(sums * 8);
+    const int chunk = tokens <= 1 ? 1 : tokens <= 2 ? 2 : tokens <= 4 ? 4 : 8;
+    const auto gpu  = [&](const gguf::MoeRouting& part) {
+        check(cudaMemset(d_fixed.p, 0, sums * 8), "zero the sums");
+        check(cudaMemset(d_gu.p, 0, std::size_t(pairs) * 2 * kWidth * 4), "zero the rows");
+        gguf::MoeOutput rows;
+        rows.f32 = as<float>(d_gu);
+        gguf::MoeOutput out;
+        out.weighted = as<unsigned long long>(d_fixed);
+        out.weights  = as<float>(d_w);
+        const int max_active = std::min(pairs, kExperts);
+        gguf::moe_vector_product(ops::detail::gguf_type(gate_up_type), gu_table, part, max_active,
+                                 kTopK, kTopK, d_xq.p, tokens, rows, chunk, nullptr);
+        k::clamped_swiglu(as<float>(d_gu), 2 * kWidth, pairs, kWidth, limit, as<float>(d_scale),
+                          kTopK, as<bf16>(d_middle), kWidth, nullptr);
+        gguf::quantize_vector_activation(as<bf16>(d_middle), kWidth, pairs, nullptr, d_act.p,
+                                         nullptr);
+        gguf::moe_vector_product(ops::detail::gguf_type(down_type), down_table, part, max_active, 1,
+                                 kTopK, d_act.p, pairs, out, chunk, nullptr);
+    };
+    gpu(routing);
+    sync("routed experts");
+    const auto whole = download<unsigned long long>(d_fixed, sums);
+
+    md::CpuExperts cpu({md::CpuExpertLayer{gate_up_type, down_type, gu_row, down_row}}, kHidden,
+                       kWidth, kTopK, limit);
+    std::vector<std::byte> inputs(cpu.input_bytes()), products(cpu.product_bytes());
+    d_xq.copy_to_host(inputs.data(), cpu.activation_bytes(tokens));
+    d_w.copy_to_host(inputs.data() + cpu.activation_bytes(tokens), cpu.weight_bytes(tokens));
+    d_scale.copy_to_host(inputs.data() + cpu.activation_bytes(tokens) + cpu.weight_bytes(tokens),
+                         md::CpuExperts::scale_bytes(tokens));
+    std::size_t done_bytes = 0;
+    const auto on_cpu      = [&](const std::vector<std::int32_t>& experts) {
+        std::vector<std::vector<const std::byte*>> blobs;
+        for (const std::int32_t e : experts) {
+            const auto b = std::size_t(e % distinct);
+            blobs.push_back({reinterpret_cast<const std::byte*>(gate_up[b].data()),
+                             reinterpret_cast<const std::byte*>(down[b].data())});
+        }
+        ExpertCpuProducts::Work work;
+        work.experts  = experts;
+        work.blobs    = blobs;
+        work.ids      = ids;
+        work.inputs   = inputs.data();
+        work.products = products.data();
+        done_bytes    = cpu.compute(work).bytes;
+        std::vector<unsigned long long> out(sums);
+        std::memcpy(out.data(), products.data(), sums * 8);
+        return out;
+    };
+    std::vector<std::int32_t> active(ids.begin(), ids.end()), even, odd;
+    std::sort(active.begin(), active.end());
+    active.erase(std::unique(active.begin(), active.end()), active.end());
+    for (const std::int32_t e : active) { (e % 2 == 0 ? even : odd).push_back(e); }
+    const auto all_cpu = on_cpu(active);
+    std::size_t wrong = 0, zero = 0;
+    for (std::size_t i = 0; i < sums; ++i) {
+        wrong += all_cpu[i] != whole[i] ? 1 : 0;
+        zero += whole[i] == 0 ? 1 : 0;
+    }
+    // The even experts on the GPU (an active set as a stage of the call passes it), the odd ones
+    // on the CPU, their sums added unless the flag is zero.
+    std::vector<std::int32_t> set{std::int32_t(even.size())};
+    set.insert(set.end(), even.begin(), even.end());
+    DeviceBuffer d_set = upload(set), d_products = upload(on_cpu(odd));
+    gguf::MoeRouting part = routing;
+    part.active_count     = as<std::int32_t>(d_set);
+    part.active           = as<std::int32_t>(d_set) + 1;
+    gpu(part);
+    sync("the even experts");
+    const auto gpu_half = download<unsigned long long>(d_fixed, sums);
+    const std::int32_t off = 0, on = 1;
+    DeviceBuffer d_off = upload(std::vector<std::int32_t>{off}),
+                 d_on  = upload(std::vector<std::int32_t>{on});
+    k::add_fixed(as<unsigned long long>(d_fixed), d_products.p, as<std::int32_t>(d_off),
+                 std::int64_t(sums), nullptr);
+    sync("add_fixed off");
+    const auto unchanged = download<unsigned long long>(d_fixed, sums);
+    k::add_fixed(as<unsigned long long>(d_fixed), d_products.p, as<std::int32_t>(d_on),
+                 std::int64_t(sums), nullptr);
+    sync("add_fixed");
+    const auto split    = download<unsigned long long>(d_fixed, sums);
+    std::size_t split_wrong = 0, moved = 0;
+    for (std::size_t i = 0; i < sums; ++i) {
+        split_wrong += split[i] != whole[i] || unchanged[i] != gpu_half[i] ? 1 : 0;
+        moved += gpu_half[i] != whole[i] ? 1 : 0;
+    }
+    report(wrong == 0 && split_wrong == 0 && zero * 100 < sums && moved * 2 > sums &&
+               done_bytes == sums * 8 && !even.empty() && !odd.empty(),
+           std::string("CPU experts ") + name + " T=" + std::to_string(tokens) + " (" +
+               ops::gguf_cpu_backend_name(ops::GgufCpuBackend::Automatic) + "): " +
+               std::to_string(active.size()) + " experts, " + std::to_string(wrong) +
+               " sums differ all on the CPU, " + std::to_string(split_wrong) + " split, " +
+               std::to_string(zero) + " zero");
+}
+
 std::vector<int> range(int first, int count) {
     std::vector<int> v(static_cast<std::size_t>(count));
     std::iota(v.begin(), v.end(), first);
@@ -1585,6 +2001,10 @@ int main() {
         for (const int rows : {1, 3, 8, 9}) { gemm(24, rows, kStreams * kHidden, rng); }
         gemm(512, 40, kHidden, rng);
         gemm(7, 5, 130, rng);
+        {
+            std::mt19937 own(5200); // a tail past the loads ahead, beside the other inputs
+            gemm(24, 2, 5200, own);
+        }
 
         hyper_connections(3, 20, rng);
         hyper_connections(1, 1, rng);
@@ -1652,7 +2072,18 @@ int main() {
         sparse_attention({"1024 latents, empty splits", {9000}, {0}, 0, kRing, 1024, 2, 40}, rng);
         sparse_attention({"sinks far below", {5000, 77}, {0, 1}, 0, kRing, 512, 2, 4, -40.0f}, rng);
         sparse_attention({"sinks above", {5000, 77}, {0, 1}, 0, kRing, 512, 2, 1, 8.0f}, rng);
-        attention_output(rng);
+        sparse_attention(
+            {"a draft block", {304, 304, 304, 304, 304}, {1, 1, 1, 1, 1}, 0, kRing, 0, 2, 3, 0.0f, 133},
+            rng);
+        sparse_attention({"a draft block at the start", {6, 6, 6, 6, 6}, {0, 0, 0, 0, 0}, 0, kRing, 0,
+                          2, 1, 0.0f, 133},
+                         rng);
+        attention_output(false, rng);
+        attention_output(true, rng);
+        grouped_output(1, rng);
+        grouped_output(3, rng);
+        grouped_output(8, rng);
+        drafter(rng);
 
         route(1, false, rng);
         route(40, false, rng);
@@ -1667,6 +2098,11 @@ int main() {
 
         column_guard(rng);
         copies(rng);
+
+        cpu_experts("IQ1_S/IQ1_M", QType::GGUF_IQ1_S, QType::GGUF_IQ1_M, 1, rng);
+        cpu_experts("IQ2_XXS/IQ1_S", QType::GGUF_IQ2_XXS, QType::GGUF_IQ1_S, 3, rng);
+        cpu_experts("IQ1_M/IQ2_S", QType::GGUF_IQ1_M, QType::GGUF_IQ2_S, 8, rng);
+        cpu_experts("IQ2_S/IQ2_XXS", QType::GGUF_IQ2_S, QType::GGUF_IQ2_XXS, 5, rng);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " DeepSeek-V4.1 kernels\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

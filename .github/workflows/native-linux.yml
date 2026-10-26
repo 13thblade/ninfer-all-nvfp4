@@ -40,7 +40,6 @@ jobs:
       run:
         shell: bash
     env:
-      HF_BUILD_CACHE_SEED_REF: ${{ vars.HF_BUILD_CACHE_SEED_REF }}
       HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
       HF_HUB_DISABLE_TELEMETRY: '1'
       NINFER_VERSION: ${{ inputs.version }}
@@ -81,7 +80,7 @@ jobs:
         run: python3.11 -m pip install --disable-pip-version-check huggingface_hub==1.17.0
       - name: Restore completed objects from HF
         id: object-cache
-        run: python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --family native-linux-cuda-${{ inputs.cuda }}-shared-v1 --fallback-family native-linux-cuda-${{ inputs.cuda }}-host-v2 --fallback-family native-linux-cuda-${{ inputs.cuda }}
+        run: python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --family native-linux-cuda-${{ inputs.cuda }}-shared-v1
       - name: Verify object-cache reuse and CUDA invalidation
         timeout-minutes: 10
         run: python3.11 .github/scripts/check-compiler-cache.py

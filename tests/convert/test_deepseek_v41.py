@@ -9,7 +9,7 @@ import pytest
 from tools.convert import deepseek_v41
 from tools.convert.sources.gguf import TYPE_BF16, TYPE_F32, GGUFFile, write_gguf
 
-TYPE_Q8_0, TYPE_Q5_K, TYPE_IQ4_NL, TYPE_I32, TYPE_I64 = 8, 13, 20, 26, 27
+TYPE_Q8_0, TYPE_Q5_K, TYPE_IQ4_NL, TYPE_I32, TYPE_I64, TYPE_MXFP4 = 8, 13, 20, 26, 27, 39
 
 HIDDEN, VOCAB, HEADS, HEAD_DIM, ROPE = 256, 512, 2, 64, 16
 Q_RANK, O_RANK, GROUPS = 64, 32, 2
@@ -20,6 +20,8 @@ ENGRAM_LAYERS, NGRAM, ENGRAM_HEADS, ENGRAM_DIM = [0], 3, 2, 32
 PRIMES = [5, 7, 11, 13]
 ENGRAM_ROWS = sum(PRIMES)
 COMPRESSED_VOCAB = 100
+# The drafter: one block over the streams entering blocks 1 and 2, two experts, one a token.
+DRAFT_TARGETS, DRAFT_EXPERTS, DRAFT_RANK, NOISE = [1, 2], 2, 16, 5
 
 
 def _hf_config(**overrides):
@@ -41,7 +43,10 @@ def _hf_config(**overrides):
         hc_sinkhorn_iters=20, hc_eps=1e-6, engram_layer_ids=ENGRAM_LAYERS,
         engram_num_embeddings=[ENGRAM_ROWS], engram_max_ngram_size=NGRAM,
         engram_n_heads=ENGRAM_HEADS, engram_head_dim=ENGRAM_DIM, engram_pad_token_id=2,
-        engram_compressed_vocab_size=COMPRESSED_VOCAB)
+        engram_compressed_vocab_size=COMPRESSED_VOCAB, num_nextn_predict_layers=1,
+        dspark_block_size=3, dspark_noise_token_id=NOISE, dspark_target_layer_ids=DRAFT_TARGETS,
+        dspark_markov_rank=DRAFT_RANK, dspark_n_routed_experts=DRAFT_EXPERTS,
+        dspark_num_experts_per_tok=1)
     text.update(overrides)
     return {"architectures": ["DeepseekV41ForCausalLM"], "model_type": "deepseek_v41",
             "bos_token_id": 0, "eos_token_id": 1, "text_config": text}
@@ -192,7 +197,89 @@ def _release(tmp_path, kv=None, offsets=None):
     return hf, first, table, stored
 
 
-def _convert(tmp_path, hf, first, table, components=("text", "engram")):
+def _drafter_kv(**overrides):
+    f = "dflash."
+    kv = {
+        "general.architecture": "dflash", f + "block_count": 1, f + "embedding_length": HIDDEN,
+        f + "attention.head_count": HEADS, f + "attention.head_count_kv": 1,
+        f + "attention.key_length": HEAD_DIM, f + "attention.value_length": HEAD_DIM,
+        f + "rope.dimension_count": ROPE, f + "rope.freq_base": 10000.0,
+        f + "attention.layer_norm_rms_epsilon": 1e-20, f + "attention.q_lora_rank": Q_RANK,
+        f + "attention.sliding_window": 8, f + "expert_count": DRAFT_EXPERTS,
+        f + "expert_used_count": 1, f + "expert_feed_forward_length": WIDTH,
+        f + "expert_shared_count": 1, f + "expert_weights_scale": 1.5,
+        f + "expert_weights_norm": True, f + "expert_gating_func": 4,
+        f + "swiglu_clamp_exp": [10.0], f + "swiglu_clamp_shexp": [10.0],
+        f + "attention.output_group_count": GROUPS, f + "attention.output_lora_rank": O_RANK,
+        f + "attention.compress_ratios": [0], f + "hyper_connection.count": HC,
+        f + "hyper_connection.sinkhorn_iterations": 20, f + "hyper_connection.epsilon": 1e-6,
+        f + "hyper_connection.single_pass": True, f + "block_size": 3,
+        f + "target_layers": DRAFT_TARGETS, f + "sample_from_anchor": True,
+        f + "has_confidence_head": True,
+    }
+    kv.update(overrides)
+    return kv
+
+
+def _drafter(tmp_path, kv=None):
+    """A one-block DSpark drafter GGUF (dflash) with MXFP4 experts."""
+
+    generator = np.random.default_rng(23)
+    tensors, stored = [], {}
+
+    def put(name, shape, kind, data):
+        tensors.append((name, shape, kind, data.tobytes()))
+        stored[name] = data
+
+    def q8(name, rows, columns):
+        put(name, (rows, columns), TYPE_Q8_0, _blocks(generator, rows, columns, 32, 34))
+
+    def vector(name, shape, kind=TYPE_F32):
+        values = generator.normal(size=shape).astype(np.float32)
+        if kind == TYPE_BF16:
+            words = (values.view(np.uint32) >> 16).astype(np.uint16)
+            tensors.append((name, shape, kind, words.tobytes()))
+            stored[name] = (words.astype(np.uint32) << 16).view(np.float32)
+        else:
+            put(name, shape, kind, values)
+
+    q8("fc.weight", HIDDEN, len(DRAFT_TARGETS) * HIDDEN)
+    vector("enc.output_norm.weight", (HIDDEN,))
+    vector("output_norm.weight", (HIDDEN,))
+    vector("markov_w1.weight", (VOCAB, DRAFT_RANK), TYPE_BF16)
+    vector("markov_w2.weight", (VOCAB, DRAFT_RANK), TYPE_BF16)
+    vector("conf_proj.weight", (1, HIDDEN + DRAFT_RANK))
+    mixes = (2 + HC) * HC
+    g = "blk.0."
+    for site in ("attn", "ffn"):
+        vector(g + f"hc_{site}_fn.weight", (mixes, HC * HIDDEN))
+        vector(g + f"hc_{site}_base.weight", (mixes,))
+        vector(g + f"hc_{site}_scale.weight", (3,))
+    vector(g + "attn_norm.weight", (HIDDEN,))
+    vector(g + "ffn_norm.weight", (HIDDEN,))
+    q8(g + "attn_q_a.weight", Q_RANK, HIDDEN)
+    q8(g + "attn_kv.weight", HEAD_DIM, HIDDEN)
+    vector(g + "attn_q_a_norm.weight", (Q_RANK,))
+    vector(g + "attn_kv_a_norm.weight", (HEAD_DIM,))
+    q8(g + "attn_q_b.weight", HEADS * HEAD_DIM, Q_RANK)
+    q8(g + "attn_output_a.weight", GROUPS * O_RANK, HEADS * HEAD_DIM // GROUPS)
+    q8(g + "attn_output_b.weight", HIDDEN, GROUPS * O_RANK)
+    vector(g + "attn_sinks.weight", (HEADS,))
+    vector(g + "ffn_gate_inp.weight", (DRAFT_EXPERTS, HIDDEN))
+    vector(g + "exp_probs_b.bias", (DRAFT_EXPERTS,))
+    for bank, rows, k in (("gate", WIDTH, HIDDEN), ("up", WIDTH, HIDDEN), ("down", HIDDEN, WIDTH)):
+        blocks = generator.integers(0, 256, size=(DRAFT_EXPERTS * rows, k // 32 * 17),
+                                    dtype=np.uint8)
+        put(g + f"ffn_{bank}_exps.weight", (DRAFT_EXPERTS, rows, k), TYPE_MXFP4, blocks)
+    q8(g + "ffn_gate_shexp.weight", WIDTH, HIDDEN)
+    q8(g + "ffn_up_shexp.weight", WIDTH, HIDDEN)
+    q8(g + "ffn_down_shexp.weight", HIDDEN, WIDTH)
+    path = tmp_path / "dspark.gguf"
+    write_gguf(path, kv or _drafter_kv(), tensors)
+    return path, stored
+
+
+def _convert(tmp_path, hf, first, table, components=("text", "engram"), drafter=None):
     from tools.convert.pipeline import convert
     from tools.convert.recipe import Recipe
     from tools.convert.sources.safetensors import SafetensorsSource
@@ -200,13 +287,16 @@ def _convert(tmp_path, hf, first, table, components=("text", "engram")):
     output = tmp_path / ("-".join(components) + ".ninfer")
     with SafetensorsSource(hf) as base, GGUFFile(table) as engram:
         gguf = deepseek_v41.GGUFShards(first) if "text" in components else None
-        model = deepseek_v41.build_model(base, gguf, components=components)
+        dspark = deepseek_v41.GGUFShards(drafter) if drafter else None
+        model = deepseek_v41.build_model(base, gguf, components=components, dspark=dspark)
         recipe = Recipe(model)
-        sources = {"base": base, "engram": engram} | ({"gguf": gguf} if gguf else {})
+        sources = ({"base": base, "engram": engram} | ({"gguf": gguf} if gguf else {})
+                   | ({"dspark": dspark} if dspark else {}))
         deepseek_v41.deepseek_v41_gguf(model, recipe, sources)
         convert(model, recipe, output, device="cpu", rows_per_chunk=96)
-        if gguf is not None:
-            gguf.__exit__()
+        for source in (gguf, dspark):
+            if source is not None:
+                source.__exit__()
     return output
 
 
@@ -325,3 +415,58 @@ def test_the_model_and_its_table_convert_apart(tmp_path):
         assert set(directory.bindings) == {"engram/table"}
         assert "text" not in directory.components
         assert directory.components["engram"]["config"]["table_sha256"] == digest
+
+
+def test_the_drafter_keeps_its_blocks(tmp_path):
+    from tools.artifact.reader import Artifact
+
+    hf, first, table, _ = _release(tmp_path)
+    drafter, stored = _drafter(tmp_path)
+    output = _convert(tmp_path, hf, first, table, ("text", "engram", "dspark"), drafter)
+    with Artifact(output) as artifact:
+        directory = artifact.directory
+        config = directory.components["dspark"]["config"]
+        assert config == {"architectures": ["DeepseekV41DSpark"],
+                          "model_type": "deepseek_v41_dspark", "num_hidden_layers": 1,
+                          "block_size": 3, "markov_rank": DRAFT_RANK,
+                          "n_routed_experts": DRAFT_EXPERTS, "num_experts_per_tok": 1,
+                          "noise_token_id": NOISE, "target_layer_ids": DRAFT_TARGETS}
+        bindings = directory.bindings
+
+        def stored_bytes(name):
+            return artifact.read_object(bindings[name]["object"])
+
+        assert stored_bytes("dspark/fc") == stored["fc.weight"].tobytes()
+        # The MXFP4 experts as stored, each expert's gate rows then its up rows.
+        gate, up = stored["blk.0.ffn_gate_exps.weight"], stored["blk.0.ffn_up_exps.weight"]
+        expected = np.concatenate([np.concatenate([gate[e * WIDTH:(e + 1) * WIDTH],
+                                                   up[e * WIDTH:(e + 1) * WIDTH]])
+                                   for e in range(DRAFT_EXPERTS)])
+        assert stored_bytes("dspark/layers/0/moe/gate_up") == expected.tobytes()
+        assert stored_bytes("dspark/layers/0/moe/down") == \
+            stored["blk.0.ffn_down_exps.weight"].tobytes()
+        assert artifact.by_id[bindings["dspark/layers/0/moe/down"]["object"]].format == "gguf_mxfp4"
+        # The Markov tables stay BF16, exactly; the confidence head is FP32.
+        embed = np.frombuffer(stored_bytes("dspark/markov_embed"), dtype=np.uint16)
+        assert np.array_equal((embed.astype(np.uint32) << 16).view(np.float32),
+                              stored["markov_w1.weight"].reshape(-1))
+        assert np.array_equal(np.frombuffer(stored_bytes("dspark/confidence"), dtype=np.float32),
+                              stored["conf_proj.weight"].reshape(-1))
+
+
+@pytest.mark.parametrize("bad", [
+    {"dflash.target_layers": [0, 2]},
+    {"dflash.expert_used_count": 2},
+    {"dflash.hyper_connection.single_pass": False},
+    {"dflash.attention.compress_ratios": [2]},
+])
+def test_the_drafter_metadata_must_match_the_config(tmp_path, bad):
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    hf, first, _, _ = _release(tmp_path)
+    drafter, _ = _drafter(tmp_path, _drafter_kv(**bad))
+    with SafetensorsSource(hf) as base, deepseek_v41.GGUFShards(first) as gguf, \
+            deepseek_v41.GGUFShards(drafter) as dspark:
+        with pytest.raises(ValueError):
+            deepseek_v41.build_model(base, gguf, components=("text", "engram", "dspark"),
+                                     dspark=dspark)

@@ -4,6 +4,7 @@
 #include "core/growable_region.h"
 #include "core/vmm.h"
 #include "core/weight_view.h"
+#include "models/deepseek_v41/cpu_experts.h"
 #include "models/deepseek_v41/kernels.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/weight_input.h"
@@ -50,6 +51,14 @@ const float* fp32(const Model& model, WeightId id, std::int64_t count) {
         throw std::invalid_argument(model.weight(id).name + " must be stored as fp32");
     }
     return static_cast<const float*>(tensor.data);
+}
+
+const __nv_bfloat16* bf16_table(const Model& model, WeightId id, std::int64_t rows, std::int64_t columns) {
+    const Tensor tensor = weight_tensor(model.weight(id).view, {std::int32_t(columns), std::int32_t(rows)});
+    if (tensor.dtype != DType::BF16) {
+        throw std::invalid_argument(model.weight(id).name + " must be stored as bf16");
+    }
+    return static_cast<const __nv_bfloat16*>(tensor.data);
 }
 
 Weight matrix(const Model& model, WeightId id) {
@@ -137,11 +146,13 @@ struct Site {
 
 struct LayerPlan {
     int ratio = 0;
+    int experts = 0, top_k = 0; // the block's routed experts and how many a row takes
     bool kv_source = false, index_source = false, candidate_source = false, uses_candidates = false;
     int kv_from = -1; // the kv source whose caches the block reads
     Site hc_attention, hc_ffn;
     std::vector<Weight> query_kv; // [query_a; kv] as one parent, or the two
     Weight query_b, output_a, output_b, shared_down;
+    DeviceBuffer output_groups; // output_a's row groups: the experts of the grouped decode product
     std::vector<Weight> shared_gate_up;
     const float *attention_norm = nullptr, *ffn_norm = nullptr, *query_norm = nullptr,
                 *kv_norm = nullptr, *sinks = nullptr, *freq = nullptr;
@@ -184,6 +195,12 @@ struct Pass {
     std::uint32_t sequence = 0, first = 0;
     // The rows whose logits the pass keeps (the last ones), and the logit column of the first.
     int logit_rows = 0, logit_column = 0;
+    // With the drafter: whether the pass's tapped rows seed its rings now (a verification's wait for
+    // commit()). A draft block's rows attend as if at `visible` (each the block's last position) over
+    // `extra_window` keys past the window.
+    bool seed = true;
+    const std::int32_t* visible = nullptr;
+    int extra_window = 0;
 };
 
 } // namespace
@@ -207,12 +224,17 @@ struct Executor::Impl {
     std::atomic<std::uint64_t> kv_backed{0};
     std::uint64_t kv_fixed = 0, kv_bytes = 0;
     std::vector<LayerPlan> layers;
+    // The CPU's share of missing experts; it outlives the delivery that calls it.
+    std::unique_ptr<CpuExperts> cpu_experts;
     std::unique_ptr<ExpertDelivery> delivery;
     mutable std::mutex expert_stats_mutex;
     ExpertDeliveryStats expert_startup_stats;
     Weight embedding, head;
     const float* final_norm = nullptr;
     DeviceBuffer freq_window, freq_compressed;
+    // The grouped output projection's routing for each decode width t (group_routing(t)).
+    DeviceBuffer group_routes;
+    std::vector<std::size_t> group_routes_at;
     std::vector<std::uint32_t> positions;
     DeviceBuffer d_tokens, d_positions, d_sequences;
     std::unique_ptr<PinnedHostBuffer> h_staging;
@@ -246,7 +268,29 @@ struct Executor::Impl {
     std::vector<std::uint64_t> engram_scratch;
     // One sequence's rings and tails, the state a branch pass returns to.
     DeviceBuffer branch_state;
-    std::vector<int> decode_splits; // by decode rows
+    // Decode attention splits: one count for every row count, so a row sums its keys in the same
+    // order however many rows its pass decodes (a verified draft's values are plain decoding's).
+    int decode_splits = 1;
+    // The DSpark drafter (Model::dspark()): its blocks (each with every sequence's window ring),
+    // the backbone blocks it taps (target_of: a block's index among the targets, -1 for none), the
+    // taps of a pass's last rows ([window][targets][hidden] FP32, the streams' mean entering each
+    // target), the seed's kv rows of each block, and a draft's buffers: the anchor and the drafts,
+    // their confidences and the Markov steps' scratch on the device, the drafts and confidences in
+    // pinned memory.
+    struct Drafter {
+        std::vector<LayerPlan> layers;
+        std::vector<int> target_of;
+        int targets = 0, block = 0, domain = 0;
+        std::int32_t noise = 0;
+        Weight fc;
+        std::vector<Weight> kv;
+        const float *tap_norm = nullptr, *final_norm = nullptr, *confidence = nullptr;
+        const __nv_bfloat16 *markov_embed = nullptr, *markov_head = nullptr;
+        DeviceBuffer taps, ids, values, scratch;
+        std::unique_ptr<PinnedHostBuffer> host;
+        std::unique_ptr<CudaCompletionEvent> copied;
+    };
+    std::optional<Drafter> drafter;
 
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(std::move(o)), config(m.config()),
@@ -296,6 +340,22 @@ struct Executor::Impl {
             freq_window.copy_from_host(window_freq.data(), window_freq.size() * 4);
             freq_compressed.copy_from_host(yarn_freq.data(), yarn_freq.size() * 4);
         }
+        {
+            // Per width t: bounds, sorted pairs, active groups and their count (see group_routing).
+            std::vector<std::int32_t> words;
+            group_routes_at.assign(std::size_t(gguf::kMaxVectorColumns) + 1, 0);
+            for (int t = 1; t <= gguf::kMaxVectorColumns; ++t) {
+                group_routes_at[std::size_t(t)] = words.size();
+                for (int g = 0; g <= groups; ++g) { words.push_back(g * t); }
+                for (int g = 0; g < groups; ++g) {
+                    for (int j = 0; j < t; ++j) { words.push_back(j * groups + g); }
+                }
+                for (int g = 0; g < groups; ++g) { words.push_back(g); }
+                words.push_back(groups);
+            }
+            group_routes = DeviceBuffer(words.size() * sizeof(std::int32_t));
+            group_routes.copy_from_host(words.data(), words.size() * sizeof(std::int32_t));
+        }
         const int sequences = int(options.sequences);
         {
             // The caches are sized up front for every sequence's whole context: refuse with the
@@ -307,6 +367,11 @@ struct Executor::Impl {
                     const std::size_t rows = options.max_context / config.compress_ratios[i];
                     needed += std::size_t(sequences) * rows * (kLatent + kIndexDim) * 2;
                 }
+            }
+            if (model.dspark()) {
+                needed += model.dspark()->layers.size() * (options.checkpoints ? 2 : 1) *
+                              std::size_t(sequences) * kRing * kLatent * 2 +
+                          std::size_t(window) * model.dspark_config()->target_layers.size() * hidden * 4;
             }
             needed += std::size_t(prefill_ring) * kLatent * 2;
             std::size_t free_bytes = 0, total_bytes = 0;
@@ -327,8 +392,7 @@ struct Executor::Impl {
         std::size_t branch_bytes     = 0;
         for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
             const LayerWeights& lw = w.layers[i];
-            LayerPlan p;
-            p.ratio            = int(config.compress_ratios[i]);
+            LayerPlan p = plan_block(lw, int(config.compress_ratios[i]), experts, top_k);
             p.kv_source        = config.kv_source[i];
             p.index_source     = config.index_source[i];
             p.candidate_source = config.candidate_source == int(i);
@@ -338,23 +402,7 @@ struct Executor::Impl {
             if (p.ratio > 0 && (p.kv_from < 0 || config.index_source_of(i) < 0)) {
                 throw std::invalid_argument("DeepSeek-V4.1: a compressed block before its sources");
             }
-            const std::int64_t mixes = config.hc_mixes(), flat = std::int64_t(streams) * hidden;
-            p.hc_attention = {fp32(model, lw.hc_attention.fn, mixes * flat),
-                              fp32(model, lw.hc_attention.base, mixes),
-                              fp32(model, lw.hc_attention.scale, 3)};
-            p.hc_ffn       = {fp32(model, lw.hc_ffn.fn, mixes * flat), fp32(model, lw.hc_ffn.base, mixes),
-                              fp32(model, lw.hc_ffn.scale, 3)};
-            const auto& at   = lw.attention;
-            p.query_kv       = matrices(model, {at.query_a, at.kv});
-            p.query_b        = matrix(model, at.query_b);
-            p.output_a       = matrix(model, at.output_a);
-            p.output_b       = matrix(model, at.output_b);
-            p.attention_norm = fp32(model, lw.attention_norm, hidden);
-            p.ffn_norm       = fp32(model, lw.ffn_norm, hidden);
-            p.query_norm     = fp32(model, at.query_a_norm, query_rank);
-            p.kv_norm        = fp32(model, at.kv_norm, kLatent);
-            p.sinks          = fp32(model, at.sinks, heads);
-            p.freq = static_cast<const float*>(p.ratio > 0 ? freq_compressed.p : freq_window.p);
+            const auto& at = lw.attention;
             if (p.kv_source) {
                 p.compressor_kv = fp32(model, *at.compressor_kv, std::int64_t(kLatent) * hidden);
                 if (p.ratio > 1) {
@@ -369,30 +417,8 @@ struct Executor::Impl {
                                        std::int64_t(index_heads) * kIndexDim * query_rank);
                 p.index_weights = fp32(model, *at.index_weights, std::int64_t(index_heads) * hidden);
             }
-            const MoeWeights& mw = lw.moe;
-            p.router           = fp32(model, mw.router, std::int64_t(experts) * hidden);
-            p.router_bias      = fp32(model, mw.router_bias, experts);
-            p.shared_gate_up   = matrices(model, {mw.shared_gate, mw.shared_up});
-            p.shared_down      = matrix(model, mw.shared_down);
             if (model.expert_residency() == ExpertResidency::Device) {
-                const Weight gate_up = matrix(model, *mw.gate_up);
-                const Weight down    = matrix(model, *mw.down);
-                p.gate_up_type       = ops::detail::gguf_type(gate_up.qtype);
-                p.down_type          = ops::detail::gguf_type(down.qtype);
-                p.gate_up_row_bytes  = row_bytes(gate_up);
-                p.down_row_bytes     = row_bytes(down);
-                std::vector<const void*> table(4 * std::size_t(experts));
-                for (int x = 0; x < experts; ++x) {
-                    const auto* gu = static_cast<const std::byte*>(gate_up.qdata) +
-                                     std::int64_t(x) * 2 * width * p.gate_up_row_bytes;
-                    table[x]               = gu;
-                    table[experts + x]     = gu + std::int64_t(width) * p.gate_up_row_bytes;
-                    table[2 * experts + x] = gu;
-                    table[3 * experts + x] = static_cast<const std::byte*>(down.qdata) +
-                                             std::int64_t(x) * hidden * p.down_row_bytes;
-                }
-                p.tables = DeviceBuffer(table.size() * sizeof(void*));
-                p.tables.copy_from_host(table.data(), table.size() * sizeof(void*));
+                plan_resident(p, lw.moe);
             } else {
                 p.delivery_layer    = int(i);
                 const auto& bank    = model.expert_banks()[i];
@@ -444,6 +470,7 @@ struct Executor::Impl {
             }
             layers.push_back(std::move(p));
         }
+        if (model.dspark()) { plan_drafter(ring_bytes, branch_bytes); }
         staging = DeviceBuffer(std::size_t(prefill_ring) * kLatent * 2);
         staging.fill(0);
         kv_bytes += staging.bytes;
@@ -460,10 +487,7 @@ struct Executor::Impl {
         }
         kv_backed = kv_fixed;
         const int sms = device.multiprocessor_count();
-        decode_splits.assign(gguf::kMaxVectorColumns + 1, 1);
-        for (int b = 1; b <= gguf::kMaxVectorColumns; ++b) {
-            decode_splits[b] = std::clamp(2 * sms / (heads / 16 * b), 1, 40);
-        }
+        decode_splits = std::clamp(2 * sms / (heads / 16), 1, 40);
         span_tokens = plan_span();
         const std::size_t rows = staging_rows();
         d_tokens    = DeviceBuffer(rows * 4);
@@ -498,6 +522,120 @@ struct Executor::Impl {
         }
         workspace = std::make_unique<WorkspaceArena>(workspace_bytes);
         if (!model.expert_banks().empty()) { plan_delivery(); }
+    }
+
+    // What every block plans, the backbone's and the drafter's: hyper-connections, the window
+    // attention, the norms, the router and the shared expert.
+    LayerPlan plan_block(const LayerWeights& lw, int ratio, int block_experts, int block_top_k) {
+        LayerPlan p;
+        p.ratio                  = ratio;
+        p.experts                = block_experts;
+        p.top_k                  = block_top_k;
+        const std::int64_t mixes = config.hc_mixes(), flat = std::int64_t(streams) * hidden;
+        p.hc_attention = {fp32(model, lw.hc_attention.fn, mixes * flat),
+                          fp32(model, lw.hc_attention.base, mixes), fp32(model, lw.hc_attention.scale, 3)};
+        p.hc_ffn       = {fp32(model, lw.hc_ffn.fn, mixes * flat), fp32(model, lw.hc_ffn.base, mixes),
+                          fp32(model, lw.hc_ffn.scale, 3)};
+        const auto& at   = lw.attention;
+        p.query_kv       = matrices(model, {at.query_a, at.kv});
+        p.query_b        = matrix(model, at.query_b);
+        p.output_a       = matrix(model, at.output_a);
+        p.output_b       = matrix(model, at.output_b);
+        {
+            std::vector<const void*> parts(static_cast<std::size_t>(groups));
+            for (int g = 0; g < groups; ++g) {
+                parts[std::size_t(g)] = static_cast<const std::byte*>(p.output_a.qdata) +
+                                        std::int64_t(g) * output_rank * row_bytes(p.output_a);
+            }
+            p.output_groups = DeviceBuffer(parts.size() * sizeof(void*));
+            p.output_groups.copy_from_host(parts.data(), parts.size() * sizeof(void*));
+        }
+        p.attention_norm = fp32(model, lw.attention_norm, hidden);
+        p.ffn_norm       = fp32(model, lw.ffn_norm, hidden);
+        p.query_norm     = fp32(model, at.query_a_norm, query_rank);
+        p.kv_norm        = fp32(model, at.kv_norm, kLatent);
+        p.sinks          = fp32(model, at.sinks, heads);
+        p.freq = static_cast<const float*>(p.ratio > 0 ? freq_compressed.p : freq_window.p);
+        const MoeWeights& mw = lw.moe;
+        p.router             = fp32(model, mw.router, std::int64_t(block_experts) * hidden);
+        p.router_bias        = fp32(model, mw.router_bias, block_experts);
+        p.shared_gate_up     = matrices(model, {mw.shared_gate, mw.shared_up});
+        p.shared_down        = matrix(model, mw.shared_down);
+        return p;
+    }
+
+    // Device experts: the tables of each expert's gate, up, gate_up and down rows.
+    void plan_resident(LayerPlan& p, const MoeWeights& mw) {
+        const Weight gate_up = matrix(model, *mw.gate_up);
+        const Weight down    = matrix(model, *mw.down);
+        p.gate_up_type       = ops::detail::gguf_type(gate_up.qtype);
+        p.down_type          = ops::detail::gguf_type(down.qtype);
+        p.gate_up_row_bytes  = row_bytes(gate_up);
+        p.down_row_bytes     = row_bytes(down);
+        const int e          = p.experts;
+        std::vector<const void*> table(4 * std::size_t(e));
+        for (int x = 0; x < e; ++x) {
+            const auto* gu = static_cast<const std::byte*>(gate_up.qdata) +
+                             std::int64_t(x) * 2 * width * p.gate_up_row_bytes;
+            table[x]         = gu;
+            table[e + x]     = gu + std::int64_t(width) * p.gate_up_row_bytes;
+            table[2 * e + x] = gu;
+            table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
+                               std::int64_t(x) * hidden * p.down_row_bytes;
+        }
+        p.tables = DeviceBuffer(table.size() * sizeof(void*));
+        p.tables.copy_from_host(table.data(), table.size() * sizeof(void*));
+    }
+
+    // The drafter's blocks with their rings (and checkpoints), its tables and its buffers.
+    void plan_drafter(std::size_t ring_bytes, std::size_t& branch_bytes) {
+        const DSparkConfig& dc = *model.dspark_config();
+        const DSparkWeights& dw = *model.dspark();
+        Drafter& d              = drafter.emplace();
+        d.targets               = int(dc.target_layers.size());
+        d.block                 = int(dc.block_size);
+        d.noise                 = dc.noise_token;
+        d.domain                = int(model.resources().public_token_count);
+        d.target_of.assign(config.num_hidden_layers, -1);
+        for (int j = 0; j < d.targets; ++j) { d.target_of[dc.target_layers[std::size_t(j)]] = j; }
+        if (d.block < 1 || std::uint32_t(d.block) > std::uint32_t(gguf::kMaxVectorColumns) ||
+            d.domain <= 0 || d.domain > vocab) {
+            throw std::invalid_argument("DeepSeek-V4.1: the DSpark block must be 1..8 rows over the vocabulary");
+        }
+        d.fc         = matrix(model, dw.fc);
+        d.tap_norm   = fp32(model, dw.tap_norm, hidden);
+        d.final_norm = fp32(model, dw.final_norm, hidden);
+        d.confidence = fp32(model, dw.confidence, std::int64_t(hidden) + kernels::kMarkovRank);
+        d.markov_embed = bf16_table(model, dw.markov_embed, vocab, kernels::kMarkovRank);
+        d.markov_head  = bf16_table(model, dw.markov_head, vocab, kernels::kMarkovRank);
+        const int sequences = int(options.sequences);
+        for (const LayerWeights& lw : dw.layers) {
+            LayerPlan p = plan_block(lw, 0, int(dc.experts), int(dc.top_k));
+            plan_resident(p, lw.moe);
+            // The seed's kv rows: of [query_a; kv] when the two are one parent.
+            Weight kv = p.query_kv.back();
+            if (p.query_kv.size() == 1) {
+                kv.qdata = static_cast<const std::byte*>(kv.qdata) + std::int64_t(query_rank) * row_bytes(kv);
+                kv.n     = kLatent;
+            }
+            d.kv.push_back(kv);
+            p.ring = DeviceBuffer(ring_bytes * sequences);
+            p.ring.fill(0);
+            kv_bytes += p.ring.bytes;
+            branch_bytes += ring_bytes;
+            if (options.checkpoints) {
+                p.checkpoint_ring = DeviceBuffer(ring_bytes * sequences);
+                kv_bytes += p.checkpoint_ring.bytes;
+            }
+            d.layers.push_back(std::move(p));
+        }
+        d.taps    = DeviceBuffer(std::size_t(window) * d.targets * hidden * 4);
+        d.ids     = DeviceBuffer(std::size_t(d.block + 1) * 4);
+        d.values  = DeviceBuffer(std::size_t(d.block) * 4);
+        d.scratch = DeviceBuffer(kernels::markov_scratch_bytes());
+        d.host    = std::make_unique<PinnedHostBuffer>(std::size_t(2 * d.block) * 4);
+        d.copied  = std::make_unique<CudaCompletionEvent>(device);
+        kv_bytes += d.taps.bytes;
     }
 
     // A whole-layer bank of the routed experts, each blob at its largest aligned size.
@@ -542,6 +680,33 @@ struct Executor::Impl {
         transport.cache_bytes     = options.expert_cache_bytes;
         transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
         transport.elastic         = growing;
+        const float dma_share     = options.expert_dma_share.value_or(0.0F);
+        if (!(dma_share >= 0 && dma_share <= 1) || options.expert_cpu_threads > 256) {
+            throw std::invalid_argument("DeepSeek-V4.1: the DMA share must be 0..1 and CPU threads 0..256");
+        }
+        std::vector<CpuExpertLayer> cpu_layers;
+        bool computes = false;
+        for (const auto& b : model.expert_banks()) {
+            cpu_layers.push_back({b.gate_up_type, b.down_type, std::int64_t(b.gate_up_row_bytes),
+                                  std::int64_t(b.down_row_bytes)});
+            computes = computes || CpuExperts::computes(cpu_layers.back(), hidden, width);
+        }
+        // A disk expert the CPU computes needs the same file read as a copied one; on an RTX 4090
+        // host every split of disk experts decoded slower than copying every miss, so the CPU
+        // computes disk experts only at an explicit share.
+        const bool cpu_share = options.expert_dma_share
+                                   ? dma_share < 1
+                                   : model.expert_residency() == ExpertResidency::Host;
+        if (computes && cpu_share) {
+            cpu_experts = std::make_unique<CpuExperts>(std::move(cpu_layers), hidden, width,
+                int(config.top_k_experts), config.swiglu_limit);
+            transport.cpu.products      = cpu_experts.get();
+            transport.cpu.input_bytes   = cpu_experts->input_bytes();
+            transport.cpu.product_bytes = cpu_experts->product_bytes();
+            transport.cpu.share         = 1.0 - double(dma_share);
+            transport.cpu.balance       = !options.expert_dma_share;
+            transport.cpu.threads       = options.expert_cpu_threads;
+        }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
     }
@@ -740,7 +905,7 @@ struct Executor::Impl {
             gguf_scratch = std::max(gguf_scratch,
                                     ops::detail::gguf_project_workspace_bytes({&shape, 1}, 1, int(t)));
         };
-        for (const LayerPlan& p : layers) {
+        const auto block_products = [&](const LayerPlan& p) {
             for (const Weight& m : p.query_kv) { product(m); }
             for (const Weight& m : p.shared_gate_up) { product(m); }
             Weight group = p.output_a;
@@ -749,6 +914,11 @@ struct Executor::Impl {
                 product(*m);
             }
             if (p.engram >= 0) { product(p.engram_projection); }
+        };
+        for (const LayerPlan& p : layers) { block_products(p); }
+        if (drafter) {
+            for (const LayerPlan& p : drafter->layers) { block_products(p); }
+            product(drafter->fc);
         }
         {
             Weight rows = head;
@@ -775,17 +945,15 @@ struct Executor::Impl {
         const std::size_t engram_bytes = sum({t * columns * 2, t * 4, t * (s + 1) * h * 4});
         const std::size_t decode_width = std::size_t(decode_rows()) * std::size_t(capacity_rows) * 4;
         const std::size_t scores = std::max(kScoreBudget, decode_width);
-        std::size_t partial = 0;
-        for (int b = 1; b <= decode_rows(); ++b) {
-            partial = std::max(partial, kernels::sparse_attention_workspace_floats(
-                                            b, heads, decode_splits[std::size_t(b)]) * 4);
-        }
+        const std::size_t partial =
+            kernels::sparse_attention_workspace_floats(decode_rows(), heads, decode_splits) * 4;
         const std::size_t attention = sum({
             t * h * 2, t * h * 4, t * 1792 * 4, t * std::size_t(query_rank) * 2,
             t * std::size_t(query_rank) * 4, t * 4, t * 4, 8 * t * 4,
             t * latent_rows * 2, t * latent_rows * 2,
             t * std::size_t(groups) * output_rank * 4, t * std::size_t(groups) * output_rank * 2,
-            t * h * 4,
+            gguf::vector_activation_bytes(heads / groups * kLatent, groups * gguf::kMaxVectorColumns),
+            std::size_t(groups) * gguf::kMaxVectorColumns * 4, t * h * 4,
             // compressor
             t * kLatent * 4, t * kLatent * 4, t * kLatent * 4, t * kIndexDim * 4,
             // indexer
@@ -801,11 +969,30 @@ struct Executor::Impl {
                      gguf::vector_activation_bytes(int(w), int(pairs))),
             pairs * h * 4, t * h * 8, t * 2 * w * 4, t * w * 2});
         const std::size_t head_bytes = sum({t * h * 2, std::size_t(kHeadRows) * vocab * 4, kHeadRows * 4});
-        return pass + std::max({engram_bytes, attention, ffn, head_bytes}) + gguf_scratch +
+        // A seed of the drafter's rings from a pass's last rows (at most a window of them).
+        std::size_t seed_bytes = 0;
+        if (drafter) {
+            const std::size_t r = std::min<std::size_t>(window, std::max<std::size_t>(t, n));
+            seed_bytes = sum({r * std::size_t(drafter->targets) * h * 2, r * h * 4, r * h * 2,
+                              r * drafter->layers.size() * kLatent * 4, r * 4});
+        }
+        return pass + std::max({engram_bytes, attention, ffn, head_bytes}) + seed_bytes + gguf_scratch +
                allocations * kAlign + (32u << 20);
     }
 
     // ---- Shared pieces ---------------------------------------------------------------------------
+
+    // A call of t <= kMaxVectorColumns tokens through the grouped output projection: group g of
+    // token j is pair j * groups + g, the groups the experts.
+    [[nodiscard]] gguf::MoeRouting group_routing(int t) const {
+        const auto* base = static_cast<const std::int32_t*>(group_routes.p) + group_routes_at.at(std::size_t(t));
+        gguf::MoeRouting routing;
+        routing.bounds       = base;
+        routing.sorted       = base + groups + 1;
+        routing.active       = routing.sorted + std::int64_t(groups) * t;
+        routing.active_count = routing.active + groups;
+        return routing;
+    }
 
     template <typename T>
     T* alloc(std::size_t count) {
@@ -1034,16 +1221,16 @@ struct Executor::Impl {
         a.q                 = static_cast<const __nv_bfloat16*>(q.data);
         a.tokens            = t;
         a.heads             = heads;
-        a.positions         = pos;
+        a.positions         = s.visible != nullptr ? s.visible : pos;
         a.sequences         = seq;
         a.sequence          = int(s.sequence);
         a.window            = s.chunk ? stage_ring : ring;
         a.window_seq_stride = s.chunk ? 0 : ring_stride;
         a.ring              = s.chunk ? prefill_ring : kRing;
-        a.window_size       = window;
+        a.window_size       = window + s.extra_window;
         a.sinks             = p.sinks;
         a.scale             = 1.0f / std::sqrt(float(kLatent));
-        a.splits            = s.chunk ? 1 : decode_splits[std::size_t(t)];
+        a.splits            = s.chunk ? 1 : decode_splits;
         if (a.splits > 1) {
             a.partial = alloc<float>(kernels::sparse_attention_workspace_floats(t, heads, a.splits));
         }
@@ -1055,14 +1242,40 @@ struct Executor::Impl {
                                stream);
         }
         // The grouped output projection: group g's heads (rounded as the reference rounds them)
-        // through rows [g * o_rank, (g + 1) * o_rank) of output_a, into the latent's rows there.
-        auto* grouped = static_cast<__nv_bfloat16*>(q.data); // q is spent
+        // through rows [g * o_rank, (g + 1) * o_rank) of output_a, into the latent's rows there. A
+        // decode or verification call runs the groups as the experts of one vector product, its
+        // pairs token by token (group_routing), so one guard, quantization, product and unscale
+        // serve every group: each pair's arithmetic is that of its group's own product, whose eight
+        // launches of 1,024 rows read output_a at about 470 GB/s on an RTX 4090.
+        auto* grouped         = static_cast<__nv_bfloat16*>(q.data); // q is spent
+        const bool vector     = t <= gguf::kMaxVectorColumns;
         kernels::attention_output(static_cast<const __nv_bfloat16*>(o.data), t, heads, groups, pos,
-                                  p.freq, grouped, stream);
+                                  p.freq, vector, grouped, stream);
         const int latent_rows = groups * output_rank;
         const int group_k     = heads / groups * kLatent;
         auto* latent          = alloc<float>(std::size_t(t) * latent_rows);
-        for (int g = 0; g < groups; ++g) {
+        if (vector) {
+            const int pairs = t * groups;
+            const auto type = ops::detail::gguf_type(p.output_a.qtype);
+            float* scale    = nullptr;
+            if (gguf::vector_activation_f16_sums(type)) {
+                scale = alloc<float>(pairs);
+                kernels::guard_columns(grouped, group_k, pairs, scale, stream);
+            }
+            void* act = workspace->alloc_bytes(gguf::vector_activation_bytes(group_k, pairs)).data;
+            gguf::quantize_vector_activation(grouped, group_k, pairs, nullptr, act, stream);
+            const gguf::MoeTable table{static_cast<const void* const*>(p.output_groups.p),
+                                       row_bytes(p.output_a), output_rank, group_k};
+            gguf::MoeOutput out;
+            out.f32         = latent;
+            const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
+            gguf::moe_vector_product(type, table, group_routing(t), groups, 1, 1, act, pairs, out,
+                                     chunk, stream);
+            if (scale != nullptr) {
+                kernels::unscale_columns(latent, output_rank, output_rank, pairs, scale, stream);
+            }
+        }
+        for (int g = 0; g < groups && !vector; ++g) {
             Weight part = p.output_a;
             part.qdata  = static_cast<const std::byte*>(p.output_a.qdata) +
                          std::int64_t(g) * output_rank * row_bytes(p.output_a);
@@ -1228,7 +1441,7 @@ struct Executor::Impl {
     template <typename Shared>
     void routed(const LayerPlan& p, const Tensor& x, const float* scale, const float* x32, int t,
                 float* y, Shared&& shared) {
-        const int e = experts, k = top_k, w = width, pairs = t * k;
+        const int e = p.experts, k = p.top_k, w = width, pairs = t * k;
         auto* logits = alloc<float>(std::size_t(t) * e);
         kernels::gemm_f32(e, t, hidden, p.router, x32, logits, stream);
         auto* ids     = alloc<std::int32_t>(pairs);
@@ -1237,28 +1450,41 @@ struct Executor::Impl {
                        stream);
         void* routing_space = workspace->alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data;
         const gguf::MoeRouting routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
-        std::optional<ExpertDelivery::Call> call;
-        if (delivery) {
-            call = delivery->begin(std::size_t(p.delivery_layer), ids, std::uint32_t(pairs), stream);
+        const auto* xb   = static_cast<const __nv_bfloat16*>(x.data);
+        const bool vector = t <= gguf::kMaxVectorColumns;
+        void* xq          = nullptr; // the vector kernels' activation of x
+        if (vector) {
+            xq = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
+            gguf::quantize_vector_activation(xb, hidden, t, nullptr, xq, stream);
         }
-        const auto* tables = delivery ? delivery->tables(std::size_t(p.delivery_layer))
-                                      : static_cast<const void* const*>(p.tables.p);
+        // A decode or verification call may leave misses to the CPU, which reads the quantized
+        // activation, the route weights and the guard's factors.
+        const bool cpu = cpu_experts && vector && t <= CpuExperts::kMaxTokens;
+        std::optional<ExpertDelivery::Call> call;
+        if (p.delivery_layer >= 0) {
+            const std::array<ExpertDelivery::Input, 3> inputs{
+                ExpertDelivery::Input{xq, cpu ? cpu_experts->activation_bytes(t) : 0},
+                ExpertDelivery::Input{weights, cpu ? cpu_experts->weight_bytes(t) : 0},
+                ExpertDelivery::Input{scale, cpu ? CpuExperts::scale_bytes(t) : 0}};
+            call = delivery->begin(std::size_t(p.delivery_layer), ids, std::uint32_t(pairs), stream,
+                                   cpu ? std::span<const ExpertDelivery::Input>(inputs)
+                                       : std::span<const ExpertDelivery::Input>());
+        }
+        const auto* tables = p.delivery_layer >= 0 ? delivery->tables(std::size_t(p.delivery_layer))
+                                                   : static_cast<const void* const*>(p.tables.p);
         const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * w, hidden};
         const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, w};
         const int max_active = std::min(pairs, e);
-        const auto* xb       = static_cast<const __nv_bfloat16*>(x.data);
         auto* gu             = alloc<float>(std::size_t(pairs) * 2 * w);
         auto* middle         = alloc<__nv_bfloat16>(std::size_t(pairs) * w);
         kernels::MoeCombineArgs combine;
         combine.y      = y;
         combine.tokens = t;
         combine.hidden = hidden;
-        if (t <= gguf::kMaxVectorColumns) {
+        if (vector) {
             const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
-            void* act  = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
             void* act2 = workspace->alloc_bytes(gguf::vector_activation_bytes(w, pairs)).data;
             auto* fixed = alloc<unsigned long long>(std::size_t(t) * hidden);
-            gguf::quantize_vector_activation(xb, hidden, t, nullptr, act, stream);
             CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, stream));
             CUDA_CHECK(cudaMemsetAsync(gu, 0, std::size_t(pairs) * 2 * w * 4, stream));
             gguf::MoeOutput rows;
@@ -1267,7 +1493,7 @@ struct Executor::Impl {
             out.weighted = fixed;
             out.weights  = weights;
             const auto compute = [&](const gguf::MoeRouting& part) {
-                gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, act, t,
+                gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, xq, t,
                                          rows, chunk, stream);
                 kernels::clamped_swiglu(gu, 2 * w, pairs, w, config.swiglu_limit, scale, k, middle,
                                         w, stream);
@@ -1290,6 +1516,9 @@ struct Executor::Impl {
                 shared();
                 delivery->await(stream);
                 compute(stage(call->missing_experts));
+                if (call->cpu != nullptr) {
+                    kernels::add_fixed(fixed, call->products, call->cpu, std::int64_t(t) * hidden, stream);
+                }
             } else {
                 compute(routing);
                 shared();
@@ -1299,7 +1528,7 @@ struct Executor::Impl {
             return;
         }
         shared();
-        if (delivery) { delivery->await(stream); }
+        if (call) { delivery->await(stream); }
         if (gguf::moe_matrix_supported(p.gate_up_type, 2 * w, hidden, true)) {
             void* act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;
             gguf::quantize_moe_matrix_activation(p.gate_up_type, xb, hidden, routing, pairs, k, act,
@@ -1353,6 +1582,134 @@ struct Executor::Impl {
         }
     }
 
+    // ---- The DSpark drafter -----------------------------------------------------------------------
+
+    // The streams' mean of `n` rows of h entering backbone block l, when the drafter taps it, into
+    // the taps from row `at`.
+    void tap(std::size_t l, const float* rows, int n, int at) {
+        const int j = drafter->target_of[l];
+        if (j < 0 || n <= 0) { return; }
+        kernels::stream_mean(rows, n, streams, hidden,
+                             static_cast<float*>(drafter->taps.p) +
+                                 (std::size_t(at) * drafter->targets + std::size_t(j)) * hidden,
+                             std::int64_t(drafter->targets) * hidden, stream);
+    }
+
+    // The drafter's ring rows of `n` taps from row `at`: the taps through the projection and its
+    // norm, then each block's kv of that, normed, turned and rounded as the window latents are, at
+    // positions pos of `sequence` (of seq[r] each when given).
+    void seed(int n, int at, const std::int32_t* pos, const std::int32_t* seq, std::uint32_t sequence) {
+        Drafter& d       = *drafter;
+        auto scope       = workspace->scope();
+        const int inputs = d.targets * hidden;
+        Tensor x         = alloc_bf16(inputs, n);
+        kernels::f32_to_bf16(static_cast<const float*>(d.taps.p) + std::size_t(at) * inputs,
+                             static_cast<__nv_bfloat16*>(x.data), std::int64_t(n) * inputs, stream);
+        auto* main = alloc<float>(std::size_t(n) * hidden);
+        project(x, d.fc, main, hidden);
+        Tensor normed = alloc_bf16(hidden, n);
+        kernels::rms_rows(main, hidden, hidden, n, d.tap_norm, eps,
+                          static_cast<__nv_bfloat16*>(normed.data), nullptr, stream);
+        const int kv_rows = int(d.kv.size()) * kLatent;
+        auto* kv          = alloc<float>(std::size_t(n) * kv_rows);
+        project(normed, d.kv, kv, kv_rows);
+        for (std::size_t b = 0; b < d.layers.size(); ++b) {
+            const LayerPlan& p = d.layers[b];
+            kernels::KvPostArgs a;
+            a.kv         = kv + b * kLatent;
+            a.kv_stride  = kv_rows;
+            a.tokens     = n;
+            a.norm       = p.kv_norm;
+            a.eps        = eps;
+            a.positions  = pos;
+            a.freq       = p.freq;
+            a.cache      = static_cast<__nv_bfloat16*>(p.ring.p);
+            a.seq_stride = std::int64_t(kRing) * kLatent;
+            a.sequences  = seq;
+            a.sequence   = int(sequence);
+            a.ring       = kRing;
+            kernels::kv_post(a, stream);
+        }
+    }
+
+    // The drafter's block over staged rows (the anchor, then the noise token, at the sequence's
+    // next positions; then each row's visible position, the block's last): its blocks, the head
+    // over the final norm of the collapsed streams, the Markov chain's greedy drafts and their
+    // confidences, copied to the pinned buffer.
+    void draft_pass(int b) {
+        Drafter& d = *drafter;
+        workspace->reset();
+        auto scope     = workspace->scope();
+        auto* h        = alloc<float>(std::size_t(b) * streams * hidden);
+        embed(b, h);
+        const int site = 2 * streams + streams * streams;
+        Coefficients attention_site, ffn_site;
+        for (Coefficients* c : {&attention_site, &ffn_site}) {
+            auto* base = alloc<float>(std::size_t(b) * site);
+            c->pre     = base;
+            c->post    = base + std::size_t(b) * streams;
+            c->comb    = base + std::size_t(b) * 2 * streams;
+        }
+        auto* mix_scratch = alloc<float>(std::size_t(b) * config.hc_mixes());
+        Pass s;
+        s.t              = b;
+        s.visible        = static_cast<const std::int32_t*>(d_positions.p) + b;
+        s.extra_window   = b;
+        const float* pre = nullptr;
+        for (const LayerPlan& p : d.layers) {
+            mixes(p.hc_attention, h, b, mix_scratch, attention_site);
+            attention(p, h, pre, b, s, nullptr, nullptr, attention_site);
+            mixes(p.hc_ffn, h, b, mix_scratch, ffn_site);
+            ffn(p, h, attention_site.pre, b, ffn_site);
+            pre = ffn_site.pre;
+        }
+        Tensor x = alloc_bf16(hidden, b);
+        kernels::hc_pre_norm(h, pre, d.final_norm, b, streams, hidden, eps,
+                             static_cast<__nv_bfloat16*>(x.data), nullptr, stream);
+        auto* plane = alloc<float>(std::size_t(b) * vocab);
+        project(x, head, plane, vocab);
+        auto* ids = static_cast<std::int32_t*>(d.ids.p);
+        CUDA_CHECK(cudaMemcpyAsync(ids, d_tokens.p, 4, cudaMemcpyDeviceToDevice, stream));
+        for (int i = 0; i < b; ++i) {
+            kernels::markov_step(plane + std::size_t(i) * vocab, d.markov_head, d.markov_embed, d.domain,
+                                 ids, i, d.scratch.p, stream);
+        }
+        kernels::dspark_confidence(h, pre, b, streams, hidden, d.confidence, d.markov_embed, ids,
+                                   static_cast<float*>(d.values.p), stream);
+        auto* host = static_cast<std::int32_t*>(d.host->data());
+        CUDA_CHECK(cudaMemcpyAsync(host, ids + 1, std::size_t(b) * 4, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(host + b, d.values.p, std::size_t(b) * 4, cudaMemcpyDeviceToHost,
+                                   stream));
+    }
+
+    void draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
+               std::span<float> confidence) {
+        if (!drafter) { throw std::logic_error("deepseek_v41 draft: no DSpark drafter"); }
+        Drafter& d  = *drafter;
+        const int b = d.block;
+        if (sequence >= options.sequences || drafts.size() != std::size_t(b) ||
+            confidence.size() != std::size_t(b) || anchor < 0 || anchor >= vocab) {
+            throw std::invalid_argument("deepseek_v41 draft: invalid call");
+        }
+        const std::uint32_t first = positions[sequence];
+        if (first + std::uint32_t(b) > options.max_context) {
+            throw std::invalid_argument("deepseek_v41 draft: context capacity exceeded");
+        }
+        std::vector<std::int32_t> tokens(b, d.noise), pos(2 * b), seq(b, std::int32_t(sequence));
+        tokens[0] = anchor;
+        for (int i = 0; i < b; ++i) {
+            pos[std::size_t(i)]     = std::int32_t(first) + i;
+            pos[std::size_t(b + i)] = std::int32_t(first) + b - 1;
+        }
+        stage(tokens, pos, seq);
+        run_graph(32 + std::uint32_t(b), [&] { draft_pass(b); });
+        d.copied->record(stream);
+        d.copied->synchronize();
+        const auto* host = static_cast<const std::int32_t*>(d.host->data());
+        std::copy_n(host, b, drafts.begin());
+        std::memcpy(confidence.data(), host + b, std::size_t(b) * 4);
+    }
+
     // A pass over staged rows (tokens, positions and, for decode rows, sequences on the device; the
     // Engram rows copied).
     void run(const Pass& s) {
@@ -1374,13 +1731,22 @@ struct Executor::Impl {
         auto* candidates  = candidate_words > 0 ? alloc<std::uint32_t>(std::size_t(t) * candidate_words)
                                                 : nullptr;
         const float* pre = nullptr; // the first block reads stream 0
-        for (const LayerPlan& p : layers) {
+        // With the drafter, the pass's last rows (a window at most) tap its target blocks.
+        const int tapped = drafter ? std::min(t, window) : 0;
+        for (std::size_t l = 0; l < layers.size(); ++l) {
+            const LayerPlan& p = layers[l];
+            if (tapped > 0) { tap(l, h + std::size_t(t - tapped) * streams * hidden, tapped, 0); }
             if (p.engram >= 0) { engram_block(p, h, t, s); }
             mixes(p.hc_attention, h, t, mix_scratch, attention_site);
             attention(p, h, pre, t, s, topk, candidates, attention_site);
             mixes(p.hc_ffn, h, t, mix_scratch, ffn_site);
             ffn(p, h, attention_site.pre, t, ffn_site);
             pre = ffn_site.pre;
+        }
+        if (tapped > 0 && s.seed) {
+            const int from = s.row + t - tapped;
+            seed(tapped, 0, static_cast<const std::int32_t*>(d_positions.p) + from,
+                 s.chunk ? nullptr : static_cast<const std::int32_t*>(d_sequences.p) + from, s.sequence);
         }
         if (s.logit_rows == 0) { return; }
         const int first = t - s.logit_rows;
@@ -1451,12 +1817,11 @@ struct Executor::Impl {
         if (span_borrow_bytes != 0) {
             borrowed = borrow_span(std::uint32_t(n));
             if (!borrowed.p) {
-                // The cache cannot lend the span's buffers now: its chunks one by one.
-                for (int row = 0; row < n; row += c) {
-                    const int t = std::min(c, n - row);
-                    forward(sequence, tokens.subspan(std::size_t(row), std::size_t(t)),
-                            row + t == n ? logit_rows : 0);
-                }
+                // The cache cannot lend the span's buffers now: its halves (whole chunks) as spans
+                // whose buffers it may lend, down to chunk by chunk.
+                const int half = (n / 2 + c - 1) / c * c;
+                forward(sequence, tokens.first(std::size_t(half)), 0);
+                forward(sequence, tokens.subspan(std::size_t(half)), logit_rows);
                 return;
             }
         }
@@ -1493,6 +1858,7 @@ struct Executor::Impl {
             return Coefficients{co.pre + std::size_t(row) * streams, co.post + std::size_t(row) * streams,
                                 co.comb + std::size_t(row) * streams * streams};
         };
+        const int tapped = drafter ? std::min(n, window) : 0; // the span's last rows the drafter taps
         for (std::size_t l = 0; l < layers.size(); ++l) {
             const LayerPlan& p = layers[l];
             for (int row = 0; row < n; row += c) {
@@ -1504,6 +1870,9 @@ struct Executor::Impl {
                 s.sequence = sequence;
                 s.first    = first + std::uint32_t(row);
                 float* hc  = h + std::size_t(row) * streams * hidden;
+                if (const int lo = std::max(row, n - tapped); tapped > 0 && lo < row + s.t) {
+                    tap(l, h + std::size_t(lo) * streams * hidden, row + s.t - lo, lo - (n - tapped));
+                }
                 const Coefficients a = rows_of(attention_site, row), f = rows_of(ffn_site, row);
                 if (p.engram >= 0) { engram_block(p, hc, s.t, s); }
                 mixes(p.hc_attention, hc, s.t, mix_scratch, a);
@@ -1514,6 +1883,10 @@ struct Executor::Impl {
                 mixes(p.hc_ffn, hc, s.t, mix_scratch, f);
                 ffn(p, hc, a.pre, s.t, f);
             }
+        }
+        if (tapped > 0) {
+            seed(tapped, 0, static_cast<const std::int32_t*>(d_positions.p) + (n - tapped), nullptr,
+                 sequence);
         }
         if (logit_rows > 0) {
             const int last = n - int(logit_rows);
@@ -1627,6 +2000,7 @@ struct Executor::Impl {
         Pass s;
         s.t          = rows;
         s.logit_rows = rows;
+        s.seed       = false; // commit() seeds the rows it keeps
         run_graph(16 + std::uint32_t(rows), [&] { run(s); });
         verify_width = std::uint32_t(w);
     }
@@ -1644,6 +2018,16 @@ struct Executor::Impl {
             advance_history(s, std::span<const std::int32_t>(verified[s]).first(kept[j]));
             verified[s].clear();
             positions[s] += kept[j];
+        }
+        if (drafter) {
+            // The kept rows' taps into the drafter's rings, at the positions and sequences the
+            // verification staged.
+            workspace->reset();
+            const auto row = [&](std::size_t j) { return std::int32_t(j * verify_width); };
+            for (std::size_t j = 0; j < sequences.size(); ++j) {
+                seed(int(kept[j]), row(j), static_cast<const std::int32_t*>(d_positions.p) + row(j),
+                     static_cast<const std::int32_t*>(d_sequences.p) + row(j), sequences[j]);
+            }
         }
         verify_width = 0;
     }
@@ -1663,6 +2047,12 @@ struct Executor::Impl {
                 const auto& score = checkpoint ? p.checkpoint_score : p.tail_score;
                 out.emplace_back(static_cast<std::uint8_t*>(kv.p) + sequence * tail_bytes, tail_bytes);
                 out.emplace_back(static_cast<std::uint8_t*>(score.p) + sequence * tail_bytes, tail_bytes);
+            }
+        }
+        if (drafter) {
+            for (const LayerPlan& p : drafter->layers) {
+                const auto& ring = checkpoint ? p.checkpoint_ring : p.ring;
+                out.emplace_back(static_cast<std::uint8_t*>(ring.p) + sequence * ring_bytes, ring_bytes);
             }
         }
         return out;
@@ -1747,6 +2137,12 @@ struct Executor::Impl {
                 commit(owners, std::vector<std::uint32_t>(n, 1));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 for (const std::uint32_t s : owners) { reset_state(s); }
+            }
+            if (drafter) {
+                std::vector<std::int32_t> drafts(std::size_t(drafter->block));
+                std::vector<float> confidence(drafts.size());
+                draft(0, 2, drafts, confidence);
+                reset_state(0);
             }
         }
         if (delivery) {
@@ -1906,6 +2302,10 @@ std::string Executor::engram_description() const {
     return impl_->engram->io_backend();
 }
 
+std::string Executor::expert_cpu_description() const {
+    return impl_->delivery ? impl_->delivery->cpu_description() : std::string();
+}
+
 std::uint32_t Executor::prompt_step() const noexcept { return impl_->prompt_step(); }
 
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
@@ -1940,6 +2340,15 @@ Tensor Executor::logits(std::uint32_t rows) const {
 cudaStream_t Executor::head_stream() const noexcept { return impl_->stream; }
 
 std::uint32_t Executor::draft_tokens() const noexcept { return impl_->options.draft_tokens; }
+
+std::uint32_t Executor::dspark_block() const noexcept {
+    return impl_->drafter ? std::uint32_t(impl_->drafter->block) : 0;
+}
+
+void Executor::draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
+                     std::span<float> confidence) {
+    impl_->draft(sequence, anchor, drafts, confidence);
+}
 
 void Executor::verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens) {
     impl_->verify(sequences, tokens);

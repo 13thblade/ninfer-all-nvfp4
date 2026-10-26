@@ -6,7 +6,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -60,20 +59,17 @@ public:
         const std::byte* inputs = nullptr; // the device inputs begin() copied, in order
         std::byte* products     = nullptr; // ExpertCpuOptions::product_bytes
         CpuSpinPool* pool       = nullptr; // the service thread and its pinned workers
-        // Runs once on the calling thread while the pool starts the first rows: the call's
-        // copies, which so overlap the products.
-        std::function<void()> side;
     };
 
     struct Done {
         // The bytes of the product buffer the pairs used, from its start (at most
         // ExpertCpuOptions::product_bytes): only those reach the device.
         std::size_t bytes   = 0;
-        double microseconds = 0; // the products' time, side() left out
+        double microseconds = 0; // the products' time
     };
 
-    // Writes the products of the pairs routed to work.experts and runs work.side once. Runs on the
-    // delivery's service thread.
+    // Writes the products of the pairs routed to work.experts. Runs on the delivery's service
+    // thread, after the call's copies are issued.
     virtual Done compute(const Work& work) = 0;
 };
 

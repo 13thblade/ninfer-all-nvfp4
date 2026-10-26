@@ -162,6 +162,29 @@ void decode_slice(QType format, const std::uint8_t* row, int slice, GgufCpuSlice
         }
         return;
     }
+    case QType::GGUF_IQ1_M: {
+        // 32 grid-index bytes, 16 bytes of a nibble per eight values (three high index bits and
+        // the delta's sign), then four 16-bit words of four 3-bit scales each and a nibble of the
+        // block's binary16 multiplier. A weight is eight times the grid's value plus its delta of
+        // +-1/8: 8 c - 7 or 8 c - 9 for the grid's code c in 0..2; the factors carry the eighth.
+        std::uint16_t sc[4];
+        std::memcpy(sc, block + 48, 8);
+        const float d = half_to_float(std::uint16_t((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0U) |
+                                                    ((sc[2] >> 4) & 0x0F00U) | (sc[3] & 0xF000U)));
+        const unsigned tmp     = unsigned(sc[sub / 2]) >> (6 * (sub % 2));
+        const std::uint8_t* qs = block + 4 * sub;
+        for (int l = 0; l < 4; ++l) {
+            const unsigned qhl = unsigned(block[32 + 2 * sub + l / 2]) >> (4 * (l % 2));
+            const auto* grid   = reinterpret_cast<const std::int8_t*>(iq1s_grid + (qs[l] | ((qhl & 7U) << 8)));
+            const int offset   = (qhl & 8U) != 0 ? 9 : 7;
+            for (int j = 0; j < 8; ++j) {
+                out.weights[8 * l + j] = static_cast<std::int8_t>(8 * (grid[j] + 1) - offset);
+            }
+        }
+        out.factor[0] = d * float(2 * (tmp & 7U) + 1) * 0.125F;
+        out.factor[1] = d * float(2 * ((tmp >> 3) & 7U) + 1) * 0.125F;
+        return;
+    }
     case QType::GGUF_Q6_K: {
         // 128 bytes of low nibbles, 64 of high bit pairs, 16 signed scales, then d. Slice u = 4 h
         // + q: the low (q < 2) or high nibbles of bytes 64 h + 32 (q % 2) ..., bits 2 q of bytes
@@ -198,6 +221,34 @@ void decode_slice(QType format, const std::uint8_t* row, int slice, GgufCpuSlice
         }
         out.factor[0] = d * float(2 * (scale & 15U) + 1) * 0.125F;
         out.factor[1] = d * float(2 * (scale >> 4) + 1) * 0.125F;
+        return;
+    }
+    case QType::GGUF_IQ2_XXS: {
+        // d, then per sub-block four grid-index bytes and a word of four 7-bit sign indices and a
+        // 4-bit scale.
+        const std::uint8_t* qs  = block + 2 + 8 * sub;
+        const std::uint32_t aux = load32(block + 6 + 8 * sub);
+        for (int l = 0; l < 4; ++l) {
+            const unsigned signs = ksigns_iq2xs[(aux >> (7 * l)) & 127U];
+            const auto* grid     = reinterpret_cast<const std::uint8_t*>(iq2xxs_grid + qs[l]);
+            for (int j = 0; j < 8; ++j) { out.weights[8 * l + j] = signed_by(grid[j], signs & (1U << j)); }
+        }
+        out.factor[0] = d * float(2 * (aux >> 28) + 1) * 0.125F;
+        return;
+    }
+    case QType::GGUF_IQ1_S: {
+        // d, 32 grid-index bytes, then per sub-block a 16-bit word of three high index bits per
+        // eight values, a 3-bit scale and the delta's sign. The weights are the grid's codes
+        // c = value + 1 (0..2), factor 1 the delta (+-1/8) less one.
+        const std::uint8_t* qs = block + 2 + 4 * sub;
+        const unsigned qh      = load16(block + 34 + 2 * sub);
+        for (int l = 0; l < 4; ++l) {
+            const auto* grid = reinterpret_cast<const std::int8_t*>(
+                iq1s_grid + (qs[l] | (((qh >> (3 * l)) & 7U) << 8)));
+            for (int j = 0; j < 8; ++j) { out.weights[8 * l + j] = static_cast<std::int8_t>(grid[j] + 1); }
+        }
+        out.factor[0] = d * float(2 * ((qh >> 12) & 7U) + 1);
+        out.factor[1] = (qh & 0x8000U) != 0 ? -1.125F : -0.875F;
         return;
     }
     case QType::GGUF_IQ3_XXS: {
@@ -262,7 +313,8 @@ void rows_scalar(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_beg
     const int tokens = x.tokens();
     const int slices = w.k / 32;
     const bool q2    = w.format == QType::GGUF_Q2_0;
-    const bool two   = w.format == QType::GGUF_IQ2_S;
+    const bool two   = w.format == QType::GGUF_IQ2_S || w.format == QType::GGUF_IQ1_M;
+    const bool delta = w.format == QType::GGUF_IQ1_S;
     const bool six   = w.format == QType::GGUF_Q6_K;
     const bool min   = w.format == QType::GGUF_Q4_K || w.format == QType::GGUF_Q5_K;
     std::vector<float> lanes(std::size_t(tokens) * 32);
@@ -283,6 +335,9 @@ void rows_scalar(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_beg
                 float product     = 0;
                 if (two) {
                     product = scale * std::fma(slice.factor[0], float(dot[0]), slice.factor[1] * float(dot[1]));
+                } else if (delta) {
+                    product = slice.factor[0] * std::fma(scale, float(dot[0] + dot[1]),
+                                                         slice.factor[1] * x.value_sums(t)[s]);
                 } else if (six) {
                     const float low  = slice.factor[0] * float(dot[0]);
                     const float high = slice.factor[1] * float(dot[1]);
@@ -309,6 +364,16 @@ void swiglu_scalar(const float* gate, const float* up, std::size_t count, std::u
 
 void geglu_scalar(const float* gate, const float* up, std::size_t count, std::uint16_t* out) {
     for (std::size_t i = 0; i < count; ++i) { out[i] = float_to_bf16(gelu_tanh(gate[i]) * up[i]); }
+}
+
+void clamped_swiglu_scalar(const float* gate, const float* up, std::size_t count, float scale,
+                           float limit, std::uint16_t* out) {
+    const auto bf16r = [](float v) { return std::bit_cast<float>(std::uint32_t(float_to_bf16(v)) << 16); };
+    for (std::size_t i = 0; i < count; ++i) {
+        const float g = std::min(bf16r(gate[i] * scale), limit);
+        const float u = std::min(std::max(bf16r(up[i] * scale), -limit), limit);
+        out[i]        = float_to_bf16(portable_silu(g) * u);
+    }
 }
 
 } // namespace gguf_cpu_detail
@@ -366,6 +431,9 @@ bool gguf_cpu_supported(QType format) noexcept {
     case QType::GGUF_Q5_K:
     case QType::GGUF_Q6_K:
     case QType::GGUF_IQ4_NL:
+    case QType::GGUF_IQ1_S:
+    case QType::GGUF_IQ1_M:
+    case QType::GGUF_IQ2_XXS:
     case QType::GGUF_IQ2_S:
     case QType::GGUF_IQ3_XXS:
     case QType::GGUF_IQ3_S:
@@ -541,6 +609,17 @@ void gguf_cpu_geglu_bf16(const float* gate, const float* up, std::size_t count, 
     }
 #endif
     gguf_cpu_detail::geglu_scalar(gate, up, count, out);
+}
+
+void gguf_cpu_clamped_swiglu_bf16(const float* gate, const float* up, std::size_t count, float scale,
+                                  float limit, std::uint16_t* out,
+                                  [[maybe_unused]] GgufCpuBackend backend) {
+#if defined(NINFER_CPU_EXPERT_X86)
+    if (gguf_cpu_backend_selected(backend) == GgufCpuBackend::Avx2) {
+        return gguf_cpu_detail::clamped_swiglu_avx2(gate, up, count, scale, limit, out);
+    }
+#endif
+    gguf_cpu_detail::clamped_swiglu_scalar(gate, up, count, scale, limit, out);
 }
 
 } // namespace ninfer::ops

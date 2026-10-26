@@ -63,27 +63,33 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   and the model answers from what it has thought.
 - **Sampling defaults.** The release's: temperature 1.0, top-p 1.0 (top-k 20, the candidates the
   sampler keeps).
-- **Speculative decoding by context lookup.** The GGUF carries none of the release's draft blocks.
-  `--lookup-ngram N` proposes what followed the last N tokens' earlier occurrence in the sequence
-  (up to `--draft-tokens`, 3 by default, at most 7), and the target verifies the proposal in one
-  pass of decode rows; the output is the one plain decoding gives.
+- **Speculative decoding with the DSpark drafter.** An artifact converted with the release's drafter
+  (the `dspark` component, [below](#the-dspark-drafter)) drafts with `--spec dspark`: up to 5
+  tokens a round (`--draft-tokens`, 1 to 5), kept while the drafter's confidence is at least 0.5,
+  verified by the target in one pass of decode rows. Its tokens and log probabilities are plain
+  decoding's.
+- **Speculative decoding by context lookup.** Without `--spec`, `--lookup-ngram N` proposes what
+  followed the last N tokens' earlier occurrence in the sequence (up to `--draft-tokens`, 3 by
+  default, at most 7), and the target verifies the proposal in one pass of decode rows; the output
+  is the one plain decoding gives.
 - **Expert residency.** The routed experts stay on the GPU, in pinned host memory or in the
-  artifact's files ([below](#expert-residency)); host memory is the residency to use.
+  artifact's files ([below](#expert-residency)); host memory is the residency to use. With host
+  experts, CPU threads compute a share of a decode call's missing experts while the GPU copies the
+  rest ([the CPU share](#the-cpu-share)).
 - **The Engram table.** Stored in the model's artifact or in a table artifact of its own, read row
   by row from its file or held in RAM ([below](#the-engram-table)).
 
-Not built for this family: the quantized `--kv-dtype` formats (the caches are BF16), the release's
-draft blocks, MTP, DFlash and n-gram copy drafts, a CPU share of the expert misses (the IQ1_S, IQ1_M
-and IQ2 blocks have no CPU kernels), rotation scaling (`--rope-yarn`, `--rope-scaling-factor`: the
-compressed blocks carry the release's own YaRN), images and video (the GGUF has no vision tower),
-pipeline stages and tensor parallelism, and of the context cache the shared paged KV pool, the disk
-tier and session slots.
+Not built for this family: the quantized `--kv-dtype` formats (the caches are BF16), MTP, DFlash
+and n-gram copy drafts, DSpark drafts while several requests decode, rotation scaling
+(`--rope-yarn`, `--rope-scaling-factor`: the compressed blocks carry the release's own YaRN), images
+and video (the GGUF has no vision tower), pipeline stages and tensor parallelism, and of the context
+cache the shared paged KV pool, the disk tier and session slots.
 
 ## Converting
 
-The converter reads the weights from the GGUF shards and the Engram GGUF, and the tokenizer and
-configuration from the base release. The release ships no Jinja chat template; the converter stores
-its own transcription of the release's encoder (`tools/convert/templates/deepseek_v41`).
+The converter reads the weights from the GGUF shards, the Engram GGUF and the drafter GGUF, and the
+tokenizer and configuration from the base release. The release ships no Jinja chat template; the
+converter stores its own transcription of the release's encoder (`tools/convert/templates/deepseek_v41`).
 
 ```bash
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 config.json tokenizer.json tokenizer_config.json \
@@ -91,11 +97,14 @@ hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 config.json tokenizer.json toke
 hf download ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF \
   --include 'DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-*.gguf' \
   --include 'DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf' --local-dir models/deepseek-v4.1
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
+  --local-dir models/deepseek-v4.1
 
-# The model, which names its Engram table by the SHA-256 of the table's rows.
-python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf --components text \
+# The model with its DSpark drafter; it names its Engram table by the SHA-256 of the table's rows.
+python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf --components text,dspark \
   --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf \
   --source engram=models/deepseek-v4.1/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
+  --source dspark=models/deepseek-v4.1/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
   --name DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M \
   --out models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer --device cpu
 # The Engram table, one artifact for every DeepSeek-V4.1-Flash-1017 conversion.
@@ -105,9 +114,11 @@ python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gg
   --out models/DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer --device cpu
 ```
 
-The model reads the Engram GGUF only for the table's digest. The model is one file of
-121,003,660,288 bytes (112.7 GiB), the table one of 110,595,294,496 bytes (103.0 GiB); on 24 cores
-of a Threadripper 3960X the conversions took 7 min 19 s and 3 min 29 s.
+The model reads the Engram GGUF only for the table's digest. `--components text` leaves the drafter
+out (121,003,660,288 bytes); its other objects are the same bytes either way. The model with its
+drafter is one file of 128,975,327,488 bytes (120.1 GiB), the table one of 110,595,294,496 bytes
+(103.0 GiB). On the 128 threads of two 32-core EPYC engineering samples the model took 3 min 54 s;
+on 24 cores of a Threadripper 3960X the table took 3 min 29 s.
 
 ## Running
 
@@ -129,22 +140,22 @@ ninfer $M --ngram-table $T --expert-residency host --prompt "Explain how a heat 
 
 On a 24 GB card with host experts the GPU holds the 6.0 GiB of dense weights, two layer banks
 (7.1 GiB), a 1.3 GiB workspace, the latent caches (133 MiB at 32,768 tokens of context) and an
-expert cache that takes the rest (7.8 GiB on an RTX 4090, of which a prompt span borrows up to
+expert cache that takes the rest (7.9 GiB on an RTX 4090, of which a prompt span borrows up to
 1.3 GiB while it runs); the host pins 106.7 GiB of experts. With disk experts the host pins 138 MiB
 of transfer buffers and the experts' pages sit in the OS page cache.
 
 ## Expert residency
 
 The routed experts are 106.7 GiB of the artifact, more than any one card holds, so the model runs
-with `--expert-residency host` or `disk`; `device` needs a card with room for every expert. Both run
-all expert arithmetic on the GPU with the resident kernels, through the transport Gemma 4 and Flint
-use ([Gemma 4's expert residency](gemma4.md#expert-residency) describes the layer banks, the cache
-and its rounds):
+with `--expert-residency host` or `disk`; `device` needs a card with room for every expert. The GPU
+runs the experts it caches or receives with the resident kernels, through the transport Gemma 4 and
+Flint use ([Gemma 4's expert residency](gemma4.md#expert-residency) describes the layer banks, the
+cache and its rounds):
 
 - **Host.** The experts are read from the artifact once at startup into pinned host memory, and a
   layer's misses are copied from there. The host needs that memory beside the Engram table's page
   cache (or its RAM copy) and the rest of the system: 106.7 GiB pinned, so a host with 128 GB
-  keeps about 12 GiB for everything else (not tested; the measurements below ran with 251 GB or more).
+  keeps about 12 GiB for everything else (not tested; the measurements below ran with 188 GiB or more).
   The startup reads the experts with direct I/O, past the page cache, on eight threads into
   ordinary pages and pins them once read.
 - **Disk.** The experts stay in the artifact's files. A layer's misses are read with ordinary file
@@ -157,8 +168,33 @@ and its rounds):
   routes most, filled at startup from a routing profile (`--expert-profile`, else the built-in
   DeepSeek-V4.1 profile, recorded on summaries of four corpora and on chat, code and reasoning
   requests).
-- **Every miss is copied.** There is no CPU share: `--expert-dma-share` and `--expert-cpu-threads`
-  are refused.
+- **CPU share.** With host experts, CPU threads compute a share of a decode or verification
+  call's misses from the pinned copy while the GPU copies and runs the rest
+  ([below](#the-cpu-share)). Prompt chunks and spans copy every miss.
+
+## The CPU share
+
+A decode or verification call of up to eight tokens leaves part of its missing experts to CPU
+threads, which compute them from the stored blocks while the GPU copies and runs the rest; the GPU
+then adds the CPU's sums to its own:
+
+- **The split.** `--expert-dma-share auto` (the default) gives each call the split whose copies and
+  CPU products end soonest by the copy and CPU times of earlier calls; a fixed `F` copies that
+  fraction of the misses and leaves the CPU the experts with the fewest pairs; `1` copies every
+  miss. `--expert-cpu-threads N` sets the pool, by default one thread per physical core and at
+  most half the usable CPUs, pinned and spinning while requests decode.
+- **Arithmetic.** For each pair the CPU computes the expert's gate and up rows over the call's q8_1
+  activation (the guarded input the GPU quantized, copied to host memory with the route weights and
+  guard factors), the clamped SwiGLU with the guard factor taken back, rounded to BF16 and
+  quantized as q8_1, and the down rows, and adds each row times the pair's route weight into its
+  token's 2^-32 fixed-point sums, as the GPU's vector kernels compute them
+  ([Qwen3.8-Flash-Next's CPU share](qwen3-8-flash-next.md#the-cpu-share) gives the IQ1_S, IQ1_M,
+  IQ2_XXS and IQ2_S slice products). Integer sums do not depend on their order, so tokens, log
+  probabilities and context states do not depend on the split, the share or the thread count.
+- **Disk experts.** An expert the CPU computes from disk needs the same file read as a copied one,
+  and on the host below every split of disk experts decoded slower than copying every miss
+  ([measurements](#the-cpu-share-on-one-rtx-4090)), so `auto` copies every miss of disk experts; a
+  share below `1` still gives the CPU its part.
 
 ## Prompt spans
 
@@ -178,7 +214,8 @@ experts. With host or disk experts the executor runs a prompt's chunks block by 
 - **Memory.** A span keeps its residual streams, coefficients and index selections between blocks:
   1,323 MiB for 16,384 tokens. Beside the default elastic expert cache, the span borrows them from
   the cache while it runs and gives them back after it, so decode keeps the whole cache; a span
-  the cache cannot lend them to at that moment runs chunk by chunk. With a fixed
+  the cache cannot lend them to at that moment runs as two halves of whole chunks, each a span the
+  cache may lend to, down to chunk by chunk. With a fixed
   `--expert-cache-mib` they stay in the workspace. The Engram rows of a span's tokens are staged
   on the card (about 95 MiB more than for one chunk).
 
@@ -191,11 +228,79 @@ addresses and copies them to the device:
 - **Where it is stored.** In its own artifact: the model names the table by digest, and
   `--ngram-table PATH` supplies it (NInfer refuses a table with another digest). A model run without
   its table is refused unless `--no-ngram-table` runs it without the Engram, which degrades the
-  output: on a 1,112-token WikiText slice the perplexity rises from 3.07 to 9.68.
+  output: on a 1,112-token WikiText slice the perplexity rose from 3.07 to 9.68 with the build that
+  added the model ([numerical checks](#numerical-checks)).
 - **How it is read.** `--ngram-residency disk` (the default) reads each pass's rows from the file
   (`--ngram-io`, `--ngram-io-depth`, `--ngram-ram-mib` for a row cache), and `ram` holds the whole
   table in RAM (`--ngram-lock` pins it). The table is 103.0 GiB, so `ram` and host experts together
   need about 210 GiB of RAM.
+
+## The DSpark drafter
+
+DeepSeek-V4.1-Flash-1017 ships DSpark, a drafter of three blocks of the backbone's shape;
+Unsloth's `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` stores it in Q8_0 with MXFP4 routed experts,
+and the converter stores those blocks as they are in the artifact's `dspark` component. With
+`--spec dspark` the executor loads it beside the model:
+
+- **What it reads.** At every position the backbone computes, the mean of the four streams entering
+  blocks 37, 38 and 39, projected (`fc`) and normalized into a key and value latent of each drafter
+  block, written to that block's window ring: the prompt's last 128 rows, every decode row and the
+  rows a verification keeps.
+- **A round.** The drafter runs the last accepted token and four noise tokens through its three
+  blocks in one pass (each row attends over the ring and over all five rows; the MoE routes each
+  row to 3 of 128 experts beside a shared expert), adds a rank-256 Markov term of the previous token
+  to the backbone's head logits and takes each row's greedy token, so five rows give five drafts.
+  A confidence head scores each draft; the round keeps the drafts up to the first scored below 0.5
+  (Strata's default for this drafter), at most `--draft-tokens`, and with none decodes one token.
+- **Exactness.** The target verifies the drafts in one pass of decode rows. Its attention splits a
+  row's keys the same way however many rows a pass has, and the log probabilities split a row's
+  vocabulary the same way however many rows they reduce, so a verified token and its log
+  probability are bit for bit those of plain decoding: greedy runs with and without the drafter
+  gave the same tokens and log probabilities with host and disk experts on an RTX 4090 and with
+  host experts on an RTX PRO 6000. A sampled request keeps a draft only while it equals the
+  target's own draw, as context-lookup drafts are kept.
+- **One request.** The drafter drafts while one request decodes; with more, each round decodes one
+  token per request.
+- **Memory.** The drafter's weights take 7.4 GiB of device memory, almost all of it its 384 MXFP4
+  experts; its rings take 0.75 MiB per sequence (twice that with prefix checkpoints) and the tapped
+  streams 7.5 MiB. The expert cache gives up that memory: on an RTX 4090 with host experts it keeps
+  73 experts instead of 1,137, and prompt spans shorten to 8,192 tokens.
+
+On October 26, 2026, two rented hosts ran the drafter on the prompts of the
+[Strata comparison](#against-strata-on-one-host) (one request, greedy, thinking off, host experts):
+that comparison's RTX 4090 host, with and without [the CPU share](#the-cpu-share), and an RTX PRO
+6000 (600 W, PCIe 5.0 x16) with a 24-core Threadripper PRO 7965WX and 188 GiB of RAM, NVIDIA driver
+595.99, with the build before the CPU share, which copied every miss as `--expert-dma-share 1` does
+(the CPU share was not run there):
+
+| card | drafts | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens | drafts accepted, short and long |
+|---|---|---:|---:|---:|---:|
+| RTX PRO 6000 | none | 50.8 tok/s | 48.3 tok/s | 1,210 tok/s | |
+| | `--spec dspark` | 83.1 tok/s | 75.0 tok/s | 1,290 tok/s | 38 of 58, 16 of 26 |
+| | `--spec dspark --draft-tokens 3` | 83.3 tok/s | 77.0 tok/s | 1,290 tok/s | 37 of 53, 16 of 24 |
+| RTX 4090, CPU share | none | 38.9 tok/s | 31.4 tok/s | 938 tok/s | |
+| | `--spec dspark` | 39.9 tok/s | 33.2 tok/s | 693 tok/s | 43 of 68, 16 of 31 |
+| RTX 4090, `--expert-dma-share 1` | none | 33.5 tok/s | 26.6 tok/s | 929 tok/s | |
+| | `--spec dspark` | 25.1 tok/s | 20.2 tok/s | 688 tok/s | 43 of 68, 16 of 31 |
+
+- **A card that caches most experts gains.** With the drafter the RTX PRO 6000 keeps 10,317 of the
+  15,360 experts on the card (11,387 without) and decodes 1.6 times as fast after the short prompt
+  and 1.55 times after the long one; three drafts a round decode as fast as five.
+- **A 24 GB card gains with the CPU share.** With the drafter the RTX 4090 keeps 73 experts on the
+  card (1,137 without), so nearly every expert a round's rows route to is missing. With the CPU
+  share the drafter decodes 1.03 and 1.06 times as fast as plain decoding; copying every miss it
+  decodes 25% and 24% slower. Either way prefill slows by 26%, in spans of 8,192 tokens. On the
+  same host Strata's `--dspark on` decodes at 34.3 and 38.7 tok/s
+  ([above](#against-strata-on-one-host)).
+- **Strata on the RTX PRO 6000.** Strata 0.2.6 exited with `router picked expert 2147483647` in
+  each of its ten runs on that host: the flags its app starts the engine with, `--dspark on` and
+  `--dspark on --dspark-block 3`, each on both prompts; the app's flags with `--reserve-mib 4096`
+  and `16384`, which left 4 and 16 GiB of the card free; `--dspark off`; and `--dspark off
+  --vram-experts 0.5`. That host has no Strata numbers.
+- **Memory.** On the RTX PRO 6000 the server peaked at 116.2 GiB of resident host memory with the
+  drafter and 116.0 GiB without it.
+
+One run per row; no spread is measured.
 
 ## Prefix reuse
 
@@ -220,14 +325,14 @@ arbitrary common prefix.
 
 ### Against Strata on one host
 
-October 25, 2026, one rented host: an RTX 4090 (450 W, PCIe 4.0 x16), two 32-core AMD EPYC
+October 25 and 26, 2026, one rented host: an RTX 4090 (450 W, PCIe 4.0 x16), two 32-core AMD EPYC
 engineering samples (128 threads) and 409 GiB of RAM, NVIDIA driver 615.71. One sequence, greedy
 decoding, thinking off, the same prompt tokens in both engines: a 14-token question and an
 8,086-token summary request (32 tokens of answer).
 
 - **NInfer** served the model with `ninfer-serve --max-context 16384 --max-concurrency 1
-  --expert-residency host`: the current build and the native release build of `b3402a6fd`, which
-  ran prompts chunk by chunk.
+  --expert-residency host`: the current build on October 26 (61 CPU threads by default) and the
+  native release build of `b3402a6fd`, which ran prompts chunk by chunk and copied every miss.
 - **Strata** 0.2.6, its latest release (its DeepSeek engine `strata-dsv41` 0.1.51, build
   `562a0c2ed`, from the release's Linux CUDA 13 package), ran the same GGUF shards and Engram GGUF
   through its `pack_gguf.py` index, with the DSpark drafter from Unsloth's
@@ -238,8 +343,10 @@ decoding, thinking off, the same prompt tokens in both engines: a 14-token quest
 
 | engine and settings | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens |
 |---|---:|---:|---:|
-| NInfer, host experts | 26.0 tok/s | 22.0 tok/s | 925 tok/s |
+| NInfer, host experts | 38.9 tok/s | 31.4 tok/s | 938 tok/s |
+| NInfer, host experts, `--expert-dma-share 1` | 33.5 tok/s | 26.6 tok/s | 929 tok/s |
 | NInfer `b3402a6fd`, host experts | 25.8 tok/s | 22.1 tok/s | 498 tok/s |
+| NInfer, host experts, `--spec dspark` | 39.9 tok/s | 33.2 tok/s | 693 tok/s |
 | Strata, `--dspark auto --dspark-conf 0.65` | 36.0 tok/s | 38.4 tok/s | 635 tok/s |
 | Strata, `--dspark on --dspark-conf 0.65` | 34.3 tok/s | 38.7 tok/s | 690 tok/s |
 | Strata, `--dspark on --dspark-conf 0.65 --dspark-block 3` | 39.9 tok/s | 37.1 tok/s | 660 tok/s |
@@ -249,29 +356,123 @@ decoding, thinking off, the same prompt tokens in both engines: a 14-token quest
 
 - **Decode.** Strata computes the experts its VRAM cache misses on CPU threads beside the GPU:
   12,396 of the 20,400 expert products of its first short answer (61%) and 3,921 of 7,440 after
-  the long prompt (53%). NInfer copies every expert its cache lacks to the GPU: the IQ1_S, IQ1_M and
-  IQ2_XXS blocks have no CPU kernels in NInfer. With all six experts Strata decodes 1.3 to 1.8 times as
-  fast.
+  the long prompt (53%). With the build `7731f3d30` NInfer's device cache served 62 to 72% of the
+  decode routes, its CPU share computed 16 to 22% and the GPU copied the rest
+  ([the CPU share](#the-cpu-share-on-one-rtx-4090)). With all six experts and no drafts, Strata's
+  settings decode 0.93 to 1.01 times as fast as NInfer after the short prompt and 1.22 to 1.23
+  times after the long one; with both engines' drafters, Strata's fastest setting for each prompt
+  decodes 1.00 and 1.17 times as fast as `--spec dspark`
+  ([the decode step](#the-decode-step-on-one-rtx-4090) shows where NInfer's time goes).
 - **Prefill.** Strata prefills in windows of 16,384 tokens; NInfer runs the 8,086 tokens as one
-  [prompt span](#prompt-spans), 1.9 times the release's rate.
-- **Drafts.** With `--dspark on`, 22 of 30 drafts were accepted on the short answer and 10 of 12
-  on the long one; `--dspark auto` offered none.
+  [prompt span](#prompt-spans), 1.9 times the release's rate and 1.36 to 1.48 times Strata's. With
+  the drafter NInfer's spans shorten to 8,192 tokens and it prefills at 693 tok/s, against Strata's
+  635 to 690.
+- **Drafts.** With `--dspark on`, Strata accepted 22 of 30 drafts on the short answer and 10 of 12
+  on the long one; `--dspark auto` offered none. NInfer's `--spec dspark` accepted 43 of 68 and
+  16 of 31 ([the drafter](#the-dspark-drafter)) and decodes 1.03 and 1.06 times as fast as without
+  drafts.
 - **Repeatability.** Strata's greedy answers to the short prompt ran 74 to 119 tokens over its six
   runs. NInfer's greedy tokens were the same in every run, in both builds, and so were the current
-  build's log probabilities. The release's log probabilities after the long prompt, which followed
-  the short one on each server, differed between servers by up to 0.024 at answer tokens 28 and
-  29: a race in the expert cache that the current build fixes ([outputs](#prompt-spans)).
+  build's log probabilities, with and without the CPU share. The current build's short answer is 94
+  tokens and the release's 78: the current GPU rounds the IQ1_S, IQ1_M and IQ2_XXS products step by
+  step, as the CPU share computes them ([the CPU share](#the-cpu-share)). The release's log
+  probabilities after the long prompt, which followed the short one on each server, differed
+  between servers by up to 0.024 at answer tokens 28 and 29: a race in the expert cache that the
+  current build fixes ([outputs](#prompt-spans)).
 - **Memory.** Strata peaked at 95.6 to 103.3 GiB of resident host memory, NInfer at 115.6 to 115.7 GiB.
+
+### The CPU share on one RTX 4090
+
+On October 26, the host of the Strata comparison (61 CPU threads in the default pool), the same
+two requests and `ninfer-serve --max-context 16384 --max-concurrency 1`; disk experts with the
+model file in the page cache:
+
+| experts | `--expert-dma-share` | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens |
+|---|---|---:|---:|---:|
+| host | `auto` | 38.9 tok/s | 31.4 tok/s | 938 tok/s |
+| host | `1` (every miss copied) | 33.5 tok/s | 26.6 tok/s | 929 tok/s |
+| host | `0` (every miss on the CPU) | 31.6 tok/s | 24.0 tok/s | 936 tok/s |
+| disk | `auto` (every miss copied) | 18.3 tok/s | 13.5 tok/s | 598 tok/s |
+| disk | `0` | 2.9 tok/s | 1.9 tok/s | 573 tok/s |
+| disk | `0`, `--expert-cpu-threads 8` | 6.3 tok/s | | |
+
+- **Host experts.** The split by measured speeds decodes 1.16 and 1.18 times as fast as copying
+  every miss; with every miss on the CPU decode is 6% and 10% slower than copying. Prefill does
+  not use the CPU.
+- **Where the routes go.** With the build `7731f3d30`, two servers with a request log decoded 400
+  tokens after each prompt
+  (`ignore_eos`), at 32.0 and 25.5 tok/s copying every miss and 36.9 and 31.0 tok/s with `auto`.
+  Over the decode intervals the device cache served 72 to 74% of the routes after the short prompt
+  and 69 to 75% after the long one, and the GPU copied 0.53 to 0.54 and 0.53 to 0.68 GB per token;
+  with `auto` the cache served 69 to 72% and 62 to 69%, the CPU computed 16 to 18% and 19 to 22%,
+  and the GPU copied 0.25 to 0.31 and 0.29 to 0.39 GB per token.
+- **Disk experts.** A build that split disk experts by measured speeds decoded at 3.4 and 2.3 tok/s
+  with 61 threads and 13.0 and 8.5 with 8, against 16.0 and 12.2 when that build copied every miss;
+  with every miss on the CPU, more threads were slower too. Prefill, which the CPU share does not
+  compute, ran at 573 tok/s beside the 61-thread pool and 598 tok/s without a pool. The cause of
+  the larger pool's cost is not established. `auto` therefore copies every miss of disk experts.
+- **Outputs.** Every run with a CPU share, host and disk, with and without `--spec dspark`, gave
+  the tokens and log probabilities of copying every miss: the 94 tokens of the short answer and the
+  32 after the long prompt.
+- **Memory.** The server peaked at 115.7 GiB of resident host memory with host experts and 9.1 GiB
+  with disk experts, with and without the CPU share.
+
+One run per row; no spread is measured.
+
+### The decode step on one RTX 4090
+
+On October 26, Nsight Systems (`nsys profile --trace=cuda --cuda-graph-trace=node`) traced one
+request decoding 200 tokens after the short prompt on the host of the Strata comparison, host
+experts, `auto`, with the build `7731f3d30` and with the current one. Medians over 190 decode
+steps:
+
+| | `7731f3d30` | current |
+|---|---:|---:|
+| decode step | 32.6 ms | 27.5 ms |
+| waits for missing experts (40 a step) | 13.5 ms | 11.9 ms |
+| other kernels | 14.1 ms | 11.8 ms |
+| GPU idle | 5.0 ms | 3.8 ms |
+| copied to the GPU | 214 MB | 171 MB |
+| GGUF vector products | 523 a step, 7.1 ms | 203 a step, 5.1 ms |
+| grouped products (routed experts and output projection) | 160 a step, 2.5 ms | 200 a step, 3.6 ms |
+| activation guards, quantizations and unscalings a step | 483, 643, 443 | 203, 363, 163 |
+| `gemv`, 147 a step | 10.4 µs each | 6.9 µs each |
+| `hc_split`, 80 a step | 6.8 µs each | 5.2 µs each |
+| `hc_pre_norm`, 81 a step | 5.7 µs each | 3.8 µs each |
+
+- **The grouped output projection is one product.** The attention output's eight head groups each
+  go through their own 1,024 rows of `output_a`. A decode or verification call of up to eight
+  tokens ran them as eight GGUF vector products, each with its own activation guard, quantization
+  and unscaling, which read the weights at about 470 GB/s. The groups now run as the eight experts
+  of one grouped vector product, with one guard, quantization and unscaling for every group; each
+  token's group computes the arithmetic of that group's own product, so every value keeps its bits.
+  Longer calls keep the eight products.
+- **Loads ahead.** `gemv` (the hyper-connections' mixes, rows of 20,480 values), `hc_split` and
+  `hc_pre_norm` give each row one block. With one load in flight per thread a block read about
+  8 GB/s: the 24 rows of a mix took 10.4 µs. Each thread now issues four loads ahead (eight in
+  `hc_pre_norm`, which keeps its 5,120 values in registers between the norm and the mix) and adds
+  them in the previous order, so every sum keeps its bits.
+- **Columns over the card.** `guard_columns` scales each activation column by a power of two before
+  the GGUF products with one block of up to 1,024 threads per column, and the hyper-connections'
+  4 × 4 Sinkhorn normalization sits on 16 lanes of one warp, each lane adding its row or column in
+  the serial loop's order.
+- **Outputs.** Greedy tokens and log probabilities equal those of `7731f3d30` with host and disk
+  experts, with and without the CPU share and `--spec dspark`; the DeepSeek kernels test compares
+  the grouped output projection bit for bit with the groups' own products.
+- **Where the rest goes.** The waits for missing experts take 43% of the step: each of the 40 MoE
+  layers waits for the copies and the CPU share of its misses. The current build copied 171 MB a
+  step against 214 MB; the cause of that difference is not measured.
+- **The profiler** slows decode: the two builds decoded at 28.6 and 34.5 tok/s under it.
 
 ### Prompt spans
 
-On the same host, two fresh servers of each build (`--max-context 32768`) took the two requests and
-a third, a 24,252-token prompt that resumes from the 8,084-token state of the second and prefills
-16,168 new tokens:
+On the same host, two fresh servers of each build (`--max-context 32768`; the span build of October
+25, before the CPU share, and the release) took the two requests and a third, a 24,252-token prompt
+that resumes from the 8,084-token state of the second and prefills 16,168 new tokens:
 
 | build, host experts | decode, short answer | after 8,086 tokens | prefill of 8,086 tokens | prefill of 16,168 more tokens | decode after them |
 |---|---:|---:|---:|---:|---:|
-| NInfer, spans of 16,384 tokens | 26.0, 25.9 tok/s | 22.2, 22.1 tok/s | 926, 925 tok/s | 1,200, 1,200 tok/s | 22.5, 22.5 tok/s |
+| NInfer span build, spans of 16,384 tokens | 26.0, 25.9 tok/s | 22.2, 22.1 tok/s | 926, 925 tok/s | 1,200, 1,200 tok/s | 22.5, 22.5 tok/s |
 | NInfer `b3402a6fd`, chunk by chunk | 26.0, 26.1 tok/s | 22.2, 22.2 tok/s | 499, 499 tok/s | 505, 505 tok/s | 23.0, 22.8 tok/s |
 
 - **Prefill.** One span sweeps the experts once where four or eight chunks swept them four or eight
@@ -360,7 +561,7 @@ release archive). Beside the two layer banks (7.1 GiB) the expert cache keeps 38
 
 | card | build | experts | device cache | decode, short answer | decode after 8,086 tokens | prefill of 8,086 tokens |
 |---|---|---|---:|---:|---:|---:|
-| RTX 4090 | current, spans of 4,096 tokens | pinned RAM | 54 | 21.4 tok/s | 20.0 tok/s | 679 tok/s |
+| RTX 4090 | span build of October 25, spans of 4,096 tokens | pinned RAM | 54 | 21.4 tok/s | 20.0 tok/s | 679 tok/s |
 | RTX 4090 | `b3402a6fd` | pinned RAM | 57 | 21.3 tok/s | 20.0 to 20.1 tok/s | 457 tok/s |
 | RTX 4090 | `b3402a6fd` | disk, page cache warm | 86 | 5.9 to 6.3 tok/s | 5.9 to 6.0 tok/s | 113 to 119 tok/s |
 | Tesla V100 | `b3402a6fd` | pinned RAM | 38 | 10.5 to 10.6 tok/s | 9.3 to 9.4 tok/s | 198 to 199 tok/s |
@@ -384,9 +585,11 @@ Rows give one run, or the range of two; no spread is measured.
 - **Against an FP64 forward.** `tools/reference/deepseek_v41.py` runs the model in FP64 over the
   GGUF's exactly decoded blocks and the Engram GGUF's rows, with the release's attention roundings.
   Over the 1,112 scored tokens of the WikiText slice above, its negative log-likelihood sums to
-  1238.7 against NInfer's 1246.3 (perplexity 3.046 against 3.067, 0.7% higher in NInfer, whose
-  matrix kernels take BF16 activations rounded to ggml's q8_1 blocks, as llama.cpp's do). NInfer's
+  1238.7 against 1246.3 for the build that added the model on October 25 (perplexity 3.046 against
+  3.067, 0.7% higher in NInfer, whose matrix kernels take BF16 activations rounded to ggml's q8_1
+  blocks, as llama.cpp's do). NInfer's
   greedy next token matched the reference's argmax at 21 of 22 positions spread over the slice (the
   exception has a top-two logit gap of 0.32) and at 6 of the 10 positions where the reference's top
   two logits are closest (gaps of 0.01 to 0.04). The FP64 forward took 2 h 53 min on the
-  Threadripper 3960X.
+  Threadripper 3960X. Since then the GPU's IQ1_S, IQ1_M and IQ2_XXS products round step by step as
+  the [CPU share](#the-cpu-share) does, which changes the outputs; this check was not rerun.
