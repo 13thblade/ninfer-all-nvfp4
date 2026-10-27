@@ -16,7 +16,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 ## What's New
 
-- **2026-10-27:** DeepSeek-V4.1-Flash takes the [STQ DSpark drafter](docs/deepseek-v41.md#the-stq-drafter) from beamster's Sushi pack: half the device memory of Unsloth's drafter at the same acceptance, so one RTX 4090 decodes up to 1.4 times as fast with it and prefills without the drafter's slowdown.
+- **2026-10-27:** DeepSeek-V4.1-Flash takes the [STQ DSpark drafter](docs/deepseek-v41.md#the-stq-drafter) from beamster's Sushi pack, and the [published artifact](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3) carries it: half the device memory of Unsloth's drafter at the same acceptance, so one RTX 4090 decodes up to 1.4 times as fast with it and prefills without the drafter's slowdown.
 - **2026-10-26:** Qwen3.8-Flash-Next with [disk experts](docs/qwen3-8-flash-next.md#expert-placements) prefills a long prompt 3.1 to 4.1 times as fast and decodes the answer 1.8 to 3.6 times as fast (Q2_0, RTX 3090 to 5090).
 - **2026-10-26:** [Tensor-parallel](docs/maintainer/pipeline-stages.md#tensor-parallelism) shares sized to each card (`--tensor-split`, or each card's measured bandwidth capped by its free memory), for every weight format of a dense model (groupwise-int, BF16, ternary, FP8, NVFP4, Hadamard-rotated) and with DFlash drafters, attention divided by KV heads; [expert parallelism](docs/maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families) divides the routed experts of every MoE family (native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash) over the GPUs.
 - **2026-10-26:** DeepSeek-V4.1-Flash decodes [39 tok/s on one RTX 4090](docs/deepseek-v41.md#the-decode-step-on-one-rtx-4090), with CPU threads [computing part of the missing experts](docs/deepseek-v41.md#the-cpu-share), and 83 tok/s on one RTX PRO 6000 with the release's [DSpark drafter](docs/deepseek-v41.md#the-dspark-drafter); it reads [images](docs/deepseek-v41.md#images) with the release's vision tower.
@@ -174,7 +174,7 @@ that only this engine reads.
 | [Qwen3.8-Flash-Next Coder GSQ-RCO IQ1_M](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 31.02 | GGUF blocks | ✓ | ✓ | — | — | expert-pruned coding build, 256 experts per layer; shared-Q8_0 MTP; reads the n-gram table |
 | [Gemma 4 26B-A4B it QAT](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3) | 14.75 | GGUF Q4_0 blocks | ✓ | ✓ | — | — | Google's QAT GGUF byte for byte; the MTP column is Google's QAT assistant |
 | [Flint UD-Q4_K_XL](https://huggingface.co/WaveCut/Flint-UD-Q4_K_XL-NInfer-v3) | 23.38 | GGUF blocks, Q8_0 to IQ3_S | — | — | — | — | Unsloth's UD-Q4_K_XL GGUF byte for byte; drafts by context lookup |
-| [DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ1_M](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3) | 121.02 | GGUF blocks, IQ1_S to IQ2_S experts | ✓ | — | — | — | ISTA-DASLab's GGUF byte for byte; experts in host memory or on disk; reads the Engram table; the release's vision tower (images); the release's DSpark drafter from Unsloth's Q8_0 GGUF (`--spec dspark`), or context lookup |
+| [DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ1_M](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3) | 117.18 | GGUF blocks, IQ1_S to IQ2_S experts | ✓ | — | — | — | ISTA-DASLab's GGUF byte for byte; experts in host memory or on disk; reads the Engram table; the release's vision tower (images); the release's DSpark drafter in beamster's STQ encoding (`--spec dspark`), or context lookup |
 
 The three Flash-Next releases read one shared n-gram table, which the model names by digest: the
 [n-gram table](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3) (26.92 GiB,
@@ -276,7 +276,7 @@ Prefill of a 4,463-token prompt, in tok/s:
 </details>
 
 <details>
-<summary><b>DeepSeek-V4.1-Flash</b> — 52 tok/s on one RTX 5090, 48 on one RTX PRO 6000 (83 with DSpark), 34 to 39 on one RTX 4090</summary>
+<summary><b>DeepSeek-V4.1-Flash</b> — 52 tok/s on one RTX 5090, 48 on one RTX PRO 6000 (DSpark: 1.3 to 2.1 times as fast), 34 to 39 on one RTX 4090</summary>
 
 ISTA-DASLab's GSQ-RCO IQ1_M GGUF (112.7 GiB, and its 103.0 GiB Engram table), one request, greedy,
 thinking off, one GPU, October 2026. The routed experts stay in pinned host memory or in the file,
@@ -297,11 +297,11 @@ the build decodes at 38.9 and 31.4 tok/s, against 33.5 and 26.6 when it copies e
 ([the CPU share](docs/deepseek-v41.md#the-cpu-share)); there Strata 0.2.6 decodes the same GGUF at
 34 to 40 tok/s, computing about half the experts on its CPU threads, and prefills at 635 to 690
 tok/s ([measurements](docs/deepseek-v41.md#measurements)). With host experts the server peaks at 116
-GiB of host memory. With the release's DSpark drafter (`--spec dspark`) the RTX PRO 6000 decodes at
-83.1 and 75.0 tok/s, against 50.8 and 48.3 for the same build without it (both copying every miss),
-and the RTX 4090 with the CPU share at 39.9 and 33.2 tok/s; the drafter's 7.4 GiB shrink the 4090's
-expert cache, so copying every miss it decodes at 25.1 and 20.2
-([the drafter](docs/deepseek-v41.md#the-dspark-drafter)). With `--vision` it reads images through
+GiB of host memory. On October 27, with the release's DSpark drafter (`--spec dspark`, 3.58 GiB on
+the card in the STQ encoding the artifact carries), an RTX PRO 6000 decoded five requests 1.28 to
+2.07 times as fast as without it, and an RTX 4090 decoded code and reasoning 1.19 and 1.21 times as
+fast, the other three requests 0.85 to 1.02 times, prefilling at plain speed
+([the drafter](docs/deepseek-v41.md#the-stq-drafter)). With `--vision` it reads images through
 the release's vision tower ([images](docs/deepseek-v41.md#images)).
 
 </details>
@@ -365,7 +365,7 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
   buffers rather than mapped, and CPU threads compute a share of each decode call's missing host
   experts. Prompts run block by block in spans of up to 16,384 tokens, so each block's experts
   cross the bus once per span. On one RTX 4090 with its experts in host memory it decodes at 31.4
-  to 38.9 tok/s (33.2 to 39.9 with DSpark) and prefills 8,086 tokens at 938 tok/s; on the same host
+  to 38.9 tok/s and prefills 8,086 tokens at 938 tok/s; on the same host
   Strata 0.2.6 decodes at 34 to 40 tok/s and prefills at 635 to 690
   ([DeepSeek-V4.1-Flash](docs/deepseek-v41.md)).
 - **CPU share of host and disk experts.** With Flash-Next, Gemma 4, Flint or native Qwen3.5/3.6
@@ -390,8 +390,10 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
   so the output is the one plain decoding gives.
 - DeepSeek-V4.1-Flash drafts with the release's DSpark drafter (`--spec dspark`, 1 to 5 drafts kept
   while its confidence holds): three blocks that read the backbone's last three blocks' streams. Its
-  verification rows are bit for bit plain decode rows. It decodes 1.6 times as fast on an RTX PRO
-  6000 and slower than plain decoding on a 24 GB card, whose expert cache it shrinks.
+  verification rows are bit for bit plain decode rows. In beamster's STQ encoding, which the
+  published artifact carries (3.58 GiB on the card), it decodes 1.28 to 2.07 times as fast on an
+  RTX PRO 6000; on an RTX 4090, whose expert cache it shrinks, it decodes code and reasoning 1.19
+  and 1.21 times as fast and other requests 0.85 to 1.02 times.
 - Flint, which has no drafter, and DeepSeek-V4.1-Flash without `--spec` draft by context lookup
   (`--lookup-ngram N`, 1 to 7 drafts): what followed the last N tokens' earlier occurrence, verified
   in one pass of decode rows.
