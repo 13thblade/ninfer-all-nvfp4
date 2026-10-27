@@ -135,13 +135,27 @@ to OFF. A pruned build needs a GPU compatible with one of its SASS images, with 
 for other targets.
 
 Windows releases also enable `NINFER_WINDOWS_KERNEL_DLL` (local default OFF). The GGML kernels
-use a shared library with the same architecture set, while the other components remain static.
-The existing bridge exposes functions and plain values; it imports no mutable globals or virtual
-tables. CMake exports those functions and stages the DLL beside consumers. The DLL is not passed
-to `nvprune`, which accepts static archives and relocatable objects, so it retains PTX.
-Compilation uses an object library with the static build's target name and flags; a separate
-target links those objects into the DLL. DLL export definitions therefore do not affect the
-CUDA compilation target.
+and the INT8-family small-T attention units use a shared library, `ninfer_kernels`, with the same
+architecture set, while the other components remain static. The Windows loader refuses a PE image
+whose `SizeOfImage` exceeds `0x77000000` (1904 MiB), below the linker's 2 GiB; the attention
+units hold more than half of the device code, so the split keeps both the runtime DLL and the
+kernel DLL within that limit. The DLL composition lives at the end of `src/ops/CMakeLists.txt`.
+The GGML bridge exposes functions and plain values; it imports no mutable globals or virtual
+tables. CMake exports those functions and stages the DLL beside consumers. The GGML objects are
+not passed to `nvprune`, which accepts static archives and relocatable objects, so they retain
+PTX. Their compilation uses an object library with the static build's target name and flags; the
+DLL target links those objects. DLL export definitions therefore do not affect the CUDA
+compilation target.
+The attention units form the static archive `ninfer_small_t_i8`, pruned like the other archives
+and linked whole into the DLL (`ninfer_export_archive_instantiations` in
+`cmake/NinferTargets.cmake`). `dumpbin` lists the archive's public symbols, and a generated
+module-definition file names only the explicit instantiations of `launch_small_t_i8`, one per
+unit; CMake merges it into the automatic exports. Exporting all their symbols would name every
+kernel the units instantiate, and a DLL can name at most 65535 exports. The units' sources are the
+same in every build, so other builds keep their cache entries. The archive carries its own copy
+of the route key (`small_t_i8_route.cpp`), and the DLL links its own copy of the device layer's
+launch helpers (`core/device_launch.cpp`), which call the DLL's own CUDA runtime, the one that
+registered its kernels.
 The DLL also owns the device-tier probe with its cache and the installed device route profiles,
 each compiled as a separate object library. Both the GGML bridge and static Ops call their exported
 functions, so there is one tier cache, one profile store and no circular library dependency. With

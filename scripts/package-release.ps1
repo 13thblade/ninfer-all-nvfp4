@@ -102,13 +102,31 @@ if ($VcpkgEntry.Count -eq 1) {
     }
 }
 $Cuobjdump = Join-Path $CudaRoot 'bin\cuobjdump.exe'
+# The Windows loader refuses an image whose SizeOfImage passes 0x77000000 (1904 MiB): LoadLibrary
+# then fails with error 193 although the file is well below the linker's 2 GiB.
+$MaximumImageBytes = 0x77000000
+function Read-ImageBytes([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $reader = [IO.BinaryReader]::new($stream)
+        $stream.Position = 0x3C
+        $header = $reader.ReadUInt32()
+        $stream.Position = $header
+        if ($reader.ReadUInt32() -ne 0x4550) { throw "No PE signature: $Path" }
+        $stream.Position = $header + 24
+        if ($reader.ReadUInt16() -ne 0x20B) { throw "Not a PE32+ image: $Path" }
+        $stream.Position = $header + 24 + 56
+        return $reader.ReadUInt32()
+    } finally { $stream.Dispose() }
+}
 $DeviceModules = @('ninfer-runtime.dll')
-if ($KernelDll) { $DeviceModules += 'ninfer_ggml_quants.dll' }
+if ($KernelDll) { $DeviceModules += 'ninfer_kernels.dll' }
 foreach ($module in $DeviceModules) {
     $exe = Join-Path $BackendRoot $module
-    if ((Get-Item -LiteralPath $exe).Length -ge 2GB) { throw "PE device module exceeds 2 GiB: $module" }
     if (-not (Test-Path -LiteralPath $exe)) { throw "Missing device module: $exe" }
-    Write-Host "Device module: $module; bytes: $((Get-Item -LiteralPath $exe).Length)"
+    $imageBytes = Read-ImageBytes $exe
+    Write-Host "Device module: $module; bytes: $((Get-Item -LiteralPath $exe).Length); image bytes: $imageBytes of $MaximumImageBytes"
+    if ($imageBytes -gt $MaximumImageBytes) { throw "PE image of $module maps $imageBytes bytes; Windows loads at most $MaximumImageBytes" }
     if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
         & dumpbin /headers $exe
         if ($LASTEXITCODE -ne 0) { throw "Cannot inspect PE headers for $exe" }
@@ -147,7 +165,7 @@ foreach ($product in $Products) {
 @{ source_revision = $Revision; modified_sources = [bool]$SourceState.Count; version = $Version;
    cuda = $CudaVersion; cuda_compiler = $CudaVersionText; architectures = $Archs; platform = 'windows-x64';
    cuda_archive_ptx_pruned = ((Read-Cache 'NINFER_CUDA_PRUNE_PTX') -eq 'ON');
-   ggml_kernel_dll = $KernelDll; layout = 'shared-runtime-v1'; commands = $Commands;
+   kernel_dll = $KernelDll; layout = 'shared-runtime-v1'; commands = $Commands;
    validation = 'Device images present; all launchers passed --help without Toolkit on PATH. GPU inference was not tested.'
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ProductRoot 'BUILD-INFO.json') -Encoding utf8
 $innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File -Recurse | Sort-Object FullName | ForEach-Object {
