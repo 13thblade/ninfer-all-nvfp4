@@ -60,19 +60,8 @@ target_compile_options(ninfer_ggml_quants PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe=--diag_suppress=177>)
 target_link_libraries(ninfer_ggml_quants PRIVATE ${NINFER_CUDART_TARGET} CUDA::cublas)
-if(NINFER_WINDOWS_KERNEL_DLL)
-  # Compile independently of DLL-only definitions, preserving the static archive's cache identity.
-  # Only linking changes. The bridge imports no global data or virtual tables.
-  add_library(ninfer_ggml_quants_dll SHARED
-    $<TARGET_OBJECTS:ninfer_ggml_quants> $<TARGET_OBJECTS:ninfer_device_tier>
-    $<TARGET_OBJECTS:ninfer_device_route>)
-  set_target_properties(ninfer_ggml_quants_dll PROPERTIES
-    OUTPUT_NAME ninfer_ggml_quants WINDOWS_EXPORT_ALL_SYMBOLS ON
-    LINKER_LANGUAGE CUDA CUDA_RUNTIME_LIBRARY Static
-    CUDA_SEPARABLE_COMPILATION OFF CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
-  target_link_libraries(ninfer_ggml_quants_dll PRIVATE ${NINFER_CUDART_TARGET} CUDA::cublas)
-  target_link_libraries(ninfer_ops PRIVATE ninfer_ggml_quants_dll)
-else()
+# In a Windows kernel-DLL build the kernel DLL links these objects (src/ops/CMakeLists.txt).
+if(NOT NINFER_WINDOWS_KERNEL_DLL)
   target_link_libraries(ninfer_ops PRIVATE ninfer_ggml_quants)
   # The flash attention's launch reads the device tier ninfer_ops keeps: a program whose other
   # objects never reach it still links (a link-only cycle the static archives resolve).

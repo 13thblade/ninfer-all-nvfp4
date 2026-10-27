@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
-#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -71,25 +70,6 @@ void destroy_event(cudaEvent_t& event) noexcept {
 }
 
 } // namespace
-
-void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
-    if (err == cudaSuccess) { return; }
-    std::fprintf(stderr, "%s:%d: CUDA_CHECK(%s) failed: %s: %s\n", file, line, expr,
-                 cudaGetErrorName(err), cudaGetErrorString(err));
-    std::abort();
-}
-
-void raise_dynamic_shared_memory(const void* kernel, int bytes) {
-    static std::mutex mutex;
-    static std::map<std::pair<int, const void*>, int> raised;
-    int device = -1;
-    CUDA_CHECK(cudaGetDevice(&device));
-    const std::scoped_lock lock(mutex);
-    int& limit = raised[{device, kernel}];
-    if (limit >= bytes) { return; }
-    CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-    limit = bytes;
-}
 
 int memory_device(const void* pointer) {
     if (pointer == nullptr) { return -1; }

@@ -66,7 +66,8 @@ it to every build as `NINFER_VERSION`. The binaries report it as their version (
 reports another tag. A run that will not publish builds `untagged` binaries.
 
 1. Compile release products with `NINFER_SHARED_RUNTIME=ON`. Six small command executables load
-   one private runtime per CUDA family. Windows also keeps GGML in its existing kernel DLL.
+   one private runtime per CUDA family. Windows also keeps the GGML and INT8 small-T attention
+   kernels in a kernel DLL, so that no PE image exceeds the loader's `0x77000000` bytes.
    Component archives remain the compile owners. Linux compiles them as PIC for the shared runtime.
 2. Check every requested architecture with `cuobjdump`. Run executable `--help` checks.
    Windows clears developer directories from `PATH`. Linux checks the dynamic library closure

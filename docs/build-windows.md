@@ -131,12 +131,17 @@ This reduces the image size without recompiling cached objects. These packages d
 PTX fallback for GPUs that cannot run any of their machine-code images. Local builds retain PTX
 by default; enabling this option requires the Toolkit's `nvprune` component.
 
-The workflow also sets `NINFER_WINDOWS_KERNEL_DLL=ON`: GGML kernels reside in
-`ninfer_ggml_quants.dll` inside the selected backend directory. The DLL carries the same architecture set and
-retains its PTX; the other CUDA archives are pruned. This separates device code across PE images
-to address MSVC's 2 GiB limit without removing GPU targets. The DLL uses the existing function-only
-GGML bridge and is staged for apps, the product benchmark and tests. Local builds default to the
-static library. The packager checks device images in the kernel DLL and the shared runtime DLL.
+The workflow also sets `NINFER_WINDOWS_KERNEL_DLL=ON`: the GGML kernels and the INT8-family
+small-T attention units reside in `ninfer_kernels.dll` inside the selected backend directory.
+The DLL carries the same architecture set. Its GGML objects retain their PTX; the attention units
+come from a pruned archive like the other CUDA archives. The split keeps every PE image within
+what Windows loads: the loader refuses an image whose `SizeOfImage` exceeds `0x77000000`
+(1904 MiB) with error 193, although the linker accepts up to 2 GiB. In the CUDA 12.9 runtime DLL
+of revision `7a89828a3`, the attention units held 1068 of the 1841 MiB of device code. The DLL
+uses the existing function-only GGML bridge, exports only the attention units' launch
+instantiations, and is staged for apps, the product benchmark and tests. Local builds default to
+the static libraries. The packager checks device images in the kernel DLL and the shared runtime
+DLL.
 
 Every push to `master` starts the current build and cancels the superseded run.
 Feature branches build only through a manual run, which builds the packages
@@ -158,8 +163,8 @@ for example `ninfer-windows-x64-cuda13.4-sm75-80-86-89-120a-0123456789ab.7z.001`
 The previous static-EXE layout produced CUDA 13.4 executables of about 1.95 GB each, plus a 313 MB
 GGML DLL. Its package was 6.73 GB unpacked and 6.37 GB archived. The shared-runtime layout removes
 this duplication between commands. Its actual linked sizes and GPU behavior still require native
-validation. The packager rejects device modules at or above 2 GiB. Archive splitting only addresses
-GitHub's asset limit.
+validation. The packager reads each device module's `SizeOfImage` and rejects one above
+`0x77000000`. Archive splitting only addresses GitHub's asset limit.
 
 The universal name is `ninfer-windows-x64-cuda12.9-13.4-<commit12>`. Each small EXE chooses one backend
 from `backends/cuda12/` and `backends/cuda13/`. Use `--cuda-backend auto|12|13` to override selection.
