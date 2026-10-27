@@ -37,14 +37,30 @@ HANDLE handle(void* value) noexcept { return static_cast<HANDLE>(value); }
 // file; share every access so a Reader behaves the same way on Windows.
 constexpr DWORD kShareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
+struct EventHandle {
+    HANDLE value = nullptr;
+    ~EventHandle() {
+        if (value != nullptr) { ::CloseHandle(value); }
+    }
+};
+
 // One positional read. Overlapped I/O carries the offset, so reads on the same handle never share
-// a file pointer; a synchronous handle completes the request inside ReadFile.
+// a file pointer; a synchronous handle completes the request inside ReadFile. An overlapped request
+// waits on an event of its own: without one GetOverlappedResult waits on the file handle, which
+// any completed request on it signals, so a thread whose read was still in flight while another
+// thread's finished would take 0 bytes and leave the read writing into a dead OVERLAPPED.
 DWORD positional_read(HANDLE file, bool overlapped, std::uint64_t offset, std::byte* destination,
                       DWORD count, const std::filesystem::path& path, const char* operation) {
     OVERLAPPED request{};
     request.Offset     = static_cast<DWORD>(offset & 0xffffffffULL);
     request.OffsetHigh = static_cast<DWORD>(offset >> 32U);
-    DWORD read         = 0;
+    EventHandle event;
+    if (overlapped) {
+        event.value = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (event.value == nullptr) { fail(path, "CreateEventW", ::GetLastError()); }
+        request.hEvent = event.value;
+    }
+    DWORD read = 0;
     if (!::ReadFile(file, destination, count, &read, &request)) {
         const DWORD error = ::GetLastError();
         if (error == ERROR_HANDLE_EOF) { return 0; }

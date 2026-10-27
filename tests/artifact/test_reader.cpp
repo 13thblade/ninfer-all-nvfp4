@@ -1,12 +1,21 @@
 #include "artifact/binder.h"
+#include "artifact/file_io.h"
+#include "artifact/framing.h"
 #include "artifact/reader.h"
 #include "artifact/fixture.h"
 #include "core/weight_view.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <cstring>
+#include <exception>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <thread>
 
 namespace {
 
@@ -144,6 +153,59 @@ void geometry_and_views() {
             "per-use native parameters changed the parent");
 }
 
+// A load reads host-kept objects with several threads on one direct handle, and an artifact may
+// end inside a block. Every read returns its whole range, the last one the bytes up to EOF.
+void concurrent_direct_reads() {
+    constexpr std::size_t kPieceBytes = 64 * 1024;
+    constexpr std::size_t kPieces     = 48;
+    constexpr std::size_t kTailBytes  = 1280;
+    constexpr std::size_t kRounds     = 8;
+    constexpr std::size_t kThreads    = 8;
+    Fixture fixture;
+    const auto path = fixture.directory / "direct.bin";
+    std::vector<std::byte> bytes(kPieces * kPieceBytes + kTailBytes);
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = std::byte((i * 131 + i / kPayloadAlignment) & 255);
+    }
+    {
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+        require(out.good(), "direct read fixture was not written");
+    }
+    const InputFile file(path);
+    std::atomic<std::size_t> next{0};
+    std::mutex mutex;
+    std::exception_ptr failure;
+    std::vector<std::thread> threads;
+    for (std::size_t t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&] {
+            try {
+                const auto release = [](std::byte* data) {
+                    ::operator delete(data, std::align_val_t{kPayloadAlignment});
+                };
+                const std::unique_ptr<std::byte, decltype(release)> staging(
+                    static_cast<std::byte*>(
+                        ::operator new(kPieceBytes, std::align_val_t{kPayloadAlignment})),
+                    release);
+                for (std::size_t index; (index = next++) < kRounds * (kPieces + 1);) {
+                    const auto begin    = index % (kPieces + 1) * kPieceBytes;
+                    const auto expected = std::min(kPieceBytes, bytes.size() - begin);
+                    const auto received = file.read_direct(begin, {staging.get(), kPieceBytes});
+                    require(received == expected &&
+                                std::memcmp(staging.get(), bytes.data() + begin, expected) == 0,
+                            "a concurrent direct read returned other bytes");
+                }
+            } catch (...) {
+                const std::lock_guard lock(mutex);
+                if (!failure) { failure = std::current_exception(); }
+            }
+        });
+    }
+    for (auto& thread : threads) { thread.join(); }
+    if (failure) { std::rethrow_exception(failure); }
+}
+
 void invalid_directories() {
     Fixture fixture;
     const auto bad = [&](auto mutate) {
@@ -215,6 +277,7 @@ int main(int argc, char** argv) {
     try {
         file_set_and_bindings();
         geometry_and_views();
+        concurrent_direct_reads();
         invalid_directories();
         // Optional production-writer fixture or explicitly selected real artifact.
         if (argc == 2) {
