@@ -34,6 +34,17 @@ its tier's kernels, shapes and routes (`ops/common/device_tier.h`), the weight l
 activation permissions of its tier (`apply_device_layouts`, `apply_rank_policies`), and the route
 profile of its own card. The context-cost model of the prefix cache is the first device's.
 
+**Peer access is checked before it is used.** A pair that reports peer capability
+(`cudaDeviceCanAccessPeer`) is refused, without touching its mappings, when either card sits in an
+IOMMU group that translates its DMA (`/sys/bus/pci/devices/<address>/iommu_group/type` other than
+`identity`; boot with `iommu=pt`) or is a GeForce card whose BAR1 is smaller than its memory (the
+GeForce P2P driver patches need a resizable-BAR VBIOS, and without one they hand out mailbox
+mappings that drop stores, return garbage loads and can reset the host when probed;
+`core/peer_preflight.h`). A pair that passes is probed once: a kernel stores into and loads from the
+peer's memory and the copy engine copies into it, and any wrong value disables peer access for that
+direction. Refused directions stage through pinned host memory and are reported at startup as
+`peer access:` warnings with the reason.
+
 ## How it works
 
 - **`StagePlan`** (`core/stage_plan.h`) says which contiguous layers each stage owns. `--stage-layers

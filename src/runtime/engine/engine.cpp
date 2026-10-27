@@ -102,6 +102,10 @@ DeviceContext initialize_device(const EngineOptions& options) {
         return device;
     }
     DeviceContext device{std::span<const int>(options.devices)};
+    for (const std::string& note : device.peer_notes()) {
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                    "peer access: %s", note.c_str());
+    }
     phase.complete();
     return device;
 }
