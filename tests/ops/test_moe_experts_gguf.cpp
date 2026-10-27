@@ -2,7 +2,8 @@
 // of the exactly dequantized weights. The tables point several experts at one buffer, so a few
 // distinct banks cover all 512 experts while the routing still groups by expert id. The products
 // quantize their activations to q8_1 as llama.cpp does, so they are held to that arithmetic's
-// error. Up to eight tokens take the vector kernel; wider calls over device-resident banks (each
+// error; on a Tesla V100 the matrix kernel's FP16 route (FP16 activations and weights) stays well
+// within it. Up to eight tokens take the vector kernel; wider calls over device-resident banks (each
 // matrix followed by 256 zero bytes, which the matrix kernel's last K step of a 640-value down row
 // reads) take the matrix kernel wherever the block type has one (IQ1_M and MXFP4 stay on the
 // vector kernel), with one or several column tiles per expert, and the same calls over banks that

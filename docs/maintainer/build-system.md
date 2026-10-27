@@ -102,8 +102,9 @@ profile does so where `ninfer-calibrate` measured it faster
 ### Volta tier (`70`)
 
 A Volta card runs its own projection routes (`ops/linear/sm70`, chosen by `sm70::enabled()`), its
-decode attention (`small_t_sm70.cuh`) and its single-row prompt attention (`prompt_sm70.cu`);
-those kernels' `mma.m8n8k4` bodies exist in the Volta image only. Its projection weights take the
+decode attention (`small_t_sm70.cuh`), its single-row prompt attention (`prompt_sm70.cu`) and its
+GGUF MoE matrix product (`ggml_bridge_sm70.cuh`, chosen in `moe_matrix_product` by the device's
+tier); those kernels' `mma.m8n8k4` bodies exist in the Volta image only. Its projection weights take the
 panel layout on the ranks whose device runs Volta's code (`apply_device_layouts`). Its route
 catalog holds the GDN prefill switches alone.
 

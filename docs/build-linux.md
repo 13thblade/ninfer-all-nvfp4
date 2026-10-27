@@ -202,7 +202,10 @@ speed, and the kernels written for Ampere everywhere else, on emulated warp prim
   decode reads stream at a larger share of the card's bandwidth.
 - **GGUF projections** keep NInfer's DP4A vector kernel up to eight columns and ggml's DP4A matrix
   kernel above (as llama.cpp does on Volta); GGUF dense projections from 65 columns take the cuBLAS
-  route.
+  route. The routed experts' matrix products (prompt chunks of Flash-Next, Gemma 4, Flint and
+  DeepSeek) run on the FP16 tensor cores instead of `dp4a`: each lane decodes its row's GGUF slices
+  into FP16 fragments, and the activation is an FP16 plane with one power-of-two factor per column,
+  which keeps BF16's range (`ggml_bridge_sm70.cuh`).
 - **Attention** of every KV format runs on Volta's tensor cores with FP32 accumulation. Decode and
   verification use a Volta kernel that decodes each format's keys and values to FP16 as it loads
   them (32 dimensions of a quantized row a load), with the same fused append, splits and reducers

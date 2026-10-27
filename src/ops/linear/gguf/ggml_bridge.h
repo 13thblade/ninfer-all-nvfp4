@@ -347,6 +347,10 @@ void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& 
                         cudaStream_t stream);
 // Column c of the activation is x column routing.sorted[c] / column_group, in the layout of the
 // type's scale/sum schedule (matrix_activation_layout), zero past k up to a whole 256-value step.
+// On a device that runs sm_70 code, which has no integer tensor cores, the activation is instead
+// an FP16 plane with a power-of-two factor per column and the product runs on the FP16 tensor
+// cores over the blocks' values rounded to FP16 (ggml_bridge_sm70.cuh); there it takes any rows
+// that are whole 32-row warps and any k of whole blocks, and needs no `tail`.
 [[nodiscard]] std::size_t moe_matrix_activation_bytes(int k, int pairs);
 void quantize_moe_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k,
                                     const MoeRouting& routing, int pairs, int column_group,
