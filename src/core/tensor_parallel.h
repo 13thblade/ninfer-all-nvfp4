@@ -45,6 +45,20 @@ namespace ninfer {
 //               ranks' device slots directly.
 //   StagedHost  a publish copies the slot into a pinned, mapped host slot, and a reduce reads the
 //               other ranks' host slots across the bus. Works between any two cards.
+//
+// Low-latency words. Under StagedHost with every rank on its own card, an exchange of at most
+// `low_latency_bytes` per partial at offset 0 (a decode or verification step) skips the copy and
+// the cross-device fences: the reduce is one kernel that stores each FP32 value of the rank's
+// partial with the exchange's 32-bit epoch as one 8-byte word into the rank's own mapped host row,
+// then polls the other ranks' rows until their words carry the same epoch, and adds in rank order
+// as above. A rank outside the contributors stores one word. Each rank counts its own exchanges in
+// device memory, so every rank derives the same epoch and a captured graph replays without new
+// arguments; the row's slot is the epoch's parity. A rank writes a slot again two exchanges later,
+// after its kernel of the exchange in between, which waited for every other rank's word of that
+// exchange, which each rank stores only after its own earlier kernel ended: no rank overwrites
+// words another is still reading. A wait that outlasts kLowLatencyTimeoutNs traps the context.
+// Ranks that share a card keep the staged protocol, since two spinning kernels on one device need
+// not run together.
 enum class TensorParallelTransport { Peer, StagedHost };
 
 struct TensorParallelExchangeOptions {
@@ -52,12 +66,15 @@ struct TensorParallelExchangeOptions {
     std::size_t slot_bytes = 0;
     // Use the staged protocol even where peer access exists (tests).
     bool force_staged = false;
+    // Largest partial exchanged as low-latency words; 0 turns them off.
+    std::size_t low_latency_bytes = 32U << 10U;
 };
 
 class TensorParallelExchange {
 public:
     static constexpr std::size_t kSlots  = 2;
     static constexpr std::size_t kPieces = 4;
+    static constexpr unsigned long long kLowLatencyTimeoutNs = 300'000'000'000ULL;
 
     TensorParallelExchange(const DeviceContext& context, TensorParallelExchangeOptions options);
     ~TensorParallelExchange();
@@ -70,6 +87,10 @@ public:
     [[nodiscard]] std::size_t ranks() const noexcept { return ranks_.size(); }
     [[nodiscard]] TensorParallelTransport transport() const noexcept { return transport_; }
     [[nodiscard]] std::size_t slot_bytes() const noexcept { return slot_bytes_; }
+    // Whether an exchange of `bytes` per partial at offset 0 travels as low-latency words.
+    [[nodiscard]] bool low_latency(std::size_t bytes) const noexcept {
+        return bytes != 0 && bytes <= low_latency_bytes_;
+    }
 
     // Where `rank` writes its FP32 partial for an exchange in `slot`: device memory of that rank.
     [[nodiscard]] float* partial(std::size_t rank, std::size_t slot) const;
@@ -95,6 +116,10 @@ private:
         cudaStream_t side = nullptr;
         std::array<cudaEvent_t, kPieces> ready{};
         std::array<cudaEvent_t, kPieces> done{};
+        // Low-latency words: the rank's mapped host row, [kSlots][low_latency_bytes / 4], and its
+        // {exchanges counted, blocks finished} in device memory.
+        unsigned long long* words = nullptr;
+        std::uint32_t* epoch      = nullptr;
     };
 
     void release() noexcept;
@@ -105,6 +130,7 @@ private:
     std::vector<Rank> ranks_;
     TensorParallelTransport transport_ = TensorParallelTransport::StagedHost;
     std::size_t slot_bytes_            = 0;
+    std::size_t low_latency_bytes_     = 0; // 0 where the transport and topology exclude them
 };
 
 // Each rank's speed for dividing work by: the device-to-device copy bandwidth of its card in bytes
@@ -121,6 +147,15 @@ namespace detail {
 // One rank's reduction: residual[i] <- bf16(float(residual[i]) + ((part[0][i] + part[1][i]) + ...)).
 void tensor_parallel_reduce(__nv_bfloat16* residual, const float* const* parts, std::size_t count,
                             std::int64_t values, cudaStream_t stream);
+
+// One rank's low-latency exchange (see TensorParallelExchange): stores `mine` (a contributor's
+// partial) as words of the next epoch into `row`, waits for the words of every other rank's row,
+// and adds the contributors' values to the residual in rank order. `rows[r]` is rank r's row of
+// `capacity` words per slot; `epoch` is the rank's counter pair.
+void tensor_parallel_low_latency(__nv_bfloat16* residual, const float* mine,
+                                 const unsigned long long* const* rows, std::size_t ranks,
+                                 std::size_t rank, std::size_t contributors, std::int64_t values,
+                                 std::size_t capacity, std::uint32_t* epoch, cudaStream_t stream);
 
 } // namespace detail
 

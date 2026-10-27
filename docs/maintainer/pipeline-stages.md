@@ -316,7 +316,12 @@ families](#expert-parallelism-of-the-other-moe-families)).
   KV heads, each over its own planes and block-table copy; GDN: every rank) and after the FFN. A contributor writes its output projection as FP32 partials;
   every rank then adds all partials to its replica in rank order and rounds once to BF16, so the
   replicas stay identical. Peer reads where every pair of cards has peer access, mapped pinned host
-  memory otherwise; both capture into the decode graphs.
+  memory otherwise; both capture into the decode graphs. Without peer access, and with every rank
+  on its own card, a partial of up to 32 KiB (a decode step or a short verification) travels as
+  low-latency words: each rank's reduce kernel stores its FP32 values with the exchange's epoch as
+  8-byte words into its own mapped host row and polls the other ranks' rows, with no copy and no
+  cross-device fence (`TensorParallelExchange`). Each rank counts its exchanges in device memory,
+  so a graph replays them without new arguments; a wait longer than five minutes traps.
 - **Prompt pieces.** Where every FFN is dense, a text prompt chunk of 512 columns or more (one
   sequence, 1-D positions) runs each layer in up to four pieces of whole 64-column blocks, at least
   256 columns each. A
@@ -511,4 +516,14 @@ What the transport costs was measured before this was built:
   (20 KB, FP32) costs 17-33 us whether done by a host-mapped kernel, a staged pinned-host copy or
   NCCL; at 640 KB it is 190-440 us and at 20 MB 5-13 ms. The transports are within about 20% of each
   other at every size, which is why the exchange is a fenced copy (or a peer read) and a local
-  reduce that captures into graphs, not a spin-wait kernel.
+  reduce that captures into graphs.
+- **Low-latency words** (`tools/tp_probe.cu`, `host-ll`, rented boxes, 2026-10-27): each value
+  travels with its epoch in one 8-byte store and the receiver polls the words themselves, as
+  sFNX's ring does. A 2x RTX 3090 box without peer access exchanged one 20 KB column in 12.5 us in a
+  graph, against 16.8 us for the host-mapped kernel with flags and 19-25 us for the staged copy
+  (eager, joint graph). A 2x Tesla V100-SXM2 box took 10.1 us against 23.3 and 31.7 us. Words
+  double the bytes, so they lose from four columns on the 3090 box (53 us against 28 for the staged
+  copy) and from 32 columns on the V100 box (214 us against 197); the exchange uses them up to
+  32 KiB per partial. The V100 box reports peer access, but its IOMMU translates the cards' DMA
+  (`iommu.strict=1`), so the preflight refuses it: there the probe's peer kernel delivered correct
+  data at about 0.4 GB/s (a 20 MB exchange in 51 ms, against 3.7 ms through host memory).
