@@ -6,13 +6,14 @@
 # nvidia-smi lists it elsewhere, so the indices for --devices must be read from a CUDA-level
 # enumeration rather than assumed.
 #
-# device.cu is compiled in directly rather than linked from the core. It only includes core/device.h
-# and standard headers, so this costs a single translation unit and keeps the probe around 1 MB
-# instead of the ~500 MB a core link would produce -- which matters because this binary gets
-# uploaded to rented hardware to be run there.
+# device.cu and its launch helpers (device_launch.cpp) are compiled in directly rather than linked
+# from the core. They only include core/device.h and standard headers, so this costs two translation
+# units and keeps the probe around 1 MB instead of the ~500 MB a core link would produce -- which
+# matters because this binary gets uploaded to rented hardware to be run there.
 add_executable(ninfer-multi-gpu-probe
   multi_gpu_probe.cu
-  ${CMAKE_SOURCE_DIR}/src/core/device.cu)
+  ${CMAKE_SOURCE_DIR}/src/core/device.cu
+  ${CMAKE_SOURCE_DIR}/src/core/device_launch.cpp)
 target_include_directories(ninfer-multi-gpu-probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
 set_target_properties(ninfer-multi-gpu-probe PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"

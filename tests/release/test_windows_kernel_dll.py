@@ -40,6 +40,54 @@ endif()
             self.assertEqual(commands[0], commands[1])
 
 
+class KernelArchiveOrderTest(unittest.TestCase):
+    def test_objects_above_the_dll_do_not_wait_for_the_exported_archive(self):
+        # Object shards compile objects one by one; none may first build the kernel DLL's archive.
+        module = Path(__file__).resolve().parents[2] / 'cmake/NinferTargets.cmake'
+        tool = Path(sys.executable).as_posix()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'CMakeLists.txt').write_text(f'''
+cmake_minimum_required(VERSION 3.28)
+project(kernel_archive_order LANGUAGES CXX)
+set(NINFER_WINDOWS_KERNEL_DLL ON)
+include("{module.as_posix()}")
+add_library(ninfer_small_t_i8 STATIC unit.cpp)
+add_library(ninfer_kernels SHARED kernel.cpp)
+set_target_properties(ninfer_kernels PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+ninfer_export_archive_instantiations(ninfer_kernels ninfer_small_t_i8 launch 1)
+add_library(consumer STATIC consumer.cpp)
+target_link_libraries(consumer PRIVATE ninfer_kernels)
+''')
+            for name in ('unit.cpp', 'kernel.cpp', 'consumer.cpp'):
+                (root / name).write_text('int value() { return 1; }\n')
+            build = root / 'build'
+            result = subprocess.run([
+                'cmake', '-S', str(root), '-B', str(build), '-G', 'Ninja',
+                '-DCMAKE_SYSTEM_NAME=Windows', f'-DCMAKE_CXX_COMPILER={tool}',
+                '-DCMAKE_CXX_COMPILER_FORCED=ON', '-DCMAKE_CXX_COMPILER_ID_RUN=TRUE',
+                '-DCMAKE_CXX_COMPILER_ID=MSVC', '-DCMAKE_CXX_COMPILER_VERSION=19.44',
+                '-DCMAKE_CXX_COMPILER_ARCHITECTURE_ID=x64', f'-DCMAKE_LINKER={tool}',
+                f'-DCMAKE_AR={tool}', f'-DNINFER_DUMPBIN={tool}', '-DCMAKE_BUILD_TYPE=Release',
+            ], text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            def planned(target):
+                plan = subprocess.run(['ninja', '-C', str(build), '-n', target],
+                                      text=True, capture_output=True, timeout=30)
+                self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+                return plan.stdout
+
+            consumer = planned('CMakeFiles/consumer.dir/consumer.cpp.obj')
+            self.assertIn('consumer.cpp.obj', consumer)
+            self.assertNotIn('ninfer_small_t_i8', consumer)
+            # The DLL still links only after the archive has written its export definitions.
+            self.assertIn('ninfer_small_t_i8.lib', planned('ninfer_kernels.dll'))
+            inputs = subprocess.run(['ninja', '-C', str(build), '-t', 'query', 'ninfer_kernels.dll'],
+                                    text=True, capture_output=True, timeout=30).stdout
+            self.assertIn('ninfer_small_t_i8_exports.def', inputs)
+
+
 def exported_names(path):
     """Names in a PE32+ image's export table."""
     data = Path(path).read_bytes()
