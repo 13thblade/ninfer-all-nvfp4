@@ -4,8 +4,9 @@
 // tower's parameters are bound as the artifact stores them (GGUF blocks, BF16 or NInfer's own
 // formats); the frontend resources are the Qwen3.5 tokenizer and chat template, which this family
 // shares. Expert banks live on the device of their layer's pipeline stage, or in the pinned Host
-// block where the GPU reads them across the bus. Under expert parallelism every device holds a
-// contiguous range of each MoE layer's routed experts and rank 0 everything else.
+// block where the GPU reads them across the bus. Under tensor parallelism every device holds a run
+// of every layer: Gated DeltaNet heads, sparse-attention KV heads and routed experts, beside
+// replicas of what each device computes for itself (LoadOptions::tensor_split).
 
 #include "artifact/materializer.h"
 #include "core/arena.h"
@@ -75,7 +76,8 @@ struct PleWeights {
 
 struct LayerWeights {
     HyperConnectionWeights attn_hc, mlp_hc;
-    std::variant<GdnWeights, SparseAttentionWeights> mixer;
+    // std::monostate: a sparse-attention layer of a tensor-parallel rank that holds no KV head.
+    std::variant<GdnWeights, SparseAttentionWeights, std::monostate> mixer;
     MoeWeights moe;
     std::optional<PleWeights> ple;
 };
@@ -84,6 +86,20 @@ struct TextWeights {
     WeightId token_embedding, output_head;
     HyperConnectionWeights final_mixer;
     std::vector<LayerWeights> layers;
+    // Tensor parallelism: what every rank after the first holds, [rank - 1]: its replica of the
+    // token embedding and its part of each layer (its MoE weights are the router's and the shared
+    // score's replicas; `layers` lists every rank's routed experts).
+    std::vector<WeightId> rank_embeddings;
+    std::vector<std::vector<LayerWeights>> rank_layers;
+};
+
+// Tensor parallelism: the runs of every layer one rank holds. A rank holds the value heads of its
+// Gated DeltaNet key heads and the 12 query heads of each of its sparse-attention KV heads; the
+// ranks holding KV heads are a prefix of the ranks.
+struct TensorShare {
+    std::uint32_t key_head_begin = 0, key_head_end = 0;
+    std::uint32_t kv_head_begin = 0, kv_head_end = 0;
+    std::uint32_t expert_begin = 0, expert_end = 0;
 };
 
 // The MTP block (vLLM Qwen4ExpMultiTokenPredictor): the two input norms and projections, one
@@ -109,10 +125,13 @@ struct LoadOptions {
     // Loads the MTP block the artifact carries (its `mtp` component) onto the last stage's device,
     // beside the head it shares; its experts take the text layers' residency.
     bool mtp = false;
-    // Expert parallelism (`--tensor-parallel`): each rank's relative share of every MoE layer's
-    // routed experts, one positive weight per rank; empty for none. The layers, the router and the
-    // shared expert stay on rank 0, in one stage; the experts must be device resident.
-    std::vector<double> expert_split;
+    // Tensor parallelism (`--tensor-parallel`): each rank's relative share of every layer, one
+    // positive weight per rank; empty for none. Each rank holds a run of every Gated DeltaNet
+    // layer's heads, of the sparse-attention layers' KV heads (as far as the two allow) and of the
+    // routed experts, and replicas of the token embedding, the hyper-connections, the routers and
+    // the PLE layer; rank 0 also the shared experts, the final mixer, the head, the MTP block and
+    // the Vision tower. One stage; the experts must be device resident.
+    std::vector<double> tensor_split;
 };
 
 class Model {
@@ -133,12 +152,18 @@ public:
     // the output head (the last).
     [[nodiscard]] std::size_t head_rank() const noexcept { return stages_.stages() - 1; }
 
-    // Expert parallelism: whether the routed experts are divided over the ranks, and the routed
-    // experts [first, second) rank `rank` holds of a MoE layer with `experts` of them.
-    [[nodiscard]] bool expert_parallel() const noexcept { return !options_.expert_split.empty(); }
+    // Tensor parallelism: whether every layer is divided over the ranks, a rank's runs of it, and
+    // a rank's weights of layer `layer` (rank 0's are weights().layers) and its token embedding.
+    [[nodiscard]] bool tensor_parallel() const noexcept { return !options_.tensor_split.empty(); }
 
-    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> expert_range(std::uint32_t experts,
-                                                                       std::size_t rank) const;
+    [[nodiscard]] const TensorShare& share(std::size_t rank) const { return shares_.at(rank); }
+
+    // The ranks holding sparse-attention KV heads, a prefix.
+    [[nodiscard]] std::size_t attention_ranks() const noexcept;
+
+    [[nodiscard]] const LayerWeights& layer_weights(std::size_t rank, std::size_t layer) const;
+
+    [[nodiscard]] WeightId embedding(std::size_t rank) const;
 
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
 
@@ -202,6 +227,7 @@ private:
     std::optional<qwen3_5::VisionWeights> vision_weights_;
     std::optional<MtpConfig> mtp_config_;
     std::optional<MtpWeights> mtp_weights_;
+    std::vector<TensorShare> shares_; // by rank under tensor parallelism
 };
 
 // Whether the artifact's text component is this family.
@@ -215,11 +241,11 @@ private:
 [[nodiscard]] std::vector<std::uint64_t> expert_ends(std::uint32_t experts,
                                                      std::span<const double> split);
 
-// An expert split for ranks with `free_bytes` of device memory and `speed`: in proportion to
-// speed, except that a rank takes no more experts than it has room for once rank 0 holds
-// everything else `options` loads (the stored bytes of the components it names) and every rank
-// keeps a margin for state and workspace.
-[[nodiscard]] std::vector<double> default_expert_split(const artifact::Reader& reader,
+// A tensor split for ranks with `free_bytes` of device memory and `speed`: in proportion to speed,
+// except that a rank takes no more of the text layers' routed experts than it has room for once
+// rank 0 holds everything else `options` loads (the stored bytes of the components it names) and
+// every rank keeps a margin for state and workspace.
+[[nodiscard]] std::vector<double> default_tensor_split(const artifact::Reader& reader,
                                                        const LoadOptions& options,
                                                        std::span<const std::uint64_t> free_bytes,
                                                        std::span<const double> speed);

@@ -246,8 +246,9 @@ container, so the cause is not confirmed.
 
 `--devices A,B,... --tensor-parallel` divides every layer of a Qwen3.5-core model over the devices
 instead of dealing layers out. It targets decode: each card reads only its share of the weights for
-every token. The other MoE families (Qwen3.8-Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash)
-divide only their routed experts this way ([expert parallelism of the other MoE
+every token. Qwen3.8-Flash-Next divides its layers too ([tensor parallelism of
+Qwen3.8-Flash-Next](#tensor-parallelism-of-qwen38-flash-next)); Gemma 4, Flint and
+DeepSeek-V4.1-Flash divide only their routed experts ([expert parallelism of the other MoE
 families](#expert-parallelism-of-the-other-moe-families)).
 
 - **The shares.** Rank r holds a contiguous range of GDN key heads with the value heads that read
@@ -472,16 +473,59 @@ on the hosts measured below it is slower than dividing by heads.
   short-prefill and prompt widths, a rank without keys included, against the FP64 oracle, and check
   that a merge of a run of query heads is those heads of the whole merge, byte for byte.
 
+### Tensor parallelism of Qwen3.8-Flash-Next
+
+`--tensor-parallel` divides every layer of Qwen3.8-Flash-Next over the devices. Each rank keeps a
+replica of the FP32 hyper-connection stack (four streams of the hidden width per token) and runs
+every layer over it (`Executor::run_tensor_segment`, `models/qwen4_exp/executor.cpp`).
+
+- **The shares** (`TensorShare`, `plan_tensor_shares`, `models/qwen4_exp/model.cpp`). A Gated
+  DeltaNet layer divides by key heads: rank r holds a contiguous range of them with the three value
+  heads per key head that read them, their query, key, value and z projection rows, convolution
+  channels, `a`/`b` projection rows and `A_log`/`dt_bias` entries, recurrent and convolution state,
+  and the matching input columns of the output projection; the gated norm is whole. A
+  sparse-attention layer divides by its two KV heads: each of the first one or two ranks holds one
+  with its twelve query heads (query, gate, key and value rows, the output projection's input
+  columns, that head's KV pages); the indexer, with its projection, pooled keys and tail, is whole
+  on each of those ranks, and they select the same blocks. The routed experts divide as whole
+  experts, a contiguous range per rank of the GGUF banks on the devices. Every rank holds the token
+  embedding, the hyper-connection mixers, the router, the shared expert's score and the PLE; the
+  shared expert, the final mixer, the head, the MTP block and Vision stay on rank 0. A share ends
+  on whole stored blocks (`Bindings::row_ends`, `Bindings::column_ends`) and whole tiles of its
+  Linear route; without `--tensor-split` the shares follow each card's copy bandwidth within its
+  free memory, counting the routed experts as the divided weights.
+- **A layer.** Every rank reads the stack (the attention mixer), runs its mixer share into an FP32
+  partial of the output projection and exchanges it (`TensorParallelExchange`,
+  `TensorParallelSum::StoreBf16`): every rank stores the rank-order sum rounded to BF16, as one
+  device's projection stores its output. A rank without a share of a sparse-attention layer
+  publishes nothing in that exchange. Every rank then writes and reads the stack (the MoE mixer),
+  routes the call itself from the same input, runs the pairs routed to its experts (rank 0 the
+  shared expert too) into a 2^-32 fixed-point part (`moe_experts_gguf_part`), stores the part as an
+  FP32 partial and exchanges again (`StoreFp32`), so every rank adds the same FP32 MoE output to its
+  stack. That is two exchanges per layer, 96 per pass; partials of up to 32 KiB (decode and
+  verification) travel as low-latency words where each rank has its own card. Each rank embeds the
+  tokens from its replica of the table; a media prompt's merged embeddings are copied to every rank
+  once the tower has run.
+- **Graphs and branches.** A segment forks the other ranks' streams from rank 0's and joins them
+  back, so the decode and verification graphs capture every rank's work; each segment makes an
+  even number of exchanges and starts in slot 0. A snapshot, a sequence image and a branch pass
+  keep every rank's state of each layer, layer by layer and rank by rank.
+- **Numerics.** The replicas run the same kernels on the same values, so on cards of one model they
+  stay equal. The divided output projections and the FP32 sum of the expert parts round
+  differently than one device, so logits are close to one device's, not identical.
+- **Refused.** Host or disk experts and native expert banks (`--expert-residency device` with GGUF
+  banks only), `--kv-resident` and `--stage-layers`.
+
 ### Expert parallelism of the other MoE families
 
-Qwen3.8-Flash-Next, Gemma 4, Flint and DeepSeek-V4.1-Flash keep every layer on rank 0 and divide
-only the routed experts of each MoE block: rank r holds experts `[e_r, e_{r+1})`, a contiguous range
+Gemma 4, Flint and DeepSeek-V4.1-Flash keep every layer on rank 0 and divide only the routed
+experts of each MoE block: rank r holds experts `[e_r, e_{r+1})`, a contiguous range
 of `--tensor-split`'s weights (`split_shares` over single experts). Rank 0 runs attention, the
 router, the shared expert, the head, the drafters and Vision, as one device does.
 
 - **A MoE call** (`ExpertParallelExchange`, `core/expert_parallel.h`). Rank 0 routes the call, then
-  sends what the experts read (Flash-Next: the BF16 input; the GGUF families: the q8_1 activation of
-  a call of up to eight tokens, or the BF16 rows of a wider one; DeepSeek also the guard's factors)
+  sends what the experts read (the q8_1 activation of a call of up to eight tokens, or the BF16 rows
+  of a wider one; DeepSeek also the guard's factors)
   with the ids and weights to every other rank over a stage link. Each rank keeps the pairs routed to
   its own experts (`moe_keep_experts`; ids of other ranks' experts become -1, which
   `moe_sort_routes` leaves out), runs them on its own stream and workspace, and sends back their
@@ -491,20 +535,18 @@ router, the shared expert, the head, the drafters and Vision, as one device does
   whose capture the peers' streams join.
 - **Numerics.** Each pair's contribution is computed and rounded exactly as on one device and integer
   addition commutes, so the sum does not depend on the split. Where one device also sums in this
-  fixed point the result is one device's bit for bit: every Flash-Next call
-  (`moe_experts_gguf_part`, `moe_experts_gguf_combine`), and the decode and verification calls of
-  up to eight tokens of Gemma 4, Flint and DeepSeek. Their prompt chunks on one device weigh the
+  fixed point the result is one device's bit for bit: the decode and verification calls of up to
+  eight tokens of Gemma 4, Flint and DeepSeek. Their prompt chunks on one device weigh the
   experts' FP32 rows in FP32 in the block's combine; under expert parallelism the same rows are
   weighted into the fixed-point sum (`moe_weighted_rows`), which rounds differently.
-- **Residency.** Flash-Next (GGUF banks), Gemma 4 and Flint divide device-resident experts: each
+- **Residency.** Gemma 4 and Flint divide device-resident experts: each
   rank binds its rows of every bank as a piece of its own (with the matrix kernel's zero tail) and
   builds expert tables whose other entries are null. DeepSeek-V4.1-Flash, whose experts live in
   pinned host memory or the artifact's files, gives every rank an `ExpertDelivery` of its own over
   its experts (tables of those alone, local ids from `moe_local_experts`): its own layer banks and
   device cache, filled over its own bus. Without `--tensor-split` the device families size the
   shares by each card's copy bandwidth within its free memory (`models::default_expert_split`),
-  DeepSeek equally. Refused: Flash-Next's native banks and host or disk experts, Gemma 4's and
-  Flint's host or disk experts, DeepSeek's device experts and its CPU share
+  DeepSeek equally. Refused: Gemma 4's and Flint's host or disk experts, DeepSeek's device experts and its CPU share
   (`--expert-dma-share`, `--expert-cpu-threads`); DeepSeek's prompt spans are off.
 
 Measured on 2x RTX 3090 (Vast, PCIe 4.0 x16, no peer access, so the mapped host transport;
@@ -512,11 +554,6 @@ Measured on 2x RTX 3090 (Vast, PCIe 4.0 x16, no peer access, so the mapped host 
 about 7,000 tokens, one pass per configuration). Every MoE call crosses the bus twice, so on this
 pair the exchange costs more decode time than the divided experts save:
 
-- **Qwen3.8-Flash-Next** Q2_0 (`--no-ngram-table`), against two pipeline stages on the same pair:
-  decode 92.0-92.4 tok/s against 108.0-108.2 (-14% to -15%), 90.3 against 105.1 after the long
-  prompt; with `--spec mtp --draft-tokens 3` 110.9-177.1 against 113.0-178.7 and 153.0 against
-  152.8. A short prompt's TTFT is 80.7-90.4 ms against 96.8-100.1 ms; the 7,054-token prompt
-  prefills at 2,109 tok/s against 3,114 (-32%). Every answer, with MTP and without, is the stages'.
 - **Gemma 4** 26B-A4B QAT (fits one card), against one card: decode 164.6-166.2 tok/s against
   216.3-218.4 (-24%), 155.1 against 195.5 after the long prompt (-21%); with `--spec mtp
   --draft-tokens 3` 240.4-377.0 against 249.7-398.1 (-6% to +1%) and 199.1 against 197.1. A short

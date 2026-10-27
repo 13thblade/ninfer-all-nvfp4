@@ -118,8 +118,10 @@ active-request preemption, and one compact decode batch per
 round. Tensor parallelism (`--tensor-parallel`) divides the GDN heads, the attention's KV heads
 with their cache and the dense FFN rows or routed experts of a Qwen3.5-core model over the devices
 in shares sized to each card (`--tensor-split`, or measured bandwidth and free memory), with the
-head, the shared expert and MTP on the first; the other MoE families divide only their routed
-experts (expert parallelism, an exact fixed-point sum of the devices' parts).
+head, the shared expert and MTP on the first; Qwen3.8-Flash-Next divides its GDN key heads,
+sparse-attention KV heads and routed experts the same way, every device keeping the
+hyper-connection stack; the other MoE families divide only their routed experts (expert
+parallelism, an exact fixed-point sum of the devices' parts).
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale/preemptive continuous

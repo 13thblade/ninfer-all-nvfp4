@@ -464,8 +464,9 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
   `--tensor-parallel` divides every layer over the devices instead: each holds a share of the GDN
   heads, of the attention's KV heads with their cache and of the dense FFN rows or MoE experts in
   any weight format, sized to the card, and reads only those per token
-  ([tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism)). Qwen3.8-Flash-Next,
-  Gemma 4, Flint and DeepSeek-V4.1-Flash divide only their routed experts this way.
+  ([tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism)), Qwen3.8-Flash-Next
+  its GDN key heads, attention KV heads and routed experts. Gemma 4, Flint and DeepSeek-V4.1-Flash
+  divide only their routed experts this way.
 - FP8 A8 and NVFP4 W4A4 tensor-core routes on every `120a` build, an FP4 tensor-core prompt kernel
   for an NVFP4 KV cache, and programmatic dependent launches on Blackwell.
 

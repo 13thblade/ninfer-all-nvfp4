@@ -215,13 +215,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     load.experts      = options.expert_residency;
     load.vision       = options.enable_vision;
     load.mtp          = mtp;
-    // Expert parallelism: the routed experts divided over the devices, everything else on the
-    // first. Without --tensor-split each device takes a share of its speed that fits beside what
-    // it holds.
+    // Tensor parallelism: every layer's mixer heads and routed experts divided over the devices,
+    // the shared expert, the head and the MTP block on the first. Without --tensor-split each
+    // device takes a share of its speed that fits beside what it holds.
     if (options.tensor_parallel) {
-        load.expert_split = options.tensor_split;
-        if (load.expert_split.empty()) {
-            load.expert_split = models::qwen4_exp::default_expert_split(
+        load.tensor_split = options.tensor_split;
+        if (load.tensor_split.empty()) {
+            load.tensor_split = models::qwen4_exp::default_tensor_split(
                 reader, load, rank_free_bytes(device), rank_copy_bandwidth(device));
         }
     }
@@ -325,16 +325,24 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0);
-    if (model->expert_parallel()) {
-        std::string ranges;
+    if (model->tensor_parallel()) {
+        std::string keys, kv, experts;
+        const auto range = [](std::string& out, std::size_t rank, std::uint32_t begin,
+                              std::uint32_t end) {
+            out += (rank == 0 ? "" : ", ") +
+                   (begin == end ? std::string("none")
+                                 : std::to_string(begin) + "-" + std::to_string(end - 1));
+        };
         for (std::size_t rank = 0; rank < device.size(); ++rank) {
-            const auto [begin, end] = model->expert_range(text.num_experts, rank);
-            ranges +=
-                (rank == 0 ? "" : ", ") + std::to_string(begin) + "-" + std::to_string(end - 1);
+            const auto share = model->share(rank);
+            range(keys, rank, share.key_head_begin, share.key_head_end);
+            range(kv, rank, share.kv_head_begin, share.kv_head_end);
+            range(experts, rank, share.expert_begin, share.expert_end);
         }
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "Qwen3.8-Flash-Next: expert parallelism, routed experts by device %s",
-                           ranges.c_str());
+                           "Qwen3.8-Flash-Next: tensor parallelism, by device Gated DeltaNet key "
+                           "heads %s, sparse-attention KV heads %s, routed experts %s",
+                           keys.c_str(), kv.c_str(), experts.c_str());
     }
     if (const auto memory = instance->executor->memory(); memory.streamed_kv) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
