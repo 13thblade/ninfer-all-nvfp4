@@ -447,7 +447,10 @@ repeats, not with one device's.
   at 56.1 tok/s against master's 54.1 (+3.7%, the words) and prefills the long prompt at 667 tok/s
   against 666. The column cuts load slower: the 35B-A3B pair's weights (millions of lines of a few
   hundred bytes) take 57 s on the 3090s and 61 s on the V100s, where master's whole experts load in
-  7.3 s and 4.7 s.
+  7.3 s and 4.7 s. The official Qwen3.8-27B `groupwise-int`, which master's pair could not start on
+  V100s (its shares refused the panel layout), decodes on a third V100 pair at 26.0 tok/s against
+  one card's 16.2 (+60%) and prefills the long prompt at 1,395 tok/s against 891 (+57%); its
+  perplexity over the slice is 6.4481 against one card's 6.4471.
 
 ### Attention by positions
 

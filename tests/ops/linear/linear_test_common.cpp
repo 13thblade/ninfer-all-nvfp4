@@ -1,9 +1,12 @@
 #include "core/weight.h"
 #include "ops/linear/linear_test_common.h"
 
+#include "artifact/permute_row_split.h"
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/weight_view.h"
+#include "ops/linear/sm70/sm70_gemm.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -328,6 +331,11 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     if (shape.invocations.empty()) {
         throw std::invalid_argument("linear test: shape has no invocations");
     }
+    if (shape.panel && !ops::detail::sm70::enabled()) {
+        std::cout << label << " [" << shape.n << "," << shape.k
+                  << "] panel: SKIP, the device runs no sm_70 route\n";
+        return 0;
+    }
     const auto maximum = std::max_element(
         shape.invocations.begin(), shape.invocations.end(),
         [](const Invocation& left, const Invocation& right) { return left.t < right.t; });
@@ -348,7 +356,24 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
     DeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), device_weight.bytes);
-    const Weight weight = host_weight.device_weight(device_weight.p);
+    Weight weight = host_weight.device_weight(device_weight.p);
+    if (shape.panel) {
+        const std::array<std::uint64_t, 2> extent{static_cast<std::uint64_t>(shape.n),
+                                                  static_cast<std::uint64_t>(shape.k)};
+        const WeightGeometry geometry =
+            weight_geometry(weight.qtype, QuantLayout::RowSplitPanel, extent);
+        if (weight.layout != QuantLayout::RowSplit || geometry.bytes > host_weight.payload.size() ||
+            geometry.code_bytes != host_weight.code_plane_bytes ||
+            geometry.scale_offset != host_weight.scale_plane_offset) {
+            throw std::invalid_argument("linear test: the fixture cannot take the panel layout");
+        }
+        artifact::permute_row_split_to_panel(geometry, static_cast<std::byte*>(device_weight.p),
+                                             nullptr);
+        cuda_check(cudaDeviceSynchronize(), "permute the weight into the panel layout");
+        weight.layout = QuantLayout::RowSplitPanel;
+        host_weight.payload.resize(device_weight.bytes);
+        device_weight.copy_to_host(host_weight.payload.data(), device_weight.bytes);
+    }
 
     // One oracle, evaluated at the widest invocation and sliced by every narrower one: the
     // activation of token j does not depend on how many tokens the call carries, so column j of the

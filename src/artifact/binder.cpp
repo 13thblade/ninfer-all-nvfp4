@@ -177,7 +177,14 @@ void Binder::transcode_device(ObjectHandle object, QType target) {
 
 void Binder::panel_device(ObjectHandle object) {
     if (selected(object)) {
-        throw ArtifactError(object_id(object) + ": a selected piece cannot be given the panel layout");
+        // A piece is uploaded in the stored row-split layout and permuted in place, as a whole
+        // object is.
+        auto& entry = selected_entry(object);
+        if (!row_split_panel_supported(entry.geometry)) {
+            throw ArtifactError(object_id(object) + ": object cannot take the panel layout");
+        }
+        entry.panel = true;
+        return;
     }
     const auto& tensor = reader_.directory().tensor(object);
     auto& demand       = demands_.at(object.index);
@@ -387,6 +394,7 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
             placement.tail      = entry.tail;
             placement.source    = entry.source;
             placement.selection = entry.selection;
+            placement.panel     = entry.panel;
             plan.device_objects.push_back(std::move(placement));
             capacity = checked_add(checked_add(offset, entry.geometry.bytes, "device capacity"),
                                    entry.tail, "device capacity");

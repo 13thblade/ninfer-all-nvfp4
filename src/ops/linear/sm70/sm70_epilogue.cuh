@@ -12,7 +12,7 @@
 namespace ninfer::ops::detail::sm70 {
 
 // Every parent row lands in the destination that takes it, times its RowFactor: stored, or added
-// onto the BF16 residual there.
+// onto the BF16 residual (or the FP32 partial) there.
 struct DestinationEpilogue {
     Destination set[kMaxDestinations];
     int count = 0;
@@ -25,8 +25,13 @@ struct DestinationEpilogue {
             if (i >= count) { return; }
             const Destination& d = set[i];
             if (row >= d.row_begin && row < d.row_begin + d.rows) {
-                __nv_bfloat16* p = d.data + static_cast<std::size_t>(token) * d.leading +
-                                   d.row_offset + (row - d.row_begin);
+                const std::size_t at = static_cast<std::size_t>(token) * d.leading +
+                                       d.row_offset + (row - d.row_begin);
+                if (d.fp32 != nullptr) {
+                    d.fp32[at] = d.accumulate ? d.fp32[at] + value : value;
+                    return;
+                }
+                __nv_bfloat16* p = d.data + at;
                 *p = d.accumulate ? residual_add_bf16(value, *p) : __float2bfloat16_rn(value);
                 return;
             }

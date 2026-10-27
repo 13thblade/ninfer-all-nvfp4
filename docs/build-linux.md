@@ -199,7 +199,9 @@ speed, and the kernels written for Ampere everywhere else, on emulated warp prim
   here, stays A16.
 - **Weight layout**: the row-split projection weights of the text and MTP layers (T2, Q2, Q4, Q5,
   Q6) load in the panel layout, four rows' records of a group per 128-byte line, which the
-  decode reads stream at a larger share of the card's bandwidth.
+  decode reads stream at a larger share of the card's bandwidth. A tensor-parallel rank's pieces
+  of them take it too, each permuted after its upload, and its FP32 partial sums run the same
+  Volta routes.
 - **GGUF projections** keep NInfer's DP4A vector kernel up to eight columns and ggml's DP4A matrix
   kernel above (as llama.cpp does on Volta); GGUF dense projections from 65 columns take the cuBLAS
   route. The routed experts' matrix products (prompt chunks of Flash-Next, Gemma 4, Flint and

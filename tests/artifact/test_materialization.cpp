@@ -1,5 +1,6 @@
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
+#include "artifact/permute_row_split.h"
 #include "artifact/selection.h"
 #include "artifact/views.h"
 #include "core/device.h"
@@ -292,6 +293,56 @@ void selected_upload(DeviceContext& device) {
     }
 }
 
+// A selected piece takes the panel layout as a stored object does: uploaded row-split, then
+// permuted in place (a V100 tensor-parallel rank's projections). The piece is judged by its own
+// rows: two rows are no whole panel. The fixture's object read as four rows of 65 columns has the
+// same planes and bytes as two rows of 130.
+void selected_panel(DeviceContext& device) {
+    {
+        Fixture fixture;
+        fixture.write(true);
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        const ObjectHandle piece = binder.select_device(
+            reader.find("q5"), {.rows = {{0, 2}}, .columns = {{0, 128}}}, 0);
+        rejects([&] { binder.panel_device(piece); }, "a piece of two rows took the panel layout");
+    }
+    Fixture fixture;
+    fixture.root["objects"][1]["shape"] = {4, 65};
+    fixture.root["bindings"]            = {{"matrix", {{"object", "q5"}}}};
+    fixture.root["uses"]                = Json::array();
+    fixture.write(true);
+    Reader reader(fixture.entry);
+    // Two loads, since one may not read the same bytes twice: the piece as stored, then with the
+    // panel layout.
+    const ObjectSelection rows{.rows = {{0, 4}}, .columns = {{0, 65}}};
+    std::vector<std::byte> want;
+    std::vector<std::byte> got;
+    for (const bool panel : {false, true}) {
+        Binder binder(reader);
+        const ObjectHandle piece = binder.select_device(reader.find("q5"), rows, 0);
+        if (panel) { binder.panel_device(piece); }
+        auto backing       = materialize(reader, std::move(binder).finish(), device);
+        const auto& parent = backing.device_parent(piece);
+        require(parent.geometry.layout ==
+                    (panel ? QuantLayout::RowSplitPanel : QuantLayout::RowSplit),
+                "a selected piece's layout ignored its panel request");
+        std::vector<std::byte>& bytes = panel ? got : want;
+        bytes.resize(parent.geometry.bytes);
+        if (!panel) {
+            void* scratch = nullptr;
+            CUDA_CHECK(cudaMalloc(&scratch, bytes.size()));
+            CUDA_CHECK(cudaMemcpy(scratch, parent.data, bytes.size(), cudaMemcpyDeviceToDevice));
+            permute_row_split_to_panel(parent.geometry, static_cast<std::byte*>(scratch), nullptr);
+            CUDA_CHECK(cudaMemcpy(bytes.data(), scratch, bytes.size(), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaFree(scratch));
+        } else {
+            CUDA_CHECK(cudaMemcpy(bytes.data(), parent.data, bytes.size(), cudaMemcpyDeviceToHost));
+        }
+    }
+    require(got == want, "a selected piece in the panel layout is not its permuted bytes");
+}
+
 void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bool writer_fixture) {
     std::optional<MaterializedArtifact> storage;
     std::map<std::size_t, std::vector<std::byte>> expected;
@@ -502,6 +553,7 @@ int main(int argc, char** argv) {
         failure_and_host_only(device);
         overlay_placement(device);
         selected_upload(device);
+        selected_panel(device);
         pipeline_rank_placement();
 #if defined(NINFER_TEST_LINK_WRAP)
         ninfer::test::materialization_cuda_errors(device);

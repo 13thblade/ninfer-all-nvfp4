@@ -864,8 +864,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     std::vector<std::uint64_t> previous_device_end(rank_count, 0);
     for (const auto& placement : plan.device_objects) {
         if (placement.selection.has_value() != placement.source.has_value() ||
-            (placement.selection && (placement.object.index < plan.object_count ||
-                                     placement.transcode || placement.panel))) {
+            (placement.selection &&
+             (placement.object.index < plan.object_count || placement.transcode))) {
             throw ArtifactError("a selected device placement is malformed");
         }
         const ObjectHandle stored   = placement.source.value_or(placement.object);

@@ -22,7 +22,8 @@
 namespace ninfer::ops::detail::sm70 {
 
 // Parent rows [row_begin, row_begin + rows) land at destination rows from row_offset of a BF16
-// plane with `leading` rows per column: stored, or added onto (the residual epilogue).
+// plane with `leading` rows per column: stored, or added onto (the residual epilogue). With `fp32`
+// set they land unrounded in that FP32 plane instead (a tensor-parallel rank's partial sum).
 struct Destination {
     __nv_bfloat16* data     = nullptr;
     std::int32_t leading    = 0;
@@ -30,6 +31,7 @@ struct Destination {
     std::int32_t row_begin  = 0;
     std::int32_t rows       = 0;
     bool accumulate         = false;
+    float* fp32             = nullptr;
 };
 
 inline constexpr int kMaxDestinations = 4;
