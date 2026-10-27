@@ -163,8 +163,8 @@ def main(argv=None):
         "model alone, its table read from a table artifact at run time) or ngram (that table "
         "artifact), and vision or mtp (from --source mtp=MTP.gguf or an HF safetensors subset) beside text; "
         "for DeepSeek-V4.1 text,engram (the default), text or engram, and dspark (its drafter, from "
-        "--source dspark=DRAFTER.gguf) and vision (its tower, from --source vision=MMPROJ.gguf and "
-        "--source bias_vl=BIAS_VL.safetensors) beside text",
+        "--source dspark=DRAFTER.gguf or an STQ pack directory) and vision (its tower, from "
+        "--source vision=MMPROJ.gguf and --source bias_vl=BIAS_VL.safetensors) beside text",
     )
     parser.add_argument(
         "--resource",
@@ -217,14 +217,19 @@ def main(argv=None):
                 raise ValueError("DeepSeek-V4.1 converts its text component from --source "
                                  "gguf=SHARD1.gguf, its Engram table from --source "
                                  "engram=ENGRAM.gguf, with --components ...,dspark its "
-                                 "drafter from --source dspark=DRAFTER.gguf and with "
+                                 "drafter from --source dspark=DRAFTER.gguf (or an STQ pack "
+                                 "directory) and with "
                                  "--components ...,vision its vision tower from --source "
                                  "vision=MMPROJ.gguf and --source bias_vl=BIAS_VL.safetensors")
             gguf = (stack.enter_context(GGUFShards(paths["gguf"]))
                     if "text" in components else None)
             engram = stack.enter_context(GGUFFile(paths["engram"]))
-            dspark = (stack.enter_context(GGUFShards(paths["dspark"]))
-                      if "dspark" in components else None)
+            # A directory is an STQ pack whose drafter (mtp.*) the dspark component stores.
+            dspark = None
+            if "dspark" in components:
+                dspark = stack.enter_context(
+                    SafetensorsSource(paths["dspark"]) if Path(paths["dspark"]).is_dir()
+                    else GGUFShards(paths["dspark"]))
             vision = (stack.enter_context(GGUFFile(paths["vision"]))
                       if "vision" in components else None)
             bias_vl = (stack.enter_context(SafetensorsSource(paths["bias_vl"]))

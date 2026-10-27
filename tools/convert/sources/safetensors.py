@@ -24,6 +24,7 @@ _DTYPES = {
     "I64": (torch.int64, 8),
     "I8": (torch.int8, 1),
     "U8": (torch.uint8, 1),
+    "U16": (torch.uint16, 2),
     "F8_E4M3": (torch.float8_e4m3fn, 1),
 }
 

@@ -55,6 +55,22 @@ int main() {
         try { (void)parse(full); } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "server accepted invalid draft confidence");
     }
+    // DSpark's confidence floor: the drafter's default unless set, 0..1, DSpark only.
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).speculative.draft_confidence,
+                      "DSpark's floor must default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-confidence",
+                             "0"}).speculative.draft_confidence == 0.0F,
+                      "server did not preserve --draft-confidence");
+    for (const auto& args : std::vector<std::vector<std::string>>{
+             {"--spec", "dspark", "--draft-confidence", "1.5"},
+             {"--spec", "mtp", "--draft-tokens", "4", "--draft-confidence", "0.5"},
+             {"--draft-confidence", "0.5"}}) {
+        std::vector<std::string> full{"ninfer-serve", "model.ninfer"};
+        full.insert(full.end(), args.begin(), args.end());
+        bool rejected = false;
+        try { (void)parse(full); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted an invalid --draft-confidence");
+    }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).embedding_residency ==
                               ninfer::EmbeddingResidency::Device &&
                           parse({"ninfer-serve", "model.ninfer", "--embedding-residency", "host"})

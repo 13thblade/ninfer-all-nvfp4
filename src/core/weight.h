@@ -48,6 +48,10 @@ enum class QType : std::uint16_t {
     // ggml's MXFP4 blocks (GgufBlocks): an E8M0 exponent byte, then 32 E2M1 codes, value j < 16 the
     // low nibble of byte j, value j + 16 its high nibble.
     GGUF_MXFP4 = 30,
+    // Direct 16-bit words (Contiguous only): binary16 values, and unsigned words a consumer decodes
+    // itself (an STQ matrix's trellis; its sign vectors are FP16).
+    FP16   = 31,
+    UINT16 = 32,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {

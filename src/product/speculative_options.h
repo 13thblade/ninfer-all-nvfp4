@@ -61,6 +61,12 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         (options.draft_min_p != 0 && options.backend != SpeculativeBackend::Mtp)) {
         throw std::invalid_argument("--draft-min-p requires --spec mtp and a finite value in [0,1]");
     }
+    if (options.draft_confidence &&
+        (!std::isfinite(*options.draft_confidence) || *options.draft_confidence < 0 ||
+         *options.draft_confidence > 1 || options.backend != SpeculativeBackend::DSpark)) {
+        throw std::invalid_argument(
+            "--draft-confidence requires --spec dspark and a finite value in [0,1]");
+    }
     if (options.ngram_archive_bytes != 0 &&
         (options.ngram_draft_tokens == 0 || options.ngram_session_bytes < (1ULL << 20) ||
          options.ngram_session_bytes > options.ngram_archive_bytes)) {

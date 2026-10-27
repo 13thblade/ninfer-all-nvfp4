@@ -76,12 +76,28 @@ struct TextWeights {
     std::vector<LayerWeights> layers;
 };
 
+// An STQ matrix (ops/linear/stq): its trellis words (UINT16 [in/16][out/16][words]), input signs
+// (FP16 [in]) and output signs (FP16 [out]); a set of matrices of one shape (the grouped output
+// projection's groups, the routed experts) leads each with [count].
+struct StqWeights {
+    WeightId trellis, suh, svh;
+};
+
+struct StqLayerWeights {
+    StqWeights query_a, kv, query_b, output_a, output_b, shared_gate, shared_up, shared_down;
+    StqWeights gate, up, down; // the routed experts
+};
+
 // The drafter: the taps' projection and its norm, the final norm, the Markov tables ([vocab][rank]
 // BF16: the embedding of the token before a row, and the bias head), the confidence head
-// ([hidden + rank] FP32), and blocks whose routed experts are resident.
+// ([hidden + rank] FP32), and blocks whose routed experts are resident. An STQ drafter
+// (DSparkConfig::stq) binds its matrices as stq_fc and stq_layers instead of fc and the blocks'
+// matrix parameters.
 struct DSparkWeights {
     WeightId fc, tap_norm, final_norm, markov_embed, markov_head, confidence;
     std::vector<LayerWeights> layers;
+    std::optional<StqWeights> stq_fc;
+    std::vector<StqLayerWeights> stq_layers;
 };
 
 // The vision tower: BF16 matrices (a block's gate and up one parent), FP32 vectors; the learned

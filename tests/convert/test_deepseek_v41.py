@@ -363,7 +363,10 @@ def _convert(tmp_path, hf, first, table, components=("text", "engram"), drafter=
     output = tmp_path / ("-".join(components) + ".ninfer")
     with SafetensorsSource(hf) as base, GGUFFile(table) as engram:
         gguf = deepseek_v41.GGUFShards(first) if "text" in components else None
-        dspark = deepseek_v41.GGUFShards(drafter) if drafter else None
+        dspark = None
+        if drafter:
+            dspark = (SafetensorsSource(drafter) if drafter.is_dir()
+                      else deepseek_v41.GGUFShards(drafter))
         vision = GGUFFile(mmproj) if mmproj else None
         bias = SafetensorsSource(bias_vl) if bias_vl else None
         model = deepseek_v41.build_model(base, gguf, components=components, dspark=dspark,
@@ -375,7 +378,7 @@ def _convert(tmp_path, hf, first, table, components=("text", "engram"), drafter=
         convert(model, recipe, output, device="cpu", rows_per_chunk=96)
         for source in (gguf, dspark, vision):
             if source is not None:
-                source.__exit__()
+                source.__exit__(None, None, None)
         if bias is not None:
             bias.close()
     return output
@@ -533,6 +536,121 @@ def test_the_drafter_keeps_its_blocks(tmp_path):
                               stored["markov_w1.weight"].reshape(-1))
         assert np.array_equal(np.frombuffer(stored_bytes("dspark/confidence"), dtype=np.float32),
                               stored["conf_proj.weight"].reshape(-1))
+
+
+def _stq_pack(tmp_path, config=None, expert_codebook="pair1"):
+    """The drafter of a Sushi STQ pack (mtp.0): random trellis words and sign vectors of every
+    matrix, the trunk's beside SPEC1 metadata and the routed experts' beside PAIR1, BF16 vectors,
+    the release's config."""
+
+    from tools.convert.fetch_tensors import write_safetensors
+
+    generator = np.random.default_rng(41)
+    pack = tmp_path / "stq"
+    pack.mkdir()
+    (pack / "config.json").write_text(json.dumps(config or _hf_config()))
+    files = {"trunk": {}, "experts": {}}
+    stored = {}
+
+    def bf16(name, shape, file="trunk"):
+        words = (generator.normal(size=shape).astype(np.float32).view(np.uint32) >> 16)
+        stored[name] = words.astype(np.uint16)
+        files[file][name] = ({"dtype": "BF16", "shape": list(shape)}, stored[name].tobytes())
+
+    def stq(name, k, n, words, count=None, file="trunk"):
+        lead = [] if count is None else [count]
+        trellis = generator.integers(0, 1 << 16, size=lead + [k // 16, n // 16, words],
+                                     dtype=np.uint16)
+        files[file][name + ".trellis"] = ({"dtype": "U16", "shape": list(trellis.shape)},
+                                          trellis.tobytes())
+        stored[name + ".trellis"] = trellis
+        for part, size in (("suh", k), ("svh", n)):
+            signs = generator.choice([-1.0, 1.0], size=lead + [size]).astype(np.float16)
+            files[file][f"{name}.{part}"] = ({"dtype": "F16", "shape": list(signs.shape)},
+                                             signs.tobytes())
+            stored[f"{name}.{part}"] = signs
+
+    g, mixes = "mtp.0.", (2 + HC) * HC
+    stq(g + "main_proj", len(DRAFT_TARGETS) * HIDDEN, HIDDEN, 64)
+    for name, shape in (("main_norm.weight", (HIDDEN,)), ("norm.weight", (HIDDEN,)),
+                        ("markov_head.embed.weight", (VOCAB, DRAFT_RANK)),
+                        ("markov_head.head.weight", (VOCAB, DRAFT_RANK)),
+                        ("confidence_head.proj.weight", (HIDDEN + DRAFT_RANK,)),
+                        ("attn_norm.weight", (HIDDEN,)), ("ffn_norm.weight", (HIDDEN,)),
+                        ("attn.q_norm.weight", (Q_RANK,)), ("attn.kv_norm.weight", (HEAD_DIM,)),
+                        ("attn.attn_sink", (HEADS,)), ("ffn.gate.weight", (DRAFT_EXPERTS, HIDDEN)),
+                        ("ffn.gate.bias", (DRAFT_EXPERTS,))):
+        bf16(g + name, shape)
+    for site in ("attn", "ffn"):
+        bf16(g + f"hc_{site}_fn", (mixes, HC * HIDDEN))
+        bf16(g + f"hc_{site}_base", (mixes,))
+        bf16(g + f"hc_{site}_scale", (3,))
+    stq(g + "attn.wq_a", HIDDEN, Q_RANK, 64)
+    stq(g + "attn.wkv", HIDDEN, HEAD_DIM, 64)
+    stq(g + "attn.wq_b", Q_RANK, HEADS * HEAD_DIM, 64)
+    stq(g + "attn.wo_a", HEADS * HEAD_DIM // GROUPS, O_RANK, 64, GROUPS)
+    stq(g + "attn.wo_b", GROUPS * O_RANK, HIDDEN, 64)
+    stq(g + "ffn.shared_experts.w1", HIDDEN, WIDTH, 64)
+    stq(g + "ffn.shared_experts.w3", HIDDEN, WIDTH, 64)
+    stq(g + "ffn.shared_experts.w2", WIDTH, HIDDEN, 64)
+    for bank, k, n in (("gate_proj", HIDDEN, WIDTH), ("up_proj", HIDDEN, WIDTH),
+                       ("down_proj", WIDTH, HIDDEN)):
+        stq(g + f"mlp.switch_mlp.{bank}.g0", k, n, 32, DRAFT_EXPERTS, "experts")
+    names = {"trunk": "model-mtp-trunk-0.safetensors", "experts": "model-mtp-0.safetensors"}
+    metadata = {"trunk": {"format": "stq", "codebook": "spec1", "k": "4"},
+                "experts": {"format": "stq", "codebook": expert_codebook,
+                            "k": "2" if expert_codebook == "pair1" else "4"}}
+    for file, tensors in files.items():
+        write_safetensors(pack / names[file], tensors, metadata[file])
+    (pack / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {name: names[file] for file, tensors in files.items() for name in tensors}}))
+    return pack, stored
+
+
+def test_the_stq_drafter_keeps_its_words(tmp_path):
+    from tools.artifact.reader import Artifact
+
+    hf, first, table, _ = _release(tmp_path)
+    pack, stored = _stq_pack(tmp_path)
+    output = _convert(tmp_path, hf, first, table, ("text", "dspark"), pack)
+    with Artifact(output) as artifact:
+        directory = artifact.directory
+        assert directory.components["dspark"]["config"]["stq"] == {
+            "trunk": "spec1_w15_n64", "experts": "pair1_w16_n32"}
+        bindings = directory.bindings
+
+        def stored_bytes(name):
+            return artifact.read_object(bindings[name]["object"])
+
+        # Trellis words and signs exactly as the pack stores them, a leading count on the grouped
+        # output projection and the expert banks.
+        for name, tensor in (("dspark/fc", "mtp.0.main_proj"),
+                             ("dspark/layers/0/attention/output_a", "mtp.0.attn.wo_a"),
+                             ("dspark/layers/0/moe/shared_down", "mtp.0.ffn.shared_experts.w2"),
+                             ("dspark/layers/0/moe/up", "mtp.0.mlp.switch_mlp.up_proj.g0")):
+            for part in ("trellis", "suh", "svh"):
+                assert stored_bytes(f"{name}/{part}") == stored[f"{tensor}.{part}"].tobytes()
+        assert artifact.by_id[bindings["dspark/fc/trellis"]["object"]].format == "uint16"
+        assert artifact.by_id[bindings["dspark/fc/suh"]["object"]].format == "fp16"
+        # Vectors widen to FP32 exactly; the Markov tables stay BF16.
+        tap_norm = np.frombuffer(stored_bytes("dspark/tap_norm"), dtype=np.float32)
+        assert np.array_equal(tap_norm.view(np.uint32) >> 16, stored["mtp.0.main_norm.weight"])
+        assert stored_bytes("dspark/markov_head") == stored["mtp.0.markov_head.head.weight"].tobytes()
+
+
+@pytest.mark.parametrize("bad", ["config", "codebook"])
+def test_the_stq_pack_must_match_the_release(tmp_path, bad):
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    hf, first, _, _ = _release(tmp_path)
+    config = _hf_config()
+    if bad == "config":
+        config["text_config"]["dspark_block_size"] = 4
+    pack, _ = _stq_pack(tmp_path, config, "pair1" if bad == "config" else "spec1")
+    with SafetensorsSource(hf) as base, deepseek_v41.GGUFShards(first) as gguf, \
+            SafetensorsSource(pack) as dspark:
+        with pytest.raises(ValueError):
+            deepseek_v41.build_model(base, gguf, components=("text", "dspark"), dspark=dspark)
 
 
 @pytest.mark.parametrize("bad", [

@@ -13,6 +13,7 @@
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
+#include "ops/linear/stq/stq_linear.h"
 
 #include <cuda_bf16.h>
 
@@ -62,6 +63,40 @@ const __nv_bfloat16* bf16_table(const Model& model, WeightId id, std::int64_t ro
         throw std::invalid_argument(model.weight(id).name + " must be stored as bf16");
     }
     return static_cast<const __nv_bfloat16*>(tensor.data);
+}
+
+// The device address of a direct weight's first element, checked to be stored as `format`.
+const std::byte* direct_words(const Model& model, WeightId id, QType format) {
+    const auto region = contiguous_weight_region(model.weight(id).view);
+    const auto& g     = region.parent->geometry;
+    if (g.layout != QuantLayout::Contiguous || g.format != format || !region.parent->data) {
+        throw std::invalid_argument(model.weight(id).name + ": unexpected direct representation");
+    }
+    return region.parent->data + region.begin * 2;
+}
+
+// An STQ drafter's matrices of k inputs and n outputs (`count` of them, each its own trellis and
+// signs, or one).
+ops::stq::Matrices stq_matrices(const Model& model, const StqWeights& w, int k, int n,
+                                ops::stq::Codebook codebook, int count = 1) {
+    ops::stq::Matrices m;
+    m.trellis  = reinterpret_cast<const std::uint16_t*>(direct_words(model, w.trellis, QType::UINT16));
+    m.suh      = reinterpret_cast<const __half*>(direct_words(model, w.suh, QType::FP16));
+    m.svh      = reinterpret_cast<const __half*>(direct_words(model, w.svh, QType::FP16));
+    m.k        = k;
+    m.n        = n;
+    m.codebook = codebook;
+    m.trellis_stride = std::int64_t(k / 16) * (n / 16) * ops::stq::tile_words(codebook);
+    m.suh_stride     = k;
+    m.svh_stride     = n;
+    for (const auto& [id, elements] : {std::pair{w.trellis, m.trellis_stride * count},
+                                       std::pair{w.suh, std::int64_t(k) * count},
+                                       std::pair{w.svh, std::int64_t(n) * count}}) {
+        if (weight_element_count(model.weight(id).view.shape) != std::uint64_t(elements)) {
+            throw std::invalid_argument(model.weight(id).name + ": STQ shape mismatch");
+        }
+    }
+    return m;
 }
 
 Weight matrix(const Model& model, WeightId id) {
@@ -147,6 +182,12 @@ struct Site {
     const float *fn = nullptr, *base = nullptr, *scale = nullptr;
 };
 
+// An STQ drafter block's matrices (DSparkConfig::stq), in place of the GGUF ones.
+struct StqPlan {
+    ops::stq::Matrices query_a, kv, query_b, output_a, output_b, shared_gate, shared_up, shared_down;
+    ops::stq::Matrices gate, up, down; // the routed experts
+};
+
 struct LayerPlan {
     int ratio = 0;
     int experts = 0, top_k = 0; // the block's routed experts and how many a row takes
@@ -182,6 +223,7 @@ struct LayerPlan {
     DeviceBuffer tail_kv, tail_score;
     // The checkpoint of every sequence's ring and tails (snapshot()).
     DeviceBuffer checkpoint_ring, checkpoint_kv, checkpoint_score;
+    std::optional<StqPlan> stq;
 };
 
 struct GraphEntry {
@@ -218,6 +260,7 @@ struct Executor::Impl {
     int hidden = 0, streams = 0, heads = 0, vocab = 0, window = 0, query_rank = 0, groups = 0,
         output_rank = 0, index_heads = 0, index_topk = 0, experts = 0, top_k = 0, width = 0;
     float eps = 0;
+    int sms   = 0; // the device's multiprocessors, the STQ products' split
     // A prompt chunk attends over a staging ring of the window before it and the chunk itself,
     // which every block and sequence shares in turn.
     int prefill_ring = 0;
@@ -315,6 +358,7 @@ struct Executor::Impl {
         std::int32_t noise = 0;
         Weight fc;
         std::vector<Weight> kv;
+        std::optional<ops::stq::Matrices> stq_fc; // an STQ drafter's projection (d.layers' stq: kv)
         const float *tap_norm = nullptr, *final_norm = nullptr, *confidence = nullptr;
         const __nv_bfloat16 *markov_embed = nullptr, *markov_head = nullptr;
         DeviceBuffer taps, ids, values, scratch;
@@ -351,6 +395,7 @@ struct Executor::Impl {
             throw std::invalid_argument("deepseek_v41 executor: at most 7 drafts a round");
         }
         stream              = device.stream;
+        sms                 = device.multiprocessor_count();
         const int device_id = device.rank(0).device;
         growing = !model.expert_banks().empty() && !options.expert_cache_bytes &&
                   vmm::granularity(device_id) != 0;
@@ -534,7 +579,6 @@ struct Executor::Impl {
             for (KvArea* area : sequence_areas) { kv_fixed -= area->bytes; }
         }
         kv_backed = kv_fixed;
-        const int sms = device.multiprocessor_count();
         decode_splits = std::clamp(2 * sms / (heads / 16), 1, 40);
         span_tokens = plan_span();
         const std::size_t rows = staging_rows();
@@ -600,8 +644,10 @@ struct Executor::Impl {
     }
 
     // What every block plans, the backbone's and the drafter's: hyper-connections, the window
-    // attention, the norms, the router and the shared expert.
-    LayerPlan plan_block(const LayerWeights& lw, int ratio, int block_experts, int block_top_k) {
+    // attention, the norms, the router and the shared expert; an STQ drafter block's matrices from
+    // `stq` (its routed experts too).
+    LayerPlan plan_block(const LayerWeights& lw, int ratio, int block_experts, int block_top_k,
+                         const StqLayerWeights* stq = nullptr) {
         LayerPlan p;
         p.ratio                  = ratio;
         p.experts                = block_experts;
@@ -612,11 +658,29 @@ struct Executor::Impl {
         p.hc_ffn       = {fp32(model, lw.hc_ffn.fn, mixes * flat), fp32(model, lw.hc_ffn.base, mixes),
                           fp32(model, lw.hc_ffn.scale, 3)};
         const auto& at   = lw.attention;
-        p.query_kv       = matrices(model, {at.query_a, at.kv});
-        p.query_b        = matrix(model, at.query_b);
-        p.output_a       = matrix(model, at.output_a);
-        p.output_b       = matrix(model, at.output_b);
-        {
+        if (stq != nullptr) {
+            using ops::stq::Codebook;
+            constexpr auto trunk = Codebook::Spec1W15N64;
+            const int latent = heads * kLatent, latent_rows = groups * output_rank;
+            StqPlan& m       = p.stq.emplace();
+            m.query_a     = stq_matrices(model, stq->query_a, hidden, query_rank, trunk);
+            m.kv          = stq_matrices(model, stq->kv, hidden, kLatent, trunk);
+            m.query_b     = stq_matrices(model, stq->query_b, query_rank, latent, trunk);
+            m.output_a    = stq_matrices(model, stq->output_a, latent / groups, output_rank, trunk, groups);
+            m.output_b    = stq_matrices(model, stq->output_b, latent_rows, hidden, trunk);
+            m.shared_gate = stq_matrices(model, stq->shared_gate, hidden, width, trunk);
+            m.shared_up   = stq_matrices(model, stq->shared_up, hidden, width, trunk);
+            m.shared_down = stq_matrices(model, stq->shared_down, width, hidden, trunk);
+            m.gate = stq_matrices(model, stq->gate, hidden, width, Codebook::Pair1W16N32, block_experts);
+            m.up   = stq_matrices(model, stq->up, hidden, width, Codebook::Pair1W16N32, block_experts);
+            m.down = stq_matrices(model, stq->down, width, hidden, Codebook::Pair1W16N32, block_experts);
+        } else {
+            p.query_kv = matrices(model, {at.query_a, at.kv});
+            p.query_b  = matrix(model, at.query_b);
+            p.output_a = matrix(model, at.output_a);
+            p.output_b = matrix(model, at.output_b);
+        }
+        if (stq == nullptr) {
             std::vector<const void*> parts(static_cast<std::size_t>(groups));
             for (int g = 0; g < groups; ++g) {
                 parts[std::size_t(g)] = static_cast<const std::byte*>(p.output_a.qdata) +
@@ -634,8 +698,10 @@ struct Executor::Impl {
         const MoeWeights& mw = lw.moe;
         p.router             = fp32(model, mw.router, std::int64_t(block_experts) * hidden);
         p.router_bias        = fp32(model, mw.router_bias, block_experts);
-        p.shared_gate_up     = matrices(model, {mw.shared_gate, mw.shared_up});
-        p.shared_down        = matrix(model, mw.shared_down);
+        if (stq == nullptr) {
+            p.shared_gate_up = matrices(model, {mw.shared_gate, mw.shared_up});
+            p.shared_down    = matrix(model, mw.shared_down);
+        }
         return p;
     }
 
@@ -677,23 +743,33 @@ struct Executor::Impl {
             d.domain <= 0 || d.domain > vocab) {
             throw std::invalid_argument("DeepSeek-V4.1: the DSpark block must be 1..8 rows over the vocabulary");
         }
-        d.fc         = matrix(model, dw.fc);
+        if (dc.stq) {
+            d.stq_fc = stq_matrices(model, *dw.stq_fc, d.targets * hidden, hidden,
+                                    ops::stq::Codebook::Spec1W15N64);
+        } else {
+            d.fc = matrix(model, dw.fc);
+        }
         d.tap_norm   = fp32(model, dw.tap_norm, hidden);
         d.final_norm = fp32(model, dw.final_norm, hidden);
         d.confidence = fp32(model, dw.confidence, std::int64_t(hidden) + kernels::kMarkovRank);
         d.markov_embed = bf16_table(model, dw.markov_embed, vocab, kernels::kMarkovRank);
         d.markov_head  = bf16_table(model, dw.markov_head, vocab, kernels::kMarkovRank);
         const int sequences = int(options.sequences);
-        for (const LayerWeights& lw : dw.layers) {
-            LayerPlan p = plan_block(lw, 0, int(dc.experts), int(dc.top_k));
-            plan_resident(p, lw.moe);
-            // The seed's kv rows: of [query_a; kv] when the two are one parent.
-            Weight kv = p.query_kv.back();
-            if (p.query_kv.size() == 1) {
-                kv.qdata = static_cast<const std::byte*>(kv.qdata) + std::int64_t(query_rank) * row_bytes(kv);
-                kv.n     = kLatent;
+        for (std::size_t b = 0; b < dw.layers.size(); ++b) {
+            const LayerWeights& lw = dw.layers[b];
+            LayerPlan p = plan_block(lw, 0, int(dc.experts), int(dc.top_k),
+                                     dc.stq ? &dw.stq_layers.at(b) : nullptr);
+            if (!dc.stq) {
+                plan_resident(p, lw.moe);
+                // The seed's kv rows: of [query_a; kv] when the two are one parent.
+                Weight kv = p.query_kv.back();
+                if (p.query_kv.size() == 1) {
+                    kv.qdata = static_cast<const std::byte*>(kv.qdata) +
+                               std::int64_t(query_rank) * row_bytes(kv);
+                    kv.n = kLatent;
+                }
+                d.kv.push_back(kv);
             }
-            d.kv.push_back(kv);
             p.ring = DeviceBuffer(ring_bytes * sequences);
             p.ring.fill(0);
             kv_bytes += p.ring.bytes;
@@ -1119,9 +1195,36 @@ struct Executor::Impl {
             if (p.engram >= 0) { product(p.engram_projection); }
         };
         for (const LayerPlan& p : layers) { block_products(p); }
+        // An STQ drafter's products: its trunk's at a draft's rows (the seed's in chunks of as
+        // many), its grouped output projection's groups, and a pair per routed expert of a row.
+        std::size_t stq_scratch = 0;
+        const auto stq_product = [&](const ops::stq::Matrices& m, int items, int rows) {
+            ops::stq::Product q;
+            q.m     = m;
+            q.items = items;
+            q.rows  = rows;
+            stq_scratch = std::max(stq_scratch, ops::stq::workspace_bytes(q, sms));
+        };
         if (drafter) {
-            for (const LayerPlan& p : drafter->layers) { block_products(p); }
-            product(drafter->fc);
+            for (const LayerPlan& p : drafter->layers) {
+                if (!p.stq) {
+                    block_products(p);
+                    continue;
+                }
+                const StqPlan& m = *p.stq;
+                constexpr int rows = ops::stq::kMaxRows;
+                for (const auto* q : {&m.query_a, &m.kv, &m.query_b, &m.output_b, &m.shared_gate,
+                                      &m.shared_up, &m.shared_down}) {
+                    stq_product(*q, 1, rows);
+                }
+                stq_product(m.output_a, groups, rows);
+                for (const auto* q : {&m.gate, &m.up, &m.down}) { stq_product(*q, rows * p.top_k, 1); }
+            }
+            if (drafter->stq_fc) {
+                stq_product(*drafter->stq_fc, 1, ops::stq::kMaxRows);
+            } else {
+                product(drafter->fc);
+            }
         }
         {
             Weight rows = head;
@@ -1182,7 +1285,7 @@ struct Executor::Impl {
                               r * drafter->layers.size() * kLatent * 4, r * 4});
         }
         return pass + std::max({engram_bytes, attention, ffn, head_bytes}) + seed_bytes + gguf_scratch +
-               allocations * kAlign + (32u << 20);
+               stq_scratch + allocations * kAlign + (32u << 20);
     }
 
     // ---- Shared pieces ---------------------------------------------------------------------------
@@ -1253,6 +1356,35 @@ struct Executor::Impl {
         ops::detail::gguf_project(x, {&product, 1}, *workspace, stream);
         if (guard) {
             kernels::unscale_columns(static_cast<__nv_bfloat16*>(out.data), w.n, w.n, t, scale, stream);
+        }
+    }
+
+    void stq_run(const ops::stq::Product& q) {
+        auto scope = workspace->scope();
+        ops::stq::product(q, workspace->alloc_bytes(ops::stq::workspace_bytes(q, sms)).data, sms,
+                          stream);
+    }
+
+    // An STQ matrix's products of the BF16 x [K, T] into FP32 [T][stride] from column `row`, or
+    // with `out16` into BF16 [T][stride], kMaxRows rows at a time.
+    void stq_project(const ops::stq::Matrices& m, const Tensor& x, float* out, int stride, int row = 0,
+                     __nv_bfloat16* out16 = nullptr) {
+        const int t = x.ne[1];
+        if (x.ne[0] != m.k) { throw std::invalid_argument("deepseek_v41: STQ input width mismatch"); }
+        for (int at = 0; at < t; at += ops::stq::kMaxRows) {
+            ops::stq::Product q;
+            q.m            = m;
+            q.rows         = std::min(ops::stq::kMaxRows, t - at);
+            q.x            = static_cast<const __nv_bfloat16*>(x.data) + std::int64_t(at) * m.k;
+            q.x_row_stride = m.k;
+            const std::int64_t first = std::int64_t(at) * stride + row;
+            if (out16 != nullptr) {
+                q.out_bf16 = out16 + first;
+            } else {
+                q.out = out + first;
+            }
+            q.out_row_stride = stride;
+            stq_run(q);
         }
     }
 
@@ -1416,7 +1548,12 @@ struct Executor::Impl {
                              static_cast<__nv_bfloat16*>(x.data), x32, stream);
         const int qkv_rows = query_rank + kLatent;
         auto* qkv          = alloc<float>(std::size_t(t) * qkv_rows);
-        project(x, p.query_kv, qkv, qkv_rows);
+        if (p.stq) {
+            stq_project(p.stq->query_a, x, qkv, qkv_rows);
+            stq_project(p.stq->kv, x, qkv, qkv_rows, query_rank);
+        } else {
+            project(x, p.query_kv, qkv, qkv_rows);
+        }
         Tensor qr  = alloc_bf16(query_rank, t);
         auto* qr32 = alloc<float>(std::size_t(t) * query_rank);
         kernels::rms_rows(qkv, qkv_rows, query_rank, t, p.query_norm, eps,
@@ -1445,7 +1582,12 @@ struct Executor::Impl {
         kv.ring      = s.chunk ? prefill_ring : kRing;
         kernels::kv_post(kv, stream);
         Tensor q = alloc_bf16(heads * kLatent, t);
-        project_bf16(qr, p.query_b, q);
+        if (p.stq) {
+            stq_project(p.stq->query_b, qr, nullptr, heads * kLatent, 0,
+                        static_cast<__nv_bfloat16*>(q.data));
+        } else {
+            project_bf16(qr, p.query_b, q);
+        }
         kernels::rotate_heads(static_cast<const __nv_bfloat16*>(q.data), t, heads, kLatent, pos,
                               p.freq, false, static_cast<__nv_bfloat16*>(q.data), stream);
         kernels::AttentionArgs a;
@@ -1489,13 +1631,29 @@ struct Executor::Impl {
         // serve every group: each pair's arithmetic is that of its group's own product, whose eight
         // launches of 1,024 rows read output_a at about 470 GB/s on an RTX 4090.
         auto* grouped         = static_cast<__nv_bfloat16*>(q.data); // q is spent
-        const bool vector     = t <= gguf::kMaxVectorColumns;
+        const bool vector     = !p.stq && t <= gguf::kMaxVectorColumns;
         kernels::attention_output(static_cast<const __nv_bfloat16*>(o.data), t, heads, groups, pos,
                                   p.freq, vector, grouped, stream);
         const int latent_rows = groups * output_rank;
         const int group_k     = heads / groups * kLatent;
         auto* latent          = alloc<float>(std::size_t(t) * latent_rows);
-        if (vector) {
+        if (p.stq) {
+            // The groups as the items of one STQ product, group g's rows [g][t][group_k].
+            if (t > ops::stq::kMaxRows) {
+                throw std::invalid_argument("deepseek_v41: an STQ block runs at most 8 rows");
+            }
+            ops::stq::Product g;
+            g.m               = p.stq->output_a;
+            g.items           = groups;
+            g.rows            = t;
+            g.x               = grouped;
+            g.x_item_stride   = std::int64_t(t) * group_k;
+            g.x_row_stride    = group_k;
+            g.out             = latent;
+            g.out_item_stride = output_rank;
+            g.out_row_stride  = latent_rows;
+            stq_run(g);
+        } else if (vector) {
             const int pairs = t * groups;
             const auto type = ops::detail::gguf_type(p.output_a.qtype);
             float* scale    = nullptr;
@@ -1516,7 +1674,7 @@ struct Executor::Impl {
                 kernels::unscale_columns(latent, output_rank, output_rank, pairs, scale, stream);
             }
         }
-        for (int g = 0; g < groups && !vector; ++g) {
+        for (int g = 0; g < groups && !vector && !p.stq; ++g) {
             Weight part = p.output_a;
             part.qdata  = static_cast<const std::byte*>(p.output_a.qdata) +
                          std::int64_t(g) * output_rank * row_bytes(p.output_a);
@@ -1528,7 +1686,11 @@ struct Executor::Impl {
         kernels::f32_to_bf16(latent, static_cast<__nv_bfloat16*>(latent16.data),
                              std::int64_t(t) * latent_rows, stream);
         auto* y = alloc<float>(std::size_t(t) * hidden);
-        project(latent16, p.output_b, y, hidden);
+        if (p.stq) {
+            stq_project(p.stq->output_b, latent16, y, hidden);
+        } else {
+            project(latent16, p.output_b, y, hidden);
+        }
         kernels::hc_post(h, y, c.post, c.comb, t, streams, hidden, stream);
     }
 
@@ -1658,6 +1820,15 @@ struct Executor::Impl {
         const auto shared = [&] {
             auto shared_scope = workspace->scope();
             auto* gu          = alloc<float>(std::size_t(t) * 2 * width);
+            if (p.stq) {
+                stq_project(p.stq->shared_gate, x, gu, 2 * width);
+                stq_project(p.stq->shared_up, x, gu, 2 * width, width);
+                Tensor middle = alloc_bf16(width, t);
+                kernels::clamped_swiglu(gu, 2 * width, t, width, config.swiglu_limit, scale, 1,
+                                        static_cast<__nv_bfloat16*>(middle.data), width, stream);
+                stq_project(p.stq->shared_down, middle, y, hidden);
+                return;
+            }
             ops::detail::GgufProduct parts[2];
             int rows = 0;
             for (std::size_t i = 0; i < p.shared_gate_up.size(); ++i) {
@@ -1830,6 +2001,48 @@ struct Executor::Impl {
         kernels::route(logits, p.router_bias, t, e, k, config.routed_scaling_factor, ids, weights,
                        stream, p.image_bias, p.image_bias != nullptr ? image_mask : nullptr);
         const auto* xb   = static_cast<const __nv_bfloat16*>(x.data);
+        if (p.stq) {
+            // An STQ drafter block's resident experts: a pair per routed expert of a row through its
+            // gate, up and down matrices, the rows weighted into y.
+            shared();
+            auto* gu     = alloc<float>(std::size_t(pairs) * 2 * w);
+            auto* middle = alloc<__nv_bfloat16>(std::size_t(pairs) * w);
+            auto* rows   = alloc<float>(std::size_t(pairs) * hidden);
+            ops::stq::Product gate;
+            gate.m               = p.stq->gate;
+            gate.ids             = ids;
+            gate.items           = pairs;
+            gate.x               = xb;
+            gate.x_item_stride   = hidden;
+            gate.x_divisor       = k;
+            gate.out             = gu;
+            gate.out_item_stride = 2 * w;
+            stq_run(gate);
+            ops::stq::Product up = gate;
+            up.m                 = p.stq->up;
+            up.out               = gu + w;
+            stq_run(up);
+            kernels::clamped_swiglu(gu, 2 * w, pairs, w, config.swiglu_limit, scale, k, middle, w,
+                                    stream);
+            ops::stq::Product down;
+            down.m               = p.stq->down;
+            down.ids             = ids;
+            down.items           = pairs;
+            down.x               = middle;
+            down.x_item_stride   = w;
+            down.out             = rows;
+            down.out_item_stride = hidden;
+            stq_run(down);
+            kernels::MoeCombineArgs combine;
+            combine.y       = y;
+            combine.tokens  = t;
+            combine.hidden  = hidden;
+            combine.rows    = rows;
+            combine.weights = weights;
+            combine.top_k   = k;
+            kernels::moe_combine(combine, stream);
+            return;
+        }
         const bool vector = t <= gguf::kMaxVectorColumns;
         void* xq          = nullptr; // the vector kernels' activation of x
         if (vector) {
@@ -1992,13 +2205,23 @@ struct Executor::Impl {
         kernels::f32_to_bf16(static_cast<const float*>(d.taps.p) + std::size_t(at) * inputs,
                              static_cast<__nv_bfloat16*>(x.data), std::int64_t(n) * inputs, stream);
         auto* main = alloc<float>(std::size_t(n) * hidden);
-        project(x, d.fc, main, hidden);
+        if (d.stq_fc) {
+            stq_project(*d.stq_fc, x, main, hidden);
+        } else {
+            project(x, d.fc, main, hidden);
+        }
         Tensor normed = alloc_bf16(hidden, n);
         kernels::rms_rows(main, hidden, hidden, n, d.tap_norm, eps,
                           static_cast<__nv_bfloat16*>(normed.data), nullptr, stream);
-        const int kv_rows = int(d.kv.size()) * kLatent;
+        const int kv_rows = int(d.layers.size()) * kLatent;
         auto* kv          = alloc<float>(std::size_t(n) * kv_rows);
-        project(normed, d.kv, kv, kv_rows);
+        if (d.stq_fc) {
+            for (std::size_t b = 0; b < d.layers.size(); ++b) {
+                stq_project(d.layers[b].stq->kv, normed, kv, kv_rows, int(b) * kLatent);
+            }
+        } else {
+            project(normed, d.kv, kv, kv_rows);
+        }
         for (std::size_t b = 0; b < d.layers.size(); ++b) {
             const LayerPlan& p = d.layers[b];
             kernels::KvPostArgs a;

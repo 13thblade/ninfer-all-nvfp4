@@ -367,7 +367,7 @@ The converter currently writes these formats:
 
 | Format | Built-in method for floating-point input | Import of already encoded input |
 |---|---|---|
-| `bf16`, `fp32`, `int32` | `cast_direct` | Direct words through the source reader |
+| `bf16`, `fp32`, `int32`, `fp16`, `uint16` | `cast_direct` (`fp16` only from values it represents exactly, `uint16` only from unsigned 16-bit words) | Direct words through the source reader |
 | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax`, `grouped_search` | Supply a custom method/source if needed |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `nvfp4` | Supply a custom quantizer | `import_encoded` |

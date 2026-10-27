@@ -200,6 +200,15 @@ DSparkConfig parse_dspark_config(const Json& value, const TextConfig& text) {
         }
         out.target_layers.push_back(static_cast<std::uint32_t>(id));
     }
+    if (value.contains("stq")) {
+        const auto& stq = value.at("stq");
+        if (!stq.is_object() || stq.size() != 2 || stq.value("trunk", "") != "spec1_w15_n64" ||
+            stq.value("experts", "") != "pair1_w16_n32") {
+            throw ArtifactError("DeepSeek-V4.1 DSpark config: STQ drafters store SPEC1 (64 words) "
+                                "trunk and PAIR1 (32 words) expert tiles");
+        }
+        out.stq = true;
+    }
     // A draft's rows are one decode pass of the vector kernels (at most eight), its Markov rank
     // a warp's eight values per lane.
     const bool ok = out.block_size >= 1 && out.block_size <= 8 && out.markov_rank == 256 &&

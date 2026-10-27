@@ -43,6 +43,9 @@ struct SpeculativeOptions {
     // Flash-Next MTP: end drafting and verification at the first draft whose absolute probability
     // is at or below this floor. Zero keeps the full window.
     float draft_min_p = 0;
+    // DeepSeek-V4.1 DSpark: verify a round's drafts up to the first its confidence head scores below
+    // this, in [0,1]; 0 keeps every draft. Unset keeps the drafter's default floor (0.5).
+    std::optional<float> draft_confidence;
     // An Engine's options() report the resolved head.
     ProposalHead proposal_head = ProposalHead::Auto;
     // Context-lookup drafting: match this many trailing tokens against the sequence so far and
