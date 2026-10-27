@@ -1076,7 +1076,8 @@ std::string make_decision_response(const DecisionRequest& request,
     body["created"] = unix_time_now();
     body["model"]   = request.model;
     OutJson rendered    = system_one ? OutJson::object() : OutJson::array();
-    OutJson diagnostics = OutJson::object();
+    // By question id for System One; in question order for OpenAI's dialect, like its answers.
+    OutJson diagnostics = system_one ? OutJson::object() : OutJson::array();
     for (std::size_t q = 0; q < answers.size(); ++q) {
         const DecisionQuestion& question = request.questions[q];
         const DecisionAnswer& answer     = answers[q];
@@ -1085,6 +1086,9 @@ std::string make_decision_response(const DecisionRequest& request,
             answer.probabilities.begin());
         const double confidence = answer.probabilities[best] * answer.label_mass;
         OutJson entry;
+        OutJson diagnostic = {{"label_mass", answer.label_mass},
+                              {"argmax_is_label", answer.argmax_is_label},
+                              {"readout", answer.exact ? "exact" : "top_k"}};
         if (system_one) {
             switch (question.type) {
             case DecisionType::Choice: {
@@ -1126,10 +1130,8 @@ std::string make_decision_response(const DecisionRequest& request,
                 break;
             }
             }
-            rendered[question.id] = std::move(entry);
-            diagnostics[question.id] = {{"label_mass", answer.label_mass},
-                                        {"argmax_is_label", answer.argmax_is_label},
-                                        {"readout", answer.exact ? "exact" : "top_k"}};
+            rendered[question.id]    = std::move(entry);
+            diagnostics[question.id] = std::move(diagnostic);
             continue;
         }
         const OutJson name = question.named ? OutJson(question.id) : OutJson(nullptr);
@@ -1171,16 +1173,17 @@ std::string make_decision_response(const DecisionRequest& request,
         }
         }
         rendered.push_back(std::move(entry));
+        diagnostics.push_back(std::move(diagnostic));
     }
     body["answers"] = std::move(rendered);
     if (system_one) {
         body["usage"] = {{"input_tokens", input_tokens}, {"output_tokens", output_tokens}};
-        body["diagnostics"] = std::move(diagnostics);
     } else {
         body["usage"] = {{"input_tokens", input_tokens},
                          {"output_tokens", output_tokens},
                          {"total_tokens", input_tokens + output_tokens}};
     }
+    body["diagnostics"] = std::move(diagnostics);
     return body.dump(-1, ' ', false, OutJson::error_handler_t::replace);
 }
 
