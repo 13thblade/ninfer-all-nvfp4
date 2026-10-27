@@ -1,5 +1,6 @@
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
+#include "artifact/selection.h"
 #include "artifact/views.h"
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
@@ -258,6 +259,39 @@ void failure_and_host_only(DeviceContext& device) {
     materialization(device);
 }
 
+// Column halves of a row-split object, as tensor-parallel ranks select them, on one device. One
+// half alone has back-to-back destination lines, packed on the host before one copy; both halves
+// interleave their lines in the file, which leave as 2D copies. Two rows leave alignment between
+// a piece's planes that no run fills: each piece must hold exactly its selected bytes and zeros.
+void selected_upload(DeviceContext& device) {
+    Fixture fixture;
+    fixture.write(true);
+    const ObjectSelection halves[] = {{.rows = {{0, 2}}, .columns = {{0, 128}}},
+                                      {.rows = {{0, 2}}, .columns = {{128, 130}}}};
+    for (const std::size_t count : {1U, 2U}) {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        const ObjectHandle q5 = reader.find("q5");
+        std::vector<ObjectHandle> pieces;
+        for (std::size_t i = 0; i < count; ++i) {
+            pieces.push_back(binder.select_device(q5, halves[i], 0));
+        }
+        const auto stored    = reader.read_object(q5);
+        const auto& geometry = reader.geometry(q5);
+        auto backing         = materialize(reader, std::move(binder).finish(), device);
+        for (std::size_t i = 0; i < count; ++i) {
+            std::vector<std::byte> want(selected_geometry(geometry, halves[i]).bytes);
+            for (const auto& run : selected_runs(geometry, halves[i])) {
+                std::memcpy(want.data() + run.destination, stored.data() + run.source, run.bytes);
+            }
+            std::vector<std::byte> got(want.size());
+            CUDA_CHECK(cudaMemcpy(got.data(), backing.device_parent(pieces[i]).data, got.size(),
+                                  cudaMemcpyDeviceToHost));
+            require(got == want, "a selected piece differs from its selected bytes");
+        }
+    }
+}
+
 void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bool writer_fixture) {
     std::optional<MaterializedArtifact> storage;
     std::map<std::size_t, std::vector<std::byte>> expected;
@@ -467,6 +501,7 @@ int main(int argc, char** argv) {
         materialization(device);
         failure_and_host_only(device);
         overlay_placement(device);
+        selected_upload(device);
         pipeline_rank_placement();
 #if defined(NINFER_TEST_LINK_WRAP)
         ninfer::test::materialization_cuda_errors(device);
