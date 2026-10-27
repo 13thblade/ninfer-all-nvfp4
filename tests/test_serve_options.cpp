@@ -3,6 +3,7 @@
 #include "serve/translate.h"
 
 #include <filesystem>
+#include <fstream>
 
 #include <iostream>
 #include <string>
@@ -546,6 +547,38 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--webui-mcp-proxy") !=
                           std::string::npos,
                       "serve help omits --webui-mcp-proxy");
+    {
+        const auto directory = std::filesystem::temp_directory_path();
+        const auto write     = [&](const char* name, const char* text) {
+            const auto path = directory / name;
+            std::ofstream(path, std::ios::binary) << text;
+            return path.string();
+        };
+        const std::string settings = write("ninfer-ui-settings.json",
+                                           R"({"mcpServers": "[{\"url\": \"http://127.0.0.1:9000/mcp\"}]",
+                                               "theme": "dark"})");
+        const std::string array    = write("ninfer-ui-settings-array.json", "[1, 2]");
+        const std::string broken   = write("ninfer-ui-settings-broken.json", "{\"theme\": ");
+        const ServeOptions configured_ui =
+            parse({"ninfer-serve", "model.ninfer", "--ui-config-file", settings});
+        failures += check(defaults.ui_settings.empty(), "WebUI settings without --ui-config-file");
+        failures += check(configured_ui.ui_settings ==
+                              R"({"mcpServers":"[{\"url\": \"http://127.0.0.1:9000/mcp\"}]","theme":"dark"})",
+                          "--ui-config-file did not keep the file's settings as compact JSON");
+        const auto rejected_ui = [&](const std::string& path) {
+            try {
+                (void)parse({"ninfer-serve", "model.ninfer", "--ui-config-file", path});
+            } catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        failures += check(rejected_ui(array) && rejected_ui(broken) &&
+                              rejected_ui((directory / "ninfer-ui-settings-missing.json").string()),
+                          "--ui-config-file accepted a non-object, malformed or missing file");
+        for (const char* name : {"ninfer-ui-settings.json", "ninfer-ui-settings-array.json",
+                                 "ninfer-ui-settings-broken.json"}) {
+            std::filesystem::remove(directory / name);
+        }
+    }
     failures += check(configured.usage_chunk_choice,
                       "--usage-chunk-choice did not reach serving options");
     failures += check(configured.preserve_thinking == true,
@@ -1244,7 +1277,8 @@ int main() {
                                         "--vision-residency",
                                         "--vram-headroom-mib",
                                         "--wddm-evictable-budget",
-                                        "--webui-mcp-proxy"}) {
+                                        "--webui-mcp-proxy",
+                                        "--ui-config-file"}) {
         const std::string message = "serve help omits " + std::string(flag);
         failures += check(serve_help.find(flag) != std::string::npos, message.c_str());
     }

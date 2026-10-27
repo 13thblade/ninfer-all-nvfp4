@@ -8,11 +8,15 @@
 #include "product/tensor_split_options.h"
 #include "product/speculative_options.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -78,6 +82,24 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
     const int value = parse_nonnegative_int(text, "kv-capacity");
     if (value == 0) { throw std::invalid_argument("--kv-capacity must be positive"); }
     return KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(value));
+}
+
+// Read at startup, so a missing or malformed file stops the server before the model loads.
+std::string read_ui_settings(const char* path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) { throw std::invalid_argument(std::string("--ui-config-file: cannot read ") + path); }
+    const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    nlohmann::json settings;
+    try {
+        settings = nlohmann::json::parse(text);
+    } catch (const nlohmann::json::parse_error& error) {
+        throw std::invalid_argument(std::string("--ui-config-file: ") + path + ": " + error.what());
+    }
+    if (!settings.is_object()) {
+        throw std::invalid_argument(std::string("--ui-config-file: ") + path +
+                                    " must hold a JSON object");
+    }
+    return settings.dump();
 }
 
 } // namespace
@@ -483,6 +505,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --webui-mcp-proxy             relay the WebUI's MCP traffic at /cors-proxy;\n"
            "                                http targets only and reaches any host, so only\n"
            "                                on a trusted bind\n"
+           "  --ui-config-file PATH         JSON object of WebUI settings that /props reports\n"
+           "                                as ui_settings, the WebUI's defaults (MCP servers\n"
+           "                                among them)\n"
            "  --max-request-mib N           request body limit, enforced before parsing\n"
            "                                (default 384)\n"
            "  --max-pending-requests N      requests waiting for admission (default 16)\n"
@@ -1496,6 +1521,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--webui-mcp-proxy") {
             options.webui_mcp_proxy = true;
+            continue;
+        }
+        if (arg == "--ui-config-file") {
+            options.ui_settings = read_ui_settings(require_value("--ui-config-file"));
             continue;
         }
         if (arg == "--structured-output") {

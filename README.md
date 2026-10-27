@@ -443,7 +443,7 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
   model sleeps instead of unloading: two 27B models on one 24 GB RTX 3090 swap in 1.8 s instead of
   an 11.6 s cold load ([several models](docs/serving.md#several-models-router)).
 - `GET /stats` and a [monitoring dashboard](tools/monitor/README.md), request logs with rotation,
-  and an optional compiled-in WebUI.
+  and llama.cpp's WebUI, built into the Linux packages and the Docker images.
 
 </details>
 
