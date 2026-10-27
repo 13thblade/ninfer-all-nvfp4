@@ -435,6 +435,25 @@ repeats, not with one device's.
   (+0.09%). The pair gave one card's answer on none of five prompts for the 27B, one for the 35B-A3B
   and three for Bonsai; the others part after 17 to 504 characters, as one card's own MTP answers
   part from its plain ones.
+- **Divided expert columns and low-latency words** (2026-10-27; greedy, 256-token answers to two
+  short prompts and one after a 9,705-token prompt, one pass per configuration, against master's
+  tensor parallelism, which divided whole experts and exchanged by fenced copies). Qwen3.6-35B-A3B
+  on 2x RTX 3090 (Vast, no peer access, so the mapped host transport) decodes at 218.1 tok/s against
+  183.8 (+18.7%) and above one card's 198.5 (+9.9%); the long prompt prefills at 4,577 tok/s
+  against 4,489 (+2.0%), one card 7,399. On another 3090 pair the divided columns with fenced copies
+  decoded at 186.2 tok/s against 183.0, and the words took it to 202.7. On 2x Tesla V100-SXM2
+  (Vast; the IOMMU translates the cards' DMA, so the preflight refuses peer access and the host
+  transport runs) the pair decodes at 106.4 tok/s against 98.8 (+7.7%) and one card's 99.7
+  (+6.7%), and prefills at 1,495 tok/s against 1,440 (+3.8%), one card 1,199. Perplexity over 40 KB
+  of PG-19 (2,048-token windows, stride 1,024, int8 KV) is 6.3987 against one card's 6.4024 on the
+  3090s and 6.3978 against 6.4006 (master's pair 6.3991) on the V100s. One card's own decode and
+  prefill stay master's: 198.5 against 198.4 tok/s on a 3090, and on a V100 over the nine KV
+  formats -0.6% to +0.4% decode and -0.5% to 0% prefill.
+  Dense Qwen3.8-27B GSQ-RCO IQ3_S on another V100 pair (host transport for both builds) decodes
+  at 56.1 tok/s against master's 54.1 (+3.7%, the words) and prefills the long prompt at 667 tok/s
+  against 666. The column cuts load slower: the 35B-A3B pair's weights (millions of lines of a few
+  hundred bytes) take 57 s on the 3090s and 61 s on the V100s, where master's whole experts load in
+  7.3 s and 4.7 s.
 
 ### Attention by positions
 
@@ -472,6 +491,16 @@ on the hosts measured below it is slower than dividing by heads.
   (`--position-split-only`) merge two and three ranks over every storage at decode, verification,
   short-prefill and prompt widths, a rank without keys included, against the FP64 oracle, and check
   that a merge of a run of query heads is those heads of the whole merge, byte for byte.
+- **Measured** (2026-10-27, the workload of [the measurements above](#tensor-parallelism),
+  Qwen3.6-35B-A3B). On two cards every rank holds a KV head either way, and by positions every rank
+  also projects every head and attention crosses the bus twice: 207.5 tok/s against 218.1 by heads
+  on 2x RTX 3090, with the long prompt at 2,944 tok/s against 4,577; 100.6 against 106.4 and 1,419
+  against 1,495 on 2x Tesla V100-SXM2. Four ranks on the two cards (`--devices 0,1,0,1`) decode at
+  155.5 tok/s against 171.3 by heads (where two ranks hold no attention) on the 3090s and at 79.2
+  against master's 92.8 on the V100s, and prefill at 1,329 against 1,732 and 800 against 948.
+  Perplexity over the 40 KB slice is 6.3960 against 6.3987 by heads (3090) and 6.3970 against
+  6.3978 (V100). A host with more cards than KV heads, where positions let every card attend, was
+  not measured.
 
 ### Tensor parallelism of Qwen3.8-Flash-Next
 
@@ -515,6 +544,19 @@ every layer over it (`Executor::run_tensor_segment`, `models/qwen4_exp/executor.
   differently than one device, so logits are close to one device's, not identical.
 - **Refused.** Host or disk experts and native expert banks (`--expert-residency device` with GGUF
   banks only), `--kv-resident` and `--stage-layers`.
+- **Measured** (2026-10-27; GSQ-RCO Q2_0 with `--no-ngram-table`, the workload of [the
+  measurements above](#tensor-parallelism), against two pipeline stages and master's expert
+  parallelism). It is a decode trade: every layer crosses the bus twice per step, which a long
+  prompt pays for. 2x RTX 3090 (mapped host transport): decode 114.7 tok/s against 107.4 with stages
+  (+6.8%) and 94.0 with expert parallelism; the long prompt prefills at 1,971 tok/s against 3,162
+  (-38%) and 1,997. With `--spec mtp --draft-tokens 3` 151.6 tok/s against 147.9 and 149.6, at an
+  acceptance of 0.560 against 0.593 (the hidden states round differently). Over the nine KV formats
+  the pair decodes 6.8% to 8.8% faster than stages. 2x Tesla V100-SXM2 (host transport): 55.2 tok/s
+  against 54.5 (+1.3%) and 52.4; prefill 1,085 tok/s against 1,454 (-25%) and 956; with MTP 79.3
+  against 82.5 (-3.9%) and 83.0, at an acceptance of 0.524 against 0.586; over the nine KV formats
+  +1.3% to +1.5% against stages. Perplexity over the 40 KB slice is 6.8209 against stages' 6.8188
+  on the 3090s and 6.8141 against 6.7975 (+0.24%) on the V100s. On the 3090s stages and expert
+  parallelism give the same greedy text; the divided layers part from it early, at close ties.
 
 ### Expert parallelism of the other MoE families
 
