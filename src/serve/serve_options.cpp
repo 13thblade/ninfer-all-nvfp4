@@ -142,6 +142,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                by each card's measured bandwidth and free memory)\n"
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
+           "  --embedding-residency device|host  token embedding on GPU (default) or in\n"
+           "                                mapped pinned host memory, read in place\n"
            "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
            "                                Gemma, Flint and DeepSeek-V4.1 allow 0 (layer\n"
            "                                banks only).\n"
@@ -1356,6 +1358,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--lm-head-q6") {
             options.lm_head_q6 = true;
+            continue;
+        }
+        if (arg == "--embedding-residency") {
+            const std::string residency = require_value("--embedding-residency");
+            if (residency == "device") {
+                options.embedding_residency = EmbeddingResidency::Device;
+            } else if (residency == "host") {
+                options.embedding_residency = EmbeddingResidency::Host;
+            } else {
+                throw std::invalid_argument("--embedding-residency must be device or host");
+            }
             continue;
         }
         if (arg == "--embedding-q4") {

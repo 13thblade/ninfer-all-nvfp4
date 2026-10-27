@@ -23,7 +23,9 @@ public:
 
     // Faults in the pages nobody wrote yet, on several threads, keeping what writers put there,
     // then locks and registers them; transfers may treat the block as pinned from then on.
-    void pin();
+    // `device_mapped` also maps the block into the device address space (see
+    // HostMemoryRegistration).
+    void pin(bool device_mapped = false);
 
     [[nodiscard]] std::byte* data() const noexcept { return data_; }
 

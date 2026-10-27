@@ -547,6 +547,13 @@ const WeightParent& MaterializedArtifact::pinned_parent(ObjectHandle handle) con
     return *objects_[handle.index].pinned;
 }
 
+const WeightParent& MaterializedArtifact::mapped_parent(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || !objects_[handle.index].mapped) {
+        throw ArtifactError("object has no mapped Host weight backing");
+    }
+    return *objects_[handle.index].mapped;
+}
+
 std::span<const std::byte> MaterializedArtifact::pinned_block() const noexcept {
     if (!pinned_) { return {}; }
     return {static_cast<const std::byte*>(pinned_->data()), pinned_->size()};
@@ -570,6 +577,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     std::uint64_t host_total = 0;
     for (const auto& placement : plan.pinned_objects) {
         host_total = checked_add(host_total, placement.bytes, "pinned payload bytes");
+    }
+    for (const auto& placement : plan.mapped_objects) {
+        host_total = checked_add(host_total, placement.bytes, "mapped payload bytes");
     }
     for (const auto& placement : plan.host_objects) {
         if (placement.data.empty()) {
@@ -629,32 +639,39 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         out.stats_.device_capacity_by_rank.push_back(capacity);
     }
-    if (plan.pinned_capacity_bytes > std::numeric_limits<std::size_t>::max()) {
-        throw ArtifactError("pinned Host backing exceeds size_t");
-    }
     std::vector<HostReadTarget> host_reads;
-    std::byte* block = nullptr;
-    if (!plan.pinned_objects.empty()) {
-        out.pinned_ = std::make_unique<HostPages>(
-            static_cast<std::size_t>(plan.pinned_capacity_bytes));
-        block                      = out.pinned_->data();
+    // The pinned and the mapped block are laid out alike: ascending, aligned, non-overlapping
+    // placements of whole stored objects, read straight into the block.
+    const auto host_block = [&](std::span<const PinnedPlacement> placements,
+                                std::uint64_t capacity, const char* label) {
+        if (capacity > std::numeric_limits<std::size_t>::max()) {
+            throw ArtifactError(std::string(label) + " Host backing exceeds size_t");
+        }
+        auto pages = std::make_unique<HostPages>(static_cast<std::size_t>(capacity));
         std::uint64_t previous_end = 0;
         std::vector<bool> placed(out.objects_.size(), false);
-        for (const auto& placement : plan.pinned_objects) {
+        for (const auto& placement : placements) {
             reader.validate_object(placement.object);
             const auto& geometry = reader.geometry(placement.object);
             if (placed.at(placement.object.index) || geometry.bytes != placement.bytes ||
                 placement.offset < previous_end || placement.alignment == 0 ||
-                placement.offset % placement.alignment != 0 ||
-                placement.offset > plan.pinned_capacity_bytes ||
-                placement.bytes > plan.pinned_capacity_bytes - placement.offset) {
-                throw ArtifactError("invalid or duplicate pinned Host placement");
+                placement.offset % placement.alignment != 0 || placement.offset > capacity ||
+                placement.bytes > capacity - placement.offset) {
+                throw ArtifactError(std::string("invalid or duplicate ") + label +
+                                    " Host placement");
             }
             placed[placement.object.index] = true;
             previous_end                   = placement.offset + placement.bytes;
             host_reads.push_back({reader.directory().tensor(placement.object).offset,
-                                  placement.bytes, block + placement.offset});
+                                  placement.bytes, pages->data() + placement.offset});
         }
+        return pages;
+    };
+    if (!plan.pinned_objects.empty()) {
+        out.pinned_ = host_block(plan.pinned_objects, plan.pinned_capacity_bytes, "pinned");
+    }
+    if (!plan.mapped_objects.empty()) {
+        out.mapped_ = host_block(plan.mapped_objects, plan.mapped_capacity_bytes, "mapped");
     }
     for (auto& placement : plan.host_objects) {
         reader.validate_object(placement.object);
@@ -671,18 +688,41 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         read_host_bytes(reader, host_reads, phase,
                         checked_add(host_total, total, "weight payload bytes"));
     out.stats_.read_bytes = checked_add(out.stats_.read_bytes, host_read, "Host read bytes");
+    if (out.mapped_) {
+        out.mapped_->pin(true);
+        // The address the primary device reads the block at. Under unified addressing it is
+        // usually the host address, but only the runtime may say so.
+        void* alias = nullptr;
+        check_cuda(cudaHostGetDevicePointer(&alias, out.mapped_->data(), 0),
+                   "resolve the mapped Host block's device address");
+        for (const auto& placement : plan.mapped_objects) {
+            const auto& geometry = reader.geometry(placement.object);
+            const std::span<std::byte> destination(out.mapped_->data() + placement.offset,
+                                                   static_cast<std::size_t>(placement.bytes));
+            const auto divisor =
+                read_divisor(reader, placement.object, geometry, destination, out.stats_);
+            out.objects_.at(placement.object.index).mapped =
+                WeightParent{geometry, static_cast<const std::byte*>(alias) + placement.offset,
+                             divisor};
+        }
+        out.stats_.mapped_bytes        = plan.mapped_capacity_bytes;
+        out.stats_.mapped_object_count = plan.mapped_objects.size();
+        out.stats_.pinned_bytes =
+            checked_add(out.stats_.pinned_bytes, plan.mapped_capacity_bytes, "mapped Host bytes");
+    }
     if (out.pinned_) {
         out.pinned_->pin();
         for (const auto& placement : plan.pinned_objects) {
             const auto& geometry = reader.geometry(placement.object);
-            const std::span<std::byte> destination(block + placement.offset,
+            const std::span<std::byte> destination(out.pinned_->data() + placement.offset,
                                                    static_cast<std::size_t>(placement.bytes));
             const auto divisor =
                 read_divisor(reader, placement.object, geometry, destination, out.stats_);
             out.objects_.at(placement.object.index).pinned =
                 WeightParent{geometry, destination.data(), divisor};
         }
-        out.stats_.pinned_bytes        = plan.pinned_capacity_bytes;
+        out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes,
+                                              plan.pinned_capacity_bytes, "pinned Host bytes");
         out.stats_.pinned_object_count = plan.pinned_objects.size();
     }
     for (auto& placement : plan.host_objects) {

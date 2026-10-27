@@ -417,6 +417,8 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
   regenerated turn resume where it left the conversation.
 - Precision trades that buy context: `--embedding-q4`, `--lm-head-q6`, `--gdn-state-fp16`
   ([quality trades](docs/maintainer/quality-trade-experiments.md)).
+- A token embedding kept in mapped host memory (`--embedding-residency host`), which frees its
+  VRAM for context with no change to the output.
 
 </details>
 

@@ -67,6 +67,7 @@ ninfer_bench --weights <artifact.ninfer>
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>] [--fast-prefill-kernel]
           [--expert-residency <device|host|disk>] [--expert-cache-mib <N|auto>]
+          [--embedding-residency <device|host>]
           [--expert-dma-share <F|auto>] [--expert-cpu-threads <n>]
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft|--full-draft-head]
           [--device <id>] [--no-cuda-graph] [--profile-measured]

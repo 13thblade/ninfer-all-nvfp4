@@ -41,7 +41,8 @@ struct DevicePlacement {
     std::optional<ObjectSelection> selection;
 };
 
-// Offset inside the one page-locked Host block (Residency::Pinned).
+// Offset inside the one page-locked Host block (Residency::Pinned), or inside the mapped Host
+// block (Residency::Mapped).
 struct PinnedPlacement {
     ObjectHandle object;
     std::uint64_t offset    = 0;
@@ -72,8 +73,10 @@ struct MaterializationPlan {
     std::uint64_t evictable_tail_offset = 0;
     std::uint64_t evictable_tail_bytes  = 0;
     std::uint64_t pinned_capacity_bytes = 0;
+    std::uint64_t mapped_capacity_bytes = 0;
     std::vector<DevicePlacement> device_objects;
     std::vector<PinnedPlacement> pinned_objects;
+    std::vector<PinnedPlacement> mapped_objects;
     std::vector<HostPlacement> host_objects;
 
     [[nodiscard]] std::size_t device_rank_count() const noexcept {
@@ -94,10 +97,12 @@ struct MaterializationStats {
     std::vector<std::uint64_t> device_capacity_by_rank;
     std::uint64_t retained_host_bytes   = 0;
     std::uint64_t owned_value_bytes     = 0;
-    std::uint64_t pinned_bytes          = 0; // pinned block plus separately registered Host objects
+    std::uint64_t pinned_bytes          = 0; // pinned and mapped blocks plus registered Host objects
+    std::uint64_t mapped_bytes          = 0; // the mapped block alone
     std::uint64_t peak_staging_bytes    = 0;
     std::size_t device_object_count     = 0;
     std::size_t pinned_object_count     = 0;
+    std::size_t mapped_object_count     = 0;
     std::size_t host_object_count       = 0;
     double upload_seconds               = 0;
 };
@@ -126,6 +131,9 @@ public:
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
     [[nodiscard]] const WeightParent& pinned_parent(ObjectHandle handle) const;
     [[nodiscard]] std::span<const std::byte> pinned_block() const noexcept;
+    // A Residency::Mapped object: its data addresses the primary device's mapping of the mapped
+    // Host block, which only device code may dereference.
+    [[nodiscard]] const WeightParent& mapped_parent(ObjectHandle handle) const;
     // Present when the device backing was supplied by an eviction pool.
     [[nodiscard]] EvictableWeightPool* weight_pool() const noexcept { return pool_.get(); }
 
@@ -163,6 +171,7 @@ private:
     struct ObjectStorage {
         std::optional<WeightParent> device;
         std::optional<WeightParent> pinned;
+        std::optional<WeightParent> mapped;
         std::optional<WeightParent> host;
         std::vector<std::byte> host_data;
         // Unregister before freeing host_data. Moving ObjectStorage keeps the vector's address.
@@ -183,6 +192,8 @@ private:
     // ever touches.
     std::vector<std::unique_ptr<DeviceArena>> arenas_;
     std::unique_ptr<HostPages> pinned_;
+    // Never released by a model suspend: a captured graph keeps reading it at the same address.
+    std::unique_ptr<HostPages> mapped_;
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;
 };

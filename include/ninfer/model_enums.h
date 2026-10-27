@@ -47,6 +47,16 @@ enum class VisionResidency : std::uint8_t {
     Cpu,      // tower decoded to FP32 host memory and run on CPU threads; no device Vision memory
 };
 
+// Qwen3.5 family: where the input token embedding lives. The table is only read as a gather of
+// one row per token, so it can stay in host RAM that the device reads in place.
+enum class EmbeddingResidency : std::uint8_t {
+    // In the primary device's weight arena.
+    Device,
+    // In page-locked host RAM mapped into the primary device's address space: the gather reads
+    // each step's rows over the bus, and the table's device memory goes to the KV cache.
+    Host,
+};
+
 // Where supported MoE families keep routed expert banks (see each family guide).
 enum class ExpertResidency : std::uint8_t {
     // In the weight arena of each layer's stage device.

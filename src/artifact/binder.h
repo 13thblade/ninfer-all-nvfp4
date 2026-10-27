@@ -13,7 +13,9 @@ namespace ninfer::artifact {
 // Pinned: the object lives only in one page-locked Host block laid out by the plan (for weights
 // streamed to the device on demand); it never receives a device placement.
 // Registered: Host bytes registered separately for DMA, with the same object/view lifetime.
-enum class Residency { Device, Host, Values, Pinned, Registered };
+// Mapped: the object lives only in a page-locked Host block mapped into the primary device's
+// address space; its view addresses that mapping, so device kernels read the bytes in place.
+enum class Residency { Device, Host, Values, Pinned, Registered, Mapped };
 
 struct ParameterReference {
     std::string name;
@@ -88,6 +90,9 @@ public:
     // Places an object in the pinned Host block, in first-request order so a caller's logical
     // groups stay contiguous. It excludes device and Host placements of the same object.
     void require_pinned(ObjectHandle object);
+    // Places an object in the mapped Host block (Residency::Mapped). It excludes every other
+    // placement of the same object.
+    void require_mapped(ObjectHandle object);
     [[nodiscard]] std::span<const std::byte> host_object(ObjectHandle object);
     [[nodiscard]] ObjectHandle resource(std::string_view component, std::string_view role);
     [[nodiscard]] HostValues values(const Binding& binding, std::optional<QType> format = {});
@@ -107,6 +112,7 @@ private:
         std::uint64_t tail       = 0;
         std::optional<std::size_t> device_rank;
         std::optional<std::uint64_t> pinned_order;
+        bool mapped = false;
         std::vector<std::byte> host_data;
     };
 

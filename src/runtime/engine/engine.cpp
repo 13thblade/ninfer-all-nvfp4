@@ -41,15 +41,29 @@
 namespace ninfer {
 namespace {
 
-// Gemma 4, Flint, DeepSeek-V4.1 and Flash-Next keep context caches of their own, which the
-// checkpoint catalog's options configure; the hybrid prefix cache, the server's default, belongs to
-// the Qwen3.5 Program.
+// Gemma 4, Flint, DeepSeek-V4.1 and Flash-Next: families with a core of their own, not the
+// Qwen3.5 load and Program.
+bool own_family_artifact(const std::filesystem::path& path) {
+    return runtime::is_gemma4_artifact(path) || runtime::is_flint_artifact(path) ||
+           runtime::is_deepseek_v41_artifact(path) || runtime::is_qwen4_exp_artifact(path);
+}
+
+// Those families keep context caches of their own, which the checkpoint catalog's options
+// configure; the hybrid prefix cache, the server's default, belongs to the Qwen3.5 Program.
 EngineOptions with_family_context_cache(EngineOptions options) {
-    if (runtime::is_gemma4_artifact(options.artifact_path) ||
-        runtime::is_flint_artifact(options.artifact_path) ||
-        runtime::is_deepseek_v41_artifact(options.artifact_path) ||
-        runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+    if (own_family_artifact(options.artifact_path)) {
         options.context_cache.mode = ContextCacheMode::Legacy;
+    }
+    return options;
+}
+
+// The host token embedding is a Qwen3.5 load placement; the other families bind their own tables.
+EngineOptions with_family_embedding(EngineOptions options) {
+    if (options.embedding_residency != EmbeddingResidency::Device &&
+        own_family_artifact(options.artifact_path)) {
+        throw std::invalid_argument(
+            "--embedding-residency host applies to Qwen3_5ForCausalLM and "
+            "Qwen3_5MoeForCausalLM artifacts");
     }
     return options;
 }
@@ -330,8 +344,8 @@ public:
                               std::unique_ptr<FlintCore>, std::unique_ptr<DeepSeekV41Core>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(runtime::normalize_engine_options(
-              with_family_speculation(with_family_context_cache(std::move(engine_options))))),
+        : options(runtime::normalize_engine_options(with_family_speculation(
+              with_family_context_cache(with_family_embedding(std::move(engine_options)))))),
           device(initialize_device(options)),
           clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
         report_gpu_clock_floor(options, clock_floor);

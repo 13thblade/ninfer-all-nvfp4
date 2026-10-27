@@ -78,6 +78,7 @@ struct Options {
     bool lm_head_q6                     = false;
     bool embedding_q4                   = false;
     bool embedding_q6                   = false;
+    ninfer::EmbeddingResidency embedding_residency = ninfer::EmbeddingResidency::Device;
     bool mtp_experts_q4                 = false;
     bool gdn_state_fp16                 = false;
     bool rope_yarn                      = false;
@@ -109,6 +110,7 @@ std::string usage_text() {
            "<directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16]\n"
+           "       [--embedding-residency device|host]\n"
            "       [--mlp-a8-decode] [--no-prefill-a8] [--rope-yarn] [--rope-yarn-factor F]\n"
            "       [--rope-scaling-factor F [--rope-scaling-original-context N]]\n"
            "       (--mlp-a8-decode is inert here: the route it enables is verify-phase"
@@ -201,6 +203,15 @@ Options parse_options(int argc, char** argv) {
             out.embedding_q4 = true;
         } else if (option == "--embedding-q6") {
             out.embedding_q6 = true;
+        } else if (option == "--embedding-residency") {
+            const std::string residency(value("--embedding-residency"));
+            if (residency == "device") {
+                out.embedding_residency = ninfer::EmbeddingResidency::Device;
+            } else if (residency == "host") {
+                out.embedding_residency = ninfer::EmbeddingResidency::Host;
+            } else {
+                throw std::invalid_argument("--embedding-residency must be device or host");
+            }
         } else if (option == "--mtp-experts-q4") {
             out.mtp_experts_q4 = true;
         } else if (option == "--gdn-state-fp16") {
@@ -396,6 +407,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.lm_head_q6       = options.lm_head_q6;
     engine_options.embedding_q4     = options.embedding_q4;
     engine_options.embedding_q6     = options.embedding_q6;
+    engine_options.embedding_residency = options.embedding_residency;
     engine_options.mtp_experts_q4   = options.mtp_experts_q4;
     engine_options.gdn_state_fp16   = options.gdn_state_fp16;
     engine_options.rope_yarn        = options.rope_yarn;

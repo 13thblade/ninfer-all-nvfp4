@@ -318,7 +318,8 @@ struct LoadSummary {
     std::uint64_t artifact_bytes_read  = 0;
     std::uint64_t host_to_device_bytes = 0;
     std::uint64_t peak_staging_bytes   = 0;
-    std::uint64_t pinned_weight_bytes  = 0; // host-pinned model weights (experts or overlay vision tower)
+    // Host-pinned model weights: experts, an overlay Vision tower, or a host token embedding.
+    std::uint64_t pinned_weight_bytes  = 0;
     std::uint64_t overlay_window_bytes = 0; // device bytes one overlay vision window borrows
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;

@@ -187,6 +187,8 @@ std::string usage_text(const char* argv0) {
            "                                by each card's measured bandwidth and free memory)\n"
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
+           "  --embedding-residency device|host  token embedding on GPU (default) or in\n"
+           "                                mapped pinned host memory, read in place\n"
            "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
            "                                Gemma and Flint allow 0 (layer banks only).\n"
            "                                Flash-Next disk requires a nonzero cache\n" +
@@ -405,6 +407,15 @@ Options parse_options(int argc, char** argv) {
                 options.expert_residency = ninfer::ExpertResidency::Disk;
             } else {
                 throw std::invalid_argument("--expert-residency must be device, host or disk");
+            }
+        } else if (arg == "--embedding-residency") {
+            const std::string residency = value(arg);
+            if (residency == "device") {
+                options.embedding_residency = ninfer::EmbeddingResidency::Device;
+            } else if (residency == "host") {
+                options.embedding_residency = ninfer::EmbeddingResidency::Host;
+            } else {
+                throw std::invalid_argument("--embedding-residency must be device or host");
             }
         } else if (arg == "--expert-cache-mib") {
             const std::string mib = value(arg);

@@ -72,6 +72,7 @@ struct BenchOptions {
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ExpertResidency expert_residency = ExpertResidency::Device;
+    EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
     HybridExpertOptions hybrid_experts; // --expert-dma-share, --expert-cpu-threads
     int device            = 0;
@@ -122,6 +123,7 @@ struct BenchEnvironment {
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ExpertResidency expert_residency = ExpertResidency::Device;
+    EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
     // Routed-expert delivery counters over the whole run (warmups included), host/disk only.
     ExpertResidencyStats experts;
     bool use_cuda_graph                            = true;

@@ -60,6 +60,8 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
             require_device(part.object);
         } else if (residency == Residency::Pinned) {
             require_pinned(part.object);
+        } else if (residency == Residency::Mapped) {
+            require_mapped(part.object);
         } else if (residency == Residency::Host || residency == Residency::Registered) {
             (void)host_object(part.object);
             if (residency == Residency::Registered) { demands_[part.object.index].registered = true; }
@@ -227,6 +229,13 @@ void Binder::require_pinned(ObjectHandle object) {
     if (!demand.pinned_order) { demand.pinned_order = next_pinned_order_++; }
 }
 
+void Binder::require_mapped(ObjectHandle object) {
+    const auto& geometry = reader_.geometry(object);
+    auto& demand         = demands_.at(object.index);
+    demand.alignment     = std::max(demand.alignment, geometry.alignment);
+    demand.mapped        = true;
+}
+
 std::span<const std::byte> Binder::host_object(ObjectHandle object) {
     reader_.validate_object(object);
     auto& demand = demands_.at(object.index);
@@ -332,6 +341,7 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
     };
     std::vector<std::size_t> evictable;
     std::vector<std::size_t> pinned;
+    std::vector<std::size_t> mapped;
     // Placements are emitted rank by rank so each rank's offsets stay ascending, which is what
     // materialization validates. Rank 0 first keeps a single-device plan byte-for-byte what it was.
     std::vector<std::vector<std::size_t>> resident(rank_count);
@@ -341,7 +351,13 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
             throw ArtifactError(reader_.directory().tensor(ObjectHandle{i}).id +
                                 ": a pinned object cannot also have device or Host placement");
         }
+        if (demand.mapped && (demand.device || demand.host || demand.pinned_order)) {
+            throw ArtifactError(reader_.directory().tensor(ObjectHandle{i}).id +
+                                ": a mapped object cannot also have device, Host or pinned "
+                                "placement");
+        }
         if (demand.pinned_order) { pinned.push_back(i); }
+        if (demand.mapped) { mapped.push_back(i); }
         if (!demand.device) { continue; }
         if (demand.evict_rank != 0) {
             // The evictable tail exists so a Vision encode window can borrow weight memory on the
@@ -402,6 +418,15 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
             align_up(plan.pinned_capacity_bytes, demand.alignment, "pinned Host offset");
         plan.pinned_objects.push_back({handle, offset, bytes, demand.alignment});
         plan.pinned_capacity_bytes = checked_add(offset, bytes, "pinned Host capacity");
+    }
+    for (const std::size_t index : mapped) {
+        const ObjectHandle handle{index};
+        const auto& demand = demands_[index];
+        const auto bytes   = reader_.geometry(handle).bytes;
+        const auto offset =
+            align_up(plan.mapped_capacity_bytes, demand.alignment, "mapped Host offset");
+        plan.mapped_objects.push_back({handle, offset, bytes, demand.alignment});
+        plan.mapped_capacity_bytes = checked_add(offset, bytes, "mapped Host capacity");
     }
     for (std::size_t i = 0; i < demands_.size(); ++i) {
         if (demands_[i].host) {

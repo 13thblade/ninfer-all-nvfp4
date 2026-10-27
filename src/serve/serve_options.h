@@ -95,6 +95,7 @@ struct ServeOptions {
     bool lm_head_q6         = false;
     bool embedding_q4       = false;
     bool embedding_q6       = false;
+    EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
     bool mtp_experts_q4     = false;
     bool gdn_state_fp16     = false;
     bool rope_yarn          = false;

@@ -3,6 +3,7 @@
 #include "ops/op_tester.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
+#include "core/host_pages.h"
 
 #include <algorithm>
 #include <cmath>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -145,6 +147,9 @@ std::vector<std::int32_t> dflash2_ids(std::size_t count, bool masked = false) {
     }
     return ids;
 }
+
+// Ids among the DFlash2 fixture's rows, `count` of them.
+std::vector<std::int32_t> dflash2_fixture_rows(std::size_t count) { return dflash2_ids(count); }
 
 std::vector<std::int32_t> dflash2_fixture_ids() {
     auto ids = dflash2_ids(128);
@@ -738,11 +743,89 @@ int qualify_dflash2(const char* format, Table& table, std::size_t aligned_offset
     return failures;
 }
 
+// A table's whole payload copied into page-locked host memory mapped into the device, the way
+// `--embedding-residency host` keeps it: the same gather reads it there in place. The oracle and
+// the stored rows are the device table's, which the copy leaves untouched.
+template <typename Table>
+class MappedTable {
+public:
+    explicit MappedTable(Table& table) : table_(table), device_(table.weight()) {
+        host_ = std::make_unique<HostPages>(device_.payload_bytes);
+        cuda_check(cudaMemcpy(host_->data(), device_.payload, device_.payload_bytes,
+                              cudaMemcpyDeviceToHost),
+                   "copy the table to host");
+        host_->pin(true);
+        cuda_check(cudaHostGetDevicePointer(&alias_, host_->data(), 0), "map the host table");
+    }
+
+    Weight weight() {
+        Weight result     = device_;
+        const auto rebase = [&](const void* plane) -> const void* {
+            if (plane == nullptr) { return nullptr; }
+            return static_cast<const std::uint8_t*>(alias_) +
+                   (static_cast<const std::uint8_t*>(plane) -
+                    static_cast<const std::uint8_t*>(device_.payload));
+        };
+        result.payload = rebase(device_.payload);
+        result.qdata   = rebase(device_.qdata);
+        result.qhigh   = rebase(device_.qhigh);
+        result.scales  = rebase(device_.scales);
+        return result;
+    }
+
+    std::vector<double> oracle(const std::vector<std::int32_t>& ids) const {
+        return table_.oracle(ids);
+    }
+
+    int verify_unchanged(const char* label) const { return table_.verify_unchanged(label); }
+
+private:
+    Table& table_;
+    Weight device_;
+    std::unique_ptr<HostPages> host_;
+    void* alias_ = nullptr;
+};
+
+// The host-table rows are bit for bit the device table's, and meet the format's oracle criterion
+// directly and from a replayed graph. `rows` draws ids among the rows the table materialized.
+template <typename Table>
+int qualify_mapped(const char* format, Table& table,
+                   std::vector<std::int32_t> (*rows)(std::size_t)) {
+    MappedTable<Table> mapped(table);
+    int failures = 0;
+    for (const std::size_t t : {1u, 7u, 128u, 2048u}) {
+        const auto ids          = rows(t);
+        const std::string label = std::string("embedding ") + format + " mapped host T=" +
+                                  std::to_string(static_cast<unsigned long long>(t));
+        failures += run_quantized_case(label.c_str(), mapped, ids, 5120);
+        GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+        device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+        const std::size_t bytes = std::size_t(5120) * ids.size() * 2;
+        GuardedDeviceBuffer from_host(bytes);
+        GuardedDeviceBuffer from_device(bytes);
+        Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+        Tensor host_rows(from_host.data(), DType::BF16, {5120, static_cast<std::int32_t>(t)});
+        Tensor device_rows(from_device.data(), DType::BF16, {5120, static_cast<std::int32_t>(t)});
+        ops::embedding(input, mapped.weight(), host_rows, nullptr);
+        ops::embedding(input, table.weight(), device_rows, nullptr);
+        cuda_synchronize();
+        failures += verify_exact(label.c_str(), guarded_to_host<std::uint8_t>(from_host, bytes),
+                                 guarded_to_host<std::uint8_t>(from_device, bytes));
+    }
+    for (const std::size_t t : {1u, 8u}) {
+        const std::string label = std::string("embedding ") + format + " mapped host Graph T=" +
+                                  std::to_string(static_cast<unsigned long long>(t));
+        failures += run_quantized_case(label.c_str(), mapped, rows(t), 5120, true);
+    }
+    return failures;
+}
+
 int test_q4() {
     int failures = 0;
     for (const std::int32_t d : {kQ8TextD, kQ8VisionD}) {
         Q4Table table(d);
         const std::string shape = "[248320," + std::to_string(d) + "]";
+        if (d == 5120) { failures += qualify_mapped("Q4 [248320,5120]", table, repeated_ids); }
         for (const std::size_t t : {1u, 4u, 7u, 16u, 128u, 1024u}) {
             const std::string label = "embedding Q4 " + shape + " T=" +
                                       std::to_string(static_cast<unsigned long long>(t));
@@ -767,6 +850,7 @@ int test_q6() {
             run_quantized_case("embedding Q6 [248320,5120] T=7", table, repeated_ids(7), kQ6D);
         failures +=
             run_quantized_case("embedding Q6 [248320,5120] T=128", table, repeated_ids(128), kQ6D);
+        failures += qualify_mapped("Q6 [248320,5120]", table, repeated_ids);
     }
     {
         // The 35B-A3B's table after --embedding-q6.
@@ -791,6 +875,7 @@ int test_q8() {
         Q8Table table(d);
         if (d == 5120) {
             failures += qualify_dflash2("Q8 [248320,5120]", table, 2);
+            failures += qualify_mapped("Q8 [248320,5120]", table, dflash2_fixture_rows);
             continue;
         }
         for (const std::size_t t : {1u, 6u, 16u, 1024u}) {
@@ -806,6 +891,7 @@ int test_fp8() {
     Fp8Table table;
     int failures = 0;
     failures += qualify_dflash2("FP8 [248320,5120]", table, 4);
+    failures += qualify_mapped("FP8 [248320,5120]", table, dflash2_fixture_rows);
     const std::vector<std::int32_t> ids = {0};
     GuardedDeviceBuffer device_ids(sizeof(std::int32_t));
     device_ids.copy_from_host(ids.data(), sizeof(std::int32_t));
