@@ -115,6 +115,11 @@ struct ReadSpan {
     std::uint64_t end   = 0;
 };
 
+// A range that starts at most this far past a span joins it: reading through the gap costs less
+// than another synchronous direct read. A tensor-parallel share of every expert's rows leaves gaps
+// of a few hundred KiB, which as separate reads loaded at about 125 MiB/s instead of GiB/s.
+constexpr std::uint64_t kSpanGapBytes = 4ULL << 20U;
+
 // Sorts `ranges` by file position and merges them into the aligned file spans that direct reads
 // cover; ranges that overlap are a planning error.
 std::vector<ReadSpan> direct_spans(std::vector<CopyRange>& ranges) {
@@ -129,7 +134,8 @@ std::vector<ReadSpan> direct_spans(std::vector<CopyRange>& ranges) {
         }
         const auto begin = range.begin / kPayloadAlignment * kPayloadAlignment;
         if (spans.empty() || spans.back().file != range.file ||
-            begin > align_up(spans.back().end, kPayloadAlignment, "direct range")) {
+            begin > checked_add(align_up(spans.back().end, kPayloadAlignment, "direct range"),
+                                kSpanGapBytes, "direct range")) {
             spans.push_back({range.file, begin, range.end});
         } else {
             spans.back().end = std::max(spans.back().end, range.end);

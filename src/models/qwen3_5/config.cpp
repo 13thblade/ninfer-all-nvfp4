@@ -301,11 +301,17 @@ TextConfig tensor_parallel_share(const TextConfig& text, const TensorShare& shar
         throw std::invalid_argument("a tensor-parallel share lies outside the GDN heads");
     }
     const auto* dense = std::get_if<DenseConfig>(&text.ffn);
+    const auto* moe   = std::get_if<MoeConfig>(&text.ffn);
+    const bool divided_columns = moe != nullptr && share.ffn_end > share.ffn_begin;
     if (dense != nullptr
             ? share.ffn_begin >= share.ffn_end || share.ffn_end > dense->intermediate_size
-            : share.expert_begin >= share.expert_end ||
-                  share.expert_end > std::get<MoeConfig>(text.ffn).num_experts) {
-        throw std::invalid_argument("a tensor-parallel share lies outside the FFN rows or experts");
+            : share.expert_begin >= share.expert_end || share.expert_end > moe->num_experts ||
+                  (divided_columns &&
+                   (share.expert_begin != 0 || share.expert_end != moe->num_experts ||
+                    share.ffn_end > std::min(moe->moe_intermediate_size,
+                                             moe->shared_expert_intermediate_size)))) {
+        throw std::invalid_argument(
+            "a tensor-parallel share lies outside the FFN rows, experts or expert columns");
     }
     if (text.attention && (share.kv_head_begin > share.kv_head_end ||
                            share.kv_head_end > text.attention->num_key_value_heads)) {

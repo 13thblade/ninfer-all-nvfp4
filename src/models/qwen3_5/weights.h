@@ -88,10 +88,13 @@ struct MoeWeights {
 
     // Expert parallelism, a tensor-parallel rank's share of the layer: its experts are
     // [expert_begin, expert_begin + experts.size()) of the router's, and only rank 0 holds the
-    // shared expert (`shared` is unbound elsewhere). Absent for a whole layer.
+    // shared expert (`shared` is unbound elsewhere). Where the ranks divide every expert's
+    // intermediate columns instead, a rank holds all experts and the shared one, each with the
+    // `intermediate` columns of its share (0: whole experts). Absent for a whole layer.
     struct ExpertShare {
         std::uint32_t expert_begin = 0;
         bool shared_expert         = true;
+        std::uint32_t intermediate = 0;
     };
 
     std::optional<ExpertShare> share;

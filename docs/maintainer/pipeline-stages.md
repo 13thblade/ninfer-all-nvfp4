@@ -274,6 +274,18 @@ families](#expert-parallelism-of-the-other-moe-families)).
   expert; the automatic split counts the experts as divided weights, the router as held by every
   rank and the shared expert as rank 0's. Experts in host memory or on disk
   (`--expert-residency host|disk`) and NVFP4 expert banks have no share and are refused.
+- **Divided expert columns.** Two ranks of about equal weight (each 40% to 60% of the split)
+  divide every expert's 512 intermediate columns in halves instead, routed and shared alike, where
+  the banks cut there (row-split groups do): each rank holds every expert's 256 gate rows and 256
+  up rows of its half, one device selection of the gate/up bank taking those row ranges of each
+  expert (`ObjectSelection::rows`, `Bindings::joint_piece` with a row cut), and those 256 columns of
+  every down projection (a column cut). Each rank runs every selected path at width 256
+  (`SparseMoeShare::intermediate`) and the FFN exchange adds the two halves, so a token's routed
+  work divides evenly whichever experts it selects (with whole experts halved between two ranks,
+  uniform routes would give one rank five or more of a token's eight 73% of the time, and its
+  shared expert to rank 0 besides). A SwiGLU column is the whole expert's; only the
+  association of the down product's FP32 sum changes. Uneven weights and more ranks keep whole
+  experts.
 - **Where the shares end** (`plan_tensor_shares`, `models/qwen3_5/load/text.cpp`). A share is a
   piece of a stored object: a row range and column ranges (`artifact/selection.h`), gathered from
   the file as byte runs at upload, so its bounds must fall on whole stored blocks (columns: one for

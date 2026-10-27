@@ -118,9 +118,10 @@ std::string Binder::object_id(ObjectHandle object) const {
         throw ArtifactError("unknown selected object");
     }
     const Selected& entry = selected_[object.index - demands_.size()];
-    std::string id = artifact::object_id(reader_.directory().object(entry.source)) + "[" +
-                     std::to_string(entry.selection.row_begin) + ":" +
-                     std::to_string(entry.selection.row_end);
+    std::string id = artifact::object_id(reader_.directory().object(entry.source)) + "[";
+    for (const auto& [begin, end] : entry.selection.rows) {
+        id += (id.back() == '[' ? "" : ";") + std::to_string(begin) + ":" + std::to_string(end);
+    }
     for (const auto& [begin, end] : entry.selection.columns) {
         id += "," + std::to_string(begin) + ":" + std::to_string(end);
     }

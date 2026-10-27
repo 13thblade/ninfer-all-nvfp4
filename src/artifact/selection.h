@@ -8,8 +8,9 @@
 
 namespace ninfer::artifact {
 
-// A piece of a stored matrix that a device object holds on its own: rows [row_begin, row_end) and,
-// of each, the columns of every range in order, side by side. A vector is one row. A tensor-parallel
+// A piece of a stored matrix that a device object holds on its own: the rows of every range in
+// `rows`, in order, and, of each, the columns of every range in `columns`, side by side. A vector
+// is one row. Several row ranges take, for instance, one part of each expert of a bank. A tensor-parallel
 // rank holds such pieces of the projections it computes (models/qwen3_5/load/text.cpp).
 //
 // Every stored layout but the device-only row-split panel cuts this way: a piece of a row is a run
@@ -19,8 +20,7 @@ namespace ninfer::artifact {
 // a row-split matrix (its rows are padded to 128), 64 columns of NVFP4. NVFP4 row bounds fall on
 // its 128-row scale tiles and on its divisors' rows.
 struct ObjectSelection {
-    std::uint64_t row_begin = 0;
-    std::uint64_t row_end   = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> rows;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> columns;
     // INT32 vectors only: subtracted from every selected value at upload, so a piece of an index
     // vector can index a piece of what it indexes.

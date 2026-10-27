@@ -94,13 +94,18 @@ Layout describe(const WeightGeometry& g) {
 }
 
 void check(const Layout& stored, const ObjectSelection& selection) {
-    if (selection.row_begin >= selection.row_end || selection.row_end > stored.rows ||
-        selection.columns.empty()) {
-        throw ArtifactError("a selection names no rows, rows outside the object or no columns");
+    if (selection.rows.empty() || selection.columns.empty()) {
+        throw ArtifactError("a selection names no rows or no columns");
     }
-    if (selection.row_begin % stored.row_unit != 0 ||
-        (selection.row_end % stored.row_unit != 0 && selection.row_end != stored.rows)) {
-        throw ArtifactError("selection rows must fall on the layout's whole row tiles");
+    std::uint64_t previous_row = 0;
+    for (const auto& [begin, end] : selection.rows) {
+        if (begin >= end || end > stored.rows || begin < previous_row) {
+            throw ArtifactError("selection rows must be ordered, disjoint and inside the object");
+        }
+        if (begin % stored.row_unit != 0 || (end % stored.row_unit != 0 && end != stored.rows)) {
+            throw ArtifactError("selection rows must fall on the layout's whole row tiles");
+        }
+        previous_row = end;
     }
     std::uint64_t previous_end = 0;
     for (const auto& [begin, end] : selection.columns) {
@@ -113,6 +118,14 @@ void check(const Layout& stored, const ObjectSelection& selection) {
         }
         previous_end = end;
     }
+}
+
+std::uint64_t selected_rows(const ObjectSelection& selection) {
+    std::uint64_t rows = 0;
+    for (const auto& [begin, end] : selection.rows) {
+        rows = checked_add(rows, end - begin, "selected rows");
+    }
+    return rows;
 }
 
 std::uint64_t selected_columns(const ObjectSelection& selection) {
@@ -150,7 +163,7 @@ WeightGeometry selected_geometry(const WeightGeometry& stored, const ObjectSelec
         const std::uint64_t shape[] = {columns};
         return weight_geometry(stored.format, stored.layout, shape, stored.divisor_count);
     }
-    const std::uint64_t rows    = selection.row_end - selection.row_begin;
+    const std::uint64_t rows    = selected_rows(selection);
     const std::uint64_t shape[] = {rows, columns};
     const std::uint64_t divisor_rows = stored.shape[0] / stored.divisor_count;
     return weight_geometry(stored.format, stored.layout, shape,
@@ -167,42 +180,49 @@ std::vector<SelectedRun> selected_runs(const WeightGeometry& stored,
     for (std::size_t p = 0; p < layout.planes.size(); ++p) {
         const Plane& from = layout.planes[p];
         const Plane& to   = piece.planes[p];
-        const std::uint64_t first = selection.row_begin / from.rows;
-        const std::uint64_t last  = (selection.row_end + from.rows - 1) / from.rows;
-        // Lines the plane's own bytes fill, taken whole, follow each other: one run.
+        // Lines the plane's own bytes fill, taken whole, follow each other: one run per row range.
         const bool dense_lines = from.record_bytes != 0
                                      ? from.stride == from.record_bytes
                                      : whole_rows && from.stride == to.stride &&
                                            from.stride == unit_index(layout, layout.columns) *
                                                               from.unit_bytes;
-        if (dense_lines) {
-            out.push_back({.source      = checked_add(from.offset,
-                                                      checked_mul(first, from.stride, "line"),
-                                                      "plane line"),
-                           .bytes       = checked_mul(last - first, from.stride, "lines"),
-                           .destination = to.offset});
-            continue;
-        }
-        for (std::uint64_t line = first; line < last; ++line) {
-            const std::uint64_t source_line =
-                checked_add(from.offset, checked_mul(line, from.stride, "line"), "plane line");
-            std::uint64_t destination =
-                checked_add(to.offset, checked_mul(line - first, to.stride, "line"), "plane line");
-            if (from.record_bytes != 0) {
-                out.push_back({.source      = source_line,
-                               .bytes       = from.record_bytes,
-                               .destination = destination});
+        std::uint64_t placed = 0; // lines of the piece's plane the earlier row ranges filled
+        for (const auto& [row_begin, row_end] : selection.rows) {
+            const std::uint64_t first = row_begin / from.rows;
+            const std::uint64_t last  = (row_end + from.rows - 1) / from.rows;
+            if (dense_lines) {
+                out.push_back(
+                    {.source      = checked_add(from.offset, checked_mul(first, from.stride, "line"),
+                                                "plane line"),
+                     .bytes       = checked_mul(last - first, from.stride, "lines"),
+                     .destination = checked_add(to.offset, checked_mul(placed, to.stride, "line"),
+                                                "plane line")});
+                placed += last - first;
                 continue;
             }
-            for (const auto& [begin, end] : selection.columns) {
-                const std::uint64_t at    = unit_index(layout, begin);
-                const std::uint64_t count = unit_index(layout, end) - at;
-                const std::uint64_t bytes = checked_mul(count, from.unit_bytes, "selection run");
-                out.push_back({.source      = source_line + checked_mul(at, from.unit_bytes, "unit"),
-                               .bytes       = bytes,
-                               .destination = destination});
-                destination += bytes;
+            for (std::uint64_t line = first; line < last; ++line) {
+                const std::uint64_t source_line =
+                    checked_add(from.offset, checked_mul(line, from.stride, "line"), "plane line");
+                std::uint64_t destination = checked_add(
+                    to.offset, checked_mul(placed + line - first, to.stride, "line"), "plane line");
+                if (from.record_bytes != 0) {
+                    out.push_back({.source      = source_line,
+                                   .bytes       = from.record_bytes,
+                                   .destination = destination});
+                    continue;
+                }
+                for (const auto& [begin, end] : selection.columns) {
+                    const std::uint64_t at    = unit_index(layout, begin);
+                    const std::uint64_t count = unit_index(layout, end) - at;
+                    const std::uint64_t bytes = checked_mul(count, from.unit_bytes, "selection run");
+                    out.push_back(
+                        {.source      = source_line + checked_mul(at, from.unit_bytes, "unit"),
+                         .bytes       = bytes,
+                         .destination = destination});
+                    destination += bytes;
+                }
             }
+            placed += last - first;
         }
     }
     return out;

@@ -153,10 +153,12 @@ struct Config {
 // Tensor parallelism: the part of every layer one rank runs. GDN key heads [key_head_begin,
 // key_head_end) with the value heads that read them; attention KV heads [kv_head_begin,
 // kv_head_end) with the query heads that read them and their KV cache; a dense FFN's rows
-// [ffn_begin, ffn_end), or a MoE layer's routed experts [expert_begin, expert_end) (expert
-// parallelism: every rank routes, and the shared expert is rank 0's). The ranks' shares are
-// contiguous, in rank order, and together cover every head, row and expert. A model has fewer KV
-// heads than GDN heads, so the ranks past its KV-head count hold no attention.
+// [ffn_begin, ffn_end); and of a MoE layer either the routed experts [expert_begin, expert_end)
+// (expert parallelism: every rank routes, and the shared expert is rank 0's), or, where
+// ffn_end > ffn_begin, every expert's intermediate columns [ffn_begin, ffn_end), routed and shared
+// (expert_begin 0, expert_end all). The ranks' shares are contiguous, in rank order, and together
+// cover every head, row, expert and column. A model has fewer KV heads than GDN heads, so the
+// ranks past its KV-head count hold no attention.
 struct TensorShare {
     std::uint32_t key_head_begin = 0;
     std::uint32_t key_head_end   = 0;

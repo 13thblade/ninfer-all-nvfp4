@@ -308,31 +308,32 @@ SparseMoeWeights prepare_sparse_moe_banks(const WeightInput& router,
                                           const WeightInput& shared_score,
                                           std::span<const WeightInput> expert_gate_up,
                                           std::span<const WeightInput> expert_down,
-                                          std::size_t experts, const WeightInput* shared_gate,
+                                          std::size_t experts, std::uint64_t width,
+                                          const WeightInput* shared_gate,
                                           const WeightInput* shared_up,
                                           const WeightInput* shared_down) {
     require(experts > 0 && expert_gate_up.size() == 2 * experts && expert_down.size() == experts,
-            experts == 256 ? "SparseMoe native input requires 256 experts"
-                           : "SparseMoe share inputs differ from its experts");
+            experts == 256 && width == 512 ? "SparseMoe native input requires 256 experts"
+                                           : "SparseMoe share inputs differ from its experts");
     require(matrix(router) == std::vector<std::uint64_t>{256, 2048} &&
                 matrix(shared_score) == std::vector<std::uint64_t>{1, 2048},
             "SparseMoe router geometry differs");
     for (const auto& input : expert_gate_up) {
-        require(matrix(input) == std::vector<std::uint64_t>{512, 2048},
+        require(matrix(input) == std::vector<std::uint64_t>{width, 2048},
                 "SparseMoe gate/up geometry differs");
     }
     for (const auto& input : expert_down) {
-        require(matrix(input) == std::vector<std::uint64_t>{2048, 512},
+        require(matrix(input) == std::vector<std::uint64_t>{2048, width},
                 "SparseMoe down geometry differs");
     }
     const bool holds_shared = shared_gate != nullptr;
     require(holds_shared == (shared_up != nullptr) && holds_shared == (shared_down != nullptr) &&
-                (holds_shared || experts < 256),
+                (holds_shared || experts < 256 || width < 512),
             "SparseMoe shared expert inputs are incomplete");
     if (holds_shared) {
-        require(matrix(*shared_gate) == std::vector<std::uint64_t>{512, 2048} &&
+        require(matrix(*shared_gate) == std::vector<std::uint64_t>{width, 2048} &&
                     matrix(*shared_up) == matrix(*shared_gate) &&
-                    matrix(*shared_down) == std::vector<std::uint64_t>{2048, 512},
+                    matrix(*shared_down) == std::vector<std::uint64_t>{2048, width},
                 "SparseMoe shared expert geometry differs");
     }
     const std::array router_inputs{router, shared_score};
@@ -383,7 +384,7 @@ prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_
                            std::span<const WeightInput> expert_gate_up,
                            std::span<const WeightInput> expert_down, const WeightInput& shared_gate,
                            const WeightInput& shared_up, const WeightInput& shared_down) {
-    return prepare_sparse_moe_banks(router, shared_score, expert_gate_up, expert_down, 256,
+    return prepare_sparse_moe_banks(router, shared_score, expert_gate_up, expert_down, 256, 512,
                                     &shared_gate, &shared_up, &shared_down);
 }
 
@@ -391,11 +392,15 @@ SparseMoeWeights prepare_sparse_moe_share_weights(
     const WeightInput& router, const WeightInput& shared_score,
     std::span<const WeightInput> expert_gate_up, std::span<const WeightInput> expert_down,
     const WeightInput* shared_gate, const WeightInput* shared_up, const WeightInput* shared_down) {
-    require(!expert_down.empty() && expert_down.size() < 256,
-            "SparseMoe share holds some of the 256 experts");
+    // A share holds some of the experts whole, or every expert's half of its intermediate
+    // columns.
+    const std::uint64_t width = expert_down.empty() ? 0 : matrix(expert_down.front()).back();
+    require(!expert_down.empty() && expert_down.size() <= 256 &&
+                (width == 256 || (width == 512 && expert_down.size() < 256)),
+            "SparseMoe share holds some of the 256 experts, or half of each one's columns");
     const auto out =
         prepare_sparse_moe_banks(router, shared_score, expert_gate_up, expert_down,
-                                 expert_down.size(), shared_gate, shared_up, shared_down);
+                                 expert_down.size(), width, shared_gate, shared_up, shared_down);
     require(out.routed_gate_up.qtype != QType::NVFP4,
             "SparseMoe NVFP4 expert banks have no expert-parallel share");
     return out;

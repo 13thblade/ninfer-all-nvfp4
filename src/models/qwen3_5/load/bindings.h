@@ -67,6 +67,12 @@ public:
     // router and shared score) reads them there.
     [[nodiscard]] std::vector<WeightId> joint_piece(std::span<const JointPart> parts,
                                                     std::size_t rank);
+    // The same for a piece of each parameter, in one device selection: rows [begin, end) of each
+    // part's own rows (a row cut, one range), or the columns of `piece.ranges` of every part (a
+    // column cut). Each view takes the piece's shape; a column cut refuses a rotated or gathered
+    // input, whose columns a piece would have to carry. The parts lie in the object in order.
+    [[nodiscard]] std::vector<WeightId> joint_piece(std::span<const JointPart> parts,
+                                                    std::size_t rank, const ParameterPiece& piece);
 
     // Where a column piece of matrix parameter `name` (`shape`, read through `inputs`) may end:
     // out[c] for c in [0, columns] says whether the columns [0, c) are whole runs of its stored

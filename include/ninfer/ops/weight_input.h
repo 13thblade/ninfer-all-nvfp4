@@ -89,7 +89,9 @@ prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_
                            const WeightInput& shared_up, const WeightInput& shared_down);
 // One device's expert-parallel share of SparseMoe (sparse_moe_share): its experts' gate/up and
 // down inputs in expert order, each list joining into one bank; the shared expert's three inputs
-// only on the device that holds it (all null elsewhere).
+// only on the device that holds it (all null elsewhere). Where the devices divide every expert's
+// intermediate columns instead, each input is that device's half: [256,2048] gate and up rows,
+// [2048,256] down columns, the shared expert's likewise on every device.
 [[nodiscard]] SparseMoeWeights prepare_sparse_moe_share_weights(
     const WeightInput& router, const WeightInput& shared_score,
     std::span<const WeightInput> expert_gate_up, std::span<const WeightInput> expert_down,
