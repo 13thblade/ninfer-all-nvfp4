@@ -1165,10 +1165,18 @@ struct Qwen4ExpCore::Impl {
     }
 
     // Pages for an image of `bytes`, pinning more when the free ones fall short; the caller has
-    // made room for them (make_host_room), so the pinned pages stay within the budget.
+    // made room for them (make_host_room), so the pinned pages stay within the budget. Empty when
+    // more pages cannot be pinned: registering them also takes device memory on every card for
+    // their page tables (2 MiB per GiB), which the expert cache may already hold.
     std::vector<std::byte*> take_pages(std::uint64_t bytes) {
         const auto count = static_cast<std::size_t>(page_rounded(bytes) / kHostPageBytes);
-        if (free_pages.size() < count) { pin_pages(count - free_pages.size()); }
+        if (free_pages.size() < count) {
+            try {
+                pin_pages(count - free_pages.size());
+            } catch (const std::exception&) {
+                return {};
+            }
+        }
         std::vector<std::byte*> pages(free_pages.end() - std::ptrdiff_t(count), free_pages.end());
         free_pages.resize(free_pages.size() - count);
         host_used += count * kHostPageBytes;
@@ -1230,6 +1238,7 @@ struct Qwen4ExpCore::Impl {
         image.path   = path;
         image.bytes  = bytes;
         image.pages  = take_pages(bytes);
+        if (image.pages.empty()) { return; }
         try {
             image.header = executor.save_image(s, at, image.pages, kHostPageBytes);
         } catch (...) {
@@ -1270,6 +1279,7 @@ struct Qwen4ExpCore::Impl {
             }
             Stored& image = stored[*index];
             image.pages   = take_pages(image.bytes);
+            if (image.pages.empty()) { return false; }
             std::ifstream in(image.file, std::ios::binary);
             in.seekg(std::streamoff(sizeof(FileHeader) +
                                     4 * (image.header.context.previous.size() + tokens.size())));
