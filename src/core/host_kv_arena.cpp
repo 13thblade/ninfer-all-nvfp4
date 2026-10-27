@@ -57,6 +57,14 @@ HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry) {
         if (plane.leading_extent <= 0 || plane.head_extent <= 0) {
             throw std::invalid_argument("Host KV plane geometry must be positive");
         }
+        if (plane.page_residue > 0) {
+            // A residue sibling shares its first sibling's region: one of them holds each page.
+            if (static_cast<std::size_t>(plane.page_residue) > out.planes.size()) {
+                throw std::invalid_argument("Host KV residue plane has no first sibling");
+            }
+            out.planes.push_back(out.planes[out.planes.size() - plane.page_residue]);
+            continue;
+        }
         // Device slab alignment is not part of the canonical packed Host representation.
         cursor = align_up(cursor, kHostKVAlignment, "Host KV plane");
         const std::size_t head_bytes =
@@ -88,9 +96,10 @@ TransferWork plan_host_kv_transfer_work(const HostKVPageLayout& layout, std::uin
     std::size_t bytes_per_page     = 0;
     std::size_t operations_per_run = 0;
     for (std::size_t index = 0; index < layout.planes.size(); ++index) {
+        const KVPlaneGeometry& plane = layout.geometry.planes[index];
+        if (plane.page_residue > 0) { continue; } // its first sibling moves the page
         bytes_per_page = checked_add(bytes_per_page, layout.planes[index].page_payload_bytes,
                                      "Host KV transfer payload overflow");
-        const KVPlaneGeometry& plane = layout.geometry.planes[index];
         const std::size_t operations =
             layout.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor
                 ? 1U
@@ -117,14 +126,17 @@ TransferWork plan_device_kv_copy_work(const HostKVPageLayout& layout, std::uint3
     }
 
     std::size_t bytes_per_page = 0;
-    for (const HostKVPlaneLayout& plane : layout.planes) {
-        bytes_per_page = checked_add(bytes_per_page, plane.page_payload_bytes,
+    std::size_t page_copies    = 0;
+    for (std::size_t index = 0; index < layout.planes.size(); ++index) {
+        if (layout.geometry.planes[index].page_residue > 0) { continue; } // one sibling holds it
+        bytes_per_page = checked_add(bytes_per_page, layout.planes[index].page_payload_bytes,
                                      "Device KV copy payload overflow");
+        ++page_copies;
     }
     const std::size_t payload =
         checked_mul(bytes_per_page, pages, "Device KV copy payload overflow");
     const std::size_t operations =
-        checked_mul(layout.planes.size(), pages, "Device KV copy operation count overflow");
+        checked_mul(page_copies, pages, "Device KV copy operation count overflow");
     if (operations > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("Device KV copy operation count exceeds uint32");
     }

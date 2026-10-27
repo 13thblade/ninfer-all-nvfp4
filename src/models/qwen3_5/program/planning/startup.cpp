@@ -161,16 +161,22 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
 
     std::vector<std::size_t> attention_layer_rank;
     std::vector<std::int32_t> kv_head_shares;
+    std::uint32_t kv_position_ranks = 0;
     std::vector<qwen3_5::StateImageShard> state_shards;
     if (ranks == 1) {
         state_shards.push_back({.rank = 0, .first_layer = 0, .layers = config.linear_attention_layers});
     } else if (parameters.text.tensor_parallel()) {
-        // Every rank holds its KV heads' share of every attention layer's cache and its GDN
-        // heads' share of every GDN layer's state.
-        for (const auto& share : parameters.text.tensor_shares) {
-            if (share.kv_head_end > share.kv_head_begin) {
-                kv_head_shares.push_back(
-                    static_cast<std::int32_t>(share.kv_head_end - share.kv_head_begin));
+        // Every rank holds its KV heads' share of every attention layer's cache, or its pages'
+        // share under position-split attention, and its GDN heads' share of every GDN layer's
+        // state.
+        if (parameters.text.tensor_shares.front().attention_positions) {
+            kv_position_ranks = static_cast<std::uint32_t>(ranks);
+        } else {
+            for (const auto& share : parameters.text.tensor_shares) {
+                if (share.kv_head_end > share.kv_head_begin) {
+                    kv_head_shares.push_back(
+                        static_cast<std::int32_t>(share.kv_head_end - share.kv_head_begin));
+                }
             }
         }
         for (std::size_t rank = 0; rank < ranks; ++rank) {
@@ -216,6 +222,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                               .mtp_physical_page_groups  = mtp_physical_pages,
                               .text_layer_rank           = std::move(attention_layer_rank),
                               .text_kv_head_shares       = std::move(kv_head_shares),
+                              .text_kv_position_ranks    = kv_position_ranks,
+                              .invariant_attention       = plan.invariant_attention,
                           });
     // The Program binds this pool's own planned geometry, so the Host page cost the RAM budget
     // trades against is priced from the plan rather than recovered from a constructed pool.
@@ -429,19 +437,27 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
     const std::int32_t narrowest_drafts =
         *std::min_element(round_widths.begin(), round_widths.end()) - 1;
-    const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
+    // Invariant attention reductions plan every call's splits at the context's segment; a plan
+    // with them reserves for the tuned splits as well, which the MTP layer keeps.
+    const std::uint32_t segment_keys =
+        plan.invariant_attention ? ops::causal_attention_invariant_segment_keys(plan.capacity) : 0U;
+    const ops::CausalAttentionExecutionEnvelope text_envelope{
+        .min_visible_keys = 1, .max_visible_keys = plan.capacity,
+        .invariant_segment_keys = segment_keys};
     // Prefill chunks of 17 to 64 rows may take the chunked small-T route over a long context, and
     // wider ones run the selected prompt kernel, whose fast NVFP4 form may split keys into
     // workspace (see execution/text.cpp).
     const ops::CausalAttentionExecutionEnvelope prefill_envelope{
-        .min_visible_keys   = 1,
-        .max_visible_keys   = plan.capacity,
-        .fast_prompt_kernel = plan.fast_prefill_kernel,
-        .small_prefill      = true};
-    const ops::CausalAttentionExecutionEnvelope verify_envelope{.min_visible_keys = 1,
-                                                                .max_visible_keys = plan.capacity,
-                                                                .wide_verification =
-                                                                    plan.ngram_draft_window > 15};
+        .min_visible_keys       = 1,
+        .max_visible_keys       = plan.capacity,
+        .fast_prompt_kernel     = plan.fast_prefill_kernel,
+        .small_prefill          = true,
+        .invariant_segment_keys = segment_keys};
+    const ops::CausalAttentionExecutionEnvelope verify_envelope{
+        .min_visible_keys       = 1,
+        .max_visible_keys       = plan.capacity,
+        .wide_verification      = plan.ngram_draft_window > 15,
+        .invariant_segment_keys = segment_keys};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
@@ -487,6 +503,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         // heads, and its mixer and FFN output projections write FP32 partials instead of adding to
         // the residual.
         const bool partial = parameters.text.tensor_parallel();
+        const bool positions =
+            partial && parameters.text.tensor_shares.front().attention_positions;
         const auto residual_scratch = [&](const execution::LinearParameters& p) {
             if (partial) {
                 linear_scratch(layout, p, first, last);
@@ -513,6 +531,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  dimension(share.attention->num_key_value_heads)},
                                 plan.kv_storage, envelope, batch_size, min_width, max_width));
                     residual_scratch(attention->output);
+                    if (positions) {
+                        // The merge of a position-split rank's query heads, a pass of its own.
+                        auto merge = layout.scope();
+                        (void)workspace::matrix(layout, DType::BF16,
+                                                dimension(config.attention->query_width()), last);
+                        residual_scratch(attention->output);
+                    }
                 } else {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
                     (void)workspace::gdn_control(layout, config, last);
@@ -554,6 +579,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         std::vector<TextConfig> shares;
         for (const auto& share : parameters.text.tensor_shares) {
             shares.push_back(qwen3_5::tensor_parallel_share(config, share));
+        }
+        if (positions) {
+            // Each rank keeps its query heads' gates from its attention to its merge for the whole
+            // pass (at most every head).
+            (void)workspace::matrix(layout, DType::BF16,
+                                    dimension(config.attention->query_width()), last);
         }
         const auto holds_attention = [&](std::size_t rank) {
             return shares.empty() || shares[rank].attention->num_key_value_heads != 0;
@@ -1211,6 +1242,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->fast_prefill_kernel = inputs.fast_prefill_kernel;
+    impl->invariant_attention = inputs.invariant_attention;
     impl->draft_window        = inputs.draft_window;
     impl->lookup_ngram        = inputs.lookup_ngram;
     impl->mtp_policy          = inputs.mtp_policy;
@@ -1507,6 +1539,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .max_concurrency            = options.max_concurrency,
         .prefill_chunk              = effective_prefill_chunk(parameters, options),
         .fast_prefill_kernel        = options.fast_prefill_kernel,
+        .invariant_attention        = options.invariant_attention,
         .draft_window               = options.speculative.draft_tokens,
         .lookup_ngram               = options.speculative.lookup_ngram,
         .mtp_policy                 = options.speculative.mtp_policy,

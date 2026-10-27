@@ -27,7 +27,7 @@ void launch_fp8_partial(const Tensor& q, CacheInput input, const Tensor& positio
         launch_small_t_sm70_quantized<Geometry, TokenTile, MultiBatch, Masked, CacheInput, true,
                                       true>(q, input, positions, scale, cache, invocation,
                                             logical_capacity, splits, partial_acc, partial_m,
-                                            partial_l, stream);
+                                            partial_l, stream, invocation.partition);
         return;
     }
 #endif
@@ -91,7 +91,7 @@ void launch_fp8_partial(const Tensor& q, CacheInput input, const Tensor& positio
                     q_ptr, input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr, v_scale_ptr,
                     tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0],
                     invocation.full_width, invocation.column_begin, logical_capacity, scale,
-                    partial_acc_ptr, partial_m_ptr, partial_l_ptr);
+                    partial_acc_ptr, partial_m_ptr, partial_l_ptr, invocation.partition);
                 CUDA_CHECK(cudaGetLastError());
             };
 
@@ -122,7 +122,8 @@ void launch_fp8_reduce(const Tensor& positions, const CausalSmallTInvocation& in
                 ? nullptr
                 : static_cast<const std::int32_t*>(invocation.valid_columns->data),
             invocation.width, invocation.full_width, invocation.column_begin, invocation.batch_size,
-            logical_capacity, splits, 0, static_cast<__nv_bfloat16*>(out.data), nullptr);
+            logical_capacity, splits, 0, static_cast<__nv_bfloat16*>(out.data), nullptr,
+            invocation.partition, invocation.partial_out);
     };
     if (invocation.column_begin == 0)
         launch.template operator()<false>();
@@ -224,7 +225,8 @@ void causal_attention_small_t_fp8_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream,
+    float* partial_out) {
     const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                   static_cast<const __nv_bfloat16*>(v.data)};
     const CausalSmallTInvocation invocation{
@@ -234,6 +236,8 @@ void causal_attention_small_t_fp8_launch(
         .column_begin  = column_begin,
         .width         = width,
         .batch_size    = q.ne[3],
+        .partition     = causal_attention_key_partition(envelope, cache),
+        .partial_out   = partial_out,
     };
     with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
         causal_attention_small_t_fp8_launch_for<Geometry>(q, input, positions, scale, cache,
@@ -249,6 +253,7 @@ void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& p
                                                 Tensor& partial_l, Tensor& out,
                                                 cudaStream_t stream) {
     const CausalCachedInput input{};
+    PagedKVBatchLayerView batch_cache = single_row_paged_kv_batch_view(cache);
     const CausalSmallTInvocation invocation{
         .valid_columns = nullptr,
         .table_rows    = nullptr,
@@ -256,8 +261,8 @@ void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& p
         .column_begin  = 0,
         .width         = q.ne[2],
         .batch_size    = 1,
+        .partition     = causal_attention_key_partition(envelope, batch_cache),
     };
-    PagedKVBatchLayerView batch_cache = single_row_paged_kv_batch_view(cache);
     with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
         causal_attention_small_t_fp8_launch_for<Geometry>(q, input, positions, scale, batch_cache,
                                                           invocation, envelope, partial_acc,

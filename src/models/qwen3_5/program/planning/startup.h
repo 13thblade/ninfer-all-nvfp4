@@ -99,6 +99,7 @@ struct SequencePlanningInputs {
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
     bool fast_prefill_kernel                = false;
+    bool invariant_attention                = false;
     std::uint32_t draft_window              = 0;
     std::uint32_t lookup_ngram             = 0;
     MtpDraftPolicy mtp_policy               = MtpDraftPolicy::Fixed;
@@ -135,6 +136,8 @@ struct SequencePlanImpl {
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
     bool fast_prefill_kernel                = false;
+    // --invariant-attention: the text cache's calls take fixed key segments.
+    bool invariant_attention                = false;
     std::uint32_t draft_window              = 0;
     std::uint32_t lookup_ngram             = 0;
     MtpDraftPolicy mtp_policy               = MtpDraftPolicy::Fixed;

@@ -181,6 +181,55 @@ int run_case(const Case& c, std::mt19937& rng) {
                                      "one contributor reaches every replica");
     }
 
+    // A block output: the sum stored in place of the output, rounded once to BF16 or kept in FP32.
+    {
+        const auto residual = residual_of(4.0f);
+        const auto partials = partials_of(1.0f);
+        load(residual, partials, 0);
+        for (std::size_t r = 0; r < c.ranks; ++r) {
+            exchange.publish(r, 0, bytes, ctx.rank(r).stream);
+        }
+        for (std::size_t r = 0; r < c.ranks; ++r) {
+            exchange.reduce(r, 0, replica[r], c.values, c.ranks, ctx.rank(r).stream, 0,
+                            ninfer::TensorParallelSum::StoreBf16);
+        }
+        ctx.synchronize();
+        const std::vector<__nv_bfloat16> zero(residual.size(), __float2bfloat16(0.0f));
+        failures += compare_replicas(replica, c.values, oracle(zero, partials),
+                                     "a stored BF16 sum is the rank-order sum rounded once");
+
+        std::vector<float*> sums(c.ranks);
+        for (std::size_t r = 0; r < c.ranks; ++r) {
+            CUDA_CHECK(cudaSetDevice(ids[r]));
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&sums[r]), bytes));
+        }
+        CUDA_CHECK(cudaSetDevice(0));
+        load(residual, partials, 1);
+        for (std::size_t r = 0; r < c.ranks; ++r) {
+            exchange.publish(r, 1, bytes, ctx.rank(r).stream);
+        }
+        for (std::size_t r = 0; r < c.ranks; ++r) {
+            exchange.reduce(r, 1, sums[r], c.values, c.ranks, ctx.rank(r).stream, 0,
+                            ninfer::TensorParallelSum::StoreFp32);
+        }
+        ctx.synchronize();
+        std::vector<float> want(static_cast<std::size_t>(c.values));
+        for (std::size_t i = 0; i < want.size(); ++i) {
+            float sum = partials[0][i];
+            for (std::size_t r = 1; r < c.ranks; ++r) { sum += partials[r][i]; }
+            want[i] = sum;
+        }
+        for (std::size_t r = 0; r < c.ranks; ++r) {
+            std::vector<float> got(want.size());
+            CUDA_CHECK(cudaMemcpy(got.data(), sums[r], bytes, cudaMemcpyDeviceToHost));
+            failures += expect(std::memcmp(got.data(), want.data(), bytes) == 0,
+                               "a stored FP32 sum is the rank-order sum");
+            CUDA_CHECK(cudaSetDevice(ids[r]));
+            CUDA_CHECK(cudaFree(sums[r]));
+        }
+        CUDA_CHECK(cudaSetDevice(0));
+    }
+
     // A captured pass: two exchanges back to back on every rank's stream, joined into rank 0's.
     {
         cudaStream_t origin = ctx.rank(0).stream;

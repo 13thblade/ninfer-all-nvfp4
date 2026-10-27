@@ -231,7 +231,8 @@ void inject_direct_graft(detail::ProgramImpl& program, const PromptGraft& graft)
     const auto& exec_row     = program.text_kv_addresses->execution_row(*text_kv);
     PagedKVCacheView kv_view = program.decoder->text_kv.execution_view(exec_row);
 
-    // With tensor parallelism each rank appends its own run of every layer's KV heads.
+    // With tensor parallelism each rank appends its own run of every layer's KV heads, or of every
+    // layer's pages.
     const std::span<const std::int32_t> head_shares = program.decoder->text_kv.head_shares();
 
     struct HeadRun {
@@ -243,6 +244,10 @@ void inject_direct_graft(detail::ProgramImpl& program, const PromptGraft& graft)
     std::vector<HeadRun> runs;
     for (std::size_t rank = 0, first = 0; rank < head_shares.size(); first += head_shares[rank++]) {
         runs.push_back({rank, static_cast<std::int32_t>(first), head_shares[rank]});
+    }
+    // Split by positions, each rank appends every head; its view keeps only its pages' rows.
+    for (std::size_t rank = 0; rank < program.decoder->text_kv.position_ranks(); ++rank) {
+        runs.push_back({rank, 0, n_kv_heads});
     }
     const std::size_t head_bytes = static_cast<std::size_t>(head_dim) * 2; // BF16
     for (std::uint32_t layer = 0; layer < n_attn; ++layer) {

@@ -61,7 +61,8 @@ void dispatch_k8v4(const Tensor& k, const Tensor& v, const Tensor& positions, Ca
 
 void kv_cache_append_k8v4_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                  PagedKVLayerView cache, cudaStream_t stream) {
-    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
+    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data),
+                                         cache.page_stride, cache.page_residue};
     dispatch_k8v4(k, v, positions, cache, metadata, stream);
 }
 
@@ -75,6 +76,8 @@ void kv_cache_append_k8v4_batch_launch(const Tensor& k, const Tensor& v, const T
                 Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
+            .page_stride  = cache.page_stride,
+            .page_residue = cache.page_residue,
         };
         dispatch_k8v4(k, v, positions, cache, metadata, stream);
     };

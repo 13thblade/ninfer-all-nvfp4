@@ -98,6 +98,8 @@ __global__ void kv_cache_append_full_bf16_kernel(const __nv_bfloat16* __restrict
     const int4 k_value = load_vec<int4>(&k[src_off]);
     const int4 v_value = load_vec<int4>(&v[src_off]);
     physical_page      = __shfl_sync(0xffffffffu, physical_page, 0);
+    physical_page = metadata.local_page(physical_page);
+    if (physical_page < 0) return; // another rank's page (a position-split cache)
     const std::int64_t cache_off =
         paged_kv_element_offset<kKVCacheAppendFullHeadDim, Geometry::KVHeads>(
             physical_page, kv_head, position & kPagedKVPageMask, d);
@@ -129,6 +131,8 @@ __launch_bounds__(256) __global__
     const std::int32_t* block_table = metadata.block_table();
     int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
     physical_page                   = __shfl_sync(FullMask, physical_page, 0);
+    physical_page = metadata.local_page(physical_page);
+    if (physical_page < 0) return; // another rank's page (a position-split cache)
     kv_cache_append_full_fp8_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head,
                                            physical_page, position & kPagedKVPageMask, lane);
 }
@@ -161,6 +165,8 @@ __launch_bounds__(256) __global__
     const std::int32_t* block_table = metadata.block_table();
     int physical_page               = lane == 0 ? block_table[logical_page] : 0;
     physical_page                   = __shfl_sync(FullMask, physical_page, 0);
+    physical_page = metadata.local_page(physical_page);
+    if (physical_page < 0) return; // another rank's page (a position-split cache)
     const int position              = base_position + token;
     kv_cache_append_full_fp8_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head,
                                            physical_page, position & kPagedKVPageMask, lane);
@@ -192,6 +198,8 @@ __launch_bounds__(256) __global__
     int page                        = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
     const int page_off              = position & kPagedKVPageMask;
     page                            = __shfl_sync(FullMask, page, 0);
+    page = metadata.local_page(page);
+    if (page < 0) return; // another rank's page (a position-split cache)
 
     float k_values[8];
 #pragma unroll
@@ -293,6 +301,8 @@ __launch_bounds__(256) __global__
     const std::int32_t* block_table = metadata.block_table();
     int physical_page               = lane == 0 ? block_table[logical_page] : 0;
     physical_page                   = __shfl_sync(FullMask, physical_page, 0);
+    physical_page = metadata.local_page(physical_page);
+    if (physical_page < 0) return; // another rank's page (a position-split cache)
 
     const int position = base_position + token;
     const int page_off = position & kPagedKVPageMask;

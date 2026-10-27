@@ -317,6 +317,14 @@ TextConfig tensor_parallel_share(const TextConfig& text, const TensorShare& shar
                            share.kv_head_end > text.attention->num_key_value_heads)) {
         throw std::invalid_argument("a tensor-parallel share lies outside the attention heads");
     }
+    if (share.attention_positions &&
+        (!text.attention || share.kv_head_begin != 0 ||
+         share.kv_head_end != text.attention->num_key_value_heads ||
+         share.query_head_begin >= share.query_head_end ||
+         share.query_head_end > text.attention->num_attention_heads)) {
+        throw std::invalid_argument(
+            "a position-split share must hold every KV head and a run of the query heads");
+    }
     const std::uint32_t ratio = text.gdn->linear_num_value_heads / text.gdn->linear_num_key_heads;
     TextConfig out            = text;
     out.gdn->linear_num_key_heads   = share.key_head_end - share.key_head_begin;

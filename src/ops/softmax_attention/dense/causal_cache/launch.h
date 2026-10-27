@@ -8,6 +8,7 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/common/device_limits.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/key_partition.h"
 
 #include <cuda_runtime.h>
 
@@ -58,7 +59,20 @@ struct CausalSmallTInvocation {
     std::int32_t column_begin   = 0;
     std::int32_t width          = 0;
     std::int32_t batch_size     = 1;
+    // How the launch divides and holds keys, and where a position-split rank's reducer leaves the
+    // partial output it exchanges (causal_store_partial_output) in place of `out`.
+    CausalKeyPartition partition{};
+    float* partial_out = nullptr;
 };
+
+// The partition a launch over `cache` within `envelope` takes.
+[[nodiscard]] inline CausalKeyPartition
+causal_attention_key_partition(CausalAttentionExecutionEnvelope envelope,
+                               const PagedKVBatchLayerView& cache) {
+    return {.segment_keys = static_cast<std::int32_t>(envelope.invariant_segment_keys),
+            .page_stride  = cache.page_stride,
+            .page_residue = cache.page_residue};
+}
 
 std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                              KvCacheStorage cache_storage,
@@ -80,7 +94,8 @@ void causal_attention_small_t_launch(const Tensor& q, const Tensor& k, const Ten
                                      CausalAttentionExecutionEnvelope envelope,
                                      std::int32_t column_begin, std::int32_t width,
                                      Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
-                                     Tensor& out, cudaStream_t stream, const void* gate = nullptr);
+                                     Tensor& out, cudaStream_t stream, const void* gate = nullptr,
+                                     float* partial_out = nullptr);
 
 // Parallel query tiles for a single row's chunked small-T width over an INT8-family cache: the
 // tile width (0 when off) whose tiles run as the batch rows of one split-KV launch and one reduce,
@@ -101,7 +116,8 @@ void causal_attention_small_t_tiles_launch(const Tensor& q, const Tensor& positi
                                            std::int32_t tile_width, Tensor& tile_valid,
                                            Tensor& tile_rows, Tensor& partial_acc,
                                            Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                                           cudaStream_t stream, const void* gate = nullptr);
+                                           cudaStream_t stream, const void* gate = nullptr,
+                                           float* partial_out = nullptr);
 
 void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
                                             const PagedKVLayerView& cache,
@@ -113,7 +129,8 @@ void causal_attention_small_t_fp8_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream);
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream,
+    float* partial_out = nullptr);
 
 void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& positions,
                                                 float scale, const PagedKVLayerView& cache,
@@ -126,7 +143,8 @@ void causal_attention_small_t_nvfp4_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream);
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream,
+    float* partial_out = nullptr);
 
 void causal_attention_cached_small_t_nvfp4_launch(const Tensor& q, const Tensor& positions,
                                                   float scale, const PagedKVLayerView& cache,
@@ -139,7 +157,8 @@ void causal_attention_small_t_k8v4_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream);
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream,
+    float* partial_out = nullptr);
 
 void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor& positions,
                                                  float scale, const PagedKVLayerView& cache,
@@ -147,6 +166,15 @@ void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor& 
                                                  Tensor& partial_acc, Tensor& partial_m,
                                                  Tensor& partial_l, Tensor& out,
                                                  cudaStream_t stream);
+
+// A position-split rank's prompt attention over the keys of its own pages, every storage: each
+// column's output normalized over those keys and its log-sum-exp, into `partial_out`
+// (causal_attention_merge_partials). The caller has appended the call's rows. One sequence; the
+// Volta prompt kernel's partial form on every architecture (prompt_sm70.h).
+void causal_attention_prompt_partial_launch(const Tensor& q, const Tensor& positions,
+                                            const Tensor& valid_columns, const Tensor& table_rows,
+                                            float scale, PagedKVBatchLayerView cache,
+                                            float* partial_out, cudaStream_t stream);
 
 // The fast INT8-family kernel plans its key splits at `max_visible_keys` and takes their partials
 // from `workspace` (causal_softmax_attention_workspace_capacity_bytes reserves them).

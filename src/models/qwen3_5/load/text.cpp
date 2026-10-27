@@ -1,6 +1,7 @@
 #include "models/qwen3_5/load/bindings.h"
 
 #include "core/tensor_split.h"
+#include "ninfer/ops/softmax_attention.h"
 
 #include <algorithm>
 #include <array>
@@ -153,6 +154,12 @@ AttentionWeights bind_attention_share(Bindings& b, const TextConfig& config, con
     const auto group  = a.num_attention_heads / a.num_key_value_heads;
     const Range query = scaled(share.kv_head_begin * group, share.kv_head_end * group, a.head_dim);
     const Range kv    = scaled(share.kv_head_begin, share.kv_head_end, a.head_dim);
+    // A position-split rank projects every head (its KV range is all of them) and projects the
+    // output of its own query heads.
+    const Range output_query =
+        share.attention_positions
+            ? scaled(share.query_head_begin, share.query_head_end, a.head_dim)
+            : query;
     const auto input  = std::vector<std::string>{p + "mixer_input"};
     AttentionWeights out;
     out.query      = b.piece(p + "attention/query", {q, h}, input, {}, rank, rows(query));
@@ -162,7 +169,7 @@ AttentionWeights bind_attention_share(Bindings& b, const TextConfig& config, con
     out.query_norm = bind_norm_replica(b, p + "attention/query_norm", a.head_dim, rank);
     out.key_norm   = bind_norm_replica(b, p + "attention/key_norm", a.head_dim, rank);
     out.output = b.piece(p + "attention/output", {h, q}, {p + "attention/gated_output"}, {}, rank,
-                         columns({query}));
+                         columns({output_query}));
     return out;
 }
 
@@ -521,8 +528,30 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& confi
                     e.query_rows[kv * group * a.head_dim] && e.kv_rows[kv * a.head_dim]);
         });
     const auto kv_ranks = std::min<std::size_t>(options.ranks, kv_head_ends.size() + 1);
+    // By positions when asked: every rank then attends over its own pages and projects the output
+    // of a run of query heads, which may end wherever every layer's output projection cuts whole
+    // stored runs. By heads, the ranks past the KV heads' ends hold no attention.
+    const bool positions = options.tensor_attention == TensorAttention::Positions;
     std::vector<std::uint64_t> kv_heads(options.ranks + 1, a.num_key_value_heads);
-    {
+    std::vector<std::uint64_t> query_heads(options.ranks + 1, 0);
+    if (positions) {
+        if (options.ranks > static_cast<std::size_t>(ops::kCausalAttentionMaximumMergeRanks)) {
+            throw std::invalid_argument("--tensor-attention positions supports up to " +
+                                        std::to_string(ops::kCausalAttentionMaximumMergeRanks) +
+                                        " devices");
+        }
+        const auto query_ends = common_ends(
+            a.num_attention_heads, layers, [&](std::uint32_t layer, std::uint64_t heads) {
+                const auto& e = ends[layer];
+                return e.attention_output.empty() || e.attention_output[heads * a.head_dim];
+            });
+        if (query_ends.size() + 1 < options.ranks) {
+            throw std::invalid_argument(
+                "--tensor-attention positions: the attention output projection cannot be divided "
+                "over this many devices");
+        }
+        query_heads = split_shares(a.num_attention_heads, query_ends, weights);
+    } else {
         const std::vector<double> kv_weights(
             weights.begin(), weights.begin() + static_cast<std::ptrdiff_t>(kv_ranks));
         const auto ends_of = split_shares(a.num_key_value_heads, kv_head_ends, kv_weights);
@@ -563,13 +592,17 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& confi
     for (std::size_t rank = 0; rank < options.ranks; ++rank) {
         out.push_back({.key_head_begin = static_cast<std::uint32_t>(heads[rank]),
                        .key_head_end   = static_cast<std::uint32_t>(heads[rank + 1]),
-                       .kv_head_begin  = static_cast<std::uint32_t>(kv_heads[rank]),
-                       .kv_head_end    = static_cast<std::uint32_t>(kv_heads[rank + 1]),
+                       .kv_head_begin  = positions ? 0U : static_cast<std::uint32_t>(kv_heads[rank]),
+                       .kv_head_end    = positions ? a.num_key_value_heads
+                                                   : static_cast<std::uint32_t>(kv_heads[rank + 1]),
                        .ffn_begin      = static_cast<std::uint32_t>(rows[rank]),
                        .ffn_end        = static_cast<std::uint32_t>(rows[rank + 1]),
                        .expert_begin   = static_cast<std::uint32_t>(
                            rows[options.ranks] != 0 && dense == nullptr ? 0 : experts[rank]),
-                       .expert_end     = static_cast<std::uint32_t>(experts[rank + 1])});
+                       .expert_end     = static_cast<std::uint32_t>(experts[rank + 1]),
+                       .attention_positions = positions,
+                       .query_head_begin = static_cast<std::uint32_t>(query_heads[rank]),
+                       .query_head_end   = static_cast<std::uint32_t>(query_heads[rank + 1])});
         (void)tensor_parallel_share(config, out.back());
     }
     return out;

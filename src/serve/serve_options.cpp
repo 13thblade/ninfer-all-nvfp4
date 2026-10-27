@@ -139,7 +139,9 @@ std::string serve_usage_text(const char* argv0) {
            "                                the other MoE families divide only their routed\n"
            "                                experts)\n"
            "  --tensor-split A,B,...        relative share of each --devices entry (default:\n"
-           "                                by each card's measured bandwidth and free memory)\n"
+           "                                by each card's measured bandwidth and free memory)\n" +
+           std::string(product::kTensorAttentionHelp) +
+           std::string(product::kInvariantAttentionHelp) +
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
            "  --embedding-residency device|host  token embedding on GPU (default) or in\n"
@@ -1152,6 +1154,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.tensor_split = product::parse_tensor_split(require_value("--tensor-split"));
             continue;
         }
+        if (arg == "--tensor-attention") {
+            options.tensor_attention =
+                product::parse_tensor_attention(require_value("--tensor-attention"));
+            continue;
+        }
+        if (arg == "--invariant-attention") {
+            options.invariant_attention = true;
+            continue;
+        }
         if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
             continue;
@@ -1753,6 +1764,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     product::check_tensor_split(options.tensor_split, options.devices.size(),
                                 options.tensor_parallel);
+    product::check_tensor_attention(options.tensor_attention, options.tensor_parallel);
     if (options.request_log_max_mib != 0 && options.request_log_jsonl.empty()) {
         throw std::invalid_argument("--request-log-max-mib requires --request-log-jsonl");
     }

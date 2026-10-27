@@ -28,8 +28,9 @@ constexpr int kStride      = sm70_attention::kQStride; // halves per staged Q, K
 constexpr int kPStride     = sm70_attention::kPStride;
 constexpr int kSharedBytes = (kRows * kStride + 2 * kTile * kStride + kWarps * 8 * kPStride) *
                              static_cast<int>(sizeof(__half));
-static_assert(kRows * kHeadDim * sizeof(float) <= (kRows + 2 * kTile) * kStride * sizeof(__half),
-              "the rotated epilogue's FP32 rows reuse the Q, K and V stages");
+static_assert((kRows * kHeadDim + kRows) * sizeof(float) <=
+                  (kRows + 2 * kTile) * kStride * sizeof(__half),
+              "the rotated epilogue's FP32 rows and log-sum-exps reuse the Q, K and V stages");
 
 // How a cache stores its K or V plane. Every plane is [page][head][page offset][row], so a token's
 // row (page * kv_heads + head) * page size + offset addresses each of them.
@@ -179,8 +180,10 @@ __device__ __forceinline__ void decode_raw(const Raw& r, unsigned (&out)[16]) {
 }
 
 // K and V of the CTA's current key tile [k0, k0 + 32), in shared memory, as attend_tile reads
-// them.
+// them. Portable rows take the products on every architecture (the partial form).
+template <bool Portable>
 struct SharedRows {
+    static constexpr bool kPortableMma = Portable;
     const __half* k_s;
     const __half* v_s;
     int k0;
@@ -203,8 +206,10 @@ struct SharedRows {
 // A BF16 cache's tile as SharedRows reads it, and the BF16 values its FP16 stage saturates: the
 // queries of the CTA's rows (numbered from 0 at the call's first), and the keys and values of the
 // pages. The flags say whether the tile's keys or values, or the CTA's queries, hold a value
-// beyond FP16 (sm70_attention::attend_tile's exact rows).
-struct SharedBf16Rows : SharedRows {
+// beyond FP16 (sm70_attention::attend_tile's exact rows). A position-split rank's pages are at
+// physical / page_stride of its planes (only the tiles of its own pages are attended).
+template <bool Portable>
+struct SharedBf16Rows : SharedRows<Portable> {
     static constexpr bool kExact = true;
     const __nv_bfloat16* cache_k;
     const __nv_bfloat16* cache_v;
@@ -217,12 +222,13 @@ struct SharedBf16Rows : SharedRows {
     int row_count;
     bool tile_beyond;
     bool query_beyond;
+    std::int32_t page_stride;
 
     __device__ __forceinline__ uint4 key8(const __half* row, int d, unsigned&) const {
-        return SharedRows::key8(row, d);
+        return SharedRows<Portable>::key8(row, d);
     }
     __device__ __forceinline__ uint2 value4(const __half* row, int n, unsigned&) const {
-        return SharedRows::value4(row, n);
+        return SharedRows<Portable>::value4(row, n);
     }
     __device__ __forceinline__ bool keys_beyond(unsigned) const { return tile_beyond; }
     __device__ __forceinline__ bool values_beyond(unsigned) const { return tile_beyond; }
@@ -235,7 +241,7 @@ struct SharedBf16Rows : SharedRows {
     }
     __device__ __forceinline__ const __nv_bfloat16* page_row(const __nv_bfloat16* plane,
                                                              int k) const {
-        const std::int64_t page = table[k >> kPagedKVPageShift];
+        const std::int64_t page = table[k >> kPagedKVPageShift] / page_stride;
         return plane +
                ((page * kv_heads + kv_head) * kPagedKVPageSize + (k & kPagedKVPageMask)) * kHeadDim;
     }
@@ -279,8 +285,11 @@ __device__ __forceinline__ std::int32_t valid_tokens(const std::int32_t* valid_c
 }
 
 // Packed row r of a KV head is token r / G and query head kv_head * G + r % G (G = the group's
-// query heads). Rows of the tokens past the valid ones are written as zeros.
-template <class Metadata, Coding K, Coding V, bool RotatedKeys, bool RotatedValues>
+// query heads). Rows of the tokens past the valid ones are written as zeros. The Partial form
+// attends only over the tiles of the pages `partition` gives this rank and writes the rows'
+// normalized FP32 outputs and log-sum-exps to `partial_out` (causal_attention_partial_elements)
+// in place of `out`; a row without a key here, or past the valid tokens, gets 0 and -inf.
+template <class Metadata, Coding K, Coding V, bool RotatedKeys, bool RotatedValues, bool Partial>
 __launch_bounds__(kThreads) __global__
     void prompt_kernel(const __nv_bfloat16* __restrict__ q,
                        const std::int32_t* __restrict__ positions,
@@ -288,7 +297,8 @@ __launch_bounds__(kThreads) __global__
                        const void* __restrict__ cache_k, const void* __restrict__ cache_v,
                        const void* __restrict__ scale_k, const void* __restrict__ scale_v,
                        std::int32_t tokens, std::int32_t q_heads, std::int32_t kv_heads,
-                       float scale, __nv_bfloat16* __restrict__ out) {
+                       float scale, __nv_bfloat16* __restrict__ out, CausalKeyPartition partition,
+                       float* __restrict__ partial_out) {
     extern __shared__ __align__(16) unsigned char shared_bytes[];
     __half* q_s = reinterpret_cast<__half*>(shared_bytes);
     __half* k_s = q_s + kRows * kStride;
@@ -353,12 +363,23 @@ __launch_bounds__(kThreads) __global__
     const int load_key        = tid >> 3;
     const int part            = tid & 7;
     const std::int32_t* table = metadata.block_table();
-    const auto read           = [&](int k0, Raw& key_raw, Raw& value_raw) {
+    // The page of the planes that holds tile k0 (a tile lies within one page), or -1 for a page
+    // another rank holds.
+    const auto tile_page = [&](int k0) -> int {
+        const int physical = table[k0 >> kPagedKVPageShift];
+        if constexpr (Partial) {
+            return causal_strided_page(physical, partition);
+        } else {
+            return physical;
+        }
+    };
+    const auto read = [&](int k0, Raw& key_raw, Raw& value_raw) {
         const int key = k0 + load_key;
-        if (key < window) {
-            const std::int64_t page = table[key >> kPagedKVPageShift];
-            const std::int64_t row =
-                (page * kv_heads + kv_head) * kPagedKVPageSize + (key & kPagedKVPageMask);
+        const int page = key < window ? tile_page(k0) : -1;
+        if (page >= 0) {
+            const std::int64_t row = (static_cast<std::int64_t>(page) * kv_heads + kv_head) *
+                                         kPagedKVPageSize +
+                                     (key & kPagedKVPageMask);
             key_raw   = read_raw<K>(cache_k, scale_k, row, part);
             value_raw = read_raw<V>(cache_v, scale_v, row, part);
         } else {
@@ -374,6 +395,13 @@ __launch_bounds__(kThreads) __global__
     query_beyond = __syncthreads_or(query_beyond) != 0;
     for (int tile = 0; tile < tiles; ++tile) {
         const int k0 = tile * kTile;
+        if constexpr (Partial) {
+            // Uniform over the CTA: every thread's key of the tile is on one page.
+            if (tile_page(k0) < 0) {
+                if (tile + 1 < tiles) { read(k0 + kTile, key_raw, value_raw); }
+                continue;
+            }
+        }
         unsigned words[16];
         const bool raw_saturates = raw_beyond<K>(key_raw) || raw_beyond<V>(value_raw);
         decode_raw<K>(key_raw, words);
@@ -384,23 +412,24 @@ __launch_bounds__(kThreads) __global__
         if (tile + 1 < tiles) { read(k0 + kTile, key_raw, value_raw); }
         if (warp_position >= k0) {
             if constexpr (Exact) {
-                const SharedBf16Rows rows{{k_s, v_s, k0},
-                                          static_cast<const __nv_bfloat16*>(cache_k),
-                                          static_cast<const __nv_bfloat16*>(cache_v),
-                                          table,
-                                          kv_heads,
-                                          kv_head,
-                                          q,
-                                          q_heads,
-                                          group,
-                                          row_count,
-                                          tile_beyond,
-                                          query_beyond};
+                const SharedBf16Rows<Partial> rows{{k_s, v_s, k0},
+                                                   static_cast<const __nv_bfloat16*>(cache_k),
+                                                   static_cast<const __nv_bfloat16*>(cache_v),
+                                                   table,
+                                                   kv_heads,
+                                                   kv_head,
+                                                   q,
+                                                   q_heads,
+                                                   group,
+                                                   row_count,
+                                                   tile_beyond,
+                                                   query_beyond,
+                                                   Partial ? partition.page_stride : 1};
                 sm70_attention::attend_tile(rows, q_row, p_tile, k0, 0, window, qabs_a, qabs_b,
                                             scale, st, row0 + warp * 8);
             } else {
-                sm70_attention::attend_tile(SharedRows{k_s, v_s, k0}, q_row, p_tile, k0, 0,
-                                            window, qabs_a, qabs_b, scale, st);
+                sm70_attention::attend_tile(SharedRows<Partial>{k_s, v_s, k0}, q_row, p_tile, k0,
+                                            0, window, qabs_a, qabs_b, scale, st);
             }
         }
         __syncthreads();
@@ -412,10 +441,24 @@ __launch_bounds__(kThreads) __global__
     const float inv_b = st.l_b > 0.0f ? 1.0f / st.l_b : 0.0f;
     const int qp      = (lane >> 2) & 3;
     const int rows    = tokens * group;
+    // The partial form's log-sum-exp of a row (natural log units: the scores are scaled), -inf
+    // without a key here or a query.
+    const auto row_lse = [&](int row, float m, float l) {
+        return row < row_count && l > 0.0f ? m + logf(l) : -CUDART_INF_F;
+    };
+    const float lse_a = row_lse(row_a, st.m_a, st.l_a);
+    const float lse_b = row_lse(row_b, st.m_b, st.l_b);
     if constexpr (RotatedValues) {
         // The values were stored rotated: each row goes back through the (self-inverse)
         // transform, from FP32 rows in the stages the tiles no longer need.
         float* rows_s = reinterpret_cast<float*>(shared_bytes) + warp * 8 * kHeadDim;
+        float* lse_s  = reinterpret_cast<float*>(shared_bytes) + kRows * kHeadDim + warp * 8;
+        if constexpr (Partial) {
+            if (qp == 0 && (lane & 2) == 0) {
+                lse_s[lane_row_a]     = lse_a;
+                lse_s[lane_row_a + 2] = lse_b;
+            }
+        }
 #pragma unroll
         for (int n = 0; n < 8; ++n) {
 #pragma unroll
@@ -434,9 +477,20 @@ __launch_bounds__(kThreads) __global__
             for (int i = 0; i < 8; ++i) { values[i] = rows_s[local * kHeadDim + lane + 32 * i]; }
             normalized_hadamard_d256_inplace(values, lane);
             const bool live = row < row_count;
+            if constexpr (Partial) {
+                const int q_head = kv_head * group + row % group;
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                out[q_index(row, lane + 32 * i)] = __float2bfloat16_rn(live ? values[i] : 0.0f);
+                for (int i = 0; i < 8; ++i) {
+                    causal_store_partial_output(partial_out, q_head, lane + 32 * i, row / group,
+                                                q_heads, live ? values[i] : 0.0f, lse_s[local],
+                                                lane == 0 && i == 0);
+                }
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    out[q_index(row, lane + 32 * i)] =
+                        __float2bfloat16_rn(live ? values[i] : 0.0f);
+                }
             }
         }
     } else {
@@ -448,8 +502,18 @@ __launch_bounds__(kThreads) __global__
                 if (row >= rows) { continue; }
                 const float inv = row < row_count ? ((i & 2) ? inv_b : inv_a) : 0.0f;
                 const int d     = 32 * n + 8 * qp + (i & 4) + (lane & 2);
-                *reinterpret_cast<__nv_bfloat162*>(out + q_index(row, d)) =
-                    __floats2bfloat162_rn(st.acc[n][i] * inv, st.acc[n][i + 1] * inv);
+                if constexpr (Partial) {
+                    const int q_head = kv_head * group + row % group;
+                    const float lse  = (i & 2) ? lse_b : lse_a;
+                    const bool lead  = n == 0 && qp == 0 && (lane & 2) == 0 && (i & 4) == 0;
+                    causal_store_partial_output(partial_out, q_head, d, row / group, q_heads,
+                                                st.acc[n][i] * inv, lse, lead);
+                    causal_store_partial_output(partial_out, q_head, d + 1, row / group, q_heads,
+                                                st.acc[n][i + 1] * inv, lse, false);
+                } else {
+                    *reinterpret_cast<__nv_bfloat162*>(out + q_index(row, d)) =
+                        __floats2bfloat162_rn(st.acc[n][i] * inv, st.acc[n][i + 1] * inv);
+                }
             }
         }
     }
@@ -482,9 +546,10 @@ void with_codings(KvCacheStorage storage, F&& f) {
     throw std::invalid_argument("causal_attention_prompt_sm70: unknown KV storage");
 }
 
-template <class View, class Metadata>
+template <bool Partial, class View, class Metadata>
 void launch(const Tensor& q, const Tensor& positions, const std::int32_t* valid_columns,
-            float scale, const View& cache, Metadata metadata, Tensor& out, cudaStream_t stream) {
+            float scale, const View& cache, Metadata metadata, Tensor* out,
+            CausalKeyPartition partition, float* partial_out, cudaStream_t stream) {
     const std::int32_t q_heads  = q.ne[1];
     const std::int32_t tokens   = q.ne[2];
     const std::int32_t kv_heads = cache.num_kv_heads;
@@ -496,14 +561,15 @@ void launch(const Tensor& q, const Tensor& positions, const std::int32_t* valid_
     const dim3 grid(static_cast<unsigned>((rows + kRows - 1) / kRows),
                     static_cast<unsigned>(kv_heads));
     with_codings(cache.storage, [&]<Coding K, Coding V, bool RotatedKeys, bool RotatedValues>() {
-        auto kernel = prompt_kernel<Metadata, K, V, RotatedKeys, RotatedValues>;
+        auto kernel = prompt_kernel<Metadata, K, V, RotatedKeys, RotatedValues, Partial>;
         raise_dynamic_shared_memory(kernel, kSharedBytes);
         kernel<<<grid, kThreads, kSharedBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data),
             static_cast<const std::int32_t*>(positions.data), valid_columns, metadata,
             cache.k_pages.data, cache.v_pages.data, cache.k_scale_pages.data,
             cache.v_scale_pages.data, tokens, q_heads, kv_heads, scale,
-            static_cast<__nv_bfloat16*>(out.data));
+            out == nullptr ? nullptr : static_cast<__nv_bfloat16*>(out->data), partition,
+            partial_out);
         CUDA_CHECK(cudaGetLastError());
     });
 }
@@ -519,7 +585,7 @@ void causal_attention_prompt_sm70_launch(const Tensor& q, const Tensor& position
                                          const PagedKVLayerView& cache, Tensor& out,
                                          cudaStream_t stream) {
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
-    launch(q, positions, nullptr, scale, cache, metadata, out, stream);
+    launch<false>(q, positions, nullptr, scale, cache, metadata, &out, {}, nullptr, stream);
 }
 
 void causal_attention_prompt_sm70_launch(const Tensor& q, const Tensor& positions,
@@ -532,8 +598,28 @@ void causal_attention_prompt_sm70_launch(const Tensor& q, const Tensor& position
         .table_rows    = static_cast<const std::int32_t*>(table_rows.data),
         .table_stride  = cache.block_tables.ne[0],
     };
-    launch(q, positions, static_cast<const std::int32_t*>(valid_columns.data), scale, cache,
-           metadata, out, stream);
+    launch<false>(q, positions, static_cast<const std::int32_t*>(valid_columns.data), scale,
+                  cache, metadata, &out, {}, nullptr, stream);
+}
+
+void causal_attention_prompt_partial_launch(const Tensor& q, const Tensor& positions,
+                                            const Tensor& valid_columns, const Tensor& table_rows,
+                                            float scale, PagedKVBatchLayerView cache,
+                                            float* partial_out, cudaStream_t stream) {
+    if (q.ne[3] != 1 || partial_out == nullptr) {
+        throw std::invalid_argument(
+            "causal_attention_prompt_partial: one sequence and a partial output are required");
+    }
+    const PagedKVBatchMetadata<false> metadata{
+        .tables        = static_cast<const std::int32_t*>(cache.block_tables.data),
+        .valid_columns = nullptr,
+        .table_rows    = static_cast<const std::int32_t*>(table_rows.data),
+        .table_stride  = cache.block_tables.ne[0],
+    };
+    const CausalKeyPartition partition{
+        .segment_keys = 0, .page_stride = cache.page_stride, .page_residue = cache.page_residue};
+    launch<true>(q, positions, static_cast<const std::int32_t*>(valid_columns.data), scale, cache,
+                 metadata, nullptr, partition, partial_out, stream);
 }
 
 } // namespace ninfer::ops::detail

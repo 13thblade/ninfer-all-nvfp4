@@ -888,6 +888,24 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     if (active_causal_attention_envelope_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
+    // The text cache's split schedule: fixed key segments under invariant reductions.
+    const auto with_segments = [&](ops::CausalAttentionExecutionEnvelope envelope) {
+        envelope.invariant_segment_keys = batch_text_kv_->attention_segment_keys();
+        return envelope;
+    };
+    const ops::CausalAttentionExecutionEnvelope envelope =
+        with_segments(*active_causal_attention_envelope_);
+    // A position-split rank attends over its own pages into its partial output and keeps its query
+    // heads' gates; attn_merge_output merges and projects once every rank's partial is out.
+    const bool positions = attention_partial_ != nullptr;
+    const auto query_heads = static_cast<std::int32_t>(config.attention->num_attention_heads);
+    const auto partial_of  = [&](std::int32_t column, std::int32_t columns) {
+        return Tensor(attention_partial_ + static_cast<std::size_t>(column) *
+                                               ops::causal_attention_partial_elements(query_heads, 1),
+                      DType::FP32,
+                      {static_cast<std::int32_t>(
+                          ops::causal_attention_partial_elements(query_heads, columns))});
+    };
 
     const auto projection        = workspace::text_attention_projection(work_, config, T);
     const Tensor& input_signs    = projection_signs(p.projection);
@@ -973,20 +991,22 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         // applies it at the store, and every other route applies it inside the Op. One contract
         // either way, and the same bytes the standalone multiply produced. A rotated output
         // projection takes the ungated attention, gated and rotated in one pass below.
+        Tensor partial = positions ? partial_of(0, T) : Tensor{};
         ops::causal_softmax_attention(
             q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
             {dimension(config.attention->head_dim),
              dimension(config.attention->num_attention_heads),
              dimension(config.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx, kv_rank), *active_causal_attention_envelope_,
-            work_, a_batch, s, rotated_output ? nullptr : &gate_batch);
+            batch_text_kv_->batch_layer_view(fidx, kv_rank), envelope, work_, a_batch, s,
+            rotated_output || positions ? nullptr : &gate_batch, positions ? &partial : nullptr);
     } else if (!active_segments_.empty()) {
         // Each segment attends over its own sequence exactly as its prefill alone would.
         for (const SegmentBinding& segment : active_segments_) {
             auto scope           = work_.scope();
             Tensor a_segment     = a.slice(2, segment.column, segment.columns);
             Tensor gate_segment  = gate.slice(2, segment.column, segment.columns);
+            Tensor partial = positions ? partial_of(segment.column, segment.columns) : Tensor{};
             ops::causal_softmax_attention(
                 qn.slice(2, segment.column, segment.columns),
                 kn.slice(2, segment.column, segment.columns),
@@ -997,18 +1017,33 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                  dimension(config.attention->num_key_value_heads)},
                 static_cast<float>(1.0 /
                                    std::sqrt(static_cast<double>(config.attention->head_dim))),
-                batch_text_kv_->batch_layer_view(fidx, kv_rank), segment.envelope, work_, a_segment,
-                s, rotated_output ? nullptr : &gate_segment);
+                batch_text_kv_->batch_layer_view(fidx, kv_rank), with_segments(segment.envelope),
+                work_, a_segment, s, rotated_output || positions ? nullptr : &gate_segment,
+                positions ? &partial : nullptr);
         }
     } else {
+        Tensor partial = positions ? partial_of(0, T) : Tensor{};
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
             {dimension(config.attention->head_dim),
              dimension(config.attention->num_attention_heads),
              dimension(config.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx, kv_rank), *active_causal_attention_envelope_,
-            work_, a, s, rotated_output ? nullptr : &gate);
+            batch_text_kv_->batch_layer_view(fidx, kv_rank), envelope, work_, a, s,
+            rotated_output || positions ? nullptr : &gate, positions ? &partial : nullptr);
+    }
+    if (positions) {
+        // The rank's query heads' gates, contiguous for the merge.
+        const TensorShare& share = stage_runtime_->tensor_parallel->shares[tensor_rank_];
+        const std::size_t row =
+            static_cast<std::size_t>(config.attention->head_dim) * sizeof(__nv_bfloat16);
+        const std::size_t heads = share.query_head_end - share.query_head_begin;
+        CUDA_CHECK(cudaMemcpy2DAsync(attention_gate_->data, heads * row,
+                                     static_cast<const std::byte*>(gate.data) +
+                                         share.query_head_begin * row,
+                                     static_cast<std::size_t>(query_heads) * row, heads * row,
+                                     static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
+        return;
     }
     const bool wide = wide_residual_verification(ph, row_width(T), row_width(T));
     Tensor gated    = a.view({dimension(config.attention->query_width()), T});
@@ -1017,6 +1052,33 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         project_residual(gated, p.output, x, InputBasis::Rotated, wide);
         return;
     }
+    project_residual(gated, p.output, x, InputBasis::Primal, wide);
+}
+
+void TextContext::attn_merge_output(const BlockParameters& w, Tensor& x,
+                                    std::span<const float* const> partials, const Tensor& gate,
+                                    Phase ph) {
+    const auto& p            = std::get<AttentionParameters>(w.mixer);
+    const TextConfig& config = layer_config();
+    const TensorShare& share = stage_runtime_->tensor_parallel->shares[tensor_rank_];
+    const int T              = x.ne[1];
+    const auto heads = static_cast<std::int32_t>(share.query_head_end - share.query_head_begin);
+    const auto head_dim      = dimension(config.attention->head_dim);
+    Tensor a = workspace::matrix(work_, DType::BF16, head_dim * heads, T).view({head_dim, heads, T});
+    Tensor gated = a.view({head_dim * heads, T});
+    const bool wide = wide_residual_verification(ph, row_width(T), row_width(T));
+    if (rotated(p.output.hadamard_signs)) {
+        // As attn_mix: the ungated output, gated and rotated in one pass.
+        ops::causal_attention_merge_partials(
+            partials, static_cast<std::int32_t>(config.attention->num_attention_heads), T,
+            static_cast<std::int32_t>(share.query_head_begin), nullptr, a, ctx_.stream);
+        ops::sigmoid_mul_hadamard(gate, a, p.output.hadamard_signs, gated, ctx_.stream);
+        project_residual(gated, p.output, x, InputBasis::Rotated, wide);
+        return;
+    }
+    ops::causal_attention_merge_partials(
+        partials, static_cast<std::int32_t>(config.attention->num_attention_heads), T,
+        static_cast<std::int32_t>(share.query_head_begin), &gate, a, ctx_.stream);
     project_residual(gated, p.output, x, InputBasis::Primal, wide);
 }
 
@@ -1648,6 +1710,21 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
         }
     }
 
+    // Position-split attention: each rank's query heads' gates, kept from its attention to its
+    // merge, in its own scratch for the whole pass.
+    const bool positions = tp.shares.front().attention_positions;
+    std::vector<Tensor> attention_gates(ranks);
+    if (positions) {
+        const auto head_dim = dimension(config_.attention->head_dim);
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            std::optional<ScopedArenaRank> arena_guard;
+            if (rank != 0) { arena_guard.emplace(work_, rank); }
+            const auto heads = static_cast<std::int32_t>(tp.shares[rank].query_head_end -
+                                                         tp.shares[rank].query_head_begin);
+            attention_gates[rank] = work_.alloc(DType::BF16, {head_dim, heads, x.ne[1]});
+        }
+    }
+
     // Issues `share` for rank `rank` on its device, against its scratch, control and replica.
     const auto on_rank = [&](std::size_t rank, const auto& share) {
         std::optional<ScopedDeviceRank> device_guard;
@@ -1663,8 +1740,10 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
             auto scope = work_.scope();
             share(replicas[rank].x);
         } catch (...) {
-            tensor_rank_      = 0;
-            residual_partial_ = nullptr;
+            tensor_rank_        = 0;
+            residual_partial_   = nullptr;
+            attention_partial_  = nullptr;
+            attention_gate_     = nullptr;
             throw;
         }
         tensor_rank_ = 0;
@@ -1716,7 +1795,8 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
     const bool dense = std::all_of(
         parameters_.text.layers.begin(), parameters_.text.layers.end(),
         [](const BlockParameters& block) { return std::holds_alternative<DenseParameters>(block.ffn); });
-    if (ph == Phase::Prefill && !Tap::enabled && dense && active_segments_.empty() &&
+    // Position-split attention exchanges twice per layer, which pieces do not schedule.
+    if (ph == Phase::Prefill && !Tap::enabled && dense && !positions && active_segments_.empty() &&
         active_sequence_batch_ == 0 && active_causal_attention_envelope_ != nullptr &&
         current[0] != nullptr && current[0]->numel() == T && current[1] != nullptr &&
         current[1]->numel() == T && T >= 2 * kTensorParallelPieceColumns) {
@@ -1841,7 +1921,39 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
             if (layer < layer_ready_.size()) {
                 CUDA_CHECK(cudaStreamWaitEvent(entry_stream, layer_ready_[layer], 0));
             }
-            if (full) {
+            if (full && positions) {
+                // Every rank attends over its own pages into a slot of the exchange and publishes
+                // the partial whole; the next exchange merges each rank's query heads from all of
+                // them and sums the output projections' shares.
+                const std::size_t gather_slot = next_exchange;
+                next_exchange ^= 1U;
+                const std::size_t gather_bytes =
+                    ops::causal_attention_partial_elements(
+                        static_cast<std::int32_t>(config_.attention->num_attention_heads),
+                        x.ne[1]) *
+                    sizeof(float);
+                if (gather_bytes > exchange.slot_bytes()) {
+                    throw std::runtime_error("a position-split attention exceeds its links");
+                }
+                for (std::size_t rank = 0; rank < ranks; ++rank) {
+                    on_rank(rank, [&](Tensor& replica) {
+                        attention_partial_ = exchange.partial(rank, gather_slot);
+                        attention_gate_    = &attention_gates[rank];
+                        attn_mix(block(rank), replica, compact, ph);
+                        attention_partial_ = nullptr;
+                        attention_gate_    = nullptr;
+                        exchange.publish_whole(rank, gather_slot, gather_bytes, ctx_.stream);
+                    });
+                }
+                exchange_step(ranks, [&](std::size_t rank, Tensor& replica) {
+                    std::array<const float*, ops::kCausalAttentionMaximumMergeRanks> parts{};
+                    exchange.gather(rank, gather_slot, std::span<const float*>(parts.data(), ranks),
+                                    ctx_.stream);
+                    attn_merge_output(block(rank), replica,
+                                      std::span<const float* const>(parts.data(), ranks),
+                                      attention_gates[rank], ph);
+                });
+            } else if (full) {
                 run_step(attention_ranks, [&](std::size_t rank, Tensor& replica) {
                     attn_mix(block(rank), replica, compact, ph);
                 });

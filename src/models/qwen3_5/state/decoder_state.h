@@ -32,6 +32,14 @@ struct DecoderStateSpec {
     // rank order (ranks [0, size) each hold a non-empty contiguous run). Empty keeps every head of
     // a layer on its `text_layer_rank` rank.
     std::vector<std::int32_t> text_kv_head_shares;
+    // Position-split attention (--tensor-attention positions): every full-attention layer has
+    // planes on ranks [0, size), each holding every KV head of the physical pages p with
+    // p % size == its rank. Zero (or one) keeps the head shares or layer ranks above.
+    std::uint32_t text_kv_position_ranks = 0;
+    // Invariant attention reductions over the text cache (--invariant-attention): its attention
+    // calls split their keys into fixed segments for the capacity
+    // (ops::causal_attention_invariant_segment_keys).
+    bool invariant_attention = false;
 };
 
 struct PagedKVCacheLayout {
@@ -45,6 +53,10 @@ struct PagedKVCacheLayout {
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
     // Tensor parallelism: each rank's KV heads of every layer; empty when one rank holds a layer.
     std::vector<std::int32_t> head_shares;
+    // Position-split attention: the ranks whose planes divide every layer's pages; 0 otherwise.
+    std::uint32_t position_ranks = 0;
+    // Invariant attention reductions: the keys of one split, 0 for the tuned splits.
+    std::uint32_t attention_segment_keys = 0;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
@@ -110,12 +122,23 @@ public:
         return head_shares_;
     }
 
+    // Position-split attention: the ranks whose planes divide every layer's pages (each rank's
+    // views give its page stride and residue); 0 otherwise.
+    [[nodiscard]] std::uint32_t position_ranks() const noexcept { return position_ranks_; }
+
+    // Invariant attention reductions: the keys of one split every attention call over this cache
+    // takes (CausalAttentionExecutionEnvelope::invariant_segment_keys); 0 for the tuned splits.
+    [[nodiscard]] std::uint32_t attention_segment_keys() const noexcept {
+        return attention_segment_keys_;
+    }
+
 private:
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, const KVExecutionRowHandle* row,
                                               std::size_t rank) const;
-    // The first plane of a rank's heads of a layer, and the rank holding them.
-    [[nodiscard]] std::size_t plane_base(std::uint32_t layer, std::size_t rank) const;
+    // A rank's plane of a layer: `kind` 0 K, 1 V, 2 K scales, 3 V scales.
+    [[nodiscard]] std::size_t plane_index(std::uint32_t layer, std::size_t rank,
+                                          std::size_t kind) const;
 
     DeviceKVPagePool pages_;
     KVExecutionTablePool execution_tables_;
@@ -125,6 +148,8 @@ private:
     std::int32_t head_dim_     = 0;
     KvCacheStorage storage_    = KvCacheStorage::BFloat16;
     std::vector<std::int32_t> head_shares_;
+    std::uint32_t position_ranks_         = 0;
+    std::uint32_t attention_segment_keys_ = 0;
 };
 
 struct DecoderStateLayout {

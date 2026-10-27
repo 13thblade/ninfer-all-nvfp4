@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace ninfer {
@@ -61,6 +62,12 @@ namespace ninfer {
 // not run together.
 enum class TensorParallelTransport { Peer, StagedHost };
 
+// What a reduce does with the sum of the partials: adds it to a BF16 residual and rounds once (the
+// residual stream of a Qwen3.5-core model), or stores it in place of the output, rounded to BF16 or
+// kept in FP32 (a block output that the caller then adds itself, as Qwen3.8-Flash-Next's
+// hyper-connections do).
+enum class TensorParallelSum : std::uint8_t { AddBf16, StoreBf16, StoreFp32 };
+
 struct TensorParallelExchangeOptions {
     // Largest partial one slot holds.
     std::size_t slot_bytes = 0;
@@ -99,9 +106,20 @@ public:
     void publish(std::size_t rank, std::size_t slot, std::size_t bytes, cudaStream_t stream,
                  std::size_t offset = 0);
     // Adds the partials ranks [0, contributors) published in `slot`, from `offset` values in, to
-    // `rank`'s BF16 residual of `count` values.
-    void reduce(std::size_t rank, std::size_t slot, __nv_bfloat16* residual, std::int64_t count,
-                std::size_t contributors, cudaStream_t stream, std::size_t offset = 0);
+    // `rank`'s BF16 residual of `count` values, or stores their sum there (`sum`).
+    void reduce(std::size_t rank, std::size_t slot, void* out, std::int64_t count,
+                std::size_t contributors, cudaStream_t stream, std::size_t offset = 0,
+                TensorParallelSum sum = TensorParallelSum::AddBf16);
+    // A gather in place of the sum (a position-split attention's partials, merged by
+    // ops::causal_attention_merge_partials): `publish_whole` makes `rank`'s partial of `bytes` in
+    // `slot` readable by the others, never as low-latency words; `gather` points `parts[r]` at
+    // every rank's partial in `slot` as `rank`'s kernels on `stream` read it (its own device slot,
+    // another's device slot under Peer or its mapped host slot under StagedHost), after `stream`
+    // waits for the other ranks' publishes. It takes its place in the slot alternation as an
+    // exchange does: a rank's next exchange in the slot follows its own reads of it.
+    void publish_whole(std::size_t rank, std::size_t slot, std::size_t bytes, cudaStream_t stream);
+    void gather(std::size_t rank, std::size_t slot, std::span<const float*> parts,
+                cudaStream_t stream);
     // A piece's exchange stream and fences on `rank` (see above).
     [[nodiscard]] cudaStream_t side_stream(std::size_t rank) const;
     [[nodiscard]] cudaEvent_t piece_ready(std::size_t rank, std::size_t piece) const;
@@ -144,18 +162,21 @@ private:
 
 namespace detail {
 
-// One rank's reduction: residual[i] <- bf16(float(residual[i]) + ((part[0][i] + part[1][i]) + ...)).
-void tensor_parallel_reduce(__nv_bfloat16* residual, const float* const* parts, std::size_t count,
-                            std::int64_t values, cudaStream_t stream);
+// One rank's reduction: out[i] <- bf16(float(out[i]) + ((part[0][i] + part[1][i]) + ...)), or the
+// sum stored as BF16 or FP32 (`sum`).
+void tensor_parallel_reduce(void* out, const float* const* parts, std::size_t count,
+                            std::int64_t values, cudaStream_t stream,
+                            TensorParallelSum sum = TensorParallelSum::AddBf16);
 
 // One rank's low-latency exchange (see TensorParallelExchange): stores `mine` (a contributor's
 // partial) as words of the next epoch into `row`, waits for the words of every other rank's row,
-// and adds the contributors' values to the residual in rank order. `rows[r]` is rank r's row of
-// `capacity` words per slot; `epoch` is the rank's counter pair.
-void tensor_parallel_low_latency(__nv_bfloat16* residual, const float* mine,
+// and adds the contributors' values in rank order, to the residual or into `out` as `sum` says.
+// `rows[r]` is rank r's row of `capacity` words per slot; `epoch` is the rank's counter pair.
+void tensor_parallel_low_latency(void* out, const float* mine,
                                  const unsigned long long* const* rows, std::size_t ranks,
                                  std::size_t rank, std::size_t contributors, std::int64_t values,
-                                 std::size_t capacity, std::uint32_t* epoch, cudaStream_t stream);
+                                 std::size_t capacity, std::uint32_t* epoch, cudaStream_t stream,
+                                 TensorParallelSum sum = TensorParallelSum::AddBf16);
 
 } // namespace detail
 

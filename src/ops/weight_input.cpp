@@ -196,7 +196,11 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     const bool attention_share = attention && !dense && !moe && q.size() == 2 && k.size() == 2 &&
                                  third == q && fourth == k && k[1] == q[1] && k[0] > 0 &&
                                  k[0] % 256 == 0 && q[0] % k[0] == 0;
-    const bool share = dense_share || attention_share;
+    // A position-split rank's pieces of every head: four device objects, of which neither pair
+    // joins as a stored attention projection's parents do.
+    const bool whole_pieces = attention && (dense || moe) && !joins(inputs.first<2>()) &&
+                              !joins(inputs.last<2>());
+    const bool share = dense_share || attention_share || whole_pieces;
     require(dense || moe || share, "input projection: unsupported logical projection geometry");
     if (std::any_of(inputs.begin(), inputs.end(), gguf_parent) || share) {
         require(dense || share, "input projection: GGUF parts need the dense geometry");

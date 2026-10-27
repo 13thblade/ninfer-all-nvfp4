@@ -95,6 +95,8 @@ __launch_bounds__(256) __global__
     const std::int32_t* block_table = metadata.block_table();
     int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
     physical_page                   = __shfl_sync(FullMask, physical_page, 0);
+    physical_page = metadata.local_page(physical_page);
+    if (physical_page < 0) return; // another rank's page (a position-split cache)
     kv_cache_append_full_k8v4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token,
                                             kv_head, physical_page, position & kPagedKVPageMask,
                                             lane, scratch[warp]);
@@ -124,6 +126,8 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_k8v4_page_kernel(
     const std::int32_t* block_table = metadata.block_table();
     int physical_page  = lane == 0 ? block_table[tile_position >> kPagedKVPageShift] : 0;
     physical_page      = __shfl_sync(FullMask, physical_page, 0);
+    physical_page = metadata.local_page(physical_page);
+    if (physical_page < 0) return; // another rank's page (a position-split cache)
     const int position = base_position + token;
     kv_cache_append_full_k8v4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token,
                                             kv_head, physical_page, position & kPagedKVPageMask,

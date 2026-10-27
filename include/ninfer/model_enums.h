@@ -70,6 +70,17 @@ enum class ExpertResidency : std::uint8_t {
     Disk,
 };
 
+// Qwen3.5-core tensor parallelism: how the devices divide a full-attention layer.
+enum class TensorAttention : std::uint8_t {
+    // Each device holds a run of the KV heads with their cache and query heads; devices past the
+    // KV-head count hold no attention.
+    Heads,
+    // Each device holds every KV head of every page p with p % devices == its index, projects every
+    // head, attends over its own keys, and merges its query heads' partial outputs with the
+    // others' before its share of the output projection.
+    Positions,
+};
+
 // Qwen3.8-Flash-Next: where the n-gram table's rows come from.
 enum class NgramResidency : std::uint8_t {
     // The table's file, with a bounded cache of rows read as the hash addresses them.

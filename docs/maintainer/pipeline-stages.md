@@ -260,8 +260,9 @@ families](#expert-parallelism-of-the-other-moe-families)).
   the query heads that read them (their query, gate, key and value projection rows and the matching
   input columns of the output projection, the per-dimension query and key norms whole) and those
   heads' planes of every layer's KV cache. The ranks holding KV heads are a prefix of the ranks;
-  with more ranks than the heads allow, the last ones hold no attention. The embedding, the final
-  norm, the head and MTP stay on rank 0. `TensorShare` and `tensor_parallel_share`
+  with more ranks than the heads allow, the others hold no attention, unless `--tensor-attention
+  positions` divides it by cache pages ([attention by positions](#attention-by-positions)). The
+  embedding, the final norm, the head and MTP stay on rank 0. `TensorShare` and `tensor_parallel_share`
   (`models/qwen3_5/config.h`) state a rank's ranges and geometry.
 - **Expert parallelism.** In a MoE model a rank holds a contiguous range of the routed experts in
   place of FFN rows: one device selection of each expert bank, its experts side by side as the bank
@@ -330,7 +331,7 @@ families](#expert-parallelism-of-the-other-moe-families)).
   only before that piece's next exchange. A piece attends over the keys up to its own last
   position, and a later piece continues the Gated DeltaNet state the earlier one wrote, so the
   result is that of shorter chunks. Decode, verification, segments, sequence batches, masked
-  drafter taps and 3-axis rotations keep one exchange per step. A MoE layer serves each piece's
+  drafter taps, 3-axis rotations and attention by positions keep one exchange per step. A MoE layer serves each piece's
   tokens separately and a piece of a long prompt routes to nearly every expert, so pieces would read
   most expert weights once per piece: Qwen3.6-35B-A3B prefilled a 7,000-token prompt at 5,300 tok/s
   in four pieces against 6,700 in one on two RTX 3090s, and MoE models keep one exchange per step.
@@ -433,6 +434,43 @@ repeats, not with one device's.
   (+0.09%). The pair gave one card's answer on none of five prompts for the 27B, one for the 35B-A3B
   and three for Bonsai; the others part after 17 to 504 characters, as one card's own MTP answers
   part from its plain ones.
+
+### Attention by positions
+
+`--tensor-attention positions` divides each attention layer's KV cache by page instead of by KV
+head, so every rank attends, also where the ranks outnumber the KV heads (eight ranks over four KV
+heads). Up to eight ranks (`kCausalAttentionMaximumMergeRanks`). It is a choice, not the default:
+on the hosts measured below it is slower than dividing by heads.
+
+- **The shares.** Every rank holds the query, gate, key and value projections whole with their
+  norms, and a run of query heads of the output projection's input columns
+  (`TensorShare::query_head_begin`, `query_head_end`), placed by the same weights at the ends every
+  layer's output projection allows. Its KV planes hold every KV head of the physical pages `p` with
+  `p % R == r`, at local page `p / R` (`KVPlaneGeometry::page_stride`, `page_residue`); every rank
+  has the same block tables. Each rank's planes are 1/R of the pool, as by heads.
+- **The step.** Each rank projects, normalizes and rotates every head of the call's tokens, and
+  appends the tokens whose pages it holds (the append metadata's `local_page` is -1 for the
+  others). Attention runs over the rank's own pages and writes, per column and query head, the
+  normalized FP32 output and its log-sum-exp, `-inf` where the rank holds none of the column's keys:
+  257 floats per head and column (`causal_attention_partial_elements`). Decode, verification and a
+  short prefill take the small-T routes, where a split over another rank's pages is empty. A prompt
+  chunk of one sequence takes the m8n8k4 prompt kernel written for sm_70 (`prompt_sm70.cu`; the
+  route emits m8n8k4 on every architecture), which skips the 32-key tiles the rank does not hold.
+- **The merge.** The partial goes into the mixer exchange's slot
+  (`TensorParallelExchange::publish_whole`). The exchange's next step gathers every rank's partial
+  (`gather`) and merges the rank's run of query heads (`causal_attention_merge_partials`: weights
+  `exp(lse - max)`, sums in rank order, the gate applied after a BF16 rounding as on one device);
+  the rank then runs its share of the output projection as an FP32 partial, which reduces as by
+  heads. A layer's attention thus crosses the bus twice per step, by heads once, and every rank
+  projects every head. Prompt pieces are off.
+- **Page copies.** A copy between two pages that different ranks hold (a forked prefix's
+  copy-on-write) is a peer copy on the source rank's stream (`DeviceKVPagePool`). The host KV tier
+  keeps one record per page, whichever rank holds it.
+- **Numerics.** The merge rescales each rank's FP32 output by its log-sum-exp, where one device
+  runs one online softmax over every key: the same mathematics, rounded differently. The op tests
+  (`--position-split-only`) merge two and three ranks over every storage at decode, verification,
+  short-prefill and prompt widths, a rank without keys included, against the FP64 oracle, and check
+  that a merge of a run of query heads is those heads of the whole merge, byte for byte.
 
 ### Expert parallelism of the other MoE families
 

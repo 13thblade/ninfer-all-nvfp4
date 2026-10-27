@@ -39,6 +39,8 @@ struct CausalSmallTBf16Split {
     int load_end;
     int first_tile;
     int key_blocks;
+    // The split's partition: a strided one sweeps only the rank's pages (causal_small_t_own_pages).
+    CausalKeyPartition partition;
 };
 
 // Runs `sweep` on the split this CTA covers, or writes the split's neutral partials when it has no
@@ -54,7 +56,8 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
     __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
-    float* partial_acc, float* partial_m, float* partial_l, Sweep&& sweep) {
+    float* partial_acc, float* partial_m, float* partial_l, CausalKeyPartition partition,
+    Sweep&& sweep) {
     constexpr int D             = kCausalHeadDim;
     constexpr unsigned FullMask = 0xffffffffu;
 
@@ -133,17 +136,25 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
 
     const int live_end = last_pos + 1;
     const int window   = causal_small_t_tile_window(first_pos, tokens, logical_capacity);
-    const int active_split_count =
-        causal_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
+    const int active_split_count = causal_small_t_partition_active(
+        partition, window, causal_small_t_active_splits<Geometry, false>(window, split_count, TokenTile),
+        split_count);
     if (split >= active_split_count) { return; }
 
-    const int logical_tiles = div_up(window, Bc);
-    const bool tile_split   = logical_tiles >= active_split_count;
-    const int units_per_split =
-        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
-    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
-    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    const int split_end   = (split_limit < window) ? split_limit : window;
+    int split_start = 0;
+    int split_end   = 0;
+    if (partition.segmented() || partition.strided()) {
+        causal_small_t_partition_range(partition, window, split, active_split_count, split_start,
+                                       split_end);
+    } else {
+        const int logical_tiles = div_up(window, Bc);
+        const bool tile_split   = logical_tiles >= active_split_count;
+        const int units_per_split = tile_split ? div_up(logical_tiles, active_split_count)
+                                               : div_up(window, active_split_count);
+        split_start           = split * units_per_split * (tile_split ? Bc : 1);
+        const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
+        split_end             = (split_limit < window) ? split_limit : window;
+    }
     if (split_start >= split_end) {
         write_neutral();
         return;
@@ -161,6 +172,11 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
                 const int lane             = tid & 31;
                 int physical_page = lane == 0 ? paged_kv_physical_page(block_table, p_tok) : 0;
                 physical_page     = __shfl_sync(FullMask, physical_page, 0);
+                if (partition.strided()) {
+                    // Another rank's planes hold this row.
+                    physical_page = causal_strided_page(physical_page, partition);
+                    if (physical_page < 0) { continue; }
+                }
                 const std::int64_t cache_off = causal_cache_index(
                     physical_page, kv_head, d, p_tok & kPagedKVPageMask, kv_heads);
                 store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
@@ -174,7 +190,7 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
                                             partial_l, kv_head, split, tokens, row_count,
                                             valid_tokens, first_pos, split_start, split_end,
                                             split_end < live_end ? split_end : live_end, first_tile,
-                                            div_up(split_end - first_tile, Bc)});
+                                            div_up(split_end - first_tile, Bc), partition});
 }
 
 // The split-local partials of the warp's rows: each row's running max and sum (by the quad's
@@ -233,7 +249,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    float* partial_acc, float* partial_m, float* partial_l) {
+    float* partial_acc, float* partial_m, float* partial_l, CausalKeyPartition partition) {
     if constexpr (!shape_set_in_image(false)) { return; } // not this image's set
     // A Volta card runs its own kernel (small_t_sm70.cuh): a build of several architectures
     // compiles this kernel empty in the Volta image.
@@ -274,7 +290,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     causal_small_t_bf16_split<Geometry, TokenTile, Br, Bc, Threads, MultiBatch, Masked>(
         q, input, pos, cache_k, cache_v, block_tables, valid_columns, table_rows, table_stride,
         tokens, full_width, column_begin, logical_capacity, partial_acc, partial_m, partial_l,
-        [&](const CausalSmallTBf16Split<CacheInput>& sp) {
+        partition, [&](const CausalSmallTBf16Split<CacheInput>& sp) {
             const int kv_head               = sp.kv_head;
             const int row_count             = sp.row_count;
             const int valid_tokens          = sp.valid_tokens;
@@ -283,7 +299,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
             const int split_end             = sp.split_end;
             const int load_end              = sp.load_end;
             const int first_tile            = sp.first_tile;
-            const int key_blocks            = sp.key_blocks;
+            int key_blocks                  = sp.key_blocks;
             q                               = sp.q;
             pos                             = sp.pos;
             input                           = sp.input;
@@ -300,6 +316,12 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                 return staged_pages ? physical_pages_s[(key >> kPagedKVPageShift) - first_page]
                                     : block_table[key >> kPagedKVPageShift];
             };
+            // A strided split's splits cover whole staged pages; it sweeps the rank's own.
+            const bool strided = sp.partition.strided();
+            if (strided) {
+                key_blocks =
+                    causal_small_t_own_pages<Bc>(physical_pages_s, page_count, split_end, sp.partition);
+            }
 
             for (int idx = tid; idx < Br * D; idx += Threads) {
                 const int row = idx / D;
@@ -337,7 +359,8 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                             smem_addr(&qkv_s[arow * D + causal_small_t_tc_swz(arow, acol)]));
             }
             __syncthreads();
-            int physical_page = page_at(first_tile);
+            int physical_page = strided ? causal_small_t_owned_tile_page<Bc>(physical_pages_s, 0)
+                                        : page_at(first_tile);
             float acc[PVNt][4];
 #    pragma unroll
             for (int n = 0; n < PVNt; ++n) {
@@ -347,8 +370,14 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
             float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
 
             for (int kb = 0; kb < key_blocks; ++kb) {
-                const int k0 = first_tile + kb * Bc;
-                if (kb != 0 && (k0 & kPagedKVPageMask) == 0) { physical_page = page_at(k0); }
+                const int k0 = strided ? causal_small_t_owned_tile_key<Bc>(physical_pages_s,
+                                                                            first_tile, kb)
+                                       : first_tile + kb * Bc;
+                if (strided) {
+                    physical_page = causal_small_t_owned_tile_page<Bc>(physical_pages_s, kb);
+                } else if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
+                    physical_page = page_at(k0);
+                }
             // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
             // Current-step tokens come from k_new/v_new; tail slots are zeroed.
 #    pragma unroll 1

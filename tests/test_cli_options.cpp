@@ -565,6 +565,24 @@ int run_tests() {
                           }),
                           "a malformed or misplaced --tensor-split was accepted");
     }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1",
+                             "--tensor-parallel", "--tensor-attention", "positions"})
+                              .tensor_attention == ninfer::TensorAttention::Positions,
+                      "--tensor-attention did not reach the options");
+    failures += check(rejects([&] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--tensor-attention", "positions"});
+                      }),
+                      "--tensor-attention positions without --tensor-parallel was accepted");
+    failures += check(rejects([&] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices",
+                                       "0,1", "--tensor-parallel", "--tensor-attention", "rows"});
+                      }),
+                      "an unknown --tensor-attention mode was accepted");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                             "--invariant-attention"})
+                          .invariant_attention,
+                      "--invariant-attention did not reach the options");
     failures += check(parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
                              "--draft-tokens", "3", "--mtp-attention-window", "2048"})
                               .speculative.mtp_attention_window == 2048,
