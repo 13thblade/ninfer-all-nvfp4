@@ -305,6 +305,18 @@ families](#expert-parallelism-of-the-other-moe-families)).
   every rank then adds all partials to its replica in rank order and rounds once to BF16, so the
   replicas stay identical. Peer reads where every pair of cards has peer access, mapped pinned host
   memory otherwise; both capture into the decode graphs.
+- **Prompt pieces.** Where every FFN is dense, a text prompt chunk of 512 columns or more (one
+  sequence, 1-D positions) runs each layer in up to four pieces of whole 64-column blocks, at least
+  256 columns each. A
+  piece writes its own columns of the exchange slot; each rank publishes and reduces the piece on
+  its side stream while its compute stream runs the next piece, and waits for the piece's reduce
+  only before that piece's next exchange. A piece attends over the keys up to its own last
+  position, and a later piece continues the Gated DeltaNet state the earlier one wrote, so the
+  result is that of shorter chunks. Decode, verification, segments, sequence batches, masked
+  drafter taps and 3-axis rotations keep one exchange per step. A MoE layer serves each piece's
+  tokens separately and a piece of a long prompt routes to nearly every expert, so pieces would read
+  most expert weights once per piece: Qwen3.6-35B-A3B prefilled a 7,000-token prompt at 5,300 tok/s
+  in four pieces against 6,700 in one on two RTX 3090s, and MoE models keep one exchange per step.
 - **Numerics.** Against one device the only difference is the order of the FP32 additions of a
   projection's output: the shares' partial sums are added, then rounded once, where one device
   rounds the full sum. Logits are close, not identical, so greedy text can diverge where two tokens

@@ -175,6 +175,13 @@ TensorParallelExchange::TensorParallelExchange(const DeviceContext& context,
                 check(cudaEventCreateWithFlags(&rank.published[slot], cudaEventDisableTiming),
                       "cudaEventCreate");
             }
+            check(cudaStreamCreateWithFlags(&rank.side, cudaStreamNonBlocking), "side stream");
+            for (std::size_t piece = 0; piece < kPieces; ++piece) {
+                check(cudaEventCreateWithFlags(&rank.ready[piece], cudaEventDisableTiming),
+                      "cudaEventCreate");
+                check(cudaEventCreateWithFlags(&rank.done[piece], cudaEventDisableTiming),
+                      "cudaEventCreate");
+            }
         }
     } catch (...) {
         release();
@@ -195,18 +202,44 @@ void TensorParallelExchange::release() noexcept {
             rank.device_slot[slot] = nullptr;
             rank.host_slot[slot]   = nullptr;
         }
+        for (std::size_t piece = 0; piece < kPieces; ++piece) {
+            if (rank.ready[piece] != nullptr) { (void)cudaEventDestroy(rank.ready[piece]); }
+            if (rank.done[piece] != nullptr) { (void)cudaEventDestroy(rank.done[piece]); }
+        }
+        if (rank.side != nullptr) { (void)cudaStreamDestroy(rank.side); }
     }
     ranks_.clear();
 }
 
-void TensorParallelExchange::check_slot(std::size_t rank, std::size_t slot,
-                                        std::size_t bytes) const {
+void TensorParallelExchange::check_slot(std::size_t rank, std::size_t slot, std::size_t bytes,
+                                        std::size_t offset_bytes) const {
     if (rank >= ranks_.size() || slot >= kSlots) {
         throw std::out_of_range("tensor-parallel rank or slot is out of range");
     }
-    if (bytes > slot_bytes_) {
+    if (offset_bytes > slot_bytes_ || bytes > slot_bytes_ - offset_bytes) {
         throw std::invalid_argument("tensor-parallel partial exceeds its slot");
     }
+}
+
+void TensorParallelExchange::check_piece(std::size_t rank, std::size_t piece) const {
+    if (rank >= ranks_.size() || piece >= kPieces) {
+        throw std::out_of_range("tensor-parallel rank or piece is out of range");
+    }
+}
+
+cudaStream_t TensorParallelExchange::side_stream(std::size_t rank) const {
+    check_piece(rank, 0);
+    return ranks_[rank].side;
+}
+
+cudaEvent_t TensorParallelExchange::piece_ready(std::size_t rank, std::size_t piece) const {
+    check_piece(rank, piece);
+    return ranks_[rank].ready[piece];
+}
+
+cudaEvent_t TensorParallelExchange::piece_done(std::size_t rank, std::size_t piece) const {
+    check_piece(rank, piece);
+    return ranks_[rank].done[piece];
 }
 
 float* TensorParallelExchange::partial(std::size_t rank, std::size_t slot) const {
@@ -215,13 +248,13 @@ float* TensorParallelExchange::partial(std::size_t rank, std::size_t slot) const
 }
 
 void TensorParallelExchange::publish(std::size_t rank, std::size_t slot, std::size_t bytes,
-                                     cudaStream_t stream) {
-    check_slot(rank, slot, bytes);
+                                     cudaStream_t stream, std::size_t offset) {
+    check_slot(rank, slot, bytes, offset * sizeof(float));
     Rank& self = ranks_[rank];
     DeviceBinding bind(self.device);
     if (transport_ == TensorParallelTransport::StagedHost && bytes != 0) {
-        check(cudaMemcpyAsync(self.host_slot[slot], self.device_slot[slot], bytes,
-                              cudaMemcpyDeviceToHost, stream),
+        check(cudaMemcpyAsync(self.host_slot[slot] + offset, self.device_slot[slot] + offset,
+                              bytes, cudaMemcpyDeviceToHost, stream),
               "publish copy");
     }
     check(cudaEventRecord(self.published[slot], stream), "publish fence");
@@ -229,8 +262,9 @@ void TensorParallelExchange::publish(std::size_t rank, std::size_t slot, std::si
 
 void TensorParallelExchange::reduce(std::size_t rank, std::size_t slot, __nv_bfloat16* residual,
                                     std::int64_t count, std::size_t contributors,
-                                    cudaStream_t stream) {
-    check_slot(rank, slot, static_cast<std::size_t>(count) * sizeof(float));
+                                    cudaStream_t stream, std::size_t offset) {
+    check_slot(rank, slot, static_cast<std::size_t>(count) * sizeof(float),
+               offset * sizeof(float));
     if (contributors == 0 || contributors > ranks_.size()) {
         throw std::invalid_argument("tensor-parallel reduce needs one to all ranks as contributors");
     }
@@ -238,12 +272,13 @@ void TensorParallelExchange::reduce(std::size_t rank, std::size_t slot, __nv_bfl
     DeviceBinding bind(ranks_[rank].device);
     for (std::size_t r = 0; r < ranks_.size(); ++r) {
         if (r == rank) {
-            parts[r] = ranks_[r].device_slot[slot];
+            parts[r] = ranks_[r].device_slot[slot] + offset;
             continue;
         }
         check(cudaStreamWaitEvent(stream, ranks_[r].published[slot], 0), "reduce wait");
-        parts[r] = transport_ == TensorParallelTransport::Peer ? ranks_[r].device_slot[slot]
-                                                               : ranks_[r].host_slot[slot];
+        parts[r] = (transport_ == TensorParallelTransport::Peer ? ranks_[r].device_slot[slot]
+                                                                : ranks_[r].host_slot[slot]) +
+                   offset;
     }
     detail::tensor_parallel_reduce(residual, parts.data(), contributors, count, stream);
 }

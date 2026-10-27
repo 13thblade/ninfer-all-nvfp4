@@ -33,6 +33,13 @@ namespace ninfer {
 // Records and waits pair within one exchange, so the protocol is legal eagerly and inside one
 // capture that spans every rank's stream.
 //
+// A pass may cut its columns into pieces (up to kPieces) and exchange each piece on the rank's
+// side stream while its compute stream runs the next piece: a piece writes, publishes and reduces
+// its own region of the slot (`offset`), the side stream waits `piece_ready` before publishing and
+// records `piece_done` after reducing, and the compute stream waits `piece_done` before the piece's
+// next use of its residual. Publishes and reduces of one piece are issued for every rank before the
+// next piece's, so each reduce waits for the publish of its own piece.
+//
 // Transports, chosen once from the topology:
 //   Peer        every pair of ranks has peer access or shares a device: a reduce reads the other
 //               ranks' device slots directly.
@@ -49,7 +56,8 @@ struct TensorParallelExchangeOptions {
 
 class TensorParallelExchange {
 public:
-    static constexpr std::size_t kSlots = 2;
+    static constexpr std::size_t kSlots  = 2;
+    static constexpr std::size_t kPieces = 4;
 
     TensorParallelExchange(const DeviceContext& context, TensorParallelExchangeOptions options);
     ~TensorParallelExchange();
@@ -65,12 +73,18 @@ public:
 
     // Where `rank` writes its FP32 partial for an exchange in `slot`: device memory of that rank.
     [[nodiscard]] float* partial(std::size_t rank, std::size_t slot) const;
-    // Makes `rank`'s partial of `bytes` in `slot` readable by the other ranks.
-    void publish(std::size_t rank, std::size_t slot, std::size_t bytes, cudaStream_t stream);
-    // Adds the partials ranks [0, contributors) published in `slot` to `rank`'s BF16 residual of
-    // `count` values.
+    // Makes `rank`'s partial of `bytes` in `slot`, from `offset` values in, readable by the other
+    // ranks.
+    void publish(std::size_t rank, std::size_t slot, std::size_t bytes, cudaStream_t stream,
+                 std::size_t offset = 0);
+    // Adds the partials ranks [0, contributors) published in `slot`, from `offset` values in, to
+    // `rank`'s BF16 residual of `count` values.
     void reduce(std::size_t rank, std::size_t slot, __nv_bfloat16* residual, std::int64_t count,
-                std::size_t contributors, cudaStream_t stream);
+                std::size_t contributors, cudaStream_t stream, std::size_t offset = 0);
+    // A piece's exchange stream and fences on `rank` (see above).
+    [[nodiscard]] cudaStream_t side_stream(std::size_t rank) const;
+    [[nodiscard]] cudaEvent_t piece_ready(std::size_t rank, std::size_t piece) const;
+    [[nodiscard]] cudaEvent_t piece_done(std::size_t rank, std::size_t piece) const;
 
 private:
     struct Rank {
@@ -78,10 +92,15 @@ private:
         std::array<float*, kSlots> device_slot{};
         std::array<float*, kSlots> host_slot{};
         std::array<cudaEvent_t, kSlots> published{};
+        cudaStream_t side = nullptr;
+        std::array<cudaEvent_t, kPieces> ready{};
+        std::array<cudaEvent_t, kPieces> done{};
     };
 
     void release() noexcept;
-    void check_slot(std::size_t rank, std::size_t slot, std::size_t bytes) const;
+    void check_slot(std::size_t rank, std::size_t slot, std::size_t bytes,
+                    std::size_t offset_bytes = 0) const;
+    void check_piece(std::size_t rank, std::size_t piece) const;
 
     std::vector<Rank> ranks_;
     TensorParallelTransport transport_ = TensorParallelTransport::StagedHost;
