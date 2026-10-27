@@ -190,7 +190,7 @@ int run_case(const Case& c, std::mt19937& rng) {
             exchange.publish(r, 0, bytes, ctx.rank(r).stream);
         }
         for (std::size_t r = 0; r < c.ranks; ++r) {
-            exchange.reduce(r, 0, replica[r], c.values, c.ranks, ctx.rank(r).stream, 0,
+            exchange.reduce(r, 0, replica[r], c.values, c.ranks, ctx.rank(r).stream,
                             ninfer::TensorParallelSum::StoreBf16);
         }
         ctx.synchronize();
@@ -209,7 +209,7 @@ int run_case(const Case& c, std::mt19937& rng) {
             exchange.publish(r, 1, bytes, ctx.rank(r).stream);
         }
         for (std::size_t r = 0; r < c.ranks; ++r) {
-            exchange.reduce(r, 1, sums[r], c.values, c.ranks, ctx.rank(r).stream, 0,
+            exchange.reduce(r, 1, sums[r], c.values, c.ranks, ctx.rank(r).stream,
                             ninfer::TensorParallelSum::StoreFp32);
         }
         ctx.synchronize();

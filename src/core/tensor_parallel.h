@@ -34,13 +34,6 @@ namespace ninfer {
 // Records and waits pair within one exchange, so the protocol is legal eagerly and inside one
 // capture that spans every rank's stream.
 //
-// A pass may cut its columns into pieces (up to kPieces) and exchange each piece on the rank's
-// side stream while its compute stream runs the next piece: a piece writes, publishes and reduces
-// its own region of the slot (`offset`), the side stream waits `piece_ready` before publishing and
-// records `piece_done` after reducing, and the compute stream waits `piece_done` before the piece's
-// next use of its residual. Publishes and reduces of one piece are issued for every rank before the
-// next piece's, so each reduce waits for the publish of its own piece.
-//
 // Transports, chosen once from the topology:
 //   Peer        every pair of ranks has peer access or shares a device: a reduce reads the other
 //               ranks' device slots directly.
@@ -48,7 +41,7 @@ namespace ninfer {
 //               other ranks' host slots across the bus. Works between any two cards.
 //
 // Low-latency words. Under StagedHost with every rank on its own card, an exchange of at most
-// `low_latency_bytes` per partial at offset 0 (a decode or verification step) skips the copy and
+// `low_latency_bytes` per partial (a decode or verification step) skips the copy and
 // the cross-device fences: the reduce is one kernel that stores each FP32 value of the rank's
 // partial with the exchange's 32-bit epoch as one 8-byte word into the rank's own mapped host row,
 // then polls the other ranks' rows until their words carry the same epoch, and adds in rank order
@@ -79,8 +72,7 @@ struct TensorParallelExchangeOptions {
 
 class TensorParallelExchange {
 public:
-    static constexpr std::size_t kSlots  = 2;
-    static constexpr std::size_t kPieces = 4;
+    static constexpr std::size_t kSlots = 2;
     static constexpr unsigned long long kLowLatencyTimeoutNs = 300'000'000'000ULL;
 
     TensorParallelExchange(const DeviceContext& context, TensorParallelExchangeOptions options);
@@ -94,21 +86,19 @@ public:
     [[nodiscard]] std::size_t ranks() const noexcept { return ranks_.size(); }
     [[nodiscard]] TensorParallelTransport transport() const noexcept { return transport_; }
     [[nodiscard]] std::size_t slot_bytes() const noexcept { return slot_bytes_; }
-    // Whether an exchange of `bytes` per partial at offset 0 travels as low-latency words.
+    // Whether an exchange of `bytes` per partial travels as low-latency words.
     [[nodiscard]] bool low_latency(std::size_t bytes) const noexcept {
         return bytes != 0 && bytes <= low_latency_bytes_;
     }
 
     // Where `rank` writes its FP32 partial for an exchange in `slot`: device memory of that rank.
     [[nodiscard]] float* partial(std::size_t rank, std::size_t slot) const;
-    // Makes `rank`'s partial of `bytes` in `slot`, from `offset` values in, readable by the other
-    // ranks.
-    void publish(std::size_t rank, std::size_t slot, std::size_t bytes, cudaStream_t stream,
-                 std::size_t offset = 0);
-    // Adds the partials ranks [0, contributors) published in `slot`, from `offset` values in, to
-    // `rank`'s BF16 residual of `count` values, or stores their sum there (`sum`).
+    // Makes `rank`'s partial of `bytes` in `slot` readable by the other ranks.
+    void publish(std::size_t rank, std::size_t slot, std::size_t bytes, cudaStream_t stream);
+    // Adds the partials ranks [0, contributors) published in `slot` to `rank`'s BF16 residual of
+    // `count` values, or stores their sum there (`sum`).
     void reduce(std::size_t rank, std::size_t slot, void* out, std::int64_t count,
-                std::size_t contributors, cudaStream_t stream, std::size_t offset = 0,
+                std::size_t contributors, cudaStream_t stream,
                 TensorParallelSum sum = TensorParallelSum::AddBf16);
     // A gather in place of the sum (a position-split attention's partials, merged by
     // ops::causal_attention_merge_partials): `publish_whole` makes `rank`'s partial of `bytes` in
@@ -120,10 +110,6 @@ public:
     void publish_whole(std::size_t rank, std::size_t slot, std::size_t bytes, cudaStream_t stream);
     void gather(std::size_t rank, std::size_t slot, std::span<const float*> parts,
                 cudaStream_t stream);
-    // A piece's exchange stream and fences on `rank` (see above).
-    [[nodiscard]] cudaStream_t side_stream(std::size_t rank) const;
-    [[nodiscard]] cudaEvent_t piece_ready(std::size_t rank, std::size_t piece) const;
-    [[nodiscard]] cudaEvent_t piece_done(std::size_t rank, std::size_t piece) const;
 
 private:
     struct Rank {
@@ -131,9 +117,6 @@ private:
         std::array<float*, kSlots> device_slot{};
         std::array<float*, kSlots> host_slot{};
         std::array<cudaEvent_t, kSlots> published{};
-        cudaStream_t side = nullptr;
-        std::array<cudaEvent_t, kPieces> ready{};
-        std::array<cudaEvent_t, kPieces> done{};
         // Low-latency words: the rank's mapped host row, [kSlots][low_latency_bytes / 4], and its
         // {exchanges counted, blocks finished} in device memory.
         unsigned long long* words = nullptr;
@@ -141,9 +124,7 @@ private:
     };
 
     void release() noexcept;
-    void check_slot(std::size_t rank, std::size_t slot, std::size_t bytes,
-                    std::size_t offset_bytes = 0) const;
-    void check_piece(std::size_t rank, std::size_t piece) const;
+    void check_slot(std::size_t rank, std::size_t slot, std::size_t bytes) const;
 
     std::vector<Rank> ranks_;
     TensorParallelTransport transport_ = TensorParallelTransport::StagedHost;

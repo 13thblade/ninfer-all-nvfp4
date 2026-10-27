@@ -324,18 +324,12 @@ families](#expert-parallelism-of-the-other-moe-families)).
   8-byte words into its own mapped host row and polls the other ranks' rows, with no copy and no
   cross-device fence (`TensorParallelExchange`). Each rank counts its exchanges in device memory,
   so a graph replays them without new arguments; a wait longer than five minutes traps.
-- **Prompt pieces.** Where every FFN is dense, a text prompt chunk of 512 columns or more (one
-  sequence, 1-D positions) runs each layer in up to four pieces of whole 64-column blocks, at least
-  256 columns each. A
-  piece writes its own columns of the exchange slot; each rank publishes and reduces the piece on
-  its side stream while its compute stream runs the next piece, and waits for the piece's reduce
-  only before that piece's next exchange. A piece attends over the keys up to its own last
-  position, and a later piece continues the Gated DeltaNet state the earlier one wrote, so the
-  result is that of shorter chunks. Decode, verification, segments, sequence batches, masked
-  drafter taps, 3-axis rotations and attention by positions keep one exchange per step. A MoE layer serves each piece's
-  tokens separately and a piece of a long prompt routes to nearly every expert, so pieces would read
-  most expert weights once per piece: Qwen3.6-35B-A3B prefilled a 7,000-token prompt at 5,300 tok/s
-  in four pieces against 6,700 in one on two RTX 3090s, and MoE models keep one exchange per step.
+- **One exchange per step.** Every step, a long prompt chunk included, exchanges each layer's
+  partials once. Cutting a prompt chunk into pieces whose exchanges overlap the next piece's
+  compute was measured slower and is not done: the dense Qwen3.8-27B GSQ-RCO IQ3_S prefilled a
+  9,705-token prompt at 657 tok/s in four pieces against 807 in one on two Tesla V100s (host
+  transport), and Qwen3.6-35B-A3B, whose pieces each read most expert weights, a 7,000-token one
+  at 5,300 against 6,700 on two RTX 3090s.
 - **Numerics.** Against one device the only difference is the order of the FP32 additions of a
   projection's output: the shares' partial sums are added, then rounded once, where one device
   rounds the full sum. Logits are close, not identical, so greedy text can diverge where two tokens
@@ -482,7 +476,7 @@ on the hosts measured below it is slower than dividing by heads.
   `exp(lse - max)`, sums in rank order, the gate applied after a BF16 rounding as on one device);
   the rank then runs its share of the output projection as an FP32 partial, which reduces as by
   heads. A layer's attention thus crosses the bus twice per step, by heads once, and every rank
-  projects every head. Prompt pieces are off.
+  projects every head.
 - **Page copies.** A copy between two pages that different ranks hold (a forked prefix's
   copy-on-write) is a peer copy on the source rank's stream (`DeviceKVPagePool`). The host KV tier
   keeps one record per page, whichever rank holds it.

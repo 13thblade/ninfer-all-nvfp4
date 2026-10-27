@@ -3172,7 +3172,7 @@ struct Executor::Impl {
             for (std::size_t r = 0; r < n; ++r) {
                 on(r, [&](RankState& rank) {
                     exchange.reduce(r, slot, rank.y, std::int64_t(h) * t, contributors,
-                                    rank.stream, 0, sum);
+                                    rank.stream, sum);
                 });
             }
         };
