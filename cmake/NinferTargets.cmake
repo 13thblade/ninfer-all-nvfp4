@@ -65,11 +65,13 @@ endfunction()
 # instantiations of the function template `symbol` it defines, and nothing else of it. Automatic
 # exports (WINDOWS_EXPORT_ALL_SYMBOLS) read only the DLL's own objects; CMake merges this
 # module-definition file into them. The archive's sources stay as every other build compiles them.
+# The archive's own link step writes the file. As the output of a custom command of the DLL, it
+# would make Ninja compile the archive before any object of a target that links the DLL.
 function(ninfer_export_archive_instantiations dll archive symbol expected)
   get_filename_component(_ninfer_linker_dir "${CMAKE_LINKER}" DIRECTORY)
   find_program(NINFER_DUMPBIN dumpbin HINTS "${_ninfer_linker_dir}" REQUIRED)
   set(_ninfer_definitions "${CMAKE_CURRENT_BINARY_DIR}/${archive}_exports.def")
-  add_custom_command(OUTPUT "${_ninfer_definitions}"
+  add_custom_command(TARGET ${archive} POST_BUILD
     COMMAND ${CMAKE_COMMAND}
       "-DDUMPBIN=${NINFER_DUMPBIN}"
       "-DARCHIVE=$<TARGET_FILE:${archive}>"
@@ -77,7 +79,7 @@ function(ninfer_export_archive_instantiations dll archive symbol expected)
       "-DEXPECTED=${expected}"
       "-DOUTPUT=${_ninfer_definitions}"
       -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ArchiveExports.cmake"
-    DEPENDS ${archive} "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ArchiveExports.cmake"
+    BYPRODUCTS "${_ninfer_definitions}"
     VERBATIM)
   target_sources(${dll} PRIVATE "${_ninfer_definitions}")
   target_link_libraries(${dll} PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${archive}>")
