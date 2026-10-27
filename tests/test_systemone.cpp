@@ -463,9 +463,9 @@ void responses() {
 
     const DecisionRequest openai = parse_decisions_request(RequestJson::parse(kOpenAI));
     std::vector<DecisionAnswer> openai_answers(3);
-    openai_answers[0] = {.probabilities = {0.3, 0.7}, .label_mass = 1.0};
+    openai_answers[0] = {.probabilities = {0.3, 0.7}, .label_mass = 1.0, .argmax_is_label = true};
     openai_answers[1] = {.probabilities = {0.4, 0.6}, .label_mass = 0.5};
-    openai_answers[2] = {.probabilities = {0.8, 0.2}, .label_mass = 1.0};
+    openai_answers[2] = {.probabilities = {0.8, 0.2}, .label_mass = 1.0, .exact = false};
     const Json decision = Json::parse(make_decision_response(openai, openai_answers, 40, 3));
     expect(decision["object"] == "decision" && decision["answers"].is_array() &&
                decision["answers"].size() == 3 && decision["usage"]["total_tokens"] == 43,
@@ -486,6 +486,13 @@ void responses() {
                severity["probabilities"][1]["label"] == "broken" &&
                severity["probabilities"][1]["value"] == 1,
            "an unnamed score with labelled, indexed levels");
+    const Json& checks = decision["diagnostics"];
+    expect(checks.is_array() && checks.size() == 3 &&
+               checks[0]["argmax_is_label"] == true &&
+               close_to(checks[1]["label_mass"].get<double>(), 0.5) &&
+               checks[1]["argmax_is_label"] == false && checks[1]["readout"] == "exact" &&
+               checks[2]["readout"] == "top_k",
+           "OpenAI's diagnostics in question order");
 }
 
 } // namespace

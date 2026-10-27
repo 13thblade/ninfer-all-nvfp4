@@ -1492,8 +1492,10 @@ and `levels: [{label, description}]` for a `score`; a `predicate` is a noul -- w
 limits, and answers with `answers` in question order: a `predicate` with its `probability`, a
 `choice` with `choice`, `probabilities: [{value, probability}]` and `confidence`, a `score` with
 `score`, `probabilities: [{value, label, probability}]` and `confidence`, and every answer with its
-`margin`; `name` is echoed, null for an unnamed question. `safety_identifier` is accepted and
-ignored; streaming, tools and refusal scoring are not implemented.
+`margin`; `name` is echoed, null for an unnamed question. `diagnostics` is an array in question
+order with each answer's `label_mass`, `argmax_is_label` and `readout`, as System One's carries them
+by id. `safety_identifier` is accepted and ignored; streaming, tools and refusal scoring are not
+implemented.
 
 Every read of a request starts with the same system turn, context and state, and its prompt carries
 explicit cache boundaries after the system turn and after the state, so the first read about a new
