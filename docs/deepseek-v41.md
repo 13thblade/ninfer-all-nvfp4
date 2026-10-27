@@ -65,8 +65,8 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
 - **Sampling defaults.** The release's: temperature 1.0, top-p 1.0 (top-k 20, the candidates the
   sampler keeps).
 - **Speculative decoding with the DSpark drafter.** An artifact converted with the release's drafter
-  (the `dspark` component, from Unsloth's GGUF or beamster's STQ pack,
-  [below](#the-dspark-drafter)) drafts with `--spec dspark`: up to 5 tokens a round
+  (the `dspark` component, from beamster's STQ pack as in the published artifact, or from Unsloth's
+  GGUF, [below](#the-dspark-drafter)) drafts with `--spec dspark`: up to 5 tokens a round
   (`--draft-tokens`, 1 to 5), kept while the drafter's confidence is at least `--draft-confidence`
   (0.5 by default), verified by the target in one pass of decode rows. Its tokens and log
   probabilities are plain decoding's.
@@ -95,12 +95,12 @@ share; [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-
 
 ## Converting
 
-The converter reads the weights from the GGUF shards, the Engram GGUF, the drafter GGUF and the
-vision tower's mmproj, the tokenizer and configuration from the base release, and the release's
-routing bias of image positions (`layers.N.ffn.gate.bias_vl`, which the GGUF lacks) by byte range
-from the release's safetensors shards (`tools/convert/fetch_tensors.py`, 65 KB of its 48 shards).
-The release ships no Jinja chat template; the converter stores its own transcription of the
-release's encoder (`tools/convert/templates/deepseek_v41`).
+The converter reads the weights from the GGUF shards, the Engram GGUF, the drafter of beamster's
+Sushi STQ pack and the vision tower's mmproj, the tokenizer and configuration from the base release,
+and the release's routing bias of image positions (`layers.N.ffn.gate.bias_vl`, which the GGUF
+lacks) by byte range from the release's safetensors shards (`tools/convert/fetch_tensors.py`, 65 KB
+of its 48 shards). The release ships no Jinja chat template; the converter stores its own
+transcription of the release's encoder (`tools/convert/templates/deepseek_v41`).
 
 ```bash
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 config.json tokenizer.json tokenizer_config.json \
@@ -109,8 +109,10 @@ hf download ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF \
   --include 'DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-*.gguf' \
   --include 'DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf' \
   --include 'mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf' --local-dir models/deepseek-v4.1
-hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
-  --local-dir models/deepseek-v4.1
+hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw \
+  --revision 07fec972538639726b868f81e89d9d4f5005fe10 --include config.json \
+  --include model.safetensors.index.json --include 'model-mtp-*.safetensors' \
+  --local-dir models/deepseek-v4.1/stq
 python -m tools.convert.fetch_tensors deepseek-ai/DeepSeek-V4.1-Flash-1017 \
   --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
   --match 'layers.*.ffn.gate.bias_vl' --out models/deepseek-v4.1/bias_vl.safetensors
@@ -121,7 +123,7 @@ python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gg
   --components text,dspark,vision \
   --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf \
   --source engram=models/deepseek-v4.1/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
-  --source dspark=models/deepseek-v4.1/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
+  --source dspark=models/deepseek-v4.1/stq \
   --source vision=models/deepseek-v4.1/mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf \
   --source bias_vl=models/deepseek-v4.1/bias_vl.safetensors \
   --name DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M \
@@ -133,43 +135,40 @@ python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gg
   --out models/DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer --device cpu
 ```
 
-The model reads the Engram GGUF only for the table's digest. `--components text,dspark` leaves the
-vision tower out and `--components text` the drafter too; the objects they keep are the same bytes
-either way. The model with its drafter and tower is one file of 129,946,453,248 bytes (121.0 GiB),
-of which the tower takes 0.90 GiB; the table is one of 110,595,294,496 bytes (103.0 GiB). On the 96
-threads of a 48-core EPYC 7K62, with a build sharing its CPUs, the model took 9 min 1 s; on 24
-cores of a Threadripper 3960X the table took 3 min 29 s.
+The model reads the Engram GGUF only for the table's digest, and of the STQ pack only its config,
+its index and its six drafter files (3.85 GB), checking that the pack states the release's model and
+drafter keys. `--components text,dspark` leaves the vision tower out and `--components text` the
+drafter too; the objects they keep are the same bytes either way. The model with its drafter and
+tower is one file of 125,824,667,392 bytes (117.2 GiB), of which the tower takes 0.90 GiB; the
+table is one of 110,595,294,496 bytes (103.0 GiB). On the 96 threads of a 48-core EPYC 7K62, with a
+download writing to the same disk, the model took 6 min 23 s; on 24 cores of a Threadripper 3960X
+the table took 3 min 29 s.
 
-The drafter can come from beamster's Sushi STQ pack of the release instead, which stores the
-release's drafter in STQ, a trellis code of 4 bits a weight in its trunk and 2 in its routed experts
-([the STQ drafter](#the-stq-drafter)). The converter reads the pack's config, its index and its six
-drafter files (3.85 GB), and checks that the pack states the release's model and drafter keys:
+The drafter can come from Unsloth's `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` instead, the
+release's drafter in Q8_0 with MXFP4 routed experts, which takes twice the STQ drafter's device
+memory at the same acceptance ([the STQ drafter](#the-stq-drafter)):
 
 ```bash
-hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw \
-  --revision 07fec972538639726b868f81e89d9d4f5005fe10 --include config.json \
-  --include model.safetensors.index.json --include 'model-mtp-*.safetensors' \
-  --local-dir models/deepseek-v4.1/stq
-# As above, with the pack's directory as the drafter's source.
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
+  --local-dir models/deepseek-v4.1
+# As above, with the GGUF as the drafter's source.
 python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf \
   --components text,dspark,vision \
   --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf \
   --source engram=models/deepseek-v4.1/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
-  --source dspark=models/deepseek-v4.1/stq \
+  --source dspark=models/deepseek-v4.1/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
   --source vision=models/deepseek-v4.1/mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf \
   --source bias_vl=models/deepseek-v4.1/bias_vl.safetensors \
   --name DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M \
-  --out models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-STQ-DSpark-ninfer-v3.ninfer --device cpu
+  --out models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-Unsloth-DSpark-ninfer-v3.ninfer --device cpu
 ```
 
-Its text objects are the same bytes as with Unsloth's drafter. Without the tower
-(`--components text,dspark`) it is one file of 124,853,542,400 bytes (116.3 GiB), 3.84 GiB less than
-the same model with Unsloth's drafter; on the 48 threads of a 24-core EPYC 7352, converting it
-beside the model with Unsloth's drafter, it took 10 min 43 s.
+Its text and vision objects are the same bytes as with the STQ drafter; the file is
+129,946,453,248 bytes (121.0 GiB).
 
 ## Running
 
-Both artifacts are published: the model as
+Both artifacts are published: the model, with the STQ drafter and the vision tower, as
 [WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3)
 and its table as
 [WaveCut/DeepSeek-V4.1-Flash-Engram-IQ4_NL-NInfer-v3](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-Engram-IQ4_NL-NInfer-v3).

@@ -921,7 +921,7 @@ and the GPU copied the rest
 ([the CPU share](deepseek-v41.md#the-cpu-share-on-one-rtx-4090)). With `--experts 5` (5 of the 6
 experts, another model's output) Strata decodes 44.8 and 42.1 tok/s.
 
-With the release's DSpark drafter, October 26, the same prompts and host experts, on that host and
+With Unsloth's DSpark drafter, October 26, the same prompts and host experts, on that host and
 on an RTX PRO 6000 host (Threadripper PRO 7965WX), where the build before the CPU share copied every
 miss:
 
@@ -934,7 +934,9 @@ miss:
 | RTX 4090 (450 W), `--expert-dma-share 1` | `--spec dspark` | 25.1 | 20.2 | 688 |
 
 Strata 0.2.6 exited with an error in every configuration tried on the RTX PRO 6000 host
-([the drafter](deepseek-v41.md#the-dspark-drafter)).
+([the drafter](deepseek-v41.md#the-dspark-drafter)). The published artifact carries the STQ drafter
+since October 27, which keeps Unsloth's acceptance with half its device memory
+([the STQ drafter](deepseek-v41.md#the-stq-drafter)).
 
 NInfer's native release build of `b3402a6fd` on one GPU of a rented host per card, the same prompts:
 
