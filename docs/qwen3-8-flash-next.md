@@ -545,11 +545,12 @@ and thinking-token budgets, including the correction or bonus token.
 probability over the public vocabulary is at or below P. The round verifies the drafts up to and
 including that one, so every round verifies at least one; P=0 disables the calculation and P=1
 drafts and verifies one. A batch drafts until each of its requests has reached such a draft (or the
-last step), verifies its largest selected prefix, and bounds acceptance separately for each
-request. This is distinct from the sampling `--min-p` filter. With a floor each draft step runs
-from its own CUDA Graph and the host reads the step's probabilities before it starts the next, so
-`drafted_tokens` counts the steps that ran; each verification width has its own CUDA Graph. The
-floor is part of the disk context-cache profile. `--spec mtp` keeps the full window unless
+last step) and verifies each request's own selected prefix, the rows packed at their own widths
+(all at the largest one when a request gathers logprobs). This is distinct from the sampling
+`--min-p` filter. With a floor each draft step runs from its own CUDA Graph and the host reads the
+step's probabilities before it starts the next, so `drafted_tokens` counts the steps that ran;
+each verification width has its own CUDA Graph. The floor is part of the disk context-cache
+profile. `--spec mtp` keeps the full window unless
 `--draft-min-p` is set; the automatic drafting uses 0.5. On an RTX 4090 with the IQ3_S release's
 host experts (EPYC 7V13, 32-CPU quota, 64K context; 256 greedy tokens after a code prompt, a prose
 prompt and a 31,865-token document, once per `--kv-dtype` format) three drafts with the floor 0.5

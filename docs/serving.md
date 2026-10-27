@@ -88,6 +88,17 @@ reduction by the verify width, so a near-tie can resolve differently at another 
 between two fixed `--draft-tokens` settings. The per-request log reports the rounds run at each
 width and the width changes.
 
+The Flash-Next, Gemma 4, Flint and DeepSeek-V4.1 Engines verify a round's rows packed at their
+own widths: a request verifies its anchor and the drafts it can take (its own extent after the
+draft floor, a lookup's length, and its output budget), not the widest request's. A round where a
+request gathers logprobs keeps every request at the round's width. With `--adaptive-mtp` these
+Engines also plan each request's extent: they price a round by the rows it verifies, from the
+round times measured at each total, and keep the extents that give the most expected committed
+tokens per second, so a request whose drafts stop surviving verifies fewer of them while one whose
+drafts survive verifies all. The Qwen3.5 Programs keep one width per round (their verification
+runs from CUDA Graphs per batch and width; attention and Gated DeltaNet already skip the columns
+past each request's extent).
+
 ### MTP attention window
 
 Each MTP draft step attends over the whole history of its cache, so at a long context the draft

@@ -659,12 +659,15 @@ struct Executor::Impl {
     // MTP speculative decoding (options.draft_tokens > 0). The MTP layer's index in the per-layer
     // route records, expert cache and expert stream is num_hidden_layers.
     std::optional<MtpPlan> mtp;
-    // Maximum and current verification widths (drafts plus anchor), and the public vocabulary.
+    // Maximum and current verification widths (drafts plus anchor; the current one the widest
+    // sequence's, the record stride), and the public vocabulary.
     std::uint32_t verify_width = 0;
     std::uint32_t active_verify_width = 0;
     std::int32_t domain        = 0;
     bool verifying             = false;
     std::vector<SequenceState*> verified; // the last verify()'s sequences, in order
+    // Their first columns and widths in that verification.
+    std::vector<std::int32_t> verified_columns, verified_widths;
     // While forward_branches() runs: the state its branches start from. Every part of the pass is
     // a branch of one sequence, and each part after the first takes the snapshot's recurrent state
     // of a layer before it runs that layer.
@@ -2484,7 +2487,8 @@ struct Executor::Impl {
 
     // A verification's record row of the part: its position among the verified sequences.
     [[nodiscard]] std::int32_t record_row(const Part& part) const {
-        return part.column / static_cast<std::int32_t>(active_verify_width);
+        const auto at = std::find(verified.begin(), verified.end(), part.sequence);
+        return static_cast<std::int32_t>(at - verified.begin());
     }
 
     void run_gdn(const LayerPlan& plan, std::size_t index, LayerState& state, RankState& rank,
@@ -4161,30 +4165,47 @@ struct Executor::Impl {
         return static_cast<std::uint32_t>(ran);
     }
 
-    void verify(std::span<const std::uint32_t> batch, std::span<const std::int32_t> tokens) {
+    void verify(std::span<const std::uint32_t> batch, std::span<const std::int32_t> tokens,
+                std::span<const std::uint32_t> widths = {}) {
         require_mtp("verify");
         const std::size_t b = batch.size();
-        const std::size_t w = b == 0 ? 0 : tokens.size() / b;
-        if (b == 0 || b > sequences.size() || w < 2 || w > verify_width || tokens.size() != b * w) {
+        std::vector<std::uint32_t> row_widths(widths.begin(), widths.end());
+        if (row_widths.empty() && b != 0) {
+            row_widths.assign(b, static_cast<std::uint32_t>(tokens.size() / b));
+        }
+        std::size_t total = 0;
+        std::uint32_t w   = 0;
+        for (const std::uint32_t width : row_widths) {
+            total += width;
+            w = std::max(w, width);
+        }
+        if (b == 0 || b > sequences.size() || row_widths.size() != b || w > verify_width ||
+            tokens.size() != total ||
+            std::find(row_widths.begin(), row_widths.end(), 0U) != row_widths.end()) {
             throw std::invalid_argument("qwen4_exp verify: an anchor and its drafts per sequence");
         }
         check_tokens(tokens, static_cast<std::uint32_t>(tokens.size()));
-        active_verify_width = static_cast<std::uint32_t>(w);
+        active_verify_width = w;
         std::vector<Part> parts;
         verified.clear();
+        verified_columns.clear();
+        verified_widths.clear();
+        std::int32_t column = 0;
         for (std::size_t j = 0; j < b; ++j) {
             SequenceState* sequence = &sequences.at(batch[j]);
             if (std::find(verified.begin(), verified.end(), sequence) != verified.end()) {
                 verified.clear();
                 throw std::invalid_argument("qwen4_exp verify: a sequence appears twice");
             }
-            parts.push_back({.sequence = sequence,
-                             .column   = static_cast<std::int32_t>(j * w),
-                             .count    = static_cast<std::int32_t>(w)});
+            const auto width = static_cast<std::int32_t>(row_widths[j]);
+            parts.push_back({.sequence = sequence, .column = column, .count = width});
             sequence->verify_context = sequence->context;
-            sequence->verify_tokens.assign(tokens.begin() + std::ptrdiff_t(j * w),
-                                           tokens.begin() + std::ptrdiff_t((j + 1) * w));
+            sequence->verify_tokens.assign(tokens.begin() + column,
+                                           tokens.begin() + column + width);
             verified.push_back(sequence);
+            verified_columns.push_back(column);
+            verified_widths.push_back(width);
+            column += width;
         }
         verifying = true;
         try {
@@ -4220,9 +4241,10 @@ struct Executor::Impl {
             throw std::invalid_argument("qwen4_exp commit: the last verification's sequences");
         }
         for (std::size_t j = 0; j < batch.size(); ++j) {
-            if (&sequences.at(batch[j]) != verified[j] || kept[j] == 0 || kept[j] > w) {
+            if (&sequences.at(batch[j]) != verified[j] || kept[j] == 0 ||
+                kept[j] > std::uint32_t(verified_widths[j])) {
                 throw std::invalid_argument("qwen4_exp commit: the last verification's sequences, "
-                                            "1 to draft_tokens + 1 tokens each");
+                                            "1 to their verified width each");
             }
         }
         if (draft_prefetch) {
@@ -4249,9 +4271,10 @@ struct Executor::Impl {
                     // the verification's first position is still staged.
                     const QsaPlan& a = *plan.qsa;
                     const Tensor projection(static_cast<std::byte*>(rank.index_records.p) +
-                                                (qsa_local[i] * columns + j * w) * index_rows * 2,
+                                                (qsa_local[i] * columns + verified_columns[j]) *
+                                                    index_rows * 2,
                                             DType::BF16, {a.index.rows, m});
-                    const Tensor first(rank.positions + j * w, DType::I32, {1});
+                    const Tensor first(rank.positions + verified_columns[j], DType::I32, {1});
                     Tensor pooled(state.pooled.p, DType::FP32,
                                   {di, static_cast<std::int32_t>(pooled_slots)});
                     Tensor tail(state.tail.p, DType::FP32,
@@ -4267,7 +4290,7 @@ struct Executor::Impl {
                         {stack_width, static_cast<std::int32_t>((config.ple_conv_kernel_size - 1) *
                                                                 config.ngram.ngram_size)});
                     const Tensor normalized(static_cast<float*>(rank.ple_records.p) +
-                                                std::size_t(stack_width) * j * w,
+                                                std::size_t(stack_width) * verified_columns[j],
                                             DType::FP32, {stack_width, m});
                     ops::ple_history_advance(history, normalized, rank.stream);
                 }
@@ -4294,7 +4317,7 @@ struct Executor::Impl {
                 ngram_row_ids(ngram, tokens, config.eos_token_id, config.vocab_size,
                               sequence.context, scratch);
             }
-            committed.push_back({&sequence, static_cast<std::int32_t>(j * w),
+            committed.push_back({&sequence, verified_columns[j],
                                  static_cast<std::int32_t>(kept[j]), sequence.position, tokens});
             sequence.position += kept[j];
         }
@@ -4606,8 +4629,8 @@ std::uint32_t Executor::draft(std::span<const std::uint32_t> sequences,
 }
 
 void Executor::verify(std::span<const std::uint32_t> sequences,
-                      std::span<const std::int32_t> tokens) {
-    impl_->verify(sequences, tokens);
+                      std::span<const std::int32_t> tokens, std::span<const std::uint32_t> widths) {
+    impl_->verify(sequences, tokens, widths);
 }
 
 void Executor::commit(std::span<const std::uint32_t> sequences,

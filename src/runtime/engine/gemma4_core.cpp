@@ -508,6 +508,7 @@ struct Gemma4Core::Impl {
     const DiagnosticObserver diagnostics;
     // With --adaptive-mtp, the drafts a round proposes and verifies, 1..drafts.
     std::optional<runtime::MtpAdaptiveBatchController> mtp_controller;
+    runtime::MtpPackedPlanner packed_planner;
 
     mutable std::mutex queue_mutex;
     std::condition_variable queue_cv;
@@ -571,7 +572,7 @@ struct Gemma4Core::Impl {
     // run (tokens, count, accepted drafts, last token); and every slot's token counts before the
     // round, which a round that keeps fewer tokens than it licensed restores.
     DeviceBuffer spec_drafts, spec_targets, spec_extents, spec_lengths, spec_licensed, spec_counts,
-        spec_accepted, spec_anchors, counts_backup;
+        spec_accepted, spec_anchors, spec_columns, counts_backup;
     std::unique_ptr<PinnedHostBuffer> host_spec;
 
     std::thread worker;
@@ -670,8 +671,9 @@ struct Gemma4Core::Impl {
             spec_counts   = plane(1);
             spec_accepted = plane(1);
             spec_anchors  = plane(1);
+            spec_columns  = plane(1);
             counts_backup = DeviceBuffer(rows * domain * sizeof(std::int32_t));
-            host_spec     = std::make_unique<PinnedHostBuffer>(rows * (drafts + width + 4) *
+            host_spec     = std::make_unique<PinnedHostBuffer>(rows * (drafts + width + 5) *
                                                                sizeof(std::int32_t));
         }
         sample_workspace = std::make_unique<WorkspaceArena>(workspace);
@@ -2092,7 +2094,24 @@ struct Gemma4Core::Impl {
                 ++m;
             }
         }
-        const std::size_t k = *std::max_element(draft_extents.begin(), draft_extents.end());
+        // Each row verifies the drafts its output budget leaves room for (the correction takes one
+        // more token); with --adaptive-mtp the plan keeps the extents worth their rows.
+        for (std::size_t j = 0; j < b; ++j) {
+            const auto remaining = batch[j]->output.model_token_budget_remaining(
+                batch[j]->budget->remaining());
+            draft_extents[j] =
+                static_cast<std::uint32_t>(std::min<std::size_t>(draft_extents[j], remaining - 1));
+        }
+        if (mtp_controller) {
+            std::vector<const runtime::MtpAdaptiveSignal*> signals;
+            for (std::size_t j = 0; j < b; ++j) {
+                signals.push_back(looked_up[j] ? nullptr : &batch[j]->mtp_signal);
+            }
+            const std::vector<std::uint32_t> limits = draft_extents;
+            packed_planner.plan(signals, limits, draft_extents);
+        }
+        const std::size_t k = std::max<std::size_t>(
+            1, *std::max_element(draft_extents.begin(), draft_extents.end()));
         const std::size_t w = k + 1;
         const auto columns  = static_cast<std::int32_t>(w);
         std::vector<TokenId> proposed;
@@ -2101,12 +2120,23 @@ struct Gemma4Core::Impl {
             proposed.insert(proposed.end(), all_drafts.begin() + std::ptrdiff_t(j * drafts),
                             all_drafts.begin() + std::ptrdiff_t(j * drafts + k));
         }
+        // The rows are packed at their own widths, no row verifying columns it cannot take; a row
+        // that gathers logprobs keeps every row at the round's width, the layout their gather reads.
+        const bool packed = std::none_of(batch.begin(), batch.end(), [](const auto& request) {
+            return request->options.execution.logprobs;
+        });
+        std::vector<std::uint32_t> widths(b);
+        std::vector<std::int32_t> starts(b);
         std::vector<TokenId> tokens;
         for (std::size_t j = 0; j < b; ++j) {
+            const std::size_t own = packed ? draft_extents[j] : k;
+            starts[j]             = static_cast<std::int32_t>(tokens.size());
+            widths[j]             = static_cast<std::uint32_t>(own + 1);
             tokens.push_back(anchors[j]);
             tokens.insert(tokens.end(), proposed.begin() + std::ptrdiff_t(j * k),
-                          proposed.begin() + std::ptrdiff_t((j + 1) * k));
+                          proposed.begin() + std::ptrdiff_t(j * k + own));
         }
+        const auto verified_columns = static_cast<std::int32_t>(tokens.size());
         // A structured row's masks, one per column after its own drafts, fill in parallel while
         // the verification runs.
         std::vector<std::shared_ptr<runtime::GrammarMaskJob>> column_masks(b);
@@ -2118,7 +2148,7 @@ struct Gemma4Core::Impl {
                 std::vector<TokenId>(proposed.begin() + std::ptrdiff_t(j * k),
                                      proposed.begin() + std::ptrdiff_t(j * k + own)));
         }
-        executor.verify(sequences, tokens);
+        executor.verify(sequences, tokens, widths);
 
         const cudaStream_t stream = executor.head_stream();
         std::vector<SampleRow> rows;
@@ -2170,22 +2200,22 @@ struct Gemma4Core::Impl {
         auto* staged = static_cast<std::int32_t*>(host_spec->data());
         std::copy(proposed.begin(), proposed.end(), staged);
         for (std::size_t j = 0; j < b; ++j) {
-            // Acceptance respects each sequence's own extent and its output budget, correction
-            // included.
-            const auto remaining = batch[j]->output.model_token_budget_remaining(
-                batch[j]->budget->remaining());
-            staged[b * k + j] = static_cast<std::int32_t>(
-                std::min<std::size_t>(draft_extents[j], remaining - 1));
+            staged[b * k + j]     = static_cast<std::int32_t>(draft_extents[j]);
             staged[b * k + b + j] = static_cast<std::int32_t>(batch[j]->position);
         }
+        // Past the licensed run (b * (k + 2) + b * w + 2 * b): the rows' first columns.
+        auto* staged_starts = staged + b * (k + 4) + b * w;
+        std::copy(starts.begin(), starts.end(), staged_starts);
         CUDA_CHECK(
             cudaMemcpyAsync(spec_drafts.p, staged, b * k * 4, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(
             cudaMemcpyAsync(spec_extents.p, staged + b * k, b * 4, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(spec_lengths.p, staged + b * k + b, b * 4,
                                    cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(spec_columns.p, staged_starts, b * 4, cudaMemcpyHostToDevice,
+                                   stream));
         const auto rows_n         = static_cast<std::int32_t>(b);
-        const Tensor logits       = executor.logits(static_cast<std::uint32_t>(b * w));
+        const Tensor logits       = executor.logits(static_cast<std::uint32_t>(verified_columns));
         const auto* device_config = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const Tensor drafted(spec_drafts.p, DType::I32, {static_cast<std::int32_t>(k), rows_n});
         // The tokens' logprob records, from the distributions their columns are drawn from,
@@ -2217,7 +2247,7 @@ struct Gemma4Core::Impl {
                                        std::size_t(domain) * sizeof(std::int32_t),
                                        cudaMemcpyDeviceToDevice, stream));
         }
-        Tensor targets(spec_targets.p, DType::I32, {columns * rows_n});
+        Tensor targets(spec_targets.p, DType::I32, {verified_columns});
         ops::argmax(logits, targets, static_cast<std::int32_t>(domain), stream);
         Tensor extents(spec_extents.p, DType::I32, {rows_n});
         Tensor lengths(spec_lengths.p, DType::I32, {rows_n});
@@ -2227,10 +2257,11 @@ struct Gemma4Core::Impl {
         Tensor accepted(spec_accepted.p, DType::I32, {rows_n});
         {
             auto scope = sample_workspace->scope();
+            const Tensor column_starts(spec_columns.p, DType::I32, {rows_n});
             ops::speculative_accept_coupled_drafts(
-                targets.view({columns, rows_n}), logits.view({logits.ne[0], columns, rows_n}),
-                drafted, extents, lengths, round_anchors, licensed, counts, accepted,
-                static_cast<std::int32_t>(domain), device_config, *sample_workspace, stream);
+                targets, logits, drafted, extents, lengths, round_anchors, licensed, counts,
+                accepted, static_cast<std::int32_t>(domain), device_config, *sample_workspace,
+                stream, &column_starts);
         }
         auto* host = staged + b * (k + 2);
         CUDA_CHECK(
@@ -2322,18 +2353,22 @@ struct Gemma4Core::Impl {
         }
         executor.commit(sequences, kept);
         // The controller measures rounds of the assistant's drafts only: a lookup changes the
-        // round's width.
-        if (mtp_controller && lookups == 0) {
-            mtp_controller->observe_execution(static_cast<std::uint32_t>(b), steps,
-                                              seconds(round_start, Clock::now()));
+        // round's width. The plan prices the rows verified, whatever proposed them.
+        if (mtp_controller) {
+            const double round_seconds = seconds(round_start, Clock::now());
+            if (lookups == 0) {
+                mtp_controller->observe_execution(static_cast<std::uint32_t>(b), steps,
+                                                  round_seconds);
+            }
+            packed_planner.observe(static_cast<std::uint32_t>(verified_columns), round_seconds);
         }
         for (std::size_t j = 0; j < b; ++j) {
             Request& r = *batch[j];
             if (failed[j]) { continue; }
             Slot& slot = slots[r.slot];
             // The verification fed the anchor and the drafts; the sequence keeps the first ones.
-            slot.fed.insert(slot.fed.end(), tokens.begin() + std::ptrdiff_t(j * w),
-                            tokens.begin() + std::ptrdiff_t(j * w + kept[j]));
+            slot.fed.insert(slot.fed.end(), tokens.begin() + starts[j],
+                            tokens.begin() + starts[j] + std::ptrdiff_t(kept[j]));
             r.position += kept[j];
             try {
                 check_capacity(batch[j]);

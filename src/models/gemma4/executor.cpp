@@ -259,7 +259,9 @@ struct Executor::Impl {
     // A chain's drafts [steps][rows] (the device feeds each step the last one) and the host copy.
     DeviceBuffer d_drafts;
     std::unique_ptr<PinnedHostBuffer> h_drafts;
-    std::uint32_t verify_width = 0; // rows per sequence of the last verify()
+    // Rows per sequence of the last verify() and each sequence's first row.
+    std::vector<std::uint32_t> verify_widths;
+    std::vector<int> verify_starts;
     std::map<std::uint32_t, GraphEntry> draft_graphs; // by rows << 8 | steps
 
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
@@ -2032,43 +2034,58 @@ struct Executor::Impl {
 
     // ---- Speculative rounds ------------------------------------------------------------------------
 
-    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens) {
+    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens,
+                std::span<const std::uint32_t> widths = {}) {
         const int n = int(sequences.size());
-        if (!drafting() || n <= 0 || tokens.size() % sequences.size() != 0) {
+        if (!drafting() || n <= 0 || (widths.empty() && tokens.size() % sequences.size() != 0) ||
+            (!widths.empty() && widths.size() != sequences.size())) {
             throw std::invalid_argument("gemma4 verify: invalid call");
         }
-        const int w = int(tokens.size()) / n, rows = n * w;
-        if (w < 1 || std::uint32_t(w) > options.draft_tokens + 1 || rows > gguf::kMaxVectorColumns) {
+        std::vector<std::uint32_t> row_widths(widths.begin(), widths.end());
+        if (row_widths.empty()) { row_widths.assign(n, std::uint32_t(tokens.size()) / n); }
+        int rows = 0;
+        for (const std::uint32_t w : row_widths) {
+            if (w < 1 || w > options.draft_tokens + 1) {
+                throw std::invalid_argument("gemma4 verify: invalid width");
+            }
+            rows += int(w);
+        }
+        if (std::size_t(rows) != tokens.size() || rows > gguf::kMaxVectorColumns) {
             throw std::invalid_argument("gemma4 verify: invalid width");
         }
         std::vector<std::int32_t> pos(rows), seq(rows);
-        for (int j = 0; j < n; ++j) {
+        verify_starts.assign(n, 0);
+        for (int j = 0, at = 0; j < n; ++j) {
             const std::uint32_t s = sequences[j];
+            const std::uint32_t w = row_widths[j];
             if (s >= options.sequences ||
                 std::count(sequences.begin(), sequences.begin() + j, s) != 0) {
                 throw std::invalid_argument("gemma4 verify: invalid sequence");
             }
-            if (positions[s] + std::uint32_t(w) > options.max_context) {
+            if (positions[s] + w > options.max_context) {
                 throw std::invalid_argument("gemma4 verify: context capacity exceeded");
             }
-            for (int i = 0; i < w; ++i) {
-                pos[j * w + i] = std::int32_t(positions[s]) + i;
-                seq[j * w + i] = std::int32_t(s);
+            verify_starts[j] = at;
+            for (std::uint32_t i = 0; i < w; ++i, ++at) {
+                pos[at] = std::int32_t(positions[s] + i);
+                seq[at] = std::int32_t(s);
             }
         }
-        for (const std::uint32_t s : sequences) { back(s, positions[s] + std::uint32_t(w), false); }
+        for (int j = 0; j < n; ++j) {
+            back(sequences[j], positions[sequences[j]] + row_widths[j], false);
+        }
         stage(tokens, pos, seq);
         run_graph(graphs, 16 + std::uint32_t(rows), [&] { decode_body(rows, true); });
-        verify_width = std::uint32_t(w);
+        verify_widths = std::move(row_widths);
     }
 
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept) {
-        if (kept.size() != sequences.size() || verify_width == 0) {
+        if (kept.size() != sequences.size() || verify_widths.size() != sequences.size()) {
             throw std::invalid_argument("gemma4 commit: invalid call");
         }
         for (std::size_t j = 0; j < sequences.size(); ++j) {
             const std::uint32_t s = sequences[j];
-            if (s >= options.sequences || kept[j] < 1 || kept[j] > verify_width) {
+            if (s >= options.sequences || kept[j] < 1 || kept[j] > verify_widths[j]) {
                 throw std::invalid_argument("gemma4 commit: invalid row");
             }
             positions[s] += kept[j];
@@ -2076,11 +2093,11 @@ struct Executor::Impl {
             CUDA_CHECK(cudaMemcpyAsync(
                 static_cast<__nv_bfloat16*>(anchor_hidden.p) + std::int64_t(s) * hidden,
                 static_cast<const __nv_bfloat16*>(row_hidden.p) +
-                    std::int64_t(j * verify_width + kept[j] - 1) * hidden,
+                    std::int64_t(verify_starts[j] + kept[j] - 1) * hidden,
                 std::size_t(hidden) * 2, cudaMemcpyDeviceToDevice, stream));
             anchored[s] = 1;
         }
-        verify_width = 0;
+        verify_widths.clear();
     }
 
     void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
@@ -2542,8 +2559,8 @@ void Executor::draft(std::span<const std::uint32_t> sequences,
 }
 
 void Executor::verify(std::span<const std::uint32_t> sequences,
-                      std::span<const std::int32_t> tokens) {
-    impl_->verify(sequences, tokens);
+                      std::span<const std::int32_t> tokens, std::span<const std::uint32_t> widths) {
+    impl_->verify(sequences, tokens, widths);
 }
 
 void Executor::commit(std::span<const std::uint32_t> sequences,

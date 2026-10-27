@@ -244,12 +244,14 @@ public:
     std::uint32_t draft(std::span<const std::uint32_t> sequences,
                         std::span<const std::int32_t> anchors, std::span<std::int32_t> out,
                         std::span<std::uint32_t> extents = {}, std::uint32_t steps = 0);
-    // Runs 2..draft_tokens() + 1 tokens of each sequence (its anchor, then its drafts) at its next
+    // Runs 1..draft_tokens() + 1 tokens of each sequence (its anchor, then its drafts) at its next
     // positions without committing them, and leaves the logits of every token in logits(), one
     // column per token, sequence after sequence. The sequences' positions and states stay where
-    // they were until commit(). Every sequence has the same width within this call.
-    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
-    // Keeps the first `columns[i]` (1..draft_tokens() + 1) tokens of the last verify() of
+    // they were until commit(). `widths` gives each sequence's token count; without it every
+    // sequence has the same width, tokens.size() / sequences.
+    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens,
+                std::span<const std::uint32_t> widths = {});
+    // Keeps the first `columns[i]` (1..its verified width) tokens of the last verify() of
     // `sequences[i]`, which lists the verified sequences in their order: each sequence's state is
     // then what feeding those tokens would have left, and its MTP block has run their cells.
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> columns);
