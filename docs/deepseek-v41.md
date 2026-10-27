@@ -65,10 +65,11 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
 - **Sampling defaults.** The release's: temperature 1.0, top-p 1.0 (top-k 20, the candidates the
   sampler keeps).
 - **Speculative decoding with the DSpark drafter.** An artifact converted with the release's drafter
-  (the `dspark` component, [below](#the-dspark-drafter)) drafts with `--spec dspark`: up to 5
-  tokens a round (`--draft-tokens`, 1 to 5), kept while the drafter's confidence is at least 0.5,
-  verified by the target in one pass of decode rows. Its tokens and log probabilities are plain
-  decoding's.
+  (the `dspark` component, from Unsloth's GGUF or beamster's STQ pack,
+  [below](#the-dspark-drafter)) drafts with `--spec dspark`: up to 5 tokens a round
+  (`--draft-tokens`, 1 to 5), kept while the drafter's confidence is at least `--draft-confidence`
+  (0.5 by default), verified by the target in one pass of decode rows. Its tokens and log
+  probabilities are plain decoding's.
 - **Speculative decoding by context lookup.** Without `--spec`, `--lookup-ngram N` proposes what
   followed the last N tokens' earlier occurrence in the sequence (up to `--draft-tokens`, 3 by
   default, at most 7), and the target verifies the proposal in one pass of decode rows; the output
@@ -138,6 +139,33 @@ either way. The model with its drafter and tower is one file of 129,946,453,248 
 of which the tower takes 0.90 GiB; the table is one of 110,595,294,496 bytes (103.0 GiB). On the 96
 threads of a 48-core EPYC 7K62, with a build sharing its CPUs, the model took 9 min 1 s; on 24
 cores of a Threadripper 3960X the table took 3 min 29 s.
+
+The drafter can come from beamster's Sushi STQ pack of the release instead, which stores the
+release's drafter in STQ, a trellis code of 4 bits a weight in its trunk and 2 in its routed experts
+([the STQ drafter](#the-stq-drafter)). The converter reads the pack's config, its index and its six
+drafter files (3.85 GB), and checks that the pack states the release's model and drafter keys:
+
+```bash
+hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw \
+  --revision 07fec972538639726b868f81e89d9d4f5005fe10 --include config.json \
+  --include model.safetensors.index.json --include 'model-mtp-*.safetensors' \
+  --local-dir models/deepseek-v4.1/stq
+# As above, with the pack's directory as the drafter's source.
+python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf \
+  --components text,dspark,vision \
+  --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf \
+  --source engram=models/deepseek-v4.1/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
+  --source dspark=models/deepseek-v4.1/stq \
+  --source vision=models/deepseek-v4.1/mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf \
+  --source bias_vl=models/deepseek-v4.1/bias_vl.safetensors \
+  --name DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M \
+  --out models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-STQ-DSpark-ninfer-v3.ninfer --device cpu
+```
+
+Its text objects are the same bytes as with Unsloth's drafter. Without the tower
+(`--components text,dspark`) it is one file of 124,853,542,400 bytes (116.3 GiB), 3.84 GiB less than
+the same model with Unsloth's drafter; on the 48 threads of a 24-core EPYC 7352, converting it
+beside the model with Unsloth's drafter, it took 10 min 43 s.
 
 ## Running
 
@@ -259,10 +287,12 @@ addresses and copies them to the device:
 
 ## The DSpark drafter
 
-DeepSeek-V4.1-Flash-1017 ships DSpark, a drafter of three blocks of the backbone's shape;
-Unsloth's `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` stores it in Q8_0 with MXFP4 routed experts,
-and the converter stores those blocks as they are in the artifact's `dspark` component. With
-`--spec dspark` the executor loads it beside the model:
+DeepSeek-V4.1-Flash-1017 ships DSpark, a drafter of three blocks of the backbone's shape. Two
+quantizations of it convert to the artifact's `dspark` component: Unsloth's
+`dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf`, in Q8_0 with MXFP4 routed experts, whose blocks the
+converter stores as they are, and the drafter of beamster's Sushi STQ pack
+([the STQ drafter](#the-stq-drafter)). With `--spec dspark` the executor loads either beside the
+model:
 
 - **What it reads.** At every position the backbone computes, the mean of the four streams entering
   blocks 37, 38 and 39, projected (`fc`) and normalized into a key and value latent of each drafter
@@ -272,8 +302,9 @@ and the converter stores those blocks as they are in the artifact's `dspark` com
   blocks in one pass (each row attends over the ring and over all five rows; the MoE routes each
   row to 3 of 128 experts beside a shared expert), adds a rank-256 Markov term of the previous token
   to the backbone's head logits and takes each row's greedy token, so five rows give five drafts.
-  A confidence head scores each draft; the round keeps the drafts up to the first scored below 0.5
-  (Strata's default for this drafter), at most `--draft-tokens`, and with none decodes one token.
+  A confidence head scores each draft; the round keeps the drafts up to the first scored below
+  `--draft-confidence` (0.5 by default, Strata's for this drafter; 0 keeps every draft), at most
+  `--draft-tokens`, and with none decodes one token.
 - **Exactness.** The target verifies the drafts in one pass of decode rows. Its attention splits a
   row's keys the same way however many rows a pass has, and the log probabilities split a row's
   vocabulary the same way however many rows they reduce, so a verified token and its log
@@ -283,12 +314,13 @@ and the converter stores those blocks as they are in the artifact's `dspark` com
   target's own draw, as context-lookup drafts are kept.
 - **One request.** The drafter drafts while one request decodes; with more, each round decodes one
   token per request.
-- **Memory.** The drafter's weights take 7.4 GiB of device memory, almost all of it its 384 MXFP4
-  experts; its rings take 0.75 MiB per sequence (twice that with prefix checkpoints) and the tapped
-  streams 7.5 MiB. The expert cache gives up that memory: on an RTX 4090 with host experts it keeps
-  73 experts instead of 1,137, and prompt spans shorten to 8,192 tokens.
+- **Memory.** Unsloth's drafter's weights take 7.4 GiB of device memory, almost all of it its 384
+  MXFP4 experts, and the STQ drafter's 3.58 GiB; the rings take 0.75 MiB per sequence (twice that
+  with prefix checkpoints) and the tapped streams 7.5 MiB. The expert cache gives up that memory:
+  on an RTX 4090 with host experts it keeps 73 experts with Unsloth's drafter and 618 with the STQ
+  drafter instead of 1,137, and with Unsloth's drafter prompt spans shorten to 8,192 tokens.
 
-On October 26, 2026, two rented hosts ran the drafter on the prompts of the
+On October 26, 2026, two rented hosts ran Unsloth's drafter on the prompts of the
 [Strata comparison](#against-strata-on-one-host) (one request, greedy, thinking off, host experts):
 that comparison's RTX 4090 host, with and without [the CPU share](#the-cpu-share), and an RTX PRO
 6000 (600 W, PCIe 5.0 x16) with a 24-core Threadripper PRO 7965WX and 188 GiB of RAM, NVIDIA driver
@@ -311,7 +343,8 @@ that comparison's RTX 4090 host, with and without [the CPU share](#the-cpu-share
 - **A 24 GB card gains with the CPU share.** With the drafter the RTX 4090 keeps 73 experts on the
   card (1,137 without), so nearly every expert a round's rows route to is missing. With the CPU
   share the drafter decodes 1.03 and 1.06 times as fast as plain decoding; copying every miss it
-  decodes 25% and 24% slower. Either way prefill slows by 26%, in spans of 8,192 tokens. On the
+  decodes 25% and 24% slower. Either way prefill slows by 26%, in spans of 8,192 tokens
+  ([why](#the-stq-drafter)). On the
   same host Strata's `--dspark on` decodes at 34.3 and 38.7 tok/s
   ([above](#against-strata-on-one-host)).
 - **Strata on the RTX PRO 6000.** Strata 0.2.6 exited with `router picked expert 2147483647` in
@@ -323,6 +356,97 @@ that comparison's RTX 4090 host, with and without [the CPU share](#the-cpu-share
   drafter and 116.0 GiB without it.
 
 One run per row; no spread is measured.
+
+### The STQ drafter
+
+beamster's `DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw` pack, made for sushi (an engine for Apple
+Silicon), stores the release's drafter (`mtp.0..2`) in STQ, a trellis code. A matrix's weights
+are 16 × 16 tiles, each a bitstream of 16-bit words read as overlapping codewords: 64 words a tile
+in the trunk (SPEC1, 15-bit codewords, 4 bits a weight) and 32 in the routed experts (PAIR1, 16-bit
+codewords, 2 bits a weight). A hash of a weight's codeword selects two FP16 halves whose sum, times
+4,096, is the weight, and the matrix works between orthonormal 128-point Hadamard transforms with
+FP16 sign vectors: y = s_out ⊙ H(Wᵀ H(s_in ⊙ x)). The converter stores the words and signs as the
+pack does (`uint16` and `fp16` objects) and the drafter's vectors as the release's. The executor's
+STQ product decodes each tile in registers and keeps the activations in FP32, for the 5 rows of a
+draft and the ring's rows in tiles of 8; the grouped `wo_a` and the routed experts (3 of 128 a row,
+all on the card) run as products over ids. The rest of a round, the rings, the Markov term and the
+confidence head are those of Unsloth's drafter.
+
+The two drafters quantize the same weights differently; their vectors, Markov tables and
+confidence heads are equal. Decoded, the STQ trunk's matrices agree with Unsloth's Q8_0 ones at
+cosines of 0.996 to 0.998, and the gate, up and down products of five sampled experts a block with
+its MXFP4 ones at 0.91 to 0.97, except two of block 2's down products at 0.84 and 0.89.
+
+On October 27, 2026, both drafters ran beside the same GSQ backbone (the artifacts' text objects
+equal byte for byte) on two rented hosts: an RTX 4090 (450 W, PCIe 3.0 x16) with a 24-core EPYC
+7352 and 251 GiB of RAM, NVIDIA driver 615.71.09, and an RTX PRO 6000 (500 W, PCIe 5.0 x16) with a
+Core Ultra 9 285K and 249 GiB of RAM, driver 580.178.04. One request, greedy, host experts, the
+CPU share on: the two prompts of the [Strata comparison](#against-strata-on-one-host) (the short
+answer, up to 128 tokens; 32 tokens after the 8,086-token prompt), a code request (384 tokens), a
+reasoning request with thinking on (384 tokens) and a summary of the 8,086-token prompt (up to 256
+tokens). Decode rates are the second run of each request, its prompt from the prefix cache;
+prefill is the 8,086-token prompt's first run.
+
+Decode and prefill, tok/s:
+
+| card | drafter | `--draft-confidence` | experts on the card | short answer | after 8,086 tokens | code | reasoning | summary | prefill of 8,086 tokens |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| RTX 4090 | none | | 1,137 | 28.1 | 28.7 | 22.8 | 30.3 | 20.5 | 620 |
+| | Unsloth's | 0.5 | 73 | 22.0 | 19.7 | 23.2 | 26.0 | 18.2 | 405 |
+| | STQ | 0.5 | 618 | 25.9 | 24.3 | 27.1 | 36.6 | 20.9 | 634 |
+| | Unsloth's | 0 | 73 | 14.6 | 11.8 | 20.1 | 23.6 | 11.7 | 405 |
+| | STQ | 0 | 618 | 18.9 | 14.9 | 24.4 | 30.5 | 13.9 | 633 |
+| RTX 4090, `--expert-cache-mib 500` | none | | 70 | 20.9 | 19.6 | 18.1 | 22.0 | 17.3 | 623 |
+| | Unsloth's | 0.5 | 70 | 22.5 | 19.9 | 23.1 | 27.5 | 19.1 | 409 |
+| | STQ | 0.5 | 70 | 23.4 | 21.4 | 24.3 | 29.5 | 18.7 | 624 |
+| RTX PRO 6000 | none | | 11,387 | 84.2 | 79.6 | 81.4 | 82.4 | 79.4 | 1,250 |
+| | Unsloth's | 0.5 | 10,316 | 114.3 | 107.0 | 170.0 | 143.0 | 123.2 | 1,250 |
+| | STQ | 0.5 | 10,868 | 119.2 | 102.2 | 168.8 | 136.5 | 115.9 | 1,260 |
+| | Unsloth's | 0 | 10,316 | 94.9 | 72.4 | 158.2 | 127.9 | 92.2 | 1,240 |
+| | STQ | 0 | 10,868 | 97.6 | 70.9 | 157.5 | 124.3 | 96.0 | 1,260 |
+
+Drafts over the five requests' first runs; tokens per target pass count verification passes and
+the steps that decode one token:
+
+| card | drafter | `--draft-confidence` | drafts accepted | accepted at positions 1 to 5 | tokens per target pass |
+|---|---|---|---:|---:|---:|
+| RTX 4090 | Unsloth's | 0.5 | 724 of 1,035 | 264, 183, 123, 94, 60 | 3.00 |
+| | STQ | 0.5 | 728 of 987 | 265, 182, 127, 94, 60 | 3.03 |
+| | Unsloth's | 0 | 761 of 1,635 | 258, 186, 136, 108, 73 | 3.34 |
+| | STQ | 0 | 762 of 1,630 | 259, 189, 134, 106, 74 | 3.35 |
+| RTX PRO 6000 | Unsloth's | 0.5 | 657 of 905 | 241, 155, 113, 82, 66 | 3.07 |
+| | STQ | 0.5 | 655 of 889 | 236, 162, 110, 84, 63 | 3.05 |
+| | Unsloth's | 0 | 688 of 1,440 | 231, 166, 124, 91, 76 | 3.40 |
+| | STQ | 0 | 692 of 1,420 | 226, 170, 121, 96, 79 | 3.45 |
+
+- **Acceptance is equal.** On each card the two drafters accept the same number of drafts within
+  1%, with close counts at each position; at the 0.5 floor the STQ drafter proposes 2 to 5% fewer.
+  Every arm gave plain decoding's tokens on its card (the two cards' answers differ from each
+  other, so acceptance compares within a card).
+- **On a 24 GB card the STQ drafter is the faster one.** With it the RTX 4090 keeps 618 experts on
+  the card, with Unsloth's 73, and decodes 1.15 to 1.41 times as fast as with Unsloth's drafter.
+  Against plain decoding it gains 19% on code and 21% on reasoning and 2% on the summary, and loses
+  8% on the short answer and 15% after the long prompt; Unsloth's drafter gains only on code (2%).
+  With both caches held at 500 MiB the STQ drafter decodes 1.04 to 1.08 times as fast as Unsloth's
+  on four requests and 0.98 times on the summary, so most of its lead is the cache it leaves.
+- **Prefill beside Unsloth's drafter.** It slows the RTX 4090's prefill from 620 to 405 tok/s; the
+  STQ drafter's 634 tok/s matches plain prefill. A span borrows its buffers from the expert cache;
+  beside Unsloth's drafter the 73-expert cache cannot lend a whole prompt's, the 8,086-token prompt
+  runs in pieces and every layer's experts cross the bus twice. Nsight Systems counted 198 GiB of
+  host-to-device copies during the request with Unsloth's drafter against 97 GiB with the STQ
+  drafter, at the same kernel time (4.9 s). With the cache fixed at 500 MiB, Unsloth's spans shrink
+  to 4,096 tokens and the prompt takes two (409 tok/s), while the other arms keep one span of
+  16,384. The RTX PRO 6000 prefills at 1,240 to 1,260 tok/s in every arm.
+- **A card that caches most experts.** On the RTX PRO 6000 both drafters decode 1.3 to 2.1 times
+  as fast as plain decoding. The STQ drafter is 4% faster than Unsloth's on the short answer and 1
+  to 6% slower on the other four requests; what costs it the difference (its product's decode
+  arithmetic, for one) is not measured.
+- **The floor.** At `--draft-confidence 0` both drafters gain tokens per target pass (3.34 to 3.45
+  against 3.00 to 3.07) and decode slower on every request on both cards: each verification
+  carries all five drafts, and the extra rows route to more experts.
+- **Memory.** The server's resident host memory peaked at 115.6 to 116.0 GiB in every arm.
+
+One run per row (the short answer's rate is the mean of its two warm runs); no spread is measured.
 
 ## Images
 
@@ -671,6 +795,14 @@ Rows give one run, or the range of two; no spread is measured.
   two logits are closest (gaps of 0.01 to 0.04). The FP64 forward took 2 h 53 min on the
   Threadripper 3960X. Since then the GPU's IQ1_S, IQ1_M and IQ2_XXS products round step by step as
   the [CPU share](#the-cpu-share) does, which changes the outputs; this check was not rerun.
+- **The STQ product.** `ninfer_linear_stq_test` qualifies the STQ drafter's matrix product against
+  an FP64 oracle over its own decode of the trellis words and sign vectors, at the drafter's shapes
+  and 1 to 8 rows: `fc` (15,360 to 5,120), `wkv`, `wq_b` with BF16 output, `wo_b`, the shared
+  expert's down product, the grouped `wo_a` (8 groups of 4,096 to 1,024) and the routed experts'
+  gate and down products through expert ids, within 2·10⁻⁵ of the output's RMS (plus BF16's half
+  step where the output is BF16); its decoder reproduces a PAIR1 vector from sushi's tests. The
+  converter's tests convert a small STQ pack and compare each stored trellis, sign and vector with
+  the pack's bytes.
 - **The vision tower's kernels.** `ninfer_deepseek_v41_vision_kernels_test` qualifies them against
   FP64 oracles at the tower's widths: the residual with the next projection's RMS norm, the 2D
   rotation of Q and K (angles past 70 radians), the softmax, SwiGLU, the erf GELU with its bias,

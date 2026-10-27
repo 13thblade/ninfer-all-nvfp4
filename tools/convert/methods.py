@@ -149,7 +149,13 @@ class PrepareRequest:
 
 
 Method = Callable[[PrepareRequest], PreparedMethod]
-_DIRECT_DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32, "int32": torch.int32}
+_DIRECT_DTYPES = {
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+    "int32": torch.int32,
+    "fp16": torch.float16,
+    "uint16": torch.uint16,
+}
 
 
 def _preflight(request: PrepareRequest, *, values: bool = True) -> None:
@@ -171,7 +177,7 @@ def _preflight(request: PrepareRequest, *, values: bool = True) -> None:
 
 
 def cast_direct(request: PrepareRequest) -> PreparedMethod:
-    """Convert values at the explicit target BF16/FP32/INT32 boundary."""
+    """Convert values at the explicit target direct-format boundary (UINT16 words pass unchanged)."""
     if not isinstance(get_format(request.target.format), DirectFormat):
         raise ValueError("cast_direct requires a direct target format")
     _preflight(request)
@@ -191,6 +197,13 @@ def cast_direct(request: PrepareRequest) -> PreparedMethod:
                 raise ValueError(
                     "int32 conversion source is outside the representable range"
                 )
+            # Stored words, not numbers: a UINT16 target takes UINT16 source words only, and an
+            # FP16 target only values it represents exactly.
+            if dtype == torch.uint16 and values.dtype != torch.uint16:
+                raise ValueError("uint16 targets take unsigned 16-bit source words")
+            if dtype == torch.float16 and values.dtype != torch.float16 and not bool(
+                    (values.to(torch.float16).to(values.dtype) == values).all()):
+                raise ValueError("fp16 conversion source is not exactly representable")
             values = values.to(dtype=dtype)
             output.write_values(begin, values)
 

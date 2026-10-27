@@ -23,6 +23,10 @@ architecture `dflash`) forms the `dspark` component beside `text` (`--components
 three blocks of the backbone's shape whose window rings the trunk's streams entering its last three
 blocks fill (`fc`, its norm), a routed MoE of 128 experts (3 a token) in MXFP4 blocks, the final
 norm, the Markov bias tables (BF16) and the confidence head, imported as stored like the backbone.
+The drafter of beamster's Sushi STQ pack (`--source dspark=PACK_DIR`, a directory with the pack's
+config.json, its index and its six `model-mtp*` files) forms the same component from the release's
+`mtp.0..2` tensors in STQ: each matrix its trellis words and sign vectors as stored
+(STQ_CODEBOOKS), its vectors as the release's.
 
 The release's vision tower forms the `vision` component beside `text` (`--components
 text,engram,vision`): the ViT and the aligner from llama.cpp's `clip` file
@@ -62,6 +66,7 @@ from .methods import cast_direct, import_encoded
 from .resources import _dump_json, _normalize_added_decoder, token_domain
 from .sources.gguf import GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source, select_rows
+from .sources.safetensors import SafetensorsSource, tensor_source
 from .ternary import rows
 
 ARCHITECTURES = ("DeepseekV41ForCausalLM",)
@@ -78,6 +83,17 @@ RESOURCES = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
 DEFAULT_RESOURCES = Path(__file__).resolve().parent / "templates" / "deepseek_v41"
 # llama.cpp's LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS.
 SQRT_SOFTPLUS_GATING = 4
+# The codebooks of an STQ pack's drafter (beamster's Sushi STQ packs, `--source dspark=PACK_DIR`):
+# each matrix's trellis words (u16 [in/16][out/16][words], 16 x 16 weights a tile) as stored, its
+# input and output sign vectors (F16) beside them; the trunk's tiles SPEC1 with 15-bit codewords
+# at 64 words (4 bits a weight), the routed experts' PAIR1 with 16-bit codewords at 32 words.
+STQ_CODEBOOKS = {"trunk": "spec1_w15_n64", "experts": "pair1_w16_n32"}
+STQ_WORDS = {"spec1_w15_n64": 64, "pair1_w16_n32": 32}
+# Model keys an STQ pack's config must share with the release beside its dspark_* keys.
+STQ_PACK_KEYS = ("vocab_size", "hidden_size", "moe_intermediate_size", "num_hidden_layers",
+                 "num_attention_heads", "head_dim", "q_lora_rank", "o_lora_rank", "o_groups",
+                 "num_nextn_predict_layers", "swiglu_limit", "rms_norm_eps", "sliding_window",
+                 "hc_mult", "hc_eps", "hc_sinkhorn_iters", "routed_scaling_factor")
 TABLE_FORMAT = "gguf_iq4_nl"
 ENGRAM_TENSOR = "blk.{}.engram_embd.weight"
 SPLIT_NAME = re.compile(r"(.*)-(\d{5})-of-(\d{5})\.gguf")
@@ -284,10 +300,9 @@ def validate(gguf: GGUFShards, config: dict) -> None:
             raise ValueError(f"{gguf.path}: {key} differs from swiglu_limit")
 
 
-def dspark_config(source: dict, config: dict, dspark: GGUFShards) -> dict:
-    """The `dspark` component's config from the release's dspark_* keys, checked against the
-    drafter GGUF's metadata: its blocks have the backbone's geometry (config), window attention only,
-    and a MoE of their own width."""
+def _dspark_release_config(source: dict, config: dict) -> dict:
+    """The `dspark` component's config from the release's dspark_* keys: blocks of the backbone's
+    geometry (config), window attention only, and a MoE of their own width."""
 
     t = source["text_config"]
     layers, vocab = config["num_hidden_layers"], config["vocab_size"]
@@ -312,7 +327,15 @@ def dspark_config(source: dict, config: dict, dspark: GGUFShards) -> dict:
         raise ValueError("the drafter routes to more experts than it has")
     if list(t.get("compress_ratios", []))[layers:] != [0] * count:
         raise ValueError("the DSpark blocks attend through their window only (compress ratio 0)")
+    return out
 
+
+def dspark_config(source: dict, config: dict, dspark: GGUFShards) -> dict:
+    """The release's drafter config (_dspark_release_config), checked against the drafter GGUF's
+    metadata."""
+
+    out = _dspark_release_config(source, config)
+    count = out["num_hidden_layers"]
     kv, f = dspark.kv, "dflash."
     if kv.get("general.architecture") != "dflash":
         raise ValueError(f"{dspark.path}: expected the release's DSpark drafter (dflash) GGUF")
@@ -352,6 +375,38 @@ def dspark_config(source: dict, config: dict, dspark: GGUFShards) -> dict:
         values = list(kv.get(f + key, []))
         if len(values) < count or any(float(v) != config["swiglu_limit"] for v in values[:count]):
             raise ValueError(f"{dspark.path}: {key} differs from swiglu_limit")
+    return out
+
+
+def _safetensors_metadata(file: Path) -> dict:
+    with file.open("rb") as stream:
+        length = int.from_bytes(stream.read(8), "little")
+        return json.loads(stream.read(length)).get("__metadata__", {})
+
+
+def dspark_stq_config(source: dict, config: dict, pack: SafetensorsSource) -> dict:
+    """The release's drafter config (_dspark_release_config) for the drafter of an STQ pack
+    (STQ_PACK), whose own config must state the release's model and drafter keys and whose drafter
+    files must hold the codebooks this recipe stores: SPEC1 (`k` 4) beside the trunk's matrices,
+    PAIR1 (`k` 2) beside the routed experts'."""
+
+    out = _dspark_release_config(source, config)
+    release, stated = source["text_config"], pack.config.get("text_config", {})
+    for key, value in release.items():
+        if key.startswith("dspark_") or key in STQ_PACK_KEYS:
+            if stated.get(key) != value:
+                raise ValueError(f"{pack.path}: text_config.{key} differs from the release's")
+    files = sorted({pack.weight_map[name] for name in pack.weight_map if name.startswith("mtp.")})
+    if not files:
+        raise ValueError(f"{pack.path}: the pack holds no drafter tensors (mtp.*)")
+    for file in files:
+        meta = _safetensors_metadata(file)
+        experts = any(owner == file and ".switch_mlp." in name
+                      for name, owner in pack.weight_map.items())
+        want = ("pair1", "2") if experts else ("spec1", "4")
+        if (meta.get("format"), meta.get("codebook"), meta.get("k")) != ("stq", *want):
+            raise ValueError(f"{file}: expected STQ {want[0]} at k={want[1]}, found {meta}")
+    out["stq"] = dict(STQ_CODEBOOKS)
     return out
 
 
@@ -658,8 +713,10 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
     payloads["resource/text/engram_token_map"] = constants["token_map"].tobytes()
     records["text"] = {"config": config, "resources": references}
     if dspark is not None:
-        records["dspark"] = {"config": dspark_config(base.config, config, dspark),
-                             "target": "text"}
+        drafter_config = (dspark_stq_config(base.config, config, dspark)
+                          if isinstance(dspark, SafetensorsSource)
+                          else dspark_config(base.config, config, dspark))
+        records["dspark"] = {"config": drafter_config, "target": "text"}
     if vision is not None:
         vc = vision_config(vision, base.config, config)
         records["vision"] = {"config": vc, "target": "text",
@@ -750,7 +807,9 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
             vector(n + "gate", None, (hc, h),
                    array_source(torch.from_numpy(np.ascontiguousarray(gate)),
                                 g + "engram_q*engram_k"))
-    if dspark is not None:
+    if dspark is not None and "stq" in records["dspark"]["config"]:
+        _stq_drafter(model, dspark, records["dspark"]["config"], config)
+    elif dspark is not None:
         drafter = records["dspark"]["config"]
         rank, taps = drafter["markov_rank"], len(drafter["target_layer_ids"])
         matrix("dspark/fc", "fc.weight", (h, taps * h), ("dspark/taps",), file=dspark)
@@ -812,6 +871,80 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
     return model
 
 
+def _stq_drafter(model, pack: SafetensorsSource, drafter: dict, config: dict) -> None:
+    """The `dspark` component from an STQ pack's drafter (`mtp.0..2`, the release's names, the
+    routed experts in the pack's one expert group): each STQ matrix as its trellis words
+    (`NAME/trellis`, UINT16 [in/16][out/16][words], a leading [count] for the grouped output
+    projection's groups and the routed experts), input signs (`NAME/suh`, FP16 [in]) and output
+    signs (`NAME/svh`, FP16 [out]), all as stored; the vectors FP32 (BF16 widened exactly), the
+    Markov tables BF16."""
+
+    from .model import Parameter
+
+    h, vocab = config["hidden_size"], config["vocab_size"]
+    heads, d, hc = config["num_attention_heads"], config["head_dim"], config["hc_mult"]
+    mixes = (2 + hc) * hc
+    q_rank, o_rank, groups = config["q_lora_rank"], config["o_lora_rank"], config["o_groups"]
+    w, e = config["moe_intermediate_size"], drafter["n_routed_experts"]
+    rank, taps = drafter["markov_rank"], len(drafter["target_layer_ids"])
+    trunk, routed = drafter["stq"]["trunk"], drafter["stq"]["experts"]
+
+    def direct(name, tensor, shape, stored, dtypes, exact=False):
+        info = pack.describe(tensor)
+        if (info.dtype not in dtypes or int(np.prod(info.shape)) != int(np.prod(shape))
+                or (exact and tuple(info.shape) != tuple(shape))):
+            raise ValueError(f"{tensor}: expected {'/'.join(dtypes)} {shape}, found "
+                             f"{info.dtype} {list(info.shape)}")
+        model.add(Parameter(name, shape, tensor_source(pack, tensor, shape,
+                                                       source_shape=tuple(info.shape)),
+                            direct_format=stored))
+
+    def vector(name, tensor, shape, stored="fp32"):
+        direct(name, tensor, shape, stored, ("F32", "BF16") if stored == "fp32" else ("BF16",))
+
+    def stq(name, tensor, k, n, codebook, count=None):
+        lead = () if count is None else (count,)
+        direct(name + "/trellis", tensor + ".trellis", lead + (k // 16, n // 16, STQ_WORDS[codebook]),
+               "uint16", ("U16",), exact=True)
+        direct(name + "/suh", tensor + ".suh", lead + (k,), "fp16", ("F16",), exact=True)
+        direct(name + "/svh", tensor + ".svh", lead + (n,), "fp16", ("F16",), exact=True)
+
+    last = f"mtp.{drafter['num_hidden_layers'] - 1}."
+    stq("dspark/fc", "mtp.0.main_proj", taps * h, h, trunk)
+    vector("dspark/tap_norm", "mtp.0.main_norm.weight", (h,))
+    vector("dspark/final_norm", last + "norm.weight", (h,))
+    vector("dspark/markov_embed", last + "markov_head.embed.weight", (vocab, rank), "bf16")
+    vector("dspark/markov_head", last + "markov_head.head.weight", (vocab, rank), "bf16")
+    vector("dspark/confidence", last + "confidence_head.proj.weight", (h + rank,))
+    for b in range(drafter["num_hidden_layers"]):
+        g, p = f"mtp.{b}.", f"dspark/layers/{b}/"
+        if pack.has(g + "mlp.switch_mlp.gate_proj.g1.trellis"):
+            raise ValueError(f"{pack.path}: drafter block {b} splits its experts into groups")
+        for site, prefix in (("attn", "hc_attention/"), ("ffn", "hc_ffn/")):
+            vector(p + prefix + "fn", g + f"hc_{site}_fn", (mixes, hc * h))
+            vector(p + prefix + "base", g + f"hc_{site}_base", (mixes,))
+            vector(p + prefix + "scale", g + f"hc_{site}_scale", (3,))
+        vector(p + "attention_norm", g + "attn_norm.weight", (h,))
+        vector(p + "ffn_norm", g + "ffn_norm.weight", (h,))
+        a, m = p + "attention/", p + "moe/"
+        stq(a + "query_a", g + "attn.wq_a", h, q_rank, trunk)
+        stq(a + "kv", g + "attn.wkv", h, d, trunk)
+        vector(a + "query_a_norm", g + "attn.q_norm.weight", (q_rank,))
+        vector(a + "kv_norm", g + "attn.kv_norm.weight", (d,))
+        stq(a + "query_b", g + "attn.wq_b", q_rank, heads * d, trunk)
+        stq(a + "output_a", g + "attn.wo_a", heads * d // groups, o_rank, trunk, groups)
+        stq(a + "output_b", g + "attn.wo_b", groups * o_rank, h, trunk)
+        vector(a + "sinks", g + "attn.attn_sink", (heads,))
+        vector(m + "router", g + "ffn.gate.weight", (e, h))
+        vector(m + "router_bias", g + "ffn.gate.bias", (e,))
+        stq(m + "shared_gate", g + "ffn.shared_experts.w1", h, w, trunk)
+        stq(m + "shared_up", g + "ffn.shared_experts.w3", h, w, trunk)
+        stq(m + "shared_down", g + "ffn.shared_experts.w2", w, h, trunk)
+        stq(m + "gate", g + "mlp.switch_mlp.gate_proj.g0", h, w, routed, e)
+        stq(m + "up", g + "mlp.switch_mlp.up_proj.g0", h, w, routed, e)
+        stq(m + "down", g + "mlp.switch_mlp.down_proj.g0", w, h, routed, e)
+
+
 def _engram_table(model):
     from .model import Parameter
 
@@ -867,7 +1000,8 @@ def deepseek_v41_gguf(model, recipe, sources):
             recipe.assign(name, format="bf16", method=cast_direct, source=parameter.source,
                           activation_policy="A16Only")
             continue
-        if (parameter.direct_format == "fp32" or name in MARKOV_TABLES) and not parameter.projection:
+        if (parameter.direct_format in ("fp32", "fp16", "uint16") or name in MARKOV_TABLES) and \
+                not parameter.projection:
             recipe.assign(name, format=parameter.direct_format, method=cast_direct,
                           source=parameter.source)
             continue
@@ -876,7 +1010,7 @@ def deepseek_v41_gguf(model, recipe, sources):
                       **({"activation_policy": "AllowA8"} if parameter.projection else {}))
     config = model.config
     blocks = [f"text/layers/{i}/" for i in range(config["num_hidden_layers"])]
-    if "dspark" in model.components:
+    if "dspark" in model.components and "stq" not in model.components["dspark"]["config"]:
         blocks += [f"dspark/layers/{b}/" for b in
                    range(model.components["dspark"]["config"]["num_hidden_layers"])]
     for p in blocks:

@@ -82,3 +82,9 @@ ninfer_add_op_test(ninfer_linear_gguf_cooperative_test
 target_include_directories(ninfer_linear_gguf_cooperative_test PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/include"
   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+
+# STQ products (the sushi DSpark drafter's matrices) against an FP64 oracle over an independent
+# decode of the trellis.
+ninfer_add_op_test(ninfer_linear_stq_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_stq.cpp"
+  LIBRARIES ninfer_ops)

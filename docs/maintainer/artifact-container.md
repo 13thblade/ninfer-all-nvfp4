@@ -317,6 +317,8 @@ group size、scale 类型和解码规则直接由该 codec 定义。
 | bf16 | Bfloat16 原始 word |
 | fp32 | IEEE binary32 原始 word |
 | int32 | 有符号 32-bit 整数 |
+| fp16 | IEEE binary16 原始 word |
+| uint16 | 无符号 16-bit word |
 | q2_g64_fp16 | Offset codes `0..3` represent `[-1,2]`，G64，signed finite FP16 multiplier |
 | q4_g64_fp16 | Signed 4-bit codes，G64，FP16 multiplier |
 | q5_g64_fp16 | Signed 5-bit codes，G64，FP16 multiplier |
@@ -337,7 +339,7 @@ Code 范围、特殊浮点值、舍入与精确重建按[数值合同](tensor-fo
 
 | 名称 | 当前允许的 format / shape | 对象对齐 |
 |---|---|---:|
-| contiguous_le_v1 | bf16/fp32/int32，rank 0..16 | 256 |
+| contiguous_le_v1 | bf16/fp32/int32/fp16/uint16，rank 0..16 | 256 |
 | row_split_k128_v1 | q2_g64_fp16、q4_g64_fp16、q5_g64_fp16、q6_g64_fp16、q8_g32_fp16、t2_g128_fp16，正 rank-2 `[N,K]` | 256 |
 | block_scale_k16_m128x4_v1 | nvfp4，`N%128=0`、`K%64=0` | 256 |
 | row_scale_v1 | fp8_e4m3fn_row_bf16，正 rank-2 `[N,K]` | 256 |

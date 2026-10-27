@@ -87,6 +87,24 @@ int run_tests() {
             failures += check(rejects([&] { (void)parse(args); }),
                               ("CLI accepted " + tail.front() + " beside --spec dspark").c_str());
         }
+        // The confidence floor: the drafter's default unless set, 0..1, DSpark only.
+        failures += check(!block.speculative.draft_confidence, "DSpark's floor must default");
+        for (const auto* floor : {"0", "0.65", "1"}) {
+            const auto set = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec",
+                                    "dspark", "--draft-confidence", floor});
+            failures += check(set.speculative.draft_confidence == std::stof(floor),
+                              "CLI did not preserve --draft-confidence");
+        }
+        for (const std::vector<std::string> tail :
+             {std::vector<std::string>{"--spec", "dspark", "--draft-confidence", "1.5"},
+              {"--spec", "dspark", "--draft-confidence", "nan"},
+              {"--spec", "mtp", "--draft-tokens", "4", "--draft-confidence", "0.5"},
+              {"--draft-confidence", "0.5"}}) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            failures += check(rejects([&] { (void)parse(args); }),
+                              "CLI accepted an invalid --draft-confidence");
+        }
     }
     {
         // Without --spec the Engine chooses; --spec none and every backend are explicit.

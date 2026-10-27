@@ -11,7 +11,7 @@ The storage registry contains exactly these identities:
 
 | Identity | Kind | Compatible numeric formats | Logical shape | Object alignment |
 |---|---|---|---|---:|
-| `contiguous_le_v1` | tensor layout | `bf16`, `fp32`, `int32` | rank `0..16` | 256 bytes |
+| `contiguous_le_v1` | tensor layout | `bf16`, `fp32`, `int32`, `fp16`, `uint16` | rank `0..16` | 256 bytes |
 | `row_split_k128_v1` | tensor layout | `q2_g64_fp16`, `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16`, `t2_g128_fp16` | rank 2 `[N,K]` | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
@@ -64,6 +64,8 @@ Words are serialized least-significant byte first:
 | `bf16` | 2 | the exact 16-bit bfloat16 logical word, little-endian |
 | `fp32` | 4 | the exact 32-bit IEEE-754 binary32 logical word, little-endian |
 | `int32` | 4 | the exact 32-bit two's-complement logical word, little-endian |
+| `fp16` | 2 | the exact 16-bit IEEE-754 binary16 logical word, little-endian |
+| `uint16` | 2 | the exact 16-bit unsigned logical word, little-endian |
 
 Signed zero, subnormal, infinity, NaN payload, and integer-word behavior are determined by the
 numeric-format contract. The layout only preserves the word bits.

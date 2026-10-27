@@ -88,11 +88,14 @@ struct TextConfig {
 // noise token, at the positions after the ring's; each row's logits are the backbone's head over
 // the final norm of its collapsed streams plus a Markov bias of the token before it (rank
 // markov_rank), and a confidence head reads the collapsed row and that token's Markov embedding.
-// Its MoE routes to top_k of `experts`.
+// Its MoE routes to top_k of `experts`. Its matrices are the GGUF blocks of a llama.cpp drafter, or
+// with `stq` the STQ matrices of an STQ pack's drafter: SPEC1 (64 words a tile) in the projection and
+// the blocks' trunk, PAIR1 (32 words) in their routed experts.
 struct DSparkConfig {
     std::uint32_t layers = 0, block_size = 0, markov_rank = 0, experts = 0, top_k = 0;
     std::int32_t noise_token = 0;
     std::vector<std::uint32_t> target_layers;
+    bool stq = false;
 };
 
 // The vision tower (the `vision` component): a ViT of num_hidden_layers blocks of hidden_size over

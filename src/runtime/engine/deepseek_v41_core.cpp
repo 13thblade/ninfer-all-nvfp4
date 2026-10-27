@@ -56,7 +56,7 @@ double seconds(Clock::time_point from, Clock::time_point to) {
 }
 
 // A DSpark round verifies the drafts while each one's confidence is at least this (Strata's
-// default for the release's drafter).
+// default for the release's drafter), unless --draft-confidence sets another floor.
 constexpr float kDSparkConfidenceFloor = 0.5F;
 
 bool request_error(const std::exception_ptr& error) {
@@ -436,7 +436,8 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                            "DeepSeek-V4.1: DSpark speculative decoding, up to %u drafts a round "
                            "while their confidence is at least %.2f, one decoding request at a "
                            "time",
-                           drafts, double(kDSparkConfidenceFloor));
+                           drafts,
+                           double(speculative.draft_confidence.value_or(kDSparkConfidenceFloor)));
     }
     ConstructedDeepSeekV41 out;
     const auto& stats         = model->storage_stats();
@@ -617,6 +618,7 @@ struct DeepSeekV41Core::Impl {
     const std::uint32_t drafts;       // a round's drafts at most; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
     const std::uint32_t dspark_block; // --spec dspark: the drafter's block; 0 is off
+    const float dspark_floor;         // the confidence a kept draft reaches
     const DiagnosticObserver diagnostics;
     static constexpr TokenId kBos = 0; // <｜begin▁of▁sentence｜>
 
@@ -696,6 +698,7 @@ struct DeepSeekV41Core::Impl {
           structured_output(options.structured_output),
           reuse_prefixes(i.executor->options().checkpoints), drafts(i.executor->draft_tokens()),
           lookup_ngram(options.speculative.lookup_ngram), dspark_block(i.executor->dspark_block()),
+          dspark_floor(options.speculative.draft_confidence.value_or(kDSparkConfidenceFloor)),
           diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(
@@ -2013,7 +2016,7 @@ struct DeepSeekV41Core::Impl {
         std::vector<float> confidence(dspark_block);
         instance.executor->draft(r.slot, r.feed.front(), drafted, confidence);
         std::uint32_t kept = 0;
-        while (kept < steps && confidence[kept] >= kDSparkConfidenceFloor &&
+        while (kept < steps && confidence[kept] >= dspark_floor &&
                drafted[kept] >= 0 && std::uint32_t(drafted[kept]) < domain) {
             out[kept] = drafted[kept];
             ++kept;

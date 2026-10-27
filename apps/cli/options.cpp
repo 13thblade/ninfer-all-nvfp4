@@ -220,6 +220,8 @@ std::string usage_text(const char* argv0) {
            "                                of 5, the default)\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0;\n"
            "                                0.5 when the engine chooses MTP)\n"
+           "  --draft-confidence C          dspark: verify drafts while their confidence is\n"
+           "                                at least C, 0..1 (default 0.5; 0 keeps every draft)\n"
            "  --lm-head-draft               draft with the optimized proposal head, which\n"
            "                                the artifact must store (the default when it does)\n"
            "  --full-draft-head             draft with the full output head even when the\n"
@@ -438,6 +440,9 @@ Options parse_options(int argc, char** argv) {
             spec_explicit               = true;
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--draft-confidence") {
+            options.speculative.draft_confidence =
+                parse_float(value(arg), "draft-confidence", 0.0F, 1.0F);
         } else if (arg == "--draft-min-p") {
             options.speculative.draft_min_p = parse_float(value(arg), "draft-min-p", 0.0F, 1.0F);
         } else if (arg == "--ngram-draft-tokens") {
