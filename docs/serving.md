@@ -810,14 +810,25 @@ they advance during a long request rather than at its completion, and their rati
 A build configured with `-DNINFER_WEBUI_DIR=<dir>` compiles the files of a built WebUI into
 `ninfer-serve` and serves them on `GET /`; any other `GET` path outside the API routes returns the
 entry page, for the UI's client-side router. The static files need no API key, the API routes it
-calls still do. `--no-webui` turns it off at startup. The build never downloads anything:
-`scripts/fetch-webui.sh [tag]` unpacks one of llama.cpp's released WebUIs, which speaks this
-server's `/props`, `/slots`, `/v1/models` and streamed Chat Completions, and prints the directory to
-configure with.
+calls still do. `--no-webui` turns it off at startup. The Linux release packages and the Docker
+images carry llama.cpp's WebUI at the release `scripts/fetch-webui.sh` pins; the Windows packages
+carry none. The build never downloads anything: `scripts/fetch-webui.sh [tag]` unpacks one of
+llama.cpp's released WebUIs, which speaks this server's `/props`, `/slots`, `/v1/models` and
+streamed Chat Completions, and prints the directory to configure with.
 
 ```bash
 ./scripts/fetch-webui.sh
 cmake -S . -B build -DNINFER_WEBUI_DIR=<the directory it printed>
+```
+
+`--ui-config-file PATH` gives the WebUI settings that survive a restart: the file holds one JSON
+object of the WebUI's setting keys, which `/props` reports as `ui_settings` and the WebUI applies
+in place of its own defaults. Configured MCP servers are its `mcpServers` key, a JSON string of an
+array of `{url, headers}` entries. A missing file, malformed JSON or a value that is not an object
+stops the server at startup. Every client that may read `/props` sees the file, headers included.
+
+```json
+{"mcpServers": "[{\"url\": \"http://127.0.0.1:9000/mcp\"}]", "theme": "dark"}
 ```
 
 The WebUI's MCP client cannot reach an MCP server from the browser: the Streamable HTTP transports
@@ -2202,6 +2213,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--no-webui` | stop serving a WebUI built in with `NINFER_WEBUI_DIR` | served when built in |
 | `--webui-mcp-proxy` | relay the WebUI's MCP traffic at `/cors-proxy` (http targets only) | off |
+| `--ui-config-file PATH` | a JSON object of WebUI settings, reported as `/props` `ui_settings` ([WebUI](#webui)) | none |
 | `--structured-output` | enforce response formats (JSON, JSON Schema, regex, choice, GBNF) and strict tool arguments (see [Structured output](#structured-output)) | off |
 | `--unconstrained-response-format` | without `--structured-output`, generate a constrained request or strict tools unconstrained instead of refusing them | off |
 | `--assistant-prefill` | continue a Chat Completions request's trailing assistant message in place, as `/v1/messages` does | off |
