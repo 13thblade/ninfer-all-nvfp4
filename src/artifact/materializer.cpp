@@ -152,6 +152,42 @@ std::vector<ReadSpan> direct_spans(std::vector<CopyRange>& ranges) {
     return spans;
 }
 
+// A range whose stored bytes another range of the same upload pass already reads: copied on the
+// device from where that range lands.
+struct RepeatedRange {
+    const std::byte* source = nullptr;
+    std::byte* destination  = nullptr;
+    std::uint64_t bytes     = 0;
+};
+
+// Sorts `ranges` by file position and takes out each range that lies inside an earlier one, so
+// direct reads still read every stored byte once. Several pieces of one stored object on a rank
+// need such bytes: every piece of a whole NVFP4 object carries the object's single divisor. Any
+// other overlap stays a planning error for direct_spans.
+std::vector<RepeatedRange> take_repeated_ranges(std::vector<CopyRange>& ranges) {
+    // At one position the longer range comes first, so the shorter one lies inside it.
+    std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.file, a.begin, b.end) < std::tie(b.file, b.begin, a.end);
+    });
+    std::vector<RepeatedRange> repeats;
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const CopyRange range = ranges[i];
+        // Kept ranges are disjoint and ordered, so only the last one can hold this one.
+        if (kept != 0) {
+            const CopyRange& cover = ranges[kept - 1];
+            if (cover.file == range.file && cover.begin <= range.begin && range.end <= cover.end) {
+                repeats.push_back({cover.destination + (range.begin - cover.begin),
+                                   range.destination, range.end - range.begin});
+                continue;
+            }
+        }
+        ranges[kept++] = range;
+    }
+    ranges.resize(kept);
+    return repeats;
+}
+
 // Host-kept objects are read in pieces of this size on this many threads: enough reads in flight
 // to keep an NVMe drive busy, and the copies out of staging keep pace on the same threads.
 constexpr std::uint64_t kHostPieceBytes = 16ULL << 20U;
@@ -277,28 +313,34 @@ std::uint64_t read_host_bytes(const Reader& reader, std::span<const HostReadTarg
     return read;
 }
 
-float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeometry& geometry,
-                   std::span<const std::byte> host, MaterializationStats& stats) {
-    if (geometry.format != QType::NVFP4) { return 0.0F; }
-    const auto bytes = checked_mul(geometry.divisor_count, sizeof(float), "weight divisors");
+// The NVFP4 divisor of the stored object's row `first_row`, from its stored bytes (`host`) or its
+// file. A selected piece names the row it starts at: the piece's own geometry places its divisors
+// inside the piece, not inside the stored object.
+float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeometry& stored,
+                   std::span<const std::byte> host, MaterializationStats& stats,
+                   std::uint64_t first_row = 0) {
+    if (stored.format != QType::NVFP4) { return 0.0F; }
+    const auto bytes = checked_mul(stored.divisor_count, sizeof(float), "weight divisors");
     std::vector<std::byte> words(bytes);
     if (!host.empty()) {
-        std::copy_n(host.data() + geometry.divisor_offset, bytes, words.data());
+        std::copy_n(host.data() + stored.divisor_offset, bytes, words.data());
     } else {
         const auto& object = reader.directory().tensor(handle);
-        reader.read_into(checked_add(object.offset, geometry.divisor_offset, "weight divisor"),
+        reader.read_into(checked_add(object.offset, stored.divisor_offset, "weight divisor"),
                          words);
         stats.read_bytes = checked_add(stats.read_bytes, bytes, "read bytes");
     }
     // Every divisor is read by a kernel, so every one is checked before anything binds.
-    for (std::uint64_t index = 0; index < geometry.divisor_count; ++index) {
+    for (std::uint64_t index = 0; index < stored.divisor_count; ++index) {
         const auto value = std::bit_cast<float>(read_u32_le(words.data() + index * sizeof(float)));
         if (!std::isfinite(value) || value <= 0) {
             throw ArtifactError(reader.directory().tensor(handle).id +
                                 ": invalid NVFP4 weight divisor");
         }
     }
-    return std::bit_cast<float>(read_u32_le(words.data()));
+    const std::uint64_t rows = stored.shape.size() == 2 ? stored.shape[0] : 1;
+    const std::uint64_t word = first_row / (rows / stored.divisor_count);
+    return std::bit_cast<float>(read_u32_le(words.data() + word * sizeof(float)));
 }
 
 // Copies of one width whose sources and destinations advance by fixed pitches, as the lines of a
@@ -498,9 +540,10 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
         if (ranges.empty()) { continue; }
         uploaded_any = true;
         const ScopedRank bound(device, rank);
-        const cudaStream_t transfer_stream = device.transfer_stream_for_rank(rank);
-        const std::vector<ReadSpan> spans   = direct_spans(ranges);
-        std::uint64_t aligned_bytes         = 0;
+        const cudaStream_t transfer_stream       = device.transfer_stream_for_rank(rank);
+        const std::vector<RepeatedRange> repeats = take_repeated_ranges(ranges);
+        const std::vector<ReadSpan> spans        = direct_spans(ranges);
+        std::uint64_t aligned_bytes              = 0;
         for (const auto& span : spans) {
             aligned_bytes =
                 checked_add(aligned_bytes,
@@ -573,6 +616,14 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
                 totals.peak_staging_bytes =
                     std::max<std::uint64_t>(totals.peak_staging_bytes, slot_bytes * 2 * slot_count);
             }
+        }
+        // Behind the uploads on the same stream, so each source already holds its bytes.
+        for (const RepeatedRange& repeat : repeats) {
+            check_cuda(cudaMemcpyAsync(repeat.destination, repeat.source,
+                                       static_cast<std::size_t>(repeat.bytes),
+                                       cudaMemcpyDeviceToDevice, transfer_stream),
+                       "repeat stored weight bytes");
+            copied = checked_add(copied, repeat.bytes, "copied bytes");
         }
         completion.finish();
         if (next_range != ranges.size()) { throw ArtifactError("incomplete device upload"); }
@@ -896,9 +947,12 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         previous_device_end[placement.rank] = placement.offset + placement.bytes + placement.tail;
         const DeviceSpan storage{static_cast<std::byte*>(arena->base()) + placement.offset,
                                  static_cast<std::size_t>(placement.bytes)};
-        const auto divisor = object.host
-                                 ? object.host->weight_scale_divisor
-                                 : read_divisor(reader, stored, geometry, {}, out.stats_);
+        // A transcoded placement is NVFP4 no more; a selected piece starts at its first stored row.
+        float divisor = object.host ? object.host->weight_scale_divisor : 0.0F;
+        if (!object.host && geometry.format == QType::NVFP4) {
+            divisor = read_divisor(reader, stored, stored_geometry, {}, out.stats_,
+                                   placement.selection ? placement.selection->rows.front().first : 0);
+        }
         object.device = WeightParent{geometry, static_cast<const std::byte*>(storage.data),
                                      divisor, stored_geometry.format};
     }

@@ -187,9 +187,14 @@ std::vector<SelectedRun> selected_runs(const WeightGeometry& stored,
                                            from.stride == unit_index(layout, layout.columns) *
                                                               from.unit_bytes;
         std::uint64_t placed = 0; // lines of the piece's plane the earlier row ranges filled
+        std::uint64_t taken  = 0; // the stored line after the last one the earlier ranges took
         for (const auto& [row_begin, row_end] : selection.rows) {
-            const std::uint64_t first = row_begin / from.rows;
+            // A line can hold rows of several ranges, as the single divisor of a whole NVFP4 object
+            // does; the piece holds it once.
+            const std::uint64_t first = std::max(row_begin / from.rows, taken);
             const std::uint64_t last  = (row_end + from.rows - 1) / from.rows;
+            if (first >= last) { continue; }
+            taken = last;
             if (dense_lines) {
                 out.push_back(
                     {.source      = checked_add(from.offset, checked_mul(first, from.stride, "line"),

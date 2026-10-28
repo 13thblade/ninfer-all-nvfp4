@@ -299,6 +299,43 @@ void nvfp4_layout() {
     require(refused, "an NVFP4 row bound inside a scale tile is refused");
 }
 
+// Several row ranges of one NVFP4 object, as a tensor-parallel rank takes its rows of q, k and v
+// from one stored object: a divisor covers the rows of every range it spans once, so a piece of a
+// single-divisor object holds that divisor once, and one of a stacked object one word per range.
+void nvfp4_row_ranges() {
+    const std::uint64_t shape[] = {512, 128};
+    const ObjectSelection selection{.rows = {{0, 128}, {256, 384}}, .columns = {{0, 128}}};
+    for (const std::uint64_t divisors : {1U, 4U}) {
+        const auto whole = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape,
+                                           divisors);
+        const auto piece = selected_geometry(whole, selection);
+        const std::uint64_t kept = divisors == 1 ? 1 : 2;
+        require(piece.shape == std::vector<std::uint64_t>({256, 128}) && piece.divisor_count == kept,
+                "an NVFP4 piece of two row ranges keeps one divisor per stored divisor it spans");
+        const auto bytes = gather(whole, selection);
+        for (std::uint64_t r = 0; r < 256; ++r) {
+            const std::uint64_t sr = source_row(selection, r);
+            for (std::uint64_t b = 0; b < 64; ++b) {
+                require(bytes.piece[r * 64 + b] == bytes.stored[sr * 64 + b],
+                        "an NVFP4 code byte of a row range holds its source");
+            }
+            for (std::uint64_t g = 0; g < 8; ++g) {
+                require(bytes.piece[weight_scale_offset(piece, r, g)] ==
+                            bytes.stored[weight_scale_offset(whole, sr, g)],
+                        "an NVFP4 scale of a row range holds its source");
+            }
+        }
+        for (std::uint64_t d = 0; d < kept; ++d) {
+            const std::uint64_t source = divisors == 1 ? 0 : 2 * d;
+            for (std::uint64_t b = 0; b < 4; ++b) {
+                require(bytes.piece[piece.divisor_offset + d * 4 + b] ==
+                            bytes.stored[whole.divisor_offset + source * 4 + b],
+                        "an NVFP4 piece of two row ranges holds the divisors of its rows");
+            }
+        }
+    }
+}
+
 void refusals() {
     const auto whole = stored(QType::FP32, QuantLayout::Contiguous, {6, 8});
     const ObjectSelection bad[] = {
@@ -340,6 +377,7 @@ int main() {
         row_split_layouts();
         fp8_layouts();
         nvfp4_layout();
+        nvfp4_row_ranges();
         refusals();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
