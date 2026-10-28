@@ -193,6 +193,22 @@ class CheckpointTests(unittest.TestCase):
                     CACHE.unpack(archive, self.root / 'destination')
                 self.assertFalse((self.root / 'destination/good').exists())
 
+    def test_old_copy_in_a_later_snapshot_cannot_replace_a_newer_file(self):
+        # A shard that started from the aggregate keeps the manifest of an entry another shard owns.
+        aggregate, owner, seeded = self.family, self.family + '-shard-0', self.family + '-shard-1'
+        manifest = self.source / 'manifest'
+        manifest.write_text('previous headers')
+        os.utime(manifest, (1000, 1000))
+        CACHE.save(self.bucket, self.source, aggregate, self.ref)
+        CACHE.save(self.bucket, self.source, seeded, self.ref)
+        manifest.write_text('previous and current headers')
+        os.utime(manifest, (2000, 2000))
+        CACHE.save(self.bucket, self.source, owner, self.ref)
+        target = self.root / 'package'
+        for family in (aggregate, owner, seeded):
+            self.assertTrue(CACHE.restore(self.bucket, target, family, self.ref, required=True))
+        self.assertEqual((target / 'manifest').read_text(), 'previous and current headers')
+
     def test_pack_excludes_mutable_statistics_and_temporary_entries(self):
         (self.source / 'tmp').mkdir()
         for name in ('object', 'stats', 'lock', 'entry.tmp', 'tmp/uncommitted'):
