@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/zero_pages.h"
 #include "models/qwen3_5/ngram.h"
 
 #include <algorithm>
@@ -18,7 +19,10 @@
 namespace ninfer::models::qwen3_5::detail {
 
 // A bounded, position-indexed proposal corpus. It never owns target state.
-// Absolute positions make overwritten ring entries rejectable before a read.
+// Absolute positions make overwritten ring entries rejectable before a read. The ring and the
+// buckets live on zero pages (an empty bucket entry has width 0, which no window has, and a ring
+// position is read only once written), so a request pays for the pages its tokens reach rather
+// than for the whole 36 MiB at construction.
 class NgramProposer {
 public:
     using Token = std::int32_t;
@@ -32,7 +36,7 @@ public:
 
     explicit NgramProposer(std::size_t token_capacity = 1U << 20,
                            std::size_t bucket_count   = 1U << 19)
-        : tokens_(power_of_two(token_capacity) && token_capacity >= 64 ? token_capacity : 0, -1),
+        : tokens_(power_of_two(token_capacity) && token_capacity >= 64 ? token_capacity : 0),
           buckets_(power_of_two(bucket_count) ? bucket_count : 0),
           token_mask_(token_capacity - 1U) {
         if (tokens_.empty() || buckets_.empty()) {
@@ -59,6 +63,14 @@ public:
     // never spans a boundary, so the input holds exactly the tokens the ring then holds, and the
     // index is the one token-by-token append() builds.
     void ingest(std::span<const Token> tokens) {
+        // Three windows per token land in random buckets, so a span this long reaches most of
+        // the 32 MiB table's 4 KiB pages; fault it in 2 MiB pages instead (measured under WSL2:
+        // 3.6K tokens 23 -> 1.6 ms, 28K 34 -> 2.2 ms). Shorter spans touch few pages, which
+        // huge pages would make cost more (24 tokens 0.16 -> 1.1 ms).
+        if (tokens.size() >= kHugePageIngestTokens && !huge_buckets_) {
+            buckets_.advise_huge_pages();
+            huge_buckets_ = true;
+        }
         boundary();
         constexpr std::size_t kLookahead = 8;
         std::array<std::array<std::uint64_t, widths_.size()>, kLookahead> ahead{};
@@ -163,9 +175,11 @@ private:
     };
 
     static constexpr std::array<std::uint32_t, 3> widths_{16, 8, 4};
-    std::vector<Token> tokens_;
+    static constexpr std::size_t kHugePageIngestTokens = 256;
+    ZeroPageArray<Token> tokens_;
     std::vector<Token> boundaries_;
-    std::vector<std::array<Entry, 4>> buckets_;
+    ZeroPageArray<std::array<Entry, 4>> buckets_;
+    bool huge_buckets_ = false;
     std::uint64_t token_mask_    = 0;
     std::uint64_t end_           = 0;
     std::uint64_t segment_start_ = 0;

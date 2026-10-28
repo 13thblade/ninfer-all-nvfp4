@@ -11,6 +11,7 @@ add_library(ninfer_core STATIC
   gpu_clock_floor.cpp
   host_memory.cpp
   host_pages.cpp
+  zero_pages.cpp
   host_worker_pool.cpp
   cpu_spin_pool.cpp
   expert_split.cpp
