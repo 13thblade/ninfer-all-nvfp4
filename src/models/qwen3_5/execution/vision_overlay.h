@@ -39,6 +39,7 @@ struct VisionOverlayWindowStats {
 };
 
 class VisionResidencyBroker;
+class VisionOverlaySession;
 
 // One open window, served either from free KV granules or from the evict-ranked weight tail.
 class VisionWindow {
@@ -91,6 +92,8 @@ private:
 
 // Program-owned arbiter of the single window a device can hold. Tier 1 is offered only while the
 // KV tier is enabled, the Program can afford a capacity change and free pages cover the request.
+// A window submitted ahead of its unit can still be open when another session needs one; that
+// session's acquire() first finishes the submitted item, whose embeddings wait in its own slot.
 class VisionResidencyBroker {
 public:
     VisionResidencyBroker(DeviceContext& device, EvictableWeightPool& pool) noexcept
@@ -115,6 +118,7 @@ public:
 
 private:
     friend class VisionWindow;
+    friend class VisionOverlaySession;
 
     void require_closed() const;
     void return_loan(std::vector<KVPageRun>& runs) noexcept;
@@ -125,6 +129,8 @@ private:
     DeviceKVPagePool* kv_pages_ = nullptr;
     std::function<bool()> can_lend_;
     std::function<void()> on_change_;
+    // The session whose submitted item holds the open window.
+    VisionOverlaySession* submitted_ = nullptr;
 };
 
 // Pinned slots receiving one item's merged embeddings each. A Vision prefill session holds one
@@ -227,8 +233,8 @@ private:
 // Encodes one media item per window: borrow the extent, stream the tower through it, land the
 // merged embeddings in the session's pinned slot, return the memory. A KV-funded window may stay
 // open across unit boundaries while the encode runs on the Vision stream; a weight-tail window is
-// exclusive and lives inside one prefill unit. Only one lane prefills at a time, so at most one
-// window exists even when a submitted one outlives its unit.
+// exclusive and lives inside one prefill unit. Another session's synchronous encode closes a
+// submitted window first (VisionResidencyBroker::acquire), so a device holds at most one window.
 class VisionOverlaySession {
 public:
     VisionOverlaySession(DeviceContext& device, VisionResidencyBroker& broker,
@@ -248,8 +254,9 @@ public:
 
     [[nodiscard]] bool item_ready() const { return pending_ && completion_.ready(); }
 
-    // Waits for the submitted item, closes its window and returns the pinned BF16
-    // [output_hidden, merged] embeddings; valid until the next item.
+    // Waits for the submitted item, closes its window (unless another session's encode already
+    // did) and returns the pinned BF16 [output_hidden, merged] embeddings; valid until the next
+    // item.
     [[nodiscard]] std::span<const std::byte> complete_item();
     // Synchronous form inside the caller's prefill unit; falls back to the weight tail.
     [[nodiscard]] std::span<const std::byte> encode_item(std::span<const std::uint16_t> patches,
@@ -258,7 +265,12 @@ public:
     [[nodiscard]] const VisionOverlayWindowStats& stats() const noexcept { return stats_; }
 
 private:
+    friend class VisionResidencyBroker;
+
     using Clock = std::chrono::steady_clock;
+
+    // Waits for the item in flight and returns its window; its embeddings stay in the slot.
+    void close_window();
 
     void begin(VisionWindow&& window, std::span<const std::uint16_t> patches,
                const qwen3_5::VisionItemControl& control, const VisionWorkspacePlan& item_plan);

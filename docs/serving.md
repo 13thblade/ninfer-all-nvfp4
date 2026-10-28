@@ -122,7 +122,9 @@ A window is funded from free KV pages when they cover it. Those pages hold nothi
 copied, the text weights stay mapped, and the encode runs on its own stream while other lanes keep
 decoding: the lane that owns the image simply yields its prefill units until the encode completes.
 The pages are out of circulation while the loan is open, so the admission capacity shrinks with it
-and no request is ever admitted into memory that has been lent away.
+and no request is ever admitted into memory that has been lent away. A device holds one window at a
+time: a lane that must encode while another lane's early encode holds the window waits for that
+encode to finish and returns its window first; the other lane's embeddings wait in its pinned slot.
 
 When free pages cannot cover the window, it falls back to the evict-ranked tail of the text weights
 (lm_head, token embedding, draft head, MTP head), restored from a pinned mirror before the prefill
