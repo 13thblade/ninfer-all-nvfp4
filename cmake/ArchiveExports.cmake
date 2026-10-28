@@ -9,7 +9,11 @@ execute_process(COMMAND "${DUMPBIN}" /nologo /linkermember:1 "${ARCHIVE}"
 if(NOT result STREQUAL "0")
   message(FATAL_ERROR "dumpbin failed for ${ARCHIVE}: ${result}")
 endif()
-string(REGEX MATCHALL "\\?\\?\\$${SYMBOL}@[^\r\n\t ]+" names "${listing}")
+# dumpbin prints one public symbol per line after its offset. A lambda or local entity of an
+# instantiation carries the instantiation's decorated name inside its own, so only a name that starts
+# the symbol column counts.
+string(REGEX MATCHALL "[ \t]\\?\\?\\$${SYMBOL}@[^\r\n\t ]+" names "${listing}")
+list(TRANSFORM names STRIP)
 list(REMOVE_DUPLICATES names)
 list(LENGTH names count)
 if(NOT count EQUAL EXPECTED)
