@@ -88,6 +88,40 @@ target_link_libraries(consumer PRIVATE ninfer_kernels)
             self.assertIn('ninfer_small_t_i8_exports.def', inputs)
 
 
+class ArchiveExportsTest(unittest.TestCase):
+    def test_only_instantiations_are_exported_not_their_lambdas(self):
+        # dumpbin lists one public symbol per line. A lambda of an instantiation carries the
+        # instantiation's decorated name inside its own.
+        script = Path(__file__).resolve().parents[2] / 'cmake/ArchiveExports.cmake'
+        instantiation = '??$launch@$06@attention@@YAHH@Z'
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            listing = root / 'listing.txt'
+            listing.write_text(
+                'Microsoft (R) COFF/PE Dumper Version 14.44.35207.1\n\n'
+                'Dump of file units.lib\n\nFile Type: LIBRARY\n\n'
+                'Archive member name at 8: /\n\n       3 public symbols\n\n'
+                f'      1C2 {instantiation}\n'
+                f'      1C2 ??R<lambda_1>@?1?{instantiation}@QEBA@H@Z\n'
+                '      2F0 ?unmarked_helper@attention@@YAHH@Z\n')
+            if os.name == 'nt':
+                dumpbin = root / 'dumpbin.cmd'
+                dumpbin.write_text(f'@type "{listing}"\n')
+            else:
+                dumpbin = root / 'dumpbin'
+                dumpbin.write_text(f'#!/bin/sh\ncat "{listing}"\n')
+                dumpbin.chmod(0o755)
+            archive = root / 'units.lib'
+            archive.write_bytes(b'!<arch>\n')
+            output = root / 'exports.def'
+            result = subprocess.run([
+                'cmake', f'-DDUMPBIN={dumpbin}', f'-DARCHIVE={archive}', '-DSYMBOL=launch',
+                '-DEXPECTED=1', f'-DOUTPUT={output}', '-P', str(script),
+            ], text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(output.read_text(), f'EXPORTS\n{instantiation}\n')
+
+
 def exported_names(path):
     """Names in a PE32+ image's export table."""
     data = Path(path).read_bytes()
