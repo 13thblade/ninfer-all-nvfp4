@@ -164,7 +164,8 @@ After all Windows object shards have succeeded, select `platforms: windows` and
 shard snapshots, verifies their archives, and builds against the selected source revision before
 packaging. Missing snapshots fail restoration; changed inputs rebuild through ccache normally.
 The default `windows_phase: full` builds the shards first.
-Publication requires `platforms: all`. Starting any new native run on the same branch cancels the
+Publication requires `platforms: all`; a `windows_phase: package` run with `platforms: all` and
+`publish: true` builds Linux too and publishes without the shard jobs. Starting any new native run on the same branch cancels the
 whole previous run, including its other platform. The cleanup wait preserves its completed caches.
 
 Native Windows, Debian and CUDA CI use pinned ccache 4.14.2. Native release and its Linux artifact bootstrap write compiler
