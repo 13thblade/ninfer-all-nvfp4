@@ -68,6 +68,17 @@ EngineOptions with_family_embedding(EngineOptions options) {
     return options;
 }
 
+// Position-split and invariant attention are Qwen3.5 Program schedules over its paged cache.
+EngineOptions with_family_attention(EngineOptions options) {
+    if ((options.tensor_attention != TensorAttention::Heads || options.invariant_attention) &&
+        own_family_artifact(options.artifact_path)) {
+        throw std::invalid_argument(
+            "--tensor-attention and --invariant-attention apply to Qwen3_5ForCausalLM and "
+            "Qwen3_5MoeForCausalLM artifacts");
+    }
+    return options;
+}
+
 // Without --spec (SpeculativeOptions::automatic), a Flash-Next or Gemma 4 artifact with host or
 // disk experts drafts with the MTP block or assistant it carries: a verification window's routes
 // share the layer's missing experts, which the CPU computes while the cached ones run.
@@ -102,6 +113,10 @@ DeviceContext initialize_device(const EngineOptions& options) {
         return device;
     }
     DeviceContext device{std::span<const int>(options.devices)};
+    for (const std::string& note : device.peer_notes()) {
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                    "peer access: %s", note.c_str());
+    }
     phase.complete();
     return device;
 }
@@ -345,7 +360,8 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(with_family_speculation(
-              with_family_context_cache(with_family_embedding(std::move(engine_options)))))),
+              with_family_context_cache(
+                  with_family_attention(with_family_embedding(std::move(engine_options))))))),
           device(initialize_device(options)),
           clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
         report_gpu_clock_floor(options, clock_floor);

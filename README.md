@@ -16,6 +16,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 ## What's New
 
+- **2026-10-27:** Two GPUs without peer access decode faster with [tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism): Qwen3.6-35B-A3B at 218 tok/s on two RTX 3090s, against 184 before and 199 on one card, and Qwen3.8-Flash-Next now divides every layer, 7% faster in decode than two pipeline stages. [`--invariant-attention`](docs/maintainer/qwen3_5-model.md#invariant-attention) makes a Qwen3.5-core model's attention outputs independent of batch and draft width.
 - **2026-10-27:** DeepSeek-V4.1-Flash takes the [STQ DSpark drafter](docs/deepseek-v41.md#the-stq-drafter) from beamster's Sushi pack, and the [published artifact](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3) carries it: half the device memory of Unsloth's drafter at the same acceptance, so one RTX 4090 decodes up to 1.4 times as fast with it and prefills without the drafter's slowdown.
 - **2026-10-26:** Qwen3.8-Flash-Next with [disk experts](docs/qwen3-8-flash-next.md#expert-placements) prefills a long prompt 3.1 to 4.1 times as fast and decodes the answer 1.8 to 3.6 times as fast (Q2_0, RTX 3090 to 5090).
 - **2026-10-26:** [Tensor-parallel](docs/maintainer/pipeline-stages.md#tensor-parallelism) shares sized to each card (`--tensor-split`, or each card's measured bandwidth capped by its free memory), for every weight format of a dense model (groupwise-int, BF16, ternary, FP8, NVFP4, Hadamard-rotated) and with DFlash drafters, attention divided by KV heads; [expert parallelism](docs/maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families) divides the routed experts of every MoE family (native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash) over the GPUs.
@@ -464,8 +465,9 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
   `--tensor-parallel` divides every layer over the devices instead: each holds a share of the GDN
   heads, of the attention's KV heads with their cache and of the dense FFN rows or MoE experts in
   any weight format, sized to the card, and reads only those per token
-  ([tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism)). Qwen3.8-Flash-Next,
-  Gemma 4, Flint and DeepSeek-V4.1-Flash divide only their routed experts this way.
+  ([tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism)), Qwen3.8-Flash-Next
+  its GDN key heads, attention KV heads and routed experts. Gemma 4, Flint and DeepSeek-V4.1-Flash
+  divide only their routed experts this way.
 - FP8 A8 and NVFP4 W4A4 tensor-core routes on every `120a` build, an FP4 tensor-core prompt kernel
   for an NVFP4 KV cache, and programmatic dependent launches on Blackwell.
 

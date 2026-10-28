@@ -1,6 +1,7 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/causal_softmax_attention.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/merge.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_route.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_fp8.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_nvfp4.cu"

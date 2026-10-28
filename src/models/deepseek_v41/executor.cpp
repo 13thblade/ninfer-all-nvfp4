@@ -315,7 +315,9 @@ struct Executor::Impl {
     std::uint32_t span_tokens = 0;
     std::size_t span_borrow_bytes = 0;
     std::map<std::uint32_t, GraphEntry> graphs;
-    std::uint32_t verify_width = 0;
+    // Rows per sequence of the last verify() and each sequence's first row.
+    std::vector<std::uint32_t> verify_widths;
+    std::vector<int> verify_starts;
     int capacity_rows = 0;   // the largest compressed cache, a decode pass's score width
     int candidate_words = 0; // words of a row's candidate mask
     int candidate_keep = 0, candidate_block = 0;
@@ -2641,33 +2643,47 @@ struct Executor::Impl {
         entry.executable.launch(stream);
     }
 
-    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens) {
+    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens,
+                std::span<const std::uint32_t> widths = {}) {
         const int n = int(sequences.size());
-        if (options.draft_tokens == 0 || n <= 0 || tokens.size() % sequences.size() != 0) {
+        if (options.draft_tokens == 0 || n <= 0 ||
+            (widths.empty() && tokens.size() % sequences.size() != 0) ||
+            (!widths.empty() && widths.size() != sequences.size())) {
             throw std::invalid_argument("deepseek_v41 verify: invalid call");
         }
-        const int w = int(tokens.size()) / n, rows = n * w;
-        if (w < 1 || std::uint32_t(w) > options.draft_tokens + 1 || rows > gguf::kMaxVectorColumns) {
+        std::vector<std::uint32_t> row_widths(widths.begin(), widths.end());
+        if (row_widths.empty()) { row_widths.assign(n, std::uint32_t(tokens.size()) / n); }
+        int rows = 0;
+        for (const std::uint32_t w : row_widths) {
+            if (w < 1 || w > options.draft_tokens + 1) {
+                throw std::invalid_argument("deepseek_v41 verify: invalid width");
+            }
+            rows += int(w);
+        }
+        if (std::size_t(rows) != tokens.size() || rows > gguf::kMaxVectorColumns) {
             throw std::invalid_argument("deepseek_v41 verify: invalid width");
         }
         std::vector<std::int32_t> pos(rows), seq(rows);
         std::vector<std::uint32_t> owners(rows);
-        for (int j = 0; j < n; ++j) {
+        verify_starts.assign(n, 0);
+        for (int j = 0, at = 0; j < n; ++j) {
             const std::uint32_t s = sequences[j];
+            const std::uint32_t w = row_widths[j];
             if (s >= options.sequences || std::count(sequences.begin(), sequences.begin() + j, s) != 0) {
                 throw std::invalid_argument("deepseek_v41 verify: invalid sequence");
             }
-            if (positions[s] + std::uint32_t(w) > options.max_context) {
+            if (positions[s] + w > options.max_context) {
                 throw std::invalid_argument("deepseek_v41 verify: context capacity exceeded");
             }
-            for (int i = 0; i < w; ++i) {
-                pos[j * w + i]    = std::int32_t(positions[s]) + i;
-                seq[j * w + i]    = std::int32_t(s);
-                owners[j * w + i] = s;
+            verify_starts[j] = at;
+            verified[s].assign(tokens.begin() + at, tokens.begin() + at + w);
+            for (std::uint32_t i = 0; i < w; ++i, ++at) {
+                pos[at]    = std::int32_t(positions[s] + i);
+                seq[at]    = std::int32_t(s);
+                owners[at] = s;
             }
-            verified[s].assign(tokens.begin() + j * w, tokens.begin() + (j + 1) * w);
         }
-        for (const std::uint32_t s : sequences) { back(s, positions[s] + std::uint32_t(w)); }
+        for (int j = 0; j < n; ++j) { back(sequences[j], positions[sequences[j]] + row_widths[j]); }
         stage(tokens, pos, seq);
         read_engram_rows(tokens, owners, false);
         Pass s;
@@ -2675,17 +2691,17 @@ struct Executor::Impl {
         s.logit_rows = rows;
         s.seed       = false; // commit() seeds the rows it keeps
         run_graph(16 + std::uint32_t(rows), [&] { run(s); });
-        verify_width = std::uint32_t(w);
+        verify_widths = std::move(row_widths);
     }
 
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept) {
-        if (kept.size() != sequences.size() || verify_width == 0) {
+        if (kept.size() != sequences.size() || verify_widths.size() != sequences.size()) {
             throw std::invalid_argument("deepseek_v41 commit: invalid call");
         }
         for (std::size_t j = 0; j < sequences.size(); ++j) {
             const std::uint32_t s = sequences[j];
-            if (s >= options.sequences || kept[j] < 1 || kept[j] > verify_width ||
-                verified[s].size() != verify_width) {
+            if (s >= options.sequences || kept[j] < 1 || kept[j] > verify_widths[j] ||
+                verified[s].size() != verify_widths[j]) {
                 throw std::invalid_argument("deepseek_v41 commit: invalid row");
             }
             advance_history(s, std::span<const std::int32_t>(verified[s]).first(kept[j]));
@@ -2696,13 +2712,13 @@ struct Executor::Impl {
             // The kept rows' taps into the drafter's rings, at the positions and sequences the
             // verification staged.
             workspace->reset();
-            const auto row = [&](std::size_t j) { return std::int32_t(j * verify_width); };
+            const auto row = [&](std::size_t j) { return std::int32_t(verify_starts[j]); };
             for (std::size_t j = 0; j < sequences.size(); ++j) {
                 seed(int(kept[j]), row(j), static_cast<const std::int32_t*>(d_positions.p) + row(j),
                      static_cast<const std::int32_t*>(d_sequences.p) + row(j), sequences[j]);
             }
         }
-        verify_width = 0;
+        verify_widths.clear();
     }
 
     // ---- Branches -------------------------------------------------------------------------------
@@ -3066,8 +3082,9 @@ void Executor::draft(std::uint32_t sequence, std::int32_t anchor, std::span<std:
     impl_->draft(sequence, anchor, drafts, confidence);
 }
 
-void Executor::verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens) {
-    impl_->verify(sequences, tokens);
+void Executor::verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens,
+                      std::span<const std::uint32_t> widths) {
+    impl_->verify(sequences, tokens, widths);
 }
 
 void Executor::commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept) {

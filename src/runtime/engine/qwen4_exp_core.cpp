@@ -215,13 +215,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     load.experts      = options.expert_residency;
     load.vision       = options.enable_vision;
     load.mtp          = mtp;
-    // Expert parallelism: the routed experts divided over the devices, everything else on the
-    // first. Without --tensor-split each device takes a share of its speed that fits beside what
-    // it holds.
+    // Tensor parallelism: every layer's mixer heads and routed experts divided over the devices,
+    // the shared expert, the head and the MTP block on the first. Without --tensor-split each
+    // device takes a share of its speed that fits beside what it holds.
     if (options.tensor_parallel) {
-        load.expert_split = options.tensor_split;
-        if (load.expert_split.empty()) {
-            load.expert_split = models::qwen4_exp::default_expert_split(
+        load.tensor_split = options.tensor_split;
+        if (load.tensor_split.empty()) {
+            load.tensor_split = models::qwen4_exp::default_tensor_split(
                 reader, load, rank_free_bytes(device), rank_copy_bandwidth(device));
         }
     }
@@ -325,16 +325,24 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0);
-    if (model->expert_parallel()) {
-        std::string ranges;
+    if (model->tensor_parallel()) {
+        std::string keys, kv, experts;
+        const auto range = [](std::string& out, std::size_t rank, std::uint32_t begin,
+                              std::uint32_t end) {
+            out += (rank == 0 ? "" : ", ") +
+                   (begin == end ? std::string("none")
+                                 : std::to_string(begin) + "-" + std::to_string(end - 1));
+        };
         for (std::size_t rank = 0; rank < device.size(); ++rank) {
-            const auto [begin, end] = model->expert_range(text.num_experts, rank);
-            ranges +=
-                (rank == 0 ? "" : ", ") + std::to_string(begin) + "-" + std::to_string(end - 1);
+            const auto share = model->share(rank);
+            range(keys, rank, share.key_head_begin, share.key_head_end);
+            range(kv, rank, share.kv_head_begin, share.kv_head_end);
+            range(experts, rank, share.expert_begin, share.expert_end);
         }
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "Qwen3.8-Flash-Next: expert parallelism, routed experts by device %s",
-                           ranges.c_str());
+                           "Qwen3.8-Flash-Next: tensor parallelism, by device Gated DeltaNet key "
+                           "heads %s, sparse-attention KV heads %s, routed experts %s",
+                           keys.c_str(), kv.c_str(), experts.c_str());
     }
     if (const auto memory = instance->executor->memory(); memory.streamed_kv) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
@@ -536,6 +544,7 @@ struct Qwen4ExpCore::Impl {
     // With --adaptive-mtp, the steps a round drafts and verifies: from one draft, since each draft
     // is a step of the MTP block of its own here, up to `drafts`.
     std::optional<runtime::MtpAdaptiveBatchController> mtp_controller;
+    runtime::MtpPackedPlanner packed_planner;
 
     mutable std::mutex queue_mutex;
     std::condition_variable queue_cv;
@@ -577,7 +586,7 @@ struct Qwen4ExpCore::Impl {
     // slot's token counts before the round, which a round that keeps fewer tokens than it
     // licensed restores.
     DeviceBuffer spec_drafts, spec_targets, spec_extents, spec_lengths, spec_licensed, spec_counts,
-        spec_accepted, spec_anchors, counts_backup;
+        spec_accepted, spec_anchors, spec_columns, counts_backup;
     std::unique_ptr<PinnedHostBuffer> host_spec;
 
     // The context cache past the sequences: images of the prefixes they give up (the state a
@@ -686,8 +695,9 @@ struct Qwen4ExpCore::Impl {
             spec_counts   = plane(1);
             spec_accepted = plane(1);
             spec_anchors  = plane(1);
+            spec_columns  = plane(1);
             counts_backup = DeviceBuffer(rows * domain * sizeof(std::int32_t));
-            host_spec     = std::make_unique<PinnedHostBuffer>(rows * (drafts + width + 4) *
+            host_spec     = std::make_unique<PinnedHostBuffer>(rows * (drafts + width + 5) *
                                                                sizeof(std::int32_t));
         }
         sample_workspace                 = std::make_unique<WorkspaceArena>(workspace);
@@ -1163,10 +1173,18 @@ struct Qwen4ExpCore::Impl {
     }
 
     // Pages for an image of `bytes`, pinning more when the free ones fall short; the caller has
-    // made room for them (make_host_room), so the pinned pages stay within the budget.
+    // made room for them (make_host_room), so the pinned pages stay within the budget. Empty when
+    // more pages cannot be pinned: registering them also takes device memory on every card for
+    // their page tables (2 MiB per GiB), which the expert cache may already hold.
     std::vector<std::byte*> take_pages(std::uint64_t bytes) {
         const auto count = static_cast<std::size_t>(page_rounded(bytes) / kHostPageBytes);
-        if (free_pages.size() < count) { pin_pages(count - free_pages.size()); }
+        if (free_pages.size() < count) {
+            try {
+                pin_pages(count - free_pages.size());
+            } catch (const std::exception&) {
+                return {};
+            }
+        }
         std::vector<std::byte*> pages(free_pages.end() - std::ptrdiff_t(count), free_pages.end());
         free_pages.resize(free_pages.size() - count);
         host_used += count * kHostPageBytes;
@@ -1228,6 +1246,7 @@ struct Qwen4ExpCore::Impl {
         image.path   = path;
         image.bytes  = bytes;
         image.pages  = take_pages(bytes);
+        if (image.pages.empty()) { return; }
         try {
             image.header = executor.save_image(s, at, image.pages, kHostPageBytes);
         } catch (...) {
@@ -1268,6 +1287,7 @@ struct Qwen4ExpCore::Impl {
             }
             Stored& image = stored[*index];
             image.pages   = take_pages(image.bytes);
+            if (image.pages.empty()) { return false; }
             std::ifstream in(image.file, std::ios::binary);
             in.seekg(std::streamoff(sizeof(FileHeader) +
                                     4 * (image.header.context.previous.size() + tokens.size())));
@@ -2431,7 +2451,24 @@ struct Qwen4ExpCore::Impl {
                 draft_extents[j] = mtp_extents[m++];
             }
         }
-        const std::size_t k = *std::max_element(draft_extents.begin(), draft_extents.end());
+        // Each row verifies the drafts its output/thinking budget leaves room for (the correction
+        // takes one more token); with --adaptive-mtp the plan keeps the extents worth their rows.
+        for (std::size_t j = 0; j < b; ++j) {
+            const auto remaining = batch[j]->output.model_token_budget_remaining(
+                batch[j]->budget->remaining());
+            draft_extents[j] =
+                static_cast<std::uint32_t>(std::min<std::size_t>(draft_extents[j], remaining - 1));
+        }
+        if (mtp_controller) {
+            std::vector<const runtime::MtpAdaptiveSignal*> signals;
+            for (std::size_t j = 0; j < b; ++j) {
+                signals.push_back(looked_up[j] ? nullptr : &batch[j]->mtp_signal);
+            }
+            const std::vector<std::uint32_t> limits = draft_extents;
+            packed_planner.plan(signals, limits, draft_extents);
+        }
+        const std::size_t k = std::max<std::size_t>(
+            1, *std::max_element(draft_extents.begin(), draft_extents.end()));
         const std::size_t w = k + 1;
         const auto columns = static_cast<std::int32_t>(w);
         std::vector<TokenId> proposed;
@@ -2440,12 +2477,23 @@ struct Qwen4ExpCore::Impl {
             proposed.insert(proposed.end(), all_drafts.begin() + std::ptrdiff_t(j * drafts),
                             all_drafts.begin() + std::ptrdiff_t(j * drafts + k));
         }
+        // The rows are packed at their own widths, no row verifying columns it cannot take; a row
+        // that gathers logprobs keeps every row at the round's width, the layout their gather reads.
+        const bool packed = std::none_of(batch.begin(), batch.end(), [](const auto& request) {
+            return request->options.execution.logprobs;
+        });
+        std::vector<std::uint32_t> widths(b);
+        std::vector<std::int32_t> starts(b);
         std::vector<TokenId> tokens;
         for (std::size_t j = 0; j < b; ++j) {
+            const std::size_t own = packed ? draft_extents[j] : k;
+            starts[j]             = static_cast<std::int32_t>(tokens.size());
+            widths[j]             = static_cast<std::uint32_t>(own + 1);
             tokens.push_back(anchors[j]);
             tokens.insert(tokens.end(), proposed.begin() + std::ptrdiff_t(j * k),
-                          proposed.begin() + std::ptrdiff_t((j + 1) * k));
+                          proposed.begin() + std::ptrdiff_t(j * k + own));
         }
+        const auto verified_columns = static_cast<std::int32_t>(tokens.size());
         // A structured row's masks, one per column after its own drafts, fill in parallel while
         // the verification runs.
         std::vector<std::shared_ptr<runtime::GrammarMaskJob>> column_masks(b);
@@ -2457,7 +2505,7 @@ struct Qwen4ExpCore::Impl {
                 std::vector<TokenId>(proposed.begin() + std::ptrdiff_t(j * k),
                                      proposed.begin() + std::ptrdiff_t(j * k + own)));
         }
-        executor.verify(sequences, tokens);
+        executor.verify(sequences, tokens, widths);
 
         RankBinding bind(device, executor.head_rank());
         const cudaStream_t stream = executor.head_stream();
@@ -2510,22 +2558,22 @@ struct Qwen4ExpCore::Impl {
         auto* staged = static_cast<std::int32_t*>(host_spec->data());
         std::copy(proposed.begin(), proposed.end(), staged);
         for (std::size_t j = 0; j < b; ++j) {
-            // The batch uses its largest confidence prefix. Acceptance also respects each
-            // sequence's shorter prefix and its output/thinking budget, including correction.
-            const auto remaining = batch[j]->output.model_token_budget_remaining(
-                batch[j]->budget->remaining());
-            staged[b * k + j] = static_cast<std::int32_t>(
-                std::min<std::size_t>(draft_extents[j], remaining - 1));
+            staged[b * k + j]     = static_cast<std::int32_t>(draft_extents[j]);
             staged[b * k + b + j] = static_cast<std::int32_t>(batch[j]->position);
         }
+        // Past the licensed run (b * (k + 2) + b * w + 2 * b): the rows' first columns.
+        auto* staged_starts = staged + b * (k + 4) + b * w;
+        std::copy(starts.begin(), starts.end(), staged_starts);
         CUDA_CHECK(
             cudaMemcpyAsync(spec_drafts.p, staged, b * k * 4, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(
             cudaMemcpyAsync(spec_extents.p, staged + b * k, b * 4, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(spec_lengths.p, staged + b * k + b, b * 4,
                                    cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(spec_columns.p, staged_starts, b * 4, cudaMemcpyHostToDevice,
+                                   stream));
         const auto rows_n         = static_cast<std::int32_t>(b);
-        const Tensor logits       = executor.logits(static_cast<std::uint32_t>(b * w));
+        const Tensor logits       = executor.logits(static_cast<std::uint32_t>(verified_columns));
         const auto* device_config = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const Tensor drafted(spec_drafts.p, DType::I32, {static_cast<std::int32_t>(k), rows_n});
         // The tokens' logprob records, from the distributions their columns are drawn from,
@@ -2557,7 +2605,7 @@ struct Qwen4ExpCore::Impl {
                                        std::size_t(domain) * sizeof(std::int32_t),
                                        cudaMemcpyDeviceToDevice, stream));
         }
-        Tensor targets(spec_targets.p, DType::I32, {columns * rows_n});
+        Tensor targets(spec_targets.p, DType::I32, {verified_columns});
         ops::argmax(logits, targets, static_cast<std::int32_t>(domain), stream);
         Tensor extents(spec_extents.p, DType::I32, {rows_n});
         Tensor lengths(spec_lengths.p, DType::I32, {rows_n});
@@ -2567,10 +2615,11 @@ struct Qwen4ExpCore::Impl {
         Tensor accepted(spec_accepted.p, DType::I32, {rows_n});
         {
             auto scope = sample_workspace->scope();
+            const Tensor column_starts(spec_columns.p, DType::I32, {rows_n});
             ops::speculative_accept_coupled_drafts(
-                targets.view({columns, rows_n}), logits.view({logits.ne[0], columns, rows_n}),
-                drafted, extents, lengths, round_anchors, licensed, counts, accepted,
-                static_cast<std::int32_t>(domain), device_config, *sample_workspace, stream);
+                targets, logits, drafted, extents, lengths, round_anchors, licensed, counts,
+                accepted, static_cast<std::int32_t>(domain), device_config, *sample_workspace,
+                stream, &column_starts);
         }
         auto* host = staged + b * (k + 2);
         CUDA_CHECK(
@@ -2666,17 +2715,22 @@ struct Qwen4ExpCore::Impl {
         }
         executor.commit(sequences, kept);
         // The controller measures rounds of MTP drafts only: a lookup changes the round's width.
-        if (mtp_controller && lookups == 0) {
-            mtp_controller->observe_execution(static_cast<std::uint32_t>(b), steps,
-                                              seconds(round_start, Clock::now()));
+        // The plan prices the rows verified, whatever proposed them.
+        if (mtp_controller) {
+            const double round_seconds = seconds(round_start, Clock::now());
+            if (lookups == 0) {
+                mtp_controller->observe_execution(static_cast<std::uint32_t>(b), steps,
+                                                  round_seconds);
+            }
+            packed_planner.observe(static_cast<std::uint32_t>(verified_columns), round_seconds);
         }
         for (std::size_t j = 0; j < b; ++j) {
             Request& r = *batch[j];
             if (failed[j]) { continue; } // its sequence keeps nothing for the context cache
             Slot& slot = slots[r.slot];
             // The verification fed the anchor and the drafts; the sequence keeps the first ones.
-            slot.fed.insert(slot.fed.end(), tokens.begin() + std::ptrdiff_t(j * w),
-                            tokens.begin() + std::ptrdiff_t(j * w + kept[j]));
+            slot.fed.insert(slot.fed.end(), tokens.begin() + starts[j],
+                            tokens.begin() + starts[j] + std::ptrdiff_t(kept[j]));
             r.position += kept[j];
             try {
                 check_capacity(batch[j]);

@@ -184,7 +184,9 @@ std::string usage_text(const char* argv0) {
            "                                the other MoE families divide only their routed\n"
            "                                experts)\n"
            "  --tensor-split A,B,...        relative share of each --devices entry (default:\n"
-           "                                by each card's measured bandwidth and free memory)\n"
+           "                                by each card's measured bandwidth and free memory)\n" +
+           std::string(ninfer::product::kTensorAttentionHelp) +
+           std::string(ninfer::product::kInvariantAttentionHelp) +
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
            "  --embedding-residency device|host  token embedding on GPU (default) or in\n"
@@ -399,6 +401,10 @@ Options parse_options(int argc, char** argv) {
             options.tensor_parallel = true;
         } else if (arg == "--tensor-split") {
             options.tensor_split = ninfer::product::parse_tensor_split(value(arg));
+        } else if (arg == "--tensor-attention") {
+            options.tensor_attention = ninfer::product::parse_tensor_attention(value(arg));
+        } else if (arg == "--invariant-attention") {
+            options.invariant_attention = true;
         } else if (arg == "--expert-residency") {
             const std::string residency = value(arg);
             if (residency == "device") {
@@ -631,6 +637,7 @@ Options parse_options(int argc, char** argv) {
     }
     ninfer::product::check_tensor_split(options.tensor_split, options.devices.size(),
                                         options.tensor_parallel);
+    ninfer::product::check_tensor_attention(options.tensor_attention, options.tensor_parallel);
     if (kv_headroom_mib.has_value()) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
             throw std::invalid_argument("--kv-headroom-mib requires --kv-capacity auto");

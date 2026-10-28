@@ -61,6 +61,8 @@ struct Options {
     // The devices share every layer (`--tensor-parallel`), each its `--tensor-split` share.
     bool tensor_parallel = false;
     std::vector<double> tensor_split;
+    ninfer::TensorAttention tensor_attention = ninfer::TensorAttention::Heads;
+    bool invariant_attention                 = false;
     ninfer::ExpertResidency expert_residency = ninfer::ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
     ninfer::HybridExpertOptions hybrid_experts;
@@ -98,6 +100,7 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N | --disjoint] [--device N | --devices A,B,...]\n"
            "       [--tensor-parallel] [--tensor-split A,B,...]\n"
+           "       [--tensor-attention heads|positions] [--invariant-attention]\n"
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
            "       [--expert-dma-share F] [--expert-cpu-threads N] [--expert-cache-adaptive]\n"
            "       [--expert-misses staged|mapped] [--expert-tail-skip N]\n"
@@ -229,6 +232,11 @@ Options parse_options(int argc, char** argv) {
             out.tensor_parallel = true;
         } else if (option == "--tensor-split") {
             out.tensor_split = ninfer::product::parse_tensor_split(value("--tensor-split"));
+        } else if (option == "--tensor-attention") {
+            out.tensor_attention =
+                ninfer::product::parse_tensor_attention(value("--tensor-attention"));
+        } else if (option == "--invariant-attention") {
+            out.invariant_attention = true;
         } else if (option == "--expert-residency") {
             const std::string residency(value("--expert-residency"));
             if (residency == "device") {
@@ -292,6 +300,7 @@ Options parse_options(int argc, char** argv) {
         usage_error("--tensor-parallel needs --devices naming more than one device");
     }
     ninfer::product::check_tensor_split(out.tensor_split, out.devices.size(), out.tensor_parallel);
+    ninfer::product::check_tensor_attention(out.tensor_attention, out.tensor_parallel);
     return out;
 }
 
@@ -396,6 +405,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.devices                       = options.devices;
     engine_options.tensor_parallel               = options.tensor_parallel;
     engine_options.tensor_split                  = options.tensor_split;
+    engine_options.tensor_attention              = options.tensor_attention;
+    engine_options.invariant_attention           = options.invariant_attention;
     engine_options.expert_residency              = options.expert_residency;
     engine_options.expert_cache_bytes            = options.expert_cache_bytes;
     engine_options.hybrid_experts                = options.hybrid_experts;

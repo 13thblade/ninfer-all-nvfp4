@@ -355,7 +355,8 @@ bool launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& positions, const Tensor& valid_columns,
                             const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                             CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                            Tensor& out, cudaStream_t stream, const void* gate) {
+                            Tensor& out, cudaStream_t stream, const void* gate,
+                            float* partial_out) {
     if (const std::int32_t tile = detail::causal_attention_parallel_tile_width(
             q.ne[1], q.ne[2], q.ne[3], cache.storage);
         tile > 0) {
@@ -368,7 +369,7 @@ bool launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
         detail::causal_attention_small_t_tiles_launch(
             q, positions, valid_columns.data == nullptr ? nullptr : &valid_columns, &table_rows,
             scale, cache, envelope, tile, tiles.valid, tiles.rows, tiles.partial.acc,
-            tiles.partial.m, tiles.partial.l, out, stream, gate);
+            tiles.partial.m, tiles.partial.l, out, stream, gate, partial_out);
         return true;
     }
     for (std::int32_t begin = 0; begin < q.ne[2];
@@ -384,7 +385,8 @@ bool launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
             allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows,
                                                 scale, cache, envelope, begin, count, partial.acc,
-                                                partial.m, partial.l, out, stream);
+                                                partial.m, partial.l, out, stream, nullptr,
+                                                partial_out);
     }
     return false;
 }
@@ -436,6 +438,12 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t call_q_heads, s
     const std::int32_t maximum_verify_tokens = batch_size == 1 && envelope.wide_verification
                                                    ? kMaximumSingleRowVerifyTokens
                                                    : kMaximumVerifyTokens;
+    if (envelope.invariant_segment_keys != 0 && width <= maximum_verify_tokens) {
+        // Invariant reductions: every verification width on the split-KV kernels, whose splits
+        // the segments fix.
+        return width <= (q_heads == 24 ? 8 : 6) ? CausalAttentionRoute::SmallT
+                                                : CausalAttentionRoute::ChunkedSmallT;
+    }
     if (q_heads == 24 && width <= maximum_verify_tokens) {
         if (batch_size == 1) {
             std::uint32_t prompt_limit = 0;
@@ -491,6 +499,15 @@ const char* causal_attention_route_name(CausalAttentionRoute route) {
 }
 
 } // namespace detail
+
+std::uint32_t causal_attention_invariant_segment_keys(std::uint32_t max_context) {
+    // The smallest geometry's split capacity (CausalD256H24Kv4::SmallTMaximumSplits), so one
+    // segment serves either geometry.
+    constexpr std::uint32_t kMaximumSegments = 85;
+    const std::uint32_t keys =
+        (max_context + kMaximumSegments - 1) / kMaximumSegments + kPagedKVPageSize - 1;
+    return std::max<std::uint32_t>(kPagedKVPageSize, keys / kPagedKVPageSize * kPagedKVPageSize);
+}
 
 int causal_softmax_attention_route_family(AttentionHeadGeometry geometry,
                                           KvCacheStorage cache_storage,
@@ -582,11 +599,11 @@ std::int32_t causal_softmax_attention_prompt_aligned_chunk(AttentionHeadGeometry
     return best;
 }
 
-std::size_t causal_softmax_attention_workspace_capacity_bytes(
-    AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
-    CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_width,
-    std::int32_t max_width) {
-    require_causal_geometry(geometry, "causal_softmax_attention workspace");
+static std::size_t workspace_capacity_bytes(AttentionHeadGeometry geometry,
+                                            KvCacheStorage cache_storage,
+                                            CausalAttentionExecutionEnvelope envelope,
+                                            std::int32_t batch_size, std::int32_t min_width,
+                                            std::int32_t max_width) {
     const std::int32_t q_heads = geometry.query_heads;
     // Propagate d256_kv_cache_profile's own diagnostic for an unrecognized storage selection
     // rather than folding it into the generic message below.
@@ -702,12 +719,29 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     return maximum;
 }
 
+std::size_t causal_softmax_attention_workspace_capacity_bytes(
+    AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
+    CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width) {
+    require_causal_geometry(geometry, "causal_softmax_attention workspace");
+    const std::size_t planned =
+        workspace_capacity_bytes(geometry, cache_storage, envelope, batch_size, min_width, max_width);
+    if (envelope.invariant_segment_keys == 0) { return planned; }
+    // One planned workspace serves the calls of both schedules: a model's draft layers keep the
+    // tuned splits over the same envelope.
+    CausalAttentionExecutionEnvelope tuned = envelope;
+    tuned.invariant_segment_keys           = 0;
+    return std::max(planned, workspace_capacity_bytes(geometry, cache_storage, tuned, batch_size,
+                                                      min_width, max_width));
+}
+
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, cudaStream_t stream, const Tensor* gate) {
+                              Tensor& out, cudaStream_t stream, const Tensor* gate,
+                              Tensor* partial) {
     constexpr const char* op = "causal_softmax_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        geometry, envelope, scale, op);
@@ -729,6 +763,23 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             throw std::invalid_argument("causal_softmax_attention: gate must be BF16");
         }
     }
+    float* partial_out = nullptr;
+    if (partial != nullptr) {
+        if (gate != nullptr || partial->dtype != DType::FP32 || !partial->is_contiguous() ||
+            partial->data == nullptr ||
+            static_cast<std::size_t>(partial->numel()) !=
+                causal_attention_partial_elements(geometry.query_heads, width * batch)) {
+            throw std::invalid_argument("causal_softmax_attention: invalid partial output");
+        }
+        partial_out = static_cast<float*>(partial->data);
+    }
+    // A position-split rank holds only some of each window's keys: its output is a partial.
+    if (cache.page_stride < 1 || cache.page_stride > kCausalAttentionMaximumMergeRanks ||
+        cache.page_residue < 0 || cache.page_residue >= cache.page_stride ||
+        (cache.page_stride > 1 && partial_out == nullptr)) {
+        throw std::invalid_argument(
+            "causal_softmax_attention: a position-split cache needs a valid rank and a partial");
+    }
 
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
@@ -737,7 +788,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         const bool fusable = kv_cache_is_int8_family(cache.storage);
         const bool gated   = launch_chunked_small_t(
             q, k, v, positions, valid_columns, kv_table_rows, scale, cache, envelope, workspace,
-            out, stream, (gate != nullptr && fusable) ? gate->data : nullptr);
+            out, stream, (gate != nullptr && fusable) ? gate->data : nullptr, partial_out);
         if (gate != nullptr && !gated) { sigmoid_mul(*gate, out, stream); }
         return;
     }
@@ -756,8 +807,17 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         detail::causal_attention_small_t_launch(
             q, k, v, positions, valid_columns, kv_table_rows, scale, cache, envelope, 0, width,
             partial.acc, partial.m, partial.l, out, stream,
-            (gate != nullptr && fusable) ? gate->data : nullptr);
+            (gate != nullptr && fusable) ? gate->data : nullptr, partial_out);
         if (gate != nullptr && !fusable) { sigmoid_mul(*gate, out, stream); }
+        return;
+    }
+    // A position-split rank's prompt: the rows it holds appended, then its keys' partial output
+    // (prompt_sm70.h), every storage on one route.
+    if (partial_out != nullptr) {
+        detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
+                                             stream);
+        detail::causal_attention_prompt_partial_launch(q, positions, valid_columns, kv_table_rows,
+                                                       scale, cache, partial_out, stream);
         return;
     }
 #if defined(NINFER_SM120_NVFP4)
@@ -792,6 +852,10 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "causal_softmax_attention_cached";
     validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
+    if (cache.page_stride != 1) {
+        throw std::invalid_argument(
+            "causal_softmax_attention_cached: a position-split cache takes the batched form");
+    }
 
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =

@@ -29,6 +29,10 @@ struct PagedKVLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    // A rank of a position-split pool (DeviceKVPagePool) holds the physical pages p with
+    // p % page_stride == page_residue, at page p / page_stride of its planes; 1 and 0 hold them all.
+    std::int32_t page_stride  = 1;
+    std::int32_t page_residue = 0;
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
@@ -41,17 +45,34 @@ struct PagedKVBatchLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    // As PagedKVLayerView.
+    std::int32_t page_stride  = 1;
+    std::int32_t page_residue = 0;
 };
 
 /** Rebinds one checked single-sequence table row as a one-row batched view. */
 [[nodiscard]] PagedKVBatchLayerView single_row_paged_kv_batch_view(const PagedKVLayerView& cache);
 
 // A plane is storage-only. Target code assigns K/V/layer meaning to plane indices.
+//
+// A residue plane (page_stride > 1) is one rank's slice of a position-split cache: it holds only
+// the physical pages p with p % page_stride == page_residue, at page p / page_stride. Its
+// siblings are the page_stride planes from index - page_residue, residues in order, with one
+// storage geometry; exactly one of them holds any page, so they share one region of a page's host
+// record and a page copy between two of them crosses devices.
 struct KVPlaneGeometry {
     DType dtype                 = DType::BF16;
     std::int32_t leading_extent = 0;
     std::int32_t head_extent    = 0;
     std::size_t alignment       = 256;
+    std::int32_t page_stride    = 1;
+    std::int32_t page_residue   = 0;
+
+    // Physical pages of a pool of `pool_pages` this plane holds.
+    [[nodiscard]] std::int32_t local_pages(std::int32_t pool_pages) const noexcept {
+        return pool_pages > page_residue ? (pool_pages - page_residue + page_stride - 1) / page_stride
+                                         : 0;
+    }
 
     friend bool operator==(const KVPlaneGeometry&, const KVPlaneGeometry&) = default;
 };
@@ -304,7 +325,9 @@ public:
 
     // Data movement. Each plane's copy is issued on the stream of the rank that holds it, so the
     // work for a page group fans out across ranks and the caller fences on all of them. The host
-    // image of a page keeps the full plane inventory: ranks write disjoint plane ranges of it.
+    // image of a page keeps the full plane inventory: ranks write disjoint plane ranges of it, and
+    // the residue planes of a position-split cache write their shared range for the pages they
+    // hold. A page copy between residue siblings on two devices runs on the source rank's stream.
     void zero_pages(std::span<const DeviceKVPageHandle> pages, RankStreams streams = {}) const;
     void copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
                    RankStreams streams = {}) const;
@@ -350,6 +373,9 @@ private:
 
     [[nodiscard]] bool valid_handle(DeviceKVPageHandle handle) const noexcept;
     [[nodiscard]] std::int32_t physical_index(DeviceKVPageHandle handle) const;
+    // One page from the residue sibling holding `source` to the one holding `destination`.
+    void copy_residue_page(std::size_t first_sibling, std::int32_t source,
+                           std::int32_t destination, RankStreams streams) const;
     void copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin, std::size_t plane_end,
                        std::int32_t first, std::size_t count, std::byte* host_base,
                        std::size_t host_pitch, const HostKVPageLayout& host,

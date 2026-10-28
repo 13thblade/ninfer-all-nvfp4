@@ -11,12 +11,28 @@ inline constexpr int kPagedKVPageMask  = kPagedKVPageSize - 1;
 
 static_assert(kPagedKVPageSize == (1 << kPagedKVPageShift));
 
+// The page of a device's planes that holds the rows of `physical_page`, or -1 where another rank's
+// planes hold them: a position-split cache gives rank r the pages p with p % stride == r, at
+// p / stride (PagedKVLayerView::page_stride).
+__device__ __forceinline__ std::int32_t paged_kv_local_page(std::int32_t physical_page,
+                                                            std::int32_t stride,
+                                                            std::int32_t residue) {
+    if (stride == 1) { return physical_page; }
+    return physical_page % stride == residue ? physical_page / stride : -1;
+}
+
 struct PagedKVDirectMetadata {
     const std::int32_t* table;
+    std::int32_t page_stride  = 1;
+    std::int32_t page_residue = 0;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
 
     __device__ __forceinline__ const std::int32_t* block_table() const { return table; }
+
+    __device__ __forceinline__ std::int32_t local_page(std::int32_t physical_page) const {
+        return paged_kv_local_page(physical_page, page_stride, page_residue);
+    }
 };
 
 template <bool Masked>
@@ -25,6 +41,8 @@ struct PagedKVBatchMetadata {
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     std::int32_t table_stride;
+    std::int32_t page_stride  = 1;
+    std::int32_t page_residue = 0;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const {
         if constexpr (Masked) {
@@ -36,6 +54,10 @@ struct PagedKVBatchMetadata {
 
     __device__ __forceinline__ const std::int32_t* block_table() const {
         return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+    }
+
+    __device__ __forceinline__ std::int32_t local_page(std::int32_t physical_page) const {
+        return paged_kv_local_page(physical_page, page_stride, page_residue);
     }
 };
 

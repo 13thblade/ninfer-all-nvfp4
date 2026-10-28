@@ -9,12 +9,16 @@
 //   peer    kernel pushes the partial into the peer's VRAM inbox (needs cudaDeviceCanAccessPeer),
 //           then raises a per-CTA flag with st.release.sys; the receiver polls its own VRAM.
 //   host    the same kernel, but the inboxes live in mapped, portable pinned host memory.
+//   peer-ll low-latency words: each FP32 value travels with its 32-bit epoch in one 8-byte store
+//           into the peer's VRAM inbox, and the receiver polls its own inbox word by word, so no
+//           fence or flag separates the data from its readiness (twice the bytes of `peer`).
+//   host-ll the same words in mapped, portable pinned host memory, for hosts without peer access.
 //   staged  D2H into a pinned ring, event, H2D, local add: what stage_cross_rank_copy does today.
 //           Timed eagerly and inside one joint multi-device capture (the current graph strategy).
 //   nccl    ncclAllReduce, eager only. Built with -DTP_PROBE_NCCL and -lnccl.
 //
 // Kernel transports use a two-slot ring and an epoch counter kept in device memory, so a captured
-// graph replays without re-parameterising. Two ranks on one device (--devices 0,0) exercise the
+// graph replays without re-parameterising; the slot is the epoch's parity, so no flag is ever reset. Two ranks on one device (--devices 0,0) exercise the
 // protocol but say nothing about interconnect cost or wrong-device bugs.
 //
 // Build (Linux):  nvcc -O3 -arch=sm_86 tools/tp_probe.cu -o tp_probe [-DTP_PROBE_NCCL -lnccl]
@@ -127,6 +131,58 @@ __global__ void exchange_reduce(XArgs a) {
     }
 }
 
+__device__ __forceinline__ void st_ll(uint2* p, uint2 v) {
+    asm volatile("st.volatile.global.v2.u32 [%0], {%1, %2};" ::"l"(p), "r"(v.x), "r"(v.y) : "memory");
+}
+
+__device__ __forceinline__ uint2 ld_ll(const uint2* p) {
+    uint2 v;
+    asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p) : "memory");
+    return v;
+}
+
+struct LlArgs {
+    const float* mine;
+    float* out;
+    uint2* peer_inbox;              // remote inbox, slot-major [2][n] of {value bits, epoch}
+    const uint2* my_inbox;          // local inbox
+    const std::uint32_t* base;
+    volatile std::uint32_t* err;
+    unsigned long long timeout_ns;
+    int n;
+    std::uint32_t k;
+    int rank;
+};
+
+// Each thread stores its values with their epoch into the peer's inbox, then waits for the peer's
+// words of the same epoch in its own inbox and adds them in rank order.
+__global__ void exchange_reduce_ll(LlArgs a) {
+    const std::uint32_t epoch   = *a.base + a.k + 1u;
+    const std::uint32_t slot    = epoch & 1u;
+    uint2* peer                 = a.peer_inbox + static_cast<size_t>(slot) * a.n;
+    const uint2* inbox          = a.my_inbox + static_cast<size_t>(slot) * a.n;
+    const int stride            = gridDim.x * blockDim.x;
+    const int first             = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = first; i < a.n; i += stride) {
+        st_ll(peer + i, make_uint2(__float_as_uint(a.mine[i]), epoch));
+    }
+    const unsigned long long t0 = globaltimer();
+    for (int i = first; i < a.n; i += stride) {
+        uint2 word          = ld_ll(inbox + i);
+        std::uint32_t spins = 0;
+        while (word.y != epoch) {
+            if ((++spins & 1023u) == 0 && globaltimer() - t0 > a.timeout_ns) {
+                *a.err = 1u;
+                break;
+            }
+            word = ld_ll(inbox + i);
+        }
+        const float theirs = __uint_as_float(word.x);
+        const float m      = a.mine[i];
+        a.out[i]           = a.rank == 0 ? m + theirs : theirs + m;
+    }
+}
+
 __global__ void bump_epoch(std::uint32_t* base, std::uint32_t by) { *base += by; }
 
 __device__ __forceinline__ float pattern(int i, int rank, std::uint32_t iter) {
@@ -158,12 +214,16 @@ __global__ void local_add(const float* mine, const float* theirs, float* out, in
 
 // ---- host side -------------------------------------------------------------------------------
 
-enum class Transport { Peer, Host, Staged, Nccl };
+enum class Transport { Peer, Host, PeerLl, HostLl, Staged, Nccl };
+
+bool low_latency(Transport t) { return t == Transport::PeerLl || t == Transport::HostLl; }
 
 const char* name_of(Transport t) {
     switch (t) {
     case Transport::Peer: return "peer";
     case Transport::Host: return "host";
+    case Transport::PeerLl: return "peer-ll";
+    case Transport::HostLl: return "host-ll";
     case Transport::Staged: return "staged";
     case Transport::Nccl: return "nccl";
     }
@@ -176,6 +236,7 @@ struct Rank {
     float* mine = nullptr;
     float* out = nullptr;
     float* inbox = nullptr;             // VRAM inbox for the peer transport (and staged H2D target)
+    uint2* ll_inbox = nullptr;          // VRAM inbox for peer-ll, [2][max_floats]
     std::uint32_t* flags = nullptr;     // VRAM flags
     std::uint32_t* base = nullptr;
     unsigned long long* mismatches = nullptr;
@@ -191,6 +252,7 @@ struct Probe {
     // mapped host inboxes, one per receiving rank (device-visible pointers)
     float* host_data[2]{};
     std::uint32_t* host_flags[2]{};
+    uint2* host_ll[2]{};                // mapped host inboxes for host-ll, [2][max_floats]
     volatile std::uint32_t* err = nullptr;
     unsigned long long timeout_ns = 3'000'000'000ULL;
     bool same_device = false;
@@ -213,6 +275,9 @@ void reset_protocol(Probe& p) {
         CK(cudaMemsetAsync(p.rank[r].base, 0, sizeof(std::uint32_t), p.rank[r].stream));
         CK(cudaMemsetAsync(p.rank[r].mismatches, 0, sizeof(unsigned long long), p.rank[r].stream));
         std::memset(p.host_flags[r], 0, 2 * kMaxCtas * sizeof(std::uint32_t));
+        const size_t ll_bytes = 2 * static_cast<size_t>(p.max_floats) * sizeof(uint2);
+        CK(cudaMemsetAsync(p.rank[r].ll_inbox, 0, ll_bytes, p.rank[r].stream));
+        std::memset(p.host_ll[r], 0, ll_bytes);
     }
     sync_all(p);
     *p.err = 0;
@@ -223,6 +288,21 @@ int ctas_for(int n) { return std::min(kMaxCtas, std::max(1, n / 4 / 128)); }
 void launch_exchange(Probe& p, Transport t, int r, int n, std::uint32_t k) {
     Rank& me = p.rank[r];
     Rank& other = p.rank[1 - r];
+    if (low_latency(t)) {
+        LlArgs a{};
+        a.mine       = me.mine;
+        a.out        = me.out;
+        a.peer_inbox = t == Transport::PeerLl ? other.ll_inbox : p.host_ll[1 - r];
+        a.my_inbox   = t == Transport::PeerLl ? me.ll_inbox : p.host_ll[r];
+        a.base       = me.base;
+        a.err        = p.err;
+        a.timeout_ns = p.timeout_ns;
+        a.n          = n;
+        a.k          = k;
+        a.rank       = r;
+        exchange_reduce_ll<<<ctas_for(n), kBlock, 0, me.stream>>>(a);
+        return;
+    }
     XArgs a{};
     a.mine = me.mine;
     a.out = me.out;
@@ -533,7 +613,7 @@ std::vector<std::string> parse_names(const std::string& s) {
 int main(int argc, char** argv) {
     std::vector<int> devices{0, 1};
     std::vector<int> cols{1, 4, 16, 32, 128, 1024};
-    std::vector<std::string> transports{"peer", "host", "staged", "nccl"};
+    std::vector<std::string> transports{"peer", "host", "peer-ll", "host-ll", "staged", "nccl"};
     int hidden = 5120;
     long long soak_total = 0;
     bool do_s2 = false;
@@ -554,7 +634,8 @@ int main(int argc, char** argv) {
         else {
             std::fprintf(stderr,
                          "usage: tp_probe [--devices a,b] [--cols 1,4,...] [--hidden N] "
-                         "[--transports peer,host,staged,nccl] [--soak N] [--s2] [--timeout-ms N]\n");
+                         "[--transports peer,host,peer-ll,host-ll,staged,nccl] [--soak N] [--s2] "
+                         "[--timeout-ms N]\n");
             return 1;
         }
     }
@@ -616,6 +697,7 @@ int main(int argc, char** argv) {
         CK(cudaMalloc(&k.mine, max_bytes));
         CK(cudaMalloc(&k.out, max_bytes));
         CK(cudaMalloc(&k.inbox, 2 * max_bytes));
+        CK(cudaMalloc(&k.ll_inbox, 4 * max_bytes));
         CK(cudaMalloc(&k.flags, 2 * kMaxCtas * sizeof(std::uint32_t)));
         CK(cudaMalloc(&k.base, sizeof(std::uint32_t)));
         CK(cudaMalloc(&k.mismatches, sizeof(unsigned long long)));
@@ -631,6 +713,9 @@ int main(int argc, char** argv) {
         CK(cudaHostAlloc(&hf, 2 * kMaxCtas * sizeof(std::uint32_t), cudaHostAllocMapped | cudaHostAllocPortable));
         p.host_data[r] = static_cast<float*>(hd);
         p.host_flags[r] = static_cast<std::uint32_t*>(hf);
+        void* hl = nullptr;
+        CK(cudaHostAlloc(&hl, 4 * max_bytes, cudaHostAllocMapped | cudaHostAllocPortable));
+        p.host_ll[r] = static_cast<uint2*>(hl);
     }
 
     std::printf("\n%-7s %-6s %5s %11s %10s %10s\n", "path", "mode", "cols", "fp32_bytes", "median_us", "min_us");
@@ -638,10 +723,12 @@ int main(int argc, char** argv) {
         Transport t;
         if (name == "peer") t = Transport::Peer;
         else if (name == "host") t = Transport::Host;
+        else if (name == "peer-ll") t = Transport::PeerLl;
+        else if (name == "host-ll") t = Transport::HostLl;
         else if (name == "staged") t = Transport::Staged;
         else if (name == "nccl") t = Transport::Nccl;
         else { std::fprintf(stderr, "unknown transport %s\n", name.c_str()); return 1; }
-        if (t == Transport::Peer && !p.peer_ok) {
+        if ((t == Transport::Peer || t == Transport::PeerLl) && !p.peer_ok) {
             std::printf("%-7s skipped: no peer access between the devices\n", name_of(t));
             continue;
         }
@@ -679,6 +766,10 @@ int main(int argc, char** argv) {
         for (const std::string& name : transports) {
             if (name == "peer" && p.peer_ok) all_ok = soak(p, Transport::Peer, hidden * 4, soak_total) && all_ok;
             if (name == "host") all_ok = soak(p, Transport::Host, hidden * 4, soak_total) && all_ok;
+            if (name == "peer-ll" && p.peer_ok) {
+                all_ok = soak(p, Transport::PeerLl, hidden * 4, soak_total) && all_ok;
+            }
+            if (name == "host-ll") all_ok = soak(p, Transport::HostLl, hidden * 4, soak_total) && all_ok;
         }
     }
     if (do_s2) {

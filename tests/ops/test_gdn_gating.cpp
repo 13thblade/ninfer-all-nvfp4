@@ -15,8 +15,6 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr std::int32_t kHeads = 48;
-
 #if defined(NINFER_SFU_SOFTPLUS) && NINFER_SFU_SOFTPLUS
 // The SFU softplus carries lg2.approx's error, about 2e-6 of the result.
 constexpr PointwiseCriterion kGdnGatingFp32{/*absolute=*/1.0e-7, /*relative=*/4.0e-6};
@@ -48,10 +46,11 @@ std::vector<double> read_fp32(const void* device, std::size_t elements) {
 void gating_oracle(const std::vector<float>& a, const std::vector<float>& b,
                    const std::vector<float>& a_log, const std::vector<float>& dt_bias,
                    std::vector<double>& g, std::vector<double>& beta) {
+    const std::size_t heads = a_log.size();
     g.resize(a.size());
     beta.resize(b.size());
     for (std::size_t i = 0; i < a.size(); ++i) {
-        const std::size_t head = i % kHeads;
+        const std::size_t head = i % heads;
         const double av        = static_cast<double>(a[i]);
         const double bv        = static_cast<double>(b[i]);
         const double bias      = static_cast<double>(dt_bias[head]);
@@ -61,9 +60,11 @@ void gating_oracle(const std::vector<float>& a, const std::vector<float>& b,
     }
 }
 
-int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendentals) {
-    const std::size_t elements = static_cast<std::size_t>(kHeads) * tokens;
-    std::vector<float> a(elements), b(elements), a_log(kHeads), dt_bias(kHeads);
+// `heads`: 48 for a whole layer, fewer for a tensor-parallel rank's share.
+int run_case(std::int32_t heads, std::int32_t tokens, std::uint32_t seed,
+             bool stress_transcendentals) {
+    const std::size_t elements = static_cast<std::size_t>(heads) * tokens;
+    std::vector<float> a(elements), b(elements), a_log(heads), dt_bias(heads);
     fill_uniform(a, seed, -8.0F, 8.0F);
     fill_uniform(b, seed + 1u, -8.0F, 8.0F);
     fill_uniform(a_log, seed + 2u, -2.0F, 1.0F);
@@ -92,18 +93,19 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
     device_g.fill(0xff);
     device_beta.fill(0xff);
 
-    Tensor tensor_a(device_a.p, DType::BF16, {kHeads, tokens});
-    Tensor tensor_b(device_b.p, DType::BF16, {kHeads, tokens});
-    Tensor tensor_a_log(device_a_log.p, DType::FP32, {kHeads});
-    Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {kHeads});
-    Tensor tensor_g(device_g.data(), DType::FP32, {kHeads, tokens});
-    Tensor tensor_beta(device_beta.data(), DType::FP32, {kHeads, tokens});
+    Tensor tensor_a(device_a.p, DType::BF16, {heads, tokens});
+    Tensor tensor_b(device_b.p, DType::BF16, {heads, tokens});
+    Tensor tensor_a_log(device_a_log.p, DType::FP32, {heads});
+    Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {heads});
+    Tensor tensor_g(device_g.data(), DType::FP32, {heads, tokens});
+    Tensor tensor_beta(device_beta.data(), DType::FP32, {heads, tokens});
 
     ops::gdn_gating(tensor_a, tensor_b, tensor_a_log, tensor_dt_bias, tensor_g, tensor_beta,
                     nullptr);
     cuda_synchronize();
 
-    const std::string label = std::string("gdn_gating T=") + std::to_string(tokens) +
+    const std::string label = std::string("gdn_gating H=") + std::to_string(heads) + " T=" +
+                              std::to_string(tokens) +
                               (stress_transcendentals ? " transcendental-range" : "");
     int failures = 0;
     failures += verify_pointwise((label + " g").c_str(), read_fp32(device_g.data(), elements),
@@ -132,11 +134,13 @@ int main() {
     }
 
     int failures = 0;
-    failures += run_case(1, 0x101u, false);
-    failures += run_case(7, 0x202u, false);
-    failures += run_case(128, 0x303u, false);
-    failures += run_case(4096, 0x404u, false);
-    failures += run_case(17, 0x505u, true);
+    failures += run_case(48, 1, 0x101u, false);
+    failures += run_case(48, 7, 0x202u, false);
+    failures += run_case(48, 128, 0x303u, false);
+    failures += run_case(48, 4096, 0x404u, false);
+    failures += run_case(48, 17, 0x505u, true);
+    failures += run_case(24, 7, 0x606u, false);
+    failures += run_case(18, 129, 0x707u, false);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating correctness\n";
     return failures == 0 ? 0 : 1;

@@ -430,6 +430,66 @@ Weight bank_rows(Weight whole, std::int32_t first, std::int32_t rows) {
     return whole;
 }
 
+// A divided expert's half of a row-split bank, gathered on the device plane by plane as the
+// artifact's selection gathers it: rows [begin, end) of every run of `period` rows (each expert's
+// gate rows and up rows), or columns [begin, end) of every row.
+struct HalfBank {
+    std::unique_ptr<DeviceBuffer> codes, high, scales;
+    Weight weight;
+};
+
+HalfBank half_bank(const Weight& whole, bool by_rows, std::int32_t period, std::int32_t begin,
+                   std::int32_t end) {
+    const QuantGeometry geometry = quant_geometry(whole.qtype);
+    const std::size_t groups     = static_cast<std::size_t>(whole.k / geometry.group);
+    const std::int32_t rows      = by_rows ? whole.n / period * (end - begin) : whole.n;
+    const std::int32_t columns   = by_rows ? whole.k : end - begin;
+    const std::size_t piece_groups = static_cast<std::size_t>(columns / geometry.group);
+    HalfBank out;
+    const auto gather = [&](const void* plane, std::size_t bytes_per_group) {
+        if (plane == nullptr || bytes_per_group == 0) { return std::unique_ptr<DeviceBuffer>{}; }
+        auto buffer = std::make_unique<DeviceBuffer>(static_cast<std::size_t>(rows) *
+                                                     piece_groups * bytes_per_group);
+        const std::size_t row_bytes = groups * bytes_per_group;
+        const auto* source          = static_cast<const std::uint8_t*>(plane);
+        if (by_rows) {
+            const std::size_t width = static_cast<std::size_t>(end - begin) * row_bytes;
+            cuda_check(cudaMemcpy2D(buffer->p, width, source + begin * row_bytes,
+                                    static_cast<std::size_t>(period) * row_bytes, width,
+                                    static_cast<std::size_t>(whole.n / period),
+                                    cudaMemcpyDeviceToDevice),
+                       "gather divided expert rows");
+        } else {
+            const std::size_t width = piece_groups * bytes_per_group;
+            cuda_check(cudaMemcpy2D(buffer->p, width,
+                                    source + static_cast<std::size_t>(begin / geometry.group) *
+                                                 bytes_per_group,
+                                    row_bytes, width, static_cast<std::size_t>(rows),
+                                    cudaMemcpyDeviceToDevice),
+                       "gather divided expert columns");
+        }
+        return buffer;
+    };
+    out.codes  = gather(whole.qdata, geometry.code_bytes_per_group);
+    out.high   = gather(whole.qhigh, geometry.high_bytes_per_group);
+    out.scales = gather(whole.scales, sizeof(std::uint16_t));
+    out.weight                  = whole;
+    out.weight.qdata            = out.codes->p;
+    out.weight.payload          = out.codes->p;
+    out.weight.qhigh            = out.high ? out.high->p : nullptr;
+    out.weight.scales           = out.scales->p;
+    out.weight.n                = rows;
+    out.weight.k                = columns;
+    out.weight.shape[0]         = rows;
+    out.weight.shape[1]         = columns;
+    out.weight.padded_shape[0]  = rows;
+    out.weight.padded_shape[1]  = columns;
+    out.weight.high_plane_bytes = out.high ? out.high->bytes : 0;
+    out.weight.payload_bytes =
+        out.codes->bytes + (out.high ? out.high->bytes : 0) + out.scales->bytes;
+    return out;
+}
+
 Weight dense_bf16_weight(void* data, std::int32_t rows, std::int32_t columns) {
     Weight result{};
     result.payload         = data;
@@ -1046,6 +1106,76 @@ public:
         return failures;
     }
 
+    // Two devices dividing every expert's intermediate columns: each holds every routed expert's
+    // and the shared expert's half (gate and up rows, down columns) and runs every selected path
+    // through sparse_moe_share at width 256. The two partials are summed in rank order and added
+    // to the residual with one BF16 rounding, and the result is held to the whole Op's oracle and
+    // criterion: the SwiGLU columns are the whole expert's, and only the association of the down
+    // product changes.
+    int run_halves(std::int32_t tokens, int first_pattern) {
+        const std::string label = std::string(profile_.name) + " T=" + std::to_string(tokens) +
+                                  " divided columns";
+        const std::size_t values = static_cast<std::size_t>(kHidden) * tokens;
+        std::vector<float> input(values), residual(values);
+        std::vector<double> reference(values);
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            const int pattern = (first_pattern + token) % static_cast<int>(kRoutePatterns.size());
+            const std::size_t at = static_cast<std::size_t>(token) * kHidden;
+            std::copy(inputs_[pattern].begin(), inputs_[pattern].end(), input.begin() + at);
+            std::copy(residuals_[pattern].begin(), residuals_[pattern].end(),
+                      residual.begin() + at);
+            std::copy(references_[pattern].begin(), references_[pattern].end(),
+                      reference.begin() + at);
+        }
+        const std::vector<std::uint16_t> input_bits = bf16_bits(input);
+        DeviceBuffer device_input                   = to_device(input_bits);
+        Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
+        constexpr std::int32_t kHalf = kIntermediate / 2;
+        std::vector<float> sum(values, 0.0f);
+        int failures = 0;
+        for (std::int32_t half = 0; half < 2; ++half) {
+            const std::int32_t begin = half * kHalf;
+            const HalfBank gate_up =
+                half_bank(routed_gate_.weight(), true, kIntermediate, begin, begin + kHalf);
+            const HalfBank down = half_bank(routed_down_.weight(), false, 0, begin, begin + kHalf);
+            const HalfBank shared_gate_up =
+                half_bank(shared_gate_.weight(), true, kIntermediate, begin, begin + kHalf);
+            const HalfBank shared_down =
+                half_bank(shared_down_device_.weight(), false, 0, begin, begin + kHalf);
+            ops::SparseMoeWeights weights{
+                dense_bf16_weight(device_router_.p, kExperts + 1, kHidden), gate_up.weight,
+                down.weight, shared_gate_up.weight, shared_down.weight};
+            DeviceBuffer partial(values * sizeof(float));
+            partial.fill(0xff);
+            Tensor out(partial.p, DType::FP32, {kHidden, tokens});
+            const std::size_t workspace_bytes = ops::sparse_moe_share_workspace_capacity_bytes(
+                gate_up.weight.qtype, down.weight.qtype, tokens, tokens);
+            WorkspaceArena workspace(workspace_bytes);
+            ops::sparse_moe_share(x, weights,
+                                  {.expert_begin  = 0,
+                                   .expert_count  = kExperts,
+                                   .shared_expert = true,
+                                   .intermediate  = kHalf},
+                                  out, workspace, nullptr);
+            cuda_synchronize();
+            const std::vector<float> host = from_device<float>(partial, values);
+            for (std::size_t i = 0; i < values; ++i) { sum[i] += host[i]; }
+            if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+                std::cerr << label << ": share workspace query/execution high-water mismatch\n";
+                ++failures;
+            }
+        }
+        std::vector<double> output(values);
+        for (std::size_t i = 0; i < values; ++i) {
+            output[i] = bf16_to_f32(f32_to_bf16(residual[i] + sum[i]));
+        }
+        failures += verify_reduction(label, output, reference, profile_.criterion(tokens));
+        failures +=
+            verify_exact((label + " input preservation").c_str(),
+                         from_device<std::uint16_t>(device_input, input_bits.size()), input_bits);
+        return failures;
+    }
+
     int verify_persistent_inputs() const {
         int failures = 0;
         failures += verify_exact((std::string(profile_.name) + " router preservation").c_str(),
@@ -1266,8 +1396,9 @@ int run_candidates(const CodecProfile& profile) {
 }
 
 // The groupwise profiles' expert shares: splits that cut between selected experts, one that leaves
-// a share a single selected expert, and one whose middle share holds a single expert, over decode,
-// Small-T and prefill calls including a sliced one.
+// a share a single selected expert, and one whose middle share holds a single expert, and two
+// devices dividing every expert's intermediate columns, over decode, Small-T and prefill calls
+// including a sliced one.
 int run_shares(const CodecProfile& profile) {
     SparseMoeFixture fixture(profile);
     constexpr std::array<std::int32_t, 4> kThree{{0, 97, 200, 256}};
@@ -1276,6 +1407,7 @@ int run_shares(const CodecProfile& profile) {
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 5, 8, 16, 20, 32, 47, 64, 768, 4097}) {
         failures += fixture.run_shares(tokens, tokens == 1 ? 1 : 0, kThree);
+        failures += fixture.run_halves(tokens, tokens == 1 ? 1 : 0);
         if (tokens == 1 || tokens == 8 || tokens == 64) {
             failures += fixture.run_shares(tokens, 0, kLast);
             failures += fixture.run_shares(tokens, 2, kOne);

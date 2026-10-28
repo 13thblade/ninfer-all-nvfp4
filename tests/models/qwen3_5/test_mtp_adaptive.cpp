@@ -1,6 +1,7 @@
 // Adaptive MTP only chooses how many drafts a round verifies; greedy output is the same at every
 // width. What these checks defend is the choice: the survival estimate, the measured cost model,
-// and that the controller widens under full acceptance and settles low under none.
+// that the controller widens under full acceptance and settles low under none, and that a packed
+// round's plan spends its rows where drafts survive.
 
 #include "runtime/contract/mtp_adaptive.h"
 
@@ -15,6 +16,7 @@ namespace {
 
 using ninfer::runtime::MtpAdaptiveBatchController;
 using ninfer::runtime::MtpAdaptiveSignal;
+using ninfer::runtime::MtpPackedPlanner;
 using ninfer::runtime::MtpRoundCostModel;
 
 void require(bool condition, const char* message) {
@@ -102,6 +104,44 @@ void the_controller_widens_and_narrows() {
             "two surviving drafts did not settle at two or three");
 }
 
+void the_packed_plan_spends_rows_on_survival() {
+    MtpAdaptiveSignal accepting;
+    MtpAdaptiveSignal rejecting;
+    for (int round = 0; round < 40; ++round) {
+        accepting.observe(6, 6);
+        rejecting.observe(6, 0);
+    }
+    const std::array<std::uint32_t, 3> limits{6, 6, 4};
+    std::array<std::uint32_t, 3> extents{};
+
+    // Nearly free rows: the accepting row verifies all its drafts, the rejecting one none, and a
+    // lookup's proposal keeps its length.
+    MtpPackedPlanner cheap;
+    const std::array<const MtpAdaptiveSignal*, 3> signals{&accepting, &rejecting, nullptr};
+    cheap.plan(signals, limits, extents);
+    require(extents[0] == 6, "an accepting row did not verify its drafts");
+    require(extents[1] == 0, "a rejecting row verified drafts that never survive");
+    require(extents[2] == 4, "a lookup's proposal lost drafts");
+
+    // Rows measured as dear as a whole round each: no draft repays its row.
+    MtpPackedPlanner dear;
+    for (std::uint32_t rows = 1; rows <= MtpPackedPlanner::kMaximumRows; ++rows) {
+        for (int sample = 0; sample < 4; ++sample) { dear.observe(rows, 0.01 * rows); }
+    }
+    const std::array<const MtpAdaptiveSignal*, 3> models{&accepting, &rejecting, &rejecting};
+    dear.plan(models, limits, extents);
+    require(extents[0] == 0 && extents[1] == 0 && extents[2] == 0,
+            "rows that cost a round each still carried drafts");
+
+    // An unmeasured total is priced between its measured neighbours.
+    MtpPackedPlanner partial;
+    for (int sample = 0; sample < 4; ++sample) {
+        partial.observe(2, 0.010);
+        partial.observe(6, 0.014);
+    }
+    require(std::abs(partial.cost(4) - 0.012F) < 1e-6F, "an unmeasured total was not interpolated");
+}
+
 } // namespace
 
 int main() {
@@ -109,10 +149,11 @@ int main() {
         survival_follows_acceptance();
         costs_are_measured_then_scaled();
         the_controller_widens_and_narrows();
+        the_packed_plan_spends_rows_on_survival();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
     }
-    std::puts("adaptive MTP: survival, costs and width selection ok");
+    std::puts("adaptive MTP: survival, costs, width selection and packed plans ok");
     return 0;
 }

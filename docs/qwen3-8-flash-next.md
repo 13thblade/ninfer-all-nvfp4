@@ -184,7 +184,7 @@ table artifact whose digest or row format differs from the one the model names.
 ./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
   --devices 0,1 --max-context 32768
 
-# The same GPUs dividing every layer's routed experts instead, the rest on the first (Linux).
+# The same GPUs dividing every layer instead: GDN key heads, attention KV heads, routed experts (Linux).
 ./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
   --devices 0,1 --tensor-parallel --max-context 32768
 
@@ -224,7 +224,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--kv-resident N\|all\|auto` | positions of each sparse-attention layer's KV a sequence keeps in device memory; a longer `--max-context` streams those layers ([streamed KV](#streamed-sparse-attention-kv)). `auto` (default): 32,768 with host or disk experts, all with device experts |
 | `--rope-yarn`, `--rope-yarn-factor F` | YaRN past the native 262,144 positions, as for the Qwen3.5 family: at `--max-context` / 262,144 once the window passes it, or at a fixed factor `F` (`1..4`) for every position. It reaches every rotation the model makes, the sparse-attention layers', their indexer's and the MTP block's, and changes every answer, short ones too. Without it positions past 262,144 rotate unscaled. `--rope-scaling-factor` is not available for this model. The startup log names the factor, and the request log's `server_start` record reports the resolved rotation (`engine.rope`) |
 | `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
-| `--tensor-parallel`, `--tensor-split A,B,...` | with `--devices`: every layer on the first GPU, its routed experts divided over the GPUs (GGUF banks on the devices; [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)) |
+| `--tensor-parallel`, `--tensor-split A,B,...` | with `--devices`: every layer divided over the GPUs, its GDN key heads, its sparse-attention KV heads and its routed experts (GGUF banks on the devices), each GPU keeping the hyper-connection stack; the shared expert, the head, MTP and Vision on the first ([tensor parallelism](maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next)) |
 
 With device experts every expert runs on the GPU. With GGUF host and disk experts, by default the
 CPU computes a share of each decode or verification call's missing experts ([the CPU
@@ -545,11 +545,12 @@ and thinking-token budgets, including the correction or bonus token.
 probability over the public vocabulary is at or below P. The round verifies the drafts up to and
 including that one, so every round verifies at least one; P=0 disables the calculation and P=1
 drafts and verifies one. A batch drafts until each of its requests has reached such a draft (or the
-last step), verifies its largest selected prefix, and bounds acceptance separately for each
-request. This is distinct from the sampling `--min-p` filter. With a floor each draft step runs
-from its own CUDA Graph and the host reads the step's probabilities before it starts the next, so
-`drafted_tokens` counts the steps that ran; each verification width has its own CUDA Graph. The
-floor is part of the disk context-cache profile. `--spec mtp` keeps the full window unless
+last step) and verifies each request's own selected prefix, the rows packed at their own widths
+(all at the largest one when a request gathers logprobs). This is distinct from the sampling
+`--min-p` filter. With a floor each draft step runs from its own CUDA Graph and the host reads the
+step's probabilities before it starts the next, so `drafted_tokens` counts the steps that ran;
+each verification width has its own CUDA Graph. The floor is part of the disk context-cache
+profile. `--spec mtp` keeps the full window unless
 `--draft-min-p` is set; the automatic drafting uses 0.5. On an RTX 4090 with the IQ3_S release's
 host experts (EPYC 7V13, 32-CPU quota, 64K context; 256 greedy tokens after a code prompt, a prose
 prompt and a 31,865-token document, once per `--kv-dtype` format) three drafts with the floor 0.5

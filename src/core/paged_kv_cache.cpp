@@ -42,11 +42,51 @@ void validate_geometry(const KVPageGeometry& geometry) {
         throw std::invalid_argument("Paged KV device geometry requires 64-token pages");
     }
     if (geometry.planes.empty()) { throw std::invalid_argument("Paged KV geometry has no planes"); }
-    for (const KVPlaneGeometry& plane : geometry.planes) {
+    for (std::size_t index = 0; index < geometry.planes.size(); ++index) {
+        const KVPlaneGeometry& plane = geometry.planes[index];
         if (plane.leading_extent <= 0 || plane.head_extent <= 0) {
             throw std::invalid_argument("Paged KV plane extents must be positive");
         }
+        if (plane.page_stride < 1 || plane.page_residue < 0 ||
+            plane.page_residue >= plane.page_stride) {
+            throw std::invalid_argument("Paged KV plane residue is outside its stride");
+        }
+        if (plane.page_residue > 0) {
+            const std::size_t first = index - static_cast<std::size_t>(plane.page_residue);
+            const KVPlaneGeometry& sibling = geometry.planes[first];
+            if (index < static_cast<std::size_t>(plane.page_residue) ||
+                sibling.page_stride != plane.page_stride ||
+                geometry.planes[index - 1].page_residue != plane.page_residue - 1 ||
+                sibling.dtype != plane.dtype || sibling.leading_extent != plane.leading_extent ||
+                sibling.head_extent != plane.head_extent) {
+                throw std::invalid_argument("Paged KV residue planes are not consecutive siblings");
+            }
+        }
+        if (plane.page_stride > 1 && plane.page_residue == plane.page_stride - 1 &&
+            index + 1 < geometry.planes.size() && geometry.planes[index + 1].page_residue != 0) {
+            throw std::invalid_argument("Paged KV residue planes overrun their stride");
+        }
+        if (plane.page_stride > 1 && plane.page_residue == 0 &&
+            index + static_cast<std::size_t>(plane.page_stride) > geometry.planes.size()) {
+            throw std::invalid_argument("Paged KV residue planes are incomplete");
+        }
     }
+}
+
+// Pages of [0, physical) a residue plane holds: the first local page of a run starting there.
+std::int64_t residue_pages_below(const KVPlaneGeometry& plane, std::int64_t physical) {
+    return physical > plane.page_residue
+               ? (physical - plane.page_residue + plane.page_stride - 1) / plane.page_stride
+               : 0;
+}
+
+// Largest source or destination pitch cudaMemcpy2DAsync accepts on the current device.
+std::size_t device_max_copy_pitch() {
+    int device = 0;
+    int pitch  = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&pitch, cudaDevAttrMaxPitch, device));
+    return static_cast<std::size_t>(pitch);
 }
 
 void increment_generation(std::uint32_t& generation) noexcept {
@@ -66,6 +106,8 @@ PagedKVBatchLayerView single_row_paged_kv_batch_view(const PagedKVLayerView& cac
         .head_dim      = cache.head_dim,
         .num_kv_heads  = cache.num_kv_heads,
         .storage       = cache.storage,
+        .page_stride   = cache.page_stride,
+        .page_residue  = cache.page_residue,
     };
 }
 
@@ -100,15 +142,17 @@ DeviceKVPagePoolLayout plan_device_kv_page_pool(std::span<LayoutBuilder* const> 
         planned.geometry        = plane;
         planned.rank            = plane_rank[index];
         const std::string label = "Paged KV plane " + std::to_string(index);
+        const std::int32_t pages = plane.local_pages(physical_pages);
+        if (pages <= 0) {
+            throw std::invalid_argument(label + " holds no page of the pool");
+        }
         if (spec.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
             planned.storage = builder.add_tensor(
-                plane.dtype,
-                {plane.leading_extent, kPagedKVPageSize, plane.head_extent, physical_pages},
+                plane.dtype, {plane.leading_extent, kPagedKVPageSize, plane.head_extent, pages},
                 plane.alignment, label);
         } else {
             planned.storage = builder.add_tensor(
-                plane.dtype,
-                {plane.leading_extent, kPagedKVPageSize, physical_pages, plane.head_extent},
+                plane.dtype, {plane.leading_extent, kPagedKVPageSize, pages, plane.head_extent},
                 plane.alignment, label);
         }
         layout.planes.push_back(planned);
@@ -253,11 +297,12 @@ DeviceKVPagePool::DeviceKVPagePool(std::span<const DeviceSpan> backings,
             plane.ne[1] != kPagedKVPageSize) {
             throw std::logic_error("Paged KV device plane tensor is inconsistent");
         }
+        const std::int32_t pages = expected.local_pages(physical_pages);
         if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
-            if (plane.ne[2] != expected.head_extent || plane.ne[3] != physical_pages) {
+            if (plane.ne[2] != expected.head_extent || plane.ne[3] != pages) {
                 throw std::logic_error("Paged KV PageMajor plane shape is inconsistent");
             }
-        } else if (plane.ne[2] != physical_pages || plane.ne[3] != expected.head_extent) {
+        } else if (plane.ne[2] != pages || plane.ne[3] != expected.head_extent) {
             throw std::logic_error("Paged KV HeadMajor plane shape is inconsistent");
         }
         plane_devices_.push_back(memory_device(plane.data));
@@ -333,18 +378,23 @@ std::vector<DeviceKVPagePool::FreeExtent> DeviceKVPagePool::free_extents() const
         const auto* const base  = static_cast<const std::byte*>(plane.data);
         const bool page_major   = spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor;
         const std::size_t heads = page_major ? 1 : static_cast<std::size_t>(plane.ne[3]);
+        const KVPlaneGeometry& geometry = spec_.geometry.planes[plane_index];
         for (const KVPageRun& run : free_page_runs_) {
+            // A run's pages a residue plane holds are consecutive there.
+            const auto first = static_cast<std::size_t>(residue_pages_below(geometry, run.begin));
+            const auto count =
+                static_cast<std::size_t>(residue_pages_below(geometry, run.begin + run.count)) -
+                first;
+            if (count == 0) { continue; }
             for (std::size_t head = 0; head < heads; ++head) {
                 if (page_major) {
                     const auto page = static_cast<std::size_t>(plane.nb[3]);
-                    out.push_back({rank, base + static_cast<std::size_t>(run.begin) * page,
-                                   static_cast<std::size_t>(run.count) * page});
+                    out.push_back({rank, base + first * page, count * page});
                 } else {
                     const auto page = static_cast<std::size_t>(plane.nb[2]);
-                    out.push_back({rank,
-                                   base + head * static_cast<std::size_t>(plane.nb[3]) +
-                                       static_cast<std::size_t>(run.begin) * page,
-                                   static_cast<std::size_t>(run.count) * page});
+                    out.push_back(
+                        {rank, base + head * static_cast<std::size_t>(plane.nb[3]) + first * page,
+                         count * page});
                 }
             }
         }
@@ -719,9 +769,14 @@ void DeviceKVPagePool::zero_pages(std::span<const DeviceKVPageHandle> pages,
     while (begin < pages.size()) {
         std::size_t end = begin + 1;
         while (end < pages.size() && pages[end].index_ == pages[end - 1].index_ + 1) { ++end; }
-        const std::int32_t first = pages[begin].index_;
-        const std::int32_t count = static_cast<std::int32_t>(end - begin);
+        const std::int32_t run_first = pages[begin].index_;
+        const std::int32_t run_end   = pages[end - 1].index_ + 1;
         for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
+            const KVPlaneGeometry& geometry = spec_.geometry.planes[plane_index];
+            const auto first = static_cast<std::int32_t>(residue_pages_below(geometry, run_first));
+            const auto count =
+                static_cast<std::int32_t>(residue_pages_below(geometry, run_end)) - first;
+            if (count == 0) { continue; }
             const Tensor& plane      = planes_[plane_index];
             const cudaStream_t stream = streams[plane_ranks_[plane_index]];
             const HoldingDeviceBinding bind(plane_devices_[plane_index]);
@@ -746,6 +801,14 @@ void DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPageHandle d
     const std::int32_t destination_index = physical_index(destination);
     if (source_index == destination_index) { return; }
     for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
+        const KVPlaneGeometry& geometry = spec_.geometry.planes[plane_index];
+        if (geometry.page_stride > 1) {
+            // Residue siblings: the plane holding the source copies to the one holding the
+            // destination, once per sibling group.
+            if (geometry.page_residue != 0) { continue; }
+            copy_residue_page(plane_index, source_index, destination_index, streams);
+            continue;
+        }
         const Tensor& plane       = planes_[plane_index];
         const cudaStream_t stream = streams[plane_ranks_[plane_index]];
         const HoldingDeviceBinding bind(plane_devices_[plane_index]);
@@ -765,6 +828,40 @@ void DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPageHandle d
     }
 }
 
+void DeviceKVPagePool::copy_residue_page(std::size_t first_sibling, std::int32_t source,
+                                         std::int32_t destination, RankStreams streams) const {
+    const std::int32_t stride  = spec_.geometry.planes[first_sibling].page_stride;
+    const std::size_t from     = first_sibling + static_cast<std::size_t>(source % stride);
+    const std::size_t to       = first_sibling + static_cast<std::size_t>(destination % stride);
+    const Tensor& source_plane = planes_[from];
+    const Tensor& target_plane = planes_[to];
+    const cudaStream_t stream  = streams[plane_ranks_[from]];
+    const HoldingDeviceBinding bind(plane_devices_[from]);
+    const auto* source_base = static_cast<const unsigned char*>(source_plane.data);
+    auto* target_base       = static_cast<unsigned char*>(target_plane.data);
+    const std::int64_t source_page      = source / stride;
+    const std::int64_t destination_page = destination / stride;
+    const auto copy = [&](unsigned char* to_ptr, const unsigned char* from_ptr, std::size_t bytes) {
+        if (plane_devices_[from] == plane_devices_[to]) {
+            CUDA_CHECK(cudaMemcpyAsync(to_ptr, from_ptr, bytes, cudaMemcpyDeviceToDevice, stream));
+        } else {
+            CUDA_CHECK(cudaMemcpyPeerAsync(to_ptr, plane_devices_[to], from_ptr,
+                                           plane_devices_[from], bytes, stream));
+        }
+    };
+    if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
+        copy(target_base + destination_page * target_plane.nb[3],
+             source_base + source_page * source_plane.nb[3],
+             static_cast<std::size_t>(source_plane.nb[3]));
+        return;
+    }
+    for (std::int64_t head = 0; head < source_plane.ne[3]; ++head) {
+        copy(target_base + head * target_plane.nb[3] + destination_page * target_plane.nb[2],
+             source_base + head * source_plane.nb[3] + source_page * source_plane.nb[2],
+             static_cast<std::size_t>(source_plane.nb[2]));
+    }
+}
+
 void DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin,
                                      std::size_t plane_end, std::int32_t first, std::size_t count,
                                      std::byte* host_base, std::size_t host_pitch,
@@ -772,30 +869,53 @@ void DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begi
     const bool to_host = kind == cudaMemcpyDeviceToHost;
     for (std::size_t plane_index = plane_begin; plane_index < plane_end; ++plane_index) {
         const Tensor& plane                 = planes_[plane_index];
+        const KVPlaneGeometry& geometry     = spec_.geometry.planes[plane_index];
         const cudaStream_t stream           = streams[plane_ranks_[plane_index]];
         const HoldingDeviceBinding bind(plane_devices_[plane_index]);
         const HostKVPlaneLayout& host_plane = host.planes[plane_index];
-        std::byte* host_plane_base          = host_base + host_plane.offset;
         auto* device_base                   = static_cast<unsigned char*>(plane.data);
-        const auto copy                     = [&](std::byte* host_ptr, unsigned char* device_ptr,
-                                                  std::size_t device_pitch, std::size_t width) {
+        // The run's pages this plane holds: every page_stride-th record from `skip`, at
+        // consecutive pages of the plane from `local`.
+        const auto stride = static_cast<std::size_t>(geometry.page_stride);
+        const std::size_t skip =
+            static_cast<std::size_t>((geometry.page_residue - first % geometry.page_stride +
+                                      geometry.page_stride) %
+                                     geometry.page_stride);
+        if (skip >= count) { continue; }
+        const std::size_t rows       = (count - 1 - skip) / stride + 1;
+        const std::int64_t local     = residue_pages_below(geometry, first);
+        std::byte* host_plane_base   = host_base + skip * host_pitch + host_plane.offset;
+        const std::size_t row_pitch  = host_pitch * stride;
+        const auto copy = [&](std::byte* host_ptr, unsigned char* device_ptr,
+                              std::size_t device_pitch, std::size_t width) {
+            if (rows > 1 && stride > 1 && row_pitch > device_max_copy_pitch()) {
+                // Too far apart for one strided transfer: one copy per page.
+                for (std::size_t row = 0; row < rows; ++row) {
+                    std::byte* h       = host_ptr + row * row_pitch;
+                    unsigned char* d   = device_ptr + row * device_pitch;
+                    CUDA_CHECK(cudaMemcpyAsync(to_host ? static_cast<void*>(h) : d,
+                                               to_host ? static_cast<const void*>(d) : h, width,
+                                               kind, stream));
+                }
+                return;
+            }
             if (to_host) {
-                CUDA_CHECK(cudaMemcpy2DAsync(host_ptr, host_pitch, device_ptr, device_pitch, width,
-                                             count, cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpy2DAsync(host_ptr, row_pitch, device_ptr, device_pitch, width,
+                                             rows, cudaMemcpyDeviceToHost, stream));
             } else {
-                CUDA_CHECK(cudaMemcpy2DAsync(device_ptr, device_pitch, host_ptr, host_pitch, width,
-                                             count, cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpy2DAsync(device_ptr, device_pitch, host_ptr, row_pitch, width,
+                                             rows, cudaMemcpyHostToDevice, stream));
             }
         };
-        if (geometry().device_plane_order == PagedKVPlaneOrder::PageMajor) {
-            copy(host_plane_base, device_base + static_cast<std::int64_t>(first) * plane.nb[3],
-                 plane.nb[3], host_plane.page_payload_bytes);
+        if (this->geometry().device_plane_order == PagedKVPlaneOrder::PageMajor) {
+            copy(host_plane_base, device_base + local * plane.nb[3], plane.nb[3],
+                 host_plane.page_payload_bytes);
         } else {
             for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
                 copy(host_plane_base +
                          static_cast<std::size_t>(head) * host_plane.head_payload_bytes,
                      device_base + static_cast<std::int64_t>(head) * plane.nb[3] +
-                         static_cast<std::int64_t>(first) * plane.nb[2],
+                         local * plane.nb[2],
                      plane.nb[2], host_plane.head_payload_bytes);
             }
         }
@@ -890,15 +1010,6 @@ std::size_t DeviceKVPagePool::host_record_run_end(std::span<const DeviceKVPageHa
 }
 
 namespace {
-
-// Largest source or destination pitch cudaMemcpy2DAsync accepts on the current device.
-std::size_t device_max_copy_pitch() {
-    int device = 0;
-    int pitch  = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&pitch, cudaDevAttrMaxPitch, device));
-    return static_cast<std::size_t>(pitch);
-}
 
 void validate_record_groups(std::span<const std::uint32_t> groups, std::size_t records,
                             const char* op) {

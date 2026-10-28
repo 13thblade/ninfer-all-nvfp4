@@ -199,7 +199,7 @@ struct Executor::Impl {
     int decode_splits_full = 1, decode_splits_sliding = 1;
     // Decode graphs by row count, verification graphs by 16 + rows.
     std::map<std::uint32_t, GraphEntry> graphs;
-    std::uint32_t verify_width = 0; // rows per sequence of the last verify()
+    std::vector<std::uint32_t> verify_widths; // rows per sequence of the last verify()
 
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(o), config(m.config()) {
@@ -1544,48 +1544,61 @@ struct Executor::Impl {
 
     // ---- Speculative rounds ------------------------------------------------------------------------
 
-    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens) {
+    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens,
+                std::span<const std::uint32_t> widths = {}) {
         const int n = int(sequences.size());
-        if (options.draft_tokens == 0 || n <= 0 || tokens.size() % sequences.size() != 0) {
+        if (options.draft_tokens == 0 || n <= 0 ||
+            (widths.empty() && tokens.size() % sequences.size() != 0) ||
+            (!widths.empty() && widths.size() != sequences.size())) {
             throw std::invalid_argument("flint verify: invalid call");
         }
-        const int w = int(tokens.size()) / n, rows = n * w;
-        if (w < 1 || std::uint32_t(w) > options.draft_tokens + 1 || rows > gguf::kMaxVectorColumns) {
+        std::vector<std::uint32_t> row_widths(widths.begin(), widths.end());
+        if (row_widths.empty()) { row_widths.assign(n, std::uint32_t(tokens.size()) / n); }
+        int rows = 0;
+        for (const std::uint32_t w : row_widths) {
+            if (w < 1 || w > options.draft_tokens + 1) {
+                throw std::invalid_argument("flint verify: invalid width");
+            }
+            rows += int(w);
+        }
+        if (std::size_t(rows) != tokens.size() || rows > gguf::kMaxVectorColumns) {
             throw std::invalid_argument("flint verify: invalid width");
         }
         std::vector<std::int32_t> pos(rows), seq(rows);
-        for (int j = 0; j < n; ++j) {
+        for (int j = 0, at = 0; j < n; ++j) {
             const std::uint32_t s = sequences[j];
             if (s >= options.sequences ||
                 std::count(sequences.begin(), sequences.begin() + j, s) != 0) {
                 throw std::invalid_argument("flint verify: invalid sequence");
             }
-            if (positions[s] + std::uint32_t(w) > options.max_context) {
+            if (positions[s] + row_widths[j] > options.max_context) {
                 throw std::invalid_argument("flint verify: context capacity exceeded");
             }
-            for (int i = 0; i < w; ++i) {
-                pos[j * w + i] = std::int32_t(positions[s]) + i;
-                seq[j * w + i] = std::int32_t(s);
+            for (std::uint32_t i = 0; i < row_widths[j]; ++i, ++at) {
+                pos[at] = std::int32_t(positions[s] + i);
+                seq[at] = std::int32_t(s);
             }
         }
-        for (const std::uint32_t s : sequences) { back(s, positions[s] + std::uint32_t(w), false); }
+        for (int j = 0; j < n; ++j) {
+            back(sequences[j], positions[sequences[j]] + row_widths[j], false);
+        }
         stage(tokens, pos, seq);
         run_graph(16 + std::uint32_t(rows), [&] { decode_body(rows); });
-        verify_width = std::uint32_t(w);
+        verify_widths = std::move(row_widths);
     }
 
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept) {
-        if (kept.size() != sequences.size() || verify_width == 0) {
+        if (kept.size() != sequences.size() || verify_widths.size() != sequences.size()) {
             throw std::invalid_argument("flint commit: invalid call");
         }
         for (std::size_t j = 0; j < sequences.size(); ++j) {
             const std::uint32_t s = sequences[j];
-            if (s >= options.sequences || kept[j] < 1 || kept[j] > verify_width) {
+            if (s >= options.sequences || kept[j] < 1 || kept[j] > verify_widths[j]) {
                 throw std::invalid_argument("flint commit: invalid row");
             }
             positions[s] += kept[j];
         }
-        verify_width = 0;
+        verify_widths.clear();
     }
 
     void warm_up() {
@@ -1826,8 +1839,8 @@ cudaStream_t Executor::head_stream() const noexcept { return impl_->stream; }
 std::uint32_t Executor::draft_tokens() const noexcept { return impl_->options.draft_tokens; }
 
 void Executor::verify(std::span<const std::uint32_t> sequences,
-                      std::span<const std::int32_t> tokens) {
-    impl_->verify(sequences, tokens);
+                      std::span<const std::int32_t> tokens, std::span<const std::uint32_t> widths) {
+    impl_->verify(sequences, tokens, widths);
 }
 
 void Executor::commit(std::span<const std::uint32_t> sequences,

@@ -3,7 +3,8 @@
 // The shapes are Qwen3.8-27B's at a 3:1 split: GDN key heads 12/4 (q and k 1536/512 rows, v and z
 // 4608/1536, the output projection's K the same), FFN rows 13056/4352. T2, FP8 and NVFP4 shares are
 // whole K slabs of 512 or 256 columns (ops::linear_share_units), and a rotated input's whole
-// 1024-column blocks: their FFN rows split 13312/4096.
+// 1024-column blocks: their FFN rows split 13312/4096. On sm_70 the formats a Volta rank takes in
+// the panel layout (T2, Q4, Q5, Q6) also run their FP32 partials and a small matrix in it.
 
 #include "ops/linear/linear_test_common.h"
 
@@ -80,6 +81,22 @@ int slab_conformance(const char* label, WeightGenerator generator, std::uint32_t
     return failures;
 }
 
+// A Volta rank's down projection share as an FP32 partial and every row of a small matrix, both
+// outputs, with the weight in the panel layout; `k` is the share's intermediate rows.
+int panel_conformance(const char* label, WeightGenerator generator, std::uint32_t seed,
+                      std::int32_t k) {
+    int failures = 0;
+    failures += run_shape(label, ActivationCompute::A16, generator,
+                          {5120, k, seed, Comparison::SampledRows, true, kWidths,
+                           ActivationSigns::Biased, DType::FP32, true});
+    for (const DType out : {DType::BF16, DType::FP32}) {
+        failures += run_shape(label, ActivationCompute::A16, generator,
+                              {384, 1024, seed + 1, Comparison::Full, true, kSmall,
+                               ActivationSigns::Centered, out, true});
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -101,6 +118,23 @@ int main() {
         };
         for (const auto& format : formats) {
             const int format_failures = conformance(format.label, format.generator, format.seed);
+            std::cout << (format_failures == 0 ? "OK " : "FAIL ") << format.label << '\n';
+            failures += format_failures;
+        }
+        const struct {
+            const char* label;
+            WeightGenerator generator;
+            std::uint32_t seed;
+            std::int32_t k;
+        } panel_formats[] = {
+            {"Q4_A16 panel runtime shape", make_q4_g64_fp16_weight, 421U, 4352},
+            {"Q5_A16 panel runtime shape", make_q5_g64_fp16_weight, 523U, 4352},
+            {"Q6_A16 panel runtime shape", make_q6_g64_fp16_weight, 627U, 4352},
+            {"T2_A16 panel runtime shape", make_t2_g128_fp16_weight, 931U, 4096},
+        };
+        for (const auto& format : panel_formats) {
+            const int format_failures =
+                panel_conformance(format.label, format.generator, format.seed, format.k);
             std::cout << (format_failures == 0 ? "OK " : "FAIL ") << format.label << '\n';
             failures += format_failures;
         }

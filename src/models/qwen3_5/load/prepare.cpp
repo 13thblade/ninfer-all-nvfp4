@@ -173,17 +173,14 @@ WeightId Bindings::piece(const std::string& name, const artifact::Shape& shape,
             const std::uint64_t lo  = std::max(begin, logical);
             const std::uint64_t hi  = std::min(end, logical + count);
             if (lo < hi) {
-                selection.row_begin = first + lo - logical;
-                selection.row_end   = first + hi - logical;
-                selection.columns   = {{0, columns}};
+                selection.rows    = {{first + lo - logical, first + hi - logical}};
+                selection.columns = {{0, columns}};
             }
         } else if (matrix) {
-            selection.row_begin = first;
-            selection.row_end   = first + count;
-            selection.columns   = stored_piece.ranges;
+            selection.rows    = {{first, first + count}};
+            selection.columns = stored_piece.ranges;
         } else {
-            selection.row_begin = 0;
-            selection.row_end   = 1;
+            selection.rows = {{0, 1}};
             for (const auto& [begin, end] : stored_piece.ranges) {
                 const std::uint64_t lo = std::max(begin, logical);
                 const std::uint64_t hi = std::min(end, logical + count);
@@ -287,8 +284,7 @@ std::vector<WeightId> Bindings::joint_piece(std::span<const JointPart> parts, st
             parts.front().name + ": a joint piece must cover one whole run of its object's rows");
     }
     artifact::ObjectSelection selection;
-    selection.row_begin                 = first;
-    selection.row_end                   = last;
+    selection.rows                      = {{first, last}};
     selection.columns                   = {{0, columns}};
     const artifact::ObjectHandle handle = binder.select_device(*object, std::move(selection), rank);
     std::vector<WeightId> out;
@@ -305,6 +301,112 @@ std::vector<WeightId> Bindings::joint_piece(std::span<const JointPart> parts, st
         pending.reference = {part.name + "@" + std::to_string(rank), part.shape, std::move(binding),
                              artifact::Residency::Device};
         add_uses(pending, part.name, part.inputs);
+        pending.source_objects.push_back(binder.object_id(handle));
+        pending.rank = rank;
+        out.push_back({weights.size()});
+        weights.push_back(std::move(pending));
+    }
+    return out;
+}
+
+std::vector<WeightId> Bindings::joint_piece(std::span<const JointPart> parts, std::size_t rank,
+                                            const ParameterPiece& piece) {
+    if (parts.empty()) { throw std::invalid_argument("a joint piece needs parameters"); }
+    const bool rows_cut = piece.cut == ParameterPiece::Cut::Rows;
+    if (piece.ranges.empty() || (rows_cut && piece.ranges.size() != 1)) {
+        throw std::invalid_argument("a joint piece cuts one row range or some column ranges");
+    }
+    const auto& bindings = binder.reader().directory().bindings;
+    const auto columns   = parts.front().shape.back();
+    std::uint64_t width  = 0;
+    for (const auto& [begin, end] : piece.ranges) {
+        if (begin >= end || (!rows_cut && end > columns)) {
+            throw std::invalid_argument("a joint piece range is empty or outside its parameters");
+        }
+        width += end - begin;
+    }
+    // Each part's first stored row in the object and its rows.
+    std::optional<artifact::ObjectHandle> object;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    for (const JointPart& part : parts) {
+        const auto found = bindings.find(part.name);
+        if (found == bindings.end()) {
+            throw artifact::ArtifactError("missing logical parameter " + part.name);
+        }
+        if (part.shape.size() != 2 || part.shape[1] != columns ||
+            weight_element_count(part.shape) != found->second.elements ||
+            found->second.parts.size() != 1) {
+            throw artifact::ArtifactError(part.name +
+                                          ": a joint piece needs one stored run of each parameter");
+        }
+        const auto& stored = found->second.parts.front();
+        if (object && stored.object.index != object->index) {
+            throw artifact::ArtifactError(part.name +
+                                          ": a joint piece needs its parameters in one object");
+        }
+        object              = stored.object;
+        const auto geometry = binder.reader().geometry(stored.object);
+        if (geometry.shape.size() != 2 || geometry.shape[1] != columns ||
+            stored.begin % columns != 0 || stored.end % columns != 0) {
+            throw artifact::ArtifactError(part.name + ": a joint piece needs parts of whole rows");
+        }
+        const std::uint64_t first = stored.begin / columns;
+        const std::uint64_t rows  = (stored.end - stored.begin) / columns;
+        if (rows_cut && piece.ranges.front().second > rows) {
+            throw std::invalid_argument(part.name + ": a joint row piece leaves the parameter");
+        }
+        if (!spans.empty() && first < spans.back().first + spans.back().second) {
+            throw artifact::ArtifactError(part.name + ": a joint piece lists its parts in order");
+        }
+        spans.emplace_back(first, rows);
+        if (!rows_cut) {
+            for (const auto& input : part.inputs) {
+                for (const auto& [role, binding] : binder.use(part.name, input).auxiliaries) {
+                    if (role == "hadamard_signs" || role == "input_columns") {
+                        throw std::invalid_argument(part.name + "@" + input +
+                                                    ": a joint column piece cannot cut a rotated "
+                                                    "or gathered input");
+                    }
+                }
+            }
+        }
+    }
+    artifact::ObjectSelection selection;
+    if (rows_cut) {
+        const auto [begin, end] = piece.ranges.front();
+        for (const auto& [first, rows] : spans) {
+            selection.rows.emplace_back(first + begin, first + end);
+        }
+        selection.columns = {{0, columns}};
+    } else {
+        const auto first      = spans.front().first;
+        const auto last       = spans.back().first + spans.back().second;
+        std::uint64_t covered = 0;
+        for (const auto& span : spans) { covered += span.second; }
+        if (covered != last - first) {
+            throw artifact::ArtifactError(parts.front().name +
+                                          ": a joint column piece covers one run of rows");
+        }
+        selection.rows    = {{first, last}};
+        selection.columns = piece.ranges;
+    }
+    const artifact::ObjectHandle handle = binder.select_device(*object, std::move(selection), rank);
+    const std::uint64_t piece_columns   = rows_cut ? columns : width;
+    std::vector<WeightId> out;
+    out.reserve(parts.size());
+    std::uint64_t row = 0; // the part's first row in the selected object
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        const JointPart& part     = parts[i];
+        const std::uint64_t rows  = rows_cut ? width : spans[i].second;
+        artifact::Binding binding;
+        binding.elements = rows * piece_columns;
+        binding.parts.push_back({handle, row * piece_columns, (row + rows) * piece_columns});
+        row += rows;
+        PendingWeight pending;
+        pending.reference = {part.name + "@" + std::to_string(rank),
+                             artifact::Shape{rows, piece_columns}, std::move(binding),
+                             artifact::Residency::Device};
+        add_uses(pending, part.name, part.inputs, rows_cut, rows_cut);
         pending.source_objects.push_back(binder.object_id(handle));
         pending.rank = rank;
         out.push_back({weights.size()});
@@ -559,7 +661,7 @@ WeightId Bindings::gather_piece(const artifact::Binding& gather,
     std::uint64_t logical = 0;
     for (const auto& part : gather.parts) {
         const std::uint64_t count = part.end - part.begin;
-        artifact::ObjectSelection selection{.row_begin = 0, .row_end = 1, .columns = {},
+        artifact::ObjectSelection selection{.rows = {{0, 1}}, .columns = {},
                                             .rebase = static_cast<std::int32_t>(base)};
         for (const auto& [begin, end] : columns) {
             const std::uint64_t lo = std::max(begin, logical);

@@ -264,7 +264,10 @@ public:
                     held(0), held(1), held(2));
                 out.share = {.expert_begin  = static_cast<std::int32_t>(moe.share->expert_begin),
                              .expert_count  = static_cast<std::int32_t>(moe.experts.size()),
-                             .shared_expert = moe.share->shared_expert};
+                             .shared_expert = moe.share->shared_expert,
+                             .intermediate  = moe.share->intermediate != 0
+                                                  ? static_cast<std::int32_t>(moe.share->intermediate)
+                                                  : 512};
                 return out;
             });
         }

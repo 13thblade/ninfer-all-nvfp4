@@ -144,6 +144,10 @@ struct DeviceContext {
     // ranks can reach each other.
     [[nodiscard]] bool peer_access() const noexcept;
     [[nodiscard]] bool peer_access(std::size_t from, std::size_t to) const;
+    // Why a pair of devices that reports peer capability was left on staged transfers: a host
+    // configuration that cannot back the mapping (core/peer_preflight.h) or a probe whose peer
+    // stores, loads or copies came back wrong. One line per refused direction.
+    [[nodiscard]] const std::vector<std::string>& peer_notes() const noexcept;
     [[nodiscard]] std::size_t active_rank() const noexcept;
     [[nodiscard]] const std::vector<int>& device_ids() const noexcept;
     [[nodiscard]] cudaStream_t stream_for_rank(std::size_t rank) const;
@@ -162,12 +166,15 @@ struct DeviceContext {
 private:
     void refresh_active_aliases() noexcept;
     void release() noexcept;
+    // Enables and probes peer access from one device to another; false leaves them staged.
+    bool enable_peer(const RankContext& from, const RankContext& to);
 
     std::vector<RankContext> endpoints_;
     std::vector<int> device_ids_;
     // peer_matrix_[from * size + to]: whether `from` can DMA into `to`. A rank always reaches a
     // rank on its own physical device.
     std::vector<char> peer_matrix_;
+    std::vector<std::string> peer_notes_;
     std::size_t active_rank_ = 0;
     bool peer_access_        = false;
 };

@@ -61,8 +61,8 @@ public:
     // consumer must accept the target format; a repeated request must name the same target.
     void transcode_device(ObjectHandle object, QType target);
     // Materialize a device row-split object in the panel layout (artifact/permute_row_split.h).
-    // The object must already have a device demand and admit the layout, and every consumer must
-    // read QuantLayout::RowSplitPanel.
+    // The object must already have a device demand, or be a selected piece, and admit the layout
+    // (a piece by its own rows), and every consumer must read QuantLayout::RowSplitPanel.
     void panel_device(ObjectHandle object);
     // Moves a device object into the arena's evictable tail. Ranked objects follow every resident
     // object; ascending rank places the highest rank at the arena end, which an eviction pool
@@ -123,6 +123,7 @@ private:
         std::size_t rank        = 0;
         std::uint64_t alignment = 256;
         std::uint64_t tail      = 0;
+        bool panel              = false;
     };
 
     [[nodiscard]] Selected& selected_entry(ObjectHandle object);

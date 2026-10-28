@@ -1589,6 +1589,76 @@ int batched_sampling_workspace_stride_case() {
     return failures;
 }
 
+// Rows packed at their own widths (column_starts) license what the uniform layout does: row 0
+// verifies one draft in two columns, row 1 three in four, on the greedy and the sampled routes and
+// on both sides of the single-block domain.
+int packed_columns_case(bool sampled, int token_domain) {
+    const int physical_rows = token_domain;
+    constexpr int k         = 3;
+    constexpr int batch     = 2;
+    constexpr int columns   = k + 1;
+    const std::vector<std::int32_t> widths{2, 4};
+    const std::vector<std::int32_t> starts{0, 2};
+    const std::vector<std::int32_t> drafts{10, 11, 12, 30, 31, 32};
+    const std::vector<std::int32_t> winners{10, 20, 30, 31, 32, 33};
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(physical_rows) * winners.size(),
+                                      f32_to_bf16(-20.0f));
+    for (std::size_t c = 0; c < winners.size(); ++c) {
+        logits[c * physical_rows + static_cast<std::size_t>(winners[c])] = f32_to_bf16(20.0f);
+    }
+    const int packed = static_cast<int>(winners.size());
+    DeviceBuffer d_targets = to_device(winners);
+    DeviceBuffer d_logits  = to_device(logits);
+    DeviceBuffer d_drafts  = to_device(drafts);
+    DeviceBuffer d_starts  = to_device(starts);
+    DeviceBuffer d_extents = to_device<std::int32_t>({widths[0] - 1, widths[1] - 1});
+    DeviceBuffer d_lengths = to_device<std::int32_t>({100, 200});
+    DeviceBuffer d_anchors = to_device<std::int32_t>({-1, -1});
+    DeviceBuffer d_licensed(static_cast<std::size_t>(columns) * batch * sizeof(std::int32_t));
+    DeviceBuffer d_counts(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    DeviceBuffer d_accepted(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    ops::SamplingConfig config{};
+    if (sampled) {
+        config.temperature = 1.0f;
+        config.top_k       = 1;
+    }
+    const std::vector<ops::SamplingConfig> configs{config, config};
+    DeviceBuffer d_configs = to_device(configs);
+    Tensor targets(d_targets.p, DType::I32, {packed});
+    Tensor logits_tensor(d_logits.p, DType::BF16, {physical_rows, packed});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
+    Tensor column_starts(d_starts.p, DType::I32, {batch});
+    Tensor extents(d_extents.p, DType::I32, {batch});
+    Tensor lengths(d_lengths.p, DType::I32, {batch});
+    Tensor anchors(d_anchors.p, DType::I32, {batch});
+    Tensor licensed(d_licensed.p, DType::I32, {columns, batch});
+    Tensor counts(d_counts.p, DType::I32, {batch});
+    Tensor accepted(d_accepted.p, DType::I32, {batch});
+    const std::size_t workspace_bytes =
+        ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(token_domain, k, k, batch,
+                                                                       batch);
+    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
+    ops::speculative_accept_coupled_drafts(
+        targets, logits_tensor, draft_tensor, extents, lengths, anchors, licensed, counts, accepted,
+        token_domain, static_cast<const ops::SamplingConfig*>(d_configs.p), workspace, nullptr,
+        &column_starts);
+    cuda_synchronize();
+    const std::string label = std::string("speculative packed rows ") +
+                              (sampled ? "sampled" : "greedy") + " domain " +
+                              std::to_string(token_domain);
+    using Ids         = std::vector<std::int32_t>;
+    const auto expect = [&](const char* what, const Ids& got, const Ids& want) {
+        return verify_exact((label + what).c_str(), got, want);
+    };
+    int failures = expect(" licensed", from_device<std::int32_t>(d_licensed, columns * batch),
+                          Ids{10, 20, 0, 0, 30, 31, 32, 33});
+    failures += expect(" counts", from_device<std::int32_t>(d_counts, batch), Ids{2, 4});
+    failures += expect(" accepted", from_device<std::int32_t>(d_accepted, batch), Ids{1, 3});
+    failures += expect(" lengths", from_device<std::int32_t>(d_lengths, batch), Ids{102, 204});
+    failures += expect(" anchors", from_device<std::int32_t>(d_anchors, batch), Ids{20, 33});
+    return failures;
+}
+
 int select_hidden_case(int rows, int columns, int accepted_value) {
     std::vector<std::uint16_t> hidden(static_cast<std::size_t>(rows) * columns);
     for (int col = 0; col < columns; ++col) {
@@ -2149,6 +2219,9 @@ int main(int argc, char** argv) {
         }
     }
     failures += batched_sampling_workspace_stride_case();
+    for (const bool sampled : {false, true}) {
+        for (const int domain : {200, 257}) { failures += packed_columns_case(sampled, domain); }
+    }
     std::size_t sparse_peak = 0;
     for (int k = 1; k <= 31; ++k) {
         for (int batch = 1; batch <= 8; ++batch) {

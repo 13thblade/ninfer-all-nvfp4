@@ -66,7 +66,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t wave_splits,
-        float scale, float* partial_acc, float* partial_m, float* partial_l) {
+        float scale, float* partial_acc, float* partial_m, float* partial_l,
+        CausalKeyPartition partition) {
     // A Volta card runs its own kernel (small_t_sm70.cuh): a build of several architectures
     // compiles this kernel empty in the Volta image.
 #if !defined(NINFER_SM70_DEVICE)
@@ -215,17 +216,26 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     const int live_end = last_pos + 1;
     const int window   = causal_small_t_tile_window(first_pos, TokenTile, logical_capacity);
-    const int active_split_count =
-        causal_small_t_active_splits<Geometry, true>(window, split_count, TokenTile, wave_splits);
+    const int active_split_count = causal_small_t_partition_active(
+        partition, window,
+        causal_small_t_active_splits<Geometry, true>(window, split_count, TokenTile, wave_splits),
+        split_count);
     if (split >= active_split_count) { return; }
 
-    const int logical_tiles = div_up(window, Bc);
-    const bool tile_split   = logical_tiles >= active_split_count;
-    const int units_per_split =
-        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
-    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
-    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    const int split_end   = (split_limit < window) ? split_limit : window;
+    int split_start = 0;
+    int split_end   = 0;
+    if (partition.segmented() || partition.strided()) {
+        causal_small_t_partition_range(partition, window, split, active_split_count, split_start,
+                                       split_end);
+    } else {
+        const int logical_tiles = div_up(window, Bc);
+        const bool tile_split   = logical_tiles >= active_split_count;
+        const int units_per_split = tile_split ? div_up(logical_tiles, active_split_count)
+                                               : div_up(window, active_split_count);
+        split_start           = split * units_per_split * (tile_split ? Bc : 1);
+        const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
+        split_end             = (split_limit < window) ? split_limit : window;
+    }
     if (split_start >= split_end) {
         write_neutral();
         return;
@@ -234,7 +244,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int load_end = split_end < live_end ? split_end : live_end;
 
     const int first_tile = (split_start / Bc) * Bc;
-    const int key_blocks = div_up(split_end - first_tile, Bc);
+    int key_blocks       = div_up(split_end - first_tile, Bc);
+    const bool strided   = partition.strided();
     const int first_page = first_tile >> kPagedKVPageShift;
     const int page_count    = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
     const bool staged_pages = page_count <= PageIds;
@@ -276,7 +287,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int grp      = pair - token * Groups;
             const int position = pos[token];
             if (position < split_start || position >= split_end) { continue; }
-            const int physical_page = page_at(position);
+            const int physical_page =
+                strided ? causal_strided_page(page_at(position), partition) : page_at(position);
+            if (physical_page < 0) { continue; } // another rank's planes hold this row
             const int page_offset   = position & kPagedKVPageMask;
             const int d0            = grp * kKVCacheInt8Group + lane;
             const int d1            = d0 + 32;
@@ -349,6 +362,24 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         }
         __syncthreads();
     }
+
+    // A strided split sweeps the tiles of the rank's own pages.
+    if (strided) {
+        key_blocks = causal_small_t_own_pages<Bc>(physical_pages_s, page_count, split_end, partition);
+        if (key_blocks == 0) {
+            write_neutral();
+            return;
+        }
+    }
+    const auto tile_key = [&](int kb) {
+        return strided ? causal_small_t_owned_tile_key<Bc>(physical_pages_s, first_tile, kb)
+                       : first_tile + kb * Bc;
+    };
+    // The page of tile kb at `key`, given the page of the tile before it.
+    const auto tile_page = [&](int kb, int key, int current) {
+        if (strided) { return causal_small_t_owned_tile_page<Bc>(physical_pages_s, kb); }
+        return (key & kPagedKVPageMask) == 0 ? page_at(key) : current;
+    };
 
     for (int i = tid; i < Br * D; i += Threads) { q_i8[i] = 0; }
     for (int i = tid; i < RowCount * Groups; i += Threads) { q_scale_tmp[i] = 0.0f; }
@@ -652,9 +683,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         ninfer::ops::cp_commit();
     };
 
-    int physical_page = page_at(first_tile);
-    load_k_tile(first_tile, physical_page);
-    issue_kv_tile(first_tile, physical_page);
+    int physical_page =
+        strided ? causal_small_t_owned_tile_page<Bc>(physical_pages_s, 0) : page_at(first_tile);
+    load_k_tile(tile_key(0), physical_page);
+    issue_kv_tile(tile_key(0), physical_page);
     if (key_thread) { expand_k_tile(); }
     commit_k_tile();
     ninfer::ops::cp_wait<0>();
@@ -691,14 +723,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     };
 
     for (int kb = 0; kb < key_blocks; ++kb) {
-        const int k0        = first_tile + kb * Bc;
+        const int k0        = tile_key(kb);
         const bool has_next = kb + 1 < key_blocks;
         if constexpr (PackedKeys || EarlyFetch) {
             // Prefetch the next tile now; see load_k_tile and EarlyFetch.
             if (has_next) {
-                const int next_k0 = k0 + Bc;
-                const int next_page =
-                    (next_k0 & kPagedKVPageMask) == 0 ? page_at(next_k0) : physical_page;
+                const int next_k0   = tile_key(kb + 1);
+                const int next_page = tile_page(kb + 1, next_k0, physical_page);
                 load_k_tile(next_k0, next_page);
                 fetch_next_tile(next_k0, next_page);
             }
@@ -863,10 +894,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         __syncthreads();
 
         if (has_next) {
-            const int next_k0 = k0 + Bc;
-            if ((next_k0 & kPagedKVPageMask) == 0) {
-                physical_page = page_at(next_k0);
-            }
+            const int next_k0 = tile_key(kb + 1);
+            physical_page     = tile_page(kb + 1, next_k0, physical_page);
             if constexpr (!EarlyFetch) { issue_kv_tile(next_k0, physical_page); }
         }
 

@@ -438,6 +438,15 @@ struct EngineOptions {
     // entry of `devices` ({3, 2}: the first takes three fifths). Empty sizes the shares from each
     // card's measured copy bandwidth, capped by its free memory.
     std::vector<double> tensor_split;
+    // With tensor parallelism over a Qwen3.5-core model, how the devices divide each
+    // full-attention layer (TensorAttention).
+    TensorAttention tensor_attention = TensorAttention::Heads;
+    // Qwen3.5-core models: attention reductions that do not depend on the call's width, batch or
+    // split schedule. Every call of up to 16 columns per sequence takes the split-KV routes with
+    // splits of a fixed key count for the context, so a token's attention output is the same
+    // bytes whether it is decoded alone, verified in a draft window or batched with others. The
+    // other kernels (projections, experts, Gated DeltaNet) keep their own schedules.
+    bool invariant_attention = false;
     // Native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4 MoE and Flint.
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Host/disk experts: device memory lent to the persistent cache, split

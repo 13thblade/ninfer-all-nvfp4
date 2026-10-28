@@ -199,10 +199,16 @@ speed, and the kernels written for Ampere everywhere else, on emulated warp prim
   here, stays A16.
 - **Weight layout**: the row-split projection weights of the text and MTP layers (T2, Q2, Q4, Q5,
   Q6) load in the panel layout, four rows' records of a group per 128-byte line, which the
-  decode reads stream at a larger share of the card's bandwidth.
+  decode reads stream at a larger share of the card's bandwidth. A tensor-parallel rank's pieces
+  of them take it too, each permuted after its upload, and its FP32 partial sums run the same
+  Volta routes.
 - **GGUF projections** keep NInfer's DP4A vector kernel up to eight columns and ggml's DP4A matrix
   kernel above (as llama.cpp does on Volta); GGUF dense projections from 65 columns take the cuBLAS
-  route.
+  route. The routed experts' matrix products (prompt chunks of Flash-Next, Gemma 4, Flint and
+  DeepSeek) run on the FP16 tensor cores instead of `dp4a`: each lane decodes its row's GGUF slices
+  into FP16 fragments, and the activation is an FP16 plane with one power-of-two factor per column,
+  which keeps BF16's range (`ggml_bridge_sm70.cuh`). Gemma 4 26B-A4B QAT on one Tesla V100-SXM2
+  prefills a 9,705-token prompt at 3,422 tok/s against 2,499 with `dp4a` (+37%; 2026-10-27).
 - **Attention** of every KV format runs on Volta's tensor cores with FP32 accumulation. Decode and
   verification use a Volta kernel that decodes each format's keys and values to FP16 as it loads
   them (32 dimensions of a quantized row a load), with the same fused append, splits and reducers

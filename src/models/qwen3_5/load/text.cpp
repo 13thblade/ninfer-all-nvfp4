@@ -1,6 +1,7 @@
 #include "models/qwen3_5/load/bindings.h"
 
 #include "core/tensor_split.h"
+#include "ninfer/ops/softmax_attention.h"
 
 #include <algorithm>
 #include <array>
@@ -153,6 +154,12 @@ AttentionWeights bind_attention_share(Bindings& b, const TextConfig& config, con
     const auto group  = a.num_attention_heads / a.num_key_value_heads;
     const Range query = scaled(share.kv_head_begin * group, share.kv_head_end * group, a.head_dim);
     const Range kv    = scaled(share.kv_head_begin, share.kv_head_end, a.head_dim);
+    // A position-split rank projects every head (its KV range is all of them) and projects the
+    // output of its own query heads.
+    const Range output_query =
+        share.attention_positions
+            ? scaled(share.query_head_begin, share.query_head_end, a.head_dim)
+            : query;
     const auto input  = std::vector<std::string>{p + "mixer_input"};
     AttentionWeights out;
     out.query      = b.piece(p + "attention/query", {q, h}, input, {}, rank, rows(query));
@@ -162,7 +169,7 @@ AttentionWeights bind_attention_share(Bindings& b, const TextConfig& config, con
     out.query_norm = bind_norm_replica(b, p + "attention/query_norm", a.head_dim, rank);
     out.key_norm   = bind_norm_replica(b, p + "attention/key_norm", a.head_dim, rank);
     out.output = b.piece(p + "attention/output", {h, q}, {p + "attention/gated_output"}, {}, rank,
-                         columns({query}));
+                         columns({output_query}));
     return out;
 }
 
@@ -178,9 +185,11 @@ DenseWeights bind_dense_share(Bindings& b, std::uint64_t h, std::uint64_t interm
                     columns({part}))};
 }
 
-// A rank's expert-parallel share of a MoE layer: its experts, one device selection of each bank,
-// and the router; rank 0 binds the router and the shared expert as they are, every other rank a
-// replica of the router and no shared expert.
+// A rank's share of a MoE layer: the router (rank 0 binds it as it is, every other rank a replica)
+// and either its experts, one device selection of each bank, with the shared expert on rank 0
+// alone; or, where the ranks divide the experts' intermediate columns, its columns of every
+// expert and of the shared one: one selection of each bank taking each expert's gate rows and up
+// rows of those columns, and one taking those columns of every down.
 MoeWeights bind_moe_share(Bindings& b, const TextConfig& config, const std::string& prefix,
                           std::size_t rank, const TensorShare& share) {
     const auto& moe = std::get<MoeConfig>(config.ffn);
@@ -189,9 +198,49 @@ MoeWeights bind_moe_share(Bindings& b, const TextConfig& config, const std::stri
     const auto h      = config.hidden_size;
     const auto ir     = moe.moe_intermediate_size;
     const auto shared = moe.shared_expert_intermediate_size;
+    const bool divided = share.ffn_end > share.ffn_begin;
     MoeWeights out;
-    out.share =
-        MoeWeights::ExpertShare{.expert_begin = share.expert_begin, .shared_expert = rank == 0};
+    out.share = MoeWeights::ExpertShare{
+        .expert_begin  = share.expert_begin,
+        .shared_expert = divided || rank == 0,
+        .intermediate  = divided ? share.ffn_end - share.ffn_begin : 0};
+    if (divided) {
+        if (rank == 0) {
+            out.router       = b.parameter(p + "router", {moe.num_experts, h}, input);
+            out.shared_score = b.parameter(p + "shared_score", {1, h}, input);
+        } else {
+            const std::array<Bindings::JointPart, 2> router{
+                Bindings::JointPart{p + "router", {moe.num_experts, h}, input},
+                Bindings::JointPart{p + "shared_score", {1, h}, input}};
+            const auto ids   = b.joint_piece(router, rank);
+            out.router       = ids[0];
+            out.shared_score = ids[1];
+        }
+        const ParameterPiece rows{.cut    = ParameterPiece::Cut::Rows,
+                                  .ranges = {{share.ffn_begin, share.ffn_end}}};
+        const ParameterPiece columns{.cut    = ParameterPiece::Cut::Columns,
+                                     .ranges = {{share.ffn_begin, share.ffn_end}}};
+        const std::array<Bindings::JointPart, 2> shared_gate_up{
+            Bindings::JointPart{p + "shared/gate", {shared, h}, input},
+            Bindings::JointPart{p + "shared/up", {shared, h}, input}};
+        const auto sgu = b.joint_piece(shared_gate_up, rank, rows);
+        const std::array<Bindings::JointPart, 1> shared_down{
+            Bindings::JointPart{p + "shared/down", {h, shared}, {p + "shared/product"}}};
+        out.shared = {sgu[0], sgu[1], b.joint_piece(shared_down, rank, columns)[0]};
+        std::vector<Bindings::JointPart> gate_up, down;
+        for (std::uint32_t e = 0; e < moe.num_experts; ++e) {
+            const auto ep = p + "experts/" + std::to_string(e) + "/";
+            gate_up.push_back({ep + "gate", {ir, h}, input});
+            gate_up.push_back({ep + "up", {ir, h}, input});
+            down.push_back({ep + "down", {h, ir}, {ep + "product"}});
+        }
+        const auto gu = b.joint_piece(gate_up, rank, rows);
+        const auto d  = b.joint_piece(down, rank, columns);
+        for (std::size_t i = 0; i < d.size(); ++i) {
+            out.experts.push_back({gu[2 * i], gu[2 * i + 1], d[i]});
+        }
+        return out;
+    }
     if (rank == 0) {
         out.router       = b.parameter(p + "router", {moe.num_experts, h}, input);
         out.shared_score = b.parameter(p + "shared_score", {1, h}, input);
@@ -398,7 +447,10 @@ std::vector<std::uint64_t> common_ends(std::uint64_t count, std::uint32_t layers
 // cut whole stored runs: the column-cut ones (the GDN and attention output projections over the
 // value or query heads, the FFN's down projection over its rows) and the row-cut ones (the GDN key
 // and value projections, the attention projections, the FFN's gate and up). Experts divide at any
-// expert.
+// expert; two ranks of about equal weight (each 40% to 60%) divide every expert's intermediate
+// columns in halves instead, routed and shared, where the stored banks cut there, so each rank
+// runs every selected expert's half and a token's routed work splits evenly whichever experts it
+// selects.
 std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& config,
                                             const LoadOptions& options) {
     const auto* dense = std::get_if<DenseConfig>(&config.ffn);
@@ -476,8 +528,30 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& confi
                     e.query_rows[kv * group * a.head_dim] && e.kv_rows[kv * a.head_dim]);
         });
     const auto kv_ranks = std::min<std::size_t>(options.ranks, kv_head_ends.size() + 1);
+    // By positions when asked: every rank then attends over its own pages and projects the output
+    // of a run of query heads, which may end wherever every layer's output projection cuts whole
+    // stored runs. By heads, the ranks past the KV heads' ends hold no attention.
+    const bool positions = options.tensor_attention == TensorAttention::Positions;
     std::vector<std::uint64_t> kv_heads(options.ranks + 1, a.num_key_value_heads);
-    {
+    std::vector<std::uint64_t> query_heads(options.ranks + 1, 0);
+    if (positions) {
+        if (options.ranks > static_cast<std::size_t>(ops::kCausalAttentionMaximumMergeRanks)) {
+            throw std::invalid_argument("--tensor-attention positions supports up to " +
+                                        std::to_string(ops::kCausalAttentionMaximumMergeRanks) +
+                                        " devices");
+        }
+        const auto query_ends = common_ends(
+            a.num_attention_heads, layers, [&](std::uint32_t layer, std::uint64_t heads) {
+                const auto& e = ends[layer];
+                return e.attention_output.empty() || e.attention_output[heads * a.head_dim];
+            });
+        if (query_ends.size() + 1 < options.ranks) {
+            throw std::invalid_argument(
+                "--tensor-attention positions: the attention output projection cannot be divided "
+                "over this many devices");
+        }
+        query_heads = split_shares(a.num_attention_heads, query_ends, weights);
+    } else {
         const std::vector<double> kv_weights(
             weights.begin(), weights.begin() + static_cast<std::ptrdiff_t>(kv_ranks));
         const auto ends_of = split_shares(a.num_key_value_heads, kv_head_ends, kv_weights);
@@ -490,19 +564,45 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& confi
         });
         rows                = split_shares(i, row_ends, weights);
     } else {
-        const auto count = std::get<MoeConfig>(config.ffn).num_experts;
-        experts          = split_shares(count, unit_positions(count, 1), weights);
+        const auto& m    = std::get<MoeConfig>(config.ffn);
+        const auto count = m.num_experts;
+        const auto half  = m.moe_intermediate_size / 2;
+        const double first_share =
+            options.ranks == 2 ? weights[0] / (weights[0] + weights[1]) : 0.0;
+        bool halves = options.ranks == 2 && first_share >= 0.4 && first_share <= 0.6 &&
+                      m.moe_intermediate_size == m.shared_expert_intermediate_size;
+        for (std::uint32_t layer = 0; halves && layer < layers; ++layer) {
+            const std::string e = "text/layers/" + std::to_string(layer) + "/moe/";
+            const auto ir       = m.moe_intermediate_size;
+            halves = b.row_ends(e + "experts/0/gate", {ir, h})[half] &&
+                     b.row_ends(e + "experts/0/up", {ir, h})[half] &&
+                     b.column_ends(e + "experts/0/down", {h, ir}, {e + "experts/0/product"})[half] &&
+                     b.row_ends(e + "shared/gate", {ir, h})[half] &&
+                     b.row_ends(e + "shared/up", {ir, h})[half] &&
+                     b.column_ends(e + "shared/down", {h, ir}, {e + "shared/product"})[half];
+        }
+        if (halves) {
+            rows    = {0, half, m.moe_intermediate_size};
+            experts = {0, count, count};
+        } else {
+            experts = split_shares(count, unit_positions(count, 1), weights);
+        }
     }
     std::vector<TensorShare> out;
     for (std::size_t rank = 0; rank < options.ranks; ++rank) {
         out.push_back({.key_head_begin = static_cast<std::uint32_t>(heads[rank]),
                        .key_head_end   = static_cast<std::uint32_t>(heads[rank + 1]),
-                       .kv_head_begin  = static_cast<std::uint32_t>(kv_heads[rank]),
-                       .kv_head_end    = static_cast<std::uint32_t>(kv_heads[rank + 1]),
+                       .kv_head_begin  = positions ? 0U : static_cast<std::uint32_t>(kv_heads[rank]),
+                       .kv_head_end    = positions ? a.num_key_value_heads
+                                                   : static_cast<std::uint32_t>(kv_heads[rank + 1]),
                        .ffn_begin      = static_cast<std::uint32_t>(rows[rank]),
                        .ffn_end        = static_cast<std::uint32_t>(rows[rank + 1]),
-                       .expert_begin   = static_cast<std::uint32_t>(experts[rank]),
-                       .expert_end     = static_cast<std::uint32_t>(experts[rank + 1])});
+                       .expert_begin   = static_cast<std::uint32_t>(
+                           rows[options.ranks] != 0 && dense == nullptr ? 0 : experts[rank]),
+                       .expert_end     = static_cast<std::uint32_t>(experts[rank + 1]),
+                       .attention_positions = positions,
+                       .query_head_begin = static_cast<std::uint32_t>(query_heads[rank]),
+                       .query_head_end   = static_cast<std::uint32_t>(query_heads[rank + 1])});
         (void)tensor_parallel_share(config, out.back());
     }
     return out;

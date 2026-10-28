@@ -101,7 +101,12 @@ void project(const Activation& x, const Weight& w, std::span<const Destination> 
                 std::int32_t columns) {
                 DestinationEpilogue epilogue;
                 for (Destination d : destinations) {
-                    d.data += static_cast<std::size_t>(first) * d.leading;
+                    const std::size_t skip = static_cast<std::size_t>(first) * d.leading;
+                    if (d.fp32 != nullptr) {
+                        d.fp32 += skip;
+                    } else {
+                        d.data += skip;
+                    }
                     epilogue.set[epilogue.count++] = d;
                 }
                 epilogue.factor = row_factor(w);

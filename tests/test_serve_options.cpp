@@ -1160,6 +1160,18 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "a malformed or misplaced --tensor-split was accepted");
     }
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--devices", "0,1", "--tensor-parallel",
+                             "--tensor-attention", "positions", "--invariant-attention"})
+                              .tensor_attention == ninfer::TensorAttention::Positions,
+                      "--tensor-attention did not reach serving options");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--tensor-attention", "positions"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected,
+                          "--tensor-attention positions without --tensor-parallel was accepted");
+    }
 
     bool exclusive_rejected = false;
     try {

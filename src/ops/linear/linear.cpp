@@ -82,18 +82,22 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
     validate_linear_policy(policy);
 }
 
-// The sm_70 routes take every dense format; without an arena, the widths that need none.
-bool sm70_route(const Tensor& x, const Weight& w, const Tensor& out,
-                const WorkspaceArena* workspace) {
-    return out.dtype == DType::BF16 && detail::sm70::covers(w, x.ne[1]) &&
+// The sm_70 routes take every dense format, into BF16 or an FP32 partial sum; they are this Op's
+// only routes that read the panel layout. Without an arena, the widths that need none.
+bool sm70_route(const Tensor& x, const Weight& w, const WorkspaceArena* workspace) {
+    return detail::sm70::covers(w, x.ne[1]) &&
            (workspace != nullptr || detail::sm70::direct_tokens(x.ne[1]));
 }
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
-    if (sm70_route(x, w, out, workspace)) {
-        const detail::sm70::Destination all{
-            static_cast<__nv_bfloat16*>(out.data), w.n, 0, 0, w.n, false};
+    if (sm70_route(x, w, workspace)) {
+        detail::sm70::Destination all{nullptr, w.n, 0, 0, w.n, false};
+        if (out.dtype == DType::FP32) {
+            all.fp32 = static_cast<float*>(out.data);
+        } else {
+            all.data = static_cast<__nv_bfloat16*>(out.data);
+        }
         if (workspace == nullptr) {
             detail::sm70::project_for(detail::sm70::prepare_direct(x), w, {&all, 1}, stream);
             return;

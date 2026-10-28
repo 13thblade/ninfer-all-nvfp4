@@ -58,6 +58,8 @@ struct LoadOptions {
     // The relative size of each rank's share (`--tensor-split`), one positive weight per device.
     // Empty divides evenly; the engine fills it from each card's speed and free memory.
     std::vector<double> tensor_split;
+    // How the ranks divide a full-attention layer (`--tensor-attention`).
+    TensorAttention tensor_attention = TensorAttention::Heads;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -146,7 +148,8 @@ struct LoadOptions {
             .ranks = std::max<std::size_t>(options.devices.size(), 1),
             .stage_layers = options.stage_layers,
             .tensor_parallel = options.tensor_parallel,
-            .tensor_split    = options.tensor_split};
+            .tensor_split    = options.tensor_split,
+            .tensor_attention = options.tensor_attention};
 }
 
 } // namespace ninfer::models

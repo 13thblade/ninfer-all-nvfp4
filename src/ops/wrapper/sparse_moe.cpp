@@ -213,19 +213,25 @@ void validate_share_weights(const SparseMoeWeights& weights, const SparseMoeShar
         share.expert_begin > kExperts - share.expert_count) {
         throw std::invalid_argument("sparse_moe share: experts lie outside [0, 256)");
     }
+    // A divided expert keeps half its intermediate columns: the down kernels walk whole passes of
+    // four 64-column (eight 32-column) groups, which 256 columns still fill.
+    if (share.intermediate != kIntermediate && share.intermediate != kIntermediate / 2) {
+        throw std::invalid_argument("sparse_moe share: an expert keeps 512 or 256 columns");
+    }
     require_router(weights.router_shared_gate, ranges);
     if (weights.routed_gate_up.qtype == QType::NVFP4 || weights.routed_down.qtype == QType::NVFP4) {
         throw std::invalid_argument("sparse_moe share: NVFP4 expert banks have no share");
     }
     require_groupwise_formats(weights, share.shared_expert);
-    require_quantized(weights.routed_gate_up, share.expert_count * kExpertRows, kHidden,
-                      "routed_gate_up", ranges);
-    require_quantized(weights.routed_down, share.expert_count * kHidden, kIntermediate,
+    require_quantized(weights.routed_gate_up, share.expert_count * 2 * share.intermediate,
+                      kHidden, "routed_gate_up", ranges);
+    require_quantized(weights.routed_down, share.expert_count * kHidden, share.intermediate,
                       "routed_down", ranges);
     if (share.shared_expert) {
-        require_quantized(weights.shared_gate_up, kSharedGateRows, kHidden, "shared_gate_up",
+        require_quantized(weights.shared_gate_up, 2 * share.intermediate, kHidden,
+                          "shared_gate_up", ranges);
+        require_quantized(weights.shared_down, kHidden, share.intermediate, "shared_down",
                           ranges);
-        require_quantized(weights.shared_down, kHidden, kIntermediate, "shared_down", ranges);
     }
 }
 
@@ -448,7 +454,7 @@ void sparse_moe_share(const Tensor& x, const SparseMoeWeights& weights, const Sp
     Tensor none;
     sparse_moe_run(x, weights, none, {}, candidate, workspace, stream, ranges,
                    {share.expert_begin, share.expert_count, share.shared_expert,
-                    static_cast<float*>(partial.data)});
+                    static_cast<float*>(partial.data), share.intermediate});
 }
 
 void detail::sparse_moe_candidate(const Tensor& x, const SparseMoeWeights& weights,

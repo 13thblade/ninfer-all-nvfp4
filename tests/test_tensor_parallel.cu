@@ -7,7 +7,9 @@
 // `force_staged` runs the real mapped-host path, and without it ranks on one card take the peer
 // path. With two or more devices the ranks are also dealt over them, so the staged path crosses
 // cards. A captured sequence of exchanges with changed inputs between replays checks that the
-// protocol holds inside one graph spanning every rank's stream.
+// protocol holds inside one graph spanning every rank's stream. Two ranks on two cards without
+// peer access exchange decode-sized partials as low-latency words; a sequence alternating them
+// with staged exchanges and with one contributor checks that the two protocols share the slots.
 //
 // The host writes the inputs with blocking copies from pageable memory, which may return before
 // the data reaches the device; the rank streams do not wait for them (they are non-blocking), so
@@ -23,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <exception>
 #include <iostream>
@@ -103,6 +106,14 @@ int run_case(const Case& c, std::mt19937& rng) {
                                                            ? ninfer::TensorParallelTransport::StagedHost
                                                            : ninfer::TensorParallelTransport::Peer),
                           "transport follows the topology and the override");
+    bool distinct = true;
+    for (std::size_t a = 0; a < c.ranks; ++a) {
+        for (std::size_t b = a + 1; b < c.ranks; ++b) { distinct = distinct && ids[a] != ids[b]; }
+    }
+    const bool words = exchange.transport() == ninfer::TensorParallelTransport::StagedHost &&
+                       distinct && bytes <= (32U << 10U);
+    failures += expect(exchange.low_latency(bytes) == words,
+                       "low-latency words exactly for small staged exchanges between cards");
 
     std::normal_distribution<float> normal(0.0f, 1.0f);
     std::vector<__nv_bfloat16*> replica(c.ranks);
@@ -168,6 +179,55 @@ int run_case(const Case& c, std::mt19937& rng) {
         const std::vector<std::vector<float>> first(partials.begin(), partials.begin() + 1);
         failures += compare_replicas(replica, c.values, oracle(residual, first),
                                      "one contributor reaches every replica");
+    }
+
+    // A block output: the sum stored in place of the output, rounded once to BF16 or kept in FP32.
+    {
+        const auto residual = residual_of(4.0f);
+        const auto partials = partials_of(1.0f);
+        load(residual, partials, 0);
+        for (std::size_t r = 0; r < c.ranks; ++r) {
+            exchange.publish(r, 0, bytes, ctx.rank(r).stream);
+        }
+        for (std::size_t r = 0; r < c.ranks; ++r) {
+            exchange.reduce(r, 0, replica[r], c.values, c.ranks, ctx.rank(r).stream,
+                            ninfer::TensorParallelSum::StoreBf16);
+        }
+        ctx.synchronize();
+        const std::vector<__nv_bfloat16> zero(residual.size(), __float2bfloat16(0.0f));
+        failures += compare_replicas(replica, c.values, oracle(zero, partials),
+                                     "a stored BF16 sum is the rank-order sum rounded once");
+
+        std::vector<float*> sums(c.ranks);
+        for (std::size_t r = 0; r < c.ranks; ++r) {
+            CUDA_CHECK(cudaSetDevice(ids[r]));
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&sums[r]), bytes));
+        }
+        CUDA_CHECK(cudaSetDevice(0));
+        load(residual, partials, 1);
+        for (std::size_t r = 0; r < c.ranks; ++r) {
+            exchange.publish(r, 1, bytes, ctx.rank(r).stream);
+        }
+        for (std::size_t r = 0; r < c.ranks; ++r) {
+            exchange.reduce(r, 1, sums[r], c.values, c.ranks, ctx.rank(r).stream,
+                            ninfer::TensorParallelSum::StoreFp32);
+        }
+        ctx.synchronize();
+        std::vector<float> want(static_cast<std::size_t>(c.values));
+        for (std::size_t i = 0; i < want.size(); ++i) {
+            float sum = partials[0][i];
+            for (std::size_t r = 1; r < c.ranks; ++r) { sum += partials[r][i]; }
+            want[i] = sum;
+        }
+        for (std::size_t r = 0; r < c.ranks; ++r) {
+            std::vector<float> got(want.size());
+            CUDA_CHECK(cudaMemcpy(got.data(), sums[r], bytes, cudaMemcpyDeviceToHost));
+            failures += expect(std::memcmp(got.data(), want.data(), bytes) == 0,
+                               "a stored FP32 sum is the rank-order sum");
+            CUDA_CHECK(cudaSetDevice(ids[r]));
+            CUDA_CHECK(cudaFree(sums[r]));
+        }
+        CUDA_CHECK(cudaSetDevice(0));
     }
 
     // A captured pass: two exchanges back to back on every rank's stream, joined into rank 0's.
@@ -240,6 +300,62 @@ int run_case(const Case& c, std::mt19937& rng) {
     return failures;
 }
 
+// Two ranks on two cards: low-latency and staged exchanges interleaved over both slots, with all
+// ranks or only rank 0 contributing.
+int run_mixed(std::mt19937& rng) {
+    const int ids[] = {0, 1};
+    ninfer::DeviceContext ctx(std::span<const int>(ids, 2));
+    constexpr std::int64_t kWide = 5120 * 4;
+    ninfer::TensorParallelExchange exchange(
+        ctx, {.slot_bytes = kWide * sizeof(float), .force_staged = true});
+    int failures = expect(exchange.low_latency(5120 * sizeof(float)) &&
+                              !exchange.low_latency(kWide * sizeof(float)),
+                          "decode columns as words, a verify window staged");
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::array<__nv_bfloat16*, 2> replica{};
+    for (int r = 0; r < 2; ++r) {
+        CUDA_CHECK(cudaSetDevice(r));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&replica[r]), kWide * sizeof(__nv_bfloat16)));
+    }
+    const std::int64_t sizes[]        = {5120, kWide, 1031, 5120, kWide, 5120};
+    const std::size_t contributors[] = {2, 2, 1, 1, 2, 2};
+    for (std::size_t step = 0; step < std::size(sizes); ++step) {
+        const std::int64_t values = sizes[step];
+        const std::size_t slot    = step % 2;
+        std::vector<__nv_bfloat16> residual(static_cast<std::size_t>(values));
+        for (auto& v : residual) { v = __float2bfloat16(4.0f * normal(rng)); }
+        std::vector<std::vector<float>> partials(2, std::vector<float>(residual.size()));
+        for (auto& p : partials) {
+            for (auto& v : p) { v = normal(rng); }
+        }
+        for (int r = 0; r < 2; ++r) {
+            CUDA_CHECK(cudaSetDevice(r));
+            CUDA_CHECK(cudaMemcpy(replica[r], residual.data(), values * sizeof(__nv_bfloat16),
+                                  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(exchange.partial(r, slot), partials[r].data(),
+                                  values * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        for (std::size_t r = 0; r < 2; ++r) {
+            exchange.publish(r, slot, r < contributors[step] ? values * sizeof(float) : 0,
+                             ctx.rank(r).stream);
+        }
+        for (std::size_t r = 0; r < 2; ++r) {
+            exchange.reduce(r, slot, replica[r], values, contributors[step], ctx.rank(r).stream);
+        }
+        ctx.synchronize();
+        partials.resize(contributors[step]);
+        failures += compare_replicas({replica[0], replica[1]}, values, oracle(residual, partials),
+                                     "interleaved exchanges match the rank-order sum");
+    }
+    for (int r = 0; r < 2; ++r) {
+        CUDA_CHECK(cudaSetDevice(r));
+        CUDA_CHECK(cudaFree(replica[r]));
+    }
+    CUDA_CHECK(cudaSetDevice(0));
+    return failures;
+}
+
 int run() {
     int count                   = 0;
     const cudaError_t count_err = cudaGetDeviceCount(&count);
@@ -262,6 +378,7 @@ int run() {
         }
         if (count < 2) { break; }
     }
+    if (count >= 2) { failures += run_mixed(rng); }
     if (failures != 0) { return 1; }
     std::cout << "tensor-parallel exchange holds\n";
     return 0;

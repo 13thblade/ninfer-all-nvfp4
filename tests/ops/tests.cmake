@@ -85,6 +85,11 @@ add_test(NAME ninfer_softmax_attention_rk2v4_e8_test
 # Tensor-parallel shares of the two model geometries, over every KV storage.
 add_test(NAME ninfer_softmax_attention_tensor_share_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --tensor-shares-only)
+# Position-split ranks (strided pages, partial outputs and their merge) and invariant reductions.
+add_test(NAME ninfer_softmax_attention_position_split_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --position-split-only)
+add_test(NAME ninfer_softmax_attention_invariant_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --invariant-only)
 
 # Upstream's DFlash2 verification sweep. ~460 s: six storage families (five upstream, plus this
 # fork's rk8v4) over every narrow width, batch and base offset, so it gets a timeout well clear of
@@ -123,6 +128,8 @@ set_tests_properties(
   ninfer_softmax_attention_small_t_pipelined_pv_f16_test
   ninfer_softmax_attention_fp8_prompt_test
   ninfer_softmax_attention_pack_gqa_test
+  ninfer_softmax_attention_position_split_test
+  ninfer_softmax_attention_invariant_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_op_test(ninfer_sliding_window_attention_test

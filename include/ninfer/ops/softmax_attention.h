@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace ninfer::ops {
 
@@ -30,7 +31,20 @@ struct CausalAttentionExecutionEnvelope {
     // row block, so a few query rows over a long context leave most SMs idle; small-T splits the
     // keys across CTAs instead. Workspace planning and execution must use the same hint.
     bool small_prefill = false;
+    // Invariant reductions (--invariant-attention) when nonzero: every call of 1 to 16 columns
+    // per row, at any batch size, takes the small-T routes, each split covers the keys
+    // [s * N, (s + 1) * N) for this N whatever the window, width or batch, and each storage runs
+    // one key tile and one reduction order. A live column's output is then the same bytes in every
+    // such call that holds it. N comes from causal_attention_invariant_segment_keys for the
+    // engine's whole context, so every envelope of one engine carries the same value. Workspace
+    // planned with it reserves for calls of either schedule.
+    std::uint32_t invariant_segment_keys = 0;
 };
+
+// The segment of invariant reductions for an engine whose calls see at most `max_context` keys:
+// the fewest keys, a multiple of the 64-key page, that keep every window within the small-T
+// launch's split capacity.
+[[nodiscard]] std::uint32_t causal_attention_invariant_segment_keys(std::uint32_t max_context);
 
 struct ContextAttentionExecutionEnvelope {
     std::uint32_t min_context = 0;
@@ -180,7 +194,36 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, cudaStream_t stream, const Tensor* gate = nullptr);
+                              Tensor& out, cudaStream_t stream, const Tensor* gate = nullptr,
+                              Tensor* partial = nullptr);
+
+/**
+ * Position-split attention (--tensor-attention positions). Each rank of a position-split pool
+ * holds some of a row's keys (PagedKVBatchLayerView::page_stride, page_residue): the stride and
+ * residue select its physical pages, and causal_softmax_attention over that rank's view attends
+ * over its own keys and appends only the rows that land in its pages. With `partial` given, the
+ * call leaves out unwritten and writes, for each of its C = W * B columns, the cross-rank form
+ * this merge combines: `partial` is contiguous FP32 holding causal_attention_partial_elements
+ * values, one block per column in order, each the outputs [256, Hq], normalized over the rank's
+ * keys alone, followed by their log-sum-exps [Hq] in natural units of the scaled scores (minus
+ * infinity where the rank holds none of the column's keys). A range of columns is thus a partial
+ * of its own. A gate is the merge's to apply, so a partial call takes none.
+ *
+ * causal_attention_merge_partials combines `partials`, one per rank in rank order, into the BF16
+ * output [256, H, C] of query heads [head_begin, head_begin + H), with H = out.ne[1]:
+ *
+ *   M = max_r lse_r,  w_r = exp(lse_r - M),  out = (sum_r w_r * value_r) / (sum_r w_r)
+ *
+ * summed in rank order, then times sigmoid(gate) when a gate [256, H, C] is given, rounded as
+ * sigmoid_mul rounds. The partials may live in another device's memory or in mapped host memory,
+ * any pointer the merging device can read; at most kCausalAttentionMaximumMergeRanks of them.
+ */
+inline constexpr std::int32_t kCausalAttentionMaximumMergeRanks = 8;
+[[nodiscard]] std::size_t causal_attention_partial_elements(std::int32_t q_heads,
+                                                            std::int32_t columns);
+void causal_attention_merge_partials(std::span<const float* const> partials, std::int32_t q_heads,
+                                     std::int32_t columns, std::int32_t head_begin,
+                                     const Tensor* gate, Tensor& out, cudaStream_t stream);
 
 /**
  * Read-only single-sequence causal attention over an already populated cache.

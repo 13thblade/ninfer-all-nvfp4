@@ -28,6 +28,21 @@ WeightGeometry stored(QType format, QuantLayout layout, std::vector<std::uint64_
     return weight_geometry(format, layout, std::span<const std::uint64_t>(shape));
 }
 
+std::uint64_t piece_rows(const ObjectSelection& selection) {
+    std::uint64_t rows = 0;
+    for (const auto& [begin, end] : selection.rows) { rows += end - begin; }
+    return rows;
+}
+
+// The stored row that row `row` of the piece holds.
+std::uint64_t source_row(const ObjectSelection& selection, std::uint64_t row) {
+    for (const auto& [begin, end] : selection.rows) {
+        if (row < end - begin) { return begin + row; }
+        row -= end - begin;
+    }
+    throw std::runtime_error("a piece row outside the selection");
+}
+
 // Gathers the piece through `runs` from a stored object whose unit (u, row) holds the bytes
 // `row * 100000 + u` in a fixed pattern, then checks each piece unit against its source.
 void check_gather(const WeightGeometry& whole, const ObjectSelection& selection,
@@ -45,8 +60,8 @@ void check_gather(const WeightGeometry& whole, const ObjectSelection& selection,
     const auto piece = selected_geometry(whole, selection);
     std::uint64_t picked_units = 0;
     for (const auto& [begin, end] : selection.columns) { picked_units += (end - begin) / column_unit; }
-    const std::uint64_t piece_rows = selection.row_end - selection.row_begin;
-    std::vector<std::uint32_t> got(piece_rows * picked_units * unit_bytes, 0xffffffffU);
+    const std::uint64_t rows_picked = piece_rows(selection);
+    std::vector<std::uint32_t> got(rows_picked * picked_units * unit_bytes, 0xffffffffU);
     std::uint64_t covered = 0;
     for (const auto& run : selected_runs(whole, selection)) {
         require(run.source % sizeof(std::uint32_t) == 0 && run.bytes % sizeof(std::uint32_t) == 0,
@@ -57,13 +72,13 @@ void check_gather(const WeightGeometry& whole, const ObjectSelection& selection,
         covered += run.bytes;
     }
     require(covered == got.size() * 4, "the runs cover the piece exactly once");
-    for (std::uint64_t r = 0; r < piece_rows; ++r) {
+    for (std::uint64_t r = 0; r < rows_picked; ++r) {
         std::uint64_t unit = 0;
         for (const auto& [begin, end] : selection.columns) {
             for (std::uint64_t u = begin / column_unit; u < end / column_unit; ++u, ++unit) {
                 for (std::uint64_t b = 0; b < unit_bytes; ++b) {
                     const std::uint64_t at = (r * picked_units + unit) * unit_bytes + b;
-                    require(got[at] == source[((selection.row_begin + r) * units + u) * unit_bytes + b],
+                    require(got[at] == source[(source_row(selection, r) * units + u) * unit_bytes + b],
                             "a piece unit holds its source unit");
                 }
             }
@@ -75,18 +90,25 @@ void check_gather(const WeightGeometry& whole, const ObjectSelection& selection,
 void contiguous_matrix() {
     // FP32 [6, 8]: one unit is one column of four bytes, cut as a cell of the gather.
     const auto whole = stored(QType::FP32, QuantLayout::Contiguous, {6, 8});
-    const ObjectSelection rows_only{.row_begin = 2, .row_end = 5, .columns = {{0, 8}}};
+    const ObjectSelection rows_only{.rows = {{2, 5}}, .columns = {{0, 8}}};
     check_gather(whole, rows_only, 6, 8, 1, 1);
     require(selected_runs(whole, rows_only).size() == 1, "whole rows gather in one run");
-    const ObjectSelection columns{.row_begin = 0, .row_end = 6, .columns = {{1, 3}, {5, 8}}};
+    const ObjectSelection columns{.rows = {{0, 6}}, .columns = {{1, 3}, {5, 8}}};
     check_gather(whole, columns, 6, 8, 1, 1);
     const auto piece = selected_geometry(whole, columns);
     require(piece.shape == std::vector<std::uint64_t>({6, 5}), "a column piece keeps the rows");
+    // Two row ranges, as one part of each of two experts: whole rows gather in one run per range.
+    const ObjectSelection ranges{.rows = {{0, 2}, {3, 5}}, .columns = {{0, 8}}};
+    check_gather(whole, ranges, 6, 8, 1, 1);
+    require(selected_runs(whole, ranges).size() == 2, "each row range of whole rows is one run");
+    require(selected_geometry(whole, ranges).shape == std::vector<std::uint64_t>({4, 8}),
+            "row ranges stack");
+    check_gather(whole, {.rows = {{1, 2}, {4, 6}}, .columns = {{2, 6}}}, 6, 8, 1, 1);
 }
 
 void vector_object() {
     const auto whole = stored(QType::FP32, QuantLayout::Contiguous, {12});
-    const ObjectSelection part{.row_begin = 0, .row_end = 1, .columns = {{4, 8}}};
+    const ObjectSelection part{.rows = {{0, 1}}, .columns = {{4, 8}}};
     check_gather(whole, part, 1, 12, 1, 1);
     require(selected_geometry(whole, part).shape == std::vector<std::uint64_t>({4}),
             "a vector piece is a vector");
@@ -97,7 +119,7 @@ void ggml_blocks() {
     // gather check runs on 2-byte multiples via a Q8_0 row of 8 blocks = 272 bytes = 68 cells.
     const auto whole = stored(QType::GGUF_Q8_0, QuantLayout::GgufBlocks, {4, 256});
     require(whole.code_bytes_per_row == 272, "a Q8_0 row of 256 values is 272 bytes");
-    const ObjectSelection blocks{.row_begin = 1, .row_end = 3, .columns = {{32, 96}, {192, 256}}};
+    const ObjectSelection blocks{.rows = {{1, 3}}, .columns = {{32, 96}, {192, 256}}};
     const auto runs = selected_runs(whole, blocks);
     require(runs.size() == 4, "two rows of two column ranges");
     require(runs[0].source == 272 + 34 && runs[0].bytes == 68 && runs[0].destination == 0,
@@ -110,7 +132,7 @@ void ggml_blocks() {
             "the piece is a Q8_0 [2, 128]");
     bool refused = false;
     try {
-        (void)selected_runs(whole, {.row_begin = 0, .row_end = 1, .columns = {{16, 64}}});
+        (void)selected_runs(whole, {.rows = {{0, 1}}, .columns = {{16, 64}}});
     } catch (const ArtifactError&) { refused = true; }
     require(refused, "a column bound inside a block is refused");
 }
@@ -159,12 +181,12 @@ void row_split(QType format, std::uint64_t group, std::uint64_t code_bytes, std:
     const auto whole = stored(format, QuantLayout::RowSplit, shape);
     const auto piece = selected_geometry(whole, selection);
     const auto bytes = gather(whole, selection);
-    const std::uint64_t rows = selection.row_end - selection.row_begin;
+    const std::uint64_t rows = piece_rows(selection);
     for (std::uint64_t r = 0; r < rows; ++r) {
         for (std::uint64_t column = 0; column < piece.shape[1]; column += group) {
             const std::uint64_t g  = column / group;
             const std::uint64_t sg = source_column(selection, column) / group;
-            const std::uint64_t sr = selection.row_begin + r;
+            const std::uint64_t sr = source_row(selection, r);
             for (std::uint64_t b = 0; b < code_bytes; ++b) {
                 require(bytes.piece[r * piece.code_bytes_per_row + g * code_bytes + b] ==
                             bytes.stored[sr * whole.code_bytes_per_row + sg * code_bytes + b],
@@ -189,21 +211,26 @@ void row_split(QType format, std::uint64_t group, std::uint64_t code_bytes, std:
 void row_split_layouts() {
     // Q5: codes, high bits and scales; rows 1..5 of 6, the second and third 128 columns.
     row_split(QType::Q5_G64_FP16, 64, 32, 8, {6, 384},
-              {.row_begin = 1, .row_end = 5, .columns = {{128, 384}}});
+              {.rows = {{1, 5}}, .columns = {{128, 384}}});
     // Q8 groups of 32, two ranges; T2 groups of 128.
     row_split(QType::Q8_G32_FP16, 32, 32, 0, {3, 512},
-              {.row_begin = 0, .row_end = 3, .columns = {{0, 128}, {256, 512}}});
+              {.rows = {{0, 3}}, .columns = {{0, 128}, {256, 512}}});
     row_split(QType::T2_G128_FP16, 128, 32, 0, {4, 384},
-              {.row_begin = 2, .row_end = 4, .columns = {{256, 384}}});
+              {.rows = {{2, 4}}, .columns = {{256, 384}}});
     // Q4 whole rows; a K that is not a multiple of 128 cuts only at its end.
     row_split(QType::Q4_G64_FP16, 64, 32, 0, {5, 320},
-              {.row_begin = 1, .row_end = 3, .columns = {{0, 320}}});
+              {.rows = {{1, 3}}, .columns = {{0, 320}}});
     row_split(QType::Q4_G64_FP16, 64, 32, 0, {5, 320},
-              {.row_begin = 0, .row_end = 5, .columns = {{128, 320}}});
+              {.rows = {{0, 5}}, .columns = {{128, 320}}});
+    // Half of each of three experts' rows, whole and by columns.
+    row_split(QType::Q5_G64_FP16, 64, 32, 8, {12, 512},
+              {.rows = {{0, 2}, {4, 6}, {8, 10}}, .columns = {{0, 512}}});
+    row_split(QType::Q6_G64_FP16, 64, 32, 16, {6, 512},
+              {.rows = {{1, 3}, {4, 6}}, .columns = {{256, 512}}});
     bool refused = false;
     try {
         (void)selected_runs(stored(QType::Q4_G64_FP16, QuantLayout::RowSplit, {2, 256}),
-                            {.row_begin = 0, .row_end = 2, .columns = {{64, 256}}});
+                            {.rows = {{0, 2}}, .columns = {{64, 256}}});
     } catch (const ArtifactError&) { refused = true; }
     require(refused, "a row-split bound inside 128 columns is refused");
 }
@@ -215,7 +242,7 @@ void fp8_layouts() {
         const auto format = layout == QuantLayout::RowScale ? QType::FP8_E4M3FN_ROW_BF16
                                                             : QType::FP8_E4M3FN_ROW_FP16;
         const auto whole  = stored(format, layout, {4, 100});
-        const ObjectSelection selection{.row_begin = 1, .row_end = 4, .columns = {{10, 50}, {60, 100}}};
+        const ObjectSelection selection{.rows = {{1, 4}}, .columns = {{10, 50}, {60, 100}}};
         const auto piece = selected_geometry(whole, selection);
         const auto bytes = gather(whole, selection);
         const auto code  = [](const WeightGeometry& g, std::uint64_t row, std::uint64_t column) {
@@ -241,7 +268,7 @@ void fp8_layouts() {
 void nvfp4_layout() {
     const std::uint64_t shape[] = {384, 256};
     const auto whole = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape, 3);
-    const ObjectSelection selection{.row_begin = 128, .row_end = 384, .columns = {{64, 192}}};
+    const ObjectSelection selection{.rows = {{128, 384}}, .columns = {{64, 192}}};
     const auto piece = selected_geometry(whole, selection);
     require(piece.shape == std::vector<std::uint64_t>({256, 128}) && piece.divisor_count == 2,
             "an NVFP4 piece keeps its divisors' rows");
@@ -267,7 +294,7 @@ void nvfp4_layout() {
     }
     bool refused = false;
     try {
-        (void)selected_geometry(whole, {.row_begin = 64, .row_end = 384, .columns = {{0, 256}}});
+        (void)selected_geometry(whole, {.rows = {{64, 384}}, .columns = {{0, 256}}});
     } catch (const ArtifactError&) { refused = true; }
     require(refused, "an NVFP4 row bound inside a scale tile is refused");
 }
@@ -275,11 +302,14 @@ void nvfp4_layout() {
 void refusals() {
     const auto whole = stored(QType::FP32, QuantLayout::Contiguous, {6, 8});
     const ObjectSelection bad[] = {
-        {.row_begin = 3, .row_end = 3, .columns = {{0, 8}}},
-        {.row_begin = 0, .row_end = 7, .columns = {{0, 8}}},
-        {.row_begin = 0, .row_end = 2, .columns = {}},
-        {.row_begin = 0, .row_end = 2, .columns = {{4, 6}, {2, 3}}},
-        {.row_begin = 0, .row_end = 2, .columns = {{0, 9}}},
+        {.rows = {{3, 3}}, .columns = {{0, 8}}},
+        {.rows = {{0, 7}}, .columns = {{0, 8}}},
+        {.rows = {{0, 2}}, .columns = {}},
+        {.rows = {{0, 2}}, .columns = {{4, 6}, {2, 3}}},
+        {.rows = {{0, 2}}, .columns = {{0, 9}}},
+        {.rows = {}, .columns = {{0, 8}}},
+        {.rows = {{2, 4}, {0, 1}}, .columns = {{0, 8}}},
+        {.rows = {{0, 3}, {2, 4}}, .columns = {{0, 8}}},
     };
     for (const auto& selection : bad) {
         bool refused = false;
@@ -290,7 +320,7 @@ void refusals() {
     }
     // Only an INT32 vector's values can be rebased.
     const auto indices = stored(QType::INT32, QuantLayout::Contiguous, {16});
-    const ObjectSelection rebased{.row_begin = 0, .row_end = 1, .columns = {{4, 8}}, .rebase = 4};
+    const ObjectSelection rebased{.rows = {{0, 1}}, .columns = {{4, 8}}, .rebase = 4};
     require(selected_geometry(indices, rebased).shape == std::vector<std::uint64_t>({4}),
             "an INT32 vector piece can be rebased");
     bool refused = false;

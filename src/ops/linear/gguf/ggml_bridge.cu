@@ -3,6 +3,7 @@
 
 #include "ggml_bridge_internal.cuh"
 
+#include "../../common/device_tier.h"
 #include "../../common/fixed_point.cuh"
 
 #include "ggml-cuda/dequantize.cuh"
@@ -906,9 +907,61 @@ constexpr int kMatrixStep = 256;
 
 int moe_padded_k(int k) { return (k + kMatrixStep - 1) / kMatrixStep * kMatrixStep; }
 
+// Whether the MoE matrix product takes Volta's FP16 route (ggml_bridge_sm70.cuh) on the current
+// device: wherever the device runs sm_70 code.
+bool moe_matrix_sm70() { return current_device_volta(); }
+
+// Volta's activation: an FP16 plane [pairs][k_padded], zero past k, then one FP32 factor per
+// column. Column c holds x column sorted[c] / column_group times 2^-e and factor 2^e, e the least
+// non-negative exponent that keeps the column's largest finite magnitude below 2^15 (zero for a
+// column with an infinity or NaN, which then propagates as it would in BF16).
+std::size_t moe_sm70_activation_bytes(int k_padded, int pairs) {
+    return std::size_t(pairs) * k_padded * sizeof(__half) + std::size_t(pairs) * sizeof(float);
+}
+
+constexpr int kSm70ActivationThreads = 256;
+
+__global__ void __launch_bounds__(kSm70ActivationThreads)
+    moe_sm70_activation_kernel(const __nv_bfloat16* __restrict__ x, int k, int k_padded,
+                               const std::int32_t* __restrict__ sorted, int column_group,
+                               __half* __restrict__ plane, float* __restrict__ factors) {
+    __shared__ float warp_max[kSm70ActivationThreads / 32];
+    const int c                  = int(blockIdx.x);
+    const __nv_bfloat162* column = reinterpret_cast<const __nv_bfloat162*>(
+        x + std::int64_t(sorted[c] / column_group) * k);
+    float largest = 0.0f;
+    for (int i = int(threadIdx.x); i < k / 2; i += kSm70ActivationThreads) {
+        const float2 v = __bfloat1622float2(column[i]);
+        largest        = fmaxf(largest, fmaxf(fabsf(v.x), fabsf(v.y)));
+        if (!isfinite(v.x) || !isfinite(v.y)) { largest = INFINITY; }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        largest = fmaxf(largest, __shfl_xor_sync(0xFFFFFFFFu, largest, offset));
+    }
+    if ((threadIdx.x & 31) == 0) { warp_max[threadIdx.x / 32] = largest; }
+    __syncthreads();
+    largest = warp_max[0];
+#pragma unroll
+    for (int w = 1; w < kSm70ActivationThreads / 32; ++w) { largest = fmaxf(largest, warp_max[w]); }
+    // largest < 2^(ilogb + 1), so largest * 2^-(ilogb - 14) < 2^15.
+    const int e      = isfinite(largest) && largest >= 32768.0f ? ilogbf(largest) - 14 : 0;
+    const float down = ldexpf(1.0f, -e);
+    __half2* out     = reinterpret_cast<__half2*>(plane + std::int64_t(c) * k_padded);
+    for (int i = int(threadIdx.x); i < k_padded / 2; i += kSm70ActivationThreads) {
+        float2 v = make_float2(0.0f, 0.0f);
+        if (2 * i < k) {
+            v = __bfloat1622float2(column[i]);
+        }
+        out[i] = __floats2half2_rn(v.x * down, v.y * down);
+    }
+    if (threadIdx.x == 0) { factors[c] = ldexpf(1.0f, e); }
+}
+
 } // namespace
 
 std::size_t moe_matrix_activation_bytes(int k, int pairs) {
+    if (moe_matrix_sm70()) { return moe_sm70_activation_bytes(moe_padded_k(k), pairs); }
     return matrix_activation_bytes(moe_padded_k(k), pairs);
 }
 
@@ -928,6 +981,15 @@ void quantize_moe_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k
                                     void* out, cudaStream_t stream) {
     if (routing.sorted == nullptr || column_group <= 0 || k <= 0 || k % 32 != 0 || pairs <= 0) {
         throw std::invalid_argument("gguf moe matrix activation: invalid routing or K");
+    }
+    if (moe_matrix_sm70()) {
+        const int k_padded = moe_padded_k(k);
+        auto* plane        = static_cast<__half*>(out);
+        moe_sm70_activation_kernel<<<pairs, kSm70ActivationThreads, 0, stream>>>(
+            x, k, k_padded, routing.sorted, column_group, plane,
+            reinterpret_cast<float*>(plane + std::size_t(pairs) * k_padded));
+        detail::check(cudaGetLastError(), "moe matrix activation (sm_70) launch");
+        return;
     }
     quantize_matrix(type, x, k, moe_padded_k(k), pairs, nullptr, routing.sorted, column_group, out,
                     stream);
@@ -1039,6 +1101,10 @@ void matrix_product_bf16(GgmlType type, const void* weight, std::int64_t row_byt
 }
 
 bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail) {
+    if (moe_matrix_sm70()) {
+        return has_matrix_kernel(type) && rows > 0 && rows % 32 == 0 && k > 0 &&
+               k % block_shape(type).elements == 0;
+    }
 #define NINFER_GGUF_MOE_FITS_CASE(NAME)                                                            \
     case GgmlType::NAME:                                                                           \
         return detail::moe_matrix_fits_impl<GGML_TYPE_##NAME>(rows, k, tail)
@@ -1074,6 +1140,40 @@ void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& 
     if (table.experts == nullptr || routing.bounds == nullptr || routing.tiles == nullptr ||
         activation == nullptr || out == nullptr) {
         throw std::invalid_argument("gguf moe matrix product: invalid tables or routing");
+    }
+    if (moe_matrix_sm70()) {
+#define NINFER_GGUF_MOE_SM70_CASE(NAME)                                                            \
+    case GgmlType::NAME:                                                                           \
+        detail::moe_matrix_sm70_launch<GGML_TYPE_##NAME>(table.experts, table.row_bytes,           \
+                                                         table.rows, table.k,                      \
+                                                         moe_padded_k(table.k), routing,           \
+                                                         max_active, pairs, activation, out,       \
+                                                         stream);                                  \
+        return
+        switch (type) {
+            NINFER_GGUF_MOE_SM70_CASE(Q8_0);
+            NINFER_GGUF_MOE_SM70_CASE(Q4_0);
+            NINFER_GGUF_MOE_SM70_CASE(Q5_0);
+            NINFER_GGUF_MOE_SM70_CASE(Q2_0);
+            NINFER_GGUF_MOE_SM70_CASE(Q2_K);
+            NINFER_GGUF_MOE_SM70_CASE(Q3_K);
+            NINFER_GGUF_MOE_SM70_CASE(Q4_K);
+            NINFER_GGUF_MOE_SM70_CASE(Q5_K);
+            NINFER_GGUF_MOE_SM70_CASE(Q6_K);
+            NINFER_GGUF_MOE_SM70_CASE(IQ2_XXS);
+            NINFER_GGUF_MOE_SM70_CASE(IQ2_XS);
+            NINFER_GGUF_MOE_SM70_CASE(IQ2_S);
+            NINFER_GGUF_MOE_SM70_CASE(IQ3_XXS);
+            NINFER_GGUF_MOE_SM70_CASE(IQ3_S);
+            NINFER_GGUF_MOE_SM70_CASE(IQ1_S);
+            NINFER_GGUF_MOE_SM70_CASE(IQ4_NL);
+            NINFER_GGUF_MOE_SM70_CASE(IQ4_XS);
+        case GgmlType::IQ1_M:
+        case GgmlType::MXFP4:
+            break;
+        }
+#undef NINFER_GGUF_MOE_SM70_CASE
+        throw std::invalid_argument("gguf moe matrix product: no matrix kernel for this block type");
     }
 #define NINFER_GGUF_MOE_MATRIX_CASE(NAME)                                                          \
     case GgmlType::NAME:                                                                           \
