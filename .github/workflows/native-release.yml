@@ -278,7 +278,13 @@ jobs:
 
   publish:
     needs: [validate, windows, linux, universal-windows, universal-linux]
-    if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || inputs.publish)
+    # Package-only runs skip the object-shard ancestor, which the implicit success() would count.
+    if: >-
+      ${{ !cancelled() && github.ref == 'refs/heads/master' &&
+          (github.event_name == 'push' || inputs.publish) &&
+          needs.validate.result == 'success' && needs.windows.result == 'success' &&
+          needs.linux.result == 'success' && needs.universal-windows.result == 'success' &&
+          needs.universal-linux.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
