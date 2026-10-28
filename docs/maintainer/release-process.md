@@ -195,7 +195,9 @@ Windows uses eight object shards per Toolkit, each with a separate
 `native-windows-cuda-<toolkit>-host-v2-shard-<index>` family. The final Windows job merges those
 snapshots, links and packages the same multiarch executables, and saves the aggregate family
 without the shard suffix. Only shard zero and the subsequent final job write the shared vcpkg
-family. A shard without a snapshot of its own starts from the aggregate. The reusable Windows
+family. A shard without a snapshot of its own starts from the aggregate, so shard snapshots also
+hold old copies of other shards' entries; where restored snapshots hold the same file, the newer
+copy stays, and an old ccache manifest cannot hide the entry its owner shard added. The reusable Windows
 workflow remains part of Native release; CI has no cache writer.
 
 CI does not upload compiler caches to HF or Actions Cache. Python dependency caches remain in

@@ -38,12 +38,24 @@ def prefix(family, ref):
 
 def unpack(archive, directory):
     with tarfile.open(archive) as package:
+        members = []
         for item in package:
             path = PurePosixPath(item.name)
             if path.is_absolute() or '..' in path.parts or '\\' in item.name or ':' in item.name or \
                     not (item.isdir() or item.isfile()):
                 raise ValueError('Invalid cache archive member')
-        package.extractall(directory, filter='data')
+            # Snapshots restored into one directory overlap: a Windows shard that started from the
+            # aggregate still holds its copies of other shards' entries. A file at least as new as
+            # the member stays, so an old copy of a ccache manifest cannot replace the one its
+            # owner shard has since extended with the current headers' entry.
+            if item.isfile():
+                try:
+                    if (directory / path).stat().st_mtime >= item.mtime:
+                        continue
+                except FileNotFoundError:
+                    pass
+            members.append(item)
+        package.extractall(directory, members=members, filter='data')
 
 
 def pack(directory, archive):
