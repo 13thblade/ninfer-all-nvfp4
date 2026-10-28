@@ -5,10 +5,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <exception>
 #include <limits>
+#include <memory>
 #include <span>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -249,6 +253,48 @@ private:
         for (std::uint32_t j = 0; j < n; ++j) { h = mix(h, at(p + j)); }
         return finalize_hash(h);
     }
+};
+
+// A request's live ngram index built on a thread of its own: the prompt tokens, then each
+// proposal source, one ingest() span apiece. Its first proposal is in the request's first decode
+// round, after its prefill, so the build runs beside admission and prefill instead of ahead of
+// them (indexing a 156K-token prompt took 15 ms, 2026-10-28). A request that goes away leaves a
+// running build to finish and be discarded.
+class NgramIndexBuild final {
+public:
+    using Token = NgramProposer::Token;
+
+    [[nodiscard]] static std::shared_ptr<NgramIndexBuild>
+    start(std::vector<Token> boundaries, std::vector<Token> tokens,
+          std::vector<std::vector<Token>> sources) {
+        auto build = std::make_shared<NgramIndexBuild>();
+        std::thread([build, boundaries = std::move(boundaries), tokens = std::move(tokens),
+                     sources = std::move(sources)]() mutable {
+            try {
+                auto index = std::make_unique<NgramProposer>();
+                index->set_boundaries(std::move(boundaries));
+                index->ingest(tokens);
+                for (const auto& source : sources) { index->ingest(source); }
+                build->index_ = std::move(index);
+            } catch (...) { build->error_ = std::current_exception(); }
+            build->done_.store(true, std::memory_order_release);
+            build->done_.notify_all();
+        }).detach();
+        return build;
+    }
+
+    // Waits for the build and takes its index, once; rethrows the build's failure.
+    [[nodiscard]] std::unique_ptr<NgramProposer> take() {
+        done_.wait(false, std::memory_order_acquire);
+        if (error_) { std::rethrow_exception(error_); }
+        if (!index_) { throw std::logic_error("ngram index build was already taken"); }
+        return std::move(index_);
+    }
+
+private:
+    std::unique_ptr<NgramProposer> index_;
+    std::exception_ptr error_;
+    std::atomic<bool> done_{false};
 };
 
 } // namespace ninfer::models::qwen3_5::detail

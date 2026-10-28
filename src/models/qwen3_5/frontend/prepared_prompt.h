@@ -157,10 +157,11 @@ struct PreparedPromptData {
     std::vector<TokenId> ngram_boundaries;
     std::vector<NgramSourceView> ngram_archive_sources;
     std::shared_ptr<const NgramSnapshot> ngram_snapshot;
-    // The request's live ngram index over token_ids and ngram_sources, present whenever ngram
-    // drafting is enabled and the prompt was prepared for a drafting request. Preparation builds
-    // it so admission only moves it into the request.
-    std::unique_ptr<detail::NgramProposer> ngram_index;
+    // The build of the request's live ngram index over token_ids and ngram_sources, present
+    // whenever ngram drafting is enabled and the prompt was prepared for a drafting request.
+    // Preparation starts it; admission moves it into the request, whose first proposal waits for
+    // it.
+    std::shared_ptr<detail::NgramIndexBuild> ngram_index;
     // Hybrid prefix-cache lookup keys over token_ids (program/prefix/block_keys.h): one chained
     // hash per full 64-token block and, with media, one cumulative Vision key per block.
     std::vector<std::uint64_t> block_hashes;
