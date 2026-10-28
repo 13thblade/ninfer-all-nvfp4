@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -293,6 +294,65 @@ void selected_upload(DeviceContext& device) {
     }
 }
 
+// Pieces of an NVFP4 object on one rank, as tensor-parallel shares of q, k and v from one stored
+// object: a piece of several row ranges, and a second piece of the same object. Each piece holds
+// its selected bytes, its divisor words among them (a single-divisor object's word goes to both
+// pieces, read once), and binds the divisor of its first stored row.
+void selected_nvfp4(DeviceContext& device) {
+    const std::uint64_t shape[] = {512, 128};
+    const std::array divisor_values{0.5F, 1.5F, 2.5F, 3.5F};
+    for (const std::uint64_t divisors : {1U, 4U}) {
+        const auto geometry = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape,
+                                              divisors);
+        Fixture fixture;
+        constexpr std::uint64_t offset = 4096;
+        fixture.root["objects"].push_back({{"id", "nvfp4"},
+                                           {"kind", "tensor"},
+                                           {"shape", {shape[0], shape[1]}},
+                                           {"format", "nvfp4"},
+                                           {"layout", "block_scale_k16_m128x4_v1"},
+                                           {"offset", offset},
+                                           {"bytes", geometry.bytes},
+                                           {"divisors", divisors}});
+        fixture.payload.resize(offset + geometry.bytes);
+        for (std::uint64_t i = 0; i < geometry.divisor_offset; ++i) {
+            fixture.payload[offset + i] = std::byte((i * 2654435761ULL) >> 13);
+        }
+        for (std::uint64_t d = 0; d < divisors; ++d) {
+            put_word(fixture.payload, offset + geometry.divisor_offset + d * 4,
+                     std::bit_cast<std::uint32_t>(divisor_values[d]), 4);
+        }
+        fixture.root["files"] = Json::array({{{"path", nullptr},
+                                              {"payload_bytes", fixture.payload.size()}}});
+        fixture.write();
+        const ObjectSelection selections[] = {
+            {.rows = {{0, 128}, {256, 384}}, .columns = {{0, 128}}},
+            {.rows = {{128, 256}, {384, 512}}, .columns = {{0, 128}}}};
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        const ObjectHandle object = reader.find("nvfp4");
+        std::vector<ObjectHandle> pieces;
+        for (const auto& selection : selections) {
+            pieces.push_back(binder.select_device(object, selection, 0));
+        }
+        const auto stored = reader.read_object(object);
+        auto backing      = materialize(reader, std::move(binder).finish(), device);
+        for (std::size_t i = 0; i < pieces.size(); ++i) {
+            std::vector<std::byte> want(selected_geometry(geometry, selections[i]).bytes);
+            for (const auto& run : selected_runs(geometry, selections[i])) {
+                std::memcpy(want.data() + run.destination, stored.data() + run.source, run.bytes);
+            }
+            const auto& parent = backing.device_parent(pieces[i]);
+            std::vector<std::byte> got(want.size());
+            CUDA_CHECK(cudaMemcpy(got.data(), parent.data, got.size(), cudaMemcpyDeviceToHost));
+            require(got == want, "an NVFP4 piece differs from its selected bytes");
+            const std::uint64_t first = selections[i].rows.front().first;
+            require(parent.weight_scale_divisor == divisor_values[first / (shape[0] / divisors)],
+                    "an NVFP4 piece bound another row's divisor");
+        }
+    }
+}
+
 // A selected piece takes the panel layout as a stored object does: uploaded row-split, then
 // permuted in place (a V100 tensor-parallel rank's projections). The piece is judged by its own
 // rows: two rows are no whole panel. The fixture's object read as four rows of 65 columns has the
@@ -313,8 +373,7 @@ void selected_panel(DeviceContext& device) {
     fixture.root["uses"]                = Json::array();
     fixture.write(true);
     Reader reader(fixture.entry);
-    // Two loads, since one may not read the same bytes twice: the piece as stored, then with the
-    // panel layout.
+    // Two loads: the piece as stored, then with the panel layout.
     const ObjectSelection rows{.rows = {{0, 4}}, .columns = {{0, 65}}};
     std::vector<std::byte> want;
     std::vector<std::byte> got;
@@ -553,6 +612,7 @@ int main(int argc, char** argv) {
         failure_and_host_only(device);
         overlay_placement(device);
         selected_upload(device);
+        selected_nvfp4(device);
         selected_panel(device);
         pipeline_rank_placement();
 #if defined(NINFER_TEST_LINK_WRAP)
