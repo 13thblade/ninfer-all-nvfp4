@@ -30,9 +30,12 @@ namespace ninfer {
 // The fractions of the divided work each rank takes: in proportion to `speed`, except that a rank
 // takes at most `capacity[r]` (a fraction of the divided work it has room for); what a full rank
 // cannot take goes to the others, still in proportion to their speed. The fractions add up to one.
-// When the capacities add up to less than one the work does not fit anywhere; the fractions then
-// follow speed alone, and the caller's later memory planning reports the device that runs out.
-[[nodiscard]] std::vector<double> fill_shares(std::span<const double> speed,
-                                              std::span<const double> capacity);
+// When the capacities add up to less than one the work does not fit anywhere. If part of it then
+// shrinks to fit (`shrinks`: automatic KV capacity) and every rank has some room, the fractions
+// follow the capacities, so each rank outgrows its room by the same factor and the shrinking part
+// keeps the most it can; otherwise they follow speed alone, and the caller's later memory planning
+// reports the device that runs out.
+[[nodiscard]] std::vector<double>
+fill_shares(std::span<const double> speed, std::span<const double> capacity, bool shrinks = false);
 
 } // namespace ninfer

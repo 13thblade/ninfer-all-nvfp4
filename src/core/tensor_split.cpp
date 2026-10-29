@@ -75,7 +75,8 @@ std::vector<std::uint64_t> unit_positions(std::uint64_t total, std::uint64_t uni
     return out;
 }
 
-std::vector<double> fill_shares(std::span<const double> speed, std::span<const double> capacity) {
+std::vector<double> fill_shares(std::span<const double> speed, std::span<const double> capacity,
+                                bool shrinks) {
     const std::size_t ranks = speed.size();
     if (ranks == 0 || capacity.size() != ranks) {
         throw std::invalid_argument("shares need one speed and one capacity per rank");
@@ -87,9 +88,15 @@ std::vector<double> fill_shares(std::span<const double> speed, std::span<const d
         }
     }
     const double speed_sum = std::accumulate(speed.begin(), speed.end(), 0.0);
+    const double room      = std::accumulate(capacity.begin(), capacity.end(), 0.0);
     std::vector<double> out(ranks);
-    if (std::accumulate(capacity.begin(), capacity.end(), 0.0) < 1.0) {
-        for (std::size_t rank = 0; rank < ranks; ++rank) { out[rank] = speed[rank] / speed_sum; }
+    if (room < 1.0) {
+        const bool every_rank_has_room =
+            std::all_of(capacity.begin(), capacity.end(), [](double c) { return c > 0.0; });
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            out[rank] =
+                shrinks && every_rank_has_room ? capacity[rank] / room : speed[rank] / speed_sum;
+        }
         return out;
     }
     std::vector<bool> full(ranks, false);

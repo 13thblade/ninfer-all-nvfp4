@@ -153,6 +153,8 @@ struct StageBudget {
     // Bytes the stage needs whatever layers it owns: the embedding on the first stage, the head and
     // prefill buffers on the last, workspace, graph memory.
     std::uint64_t fixed_bytes = 0;
+    // KV bytes per page group the stage holds whatever layers it owns: MTP's layer on the first.
+    std::uint64_t kv_bytes_per_page_group = 0;
 };
 
 struct StageSolution {
@@ -199,8 +201,9 @@ inline bool stage_fits(const StageCosts& costs, const StageBudget& budget, std::
     std::uint64_t used = budget.fixed_bytes;
     used = saturating_add(used, costs.weight_prefix[end] - costs.weight_prefix[begin]);
     used = saturating_add(used, costs.state_prefix[end] - costs.state_prefix[begin]);
-    used = saturating_add(
-        used, saturating_mul(costs.kv_prefix[end] - costs.kv_prefix[begin], page_groups));
+    const std::uint64_t kv = saturating_add(costs.kv_prefix[end] - costs.kv_prefix[begin],
+                                            budget.kv_bytes_per_page_group);
+    used = saturating_add(used, saturating_mul(kv, page_groups));
     return used <= budget.available_bytes;
 }
 
@@ -252,7 +255,10 @@ inline StageSolution solve_stage_plan(std::span<const LayerCost> layers,
 
     // Largest page-group count that is still feasible. Feasibility is monotone in the count.
     constexpr std::uint64_t kUnbounded = std::numeric_limits<std::uint64_t>::max();
-    const bool any_kv                  = costs.kv_prefix.back() != 0;
+    const bool any_kv = costs.kv_prefix.back() != 0 ||
+                        std::any_of(budgets.begin(), budgets.end(), [](const StageBudget& budget) {
+                            return budget.kv_bytes_per_page_group != 0;
+                        });
     std::uint64_t best                 = kUnbounded;
     if (any_kv) {
         std::uint64_t low  = 0;
@@ -284,7 +290,8 @@ inline StageSolution solve_stage_plan(std::span<const LayerCost> layers,
             static_cast<long double>(budgets[stage].fixed_bytes) +
             static_cast<long double>(costs.weight_prefix[end] - costs.weight_prefix[begin]) +
             static_cast<long double>(costs.state_prefix[end] - costs.state_prefix[begin]) +
-            static_cast<long double>(costs.kv_prefix[end] - costs.kv_prefix[begin]) *
+            (static_cast<long double>(costs.kv_prefix[end] - costs.kv_prefix[begin]) +
+             static_cast<long double>(budgets[stage].kv_bytes_per_page_group)) *
                 static_cast<long double>(at);
         const long double capacity = static_cast<long double>(budgets[stage].available_bytes);
         return capacity > 0 ? static_cast<double>(used / capacity) : kInfinity;

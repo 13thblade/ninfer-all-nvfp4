@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -61,7 +62,7 @@ Score score(const std::vector<LayerCost>& layers, const std::vector<StageBudget>
     double worst              = 0.0;
     std::size_t layer         = 0;
     for (std::size_t stage = 0; stage < counts.size(); ++stage) {
-        std::uint64_t weights = 0, state = 0, kv = 0;
+        std::uint64_t weights = 0, state = 0, kv = budgets[stage].kv_bytes_per_page_group;
         for (std::uint32_t i = 0; i < counts[stage]; ++i, ++layer) {
             weights += layers[layer].weight_bytes;
             state += layers[layer].state_bytes;
@@ -155,6 +156,10 @@ void solver_matches_oracle() {
             budget.fixed_bytes     = next_random(rng) % 40;
             budget.available_bytes = 150 + next_random(rng) % 900;
         }
+        // Sometimes the first stage holds KV of its own, as MTP's layer does.
+        if (next_random(rng) % 3 == 0) {
+            budgets[0].kv_bytes_per_page_group = next_random(rng) % 4;
+        }
 
         // Oracle: best page-group count over every partition, then the least-full partition that
         // still holds it.
@@ -191,7 +196,8 @@ void solver_matches_oracle() {
                           << " st=" << l.state_bytes << '\n';
             }
             for (const StageBudget& b : budgets) {
-                std::cerr << "    avail=" << b.available_bytes << " fixed=" << b.fixed_bytes << '\n';
+                std::cerr << "    avail=" << b.available_bytes << " fixed=" << b.fixed_bytes
+                          << " kv=" << b.kv_bytes_per_page_group << '\n';
             }
         }
         check(solution.page_groups == best_groups, "the solver finds the largest feasible page-group count");
@@ -233,6 +239,20 @@ void solver_scenarios() {
         const auto solution         = ninfer::solve_stage_plan(layers, budgets);
         check(solution.plan.stage_layers(0) < solution.plan.stage_layers(1),
               "a fixed cost on the first stage moves layers off it");
+    }
+    // The first card also holds MTP's KV, as much per page group as two attention layers: it
+    // takes fewer layers than with the same bytes fixed, and the plan still holds every page.
+    {
+        const StageBudget budgets[] = {{16 * GiB, 0, 4ULL << 20}, {16 * GiB, 0}};
+        const auto solution         = ninfer::solve_stage_plan(layers, budgets);
+        check(solution.plan.stage_layers(0) < solution.plan.stage_layers(1),
+              "KV the first stage holds of its own moves layers off it");
+        std::vector<std::uint32_t> chosen{solution.plan.stage_layers(0),
+                                          solution.plan.stage_layers(1)};
+        const std::vector<StageBudget> as_vector(std::begin(budgets), std::end(budgets));
+        const Score s = score(layers, as_vector, chosen, solution.page_groups);
+        check(s.feasible && s.page_groups >= solution.page_groups,
+              "the split holds the first stage's own KV at its page-group count");
     }
     // A larger second card takes more.
     {

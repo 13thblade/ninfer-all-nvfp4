@@ -47,15 +47,18 @@ direction. Refused directions stage through pinned host memory and are reported 
 
 ## How it works
 
-- **`StagePlan`** (`core/stage_plan.h`) says which contiguous layers each stage owns. `--stage-layers
-  30,34` sets the counts. Without it `default_stage_layers` (`models/qwen3_5/load.cpp`) sizes each
-  layer from the artifact and calls `solve_stage_plan`, an exact memory-balancing solver (maximum
-  page groups every stage can hold, then least-full stage), verified against a brute-force
-  partition oracle. It works from the bytes free on each device, the stored KV page-group and
-  per-slot GDN state bytes of each layer (from the engine's KV storage format and slot count), and
-  rough constants for what a stage needs beyond weights (context, workspace, graphs; more on rank
-  0 for the head), so it is a good default rather than exact; if it finds nothing fits
-  it deals the layers evenly and lets the Program's planning report the device that runs out.
+- **`StagePlan`** (`core/stage_plan.h`) says which contiguous layers each stage owns.
+  `--stage-layers 30,34` sets the counts. Without it `default_stage_layers`
+  (`models/qwen3_5/load.cpp`) sizes each layer from the artifact and calls `solve_stage_plan`, an
+  exact memory-balancing solver (maximum page groups every stage can hold, then least-full stage),
+  verified against a brute-force partition oracle. It works from the bytes free on each device, the
+  stored KV page-group and per-slot GDN state bytes of each layer (from the engine's KV storage
+  format and slot count), and rough constants for what a stage needs beyond weights (context,
+  workspace, graphs; more on rank 0 for the head). The head stage also holds the embedding, the
+  head, and as selected MTP's layer with its KV per page group, the proposal head, a DFlash drafter
+  and a resident Vision tower; automatic KV capacity keeps its headroom free on every device. It is
+  a good default rather than exact; if it finds nothing fits it deals the layers evenly and lets the
+  Program's planning report the device that runs out.
 - **Placement.** `bind_text` places every layer's weights on its stage's device
   (`Bindings::place`, recorded for rank 0 as well so an object shared between a rank-0 layer and a
   later stage's layer is refused as a conflicting placement). The embedding, final norm and head stay
@@ -308,10 +311,13 @@ families](#expert-parallelism-of-the-other-moe-families)).
   measures each card's device-to-device copy bandwidth (`rank_copy_bandwidth`, 128 MiB; ranks on one
   card divide its figure) as its speed, works out how much of the divided weights, GDN state and KV
   cache for the configured context and concurrency each card can hold beside what every rank holds
-  and, on rank 0, the embedding and the head (`default_tensor_split`,
+  and, on rank 0, the embedding, the head and, as selected, MTP's layer with its KV, the proposal
+  head, a DFlash drafter and a resident Vision tower (`default_tensor_split`,
   `models/qwen3_5/load.cpp`), and fills the cards in proportion to speed, capping a card at its room
-  and passing the excess to the others (`fill_shares`). Decode reads every weight once per token, so
-  bandwidth sets each rank's time.
+  and passing the excess to the others (`fill_shares`). Automatic KV capacity also keeps its
+  headroom free on every card, and when the longest context fits nowhere it divides the cards by
+  room instead of speed, so the KV it shrinks to is the most that fits. Decode reads every weight
+  once per token, so bandwidth sets each rank's time.
 - **The pass** (`TextContext::run_tensor_parallel`). Rank 0 sends the residual and the control
   tensors to every rank over the stage links; each rank then keeps a replica of the residual. Each
   layer has two exchanges (`core/tensor_parallel.h`): after the mixer (attention: the ranks holding
