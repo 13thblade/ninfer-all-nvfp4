@@ -10,13 +10,26 @@ endif()
 
 # vcpkg (the Windows build) exposes FFmpeg and libcurl through CMake packages; Linux uses
 # pkg-config. Both paths produce the same two consumer targets. With vcpkg's CMake toolchain its
-# own FFmpeg find wrapper serves find_package; build_native.bat instead exports VCPKG_ROOT and
-# VCPKG_TARGET_TRIPLET for a prebuilt triplet tree, which cmake/FindFFMPEG.cmake reads (it also
-# names that tree FFMPEG_VCPKG_TREE, for staging its DLLs beside the executables).
-if(WIN32 AND NOT VCPKG_TOOLCHAIN AND DEFINED ENV{VCPKG_ROOT} AND
-   DEFINED ENV{VCPKG_TARGET_TRIPLET})
+# own FFmpeg find wrapper serves find_package. Without it a prebuilt triplet tree serves them:
+# NINFER_VCPKG_TREE, which scripts\build-native.bat passes, or else the classic tree that the
+# VCPKG_ROOT and VCPKG_TARGET_TRIPLET environment variables name. cmake/FindFFMPEG.cmake reads it
+# and names it FFMPEG_VCPKG_TREE, for staging its DLLs beside the executables.
+set(NINFER_VCPKG_TREE "" CACHE PATH
+    "Prebuilt vcpkg triplet tree, <installed directory>/<triplet>, for a Windows build without the vcpkg toolchain")
+if(WIN32 AND NOT VCPKG_TOOLCHAIN)
+  set(_ninfer_vcpkg_tree "${NINFER_VCPKG_TREE}")
+  if(NOT _ninfer_vcpkg_tree AND DEFINED ENV{VCPKG_ROOT} AND DEFINED ENV{VCPKG_TARGET_TRIPLET})
+    set(_ninfer_vcpkg_tree "$ENV{VCPKG_ROOT}/installed/$ENV{VCPKG_TARGET_TRIPLET}")
+  endif()
+  if(NOT _ninfer_vcpkg_tree)
+    message(FATAL_ERROR
+      "A Windows build takes FFmpeg and curl from vcpkg: configure with the vcpkg toolchain "
+      "(CMAKE_TOOLCHAIN_FILE), or name a prebuilt triplet tree in NINFER_VCPKG_TREE "
+      "(scripts\\build-native.bat passes one)")
+  endif()
+  file(TO_CMAKE_PATH "${_ninfer_vcpkg_tree}" _ninfer_vcpkg_tree)
   list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
-  list(APPEND CMAKE_PREFIX_PATH "$ENV{VCPKG_ROOT}/installed/$ENV{VCPKG_TARGET_TRIPLET}")
+  list(APPEND CMAKE_PREFIX_PATH "${_ninfer_vcpkg_tree}")
 endif()
 if(WIN32 OR DEFINED VCPKG_TARGET_TRIPLET)
   find_package(FFMPEG REQUIRED)

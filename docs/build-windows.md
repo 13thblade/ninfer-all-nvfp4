@@ -65,12 +65,18 @@ cmake --build build-windows --parallel
 ```
 
 `scripts\build-native.bat` builds against a prebuilt vcpkg triplet tree instead of the vcpkg
-toolchain, with Visual Studio 2026 and CUDA 13 by default, for `120a`:
-`scripts\build-native.bat configure`, then `build`, or `target ninfer-serve` for one target. It
-exports `VCPKG_ROOT` and `VCPKG_TARGET_TRIPLET`, from which `cmake\FindFFMPEG.cmake` finds FFmpeg,
-and stages the triplet's DLLs beside every executable; `NINFER_VCVARS`, `NINFER_GENERATOR`,
-`NINFER_CUDA_PATH`, `NINFER_VCPKG_ROOT`, `NINFER_VCPKG_TRIPLET`, `NINFER_CUDA_ARCH` and
-`NINFER_BUILD_DIR` override its defaults.
+toolchain, with Visual Studio 2026 and CUDA 13 by default, for `120a`. Run
+`vcpkg install --triplet x64-windows` in the checkout once: in manifest mode vcpkg installs the
+packages of `vcpkg.json` into `vcpkg_installed\x64-windows`, and the script takes that tree when it
+holds FFmpeg. The vcpkg that Visual Studio bundles has only this mode. Otherwise the script takes
+the classic tree of a standalone vcpkg, `%NINFER_VCPKG_ROOT%\installed\x64-windows` (`C:\vcpkg` by
+default). Then run `scripts\build-native.bat configure`, then `build`, or `target ninfer-serve` for
+one target. The script passes the tree to CMake as `NINFER_VCPKG_TREE`; `cmake\FindFFMPEG.cmake`
+finds FFmpeg there, and the build stages the triplet's DLLs beside every executable.
+`NINFER_VCVARS`, `NINFER_GENERATOR`, `NINFER_CUDA_PATH`, `NINFER_VCPKG_TREE`, `NINFER_VCPKG_ROOT`,
+`NINFER_VCPKG_TRIPLET`, `NINFER_CUDA_ARCH` and `NINFER_BUILD_DIR` override its defaults. A
+configure without the toolchain and without `NINFER_VCPKG_TREE` reads the classic tree that the
+`VCPKG_ROOT` and `VCPKG_TARGET_TRIPLET` environment variables name.
 
 A standalone `.cu` probe outside the build tree can be compiled with `nvcc` directly from
 PowerShell (Git Bash rewrites MSVC-style flags into paths). Keep probe builds out of the
