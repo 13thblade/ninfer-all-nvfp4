@@ -118,8 +118,11 @@ inline constexpr std::int32_t kCublasPrefillFloorTokens = 128;
  * weight problems and selects its kernel internally. A RowSplit Q4/Q5/Q6/Q8 problem no registry
  * names, and every one with an FP32 `out`, runs a runtime-shape route over the same templates (any
  * N, K a multiple of 128): a tensor-parallel rank's share of a projection, for instance. So does a
- * T2, FP8 or NVFP4 problem, in whole tiles of linear_share_units() and with A16 compute whatever
- * the policy. FP8 currently registers `[N,K]` in `{[14336,5120], [16384,5120],
+ * T2, FP8 or NVFP4 problem, in whole tiles of linear_share_units(): with A16 compute for T2 and for
+ * a registered problem's FP32 result whatever the policy; for an FP8 problem no registry names
+ * with A8 compute from T=17 where the policy permits it, and for such an NVFP4 problem with K of
+ * 512 or more with A4 compute from T=9 where AllowA4 permits it. FP8 currently registers `[N,K]`
+ * in `{[14336,5120], [16384,5120],
  * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4
  * problems register the five non-vocabulary FP8 geometries and accept every positive T. Q8 also
  * registers `[5120,25600]` at every positive T. BF16 registers `[14336,5120]`,
@@ -145,11 +148,11 @@ inline constexpr std::int32_t kCublasPrefillFloorTokens = 128;
  * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
  * choice. Every policy permits the existing A16 implementations of BF16 and Q4/Q5/Q6/Q8.
  * FP8 accepts all three policies; AllowA8 and AllowA4 permit the private resolver to select a
- * qualified A16 or A8 route for the registered problem and T. FP8 `[248320,5120]` retains A16
+ * qualified A16 or A8 route for the problem and T. FP8 `[248320,5120]` retains A16
  * compute under every policy at every positive T. NVFP4 uses A16 for A16Only and
  * AllowA8; AllowA4 permits the private resolver to select either a qualified A16 route or
  * activation quantization to NVFP4 at every positive T. The selected route depends only on the
- * registered problem and T.
+ * problem, T and whether `out` is FP32.
  *
  * @par Workspace
  * `workspace` is caller-owned call-scoped transient storage sized by
