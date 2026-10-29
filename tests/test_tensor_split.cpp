@@ -106,6 +106,17 @@ void fill_cases() {
     check(near(ninfer::fill_shares(std::vector<double>{1, 3}, std::vector<double>{0.2, 0.2}),
                {0.25, 0.75}),
           "no fit follows speed");
+    // Not enough room, but the work shrinks to fit (automatic KV): in proportion to the room, so
+    // both ranks outgrow theirs by the same factor. Without room on one rank, speed again.
+    check(near(ninfer::fill_shares(std::vector<double>{1, 1}, std::vector<double>{0.3, 0.6}, true),
+               {1.0 / 3.0, 2.0 / 3.0}),
+          "a shrinking fit follows room");
+    check(near(ninfer::fill_shares(std::vector<double>{1, 1}, std::vector<double>{0.4, 0.8}, true),
+               {0.4, 0.6}),
+          "a shrinking fit that fits caps as usual");
+    check(near(ninfer::fill_shares(std::vector<double>{1, 3}, std::vector<double>{0, 0.5}, true),
+               {0.25, 0.75}),
+          "a rank without room falls back to speed");
     check_throws([] { (void)ninfer::fill_shares(std::vector<double>{1}, std::vector<double>{}); },
                  "a capacity per rank");
     check_throws(
