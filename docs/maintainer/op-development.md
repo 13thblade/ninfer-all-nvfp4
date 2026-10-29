@@ -311,6 +311,17 @@ that reads no memory: a routed launch's work list, token map and expert rows are
 so such a kernel waits before it reads them. Attention over the KV cache
 stays an ordinary launch; it has no weights to stage and measured no faster as a dependent.
 
+#### TMA pipeline stages
+
+The consumer warps of a TMA-pipelined kernel return each stage to its producer through
+`cta_mbarrier_release_stage()` (`src/ops/common/mbarrier.cuh`) after their last read of it. The
+refill is an async-proxy write. A bare `mbarrier.arrive` does not order it after the warp's
+`ldmatrix` and `ld.shared` reads, and ptxas issues such an arrive while those reads are still
+pending, so the refill can overwrite bytes a lane has not read. The helper's proxy fence orders the
+reads first. Two tensor-parallel ranks on one RTX 5090 showed the race as wrong values in one warp's
+rows of an FP8 share; `ninfer_tma_shared_card_test` runs two ranks' FP8 and NVFP4 shares on two
+streams of one card and compares each output with the same call run alone.
+
 ## 5. State, workspace, naming, and dependencies
 
 ### 5.1 State and execution views
