@@ -315,17 +315,26 @@ families](#expert-parallelism-of-the-other-moe-families)).
 - **The pass** (`TextContext::run_tensor_parallel`). Rank 0 sends the residual and the control
   tensors to every rank over the stage links; each rank then keeps a replica of the residual. Each
   layer has two exchanges (`core/tensor_parallel.h`): after the mixer (attention: the ranks holding
-  KV heads, each over its own planes and block-table copy; GDN: every rank) and after the FFN. A contributor writes its output projection as FP32 partials;
-  every rank then adds all partials to its replica in rank order and rounds once to BF16, so the
-  replicas stay identical. Peer reads where every pair of cards has peer access, mapped pinned host
-  memory otherwise; both capture into the decode graphs. The startup log names the pairs without
-  peer access (`peer access: none between CUDA devices 0-1; ...`), or says every pair reads peer
-  memory. Without peer access, and with every rank
-  on its own card, a partial of up to 32 KiB (a decode step or a short verification) travels as
-  low-latency words: each rank's reduce kernel stores its FP32 values with the exchange's epoch as
-  8-byte words into its own mapped host row and polls the other ranks' rows, with no copy and no
-  cross-device fence (`TensorParallelExchange`). Each rank counts its exchanges in device memory,
-  so a graph replays them without new arguments; a wait longer than five minutes traps.
+  KV heads, each over its own planes and block-table copy; GDN: every rank) and after the FFN. A
+  contributor writes its output projection as FP32 partials; every rank then adds all partials to
+  its replica in rank order and rounds once to BF16, so the replicas stay identical. A partial of at
+  least 128 KiB (a prompt chunk, or a step of 7 or more columns of a 5,120-wide residual) where each
+  rank reads the others through host memory from its own card, or of at least 320 KiB (16 or more
+  columns) where the ranks read peer memory or share a card, is reduced as a reduce-scatter and an
+  all-gather: each rank sums the partials only over its own range of the values, whole 64-value
+  blocks, and then copies the other ranks' finished BF16 ranges into its replica. Every value is
+  still the same rank-order sum, and a rank reads 1/N of each other rank's partial and (N-1)/N of a
+  replica instead of N-1 whole partials. Peer reads where every pair of cards has peer access,
+  mapped pinned host memory otherwise; both capture into the decode graphs. Through host memory a
+  publish copies only the ranges the other ranks read, and an owner copies its finished range there.
+  The startup log names the pairs without peer access
+  (`peer access: none between CUDA devices 0-1; ...`), or says every pair reads peer memory. Without
+  peer access, and with every rank on its own card, a partial of up to 32 KiB (a decode step or a
+  short verification) travels as low-latency words: each rank's reduce kernel stores its FP32 values
+  with the exchange's epoch as 8-byte words into its own mapped host row and polls the other ranks'
+  rows, with no copy and no cross-device fence (`TensorParallelExchange`). Each rank counts its
+  exchanges in device memory, so a graph replays them without new arguments; a wait longer than five
+  minutes traps.
 - **One exchange per step.** Every step, a long prompt chunk included, exchanges each layer's
   partials once. Cutting a prompt chunk into pieces whose exchanges overlap the next piece's
   compute was measured slower and is not done: the dense Qwen3.8-27B GSQ-RCO IQ3_S prefilled a
@@ -454,6 +463,35 @@ repeats, not with one device's.
   V100s (its shares refused the panel layout), decodes on a third V100 pair at 26.0 tok/s against
   one card's 16.2 (+60%) and prefills the long prompt at 1,395 tok/s against 891 (+57%); its
   perplexity over the slice is 6.4481 against one card's 6.4471.
+- **Reduce-scatter** (2026-10-29, against master's whole reduces; RunPod 4x A40, PCIe 4.0 x16, the
+  fourth card on the second socket; the IOMMU translates the cards' DMA, so the preflight refuses
+  peer access and the host transport runs). `tools/tp_exchange_bench.cu`, in graphs at a 5,120-wide
+  residual: two ranks take 23.9 us per exchange at two columns against 29.7 for the reduce-scatter,
+  32.9 against 32.5 at four, 57.3 against 42.3 at eight and 6.65 against 4.90 ms at 2,048 (a 40 MiB
+  prompt chunk); four ranks 52.1 against 51.4 us at four columns, 89.1 against 66.0 at eight and
+  37.7 against 11.5 ms at 2,048. Stored FP32 sums give four ranks the same crossover (88.3 against
+  74.5 us at eight columns, 39.1 against 15.0 ms at 2,048), but two ranks storing FP32 sums were
+  never faster scattered (1.005 to 1.75 times a whole reduce), so they reduce whole. With both ranks
+  on one card, through peer reads, a whole reduce stays ahead up to 260 KiB (3.4 against 4.2 us in
+  two runs) and the two tie at 320 KiB (4.4-4.8 against 4.3-4.4 us); through host memory two runs
+  disagree at 260 and 320 KiB (58.1-88.6 against 61.3-81.9 us, 70.9-90.9 against 66.8-97.6 us), so
+  the crossover lies within their spread. Where the ranks read peer memory or share a card the
+  reduce-scatter starts at 320 KiB. No rented host here had peer access between cards, so that case
+  is not measured. The copy engines bring in the reduce-scatter's bytes about twice as fast as its
+  kernels read them from mapped memory (two ranks, 2,048 columns: 2.44 against 4.90 ms, the
+  publish's copies left out). Qwen3.8-27B (`download-model.sh qwen38-27b`, `--max-context 16384`;
+  greedy 256-token answers to two short prompts and one after a 9,715-token prompt, two rounds): the
+  long prompt prefills at 1,334 tok/s against 1,183 on two cards (+12.8%; TTFT 7.28 s against 8.21
+  s), at 1,031 against 434 on four (2.37x; 9.43 s against 22.38 s), and at 1,074 against 1,052 with
+  both ranks on one card (`--devices 0,0`, peer reads; +2.0%). Four cards answer the two short
+  prompts (37 and 39 tokens) after 96-104 ms against 121-131 ms. Decode stays master's within 0.5%
+  (two cards 49.4-51.1 tok/s against 49.4-51.4, four 63.7-66.5 against 63.9-66.6), except one
+  four-card round of a short prompt at 60.9 against 65.0-65.8. All 18 answers equal master's.
+  Perplexity over 40 KB of WikiText (9,234 tokens, 4,096-token windows, stride 2,048, int8 KV)
+  equals master's to the last digit: 6.22103 on two cards and on one card's two ranks, 6.22150 on
+  four; it scores 721 tok/s against 642 on two cards, 592 against 578 on one card and 533 against
+  300 on four. These runs used one 256 KiB threshold; the thresholds now in place change only
+  exchanges of 7 to 15 columns, which they do not make.
 
 ### Attention by positions
 
@@ -532,9 +570,11 @@ every layer over it (`Executor::run_tensor_segment`, `models/qwen4_exp/executor.
   shared expert too) into a 2^-32 fixed-point part (`moe_experts_gguf_part`), stores the part as an
   FP32 partial and exchanges again (`StoreFp32`), so every rank adds the same FP32 MoE output to its
   stack. That is two exchanges per layer, 96 per pass; partials of up to 32 KiB (decode and
-  verification) travel as low-latency words where each rank has its own card. Each rank embeds the
-  tokens from its replica of the table; a media prompt's merged embeddings are copied to every rank
-  once the tower has run.
+  verification) travel as low-latency words where each rank has its own card, and prompt chunks as a
+  reduce-scatter and an all-gather from Qwen3.5-core's thresholds, except the expert exchange of two
+  ranks: its FP32 ranges would cross the bus with as many bytes as the whole partials, so it reduces
+  whole. Each rank embeds the tokens from its replica of the table; a media prompt's merged
+  embeddings are copied to every rank once the tower has run.
 - **Graphs and branches.** A segment forks the other ranks' streams from rank 0's and joins them
   back, so the decode and verification graphs capture every rank's work; each segment makes an
   even number of exchanges and starts in slot 0. A snapshot, a sequence image and a branch pass
