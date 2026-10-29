@@ -318,7 +318,9 @@ families](#expert-parallelism-of-the-other-moe-families)).
   KV heads, each over its own planes and block-table copy; GDN: every rank) and after the FFN. A contributor writes its output projection as FP32 partials;
   every rank then adds all partials to its replica in rank order and rounds once to BF16, so the
   replicas stay identical. Peer reads where every pair of cards has peer access, mapped pinned host
-  memory otherwise; both capture into the decode graphs. Without peer access, and with every rank
+  memory otherwise; both capture into the decode graphs. The startup log names the pairs without
+  peer access (`peer access: none between CUDA devices 0-1; ...`), or says every pair reads peer
+  memory. Without peer access, and with every rank
   on its own card, a partial of up to 32 KiB (a decode step or a short verification) travels as
   low-latency words: each rank's reduce kernel stores its FP32 values with the exchange's epoch as
   8-byte words into its own mapped host row and polls the other ranks' rows, with no copy and no
@@ -330,10 +332,11 @@ families](#expert-parallelism-of-the-other-moe-families)).
   9,705-token prompt at 657 tok/s in four pieces against 807 in one on two Tesla V100s (host
   transport), and Qwen3.6-35B-A3B, whose pieces each read most expert weights, a 7,000-token one
   at 5,300 against 6,700 on two RTX 3090s.
-- **Numerics.** Against one device the only difference is the order of the FP32 additions of a
-  projection's output: the shares' partial sums are added, then rounded once, where one device
-  rounds the full sum. Logits are close, not identical, so greedy text can diverge where two tokens
-  tie closely.
+- **Numerics.** Against one device the order of the FP32 additions of a projection's output
+  differs: the shares' partial sums are added, then rounded once, where one device rounds the full
+  sum. On `120a` FP8 and NVFP4 shares also keep BF16 activations (A16, under Coverage) where one
+  device quantizes them for its W8A8 and W4A4 routes. Logits are close, not identical, so greedy
+  text can diverge where two tokens tie closely.
 - **Coverage.** Every weight format of a dense Qwen3.5-core model: GGUF, BF16, row-split
   Q4/Q5/Q6/Q8 and T2, FP8 and NVFP4, Hadamard-rotated or not; any split the stored blocks allow on
   two to eight ranks, cards of different models where the build runs on each; MTP, the masked

@@ -70,7 +70,7 @@ means the card calibrates once at its first start.
 | ⬜ | RTX 5080 | 16 GB | GeForce | ✓ | |
 | ✅ | RTX 5070 Ti | 16 GB | GeForce | ✓ | IQ3_S, Swift 1.5 IQ3_S ([field report](performance/field-reports.md#rtx-5070-ti-windows-11)) |
 | ⬜ | RTX 5070 | 12 GB | GeForce | ✓ | |
-| ⬜ | RTX 5060 Ti | 16 / 8 GB | GeForce | ✓ | |
+| ✅ | RTX 5060 Ti | 16 / 8 GB | GeForce | ✓ | Qwen3.8-27B NVFP4 with tensor parallelism over two and four cards ([field report](performance/field-reports.md#rtx-5060-ti-two-and-four-cards)) |
 | ⬜ | RTX 5060 | 8 GB | GeForce | | |
 | ⬜ | RTX 5050 | 8 GB | GeForce | | |
 | ✅ | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | Workstation | ✓ | Bonsai 2, Qwen3.8-27B, Flash-Next, DeepSeek-V4.1-Flash (experts in host memory, on disk; DSpark drafts) |
