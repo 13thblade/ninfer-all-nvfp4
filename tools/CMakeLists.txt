@@ -31,6 +31,22 @@ set_target_properties(ninfer-tp-probe PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
 
+# Times the engine's own tensor-parallel exchange (core/tensor_parallel.cu) over the ranks of a
+# device list: whole reduces against the reduce-scatter and all-gather, through peer reads and
+# host memory, beside a copy-engine reference. The exchange only includes core/device.h, so it is
+# compiled in with the device sources, as for ninfer-multi-gpu-probe, instead of linking the core.
+add_executable(ninfer-tp-exchange-bench
+  tp_exchange_bench.cu
+  ${CMAKE_SOURCE_DIR}/src/core/tensor_parallel.cu
+  ${CMAKE_SOURCE_DIR}/src/core/device.cu
+  ${CMAKE_SOURCE_DIR}/src/core/device_launch.cpp
+  ${CMAKE_SOURCE_DIR}/src/core/peer_preflight.cpp)
+target_include_directories(ninfer-tp-exchange-bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ninfer-tp-exchange-bench PRIVATE CUDA::toolkit)
+set_target_properties(ninfer-tp-exchange-bench PROPERTIES
+  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+
 # Measures what the dequantise-to-int8 prefill route would cost on the weight side: the group-scale
 # spread within a row, and the relative L2 of reconstructing a weight as int8 with one scale per
 # row. Reads the real artifact, because the answer depends on the actual scale distribution.
