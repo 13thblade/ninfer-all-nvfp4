@@ -53,6 +53,24 @@ namespace ninfer {
 // words another is still reading. A wait that outlasts kLowLatencyTimeoutNs traps the context.
 // Ranks that share a card keep the staged protocol, since two spinning kernels on one device need
 // not run together.
+//
+// Reduce-scatter and all-gather. An exchange of at least `scatter_bytes` per partial
+// (`near_scatter_bytes` where the ranks read peer memory or share a card; a prompt chunk or a long
+// verification) gives each rank one contiguous range of the values, whole 64-value blocks as even
+// as they divide. A rank's reduce sums only its own range of the contributors' partials, in rank
+// order as above, into its output and records that the range is done; its `complete` then copies
+// every other rank's finished range into its own output. Each value is still evaluated once, by the
+// same expression on the same operands, so every output is bit-identical to a whole reduce, while a
+// rank reads 1/N of each other rank's FP32 partial and (N-1)/N of an output instead of N-1 whole
+// partials. Two ranks storing an FP32 sum would read half a partial and half an output, as many
+// bytes as a whole partial, so they reduce whole. Under StagedHost a publish leaves the rank's own
+// range of its partial on the device, since no other rank reads it, and the owner copies its
+// finished range into that range of its host slot, where the others read it. A rank writes its
+// range of an output again in its reduce of a later exchange, which waits for every other rank's
+// publish of that exchange, which each rank issues after its own `complete` of this one: so no rank
+// overwrites a range another is still copying. The caller issues `complete` for every rank after
+// `reduce` for every rank, since a wait issued before its event's record would see an earlier
+// record.
 enum class TensorParallelTransport { Peer, StagedHost };
 
 // What a reduce does with the sum of the partials: adds it to a BF16 residual and rounds once (the
@@ -68,6 +86,14 @@ struct TensorParallelExchangeOptions {
     bool force_staged = false;
     // Largest partial exchanged as low-latency words; 0 turns them off.
     std::size_t low_latency_bytes = 32U << 10U;
+    // Smallest partial reduced as a reduce-scatter and an all-gather; 0 reduces every partial
+    // whole. `scatter_bytes` holds where each rank reads the others through host memory from its
+    // own card: for two and four ranks the two tie at 80 KiB and the reduce-scatter is faster from
+    // 160 KiB. `near_scatter_bytes` holds where the ranks read peer memory or share a card, where a
+    // whole reduce reads faster: through peer reads on one card it stays ahead up to 260 KiB and
+    // ties at 320 KiB (tools/tp_exchange_bench.cu).
+    std::size_t scatter_bytes      = 128U << 10U;
+    std::size_t near_scatter_bytes = 320U << 10U;
 };
 
 class TensorParallelExchange {
@@ -91,15 +117,31 @@ public:
         return bytes != 0 && bytes <= low_latency_bytes_;
     }
 
+    // Whether an exchange of `bytes` per partial whose reduce does `sum` runs as a reduce-scatter
+    // and an all-gather.
+    [[nodiscard]] bool scatter(std::size_t bytes,
+                               TensorParallelSum sum = TensorParallelSum::AddBf16) const noexcept {
+        return scatter_bytes_ != 0 && bytes >= scatter_bytes_ && !low_latency(bytes) &&
+               (sum != TensorParallelSum::StoreFp32 || ranks_.size() > 2);
+    }
+
     // Where `rank` writes its FP32 partial for an exchange in `slot`: device memory of that rank.
     [[nodiscard]] float* partial(std::size_t rank, std::size_t slot) const;
-    // Makes `rank`'s partial of `bytes` in `slot` readable by the other ranks.
-    void publish(std::size_t rank, std::size_t slot, std::size_t bytes, cudaStream_t stream);
+    // Makes `rank`'s partial of `bytes` in `slot` readable by the other ranks; `sum` is the
+    // exchange's reduce.
+    void publish(std::size_t rank, std::size_t slot, std::size_t bytes, cudaStream_t stream,
+                 TensorParallelSum sum = TensorParallelSum::AddBf16);
     // Adds the partials ranks [0, contributors) published in `slot` to `rank`'s BF16 residual of
-    // `count` values, or stores their sum there (`sum`).
+    // `count` values, or stores their sum there (`sum`); for a reduce-scatter, only in the rank's
+    // own range.
     void reduce(std::size_t rank, std::size_t slot, void* out, std::int64_t count,
                 std::size_t contributors, cudaStream_t stream,
                 TensorParallelSum sum = TensorParallelSum::AddBf16);
+    // Copies the other ranks' finished ranges of a reduce-scatter into `rank`'s output; nothing for
+    // a smaller exchange. Every rank's `complete` follows every rank's `reduce` of the exchange,
+    // with the same `out`, `count` and `sum`.
+    void complete(std::size_t rank, std::size_t slot, void* out, std::int64_t count,
+                  cudaStream_t stream, TensorParallelSum sum = TensorParallelSum::AddBf16);
     // A gather in place of the sum (a position-split attention's partials, merged by
     // ops::causal_attention_merge_partials): `publish_whole` makes `rank`'s partial of `bytes` in
     // `slot` readable by the others, never as low-latency words; `gather` points `parts[r]` at
@@ -117,6 +159,9 @@ private:
         std::array<float*, kSlots> device_slot{};
         std::array<float*, kSlots> host_slot{};
         std::array<cudaEvent_t, kSlots> published{};
+        // A reduce-scatter: the output the rank's reduce wrote its range into, and its record.
+        std::array<void*, kSlots> output{};
+        std::array<cudaEvent_t, kSlots> reduced{};
         // Low-latency words: the rank's mapped host row, [kSlots][low_latency_bytes / 4], and its
         // {exchanges counted, blocks finished} in device memory.
         unsigned long long* words = nullptr;
@@ -130,6 +175,7 @@ private:
     TensorParallelTransport transport_ = TensorParallelTransport::StagedHost;
     std::size_t slot_bytes_            = 0;
     std::size_t low_latency_bytes_     = 0; // 0 where the transport and topology exclude them
+    std::size_t scatter_bytes_         = 0;
 };
 
 // Each rank's speed for dividing work by: the device-to-device copy bandwidth of its card in bytes
@@ -143,11 +189,25 @@ private:
 
 namespace detail {
 
-// One rank's reduction: out[i] <- bf16(float(out[i]) + ((part[0][i] + part[1][i]) + ...)), or the
-// sum stored as BF16 or FP32 (`sum`).
+// One rank's reduction of values [begin, end): out[i] <- bf16(float(out[i]) + ((part[0][i] +
+// part[1][i]) + ...)), or the sum stored as BF16 or FP32 (`sum`).
 void tensor_parallel_reduce(void* out, const float* const* parts, std::size_t count,
-                            std::int64_t values, cudaStream_t stream,
+                            std::int64_t begin, std::int64_t end, cudaStream_t stream,
                             TensorParallelSum sum = TensorParallelSum::AddBf16);
+
+// Values [begin, end).
+struct TensorParallelRange {
+    std::int64_t begin = 0;
+    std::int64_t end   = 0;
+};
+
+// Rank `rank`'s range of a reduce-scatter of `values` over `ranks` ranks.
+[[nodiscard]] TensorParallelRange tensor_parallel_scatter_range(std::size_t rank, std::size_t ranks,
+                                                                std::int64_t values) noexcept;
+
+// Byte copies into `out`: `bytes[i]` from `sources[i]` to `out + offsets[i]`, for i < `count`.
+void tensor_parallel_gather(void* out, const void* const* sources, const std::int64_t* offsets,
+                            const std::int64_t* bytes, std::size_t count, cudaStream_t stream);
 
 // One rank's low-latency exchange (see TensorParallelExchange): stores `mine` (a contributor's
 // partial) as words of the next epoch into `row`, waits for the words of every other rank's row,

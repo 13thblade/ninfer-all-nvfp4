@@ -3166,13 +3166,18 @@ struct Executor::Impl {
                 on(r, [&](RankState& rank) {
                     const bool contributes = r < contributors;
                     if (contributes) { partial(r, rank, exchange.partial(r, slot)); }
-                    exchange.publish(r, slot, contributes ? bytes : 0, rank.stream);
+                    exchange.publish(r, slot, contributes ? bytes : 0, rank.stream, sum);
                 });
             }
             for (std::size_t r = 0; r < n; ++r) {
                 on(r, [&](RankState& rank) {
                     exchange.reduce(r, slot, rank.y, std::int64_t(h) * t, contributors,
                                     rank.stream, sum);
+                });
+            }
+            for (std::size_t r = 0; r < n; ++r) {
+                on(r, [&](RankState& rank) {
+                    exchange.complete(r, slot, rank.y, std::int64_t(h) * t, rank.stream, sum);
                 });
             }
         };

@@ -32,17 +32,94 @@ __device__ __forceinline__ void store_sum(void* out, std::int64_t i, float sum) 
     }
 }
 
-// The adds run in rank order.
+struct alignas(8) Bf16x4 {
+    __nv_bfloat16 v[4];
+};
+
+// Four consecutive values' sums, from a multiple of four, each rounded as store_sum rounds it.
+template <TensorParallelSum Sum>
+__device__ __forceinline__ void store_sum4(void* out, std::int64_t i, float4 sum) {
+    if constexpr (Sum == TensorParallelSum::AddBf16) {
+        auto* residual = reinterpret_cast<Bf16x4*>(static_cast<__nv_bfloat16*>(out) + i);
+        Bf16x4 word    = *residual;
+        word.v[0]      = __float2bfloat16(__bfloat162float(word.v[0]) + sum.x);
+        word.v[1]      = __float2bfloat16(__bfloat162float(word.v[1]) + sum.y);
+        word.v[2]      = __float2bfloat16(__bfloat162float(word.v[2]) + sum.z);
+        word.v[3]      = __float2bfloat16(__bfloat162float(word.v[3]) + sum.w);
+        *residual      = word;
+    } else if constexpr (Sum == TensorParallelSum::StoreBf16) {
+        const Bf16x4 word{{__float2bfloat16(sum.x), __float2bfloat16(sum.y),
+                           __float2bfloat16(sum.z), __float2bfloat16(sum.w)}};
+        *reinterpret_cast<Bf16x4*>(static_cast<__nv_bfloat16*>(out) + i) = word;
+    } else {
+        *reinterpret_cast<float4*>(static_cast<float*>(out) + i) = sum;
+    }
+}
+
+// Values [begin, end); the adds run in rank order. `vector` (begin a multiple of four and every
+// pointer aligned for it) reads each partial four values at a time, which crosses the bus in
+// fewer, larger requests; the arithmetic per value is the same.
 template <TensorParallelSum Sum>
 __global__ void tensor_parallel_reduce_kernel(void* __restrict__ out, PartialSet parts,
-                                              std::int64_t values) {
+                                              std::int64_t begin, std::int64_t end, bool vector) {
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
-    for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         i < values; i += stride) {
+    const std::int64_t thread = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::int64_t tail         = begin;
+    if (vector) {
+        const std::int64_t quads = (end - begin) / 4;
+        for (std::int64_t q = thread; q < quads; q += stride) {
+            const std::int64_t i = begin + 4 * q;
+            float4 sum           = *reinterpret_cast<const float4*>(parts.part[0] + i);
+            for (int r = 1; r < parts.count; ++r) {
+                const float4 part = *reinterpret_cast<const float4*>(parts.part[r] + i);
+                sum.x += part.x;
+                sum.y += part.y;
+                sum.z += part.z;
+                sum.w += part.w;
+            }
+            store_sum4<Sum>(out, i, sum);
+        }
+        tail = begin + 4 * quads;
+    }
+    for (std::int64_t i = tail + thread; i < end; i += stride) {
         float sum = parts.part[0][i];
         for (int r = 1; r < parts.count; ++r) { sum += parts.part[r][i]; }
         store_sum<Sum>(out, i, sum);
     }
+}
+
+struct GatherSet {
+    const unsigned char* source[kMaxRanks];
+    std::int64_t offset[kMaxRanks];
+    std::int64_t bytes[kMaxRanks];
+};
+
+// Row y of the grid copies `bytes[y]` from `source[y]` to `out + offset[y]`, 16 bytes at a time
+// where `vector` says every pointer and offset allows it.
+__global__ void tensor_parallel_gather_kernel(unsigned char* __restrict__ out, GatherSet set,
+                                              bool vector) {
+    const unsigned char* source = set.source[blockIdx.y];
+    unsigned char* destination  = out + set.offset[blockIdx.y];
+    const std::int64_t bytes    = set.bytes[blockIdx.y];
+    const std::int64_t stride   = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    const std::int64_t thread   = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::int64_t tail           = 0;
+    if (vector) {
+        const std::int64_t words = bytes / 16;
+        for (std::int64_t w = thread; w < words; w += stride) {
+            reinterpret_cast<uint4*>(destination)[w] = reinterpret_cast<const uint4*>(source)[w];
+        }
+        tail = words * 16;
+    }
+    for (std::int64_t b = tail + thread; b < bytes; b += stride) { destination[b] = source[b]; }
+}
+
+bool aligned(const void* pointer, std::size_t alignment) {
+    return reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0;
+}
+
+std::size_t output_bytes(TensorParallelSum sum) {
+    return sum == TensorParallelSum::StoreFp32 ? sizeof(float) : sizeof(__nv_bfloat16);
 }
 
 struct LowLatencyArgs {
@@ -128,32 +205,82 @@ __global__ void tensor_parallel_low_latency_kernel(LowLatencyArgs a) {
 namespace detail {
 
 void tensor_parallel_reduce(void* out, const float* const* parts, std::size_t count,
-                            std::int64_t values, cudaStream_t stream, TensorParallelSum sum) {
-    if (count == 0 || count > kMaxRanks || values < 0) {
-        throw std::invalid_argument("tensor_parallel_reduce: invalid rank or value count");
+                            std::int64_t begin, std::int64_t end, cudaStream_t stream,
+                            TensorParallelSum sum) {
+    if (count == 0 || count > kMaxRanks || begin < 0 || end < begin) {
+        throw std::invalid_argument("tensor_parallel_reduce: invalid rank or value range");
     }
-    if (values == 0) { return; }
+    if (end == begin) { return; }
     PartialSet set{};
-    for (std::size_t r = 0; r < count; ++r) { set.part[r] = parts[r]; }
-    set.count             = static_cast<int>(count);
-    constexpr int kBlock  = 256;
-    const std::int64_t blocks = std::min<std::int64_t>((values + kBlock - 1) / kBlock, 4096);
-    const auto grid = static_cast<unsigned>(blocks);
+    bool vector = begin % 4 == 0 && aligned(out, 4 * output_bytes(sum));
+    for (std::size_t r = 0; r < count; ++r) {
+        set.part[r] = parts[r];
+        vector      = vector && aligned(parts[r], sizeof(float4));
+    }
+    set.count                 = static_cast<int>(count);
+    constexpr int kBlock      = 256;
+    const std::int64_t items  = vector ? (end - begin + 3) / 4 : end - begin;
+    const std::int64_t blocks = std::min<std::int64_t>((items + kBlock - 1) / kBlock, 4096);
+    const auto grid           = static_cast<unsigned>(blocks);
     switch (sum) {
     case TensorParallelSum::AddBf16:
         tensor_parallel_reduce_kernel<TensorParallelSum::AddBf16>
-            <<<grid, kBlock, 0, stream>>>(out, set, values);
+            <<<grid, kBlock, 0, stream>>>(out, set, begin, end, vector);
         break;
     case TensorParallelSum::StoreBf16:
         tensor_parallel_reduce_kernel<TensorParallelSum::StoreBf16>
-            <<<grid, kBlock, 0, stream>>>(out, set, values);
+            <<<grid, kBlock, 0, stream>>>(out, set, begin, end, vector);
         break;
     case TensorParallelSum::StoreFp32:
         tensor_parallel_reduce_kernel<TensorParallelSum::StoreFp32>
-            <<<grid, kBlock, 0, stream>>>(out, set, values);
+            <<<grid, kBlock, 0, stream>>>(out, set, begin, end, vector);
         break;
     }
     check(cudaGetLastError(), "reduce launch");
+}
+
+TensorParallelRange tensor_parallel_scatter_range(std::size_t rank, std::size_t ranks,
+                                                  std::int64_t values) noexcept {
+    constexpr std::int64_t kBlock = 64;
+    const auto n                  = static_cast<std::int64_t>(ranks);
+    const auto r                  = static_cast<std::int64_t>(rank);
+    const std::int64_t blocks     = (values + kBlock - 1) / kBlock;
+    const std::int64_t per        = blocks / n;
+    const std::int64_t extra      = blocks % n;
+    const std::int64_t first      = r * per + std::min(r, extra);
+    const std::int64_t last       = first + per + (r < extra ? 1 : 0);
+    return {std::min(first * kBlock, values), std::min(last * kBlock, values)};
+}
+
+void tensor_parallel_gather(void* out, const void* const* sources, const std::int64_t* offsets,
+                            const std::int64_t* bytes, std::size_t count, cudaStream_t stream) {
+    if (count > kMaxRanks) {
+        throw std::invalid_argument("tensor_parallel_gather: too many ranges");
+    }
+    GatherSet set{};
+    std::size_t rows     = 0;
+    std::int64_t largest = 0;
+    bool vector          = aligned(out, 16);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (bytes[i] < 0 || offsets[i] < 0) {
+            throw std::invalid_argument("tensor_parallel_gather: invalid range");
+        }
+        if (bytes[i] == 0) { continue; }
+        set.source[rows] = static_cast<const unsigned char*>(sources[i]);
+        set.offset[rows] = offsets[i];
+        set.bytes[rows]  = bytes[i];
+        vector           = vector && aligned(sources[i], 16) && offsets[i] % 16 == 0;
+        largest          = std::max(largest, bytes[i]);
+        ++rows;
+    }
+    if (rows == 0) { return; }
+    constexpr int kBlock      = 256;
+    const std::int64_t items  = vector ? (largest + 15) / 16 : largest;
+    const std::int64_t blocks = std::min<std::int64_t>((items + kBlock - 1) / kBlock, 1024);
+    tensor_parallel_gather_kernel<<<
+        dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(rows)), kBlock, 0, stream>>>(
+        static_cast<unsigned char*>(out), set, vector);
+    check(cudaGetLastError(), "gather launch");
 }
 
 void tensor_parallel_low_latency(void* out, const float* mine,
@@ -300,15 +427,21 @@ TensorParallelExchange::TensorParallelExchange(const DeviceContext& context,
         }
     }
     transport_ = peer ? TensorParallelTransport::Peer : TensorParallelTransport::StagedHost;
-    if (transport_ == TensorParallelTransport::StagedHost && context.size() <= kMaxRanks) {
-        low_latency_bytes_ = std::min(options.low_latency_bytes, slot_bytes_) / sizeof(float) *
-                             sizeof(float);
-        for (std::size_t a = 0; a < context.size(); ++a) {
-            for (std::size_t b = a + 1; b < context.size(); ++b) {
-                if (context.same_physical_device(a, b)) { low_latency_bytes_ = 0; }
-            }
+
+    // Low-latency words and the smaller reduce-scatter threshold hold through host memory with
+    // every rank on its own card.
+    bool own_cards = true;
+    for (std::size_t a = 0; a < context.size(); ++a) {
+        for (std::size_t b = a + 1; b < context.size(); ++b) {
+            if (context.same_physical_device(a, b)) { own_cards = false; }
         }
     }
+    const bool host = transport_ == TensorParallelTransport::StagedHost && own_cards;
+    if (host && context.size() <= kMaxRanks) {
+        low_latency_bytes_ = std::min(options.low_latency_bytes, slot_bytes_) / sizeof(float) *
+                             sizeof(float);
+    }
+    scatter_bytes_ = host ? options.scatter_bytes : options.near_scatter_bytes;
     ranks_.resize(context.size());
     try {
         for (std::size_t r = 0; r < ranks_.size(); ++r) {
@@ -328,6 +461,8 @@ TensorParallelExchange::TensorParallelExchange(const DeviceContext& context,
                 // Events cannot be created while a stream captures, so all exist up front. A
                 // rank records its own events.
                 check(cudaEventCreateWithFlags(&rank.published[slot], cudaEventDisableTiming),
+                      "cudaEventCreate");
+                check(cudaEventCreateWithFlags(&rank.reduced[slot], cudaEventDisableTiming),
                       "cudaEventCreate");
             }
             if (low_latency_bytes_ != 0) {
@@ -363,9 +498,11 @@ void TensorParallelExchange::release() noexcept {
         DeviceBinding bind(rank.device);
         for (std::size_t slot = 0; slot < kSlots; ++slot) {
             if (rank.published[slot] != nullptr) { (void)cudaEventDestroy(rank.published[slot]); }
+            if (rank.reduced[slot] != nullptr) { (void)cudaEventDestroy(rank.reduced[slot]); }
             if (rank.device_slot[slot] != nullptr) { (void)cudaFree(rank.device_slot[slot]); }
             if (rank.host_slot[slot] != nullptr) { (void)cudaFreeHost(rank.host_slot[slot]); }
             rank.published[slot]   = nullptr;
+            rank.reduced[slot]     = nullptr;
             rank.device_slot[slot] = nullptr;
             rank.host_slot[slot]   = nullptr;
         }
@@ -391,15 +528,32 @@ float* TensorParallelExchange::partial(std::size_t rank, std::size_t slot) const
 }
 
 void TensorParallelExchange::publish(std::size_t rank, std::size_t slot, std::size_t bytes,
-                                     cudaStream_t stream) {
+                                     cudaStream_t stream, TensorParallelSum sum) {
     check_slot(rank, slot, bytes);
     Rank& self = ranks_[rank];
     DeviceBinding bind(self.device);
-    // Low-latency words leave the slot where it is: the reduce's kernel stores them itself.
+    // Low-latency words leave the slot where it is: the reduce's kernel stores them itself. A
+    // reduce-scatter's own range of the partial stays on the device, since no other rank reads it.
     if (transport_ == TensorParallelTransport::StagedHost && bytes != 0 && !low_latency(bytes)) {
-        check(cudaMemcpyAsync(self.host_slot[slot], self.device_slot[slot], bytes,
-                              cudaMemcpyDeviceToHost, stream),
-              "publish copy");
+        std::size_t own_begin = bytes;
+        std::size_t own_end   = bytes;
+        if (scatter(bytes, sum)) {
+            const auto range = detail::tensor_parallel_scatter_range(
+                rank, ranks_.size(), static_cast<std::int64_t>(bytes / sizeof(float)));
+            own_begin = static_cast<std::size_t>(range.begin) * sizeof(float);
+            own_end   = static_cast<std::size_t>(range.end) * sizeof(float);
+        }
+        auto* host         = reinterpret_cast<unsigned char*>(self.host_slot[slot]);
+        const auto* device = reinterpret_cast<const unsigned char*>(self.device_slot[slot]);
+        if (own_begin != 0) {
+            check(cudaMemcpyAsync(host, device, own_begin, cudaMemcpyDeviceToHost, stream),
+                  "publish copy");
+        }
+        if (own_end != bytes) {
+            check(cudaMemcpyAsync(host + own_end, device + own_end, bytes - own_end,
+                                  cudaMemcpyDeviceToHost, stream),
+                  "publish copy");
+        }
     }
     check(cudaEventRecord(self.published[slot], stream), "publish fence");
 }
@@ -462,7 +616,58 @@ void TensorParallelExchange::reduce(std::size_t rank, std::size_t slot, void* ou
         parts[r] = transport_ == TensorParallelTransport::Peer ? ranks_[r].device_slot[slot]
                                                               : ranks_[r].host_slot[slot];
     }
-    detail::tensor_parallel_reduce(out, parts.data(), contributors, count, stream, sum);
+    if (!scatter(static_cast<std::size_t>(count) * sizeof(float), sum)) {
+        detail::tensor_parallel_reduce(out, parts.data(), contributors, 0, count, stream, sum);
+        return;
+    }
+    const auto range = detail::tensor_parallel_scatter_range(rank, ranks_.size(), count);
+    detail::tensor_parallel_reduce(out, parts.data(), contributors, range.begin, range.end, stream,
+                                   sum);
+    Rank& self        = ranks_[rank];
+    self.output[slot] = out;
+    if (transport_ == TensorParallelTransport::StagedHost && range.end > range.begin) {
+        const std::size_t size = output_bytes(sum);
+        check(cudaMemcpyAsync(reinterpret_cast<unsigned char*>(self.host_slot[slot]) +
+                                  static_cast<std::size_t>(range.begin) * sizeof(float),
+                              static_cast<const unsigned char*>(out) +
+                                  static_cast<std::size_t>(range.begin) * size,
+                              static_cast<std::size_t>(range.end - range.begin) * size,
+                              cudaMemcpyDeviceToHost, stream),
+              "reduce copy");
+    }
+    check(cudaEventRecord(self.reduced[slot], stream), "reduce fence");
+}
+
+void TensorParallelExchange::complete(std::size_t rank, std::size_t slot, void* out,
+                                      std::int64_t count, cudaStream_t stream,
+                                      TensorParallelSum sum) {
+    check_slot(rank, slot, static_cast<std::size_t>(count) * sizeof(float));
+    if (!scatter(static_cast<std::size_t>(count) * sizeof(float), sum)) { return; }
+    DeviceBinding bind(ranks_[rank].device);
+    const std::size_t size = output_bytes(sum);
+    std::array<const void*, kMaxRanks> sources{};
+    std::array<std::int64_t, kMaxRanks> offsets{};
+    std::array<std::int64_t, kMaxRanks> bytes{};
+    std::size_t copies = 0;
+    for (std::size_t owner = 0; owner < ranks_.size(); ++owner) {
+        const auto range = detail::tensor_parallel_scatter_range(owner, ranks_.size(), count);
+        if (owner == rank || range.end == range.begin) { continue; }
+        const Rank& from = ranks_[owner];
+        if (from.output[slot] == nullptr) {
+            throw std::logic_error("tensor-parallel complete before every rank's reduce");
+        }
+        check(cudaStreamWaitEvent(stream, from.reduced[slot], 0), "complete wait");
+        sources[copies] = transport_ == TensorParallelTransport::Peer
+                              ? static_cast<const unsigned char*>(from.output[slot]) +
+                                    static_cast<std::size_t>(range.begin) * size
+                              : reinterpret_cast<const unsigned char*>(from.host_slot[slot]) +
+                                    static_cast<std::size_t>(range.begin) * sizeof(float);
+        offsets[copies] = range.begin * static_cast<std::int64_t>(size);
+        bytes[copies]   = (range.end - range.begin) * static_cast<std::int64_t>(size);
+        ++copies;
+    }
+    detail::tensor_parallel_gather(out, sources.data(), offsets.data(), bytes.data(), copies,
+                                   stream);
 }
 
 } // namespace ninfer

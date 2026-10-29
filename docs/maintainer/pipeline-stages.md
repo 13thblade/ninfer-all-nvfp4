@@ -315,17 +315,26 @@ families](#expert-parallelism-of-the-other-moe-families)).
 - **The pass** (`TextContext::run_tensor_parallel`). Rank 0 sends the residual and the control
   tensors to every rank over the stage links; each rank then keeps a replica of the residual. Each
   layer has two exchanges (`core/tensor_parallel.h`): after the mixer (attention: the ranks holding
-  KV heads, each over its own planes and block-table copy; GDN: every rank) and after the FFN. A contributor writes its output projection as FP32 partials;
-  every rank then adds all partials to its replica in rank order and rounds once to BF16, so the
-  replicas stay identical. Peer reads where every pair of cards has peer access, mapped pinned host
-  memory otherwise; both capture into the decode graphs. The startup log names the pairs without
-  peer access (`peer access: none between CUDA devices 0-1; ...`), or says every pair reads peer
-  memory. Without peer access, and with every rank
-  on its own card, a partial of up to 32 KiB (a decode step or a short verification) travels as
-  low-latency words: each rank's reduce kernel stores its FP32 values with the exchange's epoch as
-  8-byte words into its own mapped host row and polls the other ranks' rows, with no copy and no
-  cross-device fence (`TensorParallelExchange`). Each rank counts its exchanges in device memory,
-  so a graph replays them without new arguments; a wait longer than five minutes traps.
+  KV heads, each over its own planes and block-table copy; GDN: every rank) and after the FFN. A
+  contributor writes its output projection as FP32 partials; every rank then adds all partials to
+  its replica in rank order and rounds once to BF16, so the replicas stay identical. A partial of at
+  least 128 KiB (a prompt chunk, or a step of 7 or more columns of a 5,120-wide residual) where each
+  rank reads the others through host memory from its own card, or of at least 320 KiB (16 or more
+  columns) where the ranks read peer memory or share a card, is reduced as a reduce-scatter and an
+  all-gather: each rank sums the partials only over its own range of the values, whole 64-value
+  blocks, and then copies the other ranks' finished BF16 ranges into its replica. Every value is
+  still the same rank-order sum, and a rank reads 1/N of each other rank's partial and (N-1)/N of a
+  replica instead of N-1 whole partials. Peer reads where every pair of cards has peer access,
+  mapped pinned host memory otherwise; both capture into the decode graphs. Through host memory a
+  publish copies only the ranges the other ranks read, and an owner copies its finished range there.
+  The startup log names the pairs without peer access
+  (`peer access: none between CUDA devices 0-1; ...`), or says every pair reads peer memory. Without
+  peer access, and with every rank on its own card, a partial of up to 32 KiB (a decode step or a
+  short verification) travels as low-latency words: each rank's reduce kernel stores its FP32 values
+  with the exchange's epoch as 8-byte words into its own mapped host row and polls the other ranks'
+  rows, with no copy and no cross-device fence (`TensorParallelExchange`). Each rank counts its
+  exchanges in device memory, so a graph replays them without new arguments; a wait longer than five
+  minutes traps.
 - **One exchange per step.** Every step, a long prompt chunk included, exchanges each layer's
   partials once. Cutting a prompt chunk into pieces whose exchanges overlap the next piece's
   compute was measured slower and is not done: the dense Qwen3.8-27B GSQ-RCO IQ3_S prefilled a
@@ -532,9 +541,11 @@ every layer over it (`Executor::run_tensor_segment`, `models/qwen4_exp/executor.
   shared expert too) into a 2^-32 fixed-point part (`moe_experts_gguf_part`), stores the part as an
   FP32 partial and exchanges again (`StoreFp32`), so every rank adds the same FP32 MoE output to its
   stack. That is two exchanges per layer, 96 per pass; partials of up to 32 KiB (decode and
-  verification) travel as low-latency words where each rank has its own card. Each rank embeds the
-  tokens from its replica of the table; a media prompt's merged embeddings are copied to every rank
-  once the tower has run.
+  verification) travel as low-latency words where each rank has its own card, and prompt chunks as a
+  reduce-scatter and an all-gather from Qwen3.5-core's thresholds, except the expert exchange of two
+  ranks: its FP32 ranges would cross the bus with as many bytes as the whole partials, so it reduces
+  whole. Each rank embeds the tokens from its replica of the table; a media prompt's merged
+  embeddings are copied to every rank once the tower has run.
 - **Graphs and branches.** A segment forks the other ranks' streams from rank 0's and joins them
   back, so the decode and verification graphs capture every rank's work; each segment makes an
   even number of exchanges and starts in slot 0. A snapshot, a sequence image and a branch pass

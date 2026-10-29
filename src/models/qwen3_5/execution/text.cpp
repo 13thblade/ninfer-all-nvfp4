@@ -1770,6 +1770,11 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                                 values, contributors, ctx_.stream);
             });
         }
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            on_rank(rank, [&](Tensor& replica) {
+                exchange.complete(rank, exchange_slot, replica.data, values, ctx_.stream);
+            });
+        }
     };
 
     // The ranks holding KV heads, a prefix of the ranks, run attention; the rest wait for its sum.
