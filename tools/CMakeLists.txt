@@ -6,14 +6,16 @@
 # nvidia-smi lists it elsewhere, so the indices for --devices must be read from a CUDA-level
 # enumeration rather than assumed.
 #
-# device.cu and its launch helpers (device_launch.cpp) are compiled in directly rather than linked
-# from the core. They only include core/device.h and standard headers, so this costs two translation
-# units and keeps the probe around 1 MB instead of the ~500 MB a core link would produce -- which
-# matters because this binary gets uploaded to rented hardware to be run there.
+# device.cu, its launch helpers (device_launch.cpp) and the peer preflight device.cu calls
+# (peer_preflight.cpp) are compiled in directly rather than linked from the core. They only include
+# core/device.h, core/peer_preflight.h and standard headers, so this costs three translation units
+# and keeps the probe around 1 MB instead of the ~500 MB a core link would produce -- which matters
+# because this binary gets uploaded to rented hardware to be run there.
 add_executable(ninfer-multi-gpu-probe
   multi_gpu_probe.cu
   ${CMAKE_SOURCE_DIR}/src/core/device.cu
-  ${CMAKE_SOURCE_DIR}/src/core/device_launch.cpp)
+  ${CMAKE_SOURCE_DIR}/src/core/device_launch.cpp
+  ${CMAKE_SOURCE_DIR}/src/core/peer_preflight.cpp)
 target_include_directories(ninfer-multi-gpu-probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # The host compiler needs the toolkit headers for device_launch.cpp; nvcc links the static runtime.
 target_link_libraries(ninfer-multi-gpu-probe PRIVATE CUDA::toolkit)
