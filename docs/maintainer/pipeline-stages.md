@@ -463,6 +463,35 @@ repeats, not with one device's.
   V100s (its shares refused the panel layout), decodes on a third V100 pair at 26.0 tok/s against
   one card's 16.2 (+60%) and prefills the long prompt at 1,395 tok/s against 891 (+57%); its
   perplexity over the slice is 6.4481 against one card's 6.4471.
+- **Reduce-scatter** (2026-10-29, against master's whole reduces; RunPod 4x A40, PCIe 4.0 x16, the
+  fourth card on the second socket; the IOMMU translates the cards' DMA, so the preflight refuses
+  peer access and the host transport runs). `tools/tp_exchange_bench.cu`, in graphs at a 5,120-wide
+  residual: two ranks take 23.9 us per exchange at two columns against 29.7 for the reduce-scatter,
+  32.9 against 32.5 at four, 57.3 against 42.3 at eight and 6.65 against 4.90 ms at 2,048 (a 40 MiB
+  prompt chunk); four ranks 52.1 against 51.4 us at four columns, 89.1 against 66.0 at eight and
+  37.7 against 11.5 ms at 2,048. Stored FP32 sums give four ranks the same crossover (88.3 against
+  74.5 us at eight columns, 39.1 against 15.0 ms at 2,048), but two ranks storing FP32 sums were
+  never faster scattered (1.005 to 1.75 times a whole reduce), so they reduce whole. With both ranks
+  on one card, through peer reads, a whole reduce stays ahead up to 260 KiB (3.4 against 4.2 us in
+  two runs) and the two tie at 320 KiB (4.4-4.8 against 4.3-4.4 us); through host memory two runs
+  disagree at 260 and 320 KiB (58.1-88.6 against 61.3-81.9 us, 70.9-90.9 against 66.8-97.6 us), so
+  the crossover lies within their spread. Where the ranks read peer memory or share a card the
+  reduce-scatter starts at 320 KiB. No rented host here had peer access between cards, so that case
+  is not measured. The copy engines bring in the reduce-scatter's bytes about twice as fast as its
+  kernels read them from mapped memory (two ranks, 2,048 columns: 2.44 against 4.90 ms, the
+  publish's copies left out). Qwen3.8-27B (`download-model.sh qwen38-27b`, `--max-context 16384`;
+  greedy 256-token answers to two short prompts and one after a 9,715-token prompt, two rounds): the
+  long prompt prefills at 1,334 tok/s against 1,183 on two cards (+12.8%; TTFT 7.28 s against 8.21
+  s), at 1,031 against 434 on four (2.37x; 9.43 s against 22.38 s), and at 1,074 against 1,052 with
+  both ranks on one card (`--devices 0,0`, peer reads; +2.0%). Four cards answer the two short
+  prompts (37 and 39 tokens) after 96-104 ms against 121-131 ms. Decode stays master's within 0.5%
+  (two cards 49.4-51.1 tok/s against 49.4-51.4, four 63.7-66.5 against 63.9-66.6), except one
+  four-card round of a short prompt at 60.9 against 65.0-65.8. All 18 answers equal master's.
+  Perplexity over 40 KB of WikiText (9,234 tokens, 4,096-token windows, stride 2,048, int8 KV)
+  equals master's to the last digit: 6.22103 on two cards and on one card's two ranks, 6.22150 on
+  four; it scores 721 tok/s against 642 on two cards, 592 against 578 on one card and 533 against
+  300 on four. These runs used one 256 KiB threshold; the thresholds now in place change only
+  exchanges of 7 to 15 columns, which they do not make.
 
 ### Attention by positions
 
