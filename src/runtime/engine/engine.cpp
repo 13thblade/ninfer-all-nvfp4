@@ -105,6 +105,35 @@ EngineOptions with_family_speculation(EngineOptions options) {
     return options;
 }
 
+// One line naming the pairs of devices without peer access: their transfers, a tensor-parallel
+// exchange included, stage through pinned host memory instead of reading each other's memory.
+void report_peer_access(const EngineOptions& options, const DeviceContext& device) {
+    if (device.size() < 2) { return; }
+    std::vector<std::pair<int, int>> staged;
+    for (std::size_t from = 0; from < device.size(); ++from) {
+        for (std::size_t to = from + 1; to < device.size(); ++to) {
+            if (device.peer_access(from, to) && device.peer_access(to, from)) { continue; }
+            const std::pair<int, int> pair{device.rank(from).device, device.rank(to).device};
+            if (std::find(staged.begin(), staged.end(), pair) == staged.end()) {
+                staged.push_back(pair);
+            }
+        }
+    }
+    if (staged.empty()) {
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                    "peer access: every pair of devices reads peer memory");
+        return;
+    }
+    std::string pairs;
+    for (const auto& [a, b] : staged) {
+        pairs += (pairs.empty() ? "" : ", ") + std::to_string(a) + "-" + std::to_string(b);
+    }
+    runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                "peer access: none between CUDA devices %s; their transfers stage "
+                                "through host memory",
+                                pairs.c_str());
+}
+
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
     if (options.devices.empty()) {
@@ -117,6 +146,7 @@ DeviceContext initialize_device(const EngineOptions& options) {
         runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
                                     "peer access: %s", note.c_str());
     }
+    report_peer_access(options, device);
     phase.complete();
     return device;
 }

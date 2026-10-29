@@ -27,6 +27,7 @@ drafts with the tokens committed per verify round in brackets.
 | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | `120a` | 600 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [DeepSeek](deepseek-v41.md#measurements) |
 | RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements) |
 | RTX 5070 Ti | 16 GB | `120a` | 300 W | [field report](performance/field-reports.md#rtx-5070-ti-windows-11) |
+| RTX 5060 Ti, two and four | 16 GB each | `120a` | | [field report](performance/field-reports.md#rtx-5060-ti-two-and-four-cards) |
 | RTX 4090 | 24 GB | `89` | 450 W; 500 W boards for Flint | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [field reports](performance/field-reports.md) |
 | L40S | 48 GB | | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | RTX 3090 Ti, two | 24 GB each | `86` | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
@@ -559,8 +560,9 @@ and 64.3 with MTP 3 (64.2 after 32,768) and 53.4 and 53.1 with DFlash2 5; prompt
 1,024 tokens and 8.3 s at 8,192.
 
 Users' measurements are in the [field reports](performance/field-reports.md): an RTX 5070 Ti
-from 1.2K to 104K prompt tokens against llama.cpp, and RTX 4090s serving long Qwen Code and agent
-sessions with DFlash2 and MTP.
+from 1.2K to 104K prompt tokens against llama.cpp, RTX 4090s serving long Qwen Code and agent
+sessions with DFlash2 and MTP, and Qwen3.8-27B NVFP4 with tensor parallelism over two and four
+RTX 5060 Ti.
 
 ### Engine and CLI rates
 
@@ -970,7 +972,7 @@ cache each card holds, context lookup, startup and what limits each engine.
 | [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
 | [Gemma 4 26B-A4B](gemma4.md#measurements) | against llama.cpp, KV formats, the assistant's drafts, parallel streams | RTX 3090 |
 | [Flint](flint.md#measurements) | against llama.cpp, host and disk experts, context lookup, typed decisions | RTX 3090, 4090, 5090, A40 |
-| [Field reports](performance/field-reports.md) | users' own measurements: Qwen3.8-27B IQ3_S and its Swift 1.5 fine-tune against llama.cpp, long Qwen Code and agent sessions with DFlash2 and MTP, prefix-cache hits and the time to the first token | RTX 5070 Ti, 4090, 4080 |
+| [Field reports](performance/field-reports.md) | users' own measurements: Qwen3.8-27B IQ3_S and its Swift 1.5 fine-tune against llama.cpp, long Qwen Code and agent sessions with DFlash2 and MTP, prefix-cache hits and the time to the first token, Qwen3.8-27B NVFP4 with tensor parallelism over two and four cards | RTX 5070 Ti, 4090, 4080, 5060 Ti |
 | [Quality trades](maintainer/quality-trade-experiments.md) | what each precision option costs in perplexity and buys in memory or speed | RTX 3090 |
 | [Configuration calculator](config-calculator.html) | which context, KV format and speculation fit an RTX 3090, from measured sizes | RTX 3090 |
 
