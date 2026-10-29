@@ -18,6 +18,7 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
+#include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan_unified.h"
@@ -41,6 +42,10 @@ namespace {
 // --- Linear / projection A8 routes -------------------------------------------------------------
 
 void launch_fp8_a8_quantize(const Tensor&, const Weight&, Fp8A8Workspace, cudaStream_t) {
+    reject_fp8_a8();
+}
+
+void fp8_general_a8(const Tensor&, const Weight&, Tensor&, WorkspaceArena&, cudaStream_t) {
     reject_fp8_a8();
 }
 

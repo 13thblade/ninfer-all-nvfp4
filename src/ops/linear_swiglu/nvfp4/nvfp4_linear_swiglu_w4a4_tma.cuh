@@ -246,7 +246,7 @@ __global__ __launch_bounds__(
                 }
             }
         }
-        if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
+        cta_mbarrier_release_stage(&shared.empty[stage], lane);
     }
 
     asm volatile("bar.sync 1, %0;" : : "r"(Schedule::kConsumerThreads) : "memory");

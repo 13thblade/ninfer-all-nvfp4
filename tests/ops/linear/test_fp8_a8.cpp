@@ -6,6 +6,7 @@
 #include <array>
 #include <exception>
 #include <iostream>
+#include <vector>
 
 // The A8 workspace contracts describe the parts that run FP8 A8 (its TMA split-K partials are
 // sized there); an sm_8x build never admits A8 and does not carry those schedules.
@@ -230,6 +231,50 @@ int run_fp8_a8() {
     return failures;
 }
 
+// A tensor-parallel rank's shares of Qwen3.8-27B's FP8 projections on the runtime-shape route, A16
+// up to 16 tokens and A8 from 17: GDN input parts into BF16 at two and four ranks and over 64-row
+// units, output projections and the MLP into FP32 partials, whole 512-column K slabs. A
+// row-parallel share scales each token over its own K slice. Every row of two small matrices covers
+// both outputs and both row tilings. On an RTX 5090 the widths reach every tile the A8 route picks
+// by waves (common/wave_tiles.h) into either output; the small matrices' 4096 reaches 128 by 64
+// into FP32.
+int run_fp8_a8_shares() {
+    std::vector<Invocation> invocations;
+    for (int t : {1, 2, 4, 15, 16, 17, 32, 33, 63, 64, 65, 128, 129, 1024, 1025, 2048})
+        invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8});
+    for (int t : {1, 4, 16, 17, 65, 129})
+        invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8, true});
+    auto small_invocations = invocations;
+    small_invocations.push_back({4096, CallForm::Policy, ops::LinearPolicy::AllowA8});
+
+    struct Share {
+        std::int32_t n;
+        std::int32_t k;
+        std::uint32_t seed;
+        DType out;
+    };
+
+    int failures = 0;
+    for (const Share share :
+         {Share{3072, 5120, 871U, DType::BF16}, Share{512, 5120, 873U, DType::BF16},
+          Share{576, 5120, 875U, DType::BF16}, Share{5120, 3072, 877U, DType::FP32},
+          Share{5120, 1536, 879U, DType::FP32}, Share{8704, 5120, 881U, DType::FP32},
+          Share{5120, 8704, 883U, DType::FP32}, Share{5120, 4608, 885U, DType::FP32}}) {
+        failures += run_shape("FP8_A8 share", ActivationCompute::A8, make_fp8_weight,
+                              {share.n, share.k, share.seed, Comparison::SampledRows, true,
+                               invocations, ActivationSigns::Centered, share.out});
+        failures += verify_workspace_envelopes(QType::FP8_E4M3FN_ROW_BF16, share.n, share.k);
+    }
+    for (const std::int32_t rows : {384, 320}) {
+        for (const DType out : {DType::BF16, DType::FP32}) {
+            failures += run_shape("FP8_A8 share", ActivationCompute::A8, make_fp8_weight,
+                                  {rows, 1024, 887U, Comparison::Full, true, small_invocations,
+                                   ActivationSigns::Centered, out});
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -238,7 +283,7 @@ int main() {
         return 77;
     }
     try {
-        const int failures = run_fp8_a8();
+        const int failures = run_fp8_a8() + run_fp8_a8_shares();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A8 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

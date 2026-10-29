@@ -52,6 +52,11 @@ ninfer_add_op_test(ninfer_nvfp4_tma_staging_race_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_tma_staging_race.cpp"
   LIBRARIES ninfer_ops)
 
+# Two ranks' FP8 and NVFP4 shares on two streams of one card, each against the call alone.
+ninfer_add_op_test(ninfer_tma_shared_card_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tma_shared_card.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_linear_fp8_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_a16.cpp"
   LIBRARIES ninfer_linear_test_support)

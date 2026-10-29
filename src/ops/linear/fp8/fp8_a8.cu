@@ -71,6 +71,54 @@ __global__ __launch_bounds__(Threads,
     if (tid == 0) { scales[token] = scale; }
 }
 
+// A K the call carries: a tensor-parallel rank's share of an output projection's input. The same
+// formula as the kernel above, the row read twice instead of held in registers: its maximum
+// first, then its codes, the second read mostly from L1.
+template <int Threads = 256>
+__global__ __launch_bounds__(Threads, 2) void fp8_a8_quantize_runtime_kernel(
+    const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
+    float* __restrict__ scales, std::int32_t input_rows) {
+    constexpr int warps = Threads / 32;
+    __shared__ float warp_maxima[warps];
+    __shared__ float token_scale;
+
+    pdl::enter();
+    const int token         = static_cast<int>(blockIdx.x);
+    const int tid           = static_cast<int>(threadIdx.x);
+    const int lane          = tid & 31;
+    const int warp          = tid >> 5;
+    const int pairs         = input_rows / 2;
+    const auto* input_pairs = reinterpret_cast<const std::uint32_t*>(
+        input + static_cast<std::int64_t>(token) * input_rows);
+    auto* output_pairs =
+        reinterpret_cast<std::uint16_t*>(codes + static_cast<std::int64_t>(token) * input_rows);
+
+    float maximum = 0.0F;
+    for (int pair = tid; pair < pairs; pair += Threads) {
+        const float2 value = bf16x2_bits_to_float2(input_pairs[pair]);
+        maximum            = fmaxf(maximum, fabsf(value.x));
+        maximum            = fmaxf(maximum, fabsf(value.y));
+    }
+    maximum = warp_max(maximum);
+    if (lane == 0) { warp_maxima[warp] = maximum; }
+    __syncthreads();
+    if (warp == 0) {
+        maximum = lane < warps ? warp_maxima[lane] : 0.0F;
+        maximum = warp_max(maximum);
+        if (lane == 0) { token_scale = maximum > 0.0F ? maximum / 448.0F : 0.0F; }
+    }
+    __syncthreads();
+
+    const float scale   = token_scale;
+    const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+    for (int pair = tid; pair < pairs; pair += Threads) {
+        const float2 value  = bf16x2_bits_to_float2(input_pairs[pair]);
+        const float2 scaled = make_float2(value.x * inverse, value.y * inverse);
+        output_pairs[pair]  = __nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3);
+    }
+    if (tid == 0) { scales[token] = scale; }
+}
+
 template <class ActivationGeometry>
 void launch_quantize_exact(const Tensor& x, Fp8A8Workspace workspace, cudaStream_t stream) {
     constexpr int kThreads = 256;
@@ -98,8 +146,19 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
     case Fp8Activation17408Geometry::kInputRows:
         launch_quantize_exact<Fp8Activation17408Geometry>(x, workspace, stream);
         return;
-    default:
-        throw std::invalid_argument("fp8 A8 quantize: unsupported K");
+    default: {
+        // A tensor-parallel rank's share of an output projection's input, or a K no table
+        // registers.
+        if (weight.k <= 0 || weight.k % 32 != 0) {
+            throw std::invalid_argument("fp8 A8 quantize: K must be a positive multiple of 32");
+        }
+        constexpr int kThreads = 256;
+        CUDA_CHECK(pdl::launch_consumer({dim3(x.ne[1]), dim3(kThreads), 0, stream},
+                                        fp8_a8_quantize_runtime_kernel<kThreads>,
+                                        static_cast<const __nv_bfloat16*>(x.data), workspace.codes,
+                                        workspace.scales, weight.k));
+        return;
+    }
     }
 }
 

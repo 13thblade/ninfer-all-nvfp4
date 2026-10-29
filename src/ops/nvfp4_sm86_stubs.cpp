@@ -12,6 +12,7 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan_unified.h"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 #include "ops/linear/nvfp4/nvfp4_a4_tma_launch.h"
+#include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_a4_tma_launch.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan_unified.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4_tma_launch.h"
@@ -30,6 +31,10 @@ namespace {
 
 void launch_nvfp4_w4a4_quantize(const Tensor&, const Weight&, Nvfp4W4a4Workspace, Nvfp4ScaleLayout,
                                 cudaStream_t) {
+    reject_nvfp4_a4();
+}
+
+void nvfp4_general_a4(const Tensor&, const Weight&, Tensor&, WorkspaceArena&, cudaStream_t) {
     reject_nvfp4_a4();
 }
 
@@ -81,6 +86,10 @@ namespace unified {
 
 void launch_nvfp4_a4_quantize(const Tensor&, const Weight&, Nvfp4A4Workspace, Nvfp4ScaleLayout,
                               cudaStream_t, bool) {
+    reject_nvfp4_a4();
+}
+
+void launch_nvfp4_a4_tma_general(const Nvfp4A4Operands&, const Tensor&, cudaStream_t) {
     reject_nvfp4_a4();
 }
 

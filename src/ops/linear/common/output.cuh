@@ -35,7 +35,18 @@ struct LinearFp32Output {
     __device__ __forceinline__ void store(int row, int token, float value) const {
         data[static_cast<std::int64_t>(token) * rows + row] = value;
     }
+
+    // Rows `row` and `row + 1` of one token, an MMA accumulator pair; `row` and `rows` are even.
+    __device__ __forceinline__ void store_fp32_pair(int row, int token, float2 values) const {
+        store_vec(data + static_cast<std::int64_t>(token) * rows + row, values);
+    }
 };
+
+// An output that takes its values unrounded, two adjacent rows at a time. The low-precision MMA
+// epilogues store it straight from their accumulators instead of through a BF16 staging tile.
+template <class Output>
+inline constexpr bool kLinearFp32PairOutput =
+    requires(const Output& output, float2 values) { output.store_fp32_pair(0, 0, values); };
 
 struct LinearBf16StridedOutput {
     __nv_bfloat16* data;
