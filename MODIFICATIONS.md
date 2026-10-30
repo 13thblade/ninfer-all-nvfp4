@@ -12,8 +12,8 @@ the fork's git history remains the authoritative record.
 | --- | --- |
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
-| Base commit | `3d882fc116941d9233c40bf30f4d66dbaa3d24bd` (upstream master) |
-| Upstream sync | four merges: `f2675499` took `63428ac2`, `63b68fdc` took `b3402a6f`, `121f8283` took `a53a4f33`, `78a5bbc9` took `3d882fc1`. The fork was cut at `e1f2d961`; the commits between those bases are recorded by the merge commits themselves |
+| Base commit | `78fd39aaeca75b454748d5a1281278112e34d5ce` (upstream master) |
+| Upstream sync | five merges: `f2675499` took `63428ac2`, `63b68fdc` took `b3402a6f`, `121f8283` took `a53a4f33`, `78a5bbc9` took `3d882fc1`, `ec07d895` took `78fd39aa`. The fork was cut at `e1f2d961`; the commits between those bases are recorded by the merge commits themselves |
 | Fork repository | https://github.com/13thblade/ninfer-all-nvfp4 |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
 
@@ -38,6 +38,7 @@ the fork's git history remains the authoritative record.
 | `121f8283` | 2026-10-26 | Merge upstream master a53a4f33 into the fork |
 | `78a5bbc9` | 2026-10-26 | Merge upstream master 3d882fc1 into the fork |
 | `9b3614e7` | 2026-10-26 | docs(readme): point the throughput table at its source model cards |
+| `ec07d895` | 2026-10-30 | Merge upstream master 78fd39aa into the fork |
 
 `03b78d67` no longer shows in the file lists below: upstream `7cf5b2ae` fixed
 the same defect and the merge `121f8283` took upstream's side, so the fork keeps
@@ -97,8 +98,23 @@ and gates that line the same way as its siblings. One behaviour follows from
 that: a calibration run restricted with `--only gguf_*` no longer also measures
 the nvfp4 family, which the fork's line had previously done by oversight.
 
+The merge `ec07d895` conflicted on six files, all where the tensor-parallel work
+between `3d882fc1` and `78fd39aa` met the fork's route wiring. In
+`src/models/qwen3_5/execution/ffn.h` the fork's `InputNorm` stays and upstream's
+new `partial` parameter to `ffn_workspace_bytes` is taken alongside it; in
+`ffn.cpp` the fork's deferred-norm guards stay and are followed by upstream's
+`MoeShareParameters` branch, whose rotated-share case upstream now supports, so
+the fork's `rotated_dense` rejection is dropped rather than carried forward. In
+`parameters.cpp` the fork's two nvfp4 route calls on the MTP output projection
+stay and `out.ffn` takes upstream's renamed `ffn(w.layer.ffn)`. In
+`src/ops/linear/linear.cpp` the fork's exclusion of `AllowNvfp4Int8` from the
+sm_70 FP16 route stays, while upstream's FP32 partial-sum `Destination` is
+taken whole (the fork's `out.dtype == BF16` gate was dropped: it would have
+refused the FP32 shares the new work needs). `bench/ops/linear_bench.cu` keeps
+both usage lines, and `tests/ops/tests.cmake` keeps both new test registrations.
+
 The lists below are generated from `git diff --name-status upstream/master..HEAD`
-with `upstream/master` at `3d882fc1`. Files marked as modified are upstream
+with `upstream/master` at `78fd39aa`. Files marked as modified are upstream
 files changed by this fork; files marked as added are new in this fork.
 
 ## Modified files (106)
