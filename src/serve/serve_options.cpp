@@ -121,6 +121,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                in host memory or files)\n"
            "  --decode-rounds-per-prefill N decode rounds after each prefill chunk while\n"
            "                                others generate (0: chunk / 64; 1 alternates)\n"
+           "  --prefill-stall-budget-ms N   cut a prefill step to about N ms while others\n"
+           "                                generate (0: the whole chunk; Qwen3.5 family)\n"
            "  --default-max-tokens N        output limit of a request that sets none\n"
            "                                (default: the largest budget that still lets\n"
            "                                every lane be admitted at once, the remaining\n"
@@ -730,6 +732,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 require_value("--decode-rounds-per-prefill"), "decode-rounds-per-prefill"));
             if (options.decode_rounds_per_prefill > 4096) {
                 throw std::invalid_argument("--decode-rounds-per-prefill must be in [0,4096]");
+            }
+            continue;
+        }
+        if (arg == "--prefill-stall-budget-ms") {
+            options.prefill_stall_budget_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--prefill-stall-budget-ms"), "prefill-stall-budget-ms"));
+            if (options.prefill_stall_budget_ms > 60000) {
+                throw std::invalid_argument("--prefill-stall-budget-ms must be in [0,60000]");
             }
             continue;
         }

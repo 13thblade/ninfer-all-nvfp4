@@ -119,6 +119,10 @@ struct RuntimeStats {
     std::uint64_t cancelled_prefills                = 0;
     std::uint64_t cancelled_prefill_computed_tokens = 0;
     std::uint64_t cancelled_prefills_salvaged       = 0;
+    // Prefill steps EngineOptions::prefill_stall_budget_ms cut short, and the prompt tokens they
+    // left to later steps.
+    std::uint64_t paced_prefill_steps           = 0;
+    std::uint64_t paced_prefill_deferred_tokens = 0;
 
     std::uint64_t state_moves     = 0;
     std::uint64_t state_forks     = 0;

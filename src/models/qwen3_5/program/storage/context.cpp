@@ -954,7 +954,8 @@ ProgramImpl::shared_prefix_summary(const SharedPrefixState& shared) const {
 }
 
 PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence,
-                                             runtime::ExecutionTiming* failed_timing) {
+                                             runtime::ExecutionTiming* failed_timing,
+                                             std::uint32_t max_tokens) {
     if (pending_transaction_ || !valid_sequence(sequence)) {
         throw std::logic_error("prefill sequence capability is invalid");
     }
@@ -963,7 +964,7 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence,
         throw std::logic_error("prefill advance requires a prefilling sequence");
     }
     try {
-        runtime::PrefillStepResult step = advance_prefill_raw(lane, failed_timing);
+        runtime::PrefillStepResult step = advance_prefill_raw(lane, failed_timing, max_tokens);
         if (failed_timing != nullptr) { *failed_timing += step.timing; }
         return wrap_prefill(lane, std::move(step));
     } catch (...) {

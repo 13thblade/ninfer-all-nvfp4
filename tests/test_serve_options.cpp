@@ -55,6 +55,18 @@ int main() {
         try { (void)parse(full); } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "server accepted invalid draft confidence");
     }
+    // The prefill stall budget: off unless set, at most a minute.
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).prefill_stall_budget_ms == 0 &&
+                          parse({"ninfer-serve", "model.ninfer", "--prefill-stall-budget-ms", "250"})
+                                  .prefill_stall_budget_ms == 250,
+                      "--prefill-stall-budget-ms is off by default and keeps its value");
+    for (const char* value : {"60001", "-1", "x"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--prefill-stall-budget-ms", value});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an invalid --prefill-stall-budget-ms was accepted");
+    }
     // DSpark's confidence floor: the drafter's default unless set, 0..1, DSpark only.
     failures += check(!parse({"ninfer-serve", "model.ninfer"}).speculative.draft_confidence,
                       "DSpark's floor must default");
@@ -1278,6 +1290,7 @@ int main() {
                                         "--post-thinking-top-k",
                                         "--post-thinking-top-p",
                                         "--prefill-chunk",
+                                        "--prefill-stall-budget-ms",
                                         "--prefill-cublas",
                                         "--prefix-cache-file",
                                         "--presence-penalty",

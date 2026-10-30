@@ -228,6 +228,12 @@ std::string ServeMetrics::render(const LoadCapacity& capacity, const LoadSample&
     append(out, "ninfer:cancelled_prefills_salvaged_total", "counter",
            "Cancelled prefills the context cache kept, so a retry resumes where they stopped.",
            static_cast<double>(stats.cancelled_prefills_salvaged));
+    append(out, "ninfer:paced_prefill_steps_total", "counter",
+           "Prefill steps cut short by --prefill-stall-budget-ms while another stream generated.",
+           static_cast<double>(stats.paced_prefill_steps));
+    append(out, "ninfer:paced_prefill_deferred_tokens_total", "counter",
+           "Prompt tokens those steps left to later steps.",
+           static_cast<double>(stats.paced_prefill_deferred_tokens));
     append_context_cache(out, stats);
     return out;
 }

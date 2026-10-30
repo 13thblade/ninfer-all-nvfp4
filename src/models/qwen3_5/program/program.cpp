@@ -452,9 +452,10 @@ StructuredReadiness Program::structured_readiness(SequenceHandle sequence) {
 bool Program::wait_context_transfer() noexcept { return impl_->wait_context_transfer(); }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,
-                                         runtime::ExecutionTiming* failed_timing) {
+                                         runtime::ExecutionTiming* failed_timing,
+                                         std::uint32_t max_tokens) {
     if (impl_->experts) { impl_->experts->check(); }
-    auto result = impl_->advance_prefill(sequence, failed_timing);
+    auto result = impl_->advance_prefill(sequence, failed_timing, max_tokens);
     if (impl_->experts) { impl_->experts->check(); }
     return result;
 }

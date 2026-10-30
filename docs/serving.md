@@ -811,6 +811,8 @@ they advance during a long request rather than at its completion, and their rati
 | `ninfer:cancelled_prefills_total` | counter | requests cancelled while their prompt prefilled |
 | `ninfer:cancelled_prefill_computed_tokens_total` | counter | prompt tokens those requests had computed |
 | `ninfer:cancelled_prefills_salvaged_total` | counter | cancelled prefills the context cache kept, at the point they reached or at their deepest anchor, so the retry resumes there |
+| `ninfer:paced_prefill_steps_total` | counter | prefill steps `--prefill-stall-budget-ms` cut short while another stream generated |
+| `ninfer:paced_prefill_deferred_tokens_total` | counter | prompt tokens those steps left to later steps |
 | `ninfer:context_selections_total{source}` | counter | admissions by the context-cache source they started from: `root` (a miss, prefilled from token zero), `private_endpoint`, `private_turn_closure`, `private_response_replay`, `private_long_anchor`, `shared_stable_prefix`; the hit rate is 1 - root / all |
 | `ninfer:context_pressure_events_total{event}` | counter | what pressure planning did to inactive owners: `private_owner_evicted`, `private_owner_degraded`, `shared_owner_evicted`, `shared_owner_degraded`, `checkpoint_dropped` |
 | `ninfer:context_pressure_searches_total{result}` | counter | pressure planning searches: `started`, `budget_exhausted`, `maximal_fallback` |
@@ -2178,6 +2180,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--recover-invariant-failures` | a broken internal invariant in the Engine worker fails the active and materializing requests and leaves the waiting ones queued, as recovery from out of memory does, instead of failing the Engine; eight consecutive recoveries without a completed unit still fail it | off |
 | `--prefill-chunk N` | text-prefill chunk | `1024`; `4096` for native MoE experts in host memory or files |
 | `--decode-rounds-per-prefill N` | Decode rounds that run before each prefill chunk while other requests generate, so a long prompt does not leave them one token per chunk; proportionally fewer, at least one, before a shorter prefill unit, so a short prompt gets in after one round; `1` alternates strictly, a larger value keeps streams responsive and makes the prompt finish later | `0` (`--prefill-chunk` / 64) |
+| `--prefill-stall-budget-ms N` | While other requests generate, cut each prefill step to the largest multiple of 128 tokens, at least 512, that the prefill cost model predicts to take at most N ms; the model's costs are scaled by the ratio of observed to predicted step times. Every token of the other streams then waits about N ms instead of a whole chunk, and the new prompt prefills slower; a lone prompt keeps the whole chunk. Qwen3.5-family models only | `0` (off) |
 | `--fast-prefill-kernel` | prefill an `int8` or `rk*` KV cache with the fast prompt-attention kernel (FP16 PV accumulation per 64-key tile) and round `--prefill-chunk` down to whole attention waves; on Blackwell, prefill an `nvfp4` KV cache past 2048 visible keys with its fast kernel (QK on block-scaled FP4 Tensor Cores); a small perplexity cost (see [perplexity](perplexity.md)). Without the flag the [device profile](device-profiles.md)'s `attn_prompt_fast` decides, and the built-in profiles turn the kernel on where it measured faster | the device profile |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-colours on\|off` | `on` colours the console log's levels and gives every statistic of the operational lines a stable colour; `off` keeps the log plain; a redirected stderr is always plain | levels coloured on a console |
@@ -2702,6 +2705,17 @@ ingesting a 4,900-token prompt behind four active streams, the largest inter-tok
 the ingesting request's own prefill rate fell only from 1,135 to 1,130 to 1,110 tok/s. Prefill is
 not batched across requests at any chunk size, so a smaller chunk trades almost no ingestion
 throughput for a proportionally smaller stall. The shipped concurrent launcher uses 512.
+
+A large chunk pays off where a prefill step reads the weights once for all its tokens, as the cuBLAS
+prefill route does (`--prefill-cublas`). `--prefill-stall-budget-ms` keeps that chunk for a prompt
+that prefills alone and cuts a step only while other requests generate: to the largest multiple of
+128 tokens, at least 512, that the prefill cost model, scaled by the observed to predicted step
+times, expects to fit the budget. A deeper prefix costs more attention per token and is cut harder.
+`ninfer:paced_prefill_steps_total` counts the steps it cut and
+`ninfer:paced_prefill_deferred_tokens_total` the prompt tokens they left to later steps. On an RTX
+3090 with Qwen3.8-27B (DFlash2, chunk 2048, cuBLAS prefill), a 15.6K-token prompt arriving next to
+a generating stream paused that stream for up to 0.83 s per step without a budget, 0.35-0.36 s at
+250 ms and 0.59-0.62 s at 500 ms; the new prompt's first token came 11% and 2% later.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting

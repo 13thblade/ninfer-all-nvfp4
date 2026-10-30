@@ -8,6 +8,7 @@
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/device_profile.h"
 #include "runtime/engine/diagnostics.h"
+#include "runtime/engine/prefill_pacing.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "core/paged_kv_cache.h"
@@ -104,6 +105,9 @@ void validate_options(const EngineOptions& options) {
     }
     if (options.decode_rounds_per_prefill > kMaximumDecodeRoundsPerPrefill) {
         throw std::invalid_argument("Engine decode_rounds_per_prefill must be in [0,4096]");
+    }
+    if (options.prefill_stall_budget_ms > runtime::kMaximumPrefillStallBudgetMs) {
+        throw std::invalid_argument("Engine prefill_stall_budget_ms must be in [0,60000]");
     }
     if (options.enable_vision && options.media_live_bytes == 0) {
         throw std::invalid_argument(
