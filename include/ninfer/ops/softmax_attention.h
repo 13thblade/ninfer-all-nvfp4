@@ -274,6 +274,20 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                                             std::int32_t width);
 
 /**
+ * Load the CUDA modules of the small-T kernels that causal_softmax_attention (or, with
+ * `cached_input`, causal_softmax_attention_cached) can launch for calls of at most `max_width`
+ * query rows over this geometry and cache storage. CUDA loads a module lazily, at the first launch
+ * of one of its kernels, and an INT8-family cache keeps one module per small-T width and input, so
+ * without this a request pays a module's parse (tens of milliseconds, seconds when the device is
+ * short of memory) whenever it first reaches a width. The call launches nothing and loads no kernel
+ * code into the context; a storage outside the INT8 family has nothing to load. max_width must be
+ * positive.
+ */
+void causal_softmax_attention_load_modules(AttentionHeadGeometry geometry,
+                                           KvCacheStorage cache_storage, bool cached_input,
+                                           std::int32_t max_width);
+
+/**
  * Return the prompt-route width granule of one registered head geometry on the current device.
  * A single-sequence call whose width is a multiple of the granule launches whole waves of prompt
  * CTAs, so a caller that splits a long prompt into such calls leaves no SM idle behind a partial
