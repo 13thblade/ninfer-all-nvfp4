@@ -2,7 +2,8 @@
 
 Every text projection, the token table, the output head and the MTP head of an ``-mtp`` build are
 stored as the exporter's own blocks, one ggml type per tensor, so no weight is re-quantised: a row
-of the artifact is byte for byte a row of the GGUF. llama.cpp's Qwen3.5 exporter conventions are
+of the artifact is byte for byte a row of the GGUF. An untied BF16 output head, which some
+community builds keep, stays BF16, its words exact. llama.cpp's Qwen3.5 exporter conventions are
 undone where they touch rows or small tensors: value heads return to the grouped order,
 zero-centred norms drop their stored ``1 + w`` and ``ssm_a`` becomes ``A_log`` again.
 
@@ -32,7 +33,7 @@ from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
 from .methods import cast_direct, grouped_absmax, import_encoded
 from .official_recipes import Q4, Q5, Q6, Q8
-from .sources.gguf import GGUFFile
+from .sources.gguf import TYPE_BF16, GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
 from .ternary import (
     ATTENTION_HEAD_DIM,
@@ -63,6 +64,8 @@ from .ternary import (
 MTP_BLOCK = LAYERS
 # The storage the GDN controls may have (gdn_control_source).
 GDN_CONTROL_TYPES = ("BF16", "Q8_0")
+# The storage the output head may have: stored blocks, or BF16 words (bf16_source).
+HEAD_TYPES = ("blocks", "BF16")
 
 EXPECTED_HEADER = {
     "general.architecture": "qwen35",
@@ -103,12 +106,12 @@ def _layer_tensors(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
 
 
 def expected_tensors(mtp: bool) -> dict[str, tuple[tuple[int, ...], str | tuple[str, ...]]]:
-    """Row-major shape and kind of every tensor: "blocks" (any stored ggml block type) or the
+    """Row-major shape and kinds of every tensor: "blocks" (any stored ggml block type) and the
     ggml type names it may have."""
 
     out = {
         "token_embd.weight": ((VOCABULARY, HIDDEN), "blocks"),
-        "output.weight": ((VOCABULARY, HIDDEN), "blocks"),
+        "output.weight": ((VOCABULARY, HIDDEN), HEAD_TYPES),
         "output_norm.weight": ((HIDDEN,), "F32"),
     }
     for layer in range(LAYERS):
@@ -165,10 +168,10 @@ def validate(gguf: GGUFFile) -> None:
         )
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
-        if kind == "blocks":
-            accepted = info.type_id in GGUF_FORMATS_BY_TYPE
-        else:
-            accepted = info.type_name in ((kind,) if isinstance(kind, str) else kind)
+        kinds = (kind,) if isinstance(kind, str) else kind
+        accepted = info.type_name in kinds or (
+            "blocks" in kinds and info.type_id in GGUF_FORMATS_BY_TYPE
+        )
         if info.shape != shape or not accepted:
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
     end = max(info.offset + info.nbytes for info in gguf.tensors.values())
@@ -292,6 +295,25 @@ def block_source(
     return LogicalSource(
         shape, f"{tensor}[{format}]{list(shape)}", _flat(values, shape[1]), encoded
     )
+
+
+def bf16_source(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource:
+    """A stored BF16 matrix as its exact words, read a run of rows at a time from the mapped file."""
+
+    def values(first: int, last: int) -> torch.Tensor:
+        words = np.array(gguf.read_bf16_words(tensor)[first:last], copy=True)
+        return torch.from_numpy(words.view(np.int16)).view(torch.bfloat16)
+
+    return LogicalSource(shape, f"{tensor}[BF16]{list(shape)}", _flat(values, shape[1]))
+
+
+def head_source(gguf: GGUFFile) -> tuple[LogicalSource, bool]:
+    """The output head: stored blocks as encoded rows (True), or BF16 words as values (False)."""
+
+    shape = gguf.info("output.weight").shape
+    if gguf.info("output.weight").type_id == TYPE_BF16:
+        return bf16_source(gguf, "output.weight", shape), False
+    return block_source(gguf, "output.weight", shape, rows()), True
 
 
 def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
@@ -432,15 +454,17 @@ def _layer(
 def text_sources(
     gguf: GGUFFile, *, mtp: bool
 ) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
-    """Encoded block sources and direct sources of every GGUF-backed text (and MTP) parameter."""
+    """Encoded block sources and direct sources of every GGUF-backed text (and MTP) parameter; a
+    BF16 output head is a direct source."""
 
     encoded = {
         "text/token_embedding": block_source(
             gguf, "token_embd.weight", (VOCABULARY, HIDDEN), rows()
         ),
-        "text/output_head": block_source(gguf, "output.weight", (VOCABULARY, HIDDEN), rows()),
     }
     direct = {"text/final_norm": _norm(gguf, "output_norm.weight", True)}
+    head, stored_blocks = head_source(gguf)
+    (encoded if stored_blocks else direct)["text/output_head"] = head
     for layer in range(LAYERS):
         g, p = f"blk.{layer}.", f"text/layers/{layer}/"
         e, d = _layer(gguf, g, p)
@@ -636,10 +660,12 @@ __all__ = [
     "EXPECTED_HEADER",
     "RECIPES",
     "block_format",
+    "bf16_source",
     "block_source",
     "expected_tensors",
     "gdn_control_source",
     "has_mtp",
+    "head_source",
     "qwen3_8_27b_gguf",
     "q2_native_source",
     "q8_native_source",

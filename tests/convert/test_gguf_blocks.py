@@ -290,3 +290,81 @@ def test_ssm_out_values_and_imatrix_importance_name_the_same_grouped_column(tmp_
     importance = imatrix.from_gguf(tmp_path / "imatrix.gguf", config)[OUTPUT].numpy()
     assert not np.array_equal(column, stored)
     assert np.array_equal(importance.astype(np.int64), column)
+
+
+def _header(head_type: int):
+    """A dense Qwen3.8-27B GGUF's header and tensor table, stored blocks as Q8_0; no data."""
+
+    from types import SimpleNamespace
+
+    from tools.convert.sources.gguf import TYPE_IDS, TensorInfo
+
+    tensors, offset = {}, 0
+    for name, (shape, kind) in gguf_blocks.expected_tensors(False).items():
+        kinds = (kind,) if isinstance(kind, str) else kind
+        type_id = (head_type if name == "output.weight"
+                   else TYPE_Q8_0 if "blocks" in kinds else TYPE_IDS[kinds[0]])
+        tensors[name] = TensorInfo(name, shape, type_id, offset)
+        offset += tensors[name].nbytes
+    kv = gguf_blocks.EXPECTED_HEADER | {"qwen35.block_count": gguf_blocks.LAYERS}
+    return SimpleNamespace(path="header.gguf", kv=kv, tensors=tensors, data_bytes_available=offset)
+
+
+def test_the_output_head_may_be_stored_blocks_or_bf16_words():
+    from tools.convert.sources.gguf import TYPE_BF16, TYPE_F16, TYPE_F32
+
+    gguf_blocks.validate(_header(TYPE_Q8_0))
+    gguf_blocks.validate(_header(TYPE_BF16))
+    for refused in (TYPE_F16, TYPE_F32):
+        with pytest.raises(ValueError, match="output.weight is"):
+            gguf_blocks.validate(_header(refused))
+    table = _header(TYPE_BF16)
+    info = table.tensors["token_embd.weight"]
+    table.tensors["token_embd.weight"] = type(info)(info.name, info.shape, TYPE_BF16, info.offset)
+    with pytest.raises(ValueError, match="token_embd.weight is BF16"):
+        gguf_blocks.validate(table)
+
+
+def test_a_bf16_output_head_keeps_its_exact_words(tmp_path):
+    from tools.artifact.reader import Artifact
+    from tools.convert.methods import cast_direct
+    from tools.convert.model import Model, Parameter
+    from tools.convert.pipeline import convert
+    from tools.convert.recipe import Recipe
+    from tools.convert.sources.gguf import TYPE_BF16
+
+    rows, columns = 6, 64
+    words = np.random.default_rng(12).integers(0, 1 << 16, size=(rows, columns), dtype=np.uint16)
+    words[0, :3] = (0x7F80, 0xFFC1, 0x8000)  # inf, a NaN payload and -0 pass unchanged
+    path = tmp_path / "head.gguf"
+    write_gguf(path, {"general.architecture": "qwen35"},
+               [("output.weight", (rows, columns), TYPE_BF16, words.tobytes())])
+    inputs = ("text/final_hidden", "mtp/final_hidden")
+    with GGUFFile(path) as gguf:
+        source, stored_blocks = gguf_blocks.head_source(gguf)
+        assert not stored_blocks and source.read_encoded is None
+        assert np.array_equal(source.rows(2, 4).view(torch.int16).numpy().view(np.uint16),
+                              words[2:4])
+        model = Model({"text": {"config": {}}})
+        model.add(Parameter("text/output_head", (rows, columns), source, inputs=inputs))
+        recipe = Recipe(model)
+        # As qwen3_8_27b_gguf assigns a direct source: the parameter's direct format.
+        recipe.assign("text/output_head", format=model.parameters["text/output_head"].direct_format,
+                      method=cast_direct, source=source)
+        convert(model, recipe, tmp_path / "head.ninfer", device="cpu", rows_per_chunk=4)
+    with Artifact(tmp_path / "head.ninfer") as artifact:
+        obj = artifact.object(artifact.directory.bindings["text/output_head"]["object"])
+        assert obj.format == "bf16"
+        assert artifact.read_object(obj.id) == words.tobytes()
+        uses = [u for u in artifact.directory.uses if u["parameter"] == "text/output_head"]
+        assert sorted(u["input"] for u in uses) == sorted(inputs)
+        assert all(u["activation_policy"] == "A16Only" and "auxiliaries" not in u for u in uses)
+
+
+def test_a_block_output_head_stays_stored_blocks(tmp_path):
+    path, blocks = _q8_0_file(tmp_path, 4, 64, 13, "output.weight")
+    with GGUFFile(path) as gguf:
+        source, stored_blocks = gguf_blocks.head_source(gguf)
+        rows = source.read_encoded(0, 4)
+    assert stored_blocks and rows.format == "gguf_q8_0" and rows.input_columns is None
+    assert torch.equal(rows.codes, torch.from_numpy(blocks.reshape(4, -1)))

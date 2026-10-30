@@ -18,7 +18,8 @@ the `gguf_*` formats of the `gguf_blocks_v1` layout
 ([tensor formats](maintainer/tensor-formats.md#35-gguf-block-formats),
 [storage layouts](maintainer/storage-layouts.md#6-gguf_blocks_v1)). A projection may mix types:
 the parts of a fused projection that share a type are multiplied together, the others one by one
-against the same activation.
+against the same activation. A dense release's untied BF16 output head is stored and multiplied as
+BF16.
 
 ## Products
 

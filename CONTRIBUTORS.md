@@ -37,6 +37,7 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | pelebel, natpate | openable server URLs and CORS preflight echoes |
 | Matt Anderson | wide Q5 split tiles and an idle Engine that fails only the request it cannot place |
 | hyz615, lededev, NikolaFC | schema assertions in constrained decoding; the disk tier persisted on an orderly stop and MSVC-safe test builtins; Q8_0 `ssm_alpha`/`ssm_beta` in GGUF conversion |
+| [b1231227](https://github.com/b1231227) | a BF16 output head in the dense GGUF recipe, and the native re-quantisation of a GGUF that exposed `ssm_out`'s stored column order ([#185](https://github.com/iamwavecut/ninfer-all/pull/185)) |
 
 ## Pull requests to Neroued/ninfer ported here
 

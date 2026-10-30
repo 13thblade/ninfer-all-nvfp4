@@ -398,6 +398,31 @@ void input_gathers() {
         "a native linear accepted an input gather it does not read");
 }
 
+// A dense GGUF release may keep an untied BF16 output head beside its block-format token table: the
+// head binds as BF16 with its Use, the table as GGUF blocks.
+void bf16_head_beside_gguf_blocks() {
+    ModelFixture fixture;
+    fixture.file.root["components"]["text"]["config"]["tie_word_embeddings"] = false;
+    fixture.tensor("embedding-blocks", {272, 128}, QType::GGUF_Q8_0, QuantLayout::GgufBlocks);
+    fixture.file.root["bindings"]["text/token_embedding"] = {{"object", "embedding-blocks"}};
+    for (auto& use : fixture.file.root["uses"]) {
+        if (use["parameter"] == "text/output_head") { use["activation_policy"] = "A16Only"; }
+    }
+    fixture.file.write();
+    artifact::Reader reader(fixture.file.entry);
+    const auto plan   = qwen::plan_load(reader);
+    const auto format = [&](qwen::WeightId id) {
+        return reader.geometry(plan.parameter(id).binding.parts.at(0).object).format;
+    };
+    const auto& text = plan.weights().text;
+    require(format(text.output_head) == QType::BF16 &&
+                format(text.token_embedding) == QType::GGUF_Q8_0,
+            "a BF16 head beside a GGUF token table did not bind as stored");
+    require(plan.uses(text.output_head).size() == 1 &&
+                plan.uses(text.output_head)[0].policy == ops::LinearPolicy::A16Only,
+            "the BF16 head lost its Use");
+}
+
 void invalid_model_data() {
     ModelFixture fixture;
     const Json original = fixture.file.root;
@@ -431,6 +456,7 @@ int main() {
         logical_data_and_instances();
         native_uses();
         input_gathers();
+        bf16_head_beside_gguf_blocks();
         invalid_model_data();
         std::cout << "model config, binding, resources and Use checks passed\n";
         return 0;
