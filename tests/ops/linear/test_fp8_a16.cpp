@@ -66,8 +66,12 @@ int run_fp8_a16() {
         vocabulary_invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
     for (int t : {7, 25, 41, 65, 128})
         vocabulary_invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
-    failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
-                          {248320, 5120, 823U, Comparison::SampledRows, true, vocabulary_invocations});
+    // The vocabulary head in BF16 and as the FP32 logits the sampler reads.
+    for (const DType out : {DType::BF16, DType::FP32}) {
+        failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                              {248320, 5120, 823U, Comparison::SampledRows, true,
+                               vocabulary_invocations, ActivationSigns::Centered, out});
+    }
     constexpr std::array vocabulary_policies{
         ops::LinearPolicy::A16Only,
         ops::LinearPolicy::AllowA8,
