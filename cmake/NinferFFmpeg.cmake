@@ -29,8 +29,9 @@ set(NINFER_FFMPEG_OPTIONS
   --disable-doc --disable-debug --disable-network --disable-avdevice --disable-avfilter
   --disable-swresample --disable-everything --enable-zlib --enable-libdav1d
   --enable-demuxer=mov,matroska,gif,image_jpeg_pipe,image_png_pipe,image_webp_pipe,image_bmp_pipe
-  --enable-decoder=h264,hevc,libdav1d,vp8,vp9,mpeg4,mjpeg,png,webp,gif,bmp
-  --enable-parser=h264,hevc,av1,vp8,vp9,mpeg4video,mjpeg,png,webp,gif,bmp)
+  --enable-demuxer=image_ppm_pipe,image_pgm_pipe,image_pbm_pipe
+  --enable-decoder=h264,hevc,libdav1d,vp8,vp9,mpeg4,mjpeg,png,webp,gif,bmp,ppm,pgm,pbm
+  --enable-parser=h264,hevc,av1,vp8,vp9,mpeg4video,mjpeg,png,webp,gif,bmp,pnm)
 
 find_package(PkgConfig REQUIRED)
 find_package(ZLIB REQUIRED)
