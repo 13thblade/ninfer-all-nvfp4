@@ -30,6 +30,8 @@ if command -v ccache >/dev/null; then
     launcher=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
               -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
 fi
+# FFmpeg and dav1d compile from their pinned release archives, which a fresh snapshot lacks.
+scripts/fetch-media-sources.sh
 if [ ! -f "$build/CMakeCache.txt" ] || [ ! -f "$build/build.ninja" ] || \
    [ ! -f "$build/src/runtime/engine/device_profiles_builtin.cpp" ]; then
     cmake -S . -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \

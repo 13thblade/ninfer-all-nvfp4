@@ -89,3 +89,5 @@ repro/
 
 # WebUI releases unpacked by scripts/fetch-webui.sh for -DNINFER_WEBUI_DIR.
 third_party/webui/
+# FFmpeg and dav1d release archives fetched by scripts/fetch-media-sources.sh.
+third_party/media-sources/

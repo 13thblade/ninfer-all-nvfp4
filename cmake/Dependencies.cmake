@@ -8,9 +8,11 @@ else()
   set(NINFER_CUDART_TARGET CUDA::cudart)
 endif()
 
-# vcpkg (the Windows build) exposes FFmpeg and libcurl through CMake packages; Linux uses
-# pkg-config. Both paths produce the same two consumer targets. With vcpkg's CMake toolchain its
-# own FFmpeg find wrapper serves find_package. Without it a prebuilt triplet tree serves them:
+# The Windows build takes FFmpeg and libcurl from vcpkg's CMake packages. Linux builds FFmpeg from
+# its pinned release and links it statically (cmake/NinferFFmpeg.cmake), and finds libcurl through
+# pkg-config, or through vcpkg's package with its toolchain. Both paths produce the same two
+# consumer targets. With vcpkg's CMake toolchain its own FFmpeg find wrapper serves find_package.
+# Without it a prebuilt triplet tree serves them:
 # NINFER_VCPKG_TREE, which scripts\build-native.bat passes, or else the classic tree that the
 # VCPKG_ROOT and VCPKG_TARGET_TRIPLET environment variables name. cmake/FindFFMPEG.cmake reads it
 # and names it FFMPEG_VCPKG_TREE, for staging its DLLs beside the executables.
@@ -31,7 +33,7 @@ if(WIN32 AND NOT VCPKG_TOOLCHAIN)
   list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
   list(APPEND CMAKE_PREFIX_PATH "${_ninfer_vcpkg_tree}")
 endif()
-if(WIN32 OR DEFINED VCPKG_TARGET_TRIPLET)
+if(WIN32)
   find_package(FFMPEG REQUIRED)
   add_library(ninfer_ffmpeg_dependencies INTERFACE)
   target_include_directories(ninfer_ffmpeg_dependencies INTERFACE ${FFMPEG_INCLUDE_DIRS})
@@ -39,12 +41,7 @@ if(WIN32 OR DEFINED VCPKG_TARGET_TRIPLET)
   target_link_libraries(ninfer_ffmpeg_dependencies INTERFACE ${FFMPEG_LIBRARIES})
   set(NINFER_FFMPEG_TARGET ninfer_ffmpeg_dependencies)
 else()
-  find_package(PkgConfig REQUIRED)
-  # Keep the floors the previous root build required: src/media/decode/decode.cpp is written
-  # against these ABIs, so an older installation must fail at configure rather than at link.
-  pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-    libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
-  set(NINFER_FFMPEG_TARGET PkgConfig::FFMPEG)
+  include(${CMAKE_CURRENT_LIST_DIR}/NinferFFmpeg.cmake)
 endif()
 
 # Repository-pinned header dependencies. No configure-time downloads.

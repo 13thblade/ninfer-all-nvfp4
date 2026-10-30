@@ -168,7 +168,8 @@ Message content may be a string or an ordered array containing:
 | image / image_url | `image` or `image_url` | local path, HTTP(S) URL, or base64 data URI |
 | video / video_url | `video` or `video_url` | local path, HTTP(S) URL, or base64 data URI |
 
-`image_url` and `video_url` may be strings or objects containing a string `url`. Assistant
+`image_url` and `video_url` may be strings or objects containing a string `url`. The decoded
+formats are listed in [media formats](serving.md#media-formats). Assistant
 history may include `reasoning_content` and `tool_calls`; a tool result uses role `tool` and
 `tool_call_id`.
 

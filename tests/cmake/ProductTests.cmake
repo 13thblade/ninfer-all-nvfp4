@@ -1,4 +1,4 @@
-ninfer_add_test(ninfer_media_decode_test
+ninfer_add_test(ninfer_media_decode_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_media_decode.cpp"
   LIBRARIES ninfer_media_decode)
 

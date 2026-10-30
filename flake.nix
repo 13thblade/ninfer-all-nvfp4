@@ -2,7 +2,7 @@
   description = "NInfer-3090: SM86 (RTX 3090) inference engine for Qwen3.8-27B and Qwen3.6";
 
   # Pin the nixpkgs revision currently used on this machine (CUDA 12.9 /
-  # cuda-merged-12.9, gcc13Stdenv, ffmpeg 6.1). CUDA must be >= 12.8 and the
+  # cuda-merged-12.9, gcc13Stdenv). CUDA must be >= 12.8 and the
   # nvcc host compiler must stay within CUDA 12.9's supported GCC range (<= 14),
   # so the build pins gcc13 instead of following the default (gcc15) stdenv.
   inputs = {
@@ -20,6 +20,25 @@
 
       cuda = pkgs.cudaPackages.cudatoolkit; # cuda-merged-12.9 (nvcc >= 12.8)
 
+      # The FFmpeg and dav1d release archives that cmake/MediaSources.cmake pins; keep the two in
+      # step. The build compiles them and links them statically.
+      mediaSources = pkgs.linkFarm "ninfer-media-sources" [
+        {
+          name = "ffmpeg-9.0.2.tar.xz";
+          path = pkgs.fetchurl {
+            url = "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz";
+            sha256 = "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e";
+          };
+        }
+        {
+          name = "dav1d-1.5.4.tar.xz";
+          path = pkgs.fetchurl {
+            url = "https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz";
+            sha256 = "686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5";
+          };
+        }
+      ];
+
       # Target architecture of the packaged build: 86 for the RTX 3090 this fork is tuned on. The
       # CMake configure also accepts 80 (unmeasured GA100 compatibility target) and 89; change this
       # one binding to package for another.
@@ -33,14 +52,19 @@
         nativeBuildInputs = [
           pkgs.cmake
           pkgs.ninja
+          pkgs.meson
+          pkgs.nasm
           pkgs.pkg-config
           cuda
         ];
 
         buildInputs = [
-          pkgs.ffmpeg_6-full # libavformat60/avcodec60/avutil58/swscale7, as validated in the container
+          pkgs.zlib
           pkgs.curl
         ];
+
+        # meson builds dav1d inside the CMake build; it must not take over the configure phase.
+        dontUseMesonConfigure = true;
 
         # CMakeLists.txt accepts CMAKE_CUDA_ARCHITECTURES 80, 86 or 89 (cudaArch above) and
         # requires CUDA >= 12.8. gcc13 matches the upstream-validated
@@ -55,6 +79,7 @@
           "-DNINFER_BUILD_APPS=ON"
           "-DBUILD_TESTING=OFF"
           "-DNINFER_BUILD_BENCHMARKS=OFF"
+          "-DNINFER_MEDIA_SOURCES_DIR=${mediaSources}"
         ];
 
         # Ninja job pool for single CUDA device-link slot.

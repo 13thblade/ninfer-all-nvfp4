@@ -8,6 +8,7 @@ import re
 import shutil
 import struct
 import subprocess
+import tarfile
 import tempfile
 
 
@@ -83,6 +84,12 @@ def runtime_packages(binary, env, driver_stub, cuda_root, bundle):
     dependencies = output('ldd', str(binary), env=env)
     if 'not found' in dependencies:
         raise RuntimeError(f'Unresolved libraries for {binary}:\n{dependencies}')
+    # FFmpeg and dav1d are linked in (cmake/NinferFFmpeg.cmake); a shared copy would tie the package
+    # to one distribution's SONAMEs.
+    media = re.findall(r'lib(?:avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample|dav1d)'
+                       r'\.so\S*', dependencies)
+    if media:
+        raise RuntimeError(f"{binary} links {', '.join(sorted(set(media)))} dynamically")
     packages = set()
     for library in re.findall(r'=> (/\S+)', dependencies):
         path = Path(library)
@@ -209,6 +216,18 @@ def main():
         run(str(package / command), '--version', env=clean_env, timeout=60)
     (package / 'packages').mkdir()
     (package / 'packages/multi.txt').write_text(''.join(f'{p}\n' for p in sorted(packages)))
+    # The runtime links FFmpeg (LGPL 2.1 or later) and dav1d statically: ship each exact release
+    # archive with its licence beside the binaries.
+    media = json.loads((build / 'third_party/media/sources.json').read_text())
+    (package / 'sources').mkdir()
+    for library, source in sorted(media.items()):
+        archive = Path(source['archive'])
+        if digest(archive) != source['sha256']:
+            raise RuntimeError(f'{archive} is not the pinned {library} release')
+        shutil.copy2(archive, package / 'sources' / archive.name)
+        with tarfile.open(archive) as release:
+            (package / f'LICENSE-{library}.txt').write_bytes(release.extractfile(source['license']).read())
+        source['archive'] = f'sources/{archive.name}'
     for source, destination in (
         (repo / 'LICENSE', 'LICENSE'),
         (repo / 'docs/release-archive-linux.md', 'README.md'),
@@ -227,6 +246,8 @@ def main():
                 cuda=cuda, cuda_compiler=compiler_version, architectures=arches,
                 layout='shared-runtime-v1', commands=commands, platform='linux-x64', os_release=distro, glibc=output('getconf', 'GNU_LIBC_VERSION'),
                 runtime_packages=sorted(packages),
+                media_libraries={library: {key: source[key] for key in ('version', 'sha256', 'archive', 'options')}
+                                 for library, source in sorted(media.items())},
                 validation='Device images and packaged CUDA dependency closure checked; all commands passed --help '
                 'without a driver. Runtime help captured with a temporary driver stub. GPU inference was not tested.')
     (package / 'BUILD-INFO.json').write_text(json.dumps(info, indent=2) + '\n')

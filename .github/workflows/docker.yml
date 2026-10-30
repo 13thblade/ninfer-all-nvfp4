@@ -68,7 +68,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ env.SHA }}
             org.opencontainers.image.description=NInfer CUDA ${{ matrix.cuda }} with every supported NInfer architecture for this Toolkit
-            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.licenses=Apache-2.0 AND LGPL-2.1-or-later AND BSD-2-Clause
           cache-from: type=registry,ref=${{ steps.tags.outputs.image }}:cuda${{ matrix.cuda }}
           cache-to: type=inline
 

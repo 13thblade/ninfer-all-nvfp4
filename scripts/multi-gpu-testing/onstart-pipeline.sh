@@ -43,8 +43,7 @@ echo "--- installing build dependencies ---"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq git cmake ninja-build build-essential pkg-config \
-  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev \
-  libswresample-dev libcurl4-openssl-dev >/dev/null 2>&1
+  meson nasm zlib1g-dev libcurl4-openssl-dev >/dev/null 2>&1
 
 echo "--- cloning ${BRANCH} ---"
 git clone --depth 1 --branch "$BRANCH" "$REPO" /root/src || { echo "CLONE_FAILED"; exit 1; }
@@ -61,6 +60,7 @@ apt-get install -y -qq aria2 >/dev/null 2>&1
     && echo OK > /root/model.done || echo FAILED > /root/model.done ) &
 
 echo "--- configuring ---"
+/root/src/scripts/fetch-media-sources.sh || { echo "MEDIA_SOURCES_FAILED"; exit 1; }
 cmake -S /root/src -B /root/build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$ARCH" \
   -DCMAKE_CUDA_COMPILER="$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)" \
