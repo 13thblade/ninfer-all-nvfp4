@@ -2236,6 +2236,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--ngram-session-mib N` | per-session share of that archive, 1 MiB up to the archive size | `128` |
 | `--ngram-native-sessions` | with the archive, also recognize the session identities Kilo, Codex and Claude send | off |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [quality trades](maintainer/quality-trade-experiments.md)) | off |
+| `--nvfp4-w4a8-int` | run NVFP4 weights on the int8 tensor cores (W4A8), prefill and decode alike: activations are quantised to int8 with one scale per token and 32 columns, the stored E2M1 codes widen to int8 exactly, and their E4M3 group scales apply in FP32. About 1.2-1.4% relative error from the activation quantisation; on an RTX 50-series card it replaces the W4A4 routes. The device profile's `nvfp4_int8/*` keys choose the wide kernel | off: BF16 activations (W4A16) before Blackwell, W4A4 on it |
+| `--nvfp4-w4a16` | on an RTX 50-series card, run NVFP4 weights on the dequantising BF16-activation routes (W4A16) instead of W4A4, more precise and slower; other cards run them by default, so there it changes nothing. Wins over `--nvfp4-w4a8-int` | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
 | `--no-prefill-a8` | prefill every projection on the A16 routes instead of the integer-activation ones | integer routes |
 | `--mlp-a8-decode` | integer-activation MLP gate_up at decode and verify widths | off |
