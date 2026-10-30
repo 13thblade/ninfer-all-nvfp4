@@ -13,6 +13,7 @@
 #include "ninfer/request.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
+#include "runtime/engine/prefill_pacing.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/diagnostics.h"
@@ -111,6 +112,8 @@ public:
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           context_cache_enabled_(options.context_cache.enabled),
+          prefill_chunk_(std::max<std::uint32_t>(options.prefill_chunk, 1)),
+          pacing_(options.prefill_stall_budget_ms, context_cost),
           resources_(make_resource_manager(options, std::move(context_cost))),
           suspend_options_(options.suspend) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
@@ -2205,6 +2208,35 @@ private:
                branches;
     }
 
+    // The prompt tokens before a staged-prefill lane's next step.
+    [[nodiscard]] std::uint64_t prompt_position(std::uint32_t lane) const {
+        const auto& request = slots_[lane];
+        if (request == nullptr || !request->admitted_begin) { return 0U; }
+        return std::uint64_t(request->admitted_begin->reused_prompt_tokens) +
+               request->computed_prompt_tokens;
+    }
+
+    // Whether a lane other than `lane` generates: its next token waits behind `lane`'s step.
+    [[nodiscard]] bool other_lane_streaming(std::uint32_t lane) const noexcept {
+        for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
+            const auto& request = slots_[other];
+            if (other != lane && request != nullptr &&
+                !request->cancelled.load(std::memory_order_acquire) &&
+                (request->is_decode_ready() || request->is_control_ready())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The tokens `lane`'s next prefill step may take under the stall budget, or 0 for the planned
+    // step: no budget, no other lane generating, or a planned step that fits.
+    [[nodiscard]] std::uint32_t paced_prefill_cap(std::uint32_t lane) const {
+        if (!pacing_.enabled() || !other_lane_streaming(lane)) { return 0; }
+        const std::uint32_t planned = std::min(prefill_chunk_, remaining_prompt(lane));
+        return pacing_.step_cap(prompt_position(lane), planned);
+    }
+
     // True when every lane owning staged prefill has only a last chunk left that can share one
     // pass with others: a request admitted meanwhile can join that pass.
     [[nodiscard]] bool staged_prefills_share() const {
@@ -2289,13 +2321,27 @@ private:
             return;
         }
         scheduler_.record_prefill_unit(lane);
+        // While another lane generates, a step the cost model predicts to outlast the stall budget
+        // is cut to one that fits it (EngineOptions::prefill_stall_budget_ms).
+        const std::uint64_t step_prefix = prompt_position(lane);
+        const std::uint32_t planned     = std::min(prefill_chunk_, remaining_prompt(lane));
+        const std::uint32_t step_cap    = paced_prefill_cap(lane);
         setup.finish();
         ProgramCallScope program_call(*this);
-        auto progress =
-            instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
+        auto progress = instance_.program->advance_prefill(
+            *request->sequence, &program_call.failed_timing(), step_cap);
         program_call.finish(progress.timing);
         cumulative_stats_.prefill_seconds_total +=
             static_cast<double>(progress.timing.elapsed_ns()) * 1e-9;
+        if (progress.processed_prompt_tokens != 0) {
+            pacing_.step_done(step_prefix, progress.processed_prompt_tokens,
+                              progress.timing.elapsed_ns());
+        }
+        if (step_cap != 0 && progress.processed_prompt_tokens < planned) {
+            ++cumulative_stats_.paced_prefill_steps;
+            cumulative_stats_.paced_prefill_deferred_tokens +=
+                planned - progress.processed_prompt_tokens;
+        }
         consume_armed_worker_failure();
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         // A completed prefill already re-arms admission (owner cleared above). Re-arm again when
@@ -3409,9 +3455,14 @@ private:
                     }
                 }
                 const std::optional<std::uint32_t> next_lane = runnable_prefill_lane();
+                std::uint32_t next_unit = next_lane ? remaining_prompt(*next_lane) : 0U;
+                if (next_lane) {
+                    if (const std::uint32_t cap = paced_prefill_cap(*next_lane)) {
+                        next_unit = std::min(next_unit, cap);
+                    }
+                }
                 const ExecutionAction action = scheduler_.choose_execution(
-                    !membership.empty(), next_lane.has_value(), decode_run,
-                    next_lane ? remaining_prompt(*next_lane) : 0U);
+                    !membership.empty(), next_lane.has_value(), decode_run, next_unit);
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
@@ -3530,6 +3581,9 @@ private:
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const bool context_cache_enabled_;
+    const std::uint32_t prefill_chunk_;
+    // Declared before resources_, which takes the cost model this copies.
+    PrefillPacing pacing_;
     ResourceManagement resources_;
     std::unique_ptr<NgramArchive> ngram_archive_;
 

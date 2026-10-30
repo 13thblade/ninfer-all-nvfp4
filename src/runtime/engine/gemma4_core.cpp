@@ -85,6 +85,10 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    if (options.prefill_stall_budget_ms != 0) {
+        throw std::invalid_argument("Gemma 4 sizes its own prefill steps; --prefill-stall-budget-ms "
+                                    "applies to Qwen3.5-family models");
+    }
     // The vision tower on the device or, with --vision-residency cpu, on CPU threads; its soft
     // tokens per image or video frame are bounded by --vision-max-merged (Gemma's budgets 70 to
     // 1120).

@@ -94,6 +94,10 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    if (options.prefill_stall_budget_ms != 0) {
+        throw std::invalid_argument("DeepSeek-V4.1-Flash sizes its own prefill steps; --prefill-stall-budget-ms "
+                                    "applies to Qwen3.5-family models");
+    }
     // The release's vision tower (the artifact's `vision` component, --vision): its matrices on the
     // device, or in pinned host memory through a window of two device slots (--vision-residency
     // overlay).
