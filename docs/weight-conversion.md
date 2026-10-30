@@ -221,10 +221,14 @@ Q8_0, Q2_0, Q4_0, Q5_0, Q2_K to Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_
 and IQ4_XS ([GGUF block formats](gguf.md)). The recipe undoes llama.cpp's Qwen3.5 exporter
 conventions the same way `bonsai2_27b_ternary` does, by row gathers and exact small-tensor
 transforms. The one convention a row copy cannot undo is the tiled value-head order of the GDN
-output projection's input columns: its Use carries an `input_columns` auxiliary, and the runtime
-reads the activation through that permutation when it quantizes it. Vision comes from the release's
-`mmproj` file in the official Vision formats, DFlash2 from `--source dflash2`, and `--proposal`
-gathers the proposal head's rows from the output head in its own block format.
+output projection's (`ssm_out`) input columns. Its stored blocks keep that order, and importing
+them gives the Use an `input_columns` auxiliary: the runtime reads the activation through that
+permutation when it quantizes it. The source's values, like every source's, are in the grouped
+order of the logical parameter. Only the GGUF linears read a gather, so the converter refuses an
+`input_columns` auxiliary on any other format and the loader refuses an artifact that has one.
+Vision comes from the release's `mmproj` file in the official Vision formats, DFlash2 from
+`--source dflash2`, and `--proposal` gathers the proposal head's rows from the output head in its
+own block format.
 
 ```bash
 python3 -m tools.convert \
@@ -242,6 +246,21 @@ python3 -m tools.convert \
 
 `--model` needs only the base checkpoint's configuration and tokenizer files. The products that
 serve these formats are described in [GGUF block formats](gguf.md).
+
+A recipe file can start from `qwen3_8_27b_gguf` and give some parameters native formats. A
+value-reading method (`grouped_absmax`, `grouped_search`, `cast_direct`) quantizes the GGUF's
+represented values, a second rounding, in the grouped column order, and the native matrix needs no
+gather. `grouped_search` can weight them with an imatrix from `tools.convert.imatrix`, whose
+`ssm_out` vectors are in the same grouped order:
+
+```python
+from tools.convert.gguf_blocks import qwen3_8_27b_gguf
+
+
+def configure(model, recipe, sources):
+    qwen3_8_27b_gguf(model, recipe, sources)
+    recipe.assign("text/layers/*/gdn/output", format="q6_g64_fp16", method="grouped_absmax")
+```
 
 ### Qwen3.8-Flash-Next GGUF releases
 

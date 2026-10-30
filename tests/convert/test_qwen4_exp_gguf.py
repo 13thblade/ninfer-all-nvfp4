@@ -278,3 +278,20 @@ def test_hyper_connection_matrices_become_ggml_q8_0_rows(tmp_path):
         kept = qwen4_exp_gguf.hc_matrix_source(gguf, "q8", (rows, columns))
         assert torch.equal(kept.read_encoded(0, rows).codes,
                            torch.from_numpy(blocks.reshape(rows, -1)))
+
+
+def test_bf16_ssm_out_rows_take_the_grouped_column_order(tmp_path):
+    # BF16 rows are re-stored as BF16 from their values, so they carry no gather: each stored
+    # column moves to the grouped element it multiplies, its word unchanged.
+    k = gguf_blocks.GDN_VALUE_DIM
+    words = np.random.default_rng(11).integers(0, 0x7F80, size=(3, k), dtype=np.uint16)
+    path = tmp_path / "ssm_out.gguf"
+    write_gguf(path, {"general.architecture": "qwen4exp"},
+               [("blk.0.ssm_out.weight", (3, k), TYPE_BF16, words.tobytes())])
+    with GGUFFile(path) as gguf:
+        source, encoded = qwen4_exp_gguf.matrix_source(
+            gguf, "blk.0.ssm_out.weight", (3, k), qwen4_exp_gguf.rows(),
+            gguf_blocks.tiled_input_columns())
+    assert not encoded and source.read_encoded is None
+    grouped = source.rows(0, 3).view(torch.int16).numpy().view(np.uint16)
+    assert np.array_equal(grouped[:, gguf_blocks.tiled_input_columns()], words)

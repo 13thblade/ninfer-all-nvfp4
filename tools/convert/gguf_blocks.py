@@ -7,8 +7,10 @@ undone where they touch rows or small tensors: value heads return to the grouped
 zero-centred norms drop their stored ``1 + w`` and ``ssm_a`` becomes ``A_log`` again.
 
 ``ssm_out`` is the exception. Its tiled value heads are its input columns, which a row copy cannot
-move without re-quantising, so its Use carries an ``input_columns`` auxiliary: column ``c`` of the
-stored matrix multiplies element ``input_columns[c]`` of the grouped activation.
+move without re-quantising. Its encoded rows keep the stored order, and their import gives the Use an
+``input_columns`` auxiliary: column ``c`` of the stored matrix multiplies element ``input_columns[c]``
+of the grouped activation. Its values, like every source's, are in the grouped order, so a recipe
+that re-quantises ``ssm_out`` writes grouped columns and no gather.
 
 The GDN controls ``ssm_alpha`` and ``ssm_beta`` are BF16 operands of the Engine. Exporters store
 them as BF16 words or as Q8_0 blocks (Underdog-Saluki and similar releases), whose values are
@@ -28,7 +30,7 @@ import torch
 
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
-from .methods import AuxiliaryValue, cast_direct, grouped_absmax, import_encoded
+from .methods import cast_direct, grouped_absmax, import_encoded
 from .official_recipes import Q4, Q5, Q6, Q8
 from .sources.gguf import GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
@@ -245,25 +247,47 @@ def _dequantize(gguf: GGUFFile, tensor: str, first: int, last: int) -> torch.Ten
 
 
 def block_source(
-    gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap
+    gguf: GGUFFile,
+    tensor: str,
+    shape: tuple[int, int],
+    select: RowMap,
+    columns: np.ndarray | None = None,
 ) -> LogicalSource:
-    """Rows of a stored block matrix as encoded ggml rows, and their values on request."""
+    """Rows of a stored block matrix as encoded ggml rows, and their values on request.
+
+    ``columns`` describes a matrix stored over permuted input columns: stored column ``c``
+    multiplies logical input element ``columns[c]``. The encoded rows keep the stored order and
+    carry it (EncodedRows.input_columns) to the Use that imports them; the values return to the
+    logical order, which every value-reading method quantises.
+    """
 
     format = block_format(gguf, tensor)
     empty = torch.empty(0, dtype=torch.float16)
+    gather, logical = None, None
+    if columns is not None:
+        columns = np.asarray(columns, dtype=np.int64)
+        if not np.array_equal(np.sort(columns), np.arange(shape[1])):
+            raise ValueError(f"{tensor}: stored input columns must permute [0, {shape[1]})")
+        gather = columns.astype("<i4").tobytes()
+        # Logical column g is the stored column that multiplies element g.
+        logical = torch.from_numpy(np.argsort(columns))
 
     def encoded(begin: int, end: int) -> EncodedRows:
         index = select(begin, end)
         low, high = int(index.min()), int(index.max()) + 1
         blocks = gguf.read_blocks(tensor, low, high)
         return EncodedRows(
-            format, torch.from_numpy(np.ascontiguousarray(blocks[index - low])), empty
+            format,
+            torch.from_numpy(np.ascontiguousarray(blocks[index - low])),
+            empty,
+            input_columns=gather,
         )
 
     def values(first: int, last: int) -> torch.Tensor:
         index = select(first, last)
         low, high = int(index.min()), int(index.max()) + 1
-        return _dequantize(gguf, tensor, low, high)[torch.from_numpy(index - low)]
+        stored = _dequantize(gguf, tensor, low, high)[torch.from_numpy(index - low)]
+        return stored if logical is None else stored[:, logical]
 
     return LogicalSource(
         shape, f"{tensor}[{format}]{list(shape)}", _flat(values, shape[1]), encoded
@@ -437,9 +461,13 @@ def text_sources(
         encoded[n + "z"] = block_source(
             gguf, g + "attn_gate.weight", (GDN_VALUE_DIM, HIDDEN), untiled_rows(0)
         )
-        # Tiled input columns: the Use gathers the grouped activation (see tiled_input_columns).
+        # Tiled input columns: an import keeps them and its Use gathers the grouped activation.
         encoded[n + "output"] = block_source(
-            gguf, g + "ssm_out.weight", (HIDDEN, GDN_VALUE_DIM), rows()
+            gguf,
+            g + "ssm_out.weight",
+            (HIDDEN, GDN_VALUE_DIM),
+            rows(),
+            tiled_input_columns(),
         )
         for role, tensor in (("a_projection", "ssm_alpha.weight"), ("b_projection", "ssm_beta.weight")):
             direct[n + role] = gdn_control_source(gguf, g + tensor)
@@ -600,15 +628,6 @@ def qwen3_8_27b_gguf(model, recipe, sources):
                 recipe, [a + "query", a + "key", a + "gate", a + "value"], formats
             )
         _group_same_format(recipe, [p + "mlp/gate", p + "mlp/up"], formats)
-    columns = AuxiliaryValue(
-        "int32", (GDN_VALUE_DIM,), tiled_input_columns().astype("<i4").tobytes()
-    )
-    for layer in range(LAYERS):
-        if full_attention(layer):
-            continue
-        name = f"text/layers/{layer}/gdn/output"
-        for input_name in model.parameters[name].inputs:
-            recipe.use(name, input_name, auxiliaries={"input_columns": columns})
 
 
 RECIPES = {"qwen3_8_27b_gguf": qwen3_8_27b_gguf}

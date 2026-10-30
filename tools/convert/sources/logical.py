@@ -17,6 +17,10 @@ class EncodedRows:
     weight_divisor: bytes | None = None
     # Native Q2/Q8 may supply complete packed code rows instead of logical integer codes.
     packed: bool = False
+    # INT32 little-endian words of rows stored over permuted input columns: stored column c
+    # multiplies logical input element input_columns[c]. None when the stored columns are in the
+    # logical order. The source's values are always in the logical order.
+    input_columns: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,8 +111,8 @@ def select_rows(
         ]
         first = pieces[0]
         if any(
-            (part.format, part.weight_divisor, part.packed) !=
-            (first.format, first.weight_divisor, first.packed)
+            (part.format, part.weight_divisor, part.packed, part.input_columns) !=
+            (first.format, first.weight_divisor, first.packed, first.input_columns)
             for part in pieces
         ):
             raise ValueError(f"{source.label}: incompatible encoded row groups")
@@ -120,6 +124,7 @@ def select_rows(
             torch.cat([p.scales for p in pieces]),
             first.weight_divisor,
             first.packed,
+            first.input_columns,
         )
 
     return LogicalSource(
