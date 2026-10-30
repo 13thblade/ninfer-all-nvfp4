@@ -83,17 +83,11 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     const bool registered = nvfp4_registered(weight.n, weight.k);
     const bool unified_table =
         linear_route_table(LinearRouteFamily::Nvfp4, x.ne[1]) == LinearRouteTable::Unified;
-    // The int8 flag is authoritative for plain Linear on either table: the family's route is
-    // shape-generic (its grid comes from N and its k-tiles from K at launch time), so an own-table
-    // width takes it too instead of refusing or falling back to A16. A geometry its alignment
-    // contract cannot tile is refused by the launcher, not answered by a slower composition.
-    if (allows_nvfp4_int8(policy)) {
-        unified::nvfp4_dispatch(x, weight, out, policy, workspace, stream);
-        return;
-    }
-    // A tensor-parallel rank's partial sum is FP32, and the int8 family writes BF16, so the general
-    // route answers it -- with A4 for a share above its crossover, A16 otherwise and for a
-    // registered row a table still covers.
+    // An FP32 result is a tensor-parallel rank's partial sum: the ranks add those partials before
+    // the one rounding to BF16 (core/tensor_parallel.h). The int8 family writes BF16 -- its launcher
+    // asserts that, because storing BF16 into an FP32-declared buffer would fill only half of it --
+    // so every FP32 result is answered here, ahead of the int8 route and of every BF16 route: A4 for
+    // a share above its crossover, A16 otherwise and for a registered row a table still covers.
     if (out.dtype == DType::FP32) {
         if (!registered && allows_a4(policy) && nvfp4_general_uses_a4(weight.k, x.ne[1])) {
             if (workspace == nullptr)
@@ -101,6 +95,14 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
             return nvfp4_general_a4(x, weight, out, *workspace, stream);
         }
         return nvfp4_general_a16(x, weight, out, stream);
+    }
+    // The int8 flag is authoritative for plain Linear on either table: the family's route is
+    // shape-generic (its grid comes from N and its k-tiles from K at launch time), so an own-table
+    // width takes it too instead of refusing or falling back to A16. A geometry its alignment
+    // contract cannot tile is refused by the launcher, not answered by a slower composition.
+    if (allows_nvfp4_int8(policy)) {
+        unified::nvfp4_dispatch(x, weight, out, policy, workspace, stream);
+        return;
     }
     // A geometry no table names runs the general runtime-shape route whatever table its width
     // resolves to: a tensor-parallel share's rows, whole runtime-shape tiles, A4 above the

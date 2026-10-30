@@ -43,6 +43,15 @@ void nvfp4_linear_int8_grouped_launch(const Tensor& x, const Weight& weight, Ten
         throw std::invalid_argument("nvfp4 linear int8: unsupported profile");
     }
     (void)validate_nvfp4_weight(weight, "nvfp4 linear int8");
+    // The family's epilogue stores through LinearBf16Output, which takes out.data as BF16: an
+    // FP32-declared result (a tensor-parallel rank's partial sum) would be filled to only half its
+    // bytes and the rest left stale, silently. nvfp4_dispatch answers those with the general A16
+    // route, so arriving here with FP32 is a routing mistake -- say so rather than corrupt.
+    if (out.dtype != DType::BF16) {
+        throw std::invalid_argument(
+            "nvfp4 linear int8: the int8 family writes BF16, so it cannot produce an FP32 result; "
+            "a tensor-parallel rank's partial sum must take the general A16 route");
+    }
 
     auto scope = workspace.scope();
     // The two routes quantise the same activations but lay the plane out differently: the MMQ
