@@ -292,6 +292,50 @@ void test_listed_image_formats() {
     }
 }
 
+// Netpbm files are a text header and raw samples, so the test writes them itself: the eight colors
+// as a pixmap, their red channels as a graymap and red below 128 as the black pixels of a bitmap.
+void test_listed_netpbm_formats() {
+    namespace decode = ninfer::media::decode;
+    using Colors     = std::array<std::array<int, 3>, 8>;
+    const auto bytes = [](std::string_view header) {
+        return std::vector<std::uint8_t>(header.begin(), header.end());
+    };
+    std::vector<std::uint8_t> ppm = bytes("P6\n4 2\n255\n");
+    std::vector<std::uint8_t> pgm = bytes("P5\n4 2\n255\n");
+    std::vector<std::uint8_t> pbm = bytes("P4\n4 2\n");
+    Colors gray{};
+    Colors mono{};
+    for (std::size_t index = 0; index < pixel_colors.size(); ++index) {
+        const std::array<int, 3>& color = pixel_colors[index];
+        for (const int channel : color) { ppm.push_back(static_cast<std::uint8_t>(channel)); }
+        pgm.push_back(static_cast<std::uint8_t>(color[0]));
+        gray[index]     = {color[0], color[0], color[0]};
+        const int level = color[0] < 128 ? 0 : 255;
+        mono[index]     = {level, level, level};
+        if (index % 4 == 0) { pbm.push_back(0); }
+        if (level == 0) {
+            pbm.back() = static_cast<std::uint8_t>(pbm.back() | (0x80U >> (index % 4)));
+        }
+    }
+    struct Case {
+        std::string_view name;
+        const std::vector<std::uint8_t>* bytes;
+        const Colors* colors;
+    };
+    for (const Case& netpbm : {Case{"PPM", &ppm, &pixel_colors}, Case{"PGM", &pgm, &gray},
+                               Case{"PBM", &pbm, &mono}}) {
+        const decode::ImageInfo info = decode::inspect_image(*netpbm.bytes, {});
+        const decode::Image image    = decode::decode_image(*netpbm.bytes, {});
+        if (info.width != 4 || info.height != 2 || image.width != 4 || image.height != 2) {
+            throw std::runtime_error(std::string(netpbm.name) + ": decoded dimensions mismatch");
+        }
+        for (std::size_t index = 0; index < netpbm.colors->size(); ++index) {
+            expect_pixel(image, static_cast<int>(index % 4), static_cast<int>(index / 4),
+                         (*netpbm.colors)[index], 0, netpbm.name);
+        }
+    }
+}
+
 // A container, a codec inside a listed container and an image format outside the list.
 void test_unlisted_formats_are_refused() {
     namespace decode = ninfer::media::decode;
@@ -514,6 +558,7 @@ int main() {
 #ifndef _WIN32
         test_listed_video_formats();
         test_listed_image_formats();
+        test_listed_netpbm_formats();
         test_unlisted_formats_are_refused();
 #endif
 #ifdef NINFER_MEDIA_NATIVE_PNG
