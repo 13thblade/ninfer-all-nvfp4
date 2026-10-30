@@ -408,14 +408,11 @@ fi::ChatRenderOptions render_options(const PromptOptions& options, fi::ToolCallS
     return rendered;
 }
 
-// The request's live ngram index over its final prompt tokens and tool sources, built on the
-// preparing thread so the Engine worker only moves it into the admitted request.
+// Starts the build of the request's live ngram index over copies of its final prompt tokens and
+// tool sources, which the prompt keeps for its own use.
 void build_ngram_index(PreparedPromptData& prompt) {
-    auto index = std::make_unique<detail::NgramProposer>();
-    index->set_boundaries(prompt.ngram_boundaries);
-    index->ingest(prompt.token_ids);
-    for (const auto& source : prompt.ngram_sources) { index->ingest(source); }
-    prompt.ngram_index = std::move(index);
+    prompt.ngram_index = detail::NgramIndexBuild::start(prompt.ngram_boundaries, prompt.token_ids,
+                                                        prompt.ngram_sources);
 }
 
 std::uint32_t checked_token_count(std::size_t count) {

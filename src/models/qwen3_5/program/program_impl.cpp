@@ -701,6 +701,21 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         mtp_controller.emplace();
         mtp_controller->reset(draft_window);
     }
+    // CUDA would otherwise load an attention width's module inside the first request that reaches
+    // it, behind a context synchronization.
+    if (const auto& attention = parameters.model.config().text.attention) {
+        const ops::AttentionHeadGeometry geometry{
+            .head_dim    = execution::dimension(attention->head_dim),
+            .query_heads = execution::dimension(attention->num_attention_heads),
+            .kv_heads    = execution::dimension(attention->num_key_value_heads),
+        };
+        ops::causal_softmax_attention_load_modules(
+            geometry, kv_storage, false,
+            static_cast<std::int32_t>(std::max(prefill_chunk, widest_verify_window() + 1U)));
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            ops::causal_softmax_attention_load_modules(geometry, kv_storage, true, 1);
+        }
+    }
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
         const std::size_t free_before = device.free_bytes();

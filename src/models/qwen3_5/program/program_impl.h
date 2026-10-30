@@ -556,6 +556,8 @@ struct SharedPrefixSlot {
 // gives every occupied request slot its own instance of this state.
 struct RequestControl {
     std::unique_ptr<NgramProposer> ngram;
+    // The build of `ngram` until its first proposal takes it.
+    std::shared_ptr<NgramIndexBuild> ngram_build;
     std::shared_ptr<const NgramSnapshot> ngram_snapshot;
     std::uint64_t ngram_copy_source = 0;
     std::uint32_t ngram_copy_offset = 0;

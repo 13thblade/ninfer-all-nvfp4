@@ -340,7 +340,8 @@ ProgramImpl::propose_ngram(std::span<const std::uint32_t> lanes,
 void ProgramImpl::take_ngram_index(RequestControl& request, PreparedPromptData& prompt) {
     // A prompt prepared for a request that does not draft carries none: that request reads one
     // token and proposes nothing, and request planning refuses a drafting request without one.
-    request.ngram          = std::move(prompt.ngram_index);
+    request.ngram.reset();
+    request.ngram_build    = std::move(prompt.ngram_index);
     request.ngram_indexed  = prompt.token_ids.size();
     request.ngram_snapshot = std::move(prompt.ngram_snapshot);
 }
@@ -356,6 +357,10 @@ NgramProposer::Match ProgramImpl::propose_ngram_one(std::uint32_t lane,
     const auto maximum = std::min({ngram_draft_window, remaining > 1 ? remaining - 1U : 0U, room});
     // The neural path still validates decode readiness. No draft fits an anchor-only tail.
     if (maximum == 0) { return {}; }
+    if (request.ngram_build) {
+        request.ngram = request.ngram_build->take();
+        request.ngram_build.reset();
+    }
     if (!request.ngram || request.ngram_indexed > ledger.size()) {
         throw std::logic_error("ngram committed history is not initialized");
     }

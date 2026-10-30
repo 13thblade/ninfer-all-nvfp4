@@ -15,6 +15,9 @@ struct Character {
 };
 
 std::vector<Character> characters(std::string_view text);
+// The character that starts at byte `begin`, and the one that ends at byte `end`, of valid UTF-8.
+Character character_at(std::string_view text, std::size_t begin);
+Character character_before(std::string_view text, std::size_t end);
 std::size_t length(std::string_view text);
 bool whitespace(std::int32_t codepoint);
 bool is_upper(std::string_view text);

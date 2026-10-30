@@ -297,6 +297,15 @@ device symbol across translation units has to bring RDC back to its target and m
 under RDC ptxas lowers a shuffle from a computed lane to an out-of-line call and stops pipelining
 loads across loop back edges.
 
+Without RDC each translation unit is its own CUDA module, which CUDA loads lazily, at the first
+launch of one of its kernels. The INT8-family small-T attention keeps one unit per width, geometry
+and input (`small_t_i8_w<N>_h<H>_<input>.cu`), so a request paid a module's parse whenever it first
+reached a width. A Program loads those modules at startup
+(`ops::causal_softmax_attention_load_modules`, from the Program constructor): every appending width
+up to its widest call and, with MTP, the drafter's cached width 1. `cudaGetKernel` on one anchor
+kernel of each unit parses the module without loading kernel code into the context, so free device
+memory after startup does not change.
+
 `ninfer_nvfp4_non_rdc` explicitly disables separable compilation and device-symbol resolution. It
 contains the warp-specialized Linear, LinearSwiGLU and causal-attention NVFP4 sources that depend
 on `setmaxnreg` register transfer, which RDC would discard. Their owning family manifests register

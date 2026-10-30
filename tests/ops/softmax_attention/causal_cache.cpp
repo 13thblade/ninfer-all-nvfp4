@@ -4338,6 +4338,45 @@ int run_k8v4_prompt_cases() {
     return failures;
 }
 
+// Loading every module a call can reach must succeed for each registered geometry, storage and
+// input, at widths inside and beyond the small-T tiles. The suite runs it first, so every later
+// case launches from loaded modules.
+int verify_module_load_contract() {
+    int failures = 0;
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::RotatedLloyd4KeyInt4Value,
+          KvCacheStorage::RotatedInt4KeyInt4ValueE8, KvCacheStorage::RotatedE8RootKeyInt4Value,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        for (const Geometry& heads : kGeometries) {
+            for (const bool cached : {false, true}) {
+                for (const std::int32_t width : {1, 5, 4096}) {
+                    try {
+                        ops::causal_softmax_attention_load_modules(op_geometry(heads), storage,
+                                                                   cached, width);
+                    } catch (const std::exception& error) {
+                        std::cerr << "causal_softmax_attention module load " << heads.name
+                                  << " width " << width << " failed: " << error.what() << '\n';
+                        ++failures;
+                    }
+                }
+            }
+        }
+    }
+    for (const auto& [geometry, width] :
+         {std::pair{ops::AttentionHeadGeometry{kHeadDim, 24, 4}, 0},
+          std::pair{ops::AttentionHeadGeometry{kHeadDim, 32, 8}, 1}}) {
+        try {
+            ops::causal_softmax_attention_load_modules(
+                geometry, KvCacheStorage::RotatedLloyd4KeyInt4Value, false, width);
+            std::cerr << "causal_softmax_attention module load accepted " << geometry.query_heads
+                      << " heads at width " << width << '\n';
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    }
+    return failures;
+}
+
 int verify_workspace_capacity_contract() {
     int failures = 0;
     for (const KvCacheStorage storage :
@@ -4835,7 +4874,8 @@ int run_softmax_attention_causal_cache_tests() {
         return 77;
     }
 
-    int failures = verify_workspace_capacity_contract();
+    int failures = verify_module_load_contract();
+    failures += verify_workspace_capacity_contract();
     failures += run_case_allowing_arch_skip("causal_softmax_attention nvfp4 KV cache (decode)", [] {
         int nvfp4_failures = run_nvfp4_decode_cases();
         nvfp4_failures += run_quantized_batch_cases(KvCacheStorage::Nvfp4Group16, 720u);

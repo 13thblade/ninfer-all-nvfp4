@@ -507,6 +507,42 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
     });
 }
 
+void causal_attention_small_t_load_modules(std::int32_t q_heads, std::int32_t kv_heads,
+                                           KvCacheStorage storage, bool cached_input,
+                                           std::int32_t max_width) {
+    if (!kv_cache_is_int8_family(storage)) { return; }
+    // One unit per width, geometry and input holds every INT8-family storage
+    // (small_t_i8_w<N>_h<H>_<input>.cu), so a unit's module serves them all.
+    with_causal_geometry(q_heads, kv_heads, [&]<typename Geometry>() {
+        constexpr int kWidest  = Geometry::ModelQHeads == 24 ? 8 : 6;
+        const auto load_widths = [&]<typename CacheInput>(std::int32_t last) {
+            CausalSmallTInvocation invocation{};
+            invocation.load_module_only = true;
+            const Tensor none{};
+            Tensor unused{};
+            [&]<int... Index>(std::integer_sequence<int, Index...>) {
+                ((Index < last ? launch_small_t_i8<Geometry, Index + 1, CacheInput>(
+                                     false, false, none, CacheInput{}, none, 0.0F, {}, invocation,
+                                     0, 0, 0, 0, unused, unused, unused, nullptr)
+                               : void()),
+                 ...);
+            }(std::make_integer_sequence<int, kWidest>{});
+        };
+        if (cached_input) {
+            load_widths.template operator()<CausalCachedInput>(std::min(max_width, kWidest));
+            return;
+        }
+        load_widths.template operator()<CausalAppendInput>(std::min(max_width, kWidest));
+        // Parallel query tiles run a chunked width as cached launches of its tile width.
+        std::int32_t widest_tile = 0;
+        for (std::int32_t width = 4; width <= std::min(max_width, 2 * kWidest); ++width) {
+            widest_tile = std::max(widest_tile, causal_attention_parallel_tile_width(
+                                                    Geometry::ModelQHeads, width, 1, storage));
+        }
+        load_widths.template operator()<CausalCachedInput>(widest_tile);
+    });
+}
+
 namespace {
 
 // Spreads a single row's block-table row and valid-column count over its query tiles: tile t

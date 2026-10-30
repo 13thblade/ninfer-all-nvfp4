@@ -229,8 +229,7 @@ string string::capitalize() const { return map_case(unicode::Case::Capitalize); 
 string string::titlecase() const { return map_case(unicode::Case::Title); }
 
 string string::strip(bool left, bool right, std::optional<const std::string_view> selected) const {
-    const auto text  = str();
-    const auto chars = unicode::characters(text);
+    const auto text = str();
     const auto matching =
         selected ? unicode::characters(*selected) : std::vector<unicode::Character>{};
     const auto match = [&](auto cp) {
@@ -238,13 +237,23 @@ string string::strip(bool left, bool right, std::optional<const std::string_view
                                       [&](auto ch) { return ch.value == cp; })
                         : unicode::whitespace(cp);
     };
-    std::size_t begin = 0, end = chars.size();
-    if (left)
-        while (begin < end && match(chars[begin].value)) ++begin;
-    if (right)
-        while (end > begin && match(chars[end - 1].value)) --end;
-    const auto first_byte = begin == chars.size() ? text.size() : chars[begin].begin;
-    const auto last_byte  = end == chars.size() ? text.size() : chars[end].begin;
+    // Only the stripped ends are decoded: trimming a document-sized message used to decode all of
+    // it into a character vector (about 3 ms per 500K-character message, several per prompt).
+    std::size_t first_byte = 0, last_byte = text.size();
+    if (left) {
+        while (first_byte < last_byte) {
+            const auto ch = unicode::character_at(text, first_byte);
+            if (!match(ch.value)) break;
+            first_byte = ch.end;
+        }
+    }
+    if (right) {
+        while (last_byte > first_byte) {
+            const auto ch = unicode::character_before(text, last_byte);
+            if (!match(ch.value)) break;
+            last_byte = ch.begin;
+        }
+    }
     return cut_bytes(first_byte, last_byte, true);
 }
 

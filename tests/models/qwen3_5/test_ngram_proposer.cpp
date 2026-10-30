@@ -228,6 +228,36 @@ int main() {
         require(ngram_numbered_sources(std::string("1: a") + '\0' + "b\n2: c\n3: d") ==
                     std::vector<std::string>{std::string("a") + '\0' + "b\nc\nd"},
                 "embedded NUL must not truncate a proposal source");
+        {
+            // A threaded build is the index the preparing thread used to build in place: the
+            // boundaries, then the prompt and each source as their own ingest() spans.
+            std::mt19937 random(7);
+            std::vector<int> prompt(20000);
+            for (int& token : prompt) { token = static_cast<int>(random() % 64); }
+            const std::vector<std::vector<int>> sources{{5, 6, 7, 8, 9, 10, 11, 12, 13, 14},
+                                                        std::vector<int>(prompt.begin() + 300,
+                                                                         prompt.begin() + 900)};
+            const std::vector<int> boundaries{3, 1};
+            auto build = ninfer::models::qwen3_5::detail::NgramIndexBuild::start(boundaries,
+                                                                                 prompt, sources);
+            NgramProposer direct;
+            direct.set_boundaries(boundaries);
+            direct.ingest(prompt);
+            for (const auto& source : sources) { direct.ingest(source); }
+            const auto built = build->take();
+            for (std::size_t end = 16; end <= prompt.size(); end += 97) {
+                const auto history = std::span<const int>(prompt).first(end);
+                const auto expected = direct.propose(history, 33, 4);
+                const auto actual   = built->propose(history, 33, 4);
+                require(actual.tokens == expected.tokens && actual.matched == expected.matched,
+                        "a threaded index build proposes what an in-place build does");
+            }
+            bool rejected = false;
+            try {
+                (void)build->take();
+            } catch (const std::logic_error&) { rejected = true; }
+            require(rejected, "an index build is taken once");
+        }
         std::cout << "ngram CPU tests passed; oracle proposals=" << proposals << '\n';
         return 0;
     } catch (const std::exception& error) {

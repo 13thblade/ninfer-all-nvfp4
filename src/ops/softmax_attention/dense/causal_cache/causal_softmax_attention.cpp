@@ -552,6 +552,18 @@ int causal_softmax_attention_small_t_launches(AttentionHeadGeometry geometry,
     return 0;
 }
 
+void causal_softmax_attention_load_modules(AttentionHeadGeometry geometry,
+                                           KvCacheStorage cache_storage, bool cached_input,
+                                           std::int32_t max_width) {
+    require_causal_geometry(geometry, "causal_softmax_attention module load");
+    if (max_width < 1) {
+        throw std::invalid_argument(
+            "causal_softmax_attention module load: max_width must be positive");
+    }
+    detail::causal_attention_small_t_load_modules(geometry.query_heads, geometry.kv_heads,
+                                                  cache_storage, cached_input, max_width);
+}
+
 std::int32_t causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry) {
     require_causal_geometry(geometry, "causal_softmax_attention prompt wave");
     int device          = 0;
