@@ -99,12 +99,31 @@ public:
         }
     }
 
-    // The attention and GDN input projections reach their Op as one fused single parent on NVFP4.
+    // The attention and GDN input projections reach their Op as one fused single parent on NVFP4,
+    // or, for a tensor-parallel rank, as the parts its share is stored in. Both carriers hold the
+    // policy the Op reads, so the flag promotes whichever the rank was bound as; a part is a
+    // segment of the fused parent (whole KV heads, or the GDN key heads with their value heads), so
+    // its rows are a whole 128-row tile rather than the parent's exact extent.
     void nvfp4_int8_route_single(ops::ProjectionWeights& projection, std::int32_t n,
                                  std::int32_t k) const {
         if (auto* single = std::get_if<ops::SingleProjectionWeight>(&projection)) {
             nvfp4_int8_route(*single, n, k);
+            return;
         }
+        auto* parts = std::get_if<ops::PartProjectionWeights>(&projection);
+        if (parts == nullptr || parts->parts.empty()) { return; }
+        if (!model_.options().nvfp4_w4a8_int || model_.options().nvfp4_w4a16) { return; }
+        if (parts->policy != ops::LinearPolicy::A16Only &&
+            parts->policy != ops::LinearPolicy::AllowA4) {
+            return;
+        }
+        for (const auto& part : parts->parts) {
+            if (part.weight.qtype != QType::NVFP4 || part.weight.k != k || part.weight.n <= 0 ||
+                (part.weight.n % 128) != 0) {
+                return;
+            }
+        }
+        parts->policy = ops::LinearPolicy::AllowNvfp4Int8;
     }
 
     void nvfp4_w4a16_route_single(ops::ProjectionWeights& projection, std::int32_t n,
