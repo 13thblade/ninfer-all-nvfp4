@@ -14,7 +14,7 @@ namespace {
 
 using Geometry = Nvfp4N34816K5120;
 using Schedule =
-    Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 2>;
+    Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4>;
 
 constexpr int kIntermediate = Geometry::kOutputRows / 2;
 static_assert(Schedule::kRowsPerWarp == 2);
@@ -46,9 +46,9 @@ __global__ __launch_bounds__(
     const int parent_rows[Schedule::kRowsPerWarp] = {gate_row, gate_row + kIntermediate};
 
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
-    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, inverse_weight_divisor,
-                                           parent_rows, warp * Schedule::kRowsPerWarp, lane,
-                                           accumulators);
+    compute_nvfp4_rows<Geometry, Schedule>(
+        x, codes, scales, shared, inverse_weight_divisor * kNvfp4A16CoefficientFold, parent_rows,
+        warp * Schedule::kRowsPerWarp, lane, accumulators);
 
     float gate = 0.0F;
     float up   = 0.0F;

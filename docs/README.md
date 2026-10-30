@@ -34,8 +34,9 @@ The artifacts converted for this engine (Ternary Bonsai 2, the GSQ-RCO and Flash
 the Qwen3.8-27B fine-tunes and Qwen3.6-35B-A3B NVFP4) are in the README's
 [artifact table](../README.md#artifacts); their cards live on Hugging Face. The official NInfer
 artifacts load as well; their cards on Hugging Face give upstream's requirements and its
-measurements on one RTX 5090. The `groupwise-int` artifacts run on every supported card, the
-`nvfp4` ones need a `120a` build.
+measurements on one RTX 5090. The `groupwise-int` artifacts run on every supported card. The
+`nvfp4` ones run on the FP4 tensor cores of a `120a` build and, on cards without them, through
+W4A16 routes or, with `--nvfp4-w4a8-int`, the int8 tensor cores.
 
 | Model | Weights | Download |
 |---|---|---|

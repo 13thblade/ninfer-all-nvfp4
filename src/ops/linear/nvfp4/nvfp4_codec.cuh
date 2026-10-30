@@ -2,7 +2,7 @@
 
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
-#include "ops/common/pre_sm80.cuh"
+#include "ops/linear/nvfp4/nvfp4_e4m3_scale.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
@@ -12,17 +12,68 @@
 
 namespace ninfer::ops::detail {
 
-__device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
-    __nv_fp4x2_e2m1 value;
-    value.__x = storage;
-    return static_cast<float2>(value);
-}
-
 __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
     __nv_fp8x2_e4m3 value;
     value.__x = static_cast<std::uint16_t>(storage) | (static_cast<std::uint16_t>(storage) << 8);
     return static_cast<float2>(value).x;
 }
+
+// The ue4m3 scale table for the A16 group coefficient, expanded from the same list the int8 routes
+// use (nvfp4_e4m3_scale.h) and read as a 1KB constant table. Over the reachable domain 0x00..0x7E
+// every entry is exactly half the vendor __nv_fp8x2_e4m3 value; the coefficient folds 2^15 to
+// compensate, so the product stays bit-identical.
+__device__ constexpr float kNvfp4E4M3ScaleA16[256] = {
+    NINFER_E4M3_SCALE_LIST(NINFER_E4M3_SCALE_VALUE)};
+
+// The A16 decode reads an E2M1 pair and its group's E4M3 scale in units whose product the kernel
+// rescales by kNvfp4A16CoefficientFold, a power of two, so every product is the same FP32 value.
+// Blackwell converts both in one instruction each and keeps the vendor forms (fold 1). On older
+// targets ptxas outlines both conversions into calls with BSSY/BSYNC bookkeeping, so they read the
+// integer expansion below (e2m1 * 2^-14) and the ue4m3 table (e4m3 / 2), folded by 2^15.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+inline constexpr float kNvfp4A16CoefficientFold = 1.0F;
+
+__device__ __forceinline__ float2 decode_nvfp4_e2m1x2_raw(std::uint8_t storage) {
+    __nv_fp4x2_e2m1 value;
+    value.__x = storage;
+    return static_cast<float2>(value);
+}
+
+__device__ __forceinline__ float nvfp4_e4m3_scale_a16(std::uint8_t storage) {
+    return decode_nvfp4_e4m3(storage);
+}
+
+__device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
+    return decode_nvfp4_e2m1x2_raw(storage);
+}
+#else
+inline constexpr float kNvfp4A16CoefficientFold = 32768.0F;
+
+// The FP16 pattern carries the e2m1 significand in [11:9] and the sign in [15], and FP16
+// subnormals line the exp==0 codes up on a common 2^-14 factor, so the conversion yields
+// e2m1 * 2^-14 exactly.
+__device__ __forceinline__ float2 decode_nvfp4_e2m1x2_raw(std::uint8_t storage) {
+    const unsigned v = static_cast<unsigned>(storage) | (static_cast<unsigned>(storage) << 12);
+    const unsigned r = ((v << 9) & 0x0E000E00u) | ((v & 0x00080008u) << 12);
+    __half2 packed;
+    packed.x = __ushort_as_half(static_cast<unsigned short>(r & 0xFFFFu));
+    packed.y = __ushort_as_half(static_cast<unsigned short>(r >> 16));
+    return __half22float2(packed);
+}
+
+__device__ __forceinline__ float nvfp4_e4m3_scale_a16(std::uint8_t storage) {
+    return kNvfp4E4M3ScaleA16[storage];
+}
+
+// The expansion rescaled by 2^14, a power of two: the E2M1 values themselves.
+__device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
+    const float2 raw = decode_nvfp4_e2m1x2_raw(storage);
+    float2 result;
+    result.x = raw.x * 16384.0F;
+    result.y = raw.y * 16384.0F;
+    return result;
+}
+#endif
 
 // One e4m3 block scale in the K16M128x4 layout. A 512-byte tile holds 128 rows by four groups,
 // with the rows interleaved so that four rows 32 apart share one 16-byte line. `ScaleTilesPerRow`

@@ -98,7 +98,7 @@ __device__ __forceinline__ void compute_nvfp4_simt_rows(
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
             load_nvfp4_coefficients<Geometry, Schedule>(
                 scales, shared.gemv, parent_rows[local_row], flat_row0 + local_row, warp_phase,
-                lane, inverse_weight_divisor, coefficients[local_row]);
+                lane, inverse_weight_divisor * kNvfp4A16CoefficientFold, coefficients[local_row]);
             const std::int64_t code_offset =
                 static_cast<std::int64_t>(parent_rows[local_row]) * Geometry::kCodeBytesPerRow +
                 phase * (kValuesPerPhase / 2) + warp_in_row * (kValuesPerWarpPhase / 2) +
@@ -132,7 +132,7 @@ __device__ __forceinline__ void compute_nvfp4_simt_rows(
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                     const std::uint32_t word  = row_codes[local_row].words[pair / 4];
                     const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                    const float2 code         = decode_nvfp4_e2m1x2(packed);
+                    const float2 code         = decode_nvfp4_e2m1x2_raw(packed);
                     const float coefficient   = coefficients[local_row][group];
                     row_weight[local_row] = make_float2(code.x * coefficient, code.y * coefficient);
                 }
@@ -165,7 +165,7 @@ __device__ __forceinline__ void compute_nvfp4_simt_rows(
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                     const std::uint32_t word  = row_codes[local_row].words[pair / 4];
                     const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                    const float2 code         = decode_nvfp4_e2m1x2(packed);
+                    const float2 code         = decode_nvfp4_e2m1x2_raw(packed);
                     const float coefficient   = coefficients[local_row][group];
                     row_weight[local_row] = make_float2(code.x * coefficient, code.y * coefficient);
                 }
