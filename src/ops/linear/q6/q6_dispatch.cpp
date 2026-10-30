@@ -14,11 +14,15 @@ struct ShapeEntry {
     // A device-profile route that, where it names a schedule, takes precedence over both tables.
     // Its launches also write FP32 out.
     Q6Launch (*routed)(std::int32_t) = nullptr;
+    // The two tables writing FP32; shapes without them take the runtime-shape route for FP32 out.
+    Q6Launch (*fp32)(std::int32_t)         = nullptr;
+    Q6Launch (*unified_fp32)(std::int32_t) = nullptr;
 };
 
 constexpr std::array kShapes{
     ShapeEntry{248320, 5120, select_q6_n248320_k5120, select_q6_n248320_k5120_unified,
-               routed_q6_n248320_k5120},
+               routed_q6_n248320_k5120, select_q6_n248320_k5120_fp32,
+               select_q6_n248320_k5120_unified_fp32},
     ShapeEntry{34816, 5120, select_q6_n34816_k5120},
     ShapeEntry{248320, 2048, select_q6_n248320_k2048, select_q6_n248320_k2048_unified},
     ShapeEntry{1152, 1536, select_q6_n1152_k1536, select_q6_n1152_k1536_unified},
@@ -46,11 +50,18 @@ Q6Launch select_q6_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     return select_q6_a16_launch(n, k, t);
 }
 
-// FP32 out takes a device-profile route where one is named, else the runtime-shape route.
+// FP32 out chooses as BF16 does among a shape's FP32 tables, else takes the runtime-shape route.
 Q6Launch select_q6_fp32_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     for (const auto& entry : kShapes) {
-        if (entry.n != n || entry.k != k || entry.routed == nullptr) continue;
-        if (const Q6Launch launch = entry.routed(t)) { return launch; }
+        if (entry.n != n || entry.k != k || entry.fp32 == nullptr) continue;
+        if (entry.routed != nullptr) {
+            if (const Q6Launch launch = entry.routed(t)) { return launch; }
+        }
+        if (entry.unified_fp32 != nullptr &&
+            linear_route_table(LinearRouteFamily::Q6, t) == LinearRouteTable::Unified) {
+            return entry.unified_fp32(t);
+        }
+        return entry.fp32(t);
     }
     return select_q6_general_launch(t, DType::FP32);
 }

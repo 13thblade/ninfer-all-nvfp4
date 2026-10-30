@@ -6,7 +6,8 @@
 // 1024-column blocks: their FFN rows split 13312/4096. On sm_70 the formats a Volta rank takes in
 // the panel layout (T2, Q4, Q5, Q6) also run their FP32 partials and a small matrix in it. The
 // 248320x5120 vocabulary head's FP32 logits run its own routes where it has them (Q4 and Q8
-// registered widths, a Q6 device-profile route) and the runtime-shape route beyond.
+// registered widths) and the runtime-shape route beyond; Q6 has tables at every width, which
+// test_q6_a16.cpp qualifies.
 
 #include "ops/linear/linear_test_common.h"
 
@@ -141,7 +142,6 @@ int main() {
             std::uint32_t seed;
         } heads[] = {
             {"Q4_A16 vocabulary head FP32", make_q4_g64_fp16_weight, 431U},
-            {"Q6_A16 vocabulary head FP32", make_q6_g64_fp16_weight, 631U},
             {"Q8_A16 vocabulary head FP32", make_q8_g32_fp16_weight, 831U},
         };
 

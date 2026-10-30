@@ -14,6 +14,10 @@ namespace ninfer::ops::detail {
 
 [[nodiscard]] Q6Launch select_q6_n248320_k5120_unified(std::int32_t tokens);
 
+// The head's FP32 logits on its two tables' schedules (shapes/n248320_k5120_fp32.cu).
+[[nodiscard]] Q6Launch select_q6_n248320_k5120_fp32(std::int32_t tokens);
+[[nodiscard]] Q6Launch select_q6_n248320_k5120_unified_fp32(std::int32_t tokens);
+
 // The vocabulary-head schedule the device profile's "q6_head/248320x5120" entry names for this
 // width ("gemv" through 2 tokens, "small_t" through 32), or null to keep the route tables.
 [[nodiscard]] Q6Launch routed_q6_n248320_k5120(std::int32_t tokens);
