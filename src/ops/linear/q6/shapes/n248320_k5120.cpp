@@ -23,6 +23,8 @@ Q6Launch select_q6_n248320_k5120(std::int32_t tokens) {
 // 1651 at T=4 and 2450 at T=8) and 1793-2386 at T=17..32 (against 2602-2891 for the 64-row MMA).
 // This line's unified sliced-K kernels, which the 3090 route table takes at T=4..18 and 21..40,
 // were not in that race; the profile entry, set by calibration on the GPU, decides each width.
+// ninfer-calibrate on a 3090 at 350 W, 2026-10-30: the small-T MMA 1279-1487 us at T=3..16 against
+// 2215-2510 us for the compiled routes; at T=29..32 the two did not separate.
 Q6Launch routed_q6_n248320_k5120(std::int32_t tokens) {
     enum class Head : std::uint8_t { Gemv, SmallT };
     static constexpr std::array<DeviceRouteCandidate<Head>, 2> kCandidates{{
