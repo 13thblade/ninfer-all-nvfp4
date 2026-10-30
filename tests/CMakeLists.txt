@@ -24,6 +24,14 @@ get_property(_ninfer_all_tests DIRECTORY PROPERTY TESTS)
 set_tests_properties(${_ninfer_all_tests} PROPERTIES SKIP_RETURN_CODE 77 SKIP_REGULAR_EXPRESSION
   "CUDA driver is a stub library;cudaErrorStubLibrary;no CUDA-capable device is detected;CUDA driver version is insufficient for CUDA runtime version")
 
+# And the runtime DLL directories, for every test and not only the ones ninfer_add_test declares:
+# some are registered with add_test directly (tests/ops/tests.cmake) and never reach the helper.
+ninfer_test_dll_path(_ninfer_dll_path_mods)
+if(_ninfer_dll_path_mods)
+  set_tests_properties(${_ninfer_all_tests} PROPERTIES ENVIRONMENT_MODIFICATION
+    "${_ninfer_dll_path_mods}")
+endif()
+
 # Every test executable shares one per-config runtime directory; stage the FFmpeg/curl DLL closure
 # there once so they resolve their imports (the Windows loader only searches the executable's own
 # directory, the system directories and PATH).
