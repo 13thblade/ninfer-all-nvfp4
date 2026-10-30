@@ -48,20 +48,17 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k
     if (!valid_linear_policy(policy))
         throw std::invalid_argument("nvfp4 linear workspace: unsupported policy");
     const bool registered = nvfp4_registered(n, k);
-    const bool int8       = allows_nvfp4_int8(policy);
+    // The int8 family's route is shape-generic -- its grid comes from N and its k-tiles from K at
+    // launch time -- so plain Linear's envelope under this policy is the same on either table: the
+    // unified one answers both the registered rows and the alignment admission for a geometry with
+    // no row. The flag is authoritative: no own-table width falls back to A16.
+    if (allows_nvfp4_int8(policy)) {
+        return unified::nvfp4_linear_workspace_capacity_bytes(n, k, policy, min_tokens, max_tokens);
+    }
     return capacity_by_table(
         min_tokens, max_tokens,
         [](std::int32_t width) { return linear_route_table(LinearRouteFamily::Nvfp4, width); },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) -> std::size_t {
-            // The plain int8 family is registered on the unified table alone: its rows there, and
-            // its alignment admission for a geometry with no row. An own-table width has no plain
-            // int8 route at all (the dispatcher says so), so its envelope is the own table's.
-            if (int8) {
-                return table == LinearRouteTable::Unified
-                           ? unified::nvfp4_linear_workspace_capacity_bytes(n, k, policy, first,
-                                                                            last)
-                           : nvfp4_linear_workspace_capacity_bytes_own(n, k, policy, first, last);
-            }
             // A geometry no table names runs the general runtime-shape route whenever the policy
             // allows one: A4 above its crossover (a tensor-parallel share's rows), A16 below it
             // and for every A16 request, which needs no scratch. This holds on either table --
@@ -86,19 +83,11 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     const bool registered = nvfp4_registered(weight.n, weight.k);
     const bool unified_table =
         linear_route_table(LinearRouteFamily::Nvfp4, x.ne[1]) == LinearRouteTable::Unified;
-    // The int8 family must never be answered by the general A16/A4 route: an "int8" run that never
-    // touched an int8 kernel is the hollow-green failure this policy exists to avoid. A width the
-    // unified table serves runs the unified dispatcher -- its rows, and the alignment admission for
-    // a geometry with no row (the fork's extra rows live only there). An own-table width has no
-    // plain-Linear int8 route, and the message names the knob that moves it.
+    // The int8 flag is authoritative for plain Linear on either table: the family's route is
+    // shape-generic (its grid comes from N and its k-tiles from K at launch time), so an own-table
+    // width takes it too instead of refusing or falling back to A16. A geometry its alignment
+    // contract cannot tile is refused by the launcher, not answered by a slower composition.
     if (allows_nvfp4_int8(policy)) {
-        if (!unified_table) {
-            throw std::invalid_argument(
-                "nvfp4 linear: T=" + std::to_string(x.ne[1]) +
-                " resolves to the own (non-unified) shape table, which registers no plain-Linear "
-                "int8 route. Run with NINFER_LINEAR_ROUTES=unified, or widen the device profile's "
-                "nvfp4 width band to cover it");
-        }
         unified::nvfp4_dispatch(x, weight, out, policy, workspace, stream);
         return;
     }

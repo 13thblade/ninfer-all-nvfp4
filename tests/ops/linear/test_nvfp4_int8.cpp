@@ -39,15 +39,12 @@ int run_wide_band_bitexact_mmq();
 int verify_token_tile_ladder();
 int verify_geometry_diagnostics();
 
-// Two things have to be said for an int8 measurement to be real, and they are the same shape of
-// hazard. (1) Plain Linear's int8 route is registered by the unified shape table only: its shapes
-// registry and its kernel instances are all `ops::linear::nvfp4::unified`, and an own-table call
-// raises rather than quietly running A16. This binary installs no device profile, so without a table
-// pin the schedule would be Legacy for most widths and every int8 invocation would fail the
-// dispatcher's own check -- a configuration error masquerading as a test result. (2) The wide
-// mainloop follows the table (own runs MMQ, unified runs grouped), so pin the table's answer
-// explicitly rather than letting a future band change move the kernel under test. A case that wants
-// the other mainloop says so locally and nests.
+// Two things have to be said for an int8 measurement to be real. (1) The int8 flag outranks the
+// route table: plain Linear's int8 route is shape-generic, so an own-table width takes it too and
+// no table pin is needed for a call to reach an int8 kernel. (2) The wide MAINLOOP follows the
+// table (own runs MMQ, unified runs grouped), so the pin below still matters: this suite measures
+// the grouped ladder, and pinning the table keeps a future band change from moving the kernel
+// under test. A case that wants the other mainloop says so locally and nests.
 struct UnifiedInt8Route {
     UnifiedInt8Route()
         : previous(ops::detail::force_nvfp4_int8_mainloop(
@@ -409,6 +406,32 @@ int verify_geometry_diagnostics() {
             ++failures;
         }
     }
+    // The flag outranks the route table: an own-table width answers an int8 call through the same
+    // shape-generic route, so a Legacy pin must find the very envelope the unified table does
+    // rather than refuse the call. Before the flag became authoritative this raised.
+    for (int tokens : {1, 129, 256}) {
+        ops::detail::force_linear_route_table(ops::detail::LinearRouteTable::Legacy);
+        std::size_t own = 0;
+        try {
+            own = ops::linear_workspace_capacity_bytes(QType::NVFP4, 8192, 4096,
+                                                       ops::LinearPolicy::AllowNvfp4Int8, tokens,
+                                                       tokens);
+        } catch (const std::exception& error) {
+            std::cerr << "NVFP4 int8 [8192,4096] T=" << tokens << " own table: " << error.what()
+                      << '\n';
+            ++failures;
+            continue;
+        }
+        ops::detail::force_linear_route_table(ops::detail::LinearRouteTable::Unified);
+        const std::size_t unified = ops::linear_workspace_capacity_bytes(
+            QType::NVFP4, 8192, 4096, ops::LinearPolicy::AllowNvfp4Int8, tokens, tokens);
+        if (own == 0 || own != unified) {
+            std::cerr << "NVFP4 int8 [8192,4096] T=" << tokens << " own table: " << own
+                      << " B, unified " << unified << " B\n";
+            ++failures;
+        }
+    }
+    ops::detail::force_linear_route_table(ops::detail::LinearRouteTable::Unified);
     return failures;
 }
 
