@@ -13,6 +13,12 @@
 
 namespace ninfer::ops::detail::unified {
 
+__device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
+    __nv_fp8x2_e4m3 value;
+    value.__x = static_cast<std::uint16_t>(storage) | (static_cast<std::uint16_t>(storage) << 8);
+    return static_cast<float2>(value).x;
+}
+
 // The ue4m3 scale table for the A16 decode path, expanded from the same list the int8 routes use
 // (nvfp4_e4m3_scale.h). Over the reachable domain 0x00..0x7E every entry is exactly half the vendor
 // __nv_fp8x2_e4m3 value; both users below compensate with a power-of-two fold (2^15), so every
@@ -20,11 +26,33 @@ namespace ninfer::ops::detail::unified {
 __device__ constexpr float kNvfp4E4M3ScaleA16[256] = {
     NINFER_E4M3_SCALE_LIST(NINFER_E4M3_SCALE_VALUE)};
 
-// E2M1 pair -> FP32 without the vendor conversion, which ptxas outlines on sm_86/sm_89 into a call
-// with BSSY/BSYNC bookkeeping. This form builds both halves as FP16 bit patterns and converts: the
-// FP16 pattern carries the e2m1 significand in [11:9] and the sign in [15], and FP16 subnormals
-// line the exp==0 codes up on a common 2^-14 factor, so the conversion yields e2m1 * 2^-14 exactly
-// and the trailing *2^14 rescale below is a power of two.
+// The A16 decode reads an E2M1 pair and its group's E4M3 scale in units whose product the kernel
+// rescales by kNvfp4A16CoefficientFold, a power of two, so every product is the same FP32 value.
+// Blackwell converts both in one instruction each and keeps the vendor forms (fold 1). On older
+// targets ptxas outlines both conversions into calls with BSSY/BSYNC bookkeeping, so they read the
+// integer expansion below (e2m1 * 2^-14) and the ue4m3 table (e4m3 / 2), folded by 2^15.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+inline constexpr float kNvfp4A16CoefficientFold = 1.0F;
+
+__device__ __forceinline__ float2 decode_nvfp4_e2m1x2_raw(std::uint8_t storage) {
+    __nv_fp4x2_e2m1 value;
+    value.__x = storage;
+    return static_cast<float2>(value);
+}
+
+__device__ __forceinline__ float nvfp4_e4m3_scale_a16(std::uint8_t storage) {
+    return decode_nvfp4_e4m3(storage);
+}
+
+__device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
+    return decode_nvfp4_e2m1x2_raw(storage);
+}
+#else
+inline constexpr float kNvfp4A16CoefficientFold = 32768.0F;
+
+// The FP16 pattern carries the e2m1 significand in [11:9] and the sign in [15], and FP16
+// subnormals line the exp==0 codes up on a common 2^-14 factor, so the conversion yields
+// e2m1 * 2^-14 exactly.
 __device__ __forceinline__ float2 decode_nvfp4_e2m1x2_raw(std::uint8_t storage) {
     const unsigned v = static_cast<unsigned>(storage) | (static_cast<unsigned>(storage) << 12);
     const unsigned r = ((v << 9) & 0x0E000E00u) | ((v & 0x00080008u) << 12);
@@ -34,9 +62,11 @@ __device__ __forceinline__ float2 decode_nvfp4_e2m1x2_raw(std::uint8_t storage) 
     return __half22float2(packed);
 }
 
-// The same expansion without the 2^14 rescale: callers whose group coefficient is a free scalar
-// fold that power of two into the coefficient instead of paying one FMUL per code here -- which is
-// exact because 16384 is a power of two.
+__device__ __forceinline__ float nvfp4_e4m3_scale_a16(std::uint8_t storage) {
+    return kNvfp4E4M3ScaleA16[storage];
+}
+
+// The expansion rescaled by 2^14, a power of two: the E2M1 values themselves.
 __device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
     const float2 raw = decode_nvfp4_e2m1x2_raw(storage);
     float2 result;
@@ -44,12 +74,7 @@ __device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
     result.y = raw.y * 16384.0F;
     return result;
 }
-
-__device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
-    __nv_fp8x2_e4m3 value;
-    value.__x = static_cast<std::uint16_t>(storage) | (static_cast<std::uint16_t>(storage) << 8);
-    return static_cast<float2>(value).x;
-}
+#endif
 
 __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, std::uint8_t scale) {
 #if NINFER_NATIVE_FP8_FP4_PAIR_CVT
@@ -74,7 +99,7 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
     // rescalings of exact values, so the product rounds once to the same bits the vendor pair
     // produced (lut_bitcheck.cu is bit-exact over the full domain).
     const float2 values    = decode_nvfp4_e2m1x2_raw(code);
-    const float multiplier = kNvfp4E4M3ScaleA16[scale] * 32768.0F;
+    const float multiplier = nvfp4_e4m3_scale_a16(scale) * kNvfp4A16CoefficientFold;
 
     union {
         __nv_bfloat162 pair;
@@ -112,7 +137,7 @@ __device__ __forceinline__ void nvfp4_scaled_quad_bf16(unsigned codes, std::uint
         out[i] = result;
     }
 #else
-    const float multiplier = kNvfp4E4M3ScaleA16[scale] * 32768.0F;
+    const float multiplier = nvfp4_e4m3_scale_a16(scale) * kNvfp4A16CoefficientFold;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const float2 values =

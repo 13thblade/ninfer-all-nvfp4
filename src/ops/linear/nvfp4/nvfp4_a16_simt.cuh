@@ -94,8 +94,7 @@ compute_nvfp4_simt_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
             load_nvfp4_coefficients<Geometry, Schedule>(
                 scales, shared.gemv, parent_rows[local_row], flat_row0 + local_row, warp_phase,
-                lane, inverse_weight_divisor * 32768.0F,  // folds the decoder's 2^14 rescale and the table's half scale (bit-exact)
-                coefficients[local_row]);
+                lane, inverse_weight_divisor * kNvfp4A16CoefficientFold, coefficients[local_row]);
             const std::int64_t code_offset =
                 static_cast<std::int64_t>(parent_rows[local_row]) * Geometry::kCodeBytesPerRow +
                 phase * (kValuesPerPhase / 2) + warp_in_row * (kValuesPerWarpPhase / 2) +
