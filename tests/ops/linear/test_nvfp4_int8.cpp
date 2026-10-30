@@ -377,14 +377,21 @@ int verify_geometry_diagnostics() {
         const char* expected;
     };
     const Case cases[] = {
-        // No row and no A16 route under this policy.
-        {4096, 2048, ops::LinearPolicy::A16Only, 128, "no registered shape"},
         // N is not a whole number of 128-row tiles.
         {4000, 2048, ops::LinearPolicy::AllowNvfp4Int8, 128, "N % 128 == 0"},
         // K is not a whole number of 64-column k-tiles.
         {4096, 2080, ops::LinearPolicy::AllowNvfp4Int8, 128, "K % 64 == 0"},
     };
     int failures = 0;
+    // A geometry no table names answers an A16 request through the runtime-shape route
+    // (nvfp4_general_a16), so its envelope is the zero that composition needs rather than the
+    // refusal it used to be: the general route is the A16 composition a rowless geometry has.
+    if (ops::linear_workspace_capacity_bytes(QType::NVFP4, 4096, 2048, ops::LinearPolicy::A16Only,
+                                             128, 128) != 0) {
+        std::cerr << "NVFP4 int8 [4096,2048] A16Only: expected no scratch for the runtime-shape "
+                     "route\n";
+        ++failures;
+    }
     for (const Case& probe : cases) {
         bool threw = false;
         std::string message;
