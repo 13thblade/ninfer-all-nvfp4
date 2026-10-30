@@ -44,8 +44,8 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
 
 void readout_logprobs(const Tensor& logits, const Tensor& token_ids, std::int32_t count,
                       std::int32_t valid_rows, Tensor& output, cudaStream_t stream) {
-    if (logits.dtype != DType::BF16) {
-        throw std::invalid_argument("readout_logprobs: logits must be BF16");
+    if (logits.dtype != DType::BF16 && logits.dtype != DType::FP32) {
+        throw std::invalid_argument("readout_logprobs: logits must be BF16 or FP32");
     }
     if (token_ids.dtype != DType::I32) {
         throw std::invalid_argument("readout_logprobs: token_ids must be I32");

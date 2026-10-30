@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/ninfer/ops/sampling.h
-// Match: contiguous BF16 logits, physical stride >= token domain, and at most
+// Match: contiguous BF16 or FP32 logits, physical stride >= token domain, and at most
 // sixteen columns on the multi-block route.
 // Algorithm assumptions: 256-thread/2-item partial tiles feed bounded top-20
 // group merges through caller-owned workspace; unsupported finite geometries
@@ -11,11 +11,11 @@
 
 namespace ninfer::ops {
 
+template <typename Logit>
 __launch_bounds__(kSamplerBlock) __global__
-    void sample_row_kernel(const __nv_bfloat16* logits, std::int32_t* out,
-                           const SamplingConfig* configs, const std::int32_t* logical_positions,
-                           std::int32_t purpose, std::int32_t token_domain,
-                           std::int32_t physical_rows) {
+    void sample_row_kernel(const Logit* logits, std::int32_t* out, const SamplingConfig* configs,
+                           const std::int32_t* logical_positions, std::int32_t purpose,
+                           std::int32_t token_domain, std::int32_t physical_rows) {
     const int row            = static_cast<int>(blockIdx.x);
     const std::int64_t base  = static_cast<std::int64_t>(row) * physical_rows;
     const int tid            = threadIdx.x;
@@ -32,7 +32,7 @@ __launch_bounds__(kSamplerBlock) __global__
                                cfg.token_mask != nullptr;
         if (!penalties) {
             for (int v = tid; v < token_domain; v += blockDim.x) {
-                const float x = __bfloat162float(logits[base + v]);
+                const float x = sampling_logit(logits[base + v]);
                 if (sampling_better(x, v, bv, bi)) {
                     bv = x;
                     bi = v;
@@ -40,7 +40,7 @@ __launch_bounds__(kSamplerBlock) __global__
             }
         } else {
             for (int v = tid; v < token_domain; v += blockDim.x) {
-                const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg);
+                const float x = sampling_adjusted_logit(sampling_logit(logits[base + v]), v, cfg);
                 if (sampling_better(x, v, bv, bi)) {
                     bv = x;
                     bi = v;
@@ -104,8 +104,9 @@ __launch_bounds__(kSamplerBlock) __global__
     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
 
+template <typename Logit>
 __launch_bounds__(kSamplerBlock) __global__
-    void sampling_partial_topk_kernel(const __nv_bfloat16* logits, const SamplingConfig* cfg_ptr,
+    void sampling_partial_topk_kernel(const Logit* logits, const SamplingConfig* cfg_ptr,
                                       std::int32_t token_domain, std::int32_t physical_rows,
                                       SamplingWorkspace workspace) {
     const int col            = static_cast<int>(blockIdx.y);
@@ -127,7 +128,7 @@ __launch_bounds__(kSamplerBlock) __global__
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
-            const float raw = __bfloat162float(logits[base + v]);
+            const float raw = sampling_logit(logits[base + v]);
             const float x   = penalties ? sampling_adjusted_logit(raw, v, cfg) : raw;
             keys[item]      = sampling_sort_key(x, v);
         } else {

@@ -12,6 +12,7 @@ struct ShapeEntry {
     // The unified-template table; shapes without one keep the legacy routes everywhere.
     Q6Launch (*unified)(std::int32_t) = nullptr;
     // A device-profile route that, where it names a schedule, takes precedence over both tables.
+    // Its launches also write FP32 out.
     Q6Launch (*routed)(std::int32_t) = nullptr;
 };
 
@@ -45,10 +46,19 @@ Q6Launch select_q6_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     return select_q6_a16_launch(n, k, t);
 }
 
+// FP32 out takes a device-profile route where one is named, else the runtime-shape route.
+Q6Launch select_q6_fp32_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    for (const auto& entry : kShapes) {
+        if (entry.n != n || entry.k != k || entry.routed == nullptr) continue;
+        if (const Q6Launch launch = entry.routed(t)) { return launch; }
+    }
+    return select_q6_general_launch(t, DType::FP32);
+}
+
 void q6_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream) {
     const Q6Launch launch = out.dtype == DType::FP32
-                                ? select_q6_general_launch(x.ne[1], DType::FP32)
+                                ? select_q6_fp32_launch(weight.n, weight.k, x.ne[1])
                                 : select_q6_launch(weight.n, weight.k, x.ne[1], policy);
     launch(x, weight, out, stream);
 }

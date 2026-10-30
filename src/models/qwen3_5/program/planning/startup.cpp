@@ -352,21 +352,23 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
 
     out.round = qwen3_5::begin_round_state_layout(
-        builder, qwen3_5::RoundStateSpec{.hidden         = dimension(config.hidden_size),
-                                         .output_rows    = dimension(config.vocab_size),
-                                         .batch_capacity = plan.max_concurrency,
-                                         .draft_window   = plan.draft_window,
-                                         .verify_window  = widest_verify_window(plan),
-                                         .backend        = plan.speculative_backend,
-                                         .causal_scoring = plan.causal_scoring});
+        builder, qwen3_5::RoundStateSpec{
+                     .hidden         = dimension(config.hidden_size),
+                     .output_rows    = dimension(config.vocab_size),
+                     .batch_capacity = plan.max_concurrency,
+                     .draft_window   = plan.draft_window,
+                     .verify_window  = widest_verify_window(plan),
+                     .backend        = plan.speculative_backend,
+                     .causal_scoring = plan.causal_scoring,
+                     .logits_dtype = execution::target_logits_dtype(parameters.text.output_head)});
     out.prefill_hidden =
         add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
                    "step prefill hidden");
     if (plan.causal_scoring) {
-        out.score_hidden =
-            add_tensor(builder, DType::BF16,
-                       {dimension(config.hidden_size), static_cast<std::int32_t>(kCausalScoreTile)},
-                       "causal score hidden staging");
+        const auto tile = static_cast<std::int32_t>(
+            causal_score_tile(execution::target_logits_dtype(parameters.text.output_head)));
+        out.score_hidden = add_tensor(builder, DType::BF16, {dimension(config.hidden_size), tile},
+                                      "causal score hidden staging");
     }
     qwen3_5::complete_round_state_layout(builder, out.round);
     if (!plan.causal_scoring) {
@@ -415,8 +417,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
 }
 
 WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
-    const auto& parameters = *plan.parameters;
-    const auto& config     = parameters.model.config().text;
+    const auto& parameters   = *plan.parameters;
+    const auto& config       = parameters.model.config().text;
+    const DType logits_dtype = execution::target_logits_dtype(parameters.text.output_head);
 
     const std::uint32_t chunk_u32 = std::min(plan.prefill_chunk, plan.capacity);
     if (chunk_u32 == 0 ||
@@ -713,7 +716,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         const auto lanes      = static_cast<std::int32_t>(plan.max_concurrency);
         auto tail             = text_prefill.scope();
         (void)text_prefill.alloc(DType::BF16, {dimension(config.hidden_size), rows});
-        (void)text_prefill.alloc(DType::BF16, {dimension(config.vocab_size), rows});
+        (void)text_prefill.alloc(logits_dtype, {dimension(config.vocab_size), rows});
         (void)text_prefill.alloc_bytes(sizeof(ops::SamplingConfig) *
                                        execution::kMaximumPrefillSegments);
         (void)text_prefill.alloc(DType::I32, {ops::kLogprobTopK, 1, rows});
@@ -722,7 +725,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)text_prefill.alloc(DType::I32, {ops::kReadoutLogprobsMaximum, rows});
         (void)text_prefill.alloc(DType::FP32, {ops::kReadoutLogprobsMaximum, rows});
         (void)text_prefill.alloc(DType::I32, {rows});
-        (void)text_prefill.alloc(DType::BF16, {dimension(config.vocab_size), lanes});
+        (void)text_prefill.alloc(logits_dtype, {dimension(config.vocab_size), lanes});
         (void)text_prefill.alloc_bytes(sizeof(ops::SamplingConfig) *
                                        static_cast<std::size_t>(lanes));
         (void)text_prefill.alloc(DType::I32, {lanes});
@@ -734,11 +737,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     if (plan.causal_scoring) {
         WorkspaceLayoutBuilder causal_score;
-        matrix(causal_score, DType::BF16, dimension(config.vocab_size),
-               static_cast<std::int32_t>(kCausalScoreTile));
-        matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
-        matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
-        linear_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
+        const auto tile = static_cast<std::int32_t>(causal_score_tile(logits_dtype));
+        matrix(causal_score, logits_dtype, dimension(config.vocab_size), tile);
+        matrix(causal_score, DType::I32, 1, tile);
+        matrix(causal_score, DType::FP32, 1, tile);
+        linear_scratch(causal_score, parameters.text.output_head, 1, tile);
         out.causal_score = finish(causal_score);
     }
 

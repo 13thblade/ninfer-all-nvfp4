@@ -51,7 +51,10 @@ std::size_t logprob_topk_workspace_capacity_bytes(std::int32_t token_domain, std
 void logprob_topk(const Tensor& logits, const SamplingConfig* configs, const Tensor* drafts,
                   std::int32_t token_domain, Tensor& top_ids, Tensor& top_values, Tensor& lse,
                   const Tensor& active, WorkspaceArena& workspace, cudaStream_t stream) {
-    require_accessible(logits, DType::BF16, "logits");
+    if (logits.dtype != DType::BF16 && logits.dtype != DType::FP32) {
+        reject("logits must be BF16 or FP32");
+    }
+    require_accessible(logits, logits.dtype, "logits");
     if (logits.ne[0] <= 0 || logits.ne[1] <= 0 || logits.ne[2] <= 0 || logits.ne[3] != 1) {
         reject("logits must be [physical_rows,columns,batch] with positive dimensions");
     }

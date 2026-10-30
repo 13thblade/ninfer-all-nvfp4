@@ -4,7 +4,9 @@
 // 4608/1536, the output projection's K the same), FFN rows 13056/4352. T2, FP8 and NVFP4 shares are
 // whole K slabs of 512 or 256 columns (ops::linear_share_units), and a rotated input's whole
 // 1024-column blocks: their FFN rows split 13312/4096. On sm_70 the formats a Volta rank takes in
-// the panel layout (T2, Q4, Q5, Q6) also run their FP32 partials and a small matrix in it.
+// the panel layout (T2, Q4, Q5, Q6) also run their FP32 partials and a small matrix in it. The
+// 248320x5120 vocabulary head's FP32 logits run its own routes where it has them (Q4 and Q8
+// registered widths, a Q6 device-profile route) and the runtime-shape route beyond.
 
 #include "ops/linear/linear_test_common.h"
 
@@ -30,6 +32,11 @@ constexpr std::array kWidths{
     graph(33),
 };
 constexpr std::array kSmall{a16(1), a16(4), a16(9), a16(33), a16(130), graph(2)};
+// The head's widths: GEMV, each small-T and K-split tile with a remainder, the edges of the Q8
+// K-split band (26 on sm_8x, 33 elsewhere) and the runtime-shape route past them.
+constexpr std::array kHeadWidths{a16(1),  a16(2),  a16(3),   a16(8),   a16(9),   a16(16),
+                                 a16(17), a16(24), a16(26),  a16(27),  a16(32),  a16(33),
+                                 a16(34), a16(64), graph(1), graph(8), graph(27)};
 
 int conformance(const char* label, WeightGenerator generator, std::uint32_t seed) {
     int failures = 0;
@@ -97,6 +104,12 @@ int panel_conformance(const char* label, WeightGenerator generator, std::uint32_
     return failures;
 }
 
+int head_conformance(const char* label, WeightGenerator generator, std::uint32_t seed) {
+    return run_shape(label, ActivationCompute::A16, generator,
+                     {248320, 5120, seed, Comparison::SampledRows, false, kHeadWidths,
+                      ActivationSigns::Centered, DType::FP32});
+}
+
 } // namespace
 
 int main() {
@@ -120,6 +133,22 @@ int main() {
             const int format_failures = conformance(format.label, format.generator, format.seed);
             std::cout << (format_failures == 0 ? "OK " : "FAIL ") << format.label << '\n';
             failures += format_failures;
+        }
+
+        const struct {
+            const char* label;
+            WeightGenerator generator;
+            std::uint32_t seed;
+        } heads[] = {
+            {"Q4_A16 vocabulary head FP32", make_q4_g64_fp16_weight, 431U},
+            {"Q6_A16 vocabulary head FP32", make_q6_g64_fp16_weight, 631U},
+            {"Q8_A16 vocabulary head FP32", make_q8_g32_fp16_weight, 831U},
+        };
+
+        for (const auto& head : heads) {
+            const int head_failures = head_conformance(head.label, head.generator, head.seed);
+            std::cout << (head_failures == 0 ? "OK " : "FAIL ") << head.label << '\n';
+            failures += head_failures;
         }
         const struct {
             const char* label;

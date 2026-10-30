@@ -33,4 +33,17 @@ Q8Launch select_q8_n248320_k5120(std::int32_t tokens) {
     return launch_q8_mma_r64_c128;
 }
 
+Q8Launch select_q8_n248320_k5120_fp32(std::int32_t tokens) {
+    if (tokens <= 8) return launch_q8_ksplit_fp32<Geometry, 8, C8>;
+    if (tokens <= 16) return launch_q8_ksplit_fp32<Geometry, 16, C16>;
+    if (tokens <= 24) return launch_q8_ksplit_fp32<Geometry, 24, C24>;
+#if defined(NINFER_SM8X_COMPAT)
+    if (tokens <= 26) return launch_q8_ksplit_fp32<Geometry, 32, C32>;
+#else
+    if (tokens <= 32) return launch_q8_ksplit_fp32<Geometry, 32, C32>;
+    if (tokens <= 33) return launch_q8_ksplit_fp32<Geometry, 40, C40>;
+#endif
+    return nullptr;
+}
+
 } // namespace ninfer::ops::detail

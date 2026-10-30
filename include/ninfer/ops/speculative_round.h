@@ -106,9 +106,9 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
  *
  * Logical shapes:
  *   All Tensor storage is contiguous. target_tokens/licensed_tokens are I32 [K+1,B], drafts is
- *   I32 [K,B], logits is BF16 [physical_rows,K+1,B], and current_extents/lengths/anchors/
+ *   I32 [K,B], logits is BF16 or FP32 [physical_rows,K+1,B], and current_extents/lengths/anchors/
  *   licensed_counts/accepted are I32 [B]. With column_starts (device I32 [B]) the rows are packed
- *   at their own widths instead: target_tokens is I32 [columns] and logits BF16
+ *   at their own widths instead: target_tokens is I32 [columns] and logits BF16 or FP32
  *   [physical_rows,columns], row b's column i at column_starts[b]+i for i<=current_extents[b];
  *   licensed_tokens stays [K+1,B]. token_domain is in [1,physical_rows], K>=1, B>=1, and
  *   configs points to a device-resident SamplingConfig[B]. Tensor arguments, configs, and
@@ -161,7 +161,7 @@ void speculative_accept_coupled_drafts(const Tensor& target_tokens, const Tensor
  *
  * Logical shapes and registered profile:
  *   All Tensor storage is contiguous. target_tokens/licensed_tokens are I32 [K+1,B].
- *   logits is BF16 [248320,K+1,B]; drafts is I32 [K,B]; candidate_ids is I32 [16,K,B];
+ *   logits is BF16 or FP32 [248320,K+1,B]; drafts is I32 [K,B]; candidate_ids is I32 [16,K,B];
  *   proposal_q is FP32 [16,K,B]. current_extents, round_lengths, round_anchors,
  *   licensed_counts, and accepted_drafts are I32 [B].
  *   The registered domain is token_domain=248077, K=1..31 at B=1..8, or K=32..63

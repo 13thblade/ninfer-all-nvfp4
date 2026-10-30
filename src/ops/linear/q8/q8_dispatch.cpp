@@ -15,11 +15,14 @@ struct ShapeEntry {
     ShapeSelector select;
     // The unified-template table; shapes without one keep the legacy routes everywhere.
     ShapeSelector unified;
+    // FP32 out on the widths it names; the runtime-shape route elsewhere.
+    ShapeSelector fp32 = nullptr;
 };
 
 template <class Geometry>
-constexpr ShapeEntry shape(ShapeSelector select, ShapeSelector unified = nullptr) {
-    return {Geometry::kOutputRows, Geometry::kInputRows, select, unified};
+constexpr ShapeEntry shape(ShapeSelector select, ShapeSelector unified = nullptr,
+                           ShapeSelector fp32 = nullptr) {
+    return {Geometry::kOutputRows, Geometry::kInputRows, select, unified, fp32};
 }
 
 constexpr std::array kShapes{
@@ -40,7 +43,8 @@ constexpr std::array kShapes{
     shape<Q8N14336K5120>(select_q8_n14336_k5120, select_q8_n14336_k5120_unified),
     shape<Q8N17408K5120>(select_q8_n17408_k5120),
     shape<Q8N34816K5120>(select_q8_n34816_k5120, select_q8_n34816_k5120_unified),
-    shape<Q8N248320K5120>(select_q8_n248320_k5120, select_q8_n248320_k5120_unified),
+    shape<Q8N248320K5120>(select_q8_n248320_k5120, select_q8_n248320_k5120_unified,
+                          select_q8_n248320_k5120_fp32),
 };
 } // namespace
 
@@ -62,11 +66,18 @@ Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     return select_q8_a16_launch(n, k, t);
 }
 
+Q8Launch select_q8_fp32_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    for (const auto& entry : kShapes) {
+        if (entry.n != n || entry.k != k || entry.fp32 == nullptr) continue;
+        if (const Q8Launch launch = entry.fp32(t)) { return launch; }
+    }
+    return select_q8_general_launch(t, DType::FP32);
+}
+
 void q8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream) {
-    const Q8Launch launch = out.dtype == DType::FP32
-                                ? select_q8_general_launch(x.ne[1], DType::FP32)
-                                : select_q8_launch(w.n, w.k, x.ne[1], policy);
+    const Q8Launch launch = out.dtype == DType::FP32 ? select_q8_fp32_launch(w.n, w.k, x.ne[1])
+                                                     : select_q8_launch(w.n, w.k, x.ne[1], policy);
     launch(x, w, out, stream);
 }
 

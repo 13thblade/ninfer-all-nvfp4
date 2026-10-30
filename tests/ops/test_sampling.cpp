@@ -2,8 +2,9 @@
 //
 // The deterministic branch is checked exactly against an independent CPU
 // argmax.  The stochastic branch is checked against one FP64 mathematical
-// distribution oracle built from the BF16 values represented at the public
-// input.  The test never reproduces the device RNG algorithm or uses another
+// distribution oracle built from the values represented at the public input.
+// Every contract runs on BF16 logits, then on FP32 logits holding the same
+// values.  The test never reproduces the device RNG algorithm or uses another
 // production path as a golden.
 #include "ninfer/ops/sampling.h"
 #include "ops/op_tester.h"
@@ -12,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -51,6 +53,29 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
     std::vector<std::uint16_t> bits(values.size());
     for (std::size_t i = 0; i < values.size(); ++i) { bits[i] = f32_to_bf16(values[i]); }
     return bits;
+}
+
+// The logits dtype the contracts run on.
+DType g_logits = DType::BF16;
+
+// Logits in g_logits on the device, and their bytes for the read-only check.
+struct DeviceLogits {
+    DeviceBuffer buffer;
+    std::vector<std::uint8_t> bytes;
+};
+
+DeviceLogits upload_logits(const std::vector<float>& values) {
+    std::vector<std::uint8_t> bytes;
+    if (g_logits == DType::FP32) {
+        bytes.resize(values.size() * sizeof(float));
+        std::memcpy(bytes.data(), values.data(), bytes.size());
+    } else {
+        const std::vector<std::uint16_t> bits = bf16_bits(values);
+        bytes.resize(bits.size() * sizeof(std::uint16_t));
+        std::memcpy(bytes.data(), bits.data(), bytes.size());
+    }
+    DeviceBuffer buffer = to_device(bytes);
+    return {std::move(buffer), std::move(bytes)};
 }
 
 std::vector<float> repeat_column(const std::vector<float>& column, int columns) {
@@ -151,8 +176,7 @@ RunResult run_batch(const std::vector<float>& logits, int physical_rows, int tok
         (!initial_counts.empty() && initial_counts.size() != configs.size())) {
         throw std::invalid_argument("invalid sample batch fixture");
     }
-    const std::vector<std::uint16_t> input_bits = bf16_bits(logits);
-    DeviceBuffer device_logits                  = to_device(input_bits);
+    const DeviceLogits device_logits = upload_logits(logits);
     GuardedDeviceBuffer device_out(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
     const std::vector<int> output_sentinel(static_cast<std::size_t>(batch), -777777);
     device_out.copy_from_host(output_sentinel.data(),
@@ -176,7 +200,7 @@ RunResult run_batch(const std::vector<float>& logits, int physical_rows, int tok
     DeviceBuffer device_configs                             = to_device(configs);
     DeviceBuffer device_positions                           = to_device(logical_positions);
 
-    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch});
+    Tensor logits_tensor(device_logits.buffer.p, g_logits, {physical_rows, batch});
     Tensor out_tensor(device_out.data(), DType::I32, {batch});
     Tensor positions_tensor(device_positions.p, DType::I32, {batch});
     const std::size_t workspace_bytes =
@@ -192,7 +216,8 @@ RunResult run_batch(const std::vector<float>& logits, int physical_rows, int tok
     result.integrity_failures += device_out.verify_guards("sample output");
     result.integrity_failures +=
         verify_exact("sample read-only logits",
-                     from_device<std::uint16_t>(device_logits, input_bits.size()), input_bits);
+                     from_device<std::uint8_t>(device_logits.buffer, device_logits.bytes.size()),
+                     device_logits.bytes);
 
     const std::vector<ops::SamplingConfig> actual_configs =
         from_device<ops::SamplingConfig>(device_configs, configs.size());
@@ -242,9 +267,7 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
         throw std::invalid_argument("repeated sample count must be a positive batch multiple");
     }
     const int physical_rows                     = static_cast<int>(column.size());
-    const std::vector<float> logits             = repeat_column(column, batch);
-    const std::vector<std::uint16_t> input_bits = bf16_bits(logits);
-    DeviceBuffer device_logits                  = to_device(input_bits);
+    const DeviceLogits device_logits            = upload_logits(repeat_column(column, batch));
     GuardedDeviceBuffer collected(static_cast<std::size_t>(total) * sizeof(std::int32_t));
     std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch), config);
     const std::vector<ops::SamplingConfig> expected_configs = configs;
@@ -253,7 +276,7 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
     for (int i = 0; i < total; ++i) { positions[static_cast<std::size_t>(i)] = position + i; }
     DeviceBuffer device_positions = to_device(positions);
 
-    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch});
+    Tensor logits_tensor(device_logits.buffer.p, g_logits, {physical_rows, batch});
     const std::size_t workspace_bytes =
         ops::sampling_workspace_capacity_bytes(token_domain, batch, batch);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
@@ -274,7 +297,8 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
     result.integrity_failures += collected.verify_guards("sample repeated output");
     result.integrity_failures +=
         verify_exact("sample repeated read-only logits",
-                     from_device<std::uint16_t>(device_logits, input_bits.size()), input_bits);
+                     from_device<std::uint8_t>(device_logits.buffer, device_logits.bytes.size()),
+                     device_logits.bytes);
     const std::vector<ops::SamplingConfig> actual_configs =
         from_device<ops::SamplingConfig>(device_configs, configs.size());
     for (std::size_t row = 0; row < configs.size(); ++row) {
@@ -675,6 +699,38 @@ int masked_sampling_contract() {
     return failures;
 }
 
+// Two logits 1/512 apart round to one BF16 value, 10.0, whose tie the lower id wins; FP32 logits
+// keep the gap, so the larger one wins the greedy draw.
+int fp32_near_tie_contract() {
+    constexpr int domain = 257;
+    std::vector<float> column(domain, -100.0f);
+    column[5]        = 10.0f;
+    column[9]        = 10.0f + 1.0f / 512.0f;
+    const int winner = g_logits == DType::FP32 ? 9 : 5;
+    const RunResult result =
+        run_homogeneous_batch(repeat_column(column, 8), domain, domain, 8, ops::SamplingConfig{}, 0,
+                              ops::kSamplePurposeDecode);
+    int failures = result.integrity_failures;
+    failures += verify_exact("sample near tie", result.tokens, std::vector<int>(8, winner));
+    return failures;
+}
+
+int run_contracts() {
+    int failures = 0;
+    failures += masked_sampling_contract();
+    failures += greedy_contract();
+    failures += deterministic_stochastic_contract();
+    failures += heterogeneous_batch_contract();
+    failures += filtered_distribution_contract();
+    failures += capped_distribution_contract();
+    failures += real_shape_distribution_contract();
+    failures += rng_key_contract();
+    failures += workspace_route_boundary_contract();
+    failures += workspace_route_rng_contract();
+    failures += fp32_near_tie_contract();
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -696,16 +752,13 @@ int main() {
         std::cerr << "sampling workspace accepted an invalid lane interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
-    failures += masked_sampling_contract();
-    failures += greedy_contract();
-    failures += deterministic_stochastic_contract();
-    failures += heterogeneous_batch_contract();
-    failures += filtered_distribution_contract();
-    failures += capped_distribution_contract();
-    failures += real_shape_distribution_contract();
-    failures += rng_key_contract();
-    failures += workspace_route_boundary_contract();
-    failures += workspace_route_rng_contract();
+    for (const DType dtype : {DType::BF16, DType::FP32}) {
+        g_logits                 = dtype;
+        const int dtype_failures = run_contracts();
+        std::cout << (dtype_failures == 0 ? "OK" : "FAIL") << " sample contracts on "
+                  << (dtype == DType::FP32 ? "FP32" : "BF16") << " logits\n";
+        failures += dtype_failures;
+    }
     failures += increment_counts_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";

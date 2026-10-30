@@ -19,6 +19,8 @@ namespace ninfer::ops::detail {
 [[nodiscard]] Q4Launch select_q4_n131072_k5120(std::int32_t tokens);
 [[nodiscard]] Q4Launch select_q4_n131072_k2048(std::int32_t tokens);
 [[nodiscard]] Q4Launch select_q4_n248320_k5120(std::int32_t tokens);
+// The vocabulary head's FP32 logits on its GEMV and small-T widths; null beyond them.
+[[nodiscard]] Q4Launch select_q4_n248320_k5120_fp32(std::int32_t tokens);
 [[nodiscard]] Q4Launch select_q4_n3456_k1152(std::int32_t tokens);
 [[nodiscard]] Q4Launch select_q4_n4304_k1152(std::int32_t tokens);
 

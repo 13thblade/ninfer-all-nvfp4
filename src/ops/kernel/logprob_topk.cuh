@@ -121,8 +121,9 @@ __device__ __forceinline__ void logprob_block_reduce(LogprobBlockStorage& storag
 }
 
 // Partial for vocabulary chunk blockIdx.x of row blockIdx.y = column + batch_row * columns.
+template <typename Logit>
 __global__ void __launch_bounds__(kLogprobTopkBlock)
-    logprob_topk_partials_kernel(const __nv_bfloat16* __restrict__ logits,
+    logprob_topk_partials_kernel(const Logit* __restrict__ logits,
                                  const SamplingConfig* __restrict__ configs,
                                  const std::int32_t* __restrict__ drafts, std::int32_t columns,
                                  std::int32_t token_domain, std::int64_t row_stride,
@@ -145,7 +146,7 @@ __global__ void __launch_bounds__(kLogprobTopkBlock)
     const std::int32_t* overlay  = drafts != nullptr && columns > 1
                                        ? drafts + static_cast<std::int64_t>(batch_row) * (columns - 1)
                                        : nullptr;
-    const __nv_bfloat16* source  = logits + static_cast<std::int64_t>(row) * row_stride;
+    const Logit* source          = logits + static_cast<std::int64_t>(row) * row_stride;
 
     LogprobCandidate top[kLogprobTopK];
 #pragma unroll
@@ -154,7 +155,7 @@ __global__ void __launch_bounds__(kLogprobTopkBlock)
     float sum     = 0.0f;
     for (int v = begin + static_cast<int>(threadIdx.x); v < end; v += kLogprobTopkBlock) {
         const float scaled =
-            sampling_adjusted_logit(__bfloat162float(source[v]), v, config, overlay, column) *
+            sampling_adjusted_logit(sampling_logit(source[v]), v, config, overlay, column) *
             inverse_t;
         // A masked or diverged token has no probability to report.
         if (!isfinite(scaled)) { continue; }

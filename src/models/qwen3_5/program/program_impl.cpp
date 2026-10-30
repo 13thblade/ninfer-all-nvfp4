@@ -286,11 +286,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
       experts(std::move(expert_runtime)),
-      round_host(plan.causal_scoring ? std::nullopt
-                                     : std::make_optional<PinnedHostBuffer>(
-                                           kMaximumConcurrency * sizeof(TokenId))),
+      round_host(plan.causal_scoring
+                     ? std::nullopt
+                     : std::make_optional<PinnedHostBuffer>(kMaximumConcurrency * sizeof(TokenId))),
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
-                                                    kCausalScoreTile * sizeof(float))
+                                                    kCausalScoreMaximumTile * sizeof(float))
                                               : std::nullopt),
       ordinary_host(
           !plan.causal_scoring && plan.speculative_backend == SpeculativeBackend::None
@@ -813,8 +813,10 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
 
     std::vector<float> output;
     output.reserve(token_count_size - first_target);
+    const DType logits_dtype       = execution::target_logits_dtype(parameters.text.output_head);
+    const std::uint32_t score_tile = causal_score_tile(logits_dtype);
     std::vector<TokenId> staged_targets;
-    staged_targets.reserve(kCausalScoreTile);
+    staged_targets.reserve(score_tile);
     std::uint32_t staged_columns = 0;
 
     try {
@@ -835,14 +837,14 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         const std::int32_t state_slot = state_store->physical_slot(*state);
         const auto flush              = [&] {
             if (staged_columns == 0) { return; }
-            if (staged_columns != staged_targets.size() || staged_columns > kCausalScoreTile) {
+            if (staged_columns != staged_targets.size() || staged_columns > score_tile) {
                 throw std::logic_error("causal score staging has an invalid shape");
             }
             work.reset();
             mark_workspace_usage(workspace_plan.causal_score);
             const auto columns = static_cast<std::int32_t>(staged_columns);
             Tensor logits      = work.alloc(
-                DType::BF16, {dimension(parameters.model.config().text.vocab_size), columns});
+                logits_dtype, {dimension(parameters.model.config().text.vocab_size), columns});
             Tensor target_ids = work.alloc(DType::I32, {columns});
             Tensor logprobs   = work.alloc(DType::FP32, {columns});
             Tensor hidden     = score_hidden->slice(1, 0, columns);
@@ -896,7 +898,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             std::uint32_t selected = std::max(chunk_begin, scored_predictor_begin);
             while (selected < cursor) {
                 const std::uint32_t available = cursor - selected;
-                const std::uint32_t room      = kCausalScoreTile - staged_columns;
+                const std::uint32_t room      = score_tile - staged_columns;
                 const std::uint32_t count     = std::min(available, room);
                 Tensor source =
                     prefill_hidden.slice(1, static_cast<std::int32_t>(selected - chunk_begin),
@@ -910,7 +912,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 }
                 selected += count;
                 staged_columns += count;
-                if (staged_columns == kCausalScoreTile) { flush(); }
+                if (staged_columns == score_tile) { flush(); }
             }
         }
         flush();

@@ -344,7 +344,11 @@ heads), applied while the activation is quantized.
 
 Text prefill gathers embedding columns, replaces media placeholders with Vision outputs, and runs
 the configured blocks in chunks. It preserves state and positions across chunks. Final offset
-RMSNorm and the full output head produce the target distribution. Ordinary decode repeats this
+RMSNorm and the full output head produce the target distribution. The head writes its FP32 sums
+unrounded wherever its format can (BF16, GGUF, row-split Q4/Q5/Q6/Q8/T2, FP8 and NVFP4:
+`ops::linear_writes_fp32`), and the step, ordinary-decode, MTP and DFlash verification and scoring
+logits hold them, so the sampler, argmax, draft acceptance, logprobs and scoring read no BF16 ties;
+proposal heads keep their own choice (`fp32_proposal_logits`). Ordinary decode repeats this
 schedule for one new token. CUDA Graph replay uses the same selected model implementation.
 
 MTP is a one-layer predictor conditioned on a final-normalized target hidden state h_t and the
