@@ -3,9 +3,16 @@ set -Eeuo pipefail
 build=${NINFER_BUILD_DIR:-/workspace/ninfer-work/build}
 arch=${NINFER_CUDA_ARCH:-86}
 # nvcc's concurrent temporary files can fill this rental's model volume before linking. Keep
-# them in the host's tmpfs; the build's memory-derived worker limit still applies.
+# them in the host's tmpfs; the build's memory-derived worker limit still applies. FFmpeg's
+# configure runs the programs it compiles there, so a tmpfs mounted noexec (some Vast containers)
+# gives way to the workspace.
 export TMPDIR
 TMPDIR=$(mktemp -d /dev/shm/ninfer-build-XXXXXX)
+printf '#!/bin/sh\n' >"$TMPDIR/exec-probe" && chmod +x "$TMPDIR/exec-probe"
+if ! "$TMPDIR/exec-probe" 2>/dev/null; then
+    rm -rf "$TMPDIR"
+    TMPDIR=$(mktemp -d /workspace/ninfer-work/ninfer-build-XXXXXX)
+fi
 trap 'rm -rf "$TMPDIR"' EXIT
 ulimit -c 0
 # The size-focused compressor occupied individual CPU cores for minutes in this build. Balance
