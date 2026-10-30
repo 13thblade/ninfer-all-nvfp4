@@ -488,6 +488,30 @@ class Recipe:
                 target = self.aliases[target]
             bindings[name] = deepcopy(bindings[target])
 
+        def resolve(name: str) -> str:
+            while name in self.aliases:
+                name = self.aliases[name]
+            return name
+
+        # An input gather describes the stored columns, so a parameter sharing them reads its
+        # input through the same gather.
+        for name in self.aliases:
+            target = resolve(name)
+            gathers = {
+                value
+                for (parameter, _, role), value in auxiliary_values.items()
+                if parameter == target and role == "input_columns"
+            }
+            if len(gathers) > 1:
+                raise ValueError(f"{target}: its Uses disagree on the input gather")
+            for gather in gathers:
+                for input_name in self.model.parameters[name].inputs:
+                    key = (name, input_name, "input_columns")
+                    if auxiliary_values.setdefault(key, gather) != gather:
+                        raise ValueError(
+                            f"{name}@{input_name}: input gather differs from its shared rows'"
+                        )
+
         uses = []
         auxiliary_outputs = []
         # Identical values other than activation divisors (such as one Hadamard sign vector
@@ -496,9 +520,7 @@ class Recipe:
         for (name, input_name), policy in self.policies.items():
             # Explicitly shared weights retain independent Use and calibration records.
             key = (name, input_name, "activation_input_divisor")
-            target = name
-            while target in self.aliases:
-                target = self.aliases[target]
+            target = resolve(name)
             if (
                 name in self.aliases
                 and policy == "AllowA4"
@@ -517,6 +539,19 @@ class Recipe:
                             f"{name}: activation divisor must be an FP32 scalar"
                         )
                     AuxiliaryValue.activation_divisor(value.data)
+                if role == "input_columns":
+                    # Only the GGUF linears read their input through a gather; every other
+                    # format stores its columns in the logical order.
+                    formats = sorted({s.format for s in self.selections[target]})
+                    if not all(isinstance(get_format(f), GgufFormat) for f in formats):
+                        raise ValueError(
+                            f"{name}@{input_name}: an input gather (input_columns) needs GGUF "
+                            f"block rows, not {', '.join(formats)}"
+                        )
+                    if value.format != "int32" or value.shape != (
+                        self.model.parameters[name].shape[-1],
+                    ):
+                        raise ValueError(f"{name}@{input_name}: an input gather is INT32 [K]")
                 layout = default_layout(value.format)
                 if len(value.data) != encoded_size(layout, value.format, value.shape):
                     raise ValueError(f"{name}/{role}: auxiliary data length is invalid")

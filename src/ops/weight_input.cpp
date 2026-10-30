@@ -127,6 +127,9 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
                 "fused projection rows must share one input gather");
     }
     if (columns.data != nullptr) {
+        // Only the GGUF linears read one; any other route would multiply the stored columns as
+        // if they were in the input's order.
+        require(is_gguf(result.weight.qtype), "an input gather requires a GGUF matrix");
         require(columns.dtype == DType::I32 && columns.numel() == result.weight.k,
                 "an input gather must be INT32 [K]");
         result.weight.input_columns = static_cast<const std::int32_t*>(columns.data);

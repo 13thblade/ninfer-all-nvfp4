@@ -2,13 +2,16 @@
 
 Every text projection, the token table, the output head and the MTP head of an ``-mtp`` build are
 stored as the exporter's own blocks, one ggml type per tensor, so no weight is re-quantised: a row
-of the artifact is byte for byte a row of the GGUF. llama.cpp's Qwen3.5 exporter conventions are
+of the artifact is byte for byte a row of the GGUF. An untied BF16 output head, which some
+community builds keep, stays BF16, its words exact. llama.cpp's Qwen3.5 exporter conventions are
 undone where they touch rows or small tensors: value heads return to the grouped order,
 zero-centred norms drop their stored ``1 + w`` and ``ssm_a`` becomes ``A_log`` again.
 
 ``ssm_out`` is the exception. Its tiled value heads are its input columns, which a row copy cannot
-move without re-quantising, so its Use carries an ``input_columns`` auxiliary: column ``c`` of the
-stored matrix multiplies element ``input_columns[c]`` of the grouped activation.
+move without re-quantising. Its encoded rows keep the stored order, and their import gives the Use an
+``input_columns`` auxiliary: column ``c`` of the stored matrix multiplies element ``input_columns[c]``
+of the grouped activation. Its values, like every source's, are in the grouped order, so a recipe
+that re-quantises ``ssm_out`` writes grouped columns and no gather.
 
 The GDN controls ``ssm_alpha`` and ``ssm_beta`` are BF16 operands of the Engine. Exporters store
 them as BF16 words or as Q8_0 blocks (Underdog-Saluki and similar releases), whose values are
@@ -28,9 +31,9 @@ import torch
 
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
-from .methods import AuxiliaryValue, cast_direct, grouped_absmax, import_encoded
+from .methods import cast_direct, grouped_absmax, import_encoded
 from .official_recipes import Q4, Q5, Q6, Q8
-from .sources.gguf import GGUFFile
+from .sources.gguf import TYPE_BF16, GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
 from .ternary import (
     ATTENTION_HEAD_DIM,
@@ -61,6 +64,8 @@ from .ternary import (
 MTP_BLOCK = LAYERS
 # The storage the GDN controls may have (gdn_control_source).
 GDN_CONTROL_TYPES = ("BF16", "Q8_0")
+# The storage the output head may have: stored blocks, or BF16 words (bf16_source).
+HEAD_TYPES = ("blocks", "BF16")
 
 EXPECTED_HEADER = {
     "general.architecture": "qwen35",
@@ -101,12 +106,12 @@ def _layer_tensors(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
 
 
 def expected_tensors(mtp: bool) -> dict[str, tuple[tuple[int, ...], str | tuple[str, ...]]]:
-    """Row-major shape and kind of every tensor: "blocks" (any stored ggml block type) or the
+    """Row-major shape and kinds of every tensor: "blocks" (any stored ggml block type) and the
     ggml type names it may have."""
 
     out = {
         "token_embd.weight": ((VOCABULARY, HIDDEN), "blocks"),
-        "output.weight": ((VOCABULARY, HIDDEN), "blocks"),
+        "output.weight": ((VOCABULARY, HIDDEN), HEAD_TYPES),
         "output_norm.weight": ((HIDDEN,), "F32"),
     }
     for layer in range(LAYERS):
@@ -163,10 +168,10 @@ def validate(gguf: GGUFFile) -> None:
         )
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
-        if kind == "blocks":
-            accepted = info.type_id in GGUF_FORMATS_BY_TYPE
-        else:
-            accepted = info.type_name in ((kind,) if isinstance(kind, str) else kind)
+        kinds = (kind,) if isinstance(kind, str) else kind
+        accepted = info.type_name in kinds or (
+            "blocks" in kinds and info.type_id in GGUF_FORMATS_BY_TYPE
+        )
         if info.shape != shape or not accepted:
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
     end = max(info.offset + info.nbytes for info in gguf.tensors.values())
@@ -245,29 +250,70 @@ def _dequantize(gguf: GGUFFile, tensor: str, first: int, last: int) -> torch.Ten
 
 
 def block_source(
-    gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap
+    gguf: GGUFFile,
+    tensor: str,
+    shape: tuple[int, int],
+    select: RowMap,
+    columns: np.ndarray | None = None,
 ) -> LogicalSource:
-    """Rows of a stored block matrix as encoded ggml rows, and their values on request."""
+    """Rows of a stored block matrix as encoded ggml rows, and their values on request.
+
+    ``columns`` describes a matrix stored over permuted input columns: stored column ``c``
+    multiplies logical input element ``columns[c]``. The encoded rows keep the stored order and
+    carry it (EncodedRows.input_columns) to the Use that imports them; the values return to the
+    logical order, which every value-reading method quantises.
+    """
 
     format = block_format(gguf, tensor)
     empty = torch.empty(0, dtype=torch.float16)
+    gather, logical = None, None
+    if columns is not None:
+        columns = np.asarray(columns, dtype=np.int64)
+        if not np.array_equal(np.sort(columns), np.arange(shape[1])):
+            raise ValueError(f"{tensor}: stored input columns must permute [0, {shape[1]})")
+        gather = columns.astype("<i4").tobytes()
+        # Logical column g is the stored column that multiplies element g.
+        logical = torch.from_numpy(np.argsort(columns))
 
     def encoded(begin: int, end: int) -> EncodedRows:
         index = select(begin, end)
         low, high = int(index.min()), int(index.max()) + 1
         blocks = gguf.read_blocks(tensor, low, high)
         return EncodedRows(
-            format, torch.from_numpy(np.ascontiguousarray(blocks[index - low])), empty
+            format,
+            torch.from_numpy(np.ascontiguousarray(blocks[index - low])),
+            empty,
+            input_columns=gather,
         )
 
     def values(first: int, last: int) -> torch.Tensor:
         index = select(first, last)
         low, high = int(index.min()), int(index.max()) + 1
-        return _dequantize(gguf, tensor, low, high)[torch.from_numpy(index - low)]
+        stored = _dequantize(gguf, tensor, low, high)[torch.from_numpy(index - low)]
+        return stored if logical is None else stored[:, logical]
 
     return LogicalSource(
         shape, f"{tensor}[{format}]{list(shape)}", _flat(values, shape[1]), encoded
     )
+
+
+def bf16_source(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource:
+    """A stored BF16 matrix as its exact words, read a run of rows at a time from the mapped file."""
+
+    def values(first: int, last: int) -> torch.Tensor:
+        words = np.array(gguf.read_bf16_words(tensor)[first:last], copy=True)
+        return torch.from_numpy(words.view(np.int16)).view(torch.bfloat16)
+
+    return LogicalSource(shape, f"{tensor}[BF16]{list(shape)}", _flat(values, shape[1]))
+
+
+def head_source(gguf: GGUFFile) -> tuple[LogicalSource, bool]:
+    """The output head: stored blocks as encoded rows (True), or BF16 words as values (False)."""
+
+    shape = gguf.info("output.weight").shape
+    if gguf.info("output.weight").type_id == TYPE_BF16:
+        return bf16_source(gguf, "output.weight", shape), False
+    return block_source(gguf, "output.weight", shape, rows()), True
 
 
 def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
@@ -408,15 +454,17 @@ def _layer(
 def text_sources(
     gguf: GGUFFile, *, mtp: bool
 ) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
-    """Encoded block sources and direct sources of every GGUF-backed text (and MTP) parameter."""
+    """Encoded block sources and direct sources of every GGUF-backed text (and MTP) parameter; a
+    BF16 output head is a direct source."""
 
     encoded = {
         "text/token_embedding": block_source(
             gguf, "token_embd.weight", (VOCABULARY, HIDDEN), rows()
         ),
-        "text/output_head": block_source(gguf, "output.weight", (VOCABULARY, HIDDEN), rows()),
     }
     direct = {"text/final_norm": _norm(gguf, "output_norm.weight", True)}
+    head, stored_blocks = head_source(gguf)
+    (encoded if stored_blocks else direct)["text/output_head"] = head
     for layer in range(LAYERS):
         g, p = f"blk.{layer}.", f"text/layers/{layer}/"
         e, d = _layer(gguf, g, p)
@@ -437,9 +485,13 @@ def text_sources(
         encoded[n + "z"] = block_source(
             gguf, g + "attn_gate.weight", (GDN_VALUE_DIM, HIDDEN), untiled_rows(0)
         )
-        # Tiled input columns: the Use gathers the grouped activation (see tiled_input_columns).
+        # Tiled input columns: an import keeps them and its Use gathers the grouped activation.
         encoded[n + "output"] = block_source(
-            gguf, g + "ssm_out.weight", (HIDDEN, GDN_VALUE_DIM), rows()
+            gguf,
+            g + "ssm_out.weight",
+            (HIDDEN, GDN_VALUE_DIM),
+            rows(),
+            tiled_input_columns(),
         )
         for role, tensor in (("a_projection", "ssm_alpha.weight"), ("b_projection", "ssm_beta.weight")):
             direct[n + role] = gdn_control_source(gguf, g + tensor)
@@ -600,15 +652,6 @@ def qwen3_8_27b_gguf(model, recipe, sources):
                 recipe, [a + "query", a + "key", a + "gate", a + "value"], formats
             )
         _group_same_format(recipe, [p + "mlp/gate", p + "mlp/up"], formats)
-    columns = AuxiliaryValue(
-        "int32", (GDN_VALUE_DIM,), tiled_input_columns().astype("<i4").tobytes()
-    )
-    for layer in range(LAYERS):
-        if full_attention(layer):
-            continue
-        name = f"text/layers/{layer}/gdn/output"
-        for input_name in model.parameters[name].inputs:
-            recipe.use(name, input_name, auxiliaries={"input_columns": columns})
 
 
 RECIPES = {"qwen3_8_27b_gguf": qwen3_8_27b_gguf}
@@ -617,10 +660,12 @@ __all__ = [
     "EXPECTED_HEADER",
     "RECIPES",
     "block_format",
+    "bf16_source",
     "block_source",
     "expected_tensors",
     "gdn_control_source",
     "has_mtp",
+    "head_source",
     "qwen3_8_27b_gguf",
     "q2_native_source",
     "q8_native_source",
