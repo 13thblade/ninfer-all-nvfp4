@@ -48,6 +48,11 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
         return {kBf16UnitRoundoff, kBf16UnitRoundoff, 2.0 * kBf16UnitRoundoff};
     case ActivationCompute::A8:
         return {kA8QuantizationAllowance, kBf16UnitRoundoff, 1.5 * kA8QuantizationAllowance};
+    case ActivationCompute::Int8Grouped:
+        // Both operands are integer-quantized (s8 activations at one scale per (token, 32)
+        // block, e2m1 weights at one E4M3 scale per 16 columns), the same structure the A8
+        // allowance was sized for, so the same criterion applies.
+        return {kA8QuantizationAllowance, kBf16UnitRoundoff, 1.5 * kA8QuantizationAllowance};
     case ActivationCompute::A4:
         return {kA4QuantizationAllowance, kBf16UnitRoundoff, kA4QuantizationAllowance};
     }
@@ -271,9 +276,21 @@ quantized_weight::PackedWeight make_t2_g128_fp16_weight(std::int32_t n, std::int
 
 quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
                                                  std::uint32_t seed) {
+    return make_nvfp4_weight(n, k, seed, 0.125F);
+}
+
+quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
+                                                 std::uint32_t seed, float weight_scale_divisor) {
+    return make_nvfp4_weight(n, k, seed, weight_scale_divisor, false);
+}
+
+quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
+                                                 std::uint32_t seed, float weight_scale_divisor,
+                                                 bool wide_scale_range) {
     quantized_weight::PatternedWeightOptions options;
-    options.weight_scale_divisor = 0.125F;
+    options.weight_scale_divisor = weight_scale_divisor;
     options.input_scale_divisor  = 3.5F;
+    options.wide_scale_range     = wide_scale_range;
     return quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
 }
 
