@@ -197,8 +197,9 @@ pytest suites and conversion/evaluation scripts run separately from CMake and CT
 
 Python 3.11 describes the maintained environment, not a configuration version gate. The one CUDA
 version gate is 13.1 for a `120a` build: CUDA 12.8 and 12.9 miscompile `sm_120a` kernels.
-CMake also discovers FFmpeg without imposing library version floors. Actual language/API support
-is exercised by compilation and tests. The libcurl 7.85 minimum has a concrete API basis:
+Windows builds find vcpkg's FFmpeg without imposing library version floors; Linux builds compile
+the release that `cmake/MediaSources.cmake` pins. Actual language/API support is exercised by
+compilation and tests. The libcurl 7.85 minimum has a concrete API basis:
 media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in
 [that release](https://curl.se/libcurl/c/CURLOPT_PROTOCOLS_STR.html).
 
@@ -237,8 +238,13 @@ package export or configure-time dependency download.
 
 ## Targets and dependencies
 
-`cmake/Dependencies.cmake` discovers system CUDA, Threads, FFmpeg and conditional curl, and
-exposes the repository-pinned JSON/HTTP headers and conditional spdlog library. External include
+`cmake/Dependencies.cmake` discovers system CUDA, Threads and conditional curl, takes FFmpeg from
+vcpkg on Windows, and exposes the repository-pinned JSON/HTTP headers and conditional spdlog library.
+On Linux, `cmake/NinferFFmpeg.cmake` builds dav1d and FFmpeg as static PIC libraries from the release
+archives in `NINFER_MEDIA_SOURCES_DIR` (an `ExternalProject` each, through the compiler launcher)
+and records their versions, digests and options in `third_party/media/sources.json` of the build
+tree, which the packager reads. `scripts/fetch-media-sources.sh` downloads those archives; the
+configure step only checks that they are there. External include
 requirements follow their consuming targets. `cmake/NinferTargets.cmake` provides private
 project includes and the two CUDA archive policies.
 

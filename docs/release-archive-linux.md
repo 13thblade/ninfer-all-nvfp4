@@ -30,9 +30,11 @@ The CUDA 12 build applies a glibc 2.41 exception-declaration patch to NVIDIA hea
 
 ## Debian runtime
 
-CI builds on Debian 13 (glibc 2.41). CUDA runtime libraries are included under `backends/cuda12/` or `backends/cuda13/`, with NVIDIA's EULA. System libraries remain dynamically linked. Newer distributions must also provide the
-recorded FFmpeg and other library SONAMEs; newer glibc alone is insufficient. Local builds can use
-another Debian-family host; check `BUILD-INFO.json`.
+CI builds on Debian 13 (glibc 2.41). CUDA runtime libraries are included under `backends/cuda12/` or `backends/cuda13/`, with NVIDIA's EULA. FFmpeg and dav1d are linked into the runtime (see [media libraries](#media-libraries)).
+The other libraries stay dynamically linked: glibc, the GCC runtime, zlib and libcurl, whose
+SONAMEs (`libc.so.6`, `libstdc++.so.6`, `libz.so.1`, `libcurl.so.4`) Debian and Ubuntu keep across
+releases. A newer distribution needs its own packages of these libraries and a glibc no older than
+the build host's. Local builds can use another Debian-family host; check `BUILD-INFO.json`.
 
 On Debian 13, install the recorded system runtime packages:
 
@@ -44,12 +46,22 @@ xargs -a packages/multi.txt sudo apt-get install -y ca-certificates curl
 ./ninfer_bench --help
 ```
 
-This installs FFmpeg, libcurl and the other resolved system dependencies. It does not install a
+This installs libcurl and the other resolved system dependencies. It does not install a
 CUDA Toolkit or a driver. The build's temporary driver stub is never shipped. The executables load
 one private runtime from the selected backend directory. All commands share that backend's kernel
 images. Keep `backends/` and `help/` beside the executables when moving the installation.
 `--help` and `--version` work without a driver. NVIDIA libraries remain subject to the
 `NVIDIA-CUDA-EULA.txt` in their backend directory, separately from NInfer's Apache-2.0 licence.
+
+## Media libraries
+
+The runtime contains FFmpeg and dav1d, built from their release archives with only the decoders of
+the [media formats](https://github.com/iamwavecut/ninfer-all/blob/master/docs/serving.md#media-formats)
+NInfer reads. FFmpeg is licensed under the GNU LGPL 2.1 or later and dav1d under the BSD 2-Clause
+licence. `LICENSE-ffmpeg.txt` and `LICENSE-dav1d.txt` hold the licence texts, `sources/` holds the
+exact archives, and `media_libraries` in `BUILD-INFO.json` records their versions, SHA-256 digests
+and build options. To run a modified FFmpeg, rebuild NInfer at the recorded `source_revision` with
+the modified archive and its digest in `cmake/MediaSources.cmake`.
 
 ## Docker without compilation
 
@@ -60,8 +72,8 @@ docker build -t ninfer:local .
 docker run --rm --gpus all -p 8080:8080 -v ninfer-models:/models ninfer:local
 ```
 
-The included Dockerfile installs runtime packages and copies these binaries. It does not build
-NInfer again. The host needs NVIDIA Container Toolkit for GPU access. This image uses the same
+The included Dockerfile installs runtime packages and copies these binaries, the licences and
+`sources/`. It does not build NInfer again. The host needs NVIDIA Container Toolkit for GPU access. This image uses the same
 entrypoint commands, `run.sh` launcher and model profiles as the source tree. The Container image
 workflow packages both Native release archives as `cuda12.9` and `cuda13.4`, with matching
 `cuda12.9-<commit12>` and `cuda13.4-<commit12>` tags, without recompilation.

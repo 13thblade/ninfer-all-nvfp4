@@ -16,6 +16,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 ## What's New
 
+- **2026-10-30:** Linux archives and container images link FFmpeg 9.0.2 and dav1d into the runtime and no longer need the distribution's FFmpeg: they decode the [listed media formats](docs/serving.md#media-formats) and refuse others, and each archive carries FFmpeg's [licence and exact sources](docs/release-archive-linux.md#media-libraries).
 - **2026-10-29:** [Tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism) prefills long prompts faster: each GPU sums its own range of a prompt chunk's partials and copies the other GPUs' finished ranges (a reduce-scatter), so four A40s without peer access prefill a 9,715-token prompt with Qwen3.8-27B 2.4 times as fast and two A40s 13% faster, with the same answers. On RTX 50-series cards the shares of an NVFP4 or FP8 model run the W4A4 and W8A8 routes instead of BF16, so two RTX 5090s prefill that prompt with Qwen3.8-27B NVFP4 1.5 to 1.7 times as fast. The automatic `--tensor-split` counts what the first GPU holds besides its share (MTP, drafters, Vision, KV headroom). The startup log names the GPU pairs without peer access, whose transfers go through host memory.
 - **2026-10-27:** Two GPUs without peer access decode faster with [tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism): Qwen3.6-35B-A3B at 218 tok/s on two RTX 3090s, against 184 before and 199 on one card, and Qwen3.8-Flash-Next now divides every layer, 7% faster in decode than two pipeline stages. [`--invariant-attention`](docs/maintainer/qwen3_5-model.md#invariant-attention) makes a Qwen3.5-core model's attention outputs independent of batch and draft width.
 - **2026-10-27:** DeepSeek-V4.1-Flash takes the [STQ DSpark drafter](docs/deepseek-v41.md#the-stq-drafter) from beamster's Sushi pack, and the [published artifact](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3) carries it: half the device memory of Unsloth's drafter at the same acceptance, so one RTX 4090 decodes up to 1.4 times as fast with it and prefills without the drafter's slowdown.
@@ -539,9 +540,12 @@ to `cuda13.4`. The published images use their multiarch binary automatically.
 ## Building
 
 ```bash
+scripts/fetch-media-sources.sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build --target ninfer-serve ninfer-calibrate
 ```
+
+The first command downloads the FFmpeg and dav1d releases that a Linux build compiles in.
 
 `CMAKE_CUDA_ARCHITECTURES` takes one build from [supported GPUs](#supported-gpus), or a list of them
 for a pipeline across cards of different architectures

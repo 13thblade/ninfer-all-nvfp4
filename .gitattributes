@@ -27,3 +27,6 @@
 # would check them out with CRLF and change every rendered prompt.
 *.jinja text eol=lf
 tests/fixtures/** text eol=lf
+# The media fixtures are binary files that tests/test_media_decode.cpp decodes as they are.
+tests/fixtures/media/** binary -eol
+tests/fixtures/media/*.sh text eol=lf diff merge

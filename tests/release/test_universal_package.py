@@ -74,6 +74,17 @@ class UniversalPackageTest(unittest.TestCase):
             PACKAGE.assemble(self.roots, self.destination, 'linux-x64', REVISION)
         self.assertFalse(self.destination.exists())
 
+    def test_different_media_libraries_are_rejected_before_assembly(self):
+        for cuda, version in (('12.9', '9.0.1'), ('13.4', '9.0.2')):
+            path = self.roots[cuda] / 'BUILD-INFO.json'
+            info = json.loads(path.read_text())
+            info['media_libraries'] = {'ffmpeg': {'version': version}}
+            path.write_text(json.dumps(info))
+            self.hashes(path.parent)
+        with self.assertRaisesRegex(ValueError, 'different media library releases'):
+            PACKAGE.assemble(self.roots, self.destination, 'linux-x64', REVISION)
+        self.assertFalse(self.destination.exists())
+
     def test_corrupt_backend_is_rejected_before_assembly(self):
         (self.roots['12.9'] / 'backends/cuda12/libninfer-runtime.so').write_text('corrupt')
         with self.assertRaisesRegex(ValueError, 'checksum mismatch'):

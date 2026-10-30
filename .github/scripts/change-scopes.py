@@ -6,7 +6,7 @@ SCOPES = ('changed', 'native', 'calculator', 'host', 'includes', 'linux_scripts'
 COMPILER_INPUTS = {
     'CMakeLists.txt', 'CMakePresets.json', '.gitmodules',
     '.github/scripts/configure-linux-build.sh', '.github/scripts/patch-cuda12-glibc.py',
-    '.github/scripts/install-linux-release-tools.sh',
+    '.github/scripts/install-linux-release-tools.sh', 'scripts/fetch-media-sources.sh',
     '.github/workflows/native-linux.yml', '.github/workflows/native-windows.yml',
     'scripts/build-native.bat', 'scripts/build.ps1',
 }
@@ -31,7 +31,8 @@ def classify(paths):
         test_source = path.startswith('tests/') and (path.endswith(('.cpp', '.cc', '.cu', '.cuh', '.h', '.hpp'))
                                                      or path.endswith('/CMakeLists.txt'))
         result['native'] |= product or path in RUNTIME_INPUTS
-        result['changed'] |= product or test_source
+        # tests/test_media_decode.cpp decodes the media fixtures.
+        result['changed'] |= product or test_source or path.startswith('tests/fixtures/media/')
         result['host'] |= product or test_source or path == 'scripts/check-host-compile.py'
         result['includes'] |= path.startswith(('src/', 'include/')) or path == 'scripts/check-include-boundaries.py'
         result['calculator'] |= path.startswith('docs/config-calculator')

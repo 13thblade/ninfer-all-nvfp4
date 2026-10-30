@@ -116,6 +116,9 @@ def assemble(roots, destination, platform, revision):
     if not re.fullmatch('[a-f0-9]{40}', revision):
         raise ValueError('Invalid source revision')
     info = {cuda: validate(roots[cuda], platform, cuda, revision) for cuda in VARIANTS}
+    # Only the CUDA 13 package's sources/ is kept, so both backends must link the same releases.
+    if info['12.9'].get('media_libraries') != info['13.4'].get('media_libraries'):
+        raise ValueError('The CUDA 12 and CUDA 13 packages link different media library releases')
     destination.mkdir(parents=True, exist_ok=False)
     # Launchers have no Toolkit dependency. Both variants implement the same private ABI.
     # Prefer the CUDA 13 copy, retaining each backend's own dependency closure.

@@ -29,11 +29,10 @@ RUN apt-get update \
         cmake \
         file \
         git \
-        libavcodec-dev \
-        libavformat-dev \
-        libavutil-dev \
         libcurl4-openssl-dev \
-        libswscale-dev \
+        make \
+        meson \
+        nasm \
         ninja-build \
         pkg-config \
         python3 \
@@ -56,6 +55,7 @@ COPY . .
 RUN --mount=type=cache,id=ninfer-build,target=/build,sharing=locked \
     --mount=type=cache,target=/ccache \
     export CCACHE_DIR=/ccache CCACHE_MAXSIZE=20G NINFER_TESTS=OFF NINFER_MULTICALL=ON \
+           NINFER_MEDIA_SOURCES=/build/media-sources \
     && if [ -n "$JOBS" ]; then export NINFER_JOBS="$JOBS"; fi \
     && find . -type f \( -path ./Dockerfile -o -path ./scripts/build-native.sh \
         -o -name CMakeLists.txt -o -name '*.cmake' \) -exec sha256sum {} + > /build/configuration \

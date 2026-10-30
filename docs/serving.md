@@ -1310,6 +1310,22 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 
+### Media formats
+
+Linux builds, the Linux archives and the container images contain FFmpeg 9.0.2, built with only
+these formats ([`cmake/NinferFFmpeg.cmake`](../cmake/NinferFFmpeg.cmake)):
+
+| Media | Formats |
+|---|---|
+| Images | JPEG, PNG, WebP, BMP, GIF |
+| Video containers | MP4, MOV, WebM, Matroska, animated GIF |
+| Video codecs | H.264, HEVC, AV1, VP8, VP9, MPEG-4 Part 2 |
+
+Decoding ignores audio tracks. A file in another format returns HTTP 400 `invalid_media`.
+`tests/test_media_decode.cpp` decodes one file of each listed format and refuses AVI, FFV1 video
+in Matroska and TIFF. The Windows archives decode through the FFmpeg DLLs they ship, which come from
+vcpkg and have a different set of formats; PNG images decode without FFmpeg there.
+
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
 media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
 has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision limit is therefore

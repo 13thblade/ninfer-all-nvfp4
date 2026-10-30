@@ -229,8 +229,7 @@ if (( ENGINE || TESTS )); then
   # libcurl and Python are configure-time requirements of the server target and the tests.
   apt-get update -qq
   apt-get install -y -qq cmake ninja-build build-essential pkg-config aria2 python3 \
-    libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev \
-    libswresample-dev libcurl4-openssl-dev >/dev/null 2>&1
+    meson nasm zlib1g-dev libcurl4-openssl-dev >/dev/null 2>&1
 
   # CMakeLists needs 3.28; Ubuntu 22.04 ships 3.22 and 24.04 ships 3.28.
   cmake_version="$(cmake --version | awk 'NR == 1 {print $3}')"
@@ -239,6 +238,7 @@ if (( ENGINE || TESTS )); then
   fi
 
   testing=OFF; (( TESTS )) && testing=ON
+  "$SRC/scripts/fetch-media-sources.sh" || { echo "MEDIA_SOURCES_FAILED"; exit 1; }
   cmake -S "$SRC" -B /root/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING="$testing" \
     -DCMAKE_CUDA_ARCHITECTURES="$ARCH" -DCMAKE_CUDA_COMPILER="$NVCC" 2>&1 | tail -4
   [[ "${PIPESTATUS[0]}" -eq 0 ]] || { echo "CONFIGURE_FAILED"; exit 1; }
