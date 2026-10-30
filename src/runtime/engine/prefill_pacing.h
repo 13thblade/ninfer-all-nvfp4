@@ -33,6 +33,19 @@ inline constexpr std::uint32_t kMaximumPrefillStallBudgetMs = 60'000;
     return costs.prefill_ns(make_prefill_work(prefix, tokens, 0, 0, chunk));
 }
 
+// The service quanta one prefill step charges against its request's projection, which counts one
+// per planned step of `chunk` tokens. A planned step charges one. A step cut under the budget adds
+// its `tokens` to `carried` and charges one for each whole `chunk` they then hold, so a prompt's
+// steps never charge more than its planned steps: the step that ends a prompt is never cut.
+[[nodiscard]] inline std::uint64_t prefill_step_quanta(bool cut, std::uint32_t tokens,
+                                                       std::uint32_t chunk,
+                                                       std::uint32_t& carried) noexcept {
+    if (!cut || chunk == 0) { return 1; }
+    const std::uint64_t held = std::uint64_t{carried} + tokens;
+    carried                  = static_cast<std::uint32_t>(held % chunk);
+    return held / chunk;
+}
+
 class PrefillPacing {
 public:
     PrefillPacing() = default;

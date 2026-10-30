@@ -2116,15 +2116,20 @@ private:
         (void)progress_context_transaction(false);
     }
 
-    void
-    resolve_prefill_progress(const std::shared_ptr<Request>& request,
-                             typename ModelContract::PrefillProgress&& progress,
-                             const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+    // `paced` marks a step cut under the stall budget, which charges its request's projection by
+    // whole chunks (prefill_step_quanta).
+    void resolve_prefill_progress(
+        const std::shared_ptr<Request>& request, typename ModelContract::PrefillProgress&& progress,
+        const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start, bool paced = false) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
-        Scheduling::consume_service_work(*request, 1);
+        if (const std::uint64_t quanta =
+                prefill_step_quanta(paced, progress.processed_prompt_tokens, prefill_chunk_,
+                                    request->paced_prefill_tokens)) {
+            Scheduling::consume_service_work(*request, quanta);
+        }
         if (!request->admitted_begin) {
             throw std::logic_error("prefill progress has no committed admission summary");
         }
@@ -2337,13 +2342,14 @@ private:
             pacing_.step_done(step_prefix, progress.processed_prompt_tokens,
                               progress.timing.elapsed_ns());
         }
-        if (step_cap != 0 && progress.processed_prompt_tokens < planned) {
+        const bool paced = step_cap != 0 && progress.processed_prompt_tokens < planned;
+        if (paced) {
             ++cumulative_stats_.paced_prefill_steps;
             cumulative_stats_.paced_prefill_deferred_tokens +=
                 planned - progress.processed_prompt_tokens;
         }
         consume_armed_worker_failure();
-        resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+        resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start, paced);
         // A completed prefill already re-arms admission (owner cleared above). Re-arm again when
         // the request keeps prefilling: each prefill boundary is an admission point, so a waiting
         // request can be admitted to a free lane while another request is still prefilling.

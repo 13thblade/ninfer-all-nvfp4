@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <random>
 
 namespace {
 
@@ -14,6 +15,7 @@ int check(bool condition, const char* message) {
 using ninfer::runtime::ContextMachineCostModel;
 using ninfer::runtime::PrefillPacing;
 using ninfer::runtime::predicted_prefill_step_ns;
+using ninfer::runtime::prefill_step_quanta;
 
 constexpr std::uint64_t kQ32 = std::uint64_t{1} << 32;
 
@@ -80,6 +82,38 @@ int main() {
     outlier.step_done(0, 1024, 0);
     failures += check(outlier.correction() > 2.82 && outlier.correction() < 2.83,
                       "an empty or unmeasured step must not move the correction");
+
+    // A cut step charges whole chunks only: three 896-token steps of a 2048-token chunk charge
+    // 0, 0 and 1, carrying 640 tokens.
+    std::uint32_t carried = 0;
+    failures += check(prefill_step_quanta(true, 896, 2048, carried) == 0 && carried == 896 &&
+                          prefill_step_quanta(true, 896, 2048, carried) == 0 &&
+                          prefill_step_quanta(true, 896, 2048, carried) == 1 && carried == 640,
+                      "cut steps must charge one quantum per whole chunk");
+    failures += check(prefill_step_quanta(false, 100, 2048, carried) == 1 && carried == 640,
+                      "a planned step charges one quantum and leaves the carry");
+
+    // Against the projection, 1 + (prompt - 1) / chunk quanta: any mix of planned steps (the
+    // chunk, or the rest of the prompt) and steps cut to a multiple of 128 from 512 up to below
+    // the planned step, which therefore never ends the prompt, charges at least one and never more.
+    std::mt19937 random(170);
+    bool within = true;
+    for (int trial = 0; trial < 20'000 && within; ++trial) {
+        const std::uint32_t chunk  = 512U * (2U + random() % 7U) + 128U * (random() % 4U);
+        const std::uint32_t prompt = 1U + random() % (8U * chunk);
+        std::uint32_t left = prompt, held = 0;
+        std::uint64_t charged = 0;
+        while (left != 0) {
+            const std::uint32_t planned = std::min(left, chunk);
+            const std::uint32_t cuts    = planned > 512U ? (planned - 513U) / 128U + 1U : 0U;
+            const bool cut              = cuts != 0 && random() % 2U == 0U;
+            const std::uint32_t tokens  = cut ? 512U + 128U * (random() % cuts) : planned;
+            charged += prefill_step_quanta(cut, tokens, chunk, held);
+            left -= tokens;
+        }
+        within = charged >= 1 && charged <= 1ULL + (prompt - 1ULL) / chunk;
+    }
+    failures += check(within, "a prompt's steps must not charge more than its planned steps");
 
     if (failures == 0) { std::cout << "prefill pacing tests passed\n"; }
     return failures == 0 ? 0 : 1;
