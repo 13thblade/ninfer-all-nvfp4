@@ -2712,7 +2712,10 @@ that prefills alone and cuts a step only while other requests generate: to the l
 128 tokens, at least 512, that the prefill cost model, scaled by the observed to predicted step
 times, expects to fit the budget. A deeper prefix costs more attention per token and is cut harder.
 `ninfer:paced_prefill_steps_total` counts the steps it cut and
-`ninfer:paced_prefill_deferred_tokens_total` the prompt tokens they left to later steps.
+`ninfer:paced_prefill_deferred_tokens_total` the prompt tokens they left to later steps. On an RTX
+3090 with Qwen3.8-27B (DFlash2, chunk 2048, cuBLAS prefill), a 15.6K-token prompt arriving next to
+a generating stream paused that stream for up to 0.83 s per step without a budget, 0.35-0.36 s at
+250 ms and 0.59-0.62 s at 500 ms; the new prompt's first token came 11% and 2% later.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting
