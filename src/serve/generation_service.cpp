@@ -286,6 +286,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.lm_head_q6               = options.lm_head_q6;
     engine_options.embedding_q4             = options.embedding_q4;
     engine_options.embedding_q6             = options.embedding_q6;
+    engine_options.embedding_residency      = options.embedding_residency;
     engine_options.mtp_experts_q4           = options.mtp_experts_q4;
     engine_options.gdn_state_fp16           = options.gdn_state_fp16;
     engine_options.rope_yarn                = options.rope_yarn;
@@ -312,6 +313,9 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.devices                  = options.devices;
     engine_options.stage_layers             = options.stage_layers;
     engine_options.tensor_parallel          = options.tensor_parallel;
+    engine_options.tensor_split             = options.tensor_split;
+    engine_options.tensor_attention         = options.tensor_attention;
+    engine_options.invariant_attention      = options.invariant_attention;
     engine_options.expert_residency           = options.expert_residency;
     engine_options.ngram_table                = options.ngram_table;
     engine_options.kv_resident_positions      = options.kv_resident_positions;

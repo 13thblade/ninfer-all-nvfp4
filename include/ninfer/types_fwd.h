@@ -17,7 +17,9 @@ enum class ProposalHead : std::uint8_t;
 enum class SpeculativeBackend : std::uint8_t;
 enum class MtpDraftPolicy : std::uint8_t;
 enum class VisionResidency : std::uint8_t;
+enum class EmbeddingResidency : std::uint8_t;
 enum class ExpertResidency : std::uint8_t;
+enum class TensorAttention : std::uint8_t;
 enum class NgramResidency : std::uint8_t;
 enum class NgramIo : std::uint8_t;
 

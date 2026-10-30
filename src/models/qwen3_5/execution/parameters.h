@@ -49,7 +49,15 @@ struct StreamedMoeParameters {
     std::size_t delivery_layer = 0;
 };
 
-using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights, StreamedMoeParameters>;
+// Expert parallelism: a tensor-parallel rank's share of a MoE layer, whose partial it writes
+// (ops::sparse_moe_share).
+struct MoeShareParameters {
+    ops::SparseMoeWeights weights;
+    ops::SparseMoeShare share;
+};
+
+using FfnParameters =
+    std::variant<DenseParameters, ops::SparseMoeWeights, StreamedMoeParameters, MoeShareParameters>;
 
 struct AttentionParameters {
     ops::ProjectionWeights projection;
@@ -85,6 +93,8 @@ struct TextParameters {
     // Tensor parallelism: `layers` holds rank 0's share of each layer and rank_layers[r - 1] rank
     // r's, whose attention layers carry no mixer (rank 0 runs attention alone). Empty otherwise.
     std::vector<std::vector<BlockParameters>> rank_layers;
+    // Tensor parallelism: each rank's GDN heads and FFN rows or experts. Empty otherwise.
+    std::vector<TensorShare> tensor_shares;
     // How many stages the layer loop spans, or how many tensor-parallel ranks share every layer.
     // One is the identity plan and the fast path.
     std::size_t rank_count = 1;

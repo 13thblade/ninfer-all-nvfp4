@@ -23,7 +23,8 @@ __device__ __forceinline__ void kv_cache_append_full_nvfp4_row(
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
-        values[r]   = __bfloat162float(k[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
+        values[r] =
+            __bfloat162float(k[kv_cache_nvfp4_src_index(kv_head, d, token, Geometry::KVHeads)]);
     }
     normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
@@ -31,18 +32,19 @@ __device__ __forceinline__ void kv_cache_append_full_nvfp4_row(
     __syncwarp();
     if (lane < kKVCacheNvfp4Groups) {
         const auto quantized = kv_cache_nvfp4_quantize_group16(scratch + lane * kKVCacheNvfp4Group);
-        const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
-            physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset);
+        const std::int64_t code_offset = kv_cache_nvfp4_code_index(
+            physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset, Geometry::KVHeads);
         store_vec(cache_k + code_offset, make_uint2(quantized.codes_lo, quantized.codes_hi));
-        scale_k[kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, lane, page_offset)] =
-            quantized.scale;
+        scale_k[kv_cache_nvfp4_scale_index(physical_page, kv_head, lane, page_offset,
+                                           Geometry::KVHeads)] = quantized.scale;
     }
     __syncwarp();
 
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
-        values[r]   = __bfloat162float(v[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
+        values[r] =
+            __bfloat162float(v[kv_cache_nvfp4_src_index(kv_head, d, token, Geometry::KVHeads)]);
     }
     normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
@@ -50,11 +52,11 @@ __device__ __forceinline__ void kv_cache_append_full_nvfp4_row(
     __syncwarp();
     if (lane < kKVCacheNvfp4Groups) {
         const auto quantized = kv_cache_nvfp4_quantize_group16(scratch + lane * kKVCacheNvfp4Group);
-        const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
-            physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset);
+        const std::int64_t code_offset = kv_cache_nvfp4_code_index(
+            physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset, Geometry::KVHeads);
         store_vec(cache_v + code_offset, make_uint2(quantized.codes_lo, quantized.codes_hi));
-        scale_v[kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, lane, page_offset)] =
-            quantized.scale;
+        scale_v[kv_cache_nvfp4_scale_index(physical_page, kv_head, lane, page_offset,
+                                           Geometry::KVHeads)] = quantized.scale;
     }
 }
 
@@ -83,6 +85,8 @@ __launch_bounds__(256) __global__
     const std::int32_t* block_table = metadata.block_table();
     int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
     physical_page                   = __shfl_sync(FullMask, physical_page, 0);
+    physical_page = metadata.local_page(physical_page);
+    if (physical_page < 0) return; // another rank's page (a position-split cache)
     kv_cache_append_full_nvfp4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token,
                                              kv_head, physical_page, position & kPagedKVPageMask,
                                              lane, scratch[warp]);
@@ -112,6 +116,8 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_nvfp4_page_kernel(
     const std::int32_t* block_table = metadata.block_table();
     int physical_page  = lane == 0 ? block_table[tile_position >> kPagedKVPageShift] : 0;
     physical_page      = __shfl_sync(FullMask, physical_page, 0);
+    physical_page = metadata.local_page(physical_page);
+    if (physical_page < 0) return; // another rank's page (a position-split cache)
     const int position = base_position + token;
     kv_cache_append_full_nvfp4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token,
                                              kv_head, physical_page, position & kPagedKVPageMask,

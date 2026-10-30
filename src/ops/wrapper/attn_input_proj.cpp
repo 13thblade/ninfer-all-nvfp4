@@ -3,6 +3,7 @@
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/gguf/gguf_linear.h"
+#include "ops/linear/part_projection.h"
 #include "ops/linear/sm70/sm70_dequantize.h"
 #include "ops/linear/sm70/sm70_gemm.h"
 #include "ops/linear/sm70/sm70_integer.h"
@@ -625,37 +626,34 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
 
 namespace {
 
-void require_gguf_attention(const GgufProjectionWeights& weights, std::int32_t hidden,
+void require_part_attention(const PartProjectionWeights& weights, std::int32_t hidden,
                             std::int32_t query_rows, std::int32_t kv_rows) {
+    const bool gguf = detail::gguf_parts(weights);
     std::array<std::int64_t, 4> covered{};
     for (const auto& part : weights.parts) {
-        detail::require_gguf(part.weight, "attn_input_proj GGUF part");
+        if (gguf) { detail::require_gguf(part.weight, "attn_input_proj GGUF part"); }
         const std::int32_t limit = part.output < 2 ? query_rows : kv_rows;
         if (part.weight.k != hidden || part.output < 0 || part.output > 3 || part.row < 0 ||
             part.row + part.weight.n > limit) {
-            throw std::invalid_argument("attn_input_proj: GGUF part outside the attention profile");
+            throw std::invalid_argument("attn_input_proj: part outside the attention profile");
         }
         covered[part.output] += part.weight.n;
     }
     if (covered[0] != query_rows || covered[1] != query_rows || covered[2] != kv_rows ||
         covered[3] != kv_rows) {
-        throw std::invalid_argument("attn_input_proj: GGUF parts do not cover q/gate/k/v");
+        throw std::invalid_argument("attn_input_proj: parts do not cover q/gate/k/v");
     }
 }
 
 } // namespace
 
-std::size_t attn_input_proj_workspace_capacity_bytes(const GgufProjectionWeights& weights,
+std::size_t attn_input_proj_workspace_capacity_bytes(const PartProjectionWeights& weights,
                                                      std::int32_t min_tokens,
                                                      std::int32_t max_tokens) {
-    std::vector<detail::GgufShape> shapes;
-    for (const auto& part : weights.parts) {
-        shapes.push_back({part.weight.qtype, part.weight.n, part.weight.k});
-    }
-    return detail::gguf_project_workspace_bytes(shapes, min_tokens, max_tokens);
+    return detail::project_parts_workspace_bytes(weights, min_tokens, max_tokens);
 }
 
-void attn_input_proj(const Tensor& x, const GgufProjectionWeights& weights, Tensor& q,
+void attn_input_proj(const Tensor& x, const PartProjectionWeights& weights, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, WorkspaceArena& workspace,
                      cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
@@ -667,18 +665,9 @@ void attn_input_proj(const Tensor& x, const GgufProjectionWeights& weights, Tens
     require_matrix(gate, query_rows, cols, "gate");
     require_matrix(k, kv_rows, cols, "k");
     require_matrix(v, kv_rows, cols, "v");
-    require_gguf_attention(weights, x.ne[0], query_rows, kv_rows);
-    Tensor* outputs[] = {&q, &gate, &k, &v};
-    std::vector<detail::GgufProduct> products;
-    products.reserve(weights.parts.size());
-    for (const auto& part : weights.parts) {
-        detail::GgufProduct product;
-        product.weight = &part.weight;
-        product.out    = outputs[part.output];
-        product.row    = part.row;
-        products.push_back(product);
-    }
-    detail::gguf_project(x, products, workspace, stream);
+    require_part_attention(weights, x.ne[0], query_rows, kv_rows);
+    Tensor* const outputs[] = {&q, &gate, &k, &v};
+    detail::project_parts(x, weights, outputs, workspace, stream);
 }
 
 } // namespace ninfer::ops

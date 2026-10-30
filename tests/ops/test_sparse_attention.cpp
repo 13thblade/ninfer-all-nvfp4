@@ -82,11 +82,12 @@ struct HostPlane {
     std::vector<std::uint8_t> bytes;
     std::int32_t leading = 0;
     std::size_t element  = 1;
+    int heads            = kKvHeads;
 
     template <class T>
     T at(int page, int head, int slot, int index) const {
         const std::size_t offset =
-            ((static_cast<std::size_t>(page) * kKvHeads + head) * kPage + slot) * leading + index;
+            ((static_cast<std::size_t>(page) * heads + head) * kPage + slot) * leading + index;
         T value;
         std::memcpy(&value, bytes.data() + offset * element, sizeof(T));
         return value;
@@ -158,7 +159,10 @@ void decode_row(KvCacheStorage storage, const HostPlane& k, const HostPlane& v,
     }
 }
 
-int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t seed) {
+// `kv_heads` 2 is the layer; 1 a tensor-parallel share of one KV head and its 12 query heads.
+int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t seed,
+        int kv_heads = kKvHeads) {
+    const int q_heads = 12 * kv_heads;
     const bool quantized      = storage != KvCacheStorage::BFloat16;
     const bool rotated_values = storage == KvCacheStorage::Nvfp4Group16 ||
                                 storage == KvCacheStorage::Fp8KeyNvfp4Value;
@@ -170,16 +174,16 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
     std::mt19937 random(seed);
     std::shuffle(table.begin(), table.end(), random);
     // Logical K and V, [position][head][dim], and the queries.
-    std::vector<float> k(static_cast<std::size_t>(length) * kKvHeads * kDim), v(k.size()),
-        q(static_cast<std::size_t>(tokens) * kQHeads * kDim);
+    std::vector<float> k(static_cast<std::size_t>(length) * kv_heads * kDim), v(k.size()),
+        q(static_cast<std::size_t>(tokens) * q_heads * kDim);
     fill_uniform(k, seed + 1, -1.0f, 1.0f);
     fill_uniform(v, seed + 2, -2.0f, 2.0f);
     fill_uniform(q, seed + 3, -1.0f, 1.0f);
     round_to_bf16(k);
     round_to_bf16(v);
     round_to_bf16(q);
-    const auto logical = [](int position, int head) {
-        return (static_cast<std::size_t>(position) * kKvHeads + head) * kDim;
+    const auto logical = [kv_heads](int position, int head) {
+        return (static_cast<std::size_t>(position) * kv_heads + head) * kDim;
     };
     const auto encode = [](const std::vector<float>& values) {
         std::vector<std::uint16_t> bits(values.size());
@@ -189,7 +193,7 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
 
     const PagedKVStorageLayout layout = paged_kv_storage_layout(storage, kDim);
     const auto plane_elements = [&](std::int32_t leading) {
-        return static_cast<std::size_t>(leading) * kPage * kKvHeads * pages;
+        return static_cast<std::size_t>(leading) * kPage * kv_heads * pages;
     };
     const auto buffer = [&](std::int32_t leading, DType dtype) {
         return std::make_unique<GuardedDeviceBuffer>(
@@ -206,7 +210,7 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
     d_table.copy_from_host(table.data(), d_table.bytes());
     d_first.copy_from_host(&first_position, 4);
     const auto plane = [&](GuardedDeviceBuffer& memory, std::int32_t leading, DType dtype) {
-        return Tensor(memory.data(), dtype, {leading, kPage, kKvHeads, pages});
+        return Tensor(memory.data(), dtype, {leading, kPage, kv_heads, pages});
     };
     PagedKVLayerView cache{};
     cache.k_pages = plane(*d_k, layout.key.data_leading_extent, layout.key.data_dtype);
@@ -220,7 +224,7 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
     }
     cache.block_table  = Tensor(d_table.data(), DType::I32, {pages});
     cache.head_dim     = kDim;
-    cache.num_kv_heads = kKvHeads;
+    cache.num_kv_heads = kv_heads;
     cache.storage      = storage;
 
     // The represented cache the oracle reads, [position][head][dim].
@@ -228,10 +232,10 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
     if (!quantized) {
         std::vector<std::uint16_t> paged_k(plane_elements(kDim)), paged_v(paged_k.size());
         for (int p = 0; p < length; ++p) {
-            for (int h = 0; h < kKvHeads; ++h) {
+            for (int h = 0; h < kv_heads; ++h) {
                 for (int d = 0; d < kDim; ++d) {
                     const std::size_t paged =
-                        ((static_cast<std::size_t>(table[p / kPage]) * kKvHeads + h) * kPage +
+                        ((static_cast<std::size_t>(table[p / kPage]) * kv_heads + h) * kPage +
                          p % kPage) * kDim + d;
                     paged_k[paged] = f32_to_bf16(k[logical(p, h) + d]);
                     paged_v[paged] = f32_to_bf16(v[logical(p, h) + d]);
@@ -254,9 +258,9 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
         for (int begin = 0; begin < length; begin += 1024) {
             const int count = std::min(1024, length - begin);
             const Tensor kin(static_cast<std::uint16_t*>(d_kin.data()) + logical(begin, 0),
-                             DType::BF16, {kDim, kKvHeads, count});
+                             DType::BF16, {kDim, kv_heads, count});
             const Tensor vin(static_cast<std::uint16_t*>(d_vin.data()) + logical(begin, 0),
-                             DType::BF16, {kDim, kKvHeads, count});
+                             DType::BF16, {kDim, kv_heads, count});
             const Tensor at(static_cast<std::int32_t*>(d_positions.data()) + begin, DType::I32,
                             {count});
             ops::kv_cache_append(kin, vin, at, cache, nullptr);
@@ -266,6 +270,7 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
             HostPlane out;
             out.leading = leading;
             out.element = dtype_size(dtype);
+            out.heads   = kv_heads;
             out.bytes   = from_device<std::uint8_t>(memory.data(),
                                                     plane_elements(leading) * out.element);
             return out;
@@ -277,7 +282,7 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
         const HostPlane hvs =
             read(*d_vs, layout.value.scale_leading_extent, layout.value.scale_dtype);
         for (int p = 0; p < length; ++p) {
-            for (int h = 0; h < kKvHeads; ++h) {
+            for (int h = 0; h < kv_heads; ++h) {
                 decode_row(storage, hk, hv, hks, hvs, table[p / kPage], h, p % kPage,
                            &key[logical(p, h)], &value[logical(p, h)]);
             }
@@ -306,10 +311,10 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
         for (int i = 0; i < counts[t]; ++i)
             for (int j = 0; j < 4; ++j) positions.push_back(selected[static_cast<std::size_t>(t) * kTop + i] * 4 + j);
         for (int j = tail; j <= p; ++j) positions.push_back(j);
-        for (int h = 0; h < kQHeads; ++h) {
+        for (int h = 0; h < q_heads; ++h) {
             const int kv = h / 12;
             std::array<double, kDim> query{};
-            for (int d = 0; d < kDim; ++d) query[d] = q[(static_cast<std::size_t>(t) * kQHeads + h) * kDim + d];
+            for (int d = 0; d < kDim; ++d) query[d] = q[(static_cast<std::size_t>(t) * q_heads + h) * kDim + d];
             if (quantized) hadamard(query.data());
             std::vector<double> logits(positions.size());
             double maximum = -INFINITY;
@@ -328,7 +333,7 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
                 output[d] = o / sum;
             }
             if (rotated_values) hadamard(output.data());
-            for (int d = 0; d < kDim; ++d) expected[(static_cast<std::size_t>(t) * kQHeads + h) * kDim + d] = output[d];
+            for (int d = 0; d < kDim; ++d) expected[(static_cast<std::size_t>(t) * q_heads + h) * kDim + d] = output[d];
         }
     }
     GuardedDeviceBuffer d_selected(selected.size() * 4), d_counts(counts.size() * 4);
@@ -336,8 +341,8 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
     d_q.copy_from_host(qb.data(), d_q.bytes());
     d_selected.copy_from_host(selected.data(), d_selected.bytes());
     d_counts.copy_from_host(counts.data(), d_counts.bytes());
-    Tensor t_q(d_q.data(), DType::BF16, {kDim, kQHeads, tokens});
-    Tensor t_out(d_out.data(), DType::BF16, {kDim, kQHeads, tokens});
+    Tensor t_q(d_q.data(), DType::BF16, {kDim, q_heads, tokens});
+    Tensor t_out(d_out.data(), DType::BF16, {kDim, q_heads, tokens});
     Tensor t_selected(d_selected.data(), DType::I32, {kTop, tokens});
     Tensor t_counts(d_counts.data(), DType::I32, {tokens});
     const Tensor t_first(d_first.data(), DType::I32, {1});
@@ -345,7 +350,8 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
     ops::sparse_softmax_attention(t_q, t_first, t_selected, t_counts, cache, scale, workspace, t_out, nullptr);
     cuda_synchronize();
     const std::string label = std::string("sparse attention ") + storage_name(storage) +
-                              " p=" + std::to_string(first_position) + " T=" + std::to_string(tokens);
+                              " p=" + std::to_string(first_position) + " T=" + std::to_string(tokens) +
+                              " kv_heads=" + std::to_string(kv_heads);
     int failures = verify_reduction(label, from_device_bf16(d_out.data(), q.size()), expected,
                                     {4.0e-3, 1.0e-4, 2.0 * 3.90625e-3});
     for (auto* memory : {d_k.get(), d_v.get(), d_ks.get(), d_vs.get(), &d_q, &d_out, &d_selected,
@@ -374,6 +380,9 @@ int main() {
         failures += run(storage, 4096, 3, 9103u); // a full selection
         failures += run(storage, 9000, 1, 9104u);
         failures += run(storage, 6001, 8, 9105u); // the widest split call, every split busy
+        // A tensor-parallel share of one KV head: an unsplit and a split call.
+        failures += run(storage, 2047, 9, 9106u, 1);
+        failures += run(storage, 6001, 8, 9107u, 1);
     }
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " sparse_softmax_attention\n";
     return failures == 0 ? 0 : 1;

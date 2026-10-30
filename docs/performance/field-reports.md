@@ -11,6 +11,7 @@ or against each other as a benchmark. [Send a report](#send-a-report) to add a c
 | RTX 4090, 24 GB | Windows | Qwen3.8-27B GSQ-RCO IQ3_S, Swift 1.5 IQ3_S | Qwen Code sessions with DFlash2 5 and 7 | [RTX 4090: DFlash2](#rtx-4090-qwen-code-with-dflash2) |
 | RTX 4090, 24 GB | Windows | Swift Qwen3.8 GSQ-RCO IQ3_S | agent traffic with MTP 3, four lanes and the hybrid prefix cache | [RTX 4090: MTP 3](#rtx-4090-agent-traffic-with-mtp-3-and-the-hybrid-prefix-cache) |
 | RTX 4080 and RTX 4090 | Windows 11 | Qwen3.8-27B GSQ-RCO IQ3_S | Hermes Desktop | [RTX 4080 and 4090](#rtx-4080-and-rtx-4090-windows-11) |
+| RTX 5060 Ti, 16 GB, two and four | Linux | Qwen3.8-27B NVFP4 | `--tensor-parallel` prompts to 28.8K tokens, KV capacity | [RTX 5060 Ti](#rtx-5060-ti-two-and-four-cards) |
 
 ## RTX 5070 Ti, Windows 11
 
@@ -230,6 +231,57 @@ Reported by @jabbor in [iamwavecut/ninfer-all#70](https://github.com/iamwavecut/
 13 October 2026: `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` on an RTX 4080 and on an RTX 4090,
 each machine with 64 GB of RAM, served to Hermes Desktop. The reporter found it much faster than
 llama.cpp, with larger contexts. The report gives no rates.
+
+## RTX 5060 Ti, two and four cards
+
+Reported by @sean640112 and @mmknet2025 in
+[iamwavecut/ninfer-all#170](https://github.com/iamwavecut/ninfer-all/issues/170), 28 and 29 October
+2026. Both run `master` at `33163f05`, a `120a` build, with tensor parallelism over RTX 5060 Ti 16 GB
+cards.
+
+| | sean640112 | mmknet2025 |
+|---|---|---|
+| Cards | four, PCIe Gen4 x8 each | two, PCIe Gen5 x8 + x8 |
+| Peer access | every pair, community P2P driver 610.57.04; NCCL all-reduce about 12.2 GB/s | both directions, community P2P patch, driver 615.71.09 |
+| Toolchain | CUDA 13.3.73, GCC 13.4.0, Ubuntu 26.04.1 | CUDA 13.4.92, GCC 13.4 |
+| Artifact | `neroued/Qwen3.8-27B-nvfp4-NInfer` (23,719,715,844 bytes) | an NVFP4 conversion of Qwen3.8-27B with 19.8 GiB of weights (named in the issue) |
+
+sean640112's command; the two-card arm uses `--devices 0,1` and `--max-context 32768`:
+
+```bash
+ninfer-serve qwen3_8_27b_nvfp4.ninfer --devices 0,1,2,3 --tensor-parallel \
+  --max-context 262144 --kv-capacity auto --kv-dtype int8 \
+  --spec mtp --draft-tokens 3 --lm-head-draft --max-concurrency 1
+```
+
+mmknet2025 runs `--devices 0,1 --tensor-parallel --max-context 131072 --kv-capacity 131072` with
+the same KV and drafter flags. Greedy requests, a cold prefix for the time to the first token;
+prompt rate is prompt tokens over that time. sean640112 starts one server per arm, mmknet2025
+reports the median of three runs. Prompt / decode in tok/s:
+
+| Prompt tokens | four cards, Gen4 x8 | two cards, Gen4 x8 | two cards, Gen5 x8 |
+|---:|---:|---:|---:|
+| 742 | | | 1,103 / 72.1 |
+| 940 | 418 / | 631 / | |
+| 5,777 | | | 1,283 / 77.5 |
+| 7,012 | 544 / 82.1 | 975 / 75.3 | |
+| 28,852 | 542 / 78.3 | 958 / 67.9 | |
+
+The 940-token rows give no decode rate: the second request of the pair hit the prefix cache. On the
+same box four cards prefill the 7,012- and 28,852-token prompts 1.77 to 1.79 times slower than two
+and decode 9% to 15% faster. A groupwise-int conversion of the same model on the four cards
+(`master` at `adf969f`) prefilled 28.8K tokens at 531 tok/s and decoded at 74.3. On the two-card
+box another engine, a fork of the upstream project with its own NVFP4 artifact,
+`--prefill-chunk 3072` and an exchange that overlaps the prompt's compute, prefilled 5,775 tokens
+at 6,441 tok/s; engine and artifact differ, so the reporter does not read it as an A/B.
+
+**Capacity.** On two cards an int8 KV cache of 262,144 tokens does not fit: device 0 needs
+5,656,908,608 bytes for the runtime reservation and has 4,232,773,632. An explicit
+`--kv-capacity 131072` starts, with 11.4 and 8.33 GiB of weights on the two cards. With
+`--kv-capacity auto` the same 131,072-token window stops on device 0, 34 MB short: the reservation of
+3,165,475,648 bytes plus 1 GiB of automatic headroom against 4,204,920,832 bytes left after the
+weights. Four cards hold 262,144 tokens with `--kv-capacity auto`, with 7.16, 4.04, 4.33 and
+4.33 GiB of weights; the startup report lists 5.25 GiB free.
 
 ## Send a report
 

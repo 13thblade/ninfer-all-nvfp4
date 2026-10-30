@@ -127,6 +127,9 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
                 "fused projection rows must share one input gather");
     }
     if (columns.data != nullptr) {
+        // Only the GGUF linears read one; any other route would multiply the stored columns as
+        // if they were in the input's order.
+        require(is_gguf(result.weight.qtype), "an input gather requires a GGUF matrix");
         require(columns.dtype == DType::I32 && columns.numel() == result.weight.k,
                 "an input gather must be INT32 [K]");
         result.weight.input_columns = static_cast<const std::int32_t*>(columns.data);
@@ -139,16 +142,19 @@ bool gguf_parent(const WeightInput& input) {
            is_gguf(input.weight.parts.front().parent->geometry.format);
 }
 
-// GGUF parts of a fused input projection, merged where consecutive logical inputs continue one
-// parent's rows into one output's rows.
-GgufProjectionWeights gguf_projection(std::span<const WeightInput> inputs,
+// The parts of an input projection, one per logical input: GGUF parts, merged where consecutive
+// logical inputs continue one parent's rows into one output's rows, or a tensor-parallel rank's
+// pieces of another format, each its own device object.
+PartProjectionWeights part_projection(std::span<const WeightInput> inputs,
                                       std::span<const std::int32_t> outputs,
                                       std::span<const std::int32_t> rows) {
-    GgufProjectionWeights result;
+    PartProjectionWeights result;
+    const bool gguf = gguf_parent(inputs.front());
     for (std::size_t i = 0; i < inputs.size(); ++i) {
-        require(gguf_parent(inputs[i]), "input projection: GGUF parts cannot mix formats");
+        require(gguf_parent(inputs[i]) == gguf, "input projection: parts cannot mix formats");
         auto part = single(inputs.subspan(i, 1));
-        if (!result.parts.empty()) {
+        if (!gguf) { result.policy = part.policy; }
+        if (gguf && !result.parts.empty()) {
             auto& last = result.parts.back();
             const auto block = gguf_block_shape(last.weight.qtype);
             const std::int64_t row_bytes = std::int64_t(last.weight.k / block.elements) * block.bytes;
@@ -181,27 +187,37 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
                         k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k
                   : q == std::vector<std::uint64_t>{2048, 2048} && k == q &&
                         third == std::vector<std::uint64_t>{4096, 2048} && fourth == third;
-    // A tensor-parallel rank's share of the dense GDN geometry: whole key and value heads, the
-    // three value rows of each key row kept together.
-    const bool dense_share =
-        !attention && !dense && q.size() == 2 && q[1] == 5120 && k == q && fourth == third &&
-        q[0] > 0 && 2048 % q[0] == 0 && q[0] % 128 == 0 &&
-        third == std::vector<std::uint64_t>{3 * q[0], 5120};
-    require(dense || moe || dense_share, "input projection: unsupported logical projection geometry");
-    if (std::any_of(inputs.begin(), inputs.end(), gguf_parent)) {
-        require(dense || dense_share, "input projection: GGUF parts need the dense geometry");
+    // A tensor-parallel rank's share of a GDN projection: whole key heads of 128 rows and the
+    // value heads that read them, a whole multiple of the key rows. A whole MoE layer keeps its
+    // fused route.
+    const bool dense_share = !attention && !dense && !moe && q.size() == 2 && k == q &&
+                             fourth == third &&
+                             third.size() == 2 && third[1] == q[1] && q[0] > 0 &&
+                             q[0] % 128 == 0 && third[0] % q[0] == 0;
+    // A rank's share of an attention projection: whole KV heads of 256 rows and their query heads,
+    // a whole multiple of the KV rows.
+    const bool attention_share = attention && !dense && !moe && q.size() == 2 && k.size() == 2 &&
+                                 third == q && fourth == k && k[1] == q[1] && k[0] > 0 &&
+                                 k[0] % 256 == 0 && q[0] % k[0] == 0;
+    // A position-split rank's pieces of every head: four device objects, of which neither pair
+    // joins as a stored attention projection's parents do.
+    const bool whole_pieces = attention && (dense || moe) && !joins(inputs.first<2>()) &&
+                              !joins(inputs.last<2>());
+    const bool share = dense_share || attention_share || whole_pieces;
+    require(dense || moe || share, "input projection: unsupported logical projection geometry");
+    if (std::any_of(inputs.begin(), inputs.end(), gguf_parent) || share) {
+        require(dense || share, "input projection: GGUF parts need the dense geometry");
         const auto q = static_cast<std::int32_t>(matrix(inputs[0])[0]);
         const auto k = static_cast<std::int32_t>(matrix(inputs[1])[0]);
         if (attention) {
             const std::array<std::int32_t, 4> outputs{0, 2, 1, 3};
             const std::array<std::int32_t, 4> rows{0, 0, 0, 0};
-            return gguf_projection(inputs, outputs, rows);
+            return part_projection(inputs, outputs, rows);
         }
         const std::array<std::int32_t, 4> outputs{0, 0, 0, 1};
         const std::array<std::int32_t, 4> rows{0, q, q + k, 0};
-        return gguf_projection(inputs, outputs, rows);
+        return part_projection(inputs, outputs, rows);
     }
-    require(!dense_share, "input projection: a tensor-parallel share needs GGUF parts");
     const auto joined = concatenate_rows(inputs);
     if (contiguous(joined)) {
         auto result       = single(inputs);
@@ -292,38 +308,53 @@ SingleProjectionWeight prepare_linear_swiglu_weight(const WeightInput& gate,
     return single(inputs);
 }
 
-SparseMoeWeights
-prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_score,
-                           std::span<const WeightInput> expert_gate_up,
-                           std::span<const WeightInput> expert_down, const WeightInput& shared_gate,
-                           const WeightInput& shared_up, const WeightInput& shared_down) {
-    require(expert_gate_up.size() == 512 && expert_down.size() == 256,
-            "SparseMoe native input requires 256 experts");
+namespace {
+
+// `experts` of the 256 in each bank; the shared expert's inputs, or none for a share without it.
+SparseMoeWeights prepare_sparse_moe_banks(const WeightInput& router,
+                                          const WeightInput& shared_score,
+                                          std::span<const WeightInput> expert_gate_up,
+                                          std::span<const WeightInput> expert_down,
+                                          std::size_t experts, std::uint64_t width,
+                                          const WeightInput* shared_gate,
+                                          const WeightInput* shared_up,
+                                          const WeightInput* shared_down) {
+    require(experts > 0 && expert_gate_up.size() == 2 * experts && expert_down.size() == experts,
+            experts == 256 && width == 512 ? "SparseMoe native input requires 256 experts"
+                                           : "SparseMoe share inputs differ from its experts");
     require(matrix(router) == std::vector<std::uint64_t>{256, 2048} &&
                 matrix(shared_score) == std::vector<std::uint64_t>{1, 2048},
             "SparseMoe router geometry differs");
     for (const auto& input : expert_gate_up) {
-        require(matrix(input) == std::vector<std::uint64_t>{512, 2048},
+        require(matrix(input) == std::vector<std::uint64_t>{width, 2048},
                 "SparseMoe gate/up geometry differs");
     }
     for (const auto& input : expert_down) {
-        require(matrix(input) == std::vector<std::uint64_t>{2048, 512},
+        require(matrix(input) == std::vector<std::uint64_t>{2048, width},
                 "SparseMoe down geometry differs");
     }
-    require(matrix(shared_gate) == std::vector<std::uint64_t>{512, 2048} &&
-                matrix(shared_up) == matrix(shared_gate) &&
-                matrix(shared_down) == std::vector<std::uint64_t>{2048, 512},
-            "SparseMoe shared expert geometry differs");
+    const bool holds_shared = shared_gate != nullptr;
+    require(holds_shared == (shared_up != nullptr) && holds_shared == (shared_down != nullptr) &&
+                (holds_shared || experts < 256 || width < 512),
+            "SparseMoe shared expert inputs are incomplete");
+    if (holds_shared) {
+        require(matrix(*shared_gate) == std::vector<std::uint64_t>{width, 2048} &&
+                    matrix(*shared_up) == matrix(*shared_gate) &&
+                    matrix(*shared_down) == std::vector<std::uint64_t>{2048, width},
+                "SparseMoe shared expert geometry differs");
+    }
     const std::array router_inputs{router, shared_score};
-    const auto router_bank        = single(router_inputs);
-    const auto gate_up_bank       = single(expert_gate_up);
-    const auto down_bank          = single(expert_down);
-    const auto shared             = prepare_linear_swiglu_weight(shared_gate, shared_up);
-    const auto down               = prepare_linear_weight(shared_down);
-    const auto gate_format        = gate_up_bank.weight.qtype;
-    const auto down_format        = down_bank.weight.qtype;
-    const auto shared_format      = shared.weight.qtype;
-    const auto shared_down_format = down.weight.qtype;
+    const auto router_bank  = single(router_inputs);
+    const auto gate_up_bank = single(expert_gate_up);
+    const auto down_bank    = single(expert_down);
+    const auto shared       = holds_shared ? prepare_linear_swiglu_weight(*shared_gate, *shared_up)
+                                           : SingleProjectionWeight{};
+    const auto down = holds_shared ? prepare_linear_weight(*shared_down) : SingleProjectionWeight{};
+    const auto gate_format = gate_up_bank.weight.qtype;
+    const auto down_format = down_bank.weight.qtype;
+    // A share without the shared expert takes the profile's Q8 for it.
+    const auto shared_format      = holds_shared ? shared.weight.qtype : QType::Q8_G32_FP16;
+    const auto shared_down_format = holds_shared ? down.weight.qtype : QType::Q8_G32_FP16;
     const bool groupwise =
         shared_format == QType::Q8_G32_FP16 && shared_down_format == QType::Q8_G32_FP16 &&
         ((gate_format == QType::Q4_G64_FP16 &&
@@ -347,10 +378,39 @@ prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_
         const auto permits = [](const WeightInput& input) { return allows_a4(input.policy); };
         require(std::all_of(expert_gate_up.begin(), expert_gate_up.end(), permits) &&
                     std::all_of(expert_down.begin(), expert_down.end(), permits) &&
-                    permits(shared_gate) && permits(shared_up) && permits(shared_down),
+                    permits(*shared_gate) && permits(*shared_up) && permits(*shared_down),
                 "SparseMoe NVFP4 requires AllowA4 on every expert input");
     }
     return {router_bank.weight, gate_up_bank.weight, down_bank.weight, shared.weight, down.weight};
+}
+
+} // namespace
+
+SparseMoeWeights
+prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_score,
+                           std::span<const WeightInput> expert_gate_up,
+                           std::span<const WeightInput> expert_down, const WeightInput& shared_gate,
+                           const WeightInput& shared_up, const WeightInput& shared_down) {
+    return prepare_sparse_moe_banks(router, shared_score, expert_gate_up, expert_down, 256, 512,
+                                    &shared_gate, &shared_up, &shared_down);
+}
+
+SparseMoeWeights prepare_sparse_moe_share_weights(
+    const WeightInput& router, const WeightInput& shared_score,
+    std::span<const WeightInput> expert_gate_up, std::span<const WeightInput> expert_down,
+    const WeightInput* shared_gate, const WeightInput* shared_up, const WeightInput* shared_down) {
+    // A share holds some of the experts whole, or every expert's half of its intermediate
+    // columns.
+    const std::uint64_t width = expert_down.empty() ? 0 : matrix(expert_down.front()).back();
+    require(!expert_down.empty() && expert_down.size() <= 256 &&
+                (width == 256 || (width == 512 && expert_down.size() < 256)),
+            "SparseMoe share holds some of the 256 experts, or half of each one's columns");
+    const auto out =
+        prepare_sparse_moe_banks(router, shared_score, expert_gate_up, expert_down,
+                                 expert_down.size(), width, shared_gate, shared_up, shared_down);
+    require(out.routed_gate_up.qtype != QType::NVFP4,
+            "SparseMoe NVFP4 expert banks have no expert-parallel share");
+    return out;
 }
 
 } // namespace ninfer::ops

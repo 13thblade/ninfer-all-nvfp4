@@ -43,6 +43,8 @@ struct DeepSeekV41Instance {
     std::uint32_t capacity = 0;
     std::size_t free_after_weights = 0;
     std::size_t free_after_startup = 0;
+    // --vision: the prompt positions an image's span takes at most; 0 without the tower.
+    std::uint32_t vision_budget = 0;
     // --expert-profile-out: the routing profile written at request boundaries.
     std::filesystem::path record_profile;
 };

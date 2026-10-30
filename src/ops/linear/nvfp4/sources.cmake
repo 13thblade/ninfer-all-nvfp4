@@ -5,6 +5,8 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_w4a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_dispatch.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_general.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_general_a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_dispatch_unified.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n14336_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n14336_k5120_unified.cu"

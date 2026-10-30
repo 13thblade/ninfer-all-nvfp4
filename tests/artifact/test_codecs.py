@@ -54,6 +54,26 @@ def _signed_word(word: int, bits: int) -> int:
             "i",
             torch.int32,
         ),
+        (
+            "fp16",
+            torch.tensor(
+                [_signed_word(word, 16) for word in (0x0000, 0x8000, 0x0001, 0x7E12)],
+                dtype=torch.int16,
+            ).view(torch.float16),
+            (0x0000, 0x8000, 0x0001, 0x7E12),
+            "H",
+            torch.int16,
+        ),
+        (
+            "uint16",
+            torch.tensor(
+                [_signed_word(word, 16) for word in (0x0000, 0x8000, 0x0001, 0xFFFF)],
+                dtype=torch.int16,
+            ).view(torch.uint16),
+            (0x0000, 0x8000, 0x0001, 0xFFFF),
+            "H",
+            torch.int16,
+        ),
     ],
 )
 def test_direct_layout_preserves_exact_little_endian_words(

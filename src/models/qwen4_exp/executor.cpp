@@ -8,6 +8,7 @@
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
+#include "core/tensor_parallel.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/target_logprobs.h"
 #include "models/qwen4_exp/ngram_hash.h"
@@ -238,14 +239,20 @@ HcPlan make_hc(const Model& model, const HyperConnectionWeights& w, const TextCo
     return out;
 }
 
+// A Gated DeltaNet mixer's operands: every head, or a tensor-parallel rank's key heads with the
+// value heads that read them.
 struct GdnPlan {
     Projection qkv, z, a, b, output;
     Tensor convolution, a_log, dt_bias, norm;
+    std::int32_t key_heads = 0, value_heads = 0;
 };
 
+// A sparse-attention mixer's operands: both KV heads, or a tensor-parallel rank's one with its
+// query heads (the indexer whole either way).
 struct QsaPlan {
     Projection query, gate, key, value, index, output;
     Tensor query_norm, key_norm, index_query_norm, index_key_norm;
+    std::int32_t kv_heads = 0;
 };
 
 struct PlePlan {
@@ -287,6 +294,35 @@ ExpertTable make_table(const Model& model, std::span<const WeightId> ids) {
         }
         pointers.push_back(w.qdata);
         out.rows = w.n;
+    }
+    out.table = DeviceBuffer(pointers.size() * sizeof(void*));
+    out.table.copy_from_host(pointers.data(), pointers.size() * sizeof(void*));
+    out.pointers = std::move(pointers);
+    return out;
+}
+
+// Tensor parallelism: the table of the experts `rank` holds, the other entries null (never read).
+ExpertTable make_rank_table(const Model& model, std::span<const WeightId> ids, std::size_t rank) {
+    ExpertTable out;
+    std::vector<const void*> pointers(ids.size(), nullptr);
+    for (std::size_t e = 0; e < ids.size(); ++e) {
+        const auto& bound = model.weight(ids[e]);
+        if (bound.rank != rank) { continue; }
+        const Weight w = native_weight(bound.view);
+        if (!is_gguf(w.qtype)) {
+            throw std::invalid_argument(bound.name + ": tensor parallelism takes GGUF block banks");
+        }
+        const auto block       = gguf_block_shape(w.qtype);
+        const std::int64_t row = std::int64_t(w.k / block.elements) * block.bytes;
+        if (out.row_bytes == 0) {
+            out.format    = w.qtype;
+            out.row_bytes = row;
+        } else if (w.qtype != out.format || row != out.row_bytes) {
+            throw std::invalid_argument(bound.name +
+                                        ": every expert of a bank must share its block type");
+        }
+        pointers[e] = w.qdata;
+        out.rows    = w.n;
     }
     out.table = DeviceBuffer(pointers.size() * sizeof(void*));
     out.table.copy_from_host(pointers.data(), pointers.size() * sizeof(void*));
@@ -365,6 +401,10 @@ struct MoePlan {
     // Device banks or disk experts' device slots, with zeros after the down banks; host experts
     // are read across the bus.
     bool device_resident = false;
+    // Tensor parallelism: the routed experts [expert_begin, expert_end) the rank holds, the only
+    // entries of its tables that are set; the shared expert's tables are rank 0's alone.
+    bool share = false;
+    std::uint32_t expert_begin = 0, expert_end = 0;
 
     [[nodiscard]] ops::GgufMoeWeights banks() const {
         return {gate.view(),
@@ -414,6 +454,9 @@ struct SequenceState {
     std::uint32_t position = 0;
     NgramContext context;
     std::vector<LayerState> layers;
+    // Tensor parallelism: every rank after the first's state of each layer, [rank - 1][layer]
+    // (`layers` is rank 0's).
+    std::vector<std::vector<LayerState>> rank_layers;
     // The MTP block (an executor with drafts), on the head rank: its layer's state, the target's
     // stack at the sequence's last position (which the next cell pairs with the next token), and
     // whether the block follows the sequence's tokens, which a media prompt breaks.
@@ -498,6 +541,10 @@ struct RankState {
     cudaEvent_t done   = nullptr;
     cudaEvent_t copied = nullptr; // its stack has been copied in from the previous rank
     cudaEvent_t routes = nullptr; // the last pass's routes reached the host
+    // Tensor parallelism: rank 0's work so far, which every other rank's stream waits for at a
+    // segment's start (and so joins its capture), and the rank's work, which rank 0's stream waits
+    // for at the segment's end.
+    cudaEvent_t fork = nullptr, join = nullptr;
     ops::GgufMoeSide side;        // the decode MoE's shared expert runs there concurrently
     // Activation planes (capacity: prefill_chunk tokens).
     float* stack            = nullptr;
@@ -520,6 +567,7 @@ struct RankState {
     float* route_shared     = nullptr;
     std::int32_t* selected  = nullptr;
     std::int32_t* counts    = nullptr;
+    std::int32_t* route_ids = nullptr; // a tensor-parallel rank's routes; rank 0 records its own
     void* rows              = nullptr; // staged n-gram rows
     void* logits            = nullptr; // head rank only
     // The Gated DeltaNet state of the rank's layers, one slot per sequence (gdn_local maps a layer
@@ -606,12 +654,15 @@ struct Executor::Impl {
     // MTP speculative decoding (options.draft_tokens > 0). The MTP layer's index in the per-layer
     // route records, expert cache and expert stream is num_hidden_layers.
     std::optional<MtpPlan> mtp;
-    // Maximum and current verification widths (drafts plus anchor), and the public vocabulary.
+    // Maximum and current verification widths (drafts plus anchor; the current one the widest
+    // sequence's, the record stride), and the public vocabulary.
     std::uint32_t verify_width = 0;
     std::uint32_t active_verify_width = 0;
     std::int32_t domain        = 0;
     bool verifying             = false;
     std::vector<SequenceState*> verified; // the last verify()'s sequences, in order
+    // Their first columns and widths in that verification.
+    std::vector<std::int32_t> verified_columns, verified_widths;
     // While forward_branches() runs: the state its branches start from. Every part of the pass is
     // a branch of one sequence, and each part after the first takes the snapshot's recurrent state
     // of a layer before it runs that layer.
@@ -657,6 +708,18 @@ struct Executor::Impl {
     std::vector<void*> route_records;       // by expert layer
     std::unique_ptr<PinnedHostBuffer> route_host;
     std::uint32_t pending_routes = 0;
+
+    // Tensor parallelism (Model::tensor_parallel()): every rank runs every layer over its replica
+    // of the stack, with its run of each mixer's heads and of the routed experts, and exchanges
+    // its partial of each mixer's output projection and of each MoE layer's experts
+    // (run_tensor_segment). The plans of every rank after the first, [rank - 1][layer], and each
+    // rank's token embedding (rank 0's is embedding_table) and copy of a media prompt's Vision
+    // embeddings.
+    std::vector<std::vector<LayerPlan>> rank_layers;
+    std::vector<Weight> rank_embedding_tables;
+    std::vector<DeviceBuffer> rank_vision_embeddings;
+    std::unique_ptr<TensorParallelExchange> tensor_exchange;
+    std::size_t exchange_next = 0; // the next exchange's slot within a pass
 
     // Host-resident experts, wide calls: a layer's routed experts that the cache does not hold are
     // copied into device slots and the matrix kernel reads them there; one pool and one set of
@@ -714,6 +777,8 @@ struct Executor::Impl {
     static constexpr std::uint32_t kSpanChunks = 8;
     std::uint32_t span_tokens = 0;
     DeviceBuffer span_stack, span_positions, span_rope, span_rows;
+    // With the Vision tower: a media prompt's three-axis positions, [3, chunk] per chunk.
+    DeviceBuffer span_mrope;
     // A span's n-gram rows, read in one batch while its layers before the first PLE layer run.
     std::unique_ptr<PinnedHostBuffer> span_host_rows;
     std::vector<std::uint64_t> span_row_ids;
@@ -728,6 +793,9 @@ struct Executor::Impl {
     DeviceBuffer span_ids, span_weights, span_shared, span_y;
     // A span's chunk before its last runs a layer's experts: the pool keeps that layer's experts.
     bool span_hold = false;
+    // A span's last chunk runs a layer's experts: the disk cache releases the layer's experts the
+    // span's earlier chunks read and this one does not route to.
+    bool span_last = false;
 
     // Vision (a model loaded with its tower), on rank 0 beside the token embedding: the encoder's
     // workspace, whose handoff region receives one item at a time, and the merged embeddings of
@@ -785,6 +853,10 @@ struct Executor::Impl {
                 stream_width = width;
             }
         }
+        if (model.tensor_parallel() && stream_slots != 0) {
+            throw std::invalid_argument("qwen4_exp: tensor parallelism keeps every KV position on "
+                                        "the devices (no --kv-resident)");
+        }
         memory.ranks.resize(device.size());
         plan_weights();
         if (verify_width > 0) { plan_mtp(); }
@@ -825,6 +897,7 @@ struct Executor::Impl {
         }
         plan_segments();
         allocate_ranks();
+        allocate_exchange();
         allocate_vision();
         allocate_sequences();
         allocate_staging();
@@ -886,6 +959,8 @@ struct Executor::Impl {
             if (rank.done != nullptr) { cudaEventDestroy(rank.done); }
             if (rank.copied != nullptr) { cudaEventDestroy(rank.copied); }
             if (rank.routes != nullptr) { cudaEventDestroy(rank.routes); }
+            if (rank.fork != nullptr) { cudaEventDestroy(rank.fork); }
+            if (rank.join != nullptr) { cudaEventDestroy(rank.join); }
             if (rank.side.fork != nullptr) { cudaEventDestroy(rank.side.fork); }
             if (rank.side.join != nullptr) { cudaEventDestroy(rank.side.join); }
             if (rank.side.stream != nullptr) { cudaStreamDestroy(rank.side.stream); }
@@ -911,6 +986,48 @@ struct Executor::Impl {
         }
     }
 
+    [[nodiscard]] bool tensor() const noexcept { return model.tensor_parallel(); }
+
+    // A rank's plan and a sequence's state of layer `i`: under tensor parallelism every rank has
+    // its own; otherwise the layer's stage's.
+    [[nodiscard]] const LayerPlan& plan_of(std::size_t rank, std::size_t i) const {
+        return rank == 0 || !tensor() ? layers[i] : rank_layers[rank - 1][i];
+    }
+
+    [[nodiscard]] LayerState& state_of(SequenceState& sequence, std::size_t rank,
+                                       std::size_t i) const {
+        return rank == 0 || !tensor() ? sequence.layers[i] : sequence.rank_layers[rank - 1][i];
+    }
+
+    // Calls f(rank, plan, state) for every rank's part of layer `i`: the layer's stage's, or under
+    // tensor parallelism each rank's in rank order.
+    template <class Sequence, class F>
+    void each_part(Sequence& sequence, std::size_t i, F&& f) const {
+        f(layers[i].rank, layers[i], sequence.layers[i]);
+        for (std::size_t r = 1; r <= rank_layers.size(); ++r) {
+            f(r, rank_layers[r - 1][i], sequence.rank_layers[r - 1][i]);
+        }
+    }
+
+    // The ranks a pass runs a layer on.
+    [[nodiscard]] std::size_t parts() const noexcept { return rank_layers.size() + 1; }
+
+    // A sequence's layer states, layer by layer and within a layer rank by rank: a snapshot's
+    // layers.
+    [[nodiscard]] std::size_t state_count() const noexcept { return layers.size() * parts(); }
+
+    // The snapshot layer of rank `rank`'s state of layer `i`.
+    [[nodiscard]] std::size_t state_slot(std::size_t i, std::size_t rank) const noexcept {
+        return i * parts() + (tensor() ? rank : 0);
+    }
+
+    // Whether `rank` runs a PLE layer: its stage's, or under tensor parallelism every rank.
+    [[nodiscard]] bool ple_on(std::size_t rank) const {
+        return std::any_of(layers.begin(), layers.end(), [&](const LayerPlan& p) {
+            return p.ple && (p.rank == rank || tensor());
+        });
+    }
+
     void plan_weights() {
         const auto& w   = model.weights();
         embedding_table = native_weight(model.weight(w.token_embedding).view);
@@ -921,7 +1038,17 @@ struct Executor::Impl {
         }
         for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
             layers.push_back(make_layer_plan(w.layers[i], model.stages().placement(i).stage,
-                                             config.num_experts));
+                                             config.num_experts,
+                                             tensor() ? &w.layers[i].moe : nullptr));
+        }
+        for (std::size_t r = 1; tensor() && r < device.size(); ++r) {
+            rank_embedding_tables.push_back(native_weight(model.weight(model.embedding(r)).view));
+            std::vector<LayerPlan> plans;
+            for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
+                plans.push_back(make_layer_plan(model.layer_weights(r, i), r, config.num_experts,
+                                                &w.layers[i].moe));
+            }
+            rank_layers.push_back(std::move(plans));
         }
     }
 
@@ -943,15 +1070,24 @@ struct Executor::Impl {
     }
 
     // A layer's operands on its rank; `experts` its routed experts (the MTP block may keep more
-    // than an expert-pruned text model).
-    LayerPlan make_layer_plan(const LayerWeights& lw, std::size_t rank, std::uint32_t experts) {
+    // than an expert-pruned text model). Under tensor parallelism `banks` lists every rank's routed
+    // experts of the layer, and the plan is the rank's share.
+    LayerPlan make_layer_plan(const LayerWeights& lw, std::size_t rank, std::uint32_t experts,
+                              const MoeWeights* banks = nullptr) {
         LayerPlan plan;
         plan.rank = rank;
         RankBinding bind(device, plan.rank);
         plan.attn_hc = make_hc(model, lw.attn_hc, config);
         plan.mlp_hc  = make_hc(model, lw.mlp_hc, config);
+        const TensorShare share = banks != nullptr ? model.share(rank) : TensorShare{};
         if (const auto* g = std::get_if<GdnWeights>(&lw.mixer)) {
             GdnPlan gdn;
+            gdn.key_heads = static_cast<std::int32_t>(
+                banks != nullptr ? share.key_head_end - share.key_head_begin
+                                 : config.linear_num_key_heads);
+            gdn.value_heads = gdn.key_heads * static_cast<std::int32_t>(
+                                                  config.linear_num_value_heads /
+                                                  config.linear_num_key_heads);
             gdn.qkv             = make_projection(model, {g->query, g->key, g->value});
             gdn.z               = make_projection(model, {g->z});
             gdn.a               = make_projection(model, {g->a_projection});
@@ -961,15 +1097,17 @@ struct Executor::Impl {
             gdn.convolution =
                 direct(model, g->convolution,
                        {channels, static_cast<std::int32_t>(config.linear_conv_kernel_dim)});
-            const auto heads = static_cast<std::int32_t>(config.linear_num_value_heads);
-            gdn.a_log        = direct(model, g->a_log, {heads}, DType::FP32);
-            gdn.dt_bias      = direct(model, g->dt_bias, {heads}, DType::FP32);
+            gdn.a_log   = direct(model, g->a_log, {gdn.value_heads}, DType::FP32);
+            gdn.dt_bias = direct(model, g->dt_bias, {gdn.value_heads}, DType::FP32);
             gdn.norm =
                 direct(model, g->norm, {static_cast<std::int32_t>(config.linear_value_head_dim)});
             plan.gdn = std::move(gdn);
-        } else {
-            const auto& a = std::get<SparseAttentionWeights>(lw.mixer);
+        } else if (const auto* sparse = std::get_if<SparseAttentionWeights>(&lw.mixer)) {
+            const auto& a = *sparse;
             QsaPlan qsa;
+            qsa.kv_heads = static_cast<std::int32_t>(
+                banks != nullptr ? share.kv_head_end - share.kv_head_begin
+                                 : config.num_key_value_heads);
             qsa.query            = make_projection(model, {a.query});
             qsa.gate             = make_projection(model, {a.gate});
             qsa.key              = make_projection(model, {a.key});
@@ -1002,6 +1140,21 @@ struct Executor::Impl {
         const auto h    = static_cast<std::int32_t>(config.hidden_size);
         plan.moe.router = direct(model, lw.moe.router, {h, static_cast<std::int32_t>(experts)});
         plan.moe.shared_gate = direct(model, lw.moe.shared_score, {h});
+        if (banks != nullptr) {
+            plan.moe.share           = true;
+            plan.moe.expert_begin    = share.expert_begin;
+            plan.moe.expert_end      = share.expert_end;
+            plan.moe.gate            = make_rank_table(model, banks->gate, rank);
+            plan.moe.up              = make_rank_table(model, banks->up, rank);
+            plan.moe.down            = make_rank_table(model, banks->down, rank);
+            plan.moe.device_resident = true;
+            if (rank == 0) {
+                plan.moe.shared_gate_table = make_table(model, std::span(&banks->shared_gate, 1));
+                plan.moe.shared_up_table   = make_table(model, std::span(&banks->shared_up, 1));
+                plan.moe.shared_down_table = make_table(model, std::span(&banks->shared_down, 1));
+            }
+            return plan;
+        }
         if (!lw.moe.gate.empty() &&
             !is_gguf(native_weight(model.weight(lw.moe.gate.front()).view).qtype)) {
             const auto width = static_cast<std::int32_t>(config.moe_intermediate_size);
@@ -1085,6 +1238,11 @@ struct Executor::Impl {
         bytes = std::max(
             {bytes, ops::moe_experts_gguf_workspace_bytes(t),
              ops::moe_route_workspace_bytes(t, static_cast<std::int32_t>(config.num_experts))});
+        if (tensor()) {
+            // A rank's experts' fixed-point part, held beside the part's own workspace.
+            bytes = std::max(bytes, ops::moe_experts_gguf_part_workspace_bytes(t) +
+                                        round_up(std::uint64_t(config.hidden_size) * t * 8));
+        }
         if (const std::uint32_t group = planned_group_chunks(); group > 1 && rank == 0) {
             bytes = std::max(bytes, ops::moe_experts_gguf_workspace_bytes(
                                         static_cast<std::int32_t>(group) * t));
@@ -1092,6 +1250,9 @@ struct Executor::Impl {
         std::vector<const LayerPlan*> planned;
         for (const auto& plan : layers) {
             if (plan.rank == rank) { planned.push_back(&plan); }
+        }
+        if (tensor() && rank > 0) {
+            for (const auto& plan : rank_layers[rank - 1]) { planned.push_back(&plan); }
         }
         if (mtp && rank == model.head_rank()) {
             planned.push_back(&mtp->layer);
@@ -1181,6 +1342,8 @@ struct Executor::Impl {
                 {reinterpret_cast<void**>(&rank.selected),
                  std::uint64_t(config.indexer_block_budget()) * t * 4},
                 {reinterpret_cast<void**>(&rank.counts), t * 4},
+                {reinterpret_cast<void**>(&rank.route_ids),
+                 std::uint64_t(config.num_experts_per_tok) * t * 4},
                 {&rank.rows, std::uint64_t(config.ngram_heads()) * t * row_b},
             };
             if (r == model.head_rank()) {
@@ -1209,11 +1372,25 @@ struct Executor::Impl {
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.done, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.copied, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.routes, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&rank.fork, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&rank.join, cudaEventDisableTiming));
             CUDA_CHECK(cudaStreamCreateWithFlags(&rank.side.stream, cudaStreamNonBlocking));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.side.fork, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.side.join, cudaEventDisableTiming));
             memory.ranks[r].workspace_bytes += total + rank.workspace->capacity();
             ranks.push_back(std::move(rank));
+        }
+    }
+
+    // Tensor parallelism: the exchange of a pass's partials, one FP32 [hidden, prefill_chunk]
+    // per rank and slot.
+    void allocate_exchange() {
+        if (!tensor()) { return; }
+        const std::size_t bytes = std::size_t(config.hidden_size) * options.prefill_chunk * 4;
+        tensor_exchange = std::make_unique<TensorParallelExchange>(
+            device, TensorParallelExchangeOptions{.slot_bytes = bytes});
+        for (std::size_t r = 0; r < device.size(); ++r) {
+            memory.ranks[r].workspace_bytes += TensorParallelExchange::kSlots * bytes;
         }
     }
 
@@ -1237,6 +1414,11 @@ struct Executor::Impl {
         vision_context    = std::make_unique<qwen3_5::execution::VisionContext>(
             device, *vision, *vision_parameters, ranks[0].stream);
         memory.ranks[0].workspace_bytes += vision_backing.bytes + vision_embeddings.bytes;
+        for (std::size_t r = 1; tensor() && r < device.size(); ++r) {
+            RankBinding peer(device, r);
+            rank_vision_embeddings.emplace_back(vision_embeddings.bytes);
+            memory.ranks[r].workspace_bytes += vision_embeddings.bytes;
+        }
     }
 
     [[nodiscard]] qwen3_5::execution::VisionParameters
@@ -1291,6 +1473,14 @@ struct Executor::Impl {
         // The MTP block drafts from text cells only; the sequence stops drafting until a reset.
         sequence.mtp_follows = false;
         CUDA_CHECK(cudaStreamSynchronize(ranks[0].stream));
+        // Under tensor parallelism every rank embeds the prompt itself, from its own copy.
+        for (std::size_t r = 1; r <= rank_vision_embeddings.size(); ++r) {
+            RankBinding peer(device, r);
+            CUDA_CHECK(cudaMemcpyPeerAsync(rank_vision_embeddings[r - 1].p, device.rank(r).device,
+                                           vision_embeddings.p, device.rank(0).device,
+                                           column * h * 2, ranks[r].stream));
+            CUDA_CHECK(cudaStreamSynchronize(ranks[r].stream));
+        }
     }
 
     // The planes of the sparse-attention layers' KV storage, in LayerState::kv's order (K, V,
@@ -1304,12 +1494,13 @@ struct Executor::Impl {
                   kv_layout.value.scale_dtype}}};
     }
 
-    // One plane's bytes for `pages` pages of `page_tokens` positions.
+    // One plane's bytes for `pages` pages of `page_tokens` positions of `heads` KV heads (both,
+    // or a tensor-parallel rank's).
     [[nodiscard]] std::uint64_t kv_plane_bytes(std::size_t plane, std::uint64_t page_tokens,
-                                               std::uint64_t count) const {
+                                               std::uint64_t count, std::uint64_t heads = 0) const {
         const auto [leading, dtype] = kv_planes()[plane];
-        return std::uint64_t(leading) * page_tokens * config.num_key_value_heads * count *
-               dtype_size(dtype);
+        return std::uint64_t(leading) * page_tokens *
+               (heads != 0 ? heads : config.num_key_value_heads) * count * dtype_size(dtype);
     }
 
     // A view of a sparse-attention layer's KV planes `data(i)`: pages of `page_tokens` positions,
@@ -1317,20 +1508,20 @@ struct Executor::Impl {
     template <class Data>
     [[nodiscard]] PagedKVLayerView kv_view(Data&& data, std::int32_t page_tokens,
                                            std::int32_t count, void* table,
-                                           std::int32_t entries) const {
+                                           std::int32_t entries, std::int32_t heads = 0) const {
+        if (heads == 0) { heads = static_cast<std::int32_t>(config.num_key_value_heads); }
         PagedKVLayerView cache{};
         Tensor* targets[4] = {&cache.k_pages, &cache.v_pages, &cache.k_scale_pages,
                               &cache.v_scale_pages};
         const auto planes = kv_planes();
         for (std::size_t i = 0; i < planes.size(); ++i) {
             if (planes[i].first == 0) { continue; }
-            *targets[i] = Tensor(data(i), planes[i].second,
-                                 {planes[i].first, page_tokens,
-                                  static_cast<std::int32_t>(config.num_key_value_heads), count});
+            *targets[i] =
+                Tensor(data(i), planes[i].second, {planes[i].first, page_tokens, heads, count});
         }
         cache.block_table  = Tensor(table, DType::I32, {entries});
         cache.head_dim     = static_cast<std::int32_t>(config.head_dim);
-        cache.num_kv_heads = static_cast<std::int32_t>(config.num_key_value_heads);
+        cache.num_kv_heads = heads;
         cache.storage      = options.kv_cache;
         return cache;
     }
@@ -1338,13 +1529,13 @@ struct Executor::Impl {
     // A sparse-attention layer's per-sequence state: paged KV (one plane per K or V vector and
     // per scale, each [leading, page, head, page]), pooled keys and the indexer's tail. A
     // streamed layer keeps the paged KV in pinned host memory, and its pool and map on the device.
-    void allocate_attention_state(LayerState& state, std::size_t rank) {
+    void allocate_attention_state(LayerState& state, std::size_t rank, std::uint32_t heads = 0) {
         std::uint64_t device_kv = 0, bytes = 0;
         const auto planes       = kv_planes();
         for (std::size_t i = 0; i < planes.size(); ++i) {
             if (planes[i].first == 0) { continue; }
             KvPlane& plane = state.kv[i];
-            plane.bytes    = kv_plane_bytes(i, kPagedKVPageSize, pages);
+            plane.bytes    = kv_plane_bytes(i, kPagedKVPageSize, pages, heads);
             if (stream_slots != 0) {
                 plane.host    = std::make_unique<PinnedHostBuffer>(plane.bytes);
                 plane.p       = plane.host->data();
@@ -1413,20 +1604,25 @@ struct Executor::Impl {
     void allocate_gdn_pools() {
         gdn_local.assign(layers.size(), 0);
         std::vector<std::uint32_t> count(ranks.size(), 0);
-        std::int32_t channels = 0;
+        std::vector<const GdnPlan*> geometry(ranks.size(), nullptr);
         for (std::size_t i = 0; i < layers.size(); ++i) {
             if (!layers[i].gdn) { continue; }
             gdn_local[i] = count[layers[i].rank]++;
-            channels     = layers[i].gdn->qkv.rows;
+            for (std::size_t r = 0; r < ranks.size(); ++r) {
+                if (plan_of(r, i).rank == r) { geometry[r] = &*plan_of(r, i).gdn; }
+            }
         }
+        // Under tensor parallelism every rank pools its run of every layer, at rank 0's indices.
+        if (tensor()) { std::fill(count.begin(), count.end(), count[0]); }
         for (RankState& rank : ranks) {
             if (count[rank.rank] == 0) { continue; }
             RankBinding bind(device, rank.rank);
+            const GdnPlan& g = *geometry[rank.rank];
             const LinearAttentionStatePoolSpec spec{
                 .layers         = count[rank.rank],
-                .conv_channels  = channels,
+                .conv_channels  = g.qkv.rows,
                 .conv_width     = static_cast<std::int32_t>(config.linear_conv_kernel_dim - 1),
-                .value_heads    = static_cast<std::int32_t>(config.linear_num_value_heads),
+                .value_heads    = g.value_heads,
                 .value_head_dim = static_cast<std::int32_t>(config.linear_value_head_dim),
                 .key_head_dim   = static_cast<std::int32_t>(config.linear_key_head_dim),
                 .slot_count     = static_cast<std::int32_t>(options.sequences),
@@ -1443,25 +1639,38 @@ struct Executor::Impl {
     void allocate_sequences() {
         const std::uint64_t width = std::uint64_t(config.hc_count) * config.hidden_size;
         allocate_gdn_pools();
+        // One rank's state of layer i for sequence s.
+        const auto layer_state = [&](const LayerPlan& plan, std::size_t i, std::uint32_t s) {
+            RankBinding bind(device, plan.rank);
+            LayerState state;
+            if (plan.gdn) {
+                const auto slot = static_cast<std::int32_t>(s);
+                state.ssm       = ranks[plan.rank].gdn->recurrent_slot(gdn_local[i], slot);
+                state.conv      = ranks[plan.rank].gdn->conv_slot(gdn_local[i], slot);
+            }
+            if (plan.qsa) {
+                allocate_attention_state(state, plan.rank,
+                                         static_cast<std::uint32_t>(plan.qsa->kv_heads));
+            }
+            if (plan.ple) {
+                state.history = DeviceBuffer(width * (config.ple_conv_kernel_size - 1) *
+                                             config.ngram.ngram_size * 4);
+                memory.ranks[plan.rank].state_bytes += state.history.bytes;
+            }
+            return state;
+        };
         for (std::uint32_t s = 0; s < options.sequences; ++s) {
             SequenceState sequence;
             sequence.slot = s;
             for (std::size_t i = 0; i < layers.size(); ++i) {
-                const LayerPlan& plan = layers[i];
-                RankBinding bind(device, plan.rank);
-                LayerState state;
-                if (plan.gdn) {
-                    const auto slot = static_cast<std::int32_t>(s);
-                    state.ssm       = ranks[plan.rank].gdn->recurrent_slot(gdn_local[i], slot);
-                    state.conv      = ranks[plan.rank].gdn->conv_slot(gdn_local[i], slot);
+                sequence.layers.push_back(layer_state(layers[i], i, s));
+            }
+            for (const auto& plans : rank_layers) {
+                std::vector<LayerState> states;
+                for (std::size_t i = 0; i < plans.size(); ++i) {
+                    states.push_back(layer_state(plans[i], i, s));
                 }
-                if (plan.qsa) { allocate_attention_state(state, plan.rank); }
-                if (plan.ple) {
-                    state.history = DeviceBuffer(width * (config.ple_conv_kernel_size - 1) *
-                                                 config.ngram.ngram_size * 4);
-                    memory.ranks[plan.rank].state_bytes += state.history.bytes;
-                }
-                sequence.layers.push_back(std::move(state));
+                sequence.rank_layers.push_back(std::move(states));
             }
             if (mtp) {
                 const std::size_t head = model.head_rank();
@@ -1489,6 +1698,11 @@ struct Executor::Impl {
         for (std::size_t i = 0; i < layers.size(); ++i) {
             if (layers[i].qsa) { qsa_local[i] = attention[layers[i].rank]++; }
         }
+        // Under tensor parallelism each attention rank records every sparse-attention layer at
+        // rank 0's indices.
+        for (std::size_t r = 1; tensor() && r < ranks.size(); ++r) {
+            attention[r] = r < model.attention_ranks() ? attention[0] : 0;
+        }
         for (RankState& rank : ranks) {
             RankBinding bind(device, rank.rank);
             std::uint64_t bytes = 0;
@@ -1499,7 +1713,9 @@ struct Executor::Impl {
                     .record_capacity = static_cast<std::int32_t>(options.sequences),
                     .width           = static_cast<std::int32_t>(verify_width),
                     .conv_channels   = pool.conv_channels,
-                    .qk_heads        = static_cast<std::int32_t>(config.linear_num_key_heads),
+                    .qk_heads        = static_cast<std::int32_t>(
+                        std::uint64_t(pool.value_heads) * config.linear_num_key_heads /
+                        config.linear_num_value_heads),
                     .value_heads     = pool.value_heads,
                     .key_dim         = pool.key_head_dim,
                     .value_dim       = pool.value_head_dim,
@@ -1520,10 +1736,7 @@ struct Executor::Impl {
                                                   (config.indexer_compress_ratio - 1) * 4);
                 bytes += rank.index_records.bytes + rank.tail_scratch.bytes;
             }
-            const bool ple_here =
-                std::any_of(layers.begin(), layers.end(),
-                            [&](const LayerPlan& p) { return p.ple && p.rank == rank.rank; });
-            if (ple_here) {
+            if (ple_on(rank.rank)) {
                 rank.ple_records = DeviceBuffer(stack_width * columns * 4);
                 bytes += rank.ple_records.bytes;
             }
@@ -1654,14 +1867,20 @@ struct Executor::Impl {
             if (options.expert_cache_bytes == 0) {
                 throw std::invalid_argument("disk-resident experts need a device expert cache");
             }
+            // One call routes at most a chunk's tokens: a span's chunks prepare one by one.
+            const std::size_t widest_call =
+                std::size_t(config.num_experts_per_tok) * options.prefill_chunk;
             std::vector<ExpertStreamLayer> stream_layers;
-            for (const auto& [plan, moe] : expert) {
+            for (std::size_t i = 0; i < expert.size(); ++i) {
+                const auto& [plan, moe] = expert[i];
                 stream_layers.push_back(ExpertStreamLayer{
-                    .rank    = plan->rank,
-                    .stream  = ranks[plan->rank].stream,
-                    .experts = {moe->located_gate, moe->located_up, moe->located_down},
-                    .tables  = {plan->moe.gate.table.p, plan->moe.up.table.p,
-                                plan->moe.down.table.p}});
+                    .rank        = plan->rank,
+                    .stream      = ranks[plan->rank].stream,
+                    .experts     = {moe->located_gate, moe->located_up, moe->located_down},
+                    .tables      = {plan->moe.gate.table.p, plan->moe.up.table.p,
+                                    plan->moe.down.table.p},
+                    .widest_call = widest_call,
+                    .own_pool    = i >= layers.size()});
             }
             stream = std::make_unique<ExpertStream>(device, model.files(), std::move(stream_layers),
                                                     bytes);
@@ -1741,7 +1960,7 @@ struct Executor::Impl {
             if (cache) {
                 layer.resident = cache->storage(i);
             } else if (stream) {
-                layer.resident[0] = stream->storage(plan->rank);
+                layer.resident[0] = stream->storage(i);
             }
             out.push_back(std::move(layer));
         }
@@ -2034,15 +2253,16 @@ struct Executor::Impl {
         sequence.rope_delta  = 0;
         sequence.mtp_follows = true;
         for (std::size_t i = 0; i < layers.size(); ++i) {
-            RankBinding bind(device, layers[i].rank);
-            const cudaStream_t stream = ranks[layers[i].rank].stream;
-            LayerState& state         = sequence.layers[i];
-            for (const auto& [data, bytes] : recurrent_regions(state)) {
-                if (data != nullptr) { CUDA_CHECK(cudaMemsetAsync(data, 0, bytes, stream)); }
-            }
-            if (state.pooled.p != nullptr) {
-                CUDA_CHECK(cudaMemsetAsync(state.pooled.p, 0, state.pooled.bytes, stream));
-            }
+            each_part(sequence, i, [&](std::size_t r, const LayerPlan&, LayerState& state) {
+                RankBinding bind(device, r);
+                const cudaStream_t stream = ranks[r].stream;
+                for (const auto& [data, bytes] : recurrent_regions(state)) {
+                    if (data != nullptr) { CUDA_CHECK(cudaMemsetAsync(data, 0, bytes, stream)); }
+                }
+                if (state.pooled.p != nullptr) {
+                    CUDA_CHECK(cudaMemsetAsync(state.pooled.p, 0, state.pooled.bytes, stream));
+                }
+            });
         }
         if (mtp) {
             RankBinding bind(device, model.head_rank());
@@ -2208,7 +2428,9 @@ struct Executor::Impl {
                                        rank.stream));
             upload(rank.positions, 4 * c, positions);
             upload(rank.rope, 8 * c, rope);
-            if (!scatter.empty() && rank.rank == 0) { upload(rank.scatter, 12 * c, scatter); }
+            if (!scatter.empty() && (rank.rank == 0 || tensor())) {
+                upload(rank.scatter, 12 * c, scatter);
+            }
             if (mrope) { upload(rank.mrope, 16 * c, mrope_positions); }
             if (table && read_rows && rank.rank == rows_rank) {
                 // The rows are read while the layers before the PLE layer run; stage_rows()
@@ -2216,10 +2438,9 @@ struct Executor::Impl {
                 table->submit(row_ids, staged_rows(rank, row_ids.size() * row_b));
                 rows_waited = false;
             }
-            const bool ple_here =
-                std::any_of(layers.begin(), layers.end(),
-                            [&](const LayerPlan& p) { return p.ple && p.rank == rank.rank; });
-            if (!ple_here || !read_rows) { CUDA_CHECK(cudaEventRecord(rank.staged, rank.stream)); }
+            if (!ple_on(rank.rank) || !read_rows) {
+                CUDA_CHECK(cudaEventRecord(rank.staged, rank.stream));
+            }
         }
     }
 
@@ -2305,22 +2526,23 @@ struct Executor::Impl {
 
     // A verification's record row of the part: its position among the verified sequences.
     [[nodiscard]] std::int32_t record_row(const Part& part) const {
-        return part.column / static_cast<std::int32_t>(active_verify_width);
+        const auto at = std::find(verified.begin(), verified.end(), part.sequence);
+        return static_cast<std::int32_t>(at - verified.begin());
     }
 
+    // The layer's output into the part's columns of rank.y (BF16), or under tensor parallelism of
+    // the rank's FP32 `partial` [hidden, *] of the exchange; the heads are the plan's.
     void run_gdn(const LayerPlan& plan, std::size_t index, LayerState& state, RankState& rank,
-                 const Part& part) {
+                 const Part& part, float* partial = nullptr) {
         const GdnPlan& g     = *plan.gdn;
         WorkspaceArena& ws   = *rank.workspace;
         const cudaStream_t s = rank.stream;
         const auto t         = part.count;
         const auto h         = static_cast<std::int32_t>(config.hidden_size);
-        const auto kd =
-            static_cast<std::int32_t>(config.linear_num_key_heads * config.linear_key_head_dim);
-        const auto vd =
-            static_cast<std::int32_t>(config.linear_num_value_heads * config.linear_value_head_dim);
-        const auto nk = static_cast<std::int32_t>(config.linear_num_key_heads);
-        const auto nv = static_cast<std::int32_t>(config.linear_num_value_heads);
+        const auto nk        = g.key_heads;
+        const auto nv        = g.value_heads;
+        const auto kd = nk * static_cast<std::int32_t>(config.linear_key_head_dim);
+        const auto vd = nv * static_cast<std::int32_t>(config.linear_value_head_dim);
         const auto dh = static_cast<std::int32_t>(config.linear_value_head_dim);
         const Tensor mixed(columns(rank.mixed, h, part.column, 2), DType::BF16, {h, t});
         // A verification records its raw projection, the transitions and the gates for the fold
@@ -2382,8 +2604,18 @@ struct Executor::Impl {
         ops::gated_rmsnorm(rows_o, g.norm, rows_z, ops::GateActivation::Sigmoid,
                            config.rms_norm_eps, gated_rows, s);
         const Tensor gated(rank.a, DType::BF16, {vd, t});
-        Tensor y(columns(rank.y, h, part.column, 2), DType::BF16, {h, t});
+        Tensor y = mixer_output(rank, part, partial);
         project(g.output, gated, y, ws, s);
+    }
+
+    // Where a mixer writes the part's output: rank.y as BF16, or an FP32 exchange partial.
+    [[nodiscard]] Tensor mixer_output(RankState& rank, const Part& part, float* partial) const {
+        const auto h = static_cast<std::int32_t>(config.hidden_size);
+        if (partial != nullptr) {
+            return Tensor(partial + std::size_t(h) * std::size_t(part.column), DType::FP32,
+                          {h, part.count});
+        }
+        return Tensor(columns(rank.y, h, part.column, 2), DType::BF16, {h, part.count});
     }
 
     // Where a sparse-attention layer finds its positions and keeps its indexer state. By default
@@ -2419,15 +2651,17 @@ struct Executor::Impl {
     }
 
     void run_qsa(const LayerPlan& plan, LayerState& state, RankState& rank, const Part& part,
-                 const AttentionInputs& in) {
+                 const AttentionInputs& in, float* partial = nullptr) {
         const QsaPlan& a     = *plan.qsa;
         WorkspaceArena& ws   = *rank.workspace;
         const cudaStream_t s = rank.stream;
         const auto t         = part.count;
-        const auto h         = static_cast<std::int32_t>(config.hidden_size);
         const auto d         = static_cast<std::int32_t>(config.head_dim);
-        const auto nq        = static_cast<std::int32_t>(config.num_attention_heads);
-        const auto nk        = static_cast<std::int32_t>(config.num_key_value_heads);
+        // A tensor-parallel rank's KV heads with their query heads.
+        const auto nk = a.kv_heads;
+        const auto nq = nk * static_cast<std::int32_t>(config.num_attention_heads /
+                                                       config.num_key_value_heads);
+        const auto h  = static_cast<std::int32_t>(config.hidden_size);
         const Tensor mixed(columns(rank.mixed, h, part.column, 2), DType::BF16, {h, t});
         Tensor q(rank.a, DType::BF16, {d * nq, t});
         Tensor gate(rank.b, DType::BF16, {d * nq, t});
@@ -2448,7 +2682,9 @@ struct Executor::Impl {
         auto* const part_positions = const_cast<std::int32_t*>(in.positions);
         const Tensor positions(part_positions, DType::I32, {t});
         const ops::RopeYarn& yarn = options.rope_yarn;
-        if (mrope || yarn.active()) {
+        // A tensor-parallel share of the heads leaves the fused norm and rotation's head counts.
+        const bool share = nk != static_cast<std::int32_t>(config.num_key_value_heads);
+        if (mrope || yarn.active() || share) {
             // A media prompt: the three-axis positions of its images and video, each pair of
             // rotated dimensions on axis i % 3 (the interleaved MRoPE sections). Under YaRN, text
             // too: the fused norm and rotation fixes the unscaled one, so the rotation is its own
@@ -2462,7 +2698,7 @@ struct Executor::Impl {
                 ops::rope(mrope ? axes : line, rotary, config.rope_theta, yarn, qo, s);
                 ops::rope(mrope ? axes : line, rotary, config.rope_theta, yarn, ko, s);
             } else {
-                ops::rope(axes, rotary, config.rope_theta, qo, ko, s);
+                ops::rope(mrope ? axes : line, rotary, config.rope_theta, qo, ko, s);
             }
         } else {
             const Tensor rope(const_cast<std::int32_t*>(in.rope), DType::I32, {t});
@@ -2475,7 +2711,7 @@ struct Executor::Impl {
         const auto paged_count = static_cast<std::int32_t>(pages);
         const PagedKVLayerView cache =
             kv_view([&](std::size_t i) { return state.kv[i].p; }, kPagedKVPageSize, paged_count,
-                    rank.block_table.p, paged_count);
+                    rank.block_table.p, paged_count, nk);
         const bool streamed = state.map.table != nullptr;
         const bool pooled_read = streamed && t <= static_cast<std::int32_t>(stream_width);
         const Tensor v3(v.data, DType::BF16, {d, nk, t});
@@ -2527,7 +2763,7 @@ struct Executor::Impl {
         }
         Tensor flat(rank.f, DType::BF16, {d * nq, t});
         ops::sigmoid_mul(gate, flat, s);
-        Tensor y(columns(rank.y, h, part.column, 2), DType::BF16, {h, t});
+        Tensor y = mixer_output(rank, part, partial);
         project(a.output, flat, y, ws, s);
     }
 
@@ -2752,33 +2988,50 @@ struct Executor::Impl {
             CUDA_CHECK(cudaMemcpyAsync(host, ids.data, std::size_t(top) * t * 4,
                                        cudaMemcpyDeviceToHost, s));
             CUDA_CHECK(cudaStreamSynchronize(s));
-            stream->prepare(index, std::span<const std::int32_t>(host, std::size_t(top) * t));
+            stream->prepare(index, std::span<const std::int32_t>(host, std::size_t(top) * t),
+                            span_last);
         }
         Tensor y(rank.y, DType::FP32, {h, t});
         auto scope = ws.scope();
         ops::moe_experts_gguf(mixed, ids, weights, shared, m.banks(), ws, y, s);
     }
 
+    // The staged tokens' embeddings into `mixed` [hidden, t]: a media prompt's image and video
+    // tokens take the tower's merged embeddings (media_runs, as stage_inputs() left them). Under
+    // tensor parallelism each rank embeds from its own table and copy of the media's.
+    void embed(RankState& rank, std::int32_t t, Tensor& mixed) {
+        const auto h = static_cast<std::int32_t>(config.hidden_size);
+        const bool own = tensor() && rank.rank > 0;
+        ops::embedding(Tensor(rank.ids, DType::I32, {t}),
+                       own ? rank_embedding_tables[rank.rank - 1] : embedding_table, mixed,
+                       rank.stream);
+        // A model without a Vision tower has no media copies on the other ranks.
+        if (media_runs.empty()) { return; }
+        void* media = own ? rank_vision_embeddings[rank.rank - 1].p : vision_embeddings.p;
+        for (const MediaRun& run : media_runs) {
+            const Tensor source(static_cast<std::byte*>(media) +
+                                    std::size_t(run.source) * std::size_t(h) * 2,
+                                DType::BF16, {h, run.count});
+            const Tensor columns(rank.scatter + run.offset, DType::I32, {run.count});
+            ops::scatter(source, columns, mixed, rank.stream);
+        }
+    }
+
     // Queues one segment of the pass for the parts' `t` tokens on its rank's stream; with `head`,
     // the logits of the last `logit_rows` tokens.
     void run_segment(std::span<const Part> parts, const Segment& segment, std::int32_t t,
                      std::uint32_t logit_rows) {
+        if (tensor()) {
+            run_tensor_segment(parts, segment, t, logit_rows);
+            return;
+        }
         RankState& rank = ranks[segment.rank];
         const auto h    = static_cast<std::int32_t>(config.hidden_size);
         const auto hc   = static_cast<std::int32_t>(config.hc_count);
         Tensor stack(rank.stack, DType::FP32, {h, hc, t});
         Tensor mixed(rank.mixed, DType::BF16, {h, t});
         if (segment.embed) {
-            const Tensor ids(rank.ids, DType::I32, {t});
-            ops::embedding(ids, embedding_table, mixed, rank.stream);
-            // A media prompt's image and video tokens take the tower's merged embeddings.
-            for (const MediaRun& run : media_runs) {
-                const Tensor source(static_cast<std::byte*>(vision_embeddings.p) +
-                                        std::size_t(run.source) * std::size_t(h) * 2,
-                                    DType::BF16, {h, run.count});
-                const Tensor columns(rank.scatter + run.offset, DType::I32, {run.count});
-                ops::scatter(source, columns, mixed, rank.stream);
-            }
+            embed(rank, t, mixed);
             ops::hyper_connection_expand(mixed, stack, rank.stream);
         }
         // A layer's MoE output is written into the stack by the next layer's read, which takes
@@ -2797,9 +3050,13 @@ struct Executor::Impl {
                 pending = false;
                 for (std::size_t k = 0; k < parts.size(); ++k) {
                     LayerState& state = parts[k].sequence->layers[i];
-                    if (k > first_branch) { restore_branch_layer(state, i, rank, kPleRegions); }
+                    if (k > first_branch) {
+                        restore_branch_layer(state, state_slot(i, rank.rank), rank, kPleRegions);
+                    }
                     run_ple(plan, state, rank, parts[k]);
-                    if (k == 0) { capture_branch_layer(state, i, rank, kPleRegions); }
+                    if (k == 0) {
+                        capture_branch_layer(state, state_slot(i, rank.rank), rank, kPleRegions);
+                    }
                 }
             }
             {
@@ -2817,13 +3074,17 @@ struct Executor::Impl {
             for (std::size_t k = 0; k < parts.size(); ++k) {
                 const Part& part  = parts[k];
                 LayerState& state = part.sequence->layers[i];
-                if (k > first_branch) { restore_branch_layer(state, i, rank, kMixerRegions); }
+                if (k > first_branch) {
+                    restore_branch_layer(state, state_slot(i, rank.rank), rank, kMixerRegions);
+                }
                 if (plan.gdn) {
                     run_gdn(plan, i, state, rank, part);
                 } else {
                     run_qsa(plan, state, rank, part, target_inputs(i, state, rank, part));
                 }
-                if (k == 0) { capture_branch_layer(state, i, rank, kMixerRegions); }
+                if (k == 0) {
+                    capture_branch_layer(state, state_slot(i, rank.rank), rank, kMixerRegions);
+                }
             }
             {
                 auto scope = rank.workspace->scope();
@@ -2835,8 +3096,17 @@ struct Executor::Impl {
             pending = true;
         }
         if (pending) { ops::hyper_connection_write(stack, moe_out, inject, rank.stream); }
-        if (!segment.head) { return; }
-        const auto n = static_cast<std::int32_t>(logit_rows);
+        if (segment.head) { run_head(parts, rank, t, logit_rows); }
+    }
+
+    // The logits of the last `logit_rows` columns of the head rank's stack, or of each branch's
+    // last column in a branch pass.
+    void run_head(std::span<const Part> parts, RankState& rank, std::int32_t t,
+                  std::uint32_t logit_rows) {
+        const auto h                   = static_cast<std::int32_t>(config.hidden_size);
+        const auto hc                  = static_cast<std::int32_t>(config.hc_count);
+        const std::size_t first_branch = branch_capture != nullptr ? 1 : 0;
+        const auto n                   = static_cast<std::int32_t>(logit_rows);
         if (branch_origin != nullptr) {
             // Each branch's last column, to the front of the stack in branch order. A branch's
             // last column lies at or past its index, so no copy overwrites a later one's source.
@@ -2860,6 +3130,205 @@ struct Executor::Impl {
         }
         Tensor logits(rank.logits, DType::BF16, {static_cast<std::int32_t>(config.vocab_size), n});
         project(head, head_mixed, logits, *rank.workspace, rank.stream);
+    }
+
+    // Tensor parallelism: one segment on every rank. Each rank runs every layer over its replica
+    // of the stack. A layer's mixer and its experts each end in an exchange of the ranks' FP32
+    // partials (TensorParallelExchange), whose rank-order sum every rank stores in rank.y: the
+    // mixer's rounded to BF16, as one device's output projection stores it, the experts' in FP32.
+    // The hyper-connections, the PLE and the router run on every rank from equal inputs, so the
+    // replicas stay equal; the shared expert and the head run on rank 0. The other ranks' streams
+    // fork from rank 0's and join it again, so a captured segment spans every rank.
+    void run_tensor_segment(std::span<const Part> parts, const Segment& segment, std::int32_t t,
+                            std::uint32_t logit_rows) {
+        const auto h                     = static_cast<std::int32_t>(config.hidden_size);
+        const auto hc                    = static_cast<std::int32_t>(config.hc_count);
+        const std::size_t n              = this->parts();
+        const std::size_t bytes          = std::size_t(h) * std::size_t(t) * 4;
+        const std::size_t first_branch   = branch_capture != nullptr ? 1 : 0;
+        TensorParallelExchange& exchange = *tensor_exchange;
+        const auto on = [&](std::size_t r, const auto& f) {
+            RankBinding bind(device, r);
+            f(ranks[r]);
+        };
+        on(0, [&](RankState& rank) { CUDA_CHECK(cudaEventRecord(rank.fork, rank.stream)); });
+        for (std::size_t r = 1; r < n; ++r) {
+            on(r, [&](RankState& rank) {
+                CUDA_CHECK(cudaStreamWaitEvent(rank.stream, ranks[0].fork, 0));
+            });
+        }
+        // One exchange: ranks [0, contributors) write their partials, every rank stores the sum.
+        const auto exchange_step = [&](std::size_t contributors, TensorParallelSum sum,
+                                       const auto& partial) {
+            const std::size_t slot = exchange_next;
+            exchange_next ^= 1U;
+            for (std::size_t r = 0; r < n; ++r) {
+                on(r, [&](RankState& rank) {
+                    const bool contributes = r < contributors;
+                    if (contributes) { partial(r, rank, exchange.partial(r, slot)); }
+                    exchange.publish(r, slot, contributes ? bytes : 0, rank.stream, sum);
+                });
+            }
+            for (std::size_t r = 0; r < n; ++r) {
+                on(r, [&](RankState& rank) {
+                    exchange.reduce(r, slot, rank.y, std::int64_t(h) * t, contributors,
+                                    rank.stream, sum);
+                });
+            }
+            for (std::size_t r = 0; r < n; ++r) {
+                on(r, [&](RankState& rank) {
+                    exchange.complete(r, slot, rank.y, std::int64_t(h) * t, rank.stream, sum);
+                });
+            }
+        };
+        const auto stack_of = [&](RankState& rank) {
+            return Tensor(rank.stack, DType::FP32, {h, hc, t});
+        };
+        const auto mixed_of = [&](RankState& rank) {
+            return Tensor(rank.mixed, DType::BF16, {h, t});
+        };
+        const auto inject_of = [&](RankState& rank) {
+            return Tensor(rank.inject, DType::FP32, {hc, t});
+        };
+        if (segment.embed) {
+            for (std::size_t r = 0; r < n; ++r) {
+                on(r, [&](RankState& rank) {
+                    Tensor mixed = mixed_of(rank);
+                    Tensor stack = stack_of(rank);
+                    embed(rank, t, mixed);
+                    ops::hyper_connection_expand(mixed, stack, rank.stream);
+                });
+            }
+        }
+        // A layer's MoE output is written into the stack by the next layer's read, unless the PLE
+        // comes between.
+        bool pending = false;
+        for (std::size_t i = segment.begin; i < segment.end; ++i) {
+            for (std::size_t r = 0; r < n; ++r) {
+                on(r, [&](RankState& rank) {
+                    const LayerPlan& plan = plan_of(r, i);
+                    Tensor stack          = stack_of(rank);
+                    Tensor mixed          = mixed_of(rank);
+                    Tensor inject         = inject_of(rank);
+                    const Tensor moe_out(rank.y, DType::FP32, {h, t});
+                    bool write_read = pending;
+                    if (plan.ple) {
+                        if (pending) {
+                            ops::hyper_connection_write(stack, moe_out, inject, rank.stream);
+                        }
+                        write_read = false;
+                        for (std::size_t k = 0; k < parts.size(); ++k) {
+                            LayerState& state = state_of(*parts[k].sequence, r, i);
+                            if (k > first_branch) {
+                                restore_branch_layer(state, state_slot(i, r), rank, kPleRegions);
+                            }
+                            run_ple(plan, state, rank, parts[k]);
+                            if (k == 0) {
+                                capture_branch_layer(state, state_slot(i, r), rank, kPleRegions);
+                            }
+                        }
+                    }
+                    auto scope = rank.workspace->scope();
+                    if (write_read) {
+                        ops::hyper_connection_write_read(stack, moe_out, inject,
+                                                         plan.attn_hc.weights(), config.rms_norm_eps,
+                                                         *rank.workspace, mixed, &inject, rank.stream);
+                    } else {
+                        ops::hyper_connection_read(stack, plan.attn_hc.weights(), config.rms_norm_eps,
+                                                   *rank.workspace, mixed, &inject, rank.stream);
+                    }
+                });
+            }
+            // Every rank runs its key heads of a Gated DeltaNet layer; the ranks holding KV heads
+            // of a sparse-attention layer run those.
+            const std::size_t mixers = layers[i].gdn ? n : model.attention_ranks();
+            exchange_step(mixers, TensorParallelSum::StoreBf16,
+                          [&](std::size_t r, RankState& rank, float* partial) {
+                              const LayerPlan& plan = plan_of(r, i);
+                              const std::size_t slot = state_slot(i, r);
+                              for (std::size_t k = 0; k < parts.size(); ++k) {
+                                  const Part& part  = parts[k];
+                                  LayerState& state = state_of(*part.sequence, r, i);
+                                  if (k > first_branch) {
+                                      restore_branch_layer(state, slot, rank, kMixerRegions);
+                                  }
+                                  if (plan.gdn) {
+                                      run_gdn(plan, i, state, rank, part, partial);
+                                  } else {
+                                      run_qsa(plan, state, rank, part,
+                                              target_inputs(i, state, rank, part), partial);
+                                  }
+                                  if (k == 0) {
+                                      capture_branch_layer(state, slot, rank, kMixerRegions);
+                                  }
+                              }
+                          });
+            for (std::size_t r = 0; r < n; ++r) {
+                on(r, [&](RankState& rank) {
+                    Tensor stack  = stack_of(rank);
+                    Tensor mixed  = mixed_of(rank);
+                    Tensor inject = inject_of(rank);
+                    auto scope    = rank.workspace->scope();
+                    ops::hyper_connection_write_read(
+                        stack, Tensor(rank.y, DType::BF16, {h, t}), inject,
+                        plan_of(r, i).mlp_hc.weights(), config.rms_norm_eps, *rank.workspace, mixed,
+                        &inject, rank.stream);
+                });
+            }
+            exchange_step(n, TensorParallelSum::StoreFp32,
+                          [&](std::size_t r, RankState& rank, float* partial) {
+                              run_moe_share(plan_of(r, i), rank, t, i, partial);
+                          });
+            pending = true;
+        }
+        for (std::size_t r = 0; r < n && pending; ++r) {
+            on(r, [&](RankState& rank) {
+                Tensor stack  = stack_of(rank);
+                Tensor inject = inject_of(rank);
+                ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, t}), inject,
+                                            rank.stream);
+            });
+        }
+        for (std::size_t r = 1; r < n; ++r) {
+            on(r, [&](RankState& rank) { CUDA_CHECK(cudaEventRecord(rank.join, rank.stream)); });
+            on(0, [&](RankState& rank) {
+                CUDA_CHECK(cudaStreamWaitEvent(rank.stream, ranks[r].join, 0));
+            });
+        }
+        if (segment.head) {
+            on(0, [&](RankState& rank) { run_head(parts, rank, t, logit_rows); });
+        }
+    }
+
+    // A rank's share of a layer's experts under tensor parallelism. Every rank routes the whole
+    // call itself from the same MoE input, runs the routed pairs of its experts (rank 0 the shared
+    // expert too) into a 2^-32 fixed-point part, and stores the part in its FP32 `partial`.
+    void run_moe_share(const LayerPlan& plan, RankState& rank, std::int32_t t, std::size_t index,
+                       float* partial) {
+        const MoePlan& m     = plan.moe;
+        WorkspaceArena& ws   = *rank.workspace;
+        const cudaStream_t s = rank.stream;
+        const auto h         = static_cast<std::int32_t>(config.hidden_size);
+        const auto top       = static_cast<std::int32_t>(config.num_experts_per_tok);
+        const bool first     = rank.rank == 0;
+        const Tensor mixed(rank.mixed, DType::BF16, {h, t});
+        // Rank 0's routes are the ones the route records keep.
+        Tensor ids(first ? route_records[index] : static_cast<void*>(rank.route_ids), DType::I32,
+                   {top, t});
+        Tensor weights(rank.route_weights, DType::FP32, {top, t});
+        Tensor shared(rank.route_shared, DType::FP32, {t});
+        {
+            auto scope = ws.scope();
+            ops::moe_route(mixed, m.router, m.shared_gate, ws, ids, weights, shared, s);
+        }
+        auto scope   = ws.scope();
+        Tensor fixed = ws.alloc(DType::I64, {h, t});
+        ops::moe_experts_gguf_part(mixed, ids, weights, first ? &shared : nullptr, m.banks(),
+                                   static_cast<std::int32_t>(m.expert_begin),
+                                   static_cast<std::int32_t>(m.expert_end), ws, fixed, s,
+                                   &rank.side);
+        Tensor y(partial, DType::FP32, {h, t});
+        ops::moe_experts_gguf_combine(std::span<const Tensor>(&fixed, 1), y, s);
     }
 
     // A graph per segment of a pass over one part of `t` tokens of `sequence` (a decode step, or a
@@ -2928,6 +3397,9 @@ struct Executor::Impl {
                                   host_free && t <= kVectorTokens && branch_origin == nullptr;
         if (misses) { misses->keep_alive(); }
         if (graph && first.decode.empty() && first.decode_steps++ > 0) { capture_decode(first); }
+        // Every segment of a tensor-parallel pass makes an even number of exchanges, so each one,
+        // captured or not, starts in slot 0.
+        exchange_next      = 0;
         auto* verification = verify_graph ? &first.verify.at(std::size_t(t)) : nullptr;
         if (verification && verification->segments.empty() && verification->runs++ > 0) {
             verification->segments = capture_segments(first, t);
@@ -2938,7 +3410,12 @@ struct Executor::Impl {
                 cross(segments[i - 1].rank, segment.rank, t);
             }
             RankBinding bind(device, segment.rank);
-            if (segment.rows && table) { stage_rows(ranks[segment.rank]); }
+            // Under tensor parallelism every rank runs the PLE layer and takes its rows.
+            for (std::size_t r = 0; segment.rows && table && r < ranks.size(); ++r) {
+                if (r != segment.rank && !tensor()) { continue; }
+                RankBinding rows(device, r);
+                stage_rows(ranks[r]);
+            }
             if (graph && !first.decode.empty()) {
                 first.decode[i].launch(ranks[segment.rank].stream);
             } else if (verification && !verification->segments.empty()) {
@@ -2948,6 +3425,9 @@ struct Executor::Impl {
             }
         }
         if (hybrid) { hybrid->finish(); }
+        if (exchange_next != 0) {
+            throw std::logic_error("qwen4_exp: a tensor-parallel segment left an exchange unpaired");
+        }
         // A verification commits its positions later (commit()).
         if (!verifying) {
             for (const Part& part : parts) {
@@ -2969,24 +3449,28 @@ struct Executor::Impl {
         }
     }
 
-    // The tokens a prompt span takes, 0 without spans. Spans need one device and GGUF host
-    // experts, whose wide calls copy every uncached expert of a layer into the pool: per span
-    // instead of per chunk.
+    // The tokens a prompt span takes, 0 without spans. Spans need one device and GGUF experts off
+    // the GPU: a host layer's wide calls copy every uncached expert of the layer into the pool,
+    // and a disk layer's read the ones its slots lack, which the chunks before them in the span
+    // left there; per span instead of per chunk.
     [[nodiscard]] std::uint32_t planned_span_tokens() const {
         const bool native = std::any_of(layers.begin(), layers.end(),
                                         [](const LayerPlan& plan) { return plan.moe.native.has_value(); });
         // One device: its segments split only where the PLE layer's rows arrive.
         const bool one_rank = std::all_of(segments.begin(), segments.end(),
                                           [](const Segment& segment) { return segment.rank == 0; });
-        if (model.options().experts != ExpertResidency::Host || native || !one_rank) { return 0; }
+        if (model.options().experts == ExpertResidency::Device || native || !one_rank) { return 0; }
         const std::uint32_t tokens =
             std::min<std::uint32_t>(options.max_context, kSpanChunks * options.prefill_chunk);
         return tokens > options.prefill_chunk ? tokens : 0;
     }
 
-    // The chunks one expert call of a span's expert phase takes: as many as kGroupTokens holds.
+    // The chunks one expert call of a span's expert phase takes: as many as kGroupTokens holds,
+    // with host experts, whose groups run from the pool.
     [[nodiscard]] std::uint32_t planned_group_chunks() const {
-        if (planned_span_tokens() == 0) { return 1; }
+        if (planned_span_tokens() == 0 || model.options().experts != ExpertResidency::Host) {
+            return 1;
+        }
         return std::clamp<std::uint32_t>(kGroupTokens / options.prefill_chunk, 1, kSpanChunks);
     }
 
@@ -3003,6 +3487,10 @@ struct Executor::Impl {
         span_inject    = DeviceBuffer(std::size_t(tokens) * config.hc_count * 4);
         std::uint64_t bytes = span_stack.bytes + span_positions.bytes + span_rope.bytes +
                               span_mixed.bytes + span_inject.bytes;
+        if (vision_context) {
+            span_mrope = DeviceBuffer(std::size_t(tokens) * 3 * 4);
+            bytes += span_mrope.bytes;
+        }
         if (table) {
             span_row_bytes = std::size_t(config.ngram_heads()) *
                              ops::ngram_row_bytes(options.ngram->format);
@@ -3094,10 +3582,6 @@ struct Executor::Impl {
         if (start + n > options.max_context) {
             throw std::invalid_argument("qwen4_exp forward: the sequence exceeds max_context");
         }
-        const std::size_t prompt = sequence.media_rope.size() / 3;
-        if (prompt != 0 && start < prompt) {
-            throw std::invalid_argument("qwen4_exp forward: a media prompt prefills chunk by chunk");
-        }
         const std::size_t chunks = (n + c - 1) / c;
         const auto last_count    = static_cast<std::uint32_t>(n - (chunks - 1) * c);
         check_tokens(tokens.subspan((chunks - 1) * c), logit_rows);
@@ -3126,6 +3610,8 @@ struct Executor::Impl {
                                  [](const Segment& segment) { return segment.rows; });
         const std::size_t heads = config.ngram_heads();
         if (reads_rows) { span_row_ids.resize(n * heads); }
+        // Which chunks of a media prompt rotate at its three-axis positions (span_mrope).
+        std::vector<char> chunk_mrope(chunks, 0);
         for (std::size_t k = 0; k < chunks; ++k) {
             const std::int32_t t = count_of(k);
             const Part part{.sequence = &sequence, .column = 0, .count = t};
@@ -3135,7 +3621,7 @@ struct Executor::Impl {
                           span_row_ids.begin() + std::ptrdiff_t(k * c * heads));
             }
             Tensor mixed(rank.mixed, DType::BF16, {h, t});
-            ops::embedding(Tensor(rank.ids, DType::I32, {t}), embedding_table, mixed, st);
+            embed(rank, t, mixed);
             Tensor stack(chunk_stack(k), DType::FP32, {h, hc, t});
             ops::hyper_connection_expand(mixed, stack, st);
             CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_positions.p) + k * c,
@@ -3143,6 +3629,12 @@ struct Executor::Impl {
                                        cudaMemcpyDeviceToDevice, st));
             CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_rope.p) + k * c, rank.rope,
                                        std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
+            if (mrope) {
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_mrope.p) + 3 * k * c,
+                                           rank.mrope, 3 * std::size_t(t) * 4,
+                                           cudaMemcpyDeviceToDevice, st));
+                chunk_mrope[k] = 1;
+            }
             sequence.position += std::uint32_t(t);
         }
         sequence.position = start;
@@ -3182,6 +3674,12 @@ struct Executor::Impl {
                     CUDA_CHECK(cudaMemcpyAsync(rank.rope,
                                                static_cast<std::int32_t*>(span_rope.p) + k * c,
                                                std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
+                    mrope = chunk_mrope[k] != 0;
+                    if (mrope) {
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            rank.mrope, static_cast<std::int32_t*>(span_mrope.p) + 3 * k * c,
+                            3 * std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
+                    }
                     if (plan.ple) {
                         CUDA_CHECK(cudaMemcpyAsync(rank.rows,
                                                    static_cast<std::byte*>(span_rows.p) +
@@ -3223,6 +3721,7 @@ struct Executor::Impl {
                     rank.stack = chunk_stack(k);
                     chunk_planes(k);
                     span_hold = last < chunks;
+                    span_last = last == chunks;
                     Tensor stack(rank.stack, DType::FP32, {h, hc, t});
                     Tensor inject(rank.inject, DType::FP32, {hc, t});
                     if (last == k + 1) {
@@ -3248,6 +3747,7 @@ struct Executor::Impl {
                 }
             }
             span_hold   = false;
+            span_last   = false;
             rank.mixed  = own_mixed;
             rank.inject = own_inject;
             // The head reads the last chunk's last rows.
@@ -3282,6 +3782,7 @@ struct Executor::Impl {
             rank.mixed  = own_mixed;
             rank.inject = own_inject;
             span_hold   = false;
+            span_last   = false;
             throw;
         }
         rank.stack = own_stack;
@@ -3421,12 +3922,13 @@ struct Executor::Impl {
     static constexpr std::array<bool, 4> kMixerRegions{true, true, true, false};
     static constexpr std::array<bool, 4> kPleRegions{false, false, false, true};
 
-    // The prompt part's state of a layer, into the snapshot the pass's branches start from.
-    void capture_branch_layer(const LayerState& state, std::size_t i, RankState& rank,
+    // The prompt part's state of a layer on a rank (snapshot layer `slot`, state_slot()), into the
+    // snapshot the pass's branches start from.
+    void capture_branch_layer(const LayerState& state, std::size_t slot, RankState& rank,
                               const std::array<bool, 4>& which) {
         if (branch_capture == nullptr) { return; }
         const auto regions = recurrent_regions(state);
-        auto& kept         = branch_capture->layers.at(i).buffers;
+        auto& kept         = branch_capture->layers.at(slot).buffers;
         for (std::size_t k = 0; k < regions.size(); ++k) {
             if (!which[k] || regions[k].first == nullptr || kept[k].bytes == 0) { continue; }
             CUDA_CHECK(cudaMemcpyAsync(kept[k].p, regions[k].first, kept[k].bytes,
@@ -3434,11 +3936,11 @@ struct Executor::Impl {
         }
     }
 
-    void restore_branch_layer(const LayerState& state, std::size_t i, RankState& rank,
+    void restore_branch_layer(const LayerState& state, std::size_t slot, RankState& rank,
                               const std::array<bool, 4>& which) {
         if (branch_origin == nullptr) { return; }
         const auto regions = recurrent_regions(state);
-        const auto& kept   = branch_origin->layers.at(i).buffers;
+        const auto& kept   = branch_origin->layers.at(slot).buffers;
         for (std::size_t k = 0; k < regions.size(); ++k) {
             if (!which[k] || regions[k].first == nullptr || kept[k].bytes == 0) { continue; }
             CUDA_CHECK(cudaMemcpyAsync(regions[k].first, kept[k].p, kept[k].bytes,
@@ -3866,7 +4368,9 @@ struct Executor::Impl {
         // Tokens and positions stay in the staged buffers. Native hybrid experts use the same
         // captured exchange as text decode; GGUF host experts replay too, without counting the
         // draft steps' routes. A graph is captured at its second use.
-        const bool graph = options.cuda_graphs && b == 1 && device.size() == 1 && !stream;
+        // Under tensor parallelism the MTP block runs on rank 0 alone.
+        const bool graph  = options.cuda_graphs && b == 1 &&
+                            (device.size() == 1 || tensor()) && !stream;
         const auto replay = [&](SequenceState::DraftGraph& slot, const auto& body) {
             if (graph && !slot.chain.ready() && slot.runs++ > 0) {
                 DecodeGraphDefinition definition;
@@ -3949,30 +4453,47 @@ struct Executor::Impl {
         return static_cast<std::uint32_t>(ran);
     }
 
-    void verify(std::span<const std::uint32_t> batch, std::span<const std::int32_t> tokens) {
+    void verify(std::span<const std::uint32_t> batch, std::span<const std::int32_t> tokens,
+                std::span<const std::uint32_t> widths = {}) {
         require_mtp("verify");
         const std::size_t b = batch.size();
-        const std::size_t w = b == 0 ? 0 : tokens.size() / b;
-        if (b == 0 || b > sequences.size() || w < 2 || w > verify_width || tokens.size() != b * w) {
+        std::vector<std::uint32_t> row_widths(widths.begin(), widths.end());
+        if (row_widths.empty() && b != 0) {
+            row_widths.assign(b, static_cast<std::uint32_t>(tokens.size() / b));
+        }
+        std::size_t total = 0;
+        std::uint32_t w   = 0;
+        for (const std::uint32_t width : row_widths) {
+            total += width;
+            w = std::max(w, width);
+        }
+        if (b == 0 || b > sequences.size() || row_widths.size() != b || w > verify_width ||
+            tokens.size() != total ||
+            std::find(row_widths.begin(), row_widths.end(), 0U) != row_widths.end()) {
             throw std::invalid_argument("qwen4_exp verify: an anchor and its drafts per sequence");
         }
         check_tokens(tokens, static_cast<std::uint32_t>(tokens.size()));
-        active_verify_width = static_cast<std::uint32_t>(w);
+        active_verify_width = w;
         std::vector<Part> parts;
         verified.clear();
+        verified_columns.clear();
+        verified_widths.clear();
+        std::int32_t column = 0;
         for (std::size_t j = 0; j < b; ++j) {
             SequenceState* sequence = &sequences.at(batch[j]);
             if (std::find(verified.begin(), verified.end(), sequence) != verified.end()) {
                 verified.clear();
                 throw std::invalid_argument("qwen4_exp verify: a sequence appears twice");
             }
-            parts.push_back({.sequence = sequence,
-                             .column   = static_cast<std::int32_t>(j * w),
-                             .count    = static_cast<std::int32_t>(w)});
+            const auto width = static_cast<std::int32_t>(row_widths[j]);
+            parts.push_back({.sequence = sequence, .column = column, .count = width});
             sequence->verify_context = sequence->context;
-            sequence->verify_tokens.assign(tokens.begin() + std::ptrdiff_t(j * w),
-                                           tokens.begin() + std::ptrdiff_t((j + 1) * w));
+            sequence->verify_tokens.assign(tokens.begin() + column,
+                                           tokens.begin() + column + width);
             verified.push_back(sequence);
+            verified_columns.push_back(column);
+            verified_widths.push_back(width);
+            column += width;
         }
         verifying = true;
         try {
@@ -4008,9 +4529,10 @@ struct Executor::Impl {
             throw std::invalid_argument("qwen4_exp commit: the last verification's sequences");
         }
         for (std::size_t j = 0; j < batch.size(); ++j) {
-            if (&sequences.at(batch[j]) != verified[j] || kept[j] == 0 || kept[j] > w) {
+            if (&sequences.at(batch[j]) != verified[j] || kept[j] == 0 ||
+                kept[j] > std::uint32_t(verified_widths[j])) {
                 throw std::invalid_argument("qwen4_exp commit: the last verification's sequences, "
-                                            "1 to draft_tokens + 1 tokens each");
+                                            "1 to their verified width each");
             }
         }
         if (draft_prefetch) {
@@ -4025,40 +4547,46 @@ struct Executor::Impl {
             std::uint64_t(config.indexer_n_heads + 1) * config.indexer_head_dim;
         const std::uint64_t columns = std::uint64_t(verify_width) * options.sequences;
         const auto stack_width      = std::int32_t(config.hc_count * config.hidden_size);
+        const auto advance = [&](std::size_t i, std::size_t r, const LayerPlan& plan,
+                                 std::size_t j, LayerState& state) {
+            RankBinding bind(device, r);
+            RankState& rank = ranks[r];
+            const auto m = static_cast<std::int32_t>(kept[j]);
+            if (plan.qsa) {
+                // The indexer's tail advances over the kept positions' recorded projections;
+                // the verification's first position is still staged.
+                const QsaPlan& a = *plan.qsa;
+                const Tensor projection(static_cast<std::byte*>(rank.index_records.p) +
+                                            (qsa_local[i] * columns + verified_columns[j]) *
+                                                index_rows * 2,
+                                        DType::BF16, {a.index.rows, m});
+                const Tensor first(rank.positions + verified_columns[j], DType::I32, {1});
+                Tensor pooled(state.pooled.p, DType::FP32,
+                              {di, static_cast<std::int32_t>(pooled_slots)});
+                Tensor tail(state.tail.p, DType::FP32,
+                            {di, static_cast<std::int32_t>(config.indexer_compress_ratio - 1)});
+                const ops::QsaIndexerWeights iw{&a.index_query_norm, &a.index_key_norm};
+                ops::qsa_indexer_append(projection, first, iw, config.rms_norm_eps,
+                                        options.rope_yarn, pooled, tail, rank.stream);
+            }
+            if (plan.ple) {
+                // The PLE history advances over the kept positions' recorded input.
+                Tensor history(
+                    state.history.p, DType::FP32,
+                    {stack_width, static_cast<std::int32_t>((config.ple_conv_kernel_size - 1) *
+                                                            config.ngram.ngram_size)});
+                const Tensor normalized(static_cast<float*>(rank.ple_records.p) +
+                                            std::size_t(stack_width) * verified_columns[j],
+                                        DType::FP32, {stack_width, m});
+                ops::ple_history_advance(history, normalized, rank.stream);
+            }
+        };
         for (std::size_t i = 0; i < layers.size(); ++i) {
-            const LayerPlan& plan = layers[i];
-            RankBinding bind(device, plan.rank);
-            RankState& rank = ranks[plan.rank];
             for (std::size_t j = 0; j < verified.size(); ++j) {
-                LayerState& state = verified[j]->layers[i];
-                const auto m      = static_cast<std::int32_t>(kept[j]);
-                if (plan.qsa) {
-                    // The indexer's tail advances over the kept positions' recorded projections;
-                    // the verification's first position is still staged.
-                    const QsaPlan& a = *plan.qsa;
-                    const Tensor projection(static_cast<std::byte*>(rank.index_records.p) +
-                                                (qsa_local[i] * columns + j * w) * index_rows * 2,
-                                            DType::BF16, {a.index.rows, m});
-                    const Tensor first(rank.positions + j * w, DType::I32, {1});
-                    Tensor pooled(state.pooled.p, DType::FP32,
-                                  {di, static_cast<std::int32_t>(pooled_slots)});
-                    Tensor tail(state.tail.p, DType::FP32,
-                                {di, static_cast<std::int32_t>(config.indexer_compress_ratio - 1)});
-                    const ops::QsaIndexerWeights iw{&a.index_query_norm, &a.index_key_norm};
-                    ops::qsa_indexer_append(projection, first, iw, config.rms_norm_eps,
-                                            options.rope_yarn, pooled, tail, rank.stream);
-                }
-                if (plan.ple) {
-                    // The PLE history advances over the kept positions' recorded input.
-                    Tensor history(
-                        state.history.p, DType::FP32,
-                        {stack_width, static_cast<std::int32_t>((config.ple_conv_kernel_size - 1) *
-                                                                config.ngram.ngram_size)});
-                    const Tensor normalized(static_cast<float*>(rank.ple_records.p) +
-                                                std::size_t(stack_width) * j * w,
-                                            DType::FP32, {stack_width, m});
-                    ops::ple_history_advance(history, normalized, rank.stream);
-                }
+                each_part(*verified[j], i,
+                          [&](std::size_t r, const LayerPlan& plan, LayerState& state) {
+                              advance(i, r, plan, j, state);
+                          });
             }
         }
         // The Gated DeltaNet layers replay the kept transitions into each sequence's slot.
@@ -4082,7 +4610,7 @@ struct Executor::Impl {
                 ngram_row_ids(ngram, tokens, config.eos_token_id, config.vocab_size,
                               sequence.context, scratch);
             }
-            committed.push_back({&sequence, static_cast<std::int32_t>(j * w),
+            committed.push_back({&sequence, verified_columns[j],
                                  static_cast<std::int32_t>(kept[j]), sequence.position, tokens});
             sequence.position += kept[j];
         }
@@ -4094,9 +4622,11 @@ struct Executor::Impl {
         const SequenceState& sequence = sequences.at(0);
         std::uint64_t bytes = 0;
         for (std::size_t i = 0; i < layers.size(); ++i) {
-            for (const auto& region : recurrent_regions(sequence.layers[i])) {
-                if (region.first != nullptr) { bytes += region.second; }
-            }
+            each_part(sequence, i, [&](std::size_t, const LayerPlan&, const LayerState& state) {
+                for (const auto& region : recurrent_regions(state)) {
+                    if (region.first != nullptr) { bytes += region.second; }
+                }
+            });
         }
         if (mtp) { bytes += sequence.mtp.tail.bytes + sequence.mtp_pending.bytes; }
         return bytes;
@@ -4113,15 +4643,19 @@ struct Executor::Impl {
 
     // Gives `out` its buffers, sized as `sequence`'s regions, unless it has them.
     void size_snapshot(const SequenceState& sequence, SequenceSnapshot& out) {
-        if (out.layers.size() != layers.size()) {
+        if (out.layers.size() != state_count()) {
             out.layers.clear();
             for (std::size_t i = 0; i < layers.size(); ++i) {
-                RankBinding bind(device, layers[i].rank);
-                SequenceSnapshot::Layer layer;
-                for (const auto& [data, bytes] : recurrent_regions(sequence.layers[i])) {
-                    layer.buffers.push_back(data != nullptr ? DeviceBuffer(bytes) : DeviceBuffer());
-                }
-                out.layers.push_back(std::move(layer));
+                each_part(sequence, i,
+                          [&](std::size_t r, const LayerPlan&, const LayerState& state) {
+                              RankBinding bind(device, r);
+                              SequenceSnapshot::Layer layer;
+                              for (const auto& [data, bytes] : recurrent_regions(state)) {
+                                  layer.buffers.push_back(data != nullptr ? DeviceBuffer(bytes)
+                                                                          : DeviceBuffer());
+                              }
+                              out.layers.push_back(std::move(layer));
+                          });
             }
         }
         if (mtp && out.mtp.empty()) {
@@ -4132,7 +4666,7 @@ struct Executor::Impl {
     }
 
     void restore(std::uint32_t s, const SequenceSnapshot& from) {
-        if (from.layers.size() != layers.size()) {
+        if (from.layers.size() != state_count()) {
             throw std::invalid_argument("qwen4_exp restore: the snapshot holds no state");
         }
         SequenceState& sequence = sequences.at(s);
@@ -4173,15 +4707,20 @@ struct Executor::Impl {
             out.push_back(
                 {state.pooled.p, std::size_t(config.indexer_head_dim) * 4 * blocks, rank});
         };
+        std::size_t kept = 0;
         for (std::size_t i = 0; i < layers.size(); ++i) {
-            const LayerState& state = sequence.layers[i];
-            const auto regions      = recurrent_regions(state);
-            for (std::size_t k = 0; k < regions.size(); ++k) {
-                if (regions[k].first == nullptr) { continue; }
-                void* source = at != nullptr ? at->layers[i].buffers[k].p : regions[k].first;
-                out.push_back({source, regions[k].second, layers[i].rank});
-            }
-            if (layers[i].qsa) { attention(state, layers[i].rank); }
+            each_part(sequence, i,
+                      [&](std::size_t r, const LayerPlan& plan, const LayerState& state) {
+                          const auto regions = recurrent_regions(state);
+                          for (std::size_t k = 0; k < regions.size(); ++k) {
+                              if (regions[k].first == nullptr) { continue; }
+                              void* source =
+                                  at != nullptr ? at->layers[kept].buffers[k].p : regions[k].first;
+                              out.push_back({source, regions[k].second, r});
+                          }
+                          if (plan.qsa) { attention(state, r); }
+                          ++kept;
+                      });
         }
         if (mtp) {
             const std::size_t head = model.head_rank();
@@ -4236,7 +4775,7 @@ struct Executor::Impl {
     SequenceImage save_image(std::uint32_t s, const SequenceSnapshot* at,
                              std::span<std::byte* const> pages, std::size_t page_bytes) {
         const SequenceState& sequence = sequences.at(s);
-        if (at != nullptr && (at->layers.size() != layers.size() || (mtp && at->mtp.size() != 2))) {
+        if (at != nullptr && (at->layers.size() != state_count() || (mtp && at->mtp.size() != 2))) {
             throw std::invalid_argument("qwen4_exp image: the snapshot holds no state");
         }
         const std::uint32_t position = at != nullptr ? at->position : sequence.position;
@@ -4273,12 +4812,16 @@ struct Executor::Impl {
             CUDA_CHECK(cudaMemcpyAsync(save ? kept.p : live, save ? live : kept.p, kept.bytes,
                                        cudaMemcpyDeviceToDevice, stream));
         };
+        std::size_t kept = 0;
         for (std::size_t i = 0; i < layers.size(); ++i) {
-            RankBinding bind(device, layers[i].rank);
-            const auto regions = recurrent_regions(sequence.layers[i]);
-            for (std::size_t k = 0; k < regions.size(); ++k) {
-                copy(regions[k].first, snapshot.layers[i].buffers[k], ranks[layers[i].rank].stream);
-            }
+            each_part(sequence, i, [&](std::size_t r, const LayerPlan&, LayerState& state) {
+                RankBinding bind(device, r);
+                const auto regions = recurrent_regions(state);
+                for (std::size_t k = 0; k < regions.size(); ++k) {
+                    copy(regions[k].first, snapshot.layers[kept].buffers[k], ranks[r].stream);
+                }
+                ++kept;
+            });
         }
         if (mtp && snapshot.mtp.size() == 2) {
             RankBinding bind(device, model.head_rank());
@@ -4394,8 +4937,8 @@ std::uint32_t Executor::draft(std::span<const std::uint32_t> sequences,
 }
 
 void Executor::verify(std::span<const std::uint32_t> sequences,
-                      std::span<const std::int32_t> tokens) {
-    impl_->verify(sequences, tokens);
+                      std::span<const std::int32_t> tokens, std::span<const std::uint32_t> widths) {
+    impl_->verify(sequences, tokens, widths);
 }
 
 void Executor::commit(std::span<const std::uint32_t> sequences,

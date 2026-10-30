@@ -53,6 +53,39 @@ public:
                                  std::optional<QType> exact_format, std::size_t rank,
                                  const ParameterPiece& piece);
 
+    // A parameter that joint_piece binds on a rank.
+    struct JointPart {
+        std::string name;
+        artifact::Shape shape;
+        std::vector<std::string> inputs;
+    };
+
+    // Binds the matrix parameters `parts` on `rank`, each named `name@rank`, as views into one
+    // device selection of the stored object behind them all: the run of its rows they cover
+    // together, which they must cover exactly. Views stay side by side as the object holds them,
+    // so an Op that reads several parameters as one bank (a rank's experts, or a replica of the
+    // router and shared score) reads them there.
+    [[nodiscard]] std::vector<WeightId> joint_piece(std::span<const JointPart> parts,
+                                                    std::size_t rank);
+    // The same for a piece of each parameter, in one device selection: rows [begin, end) of each
+    // part's own rows (a row cut, one range), or the columns of `piece.ranges` of every part (a
+    // column cut). Each view takes the piece's shape; a column cut refuses a rotated or gathered
+    // input, whose columns a piece would have to carry. The parts lie in the object in order.
+    [[nodiscard]] std::vector<WeightId> joint_piece(std::span<const JointPart> parts,
+                                                    std::size_t rank, const ParameterPiece& piece);
+
+    // Where a column piece of matrix parameter `name` (`shape`, read through `inputs`) may end:
+    // out[c] for c in [0, columns] says whether the columns [0, c) are whole runs of its stored
+    // bytes (artifact::selection_column_unit); with an input gather (`input_columns`), a run is
+    // whole when all or none of the logical columns its stored columns read lie below c.
+    [[nodiscard]] std::vector<bool> column_ends(const std::string& name, const artifact::Shape& shape,
+                                                const std::vector<std::string>& inputs);
+
+    // Where a row piece of matrix parameter `name` may end: out[r] for r in [0, rows] says whether
+    // rows [0, r) end on a row bound of the stored object holding row r
+    // (artifact::selection_row_unit; NVFP4 scale tiles), or at a stored object's end.
+    [[nodiscard]] std::vector<bool> row_ends(const std::string& name, const artifact::Shape& shape);
+
     [[nodiscard]] const PendingWeight& at(WeightId id) const { return weights.at(id.index); }
 
     [[nodiscard]] WeightUseId use(WeightId id, std::string_view input) const;
@@ -74,9 +107,11 @@ public:
     std::vector<PendingWeight> weights;
 
 private:
-    // `whole_gathers` false leaves an input gather out, for a piece that binds its own.
+    // `whole_gathers` false leaves an input gather out, and `whole_signs` false the Hadamard signs,
+    // for a piece that binds its own.
     void add_uses(PendingWeight& pending, const std::string& name,
-                  const std::vector<std::string>& inputs, bool whole_gathers = true);
+                  const std::vector<std::string>& inputs, bool whole_gathers = true,
+                  bool whole_signs = true);
     // One device weight per distinct sign binding, however many Uses name it.
     WeightId hadamard_signs(const artifact::Binding& binding, std::uint64_t width,
                             const std::string& use);

@@ -55,10 +55,9 @@ void validate_linear_policy(LinearPolicy policy) {
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
                                LinearPolicy policy) {
     if (x.dtype != DType::BF16 ||
-        (out.dtype != DType::BF16 &&
-         !(out.dtype == DType::FP32 && (w.qtype == QType::BF16 || is_gguf(w.qtype))))) {
-        throw std::invalid_argument(
-            "linear: x must be BF16 and out BF16 (or FP32 for BF16 and GGUF weights)");
+        (out.dtype != DType::BF16 && !(out.dtype == DType::FP32 && linear_writes_fp32(w.qtype)))) {
+        throw std::invalid_argument("linear: x must be BF16 and out BF16 (or FP32 for BF16, GGUF, "
+                                    "row-split Q4/Q5/Q6/Q8/T2, FP8 and NVFP4 weights)");
     }
     (void)checked_numel(x, "x");
     (void)checked_numel(out, "out");
@@ -83,21 +82,25 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
     validate_linear_policy(policy);
 }
 
-// The sm_70 routes take every dense format; without an arena, the widths that need none.
-// The sm_70 routes take every dense format, but not the NVFP4 int8 family: that policy is the
-// caller telling this Op which kernels it wants, and sm_70's FP16 route is not one of them.
-bool sm70_route(const Tensor& x, const Weight& w, const Tensor& out, LinearPolicy policy,
+// The sm_70 routes take every dense format, into BF16 or an FP32 partial sum; they are this Op's
+// only routes that read the panel layout. Without an arena, the widths that need none. The NVFP4
+// int8 family is excluded: that policy is the caller telling this Op which kernels it wants, and
+// sm_70's FP16 route is not one of them.
+bool sm70_route(const Tensor& x, const Weight& w, LinearPolicy policy,
                 const WorkspaceArena* workspace) {
-    return policy != LinearPolicy::AllowNvfp4Int8 && out.dtype == DType::BF16 &&
-           detail::sm70::covers(w, x.ne[1]) &&
+    return policy != LinearPolicy::AllowNvfp4Int8 && detail::sm70::covers(w, x.ne[1]) &&
            (workspace != nullptr || detail::sm70::direct_tokens(x.ne[1]));
 }
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
-    if (sm70_route(x, w, out, policy, workspace)) {
-        const detail::sm70::Destination all{
-            static_cast<__nv_bfloat16*>(out.data), w.n, 0, 0, w.n, false};
+    if (sm70_route(x, w, policy, workspace)) {
+        detail::sm70::Destination all{nullptr, w.n, 0, 0, w.n, false};
+        if (out.dtype == DType::FP32) {
+            all.fp32 = static_cast<float*>(out.data);
+        } else {
+            all.data = static_cast<__nv_bfloat16*>(out.data);
+        }
         if (workspace == nullptr) {
             detail::sm70::project_for(detail::sm70::prepare_direct(x), w, {&all, 1}, stream);
             return;
@@ -129,7 +132,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q8_dispatch(x, w, out, policy, stream);
         return;
     case QType::T2_G128_FP16:
-        if (workspace != nullptr && detail::t2_a8_admits(policy) &&
+        if (workspace != nullptr && out.dtype == DType::BF16 && detail::t2_a8_admits(policy) &&
             detail::t2_a8_supported(w, x.ne[1])) {
             detail::t2_a8_linear(x, w, out, *workspace, stream);
             return;
@@ -228,6 +231,35 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
     dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
+}
+
+bool linear_writes_fp32(QType format) noexcept {
+    switch (format) {
+    case QType::BF16:
+    case QType::Q4_G64_FP16:
+    case QType::Q5_G64_FP16:
+    case QType::Q6_G64_FP16:
+    case QType::Q8_G32_FP16:
+    case QType::T2_G128_FP16:
+    case QType::FP8_E4M3FN_ROW_BF16:
+    case QType::NVFP4:
+        return true;
+    default:
+        return is_gguf(format);
+    }
+}
+
+LinearShareUnits linear_share_units(QType format) noexcept {
+    switch (format) {
+    case QType::T2_G128_FP16:
+        return {32, detail::kT2RuntimeShapeK};
+    case QType::FP8_E4M3FN_ROW_BF16:
+        return detail::kFp8ShareUnits;
+    case QType::NVFP4:
+        return detail::kNvfp4ShareUnits;
+    default:
+        return {};
+    }
 }
 
 } // namespace ninfer::ops

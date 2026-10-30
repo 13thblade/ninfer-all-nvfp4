@@ -6,6 +6,8 @@
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q5/q5_schedule.cuh"
 
+#include <type_traits>
+
 namespace ninfer::ops::detail {
 
 // Direct global loads retain the split-2/split-4 SIMT dataflow. Each warp owns
@@ -43,13 +45,16 @@ q5_a16_direct_simt_kernel(
     const int iterations    = (logical_k + BK - 1) / BK;
     const auto group0       = std::int64_t(R == 1 || row < rows ? row : 0) * (padded_k / 64);
     float acc[T]            = {};
-    constexpr int kUnroll   = Schedule::kStaticK ? (Schedule::kStaticK + BK - 1) / BK : 1;
-#pragma unroll kUnroll
-    for (int iteration = 0; iteration < iterations; ++iteration) {
+    constexpr int kUnroll   = Schedule::kStaticK ? (Schedule::kStaticK + BK - 1) / BK
+                                                   : Schedule::kRuntimeUnroll;
+    // One block-K step. Only a partial K's last step masks the columns past K, so every whole step
+    // issues its loads unconditionally.
+    const auto step = [&](auto checked, int iteration) {
+        constexpr bool Checked = decltype(checked)::value;
 #pragma unroll
         for (int phase = 0; phase < P; ++phase) {
             const int kk             = iteration * BK + (part * P + phase) * 256 + lane * 8;
-            const bool active        = FullK || kk + 8 <= logical_k;
+            const bool active        = !Checked || kk + 8 <= logical_k;
             const auto group_index   = group0 + kk / 64;
             std::uint32_t scale_bits = 0;
             if ((lane & 7) == 0 && active)
@@ -81,6 +86,12 @@ q5_a16_direct_simt_kernel(
                 }
             }
         }
+    };
+    const int whole = FullK ? iterations : logical_k / BK;
+#pragma unroll kUnroll
+    for (int iteration = 0; iteration < whole; ++iteration) step(std::false_type{}, iteration);
+    if constexpr (!FullK) {
+        if (whole < iterations) step(std::true_type{}, whole);
     }
 #pragma unroll
     for (int token = 0; token < T; ++token) {

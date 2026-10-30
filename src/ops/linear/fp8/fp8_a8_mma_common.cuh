@@ -160,6 +160,49 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
     static_assert(!PairRows || collective, "paired rows require a collective epilogue");
     const int accumulator_token = lane >> 2;
     const int accumulator_row   = 2 * (lane & 3);
+    if constexpr (!collective && kLinearFp32PairOutput<Output>) {
+        // An FP32 result is stored from the accumulators, each pair of rows unrounded: the values
+        // the BF16 tile below would round.
+        static_assert(!PairRows, "an FP32 pair store needs contiguous rows");
+#pragma unroll
+        for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
+            const int token0 = token_begin + warp_token * Schedule::kWarpTokens + mma_token * 16 +
+                               accumulator_token;
+            const int token1 = token0 + 8;
+            const float activation_scale0 =
+                (FullTokens || token0 < tokens) ? __ldg(activation_scales + token0) : 0.0F;
+            const float activation_scale1 =
+                (FullTokens || token1 < tokens) ? __ldg(activation_scales + token1) : 0.0F;
+#pragma unroll
+            for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
+                const int local_row0 =
+                    warp_row * Schedule::kWarpRows + mma_row * 8 + accumulator_row;
+                const int parent_row0 = row_policy.weight_row(row_begin, local_row0, rows);
+                const int parent_row1 = row_policy.weight_row(row_begin, local_row0 + 1, rows);
+                const float2 weight_scale =
+                    make_float2(__bfloat162float(weight_scales[parent_row0]),
+                                __bfloat162float(weight_scales[parent_row1]));
+                const auto& accumulator = accumulators[mma_token][mma_row];
+                if (FullTokens || token0 < tokens) {
+                    output.store_fp32_pair(
+                        row_begin + local_row0, token0,
+                        fp8_apply_row_pair(
+                            epilogue, parent_row0, parent_row1, token0,
+                            make_float2(accumulator[0] * activation_scale0 * weight_scale.x,
+                                        accumulator[1] * activation_scale0 * weight_scale.y)));
+                }
+                if (FullTokens || token1 < tokens) {
+                    output.store_fp32_pair(
+                        row_begin + local_row0, token1,
+                        fp8_apply_row_pair(
+                            epilogue, parent_row0, parent_row1, token1,
+                            make_float2(accumulator[2] * activation_scale1 * weight_scale.x,
+                                        accumulator[3] * activation_scale1 * weight_scale.y)));
+                }
+            }
+        }
+        return;
+    }
     constexpr int output_stride = BN + 8;
     auto* shared_output         = reinterpret_cast<__nv_bfloat16*>(shared_raw);
 #pragma unroll

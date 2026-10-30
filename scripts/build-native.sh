@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Native Linux build in explicit steps, the counterpart of build-native.bat: CUDA from
-# NINFER_CUDA_PATH, FFmpeg and libcurl from pkg-config, optionally under a prebuilt dependency
-# prefix (NINFER_PREFIX, added to CMAKE_PREFIX_PATH and PKG_CONFIG_PATH). The Docker image and CI
-# build through this script. Every setting below can be overridden from the environment.
+# NINFER_CUDA_PATH, libcurl from pkg-config, optionally under a prebuilt dependency prefix
+# (NINFER_PREFIX, added to CMAKE_PREFIX_PATH and PKG_CONFIG_PATH), and FFmpeg and dav1d compiled
+# from the pinned release archives that `configure` fetches into NINFER_MEDIA_SOURCES. The Docker
+# image and CI build through this script. Every setting below can be overridden from the environment.
 #
 #   scripts/build-native.sh configure
 #   scripts/build-native.sh build
@@ -16,6 +17,7 @@
 #   NINFER_MULTICALL   ON or OFF: the programs as one multi-call executable, ninfer-multicall,
 #                      with their names as symlinks (apps/CMakeLists.txt)   (default OFF)
 #   NINFER_PREFIX      prebuilt dependency prefix   (default none)
+#   NINFER_MEDIA_SOURCES  FFmpeg and dav1d release archives (default third_party/media-sources)
 #   NINFER_COMPILER_LAUNCHER  explicit compiler cache (default: ccache when installed)
 #   NINFER_JOBS        build parallelism            (default: all cores)
 set -euo pipefail
@@ -50,11 +52,14 @@ if [[ -n "$launcher" ]]; then
                  "-DCMAKE_CUDA_COMPILER_LAUNCHER=$launcher")
 fi
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+media_sources="${NINFER_MEDIA_SOURCES:-$PWD/third_party/media-sources}"
 
 case "${1:-}" in
   configure)
+    scripts/fetch-media-sources.sh "$media_sources"
     cmake -S . -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_ARCHITECTURES="$arch" -DBUILD_TESTING="$tests" -DNINFER_MULTICALL="$multicall" \
+      -DNINFER_MEDIA_SOURCES_DIR="$media_sources" \
       ${prefix_args[@]+"${prefix_args[@]}"} ${launcher_args[@]+"${launcher_args[@]}"} ;;
   build)
     cmake --build "$build_dir" --parallel "$jobs" ;;

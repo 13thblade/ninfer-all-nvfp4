@@ -36,8 +36,12 @@ inline constexpr std::uint32_t kEngramRowBytes = 144; // 256 IQ4_NL values
 // ngram_size) is the compressed ids of the token and the n - 1 before it (the pad id before the
 // sequence starts), multiplied by the block's multipliers and folded by XOR; a column's row is that
 // value modulo the column's prime, past the column's offset and the block's first row in the table.
+// A dead position (an image's) takes no part in an n-gram: its own n-grams are the pad id's, and
+// a later position's look-back stops at it, the pad id from there back (engram.py's DEAD).
 class EngramHasher {
 public:
+    static constexpr std::int32_t kDead = -1;
+
     EngramHasher(const EngramHash& hash, std::vector<std::int32_t> token_map);
 
     [[nodiscard]] const EngramHash& hash() const noexcept { return hash_; }
@@ -48,8 +52,8 @@ public:
     }
     [[nodiscard]] std::int32_t compressed(std::int32_t token) const;
 
-    // The compressed ids of the last ngram_size - 1 tokens a sequence holds, the latest last, and
-    // how many there are (fewer at its start).
+    // The compressed ids of the last ngram_size - 1 tokens a sequence holds (kDead for a dead
+    // position), the latest last, and how many there are (fewer at its start).
     struct History {
         std::int32_t ids[8] = {};
         std::uint32_t count = 0;
@@ -58,8 +62,9 @@ public:
 
     // The table rows of `tokens` continuing `history`: out[t][block * columns + column] (table
     // rows, each block's first row added). `history` advances past the tokens when `advance`.
+    // dead[t] nonzero marks token t dead (empty: none is).
     void rows(History& history, std::span<const std::int32_t> tokens, std::uint64_t* out,
-              bool advance = true) const;
+              bool advance = true, std::span<const std::uint8_t> dead = {}) const;
 
 private:
     EngramHash hash_;

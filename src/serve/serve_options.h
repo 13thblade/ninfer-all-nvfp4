@@ -74,6 +74,10 @@ struct ServeOptions {
     std::vector<std::uint32_t> stage_layers;
     // The `devices` share every layer instead (tensor parallelism).
     bool tensor_parallel = false;
+    // The relative size of each device's tensor-parallel share. Empty lets the engine choose.
+    std::vector<double> tensor_split;
+    TensorAttention tensor_attention = TensorAttention::Heads;
+    bool invariant_attention         = false;
     // Qwen3.8-Flash-Next: where the expert banks live, and where its n-gram table comes from.
     ExpertResidency expert_residency = ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
@@ -93,6 +97,7 @@ struct ServeOptions {
     bool lm_head_q6         = false;
     bool embedding_q4       = false;
     bool embedding_q6       = false;
+    EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
     bool mtp_experts_q4     = false;
     bool gdn_state_fp16     = false;
     bool rope_yarn          = false;
@@ -175,6 +180,9 @@ struct ServeOptions {
     // --webui-mcp-proxy: relay the WebUI's MCP traffic at /cors-proxy. It reaches any http host it
     // is given, so it stays off unless asked for by name.
     bool webui_mcp_proxy = false;
+    // --ui-config-file: the file's JSON object of WebUI settings, compact; /props reports it as
+    // ui_settings, which llama.cpp's WebUI applies as its defaults. Empty without the option.
+    std::string ui_settings;
     bool structured_output = false; // accept JSON/JSON Schema constrained requests
     bool concurrent_prefill = false; // admit to free lanes while other requests prefill
     // --recover-invariant-failures: a worker logic_error fails the active requests, not the Engine.

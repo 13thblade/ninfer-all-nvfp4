@@ -145,6 +145,9 @@ std::optional<VisionWindow> VisionResidencyBroker::try_acquire_kv(std::size_t by
 }
 
 VisionWindow VisionResidencyBroker::acquire(std::size_t bytes) {
+    // The submitting lane collects its item in a later unit of its own, which cannot run while
+    // this encode waits for the window; finish the item here instead.
+    if (submitted_ != nullptr) { submitted_->close_window(); }
     std::optional<VisionWindow> borrowed = try_acquire_kv(bytes);
     if (borrowed) { return std::move(*borrowed); }
     VisionWindow window;
@@ -387,6 +390,7 @@ VisionOverlaySession::VisionOverlaySession(DeviceContext& device, VisionResidenc
 }
 
 VisionOverlaySession::~VisionOverlaySession() {
+    if (broker_.submitted_ == this) { broker_.submitted_ = nullptr; }
     if (!pending_) { return; }
     // The encode still owns the borrowed memory and the staging events; wait it out before the
     // weight stream and the window are destroyed. Failures here are not recoverable and must not
@@ -461,11 +465,19 @@ bool VisionOverlaySession::submit_item(std::span<const std::uint16_t> patches,
         window_.close();
         throw;
     }
+    broker_.submitted_ = this;
     return true;
 }
 
 std::span<const std::byte> VisionOverlaySession::complete_item() {
     if (!pending_) { throw std::logic_error("no Vision item is in flight"); }
+    if (window_.open()) { close_window(); }
+    pending_ = false;
+    return {result_.bytes().data(), result_bytes_};
+}
+
+void VisionOverlaySession::close_window() {
+    if (broker_.submitted_ == this) { broker_.submitted_ = nullptr; }
     // Both producers into the borrowed extent are drained before it is handed back: the encode on
     // `encode_stream_`, whose completion event is recorded after the result copy, and the layer
     // uploads on the transfer stream. Nothing below enqueues again -- `weights_.reset()` is
@@ -480,7 +492,6 @@ std::span<const std::byte> VisionOverlaySession::complete_item() {
     const double open_seconds  = window_.open_seconds();
     const std::size_t borrowed = window_.borrowed_bytes();
     window_.close();
-    pending_ = false;
     if (broker_.poisoned()) {
         throw std::runtime_error(
             "Vision overlay window failed to return its memory; the model state is no longer "
@@ -492,7 +503,6 @@ std::span<const std::byte> VisionOverlaySession::complete_item() {
     stats_.evicted_bytes += borrowed;
     stats_.windows += 1;
     stats_.exclusive_windows += exclusive ? 1U : 0U;
-    return {result_.bytes().data(), result_bytes_};
 }
 
 std::span<const std::byte>

@@ -1,6 +1,7 @@
 """Check archive contents and failure boundaries with fixture executables, without a GPU."""
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -133,6 +134,21 @@ class LinuxPackageTest(unittest.TestCase):
             '#define NINFER_BUILD_ID "aaaaaaaaa"\n#define NINFER_VERSION "2026-10-23.2"\n')
         shutil.copy2(ROOT / 'docker/entrypoint.sh', self.repo / 'docker/entrypoint.sh')
         shutil.copy2(ROOT / 'docker/release.Dockerfile', self.repo / 'docker/release.Dockerfile')
+        # The release archives cmake/NinferFFmpeg.cmake records for the linked media libraries.
+        media = {}
+        for library, version, licence in (('dav1d', '1.5.4', 'COPYING'), ('ffmpeg', '9.0.2', 'COPYING.LGPLv2.1')):
+            archive = self.root / 'media' / f'{library}-{version}.tar.xz'
+            archive.parent.mkdir(exist_ok=True)
+            with tarfile.open(archive, 'w:xz') as release:
+                text = f'{library} licence\n'.encode()
+                member = tarfile.TarInfo(f'{library}-{version}/{licence}')
+                member.size = len(text)
+                release.addfile(member, io.BytesIO(text))
+            media[library] = dict(version=version, sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+                                  license=f'{library}-{version}/{licence}', archive=str(archive),
+                                  options=[f'--{library}-option'])
+        (self.build / 'third_party/media').mkdir(parents=True)
+        (self.build / 'third_party/media/sources.json').write_text(json.dumps(media))
         self.images = 'ELF file: sm_75.cubin\nELF file: sm_120a.cubin'
         self.help_failure = False
         self.original_read = Path.read_text
@@ -198,6 +214,20 @@ class LinuxPackageTest(unittest.TestCase):
             info = json.load(archive.extractfile(prefix + '/BUILD-INFO.json'))
             self.assertEqual(info['architectures'], ['75', '120a'])
             self.assertEqual(info['version'], '2026-10-23.2')
+            self.assertEqual(archive.extractfile(prefix + '/LICENSE-ffmpeg.txt').read(), b'ffmpeg licence\n')
+            self.assertEqual(archive.extractfile(prefix + '/LICENSE-dav1d.txt').read(), b'dav1d licence\n')
+            media = info['media_libraries']
+            self.assertEqual(sorted(media), ['dav1d', 'ffmpeg'])
+            for library, entry in media.items():
+                packaged = archive.extractfile(f"{prefix}/{entry['archive']}").read()
+                self.assertEqual(hashlib.sha256(packaged).hexdigest(), entry['sha256'])
+                self.assertEqual(entry['options'], [f'--{library}-option'])
+
+    def test_changed_media_archive_cannot_produce_manifest(self):
+        (self.root / 'media/ffmpeg-9.0.2.tar.xz').write_bytes(b'changed')
+        with self.assertRaisesRegex(RuntimeError, 'not the pinned ffmpeg release'):
+            PACKAGE.main()
+        self.assertFalse(list((self.repo / 'dist').glob('SHA256SUMS-*')))
 
     def test_build_reporting_another_release_tag_is_refused(self):
         with patch.dict(os.environ, NINFER_VERSION='2026-10-23.3'):
@@ -225,8 +255,13 @@ class DependencyTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Unresolved libraries'):
                 PACKAGE.runtime_packages(Path('/binary'), {}, Path('/stub'), Path('/cuda'), Path('/bundle'))
 
+    def test_shared_media_library_is_rejected(self):
+        with patch.object(PACKAGE, 'output', return_value='libavcodec.so.61 => /usr/lib/libavcodec.so.61 (0x1)'):
+            with self.assertRaisesRegex(RuntimeError, 'links libavcodec.so.61 dynamically'):
+                PACKAGE.runtime_packages(Path('/binary'), {}, Path('/stub'), Path('/cuda'), Path('/bundle'))
+
     def test_unowned_library_is_rejected(self):
-        with patch.object(PACKAGE, 'output', return_value='libavcodec.so.61 => /unowned/libavcodec.so.61 (0x1)'), \
+        with patch.object(PACKAGE, 'output', return_value='libfixture.so.1 => /unowned/libfixture.so.1 (0x1)'), \
              patch.object(PACKAGE.subprocess, 'run') as run:
             run.return_value.returncode = 1
             with self.assertRaisesRegex(RuntimeError, 'No Debian package owns'):

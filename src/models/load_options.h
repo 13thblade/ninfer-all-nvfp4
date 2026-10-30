@@ -22,6 +22,8 @@ struct LoadOptions {
     bool embedding_q4   = false;
     bool embedding_q6   = false;
     bool mtp_experts_q4 = false;
+    // Host keeps the token embedding in mapped host RAM, read in place by the gather.
+    EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Execution selection carried with the instance: admit the integer small-T gate_up route at
     // verify widths (see execution::DenseParameters::verify_gate_up_policy).
@@ -56,8 +58,13 @@ struct LoadOptions {
     // Layers per stage (`--stage-layers`), one count per device. Empty lets the engine choose.
     std::vector<std::uint32_t> stage_layers;
     // The `ranks` devices share every layer instead (`--tensor-parallel`): each holds a share of
-    // the GDN heads and dense FFN rows, and the first one the rest.
+    // the GDN heads and dense FFN rows or MoE experts, and the first one the rest.
     bool tensor_parallel = false;
+    // The relative size of each rank's share (`--tensor-split`), one positive weight per device.
+    // Empty divides evenly; the engine fills it from each card's speed and free memory.
+    std::vector<double> tensor_split;
+    // How the ranks divide a full-attention layer (`--tensor-attention`).
+    TensorAttention tensor_attention = TensorAttention::Heads;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -133,6 +140,7 @@ struct LoadOptions {
             .embedding_q4   = options.embedding_q4,
             .embedding_q6   = options.embedding_q6,
             .mtp_experts_q4 = options.mtp_experts_q4,
+            .embedding_residency = options.embedding_residency,
             .expert_residency = options.expert_residency,
             .mlp_a8_decode  = options.mlp_a8_decode,
             .prefill_a8     = options.prefill_a8,
@@ -146,7 +154,9 @@ struct LoadOptions {
                                                               : VisionResidency::Resident,
             .ranks = std::max<std::size_t>(options.devices.size(), 1),
             .stage_layers = options.stage_layers,
-            .tensor_parallel = options.tensor_parallel};
+            .tensor_parallel = options.tensor_parallel,
+            .tensor_split    = options.tensor_split,
+            .tensor_attention = options.tensor_attention};
 }
 
 } // namespace ninfer::models

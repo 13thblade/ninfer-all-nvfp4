@@ -1,5 +1,7 @@
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
+#include "artifact/permute_row_split.h"
+#include "artifact/selection.h"
 #include "artifact/views.h"
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
@@ -9,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -169,6 +172,46 @@ void overlay_placement(DeviceContext& device) {
     {
         Reader reader(fixture.entry);
         Binder binder(reader);
+        const auto row  = binder.parameter("row", {1, 130}, Residency::Mapped);
+        const auto plan = std::move(binder).finish();
+        require(plan.device_capacity(0) == 0 && plan.pinned_objects.empty() &&
+                    plan.mapped_objects.size() == 1 && plan.mapped_capacity_bytes == 528,
+                "mapped residency did not plan the mapped block");
+        auto backing = materialize(reader, MaterializationPlan(plan), device);
+        require(backing.stats().mapped_bytes == 528 && backing.stats().pinned_bytes == 528 &&
+                    backing.pinned_block().empty() && !backing.has_device(reader.find("q5")),
+                "mapped object received other backing or was not accounted");
+        const auto view   = bind_view(row, backing);
+        const auto* alias = view.parts.front().parent->data;
+        cudaPointerAttributes attributes{};
+        CUDA_CHECK(cudaPointerGetAttributes(&attributes, alias));
+        require(attributes.type == cudaMemoryTypeHost && attributes.devicePointer == alias,
+                "the mapped view does not address the device's mapping of page-locked memory");
+        // Read the bytes back through the device address the kernels use.
+        std::vector<std::byte> read(528);
+        CUDA_CHECK(cudaMemcpy(read.data(), alias, read.size(), cudaMemcpyDeviceToHost));
+        require(std::equal(read.begin(), read.end(), fixture.payload.begin() + 256),
+                "mapped block content differs from the artifact payload");
+    }
+    {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        (void)binder.parameter("matrix", {2, 130});
+        binder.require_mapped(reader.find("q5"));
+        rejects([&] { (void)std::move(binder).finish(); },
+                "an object with both device and mapped placement was accepted");
+    }
+    {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        binder.require_pinned(reader.find("q5"));
+        binder.require_mapped(reader.find("q5"));
+        rejects([&] { (void)std::move(binder).finish(); },
+                "an object with both pinned and mapped placement was accepted");
+    }
+    {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
         const auto row = binder.parameter("row", {1, 130}, Residency::Registered);
         (void)binder.parameter("matrix", {2, 130}, Residency::Registered);
         const auto* original = binder.host_object(reader.find("q5")).data();
@@ -216,6 +259,147 @@ void failure_and_host_only(DeviceContext& device) {
                 backing.host_bytes(resource).size() == 5,
             "Host-only demand allocated device weights");
     materialization(device);
+}
+
+// Column halves of a row-split object, as tensor-parallel ranks select them, on one device. One
+// half alone has back-to-back destination lines, packed on the host before one copy; both halves
+// interleave their lines in the file, which leave as 2D copies. Two rows leave alignment between
+// a piece's planes that no run fills: each piece must hold exactly its selected bytes and zeros.
+void selected_upload(DeviceContext& device) {
+    Fixture fixture;
+    fixture.write(true);
+    const ObjectSelection halves[] = {{.rows = {{0, 2}}, .columns = {{0, 128}}},
+                                      {.rows = {{0, 2}}, .columns = {{128, 130}}}};
+    for (const std::size_t count : {1U, 2U}) {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        const ObjectHandle q5 = reader.find("q5");
+        std::vector<ObjectHandle> pieces;
+        for (std::size_t i = 0; i < count; ++i) {
+            pieces.push_back(binder.select_device(q5, halves[i], 0));
+        }
+        const auto stored    = reader.read_object(q5);
+        const auto& geometry = reader.geometry(q5);
+        auto backing         = materialize(reader, std::move(binder).finish(), device);
+        for (std::size_t i = 0; i < count; ++i) {
+            std::vector<std::byte> want(selected_geometry(geometry, halves[i]).bytes);
+            for (const auto& run : selected_runs(geometry, halves[i])) {
+                std::memcpy(want.data() + run.destination, stored.data() + run.source, run.bytes);
+            }
+            std::vector<std::byte> got(want.size());
+            CUDA_CHECK(cudaMemcpy(got.data(), backing.device_parent(pieces[i]).data, got.size(),
+                                  cudaMemcpyDeviceToHost));
+            require(got == want, "a selected piece differs from its selected bytes");
+        }
+    }
+}
+
+// Pieces of an NVFP4 object on one rank, as tensor-parallel shares of q, k and v from one stored
+// object: a piece of several row ranges, and a second piece of the same object. Each piece holds
+// its selected bytes, its divisor words among them (a single-divisor object's word goes to both
+// pieces, read once), and binds the divisor of its first stored row.
+void selected_nvfp4(DeviceContext& device) {
+    const std::uint64_t shape[] = {512, 128};
+    const std::array divisor_values{0.5F, 1.5F, 2.5F, 3.5F};
+    for (const std::uint64_t divisors : {1U, 4U}) {
+        const auto geometry = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape,
+                                              divisors);
+        Fixture fixture;
+        constexpr std::uint64_t offset = 4096;
+        fixture.root["objects"].push_back({{"id", "nvfp4"},
+                                           {"kind", "tensor"},
+                                           {"shape", {shape[0], shape[1]}},
+                                           {"format", "nvfp4"},
+                                           {"layout", "block_scale_k16_m128x4_v1"},
+                                           {"offset", offset},
+                                           {"bytes", geometry.bytes},
+                                           {"divisors", divisors}});
+        fixture.payload.resize(offset + geometry.bytes);
+        for (std::uint64_t i = 0; i < geometry.divisor_offset; ++i) {
+            fixture.payload[offset + i] = std::byte((i * 2654435761ULL) >> 13);
+        }
+        for (std::uint64_t d = 0; d < divisors; ++d) {
+            put_word(fixture.payload, offset + geometry.divisor_offset + d * 4,
+                     std::bit_cast<std::uint32_t>(divisor_values[d]), 4);
+        }
+        fixture.root["files"] = Json::array({{{"path", nullptr},
+                                              {"payload_bytes", fixture.payload.size()}}});
+        fixture.write();
+        const ObjectSelection selections[] = {
+            {.rows = {{0, 128}, {256, 384}}, .columns = {{0, 128}}},
+            {.rows = {{128, 256}, {384, 512}}, .columns = {{0, 128}}}};
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        const ObjectHandle object = reader.find("nvfp4");
+        std::vector<ObjectHandle> pieces;
+        for (const auto& selection : selections) {
+            pieces.push_back(binder.select_device(object, selection, 0));
+        }
+        const auto stored = reader.read_object(object);
+        auto backing      = materialize(reader, std::move(binder).finish(), device);
+        for (std::size_t i = 0; i < pieces.size(); ++i) {
+            std::vector<std::byte> want(selected_geometry(geometry, selections[i]).bytes);
+            for (const auto& run : selected_runs(geometry, selections[i])) {
+                std::memcpy(want.data() + run.destination, stored.data() + run.source, run.bytes);
+            }
+            const auto& parent = backing.device_parent(pieces[i]);
+            std::vector<std::byte> got(want.size());
+            CUDA_CHECK(cudaMemcpy(got.data(), parent.data, got.size(), cudaMemcpyDeviceToHost));
+            require(got == want, "an NVFP4 piece differs from its selected bytes");
+            const std::uint64_t first = selections[i].rows.front().first;
+            require(parent.weight_scale_divisor == divisor_values[first / (shape[0] / divisors)],
+                    "an NVFP4 piece bound another row's divisor");
+        }
+    }
+}
+
+// A selected piece takes the panel layout as a stored object does: uploaded row-split, then
+// permuted in place (a V100 tensor-parallel rank's projections). The piece is judged by its own
+// rows: two rows are no whole panel. The fixture's object read as four rows of 65 columns has the
+// same planes and bytes as two rows of 130.
+void selected_panel(DeviceContext& device) {
+    {
+        Fixture fixture;
+        fixture.write(true);
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        const ObjectHandle piece = binder.select_device(
+            reader.find("q5"), {.rows = {{0, 2}}, .columns = {{0, 128}}}, 0);
+        rejects([&] { binder.panel_device(piece); }, "a piece of two rows took the panel layout");
+    }
+    Fixture fixture;
+    fixture.root["objects"][1]["shape"] = {4, 65};
+    fixture.root["bindings"]            = {{"matrix", {{"object", "q5"}}}};
+    fixture.root["uses"]                = Json::array();
+    fixture.write(true);
+    Reader reader(fixture.entry);
+    // Two loads: the piece as stored, then with the panel layout.
+    const ObjectSelection rows{.rows = {{0, 4}}, .columns = {{0, 65}}};
+    std::vector<std::byte> want;
+    std::vector<std::byte> got;
+    for (const bool panel : {false, true}) {
+        Binder binder(reader);
+        const ObjectHandle piece = binder.select_device(reader.find("q5"), rows, 0);
+        if (panel) { binder.panel_device(piece); }
+        auto backing       = materialize(reader, std::move(binder).finish(), device);
+        const auto& parent = backing.device_parent(piece);
+        require(parent.geometry.layout ==
+                    (panel ? QuantLayout::RowSplitPanel : QuantLayout::RowSplit),
+                "a selected piece's layout ignored its panel request");
+        std::vector<std::byte>& bytes = panel ? got : want;
+        bytes.resize(parent.geometry.bytes);
+        if (!panel) {
+            void* scratch = nullptr;
+            CUDA_CHECK(cudaMalloc(&scratch, bytes.size()));
+            CUDA_CHECK(cudaMemcpy(scratch, parent.data, bytes.size(), cudaMemcpyDeviceToDevice));
+            permute_row_split_to_panel(parent.geometry, static_cast<std::byte*>(scratch), nullptr);
+            CUDA_CHECK(cudaMemcpy(bytes.data(), scratch, bytes.size(), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaFree(scratch));
+        } else {
+            CUDA_CHECK(cudaMemcpy(bytes.data(), parent.data, bytes.size(), cudaMemcpyDeviceToHost));
+        }
+    }
+    require(got == want, "a selected piece in the panel layout is not its permuted bytes");
 }
 
 void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bool writer_fixture) {
@@ -427,6 +611,9 @@ int main(int argc, char** argv) {
         materialization(device);
         failure_and_host_only(device);
         overlay_placement(device);
+        selected_upload(device);
+        selected_nvfp4(device);
+        selected_panel(device);
         pipeline_rank_placement();
 #if defined(NINFER_TEST_LINK_WRAP)
         ninfer::test::materialization_cuda_errors(device);

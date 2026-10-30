@@ -36,6 +36,11 @@ void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, c
 // h[t][s] = h[t][0] for the streams s > 0.
 void expand_streams(float* h, int tokens, int streams, int hidden, cudaStream_t stream);
 
+// h[(row + i) * stride + c] = rows[i][c] for `count` BF16 rows of `hidden`: an image's span rows
+// in place of their tokens' embeddings.
+void place_rows(const __nv_bfloat16* rows, int count, int hidden, float* h, std::int64_t stride,
+                cudaStream_t stream);
+
 // The hyper-connection coefficients of a site from its projection `mixes` [T][M] (M = (2 + S) S,
 // fn . flatten(h[t])) and the stream h: m = mixes * rsqrt(mean(h[t]^2) + norm_eps), then
 //   pre[t][s]     = sigmoid(m[s] scale[0] + base[s]) + hc_eps
@@ -220,8 +225,10 @@ void attention_output(const __nv_bfloat16* o, int tokens, int heads, int groups,
 
 // The router: scores s = sqrt(softplus(logits)), the top_k experts by s + bias (lower id first on
 // equal values), each weighted s / (sum of the chosen s + 1e-20) * scale. ids/weights [T][top_k].
+// With `image` (a flag per token), an image token's bias is image_bias.
 void route(const float* logits, const float* bias, int tokens, int experts, int top_k, float scale,
-           std::int32_t* ids, float* weights, cudaStream_t stream);
+           std::int32_t* ids, float* weights, cudaStream_t stream,
+           const float* image_bias = nullptr, const std::uint8_t* image = nullptr);
 
 // out[r][i] = bf16(silu(min(g, limit)) * clamp(u, -limit, limit)) for rows of [g (width);
 // u (width)] FP32 x, `x_stride` apart, g and u first multiplied by scale[r / per_token] (when
@@ -256,8 +263,9 @@ void engram_rows(const std::uint8_t* rows, int count, __nv_bfloat16* out, cudaSt
 //   dot = sum_i h[s][i] w[s][i] key[s][i] * rsqrt(mean(h[s]^2) + eps) * rsqrt(mean(key[s]^2) + eps)
 //         / sqrt(H)
 //   h[s] += sigmoid(sign(dot) sqrt(max(|dot|, 1e-6))) * value.
+// With `image` (a flag per token), an image token's streams stay as they are.
 void engram_gate(float* h, const float* kv, const float* w, int tokens, int streams, int hidden,
-                 float eps, cudaStream_t stream);
+                 float eps, cudaStream_t stream, const std::uint8_t* image = nullptr);
 
 // The matrix and vector activations of some GGUF types keep each 32 values' sum in F16
 // (gguf::*_activation_f16_sums): a column of the BF16 x [columns][rows] (rows % 32 == 0) whose

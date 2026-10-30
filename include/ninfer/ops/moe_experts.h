@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace ninfer::ops {
 
@@ -153,6 +154,24 @@ void moe_experts_gguf_decode_finish(const GgufMoeDecode& state, const Tensor& id
                                     const float* products, const std::int32_t* product_pairs,
                                     const std::int32_t* product_count, Tensor& y,
                                     cudaStream_t stream);
+
+/**
+ * Expert parallelism over GGUF banks: one device's part of moe_experts_gguf's sum. The part runs
+ * the routed pairs whose `ids` entry lies in [expert_begin, expert_end), through `banks`, whose
+ * other routed entries are never read, and the shared expert when `shared` is given; `fixed` I64
+ * [2560, tokens] receives the 2^-32 fixed-point sum of their contributions. The routes, weights
+ * and m are the whole call's, the same on every device. With parts whose ranges partition the
+ * routed experts and the shared expert in exactly one, moe_experts_gguf_combine stores the y
+ * moe_experts_gguf stores, bit for bit: each contribution is computed and rounded on its own, and
+ * the parts add as integers. `parts` of combine are device memory of the stream's device.
+ */
+[[nodiscard]] std::size_t moe_experts_gguf_part_workspace_bytes(std::int32_t tokens);
+void moe_experts_gguf_part(const Tensor& m, const Tensor& ids, const Tensor& weights,
+                           const Tensor* shared, const GgufMoeWeights& banks,
+                           std::int32_t expert_begin, std::int32_t expert_end,
+                           WorkspaceArena& workspace, Tensor& fixed, cudaStream_t stream,
+                           const GgufMoeSide* side = nullptr);
+void moe_experts_gguf_combine(std::span<const Tensor> parts, Tensor& y, cudaStream_t stream);
 
 /**
  * One native expert projection bank. `experts` is a caller-owned device array of prepared

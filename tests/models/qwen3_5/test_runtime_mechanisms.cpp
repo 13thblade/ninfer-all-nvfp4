@@ -186,6 +186,28 @@ void test_decoder_layout() {
     expect(k8v4.kv_payload_bytes() ==
                k8v4.text_kv.payload_bytes() + k8v4.mtp_kv->payload_bytes(),
            "K8V4 Text/MTP KV payload accounting");
+
+    // Split by positions over three ranks, each of a layer's K, V and scale planes is a run of
+    // the ranks' residue planes, every plane on its rank with every head.
+    std::array<ninfer::LayoutBuilder, 3> rank_builders;
+    ninfer::LayoutBuilder* const rank_builder_ptrs[] = {&rank_builders[0], &rank_builders[1],
+                                                        &rank_builders[2]};
+    q36::DecoderStateSpec split_spec  = decoder_spec(ninfer::KvCacheStorage::Int8Group64, false);
+    split_spec.text_kv_position_ranks = 3;
+    const q36::DecoderStateLayout split = q36::plan_decoder_state(rank_builder_ptrs, split_spec);
+    bool split_order = split.text_kv.pages.planes.size() == 24 &&
+                       split.text_kv.position_ranks == 3;
+    for (std::size_t index = 0; split_order && index < split.text_kv.pages.planes.size();
+         ++index) {
+        const ninfer::DeviceKVPlaneLayout& plane = split.text_kv.pages.planes[index];
+        const std::size_t kind                   = index / 3 % 4;
+        split_order = plane.geometry.page_stride == 3 &&
+                      plane.geometry.page_residue == static_cast<std::int32_t>(index % 3) &&
+                      plane.rank == index % 3 && plane.geometry.head_extent == 2 &&
+                      plane.geometry.dtype ==
+                          (kind < 2 ? ninfer::DType::I8 : ninfer::DType::FP16);
+    }
+    expect(split_order, "position-split Text KV keeps each plane's residue siblings adjacent");
 }
 
 void test_round_layout() {

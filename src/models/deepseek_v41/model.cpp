@@ -22,9 +22,9 @@ using qwen3_5::loading::Bindings;
 constexpr std::uint64_t kRowTail = 512;
 
 FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& config,
-                                 std::vector<std::int32_t>& token_map) {
-    const auto resource = [&](std::string_view role) {
-        const auto bytes = binder.host_object(binder.resource("text", role));
+                                 std::vector<std::int32_t>& token_map, bool vision) {
+    const auto resource = [&](std::string_view role, std::string_view component = "text") {
+        const auto bytes = binder.host_object(binder.resource(component, role));
         return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     };
     FrontendResources out;
@@ -32,6 +32,7 @@ FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& con
     out.tokenizer_config_json  = resource("tokenizer_config.json");
     out.chat_template_jinja    = resource("chat_template.jinja");
     out.generation_config_json = resource("generation_config.json");
+    if (vision) { out.processor_config_json = resource("processor_config.json", "vision"); }
     out.tokenizer =
         std::make_shared<const qwen3_5::frontend::Tokenizer>(qwen3_5::frontend::TokenizerResources{
             out.tokenizer_json, out.tokenizer_config_json, out.generation_config_json});
@@ -129,6 +130,10 @@ bool has_dspark(const artifact::Reader& reader) {
     return reader.directory().components.contains("dspark");
 }
 
+bool has_vision(const artifact::Reader& reader) {
+    return is_deepseek_v41(reader) && reader.directory().components.contains("vision");
+}
+
 bool is_deepseek_v41(const artifact::Reader& reader) {
     const auto& components = reader.directory().components;
     const auto text        = components.find("text");
@@ -145,9 +150,14 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         throw artifact::ArtifactError("the artifact's text component is not DeepseekV41ForCausalLM");
     }
     TextConfig config = parse_text_config(reader.directory().component("text").config);
+    const bool vision = options.vision != VisionPlacement::None;
+    if (vision && !has_vision(reader)) {
+        throw artifact::ArtifactError("the artifact carries no vision tower (convert with "
+                                      "--components text,dspark,vision)");
+    }
     artifact::Binder binder(reader);
     std::vector<std::int32_t> token_map;
-    FrontendResources resources = bind_resources(binder, config, token_map);
+    FrontendResources resources = bind_resources(binder, config, token_map, vision);
     Bindings b(binder);
     const bool offload = options.experts != ExpertResidency::Device;
     std::vector<std::array<artifact::ParameterReference, 2>> expert_references;
@@ -167,7 +177,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     const std::uint64_t e = config.num_experts, w = config.moe_intermediate_size;
     // What every block binds, the backbone's and the drafter's: hyper-connections, norms, the
     // window attention, the router and the shared expert.
-    const auto block = [&](const std::string& p, std::uint64_t experts) {
+    // `matrices` false leaves the attention's and the shared expert's matrices to an STQ binding.
+    const auto block = [&](const std::string& p, std::uint64_t experts, bool matrices = true) {
         const std::string a = p + "attention/";
         LayerWeights layer;
         for (auto [site, prefix] : {std::pair{&layer.hc_attention, p + "hc_attention/"},
@@ -179,28 +190,43 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         layer.attention_norm = b.direct(p + "attention_norm", {h}, QType::FP32);
         layer.ffn_norm       = b.direct(p + "ffn_norm", {h}, QType::FP32);
         auto& at             = layer.attention;
-        at.query_a      = b.parameter(a + "query_a", {q_rank, h}, {p + "attention_input"});
-        at.kv           = b.parameter(a + "kv", {d, h}, {p + "attention_input"});
         at.query_a_norm = b.direct(a + "query_a_norm", {q_rank}, QType::FP32);
         at.kv_norm      = b.direct(a + "kv_norm", {d}, QType::FP32);
-        at.query_b      = b.parameter(a + "query_b", {heads * d, q_rank}, {a + "query_latent"});
-        at.output_a     = b.parameter(a + "output_a", {groups * o_rank, heads * d / groups},
-                                      {a + "grouped_output"});
-        at.output_b     = b.parameter(a + "output_b", {h, groups * o_rank}, {a + "output_latent"});
         at.sinks        = b.direct(a + "sinks", {heads}, QType::FP32);
-        for (const WeightId id : {at.query_a, at.kv, at.query_b, at.output_a, at.output_b}) {
-            tail(b, id);
+        if (matrices) {
+            at.query_a  = b.parameter(a + "query_a", {q_rank, h}, {p + "attention_input"});
+            at.kv       = b.parameter(a + "kv", {d, h}, {p + "attention_input"});
+            at.query_b  = b.parameter(a + "query_b", {heads * d, q_rank}, {a + "query_latent"});
+            at.output_a = b.parameter(a + "output_a", {groups * o_rank, heads * d / groups},
+                                      {a + "grouped_output"});
+            at.output_b = b.parameter(a + "output_b", {h, groups * o_rank}, {a + "output_latent"});
+            for (const WeightId id : {at.query_a, at.kv, at.query_b, at.output_a, at.output_b}) {
+                tail(b, id);
+            }
         }
         const std::string m = p + "moe/";
         MoeWeights& moe     = layer.moe;
         moe.router          = b.direct(m + "router", {experts, h}, QType::FP32);
         moe.router_bias     = b.direct(m + "router_bias", {experts}, QType::FP32);
-        moe.shared_gate     = b.parameter(m + "shared_gate", {w, h}, {m + "input"});
-        moe.shared_up       = b.parameter(m + "shared_up", {w, h}, {m + "input"});
-        moe.shared_down     = b.parameter(m + "shared_down", {h, w}, {m + "shared_product"});
-        tail(b, moe.shared_down);
-        tail(b, moe.shared_gate);
+        if (matrices) {
+            moe.shared_gate = b.parameter(m + "shared_gate", {w, h}, {m + "input"});
+            moe.shared_up   = b.parameter(m + "shared_up", {w, h}, {m + "input"});
+            moe.shared_down = b.parameter(m + "shared_down", {h, w}, {m + "shared_product"});
+            tail(b, moe.shared_down);
+            tail(b, moe.shared_gate);
+        }
         return layer;
+    };
+    // An STQ matrix of k inputs and n outputs, tiles of `words` words; `count` > 0 leads a set.
+    const auto stq = [&](const std::string& name, std::uint64_t k, std::uint64_t n,
+                         std::uint64_t words, std::uint64_t count = 0) {
+        artifact::Shape tiles{k / 16, n / 16, words}, in{k}, out{n};
+        if (count != 0) {
+            for (artifact::Shape* shape : {&tiles, &in, &out}) { shape->insert(shape->begin(), count); }
+        }
+        return StqWeights{b.direct(name + "/trellis", std::move(tiles), QType::UINT16),
+                          b.direct(name + "/suh", std::move(in), QType::FP16),
+                          b.direct(name + "/svh", std::move(out), QType::FP16)};
     };
     const auto resident_experts = [&](LayerWeights& layer, const std::string& p,
                                       std::uint64_t experts) {
@@ -270,18 +296,87 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         const std::uint64_t taps = dspark_config->target_layers.size();
         const std::uint64_t rank = dspark_config->markov_rank;
         DSparkWeights& drafter   = dspark.emplace();
-        drafter.fc               = b.parameter("dspark/fc", {h, taps * h}, {"dspark/taps"});
+        const bool stq_drafter   = dspark_config->stq;
+        constexpr std::uint64_t kTrunkWords = 64, kExpertWords = 32;
+        if (stq_drafter) {
+            drafter.stq_fc = stq("dspark/fc", taps * h, h, kTrunkWords);
+        } else {
+            drafter.fc = b.parameter("dspark/fc", {h, taps * h}, {"dspark/taps"});
+            tail(b, drafter.fc);
+        }
         drafter.tap_norm         = b.direct("dspark/tap_norm", {h}, QType::FP32);
         drafter.final_norm       = b.direct("dspark/final_norm", {h}, QType::FP32);
         drafter.markov_embed     = b.direct("dspark/markov_embed", {config.vocab_size, rank});
         drafter.markov_head      = b.direct("dspark/markov_head", {config.vocab_size, rank});
         drafter.confidence       = b.direct("dspark/confidence", {h + rank}, QType::FP32);
-        tail(b, drafter.fc);
+        const std::uint64_t de   = dspark_config->experts;
         for (std::uint32_t i = 0; i < dspark_config->layers; ++i) {
             const std::string p = "dspark/layers/" + std::to_string(i) + "/";
-            LayerWeights layer  = block(p, dspark_config->experts);
-            resident_experts(layer, p, dspark_config->experts);
+            LayerWeights layer  = block(p, de, !stq_drafter);
+            if (stq_drafter) {
+                const std::string a = p + "attention/", m = p + "moe/";
+                StqLayerWeights s;
+                s.query_a     = stq(a + "query_a", h, q_rank, kTrunkWords);
+                s.kv          = stq(a + "kv", h, d, kTrunkWords);
+                s.query_b     = stq(a + "query_b", q_rank, heads * d, kTrunkWords);
+                s.output_a    = stq(a + "output_a", heads * d / groups, o_rank, kTrunkWords, groups);
+                s.output_b    = stq(a + "output_b", groups * o_rank, h, kTrunkWords);
+                s.shared_gate = stq(m + "shared_gate", h, w, kTrunkWords);
+                s.shared_up   = stq(m + "shared_up", h, w, kTrunkWords);
+                s.shared_down = stq(m + "shared_down", w, h, kTrunkWords);
+                s.gate        = stq(m + "gate", h, w, kExpertWords, de);
+                s.up          = stq(m + "up", h, w, kExpertWords, de);
+                s.down        = stq(m + "down", w, h, kExpertWords, de);
+                drafter.stq_layers.push_back(s);
+            } else {
+                resident_experts(layer, p, de);
+            }
             drafter.layers.push_back(std::move(layer));
+        }
+    }
+    std::optional<VisionConfig> vision_config;
+    std::optional<VisionWeights> vision_weights;
+    if (vision) {
+        const VisionConfig& vc =
+            vision_config.emplace(parse_vision_config(reader.directory().component("vision").config,
+                                                      config));
+        const auto residency = options.vision == VisionPlacement::Pinned
+                                   ? artifact::Residency::Pinned : artifact::Residency::Device;
+        const std::uint64_t vh = vc.hidden_size, vw = vc.intermediate_size;
+        const auto matrix = [&](const std::string& name, artifact::Shape shape,
+                                const std::string& input) {
+            return b.parameter(name, std::move(shape), {input}, QType::BF16, residency);
+        };
+        const auto vector = [&](const std::string& name, std::uint64_t n) {
+            return b.direct(name, {n}, QType::FP32);
+        };
+        VisionWeights& v   = vision_weights.emplace();
+        v.patch_embedding  = matrix("vision/patch_embedding", {vh, vc.patch_features()},
+                                    "vision/patches");
+        v.patch_bias       = vector("vision/patch_bias", vh);
+        v.final_norm       = vector("vision/final_norm", vh);
+        v.aligner_up       = matrix("vision/aligner/up", {h, vc.merged_features()}, "vision/merged");
+        v.aligner_up_bias  = vector("vision/aligner/up_bias", h);
+        v.aligner_out      = matrix("vision/aligner/out", {h, h}, "vision/aligner_hidden");
+        v.aligner_out_bias = vector("vision/aligner/out_bias", h);
+        v.image_start      = vector("vision/image_start", h);
+        v.image_newline    = vector("vision/image_newline", h);
+        v.image_end        = vector("vision/image_end", h);
+        v.image_router_bias =
+            b.direct("vision/image_router_bias", {config.num_hidden_layers, e}, QType::FP32);
+        for (std::uint32_t i = 0; i < vc.num_hidden_layers; ++i) {
+            const std::string p = "vision/layers/" + std::to_string(i) + "/";
+            VisionLayerWeights layer;
+            layer.attention_norm = vector(p + "attention_norm", vh);
+            layer.qkv            = matrix(p + "attention/qkv", {3 * vh, vh}, p + "attention_input");
+            layer.qkv_bias       = vector(p + "attention/qkv_bias", 3 * vh);
+            layer.output         = matrix(p + "attention/output", {vh, vh}, p + "attention_output");
+            layer.output_bias    = vector(p + "attention/output_bias", vh);
+            layer.mlp_norm       = vector(p + "mlp_norm", vh);
+            layer.gate           = matrix(p + "mlp/gate", {vw, vh}, p + "mlp_input");
+            layer.up             = matrix(p + "mlp/up", {vw, vh}, p + "mlp_input");
+            layer.down           = matrix(p + "mlp/down", {vh, vw}, p + "mlp_product");
+            v.layers.push_back(layer);
         }
     }
     InstanceInfo info;
@@ -313,6 +408,9 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     model->engram_token_map_ = std::move(token_map);
     model->dspark_config_    = std::move(dspark_config);
     model->dspark_           = std::move(dspark);
+    model->vision_config_    = std::move(vision_config);
+    model->vision_           = std::move(vision_weights);
+    model->vision_placement_ = options.vision;
     model->expert_residency_ = options.experts;
     model->expert_banks_     = std::move(expert_banks);
     if (options.experts == ExpertResidency::Disk) {

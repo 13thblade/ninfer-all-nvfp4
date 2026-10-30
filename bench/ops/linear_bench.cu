@@ -123,7 +123,11 @@ struct Options {
     int repeat                = kDefaultRepeat;
     std::uint64_t flush_bytes = kDefaultFlushBytes;
     std::string csv_out;
+    // BF16, or FP32: a tensor-parallel rank's partial sum, for the formats whose Linear writes it.
+    DType out = DType::BF16;
 };
+
+std::uint64_t output_element_bytes(const Options& opt) { return opt.out == DType::FP32 ? 4 : 2; }
 
 struct BenchPoint {
     QType qtype;
@@ -386,6 +390,8 @@ void usage(const char* argv0) {
                  "  random blocks.\n\n"
                  "Options:\n"
                  "  --policy a16|a8|a4|a8int|nvfp4int8 Activation-compute policy (default a16).\n"
+                 "  --out bf16|fp32    Output dtype (default bf16); fp32 is a tensor-parallel\n"
+                 "                     rank's partial sum.\n"
                  "  --execution MODE   eager (default) or graph; time the complete Op.\n"
                  "  --graph-calls N    Calls per timed graph (1..64, default 1); report per call.\n"
                  "  --profile          Capture exactly one post-warmup public Linear call.\n"
@@ -443,6 +449,11 @@ Options parse_args(int argc, char** argv) {
                 checked_mul(parse_u64(next("flush-mib"), "flush-mib"), 1ULL << 20, "flush bytes");
         } else if (arg == "--csv-out") {
             opt.csv_out = next("csv output path");
+        } else if (arg == "--out") {
+            const std::string value = lower(next("out"));
+            if (value != "bf16" && value != "fp32")
+                throw std::invalid_argument("out must be bf16 or fp32");
+            opt.out = value == "fp32" ? DType::FP32 : DType::BF16;
         } else if (arg == "--help" || arg == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -691,7 +702,8 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     const std::uint64_t out_elements =
         checked_mul(static_cast<std::uint64_t>(point.n), point.t, "output elements");
     const std::uint64_t x_bytes     = checked_mul(x_elements, 2, "activation bytes");
-    const std::uint64_t out_bytes   = checked_mul(out_elements, 2, "output bytes");
+    const std::uint64_t out_bytes =
+        checked_mul(out_elements, output_element_bytes(opt), "output bytes");
     const std::uint64_t model_bytes = checked_add(
         checked_add(weight.model_weight_bytes(), x_bytes, "model bytes"), out_bytes, "model bytes");
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *
@@ -752,7 +764,8 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
 
     LinearBenchWeight weight = make_weight(group.qtype, group.n, group.k);
     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
-    DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
+    DeviceBuffer out(
+        checked_mul(out_elements, output_element_bytes(opt), "output allocation bytes"));
     const std::size_t workspace_capacity = ops::linear_workspace_capacity_bytes(
         group.qtype, group.n, group.k, group.policy, min_t, max_t);
     DeviceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
@@ -767,7 +780,7 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
 
     for (const BenchPoint& point : group.points) {
         Tensor activation(x.p, DType::BF16, {group.k, point.t});
-        Tensor output(out.p, DType::BF16, {group.n, point.t});
+        Tensor output(out.p, opt.out, {group.n, point.t});
         const auto launch = [&](cudaStream_t launch_stream) {
             ops::linear(activation, weight.weight, output, group.policy, workspace, launch_stream);
         };
@@ -808,7 +821,8 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
         checked_mul(static_cast<std::uint64_t>(point.n), point.t, "output allocation");
     LinearBenchWeight weight = make_weight(point.qtype, point.n, point.k);
     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
-    DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
+    DeviceBuffer out(
+        checked_mul(out_elements, output_element_bytes(opt), "output allocation bytes"));
     const std::size_t workspace_capacity = ops::linear_workspace_capacity_bytes(
         point.qtype, point.n, point.k, point.policy, point.t, point.t);
     DeviceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
@@ -817,7 +831,7 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     Tensor activation(x.p, DType::BF16, {point.k, point.t});
-    Tensor output(out.p, DType::BF16, {point.n, point.t});
+    Tensor output(out.p, opt.out, {point.n, point.t});
     const auto body = [&](cudaStream_t launch_stream) {
         ops::linear(activation, weight.weight, output, point.policy, workspace, launch_stream);
     };
@@ -838,8 +852,9 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
     bench::flush_l2(flush, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    const std::uint64_t x_bytes     = checked_mul(x_elements, 2, "activation bytes");
-    const std::uint64_t out_bytes   = checked_mul(out_elements, 2, "output bytes");
+    const std::uint64_t x_bytes = checked_mul(x_elements, 2, "activation bytes");
+    const std::uint64_t out_bytes =
+        checked_mul(out_elements, output_element_bytes(opt), "output bytes");
     const std::uint64_t model_bytes = checked_add(
         checked_add(weight.model_weight_bytes(), x_bytes, "model bytes"), out_bytes, "model bytes");
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *
@@ -857,8 +872,9 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
 }
 
 void print_header(const Options& opt) {
-    std::printf("# execution=%s graph_calls=%d cuda_runtime=%d\n", opt.graph ? "graph" : "eager",
-                opt.graph_calls, CUDART_VERSION);
+    std::printf("# execution=%s graph_calls=%d out=%s cuda_runtime=%d\n",
+                opt.graph ? "graph" : "eager", opt.graph_calls,
+                opt.out == DType::FP32 ? "fp32" : "bf16", CUDART_VERSION);
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     cudaDeviceProp properties{};

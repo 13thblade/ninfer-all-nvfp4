@@ -55,8 +55,9 @@ private:
 [[nodiscard]] std::vector<ops::DeviceTier> rank_tiers(const DeviceContext& device);
 // How many layers each of `free_bytes.size()` pipeline stages should own so that the most KV cache
 // fits on every device at once, given the bytes free on each. Sized from the artifact's stored
-// layers; the head stage (rank 0) also carries the embedding, head and round buffers. The default
-// when `--stage-layers` is not given.
+// layers; the head stage (rank 0) also carries the embedding, head and round buffers, and as
+// selected a resident Vision tower, MTP's layer and its KV, a DFlash drafter and the proposal head.
+// The default when `--stage-layers` is not given.
 //
 // The per-device KV and recurrent-state costs use the same layouts startup planning reserves, so
 // they follow the runtime choices that size them.
@@ -66,11 +67,30 @@ struct StageSizing {
     // Recurrent-state slots each Linear Attention layer holds: concurrent requests plus the device
     // state slots the context cache keeps.
     std::uint32_t state_slots = 1;
+    // Tensor parallelism: the tokens of KV cache rank 0 holds for the attention layers (the longest
+    // context times the concurrent requests).
+    std::uint64_t kv_tokens = 0;
+    // Automatic KV capacity: the KV shrinks to what fits beside `kv_headroom_bytes` left free on
+    // every device.
+    bool automatic_kv               = false;
+    std::uint64_t kv_headroom_bytes = 0;
 };
 [[nodiscard]] std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
                                                               LoadOptions options,
                                                               const StageSizing& sizing,
                                                               std::span<const std::uint64_t> free_bytes);
+// The relative share of each of `speed.size()` tensor-parallel ranks (the default
+// `--tensor-split`): in proportion to `speed` (rank_copy_bandwidth), but no more of the divided
+// weights, recurrent state and KV cache than fits beside what a rank holds whole (rank 0: the head
+// stage's parts as for default_stage_layers, and MTP's KV), sized from the artifact. When the
+// longest context fits nowhere, automatic KV capacity divides by room (fill_shares), so the KV it
+// shrinks to is the most that fits; otherwise the shares follow speed alone and the Program's
+// planning reports the device that runs out.
+[[nodiscard]] std::vector<double> default_tensor_split(const artifact::Reader& reader,
+                                                       LoadOptions options,
+                                                       const StageSizing& sizing,
+                                                       std::span<const std::uint64_t> free_bytes,
+                                                       std::span<const double> speed);
 // `materialize` makes the weight arenas suspendable when asked (see Model::release_device_weights).
 [[nodiscard]] std::unique_ptr<Model>
 materialize_model(LoadPlan&& plan, DeviceContext& device, const StartupObserver* observer = nullptr,

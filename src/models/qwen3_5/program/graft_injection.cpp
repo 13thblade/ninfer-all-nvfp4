@@ -7,6 +7,7 @@
 #include "core/tensor.h"
 
 #include <cstring>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -230,34 +231,64 @@ void inject_direct_graft(detail::ProgramImpl& program, const PromptGraft& graft)
     const auto& exec_row     = program.text_kv_addresses->execution_row(*text_kv);
     PagedKVCacheView kv_view = program.decoder->text_kv.execution_view(exec_row);
 
+    // With tensor parallelism each rank appends its own run of every layer's KV heads, or of every
+    // layer's pages.
+    const std::span<const std::int32_t> head_shares = program.decoder->text_kv.head_shares();
+
+    struct HeadRun {
+        std::size_t rank;
+        std::int32_t first;
+        std::int32_t heads;
+    };
+
+    std::vector<HeadRun> runs;
+    for (std::size_t rank = 0, first = 0; rank < head_shares.size(); first += head_shares[rank++]) {
+        runs.push_back({rank, static_cast<std::int32_t>(first), head_shares[rank]});
+    }
+    // Split by positions, each rank appends every head; its view keeps only its pages' rows.
+    for (std::size_t rank = 0; rank < program.decoder->text_kv.position_ranks(); ++rank) {
+        runs.push_back({rank, 0, n_kv_heads});
+    }
+    const std::size_t head_bytes = static_cast<std::size_t>(head_dim) * 2; // BF16
     for (std::uint32_t layer = 0; layer < n_attn; ++layer) {
-        const std::size_t rank         = program.decoder->text_kv.layer_rank(layer);
-        const cudaStream_t rank_stream = streams[rank];
-        RankBinding bind(device, rank);
-        RankStaging& buffers = staging[rank];
-        if (buffers.positions.p == nullptr) {
-            buffers.positions = DeviceBuffer(positions_bytes);
-            buffers.k         = DeviceBuffer(kv_layer_bytes);
-            buffers.v         = DeviceBuffer(kv_layer_bytes);
-            cudaMemcpyAsync(buffers.positions.p, pos_data, positions_bytes,
-                            cudaMemcpyHostToDevice, rank_stream);
-        } else {
-            device.synchronize_rank(rank);
+        std::vector<HeadRun> layer_runs = runs;
+        if (layer_runs.empty()) {
+            layer_runs.push_back({program.decoder->text_kv.layer_rank(layer), 0, n_kv_heads});
         }
+        for (const HeadRun& run : layer_runs) {
+            const std::size_t rank         = run.rank;
+            const cudaStream_t rank_stream = streams[rank];
+            RankBinding bind(device, rank);
+            RankStaging& buffers = staging[rank];
+            if (buffers.positions.p == nullptr) {
+                buffers.positions = DeviceBuffer(positions_bytes);
+                buffers.k         = DeviceBuffer(kv_layer_bytes);
+                buffers.v         = DeviceBuffer(kv_layer_bytes);
+                cudaMemcpyAsync(buffers.positions.p, pos_data, positions_bytes,
+                                cudaMemcpyHostToDevice, rank_stream);
+            } else {
+                device.synchronize_rank(rank);
+            }
 
-        const std::uint8_t* k_src = tensors.k_data() + layer * kv_layer_bytes;
-        const std::uint8_t* v_src = tensors.v_data() + layer * kv_layer_bytes;
-        cudaMemcpyAsync(buffers.k.p, k_src, kv_layer_bytes, cudaMemcpyHostToDevice, rank_stream);
-        cudaMemcpyAsync(buffers.v.p, v_src, kv_layer_bytes, cudaMemcpyHostToDevice, rank_stream);
+            // The run's heads of every slot, packed.
+            const std::size_t src_pitch = head_bytes * static_cast<std::size_t>(n_kv_heads);
+            const std::size_t run_bytes = head_bytes * static_cast<std::size_t>(run.heads);
+            const std::size_t offset =
+                layer * kv_layer_bytes + head_bytes * static_cast<std::size_t>(run.first);
+            cudaMemcpy2DAsync(buffers.k.p, run_bytes, tensors.k_data() + offset, src_pitch,
+                              run_bytes, n_slots, cudaMemcpyHostToDevice, rank_stream);
+            cudaMemcpy2DAsync(buffers.v.p, run_bytes, tensors.v_data() + offset, src_pitch,
+                              run_bytes, n_slots, cudaMemcpyHostToDevice, rank_stream);
 
-        Tensor positions_tensor(buffers.positions.p, DType::I32,
-                                {static_cast<std::int32_t>(n_slots)});
-        Tensor k_tensor(buffers.k.p, DType::BF16,
-                        {head_dim, n_kv_heads, static_cast<std::int32_t>(n_slots)});
-        Tensor v_tensor(buffers.v.p, DType::BF16,
-                        {head_dim, n_kv_heads, static_cast<std::int32_t>(n_slots)});
-        PagedKVLayerView layer_view = kv_view.layer_view(layer);
-        ops::kv_cache_append(k_tensor, v_tensor, positions_tensor, layer_view, rank_stream);
+            Tensor positions_tensor(buffers.positions.p, DType::I32,
+                                    {static_cast<std::int32_t>(n_slots)});
+            Tensor k_tensor(buffers.k.p, DType::BF16,
+                            {head_dim, run.heads, static_cast<std::int32_t>(n_slots)});
+            Tensor v_tensor(buffers.v.p, DType::BF16,
+                            {head_dim, run.heads, static_cast<std::int32_t>(n_slots)});
+            PagedKVLayerView layer_view = kv_view.layer_view(layer, rank);
+            ops::kv_cache_append(k_tensor, v_tensor, positions_tensor, layer_view, rank_stream);
+        }
     }
 
     // --- Step 3b: give a speculative backend an address space of its own ---

@@ -27,6 +27,7 @@ drafts with the tokens committed per verify round in brackets.
 | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | `120a` | 600 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [DeepSeek](deepseek-v41.md#measurements) |
 | RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements) |
 | RTX 5070 Ti | 16 GB | `120a` | 300 W | [field report](performance/field-reports.md#rtx-5070-ti-windows-11) |
+| RTX 5060 Ti, two and four | 16 GB each | `120a` | | [field report](performance/field-reports.md#rtx-5060-ti-two-and-four-cards) |
 | RTX 4090 | 24 GB | `89` | 450 W; 500 W boards for Flint | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [field reports](performance/field-reports.md) |
 | L40S | 48 GB | | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | RTX 3090 Ti, two | 24 GB each | `86` | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
@@ -559,8 +560,9 @@ and 64.3 with MTP 3 (64.2 after 32,768) and 53.4 and 53.1 with DFlash2 5; prompt
 1,024 tokens and 8.3 s at 8,192.
 
 Users' measurements are in the [field reports](performance/field-reports.md): an RTX 5070 Ti
-from 1.2K to 104K prompt tokens against llama.cpp, and RTX 4090s serving long Qwen Code and agent
-sessions with DFlash2 and MTP.
+from 1.2K to 104K prompt tokens against llama.cpp, RTX 4090s serving long Qwen Code and agent
+sessions with DFlash2 and MTP, and Qwen3.8-27B NVFP4 with tensor parallelism over two and four
+RTX 5060 Ti.
 
 ### Engine and CLI rates
 
@@ -642,7 +644,11 @@ operations, as the CPU does. Startup took 1.2-1.7 s longer and device memory was
 Greedy, one request. Decode is measured over a short answer (78 tokens for Q2_0, 81 to 87 for
 IQ3_S) and over the first tokens after a 4,463-token prompt; prefill is that prompt. Host memory
 is the process's peak resident set, device memory the most `nvidia-smi` showed. The host-memory
-and disk rows of one card use its free memory as the expert cache. A range is two runs.
+and disk rows of one card use its free memory as the expert cache. The single RTX 5090, RTX 4090
+and RTX 3090 rows are the generate test of October 26 in 512-token prefill chunks (with host or disk
+experts a span of eight chunks and a last chunk of 367 tokens), one run each;
+the others come from builds of October 5 and 6, where a range is two runs
+([hosts and builds](qwen3-8-flash-next.md#expert-placements)).
 
 | Card | Release | Experts | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
 |---|---|---|---:|---:|---:|---:|---:|
@@ -656,32 +662,34 @@ and disk rows of one card use its free memory as the expert cache. A range is tw
 | RTX PRO 6000 | IQ3_S | disk, pages evicted every second | 93.5 GiB | 1.2 GiB | 28.7 | 78.6 | 773 |
 | 2× RTX 5090 | Q2_0 | on the GPUs | 18.8 + 19.6 GiB | 0.9 GiB | 136.1-136.3 | 157.0-157.2 | 3,807-3,811 |
 | 2× RTX 5090 | IQ3_S | on the GPUs | 26.5 + 27.8 GiB | 1.0 GiB | 121.6-121.9 | 141.8-142.0 | 3,310-3,341 |
-| RTX 5090 | Q2_0 | pinned host memory | 30.0 GiB | 34.0 GB | 74.1-74.2 | 93.9-94.2 | 1,676-1,678 |
-| RTX 5090 | IQ3_S | pinned host memory | 30.0 GiB | 50.3 GB | 40.7 | 41.0 | 1,100 |
-| RTX 5090 | Q2_0 | disk, in the page cache | 29.9 GiB | 1.0 GiB | 67.5 | 76.7 | 1,739 |
-| RTX 5090 | IQ3_S | disk, in the page cache | 29.9 GiB | 1.1 GiB | 55.3 | 44.3 | 439 |
-| RTX 5090 | Q2_0 | disk, pages evicted every second | 29.9 GiB | 1.0 GiB | 25.3 | 28.7 | 694 |
-| RTX 5090 | IQ3_S | disk, pages evicted every second | 29.9 GiB | 1.1 GiB | 18.8 | 14.9 | 171 |
+| RTX 5090 | Q2_0 | pinned host memory | 30.1 GiB | 33.3 GiB | 97.8 | 83.2 | 3,290 |
+| RTX 5090 | IQ3_S | pinned host memory | 30.1 GiB | 48.7 GiB | 82.5 | 70.7 | 2,451 |
+| RTX 5090 | Q2_0 | disk, in the page cache | 30.1 GiB | 1.7 GiB | 72.1 | 102.9 | 1,827 |
+| RTX 5090 | IQ3_S | disk, in the page cache | 30.1 GiB | 2.0 GiB | 56.4 | 35.5 | 770 |
+| RTX 5090 | Q2_0 | disk, pages evicted every second | 30.1 GiB | 1.7 GiB | 37.7 | 66.4 | 1,108 |
+| RTX 5090 | IQ3_S | disk, pages evicted every second | 30.1 GiB | 2.0 GiB | 28.5 | 16.7 | 399 |
 | 2× RTX 4090 | Q2_0 | on the GPUs | 18.5 + 19.4 GiB | 0.8 GiB | 92.6-100.7 | 116-120 | 3,482-3,734 |
-| RTX 4090 | Q2_0 | pinned host memory | 20.7 GiB | 34.0 GB | 52.6-52.7 | 44.3-44.6 | 1,137-1,139 |
-| RTX 4090 | Q2_0 | disk, in the page cache | 20.7 GiB | 1.0 GiB | 42.0 | 45.6 | 723 |
-| RTX 4090 | Q2_0 | disk, pages evicted every second | 20.5 GiB | 1.0 GiB | 17.7 | 12.2 | 160 |
+| RTX 4090 | Q2_0 | pinned host memory | 22.1 GiB | 33.1 GiB | 73.9 | 66.9 | 1,801 |
+| RTX 4090 | Q2_0 | disk, in the page cache | 22.1 GiB | 1.5 GiB | 46.5 | 42.5 | 1,144 |
+| RTX 4090 | Q2_0 | disk, pages evicted every second | 22.1 GiB | 1.5 GiB | 21.0 | 14.6 | 558 |
 | 2× RTX 3090 Ti | Q2_0 | on the GPUs | 18.4 + 19.4 GB | 0.7 GB | 90.2 | 107 | 1,504 |
-| RTX 3090 | Q2_0 | pinned host memory | 22.6 GB | 34 GB | 48.9 | 42.1 | 842 |
-| RTX 3090 | Q2_0 | disk, in the page cache | 22.6 GB | 0.9 GB | 47.0 | 39.1 | 630 |
-| RTX 3090 | Q2_0 | disk, page cache dropped every second | 22.6 GB | 0.9 GB | 17.2 | 11.3 | 195 |
-| RTX 3090 | IQ3_S | pinned host memory | 22.1 GiB | 50.3 GB | 34.4 | 30.2 | 533 |
-| RTX 3090 | IQ3_S | disk, the page cache holding part of the file | 22.1 GiB | | 19.0 | 21.6 | 209 |
-| RTX 3090 | IQ3_S | disk, pages evicted every second | 22.1 GiB | | 10.7 | 5.4 | 47 |
-| RTX 3090 | Q2_0 | pinned host memory | 22.1 GiB | 34.0 GB | 50.2 | 43.7 | 847 |
+| RTX 3090 | Q2_0 | pinned host memory | 22.2 GiB | 33.1 GiB | 39.1 | 45.7 | 663 |
+| RTX 3090 | IQ3_S | pinned host memory | 22.2 GiB | 48.5 GiB | 27.1 | 33.1 | 438 |
+| RTX 3090 | Q2_0 | disk, in the page cache | 22.1 GiB | 1.5 GiB | 27.8 | 27.5 | 503 |
+| RTX 3090 | IQ3_S | disk, in the page cache | 22.1 GiB | 1.7 GiB | 17.4 | 13.7 | 256 |
+| RTX 3090 | Q2_0 | disk, pages evicted every second | 22.1 GiB | 1.5 GiB | 19.7 | 14.4 | 474 |
+| RTX 3090 | IQ3_S | disk, pages evicted every second | 22.1 GiB | 1.7 GiB | 12.3 | 6.0 | 179 |
 | L40S (48 GB) | Coder IQ1_M | pinned host memory | | | 35 | | 1,648 |
 | L40S (48 GB) | Coder IQ1_M | disk, in the page cache | | | 42 | | 1,938 |
 
 The Coder IQ1_M rows are the 28.4 GiB model beside the shared n-gram table on one NVIDIA L40S (48 GB).
-The two RTX 3090 Q2_0 host-memory rows come from two hosts (an earlier build with 512-token prompt
-chunks, and the IQ3_S sitting). The host link carries host and disk experts: PCIe 5.0 x16 on the
-RTX 5090 host, 4.0 x16 on the RTX PRO 6000, RTX 4090 and RTX 3090 hosts. The RTX 4090 rows ran pinned to the GPU's NUMA node; left
-unpinned, host experts decode 40 tok/s and disk experts 32 to 33.
+The host link carries host and disk experts: PCIe 5.0 x16 on the RTX 5090 hosts, 4.0 x16 on the
+RTX PRO 6000 and RTX 4090 hosts, 3.0 x16 on the two-socket RTX 3090 host, whose rows ran pinned to
+the GPU's NUMA node. With host or disk experts a prompt prefills in spans of up to eight chunks, so
+a layer's missing experts cross the link once per span. From the CLI with its defaults, Q2_0 disk
+experts in the page cache and a 7,680-token prompt, the RTX 5090 prefilled at 1,830 tok/s and
+decoded the 16 tokens after it at 115 tok/s, against 450 and 32 when disk experts ran chunk by
+chunk ([all three cards](qwen3-8-flash-next.md#expert-placements)).
 
 Other cards ran the Q2_0 release from the CLI with other prompts, 128 generated tokens, a cold
 expert cache, the files in the page cache (most or all of them on the 8 and 12 GB cards); prefill /
@@ -915,7 +923,7 @@ and the GPU copied the rest
 ([the CPU share](deepseek-v41.md#the-cpu-share-on-one-rtx-4090)). With `--experts 5` (5 of the 6
 experts, another model's output) Strata decodes 44.8 and 42.1 tok/s.
 
-With the release's DSpark drafter, October 26, the same prompts and host experts, on that host and
+With Unsloth's DSpark drafter, October 26, the same prompts and host experts, on that host and
 on an RTX PRO 6000 host (Threadripper PRO 7965WX), where the build before the CPU share copied every
 miss:
 
@@ -928,7 +936,9 @@ miss:
 | RTX 4090 (450 W), `--expert-dma-share 1` | `--spec dspark` | 25.1 | 20.2 | 688 |
 
 Strata 0.2.6 exited with an error in every configuration tried on the RTX PRO 6000 host
-([the drafter](deepseek-v41.md#the-dspark-drafter)).
+([the drafter](deepseek-v41.md#the-dspark-drafter)). The published artifact carries the STQ drafter
+since October 27, which keeps Unsloth's acceptance with half its device memory
+([the STQ drafter](deepseek-v41.md#the-stq-drafter)).
 
 NInfer's native release build of `b3402a6fd` on one GPU of a rented host per card, the same prompts:
 
@@ -945,7 +955,8 @@ That build ran prompts chunk by chunk. [Prompt spans](deepseek-v41.md#prompt-spa
 8,086 tokens at 906 tok/s with host experts and 390 with disk experts on an RTX 4090 host of the
 same type (EPYC 7K62), with the same decode rates.
 
-DeepSeek-V4.1-Flash runs on one GPU only; it has no pipeline stages or tensor parallelism.
+DeepSeek-V4.1-Flash has no pipeline stages; several GPUs divide only its routed experts
+([expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 [DeepSeek-V4.1-Flash's measurements](deepseek-v41.md#measurements) add the hosts, the device
 cache each card holds, context lookup, startup and what limits each engine.
 
@@ -961,7 +972,7 @@ cache each card holds, context lookup, startup and what limits each engine.
 | [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
 | [Gemma 4 26B-A4B](gemma4.md#measurements) | against llama.cpp, KV formats, the assistant's drafts, parallel streams | RTX 3090 |
 | [Flint](flint.md#measurements) | against llama.cpp, host and disk experts, context lookup, typed decisions | RTX 3090, 4090, 5090, A40 |
-| [Field reports](performance/field-reports.md) | users' own measurements: Qwen3.8-27B IQ3_S and its Swift 1.5 fine-tune against llama.cpp, long Qwen Code and agent sessions with DFlash2 and MTP, prefix-cache hits and the time to the first token | RTX 5070 Ti, 4090, 4080 |
+| [Field reports](performance/field-reports.md) | users' own measurements: Qwen3.8-27B IQ3_S and its Swift 1.5 fine-tune against llama.cpp, long Qwen Code and agent sessions with DFlash2 and MTP, prefix-cache hits and the time to the first token, Qwen3.8-27B NVFP4 with tensor parallelism over two and four cards | RTX 5070 Ti, 4090, 4080, 5060 Ti |
 | [Quality trades](maintainer/quality-trade-experiments.md) | what each precision option costs in perplexity and buys in memory or speed | RTX 3090 |
 | [Configuration calculator](config-calculator.html) | which context, KV format and speculation fit an RTX 3090, from measured sizes | RTX 3090 |
 

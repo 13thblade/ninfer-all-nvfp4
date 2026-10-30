@@ -37,6 +37,7 @@ struct ModelFixture {
                                         {"layout", artifact::layout_name(layout)},
                                         {"offset", offset},
                                         {"bytes", geometry.bytes}});
+        cover_payload();
     }
 
     void resource(const std::string& role, const std::string& bytes) {
@@ -48,6 +49,13 @@ struct ModelFixture {
                                         {"offset", offset},
                                         {"bytes", bytes.size()}});
         file.root["components"]["text"]["resources"][role] = role;
+        cover_payload();
+    }
+
+    // The entry file holds the whole payload, so an object added after construction stays in it.
+    void cover_payload() {
+        file.root["files"] =
+            Json::array({{{"path", nullptr}, {"payload_bytes", file.payload.size()}}});
     }
 
     void use(const std::string& name, const std::string& input, std::optional<int> divisor = {}) {
@@ -68,7 +76,22 @@ struct ModelFixture {
         if (!input.empty()) { use(name, input); }
     }
 
-    ModelFixture() {
+    // A reversed input gather of `width` columns on the Use `name`@`input`.
+    void gather(const std::string& name, const std::string& input, std::uint64_t width) {
+        tensor("gather", {width}, QType::INT32);
+        const auto offset = file.root["objects"].back()["offset"].get<std::size_t>();
+        for (std::uint64_t column = 0; column < width; ++column) {
+            put_word(file.payload, offset + 4 * column, width - 1 - column, 4);
+        }
+        for (auto& use : file.root["uses"]) {
+            if (use["parameter"] == name && use["input"] == input) {
+                use["auxiliaries"]["input_columns"] = {{"object", "gather"}};
+            }
+        }
+    }
+
+    explicit ModelFixture(std::uint64_t intermediate = 24, QType down = QType::Q6_G64_FP16,
+                          QuantLayout down_layout = QuantLayout::RowSplit) {
         file.payload.clear();
         file.root = {{"components",
                       {{"text",
@@ -85,7 +108,7 @@ struct ModelFixture {
                            {"num_attention_heads", 2},
                            {"num_key_value_heads", 1},
                            {"head_dim", 8},
-                           {"intermediate_size", 24},
+                           {"intermediate_size", intermediate},
                            {"rope_parameters",
                             {{"rope_theta", 10000},
                              {"partial_rotary_factor", 0.5},
@@ -119,9 +142,9 @@ struct ModelFixture {
         parameter(p + "attention/query_norm", {8});
         parameter(p + "attention/key_norm", {8});
         parameter(p + "attention/output", {128, 16}, p + "attention/gated_output");
-        parameter(p + "mlp/gate", {24, 128}, p + "ffn_input");
-        parameter(p + "mlp/up", {24, 128}, p + "ffn_input");
-        tensor("down-storage", {128, 24}, QType::Q6_G64_FP16, QuantLayout::RowSplit);
+        parameter(p + "mlp/gate", {intermediate, 128}, p + "ffn_input");
+        parameter(p + "mlp/up", {intermediate, 128}, p + "ffn_input");
+        tensor("down-storage", {128, intermediate}, down, down_layout);
         file.root["bindings"][p + "mlp/down"] = {{"object", "down-storage"}};
         use(p + "mlp/down", p + "mlp/product");
 
@@ -157,8 +180,6 @@ struct ModelFixture {
         resource("tokenizer_config.json", Json{{"added_tokens_decoder", decoder}}.dump());
         resource("generation_config.json", Json{{"eos_token_id", {256, 258}}}.dump());
         resource("chat_template.jinja", "a user-provided template, preserved as data");
-        file.root["files"] =
-            Json::array({{{"path", nullptr}, {"payload_bytes", file.payload.size()}}});
     }
 };
 
@@ -324,6 +345,84 @@ void native_uses() {
         "combined coverage hid an incorrect gate/up boundary");
 }
 
+// An input gather (`input_columns`) names the order of a GGUF matrix's stored columns, which only
+// the GGUF linears read. Every other format stores its columns in the input's order, so a gather on
+// it is refused when the model binds it, by the Use's name.
+void input_gathers() {
+    const std::string down    = "text/layers/0/mlp/down";
+    const std::string product = "text/layers/0/mlp/product";
+    for (const bool gguf : {true, false}) {
+        ModelFixture fixture(32, gguf ? QType::GGUF_Q8_0 : QType::Q6_G64_FP16,
+                             gguf ? QuantLayout::GgufBlocks : QuantLayout::RowSplit);
+        fixture.gather(down, product, 32);
+        fixture.file.write();
+        artifact::Reader reader(fixture.file.entry);
+        if (gguf) {
+            const auto plan = qwen::plan_load(reader);
+            const auto& ffn = std::get<qwen::DenseWeights>(plan.weights().text.layers[0].ffn);
+            require(plan.uses(ffn.down)[0].input_columns.has_value(),
+                    "a GGUF matrix lost its input gather");
+            continue;
+        }
+        try {
+            (void)qwen::plan_load(reader);
+        } catch (const artifact::ArtifactError& error) {
+            const std::string message = error.what();
+            require(message.starts_with(down + "@" + product + ": an input gather"),
+                    "the refused input gather does not name its Use");
+            continue;
+        }
+        throw std::runtime_error("a row-split Q6 matrix accepted an input gather");
+    }
+
+    // The Op preparation refuses it too.
+    const std::array<std::uint64_t, 2> shape{128, 64};
+    std::vector<std::int32_t> order(64);
+    for (std::int32_t column = 0; column < 64; ++column) { order[column] = 63 - column; }
+    const Tensor columns(order.data(), DType::I32, {64});
+    const auto native = weight_geometry(QType::Q6_G64_FP16, QuantLayout::RowSplit, shape);
+    const auto blocks = weight_geometry(QType::GGUF_Q8_0, QuantLayout::GgufBlocks, shape);
+    std::vector<std::byte> bytes(std::max(native.bytes, blocks.bytes));
+    const WeightParent native_parent{native, bytes.data(), 0.0F};
+    const WeightParent gguf_parent{blocks, bytes.data(), 0.0F};
+    const WeightView native_view{{128, 64}, {{&native_parent, 0, 8192}}};
+    const WeightView gguf_view{{128, 64}, {{&gguf_parent, 0, 8192}}};
+    require(ops::prepare_linear_weight({gguf_view, ops::LinearPolicy::A16Only, {}, {}, columns})
+                    .weight.input_columns == order.data(),
+            "a GGUF matrix lost its input gather");
+    rejects<std::invalid_argument>(
+        [&] {
+            (void)ops::prepare_linear_weight(
+                {native_view, ops::LinearPolicy::A16Only, {}, {}, columns});
+        },
+        "a native linear accepted an input gather it does not read");
+}
+
+// A dense GGUF release may keep an untied BF16 output head beside its block-format token table: the
+// head binds as BF16 with its Use, the table as GGUF blocks.
+void bf16_head_beside_gguf_blocks() {
+    ModelFixture fixture;
+    fixture.file.root["components"]["text"]["config"]["tie_word_embeddings"] = false;
+    fixture.tensor("embedding-blocks", {272, 128}, QType::GGUF_Q8_0, QuantLayout::GgufBlocks);
+    fixture.file.root["bindings"]["text/token_embedding"] = {{"object", "embedding-blocks"}};
+    for (auto& use : fixture.file.root["uses"]) {
+        if (use["parameter"] == "text/output_head") { use["activation_policy"] = "A16Only"; }
+    }
+    fixture.file.write();
+    artifact::Reader reader(fixture.file.entry);
+    const auto plan   = qwen::plan_load(reader);
+    const auto format = [&](qwen::WeightId id) {
+        return reader.geometry(plan.parameter(id).binding.parts.at(0).object).format;
+    };
+    const auto& text = plan.weights().text;
+    require(format(text.output_head) == QType::BF16 &&
+                format(text.token_embedding) == QType::GGUF_Q8_0,
+            "a BF16 head beside a GGUF token table did not bind as stored");
+    require(plan.uses(text.output_head).size() == 1 &&
+                plan.uses(text.output_head)[0].policy == ops::LinearPolicy::A16Only,
+            "the BF16 head lost its Use");
+}
+
 void invalid_model_data() {
     ModelFixture fixture;
     const Json original = fixture.file.root;
@@ -356,6 +455,8 @@ int main() {
     try {
         logical_data_and_instances();
         native_uses();
+        input_gathers();
+        bf16_head_beside_gguf_blocks();
         invalid_model_data();
         std::cout << "model config, binding, resources and Use checks passed\n";
         return 0;

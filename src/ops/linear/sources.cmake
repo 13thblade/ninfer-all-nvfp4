@@ -1,5 +1,6 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/linear.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/part_projection.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/common/route_table.cpp"
 )
 
@@ -13,3 +14,4 @@ include("${CMAKE_CURRENT_LIST_DIR}/q8/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/sm70/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/t2/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gguf/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/stq/sources.cmake")

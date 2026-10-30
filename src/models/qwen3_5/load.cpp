@@ -6,11 +6,15 @@
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
 #include "core/stage_plan.h"
+#include "core/tensor_split.h"
 #include "models/qwen3_5/load/bindings.h"
 #include "models/qwen3_5/load/vision_cpu.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace ninfer::models::qwen3_5 {
@@ -182,6 +186,64 @@ std::uint64_t parameter_bytes(const artifact::Reader& reader, const loading::Bin
     return total;
 }
 
+// The device bytes of what the head stage (rank 0 under tensor parallelism) holds beside its layers
+// or its share: the embedding, the head and the final norm, and as selected a resident Vision
+// tower, MTP's layer, a DFlash drafter's own weights and the proposal head the drafts project onto.
+// Binds them into `bindings` only to size them.
+std::uint64_t head_stage_bytes(const artifact::Reader& reader, loading::Bindings& bindings,
+                               const Config& config, const TextWeights& weights,
+                               const LoadOptions& options) {
+    const auto& text       = config.text;
+    std::uint64_t out      = parameter_bytes(reader, bindings, weights.token_embedding) +
+                             parameter_bytes(reader, bindings, weights.output_head) +
+                             parameter_bytes(reader, bindings, weights.final_norm);
+    const auto bound_since = [&](std::size_t first) {
+        std::uint64_t bytes = 0;
+        for (std::size_t index = first; index < bindings.weights.size(); ++index) {
+            bytes += parameter_bytes(reader, bindings, WeightId{index});
+        }
+        return bytes;
+    };
+    if (config.vision && options.vision && !options.host_staged_vision()) {
+        // A resident Vision tower runs where the embedding is.
+        const std::size_t first = bindings.weights.size();
+        (void)loading::bind_vision(bindings, *config.vision, text.hidden_size,
+                                   artifact::Residency::Device);
+        out += bound_since(first);
+    }
+    if (config.mtp) {
+        // MTP's own parameters; it shares the target's embedding and head.
+        const std::size_t first = bindings.weights.size();
+        (void)loading::bind_mtp(bindings, text, weights);
+        out += bound_since(first);
+    }
+    if (config.draft && options.masked_draft()) {
+        // The drafter shares the target's embedding and head, so only what it binds anew counts.
+        const std::size_t first = bindings.weights.size();
+        (void)loading::bind_draft(bindings, *config.draft, text, weights,
+                                  std::string(options.speculative_component()));
+        out += bound_since(first);
+    }
+    const auto& proposal = reader.directory().component("text").proposal;
+    if (options.proposal_enabled() && proposal) {
+        // Sized only: plan_load checks the head's rows against the tokenizer's public tokens.
+        const std::size_t first = bindings.weights.size();
+        (void)loading::bind_proposal(bindings, *proposal, text, options,
+                                     std::numeric_limits<std::uint32_t>::max());
+        out += bound_since(first);
+    }
+    return out;
+}
+
+// KV bytes per token of MTP's layer, which keeps every KV head on the head stage; 0 without MTP.
+std::uint64_t mtp_kv_bytes_per_token(const Config& config, KvCacheStorage kv_storage) {
+    if (!config.mtp || !config.text.attention) { return 0; }
+    const auto& attention = *config.text.attention;
+    const PagedKVStorageLayout storage =
+        paged_kv_storage_layout(kv_storage, static_cast<std::int32_t>(attention.head_dim));
+    return std::uint64_t(attention.num_key_value_heads) * storage.physical_bytes_per_token_head();
+}
+
 } // namespace
 
 std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
@@ -202,7 +264,6 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
 
     std::vector<LayerCost> layers;
     layers.reserve(weights.layers.size());
-    std::uint64_t layer_bytes_total = 0;
     for (std::size_t layer = 0; layer < weights.layers.size(); ++layer) {
         LayerCost cost;
         for (const WeightId id : loading::layer_weights(weights.layers[layer])) {
@@ -226,43 +287,23 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
                 dtype_size(options.gdn_state_fp16 ? DType::FP16 : DType::FP32);
             cost.state_bytes = sizing.state_slots * (conv_bytes + recurrent_bytes);
         }
-        layer_bytes_total += cost.weight_bytes;
         layers.push_back(cost);
     }
 
-    // The head stage keeps the embedding, the head and the final norm; a resident Vision tower, MTP's
-    // layer, or a DFlash drafter's layers and feature projection, sit with them.
-    std::uint64_t head_bytes = parameter_bytes(reader, bindings, weights.token_embedding) +
-                               parameter_bytes(reader, bindings, weights.output_head) +
-                               parameter_bytes(reader, bindings, weights.final_norm);
-    if (config.mtp && options.speculative == SpeculativeBackend::Mtp) {
-        head_bytes += layer_bytes_total / std::max<std::size_t>(layers.size(), 1);
-    }
-    if (config.vision && options.vision && !options.host_staged_vision()) {
-        // A resident Vision tower runs where the embedding is.
-        const std::size_t first = bindings.weights.size();
-        (void)loading::bind_vision(bindings, *config.vision, text.hidden_size,
-                                   artifact::Residency::Device);
-        for (std::size_t index = first; index < bindings.weights.size(); ++index) {
-            head_bytes += parameter_bytes(reader, bindings, WeightId{index});
-        }
-    }
-    if (config.draft && options.masked_draft()) {
-        // The drafter shares the target's embedding and head, so only what it binds anew counts.
-        const std::size_t first = bindings.weights.size();
-        (void)loading::bind_draft(bindings, *config.draft, text, weights,
-                                  std::string(options.speculative_component()));
-        for (std::size_t index = first; index < bindings.weights.size(); ++index) {
-            head_bytes += parameter_bytes(reader, bindings, WeightId{index});
-        }
-    }
+    // The head stage keeps the embedding, the head, the final norm and what drafts and Vision add,
+    // and MTP's KV for every page group. Automatic KV capacity keeps headroom free on every device.
+    const std::uint64_t head_bytes = head_stage_bytes(reader, bindings, config, weights, options);
+    const std::uint64_t mtp_kv     = static_cast<std::uint64_t>(kPagedKVPageSize) *
+                                     mtp_kv_bytes_per_token(config, sizing.kv_storage);
+    const std::uint64_t headroom   = sizing.automatic_kv ? sizing.kv_headroom_bytes : 0;
 
     std::vector<StageBudget> budgets;
     budgets.reserve(free_bytes.size());
     for (std::size_t stage = 0; stage < free_bytes.size(); ++stage) {
-        budgets.push_back({.available_bytes = free_bytes[stage],
-                           .fixed_bytes     = kStageFixedBytes +
-                                          (stage == 0 ? kHeadStageFixedBytes + head_bytes : 0)});
+        budgets.push_back(
+            {.available_bytes = free_bytes[stage] > headroom ? free_bytes[stage] - headroom : 0,
+             .fixed_bytes = kStageFixedBytes + (stage == 0 ? kHeadStageFixedBytes + head_bytes : 0),
+             .kv_bytes_per_page_group = stage == 0 ? mtp_kv : 0});
     }
     // The estimates above are rough. When they say nothing fits, deal the layers out evenly and let
     // the Program's exact planning accept the split or report which device runs out.
@@ -279,6 +320,95 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
         counts.push_back(plan.stage_layers(stage));
     }
     return counts;
+}
+
+std::vector<double> default_tensor_split(const artifact::Reader& reader, LoadOptions options,
+                                         const StageSizing& sizing,
+                                         std::span<const std::uint64_t> free_bytes,
+                                         std::span<const double> speed) {
+    if (free_bytes.size() < 2 || speed.size() != free_bytes.size()) {
+        throw std::invalid_argument("a tensor split needs the free bytes and speed of each rank");
+    }
+    // Bind the text model whole on one device purely to size its parts.
+    options.ranks = 1;
+    options.tensor_parallel = false;
+    options.tensor_split.clear();
+    options.stage_layers.clear();
+    const Config config = parse_config(reader.directory(), options);
+    const auto& text    = config.text;
+    artifact::Binder binder(reader);
+    loading::Bindings bindings(binder, options);
+    const TextWeights weights =
+        loading::bind_text(bindings, text, options, StagePlan(text.num_hidden_layers));
+    const auto bytes = [&](WeightId id) { return parameter_bytes(reader, bindings, id); };
+
+    // GDN and KV heads and FFN rows or experts, with their state and KV cache
+    std::uint64_t divided = 0;
+    std::uint64_t every   = 0; // what each rank holds whole: norms, GDN gating, the router
+    std::uint64_t first   = 0; // rank 0 alone: embedding, head, shared expert
+    for (std::size_t layer = 0; layer < weights.layers.size(); ++layer) {
+        const BlockWeights& block = weights.layers[layer];
+        every += bytes(block.input_norm) + bytes(block.post_attention_norm);
+        if (const auto* gdn = std::get_if<GdnWeights>(&block.mixer)) {
+            divided += bytes(gdn->query) + bytes(gdn->key) + bytes(gdn->value) + bytes(gdn->z) +
+                       bytes(gdn->convolution) + bytes(gdn->output);
+            every += bytes(gdn->a_projection) + bytes(gdn->b_projection) + bytes(gdn->a_log) +
+                     bytes(gdn->dt_bias) + bytes(gdn->norm);
+        } else {
+            const auto& attention = std::get<AttentionWeights>(block.mixer);
+            divided += bytes(attention.query) + bytes(attention.key) + bytes(attention.gate) +
+                       bytes(attention.value) + bytes(attention.output);
+            every += bytes(attention.query_norm) + bytes(attention.key_norm);
+        }
+        if (const auto* dense = std::get_if<DenseWeights>(&block.ffn)) {
+            divided += bytes(dense->gate) + bytes(dense->up) + bytes(dense->down);
+            continue;
+        }
+        // Expert parallelism: every rank routes, rank 0 holds the shared expert.
+        const auto& moe   = std::get<MoeWeights>(block.ffn);
+        const auto expert = [&](const DenseWeights& e) {
+            return bytes(e.gate) + bytes(e.up) + bytes(e.down);
+        };
+        const std::uint64_t router = bytes(moe.router) + bytes(moe.shared_score);
+        std::uint64_t experts      = 0;
+        for (const DenseWeights& e : moe.experts) { experts += expert(e); }
+        every += router;
+        first += expert(moe.shared);
+        divided += experts;
+    }
+    if (text.gdn) {
+        const auto& gdn = *text.gdn;
+        const std::uint64_t conv_bytes =
+            gdn.conv_channels() * (gdn.linear_conv_kernel_dim - 1) * dtype_size(DType::BF16);
+        const std::uint64_t recurrent_bytes =
+            static_cast<std::uint64_t>(gdn.linear_key_head_dim) * gdn.linear_value_head_dim *
+            gdn.linear_num_value_heads *
+            dtype_size(options.gdn_state_fp16 ? DType::FP16 : DType::FP32);
+        divided += std::uint64_t(text.linear_attention_layers) * sizing.state_slots *
+                   (conv_bytes + recurrent_bytes);
+    }
+    if (text.attention) {
+        const PagedKVStorageLayout storage = paged_kv_storage_layout(
+            sizing.kv_storage, static_cast<std::int32_t>(text.attention->head_dim));
+        divided += sizing.kv_tokens * text.full_attention_layers *
+                   text.attention->num_key_value_heads * storage.physical_bytes_per_token_head();
+    }
+    // Rank 0 also holds the head stage's parts and MTP's KV, whose heads stay whole there.
+    first += head_stage_bytes(reader, bindings, config, weights, options) + kHeadStageFixedBytes +
+             sizing.kv_tokens * mtp_kv_bytes_per_token(config, sizing.kv_storage);
+    if (divided == 0) { return std::vector<double>(speed.begin(), speed.end()); }
+
+    // Automatic KV capacity keeps headroom free on every device, and its KV shrinks to what fits.
+    const std::uint64_t headroom = sizing.automatic_kv ? sizing.kv_headroom_bytes : 0;
+    std::vector<double> capacity(free_bytes.size());
+    for (std::size_t rank = 0; rank < free_bytes.size(); ++rank) {
+        const std::uint64_t whole = kStageFixedBytes + headroom + every + (rank == 0 ? first : 0);
+        capacity[rank] = free_bytes[rank] > whole
+                             ? static_cast<double>(free_bytes[rank] - whole) /
+                                   static_cast<double>(divided)
+                             : 0.0;
+    }
+    return fill_shares(speed, capacity, sizing.automatic_kv);
 }
 
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,

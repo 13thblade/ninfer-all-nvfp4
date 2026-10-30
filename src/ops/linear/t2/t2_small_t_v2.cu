@@ -29,10 +29,17 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
         throw std::invalid_argument("t2 small-T v2: unsupported shape");
     }
     const dim3 grid(static_cast<unsigned>(rows / Schedule::kRows), 1u, 1u);
-    t2_small_t_v2_kernel<Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), rows, k,
-        cols);
+    const auto launch_out = [&]<class Out>() {
+        t2_small_t_v2_kernel<Schedule, Out><<<grid, Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), static_cast<Out*>(out.data), rows, k,
+            cols);
+    };
+    if (out.dtype == DType::FP32) {
+        launch_out.template operator()<float>();
+    } else {
+        launch_out.template operator()<__nv_bfloat16>();
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

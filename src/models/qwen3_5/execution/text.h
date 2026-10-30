@@ -247,6 +247,11 @@ private:
     }
 
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
+    // Position-split attention's second half on a rank: the merge of every rank's partial for its
+    // query heads, gated by the gates attn_mix kept, and its share of the output projection.
+    void attn_merge_output(const BlockParameters& weights, Tensor& x,
+                           std::span<const float* const> partials, const Tensor& gate,
+                           Phase phase);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints);
@@ -273,7 +278,7 @@ private:
     // The GDN and FFN geometry of the rank a pass is issuing: a tensor-parallel share, or the model.
     [[nodiscard]] const TextConfig& layer_config() const noexcept {
         return stage_runtime_ != nullptr && stage_runtime_->tensor_parallel
-                   ? stage_runtime_->tensor_parallel->shard
+                   ? stage_runtime_->tensor_parallel->shards[tensor_rank_]
                    : config_;
     }
     // A mixer's output projection: added to the residual, or in a tensor-parallel pass written to
@@ -404,6 +409,11 @@ private:
     // projections write their FP32 partial instead of adding to the residual.
     std::size_t tensor_rank_  = 0;
     Tensor* residual_partial_ = nullptr;
+    // A position-split attention pass: where the rank's attention writes its FP32 partial output
+    // (ops::causal_attention_partial_elements) and where it keeps its query heads' gates [256,
+    // heads, T] for attn_merge_output, in place of the output projection.
+    float* attention_partial_ = nullptr;
+    Tensor* attention_gate_   = nullptr;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

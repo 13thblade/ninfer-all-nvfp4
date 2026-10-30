@@ -47,14 +47,21 @@ the command for each published artifact.
 ## Native Ubuntu 24.04 build
 
 Install the CUDA Toolkit from NVIDIA (12.8 or newer, 13.1 or newer for `120a`).
-Then install the host compiler and media dependencies:
+Then install the host compiler and build tools:
 
 ```bash
 sudo apt-get update
 sudo apt-get install --yes \
   build-essential gcc-13 g++-13 cmake ninja-build pkg-config \
-  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-  libcurl4-openssl-dev
+  meson nasm zlib1g-dev libcurl4-openssl-dev
+```
+
+The build compiles FFmpeg and dav1d (its AV1 decoder) from their release archives and links them
+in, with only the decoders of the [media formats](serving.md#media-formats). Download the archives
+once; the script checks their SHA-256 digests and keeps them in `third_party/media-sources`:
+
+```bash
+scripts/fetch-media-sources.sh
 ```
 
 Select GCC 13 for host and CUDA compilation:
@@ -199,10 +206,16 @@ speed, and the kernels written for Ampere everywhere else, on emulated warp prim
   here, stays A16.
 - **Weight layout**: the row-split projection weights of the text and MTP layers (T2, Q2, Q4, Q5,
   Q6) load in the panel layout, four rows' records of a group per 128-byte line, which the
-  decode reads stream at a larger share of the card's bandwidth.
+  decode reads stream at a larger share of the card's bandwidth. A tensor-parallel rank's pieces
+  of them take it too, each permuted after its upload, and its FP32 partial sums run the same
+  Volta routes.
 - **GGUF projections** keep NInfer's DP4A vector kernel up to eight columns and ggml's DP4A matrix
   kernel above (as llama.cpp does on Volta); GGUF dense projections from 65 columns take the cuBLAS
-  route.
+  route. The routed experts' matrix products (prompt chunks of Flash-Next, Gemma 4, Flint and
+  DeepSeek) run on the FP16 tensor cores instead of `dp4a`: each lane decodes its row's GGUF slices
+  into FP16 fragments, and the activation is an FP16 plane with one power-of-two factor per column,
+  which keeps BF16's range (`ggml_bridge_sm70.cuh`). Gemma 4 26B-A4B QAT on one Tesla V100-SXM2
+  prefills a 9,705-token prompt at 3,422 tok/s against 2,499 with `dp4a` (+37%; 2026-10-27).
 - **Attention** of every KV format runs on Volta's tensor cores with FP32 accumulation. Decode and
   verification use a Volta kernel that decodes each format's keys and values to FP16 as it loads
   them (32 dimensions of a quantized row a load), with the same fused append, splits and reducers
@@ -229,8 +242,9 @@ calibrates at first start, in about nine seconds (see [device profiles](device-p
 
 ## Optional vcpkg dependencies
 
-Linux can use the pinned `vcpkg.json` manifest instead of system FFmpeg and curl packages.
-Bootstrap the pinned vcpkg revision:
+Linux can take libcurl from the pinned `vcpkg.json` manifest instead of the system package.
+FFmpeg still comes from its release archive: vcpkg also builds the manifest's FFmpeg, which only
+Windows builds link. Bootstrap the pinned vcpkg revision:
 
 ```bash
 git clone https://github.com/microsoft/vcpkg.git "$HOME/.local/share/vcpkg"
@@ -262,6 +276,7 @@ CMake configure command as `-DNAME=VALUE`.
 | `NINFER_PDL=ON` | on a `120a` build of the `mma.sync` path, launches decode-graph kernels as programmatic dependents, so a kernel stages its weights while the one before it finishes (the native routes always do) |
 | `NINFER_TMA_STAGING=ON` | passes the NVFP4 TMA descriptors through device memory with a capturable staging kernel, as Windows builds must, so that path can be tested on Linux (`120a`) |
 | `NINFER_MULTICALL=ON` | Linux: links `ninfer`, `ninfer-serve`, `ninfer-calibrate` and `ninfer-perplexity` into one executable, `apps/ninfer-multicall`, with the four names as symlinks to it, so the kernel image (about 0.5 GB per architecture) is there once instead of four times; the container image is built this way |
+| `NINFER_MEDIA_SOURCES_DIR=PATH` | Linux: reads the FFmpeg and dav1d release archives from that directory instead of `third_party/media-sources` (`scripts/fetch-media-sources.sh PATH` fills it) |
 | `NINFER_MEDIA_NATIVE_PNG=ON` | decodes PNG images natively instead of through FFmpeg, as Windows builds do by default, so that decoder can be tested on Linux |
 | `NINFER_DIRECTSTORAGE=ON` | Windows: fetches the DirectStorage 1.3 runtime and offers `--disk-kv-directstorage` for disk-tier restores |
 

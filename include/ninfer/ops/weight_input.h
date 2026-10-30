@@ -39,24 +39,25 @@ struct PairedProjectionWeights {
     Tensor hadamard_signs{};
 };
 
-// A fused input projection over GGUF matrices, whose logical parts may sit in different parents
-// of different block types. Each part is rows of one parent landing at `row` of output `output`:
-// for a GDN projection 0 = q/k/v and 1 = z; for an attention projection 0 = query, 1 = gate,
-// 2 = key and 3 = value.
-struct GgufProjectionPart {
+// An input projection over parts that no single native route reads as one parent: GGUF matrices,
+// which may sit in different parents of different block types, or a tensor-parallel rank's pieces
+// of BF16, row-split, FP8 or NVFP4 projections. Each part is rows of one parent landing at `row` of
+// output `output`: for a GDN projection 0 = q/k/v and 1 = z; for an attention projection 0 = query,
+// 1 = gate, 2 = key and 3 = value. The parts are all GGUF or all of the other formats.
+struct ProjectionPart {
     Weight weight;
     std::int32_t output = 0;
     std::int32_t row    = 0;
 };
 
-struct GgufProjectionWeights {
-    std::vector<GgufProjectionPart> parts;
+struct PartProjectionWeights {
+    std::vector<ProjectionPart> parts;
     LinearPolicy policy = LinearPolicy::A16Only;
     Tensor hadamard_signs{};
 };
 
 using ProjectionWeights =
-    std::variant<SingleProjectionWeight, PairedProjectionWeights, GgufProjectionWeights>;
+    std::variant<SingleProjectionWeight, PairedProjectionWeights, PartProjectionWeights>;
 
 // Whether the rows of `inputs`, in order, are one contiguous region of one parent.
 [[nodiscard]] bool joins(std::span<const WeightInput> inputs);
@@ -86,5 +87,14 @@ prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_
                            std::span<const WeightInput> expert_gate_up,
                            std::span<const WeightInput> expert_down, const WeightInput& shared_gate,
                            const WeightInput& shared_up, const WeightInput& shared_down);
+// One device's expert-parallel share of SparseMoe (sparse_moe_share): its experts' gate/up and
+// down inputs in expert order, each list joining into one bank; the shared expert's three inputs
+// only on the device that holds it (all null elsewhere). Where the devices divide every expert's
+// intermediate columns instead, each input is that device's half: [256,2048] gate and up rows,
+// [2048,256] down columns, the shared expert's likewise on every device.
+[[nodiscard]] SparseMoeWeights prepare_sparse_moe_share_weights(
+    const WeightInput& router, const WeightInput& shared_score,
+    std::span<const WeightInput> expert_gate_up, std::span<const WeightInput> expert_down,
+    const WeightInput* shared_gate, const WeightInput* shared_up, const WeightInput* shared_down);
 
 } // namespace ninfer::ops

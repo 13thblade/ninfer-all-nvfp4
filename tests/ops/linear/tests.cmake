@@ -2,7 +2,7 @@ add_library(ninfer_linear_test_support STATIC
   "${CMAKE_CURRENT_LIST_DIR}/linear_test_common.cpp")
 ninfer_test_includes(ninfer_linear_test_support)
 ninfer_op_oracle_options(ninfer_linear_test_support)
-target_link_libraries(ninfer_linear_test_support PUBLIC ninfer_ops)
+target_link_libraries(ninfer_linear_test_support PUBLIC ninfer_ops ninfer_artifact)
 
 ninfer_add_op_test(ninfer_linear_q4_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_a16.cpp"
@@ -18,6 +18,11 @@ ninfer_add_op_test(ninfer_linear_q6_a16_test
 
 ninfer_add_op_test(ninfer_linear_q8_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q8_a16.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
+# A tensor-parallel share's projections: shapes outside the tuned tables, BF16 or FP32 out.
+ninfer_add_op_test(ninfer_linear_rowsplit_runtime_shape_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rowsplit_runtime_shape.cpp"
   LIBRARIES ninfer_linear_test_support)
 
 ninfer_add_op_test(ninfer_linear_t2_a16_test
@@ -60,6 +65,11 @@ ninfer_add_op_test(ninfer_nvfp4_tma_staging_race_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_tma_staging_race.cpp"
   LIBRARIES ninfer_ops)
 
+# Two ranks' FP8 and NVFP4 shares on two streams of one card, each against the call alone.
+ninfer_add_op_test(ninfer_tma_shared_card_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tma_shared_card.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_linear_fp8_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_a16.cpp"
   LIBRARIES ninfer_linear_test_support)
@@ -90,3 +100,9 @@ ninfer_add_op_test(ninfer_linear_gguf_cooperative_test
 target_include_directories(ninfer_linear_gguf_cooperative_test PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/include"
   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+
+# STQ products (the sushi DSpark drafter's matrices) against an FP64 oracle over an independent
+# decode of the trellis.
+ninfer_add_op_test(ninfer_linear_stq_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_stq.cpp"
+  LIBRARIES ninfer_ops)

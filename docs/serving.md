@@ -85,8 +85,20 @@ three drafts are ready the width stays at three or more, so the Engine captures 
 widths `min(3, K)..K`: the graph memory, and the startup capture time, grow with the number of
 widths. Committed tokens are still the target's greedy choices, but attention splits its
 reduction by the verify width, so a near-tie can resolve differently at another width, as it does
-between two fixed `--draft-tokens` settings. The per-request log reports the rounds run at each
+between two fixed `--draft-tokens` settings (`--invariant-attention` removes attention's part of
+that difference; the other Ops keep theirs). The per-request log reports the rounds run at each
 width and the width changes.
+
+The Flash-Next, Gemma 4, Flint and DeepSeek-V4.1 Engines verify a round's rows packed at their
+own widths: a request verifies its anchor and the drafts it can take (its own extent after the
+draft floor, a lookup's length, and its output budget), not the widest request's. A round where a
+request gathers logprobs keeps every request at the round's width. With `--adaptive-mtp` these
+Engines also plan each request's extent: they price a round by the rows it verifies, from the
+round times measured at each total, and keep the extents that give the most expected committed
+tokens per second, so a request whose drafts stop surviving verifies fewer of them while one whose
+drafts survive verifies all. The Qwen3.5 Programs keep one width per round (their verification
+runs from CUDA Graphs per batch and width; attention and Gated DeltaNet already skip the columns
+past each request's extent).
 
 ### MTP attention window
 
@@ -110,7 +122,9 @@ A window is funded from free KV pages when they cover it. Those pages hold nothi
 copied, the text weights stay mapped, and the encode runs on its own stream while other lanes keep
 decoding: the lane that owns the image simply yields its prefill units until the encode completes.
 The pages are out of circulation while the loan is open, so the admission capacity shrinks with it
-and no request is ever admitted into memory that has been lent away.
+and no request is ever admitted into memory that has been lent away. A device holds one window at a
+time: a lane that must encode while another lane's early encode holds the window waits for that
+encode to finish and returns its window first; the other lane's embeddings wait in its pinned slot.
 
 When free pages cannot cover the window, it falls back to the evict-ranked tail of the text weights
 (lm_head, token embedding, draft head, MTP head), restored from a pinned mirror before the prefill
@@ -142,6 +156,9 @@ Gemma 4 places its tower the same three ways with its own mechanics: `overlay` k
 blocks' matrices in pinned host memory and streams them through a two-block device window during
 each encode (about 0.14 GiB of device memory instead of 1.07 GiB), and `cpu` runs an FP32 tower
 with AVX2/FMA kernels. Its budgets, layout and measurements are in [Gemma 4](gemma4.md#images-and-video).
+DeepSeek-V4.1 keeps its tower `resident` or `overlay`, which streams the 32 blocks' matrices
+through a two-block device window as Gemma 4's does, and refuses `cpu`
+([DeepSeek-V4.1](deepseek-v41.md#images)).
 
 ### Image detail
 
@@ -153,7 +170,8 @@ for a cheaper and coarser look. The same bytes at both details are prepared, cac
 two different images. Any other value is refused with `image_detail_not_supported`, or read as
 `auto` when the server runs with `--lenient-image-detail`. Gemma 4 maps the three to its budgets:
 `low` 70 soft tokens, `auto` the release's 280, `high` the `--vision-max-merged` bound (1120 by
-default).
+default). DeepSeek-V4.1 gives an image's span at most the release's 1024 prompt positions (fewer
+with `--vision-max-merged`) at `auto` and `high`, and a quarter of that at `low`.
 
 ## Several models (router)
 
@@ -806,14 +824,25 @@ they advance during a long request rather than at its completion, and their rati
 A build configured with `-DNINFER_WEBUI_DIR=<dir>` compiles the files of a built WebUI into
 `ninfer-serve` and serves them on `GET /`; any other `GET` path outside the API routes returns the
 entry page, for the UI's client-side router. The static files need no API key, the API routes it
-calls still do. `--no-webui` turns it off at startup. The build never downloads anything:
-`scripts/fetch-webui.sh [tag]` unpacks one of llama.cpp's released WebUIs, which speaks this
-server's `/props`, `/slots`, `/v1/models` and streamed Chat Completions, and prints the directory to
-configure with.
+calls still do. `--no-webui` turns it off at startup. The Linux release packages and the Docker
+images carry llama.cpp's WebUI at the release `scripts/fetch-webui.sh` pins; the Windows packages
+carry none. The build never downloads anything: `scripts/fetch-webui.sh [tag]` unpacks one of
+llama.cpp's released WebUIs, which speaks this server's `/props`, `/slots`, `/v1/models` and
+streamed Chat Completions, and prints the directory to configure with.
 
 ```bash
 ./scripts/fetch-webui.sh
 cmake -S . -B build -DNINFER_WEBUI_DIR=<the directory it printed>
+```
+
+`--ui-config-file PATH` gives the WebUI settings that survive a restart: the file holds one JSON
+object of the WebUI's setting keys, which `/props` reports as `ui_settings` and the WebUI applies
+in place of its own defaults. Configured MCP servers are its `mcpServers` key, a JSON string of an
+array of `{url, headers}` entries. A missing file, malformed JSON or a value that is not an object
+stops the server at startup. Every client that may read `/props` sees the file, headers included.
+
+```json
+{"mcpServers": "[{\"url\": \"http://127.0.0.1:9000/mcp\"}]", "theme": "dark"}
 ```
 
 The WebUI's MCP client cannot reach an MCP server from the browser: the Streamable HTTP transports
@@ -1281,6 +1310,22 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 
+### Media formats
+
+Linux builds, the Linux archives and the container images contain FFmpeg 9.0.2, built with only
+these formats ([`cmake/NinferFFmpeg.cmake`](../cmake/NinferFFmpeg.cmake)):
+
+| Media | Formats |
+|---|---|
+| Images | JPEG, PNG, WebP, BMP, GIF |
+| Video containers | MP4, MOV, WebM, Matroska, animated GIF |
+| Video codecs | H.264, HEVC, AV1, VP8, VP9, MPEG-4 Part 2 |
+
+Decoding ignores audio tracks. A file in another format returns HTTP 400 `invalid_media`.
+`tests/test_media_decode.cpp` decodes one file of each listed format and refuses AVI, FFV1 video
+in Matroska and TIFF. The Windows archives decode through the FFmpeg DLLs they ship, which come from
+vcpkg and have a different set of formats; PNG images decode without FFmpeg there.
+
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
 media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
 has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision limit is therefore
@@ -1488,8 +1533,10 @@ and `levels: [{label, description}]` for a `score`; a `predicate` is a noul -- w
 limits, and answers with `answers` in question order: a `predicate` with its `probability`, a
 `choice` with `choice`, `probabilities: [{value, probability}]` and `confidence`, a `score` with
 `score`, `probabilities: [{value, label, probability}]` and `confidence`, and every answer with its
-`margin`; `name` is echoed, null for an unnamed question. `safety_identifier` is accepted and
-ignored; streaming, tools and refusal scoring are not implemented.
+`margin`; `name` is echoed, null for an unnamed question. `diagnostics` is an array in question
+order with each answer's `label_mass`, `argmax_is_label` and `readout`, as System One's carries them
+by id. `safety_identifier` is accepted and ignored; streaming, tools and refusal scoring are not
+implemented.
 
 Every read of a request starts with the same system turn, context and state, and its prompt carries
 explicit cache boundaries after the system turn and after the state, so the first read about a new
@@ -2137,8 +2184,12 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device N` | CUDA device index | `0` |
 | `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8; the cards may differ where the build runs on each; see [pipeline stages](maintainer/pipeline-stages.md)); on the Qwen3.5 family MTP, DFlash, DFlash2 and resident or CPU Vision run across the stages (the Vision tower stays on the first device; `--vision-residency overlay` is refused); overrides `--device` | none |
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
-| `--tensor-parallel` | the `--devices` share every layer instead of dividing the layers: GDN heads and dense FFN rows per device, attention, KV, head and MTP on the first; dense Qwen3.5-core models with GGUF weights ([tensor parallelism](maintainer/pipeline-stages.md#tensor-parallelism)) | off |
+| `--tensor-parallel` | the `--devices` share every layer instead of dividing the layers: GDN heads, KV heads with their query heads and cache, and dense FFN rows or MoE experts per device, the head, the shared expert and MTP on the first; Qwen3.5-core models in every weight format, MoE experts on the devices ([tensor parallelism](maintainer/pipeline-stages.md#tensor-parallelism)); Qwen3.8-Flash-Next by GDN key heads, sparse-attention KV heads and GGUF expert banks on the devices ([its tensor parallelism](maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next)); Gemma 4 and Flint divide only their routed experts on the devices, DeepSeek-V4.1-Flash its host or disk experts ([expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)) | off |
+| `--tensor-split A,B,...` | with `--tensor-parallel`, the relative size of each device's share, one positive number per `--devices` entry; shares end on whole stored blocks, so the split is the nearest one the weights allow | by each card's measured copy bandwidth, capped by its free memory |
+| `--tensor-attention heads\|positions` | with `--tensor-parallel` on a Qwen3.5-core model, how attention divides: `heads` gives each device a range of KV heads with their query heads and cache planes, the devices past the KV heads holding none; `positions` gives every device every head of the cache pages `p % devices == device`, and the devices merge their partial outputs ([attention by positions](maintainer/pipeline-stages.md#attention-by-positions)) | `heads` |
+| `--invariant-attention` | Qwen3.5-core models: every text attention call of 1 to 16 columns per sequence (64 for one sequence verifying a lookup window longer than 15) reduces its keys in fixed segments of the context, so a column's attention output is the same bytes at any decode width, verification window and batch ([invariant attention](maintainer/qwen3_5-model.md#invariant-attention)); MTP attention keeps its tuned splits | off |
 | `--expert-residency device\|host\|disk` | routed MoE experts on GPU, in pinned host memory, or in artifact files: [native Qwen](maintainer/qwen3_5-model.md#routed-expert-residency), [Gemma 4](gemma4.md#expert-residency), [Flint](flint.md#expert-residency) and [Flash-Next](qwen3-8-flash-next.md#run). Native Qwen, Gemma 4 and Flint bring misses into whole-layer device banks | `device` |
+| `--embedding-residency device\|host` | Qwen3.5 family: the input token embedding in the GPU's weight arena, or in pinned host memory mapped into the GPU, which the gather reads in place over the bus each step. The table's VRAM goes to the KV cache (Qwen3.8-27B: 388 MiB for an IQ2_S table, 1.26 GiB for Q8); output is unchanged. Excludes `--embedding-q4/q6`; refused for an artifact whose embedding is tied to the output head and for the other families. On Windows (WDDM) mapped host memory may still count against the card | `device` |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; native Qwen, Gemma 4 and Flint allow `0` and then keep only their layer banks, and Flash-Next disk mode needs a cache. With automatic KV, native Qwen gives the cache priority over KV beyond one request's context | `auto` (what is free after startup) |
 | `--expert-misses staged\|mapped` | Qwen3.8-Flash-Next only, GGUF host experts: copy each missing expert to the device while the cached experts run, into a cache slot when the [expert tier](qwen3-8-flash-next.md#the-expert-cache) admits it (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
 | `--expert-dma-share F\|auto` | Host or disk experts: the GPU's share of a call's cache misses, `0..1`; the CPU computes the rest (GGUF and Qwen3.5/3.6 MoE experts: the GPU's results bit for bit); `auto` splits each such call by the copy and CPU times measured on earlier calls and copies every miss of Flash-Next native experts. Flash-Next, Gemma 4, Flint and DeepSeek-V4.1 calls of more than eight tokens, and Qwen3.5/3.6 calls that route to half the experts or more, always use the GPU ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); DeepSeek-V4.1's `auto` copies every miss of disk experts ([its CPU share](deepseek-v41.md#the-cpu-share)) | `auto` |
@@ -2173,6 +2224,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--spec none\|mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)), Gemma 4 from one converted with its assistant; Flint has no drafter and takes `--lookup-ngram` without `--spec` | `mtp` with 3 drafts for Flash-Next (with `--draft-min-p 0.5`) and Gemma 4 artifacts with their MTP block or assistant and host or disk experts; otherwise off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2; `1..7` for Gemma 4's assistant and Flint's context lookup | unset (Flint's lookup: 3) |
 | `--draft-min-p P` | Flash-Next MTP only: end the round's drafting at the first draft at or below this absolute probability and verify through it; see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding) | `0` (off); `0.5` when the engine chooses MTP (no `--spec`) |
+| `--draft-confidence C` | DSpark only: verify a round's drafts up to the first its confidence head scores below `C` (`0..1`); `0` verifies every draft | `0.5` |
 | `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |
 | `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |
 | `--adaptive-mtp` | MTP only: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens`, drafting only those), the width favored by the drafts' measured survival and the measured round cost; see [Adaptive MTP](#adaptive-mtp) | off |
@@ -2195,6 +2247,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--no-webui` | stop serving a WebUI built in with `NINFER_WEBUI_DIR` | served when built in |
 | `--webui-mcp-proxy` | relay the WebUI's MCP traffic at `/cors-proxy` (http targets only) | off |
+| `--ui-config-file PATH` | a JSON object of WebUI settings, reported as `/props` `ui_settings` ([WebUI](#webui)) | none |
 | `--structured-output` | enforce response formats (JSON, JSON Schema, regex, choice, GBNF) and strict tool arguments (see [Structured output](#structured-output)) | off |
 | `--unconstrained-response-format` | without `--structured-output`, generate a constrained request or strict tools unconstrained instead of refusing them | off |
 | `--assistant-prefill` | continue a Chat Completions request's trailing assistant message in place, as `/v1/messages` does | off |

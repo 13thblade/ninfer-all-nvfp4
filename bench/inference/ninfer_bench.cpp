@@ -163,6 +163,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_cublas        = options.prefill_cublas;
         engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
         engine_options.expert_residency      = options.expert_residency;
+        engine_options.embedding_residency   = options.embedding_residency;
         engine_options.expert_cache_bytes    = options.expert_cache_bytes;
         engine_options.hybrid_experts        = options.hybrid_experts;
 
@@ -172,6 +173,7 @@ int main(int argc, char** argv) {
         env.max_context              = max_context;
         env.rope_yarn_factor         = options.rope_yarn_factor;
         env.expert_residency         = options.expert_residency;
+        env.embedding_residency      = options.embedding_residency;
         env.fast_prefill_kernel      = options.fast_prefill_kernel;
         env.kv_cache                 = options.kv_cache;
         env.speculative              = options.speculative;

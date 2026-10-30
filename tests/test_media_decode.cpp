@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <iterator>
@@ -16,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -107,13 +109,14 @@ std::vector<std::uint8_t> decode_base64(std::string_view encoded) {
 }
 
 void expect_pixel(const ninfer::media::decode::Image& image, int x, int y,
-                  std::array<int, 3> expected, int tolerance) {
+                  std::array<int, 3> expected, int tolerance, std::string_view what = "JPEG") {
     const std::size_t offset = (static_cast<std::size_t>(y) * image.width + x) * 3;
     for (int channel = 0; channel < 3; ++channel) {
         const int actual = image.rgb[offset + static_cast<std::size_t>(channel)];
         if (actual < expected[static_cast<std::size_t>(channel)] - tolerance ||
             actual > expected[static_cast<std::size_t>(channel)] + tolerance) {
-            throw std::runtime_error("decoded JPEG pixel mismatch");
+            throw std::runtime_error("decoded " + std::string(what) + " pixel mismatch at " +
+                                     std::to_string(x) + "," + std::to_string(y));
         }
     }
 }
@@ -194,6 +197,113 @@ void test_library_log_routing() {
             "the swscaler deprecated-format warning did not reach the handler");
     }
 }
+
+#ifndef _WIN32
+
+// Linux builds link the FFmpeg that cmake/NinferFFmpeg.cmake configures with exactly the formats of
+// docs/serving.md#media-formats; Windows decodes through vcpkg's FFmpeg DLLs instead.
+// tests/fixtures/media/generate.sh writes these colors into the fixtures.
+constexpr std::array<std::array<int, 3>, 6> clip_colors = {{
+    {200, 40, 40}, {40, 200, 40}, {40, 40, 200}, {200, 200, 40}, {40, 200, 200}, {200, 40, 200},
+}};
+constexpr std::array<std::array<int, 3>, 8> pixel_colors = {{
+    {255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {128, 128, 128},
+    {1, 2, 3}, {250, 251, 252}, {7, 8, 9}, {200, 150, 100},
+}};
+constexpr std::array<std::array<int, 3>, 4> quadrant_colors = {{
+    {200, 40, 40}, {40, 200, 40}, {40, 40, 200}, {200, 200, 40},
+}};
+// The lossy codecs and the 4:2:0 round trip move a solid color by a few values. The GIF encoder's
+// palette moves one value of the fixtures by one; the other lossless formats decode exactly.
+constexpr int lossy_tolerance = 12;
+
+std::vector<std::uint8_t> read_fixture(std::string_view name) {
+    const std::string path =
+        std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/media/" + std::string(name);
+    std::ifstream input(path, std::ios::binary);
+    if (!input) { throw std::runtime_error("cannot read media fixture " + path); }
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+void expect_invalid_media(const std::function<void()>& decode, std::string_view what) {
+    try {
+        decode();
+    } catch (const ninfer::media::decode::Error& error) {
+        if (error.kind() == ninfer::media::decode::ErrorKind::InvalidInput) { return; }
+        throw std::runtime_error(std::string(what) + ": expected invalid input, got " +
+                                 error.what());
+    }
+    throw std::runtime_error(std::string(what) + " decoded, but its format is not listed");
+}
+
+// Every listed container and video codec, two of them beside an audio track that no decoder
+// reads, yields the six solid frames of the clip.
+void test_listed_video_formats() {
+    namespace decode = ninfer::media::decode;
+    for (const std::string_view name : {"h264-aac.mp4", "hevc.mov", "mpeg4.mp4", "av1-opus.webm",
+                                        "vp8.webm", "vp9.mkv", "animation.gif"}) {
+        const std::vector<std::uint8_t> bytes = read_fixture(name);
+        const decode::VideoInfo info =
+            decode::inspect_video(bytes, {}, 6.0, 1, 64, decode::FrameSpacing::Floor);
+        const decode::Video video =
+            decode::decode_video(bytes, {}, 6.0, 1, 64, decode::FrameSpacing::Floor);
+        if (video.width != 64 || video.height != 48 || video.frames.size() != clip_colors.size() ||
+            info.width != video.width || info.height != video.height ||
+            info.sampled_frames != static_cast<int>(video.frames.size())) {
+            throw std::runtime_error(std::string(name) + ": decoded " + std::to_string(video.width) +
+                                     "x" + std::to_string(video.height) + " with " +
+                                     std::to_string(video.frames.size()) + " frames");
+        }
+        const int tolerance = name.ends_with(".gif") ? 1 : lossy_tolerance;
+        for (std::size_t frame = 0; frame < video.frames.size(); ++frame) {
+            for (const auto [x, y] : {std::pair{0, 0}, std::pair{32, 24}, std::pair{63, 47}}) {
+                expect_pixel(video.frames[frame], x, y, clip_colors[frame], tolerance,
+                             std::string(name) + " frame " + std::to_string(frame));
+            }
+        }
+    }
+}
+
+void test_listed_image_formats() {
+    namespace decode = ninfer::media::decode;
+    for (const std::string_view name : {"pixels.png", "pixels.bmp", "pixels.webp", "pixels.gif"}) {
+        const std::vector<std::uint8_t> bytes = read_fixture(name);
+        const decode::ImageInfo info = decode::inspect_image(bytes, {});
+        const decode::Image image    = decode::decode_image(bytes, {});
+        if (info.width != 4 || info.height != 2 || image.width != 4 || image.height != 2) {
+            throw std::runtime_error(std::string(name) + ": decoded dimensions mismatch");
+        }
+        const int tolerance = name.ends_with(".gif") ? 1 : 0;
+        for (int y = 0; y < 2; ++y) {
+            for (int x = 0; x < 4; ++x) {
+                expect_pixel(image, x, y, pixel_colors[static_cast<std::size_t>(y * 4 + x)],
+                             tolerance, name);
+            }
+        }
+    }
+    const decode::Image lossy = decode::decode_image(read_fixture("quadrants.webp"), {});
+    if (lossy.width != 64 || lossy.height != 48) {
+        throw std::runtime_error("quadrants.webp: decoded dimensions mismatch");
+    }
+    for (int quadrant = 0; quadrant < 4; ++quadrant) {
+        expect_pixel(lossy, quadrant % 2 == 0 ? 16 : 48, quadrant < 2 ? 12 : 36,
+                     quadrant_colors[static_cast<std::size_t>(quadrant)], lossy_tolerance,
+                     "lossy WebP");
+    }
+}
+
+// A container, a codec inside a listed container and an image format outside the list.
+void test_unlisted_formats_are_refused() {
+    namespace decode = ninfer::media::decode;
+    for (const std::string_view name : {"mjpeg.avi", "ffv1.mkv"}) {
+        const std::vector<std::uint8_t> bytes = read_fixture(name);
+        expect_invalid_media([&] { (void)decode::decode_video(bytes, {}, 6.0, 1, 64); }, name);
+    }
+    const std::vector<std::uint8_t> tiff = read_fixture("pixels.tiff");
+    expect_invalid_media([&] { (void)decode::decode_image(tiff, {}); }, "pixels.tiff");
+}
+
+#endif // _WIN32
 
 #ifdef NINFER_MEDIA_NATIVE_PNG
 
@@ -401,6 +511,11 @@ int main() {
     try {
         test_issue_20_unaligned_jpeg();
         test_library_log_routing();
+#ifndef _WIN32
+        test_listed_video_formats();
+        test_listed_image_formats();
+        test_unlisted_formats_are_refused();
+#endif
 #ifdef NINFER_MEDIA_NATIVE_PNG
         test_png_decoders();
         test_png_row_width_guard();

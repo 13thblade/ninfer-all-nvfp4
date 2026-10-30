@@ -238,6 +238,40 @@ fi::GemmaMediaOptions gemma_media_options(const FrontendResources& resources) {
     return out;
 }
 
+// DeepSeek-V4.1's processor_config.json (the converter's transcription of the release's
+// image_processor.py): patches of 14 merged 3 x 3, the minimum pixels and the token budget of an
+// image, no aspect cap, the bicubic resize onto gray 127, values (x / 255 - 0.5) / 0.5.
+fi::DeepSeekMediaOptions deepseek_media_options(const FrontendResources& resources) {
+    constexpr std::string_view kResource = "processor_config.json";
+    const Json config = parse_resource_json(resources.processor_config_json, kResource);
+    const Json& image = require_object(config, "image_processor", kResource);
+    fi::DeepSeekMediaOptions out;
+    const auto values = [&](const char* field, double expected) {
+        const Json& v = image.contains(field) ? image.at(field) : Json();
+        return v.is_array() && v.size() == 3 &&
+               std::all_of(v.begin(), v.end(), [&](const Json& x) {
+                   return x.is_number() && x.get<double>() == expected;
+               });
+    };
+    if (require_integer(image, "patch_size", kResource) != out.patch ||
+        require_integer(image, "downsample_ratio", kResource) != out.merge ||
+        !image.contains("max_wh_ratio") || !image.at("max_wh_ratio").is_null() ||
+        require_integer(image, "resample", kResource) != 3 || !values("pad_color", 127.0) ||
+        !values("image_mean", 0.5) || !values("image_std", 0.5) ||
+        image.value("image_token", std::string()) != fi::kDeepSeekMediaPads.image) {
+        throw std::invalid_argument(
+            "processor_config.json does not match the compiled DeepSeek-V4.1 image processing");
+    }
+    out.min_pixels = positive_u64(require_integer(image, "min_pixels", kResource), "min_pixels");
+    const std::uint64_t tokens =
+        positive_u64(require_integer(image, "max_image_tokens", kResource), "max_image_tokens");
+    if (tokens < 4 || tokens > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("processor_config.json max_image_tokens is out of range");
+    }
+    out.max_tokens = static_cast<std::uint32_t>(tokens);
+    return out;
+}
+
 void validate_tokenizer_config(const FrontendResources& resources) {
     const Json tokenizer_config =
         parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
@@ -926,9 +960,10 @@ public:
                                         options.architecture != Architecture::Flint &&
                                         options.architecture != Architecture::DeepSeekV41)),
           tokenizer(resources.tokenizer),
-          processor(!options.vision_enabled                        ? fi::ProcessorOptions{}
-                    : options.architecture == Architecture::Gemma4 ? fi::ProcessorOptions{}
-                                                                   : processor_options(resources)),
+          processor(!options.vision_enabled                             ? fi::ProcessorOptions{}
+                    : options.architecture == Architecture::Gemma4      ? fi::ProcessorOptions{}
+                    : options.architecture == Architecture::DeepSeekV41 ? fi::ProcessorOptions{}
+                                                                        : processor_options(resources)),
           vision_enabled(options.vision_enabled), max_context(options.max_context),
           automatic_long_anchors(options.automatic_long_anchors),
           long_anchor_min_spacing_tokens(options.long_anchor_min_spacing_tokens),
@@ -939,7 +974,18 @@ public:
                                         std::to_string(kMinimumProgressAnchorTokens) + " tokens");
         }
         const bool gemma_media = options.architecture == Architecture::Gemma4 && vision_enabled;
-        if (gemma_media) {
+        const bool deepseek_media =
+            options.architecture == Architecture::DeepSeekV41 && vision_enabled;
+        if (deepseek_media) {
+            fi::DeepSeekMediaOptions& d = processor.deepseek.emplace(deepseek_media_options(resources));
+            if (options.vision_max_merged_tokens != 0) {
+                d.max_tokens = std::min(d.max_tokens, options.vision_max_merged_tokens);
+            }
+            if (d.max_tokens < 4) {
+                throw std::invalid_argument("--vision-max-merged: a DeepSeek-V4.1 image takes at "
+                                            "least 4 prompt positions");
+            }
+        } else if (gemma_media) {
             fi::GemmaMediaOptions& g = processor.gemma.emplace(gemma_media_options(resources));
             g.max_tokens   = fi::gemma_budget_at_most(options.vision_max_merged_tokens);
             g.image_tokens = std::min(g.image_tokens, g.max_tokens);
@@ -953,13 +999,15 @@ public:
         const std::uint64_t vision_tokens =
             std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
         // Raw patches per soft token and values per patch: Gemma 4 pools 3 x 3 patches of
-        // 3 x 16 x 16, Qwen merges 2 x 2 patches of 2 x 3 x 16 x 16.
+        // 3 x 16 x 16, DeepSeek-V4.1 merges 3 x 3 of 3 x 14 x 14, Qwen 2 x 2 of 2 x 3 x 16 x 16.
         const std::uint64_t patches_per_token =
-            gemma_media ? std::uint64_t(processor.gemma->pooling) * processor.gemma->pooling
-                  : kRawPatchesPerVisionToken;
+            deepseek_media ? std::uint64_t(processor.deepseek->merge) * processor.deepseek->merge
+            : gemma_media  ? std::uint64_t(processor.gemma->pooling) * processor.gemma->pooling
+                           : kRawPatchesPerVisionToken;
         const std::uint64_t patch_features =
-            gemma_media ? std::uint64_t(3) * processor.gemma->patch * processor.gemma->patch
-                  : kPreparedVisionPatchFeatures;
+            deepseek_media ? std::uint64_t(3) * processor.deepseek->patch * processor.deepseek->patch
+            : gemma_media  ? std::uint64_t(3) * processor.gemma->patch * processor.gemma->patch
+                           : kPreparedVisionPatchFeatures;
         processor.max_vision_tokens = vision_tokens;
         processor.max_raw_patches   = vision_tokens * patches_per_token;
         if (vision_enabled) {

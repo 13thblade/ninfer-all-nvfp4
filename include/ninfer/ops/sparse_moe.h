@@ -85,4 +85,47 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
                 Tensor& destination, const SparseMoeHints& hints, WorkspaceArena& workspace,
                 cudaStream_t stream);
 
+/**
+ * One device's part of SparseMoe under expert parallelism: routed experts
+ * [expert_begin, expert_begin + expert_count) of the 256, and the shared expert when
+ * `shared_expert`, each with `intermediate` of its 512 intermediate columns: all of them, or one
+ * half (256) where the devices divide every expert's intermediate columns instead.
+ */
+struct SparseMoeShare {
+    std::int32_t expert_begin = 0;
+    std::int32_t expert_count = 256;
+    bool shared_expert        = true;
+    std::int32_t intermediate = 512;
+};
+
+/**
+ * SparseMoe over one device's share of the experts, before the residual.
+ *
+ * The device routes every token exactly as sparse_moe does, from its own router replica, and
+ * evaluates only the selected paths of the experts it holds, and the shared path when it holds the
+ * shared expert. It writes their weighted FP32 sum to `partial` [2048,T] (contiguous FP32,
+ * 16-byte aligned) and leaves the residual alone. Over shares that partition the routed experts
+ * and their intermediate columns, with each column of the shared expert in exactly one, the sum of
+ * the partials is sparse_moe's result less its residual: the caller adds that sum to the residual
+ * and rounds once to BF16. A divided expert's SwiGLU columns are exactly the whole expert's; only
+ * the association of its down product's FP32 sum changes.
+ *
+ * router_shared_gate is the whole [257,2048] router. With W = intermediate, routed_gate_up
+ * [expert_count*2W,2048] and routed_down [expert_count*2048,W] hold the share's experts in order,
+ * expert e at rows of e - expert_begin (its W gate rows, then its W up rows, and its W columns of
+ * down), and shared_gate_up [2W,2048] and shared_down [2048,W] the shared expert's columns. The
+ * shared weights are read only when shared_expert. Admitted profiles are the groupwise ones of
+ * sparse_moe; NVFP4 banks have no share.
+ *
+ * Every device's routes have to agree, so the share chooses its route by T alone, from the codec's
+ * own prefill frontier rather than a device profile's: two different cards score the tokens with
+ * the same kernel. Its workspace requirement is sparse_moe_share_workspace_capacity_bytes.
+ */
+[[nodiscard]] std::size_t sparse_moe_share_workspace_capacity_bytes(QType routed_gate_up,
+                                                                    QType routed_down,
+                                                                    std::int32_t min_tokens,
+                                                                    std::int32_t max_tokens);
+void sparse_moe_share(const Tensor& x, const SparseMoeWeights& weights, const SparseMoeShare& share,
+                      Tensor& partial, WorkspaceArena& workspace, cudaStream_t stream);
+
 } // namespace ninfer::ops

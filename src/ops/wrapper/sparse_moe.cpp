@@ -161,6 +161,23 @@ void require_nvfp4(const Weight& weight, std::int32_t n, std::int32_t k, const c
         address_range(weight.scales, geometry.scale_plane_bytes, std::string(name) + " scales"));
 }
 
+// The groupwise profile of the routed banks, which a share validates for its own experts too.
+void require_groupwise_formats(const SparseMoeWeights& weights, bool shared) {
+    if (weights.routed_gate_up.qtype != QType::Q4_G64_FP16 &&
+        weights.routed_gate_up.qtype != QType::Q8_G32_FP16) {
+        throw std::invalid_argument("sparse_moe: routed_gate_up must be Q4 or Q8");
+    }
+    if (weights.routed_down.qtype != QType::Q5_G64_FP16 &&
+        weights.routed_down.qtype != QType::Q6_G64_FP16 &&
+        weights.routed_down.qtype != QType::Q8_G32_FP16) {
+        throw std::invalid_argument("sparse_moe: routed_down must be Q5, Q6, or Q8");
+    }
+    if (shared && (weights.shared_gate_up.qtype != QType::Q8_G32_FP16 ||
+                   weights.shared_down.qtype != QType::Q8_G32_FP16)) {
+        throw std::invalid_argument("sparse_moe: shared weights must be Q8");
+    }
+}
+
 void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>& ranges) {
     require_router(weights.router_shared_gate, ranges);
     if (nvfp4_profile(weights)) {
@@ -182,37 +199,56 @@ void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>
         weights.shared_gate_up.qtype == QType::NVFP4 || weights.shared_down.qtype == QType::NVFP4) {
         throw std::invalid_argument("sparse_moe: NVFP4 requires all four expert matrices");
     }
-    if (weights.routed_gate_up.qtype != QType::Q4_G64_FP16 &&
-        weights.routed_gate_up.qtype != QType::Q8_G32_FP16) {
-        throw std::invalid_argument("sparse_moe: routed_gate_up must be Q4 or Q8");
-    }
-    if (weights.routed_down.qtype != QType::Q5_G64_FP16 &&
-        weights.routed_down.qtype != QType::Q6_G64_FP16 &&
-        weights.routed_down.qtype != QType::Q8_G32_FP16) {
-        throw std::invalid_argument("sparse_moe: routed_down must be Q5, Q6, or Q8");
-    }
-    if (weights.shared_gate_up.qtype != QType::Q8_G32_FP16 ||
-        weights.shared_down.qtype != QType::Q8_G32_FP16) {
-        throw std::invalid_argument("sparse_moe: shared weights must be Q8");
-    }
+    require_groupwise_formats(weights, true);
     require_quantized(weights.routed_gate_up, kRoutedGateRows, kHidden, "routed_gate_up", ranges);
     require_quantized(weights.routed_down, kRoutedDownRows, kIntermediate, "routed_down", ranges);
     require_quantized(weights.shared_gate_up, kSharedGateRows, kHidden, "shared_gate_up", ranges);
     require_quantized(weights.shared_down, kHidden, kIntermediate, "shared_down", ranges);
 }
 
+// A share's banks: its experts' rows of the two routed banks, and the shared expert where it is.
+void validate_share_weights(const SparseMoeWeights& weights, const SparseMoeShare& share,
+                            std::vector<AddressRange>& ranges) {
+    if (share.expert_count < 1 || share.expert_begin < 0 ||
+        share.expert_begin > kExperts - share.expert_count) {
+        throw std::invalid_argument("sparse_moe share: experts lie outside [0, 256)");
+    }
+    // A divided expert keeps half its intermediate columns: the down kernels walk whole passes of
+    // four 64-column (eight 32-column) groups, which 256 columns still fill.
+    if (share.intermediate != kIntermediate && share.intermediate != kIntermediate / 2) {
+        throw std::invalid_argument("sparse_moe share: an expert keeps 512 or 256 columns");
+    }
+    require_router(weights.router_shared_gate, ranges);
+    if (weights.routed_gate_up.qtype == QType::NVFP4 || weights.routed_down.qtype == QType::NVFP4) {
+        throw std::invalid_argument("sparse_moe share: NVFP4 expert banks have no share");
+    }
+    require_groupwise_formats(weights, share.shared_expert);
+    require_quantized(weights.routed_gate_up, share.expert_count * 2 * share.intermediate,
+                      kHidden, "routed_gate_up", ranges);
+    require_quantized(weights.routed_down, share.expert_count * kHidden, share.intermediate,
+                      "routed_down", ranges);
+    if (share.shared_expert) {
+        require_quantized(weights.shared_gate_up, 2 * share.intermediate, kHidden,
+                          "shared_gate_up", ranges);
+        require_quantized(weights.shared_down, kHidden, share.intermediate, "shared_down",
+                          ranges);
+    }
+}
+
 } // namespace
 
-std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType routed_down,
-                                                std::int32_t min_tokens, std::int32_t max_tokens) {
+namespace {
+
+// The capacity of every route [min_tokens, max_tokens] reaches when prefill starts at
+// `prefill_first`.
+std::size_t workspace_capacity(QType routed_gate_up, QType routed_down, std::int32_t min_tokens,
+                               std::int32_t max_tokens, std::int32_t prefill_first) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("sparse_moe workspace: invalid token interval");
     }
     (void)detail::resolve_sparse_moe_decode_plan(routed_gate_up, routed_down);
 
     const bool nvfp4_profile = routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
-    const std::int32_t prefill_first =
-        detail::sparse_moe_prefill_min_tokens(routed_gate_up, routed_down);
 
     std::size_t required = 0;
     if (min_tokens == 1) { required = detail::sparse_moe_decode_workspace_bytes(); }
@@ -236,6 +272,22 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType rout
     return required;
 }
 
+} // namespace
+
+std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType routed_down,
+                                                std::int32_t min_tokens, std::int32_t max_tokens) {
+    return workspace_capacity(routed_gate_up, routed_down, min_tokens, max_tokens,
+                              detail::sparse_moe_prefill_min_tokens(routed_gate_up, routed_down));
+}
+
+std::size_t sparse_moe_share_workspace_capacity_bytes(QType routed_gate_up, QType routed_down,
+                                                      std::int32_t min_tokens,
+                                                      std::int32_t max_tokens) {
+    return workspace_capacity(
+        routed_gate_up, routed_down, min_tokens, max_tokens,
+        detail::sparse_moe_prefill_builtin_min_tokens(routed_gate_up, routed_down));
+}
+
 std::size_t detail::sparse_moe_candidate_workspace_bytes(QType gate, QType down,
                                                          std::int32_t tokens,
                                                          SparseMoeCandidate candidate) {
@@ -257,24 +309,14 @@ std::size_t detail::sparse_moe_candidate_workspace_bytes(QType gate, QType down,
     throw std::invalid_argument("sparse_moe: invalid candidate");
 }
 
-static void sparse_moe_impl(const Tensor& x, const SparseMoeWeights& weights,
-                            SparseMoeEpilogue epilogue, Tensor& destination,
-                            const SparseMoeHints& hints, detail::SparseMoeCandidate candidate,
-                            WorkspaceArena& workspace, cudaStream_t stream) {
-    if (epilogue != SparseMoeEpilogue::AddResidual) {
-        throw std::invalid_argument("sparse_moe: unsupported epilogue");
-    }
-    const std::int32_t tokens = require_tensor(x, "x");
-    if (require_tensor(destination, "destination") != tokens) {
-        throw std::invalid_argument("sparse_moe: x and destination token counts must match");
-    }
-
-    std::vector<AddressRange> ranges;
-    ranges.reserve(16);
-    ranges.push_back(address_range(x.data, x.bytes(), "x"));
-    ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
-    validate_weights(weights, ranges);
-
+// Selects the route for `tokens` and runs it. `share` names a device's experts and its partial;
+// the whole Op's default adds to `destination`.
+static void sparse_moe_run(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
+                           const SparseMoeHints& hints, detail::SparseMoeCandidate candidate,
+                           WorkspaceArena& workspace, cudaStream_t stream,
+                           std::vector<AddressRange>& ranges,
+                           const detail::SparseMoeShareArgs& share) {
+    const std::int32_t tokens = x.ne[1];
     using Candidate = detail::SparseMoeCandidate;
     const bool automatic = candidate == Candidate::Automatic;
     if (!detail::sparse_moe_candidate_supports_tokens(candidate, tokens)) {
@@ -325,7 +367,7 @@ static void sparse_moe_impl(const Tensor& x, const SparseMoeWeights& weights,
             tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype, candidate);
         const detail::SparseMoePrefillWorkspace views =
             detail::allocate_sparse_moe_prefill_workspace(workspace, plan.slice_tokens, plan.nvfp4);
-        detail::sparse_moe_prefill_launch(x, weights, destination, plan, views, stream);
+        detail::sparse_moe_prefill_launch(x, weights, destination, plan, views, stream, share);
         return;
     }
     if (use_small_t) {
@@ -333,7 +375,7 @@ static void sparse_moe_impl(const Tensor& x, const SparseMoeWeights& weights,
             tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
         const detail::SparseMoeSmallTWorkspace views =
             detail::allocate_sparse_moe_small_t_workspace(workspace, tokens);
-        detail::sparse_moe_small_t_launch(x, weights, destination, plan, views, stream);
+        detail::sparse_moe_small_t_launch(x, weights, destination, plan, views, stream, share);
         return;
     }
 
@@ -343,10 +385,35 @@ static void sparse_moe_impl(const Tensor& x, const SparseMoeWeights& weights,
         detail::allocate_sparse_moe_decode_workspace(workspace);
     for (std::int32_t token = 0; token < tokens; ++token) {
         const Tensor x_column     = x.slice(1, token, 1);
-        Tensor destination_column = destination.slice(1, token, 1);
-        detail::sparse_moe_decode_launch(x_column, weights, destination_column, plan, views,
-                                         stream);
+        Tensor destination_column =
+            share.partial == nullptr ? destination.slice(1, token, 1) : Tensor{};
+        detail::SparseMoeShareArgs column = share;
+        if (share.partial != nullptr) {
+            column.partial = share.partial + std::int64_t(token) * kHidden;
+        }
+        detail::sparse_moe_decode_launch(x_column, weights, destination_column, plan, views, stream,
+                                         column);
     }
+}
+
+static void sparse_moe_impl(const Tensor& x, const SparseMoeWeights& weights,
+                            SparseMoeEpilogue epilogue, Tensor& destination,
+                            const SparseMoeHints& hints, detail::SparseMoeCandidate candidate,
+                            WorkspaceArena& workspace, cudaStream_t stream) {
+    if (epilogue != SparseMoeEpilogue::AddResidual) {
+        throw std::invalid_argument("sparse_moe: unsupported epilogue");
+    }
+    const std::int32_t tokens = require_tensor(x, "x");
+    if (require_tensor(destination, "destination") != tokens) {
+        throw std::invalid_argument("sparse_moe: x and destination token counts must match");
+    }
+
+    std::vector<AddressRange> ranges;
+    ranges.reserve(16);
+    ranges.push_back(address_range(x.data, x.bytes(), "x"));
+    ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
+    validate_weights(weights, ranges);
+    sparse_moe_run(x, weights, destination, hints, candidate, workspace, stream, ranges, {});
 }
 
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
@@ -360,6 +427,34 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
                 cudaStream_t stream) {
     sparse_moe_impl(x, weights, epilogue, destination, hints, detail::SparseMoeCandidate::Automatic,
                     workspace, stream);
+}
+
+void sparse_moe_share(const Tensor& x, const SparseMoeWeights& weights, const SparseMoeShare& share,
+                      Tensor& partial, WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = require_tensor(x, "x");
+    if (partial.dtype != DType::FP32 || partial.ne[0] != kHidden || partial.ne[1] != tokens ||
+        partial.ne[2] != 1 || partial.ne[3] != 1 || !partial.is_contiguous() ||
+        !aligned_to(partial.data, 16)) {
+        throw std::invalid_argument("sparse_moe share: partial must be contiguous FP32 [2048,T]");
+    }
+    std::vector<AddressRange> ranges;
+    ranges.reserve(16);
+    ranges.push_back(address_range(x.data, x.bytes(), "x"));
+    ranges.push_back(address_range(partial.data, partial.bytes(), "partial"));
+    validate_share_weights(weights, share, ranges);
+    // Every device routes its own copy of the tokens, and the shares add up to the Op only when
+    // they select the same experts. The route that computes the scores therefore follows the
+    // codec's built-in frontier, never a device profile, which may differ between the cards.
+    using Candidate         = detail::SparseMoeCandidate;
+    const auto prefill_from = detail::sparse_moe_prefill_builtin_min_tokens(
+        weights.routed_gate_up.qtype, weights.routed_down.qtype);
+    const Candidate candidate = tokens >= prefill_from                    ? Candidate::Prefill
+                                : detail::sparse_moe_uses_small_t(tokens) ? Candidate::SmallT
+                                                                          : Candidate::Decode;
+    Tensor none;
+    sparse_moe_run(x, weights, none, {}, candidate, workspace, stream, ranges,
+                   {share.expert_begin, share.expert_count, share.shared_expert,
+                    static_cast<float*>(partial.data), share.intermediate});
 }
 
 void detail::sparse_moe_candidate(const Tensor& x, const SparseMoeWeights& weights,

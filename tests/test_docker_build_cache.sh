@@ -31,6 +31,9 @@ mkdir -p "$context/scripts" "$context/docker" "$test_dir/scripts"
 cp "$repo/scripts/build-native.sh" "$test_dir/scripts/build-native.sh"
 cp "$repo/scripts/build-native.sh" "$context/scripts/build-native.sh"
 cp "$repo/docker/stage-dist.sh" "$context/docker/stage-dist.sh"
+# The fixture project compiles no FFmpeg, so it needs none of its archives.
+printf '#!/usr/bin/env bash\n' > "$context/scripts/fetch-media-sources.sh"
+chmod +x "$context/scripts/fetch-media-sources.sh"
 
 cat > "$context/CMakeLists.txt" <<'EOF'
 cmake_minimum_required(VERSION 3.28)

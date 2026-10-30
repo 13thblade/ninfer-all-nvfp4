@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -71,13 +72,23 @@ struct T2RowSplitMmaGemmSchedule {
 };
 
 // clang-format off
-template <class Schedule_, bool Full>
+template <class Out>
+__device__ __forceinline__ Out t2_store(float value) {
+    if constexpr (std::is_same_v<Out, float>) {
+        return value;
+    } else {
+        return __float2bfloat16_rn(value);
+    }
+}
+
+// `Out` is BF16, or FP32 for a tensor-parallel rank's partial sum.
+template <class Schedule_, bool Full, class Out = __nv_bfloat16>
 __global__ __launch_bounds__(Schedule_::kThreads, Schedule_::kLaunchBoundsMinBlocks)
 void t2_rowsplit_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x,
     const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ out,
+    Out* __restrict__ out,
     std::int32_t rows,
     std::int32_t k,
     std::int32_t cols,
@@ -288,32 +299,32 @@ void t2_rowsplit_gemm_mma_kernel(
             const float* values   = accum[mi][ni];
             if constexpr (kFull) {
                 out[static_cast<std::int64_t>(output_col0) * rows + output_row0] =
-                    __float2bfloat16_rn(values[0]);
+                    t2_store<Out>(values[0]);
                 out[static_cast<std::int64_t>(output_col1) * rows + output_row0] =
-                    __float2bfloat16_rn(values[1]);
+                    t2_store<Out>(values[1]);
                 out[static_cast<std::int64_t>(output_col0) * rows + output_row1] =
-                    __float2bfloat16_rn(values[2]);
+                    t2_store<Out>(values[2]);
                 out[static_cast<std::int64_t>(output_col1) * rows + output_row1] =
-                    __float2bfloat16_rn(values[3]);
+                    t2_store<Out>(values[3]);
             } else {
                 if (output_row0 < rows) {
                     if (output_col0 < cols) {
                         out[static_cast<std::int64_t>(output_col0) * rows + output_row0] =
-                            __float2bfloat16_rn(values[0]);
+                            t2_store<Out>(values[0]);
                     }
                     if (output_col1 < cols) {
                         out[static_cast<std::int64_t>(output_col1) * rows + output_row0] =
-                            __float2bfloat16_rn(values[1]);
+                            t2_store<Out>(values[1]);
                     }
                 }
                 if (output_row1 < rows) {
                     if (output_col0 < cols) {
                         out[static_cast<std::int64_t>(output_col0) * rows + output_row1] =
-                            __float2bfloat16_rn(values[2]);
+                            t2_store<Out>(values[2]);
                     }
                     if (output_col1 < cols) {
                         out[static_cast<std::int64_t>(output_col1) * rows + output_row1] =
-                            __float2bfloat16_rn(values[3]);
+                            t2_store<Out>(values[3]);
                     }
                 }
             }

@@ -65,7 +65,15 @@ public:
         }
     }
 
+    // Pinned memory the slot's narrow lines are packed into before their copy, made on first use
+    // and free again once the slot's event completes.
+    [[nodiscard]] std::byte* packing(std::size_t bytes) {
+        if (!packed) { packed.emplace(bytes); }
+        return static_cast<std::byte*>(packed->data());
+    }
+
     PinnedHostBuffer buffer;
+    std::optional<PinnedHostBuffer> packed;
     std::byte* aligned_data = nullptr;
     cudaEvent_t event       = nullptr;
     bool pending            = false;
@@ -115,6 +123,11 @@ struct ReadSpan {
     std::uint64_t end   = 0;
 };
 
+// A range that starts at most this far past a span joins it: reading through the gap costs less
+// than another synchronous direct read. A tensor-parallel share of every expert's rows leaves gaps
+// of a few hundred KiB, which as separate reads are slow.
+constexpr std::uint64_t kSpanGapBytes = 4ULL << 20U;
+
 // Sorts `ranges` by file position and merges them into the aligned file spans that direct reads
 // cover; ranges that overlap are a planning error.
 std::vector<ReadSpan> direct_spans(std::vector<CopyRange>& ranges) {
@@ -129,13 +142,50 @@ std::vector<ReadSpan> direct_spans(std::vector<CopyRange>& ranges) {
         }
         const auto begin = range.begin / kPayloadAlignment * kPayloadAlignment;
         if (spans.empty() || spans.back().file != range.file ||
-            begin > align_up(spans.back().end, kPayloadAlignment, "direct range")) {
+            begin > checked_add(align_up(spans.back().end, kPayloadAlignment, "direct range"),
+                                kSpanGapBytes, "direct range")) {
             spans.push_back({range.file, begin, range.end});
         } else {
             spans.back().end = std::max(spans.back().end, range.end);
         }
     }
     return spans;
+}
+
+// A range whose stored bytes another range of the same upload pass already reads: copied on the
+// device from where that range lands.
+struct RepeatedRange {
+    const std::byte* source = nullptr;
+    std::byte* destination  = nullptr;
+    std::uint64_t bytes     = 0;
+};
+
+// Sorts `ranges` by file position and takes out each range that lies inside an earlier one, so
+// direct reads still read every stored byte once. Several pieces of one stored object on a rank
+// need such bytes: every piece of a whole NVFP4 object carries the object's single divisor. Any
+// other overlap stays a planning error for direct_spans.
+std::vector<RepeatedRange> take_repeated_ranges(std::vector<CopyRange>& ranges) {
+    // At one position the longer range comes first, so the shorter one lies inside it.
+    std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.file, a.begin, b.end) < std::tie(b.file, b.begin, a.end);
+    });
+    std::vector<RepeatedRange> repeats;
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const CopyRange range = ranges[i];
+        // Kept ranges are disjoint and ordered, so only the last one can hold this one.
+        if (kept != 0) {
+            const CopyRange& cover = ranges[kept - 1];
+            if (cover.file == range.file && cover.begin <= range.begin && range.end <= cover.end) {
+                repeats.push_back({cover.destination + (range.begin - cover.begin),
+                                   range.destination, range.end - range.begin});
+                continue;
+            }
+        }
+        ranges[kept++] = range;
+    }
+    ranges.resize(kept);
+    return repeats;
 }
 
 // Host-kept objects are read in pieces of this size on this many threads: enough reads in flight
@@ -263,29 +313,110 @@ std::uint64_t read_host_bytes(const Reader& reader, std::span<const HostReadTarg
     return read;
 }
 
-float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeometry& geometry,
-                   std::span<const std::byte> host, MaterializationStats& stats) {
-    if (geometry.format != QType::NVFP4) { return 0.0F; }
-    const auto bytes = checked_mul(geometry.divisor_count, sizeof(float), "weight divisors");
+// The NVFP4 divisor of the stored object's row `first_row`, from its stored bytes (`host`) or its
+// file. A selected piece names the row it starts at: the piece's own geometry places its divisors
+// inside the piece, not inside the stored object.
+float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeometry& stored,
+                   std::span<const std::byte> host, MaterializationStats& stats,
+                   std::uint64_t first_row = 0) {
+    if (stored.format != QType::NVFP4) { return 0.0F; }
+    const auto bytes = checked_mul(stored.divisor_count, sizeof(float), "weight divisors");
     std::vector<std::byte> words(bytes);
     if (!host.empty()) {
-        std::copy_n(host.data() + geometry.divisor_offset, bytes, words.data());
+        std::copy_n(host.data() + stored.divisor_offset, bytes, words.data());
     } else {
         const auto& object = reader.directory().tensor(handle);
-        reader.read_into(checked_add(object.offset, geometry.divisor_offset, "weight divisor"),
+        reader.read_into(checked_add(object.offset, stored.divisor_offset, "weight divisor"),
                          words);
         stats.read_bytes = checked_add(stats.read_bytes, bytes, "read bytes");
     }
     // Every divisor is read by a kernel, so every one is checked before anything binds.
-    for (std::uint64_t index = 0; index < geometry.divisor_count; ++index) {
+    for (std::uint64_t index = 0; index < stored.divisor_count; ++index) {
         const auto value = std::bit_cast<float>(read_u32_le(words.data() + index * sizeof(float)));
         if (!std::isfinite(value) || value <= 0) {
             throw ArtifactError(reader.directory().tensor(handle).id +
                                 ": invalid NVFP4 weight divisor");
         }
     }
-    return std::bit_cast<float>(read_u32_le(words.data()));
+    const std::uint64_t rows = stored.shape.size() == 2 ? stored.shape[0] : 1;
+    const std::uint64_t word = first_row / (rows / stored.divisor_count);
+    return std::bit_cast<float>(read_u32_le(words.data() + word * sizeof(float)));
 }
+
+// Copies of one width whose sources and destinations advance by fixed pitches, as the lines of a
+// column cut do (a tensor-parallel share of every expert's columns is millions of lines of a few
+// to a few hundred bytes), leave together instead of one call per line: lines narrower than
+// kPackedLineBytes that land back to back are packed on the host into the slot's packing memory
+// and copied as one block (the copy engine moves such narrow 2D rows at a fraction of the bus
+// rate), others as one 2D copy.
+class LineBatch {
+public:
+    static constexpr std::size_t kPackedLineBytes = 4096;
+
+    // The staging slot whose bytes the next copies read, `bytes` large.
+    void begin(Slot& slot, std::size_t bytes) {
+        slot_       = &slot;
+        slot_bytes_ = bytes;
+        packed_     = 0;
+    }
+
+    // Adds a copy from the staging slot; false when it does not continue the batch.
+    bool extend(std::byte* destination, const std::byte* source, std::size_t bytes) {
+        if (height_ == 0) {
+            destination_ = destination;
+            source_      = source;
+            width_       = bytes;
+            height_      = 1;
+            return true;
+        }
+        if (bytes != width_ || destination <= destination_ || source <= source_) { return false; }
+        if (height_ == 1) {
+            const auto destination_pitch = static_cast<std::size_t>(destination - destination_);
+            const auto source_pitch      = static_cast<std::size_t>(source - source_);
+            if (destination_pitch < width_ || source_pitch < width_) { return false; }
+            destination_pitch_ = destination_pitch;
+            source_pitch_      = source_pitch;
+        } else if (destination != destination_ + height_ * destination_pitch_ ||
+                   source != source_ + height_ * source_pitch_) {
+            return false;
+        }
+        ++height_;
+        return true;
+    }
+
+    void flush(cudaStream_t stream) {
+        if (height_ == 1) {
+            check_cuda(cudaMemcpyAsync(destination_, source_, width_, cudaMemcpyHostToDevice, stream),
+                       "upload weight bytes");
+        } else if (height_ > 1 && destination_pitch_ == width_ && width_ < kPackedLineBytes) {
+            // The packed lines of one slot never exceed the bytes it read.
+            std::byte* const packed = slot_->packing(slot_bytes_) + packed_;
+            for (std::size_t line = 0; line < height_; ++line) {
+                std::memcpy(packed + line * width_, source_ + line * source_pitch_, width_);
+            }
+            packed_ += height_ * width_;
+            check_cuda(cudaMemcpyAsync(destination_, packed, height_ * width_,
+                                       cudaMemcpyHostToDevice, stream),
+                       "upload packed weight lines");
+        } else if (height_ > 1) {
+            check_cuda(cudaMemcpy2DAsync(destination_, destination_pitch_, source_, source_pitch_,
+                                         width_, height_, cudaMemcpyHostToDevice, stream),
+                       "upload weight lines");
+        }
+        height_ = 0;
+    }
+
+private:
+    Slot* slot_             = nullptr;
+    std::size_t slot_bytes_ = 0;
+    std::size_t packed_     = 0;
+    std::byte* destination_        = nullptr;
+    const std::byte* source_       = nullptr;
+    std::size_t width_             = 0;
+    std::size_t height_            = 0;
+    std::size_t destination_pitch_ = 0;
+    std::size_t source_pitch_      = 0;
+};
 
 struct UploadTotals {
     std::uint64_t read_bytes         = 0;
@@ -306,6 +437,9 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
     std::vector<std::vector<CopyRange>> ranges_by_rank(rank_count);
     std::vector<const DevicePlacement*> transcoded;
     std::vector<const DevicePlacement*> rebased;
+    // Bytes of selected pieces that no run fills: the alignment between a small piece's planes,
+    // zeroed instead of uploaded.
+    std::uint64_t zeroed = 0;
     for (const auto& placement : placements) {
         if (placement.rank >= rank_count || bases[placement.rank] == nullptr) {
             throw ArtifactError("device placement names a rank the plan has no arena for");
@@ -326,8 +460,17 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
         }
         if (placement.selection) {
             const auto& descriptor = reader.directory().tensor(*placement.source);
-            for (const SelectedRun& run :
-                 selected_runs(reader.geometry(*placement.source), *placement.selection)) {
+            const auto runs = selected_runs(reader.geometry(*placement.source), *placement.selection);
+            std::uint64_t covered = 0;
+            for (const SelectedRun& run : runs) {
+                covered = checked_add(covered, run.bytes, "selected bytes");
+            }
+            if (covered < placement.bytes) {
+                const ScopedRank bound(device, placement.rank);
+                check_cuda(cudaMemset(destination, 0, placement.bytes), "zero a selected piece");
+                zeroed = checked_add(zeroed, placement.bytes - covered, "zeroed bytes");
+            }
+            for (const SelectedRun& run : runs) {
                 for (const auto& segment : reader.segments(
                          checked_add(descriptor.offset, run.source, "selected run"), run.bytes)) {
                     ranges_by_rank[placement.rank].push_back(
@@ -385,7 +528,7 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
         transcoded_bytes = checked_add(transcoded_bytes, bytes.size(), "rebased bytes");
     }
     totals.h2d_bytes     = transcoded_bytes;
-    std::uint64_t copied = 0;
+    std::uint64_t copied = zeroed;
     const auto start     = std::chrono::steady_clock::now();
     bool uploaded_any    = false;
     // One staging pass per rank, each on its own device: a host-to-device copy and the event that
@@ -397,9 +540,10 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
         if (ranges.empty()) { continue; }
         uploaded_any = true;
         const ScopedRank bound(device, rank);
-        const cudaStream_t transfer_stream = device.transfer_stream_for_rank(rank);
-        const std::vector<ReadSpan> spans   = direct_spans(ranges);
-        std::uint64_t aligned_bytes         = 0;
+        const cudaStream_t transfer_stream       = device.transfer_stream_for_rank(rank);
+        const std::vector<RepeatedRange> repeats = take_repeated_ranges(ranges);
+        const std::vector<ReadSpan> spans        = direct_spans(ranges);
+        std::uint64_t aligned_bytes              = 0;
         for (const auto& span : spans) {
             aligned_bytes =
                 checked_add(aligned_bytes,
@@ -424,10 +568,12 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
         TransferCompletion completion{transfer_stream};
         std::size_t next_slot  = 0;
         std::size_t next_range = 0;
+        LineBatch lines;
         for (const auto& span : spans) {
             for (auto source = span.begin; source < span.end; source += slot_bytes) {
                 auto& slot = *slots[next_slot++ % slot_count];
                 slot.wait();
+                lines.begin(slot, slot_bytes);
                 const auto remaining = span.end - source;
                 const auto request   = static_cast<std::size_t>(std::min<std::uint64_t>(
                     slot_bytes, align_up(remaining, kPayloadAlignment, "direct block bytes")));
@@ -444,16 +590,19 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
                     const auto begin  = std::max(source, range.begin);
                     const auto end    = std::min(chunk_end, range.end);
                     if (begin < end) {
-                        check_cuda(cudaMemcpyAsync(range.destination + (begin - range.begin),
-                                                   slot.data() + (begin - source),
-                                                   static_cast<std::size_t>(end - begin),
-                                                   cudaMemcpyHostToDevice, transfer_stream),
-                                   "upload weight bytes");
+                        std::byte* const to     = range.destination + (begin - range.begin);
+                        const std::byte* const from = slot.data() + (begin - source);
+                        const auto bytes        = static_cast<std::size_t>(end - begin);
+                        if (!lines.extend(to, from, bytes)) {
+                            lines.flush(transfer_stream);
+                            (void)lines.extend(to, from, bytes);
+                        }
                         copied = checked_add(copied, end - begin, "copied bytes");
                     }
                     if (range.end > chunk_end) { break; }
                     ++next_range;
                 }
+                lines.flush(transfer_stream);
                 check_cuda(cudaEventRecord(slot.event, transfer_stream),
                            "record weight staging completion");
                 slot.pending = true;
@@ -461,7 +610,21 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
                                done + total);
             }
         }
-        for (const auto& slot : slots) { slot->wait(); }
+        for (const auto& slot : slots) {
+            slot->wait();
+            if (slot->packed) {
+                totals.peak_staging_bytes =
+                    std::max<std::uint64_t>(totals.peak_staging_bytes, slot_bytes * 2 * slot_count);
+            }
+        }
+        // Behind the uploads on the same stream, so each source already holds its bytes.
+        for (const RepeatedRange& repeat : repeats) {
+            check_cuda(cudaMemcpyAsync(repeat.destination, repeat.source,
+                                       static_cast<std::size_t>(repeat.bytes),
+                                       cudaMemcpyDeviceToDevice, transfer_stream),
+                       "repeat stored weight bytes");
+            copied = checked_add(copied, repeat.bytes, "copied bytes");
+        }
         completion.finish();
         if (next_range != ranges.size()) { throw ArtifactError("incomplete device upload"); }
     }
@@ -472,10 +635,10 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
     if (checked_add(copied, transcoded_bytes, "uploaded bytes") != total) {
         throw ArtifactError("incomplete device upload");
     }
-    totals.h2d_bytes = checked_add(copied, transcoded_bytes, "uploaded bytes");
+    totals.h2d_bytes = checked_add(copied - zeroed, transcoded_bytes, "uploaded bytes");
     totals.seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    phase.complete(done + totals.h2d_bytes, done + total);
+    phase.complete(done + total, done + total);
     return totals;
 }
 
@@ -547,6 +710,13 @@ const WeightParent& MaterializedArtifact::pinned_parent(ObjectHandle handle) con
     return *objects_[handle.index].pinned;
 }
 
+const WeightParent& MaterializedArtifact::mapped_parent(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || !objects_[handle.index].mapped) {
+        throw ArtifactError("object has no mapped Host weight backing");
+    }
+    return *objects_[handle.index].mapped;
+}
+
 std::span<const std::byte> MaterializedArtifact::pinned_block() const noexcept {
     if (!pinned_) { return {}; }
     return {static_cast<const std::byte*>(pinned_->data()), pinned_->size()};
@@ -570,6 +740,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     std::uint64_t host_total = 0;
     for (const auto& placement : plan.pinned_objects) {
         host_total = checked_add(host_total, placement.bytes, "pinned payload bytes");
+    }
+    for (const auto& placement : plan.mapped_objects) {
+        host_total = checked_add(host_total, placement.bytes, "mapped payload bytes");
     }
     for (const auto& placement : plan.host_objects) {
         if (placement.data.empty()) {
@@ -629,32 +802,39 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         out.stats_.device_capacity_by_rank.push_back(capacity);
     }
-    if (plan.pinned_capacity_bytes > std::numeric_limits<std::size_t>::max()) {
-        throw ArtifactError("pinned Host backing exceeds size_t");
-    }
     std::vector<HostReadTarget> host_reads;
-    std::byte* block = nullptr;
-    if (!plan.pinned_objects.empty()) {
-        out.pinned_ = std::make_unique<HostPages>(
-            static_cast<std::size_t>(plan.pinned_capacity_bytes));
-        block                      = out.pinned_->data();
+    // The pinned and the mapped block are laid out alike: ascending, aligned, non-overlapping
+    // placements of whole stored objects, read straight into the block.
+    const auto host_block = [&](std::span<const PinnedPlacement> placements,
+                                std::uint64_t capacity, const char* label) {
+        if (capacity > std::numeric_limits<std::size_t>::max()) {
+            throw ArtifactError(std::string(label) + " Host backing exceeds size_t");
+        }
+        auto pages = std::make_unique<HostPages>(static_cast<std::size_t>(capacity));
         std::uint64_t previous_end = 0;
         std::vector<bool> placed(out.objects_.size(), false);
-        for (const auto& placement : plan.pinned_objects) {
+        for (const auto& placement : placements) {
             reader.validate_object(placement.object);
             const auto& geometry = reader.geometry(placement.object);
             if (placed.at(placement.object.index) || geometry.bytes != placement.bytes ||
                 placement.offset < previous_end || placement.alignment == 0 ||
-                placement.offset % placement.alignment != 0 ||
-                placement.offset > plan.pinned_capacity_bytes ||
-                placement.bytes > plan.pinned_capacity_bytes - placement.offset) {
-                throw ArtifactError("invalid or duplicate pinned Host placement");
+                placement.offset % placement.alignment != 0 || placement.offset > capacity ||
+                placement.bytes > capacity - placement.offset) {
+                throw ArtifactError(std::string("invalid or duplicate ") + label +
+                                    " Host placement");
             }
             placed[placement.object.index] = true;
             previous_end                   = placement.offset + placement.bytes;
             host_reads.push_back({reader.directory().tensor(placement.object).offset,
-                                  placement.bytes, block + placement.offset});
+                                  placement.bytes, pages->data() + placement.offset});
         }
+        return pages;
+    };
+    if (!plan.pinned_objects.empty()) {
+        out.pinned_ = host_block(plan.pinned_objects, plan.pinned_capacity_bytes, "pinned");
+    }
+    if (!plan.mapped_objects.empty()) {
+        out.mapped_ = host_block(plan.mapped_objects, plan.mapped_capacity_bytes, "mapped");
     }
     for (auto& placement : plan.host_objects) {
         reader.validate_object(placement.object);
@@ -671,18 +851,41 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         read_host_bytes(reader, host_reads, phase,
                         checked_add(host_total, total, "weight payload bytes"));
     out.stats_.read_bytes = checked_add(out.stats_.read_bytes, host_read, "Host read bytes");
+    if (out.mapped_) {
+        out.mapped_->pin(true);
+        // The address the primary device reads the block at. Under unified addressing it is
+        // usually the host address, but only the runtime may say so.
+        void* alias = nullptr;
+        check_cuda(cudaHostGetDevicePointer(&alias, out.mapped_->data(), 0),
+                   "resolve the mapped Host block's device address");
+        for (const auto& placement : plan.mapped_objects) {
+            const auto& geometry = reader.geometry(placement.object);
+            const std::span<std::byte> destination(out.mapped_->data() + placement.offset,
+                                                   static_cast<std::size_t>(placement.bytes));
+            const auto divisor =
+                read_divisor(reader, placement.object, geometry, destination, out.stats_);
+            out.objects_.at(placement.object.index).mapped =
+                WeightParent{geometry, static_cast<const std::byte*>(alias) + placement.offset,
+                             divisor};
+        }
+        out.stats_.mapped_bytes        = plan.mapped_capacity_bytes;
+        out.stats_.mapped_object_count = plan.mapped_objects.size();
+        out.stats_.pinned_bytes =
+            checked_add(out.stats_.pinned_bytes, plan.mapped_capacity_bytes, "mapped Host bytes");
+    }
     if (out.pinned_) {
         out.pinned_->pin();
         for (const auto& placement : plan.pinned_objects) {
             const auto& geometry = reader.geometry(placement.object);
-            const std::span<std::byte> destination(block + placement.offset,
+            const std::span<std::byte> destination(out.pinned_->data() + placement.offset,
                                                    static_cast<std::size_t>(placement.bytes));
             const auto divisor =
                 read_divisor(reader, placement.object, geometry, destination, out.stats_);
             out.objects_.at(placement.object.index).pinned =
                 WeightParent{geometry, destination.data(), divisor};
         }
-        out.stats_.pinned_bytes        = plan.pinned_capacity_bytes;
+        out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes,
+                                              plan.pinned_capacity_bytes, "pinned Host bytes");
         out.stats_.pinned_object_count = plan.pinned_objects.size();
     }
     for (auto& placement : plan.host_objects) {
@@ -712,8 +915,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     std::vector<std::uint64_t> previous_device_end(rank_count, 0);
     for (const auto& placement : plan.device_objects) {
         if (placement.selection.has_value() != placement.source.has_value() ||
-            (placement.selection && (placement.object.index < plan.object_count ||
-                                     placement.transcode || placement.panel))) {
+            (placement.selection &&
+             (placement.object.index < plan.object_count || placement.transcode))) {
             throw ArtifactError("a selected device placement is malformed");
         }
         const ObjectHandle stored   = placement.source.value_or(placement.object);
@@ -744,9 +947,12 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         previous_device_end[placement.rank] = placement.offset + placement.bytes + placement.tail;
         const DeviceSpan storage{static_cast<std::byte*>(arena->base()) + placement.offset,
                                  static_cast<std::size_t>(placement.bytes)};
-        const auto divisor = object.host
-                                 ? object.host->weight_scale_divisor
-                                 : read_divisor(reader, stored, geometry, {}, out.stats_);
+        // A transcoded placement is NVFP4 no more; a selected piece starts at its first stored row.
+        float divisor = object.host ? object.host->weight_scale_divisor : 0.0F;
+        if (!object.host && geometry.format == QType::NVFP4) {
+            divisor = read_divisor(reader, stored, stored_geometry, {}, out.stats_,
+                                   placement.selection ? placement.selection->rows.front().first : 0);
+        }
         object.device = WeightParent{geometry, static_cast<const std::byte*>(storage.data),
                                      divisor, stored_geometry.format};
     }

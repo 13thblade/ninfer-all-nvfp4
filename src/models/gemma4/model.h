@@ -39,7 +39,9 @@ struct AttentionWeights {
 
 struct MoeWeights {
     WeightId router, router_scale, expert_scale, pre_norm, post_norm;
-    std::optional<WeightId> gate_up, down; // resident banks only
+    std::optional<WeightId> gate_up, down; // resident banks only, without expert parallelism
+    // Expert parallelism: each rank's rows of the two banks (its experts), by rank.
+    std::vector<WeightId> gate_up_shares, down_shares;
     WeightId mlp_post_norm; // post_feedforward_layernorm_1 of the dense branch
 };
 
@@ -107,6 +109,10 @@ struct LoadOptions {
     // Binds the artifact's `vision` component, which must then exist, in this placement.
     VisionPlacement vision = VisionPlacement::None;
     ExpertResidency experts = ExpertResidency::Device;
+    // Expert parallelism (`--tensor-parallel`): each device rank's relative share of every MoE
+    // block's routed experts; empty for one device. Everything else stays on rank 0, and the
+    // experts must be device resident.
+    std::vector<double> expert_split;
 };
 
 class Model {
@@ -118,6 +124,12 @@ public:
     [[nodiscard]] const TextConfig& config() const noexcept { return config_; }
     [[nodiscard]] const TextWeights& weights() const noexcept { return weights_; }
     [[nodiscard]] ExpertResidency expert_residency() const noexcept { return expert_residency_; }
+
+    // Expert parallelism: whether the routed experts are divided over the ranks, and the experts
+    // [first, second) rank `rank` holds.
+    [[nodiscard]] bool expert_parallel() const noexcept { return !expert_split_.empty(); }
+
+    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> expert_range(std::size_t rank) const;
     [[nodiscard]] std::span<const ExpertBanks> expert_banks() const noexcept { return expert_banks_; }
     [[nodiscard]] std::uint64_t expert_pinned_bytes() const noexcept {
         std::uint64_t bytes = 0;
@@ -178,6 +190,7 @@ private:
     FrontendResources resources_;
     InstanceInfo info_;
     ExpertResidency expert_residency_ = ExpertResidency::Device;
+    std::vector<double> expert_split_;
     std::vector<ExpertBanks> expert_banks_;
     std::vector<std::filesystem::path> expert_files_;
 };
@@ -192,5 +205,12 @@ private:
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader,
                                                 const LoadOptions& options, DeviceContext& device,
                                                 const StartupObserver* observer = nullptr);
+
+// Expert parallelism's split of the routed experts when none is given: by `speed`, within each
+// rank's `free_bytes` beside what the load of `options` puts on it (models::default_expert_split).
+[[nodiscard]] std::vector<double> default_expert_split(const artifact::Reader& reader,
+                                                       const LoadOptions& options,
+                                                       std::span<const std::uint64_t> free_bytes,
+                                                       std::span<const double> speed);
 
 } // namespace ninfer::models::gemma4

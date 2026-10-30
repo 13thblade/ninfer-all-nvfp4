@@ -47,11 +47,13 @@ ops::WeightInput Model::rotated_input(WeightUseId id) const {
     if (use.hadamard_signs) {
         const auto& signs = weight(*use.hadamard_signs).view;
         if (signs.shape.size() != 1 || parameter.view.shape.size() != 2 ||
-            signs.shape[0] != parameter.view.shape[1]) {
+            use.hadamard_begin + parameter.view.shape[1] > signs.shape[0]) {
             throw std::invalid_argument(parameter.name + "@" + use.input +
                                         ": Hadamard signs must cover the input width");
         }
-        result.hadamard_signs = replicas_.on_rank(bound_, *use.hadamard_signs, parameter.rank);
+        result.hadamard_signs = replicas_.on_rank(bound_, *use.hadamard_signs, parameter.rank)
+                                    .slice(0, static_cast<std::int32_t>(use.hadamard_begin),
+                                           static_cast<std::int32_t>(parameter.view.shape[1]));
     }
     if (use.input_columns) {
         result.input_columns = replicas_.on_rank(bound_, *use.input_columns, parameter.rank);

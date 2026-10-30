@@ -16,7 +16,26 @@ void launch(const Nvfp4A4Operands& p, __nv_bfloat16* output, cudaStream_t stream
             Nvfp4ScheduleInstance<Nvfp4A4TmaMmaSchedule<256, 3, 1, Promotion>, K>>(
             p, y, LinearIdentityEpilogue{}, stream);
 }
+
+template <class Output>
+void launch_general(const Nvfp4A4Operands& p, Output y, cudaStream_t stream) {
+    if (p.scale_layout == Nvfp4ScaleLayout::Tiled128)
+        launch_nvfp4_a4_tma_mma<Nvfp4A4TmaMmaSchedule<128, 4, 1>>(p, y, LinearIdentityEpilogue{},
+                                                                  stream);
+    else
+        launch_nvfp4_a4_tma_mma<Nvfp4A4TmaMmaSchedule<256, 3, 1>>(p, y, LinearIdentityEpilogue{},
+                                                                  stream);
+}
 } // namespace
+
+void launch_nvfp4_a4_tma_general(const Nvfp4A4Operands& p, const Tensor& out, cudaStream_t stream) {
+    require_nvfp4_a4_card();
+    if (out.dtype == DType::FP32) {
+        launch_general(p, LinearFp32Output{static_cast<float*>(out.data), p.rows}, stream);
+    } else {
+        launch_general(p, LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), p.rows}, stream);
+    }
+}
 
 void launch_nvfp4_a4_tma_linear(Nvfp4GeometryId problem, const Nvfp4A4Operands& p,
                                 __nv_bfloat16* output, cudaStream_t stream) {

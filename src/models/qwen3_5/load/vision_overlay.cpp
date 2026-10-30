@@ -79,7 +79,11 @@ void apply_vision_overlay_placement(Bindings& bindings, const ModelWeights& weig
         }
     }
     if (weights.proposal) { bindings.evict(weights.proposal->head, kEvictRankProposalHead); }
-    bindings.evict(weights.text.token_embedding, kEvictRankEmbedding);
+    // A host embedding holds no device memory for a window to borrow.
+    if (bindings.at(weights.text.token_embedding).reference.residency ==
+        artifact::Residency::Device) {
+        bindings.evict(weights.text.token_embedding, kEvictRankEmbedding);
+    }
     bindings.evict(weights.text.output_head, kEvictRankOutputHead);
 }
 

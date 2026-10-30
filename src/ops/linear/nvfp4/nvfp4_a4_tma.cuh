@@ -343,7 +343,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                 }
             }
         }
-        if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
+        cta_mbarrier_release_stage(&shared.empty[stage], lane);
     }
 
     // The epilogue reuses the tensor pipeline's shared-memory storage. All consumer
@@ -364,6 +364,33 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                 for (int v = 0; v < 4; ++v) accumulators[mt][mr][v] *= alpha;
         epilogue.template finish_tile<Schedule, false>(
             output, shared_bytes, accumulators, row_begin, token_begin, output_rows, token_count);
+    } else if constexpr (kLinearFp32PairOutput<OutputPolicy>) {
+        // An FP32 result is stored from the accumulators, each pair of rows unrounded.
+        static_assert(!Rows::kPaired, "an FP32 pair store needs contiguous rows");
+        const int ar = lane >> 2, ac = 2 * (lane & 3);
+#pragma unroll
+        for (int mt = 0; mt < Schedule::kMmaTokens; ++mt) {
+            const int t0 = token_begin + warp_m * Schedule::kWarpTokens + mt * 16 + ar;
+            const int t1 = t0 + 8;
+#pragma unroll
+            for (int mr = 0; mr < Schedule::kMmaRows; ++mr) {
+                const int r0 = row_begin + warp_n * Schedule::kWarpRows + mr * 8 + ac;
+                if (t0 < token_count) {
+                    output.store_fp32_pair(
+                        r0, t0,
+                        make_float2(
+                            epilogue.apply_scaled(r0, t0, accumulators[mt][mr][0], alpha),
+                            epilogue.apply_scaled(r0 + 1, t0, accumulators[mt][mr][1], alpha)));
+                }
+                if (t1 < token_count) {
+                    output.store_fp32_pair(
+                        r0, t1,
+                        make_float2(
+                            epilogue.apply_scaled(r0, t1, accumulators[mt][mr][2], alpha),
+                            epilogue.apply_scaled(r0 + 1, t1, accumulators[mt][mr][3], alpha)));
+                }
+            }
+        }
     } else {
         constexpr int stride = Schedule::kBlockRows + 8;
         auto* tile           = shared.scratch.output;

@@ -17,6 +17,8 @@ Direct scalar formats preserve one logical scalar word per tensor element:
 | `bf16` | direct floating point | 16 | bfloat16 bit encoding |
 | `fp32` | direct floating point | 32 | IEEE-754 binary32 |
 | `int32` | direct signed integer | 32 | 32-bit two's-complement integer |
+| `fp16` | direct floating point | 16 | IEEE-754 binary16 |
+| `uint16` | direct unsigned integer | 16 | 16-bit unsigned word |
 
 Grouped quantized-weight formats preserve signed codes plus one scale per logical group:
 
@@ -87,7 +89,7 @@ identify a tensor's model role, physical byte layout, or supported consumer.
 
 A **direct scalar format** assigns one fixed-width logical word to every logical tensor coordinate.
 It defines the value of that word without a group, scale, zero point, or reconstruction step. `bf16`,
-`fp32`, and `int32` are direct scalar formats.
+`fp32`, `int32`, `fp16` and `uint16` are direct scalar formats.
 
 The adjective “direct” does not require a particular physical layout or prohibit a registered
 lossless storage transformation. It means only that layout decoding recovers the original logical
@@ -227,6 +229,22 @@ Every 32-bit word is valid, and the value interval is `[-2147483648, 2147483647]
 scale, zero point, saturation behavior, sentinel convention, or dependency on the host C++ `int`
 type. Requirements such as nonnegativity, vocabulary bounds, or the meaning of `-1` belong to the
 specific tensor role.
+
+#### `fp16`
+
+`fp16` is IEEE-754 binary16: one sign bit at bit 15, a 5-bit exponent at bits 14 through 10 with
+bias 15, and a 10-bit trailing fraction at bits 9 through 0, with the standard binary16 zeros,
+subnormals (the least positive is `2^-24`), normal values, infinities and NaNs. As with BF16, all
+65,536 words are valid at the format layer and a direct layout recovers each word unchanged. The
+converter writes an `fp16` tensor only from FP16 source words or from values FP16 represents
+exactly. The STQ drafter of DeepSeek-V4.1 stores its sign vectors in it.
+
+#### `uint16`
+
+`uint16` is a 16-bit unsigned word, `value = u` for `u` in `[0, 65535]`, with no scale, sign or
+sentinel. It carries words whose meaning belongs to the consuming tensor role: the trellis words of
+an STQ matrix (DeepSeek-V4.1's STQ drafter), which no numeric conversion may produce or change;
+the converter takes them only from unsigned 16-bit source words.
 
 #### Common direct-format rules
 

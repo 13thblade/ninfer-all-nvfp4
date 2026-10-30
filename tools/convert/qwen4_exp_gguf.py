@@ -8,8 +8,9 @@ matrices (router, indexer, the GDN gates) stay BF16; F32/F16 vectors become the 
 formats.
 
 llama.cpp's exporter conventions are undone where they touch rows or small tensors: Gated DeltaNet
-value heads return to the grouped order (``ssm_out`` keeps its tiled input columns, which a row copy
-cannot move, and carries them as an ``input_columns`` auxiliary), zero-centred norms drop their
+value heads return to the grouped order (stored ``ssm_out`` blocks keep their tiled input columns,
+which a row copy cannot move, and their import carries them as an ``input_columns`` auxiliary; its
+values and BF16 rows return to the grouped order), zero-centred norms drop their
 stored ``1 + w`` (every norm but ``ssm_norm``), ``ssm_a`` becomes ``A_log`` again, the head-
 interleaved ``attn_q`` splits into query and gate rows, and the indexer's split projections and the
 squeezed PLE convolution keep the layout the HF adapter (qwen4_exp.py) declares.
@@ -42,7 +43,7 @@ from .gguf_blocks import (
     q8_native_source,
     quantize_q8_0,
 )
-from .methods import AuxiliaryValue, cast_direct, import_encoded
+from .methods import cast_direct, import_encoded
 from .sources.gguf import TYPE_BF16, TYPE_F16, TYPE_F32, GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
 from .ternary import (
@@ -363,8 +364,10 @@ def _norm(gguf: GGUFFile, tensor: str, zero_centred: bool) -> LogicalSource:
     return _direct(values - 1.0 if zero_centred else values, torch.bfloat16, tensor)
 
 
-def _bf16_rows(gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap) -> LogicalSource:
-    """Selected rows of a direct matrix, as BF16 (BF16 words are kept exactly)."""
+def _bf16_rows(gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap,
+               columns: np.ndarray | None = None) -> LogicalSource:
+    """Selected rows of a direct matrix, as BF16 (BF16 words are kept exactly), their columns in
+    the logical order (stored column c is logical input element ``columns[c]``)."""
 
     info = gguf.info(tensor)
     flat = (prod(info.shape[:-1]), info.shape[-1])
@@ -378,17 +381,21 @@ def _bf16_rows(gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowM
         values = torch.from_numpy(
             np.ascontiguousarray(_words(gguf, tensor).reshape(flat)[select(0, shape[0])])
         ).to(torch.bfloat16)
+    if columns is not None:
+        values = values[:, torch.from_numpy(np.argsort(columns))]
     return array_source(values.reshape(shape), f"{tensor}[{info.type_name}]{list(shape)}")
 
 
 def matrix_source(
-    gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap
+    gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap,
+    columns: np.ndarray | None = None,
 ) -> tuple[LogicalSource, bool]:
-    """Rows of a stored matrix: encoded ggml rows (True) or BF16 values (False)."""
+    """Rows of a stored matrix: encoded ggml rows (True) or BF16 values (False). ``columns`` is the
+    stored input order of a matrix over permuted columns (block_source)."""
 
     if gguf.info(tensor).type_id in GGUF_FORMATS_BY_TYPE:
-        return block_source(gguf, tensor, shape, select), True
-    return _bf16_rows(gguf, tensor, shape, select), False
+        return block_source(gguf, tensor, shape, select, columns), True
+    return _bf16_rows(gguf, tensor, shape, select, columns), False
 
 
 def bf16_matrix_source(
@@ -543,8 +550,9 @@ def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | 
 
     out: dict[str, tuple[LogicalSource, bool]] = {}
 
-    def matrix(name: str, tensor: str, shape: tuple[int, int], select: RowMap = rows()):
-        out[name] = matrix_source(gguf, tensor, shape, select)
+    def matrix(name: str, tensor: str, shape: tuple[int, int], select: RowMap = rows(),
+               columns: np.ndarray | None = None):
+        out[name] = matrix_source(gguf, tensor, shape, select, columns)
 
     def direct(name: str, source: LogicalSource):
         out[name] = (source, False)
@@ -587,8 +595,9 @@ def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | 
             matrix(n + "key", qkv, (GDN_KEY_DIM, HIDDEN), rows(GDN_KEY_DIM))
             matrix(n + "value", qkv, (GDN_VALUE_DIM, HIDDEN), untiled_rows(2 * GDN_KEY_DIM))
             matrix(n + "z", g + "attn_gate.weight", (GDN_VALUE_DIM, HIDDEN), untiled_rows(0))
-            # Tiled input columns: the Use gathers the grouped activation (tiled_input_columns).
-            matrix(n + "output", g + "ssm_out.weight", (HIDDEN, GDN_VALUE_DIM))
+            # Tiled input columns: an import keeps them and its Use gathers the grouped activation.
+            matrix(n + "output", g + "ssm_out.weight", (HIDDEN, GDN_VALUE_DIM), rows(),
+                   tiled_input_columns())
             for role, tensor in (("a_projection", "ssm_alpha.weight"),
                                  ("b_projection", "ssm_beta.weight")):
                 matrix(n + role, g + tensor, (GDN_VALUE_HEADS, HIDDEN), untiled_heads())
@@ -741,15 +750,6 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
         _group_attention(recipe, "mtp/layer/", formats)
         _group_moe(recipe, "mtp/layer/moe/", model.components["mtp"]["config"]["num_experts"],
                    formats)
-    columns = AuxiliaryValue(
-        "int32", (GDN_VALUE_DIM,), tiled_input_columns().astype("<i4").tobytes()
-    )
-    for layer in range(config["num_hidden_layers"]):
-        if config["layer_types"][layer] == "full_attention":
-            continue
-        name = f"text/layers/{layer}/gdn/output"
-        for input_name in model.parameters[name].inputs:
-            recipe.use(name, input_name, auxiliaries={"input_columns": columns})
 
 
 def qwen3_8_flash_next_gsq_q2(model, recipe, sources):

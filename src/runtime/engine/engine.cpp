@@ -41,15 +41,40 @@
 namespace ninfer {
 namespace {
 
-// Gemma 4, Flint, DeepSeek-V4.1 and Flash-Next keep context caches of their own, which the
-// checkpoint catalog's options configure; the hybrid prefix cache, the server's default, belongs to
-// the Qwen3.5 Program.
+// Gemma 4, Flint, DeepSeek-V4.1 and Flash-Next: families with a core of their own, not the
+// Qwen3.5 load and Program.
+bool own_family_artifact(const std::filesystem::path& path) {
+    return runtime::is_gemma4_artifact(path) || runtime::is_flint_artifact(path) ||
+           runtime::is_deepseek_v41_artifact(path) || runtime::is_qwen4_exp_artifact(path);
+}
+
+// Those families keep context caches of their own, which the checkpoint catalog's options
+// configure; the hybrid prefix cache, the server's default, belongs to the Qwen3.5 Program.
 EngineOptions with_family_context_cache(EngineOptions options) {
-    if (runtime::is_gemma4_artifact(options.artifact_path) ||
-        runtime::is_flint_artifact(options.artifact_path) ||
-        runtime::is_deepseek_v41_artifact(options.artifact_path) ||
-        runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+    if (own_family_artifact(options.artifact_path)) {
         options.context_cache.mode = ContextCacheMode::Legacy;
+    }
+    return options;
+}
+
+// The host token embedding is a Qwen3.5 load placement; the other families bind their own tables.
+EngineOptions with_family_embedding(EngineOptions options) {
+    if (options.embedding_residency != EmbeddingResidency::Device &&
+        own_family_artifact(options.artifact_path)) {
+        throw std::invalid_argument(
+            "--embedding-residency host applies to Qwen3_5ForCausalLM and "
+            "Qwen3_5MoeForCausalLM artifacts");
+    }
+    return options;
+}
+
+// Position-split and invariant attention are Qwen3.5 Program schedules over its paged cache.
+EngineOptions with_family_attention(EngineOptions options) {
+    if ((options.tensor_attention != TensorAttention::Heads || options.invariant_attention) &&
+        own_family_artifact(options.artifact_path)) {
+        throw std::invalid_argument(
+            "--tensor-attention and --invariant-attention apply to Qwen3_5ForCausalLM and "
+            "Qwen3_5MoeForCausalLM artifacts");
     }
     return options;
 }
@@ -80,6 +105,35 @@ EngineOptions with_family_speculation(EngineOptions options) {
     return options;
 }
 
+// One line naming the pairs of devices without peer access: their transfers, a tensor-parallel
+// exchange included, stage through pinned host memory instead of reading each other's memory.
+void report_peer_access(const EngineOptions& options, const DeviceContext& device) {
+    if (device.size() < 2) { return; }
+    std::vector<std::pair<int, int>> staged;
+    for (std::size_t from = 0; from < device.size(); ++from) {
+        for (std::size_t to = from + 1; to < device.size(); ++to) {
+            if (device.peer_access(from, to) && device.peer_access(to, from)) { continue; }
+            const std::pair<int, int> pair{device.rank(from).device, device.rank(to).device};
+            if (std::find(staged.begin(), staged.end(), pair) == staged.end()) {
+                staged.push_back(pair);
+            }
+        }
+    }
+    if (staged.empty()) {
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                    "peer access: every pair of devices reads peer memory");
+        return;
+    }
+    std::string pairs;
+    for (const auto& [a, b] : staged) {
+        pairs += (pairs.empty() ? "" : ", ") + std::to_string(a) + "-" + std::to_string(b);
+    }
+    runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                "peer access: none between CUDA devices %s; their transfers stage "
+                                "through host memory",
+                                pairs.c_str());
+}
+
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
     if (options.devices.empty()) {
@@ -88,6 +142,11 @@ DeviceContext initialize_device(const EngineOptions& options) {
         return device;
     }
     DeviceContext device{std::span<const int>(options.devices)};
+    for (const std::string& note : device.peer_notes()) {
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                    "peer access: %s", note.c_str());
+    }
+    report_peer_access(options, device);
     phase.complete();
     return device;
 }
@@ -330,8 +389,9 @@ public:
                               std::unique_ptr<FlintCore>, std::unique_ptr<DeepSeekV41Core>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(runtime::normalize_engine_options(
-              with_family_speculation(with_family_context_cache(std::move(engine_options))))),
+        : options(runtime::normalize_engine_options(with_family_speculation(
+              with_family_context_cache(
+                  with_family_attention(with_family_embedding(std::move(engine_options))))))),
           device(initialize_device(options)),
           clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
         report_gpu_clock_floor(options, clock_floor);

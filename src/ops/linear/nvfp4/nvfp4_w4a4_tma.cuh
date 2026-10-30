@@ -380,7 +380,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                 }
             }
         }
-        if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
+        cta_mbarrier_release_stage(&shared.empty[stage], lane);
     }
 
     // The epilogue reuses the tensor pipeline's shared-memory storage. All consumer

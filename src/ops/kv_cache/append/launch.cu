@@ -22,7 +22,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
-        if (tokens >= 128 && Geometry::KVHeads == 2) {
+        if (tokens >= 128 && Geometry::KVHeads <= 2) {
             constexpr int TokensPerTile = 8;
             const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
             const dim3 fill_grid(static_cast<unsigned>(max_tiles),
@@ -59,7 +59,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
         // plane is a packed key coding, told apart by storage. Otherwise the plane is plain INT8.
         const bool packed_values = cache.v_pages.dtype == DType::U8;
         const auto issue         = [&]<bool PackedValues, KvKeyCoding Keys>() {
-            if (tokens >= 128 && Geometry::KVHeads == 2) {
+            if (tokens >= 128 && Geometry::KVHeads <= 2) {
                 constexpr int TokensPerTile = 8;
                 const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
                 const dim3 fill_grid(static_cast<unsigned>(max_tiles),
@@ -208,12 +208,11 @@ void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& posi
         kv_cache_append_nvfp4_launch(k, v, positions, cache, stream);
         return;
     }
-    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
-    if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
-        launch_full<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
-        return;
-    }
-    launch_full<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
+    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data),
+                                         cache.page_stride, cache.page_residue};
+    with_kv_append_geometry(k.ne[1], [&]<typename Geometry>() {
+        launch_full<Geometry>(k, v, positions, cache, metadata, stream);
+    });
 }
 
 void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -236,12 +235,12 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
                 Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
+            .page_stride  = cache.page_stride,
+            .page_residue = cache.page_residue,
         };
-        if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
-            launch_full<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
-            return;
-        }
-        launch_full<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
+        with_kv_append_geometry(k.ne[1], [&]<typename Geometry>() {
+            launch_full<Geometry>(k, v, positions, cache, metadata, stream);
+        });
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

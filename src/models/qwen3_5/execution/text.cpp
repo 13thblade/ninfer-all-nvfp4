@@ -880,11 +880,34 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    // A tensor-parallel rank runs its KV heads and the query heads that read them, over its own
+    // planes of the layer's KV cache.
+    const TextConfig& config = layer_config();
+    const std::size_t kv_rank =
+        stage_runtime_ != nullptr && stage_runtime_->tensor_parallel ? tensor_rank_ : 0;
     if (active_causal_attention_envelope_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
+    // The text cache's split schedule: fixed key segments under invariant reductions.
+    const auto with_segments = [&](ops::CausalAttentionExecutionEnvelope envelope) {
+        envelope.invariant_segment_keys = batch_text_kv_->attention_segment_keys();
+        return envelope;
+    };
+    const ops::CausalAttentionExecutionEnvelope envelope =
+        with_segments(*active_causal_attention_envelope_);
+    // A position-split rank attends over its own pages into its partial output and keeps its query
+    // heads' gates; attn_merge_output merges and projects once every rank's partial is out.
+    const bool positions = attention_partial_ != nullptr;
+    const auto query_heads = static_cast<std::int32_t>(config.attention->num_attention_heads);
+    const auto partial_of  = [&](std::int32_t column, std::int32_t columns) {
+        return Tensor(attention_partial_ + static_cast<std::size_t>(column) *
+                                               ops::causal_attention_partial_elements(query_heads, 1),
+                      DType::FP32,
+                      {static_cast<std::int32_t>(
+                          ops::causal_attention_partial_elements(query_heads, columns))});
+    };
 
-    const auto projection        = workspace::text_attention_projection(work_, config_, T);
+    const auto projection        = workspace::text_attention_projection(work_, config, T);
     const Tensor& input_signs    = projection_signs(p.projection);
     const InputBasis input_basis = rotated(input_signs) ? InputBasis::Rotated : InputBasis::Primal;
     // The NVFP4 W4A4 route can normalize while it quantizes, which skips the BF16 round trip of
@@ -909,18 +932,18 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
     }
 
-    Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
-                                              dimension(config_.attention->num_attention_heads), T});
-    Tensor gate      = projection.gate.view({dimension(config_.attention->head_dim),
-                                             dimension(config_.attention->num_attention_heads), T});
-    Tensor k         = projection.key.view({dimension(config_.attention->head_dim),
-                                            dimension(config_.attention->num_key_value_heads), T});
-    Tensor v         = projection.value.view({dimension(config_.attention->head_dim),
-                                              dimension(config_.attention->num_key_value_heads), T});
-    Tensor q_flat    = q.view({dimension(config_.attention->query_width()), T});
-    Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
-    Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
-    Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
+    Tensor q         = projection.query.view({dimension(config.attention->head_dim),
+                                              dimension(config.attention->num_attention_heads), T});
+    Tensor gate      = projection.gate.view({dimension(config.attention->head_dim),
+                                             dimension(config.attention->num_attention_heads), T});
+    Tensor k         = projection.key.view({dimension(config.attention->head_dim),
+                                            dimension(config.attention->num_key_value_heads), T});
+    Tensor v         = projection.value.view({dimension(config.attention->head_dim),
+                                              dimension(config.attention->num_key_value_heads), T});
+    Tensor q_flat    = q.view({dimension(config.attention->query_width()), T});
+    Tensor gate_flat = gate.view({dimension(config.attention->query_width()), T});
+    Tensor k_flat    = k.view({dimension(config.attention->key_width()), T});
+    Tensor v_flat    = v.view({dimension(config.attention->key_width()), T});
     if (fused_nvfp4) {
         ops::attn_input_proj_fused_rmsnorm_nvfp4(x, w.input_norm, config_.rms_norm_eps,
                                                  single->weight, q_flat, gate_flat, k_flat, v_flat,
@@ -933,23 +956,22 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s, input_basis);
     }
 
-    const auto results = workspace::text_attention_results(work_, config_, T);
+    const auto results = workspace::text_attention_results(work_, config, T);
     Tensor qn =
-        results.normalized_query.view({dimension(config_.attention->head_dim),
-                                       dimension(config_.attention->num_attention_heads), T});
-    Tensor kn = results.normalized_key.view({dimension(config_.attention->head_dim),
-                                             dimension(config_.attention->num_key_value_heads), T});
+        results.normalized_query.view({dimension(config.attention->head_dim),
+                                       dimension(config.attention->num_attention_heads), T});
+    Tensor kn = results.normalized_key.view({dimension(config.attention->head_dim),
+                                             dimension(config.attention->num_key_value_heads), T});
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config_.attention,
-                      config_.rms_norm_eps, p.query_norm, p.key_norm, q, k, qn, kn, rope_yarn_,
-                      s);
+    text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config.attention,
+                      config_.rms_norm_eps, p.query_norm, p.key_norm, q, k, qn, kn, rope_yarn_, s);
 
-    Tensor a = results.attention.view({dimension(config_.attention->head_dim),
-                                       dimension(config_.attention->num_attention_heads), T});
+    Tensor a = results.attention.view({dimension(config.attention->head_dim),
+                                       dimension(config.attention->num_attention_heads), T});
     const bool rotated_output = rotated(p.output.hadamard_signs);
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
@@ -958,20 +980,20 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         if (width <= 0 || width * active_sequence_batch_ != T) {
             throw std::logic_error("Text sequence batch binding does not match aggregate columns");
         }
-        Tensor q_batch        = qn.view({dimension(config_.attention->head_dim),
-                                         dimension(config_.attention->num_attention_heads), width,
+        Tensor q_batch        = qn.view({dimension(config.attention->head_dim),
+                                         dimension(config.attention->num_attention_heads), width,
                                          active_sequence_batch_});
-        Tensor k_batch        = kn.view({dimension(config_.attention->head_dim),
-                                         dimension(config_.attention->num_key_value_heads), width,
+        Tensor k_batch        = kn.view({dimension(config.attention->head_dim),
+                                         dimension(config.attention->num_key_value_heads), width,
                                          active_sequence_batch_});
-        Tensor v_batch        = v.view({dimension(config_.attention->head_dim),
-                                        dimension(config_.attention->num_key_value_heads), width,
+        Tensor v_batch        = v.view({dimension(config.attention->head_dim),
+                                        dimension(config.attention->num_key_value_heads), width,
                                         active_sequence_batch_});
-        Tensor a_batch        = a.view({dimension(config_.attention->head_dim),
-                                        dimension(config_.attention->num_attention_heads), width,
+        Tensor a_batch        = a.view({dimension(config.attention->head_dim),
+                                        dimension(config.attention->num_attention_heads), width,
                                         active_sequence_batch_});
-        Tensor gate_batch     = gate.view({dimension(config_.attention->head_dim),
-                                           dimension(config_.attention->num_attention_heads), width,
+        Tensor gate_batch     = gate.view({dimension(config.attention->head_dim),
+                                           dimension(config.attention->num_attention_heads), width,
                                            active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
@@ -979,50 +1001,94 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         // applies it at the store, and every other route applies it inside the Op. One contract
         // either way, and the same bytes the standalone multiply produced. A rotated output
         // projection takes the ungated attention, gated and rotated in one pass below.
+        Tensor partial = positions ? partial_of(0, T) : Tensor{};
         ops::causal_softmax_attention(
             q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-            {dimension(config_.attention->head_dim),
-             dimension(config_.attention->num_attention_heads),
-             dimension(config_.attention->num_key_value_heads)},
-            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
-            a_batch, s, rotated_output ? nullptr : &gate_batch);
+            {dimension(config.attention->head_dim),
+             dimension(config.attention->num_attention_heads),
+             dimension(config.attention->num_key_value_heads)},
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config.attention->head_dim))),
+            batch_text_kv_->batch_layer_view(fidx, kv_rank), envelope, work_, a_batch, s,
+            rotated_output || positions ? nullptr : &gate_batch, positions ? &partial : nullptr);
     } else if (!active_segments_.empty()) {
         // Each segment attends over its own sequence exactly as its prefill alone would.
         for (const SegmentBinding& segment : active_segments_) {
             auto scope           = work_.scope();
             Tensor a_segment     = a.slice(2, segment.column, segment.columns);
             Tensor gate_segment  = gate.slice(2, segment.column, segment.columns);
+            Tensor partial = positions ? partial_of(segment.column, segment.columns) : Tensor{};
             ops::causal_softmax_attention(
                 qn.slice(2, segment.column, segment.columns),
                 kn.slice(2, segment.column, segment.columns),
                 v.slice(2, segment.column, segment.columns), segment.positions, Tensor{},
                 segment.kv_table_row,
-                {dimension(config_.attention->head_dim),
-                 dimension(config_.attention->num_attention_heads),
-                 dimension(config_.attention->num_key_value_heads)},
+                {dimension(config.attention->head_dim),
+                 dimension(config.attention->num_attention_heads),
+                 dimension(config.attention->num_key_value_heads)},
                 static_cast<float>(1.0 /
-                                   std::sqrt(static_cast<double>(config_.attention->head_dim))),
-                batch_text_kv_->batch_layer_view(fidx), segment.envelope, work_, a_segment, s,
-                rotated_output ? nullptr : &gate_segment);
+                                   std::sqrt(static_cast<double>(config.attention->head_dim))),
+                batch_text_kv_->batch_layer_view(fidx, kv_rank), with_segments(segment.envelope),
+                work_, a_segment, s, rotated_output || positions ? nullptr : &gate_segment,
+                positions ? &partial : nullptr);
         }
     } else {
+        Tensor partial = positions ? partial_of(0, T) : Tensor{};
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
-            {dimension(config_.attention->head_dim),
-             dimension(config_.attention->num_attention_heads),
-             dimension(config_.attention->num_key_value_heads)},
-            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a, s,
-            rotated_output ? nullptr : &gate);
+            {dimension(config.attention->head_dim),
+             dimension(config.attention->num_attention_heads),
+             dimension(config.attention->num_key_value_heads)},
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config.attention->head_dim))),
+            batch_text_kv_->batch_layer_view(fidx, kv_rank), envelope, work_, a, s,
+            rotated_output || positions ? nullptr : &gate, positions ? &partial : nullptr);
+    }
+    if (positions) {
+        // The rank's query heads' gates, contiguous for the merge.
+        const TensorShare& share = stage_runtime_->tensor_parallel->shares[tensor_rank_];
+        const std::size_t row =
+            static_cast<std::size_t>(config.attention->head_dim) * sizeof(__nv_bfloat16);
+        const std::size_t heads = share.query_head_end - share.query_head_begin;
+        CUDA_CHECK(cudaMemcpy2DAsync(attention_gate_->data, heads * row,
+                                     static_cast<const std::byte*>(gate.data) +
+                                         share.query_head_begin * row,
+                                     static_cast<std::size_t>(query_heads) * row, heads * row,
+                                     static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
+        return;
     }
     const bool wide = wide_residual_verification(ph, row_width(T), row_width(T));
-    Tensor gated    = a.view({dimension(config_.attention->query_width()), T});
+    Tensor gated    = a.view({dimension(config.attention->query_width()), T});
     if (rotated_output) {
         ops::sigmoid_mul_hadamard(gate, a, p.output.hadamard_signs, gated, s);
         project_residual(gated, p.output, x, InputBasis::Rotated, wide);
         return;
     }
+    project_residual(gated, p.output, x, InputBasis::Primal, wide);
+}
+
+void TextContext::attn_merge_output(const BlockParameters& w, Tensor& x,
+                                    std::span<const float* const> partials, const Tensor& gate,
+                                    Phase ph) {
+    const auto& p            = std::get<AttentionParameters>(w.mixer);
+    const TextConfig& config = layer_config();
+    const TensorShare& share = stage_runtime_->tensor_parallel->shares[tensor_rank_];
+    const int T              = x.ne[1];
+    const auto heads = static_cast<std::int32_t>(share.query_head_end - share.query_head_begin);
+    const auto head_dim      = dimension(config.attention->head_dim);
+    Tensor a = workspace::matrix(work_, DType::BF16, head_dim * heads, T).view({head_dim, heads, T});
+    Tensor gated = a.view({head_dim * heads, T});
+    const bool wide = wide_residual_verification(ph, row_width(T), row_width(T));
+    if (rotated(p.output.hadamard_signs)) {
+        // As attn_mix: the ungated output, gated and rotated in one pass.
+        ops::causal_attention_merge_partials(
+            partials, static_cast<std::int32_t>(config.attention->num_attention_heads), T,
+            static_cast<std::int32_t>(share.query_head_begin), nullptr, a, ctx_.stream);
+        ops::sigmoid_mul_hadamard(gate, a, p.output.hadamard_signs, gated, ctx_.stream);
+        project_residual(gated, p.output, x, InputBasis::Rotated, wide);
+        return;
+    }
+    ops::causal_attention_merge_partials(
+        partials, static_cast<std::int32_t>(config.attention->num_attention_heads), T,
+        static_cast<std::int32_t>(share.query_head_begin), &gate, a, ctx_.stream);
     project_residual(gated, p.output, x, InputBasis::Primal, wide);
 }
 
@@ -1052,12 +1118,16 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     const InputBasis projection_basis = gdn_norm_control(x, w.input_norm, config.rms_norm_eps, p,
                                                          h, g, beta, work_, ctx_.execution_view());
     if (&config != &config_) {
-        const auto heads       = static_cast<std::size_t>(config.gdn->linear_num_value_heads);
-        const auto all_heads   = static_cast<std::size_t>(config_.gdn->linear_num_value_heads);
-        const auto own_gates   = [&](const Tensor& all) {
+        const auto heads     = static_cast<std::size_t>(config.gdn->linear_num_value_heads);
+        const auto all_heads = static_cast<std::size_t>(config_.gdn->linear_num_value_heads);
+        // The rank's value heads follow its first key head's.
+        const auto first = static_cast<std::size_t>(
+                               stage_runtime_->tensor_parallel->shares[tensor_rank_].key_head_begin) *
+                           (all_heads / config_.gdn->linear_num_key_heads);
+        const auto own_gates = [&](const Tensor& all) {
             Tensor own = work_.alloc(DType::FP32, {static_cast<std::int32_t>(heads), T});
             CUDA_CHECK(cudaMemcpy2DAsync(own.data, heads * sizeof(float),
-                                         static_cast<const float*>(all.data) + tensor_rank_ * heads,
+                                         static_cast<const float*>(all.data) + first,
                                          all_heads * sizeof(float), heads * sizeof(float),
                                          static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
             return own;
@@ -1577,14 +1647,11 @@ void TextContext::run_staged(Tensor& x, Phase ph, Tap& tap) {
 // Runs every layer with each rank issuing its share of it. Rank 0 sends the residual and the
 // control tensors to the other ranks once, and each holds a replica of the residual from then on.
 // A GDN mixer or an FFN is one exchange: every rank projects its share into an FP32 partial and
-// every replica adds the sum of the partials. Attention runs on rank 0 alone, an exchange with one
-// contributor. The replicas stay equal, and rank 0's ends the pass where one device's would.
+// every replica adds the sum of the partials. Attention is the same exchange over the ranks that
+// hold KV heads, each attending with its own heads. The replicas stay equal, and rank 0's ends the
+// pass where one device's would.
 template <class Tap>
 void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
-    if constexpr (Tap::enabled) {
-        (void)tap;
-        throw std::logic_error("layer feature taps are not available with tensor parallelism");
-    }
     StageRuntime& runtime            = *stage_runtime_;
     auto& tp                         = *runtime.tensor_parallel;
     TensorParallelExchange& exchange = *tp.exchange;
@@ -1671,6 +1738,21 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
         }
     }
 
+    // Position-split attention: each rank's query heads' gates, kept from its attention to its
+    // merge, in its own scratch for the whole pass.
+    const bool positions = tp.shares.front().attention_positions;
+    std::vector<Tensor> attention_gates(ranks);
+    if (positions) {
+        const auto head_dim = dimension(config_.attention->head_dim);
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            std::optional<ScopedArenaRank> arena_guard;
+            if (rank != 0) { arena_guard.emplace(work_, rank); }
+            const auto heads = static_cast<std::int32_t>(tp.shares[rank].query_head_end -
+                                                         tp.shares[rank].query_head_begin);
+            attention_gates[rank] = work_.alloc(DType::BF16, {head_dim, heads, x.ne[1]});
+        }
+    }
+
     // Issues `share` for rank `rank` on its device, against its scratch, control and replica.
     const auto on_rank = [&](std::size_t rank, const auto& share) {
         std::optional<ScopedDeviceRank> device_guard;
@@ -1686,8 +1768,10 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
             auto scope = work_.scope();
             share(replicas[rank].x);
         } catch (...) {
-            tensor_rank_      = 0;
-            residual_partial_ = nullptr;
+            tensor_rank_        = 0;
+            residual_partial_   = nullptr;
+            attention_partial_  = nullptr;
+            attention_gate_     = nullptr;
             throw;
         }
         tensor_rank_ = 0;
@@ -1717,8 +1801,19 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                                 values, contributors, ctx_.stream);
             });
         }
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            on_rank(rank, [&](Tensor& replica) {
+                exchange.complete(rank, exchange_slot, replica.data, values, ctx_.stream);
+            });
+        }
     };
 
+    // The ranks holding KV heads, a prefix of the ranks, run attention; the rest wait for its sum.
+    std::size_t attention_ranks = 0;
+    while (attention_ranks < tp.shares.size() &&
+           tp.shares[attention_ranks].kv_head_end > tp.shares[attention_ranks].kv_head_begin) {
+        ++attention_ranks;
+    }
     const auto layers = static_cast<std::uint32_t>(parameters_.text.layers.size());
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const auto block = [&](std::size_t rank) -> const BlockParameters& {
@@ -1731,9 +1826,41 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
             if (layer < layer_ready_.size()) {
                 CUDA_CHECK(cudaStreamWaitEvent(entry_stream, layer_ready_[layer], 0));
             }
-            if (full) {
-                exchange_step(1, [&](std::size_t, Tensor& replica) {
-                    attn_mix(block(0), replica, compact, ph);
+            if (full && positions) {
+                // Every rank attends over its own pages into a slot of the exchange and publishes
+                // the partial whole; the next exchange merges each rank's query heads from all of
+                // them and sums the output projections' shares.
+                const std::size_t gather_slot = next_exchange;
+                next_exchange ^= 1U;
+                const std::size_t gather_bytes =
+                    ops::causal_attention_partial_elements(
+                        static_cast<std::int32_t>(config_.attention->num_attention_heads),
+                        x.ne[1]) *
+                    sizeof(float);
+                if (gather_bytes > exchange.slot_bytes()) {
+                    throw std::runtime_error("a position-split attention exceeds its links");
+                }
+                for (std::size_t rank = 0; rank < ranks; ++rank) {
+                    on_rank(rank, [&](Tensor& replica) {
+                        attention_partial_ = exchange.partial(rank, gather_slot);
+                        attention_gate_    = &attention_gates[rank];
+                        attn_mix(block(rank), replica, compact, ph);
+                        attention_partial_ = nullptr;
+                        attention_gate_    = nullptr;
+                        exchange.publish_whole(rank, gather_slot, gather_bytes, ctx_.stream);
+                    });
+                }
+                exchange_step(ranks, [&](std::size_t rank, Tensor& replica) {
+                    std::array<const float*, ops::kCausalAttentionMaximumMergeRanks> parts{};
+                    exchange.gather(rank, gather_slot, std::span<const float*>(parts.data(), ranks),
+                                    ctx_.stream);
+                    attn_merge_output(block(rank), replica,
+                                      std::span<const float* const>(parts.data(), ranks),
+                                      attention_gates[rank], ph);
+                });
+            } else if (full) {
+                exchange_step(attention_ranks, [&](std::size_t rank, Tensor& replica) {
+                    attn_mix(block(rank), replica, compact, ph);
                 });
             } else {
                 exchange_step(ranks, [&](std::size_t rank, Tensor& replica) {
@@ -1746,6 +1873,11 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                              ? next_projection_hints(static_cast<int>(layer))
                              : ops::SparseMoeHints{});
             });
+            // Rank 0's replica is one device's residual after the layer: a masked drafter's
+            // target features are tapped from it.
+            if constexpr (Tap::enabled) {
+                tap.capture_layer(static_cast<int>(layer), x, entry_stream);
+            }
         } catch (const std::exception& error) {
             throw std::runtime_error("text/layers/" + std::to_string(layer) +
                                      (ph == Phase::Prefill ? " prefill" : " verify") +

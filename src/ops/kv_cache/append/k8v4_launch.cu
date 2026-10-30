@@ -29,7 +29,7 @@ void launch_k8v4_for(const Tensor& k, const Tensor& v, const Tensor& positions, 
     auto* scale_v           = static_cast<KvValueScaleT<kStorage>*>(cache.v_scale_pages.data);
     assert_kv_planes<kStorage, decltype(cache_k), decltype(cache_v), decltype(scale_k),
                      decltype(scale_v)>();
-    if (tokens >= 128 && Geometry::KVHeads == 2) {
+    if (tokens >= 128 && Geometry::KVHeads <= 2) {
         constexpr int TokensPerTile = 8;
         const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
         const dim3 grid(static_cast<unsigned>(max_tiles), static_cast<unsigned>(Geometry::KVHeads));
@@ -52,18 +52,17 @@ void launch_k8v4_for(const Tensor& k, const Tensor& v, const Tensor& positions, 
 template <typename CacheView, typename Metadata>
 void dispatch_k8v4(const Tensor& k, const Tensor& v, const Tensor& positions, CacheView cache,
                    Metadata metadata, cudaStream_t stream) {
-    if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
-        launch_k8v4_for<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
-        return;
-    }
-    launch_k8v4_for<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
+    with_kv_append_geometry(k.ne[1], [&]<typename Geometry>() {
+        launch_k8v4_for<Geometry>(k, v, positions, cache, metadata, stream);
+    });
 }
 
 } // namespace
 
 void kv_cache_append_k8v4_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                  PagedKVLayerView cache, cudaStream_t stream) {
-    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
+    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data),
+                                         cache.page_stride, cache.page_residue};
     dispatch_k8v4(k, v, positions, cache, metadata, stream);
 }
 
@@ -77,6 +76,8 @@ void kv_cache_append_k8v4_batch_launch(const Tensor& k, const Tensor& v, const T
                 Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
+            .page_stride  = cache.page_stride,
+            .page_residue = cache.page_residue,
         };
         dispatch_k8v4(k, v, positions, cache, metadata, stream);
     };

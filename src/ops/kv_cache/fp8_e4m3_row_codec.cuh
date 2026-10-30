@@ -21,26 +21,23 @@ inline constexpr float kKVCacheFp8MaxFinite    = 448.0F;
 inline constexpr float kKVCacheFp8ScaleMinimum = 0x1p-24F;
 inline constexpr float kKVCacheFp8ScaleMaximum = 65504.0F;
 
-template <typename Geometry>
-__device__ __forceinline__ std::int64_t kv_cache_fp8_code_index(int physical_page, int kv_head,
-                                                                int d, int page_offset) {
-    return paged_kv_element_offset<kKVCacheFp8HeadDim, Geometry::KVHeads>(physical_page, kv_head,
-                                                                          page_offset, d);
+__device__ __forceinline__ std::int64_t
+kv_cache_fp8_code_index(int physical_page, int kv_head, int d, int page_offset, int kv_heads) {
+    return paged_kv_element_offset<kKVCacheFp8HeadDim>(physical_page, kv_head, page_offset, d,
+                                                       kv_heads);
 }
 
-template <typename Geometry>
 __device__ __forceinline__ std::int64_t kv_cache_fp8_scale_index(int physical_page, int kv_head,
-                                                                 int page_offset) {
-    return paged_kv_element_offset<kKVCacheFp8Groups, Geometry::KVHeads>(physical_page, kv_head,
-                                                                         page_offset, 0);
+                                                                 int page_offset, int kv_heads) {
+    return paged_kv_element_offset<kKVCacheFp8Groups>(physical_page, kv_head, page_offset, 0,
+                                                      kv_heads);
 }
 
-template <typename Geometry>
-__device__ __forceinline__ std::int64_t kv_cache_fp8_src_index(int kv_head, int d, int token) {
+__device__ __forceinline__ std::int64_t kv_cache_fp8_src_index(int kv_head, int d, int token,
+                                                               int kv_heads) {
     return static_cast<std::int64_t>(d) +
            static_cast<std::int64_t>(kKVCacheFp8HeadDim) *
-               (static_cast<std::int64_t>(kv_head) +
-                static_cast<std::int64_t>(Geometry::KVHeads) * token);
+               (static_cast<std::int64_t>(kv_head) + static_cast<std::int64_t>(kv_heads) * token);
 }
 
 struct KVCacheFp8QuantParams {

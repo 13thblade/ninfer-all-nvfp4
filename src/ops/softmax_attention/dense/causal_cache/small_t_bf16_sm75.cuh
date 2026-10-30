@@ -33,6 +33,8 @@ struct Split : CausalSmallTBf16Split<CacheInput> {
     const __nv_bfloat16* cache_k;
     const __nv_bfloat16* cache_v;
     float scale;
+    // A strided split's own pages (causal_small_t_own_pages), or null.
+    const std::int32_t* owned;
 };
 
 // The CTA's Q rows (zero padded) through qkv_s into BF16 A fragments.
@@ -43,6 +45,9 @@ __device__ __forceinline__ void load_q(const Split<CacheInput>& s, __nv_bfloat16
     constexpr int Br      = Wc * 16;
     constexpr int Threads = Wc * 32;
     const int tid         = static_cast<int>(threadIdx.x);
+    // The grid spans the call's KV heads.
+    const int kv_heads = static_cast<int>(gridDim.x);
+    const int q_heads  = kv_heads * Geometry::GroupSize;
     for (int idx = tid; idx < Br * D; idx += Threads) {
         const int row = idx / D;
         const int d   = idx - row * D;
@@ -50,8 +55,8 @@ __device__ __forceinline__ void load_q(const Split<CacheInput>& s, __nv_bfloat16
         int token     = 0;
         causal_small_t_tc_row_to_qt<Geometry>(row, s.tokens, s.kv_head, q_head, token);
         __nv_bfloat16 value = __float2bfloat16(0.0f);
-        if (row < s.row_count && causal_valid_q_head<Geometry>(s.kv_head, q_head)) {
-            value = s.q[causal_q_index<Geometry>(q_head, d, token)];
+        if (row < s.row_count && causal_valid_q_head<Geometry>(s.kv_head, q_head, kv_heads)) {
+            value = s.q[causal_q_index(q_head, d, token, q_heads)];
         }
         qkv_s[row * D + causal_small_t_tc_swz(row, d)] = value;
     }
@@ -90,6 +95,8 @@ __device__ __forceinline__ bool sweep(const Split<CacheInput>& s, __nv_bfloat16*
     __nv_bfloat16* k_s = qkv_s;
     __nv_bfloat16* v_s = qkv_s + Bc * D;
     const int tid      = static_cast<int>(threadIdx.x);
+    // The grid spans the call's KV heads.
+    const int kv_heads = static_cast<int>(gridDim.x);
     const int lane     = tid & 31;
     const int gid      = lane >> 2;
     const int lid      = lane & 3;
@@ -111,11 +118,16 @@ __device__ __forceinline__ bool sweep(const Split<CacheInput>& s, __nv_bfloat16*
         for (int i = 0; i < 4; ++i) { acc[n][i] = 0.0f; }
     }
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
-    int physical_page = s.block_table[s.first_tile >> kPagedKVPageShift];
+    int physical_page = s.owned != nullptr ? causal_small_t_owned_tile_page<Bc>(s.owned, 0)
+                                           : s.block_table[s.first_tile >> kPagedKVPageShift];
 
     for (int kb = 0; kb < s.key_blocks; ++kb) {
-        const int k0 = s.first_tile + kb * Bc;
-        if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
+        const int k0 = s.owned != nullptr
+                           ? causal_small_t_owned_tile_key<Bc>(s.owned, s.first_tile, kb)
+                           : s.first_tile + kb * Bc;
+        if (s.owned != nullptr) {
+            physical_page = causal_small_t_owned_tile_page<Bc>(s.owned, kb);
+        } else if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
             physical_page = s.block_table[k0 >> kPagedKVPageShift];
         }
         // The tile's K and V: current-step tokens from the input, tail slots zeroed.
@@ -135,14 +147,14 @@ __device__ __forceinline__ bool sweep(const Split<CacheInput>& s, __nv_bfloat16*
                 if (key >= s.split_start && key < s.load_end) {
                     const __nv_bfloat16* k_src = s.cache_k;
                     const __nv_bfloat16* v_src = s.cache_v;
-                    std::int64_t off = causal_cache_index<Geometry>(physical_page, s.kv_head, d,
-                                                                    key & kPagedKVPageMask);
+                    std::int64_t off = causal_cache_index(physical_page, s.kv_head, d,
+                                                          key & kPagedKVPageMask, kv_heads);
                     if constexpr (CacheInput::writes_cache) {
                         const int new_token = key - s.first_pos;
                         if (new_token >= 0 && new_token < s.valid_tokens && key >= s.first_pos) {
                             k_src = s.input.k;
                             v_src = s.input.v;
-                            off   = kv_cache_int8_new_index<Geometry>(s.kv_head, d, new_token);
+                            off   = kv_cache_int8_new_index(s.kv_head, d, new_token, kv_heads);
                         }
                     }
                     k_raw[j] = load_vec<int4>(k_src + off);
@@ -303,7 +315,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    float* partial_acc, float* partial_m, float* partial_l) {
+    float* partial_acc, float* partial_m, float* partial_l, CausalKeyPartition partition) {
     if constexpr (!shape_set_in_image(true)) { return; } // not this image's set
 #if defined(NINFER_SM75_FORMS)
     static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
@@ -320,12 +332,26 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     static_assert(QkvRows >= Br && QkvRows * D * 2 == 32 * 1024);
 
     __shared__ __align__(16) __nv_bfloat16 qkv_s[QkvRows * D];
+    __shared__ std::int32_t owned_s[64];
 
     causal_small_t_bf16_split<Geometry, TokenTile, Br, Bc, Threads, MultiBatch, Masked>(
         q, input, pos, cache_k, cache_v, block_tables, valid_columns, table_rows, table_stride,
         tokens, full_width, column_begin, logical_capacity, partial_acc, partial_m, partial_l,
-        [&](const CausalSmallTBf16Split<CacheInput>& split) {
-            const sm75_small_t_bf16::Split<CacheInput> s{split, cache_k, cache_v, scale};
+        partition, [&](const CausalSmallTBf16Split<CacheInput>& split) {
+            sm75_small_t_bf16::Split<CacheInput> s{split, cache_k, cache_v, scale, nullptr};
+            if (split.partition.strided()) {
+                // The split's whole pages, of which the sweeps take the rank's own.
+                const int first_page = split.first_tile >> kPagedKVPageShift;
+                const int page_count =
+                    ((split.split_end - 1) >> kPagedKVPageShift) - first_page + 1;
+                for (int page = static_cast<int>(threadIdx.x); page < page_count && page < 64;
+                     page += Threads) {
+                    owned_s[page] = split.block_table[first_page + page];
+                }
+                s.key_blocks =
+                    causal_small_t_own_pages<Bc>(owned_s, page_count, split.split_end, split.partition);
+                s.owned = owned_s;
+            }
 
             // Q keeps its fragments for the fast sweep (the K and V tiles overwrite qkv_s).
             unsigned af_q[QKKs][4];

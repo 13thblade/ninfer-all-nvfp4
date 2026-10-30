@@ -8,6 +8,11 @@
 // shared memory once, and each warp runs the decode kernel's m8n8k4 products and FP32 online
 // softmax over it for eight rows (small_t_sm70.cuh). The next tile's codes are read into registers
 // while the current one is multiplied. No workspace: the pages are read where they are.
+//
+// The same kernel is the position-split prompt route on every architecture
+// (causal_attention_prompt_partial_launch, launch.h): it emits the m8n8k4 products wherever it is
+// compiled, skips the tiles of pages another rank holds, and writes FP32 outputs and log-sum-exps
+// for the cross-rank merge instead of BF16 rows.
 
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"

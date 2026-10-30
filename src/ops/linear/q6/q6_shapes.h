@@ -4,6 +4,9 @@
 
 namespace ninfer::ops::detail {
 
+// Any shape no table below names, writing BF16 or FP32 (q6_general.cu).
+[[nodiscard]] Q6Launch select_q6_general_launch(std::int32_t tokens, DType out);
+
 [[nodiscard]] Q6Launch select_q6_n248320_k5120(std::int32_t tokens);
 [[nodiscard]] Q6Launch select_q6_n34816_k5120(std::int32_t tokens);
 [[nodiscard]] Q6Launch select_q6_n248320_k2048(std::int32_t tokens);

@@ -200,7 +200,7 @@ option(NINFER_PTXAS_VERBOSE "Print each kernel's registers and local-memory spil
 option(NINFER_CUDA_PRUNE_PTX
        "Remove PTX from CUDA archives while retaining every configured machine-code image" OFF)
 option(NINFER_WINDOWS_KERNEL_DLL
-       "Link GGML CUDA kernels as a Windows DLL to keep multi-architecture executables below 2 GiB" OFF)
+       "Link the GGML and INT8 small-T attention kernels as a Windows DLL to keep every multi-architecture PE image within what the Windows loader maps" OFF)
 if(NINFER_WINDOWS_KERNEL_DLL AND NOT WIN32)
   message(FATAL_ERROR "NINFER_WINDOWS_KERNEL_DLL is only supported on Windows")
 endif()

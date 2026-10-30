@@ -57,6 +57,21 @@ __device__ __forceinline__ void cta_mbarrier_arrive_expect_tx(std::uint64_t* bar
 #endif
 }
 
+// Every lane of a consumer warp calls this after its last read of a pipeline stage. It returns the
+// stage to the producer whose TMA refills it. That refill is an async-proxy write. An arrive alone
+// does not order it after the warp's generic-proxy reads (ldmatrix, ld.shared): ptxas issues the
+// arrive while those reads are still pending, and the refill can then overwrite bytes that a lane
+// has not read yet. The proxy fence orders the reads first.
+__device__ __forceinline__ void cta_mbarrier_release_stage(std::uint64_t* barrier, int lane) {
+#if defined(NINFER_PRE_BLACKWELL_DEVICE)
+    __trap();
+#else
+    asm volatile("fence.proxy.async.shared::cta;" : : : "memory");
+    __syncwarp();
+    if (lane == 0) cta_mbarrier_arrive(barrier);
+#endif
+}
+
 __device__ __forceinline__ void cta_mbarrier_fence_init() {
 #if defined(NINFER_PRE_BLACKWELL_DEVICE)
     __trap();

@@ -5,13 +5,18 @@
 #include "product/post_thinking_options.h"
 #include "product/reasoning_loop_options.h"
 #include "product/rope_yarn_options.h"
+#include "product/tensor_split_options.h"
 #include "product/speculative_options.h"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -79,6 +84,24 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
     return KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(value));
 }
 
+// Read at startup, so a missing or malformed file stops the server before the model loads.
+std::string read_ui_settings(const char* path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) { throw std::invalid_argument(std::string("--ui-config-file: cannot read ") + path); }
+    const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    nlohmann::json settings;
+    try {
+        settings = nlohmann::json::parse(text);
+    } catch (const nlohmann::json::parse_error& error) {
+        throw std::invalid_argument(std::string("--ui-config-file: ") + path + ": " + error.what());
+    }
+    if (!settings.is_object()) {
+        throw std::invalid_argument(std::string("--ui-config-file: ") + path +
+                                    " must hold a JSON object");
+    }
+    return settings.dump();
+}
+
 } // namespace
 
 std::string serve_usage_text(const char* argv0) {
@@ -110,11 +133,19 @@ std::string serve_usage_text(const char* argv0) {
            "                                excludes --device\n"
            "  --stage-layers A,B,...        layers per stage in --devices order (default:\n"
            "                                split by free memory)\n"
-           "  --tensor-parallel             the --devices share every layer: GDN heads and\n"
-           "                                dense FFN rows; attention, KV, head and MTP on\n"
-           "                                the first (dense Qwen3.5-core GGUF models)\n"
+           "  --tensor-parallel             the --devices share every layer: GDN heads, KV\n"
+           "                                heads, dense FFN rows or MoE experts; head and\n"
+           "                                MTP on the first (Qwen3.5-core models;\n"
+           "                                the other MoE families divide only their routed\n"
+           "                                experts)\n"
+           "  --tensor-split A,B,...        relative share of each --devices entry (default:\n"
+           "                                by each card's measured bandwidth and free memory)\n" +
+           std::string(product::kTensorAttentionHelp) +
+           std::string(product::kInvariantAttentionHelp) +
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
+           "  --embedding-residency device|host  token embedding on GPU (default) or in\n"
+           "                                mapped pinned host memory, read in place\n"
            "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
            "                                Gemma, Flint and DeepSeek-V4.1 allow 0 (layer\n"
            "                                banks only).\n"
@@ -355,6 +386,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                of 5, the default)\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0;\n"
            "                                0.5 when the engine chooses MTP)\n"
+           "  --draft-confidence C          dspark: verify drafts while their confidence is\n"
+           "                                at least C, 0..1 (default 0.5; 0 keeps every draft)\n"
            "  --lm-head-draft               draft with the optimized proposal head, which\n"
            "                                the artifact must store (the default when it does)\n"
            "  --full-draft-head             draft with the full output head even when the\n"
@@ -482,6 +515,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --webui-mcp-proxy             relay the WebUI's MCP traffic at /cors-proxy;\n"
            "                                http targets only and reaches any host, so only\n"
            "                                on a trusted bind\n"
+           "  --ui-config-file PATH         JSON object of WebUI settings that /props reports\n"
+           "                                as ui_settings, the WebUI's defaults (MCP servers\n"
+           "                                among them)\n"
            "  --max-request-mib N           request body limit, enforced before parsing\n"
            "                                (default 384)\n"
            "  --max-pending-requests N      requests waiting for admission (default 16)\n"
@@ -1118,6 +1154,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.tensor_parallel = true;
             continue;
         }
+        if (arg == "--tensor-split") {
+            options.tensor_split = product::parse_tensor_split(require_value("--tensor-split"));
+            continue;
+        }
+        if (arg == "--tensor-attention") {
+            options.tensor_attention =
+                product::parse_tensor_attention(require_value("--tensor-attention"));
+            continue;
+        }
+        if (arg == "--invariant-attention") {
+            options.invariant_attention = true;
+            continue;
+        }
         if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
             continue;
@@ -1136,6 +1185,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--draft-min-p") {
             options.speculative.draft_min_p =
                 parse_float_in(require_value("--draft-min-p"), "draft-min-p", 0.0F, 1.0F);
+            continue;
+        }
+        if (arg == "--draft-confidence") {
+            options.speculative.draft_confidence =
+                parse_float_in(require_value("--draft-confidence"), "draft-confidence", 0.0F, 1.0F);
             continue;
         }
         if (arg == "--ngram-draft-tokens") {
@@ -1328,6 +1382,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.lm_head_q6 = true;
             continue;
         }
+        if (arg == "--embedding-residency") {
+            const std::string residency = require_value("--embedding-residency");
+            if (residency == "device") {
+                options.embedding_residency = EmbeddingResidency::Device;
+            } else if (residency == "host") {
+                options.embedding_residency = EmbeddingResidency::Host;
+            } else {
+                throw std::invalid_argument("--embedding-residency must be device or host");
+            }
+            continue;
+        }
         if (arg == "--embedding-q4") {
             options.embedding_q4 = true;
             continue;
@@ -1499,6 +1564,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--webui-mcp-proxy") {
             options.webui_mcp_proxy = true;
+            continue;
+        }
+        if (arg == "--ui-config-file") {
+            options.ui_settings = read_ui_settings(require_value("--ui-config-file"));
             continue;
         }
         if (arg == "--structured-output") {
@@ -1705,6 +1774,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.tensor_parallel && options.devices.size() < 2) {
         throw std::invalid_argument("--tensor-parallel needs --devices naming more than one device");
     }
+    product::check_tensor_split(options.tensor_split, options.devices.size(),
+                                options.tensor_parallel);
+    product::check_tensor_attention(options.tensor_attention, options.tensor_parallel);
     if (options.request_log_max_mib != 0 && options.request_log_jsonl.empty()) {
         throw std::invalid_argument("--request-log-max-mib requires --request-log-jsonl");
     }

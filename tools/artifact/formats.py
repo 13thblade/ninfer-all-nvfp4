@@ -70,6 +70,10 @@ NumericFormat: TypeAlias = (
 BF16 = DirectFormat("bf16", 2)
 FP32 = DirectFormat("fp32", 4)
 INT32 = DirectFormat("int32", 4)
+# Binary16 values and unsigned 16-bit words as stored (an STQ matrix's sign vectors and its trellis
+# words, which the engine decodes itself).
+FP16 = DirectFormat("fp16", 2)
+UINT16 = DirectFormat("uint16", 2)
 
 Q2_G64_FP16 = QuantFormat("q2_g64_fp16", 2, 64, -1, 2, code_bias=1)
 Q4_G64_FP16 = QuantFormat("q4_g64_fp16", 4, 64, -8, 7)
@@ -107,7 +111,9 @@ GGUF_Q2_0 = GgufFormat("gguf_q2_0", 42, 64, 18)
 GGUF_MXFP4 = GgufFormat("gguf_mxfp4", 39, 32, 17)
 
 
-DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
+DIRECT_FORMATS = MappingProxyType(
+    {item.name: item for item in (BF16, FP32, INT32, FP16, UINT16)}
+)
 QUANT_FORMATS = MappingProxyType(
     {
         item.name: item
@@ -230,6 +236,8 @@ __all__ = [
     "BF16",
     "FP32",
     "INT32",
+    "FP16",
+    "UINT16",
     "Q2_G64_FP16",
     "Q4_G64_FP16",
     "Q5_G64_FP16",

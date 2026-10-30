@@ -72,8 +72,10 @@ fi
 export CUDACXX
 export PATH="$(dirname -- "$CUDACXX"):$PATH"
 
-for tool in cmake ninja; do
-  command -v "$tool" >/dev/null || { printf 'Missing %s. apt install cmake ninja-build\n' "$tool" >&2; exit 1; }
+# meson, nasm and make build the FFmpeg and dav1d that the runtime links.
+for tool in cmake ninja meson nasm make; do
+  command -v "$tool" >/dev/null \
+    || { printf 'Missing %s. apt install cmake ninja-build meson nasm make zlib1g-dev\n' "$tool" >&2; exit 1; }
 done
 
 printf 'toolchain: %s (%s)\n' "$CUDACXX" "$("$CUDACXX" --version | tail -1)"
@@ -92,6 +94,8 @@ if (( benchmarks )); then benchmarks_option=ON; fi
 
 runtime=OFF
 if [[ "$package" == 1 ]]; then runtime=ON; fi
+# FFmpeg and dav1d are compiled from their pinned release archives (cmake/MediaSources.cmake).
+scripts/fetch-media-sources.sh
 cmake -S . -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$arch" -DNINFER_SHARED_RUNTIME="$runtime" \
       -DNINFER_BUILD_BENCHMARKS="$benchmarks_option"
 if [[ -n "$target" ]]; then

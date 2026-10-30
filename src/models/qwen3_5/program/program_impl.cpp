@@ -8,6 +8,7 @@
 #include "core/startup.h"
 #include "core/device.h"
 #include <cuda_runtime.h>
+#include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/target_logprobs.h"
 
 #include <algorithm>
@@ -166,10 +167,22 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
         for (std::size_t rank = 1; rank < stages; ++rank) {
             runtime->forward.emplace_back(device, 0, rank, residual);
         }
-        auto& tp = runtime->tensor_parallel.emplace();
-        tp.shard = qwen3_5::tensor_parallel_share(parameters.model.config().text, stages);
+        auto& tp  = runtime->tensor_parallel.emplace();
+        tp.shares = text.tensor_shares;
+        for (const TensorShare& share : tp.shares) {
+            tp.shards.push_back(
+                qwen3_5::tensor_parallel_share(parameters.model.config().text, share));
+        }
+        // A position-split attention exchanges its partial outputs through the same slots.
+        std::size_t values = hidden;
+        if (!tp.shares.empty() && tp.shares.front().attention_positions) {
+            const auto& attention = *parameters.model.config().text.attention;
+            values                = std::max<std::size_t>(
+                values, ops::causal_attention_partial_elements(
+                            static_cast<std::int32_t>(attention.num_attention_heads), 1));
+        }
         tp.exchange = std::make_unique<TensorParallelExchange>(
-            device, TensorParallelExchangeOptions{.slot_bytes   = columns * hidden * sizeof(float),
+            device, TensorParallelExchangeOptions{.slot_bytes   = columns * values * sizeof(float),
                                                   .force_staged = force_staged});
         for (std::size_t rank = 1; rank < stages; ++rank) { tp.joined.emplace_back(device.rank(rank)); }
         return runtime;

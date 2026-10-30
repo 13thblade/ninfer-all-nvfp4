@@ -45,30 +45,35 @@ namespace ninfer::ops {
 
 namespace sm70_attention {
 
-template <bool RowB>
+// Volta's m8n8k4 product. Kernels launched on Volta only emit it in the 70 image; a portable
+// caller (the position-split prompt partials, prompt_sm70.cu) emits it on every architecture,
+// where the later tensor cores still execute it.
+template <bool RowB, bool Portable = false>
 __device__ __forceinline__ void hmma(float (&c)[8], unsigned a0, unsigned a1, unsigned b0,
                                      unsigned b1) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-    if constexpr (RowB) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    constexpr bool kEmit = Portable || __CUDA_ARCH__ == 700;
+    if constexpr (kEmit && RowB) {
         asm volatile("mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 "
                      "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
                      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]),
                        "+f"(c[6]), "+f"(c[7])
                      : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
-    } else {
+        return;
+    } else if constexpr (kEmit) {
         asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
                      "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
                      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]),
                        "+f"(c[6]), "+f"(c[7])
                      : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+        return;
     }
-#else
+#endif
     (void)c;
     (void)a0;
     (void)a1;
     (void)b0;
     (void)b1;
-#endif
 }
 
 __device__ __forceinline__ unsigned to_f16x2(unsigned bf16x2) {
@@ -140,6 +145,7 @@ struct Bf16Rows {
     int first_page;
     bool staged_pages;
     int kv_head;
+    int kv_heads; // the call's KV heads
     int first_pos;
     int valid_tokens;
     const __nv_bfloat16* q; // the call's queries from the CTA's column on
@@ -151,8 +157,8 @@ struct Bf16Rows {
         int q_head = 0;
         int token  = 0;
         causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-        return row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head)
-                   ? q + causal_q_index<Geometry>(q_head, 0, token)
+        return row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)
+                   ? q + causal_q_index(q_head, 0, token, kv_heads * Geometry::GroupSize)
                    : nullptr;
     }
 
@@ -173,12 +179,12 @@ struct Bf16Rows {
             const int new_token = key - first_pos;
             if (key >= first_pos && new_token < valid_tokens) {
                 return (keys ? input.k : input.v) +
-                       kv_cache_int8_new_index<Geometry>(kv_head, d, new_token);
+                       kv_cache_int8_new_index(kv_head, d, new_token, kv_heads);
             }
         }
         const int page = staged_pages ? pages[(key >> kPagedKVPageShift) - first_page]
                                       : block_table[key >> kPagedKVPageShift];
-        return plane + causal_cache_index<Geometry>(page, kv_head, d, key & kPagedKVPageMask);
+        return plane + causal_cache_index(page, kv_head, d, key & kPagedKVPageMask, kv_heads);
     }
 
     __device__ __forceinline__ const __nv_bfloat16* key(int k) const {
@@ -240,6 +246,7 @@ struct Int8Rows {
     int first_page;
     bool staged_pages;
     int kv_head;
+    int kv_heads; // the call's KV heads
 
     struct KeyRow {
         const std::uint8_t* codes;
@@ -276,13 +283,13 @@ struct Int8Rows {
         const int offset = k & kPagedKVPageMask;
         std::int64_t at  = 0;
         if constexpr (Keys == KvKeyCoding::Int8) {
-            at = kv_cache_int8_quant_code_index<Geometry>(page, kv_head, 0, offset);
+            at = kv_cache_int8_quant_code_index(page, kv_head, 0, offset, kv_heads);
         } else {
-            at = kv_cache_packed_key_chunk_index<Geometry, Keys>(page, kv_head, 0, offset);
+            at = kv_cache_packed_key_chunk_index<Keys>(page, kv_head, 0, offset, kv_heads);
         }
         return {cache_k + at,
                 *reinterpret_cast<const uint2*>(
-                    scale_k + kv_cache_int8_quant_scale_index<Geometry>(page, kv_head, 0, offset))};
+                    scale_k + kv_cache_int8_quant_scale_index(page, kv_head, 0, offset, kv_heads))};
     }
 
     // The stored bytes of dimensions [d0, d0 + 32), d0 a multiple of 32.
@@ -330,16 +337,16 @@ struct Int8Rows {
         if constexpr (PackedValues) {
             out.lo = *reinterpret_cast<const uint4*>(
                 cache_v +
-                kv_cache_int4_value_code_index<Geometry>(page, kv_head, dim0 / 2, offset));
-            out.scale = __half2half2(scale_v[kv_cache_int4_value_scale_index<Geometry>(
-                page, kv_head, dim0 / 32, offset)]);
+                kv_cache_int4_value_code_index(page, kv_head, dim0 / 2, offset, kv_heads));
+            out.scale = __half2half2(scale_v[kv_cache_int4_value_scale_index(
+                page, kv_head, dim0 / 32, offset, kv_heads)]);
         } else {
             const auto* p = reinterpret_cast<const uint4*>(
-                cache_v + kv_cache_int8_quant_code_index<Geometry>(page, kv_head, dim0, offset));
+                cache_v + kv_cache_int8_quant_code_index(page, kv_head, dim0, offset, kv_heads));
             out.lo    = p[0];
             out.hi    = p[1];
-            out.scale = __half2half2(scale_v[kv_cache_int8_quant_scale_index<Geometry>(
-                page, kv_head, dim0 / kKVCacheInt8Group, offset)]);
+            out.scale = __half2half2(scale_v[kv_cache_int8_quant_scale_index(
+                page, kv_head, dim0 / kKVCacheInt8Group, offset, kv_heads)]);
         }
         return out;
     }
@@ -380,6 +387,7 @@ struct QuantRows {
     int first_page;
     bool staged_pages;
     int kv_head;
+    int kv_heads; // the call's KV heads
 
     struct KeyRow {
         const std::uint8_t* codes;
@@ -434,15 +442,15 @@ struct QuantRows {
 
     template <bool Fp8>
     __device__ __forceinline__ static uint4 load_scales(const void* plane, int page, int kv_head,
-                                                        int offset) {
+                                                        int offset, int kv_heads) {
         if constexpr (Fp8) {
             const __half s = static_cast<const __half*>(
-                plane)[kv_cache_fp8_scale_index<Geometry>(page, kv_head, offset)];
+                plane)[kv_cache_fp8_scale_index(page, kv_head, offset, kv_heads)];
             return make_uint4(__half_as_ushort(s), 0, 0, 0);
         } else {
             return *reinterpret_cast<const uint4*>(
                 static_cast<const std::uint8_t*>(plane) +
-                kv_cache_nvfp4_scale_index<Geometry>(page, kv_head, 0, offset));
+                kv_cache_nvfp4_scale_index(page, kv_head, 0, offset, kv_heads));
         }
     }
 
@@ -450,9 +458,9 @@ struct QuantRows {
         const int page        = page_of(k);
         const int offset      = k & kPagedKVPageMask;
         const std::int64_t at = KeyFp8
-                                    ? kv_cache_fp8_code_index<Geometry>(page, kv_head, 0, offset)
-                                    : kv_cache_nvfp4_code_index<Geometry>(page, kv_head, 0, offset);
-        return {cache_k + at, load_scales<KeyFp8>(scale_k, page, kv_head, offset)};
+                                    ? kv_cache_fp8_code_index(page, kv_head, 0, offset, kv_heads)
+                                    : kv_cache_nvfp4_code_index(page, kv_head, 0, offset, kv_heads);
+        return {cache_k + at, load_scales<KeyFp8>(scale_k, page, kv_head, offset, kv_heads)};
     }
 
     // The stored bytes of dimensions [d0, d0 + 32), d0 a multiple of 32.
@@ -491,14 +499,14 @@ struct QuantRows {
         ValueRow out{};
         if constexpr (ValueFp8) {
             const auto* p = reinterpret_cast<const uint4*>(
-                cache_v + kv_cache_fp8_code_index<Geometry>(page, kv_head, dim0, offset));
+                cache_v + kv_cache_fp8_code_index(page, kv_head, dim0, offset, kv_heads));
             out.lo = p[0];
             out.hi = p[1];
         } else {
             out.lo = *reinterpret_cast<const uint4*>(
-                cache_v + kv_cache_nvfp4_code_index<Geometry>(page, kv_head, dim0, offset));
+                cache_v + kv_cache_nvfp4_code_index(page, kv_head, dim0, offset, kv_heads));
         }
-        out.scales = load_scales<ValueFp8>(scale_v, page, kv_head, offset);
+        out.scales = load_scales<ValueFp8>(scale_v, page, kv_head, offset, kv_heads);
         out.group0 = dim0 / kKVCacheNvfp4Group;
         return out;
     }
@@ -550,10 +558,11 @@ struct Nvfp4ScalarRows {
     __device__ __forceinline__ ValueRow value(int k, int dim0) const {
         const int page = packed.page_of(k);
         const int offset = k & kPagedKVPageMask;
-        const auto at = kv_cache_nvfp4_code_index<Geometry>(page, packed.kv_head, dim0, offset);
+        const auto at =
+            kv_cache_nvfp4_code_index(page, packed.kv_head, dim0, offset, packed.kv_heads);
         return {packed.cache_v + at,
                 PackedRows::template load_scales<false>(packed.scale_v, page, packed.kv_head,
-                                                        offset),
+                                                        offset, packed.kv_heads),
                 dim0 / kKVCacheNvfp4Group};
     }
 
@@ -577,6 +586,13 @@ template <class Rows, class = void>
 struct exact_rows : std::false_type {};
 template <class Rows>
 struct exact_rows<Rows, std::void_t<decltype(Rows::kExact)>> : std::bool_constant<Rows::kExact> {};
+
+// Rows whose products run on every architecture (hmma's Portable form; Rows::kPortableMma).
+template <class Rows, class = void>
+struct portable_mma_rows : std::false_type {};
+template <class Rows>
+struct portable_mma_rows<Rows, std::void_t<decltype(Rows::kPortableMma)>>
+    : std::bool_constant<Rows::kPortableMma> {};
 
 // Eight BF16 values of a and of b: sum a_e b_e in FP32.
 __device__ __forceinline__ float dot8_bf16(uint4 a, uint4 b) {
@@ -725,8 +741,9 @@ __device__ __forceinline__ void attend_tile(const Rows& rows, const __half* q_ro
     const int h                 = lane >> 4;
     const int a_row             = (lane & 3) + 4 * h;
 
-    constexpr bool Chunks = chunked_rows<Rows>::value;
-    constexpr bool Exact  = exact_rows<Rows>::value;
+    constexpr bool Chunks   = chunked_rows<Rows>::value;
+    constexpr bool Exact    = exact_rows<Rows>::value;
+    constexpr bool Portable = portable_mma_rows<Rows>::value;
 
     // S = Q K^T: this lane supplies the K row of key k0 + 8 qp + (lane % 4) + 4h.
     float s[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -743,8 +760,8 @@ __device__ __forceinline__ void attend_tile(const Rows& rows, const __half* q_ro
                 for (int j = 0; j < 4; ++j) {
                     const uint4 k8 = live ? rows.key8(k_row, chunk, d0, j) : make_uint4(0, 0, 0, 0);
                     const uint4 q8 = *reinterpret_cast<const uint4*>(q_row + d0 + 8 * j);
-                    hmma<false>(s, q8.x, q8.y, k8.x, k8.y);
-                    hmma<false>(s, q8.z, q8.w, k8.z, k8.w);
+                    hmma<false, Portable>(s, q8.x, q8.y, k8.x, k8.y);
+                    hmma<false, Portable>(s, q8.z, q8.w, k8.z, k8.w);
                 }
             }
         } else {
@@ -759,8 +776,8 @@ __device__ __forceinline__ void attend_tile(const Rows& rows, const __half* q_ro
                     }
                 }
                 const uint4 q8 = *reinterpret_cast<const uint4*>(q_row + d);
-                hmma<false>(s, q8.x, q8.y, k8.x, k8.y);
-                hmma<false>(s, q8.z, q8.w, k8.z, k8.w);
+                hmma<false, Portable>(s, q8.x, q8.y, k8.x, k8.y);
+                hmma<false, Portable>(s, q8.z, q8.w, k8.z, k8.w);
             }
         }
     }
@@ -844,7 +861,7 @@ __device__ __forceinline__ void attend_tile(const Rows& rows, const __half* q_ro
                     v4 = rows.value4(v_row, n);
                 }
             }
-            hmma<true>(st.acc[n], p4.x, p4.y, v4.x, v4.y);
+            hmma<true, Portable>(st.acc[n], p4.x, p4.y, v4.x, v4.y);
         }
     }
     if constexpr (Exact) {
@@ -862,7 +879,8 @@ __device__ __forceinline__ void
 attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], float (*stat_l)[8],
        float* combined, int tokens, int row_count, int kv_head, int split, int split_start,
        int split_end, int first_tile, int key_blocks, const std::int32_t* pos, float scale,
-       float* partial_acc, float* partial_m, float* partial_l) {
+       float* partial_acc, float* partial_m, float* partial_l, CausalKeyPartition partition,
+       const std::int32_t* pages, int first_page) {
     using Dims             = Shape<TokenTile * Geometry::GroupSize>;
     constexpr int D        = kCausalHeadDim;
     constexpr int Bc       = 32;
@@ -873,6 +891,9 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
     constexpr int PStride  = kPStride;
     constexpr float Log2E  = 1.4426950408889634074f;
     constexpr bool Chunks  = chunked_rows<Rows>::value;
+    // The grid spans the call's KV heads.
+    const int kv_heads     = static_cast<int>(gridDim.x);
+    const int q_heads      = kv_heads * Geometry::GroupSize;
     const int tid          = static_cast<int>(threadIdx.x);
     const int warp         = tid >> 5;
     const int lane         = tid & 31;
@@ -893,9 +914,17 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
     __half* p_tile      = p_s + warp * 8 * PStride;
 
     RowState st;
-    for (int block = key_warp; block < key_blocks; block += KeyWarps) {
-        attend_tile(rows, q_row, p_tile, first_tile + block * Bc, split_start, split_end, qabs_a,
-                    qabs_b, scale, st, group * 8);
+    // A segmented partition sweeps each row group's tiles on its first key warp alone, so a row's
+    // arithmetic is the same however many row groups share the CTA; the combine below then adds
+    // the other warps' empty shares exactly. A strided one skips the tiles of other ranks' pages
+    // (causal_small_t_localize_pages).
+    const int first_block = partition.segmented() ? (key_warp == 0 ? 0 : key_blocks) : key_warp;
+    const int block_step  = partition.segmented() ? 1 : KeyWarps;
+    for (int block = first_block; block < key_blocks; block += block_step) {
+        const int k0 = first_tile + block * Bc;
+        if (partition.strided() && pages[(k0 >> kPagedKVPageShift) - first_page] < 0) { continue; }
+        attend_tile(rows, q_row, p_tile, k0, split_start, split_end, qabs_a, qabs_b, scale, st,
+                    group * 8);
     }
     float& m_a         = st.m_a;
     float& m_b         = st.m_b;
@@ -908,8 +937,8 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
         int q_head = 0;
         int token  = 0;
         causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-        partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = m;
-        partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = l;
+        partial_m[causal_partial_stat_index(q_head, token, split, tokens, q_heads)] = m;
+        partial_l[causal_partial_stat_index(q_head, token, split, tokens, q_heads)] = l;
     };
     if constexpr (KeyWarps == 1) {
         if ((lane & 14) == 0) {
@@ -926,8 +955,9 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
                 int token  = 0;
                 causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
                 const int d                            = acc_dim<Chunks>(lane, n, i);
-                *reinterpret_cast<float2*>(&partial_acc[causal_partial_acc_index<Geometry>(
-                    q_head, d, token, split, tokens)]) = make_float2(acc[n][i], acc[n][i + 1]);
+                *reinterpret_cast<float2*>(&partial_acc[causal_partial_acc_index(
+                    q_head, d, token, split, tokens, q_heads)]) =
+                    make_float2(acc[n][i], acc[n][i + 1]);
             }
         }
     } else {
@@ -988,7 +1018,7 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
             int q_head      = 0;
             int token       = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-            if (!causal_valid_q_head<Geometry>(kv_head, q_head)) { continue; }
+            if (!causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) { continue; }
             float m = -CUDART_INF_F;
 #pragma unroll
             for (int w = 0; w < KeyWarps; ++w) { m = fmaxf(m, stat_m[g * KeyWarps + w][local]); }
@@ -1001,12 +1031,12 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
                              ? 0.0f
                              : stat_l[g * KeyWarps + w][local] * exp2_approx((mw - m) * Log2E);
                 }
-                partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = m;
-                partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = l;
+                partial_m[causal_partial_stat_index(q_head, token, split, tokens, q_heads)] = m;
+                partial_l[causal_partial_stat_index(q_head, token, split, tokens, q_heads)] = l;
             }
             const float* src = combined + (g * 8 + local) * D + slot_of(d, local);
             *reinterpret_cast<float2*>(
-                &partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens)]) =
+                &partial_acc[causal_partial_acc_index(q_head, d, token, split, tokens, q_heads)]) =
                 make_float2(src[0], src[1]);
         }
     }
@@ -1021,7 +1051,8 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
         std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
-        float scale, float* partial_acc, float* partial_m, float* partial_l) {
+        float scale, float* partial_acc, float* partial_m, float* partial_l,
+        CausalKeyPartition partition) {
     using Shape            = sm70_attention::Shape<TokenTile * Geometry::GroupSize>;
     constexpr int D        = kCausalHeadDim;
     constexpr int Bc       = 32;
@@ -1040,6 +1071,9 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
     __shared__ float combined[KeyWarps > 1 ? Groups * 8 * D : 1];
 
     const int kv_head     = static_cast<int>(blockIdx.x);
+    // The grid spans the call's KV heads.
+    const int kv_heads    = static_cast<int>(gridDim.x);
+    const int q_heads     = kv_heads * Geometry::GroupSize;
     const int split       = static_cast<int>(blockIdx.y);
     const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
     const int split_count = static_cast<int>(gridDim.y);
@@ -1053,20 +1087,19 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
 
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
-    q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
+    q += static_cast<std::int64_t>(D) * q_heads * column_base;
     pos += column_base;
     if constexpr (CacheInput::writes_cache) {
-        input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
-        input.v += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
+        input.k += static_cast<std::int64_t>(D) * kv_heads * column_base;
+        input.v += static_cast<std::int64_t>(D) * kv_heads * column_base;
     }
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
-        partial_acc +=
-            static_cast<std::int64_t>(batch) * D * Geometry::QHeads * tokens * split_count;
-        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
-        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+        partial_acc += static_cast<std::int64_t>(batch) * D * q_heads * tokens * split_count;
+        partial_m += static_cast<std::int64_t>(batch) * q_heads * tokens * split_count;
+        partial_l += static_cast<std::int64_t>(batch) * q_heads * tokens * split_count;
     }
 
     auto write_neutral = [&]() {
@@ -1074,10 +1107,10 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
             int q_head = 0;
             int token  = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] =
+            if (causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                partial_m[causal_partial_stat_index(q_head, token, split, tokens, q_heads)] =
                     -CUDART_INF_F;
-                partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = 0.0f;
+                partial_l[causal_partial_stat_index(q_head, token, split, tokens, q_heads)] = 0.0f;
             }
         }
         for (int idx = tid; idx < row_count * D; idx += Threads) {
@@ -1086,14 +1119,14 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
             int q_head    = 0;
             int token     = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] =
+            if (causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                partial_acc[causal_partial_acc_index(q_head, d, token, split, tokens, q_heads)] =
                     0.0f;
             }
         }
     };
 
-    if (kv_head < 0 || kv_head >= Geometry::KVHeads || tokens < 1 || tokens > TokenTile ||
+    if (kv_head < 0 || kv_head >= kv_heads || tokens < 1 || tokens > TokenTile ||
         row_count > Groups * 8 || split_count <= 0) {
         return;
     }
@@ -1111,17 +1144,26 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
 
     const int live_end = last_pos + 1;
     const int window   = causal_small_t_tile_window(first_pos, tokens, logical_capacity);
-    const int active_split_count =
-        causal_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
+    const int active_split_count = causal_small_t_partition_active(
+        partition, window,
+        causal_small_t_active_splits<Geometry, false>(window, split_count, TokenTile),
+        split_count);
     if (split >= active_split_count) { return; }
 
-    const int logical_tiles = div_up(window, Bc);
-    const bool tile_split   = logical_tiles >= active_split_count;
-    const int units_per_split =
-        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
-    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
-    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    const int split_end   = (split_limit < window) ? split_limit : window;
+    int split_start = 0;
+    int split_end   = 0;
+    if (partition.segmented() || partition.strided()) {
+        causal_small_t_partition_range(partition, window, split, active_split_count, split_start,
+                                       split_end);
+    } else {
+        const int logical_tiles = div_up(window, Bc);
+        const bool tile_split   = logical_tiles >= active_split_count;
+        const int units_per_split = tile_split ? div_up(logical_tiles, active_split_count)
+                                               : div_up(window, active_split_count);
+        split_start           = split * units_per_split * (tile_split ? Bc : 1);
+        const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
+        split_end             = (split_limit < window) ? split_limit : window;
+    }
     if (split_start >= split_end) {
         write_neutral();
         return;
@@ -1140,6 +1182,10 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         }
     }
     __syncthreads();
+    // A strided split's staged pages become the rank's own, -1 where another rank holds one.
+    if (partition.strided()) {
+        causal_small_t_localize_pages(physical_pages_s, page_count, partition);
+    }
 
     if constexpr (CacheInput::writes_cache) {
         // The owning split writes each new row. Current attention reads those rows directly from
@@ -1150,10 +1196,13 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
             const int p_tok = pos[token];
             if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 &&
                 p_tok < logical_capacity) {
-                const std::int64_t new_off = kv_cache_int8_new_index<Geometry>(kv_head, d, token);
+                const int page = partition.strided()
+                                     ? physical_pages_s[(p_tok >> kPagedKVPageShift) - first_page]
+                                     : paged_kv_physical_page(block_table, p_tok);
+                if (page < 0) { continue; } // another rank's planes hold this row
+                const std::int64_t new_off = kv_cache_int8_new_index(kv_head, d, token, kv_heads);
                 const std::int64_t cache_off =
-                    causal_cache_index<Geometry>(paged_kv_physical_page(block_table, p_tok),
-                                                 kv_head, d, p_tok & kPagedKVPageMask);
+                    causal_cache_index(page, kv_head, d, p_tok & kPagedKVPageMask, kv_heads);
                 store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
                 store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
             }
@@ -1169,9 +1218,9 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         int token     = 0;
         causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
         unsigned value = 0;
-        if (row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head)) {
+        if (row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
             const unsigned word =
-                *reinterpret_cast<const unsigned*>(&q[causal_q_index<Geometry>(q_head, d, token)]);
+                *reinterpret_cast<const unsigned*>(&q[causal_q_index(q_head, d, token, q_heads)]);
             query_bits |= sm70_attention::beyond_bits(word);
             value = sm70_attention::to_f16x2(word);
         }
@@ -1180,12 +1229,13 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
     const bool query_beyond = __syncthreads_or((query_bits & sm70_attention::kBeyondBits) != 0u);
 
     const sm70_attention::Bf16Rows<Geometry, CacheInput> rows{
-        cache_k,    cache_v,      input,   physical_pages_s, block_table,
-        first_page, staged_pages, kv_head, first_pos,        valid_tokens,
-        q,          tokens,       row_count, query_beyond};
+        cache_k,      cache_v,   input,       physical_pages_s, block_table,  first_page,
+        staged_pages, kv_head,   kv_heads,    first_pos,        valid_tokens, q,
+        tokens,       row_count, query_beyond};
     sm70_attention::attend<Geometry, TokenTile>(
         rows, q_s, p_s, stat_m, stat_l, combined, tokens, row_count, kv_head, split, split_start,
-        load_end, first_tile, key_blocks, pos, scale, partial_acc, partial_m, partial_l);
+        load_end, first_tile, key_blocks, pos, scale, partial_acc, partial_m, partial_l, partition,
+        physical_pages_s, first_page);
 }
 
 // The INT8-family caches (rotated keys in any key coding, INT8 or packed int4 values), launched by
@@ -1201,7 +1251,8 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t wave_splits,
-        float scale, float* partial_acc, float* partial_m, float* partial_l) {
+        float scale, float* partial_acc, float* partial_m, float* partial_l,
+        CausalKeyPartition partition) {
     using Shape                 = sm70_attention::Shape<TokenTile * Geometry::GroupSize>;
     constexpr int D             = kCausalHeadDim;
     constexpr int Bc            = 32;
@@ -1225,6 +1276,9 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
     __shared__ float k_h64_s[CacheInput::writes_cache ? TokenTile * D : 1];
 
     const int kv_head     = static_cast<int>(blockIdx.x);
+    // The grid spans the call's KV heads.
+    const int kv_heads    = static_cast<int>(gridDim.x);
+    const int q_heads     = kv_heads * Geometry::GroupSize;
     const int split       = static_cast<int>(blockIdx.y);
     const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
     const int split_count = static_cast<int>(gridDim.y);
@@ -1239,20 +1293,19 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
 
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
-    q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
+    q += static_cast<std::int64_t>(D) * q_heads * column_base;
     pos += column_base;
     if constexpr (CacheInput::writes_cache) {
-        input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
-        input.v += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
+        input.k += static_cast<std::int64_t>(D) * kv_heads * column_base;
+        input.v += static_cast<std::int64_t>(D) * kv_heads * column_base;
     }
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
-        partial_acc +=
-            static_cast<std::int64_t>(batch) * D * Geometry::QHeads * TokenTile * split_count;
-        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
-        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
+        partial_acc += static_cast<std::int64_t>(batch) * D * q_heads * TokenTile * split_count;
+        partial_m += static_cast<std::int64_t>(batch) * q_heads * TokenTile * split_count;
+        partial_l += static_cast<std::int64_t>(batch) * q_heads * TokenTile * split_count;
     }
 
     auto write_neutral = [&]() {
@@ -1260,10 +1313,10 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
             int q_head = 0;
             int token  = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] =
+            if (causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                partial_m[causal_partial_stat_index(q_head, token, split, TokenTile, q_heads)] =
                     -CUDART_INF_F;
-                partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] =
+                partial_l[causal_partial_stat_index(q_head, token, split, TokenTile, q_heads)] =
                     0.0f;
             }
         }
@@ -1273,14 +1326,14 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
             int q_head    = 0;
             int token     = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split,
-                                                               TokenTile)] = 0.0f;
+            if (causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                partial_acc[causal_partial_acc_index(q_head, d, token, split, TokenTile, q_heads)] =
+                    0.0f;
             }
         }
     };
 
-    if (kv_head < 0 || kv_head >= Geometry::KVHeads || split_count <= 0) { return; }
+    if (kv_head < 0 || kv_head >= kv_heads || split_count <= 0) { return; }
     if (valid_tokens == 0) {
         write_neutral();
         return;
@@ -1295,17 +1348,26 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
 
     const int live_end = last_pos + 1;
     const int window   = causal_small_t_tile_window(first_pos, TokenTile, logical_capacity);
-    const int active_split_count =
-        causal_small_t_active_splits<Geometry, true>(window, split_count, TokenTile, wave_splits);
+    const int active_split_count = causal_small_t_partition_active(
+        partition, window,
+        causal_small_t_active_splits<Geometry, true>(window, split_count, TokenTile, wave_splits),
+        split_count);
     if (split >= active_split_count) { return; }
 
-    const int logical_tiles = div_up(window, Bc);
-    const bool tile_split   = logical_tiles >= active_split_count;
-    const int units_per_split =
-        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
-    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
-    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    const int split_end   = (split_limit < window) ? split_limit : window;
+    int split_start = 0;
+    int split_end   = 0;
+    if (partition.segmented() || partition.strided()) {
+        causal_small_t_partition_range(partition, window, split, active_split_count, split_start,
+                                       split_end);
+    } else {
+        const int logical_tiles = div_up(window, Bc);
+        const bool tile_split   = logical_tiles >= active_split_count;
+        const int units_per_split = tile_split ? div_up(logical_tiles, active_split_count)
+                                               : div_up(window, active_split_count);
+        split_start           = split * units_per_split * (tile_split ? Bc : 1);
+        const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
+        split_end             = (split_limit < window) ? split_limit : window;
+    }
     if (split_start >= split_end) {
         write_neutral();
         return;
@@ -1324,6 +1386,10 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         }
     }
     __syncthreads();
+    // A strided split's staged pages become the rank's own, -1 where another rank holds one.
+    if (partition.strided()) {
+        causal_small_t_localize_pages(physical_pages_s, page_count, partition);
+    }
     const auto page_at = [&](int key) {
         return staged_pages ? physical_pages_s[(key >> kPagedKVPageShift) - first_page]
                             : block_table[key >> kPagedKVPageShift];
@@ -1340,8 +1406,8 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
             if (position < split_start || position >= split_end) { continue; }
             const int d0            = grp * kKVCacheInt8Group + lane;
             const int d1            = d0 + 32;
-            const std::int64_t src0 = kv_cache_int8_new_index<Geometry>(kv_head, d0, token);
-            const std::int64_t src1 = kv_cache_int8_new_index<Geometry>(kv_head, d1, token);
+            const std::int64_t src0 = kv_cache_int8_new_index(kv_head, d0, token, kv_heads);
+            const std::int64_t src1 = kv_cache_int8_new_index(kv_head, d1, token, kv_heads);
             float k_h64[2] = {__bfloat162float(input.k[src0]), __bfloat162float(input.k[src1])};
             hadamard_d64_fragment_inplace(k_h64, lane);
             k_h64_s[token * D + d0] = k_h64[0];
@@ -1355,11 +1421,12 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
             const int position = pos[token];
             if (position < split_start || position >= split_end) { continue; }
             const int physical_page = page_at(position);
+            if (physical_page < 0) { continue; } // another rank's planes hold this row
             const int page_offset   = position & kPagedKVPageMask;
             const int d0            = grp * kKVCacheInt8Group + lane;
             const int d1            = d0 + 32;
-            const std::int64_t src0 = kv_cache_int8_new_index<Geometry>(kv_head, d0, token);
-            const std::int64_t src1 = kv_cache_int8_new_index<Geometry>(kv_head, d1, token);
+            const std::int64_t src0 = kv_cache_int8_new_index(kv_head, d0, token, kv_heads);
+            const std::int64_t src1 = kv_cache_int8_new_index(kv_head, d1, token, kv_heads);
             float k_out[2];
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
@@ -1370,9 +1437,9 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
                 const float x3 = k_h64_s[token * D + 3 * kKVCacheInt8Group + dh];
                 k_out[half]    = normalized_hadamard_d256_group_value_from_h64(x0, x1, x2, x3, grp);
             }
-            kv_cache_i8_family_store_key_group<Geometry, Keys>(
-                cache_k_i8, cache_k_scale, physical_page, kv_head, grp, page_offset, lane, k_out[0],
-                k_out[1]);
+            kv_cache_i8_family_store_key_group<Keys>(cache_k_i8, cache_k_scale, physical_page,
+                                                     kv_head, grp, page_offset, lane, k_out[0],
+                                                     k_out[1], kv_heads);
             // The vv0 lanes span dimensions [64g, 64g+32) and the vv1 lanes the next 32, so the
             // packed coding's two G32 groups fall out of the lane assignment directly.
             const float vv0       = __bfloat162float(input.v[src0]);
@@ -1391,30 +1458,32 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
                 const int partner1   = __shfl_xor_sync(FullMask, static_cast<int>(c1), 1);
                 if ((lane & 1) == 0) {
                     auto* packed_v                 = reinterpret_cast<std::uint8_t*>(cache_v_i8);
-                    const std::int64_t packed_base = kv_cache_int4_value_code_index<Geometry>(
-                        physical_page, kv_head, grp * (kKVCacheInt8Group / 2), page_offset);
+                    const std::int64_t packed_base = kv_cache_int4_value_code_index(
+                        physical_page, kv_head, grp * (kKVCacheInt8Group / 2), page_offset,
+                        kv_heads);
                     packed_v[packed_base + (lane >> 1)] =
                         kv_cache_int4_pack(c0, static_cast<std::int8_t>(partner0));
                     packed_v[packed_base + (lane >> 1) + 16] =
                         kv_cache_int4_pack(c1, static_cast<std::int8_t>(partner1));
                 }
             } else {
-                cache_v_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d0,
-                                                                    page_offset)] =
+                cache_v_i8[kv_cache_int8_quant_code_index(physical_page, kv_head, d0, page_offset,
+                                                          kv_heads)] =
                     kv_cache_int8_quant_code(vv0, v_quant.inverse_scale);
-                cache_v_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d1,
-                                                                    page_offset)] =
+                cache_v_i8[kv_cache_int8_quant_code_index(physical_page, kv_head, d1, page_offset,
+                                                          kv_heads)] =
                     kv_cache_int8_quant_code(vv1, v_quant.inverse_scale);
             }
             if (lane == 0) {
                 if constexpr (PackedValues) {
-                    cache_v_scale[kv_cache_int4_value_scale_index<Geometry>(
-                        physical_page, kv_head, 2 * grp, page_offset)]     = v_quant.scale;
-                    cache_v_scale[kv_cache_int4_value_scale_index<Geometry>(
-                        physical_page, kv_head, 2 * grp + 1, page_offset)] = v_quant_hi.scale;
+                    cache_v_scale[kv_cache_int4_value_scale_index(
+                        physical_page, kv_head, 2 * grp, page_offset, kv_heads)] = v_quant.scale;
+                    cache_v_scale[kv_cache_int4_value_scale_index(
+                        physical_page, kv_head, 2 * grp + 1, page_offset, kv_heads)] =
+                        v_quant_hi.scale;
                 } else {
-                    cache_v_scale[kv_cache_int8_quant_scale_index<Geometry>(
-                        physical_page, kv_head, grp, page_offset)] = v_quant.scale;
+                    cache_v_scale[kv_cache_int8_quant_scale_index(
+                        physical_page, kv_head, grp, page_offset, kv_heads)] = v_quant.scale;
                 }
             }
         }
@@ -1427,11 +1496,12 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         int q_head = 0;
         int token  = 0;
         causal_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
-        const bool live = row < RowCount && causal_valid_q_head<Geometry>(kv_head, q_head);
+        const bool live =
+            row < RowCount && causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads);
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             values[r] =
-                live ? __bfloat162float(q[causal_q_index<Geometry>(q_head, lane + 32 * r, token)])
+                live ? __bfloat162float(q[causal_q_index(q_head, lane + 32 * r, token, q_heads)])
                      : 0.0f;
         }
         normalized_hadamard_d256_inplace(values, lane);
@@ -1451,10 +1521,12 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         block_table,
         first_page,
         staged_pages,
-        kv_head};
+        kv_head,
+        kv_heads};
     sm70_attention::attend<Geometry, TokenTile>(
         rows, q_s, p_s, stat_m, stat_l, combined, TokenTile, RowCount, kv_head, split, split_start,
-        load_end, first_tile, key_blocks, pos, scale, partial_acc, partial_m, partial_l);
+        load_end, first_tile, key_blocks, pos, scale, partial_acc, partial_m, partial_l, partition,
+        physical_pages_s, first_page);
 }
 
 // The FP8 and NVFP4 caches (fp8: FP8 keys and values; nvfp4: NVFP4 keys and values; k8v4: FP8
@@ -1473,7 +1545,7 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float attention_scale,
-        float* partial_acc, float* partial_m, float* partial_l) {
+        float* partial_acc, float* partial_m, float* partial_l, CausalKeyPartition partition) {
     using Shape                 = sm70_attention::Shape<TokenTile * Geometry::GroupSize>;
     constexpr int D             = kCausalHeadDim;
     constexpr int Bc            = 32;
@@ -1497,6 +1569,9 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
     __shared__ float quant_scratch[CacheInput::writes_cache && Nvfp4Append ? Warps * D : 1];
 
     const int kv_head     = static_cast<int>(blockIdx.x);
+    // The grid spans the call's KV heads.
+    const int kv_heads    = static_cast<int>(gridDim.x);
+    const int q_heads     = kv_heads * Geometry::GroupSize;
     const int split       = static_cast<int>(blockIdx.y);
     const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
     const int split_count = static_cast<int>(gridDim.y);
@@ -1511,20 +1586,19 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
 
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
-    q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
+    q += static_cast<std::int64_t>(D) * q_heads * column_base;
     positions += column_base;
     if constexpr (CacheInput::writes_cache) {
-        input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
-        input.v += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
+        input.k += static_cast<std::int64_t>(D) * kv_heads * column_base;
+        input.v += static_cast<std::int64_t>(D) * kv_heads * column_base;
     }
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
-        partial_acc +=
-            static_cast<std::int64_t>(batch) * D * Geometry::QHeads * TokenTile * split_count;
-        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
-        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
+        partial_acc += static_cast<std::int64_t>(batch) * D * q_heads * TokenTile * split_count;
+        partial_m += static_cast<std::int64_t>(batch) * q_heads * TokenTile * split_count;
+        partial_l += static_cast<std::int64_t>(batch) * q_heads * TokenTile * split_count;
     }
 
     auto write_neutral = [&]() {
@@ -1532,10 +1606,10 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
             int q_head = 0;
             int token  = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] =
+            if (causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                partial_m[causal_partial_stat_index(q_head, token, split, TokenTile, q_heads)] =
                     -CUDART_INF_F;
-                partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] =
+                partial_l[causal_partial_stat_index(q_head, token, split, TokenTile, q_heads)] =
                     0.0f;
             }
         }
@@ -1545,14 +1619,14 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
             int q_head    = 0;
             int token     = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split,
-                                                               TokenTile)] = 0.0f;
+            if (causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                partial_acc[causal_partial_acc_index(q_head, d, token, split, TokenTile, q_heads)] =
+                    0.0f;
             }
         }
     };
 
-    if (kv_head < 0 || kv_head >= Geometry::KVHeads || split_count <= 0) { return; }
+    if (kv_head < 0 || kv_head >= kv_heads || split_count <= 0) { return; }
     if (valid_tokens == 0) {
         write_neutral();
         return;
@@ -1567,15 +1641,20 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
 
     const int live_end = last_pos + 1;
     const int window   = causal_small_t_tile_window(first_pos, TokenTile, logical_capacity);
-    const int active_split_count =
-        causal_small_t_quantized_active_splits<Geometry>(window, split_count, TokenTile);
+    const int active_split_count = causal_small_t_partition_active(
+        partition, window,
+        causal_small_t_quantized_active_splits<Geometry>(window, split_count, TokenTile),
+        split_count);
     if (split >= active_split_count) { return; }
 
     const int logical_tiles = div_up(window, Bc);
     const bool tile_split   = logical_tiles >= active_split_count;
     int split_start         = 0;
     int split_end           = 0;
-    if constexpr (TokenTile == 1) {
+    if (partition.segmented() || partition.strided()) {
+        causal_small_t_partition_range(partition, window, split, active_split_count, split_start,
+                                       split_end);
+    } else if constexpr (TokenTile == 1) {
         const int first_owned_tile = split * logical_tiles / active_split_count;
         const int end_owned_tile   = (split + 1) * logical_tiles / active_split_count;
         split_start                = first_owned_tile * Bc;
@@ -1604,6 +1683,10 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         }
     }
     __syncthreads();
+    // A strided split's staged pages become the rank's own, -1 where another rank holds one.
+    if (partition.strided()) {
+        causal_small_t_localize_pages(physical_pages_s, page_count, partition);
+    }
     const auto page_at = [&](int key) {
         return staged_pages ? physical_pages_s[(key >> kPagedKVPageShift) - first_page]
                             : block_table[key >> kPagedKVPageShift];
@@ -1617,6 +1700,7 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
             const int position = positions[token];
             if (position < split_start || position >= split_end) { continue; }
             const int physical_page = page_at(position);
+            if (physical_page < 0) { continue; } // another rank's planes hold this row
             const int page_offset   = position & kPagedKVPageMask;
             float* row_s            = Nvfp4Append ? quant_scratch + warp * D : nullptr;
             const auto store_fp8    = [&](std::uint8_t* plane, __half* scales,
@@ -1627,13 +1711,13 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
                 const auto quant = kv_cache_fp8_quant_params(warp_max(local_absmax, FullMask));
 #pragma unroll
                 for (int r = 0; r < 8; ++r) {
-                    plane[kv_cache_fp8_code_index<Geometry>(physical_page, kv_head, lane + 32 * r,
-                                                            page_offset)] =
+                    plane[kv_cache_fp8_code_index(physical_page, kv_head, lane + 32 * r,
+                                                  page_offset, kv_heads)] =
                         kv_cache_fp8_quant_code(values[r], quant.inverse_scale);
                 }
                 if (lane == 0) {
-                    scales[kv_cache_fp8_scale_index<Geometry>(physical_page, kv_head,
-                                                              page_offset)] = quant.scale;
+                    scales[kv_cache_fp8_scale_index(physical_page, kv_head, page_offset,
+                                                    kv_heads)] = quant.scale;
                 }
             };
             const auto store_nvfp4 = [&](std::uint8_t* plane, std::uint8_t* scales,
@@ -1644,12 +1728,12 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
                 if (lane < kKVCacheNvfp4Groups) {
                     const auto quantized =
                         kv_cache_nvfp4_quantize_group16(row_s + lane * kKVCacheNvfp4Group);
-                    const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
-                        physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset);
+                    const std::int64_t code_offset = kv_cache_nvfp4_code_index(
+                        physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset, kv_heads);
                     store_vec(plane + code_offset,
                               make_uint2(quantized.codes_lo, quantized.codes_hi));
-                    scales[kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, lane,
-                                                                page_offset)] = quantized.scale;
+                    scales[kv_cache_nvfp4_scale_index(physical_page, kv_head, lane, page_offset,
+                                                      kv_heads)] = quantized.scale;
                 }
                 __syncwarp();
             };
@@ -1657,7 +1741,7 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 values[r] = __bfloat162float(
-                    input.k[kv_cache_fp8_src_index<Geometry>(kv_head, lane + 32 * r, token)]);
+                    input.k[kv_cache_fp8_src_index(kv_head, lane + 32 * r, token, kv_heads)]);
             }
             normalized_hadamard_d256_inplace(values, lane);
             if constexpr (KeyFp8) {
@@ -1668,7 +1752,7 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 values[r] = __bfloat162float(
-                    input.v[kv_cache_fp8_src_index<Geometry>(kv_head, lane + 32 * r, token)]);
+                    input.v[kv_cache_fp8_src_index(kv_head, lane + 32 * r, token, kv_heads)]);
             }
             if constexpr (ValueFp8) {
                 store_fp8(cache_v, cache_v_scale, values);
@@ -1686,11 +1770,12 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         int q_head = 0;
         int token  = 0;
         causal_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
-        const bool live = row < RowCount && causal_valid_q_head<Geometry>(kv_head, q_head);
+        const bool live =
+            row < RowCount && causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads);
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             values[r] =
-                live ? __bfloat162float(q[causal_q_index<Geometry>(q_head, lane + 32 * r, token)])
+                live ? __bfloat162float(q[causal_q_index(q_head, lane + 32 * r, token, q_heads)])
                      : 0.0f;
         }
         normalized_hadamard_d256_inplace(values, lane);
@@ -1703,37 +1788,41 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
 
     const sm70_attention::QuantRows<Geometry, KeyFp8, ValueFp8> rows{
         cache_k,     cache_v,    cache_k_scale, cache_v_scale, physical_pages_s,
-        block_table, first_page, staged_pages,  kv_head};
+        block_table, first_page, staged_pages,  kv_head,       kv_heads};
+    // A segmented partition keeps every width on the generic rows, whose arithmetic it fixes.
     if constexpr (!MultiBatch && !KeyFp8 && !ValueFp8 && TokenTile == 4) {
+      if (!partition.segmented()) {
         // These choices are measured over the complete Op on V100. Use the actual split work,
         // not the host envelope: one captured graph serves every position inside that envelope.
-        if constexpr (Geometry::QHeads == 16) {
+        if constexpr (Geometry::GroupSize == 8) {
             if (key_blocks <= 2) {
                 const sm70_attention::Nvfp4ScalarRows<Geometry> scalar{rows};
                 sm70_attention::attend<Geometry, TokenTile>(
                     scalar, q_s, p_s, stat_m, stat_l, combined, TokenTile, RowCount, kv_head, split,
                     split_start, load_end, first_tile, key_blocks, positions, attention_scale,
-                    partial_acc, partial_m, partial_l);
+                    partial_acc, partial_m, partial_l, partition, physical_pages_s, first_page);
                 return;
             }
         }
         // Fused append benefits from the shorter QK unroll. Cached-only H16 splits at 9K/12K/
         // 24K keep eight chunks in flight; above 256 active CTAs, two chunks win again.
-        if (CacheInput::writes_cache || Geometry::KVHeads * active_split_count > 256) {
+        if (CacheInput::writes_cache || kv_heads * active_split_count > 256) {
             const sm70_attention::QuantRows<Geometry, false, false, 2> limited{
-                cache_k, cache_v, cache_k_scale, cache_v_scale, physical_pages_s,
-                block_table, first_page, staged_pages, kv_head};
+                cache_k,     cache_v,    cache_k_scale, cache_v_scale, physical_pages_s,
+                block_table, first_page, staged_pages,  kv_head,       kv_heads};
             sm70_attention::attend<Geometry, TokenTile>(
                 limited, q_s, p_s, stat_m, stat_l, combined, TokenTile, RowCount, kv_head, split,
                 split_start, load_end, first_tile, key_blocks, positions, attention_scale,
-                partial_acc, partial_m, partial_l);
+                partial_acc, partial_m, partial_l, partition, physical_pages_s, first_page);
             return;
         }
+      }
     }
     sm70_attention::attend<Geometry, TokenTile>(rows, q_s, p_s, stat_m, stat_l, combined, TokenTile,
                                                 RowCount, kv_head, split, split_start, load_end,
                                                 first_tile, key_blocks, positions, attention_scale,
-                                                partial_acc, partial_m, partial_l);
+                                                partial_acc, partial_m, partial_l, partition,
+                                                physical_pages_s, first_page);
 }
 
 namespace detail {
@@ -1747,10 +1836,10 @@ void launch_small_t_sm70_quantized(const Tensor& q, CacheInput input, const Tens
                                    const CausalSmallTInvocation& invocation,
                                    std::int32_t logical_capacity, std::int32_t splits,
                                    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, CausalKeyPartition partition) {
     using KeyScale   = std::conditional_t<KeyFp8, __half, std::uint8_t>;
     using ValueScale = std::conditional_t<ValueFp8, __half, std::uint8_t>;
-    const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+    const dim3 grid(q.ne[1] / Geometry::GroupSize, splits, invocation.batch_size);
     constexpr int kBlock = 32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::kWarps;
     causal_attention_small_t_sm70_quantized_kernel<Geometry, TokenTile, MultiBatch, Masked,
                                                    CacheInput, KeyFp8, ValueFp8>
@@ -1770,7 +1859,7 @@ void launch_small_t_sm70_quantized(const Tensor& q, CacheInput input, const Tens
                 : static_cast<const std::int32_t*>(invocation.table_rows->data),
             cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
             logical_capacity, scale, static_cast<float*>(partial_acc.data),
-            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data), partition);
     CUDA_CHECK(cudaGetLastError());
 }
 

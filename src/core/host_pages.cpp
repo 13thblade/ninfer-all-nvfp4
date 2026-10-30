@@ -65,7 +65,7 @@ HostPages::~HostPages() {
 #endif
 }
 
-void HostPages::pin() {
+void HostPages::pin(bool device_mapped) {
     if (registration_) { return; }
     // Registration faults in every page nobody wrote on its one thread; rewriting a byte of each
     // page first does that on several. A page a writer filled keeps its bytes.
@@ -91,7 +91,7 @@ void HostPages::pin() {
     touch(0, pages / count);
     for (auto& thread : threads) { thread.join(); }
     try {
-        registration_ = std::make_unique<HostMemoryRegistration>(data_, bytes_);
+        registration_ = std::make_unique<HostMemoryRegistration>(data_, bytes_, device_mapped);
     } catch (const std::exception& error) {
         throw std::runtime_error("failed to pin " + mib(bytes_) + " MiB of host memory (" +
                                  error.what() + ")");

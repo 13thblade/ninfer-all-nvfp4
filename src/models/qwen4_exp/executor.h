@@ -162,15 +162,15 @@ public:
     [[nodiscard]] std::uint32_t position(std::uint32_t sequence) const;
 
     // Prompt tokens one forward() may take: prefill_chunk, or with layer-major spans (one stage,
-    // GGUF host experts) several chunks, which forward() runs layer by layer so that each layer's
-    // uncached experts cross the bus once for all of them.
+    // GGUF host or disk experts) several chunks, which forward() runs layer by layer so that each
+    // layer's uncached experts cross the bus once for all of them, a media prompt's as a text
+    // prompt's.
     [[nodiscard]] std::uint32_t prompt_step() const noexcept;
-    // Runs `tokens` (at most prompt_step(); beyond prefill_chunk not a media prompt's) at the
-    // sequence's next positions and leaves the logits of the last `logit_rows` of them in
-    // logits(), BF16 [vocab, logit_rows] on the head device. Work is queued on the device
-    // streams; logits() is ready on head_stream(). Once the table rows of `tokens` are read, the
-    // rows of `next` (the known tokens that follow, at most prompt_step()) are hinted, to be
-    // read while the device runs `tokens`.
+    // Runs `tokens` (at most prompt_step()) at the sequence's next positions and leaves the
+    // logits of the last `logit_rows` of them in logits(), BF16 [vocab, logit_rows] on the head
+    // device. Work is queued on the device streams; logits() is ready on head_stream(). Once the
+    // table rows of `tokens` are read, the rows of `next` (the known tokens that follow, at most
+    // prompt_step()) are hinted, to be read while the device runs `tokens`.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::span<const std::int32_t> next = {});
     // Branches of a sequence in one pass, each from the state `at` (a snapshot of the sequence):
@@ -244,12 +244,14 @@ public:
     std::uint32_t draft(std::span<const std::uint32_t> sequences,
                         std::span<const std::int32_t> anchors, std::span<std::int32_t> out,
                         std::span<std::uint32_t> extents = {}, std::uint32_t steps = 0);
-    // Runs 2..draft_tokens() + 1 tokens of each sequence (its anchor, then its drafts) at its next
+    // Runs 1..draft_tokens() + 1 tokens of each sequence (its anchor, then its drafts) at its next
     // positions without committing them, and leaves the logits of every token in logits(), one
     // column per token, sequence after sequence. The sequences' positions and states stay where
-    // they were until commit(). Every sequence has the same width within this call.
-    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
-    // Keeps the first `columns[i]` (1..draft_tokens() + 1) tokens of the last verify() of
+    // they were until commit(). `widths` gives each sequence's token count; without it every
+    // sequence has the same width, tokens.size() / sequences.
+    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens,
+                std::span<const std::uint32_t> widths = {});
+    // Keeps the first `columns[i]` (1..its verified width) tokens of the last verify() of
     // `sequences[i]`, which lists the verified sequences in their order: each sequence's state is
     // then what feeding those tokens would have left, and its MTP block has run their cells.
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> columns);

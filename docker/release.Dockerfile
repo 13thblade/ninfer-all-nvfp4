@@ -9,6 +9,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* /tmp/ninfer-packages
 COPY backends/ /opt/ninfer/multi/backends/
 COPY help/ /opt/ninfer/multi/help/
+# The runtime links FFmpeg (LGPL 2.1 or later) and dav1d: their licences and exact sources.
+COPY LICENSE* /opt/ninfer/licenses/
+COPY sources/ /opt/ninfer/sources/
 COPY --chmod=0755 ninfer ninfer-serve ninfer_bench ninfer-calibrate ninfer-perplexity ninfer-ngram-profile /opt/ninfer/multi/
 COPY --chmod=0755 run.sh download-model.sh entrypoint.sh /opt/ninfer/
 ENV NINFER_IMAGE_ARCH=multi \

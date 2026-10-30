@@ -8,6 +8,7 @@
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
 #include "product/kv_resident_options.h"
+#include "product/tensor_split_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/rope_yarn_options.h"
@@ -57,6 +58,11 @@ struct Options {
     // Qwen3.8-Flash-Next: a pipeline over several devices, host-resident experts and their
     // device cache, and where the n-gram table comes from.
     std::vector<int> devices;
+    // The devices share every layer (`--tensor-parallel`), each its `--tensor-split` share.
+    bool tensor_parallel = false;
+    std::vector<double> tensor_split;
+    ninfer::TensorAttention tensor_attention = ninfer::TensorAttention::Heads;
+    bool invariant_attention                 = false;
     ninfer::ExpertResidency expert_residency = ninfer::ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
     ninfer::HybridExpertOptions hybrid_experts;
@@ -74,6 +80,7 @@ struct Options {
     bool lm_head_q6                     = false;
     bool embedding_q4                   = false;
     bool embedding_q6                   = false;
+    ninfer::EmbeddingResidency embedding_residency = ninfer::EmbeddingResidency::Device;
     bool mtp_experts_q4                 = false;
     bool gdn_state_fp16                 = false;
     bool rope_yarn                      = false;
@@ -96,6 +103,8 @@ std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N | --disjoint] [--device N | --devices A,B,...]\n"
+           "       [--tensor-parallel] [--tensor-split A,B,...]\n"
+           "       [--tensor-attention heads|positions] [--invariant-attention]\n"
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
            "       [--expert-dma-share F] [--expert-cpu-threads N] [--expert-cache-adaptive]\n"
            "       [--expert-misses staged|mapped] [--expert-tail-skip N]\n"
@@ -108,6 +117,7 @@ std::string usage_text() {
            "<directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16]\n"
+           "       [--embedding-residency device|host]\n"
            "       [--mlp-a8-decode] [--no-prefill-a8] [--rope-yarn] [--rope-yarn-factor F]\n"
            "       [--rope-scaling-factor F [--rope-scaling-original-context N]]\n"
            "       (--mlp-a8-decode is inert here: the route it enables is verify-phase"
@@ -204,6 +214,15 @@ Options parse_options(int argc, char** argv) {
             out.embedding_q4 = true;
         } else if (option == "--embedding-q6") {
             out.embedding_q6 = true;
+        } else if (option == "--embedding-residency") {
+            const std::string residency(value("--embedding-residency"));
+            if (residency == "device") {
+                out.embedding_residency = ninfer::EmbeddingResidency::Device;
+            } else if (residency == "host") {
+                out.embedding_residency = ninfer::EmbeddingResidency::Host;
+            } else {
+                throw std::invalid_argument("--embedding-residency must be device or host");
+            }
         } else if (option == "--mtp-experts-q4") {
             out.mtp_experts_q4 = true;
         } else if (option == "--gdn-state-fp16") {
@@ -217,6 +236,15 @@ Options parse_options(int argc, char** argv) {
                     parse_integer<int>(list.substr(begin, end - begin), "devices"));
                 begin = end + 1;
             }
+        } else if (option == "--tensor-parallel") {
+            out.tensor_parallel = true;
+        } else if (option == "--tensor-split") {
+            out.tensor_split = ninfer::product::parse_tensor_split(value("--tensor-split"));
+        } else if (option == "--tensor-attention") {
+            out.tensor_attention =
+                ninfer::product::parse_tensor_attention(value("--tensor-attention"));
+        } else if (option == "--invariant-attention") {
+            out.invariant_attention = true;
         } else if (option == "--expert-residency") {
             const std::string residency(value("--expert-residency"));
             if (residency == "device") {
@@ -276,6 +304,11 @@ Options parse_options(int argc, char** argv) {
         (!out.disjoint && (out.stride == 0 || out.stride >= out.context))) {
         usage_error("context/stride must satisfy context>=2 and 1<=stride<context");
     }
+    if (out.tensor_parallel && out.devices.size() < 2) {
+        usage_error("--tensor-parallel needs --devices naming more than one device");
+    }
+    ninfer::product::check_tensor_split(out.tensor_split, out.devices.size(), out.tensor_parallel);
+    ninfer::product::check_tensor_attention(out.tensor_attention, out.tensor_parallel);
     return out;
 }
 
@@ -378,6 +411,10 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.purpose          = ninfer::EnginePurpose::CausalScoring;
     engine_options.device           = options.device;
     engine_options.devices                       = options.devices;
+    engine_options.tensor_parallel               = options.tensor_parallel;
+    engine_options.tensor_split                  = options.tensor_split;
+    engine_options.tensor_attention              = options.tensor_attention;
+    engine_options.invariant_attention           = options.invariant_attention;
     engine_options.expert_residency              = options.expert_residency;
     engine_options.expert_cache_bytes            = options.expert_cache_bytes;
     engine_options.hybrid_experts                = options.hybrid_experts;
@@ -389,6 +426,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.lm_head_q6       = options.lm_head_q6;
     engine_options.embedding_q4     = options.embedding_q4;
     engine_options.embedding_q6     = options.embedding_q6;
+    engine_options.embedding_residency = options.embedding_residency;
     engine_options.mtp_experts_q4   = options.mtp_experts_q4;
     engine_options.gdn_state_fp16   = options.gdn_state_fp16;
     engine_options.rope_yarn        = options.rope_yarn;

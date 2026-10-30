@@ -1941,6 +1941,8 @@ void slice_dequantize(const void* weight, std::int64_t row_bytes, int k, const s
 
 } // namespace ninfer::ops::gguf::detail
 
+#include "ggml_bridge_sm70.cuh"
+
 #define NINFER_GGUF_SLICE_DEQUANTIZE_INSTANCE(TYPE, DST)                                           \
     template void ninfer::ops::gguf::detail::slice_dequantize<TYPE, DST>(                          \
         const void*, std::int64_t, int, const std::int32_t*, int, DST*, std::int64_t, cudaStream_t)

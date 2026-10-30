@@ -51,11 +51,13 @@ struct StateImageShard {
     std::size_t rank          = 0;
     std::uint32_t first_layer = 0;
     std::uint32_t layers      = 0;
-    // Tensor parallelism: the shard holds the `part`-th of `parts` equal head groups of each of its
-    // layers' state, and the shards of one run of layers follow each other in part order. A host
-    // image keeps a layer's parts side by side, in part order.
-    std::uint32_t part  = 0;
-    std::uint32_t parts = 1;
+    // Tensor parallelism: the shard holds part `part` of each of its layers' state, `value_heads`
+    // value heads and their `conv_channels` convolution channels (zero for each: the whole
+    // layer's). The parts of one run of layers follow each other in part order and together hold
+    // every head and channel. A host image keeps a layer's parts side by side, in part order.
+    std::uint32_t part          = 0;
+    std::int32_t value_heads    = 0;
+    std::int32_t conv_channels  = 0;
 };
 
 struct StateImageDeviceLayout {
@@ -238,6 +240,10 @@ private:
     void for_each_host_component(std::int32_t slot, StateImagePart part, Visit&& visit) const;
 
     std::vector<StateImageShard> shards_;
+    // Where each shard's part of a layer's state starts in the host image's layer: the bytes of the
+    // run's earlier parts.
+    std::vector<std::size_t> conv_part_offset_;
+    std::vector<std::size_t> recurrent_part_offset_;
     // The device holding each rank's backing: a rank's copies and memsets run with that device
     // current (HoldingDeviceBinding).
     std::vector<int> rank_devices_;

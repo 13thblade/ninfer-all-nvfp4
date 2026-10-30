@@ -1,6 +1,7 @@
 #include "models/flint/executor.h"
 
 #include "core/decode_graph.h"
+#include "core/expert_parallel.h"
 #include "core/growable_region.h"
 #include "core/vmm.h"
 #include "core/weight_view.h"
@@ -117,6 +118,9 @@ struct LayerPlan {
     gguf::GgmlType gate_up_type{}, down_type{};
     std::int64_t gate_up_row_bytes = 0, down_row_bytes = 0;
     DeviceBuffer tables; // pointers: [E] gate, [E] up, [E] gate_up, [E] down
+    // Expert parallelism: rank r's tables (r > 0) in its device memory, entries of the experts it
+    // holds (`tables` holds rank 0's); the other entries are null.
+    std::vector<DeviceBuffer> peer_tables;
     // The F16 K and V caches: [sequences][kv heads][slots][D].
     KvArea k, v;
     int slots = 0, ring = 0;
@@ -161,6 +165,18 @@ struct Executor::Impl {
     // The CPU's share of missing experts; it outlives the delivery that calls it.
     std::unique_ptr<CpuExperts> cpu_experts;
     std::unique_ptr<ExpertDelivery> delivery;
+
+    // Expert parallelism (model.expert_parallel()): every rank holds a range of each MoE block's
+    // routed experts and rank 0 everything else. A MoE call's input goes to every other rank, which
+    // runs its part on its own stream and workspace and sends it back (experts_parallel()).
+    struct ExpertPeer {
+        cudaStream_t stream = nullptr;
+        std::unique_ptr<WorkspaceArena> workspace;
+    };
+
+    std::vector<ExpertPeer> expert_peers; // by rank; rank 0's is unused
+    std::unique_ptr<ExpertParallelExchange> expert_exchange;
+    DeviceBuffer expert_pack; // a call's packed input, on rank 0
     mutable std::mutex expert_stats_mutex;
     ExpertDeliveryStats expert_startup_stats;
     Weight embedding, head;
@@ -183,14 +199,17 @@ struct Executor::Impl {
     int decode_splits_full = 1, decode_splits_sliding = 1;
     // Decode graphs by row count, verification graphs by 16 + rows.
     std::map<std::uint32_t, GraphEntry> graphs;
-    std::uint32_t verify_width = 0; // rows per sequence of the last verify()
+    std::vector<std::uint32_t> verify_widths; // rows per sequence of the last verify()
 
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(o), config(m.config()) {
         if (options.sequences == 0 || options.prefill_chunk == 0 || options.max_context == 0) {
             throw std::invalid_argument("flint executor: invalid options");
         }
-        if (device.size() != 1) { throw std::invalid_argument("Flint runs on one device"); }
+        if (device.size() != 1 && !model.expert_parallel()) {
+            throw std::invalid_argument("Flint runs on one device, or divides its experts over "
+                                        "several");
+        }
         if (options.draft_tokens > std::uint32_t(gguf::kMaxVectorColumns) - 1) {
             throw std::invalid_argument("flint executor: at most 7 drafts a round");
         }
@@ -287,27 +306,52 @@ struct Executor::Impl {
                 p.width   = int(config.shared_intermediate_size);
                 p.router  = fp32(model, mw.router, e * hidden);
                 if (model.expert_residency() == ExpertResidency::Device) {
-                    const Weight gate_up = matrix(model, {*mw.gate_up});
-                    const Weight down    = matrix(model, {*mw.down});
-                    if (!is_gguf(gate_up.qtype) || !is_gguf(down.qtype)) {
-                        throw std::invalid_argument("Flint experts must be GGUF block matrices");
+                    // The tables of experts [first, last), held from `first` on by the two banks.
+                    const auto bank_tables = [&](WeightId gate_up_id, WeightId down_id,
+                                                 std::uint32_t first, std::uint32_t last) {
+                        const Weight gate_up = matrix(model, {gate_up_id});
+                        const Weight down    = matrix(model, {down_id});
+                        if (!is_gguf(gate_up.qtype) || !is_gguf(down.qtype)) {
+                            throw std::invalid_argument(
+                                "Flint experts must be GGUF block matrices");
+                        }
+                        const auto gate_up_type = ops::detail::gguf_type(gate_up.qtype);
+                        const auto down_type    = ops::detail::gguf_type(down.qtype);
+                        if (p.gate_up_row_bytes == 0) {
+                            p.gate_up_type      = gate_up_type;
+                            p.down_type         = down_type;
+                            p.gate_up_row_bytes = row_bytes(gate_up);
+                            p.down_row_bytes    = row_bytes(down);
+                        } else if (gate_up_type != p.gate_up_type || down_type != p.down_type) {
+                            throw std::invalid_argument("Flint: one block's experts in different "
+                                                        "formats");
+                        }
+                        std::vector<const void*> table(4 * std::size_t(e), nullptr);
+                        for (std::uint32_t x = first; x < last; ++x) {
+                            const auto* gu =
+                                static_cast<const std::byte*>(gate_up.qdata) +
+                                std::int64_t(x - first) * 2 * width * p.gate_up_row_bytes;
+                            table[x]         = gu;
+                            table[e + x]     = gu + std::int64_t(width) * p.gate_up_row_bytes;
+                            table[2 * e + x] = gu;
+                            table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
+                                               std::int64_t(x - first) * hidden * p.down_row_bytes;
+                        }
+                        DeviceBuffer buffer(table.size() * sizeof(void*));
+                        buffer.copy_from_host(table.data(), table.size() * sizeof(void*));
+                        return buffer;
+                    };
+                    if (!model.expert_parallel()) {
+                        p.tables = bank_tables(*mw.gate_up, *mw.down, 0, std::uint32_t(e));
+                    } else {
+                        p.peer_tables.resize(device.size());
+                        for (std::size_t r = 0; r < device.size(); ++r) {
+                            const auto [first, last] = model.expert_range(r);
+                            RankBinding bind(device, r);
+                            (r == 0 ? p.tables : p.peer_tables[r]) = bank_tables(
+                                mw.gate_up_shares.at(r), mw.down_shares.at(r), first, last);
+                        }
                     }
-                    p.gate_up_type      = ops::detail::gguf_type(gate_up.qtype);
-                    p.down_type         = ops::detail::gguf_type(down.qtype);
-                    p.gate_up_row_bytes = row_bytes(gate_up);
-                    p.down_row_bytes    = row_bytes(down);
-                    std::vector<const void*> table(4 * std::size_t(e));
-                    for (int x = 0; x < e; ++x) {
-                        const auto* gu = static_cast<const std::byte*>(gate_up.qdata) +
-                                         std::int64_t(x) * 2 * width * p.gate_up_row_bytes;
-                        table[x]         = gu;
-                        table[e + x]     = gu + std::int64_t(width) * p.gate_up_row_bytes;
-                        table[2 * e + x] = gu;
-                        table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
-                                           std::int64_t(x) * hidden * p.down_row_bytes;
-                    }
-                    p.tables = DeviceBuffer(table.size() * sizeof(void*));
-                    p.tables.copy_from_host(table.data(), table.size() * sizeof(void*));
                 } else {
                     p.delivery_layer    = int(i - config.dense_layers);
                     const auto& bank    = model.expert_banks()[std::size_t(p.delivery_layer)];
@@ -402,6 +446,7 @@ struct Executor::Impl {
             }
         }
         workspace = std::make_unique<WorkspaceArena>(workspace_bytes);
+        allocate_expert_peers();
         if (!model.expert_banks().empty()) { plan_delivery(); }
     }
 
@@ -600,6 +645,13 @@ struct Executor::Impl {
 
     ~Impl() {
         if (delivery || growing) { cudaStreamSynchronize(stream); }
+        for (std::size_t r = 1; r < expert_peers.size(); ++r) {
+            if (expert_peers[r].stream == nullptr) { continue; }
+            RankBinding bind(device, r);
+            cudaStreamSynchronize(expert_peers[r].stream);
+            expert_peers[r].workspace.reset();
+            cudaStreamDestroy(expert_peers[r].stream);
+        }
     }
     Impl(const Impl&)            = delete;
     Impl& operator=(const Impl&) = delete;
@@ -663,10 +715,188 @@ struct Executor::Impl {
             moe += round_up(pairs * w * 2, kAlign);
             moe += round_up(gguf::moe_matrix_activation_bytes(int(w), int(pairs)), kAlign);
             moe += round_up(pairs * h * 4, kAlign);
+            if (model.expert_parallel()) {
+                // Rank 0's part: its pairs' ids and routing, and its fixed-point sum.
+                moe +=
+                    round_up(pairs * 4, kAlign) +
+                    round_up(gguf::moe_routing_bytes(int(config.num_experts), int(pairs)), kAlign) +
+                    round_up(t * h * 8, kAlign);
+            }
         }
         const std::size_t decode = kernels::decode_attention_workspace_floats(
             decode_rows(), query_heads, head_dim, std::max(decode_splits_full, decode_splits_sliding)) * 4;
         return bytes + moe + round_up(decode, kAlign) + gguf_scratch + (16u << 20);
+    }
+
+    // ---- Expert parallelism
+    // ----------------------------------------------------------------------
+
+    // The most tokens one MoE call takes: a prompt chunk, or a decode or verification call.
+    [[nodiscard]] int max_moe_tokens() const {
+        return std::max<int>(int(options.prefill_chunk), gguf::kMaxVectorColumns);
+    }
+
+    // The byte layout of a MoE call's packed input: the activation the experts read (up to 8
+    // tokens: their q8_1 vector form; wider: BF16 [T][H]), then the ids and weights, 256-aligned.
+    struct ExpertInput {
+        std::size_t activation = 0, ids = 0, weights = 0, bytes = 0;
+    };
+
+    [[nodiscard]] ExpertInput expert_input(int t) const {
+        const std::size_t pairs = std::size_t(t) * config.top_k_experts;
+        ExpertInput out;
+        out.activation = t <= gguf::kMaxVectorColumns ? gguf::vector_activation_bytes(hidden, t)
+                                                      : std::size_t(t) * hidden * 2;
+        out.ids        = round_up(out.activation, kAlign);
+        out.weights    = out.ids + round_up(pairs * 4, kAlign);
+        out.bytes      = out.weights + pairs * 4;
+        return out;
+    }
+
+    // Workspace of one rank's part of a call of up to `t` tokens (expert_part()).
+    [[nodiscard]] std::size_t expert_part_bytes(int t) const {
+        const std::size_t pairs = std::size_t(t) * config.top_k_experts;
+        const std::size_t vector_pairs =
+            std::size_t(gguf::kMaxVectorColumns) * config.top_k_experts;
+        const std::size_t h = hidden, w = config.moe_intermediate_size;
+        std::size_t bytes =
+            round_up(pairs * 4, kAlign) +
+            round_up(gguf::moe_routing_bytes(int(config.num_experts), int(pairs)), kAlign) +
+            round_up(pairs * w * 2, kAlign);
+        const std::size_t vector =
+            round_up(gguf::vector_activation_bytes(int(w), int(vector_pairs)), kAlign);
+        const std::size_t matrix =
+            round_up(gguf::moe_matrix_activation_bytes(int(h), int(pairs)), kAlign) +
+            round_up(pairs * 2 * w * 4, kAlign) +
+            round_up(gguf::moe_matrix_activation_bytes(int(w), int(pairs)), kAlign) +
+            round_up(pairs * h * 4, kAlign);
+        return bytes + std::max(vector, matrix) + (std::size_t(1) << 20);
+    }
+
+    void allocate_expert_peers() {
+        if (!model.expert_parallel()) { return; }
+        const int t = max_moe_tokens();
+        const std::size_t input =
+            std::max(expert_input(t).bytes, expert_input(gguf::kMaxVectorColumns).bytes);
+        const std::size_t part = std::size_t(t) * hidden * 8;
+        expert_pack            = DeviceBuffer(input);
+        expert_exchange        = std::make_unique<ExpertParallelExchange>(device, input, part);
+        expert_peers.resize(device.size());
+        for (std::size_t r = 1; r < device.size(); ++r) {
+            RankBinding bind(device, r);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&expert_peers[r].stream, cudaStreamNonBlocking));
+            expert_peers[r].workspace = std::make_unique<WorkspaceArena>(expert_part_bytes(t));
+        }
+    }
+
+    // One rank's part of a MoE call of block `p`: the call's pairs routed to the experts the rank
+    // holds (`range`), through its `tables`, weighted into the 2^-32 fixed-point sum `fixed`
+    // ([T][H]). Up to 8 tokens read the call's q8_1 activation `act`, wider calls its BF16 rows
+    // `x`. The F16-sum guards may scale `weights` in place. Each contribution is the one a single
+    // device computes and rounds, so the parts add up to its sum exactly.
+    void expert_part(const LayerPlan& p, const void* const* tables,
+                     std::pair<std::uint32_t, std::uint32_t> range, const void* act,
+                     const __nv_bfloat16* x, const std::int32_t* ids, float* weights, int t,
+                     unsigned long long* fixed, WorkspaceArena& space, cudaStream_t on) {
+        auto scope  = space.scope();
+        const int e = int(config.num_experts), k = int(config.top_k_experts);
+        const int width = int(config.moe_intermediate_size);
+        const int pairs = t * k;
+        auto* mine = static_cast<std::int32_t*>(space.alloc_bytes(std::size_t(pairs) * 4).data);
+        gguf::moe_keep_experts(ids, pairs, int(range.first), int(range.second), mine, on);
+        const gguf::MoeRouting routing = gguf::moe_sort_routes(
+            mine, pairs, e, space.alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data, on);
+        const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden};
+        const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden};
+        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden};
+        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width};
+        const int max_active = std::max(1, std::min(pairs, int(range.second - range.first)));
+        auto* middle =
+            static_cast<__nv_bfloat16*>(space.alloc_bytes(std::size_t(pairs) * width * 2).data);
+        if (t <= gguf::kMaxVectorColumns) {
+            const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
+            void* act2      = space.alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
+            CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, on));
+            gguf::MoeOutput out;
+            out.weighted = fixed;
+            out.weights  = weights;
+            gguf::moe_vector_swiglu(p.gate_up_type, gate, up, routing, max_active, k, act, t,
+                                    middle, chunk, on);
+            // Every pair's middle is quantized; another rank's pairs are never read.
+            if (gguf::vector_activation_f16_sums(p.down_type)) {
+                const kernels::Q8Rows middle_q{
+                    static_cast<std::int8_t*>(act2),
+                    reinterpret_cast<half2*>(static_cast<std::byte*>(act2) +
+                                             gguf::vector_activation_scales_offset(width, pairs))};
+                kernels::quantize_pairs(middle, pairs, width, weights, middle_q, on);
+            } else {
+                gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, on);
+            }
+            gguf::moe_vector_product(p.down_type, down, routing, max_active, 1, k, act2, pairs, out,
+                                     chunk, on);
+            return;
+        }
+        void* rows_act = space.alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;
+        gguf::quantize_moe_matrix_activation(p.gate_up_type, x, hidden, routing, pairs, k, rows_act,
+                                             on);
+        auto* gu = static_cast<float*>(space.alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
+        gguf::moe_matrix_product(p.gate_up_type, gate_up, routing, max_active, pairs, true,
+                                 rows_act, gu, on);
+        kernels::swiglu_rows(gu, pairs, width, middle,
+                             gguf::matrix_activation_f16_sums(p.down_type) ? weights : nullptr, on);
+        void* act2 = space.alloc_bytes(gguf::moe_matrix_activation_bytes(width, pairs)).data;
+        gguf::quantize_moe_matrix_activation(p.down_type, middle, width, routing, pairs, 1, act2,
+                                             on);
+        auto* rows = static_cast<float*>(space.alloc_bytes(std::size_t(pairs) * hidden * 4).data);
+        gguf::moe_matrix_product(p.down_type, down, routing, max_active, pairs, true, act2, rows,
+                                 on);
+        gguf::moe_weighted_rows(rows, mine, weights, t, k, hidden, fixed, on);
+    }
+
+    // Expert parallelism's MoE call after rank 0 has routed it: the input goes to every other
+    // rank, each runs its part while rank 0 runs its own and the shared expert, and the parts' sum
+    // lands where `combine` reads it. Up to 8 tokens this is the sum one device stores, bit for
+    // bit; a wider call sums in the same fixed point where one device weighs FP32 rows in
+    // ffn_combine.
+    template <typename Shared>
+    void experts_parallel(const LayerPlan& p, const __nv_bfloat16* x, const void* act,
+                          const std::int32_t* ids, float* weights, int t,
+                          kernels::FfnCombineArgs& combine, Shared&& shared) {
+        const std::size_t pairs  = std::size_t(t) * config.top_k_experts;
+        const std::size_t part   = std::size_t(t) * hidden * 8;
+        const ExpertInput layout = expert_input(t);
+        auto* pack               = static_cast<std::byte*>(expert_pack.p);
+        CUDA_CHECK(cudaMemcpyAsync(pack, t <= gguf::kMaxVectorColumns ? act : x, layout.activation,
+                                   cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(pack + layout.ids, ids, pairs * 4, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(pack + layout.weights, weights, pairs * 4,
+                                   cudaMemcpyDeviceToDevice, stream));
+        const std::size_t slot = expert_exchange->send(pack, layout.bytes, stream);
+        for (std::size_t r = 1; r < device.size(); ++r) {
+            RankBinding bind(device, r);
+            ExpertPeer& peer = expert_peers[r];
+            auto* input      = static_cast<std::byte*>(
+                expert_exchange->receive(r, layout.bytes, slot, peer.stream));
+            expert_part(p, static_cast<const void* const*>(p.peer_tables[r].p),
+                        model.expert_range(r), input, reinterpret_cast<const __nv_bfloat16*>(input),
+                        reinterpret_cast<const std::int32_t*>(input + layout.ids),
+                        reinterpret_cast<float*>(input + layout.weights), t,
+                        static_cast<unsigned long long*>(expert_exchange->part(r)), *peer.workspace,
+                        peer.stream);
+            expert_exchange->reply(r, part, slot, peer.stream);
+        }
+        auto* fixed = static_cast<unsigned long long*>(workspace->alloc_bytes(part).data);
+        expert_part(p, static_cast<const void* const*>(p.tables.p), model.expert_range(0), act, x,
+                    ids, weights, t, fixed, *workspace, stream);
+        shared();
+        std::vector<const unsigned long long*> parts;
+        for (void* received : expert_exchange->collect(part, slot, stream)) {
+            parts.push_back(static_cast<const unsigned long long*>(received));
+        }
+        gguf::add_fixed_parts(fixed, parts.data(), int(parts.size()), std::int64_t(t) * hidden,
+                              stream);
+        combine.moe_fixed = fixed;
     }
 
     // ---- Shared pieces ---------------------------------------------------------------------------
@@ -867,12 +1097,18 @@ struct Executor::Impl {
                                   static_cast<std::uint32_t*>(route_done.p), stream);
         } else {
             kernels::route(router_x, hidden, t, p.router, e, k, logits, ids, weights, stream);
-            routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
+            if (!model.expert_parallel()) {
+                routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
+            }
         }
         // A decode or verification call may leave misses to the CPU, which reads the quantized
         // activation and the route weights.
         const bool cpu = cpu_experts && t <= CpuExperts::kMaxTokens && vector;
         const void* act = vector ? xq->base : nullptr;
+        if (model.expert_parallel()) {
+            experts_parallel(p, x, act, ids, weights, t, combine, shared);
+            return;
+        }
         std::optional<ExpertDelivery::Call> call;
         if (delivery) {
             const std::array<ExpertDelivery::Input, 2> inputs{
@@ -1308,48 +1544,61 @@ struct Executor::Impl {
 
     // ---- Speculative rounds ------------------------------------------------------------------------
 
-    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens) {
+    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens,
+                std::span<const std::uint32_t> widths = {}) {
         const int n = int(sequences.size());
-        if (options.draft_tokens == 0 || n <= 0 || tokens.size() % sequences.size() != 0) {
+        if (options.draft_tokens == 0 || n <= 0 ||
+            (widths.empty() && tokens.size() % sequences.size() != 0) ||
+            (!widths.empty() && widths.size() != sequences.size())) {
             throw std::invalid_argument("flint verify: invalid call");
         }
-        const int w = int(tokens.size()) / n, rows = n * w;
-        if (w < 1 || std::uint32_t(w) > options.draft_tokens + 1 || rows > gguf::kMaxVectorColumns) {
+        std::vector<std::uint32_t> row_widths(widths.begin(), widths.end());
+        if (row_widths.empty()) { row_widths.assign(n, std::uint32_t(tokens.size()) / n); }
+        int rows = 0;
+        for (const std::uint32_t w : row_widths) {
+            if (w < 1 || w > options.draft_tokens + 1) {
+                throw std::invalid_argument("flint verify: invalid width");
+            }
+            rows += int(w);
+        }
+        if (std::size_t(rows) != tokens.size() || rows > gguf::kMaxVectorColumns) {
             throw std::invalid_argument("flint verify: invalid width");
         }
         std::vector<std::int32_t> pos(rows), seq(rows);
-        for (int j = 0; j < n; ++j) {
+        for (int j = 0, at = 0; j < n; ++j) {
             const std::uint32_t s = sequences[j];
             if (s >= options.sequences ||
                 std::count(sequences.begin(), sequences.begin() + j, s) != 0) {
                 throw std::invalid_argument("flint verify: invalid sequence");
             }
-            if (positions[s] + std::uint32_t(w) > options.max_context) {
+            if (positions[s] + row_widths[j] > options.max_context) {
                 throw std::invalid_argument("flint verify: context capacity exceeded");
             }
-            for (int i = 0; i < w; ++i) {
-                pos[j * w + i] = std::int32_t(positions[s]) + i;
-                seq[j * w + i] = std::int32_t(s);
+            for (std::uint32_t i = 0; i < row_widths[j]; ++i, ++at) {
+                pos[at] = std::int32_t(positions[s] + i);
+                seq[at] = std::int32_t(s);
             }
         }
-        for (const std::uint32_t s : sequences) { back(s, positions[s] + std::uint32_t(w), false); }
+        for (int j = 0; j < n; ++j) {
+            back(sequences[j], positions[sequences[j]] + row_widths[j], false);
+        }
         stage(tokens, pos, seq);
         run_graph(16 + std::uint32_t(rows), [&] { decode_body(rows); });
-        verify_width = std::uint32_t(w);
+        verify_widths = std::move(row_widths);
     }
 
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept) {
-        if (kept.size() != sequences.size() || verify_width == 0) {
+        if (kept.size() != sequences.size() || verify_widths.size() != sequences.size()) {
             throw std::invalid_argument("flint commit: invalid call");
         }
         for (std::size_t j = 0; j < sequences.size(); ++j) {
             const std::uint32_t s = sequences[j];
-            if (s >= options.sequences || kept[j] < 1 || kept[j] > verify_width) {
+            if (s >= options.sequences || kept[j] < 1 || kept[j] > verify_widths[j]) {
                 throw std::invalid_argument("flint commit: invalid row");
             }
             positions[s] += kept[j];
         }
-        verify_width = 0;
+        verify_widths.clear();
     }
 
     void warm_up() {
@@ -1590,8 +1839,8 @@ cudaStream_t Executor::head_stream() const noexcept { return impl_->stream; }
 std::uint32_t Executor::draft_tokens() const noexcept { return impl_->options.draft_tokens; }
 
 void Executor::verify(std::span<const std::uint32_t> sequences,
-                      std::span<const std::int32_t> tokens) {
-    impl_->verify(sequences, tokens);
+                      std::span<const std::int32_t> tokens, std::span<const std::uint32_t> widths) {
+    impl_->verify(sequences, tokens, widths);
 }
 
 void Executor::commit(std::span<const std::uint32_t> sequences,

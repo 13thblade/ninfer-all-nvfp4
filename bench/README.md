@@ -67,6 +67,7 @@ ninfer_bench --weights <artifact.ninfer>
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>] [--fast-prefill-kernel]
           [--expert-residency <device|host|disk>] [--expert-cache-mib <N|auto>]
+          [--embedding-residency <device|host>]
           [--expert-dma-share <F|auto>] [--expert-cpu-threads <n>]
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft|--full-draft-head]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
@@ -294,10 +295,12 @@ are not directly comparable to new ones.
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
-Q8, registered BF16 weights, the registered NVFP4 problems, and the registered FP8 problems.
+Q8, registered BF16 weights, and NVFP4 and FP8 at their registered problems or at any other shape
+their runtime-shape routes take (whole 128-row and 256-column units for NVFP4, 64 and 512 for FP8).
 Existing formats use `--policy a16`; NVFP4 additionally supports `--policy a4`, and
 FP8 supports `--policy a8`. Each permission lets the production resolver select the qualified
-route for the exact geometry and T. LinearAdd, LinearSwiGLU,
+route for the exact geometry and T. `--out fp32` writes FP32 results, a tensor-parallel rank's
+partial sums, for the formats whose Linear writes them. LinearAdd, LinearSwiGLU,
 LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops and are not
 benchmark modes here.
 

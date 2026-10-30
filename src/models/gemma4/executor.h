@@ -167,11 +167,12 @@ public:
     // position takes: drafts[j * steps + i] is sequence j's i-th draft.
     void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
                std::span<std::int32_t> drafts, std::uint32_t steps);
-    // tokens.size() / sequences.size() tokens of each sequence (its anchor, then its drafts) at its
-    // next positions, as decode rows: logits one column each, sequence by sequence. The positions
-    // advance only with commit().
-    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
-    // Keeps the first kept[j] (1..width) of sequence j's verified tokens.
+    // widths[j] tokens of sequence j (its anchor, then its drafts; without widths, tokens.size() /
+    // sequences.size() each) at its next positions, as decode rows: logits one column each,
+    // sequence by sequence. The positions advance only with commit().
+    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens,
+                std::span<const std::uint32_t> widths = {});
+    // Keeps the first kept[j] (1..its width) of sequence j's verified tokens.
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept);
     [[nodiscard]] cudaStream_t head_stream() const noexcept;
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);

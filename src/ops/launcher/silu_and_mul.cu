@@ -37,6 +37,15 @@ bool can_use_dim0_split_fast_path(const Tensor& gate, const Tensor& up, const Te
 void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
     const std::int64_t n = out.numel();
     constexpr int kBlock = 128;
+    if (gate.dtype == DType::FP32) {
+        const int grid = static_cast<int>(
+            std::min<std::int64_t>(div_up(n, static_cast<std::int64_t>(kBlock)), 65535));
+        silu_and_mul_fp32_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const float*>(gate.data), static_cast<const float*>(up.data),
+            static_cast<__nv_bfloat16*>(out.data), n);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (!gate.is_contiguous() || !up.is_contiguous()) {
         if (can_use_dim0_split_fast_path(gate, up, out)) {
             const std::int64_t row_pairs          = gate.ne[0] / 2;

@@ -149,8 +149,10 @@ struct Q5A16SlicedKMmaSchedule {
     static_assert(kSharedBytes <= 48 * 1024, "Q5 sliced-K shared memory exceeds 48 KiB");
 };
 
+// RuntimeUnroll unrolls the K loop of a runtime K that many block-K steps deep, for the loads it
+// keeps in flight; a static K unrolls whole.
 template <int BlockRows, int BlockTokens, int WarpsPerRow, int GroupsPerWarpTile,
-          int MinBlocksPerSm, int StaticK = 0, bool ExactTokens = false>
+          int MinBlocksPerSm, int StaticK = 0, bool ExactTokens = false, int RuntimeUnroll = 1>
 struct Q5A16DirectSimtSchedule {
     static_assert(BlockRows > 0 && BlockTokens > 0 && BlockTokens <= 32);
     static_assert(WarpsPerRow == 1 || WarpsPerRow == 2 || WarpsPerRow == 4 || WarpsPerRow == 8);
@@ -164,6 +166,7 @@ struct Q5A16DirectSimtSchedule {
     static constexpr int kBlockK            = WarpsPerRow * GroupsPerWarpTile * 64;
     static constexpr bool kExactTokens      = ExactTokens;
     static constexpr int kStaticK           = StaticK;
+    static constexpr int kRuntimeUnroll     = RuntimeUnroll;
     static constexpr int kMinBlocksPerSm    = MinBlocksPerSm;
     static constexpr int kWarps             = BlockRows * WarpsPerRow;
     static constexpr int kThreads           = kWarps * 32;

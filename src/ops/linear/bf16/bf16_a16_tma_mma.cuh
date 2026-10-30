@@ -152,9 +152,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
         cta_mbarrier_wait(full + stage, (kt / S) & 1U);
         bf16_mma_compute_stage<Schedule>(a + stage * BR * BK, b + stage * BT * BK, accum, warp,
                                          lane);
-        // Every lane must finish its shared reads before the elected lane releases this stage.
-        __syncwarp();
-        if (lane == 0) cta_mbarrier_arrive(empty + stage);
+        cta_mbarrier_release_stage(empty + stage, lane);
     }
     bf16_finish_mma_tile<Schedule, FullTokens>(output, epilogue, storage, accum, row_begin,
                                                token_begin, rows, token_offset + count, warp, lane);

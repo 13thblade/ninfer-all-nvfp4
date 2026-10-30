@@ -51,7 +51,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         // active splits and partial outputs. The tiled kernels below are the other tiers'; a build
         // of Volta alone does not compile them.
         const auto run = [&]<bool PackedValues, KvKeyCoding Keys>() {
-            const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+            const dim3 grid(q.ne[1] / Geometry::GroupSize, splits, invocation.batch_size);
             constexpr int kBlock =
                 32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::kWarps;
             causal_attention_small_t_sm70_i8_kernel<Geometry, TokenTile, MultiBatch, Masked,
@@ -72,7 +72,8 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                         : static_cast<const std::int32_t*>(invocation.table_rows->data),
                     cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
                     logical_capacity, wave_splits, scale, static_cast<float*>(partial_acc.data),
-                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                    invocation.partition);
         };
         if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
             run.template operator()<true, KvKeyCoding::Lloyd4>();
@@ -92,7 +93,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     if constexpr (kBuildPostVolta) {
         auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena,
                           int QkSplit = 1, bool EarlyFetch = false>() {
-            const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+            const dim3 grid(q.ne[1] / Geometry::GroupSize, splits, invocation.batch_size);
             constexpr std::size_t kDynamicBytes =
                 DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kCausalHeadDim) : 0u;
             auto issue_pv = [&]<bool PackedValues, KvKeyCoding Keys, bool PvF16>() {
@@ -123,10 +124,12 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                             : static_cast<const std::int32_t*>(invocation.table_rows->data),
                         cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
                         logical_capacity, wave_splits, scale, static_cast<float*>(partial_acc.data),
-                        static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+                        static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                        invocation.partition);
             };
             auto issue = [&]<bool PackedValues, KvKeyCoding Keys>() {
-                if (small_t_pv_f16()) {
+                // Invariant reductions keep the products of every key tile in FP32.
+                if (small_t_pv_f16() && !invocation.partition.segmented()) {
                     issue_pv.template operator()<PackedValues, Keys, true>();
                 } else {
                     issue_pv.template operator()<PackedValues, Keys, false>();
@@ -147,17 +150,32 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         // A device profile names the tier per window: "<warps>x<CTAs per SM>x<key block>", with a
         // trailing "d" for the dynamic-arena variant, "q" for split QK, "e" for EarlyFetch and
         // "p" for the pipelined kernel (small_t_i8_pipelined.cuh, INT8 keys and values only).
-        const std::string_view routed =
-            device_route_schedule(small_t_i8_route_key(Geometry::QHeads, cache.storage, TokenTile),
-                                  implementation_window);
-        if (routed == "8x2x32p" && cache.storage == KvCacheStorage::Int8Group64) {
+        constexpr int kRowTiles = (TokenTile * Geometry::GroupSize + 15) / 16;
+        if (invocation.partition.segmented()) {
+            // Invariant reductions: one 32-key tile and one producer warp per row tile at every
+            // width, so a row's arithmetic does not depend on the rows beside it.
+            if constexpr (kRowTiles == 3) {
+                launch.template operator()<6, 2, 32, false>();
+            } else {
+                launch.template operator()<8, 2, 32, false>();
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        const std::string_view routed = device_route_schedule(
+            small_t_i8_route_key(Geometry::ModelQHeads, cache.storage, TokenTile),
+            implementation_window);
+        // The pipelined kernel sweeps every page of its split: a position-split rank takes the
+        // tiled kernels.
+        if (routed == "8x2x32p" && cache.storage == KvCacheStorage::Int8Group64 &&
+            !invocation.partition.strided()) {
             const auto issue = [&]<bool PvF16>() {
                 constexpr auto kernel =
                     causal_attention_small_t_i8_pipelined_kernel<Geometry, TokenTile, MultiBatch,
                                                                  Masked, CacheInput, PvF16>;
                 constexpr int kArena = CausalSmallTI8PipelinedShape::kArenaBytes;
                 raise_dynamic_shared_memory(kernel, kArena);
-                const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+                const dim3 grid(q.ne[1] / Geometry::GroupSize, splits, invocation.batch_size);
                 kernel<<<grid, CausalSmallTI8PipelinedShape::kThreads, kArena, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data), input,
                     static_cast<const std::int32_t*>(pos.data),
@@ -185,8 +203,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             return;
         }
         if (!routed.empty()) {
-            constexpr int kRowTiles = (TokenTile * Geometry::GroupSize + 15) / 16;
-            bool taken              = true;
+            bool taken = true;
             if constexpr (kRowTiles == 1) {
                 if (routed == "2x4x32") {
                     launch.template operator()<2, 4, 32, false>();

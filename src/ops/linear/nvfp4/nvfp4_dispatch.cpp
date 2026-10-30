@@ -1,5 +1,6 @@
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/common/route_table.h"
+#include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch_unified.h"
 #include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
@@ -21,6 +22,12 @@ const Nvfp4LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPoli
 }
 } // namespace
 
+bool nvfp4_registered(std::int32_t n, std::int32_t k) {
+    for (const auto* shape : kShapes)
+        if (shape->n == n && shape->k == k) return true;
+    return false;
+}
+
 static std::size_t nvfp4_linear_workspace_capacity_bytes_own(std::int32_t n, std::int32_t k,
                                                              LinearPolicy policy,
                                                              std::int32_t min_tokens,
@@ -36,6 +43,15 @@ static std::size_t nvfp4_linear_workspace_capacity_bytes_own(std::int32_t n, std
 std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k,
                                                   LinearPolicy policy, std::int32_t min_tokens,
                                                   std::int32_t max_tokens) {
+    if (!nvfp4_registered(n, k)) {
+        if (min_tokens <= 0 || max_tokens < min_tokens)
+            throw std::invalid_argument("nvfp4 linear workspace: invalid token interval");
+        if (!valid_linear_policy(policy))
+            throw std::invalid_argument("nvfp4 linear: unsupported policy");
+        return allows_a4(policy) && nvfp4_general_uses_a4(k, max_tokens)
+                   ? unified::nvfp4_a4_workspace_capacity_bytes(max_tokens, k)
+                   : 0;
+    }
     return capacity_by_table(
         min_tokens, max_tokens,
         [](std::int32_t width) { return linear_route_table(LinearRouteFamily::Nvfp4, width); },
@@ -48,6 +64,19 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k
 
 void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                     WorkspaceArena* workspace, cudaStream_t stream) {
+    const bool registered = nvfp4_registered(weight.n, weight.k);
+    if (out.dtype == DType::FP32 || !registered) {
+        validate_nvfp4_weight(weight, "nvfp4 linear");
+        if (x.ne[1] <= 0) throw std::invalid_argument("nvfp4 linear: T must be positive");
+        if (!valid_linear_policy(policy))
+            throw std::invalid_argument("nvfp4 linear: unsupported policy");
+        if (!registered && allows_a4(policy) && nvfp4_general_uses_a4(weight.k, x.ne[1])) {
+            if (workspace == nullptr)
+                throw std::invalid_argument("nvfp4 A4 linear requires caller workspace");
+            return nvfp4_general_a4(x, weight, out, *workspace, stream);
+        }
+        return nvfp4_general_a16(x, weight, out, stream);
+    }
     if (x.ne[1] > 0 &&
         linear_route_table(LinearRouteFamily::Nvfp4, x.ne[1]) == LinearRouteTable::Unified) {
         unified::nvfp4_dispatch(x, weight, out, policy, workspace, stream);

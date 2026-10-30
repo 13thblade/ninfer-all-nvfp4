@@ -39,6 +39,8 @@ struct CausalSmallTBf16Split {
     int load_end;
     int first_tile;
     int key_blocks;
+    // The split's partition: a strided one sweeps only the rank's pages (causal_small_t_own_pages).
+    CausalKeyPartition partition;
 };
 
 // Runs `sweep` on the split this CTA covers, or writes the split's neutral partials when it has no
@@ -54,11 +56,15 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
     __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
-    float* partial_acc, float* partial_m, float* partial_l, Sweep&& sweep) {
+    float* partial_acc, float* partial_m, float* partial_l, CausalKeyPartition partition,
+    Sweep&& sweep) {
     constexpr int D             = kCausalHeadDim;
     constexpr unsigned FullMask = 0xffffffffu;
 
     const int kv_head     = static_cast<int>(blockIdx.x);
+    // The grid spans the call's KV heads.
+    const int kv_heads    = static_cast<int>(gridDim.x);
+    const int q_heads     = kv_heads * Geometry::GroupSize;
     const int split       = static_cast<int>(blockIdx.y);
     const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
     const int split_count = static_cast<int>(gridDim.y);
@@ -72,20 +78,20 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
 
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
-    q += static_cast<std::int64_t>(kCausalHeadDim) * Geometry::QHeads * column_base;
+    q += static_cast<std::int64_t>(kCausalHeadDim) * q_heads * column_base;
     pos += column_base;
     if constexpr (CacheInput::writes_cache) {
-        input.k += static_cast<std::int64_t>(kCausalHeadDim) * Geometry::KVHeads * column_base;
-        input.v += static_cast<std::int64_t>(kCausalHeadDim) * Geometry::KVHeads * column_base;
+        input.k += static_cast<std::int64_t>(kCausalHeadDim) * kv_heads * column_base;
+        input.v += static_cast<std::int64_t>(kCausalHeadDim) * kv_heads * column_base;
     }
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
-        partial_acc += static_cast<std::int64_t>(batch) * kCausalHeadDim * Geometry::QHeads *
-                       tokens * split_count;
-        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
-        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+        partial_acc +=
+            static_cast<std::int64_t>(batch) * kCausalHeadDim * q_heads * tokens * split_count;
+        partial_m += static_cast<std::int64_t>(batch) * q_heads * tokens * split_count;
+        partial_l += static_cast<std::int64_t>(batch) * q_heads * tokens * split_count;
     }
 
     auto write_neutral = [&]() {
@@ -93,10 +99,10 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
             int q_head = 0;
             int token  = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] =
+            if (causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                partial_m[causal_partial_stat_index(q_head, token, split, tokens, q_heads)] =
                     -CUDART_INF_F;
-                partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = 0.0f;
+                partial_l[causal_partial_stat_index(q_head, token, split, tokens, q_heads)] = 0.0f;
             }
         }
         for (int idx = tid; idx < row_count * D; idx += Threads) {
@@ -105,15 +111,15 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
             int q_head    = 0;
             int token     = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] =
+            if (causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                partial_acc[causal_partial_acc_index(q_head, d, token, split, tokens, q_heads)] =
                     0.0f;
             }
         }
     };
 
-    if (kv_head < 0 || kv_head >= Geometry::KVHeads || tokens < 1 || tokens > TokenTile ||
-        row_count > Br || split_count <= 0) {
+    if (kv_head < 0 || kv_head >= kv_heads || tokens < 1 || tokens > TokenTile || row_count > Br ||
+        split_count <= 0) {
         return;
     }
     if (valid_tokens == 0) {
@@ -130,17 +136,25 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
 
     const int live_end = last_pos + 1;
     const int window   = causal_small_t_tile_window(first_pos, tokens, logical_capacity);
-    const int active_split_count =
-        causal_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
+    const int active_split_count = causal_small_t_partition_active(
+        partition, window, causal_small_t_active_splits<Geometry, false>(window, split_count, TokenTile),
+        split_count);
     if (split >= active_split_count) { return; }
 
-    const int logical_tiles = div_up(window, Bc);
-    const bool tile_split   = logical_tiles >= active_split_count;
-    const int units_per_split =
-        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
-    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
-    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    const int split_end   = (split_limit < window) ? split_limit : window;
+    int split_start = 0;
+    int split_end   = 0;
+    if (partition.segmented() || partition.strided()) {
+        causal_small_t_partition_range(partition, window, split, active_split_count, split_start,
+                                       split_end);
+    } else {
+        const int logical_tiles = div_up(window, Bc);
+        const bool tile_split   = logical_tiles >= active_split_count;
+        const int units_per_split = tile_split ? div_up(logical_tiles, active_split_count)
+                                               : div_up(window, active_split_count);
+        split_start           = split * units_per_split * (tile_split ? Bc : 1);
+        const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
+        split_end             = (split_limit < window) ? split_limit : window;
+    }
     if (split_start >= split_end) {
         write_neutral();
         return;
@@ -154,12 +168,17 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
             const int p_tok = pos[token];
             if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 &&
                 p_tok < logical_capacity) {
-                const std::int64_t new_off = kv_cache_int8_new_index<Geometry>(kv_head, d, token);
+                const std::int64_t new_off   = kv_cache_int8_new_index(kv_head, d, token, kv_heads);
                 const int lane             = tid & 31;
                 int physical_page = lane == 0 ? paged_kv_physical_page(block_table, p_tok) : 0;
                 physical_page     = __shfl_sync(FullMask, physical_page, 0);
-                const std::int64_t cache_off = causal_cache_index<Geometry>(
-                    physical_page, kv_head, d, p_tok & kPagedKVPageMask);
+                if (partition.strided()) {
+                    // Another rank's planes hold this row.
+                    physical_page = causal_strided_page(physical_page, partition);
+                    if (physical_page < 0) { continue; }
+                }
+                const std::int64_t cache_off = causal_cache_index(
+                    physical_page, kv_head, d, p_tok & kPagedKVPageMask, kv_heads);
                 store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
                 store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
             }
@@ -171,7 +190,7 @@ __device__ __forceinline__ void causal_small_t_bf16_split(
                                             partial_l, kv_head, split, tokens, row_count,
                                             valid_tokens, first_pos, split_start, split_end,
                                             split_end < live_end ? split_end : live_end, first_tile,
-                                            div_up(split_end - first_tile, Bc)});
+                                            div_up(split_end - first_tile, Bc), partition});
 }
 
 // The split-local partials of the warp's rows: each row's running max and sum (by the quad's
@@ -180,9 +199,11 @@ template <typename Geometry, class CacheInput, int PVNt>
 __device__ __forceinline__ void
 causal_small_t_bf16_store(const CausalSmallTBf16Split<CacheInput>& s, const float (&acc)[PVNt][4],
                           float m0, float m1, float l0, float l1, int warp_row0, int lane) {
-    const int gid  = lane >> 2;
-    const int lid  = lane & 3;
-    const int row0 = warp_row0 + gid;
+    // The grid spans the call's KV heads.
+    const int q_heads = static_cast<int>(gridDim.x) * Geometry::GroupSize;
+    const int gid     = lane >> 2;
+    const int lid     = lane & 3;
+    const int row0    = warp_row0 + gid;
     const int row1 = row0 + 8;
     int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
     causal_small_t_tc_row_to_qt<Geometry>(row0, s.tokens, s.kv_head, q_head0, token0);
@@ -190,13 +211,13 @@ causal_small_t_bf16_store(const CausalSmallTBf16Split<CacheInput>& s, const floa
     if (lid == 0) {
         if (row0 < s.row_count) {
             const std::int64_t at =
-                causal_partial_stat_index<Geometry>(q_head0, token0, s.split, s.tokens);
+                causal_partial_stat_index(q_head0, token0, s.split, s.tokens, q_heads);
             s.partial_m[at] = m0;
             s.partial_l[at] = l0;
         }
         if (row1 < s.row_count) {
             const std::int64_t at =
-                causal_partial_stat_index<Geometry>(q_head1, token1, s.split, s.tokens);
+                causal_partial_stat_index(q_head1, token1, s.split, s.tokens, q_heads);
             s.partial_m[at] = m1;
             s.partial_l[at] = l1;
         }
@@ -206,12 +227,12 @@ causal_small_t_bf16_store(const CausalSmallTBf16Split<CacheInput>& s, const floa
         const int d0 = n * 8 + 2 * lid;
         if (row0 < s.row_count) {
             const std::int64_t dst =
-                causal_partial_acc_index<Geometry>(q_head0, d0, token0, s.split, s.tokens);
+                causal_partial_acc_index(q_head0, d0, token0, s.split, s.tokens, q_heads);
             *reinterpret_cast<float2*>(&s.partial_acc[dst]) = make_float2(acc[n][0], acc[n][1]);
         }
         if (row1 < s.row_count) {
             const std::int64_t dst =
-                causal_partial_acc_index<Geometry>(q_head1, d0, token1, s.split, s.tokens);
+                causal_partial_acc_index(q_head1, d0, token1, s.split, s.tokens, q_heads);
             *reinterpret_cast<float2*>(&s.partial_acc[dst]) = make_float2(acc[n][2], acc[n][3]);
         }
     }
@@ -228,7 +249,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    float* partial_acc, float* partial_m, float* partial_l) {
+    float* partial_acc, float* partial_m, float* partial_l, CausalKeyPartition partition) {
     if constexpr (!shape_set_in_image(false)) { return; } // not this image's set
     // A Volta card runs its own kernel (small_t_sm70.cuh): a build of several architectures
     // compiles this kernel empty in the Volta image.
@@ -263,10 +284,13 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
+    // The grid spans the call's KV heads.
+    const int kv_heads = static_cast<int>(gridDim.x);
+    const int q_heads  = kv_heads * Geometry::GroupSize;
     causal_small_t_bf16_split<Geometry, TokenTile, Br, Bc, Threads, MultiBatch, Masked>(
         q, input, pos, cache_k, cache_v, block_tables, valid_columns, table_rows, table_stride,
         tokens, full_width, column_begin, logical_capacity, partial_acc, partial_m, partial_l,
-        [&](const CausalSmallTBf16Split<CacheInput>& sp) {
+        partition, [&](const CausalSmallTBf16Split<CacheInput>& sp) {
             const int kv_head               = sp.kv_head;
             const int row_count             = sp.row_count;
             const int valid_tokens          = sp.valid_tokens;
@@ -275,7 +299,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
             const int split_end             = sp.split_end;
             const int load_end              = sp.load_end;
             const int first_tile            = sp.first_tile;
-            const int key_blocks            = sp.key_blocks;
+            int key_blocks                  = sp.key_blocks;
             q                               = sp.q;
             pos                             = sp.pos;
             input                           = sp.input;
@@ -292,6 +316,12 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                 return staged_pages ? physical_pages_s[(key >> kPagedKVPageShift) - first_page]
                                     : block_table[key >> kPagedKVPageShift];
             };
+            // A strided split's splits cover whole staged pages; it sweeps the rank's own.
+            const bool strided = sp.partition.strided();
+            if (strided) {
+                key_blocks =
+                    causal_small_t_own_pages<Bc>(physical_pages_s, page_count, split_end, sp.partition);
+            }
 
             for (int idx = tid; idx < Br * D; idx += Threads) {
                 const int row = idx / D;
@@ -300,8 +330,8 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                 int token     = 0;
                 causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
                 __nv_bfloat16 value = __float2bfloat16(0.0f);
-                if (row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                    value = q[causal_q_index<Geometry>(q_head, d, token)];
+                if (row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                    value = q[causal_q_index(q_head, d, token, q_heads)];
                 }
                 qkv_s[row * D + causal_small_t_tc_swz(row, d)] = value;
             }
@@ -329,7 +359,8 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                             smem_addr(&qkv_s[arow * D + causal_small_t_tc_swz(arow, acol)]));
             }
             __syncthreads();
-            int physical_page = page_at(first_tile);
+            int physical_page = strided ? causal_small_t_owned_tile_page<Bc>(physical_pages_s, 0)
+                                        : page_at(first_tile);
             float acc[PVNt][4];
 #    pragma unroll
             for (int n = 0; n < PVNt; ++n) {
@@ -339,8 +370,14 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
             float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
 
             for (int kb = 0; kb < key_blocks; ++kb) {
-                const int k0 = first_tile + kb * Bc;
-                if (kb != 0 && (k0 & kPagedKVPageMask) == 0) { physical_page = page_at(k0); }
+                const int k0 = strided ? causal_small_t_owned_tile_key<Bc>(physical_pages_s,
+                                                                            first_tile, kb)
+                                       : first_tile + kb * Bc;
+                if (strided) {
+                    physical_page = causal_small_t_owned_tile_page<Bc>(physical_pages_s, kb);
+                } else if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
+                    physical_page = page_at(k0);
+                }
             // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
             // Current-step tokens come from k_new/v_new; tail slots are zeroed.
 #    pragma unroll 1
@@ -357,18 +394,18 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                                 new_token >= 0 && new_token < valid_tokens && key >= first_pos;
                             if (from_new) {
                                 const std::int64_t off =
-                                    kv_cache_int8_new_index<Geometry>(kv_head, d, new_token);
+                                    kv_cache_int8_new_index(kv_head, d, new_token, kv_heads);
                                 ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
                                 ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
                             } else {
-                                const std::int64_t off = causal_cache_index<Geometry>(
-                                    physical_page, kv_head, d, key & kPagedKVPageMask);
+                                const std::int64_t off = causal_cache_index(
+                                    physical_page, kv_head, d, key & kPagedKVPageMask, kv_heads);
                                 ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
                                 ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
                             }
                         } else {
-                            const std::int64_t off = causal_cache_index<Geometry>(
-                                physical_page, kv_head, d, key & kPagedKVPageMask);
+                            const std::int64_t off = causal_cache_index(
+                                physical_page, kv_head, d, key & kPagedKVPageMask, kv_heads);
                             ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
                             ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
                         }

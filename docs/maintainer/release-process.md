@@ -52,7 +52,8 @@ It imports `vcvars64.bat`; setup-msbuild alone does not provide the compiler env
 Linux uses Debian 13. CUDA 13 uses NVIDIA's exact Debian 13 Toolkit metapackage. CUDA 12 uses
 NVIDIA's official runfile installer, with only the Toolkit selected. Debian 13 rejects the SHA-1
 binding in NVIDIA's Debian 12 APT key; the workflow does not relax signature verification.
-Debian 13 supplies the FFmpeg version required by NInfer. CUDA 12.9 also needs matching
+FFmpeg and dav1d come from the release archives that `cmake/MediaSources.cmake` pins, which
+`scripts/fetch-media-sources.sh` downloads before configure. CUDA 12.9 also needs matching
 `noexcept(true)` declarations for `sinpi`, `cospi`, `sinpif` and `cospif` with glibc 2.41.
 A version-guarded script patches those declarations and inline helper signatures, without changing
 function bodies. `BUILD-INFO.json` records the patch. The pre-build probe compiles CUDA headers
@@ -66,7 +67,8 @@ it to every build as `NINFER_VERSION`. The binaries report it as their version (
 reports another tag. A run that will not publish builds `untagged` binaries.
 
 1. Compile release products with `NINFER_SHARED_RUNTIME=ON`. Six small command executables load
-   one private runtime per CUDA family. Windows also keeps GGML in its existing kernel DLL.
+   one private runtime per CUDA family. Windows also keeps the GGML and INT8 small-T attention
+   kernels in a kernel DLL, so that no PE image exceeds the loader's `0x77000000` bytes.
    Component archives remain the compile owners. Linux compiles them as PIC for the shared runtime.
 2. Check every requested architecture with `cuobjdump`. Run executable `--help` checks.
    Windows clears developer directories from `PATH`. Linux checks the dynamic library closure
@@ -163,7 +165,8 @@ After all Windows object shards have succeeded, select `platforms: windows` and
 shard snapshots, verifies their archives, and builds against the selected source revision before
 packaging. Missing snapshots fail restoration; changed inputs rebuild through ccache normally.
 The default `windows_phase: full` builds the shards first.
-Publication requires `platforms: all`. Starting any new native run on the same branch cancels the
+Publication requires `platforms: all`; a `windows_phase: package` run with `platforms: all` and
+`publish: true` builds Linux too and publishes without the shard jobs. Starting any new native run on the same branch cancels the
 whole previous run, including its other platform. The cleanup wait preserves its completed caches.
 
 Native Windows, Debian and CUDA CI use pinned ccache 4.14.2. Native release and its Linux artifact bootstrap write compiler
@@ -194,7 +197,9 @@ Windows uses eight object shards per Toolkit, each with a separate
 `native-windows-cuda-<toolkit>-host-v2-shard-<index>` family. The final Windows job merges those
 snapshots, links and packages the same multiarch executables, and saves the aggregate family
 without the shard suffix. Only shard zero and the subsequent final job write the shared vcpkg
-family. A shard without a snapshot of its own starts from the aggregate. The reusable Windows
+family. A shard without a snapshot of its own starts from the aggregate, so shard snapshots also
+hold old copies of other shards' entries; where restored snapshots hold the same file, the newer
+copy stays, and an old ccache manifest cannot hide the entry its owner shard added. The reusable Windows
 workflow remains part of Native release; CI has no cache writer.
 
 CI does not upload compiler caches to HF or Actions Cache. Python dependency caches remain in
@@ -426,10 +431,14 @@ the EULA and protect NVIDIA's rights. The packager therefore ships the toolkit's
 `NVIDIA-CUDA-EULA.txt`, and the archive README names the two DLLs as NVIDIA's, outside the
 project's Apache-2.0 licence. Re-read the EULA of the toolkit that builds a release.
 
-**Linux links cuBLAS, FFmpeg and glibc dynamically.** The packager copies the CUDA runtime closure
-into `lib/`, checks the executable loader path, and ships NVIDIA's EULA. It lists system libraries'
-Debian packages in `packages/multi.txt`; the runtime Dockerfile installs those without adding a
-CUDA APT repository. An unowned system library or unresolved dependency fails packaging.
+**Linux links cuBLAS and glibc dynamically, FFmpeg statically.** The packager copies the CUDA
+runtime closure into `lib/`, checks the executable loader path, and ships NVIDIA's EULA. It lists
+system libraries' Debian packages in `packages/multi.txt`; the runtime Dockerfile installs those
+without adding a CUDA APT repository. An unowned system library, an unresolved dependency or a
+shared FFmpeg or dav1d library fails packaging. FFmpeg's LGPL allows a static copy when the user can
+relink a modified one: the archive carries the exact FFmpeg and dav1d release archives in `sources/`
+with their licence texts, and `BUILD-INFO.json` records their digests and options beside the NInfer
+source revision. Both CUDA packages of a universal archive must link the same releases.
 
 **Asset sizes.** Every executable links every device image. Native packages use 1900 MiB archive
 volumes to remain below GitHub's 2 GiB asset limit. This does not remove MSVC's linked-image limit

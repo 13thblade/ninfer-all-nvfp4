@@ -36,6 +36,10 @@ struct Options {
     std::vector<std::uint32_t> stage_layers;
     // The `devices` share every layer instead (tensor parallelism).
     bool tensor_parallel = false;
+    // The relative size of each device's tensor-parallel share. Empty lets the engine choose.
+    std::vector<double> tensor_split;
+    ninfer::TensorAttention tensor_attention = ninfer::TensorAttention::Heads;
+    bool invariant_attention                 = false;
     // Qwen3.8-Flash-Next: where the expert banks live, and where its n-gram table comes from.
     ninfer::ExpertResidency expert_residency = ninfer::ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
@@ -54,6 +58,7 @@ struct Options {
     bool lm_head_q6     = false;
     bool embedding_q4   = false;
     bool embedding_q6   = false;
+    ninfer::EmbeddingResidency embedding_residency = ninfer::EmbeddingResidency::Device;
     bool mtp_experts_q4 = false;
     bool gdn_state_fp16 = false;
     bool rope_yarn      = false;

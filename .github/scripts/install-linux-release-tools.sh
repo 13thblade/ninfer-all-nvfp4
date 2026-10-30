@@ -7,11 +7,12 @@ suffix="${minor/./-}"
 apt-get update
 apt-get install -y --no-install-recommends \
   build-essential ninja-build pkg-config patchelf python3 python3-venv \
-  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
-  libcurl4-openssl-dev zlib1g-dev
+  meson nasm libcurl4-openssl-dev zlib1g-dev
 if [[ "$CUDA_VERSION" == 12.9.2 ]]; then
   # Debian 13 rejects the SHA-1 binding in NVIDIA's Debian 12 repository key.
   # Use NVIDIA's release installer instead; do not weaken APT signature policy.
+  # Its cuda-installer binary links libxml2.so.2, which no other build dependency pulls in.
+  apt-get install -y --no-install-recommends libxml2
   installer=/tmp/cuda-toolkit.run
   curl --retry 3 -fL -o "$installer" \
     https://developer.download.nvidia.com/compute/cuda/12.9.2/local_installers/cuda_12.9.2_575.57.08_linux.run

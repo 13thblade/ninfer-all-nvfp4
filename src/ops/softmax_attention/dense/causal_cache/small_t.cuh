@@ -11,6 +11,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
+#include "ops/softmax_attention/dense/causal_cache/key_partition.h"
 #include "ops/kernel/paged_kv_address.cuh"
 
 #include <cuda_bf16.h>
@@ -56,50 +57,47 @@ struct CausalCachedInput {
     static constexpr bool writes_cache = false;
 };
 
-template <typename Geometry>
+// The indexes below take the call's head counts at run time (geometry.cuh): `kv_heads` KV heads
+// and `q_heads` = kv_heads * GroupSize query heads.
 __device__ __forceinline__ std::int64_t causal_cache_index(int physical_page, int kv_head, int d,
-                                                           int page_offset) {
-    return paged_kv_element_offset<kCausalHeadDim, Geometry::KVHeads>(physical_page, kv_head,
-                                                                      page_offset, d);
+                                                           int page_offset, int kv_heads) {
+    return paged_kv_element_offset<kCausalHeadDim>(physical_page, kv_head, page_offset, d,
+                                                   kv_heads);
 }
 
-template <typename Geometry>
-__device__ __forceinline__ std::int64_t causal_q_index(int q_head, int d, int token = 0) {
-    return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kCausalHeadDim) *
-                                              (static_cast<std::int64_t>(q_head) +
-                                               static_cast<std::int64_t>(Geometry::QHeads) * token);
-}
-
-template <typename Geometry>
-__device__ __forceinline__ std::int64_t kv_cache_int8_new_index(int kv_head, int d, int token = 0) {
+__device__ __forceinline__ std::int64_t causal_q_index(int q_head, int d, int token, int q_heads) {
     return static_cast<std::int64_t>(d) +
            static_cast<std::int64_t>(kCausalHeadDim) *
-               (static_cast<std::int64_t>(kv_head) +
-                static_cast<std::int64_t>(Geometry::KVHeads) * token);
+               (static_cast<std::int64_t>(q_head) + static_cast<std::int64_t>(q_heads) * token);
 }
 
-template <typename Geometry>
-__device__ __forceinline__ std::int64_t causal_partial_acc_index(int q_head, int d, int token,
-                                                                 int split, int tokens) {
+__device__ __forceinline__ std::int64_t kv_cache_int8_new_index(int kv_head, int d, int token,
+                                                                int kv_heads) {
+    return static_cast<std::int64_t>(d) +
+           static_cast<std::int64_t>(kCausalHeadDim) *
+               (static_cast<std::int64_t>(kv_head) + static_cast<std::int64_t>(kv_heads) * token);
+}
+
+__device__ __forceinline__ std::int64_t
+causal_partial_acc_index(int q_head, int d, int token, int split, int tokens, int q_heads) {
     return static_cast<std::int64_t>(d) +
            static_cast<std::int64_t>(kCausalHeadDim) *
                (static_cast<std::int64_t>(q_head) +
-                static_cast<std::int64_t>(Geometry::QHeads) *
+                static_cast<std::int64_t>(q_heads) *
                     (static_cast<std::int64_t>(token) + static_cast<std::int64_t>(tokens) * split));
 }
 
-template <typename Geometry>
 __device__ __forceinline__ std::int64_t causal_partial_stat_index(int q_head, int token, int split,
-                                                                  int tokens) {
+                                                                  int tokens, int q_heads) {
     return static_cast<std::int64_t>(q_head) +
-           static_cast<std::int64_t>(Geometry::QHeads) *
+           static_cast<std::int64_t>(q_heads) *
                (static_cast<std::int64_t>(token) + static_cast<std::int64_t>(tokens) * split);
 }
 
 template <typename Geometry>
-__device__ __forceinline__ bool causal_valid_q_head(int kv_head, int q_head) {
-    return kv_head >= 0 && kv_head < Geometry::KVHeads && q_head >= kv_head * Geometry::GroupSize &&
-           q_head < (kv_head + 1) * Geometry::GroupSize && q_head < Geometry::QHeads;
+__device__ __forceinline__ bool causal_valid_q_head(int kv_head, int q_head, int kv_heads) {
+    return kv_head >= 0 && kv_head < kv_heads && q_head >= kv_head * Geometry::GroupSize &&
+           q_head < (kv_head + 1) * Geometry::GroupSize;
 }
 
 // The key window a tile of verification columns partitions by: its first position plus its
@@ -164,6 +162,111 @@ __device__ __forceinline__ int causal_small_t_active_splits(int window, int laun
     return splits < launch_capacity ? splits : launch_capacity;
 }
 
+// The active splits of a window under `partition`: one per segment of a segmented partition,
+// otherwise the kernel's tuned count. The host sizes a segmented launch's capacity for its whole
+// envelope, so the clamp never binds there.
+__device__ __forceinline__ int causal_small_t_partition_active(CausalKeyPartition partition,
+                                                               int window, int tuned,
+                                                               int launch_capacity) {
+    if (!partition.segmented()) { return tuned; }
+    const int segments = div_up(window, partition.segment_keys);
+    return segments < launch_capacity ? segments : launch_capacity;
+}
+
+// The keys [start, end) of split `split` under a segmented or strided partition: a segment, or the
+// tuned split count cut at whole pages, so no tile of a strided split straddles a page another rank
+// holds. The tuned counts keep every split within kCausalSmallTSplitKeyLimit keys, which page
+// rounding keeps within the 64 staged page IDs.
+__device__ __forceinline__ void causal_small_t_partition_range(CausalKeyPartition partition,
+                                                               int window, int split, int active,
+                                                               int& start, int& end) {
+    if (partition.segmented()) {
+        start = split * partition.segment_keys;
+        end   = start + partition.segment_keys;
+    } else {
+        const int pages = div_up(div_up(window, kPagedKVPageSize), active);
+        start           = split * pages * kPagedKVPageSize;
+        end             = start + pages * kPagedKVPageSize;
+    }
+    end = end < window ? end : window;
+}
+
+// The page of this rank's planes that holds a row of `physical_page`, or -1 where another rank's
+// planes hold it (CausalKeyPartition).
+__device__ __forceinline__ int causal_strided_page(int physical_page,
+                                                   CausalKeyPartition partition) {
+    return physical_page % partition.page_stride == partition.page_residue
+               ? physical_page / partition.page_stride
+               : -1;
+}
+
+// A strided split's staged physical page IDs replaced in place by the pages of the rank's planes
+// that hold them, or -1 where another rank's planes do; kernels that test each tile instead of
+// compacting their pages (causal_small_t_own_pages) take this. Every thread of the block calls it
+// once the IDs are staged.
+__device__ __forceinline__ void causal_small_t_localize_pages(std::int32_t* pages, int page_count,
+                                                              CausalKeyPartition partition) {
+    __syncthreads();
+    for (int page = static_cast<int>(threadIdx.x); page < page_count;
+         page += static_cast<int>(blockDim.x)) {
+        pages[page] = causal_strided_page(pages[page], partition);
+    }
+    __syncthreads();
+}
+
+// A strided split's own pages. `pages` holds the physical IDs of the split's `page_count` pages
+// from its first (at most 64); every thread of the block calls this once they are staged. It
+// leaves in `pages` one entry per page this rank holds, in key order, packing the page of the
+// rank's planes with the page's index in the split ((page << 7) | index), and returns how many
+// tiles of Bc keys below `split_end` those pages hold. The split starts at a page boundary.
+template <int Bc>
+__device__ __forceinline__ int causal_small_t_own_pages(std::int32_t* pages, int page_count,
+                                                        int split_end,
+                                                        CausalKeyPartition partition) {
+    static_assert(kPagedKVPageSize % Bc == 0);
+    constexpr int kTilesPerPage = kPagedKVPageSize / Bc;
+    const int lane              = static_cast<int>(threadIdx.x) & 31;
+    const int warp              = static_cast<int>(threadIdx.x) >> 5;
+    __syncthreads();
+    const int first  = lane < page_count ? causal_strided_page(pages[lane], partition) : -1;
+    const int second = lane + 32 < page_count ? causal_strided_page(pages[lane + 32], partition)
+                                              : -1;
+    const unsigned low  = __ballot_sync(0xffffffffu, first >= 0);
+    const unsigned high = __ballot_sync(0xffffffffu, second >= 0);
+    __syncthreads();
+    if (warp == 0) {
+        const unsigned below = (1u << lane) - 1u;
+        if (first >= 0) { pages[__popc(low & below)] = (first << 7) | lane; }
+        if (second >= 0) { pages[__popc(low) + __popc(high & below)] = (second << 7) | (lane + 32); }
+    }
+    __syncthreads();
+    const int owned = __popc(low) + __popc(high);
+    const int last  = page_count - 1;
+    const bool last_owned =
+        last < 32 ? ((low >> last) & 1u) != 0u : ((high >> (last - 32)) & 1u) != 0u;
+    int tiles = owned * kTilesPerPage;
+    if (owned > 0 && last_owned) {
+        tiles -= kTilesPerPage - div_up(((split_end - 1) & kPagedKVPageMask) + 1, Bc);
+    }
+    return tiles;
+}
+
+// Tile `tile` of a strided split whose first page starts at key `first_key`: its first key, and the
+// page of the rank's planes holding it (causal_small_t_own_pages' entries).
+template <int Bc>
+__device__ __forceinline__ int causal_small_t_owned_tile_key(const std::int32_t* pages,
+                                                             int first_key, int tile) {
+    constexpr int kTilesPerPage = kPagedKVPageSize / Bc;
+    return first_key + ((pages[tile / kTilesPerPage] & 127) << kPagedKVPageShift) +
+           (tile % kTilesPerPage) * Bc;
+}
+
+template <int Bc>
+__device__ __forceinline__ int causal_small_t_owned_tile_page(const std::int32_t* pages,
+                                                              int tile) {
+    return pages[tile / (kPagedKVPageSize / Bc)] >> 7;
+}
+
 // Quantized storages take the plain default tier. This used to ask for SmallTMaximumSplits at
 // tokens==1 and window>8198 while the host granted that capacity to fp8 only, so nvfp4 and k8v4
 // silently ran fewer splits than this function returned and the two sides disagreed about intent.
@@ -217,10 +320,10 @@ template <class Geometry>
 __device__ __forceinline__ float
 causal_merge_split_statistics(const float* partial_m, const float* partial_l, int q_head, int token,
                               int tokens, int splits, float* weights, float* warp_sums,
-                              float* scalars) {
+                              float* scalars, int q_heads) {
     static_assert(Geometry::SmallTMaximumSplits <= 256);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const auto index   = causal_partial_stat_index<Geometry>(q_head, token, tid, tokens);
+    const auto index   = causal_partial_stat_index(q_head, token, tid, tokens, q_heads);
     const float m      = tid < splits ? partial_m[index] : -CUDART_INF_F;
     const float warp_m = warp_max(m);
     if (lane == 0) warp_sums[warp] = warp_m;
@@ -245,10 +348,10 @@ causal_merge_split_statistics(const float* partial_m, const float* partial_l, in
 // One column's split partials weighted and summed in split order. Eight splits' partials are read
 // before any of them is added, so the reads overlap; the adds keep the original order and a split of
 // zero weight is still skipped, so the sum is the one the plain loop gives.
-template <class Geometry>
 __device__ __forceinline__ float causal_weighted_split_sum(const float* partial_acc,
                                                            const float* weights, int q_head, int d,
-                                                           int token, int tokens, int splits) {
+                                                           int token, int tokens, int splits,
+                                                           int q_heads) {
     constexpr int kBatch = 8;
     float numerator      = 0.0f;
     for (int first = 0; first < splits; first += kBatch) {
@@ -256,10 +359,10 @@ __device__ __forceinline__ float causal_weighted_split_sum(const float* partial_
 #pragma unroll
         for (int j = 0; j < kBatch; ++j) {
             const int split = first + j;
-            value[j]        = split < splits && weights[split] != 0.0f
-                                  ? partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token,
-                                                                                   split, tokens)]
-                                  : 0.0f;
+            value[j] = split < splits && weights[split] != 0.0f
+                           ? partial_acc[causal_partial_acc_index(q_head, d, token, split, tokens,
+                                                                  q_heads)]
+                           : 0.0f;
         }
 #pragma unroll
         for (int j = 0; j < kBatch; ++j) {
@@ -270,15 +373,34 @@ __device__ __forceinline__ float causal_weighted_split_sum(const float* partial_
     return numerator;
 }
 
+// A column's output in the cross-rank form a position-split rank exchanges
+// (causal_attention_merge_partials): per column, a block of the FP32 outputs [256, H], each
+// normalized over the rank's keys alone, followed by their log-sum-exps [H] in natural units of the
+// scaled scores (minus infinity where the rank holds none of the column's keys). Columns are
+// consecutive blocks, so a range of a call's columns is a partial of its own.
+__device__ __forceinline__ void causal_store_partial_output(float* partial_out, int q_head, int d,
+                                                            int column, int q_heads, float value,
+                                                            float lse, bool lead) {
+    const std::int64_t block =
+        static_cast<std::int64_t>(column) * (kCausalHeadDim + 1) * static_cast<std::int64_t>(q_heads);
+    partial_out[block + static_cast<std::int64_t>(q_head) * kCausalHeadDim + d] = value;
+    if (lead) {
+        partial_out[block + static_cast<std::int64_t>(kCausalHeadDim) * q_heads + q_head] = lse;
+    }
+}
+
 template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
 __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_kernel(
     const float* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
     std::int32_t visible_capacity, std::int32_t split_count, std::int32_t wave_splits,
-    __nv_bfloat16* out, const __nv_bfloat16* __restrict__ gate) {
+    __nv_bfloat16* out, const __nv_bfloat16* __restrict__ gate, CausalKeyPartition partition,
+    float* partial_out) {
     static_assert(DChunk > 0 && DChunk <= kCausalHeadDim);
 
+    // The grid spans the call's query heads.
+    const int q_heads     = static_cast<int>(gridDim.x);
     const int q_head      = static_cast<int>(blockIdx.x);
     const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
     const int flat_column = static_cast<int>(blockIdx.z);
@@ -289,7 +411,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
         token = flat_column - batch * tokens;
     }
     const int tid = threadIdx.x;
-    if (q_head >= Geometry::QHeads || token >= tokens) { return; }
+    if (token >= tokens) { return; }
     if constexpr (MultiBatch) {
         if (batch >= batch_size) { return; }
     }
@@ -303,8 +425,16 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
     if constexpr (Masked) {
         const int absolute_column = token + (Offset ? column_begin : 0);
         if (absolute_column >= valid_columns[batch]) {
+            if (partial_out != nullptr) {
+                if (tid < DChunk && d_start + tid < kCausalHeadDim) {
+                    causal_store_partial_output(partial_out, q_head, d_start + tid,
+                                                output_column, q_heads, 0.0f, -CUDART_INF_F,
+                                                tid == 0 && d_start == 0);
+                }
+                return;
+            }
             if (tid < DChunk && d_start + tid < kCausalHeadDim) {
-                const auto index = causal_q_index<Geometry>(q_head, d_start + tid, output_column);
+                const auto index = causal_q_index(q_head, d_start + tid, output_column, q_heads);
                 // 0 * sigmoid(g) is 0 for every finite g, but not for a NaN gate, and the
                 // standalone multiply would propagate that NaN. Do the multiply either way.
                 out[index] =
@@ -318,30 +448,38 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
 
 
     if constexpr (MultiBatch) {
-        const std::int64_t partial_acc_row = static_cast<std::int64_t>(batch) * kCausalHeadDim *
-                                             Geometry::QHeads * tokens * split_count;
+        const std::int64_t partial_acc_row =
+            static_cast<std::int64_t>(batch) * kCausalHeadDim * q_heads * tokens * split_count;
         const std::int64_t partial_stat_row =
-            static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+            static_cast<std::int64_t>(batch) * q_heads * tokens * split_count;
         partial_acc += partial_acc_row;
         partial_m += partial_stat_row;
         partial_l += partial_stat_row;
     }
 
     const int window = causal_small_t_tile_window(first_pos, tokens, visible_capacity);
-    const int active_split_count =
-        causal_small_t_active_splits<Geometry, Int8>(window, split_count, tokens, wave_splits);
+    const int active_split_count = causal_small_t_partition_active(
+        partition, window,
+        causal_small_t_active_splits<Geometry, Int8>(window, split_count, tokens, wave_splits),
+        split_count);
 
     __shared__ float weights[256], warp_sums[8], scalars[2];
-    const float head_l =
-        causal_merge_split_statistics<Geometry>(partial_m, partial_l, q_head, token, tokens,
-                                                active_split_count, weights, warp_sums, scalars);
+    const float head_l = causal_merge_split_statistics<Geometry>(
+        partial_m, partial_l, q_head, token, tokens, active_split_count, weights, warp_sums,
+        scalars, q_heads);
     const int d = d_start + tid;
     if (tid >= DChunk || d >= kCausalHeadDim) return;
-    const float numerator = causal_weighted_split_sum<Geometry>(partial_acc, weights, q_head, d, token,
-                                                                tokens, active_split_count);
+    const float numerator = causal_weighted_split_sum(partial_acc, weights, q_head, d, token,
+                                                      tokens, active_split_count, q_heads);
 
     const float value    = (head_l > 0.0f) ? numerator / head_l : 0.0f;
-    const auto out_index = causal_q_index<Geometry>(q_head, d, output_column);
+    if (partial_out != nullptr) {
+        causal_store_partial_output(partial_out, q_head, d, output_column, q_heads, value,
+                                    head_l > 0.0f ? scalars[0] + logf(head_l) : -CUDART_INF_F,
+                                    tid == 0 && d_start == 0);
+        return;
+    }
+    const auto out_index = causal_q_index(q_head, d, output_column, q_heads);
     if (gate == nullptr) {
         out[out_index] = __float2bfloat16(value);
         return;

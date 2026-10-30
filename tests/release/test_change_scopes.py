@@ -30,16 +30,18 @@ class ChangeScopesTest(unittest.TestCase):
         for path in ['src/ops/foo.cu', 'include/ninfer/engine.h', 'apps/launcher/main.cpp',
                      'third_party/ggml/a.cpp', 'cmake/NinferRuntime.cmake', 'CMakePresets.json',
                      '.github/scripts/configure-linux-build.sh', '.github/workflows/native-linux.yml',
-                     'bench/ops/foo.cu']:
+                     'scripts/fetch-media-sources.sh', 'cmake/MediaSources.cmake', 'bench/ops/foo.cu']:
             with self.subTest(path=path):
                 result = SCOPES.classify([path])
                 self.assertTrue(result['native'])
                 self.assertTrue(result['changed'])
 
     def test_tests_and_python_tools_do_not_repackage_native(self):
-        result = SCOPES.classify(['tests/test_sampling.cpp'])
-        self.assertTrue(result['changed'])
-        self.assertFalse(result['native'])
+        for path in ['tests/test_sampling.cpp', 'tests/fixtures/media/vp9.mkv']:
+            with self.subTest(path=path):
+                result = SCOPES.classify([path])
+                self.assertTrue(result['changed'])
+                self.assertFalse(result['native'])
         result = SCOPES.classify(['tools/convert/foo.py', 'tests/convert/test_foo.py'])
         self.assertTrue(result['python'])
         self.assertFalse(result['changed'])

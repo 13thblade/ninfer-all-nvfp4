@@ -43,6 +43,9 @@ struct SpeculativeOptions {
     // Flash-Next MTP: end drafting and verification at the first draft whose absolute probability
     // is at or below this floor. Zero keeps the full window.
     float draft_min_p = 0;
+    // DeepSeek-V4.1 DSpark: verify a round's drafts up to the first its confidence head scores below
+    // this, in [0,1]; 0 keeps every draft. Unset keeps the drafter's default floor (0.5).
+    std::optional<float> draft_confidence;
     // An Engine's options() report the resolved head.
     ProposalHead proposal_head = ProposalHead::Auto;
     // Context-lookup drafting: match this many trailing tokens against the sequence so far and
@@ -426,9 +429,24 @@ struct EngineOptions {
     // device's free memory.
     std::vector<std::uint32_t> stage_layers;
     // The devices share every layer instead of dealing layers out: tensor parallelism over the GDN
-    // heads and the dense FFN rows, with attention, the KV cache, the embedding, the head and MTP
-    // on the first device. Needs identical devices and a dense Qwen3.5-core model.
+    // heads, the attention's KV heads with their cache and the dense FFN rows, or expert
+    // parallelism over a MoE layer's experts, with the embedding, the head, the shared expert and
+    // MTP on the first device. Qwen3.8-Flash-Next, Gemma 4, Flint and DeepSeek-V4.1-Flash divide
+    // only their routed experts. The cards may differ.
     bool tensor_parallel = false;
+    // With tensor parallelism, the relative size of each device's share, one positive weight per
+    // entry of `devices` ({3, 2}: the first takes three fifths). Empty sizes the shares from each
+    // card's measured copy bandwidth, capped by its free memory.
+    std::vector<double> tensor_split;
+    // With tensor parallelism over a Qwen3.5-core model, how the devices divide each
+    // full-attention layer (TensorAttention).
+    TensorAttention tensor_attention = TensorAttention::Heads;
+    // Qwen3.5-core models: attention reductions that do not depend on the call's width, batch or
+    // split schedule. Every call of up to 16 columns per sequence takes the split-KV routes with
+    // splits of a fixed key count for the context, so a token's attention output is the same
+    // bytes whether it is decoded alone, verified in a draft window or batched with others. The
+    // other kernels (projections, experts, Gated DeltaNet) keep their own schedules.
+    bool invariant_attention = false;
     // Native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4 MoE and Flint.
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Host/disk experts: device memory lent to the persistent cache, split
@@ -519,6 +537,10 @@ struct EngineOptions {
     // Q6G64 token embedding: the narrower-model option where Q4 costs measurable perplexity
     // (the 35B-A3B's 2048-wide table). Mutually exclusive with embedding_q4.
     bool embedding_q6                      = false;
+    // Qwen3.5 family: keep the token embedding in mapped host RAM (`--embedding-residency
+    // host`). Output is unchanged (the same gather reads the same stored bytes); excludes
+    // embedding_q4/q6, which only shrink the device copy.
+    EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
     // Qwen3.6-35B-A3B only: the MTP draft layer's routed experts are stored W8 in the artifact;
     // transcode them to the text layers' formats (Q4 gate_up, Q6 down) at load. Drafts are
     // verified exactly, so this can change acceptance but never the output distribution.

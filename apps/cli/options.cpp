@@ -5,6 +5,7 @@
 #include "product/post_thinking_options.h"
 #include "product/reasoning_loop_options.h"
 #include "product/rope_yarn_options.h"
+#include "product/tensor_split_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -177,11 +178,19 @@ std::string usage_text(const char* argv0) {
            "                                exercises the path on one GPU\n"
            "  --stage-layers A,B,...        layers per stage (default: split by each GPU's\n"
            "                                free memory)\n"
-           "  --tensor-parallel             the --devices share every layer: GDN heads and\n"
-           "                                dense FFN rows; attention, KV, head and MTP on\n"
-           "                                the first (dense Qwen3.5-core GGUF models)\n"
+           "  --tensor-parallel             the --devices share every layer: GDN heads, KV\n"
+           "                                heads, dense FFN rows or MoE experts; head and\n"
+           "                                MTP on the first (Qwen3.5-core models;\n"
+           "                                the other MoE families divide only their routed\n"
+           "                                experts)\n"
+           "  --tensor-split A,B,...        relative share of each --devices entry (default:\n"
+           "                                by each card's measured bandwidth and free memory)\n" +
+           std::string(ninfer::product::kTensorAttentionHelp) +
+           std::string(ninfer::product::kInvariantAttentionHelp) +
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
+           "  --embedding-residency device|host  token embedding on GPU (default) or in\n"
+           "                                mapped pinned host memory, read in place\n"
            "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
            "                                Gemma and Flint allow 0 (layer banks only).\n"
            "                                Flash-Next disk requires a nonzero cache\n" +
@@ -213,6 +222,8 @@ std::string usage_text(const char* argv0) {
            "                                of 5, the default)\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0;\n"
            "                                0.5 when the engine chooses MTP)\n"
+           "  --draft-confidence C          dspark: verify drafts while their confidence is\n"
+           "                                at least C, 0..1 (default 0.5; 0 keeps every draft)\n"
            "  --lm-head-draft               draft with the optimized proposal head, which\n"
            "                                the artifact must store (the default when it does)\n"
            "  --full-draft-head             draft with the full output head even when the\n"
@@ -395,6 +406,12 @@ Options parse_options(int argc, char** argv) {
             options.stage_layers = parse_stage_layers(value(arg));
         } else if (arg == "--tensor-parallel") {
             options.tensor_parallel = true;
+        } else if (arg == "--tensor-split") {
+            options.tensor_split = ninfer::product::parse_tensor_split(value(arg));
+        } else if (arg == "--tensor-attention") {
+            options.tensor_attention = ninfer::product::parse_tensor_attention(value(arg));
+        } else if (arg == "--invariant-attention") {
+            options.invariant_attention = true;
         } else if (arg == "--expert-residency") {
             const std::string residency = value(arg);
             if (residency == "device") {
@@ -405,6 +422,15 @@ Options parse_options(int argc, char** argv) {
                 options.expert_residency = ninfer::ExpertResidency::Disk;
             } else {
                 throw std::invalid_argument("--expert-residency must be device, host or disk");
+            }
+        } else if (arg == "--embedding-residency") {
+            const std::string residency = value(arg);
+            if (residency == "device") {
+                options.embedding_residency = ninfer::EmbeddingResidency::Device;
+            } else if (residency == "host") {
+                options.embedding_residency = ninfer::EmbeddingResidency::Host;
+            } else {
+                throw std::invalid_argument("--embedding-residency must be device or host");
             }
         } else if (arg == "--expert-cache-mib") {
             const std::string mib = value(arg);
@@ -427,6 +453,9 @@ Options parse_options(int argc, char** argv) {
             spec_explicit               = true;
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--draft-confidence") {
+            options.speculative.draft_confidence =
+                parse_float(value(arg), "draft-confidence", 0.0F, 1.0F);
         } else if (arg == "--draft-min-p") {
             options.speculative.draft_min_p = parse_float(value(arg), "draft-min-p", 0.0F, 1.0F);
         } else if (arg == "--ngram-draft-tokens") {
@@ -617,6 +646,9 @@ Options parse_options(int argc, char** argv) {
     if (options.tensor_parallel && options.devices.size() < 2) {
         throw std::invalid_argument("--tensor-parallel needs --devices naming more than one device");
     }
+    ninfer::product::check_tensor_split(options.tensor_split, options.devices.size(),
+                                        options.tensor_parallel);
+    ninfer::product::check_tensor_attention(options.tensor_attention, options.tensor_parallel);
     if (kv_headroom_mib.has_value()) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
             throw std::invalid_argument("--kv-headroom-mib requires --kv-capacity auto");

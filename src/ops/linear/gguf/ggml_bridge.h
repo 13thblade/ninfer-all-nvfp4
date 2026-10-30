@@ -176,11 +176,32 @@ struct MoeRouting {
 };
 
 [[nodiscard]] std::size_t moe_routing_bytes(int experts, int pairs);
-// Groups the pairs of `ids` ([pairs], each in [0, experts)) into `workspace` (moe_routing_bytes).
-// Within one expert the pairs keep no particular order; every product below writes each pair's
-// result to its own place, so the order changes no value.
+// Groups the pairs of `ids` ([pairs]) into `workspace` (moe_routing_bytes); a pair whose id lies
+// outside [0, experts) is left out (expert parallelism marks another device's pairs -1), and the
+// positions of `sorted` past the kept pairs name pair 0. Within one expert the pairs keep no
+// particular order; every product below writes each pair's result to its own place, so the order
+// changes no value.
 [[nodiscard]] MoeRouting moe_sort_routes(const std::int32_t* ids, int pairs, int experts,
                                          void* workspace, cudaStream_t stream);
+
+// Expert parallelism: a device's part of a MoE call runs the routed experts [begin, end) it holds.
+// moe_keep_experts copies ids into `out` with -1 for every pair of another device's expert, which
+// moe_sort_routes then leaves out. moe_weighted_rows sums the FP32 rows [pairs][row_values] of a
+// matrix product weighted into the 2^-32 fixed-point sum [tokens][row_values] (token =
+// p / per_token), each contribution rounded as MoeOutput::weighted rounds it; a pair whose `ids`
+// entry is negative is skipped and its row never read. The parts' sums then add as integers
+// (add_fixed_parts: sums += each of `count` parts of n values, up to 8 parts), independent of how
+// the experts are divided.
+void moe_keep_experts(const std::int32_t* ids, int pairs, int begin, int end, std::int32_t* out,
+                      cudaStream_t stream);
+// The same with each kept id less `begin`: ids into tables of the device's experts alone.
+void moe_local_experts(const std::int32_t* ids, int pairs, int begin, int end, std::int32_t* out,
+                       cudaStream_t stream);
+void moe_weighted_rows(const float* rows, const std::int32_t* ids, const float* weights, int tokens,
+                       int per_token, int row_values, unsigned long long* fixed,
+                       cudaStream_t stream);
+void add_fixed_parts(unsigned long long* sums, const unsigned long long* const* parts, int count,
+                     std::int64_t n, cudaStream_t stream);
 
 // One projection of every expert: expert e's `rows` rows of `k` values start at experts[e].
 struct MoeTable {
@@ -326,6 +347,10 @@ void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& 
                         cudaStream_t stream);
 // Column c of the activation is x column routing.sorted[c] / column_group, in the layout of the
 // type's scale/sum schedule (matrix_activation_layout), zero past k up to a whole 256-value step.
+// On a device that runs sm_70 code, which has no integer tensor cores, the activation is instead
+// an FP16 plane with a power-of-two factor per column and the product runs on the FP16 tensor
+// cores over the blocks' values rounded to FP16 (ggml_bridge_sm70.cuh); there it takes any rows
+// that are whole 32-row warps and any k of whole blocks, and needs no `tail`.
 [[nodiscard]] std::size_t moe_matrix_activation_bytes(int k, int pairs);
 void quantize_moe_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k,
                                     const MoeRouting& routing, int pairs, int column_group,

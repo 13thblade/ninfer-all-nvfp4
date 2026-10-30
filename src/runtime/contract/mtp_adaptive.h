@@ -1,7 +1,7 @@
 #pragma once
 
 // Adaptive MTP verification width (--adaptive-mtp), shared by the Qwen3.5 Programs and the
-// Qwen3.8-Flash-Next core. Each request keeps an estimate of how far its drafts survive; a batch
+// Qwen3.8-Flash-Next core, and the per-row extents of a packed verification (MtpPackedPlanner). Each request keeps an estimate of how far its drafts survive; a batch
 // controller picks the verification width that maximizes expected committed tokens per unit of
 // round cost, moving between widths only after a candidate has won several rounds and a width has
 // held for a few. Round costs are measured per batch size and width as the rounds run; a width not
@@ -406,6 +406,116 @@ private:
     std::uint64_t selection_cohort_key_ = 0;
     std::uint32_t last_transition_from_ = 1;
     std::uint32_t last_transition_to_   = 1;
+};
+
+// Draft extents of a packed verification, where each row verifies only its own anchor and drafts
+// and the round's cost follows the total rows verified. Given each row's ready drafts, the plan
+// keeps the extents that maximize expected committed tokens per unit of that cost: for every total
+// it finds the best split over the rows (a knapsack over each row's expected tokens, whose gains
+// shrink with depth), then takes the total with the best ratio. Costs are measured per total as
+// rounds run; a total not yet measured is priced from the nearest measured totals, or from a cost
+// that grows by a twentieth of one row's per extra row while nothing is measured.
+class MtpPackedPlanner final {
+public:
+    static constexpr std::uint32_t kMaximumRows =
+        kAdaptiveMtpMaximumBatch * (kAdaptiveMtpMaximumDrafts + 1U);
+
+    void observe(std::uint32_t rows, double seconds) noexcept {
+        if (rows == 0 || rows > kMaximumRows || !(seconds > 0.0)) { return; }
+        float& cost           = seconds_[rows - 1U];
+        std::uint16_t& counts = samples_[rows - 1U];
+        const auto sample     = static_cast<float>(seconds);
+        cost                  = counts == 0 ? sample : cost + kAlpha * (sample - cost);
+        if (counts != UINT16_MAX) { ++counts; }
+    }
+
+    [[nodiscard]] float cost(std::uint32_t rows) const noexcept {
+        rows = std::clamp(rows, 1U, kMaximumRows);
+        if (samples_[rows - 1U] >= kMeasuredRounds) { return seconds_[rows - 1U]; }
+        std::uint32_t below = 0;
+        std::uint32_t above = 0;
+        for (std::uint32_t r = rows; r-- > 1U;) {
+            if (samples_[r - 1U] >= kMeasuredRounds) {
+                below = r;
+                break;
+            }
+        }
+        for (std::uint32_t r = rows + 1U; r <= kMaximumRows; ++r) {
+            if (samples_[r - 1U] >= kMeasuredRounds) {
+                above = r;
+                break;
+            }
+        }
+        const auto shape = [](std::uint32_t r) { return 1.0F + kRowShare * float(r - 1U); };
+        if (below != 0 && above != 0) {
+            const float t = float(rows - below) / float(above - below);
+            return seconds_[below - 1U] + t * (seconds_[above - 1U] - seconds_[below - 1U]);
+        }
+        if (below != 0) { return seconds_[below - 1U] * shape(rows) / shape(below); }
+        if (above != 0) { return seconds_[above - 1U] * shape(rows) / shape(above); }
+        return shape(rows);
+    }
+
+    // extents[j] in [0, limits[j]]; a row without a signal keeps its limit (a lookup's proposal).
+    void plan(std::span<const MtpAdaptiveSignal* const> signals,
+              std::span<const std::uint32_t> limits, std::span<std::uint32_t> extents) const noexcept {
+        const std::size_t b = signals.size();
+        if (b == 0 || b > kAdaptiveMtpMaximumBatch || limits.size() != b || extents.size() != b) {
+            return;
+        }
+        constexpr std::uint32_t kDrafts = kAdaptiveMtpMaximumBatch * kAdaptiveMtpMaximumDrafts;
+        constexpr float kNone           = -1.0F;
+        // best[j][d]: the most expected tokens of rows [0, j) verifying d drafts in all.
+        std::array<std::array<float, kDrafts + 1U>, kAdaptiveMtpMaximumBatch + 1U> best{};
+        std::array<std::array<std::uint8_t, kDrafts + 1U>, kAdaptiveMtpMaximumBatch> choice{};
+        for (auto& row : best) { row.fill(kNone); }
+        best[0][0]          = 0.0F;
+        std::uint32_t total = 0;
+        for (std::size_t j = 0; j < b; ++j) {
+            const std::uint32_t limit = std::min(limits[j], kAdaptiveMtpMaximumDrafts);
+            const std::uint32_t first = signals[j] == nullptr ? limit : 0U;
+            for (std::uint32_t d = 0; d <= total; ++d) {
+                if (best[j][d] == kNone) { continue; }
+                for (std::uint32_t e = first; e <= limit; ++e) {
+                    const float gain = signals[j] == nullptr
+                                           ? 1.0F + kLookupSurvival * float(e)
+                                           : signals[j]->expected_tokens(e, limit);
+                    if (best[j][d] + gain > best[j + 1U][d + e]) {
+                        best[j + 1U][d + e] = best[j][d] + gain;
+                        choice[j][d + e]    = static_cast<std::uint8_t>(e);
+                    }
+                }
+            }
+            total += limit;
+        }
+        std::uint32_t chosen = 0;
+        float ratio          = kNone;
+        for (std::uint32_t d = 0; d <= total; ++d) {
+            if (best[b][d] == kNone) { continue; }
+            const float candidate =
+                best[b][d] / std::max(cost(static_cast<std::uint32_t>(b) + d), 1e-9F);
+            if (candidate > ratio * kGain) {
+                ratio  = candidate;
+                chosen = d;
+            }
+        }
+        for (std::size_t j = b; j-- > 0;) {
+            extents[j] = choice[j][chosen];
+            chosen -= extents[j];
+        }
+    }
+
+private:
+    static constexpr float kAlpha                  = 0.125F;
+    static constexpr std::uint16_t kMeasuredRounds = 4;
+    static constexpr float kRowShare               = 0.05F;
+    // A deeper plan replaces a shallower one only for a ratio this much better.
+    static constexpr float kGain = 1.005F;
+    // The share of a lookup's drafts a plan counts on.
+    static constexpr float kLookupSurvival = 0.5F;
+
+    std::array<float, kMaximumRows> seconds_{};
+    std::array<std::uint16_t, kMaximumRows> samples_{};
 };
 
 } // namespace ninfer::runtime

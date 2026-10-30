@@ -1,11 +1,15 @@
 #include "models/qwen3_5/load/bindings.h"
 
+#include "artifact/formats.h"
+#include "artifact/selection.h"
 #include "artifact/transcode.h"
 #include "artifact/views.h"
+#include "ninfer/ops/linear.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -49,6 +53,30 @@ bool keeps_permission(const artifact::Binder& binder, const artifact::ParameterR
 
 } // namespace
 #endif
+
+namespace {
+
+// Only the GGUF linears read their input through a gather (Weight::input_columns): every other
+// format stores its columns in the logical order and has no route that applies one.
+void require_gguf_gather(const artifact::Binder& binder, const std::string& name,
+                         const std::string& input) {
+    const auto& bindings = binder.reader().directory().bindings;
+    const auto found     = bindings.find(name);
+    if (found == bindings.end()) {
+        throw artifact::ArtifactError("missing logical parameter " + name);
+    }
+    for (const auto& part : found->second.parts) {
+        const auto format = binder.reader().geometry(part.object).format;
+        if (!is_gguf(format)) {
+            throw artifact::ArtifactError(name + "@" + input +
+                                          ": an input gather (input_columns) needs GGUF blocks, "
+                                          "not " +
+                                          std::string(artifact::format_name(format)));
+        }
+    }
+}
+
+} // namespace
 
 void apply_rank_policies(Bindings& bindings, std::span<const ops::DeviceTier> rank_tiers) {
     // A build without 120a narrowed these permissions when it bound the weights.
@@ -122,7 +150,10 @@ WeightId Bindings::piece(const std::string& name, const artifact::Shape& shape,
     std::optional<artifact::Binding> gather;
     for (const auto& input : inputs) {
         for (const auto& [role, binding] : binder.use(name, input).auxiliaries) {
-            if (role == "input_columns") { gather = binding; }
+            if (role == "input_columns") {
+                require_gguf_gather(binder, name, input);
+                gather = binding;
+            }
         }
     }
     ParameterPiece stored_piece = piece;
@@ -170,17 +201,14 @@ WeightId Bindings::piece(const std::string& name, const artifact::Shape& shape,
             const std::uint64_t lo  = std::max(begin, logical);
             const std::uint64_t hi  = std::min(end, logical + count);
             if (lo < hi) {
-                selection.row_begin = first + lo - logical;
-                selection.row_end   = first + hi - logical;
-                selection.columns   = {{0, columns}};
+                selection.rows    = {{first + lo - logical, first + hi - logical}};
+                selection.columns = {{0, columns}};
             }
         } else if (matrix) {
-            selection.row_begin = first;
-            selection.row_end   = first + count;
-            selection.columns   = stored_piece.ranges;
+            selection.rows    = {{first, first + count}};
+            selection.columns = stored_piece.ranges;
         } else {
-            selection.row_begin = 0;
-            selection.row_end   = 1;
+            selection.rows = {{0, 1}};
             for (const auto& [begin, end] : stored_piece.ranges) {
                 const std::uint64_t lo = std::max(begin, logical);
                 const std::uint64_t hi = std::min(end, logical + count);
@@ -209,11 +237,22 @@ WeightId Bindings::piece(const std::string& name, const artifact::Shape& shape,
     PendingWeight pending;
     pending.reference = {name + "@" + std::to_string(rank), std::move(piece_shape),
                          std::move(binding), artifact::Residency::Device};
-    add_uses(pending, name, inputs, piece.cut == ParameterPiece::Cut::Rows);
+    add_uses(pending, name, inputs, piece.cut == ParameterPiece::Cut::Rows, false);
     for (WeightUse& use : pending.uses) {
-        if (use.hadamard_signs) {
-            throw std::invalid_argument(name + "@" + use.input +
-                                        ": tensor parallelism cannot split a rotated input");
+        // A rotated input turns in blocks of 1024 columns: a row piece reads the whole input and a
+        // column piece whole blocks of it, each with its own slice of the whole sign vector, which
+        // the model copies to every rank that reads it (AuxiliaryReplicas).
+        for (const auto& [role, signs] : binder.use(name, use.input).auxiliaries) {
+            if (role != "hadamard_signs") { continue; }
+            const auto [begin, end] = piece.cut == ParameterPiece::Cut::Rows
+                                          ? std::pair<std::uint64_t, std::uint64_t>{0, columns}
+                                          : piece.ranges.front();
+            if (!matrix || piece.ranges.size() != 1 || begin % 1024 != 0 || end % 1024 != 0) {
+                throw std::invalid_argument(name + "@" + use.input +
+                                            ": a rotated input splits at whole 1024-column blocks");
+            }
+            use.hadamard_signs = hadamard_signs(signs, columns, name + "@" + use.input);
+            use.hadamard_begin = begin;
         }
         // A row piece reads the whole input and keeps the whole gather.
         if (gather && piece.cut == ParameterPiece::Cut::Columns) {
@@ -230,8 +269,276 @@ WeightId Bindings::piece(const std::string& name, const artifact::Shape& shape,
     return id;
 }
 
+std::vector<WeightId> Bindings::joint_piece(std::span<const JointPart> parts, std::size_t rank) {
+    if (parts.empty()) { throw std::invalid_argument("a joint piece needs parameters"); }
+    const auto& bindings = binder.reader().directory().bindings;
+    const auto columns   = parts.front().shape.back();
+    std::optional<artifact::ObjectHandle> object;
+    std::uint64_t first = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t last  = 0;
+    std::uint64_t rows  = 0;
+    for (const JointPart& part : parts) {
+        const auto found = bindings.find(part.name);
+        if (found == bindings.end()) {
+            throw artifact::ArtifactError("missing logical parameter " + part.name);
+        }
+        if (part.shape.size() != 2 || part.shape[1] != columns ||
+            weight_element_count(part.shape) != found->second.elements) {
+            throw artifact::ArtifactError(part.name +
+                                          ": logical shape differs from Binding coverage");
+        }
+        for (const auto& stored : found->second.parts) {
+            if (object && stored.object.index != object->index) {
+                throw artifact::ArtifactError(part.name +
+                                              ": a joint piece needs its parameters in one object");
+            }
+            object              = stored.object;
+            const auto geometry = binder.reader().geometry(stored.object);
+            if (geometry.shape.size() != 2 || geometry.shape[1] != columns ||
+                stored.begin % columns != 0 || stored.end % columns != 0) {
+                throw artifact::ArtifactError(part.name +
+                                              ": a joint piece needs parts of whole rows");
+            }
+            first = std::min(first, stored.begin / columns);
+            last  = std::max(last, stored.end / columns);
+            rows += (stored.end - stored.begin) / columns;
+        }
+    }
+    const auto geometry = binder.reader().geometry(*object);
+    const auto row_unit = artifact::selection_row_unit(geometry);
+    if (rows != last - first || first % row_unit != 0 ||
+        (last % row_unit != 0 && last != geometry.shape[0])) {
+        throw artifact::ArtifactError(
+            parts.front().name + ": a joint piece must cover one whole run of its object's rows");
+    }
+    artifact::ObjectSelection selection;
+    selection.rows                      = {{first, last}};
+    selection.columns                   = {{0, columns}};
+    const artifact::ObjectHandle handle = binder.select_device(*object, std::move(selection), rank);
+    std::vector<WeightId> out;
+    out.reserve(parts.size());
+    for (const JointPart& part : parts) {
+        const artifact::Binding& whole = bindings.at(part.name);
+        artifact::Binding binding;
+        binding.elements = whole.elements;
+        for (const auto& stored : whole.parts) {
+            binding.parts.push_back(
+                {handle, stored.begin - first * columns, stored.end - first * columns});
+        }
+        PendingWeight pending;
+        pending.reference = {part.name + "@" + std::to_string(rank), part.shape, std::move(binding),
+                             artifact::Residency::Device};
+        add_uses(pending, part.name, part.inputs);
+        pending.source_objects.push_back(binder.object_id(handle));
+        pending.rank = rank;
+        out.push_back({weights.size()});
+        weights.push_back(std::move(pending));
+    }
+    return out;
+}
+
+std::vector<WeightId> Bindings::joint_piece(std::span<const JointPart> parts, std::size_t rank,
+                                            const ParameterPiece& piece) {
+    if (parts.empty()) { throw std::invalid_argument("a joint piece needs parameters"); }
+    const bool rows_cut = piece.cut == ParameterPiece::Cut::Rows;
+    if (piece.ranges.empty() || (rows_cut && piece.ranges.size() != 1)) {
+        throw std::invalid_argument("a joint piece cuts one row range or some column ranges");
+    }
+    const auto& bindings = binder.reader().directory().bindings;
+    const auto columns   = parts.front().shape.back();
+    std::uint64_t width  = 0;
+    for (const auto& [begin, end] : piece.ranges) {
+        if (begin >= end || (!rows_cut && end > columns)) {
+            throw std::invalid_argument("a joint piece range is empty or outside its parameters");
+        }
+        width += end - begin;
+    }
+    // Each part's first stored row in the object and its rows.
+    std::optional<artifact::ObjectHandle> object;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    for (const JointPart& part : parts) {
+        const auto found = bindings.find(part.name);
+        if (found == bindings.end()) {
+            throw artifact::ArtifactError("missing logical parameter " + part.name);
+        }
+        if (part.shape.size() != 2 || part.shape[1] != columns ||
+            weight_element_count(part.shape) != found->second.elements ||
+            found->second.parts.size() != 1) {
+            throw artifact::ArtifactError(part.name +
+                                          ": a joint piece needs one stored run of each parameter");
+        }
+        const auto& stored = found->second.parts.front();
+        if (object && stored.object.index != object->index) {
+            throw artifact::ArtifactError(part.name +
+                                          ": a joint piece needs its parameters in one object");
+        }
+        object              = stored.object;
+        const auto geometry = binder.reader().geometry(stored.object);
+        if (geometry.shape.size() != 2 || geometry.shape[1] != columns ||
+            stored.begin % columns != 0 || stored.end % columns != 0) {
+            throw artifact::ArtifactError(part.name + ": a joint piece needs parts of whole rows");
+        }
+        const std::uint64_t first = stored.begin / columns;
+        const std::uint64_t rows  = (stored.end - stored.begin) / columns;
+        if (rows_cut && piece.ranges.front().second > rows) {
+            throw std::invalid_argument(part.name + ": a joint row piece leaves the parameter");
+        }
+        if (!spans.empty() && first < spans.back().first + spans.back().second) {
+            throw artifact::ArtifactError(part.name + ": a joint piece lists its parts in order");
+        }
+        spans.emplace_back(first, rows);
+        if (!rows_cut) {
+            for (const auto& input : part.inputs) {
+                for (const auto& [role, binding] : binder.use(part.name, input).auxiliaries) {
+                    if (role == "hadamard_signs" || role == "input_columns") {
+                        throw std::invalid_argument(part.name + "@" + input +
+                                                    ": a joint column piece cannot cut a rotated "
+                                                    "or gathered input");
+                    }
+                }
+            }
+        }
+    }
+    artifact::ObjectSelection selection;
+    if (rows_cut) {
+        const auto [begin, end] = piece.ranges.front();
+        for (const auto& [first, rows] : spans) {
+            selection.rows.emplace_back(first + begin, first + end);
+        }
+        selection.columns = {{0, columns}};
+    } else {
+        const auto first      = spans.front().first;
+        const auto last       = spans.back().first + spans.back().second;
+        std::uint64_t covered = 0;
+        for (const auto& span : spans) { covered += span.second; }
+        if (covered != last - first) {
+            throw artifact::ArtifactError(parts.front().name +
+                                          ": a joint column piece covers one run of rows");
+        }
+        selection.rows    = {{first, last}};
+        selection.columns = piece.ranges;
+    }
+    const artifact::ObjectHandle handle = binder.select_device(*object, std::move(selection), rank);
+    const std::uint64_t piece_columns   = rows_cut ? columns : width;
+    std::vector<WeightId> out;
+    out.reserve(parts.size());
+    std::uint64_t row = 0; // the part's first row in the selected object
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        const JointPart& part     = parts[i];
+        const std::uint64_t rows  = rows_cut ? width : spans[i].second;
+        artifact::Binding binding;
+        binding.elements = rows * piece_columns;
+        binding.parts.push_back({handle, row * piece_columns, (row + rows) * piece_columns});
+        row += rows;
+        PendingWeight pending;
+        pending.reference = {part.name + "@" + std::to_string(rank),
+                             artifact::Shape{rows, piece_columns}, std::move(binding),
+                             artifact::Residency::Device};
+        add_uses(pending, part.name, part.inputs, rows_cut, rows_cut);
+        pending.source_objects.push_back(binder.object_id(handle));
+        pending.rank = rank;
+        out.push_back({weights.size()});
+        weights.push_back(std::move(pending));
+    }
+    return out;
+}
+
+std::vector<bool> Bindings::column_ends(const std::string& name, const artifact::Shape& shape,
+                                        const std::vector<std::string>& inputs) {
+    const auto found = binder.reader().directory().bindings.find(name);
+    if (found == binder.reader().directory().bindings.end()) {
+        throw artifact::ArtifactError("missing logical parameter " + name);
+    }
+    if (shape.size() != 2) { throw std::invalid_argument(name + ": column ends need a matrix"); }
+    const std::uint64_t columns = shape[1];
+    // Columns per indivisible run of stored bytes in every part, per K step of the share's route,
+    // and per block of a rotated input's Hadamard transform.
+    std::uint64_t unit = 1;
+    for (const auto& part : found->second.parts) {
+        const auto stored = binder.reader().geometry(part.object);
+        unit = std::lcm(unit, artifact::selection_column_unit(stored));
+        unit = std::lcm(unit, ops::linear_share_units(stored.format).columns);
+    }
+    std::optional<artifact::Binding> gather;
+    for (const auto& input : inputs) {
+        for (const auto& [role, binding] : binder.use(name, input).auxiliaries) {
+            if (role == "input_columns") {
+                require_gguf_gather(binder, name, input);
+                gather = binding;
+            }
+            if (role == "hadamard_signs") { unit = std::lcm<std::uint64_t>(unit, 1024); }
+        }
+    }
+    std::vector<bool> out(columns + 1, false);
+    out.front() = true;
+    out.back()  = true;
+    if (columns % unit != 0) { return out; }
+    if (!gather) {
+        for (std::uint64_t end = unit; end < columns; end += unit) { out[end] = true; }
+        return out;
+    }
+    // A block of stored columns reading logical columns lo..hi forbids every end in (lo, hi].
+    const auto order = binder.values(*gather, QType::INT32).integers();
+    if (order.size() != columns) {
+        throw artifact::ArtifactError(name + ": the input gather does not cover the columns");
+    }
+    std::vector<std::int64_t> forbidden(columns + 2, 0);
+    for (std::uint64_t block = 0; block < columns; block += unit) {
+        std::int64_t lo = order[block];
+        std::int64_t hi = order[block];
+        for (std::uint64_t column = block + 1; column < block + unit; ++column) {
+            lo = std::min<std::int64_t>(lo, order[column]);
+            hi = std::max<std::int64_t>(hi, order[column]);
+        }
+        ++forbidden[static_cast<std::size_t>(lo + 1)];
+        --forbidden[static_cast<std::size_t>(hi + 1)];
+    }
+    std::int64_t open = 0;
+    for (std::uint64_t end = 1; end < columns; ++end) {
+        open += forbidden[end];
+        out[end] = open == 0;
+    }
+    return out;
+}
+
+std::vector<bool> Bindings::row_ends(const std::string& name, const artifact::Shape& shape) {
+    const auto found = binder.reader().directory().bindings.find(name);
+    if (found == binder.reader().directory().bindings.end()) {
+        throw artifact::ArtifactError("missing logical parameter " + name);
+    }
+    if (shape.size() != 2) { throw std::invalid_argument(name + ": row ends need a matrix"); }
+    const std::uint64_t columns = shape[1];
+    // A cut at a part's first row begins a piece there; at its last, ends one; inside, both.
+    std::vector<bool> out(shape[0] + 1, true);
+    std::uint64_t logical = 0;
+    for (const auto& part : found->second.parts) {
+        const auto stored = binder.reader().geometry(part.object);
+        if (stored.shape.size() != 2 || stored.shape[1] != columns || part.begin % columns != 0 ||
+            part.end % columns != 0) {
+            throw artifact::ArtifactError(name + ": a tensor-parallel piece needs parts of whole rows");
+        }
+        const std::uint64_t first = part.begin / columns;
+        const std::uint64_t count = (part.end - part.begin) / columns;
+        const std::uint64_t unit  = std::lcm(artifact::selection_row_unit(stored),
+                                             ops::linear_share_units(stored.format).rows);
+        if (logical + count > shape[0]) {
+            throw artifact::ArtifactError(name + ": parts exceed the parameter's rows");
+        }
+        for (std::uint64_t row = 0; row <= count; ++row) {
+            const std::uint64_t at = first + row;
+            const bool bound       = at % unit == 0 || (row == count && at == stored.shape[0]);
+            out[logical + row]     = out[logical + row] && bound;
+        }
+        logical += count;
+    }
+    out.front() = true;
+    out.back()  = true;
+    return out;
+}
+
 void Bindings::add_uses(PendingWeight& pending, const std::string& name,
-                        const std::vector<std::string>& inputs, bool whole_gathers) {
+                        const std::vector<std::string>& inputs, bool whole_gathers,
+                        bool whole_signs) {
     for (const auto& input : inputs) {
         const auto& use = binder.use(name, input);
         if (!use.activation_policy) {
@@ -261,6 +568,7 @@ void Bindings::add_uses(PendingWeight& pending, const std::string& name,
 #endif
         for (const auto& [role, binding] : use.auxiliaries) {
             if (role == "hadamard_signs") {
+                if (!whole_signs) { continue; }
                 if (pending.reference.shape.size() != 2) {
                     throw artifact::ArtifactError(name + "@" + input +
                                                   ": Hadamard signs require a matrix");
@@ -270,6 +578,7 @@ void Bindings::add_uses(PendingWeight& pending, const std::string& name,
                 continue;
             }
             if (role == "input_columns") {
+                require_gguf_gather(binder, name, input);
                 if (!whole_gathers) { continue; }
                 if (pending.reference.shape.size() != 2) {
                     throw artifact::ArtifactError(name + "@" + input +
@@ -384,7 +693,7 @@ WeightId Bindings::gather_piece(const artifact::Binding& gather,
     std::uint64_t logical = 0;
     for (const auto& part : gather.parts) {
         const std::uint64_t count = part.end - part.begin;
-        artifact::ObjectSelection selection{.row_begin = 0, .row_end = 1, .columns = {},
+        artifact::ObjectSelection selection{.rows = {{0, 1}}, .columns = {},
                                             .rebase = static_cast<std::int32_t>(base)};
         for (const auto& [begin, end] : columns) {
             const std::uint64_t lo = std::max(begin, logical);

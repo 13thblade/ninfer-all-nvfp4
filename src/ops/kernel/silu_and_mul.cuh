@@ -30,6 +30,16 @@ __global__ void silu_and_mul_scalar_kernel(const __nv_bfloat16* gate, const __nv
     }
 }
 
+// Unrounded FP32 gate and up (a projection's partial-free accumulators), rounded once at out.
+__global__ void silu_and_mul_fp32_kernel(const float* gate, const float* up, __nv_bfloat16* out,
+                                         std::int64_t n) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < n; i += stride) {
+        out[i] = __float2bfloat16(silu(gate[i]) * up[i]);
+    }
+}
+
 __global__ void silu_and_mul_strided_input_kernel(
     const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out, std::int64_t n,
     std::int32_t ne0, std::int32_t ne1, std::int32_t ne2, std::int64_t gnb0, std::int64_t gnb1,

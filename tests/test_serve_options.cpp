@@ -3,6 +3,7 @@
 #include "serve/translate.h"
 
 #include <filesystem>
+#include <fstream>
 
 #include <iostream>
 #include <string>
@@ -53,6 +54,34 @@ int main() {
         bool rejected = false;
         try { (void)parse(full); } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "server accepted invalid draft confidence");
+    }
+    // DSpark's confidence floor: the drafter's default unless set, 0..1, DSpark only.
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).speculative.draft_confidence,
+                      "DSpark's floor must default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-confidence",
+                             "0"}).speculative.draft_confidence == 0.0F,
+                      "server did not preserve --draft-confidence");
+    for (const auto& args : std::vector<std::vector<std::string>>{
+             {"--spec", "dspark", "--draft-confidence", "1.5"},
+             {"--spec", "mtp", "--draft-tokens", "4", "--draft-confidence", "0.5"},
+             {"--draft-confidence", "0.5"}}) {
+        std::vector<std::string> full{"ninfer-serve", "model.ninfer"};
+        full.insert(full.end(), args.begin(), args.end());
+        bool rejected = false;
+        try { (void)parse(full); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted an invalid --draft-confidence");
+    }
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).embedding_residency ==
+                              ninfer::EmbeddingResidency::Device &&
+                          parse({"ninfer-serve", "model.ninfer", "--embedding-residency", "host"})
+                                  .embedding_residency == ninfer::EmbeddingResidency::Host,
+                      "server did not default the embedding to the device or keep a host one");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--embedding-residency", "ram"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted an invalid embedding residency");
     }
     failures += check(!parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host"})
                                .hybrid_experts.dma_share.has_value(),
@@ -546,6 +575,38 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--webui-mcp-proxy") !=
                           std::string::npos,
                       "serve help omits --webui-mcp-proxy");
+    {
+        const auto directory = std::filesystem::temp_directory_path();
+        const auto write     = [&](const char* name, const char* text) {
+            const auto path = directory / name;
+            std::ofstream(path, std::ios::binary) << text;
+            return path.string();
+        };
+        const std::string settings = write("ninfer-ui-settings.json",
+                                           R"({"mcpServers": "[{\"url\": \"http://127.0.0.1:9000/mcp\"}]",
+                                               "theme": "dark"})");
+        const std::string array    = write("ninfer-ui-settings-array.json", "[1, 2]");
+        const std::string broken   = write("ninfer-ui-settings-broken.json", "{\"theme\": ");
+        const ServeOptions configured_ui =
+            parse({"ninfer-serve", "model.ninfer", "--ui-config-file", settings});
+        failures += check(defaults.ui_settings.empty(), "WebUI settings without --ui-config-file");
+        failures += check(configured_ui.ui_settings ==
+                              R"({"mcpServers":"[{\"url\": \"http://127.0.0.1:9000/mcp\"}]","theme":"dark"})",
+                          "--ui-config-file did not keep the file's settings as compact JSON");
+        const auto rejected_ui = [&](const std::string& path) {
+            try {
+                (void)parse({"ninfer-serve", "model.ninfer", "--ui-config-file", path});
+            } catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        failures += check(rejected_ui(array) && rejected_ui(broken) &&
+                              rejected_ui((directory / "ninfer-ui-settings-missing.json").string()),
+                          "--ui-config-file accepted a non-object, malformed or missing file");
+        for (const char* name : {"ninfer-ui-settings.json", "ninfer-ui-settings-array.json",
+                                 "ninfer-ui-settings-broken.json"}) {
+            std::filesystem::remove(directory / name);
+        }
+    }
     failures += check(configured.usage_chunk_choice,
                       "--usage-chunk-choice did not reach serving options");
     failures += check(configured.preserve_thinking == true,
@@ -1083,6 +1144,34 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "--tensor-parallel without several devices was accepted");
     }
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--devices", "0,1", "--tensor-parallel",
+                             "--tensor-split", "2,1"})
+                              .tensor_split == std::vector<double>{2.0, 1.0},
+                      "--tensor-split did not reach serving options");
+    for (const std::vector<std::string>& split :
+         {std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1"},
+          std::vector<std::string>{"--tensor-split", "1,1"},
+          std::vector<std::string>{"--tensor-parallel", "--tensor-split", "-1,1"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--devices", "0,1"};
+        args.insert(args.end(), split.begin(), split.end());
+        bool rejected = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "a malformed or misplaced --tensor-split was accepted");
+    }
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--devices", "0,1", "--tensor-parallel",
+                             "--tensor-attention", "positions", "--invariant-attention"})
+                              .tensor_attention == ninfer::TensorAttention::Positions,
+                      "--tensor-attention did not reach serving options");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--tensor-attention", "positions"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected,
+                          "--tensor-attention positions without --tensor-parallel was accepted");
+    }
 
     bool exclusive_rejected = false;
     try {
@@ -1126,6 +1215,7 @@ int main() {
                                         "--draft-tokens",
                                         "--embedding-q4",
                                         "--embedding-q6",
+                                        "--embedding-residency",
                                         "--fast-prefill-kernel",
                                         "--frequency-penalty",
                                         "--full-draft-head",
@@ -1228,7 +1318,8 @@ int main() {
                                         "--vision-residency",
                                         "--vram-headroom-mib",
                                         "--wddm-evictable-budget",
-                                        "--webui-mcp-proxy"}) {
+                                        "--webui-mcp-proxy",
+                                        "--ui-config-file"}) {
         const std::string message = "serve help omits " + std::string(flag);
         failures += check(serve_help.find(flag) != std::string::npos, message.c_str());
     }

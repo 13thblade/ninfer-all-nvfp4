@@ -6,6 +6,11 @@
 
 namespace ninfer::ops::detail {
 
+// The small-T kernel's tiles: whole 32-row tiles and 512-column slabs (its widest schedules).
+bool t2_runtime_shape(std::int32_t n, std::int32_t k) {
+    return n > 0 && k > 0 && n % 32 == 0 && k % kT2RuntimeShapeK == 0;
+}
+
 // The ternary profile's registered problems (qwen3.8-27b-ternary.md §8): decode (T = 1) through
 // the GEMV, the small-T bands through the SIMT route, everything wider through the MMA route.
 T2Launch select_t2_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
@@ -66,8 +71,20 @@ T2Launch select_t2_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     default:
         break;
     }
-
+    // Any other shape (a tensor-parallel rank's share): the same bands, the kernels taking the
+    // rows and K from the operands.
+    if (t2_runtime_shape(n, k)) { return small_t(); }
     throw std::invalid_argument("t2 linear: unsupported shape or T");
+}
+
+T2Launch select_t2_fp32_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    if (t <= 0 || !t2_runtime_shape(n, k)) {
+        throw std::invalid_argument("t2 linear: unsupported FP32 shape or T");
+    }
+    if (t <= 16) { return launch_t2_small_t_v2; }
+    if (t <= 32) { return launch_t2_mma_r64_c32; }
+    if (t <= 64) { return launch_t2_mma_r64_c64; }
+    return launch_t2_mma_r64_c128;
 }
 
 T2Launch select_t2_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
@@ -91,7 +108,9 @@ void t2_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
     if (w.layout != QuantLayout::RowSplit || w.qdata == nullptr || w.scales == nullptr) {
         throw std::invalid_argument("t2 linear: requires a row-split weight");
     }
-    const T2Launch launch = select_t2_launch(w.n, w.k, x.ne[1], policy);
+    const T2Launch launch = out.dtype == DType::FP32
+                                ? select_t2_fp32_launch(w.n, w.k, x.ne[1])
+                                : select_t2_launch(w.n, w.k, x.ne[1], policy);
     launch(x, w, out, stream);
 }
 

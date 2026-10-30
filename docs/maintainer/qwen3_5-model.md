@@ -456,6 +456,21 @@ proposal token with the target argmax for that verify column. Sampling uses the 
 acceptance and correction distribution. This does not impose token or logits equality between
 different quantization, prefill or kernel paths.
 
+### Invariant attention
+
+Attention's split-KV routes choose their key splits from the call's window, width and batch, so
+the FP32 reduction of a column's keys, and its rounded output, depend on the calls it shares.
+`--invariant-attention` fixes that for the text attention: every call of 1 to 16 columns per
+sequence (64 for one sequence verifying a lookup window longer than 15), at any batch size, takes
+the small-T routes, each split covers the keys `[s * N, (s + 1) * N)`, and each storage runs one
+key tile and one reduction order. `N` is the fewest keys, a multiple of the 64-key page, that keep
+the engine's whole context within 85 splits (`causal_attention_invariant_segment_keys`), so every
+call of one engine uses the same segments. A column's attention output is then the same bytes at
+any decode width, verification window and batch. The other Ops keep their width-dependent routes,
+so logits can still differ between widths; MTP attention keeps its tuned splits. Workspace
+reserves for either schedule. The op tests (`--invariant-only`) compare widths 1, 3 and 8 and a
+batch of two byte for byte over every storage.
+
 Each floating-point Op is qualified against its independent mathematical oracle over represented
 public inputs. Packed weights are decoded with their stored scales. Exact transforms use exact
 oracles; private accumulation, staging and reduction order use the Op's numerical criteria.

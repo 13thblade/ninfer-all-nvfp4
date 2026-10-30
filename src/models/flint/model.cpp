@@ -2,6 +2,8 @@
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
+#include "core/tensor_split.h"
+#include "models/expert_parallel.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/load/bindings.h"
 
@@ -43,7 +45,7 @@ FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& con
 
 void tail(Bindings& b, WeightId id) {
     for (const auto& part : b.at(id).reference.binding.parts) {
-        if (is_gguf(b.binder.reader().geometry(part.object).format)) {
+        if (is_gguf(b.binder.geometry(part.object).format)) {
             b.binder.device_tail(part.object, kRowTail);
         }
     }
@@ -113,6 +115,24 @@ ops::WeightInput Model::input(WeightId id) const {
     return ops::WeightInput{parameter.view, use.policy, use.activation_input_divisor};
 }
 
+std::pair<std::uint32_t, std::uint32_t> Model::expert_range(std::size_t rank) const {
+    if (expert_split_.empty()) { return {0, rank == 0 ? config_.num_experts : 0}; }
+    const auto ends =
+        split_shares(config_.num_experts, unit_positions(config_.num_experts, 1), expert_split_);
+    return {std::uint32_t(ends.at(rank)), std::uint32_t(ends.at(rank + 1))};
+}
+
+std::vector<double> default_expert_split(const artifact::Reader& reader,
+                                         std::span<const std::uint64_t> free_bytes,
+                                         std::span<const double> speed) {
+    return models::default_expert_split(
+        reader, [](std::string_view name) { return name.starts_with("text/"); },
+        [](std::string_view name) {
+            return name.ends_with("/moe/gate_up") || name.ends_with("/moe/down");
+        },
+        free_bytes, speed);
+}
+
 bool is_flint(const artifact::Reader& reader) {
     const auto& components = reader.directory().components;
     const auto text        = components.find("text");
@@ -133,6 +153,22 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     FrontendResources resources = bind_resources(binder, config);
     Bindings b(binder);
     const bool offload = options.experts != ExpertResidency::Device;
+    // Expert parallelism: rank r holds experts [ends[r], ends[r + 1]) of every MoE block.
+    std::vector<std::uint64_t> ends;
+    if (!options.expert_split.empty()) {
+        if (offload) {
+            throw std::invalid_argument("--tensor-parallel divides Flint's experts over the "
+                                        "devices: it needs --expert-residency device");
+        }
+        if (options.expert_split.size() != device.size() || device.size() < 2) {
+            throw std::invalid_argument("expert parallelism needs one share per device rank");
+        }
+        ends = split_shares(config.num_experts, unit_positions(config.num_experts, 1),
+                            options.expert_split);
+    } else if (device.size() != 1) {
+        throw std::invalid_argument("Flint runs on one device, or divides its experts over "
+                                    "several with --tensor-parallel");
+    }
     std::vector<std::array<artifact::ParameterReference, 2>> expert_references;
     const std::uint64_t h = config.hidden_size;
     TextWeights weights;
@@ -190,6 +226,18 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                         ": streamed GGUF experts require an activation policy and no auxiliaries");
                 }
             }
+        } else if (!ends.empty()) {
+            using Piece = qwen3_5::loading::ParameterPiece;
+            for (std::size_t r = 0; r + 1 < ends.size(); ++r) {
+                const Piece gate_up{Piece::Cut::Rows, {{ends[r] * 2 * w, ends[r + 1] * 2 * w}}};
+                const Piece down{Piece::Cut::Rows, {{ends[r] * h, ends[r + 1] * h}}};
+                moe.gate_up_shares.push_back(
+                    b.piece(m + "gate_up", {e * 2 * w, h}, {m + "input"}, {}, r, gate_up));
+                moe.down_shares.push_back(
+                    b.piece(m + "down", {e * h, w}, {m + "product"}, {}, r, down));
+                tail(b, moe.down_shares.back());
+                tail(b, moe.gate_up_shares.back());
+            }
         } else {
             moe.gate_up = b.parameter(m + "gate_up", {e * 2 * w, h}, {m + "input"});
             moe.down    = b.parameter(m + "down", {e * h, w}, {m + "product"});
@@ -229,6 +277,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                                                   std::move(bound), std::move(resources),
                                                   std::move(info), std::move(backing)));
     model->expert_residency_ = options.experts;
+    model->expert_split_     = options.expert_split;
     model->expert_banks_     = std::move(expert_banks);
     if (options.experts == ExpertResidency::Disk) {
         for (const auto& file : reader.directory().files) {

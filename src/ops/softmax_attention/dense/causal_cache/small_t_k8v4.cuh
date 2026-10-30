@@ -37,7 +37,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* valid_columns, const std::int32_t* table_rows,
         std::int32_t table_stride, std::int32_t full_width, std::int32_t column_begin,
         std::int32_t logical_capacity, float attention_scale, float* partial_acc, float* partial_m,
-        float* partial_l) {
+        float* partial_l, CausalKeyPartition partition) {
     if constexpr (!shape_set_in_image(TuringShapes)) { return; } // not this image's set
     // A Volta card runs its own kernel (small_t_sm70.cuh): a build of several architectures
     // compiles this kernel empty in the Volta image.
@@ -90,6 +90,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     __shared__ std::int32_t physical_pages_s[PageIds];
 
     const int kv_head     = static_cast<int>(blockIdx.x);
+    // The grid spans the call's KV heads.
+    const int kv_heads    = static_cast<int>(gridDim.x);
+    const int q_heads     = kv_heads * Geometry::GroupSize;
     const int split       = static_cast<int>(blockIdx.y);
     const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
     const int split_count = static_cast<int>(gridDim.y);
@@ -104,20 +107,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     }
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
-    q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
+    q += static_cast<std::int64_t>(D) * q_heads * column_base;
     positions += column_base;
     if constexpr (CacheInput::writes_cache) {
-        input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
-        input.v += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
+        input.k += static_cast<std::int64_t>(D) * kv_heads * column_base;
+        input.v += static_cast<std::int64_t>(D) * kv_heads * column_base;
     }
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
-        partial_acc +=
-            static_cast<std::int64_t>(batch) * D * Geometry::QHeads * TokenTile * split_count;
-        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
-        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
+        partial_acc += static_cast<std::int64_t>(batch) * D * q_heads * TokenTile * split_count;
+        partial_m += static_cast<std::int64_t>(batch) * q_heads * TokenTile * split_count;
+        partial_l += static_cast<std::int64_t>(batch) * q_heads * TokenTile * split_count;
     }
 
     auto write_neutral = [&]() {
@@ -125,10 +127,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             int q_head = 0;
             int token  = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] =
+            if (causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                partial_m[causal_partial_stat_index(q_head, token, split, TokenTile, q_heads)] =
                     -CUDART_INF_F;
-                partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] =
+                partial_l[causal_partial_stat_index(q_head, token, split, TokenTile, q_heads)] =
                     0.0F;
             }
         }
@@ -138,13 +140,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             int q_head    = 0;
             int token     = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split,
-                                                               TokenTile)] = 0.0F;
+            if (causal_valid_q_head<Geometry>(kv_head, q_head, kv_heads)) {
+                partial_acc[causal_partial_acc_index(q_head, d, token, split, TokenTile, q_heads)] =
+                    0.0F;
             }
         }
     };
-    if (kv_head < 0 || kv_head >= Geometry::KVHeads || split_count <= 0) return;
+    if (kv_head < 0 || kv_head >= kv_heads || split_count <= 0) return;
     if (valid_tokens == 0) {
         write_neutral();
         return;
@@ -159,15 +161,20 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     const int live_end = last_pos + 1;
     const int window   = causal_small_t_tile_window(first_pos, TokenTile, logical_capacity);
-    const int active_split_count =
-        causal_small_t_quantized_active_splits<Geometry>(window, split_count, TokenTile);
+    const int active_split_count = causal_small_t_partition_active(
+        partition, window,
+        causal_small_t_quantized_active_splits<Geometry>(window, split_count, TokenTile),
+        split_count);
     if (split >= active_split_count) return;
 
     const int logical_tiles = div_up(window, Bc);
     const bool tile_split   = logical_tiles >= active_split_count;
     int split_start         = 0;
     int split_end           = 0;
-    if constexpr (TokenTile == 1 && Bc == 32) {
+    if (partition.segmented() || partition.strided()) {
+        causal_small_t_partition_range(partition, window, split, active_split_count, split_start,
+                                       split_end);
+    } else if constexpr (TokenTile == 1 && Bc == 32) {
         const int first_owned_tile = split * logical_tiles / active_split_count;
         const int end_owned_tile   = (split + 1) * logical_tiles / active_split_count;
         split_start                = first_owned_tile * Bc;
@@ -186,7 +193,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int load_end = split_end < live_end ? split_end : live_end;
 
     const int first_tile = (split_start / Bc) * Bc;
-    const int key_blocks = div_up(split_end - first_tile, Bc);
+    int key_blocks       = div_up(split_end - first_tile, Bc);
+    const bool strided   = partition.strided();
     const int first_page = first_tile >> kPagedKVPageShift;
     const int page_count    = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
     const bool staged_pages = page_count <= PageIds;
@@ -208,7 +216,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         for (int token = warp; token < valid_tokens; token += Wc) {
             const int position = positions[token];
             if (position < split_start || position >= split_end) continue;
-            const int physical_page = page_at(position);
+            const int physical_page =
+                strided ? causal_strided_page(page_at(position), partition) : page_at(position);
+            if (physical_page < 0) continue; // another rank's planes hold this row
             const int page_offset = position & kPagedKVPageMask;
             float values[8];
             float local_absmax = 0.0F;
@@ -216,7 +226,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             for (int r = 0; r < 8; ++r) {
                 const int d = lane + 32 * r;
                 values[r] =
-                    __bfloat162float(input.k[kv_cache_fp8_src_index<Geometry>(kv_head, d, token)]);
+                    __bfloat162float(input.k[kv_cache_fp8_src_index(kv_head, d, token, kv_heads)]);
             }
             normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
@@ -225,19 +235,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int d = lane + 32 * r;
-                cache_k[kv_cache_fp8_code_index<Geometry>(physical_page, kv_head, d, page_offset)] =
+                cache_k[kv_cache_fp8_code_index(physical_page, kv_head, d, page_offset, kv_heads)] =
                     kv_cache_fp8_quant_code(values[r], k_quant.inverse_scale);
             }
             if (lane == 0) {
-                cache_k_scale[kv_cache_fp8_scale_index<Geometry>(physical_page, kv_head,
-                                                                 page_offset)] = k_quant.scale;
+                cache_k_scale[kv_cache_fp8_scale_index(physical_page, kv_head, page_offset,
+                                                       kv_heads)] = k_quant.scale;
             }
 
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int d = lane + 32 * r;
                 values[r]   = __bfloat162float(
-                    input.v[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
+                    input.v[kv_cache_nvfp4_src_index(kv_head, d, token, kv_heads)]);
             }
             normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
@@ -246,12 +256,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             if (lane < kKVCacheNvfp4Groups) {
                 const auto quantized = kv_cache_nvfp4_quantize_group16(append_scratch + warp * D +
                                                                        lane * kKVCacheNvfp4Group);
-                const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
-                    physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset);
+                const std::int64_t code_offset = kv_cache_nvfp4_code_index(
+                    physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset, kv_heads);
                 store_vec(cache_v + code_offset,
                           make_uint2(quantized.codes_lo, quantized.codes_hi));
-                cache_v_scale[kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, lane,
-                                                                   page_offset)] = quantized.scale;
+                cache_v_scale[kv_cache_nvfp4_scale_index(physical_page, kv_head, lane, page_offset,
+                                                         kv_heads)] = quantized.scale;
             }
         }
         __syncthreads();
@@ -271,7 +281,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int d = lane + 32 * r;
-            values[r]   = __bfloat162float(q[causal_q_index<Geometry>(q_head, d, token)]);
+            values[r]   = __bfloat162float(q[causal_q_index(q_head, d, token, q_heads)]);
         }
         normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
@@ -307,10 +317,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int key             = tile_k0 + key_l;
             std::uint8_t* v_scale_dst = v_scale_s + key_l * kKVCacheNvfp4Groups;
             if (key >= split_start && key < load_end) {
-                const std::int64_t k_scale_offset = kv_cache_fp8_scale_index<Geometry>(
-                    physical_page, kv_head, key & kPagedKVPageMask);
-                const std::int64_t v_scale_offset = kv_cache_nvfp4_scale_index<Geometry>(
-                    physical_page, kv_head, 0, key & kPagedKVPageMask);
+                const std::int64_t k_scale_offset = kv_cache_fp8_scale_index(
+                    physical_page, kv_head, key & kPagedKVPageMask, kv_heads);
+                const std::int64_t v_scale_offset = kv_cache_nvfp4_scale_index(
+                    physical_page, kv_head, 0, key & kPagedKVPageMask, kv_heads);
                 k_scale_s[key_l] = cache_k_scale[k_scale_offset];
                 cp_async<16>(v_scale_dst, cache_v_scale + v_scale_offset);
             } else {
@@ -326,8 +336,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int key       = tile_k0 + key_l;
             std::uint8_t* k_dst = &k_fp8[key_l * D + d];
             if (key >= split_start && key < load_end) {
-                const std::int64_t code_offset = kv_cache_fp8_code_index<Geometry>(
-                    physical_page, kv_head, d, key & kPagedKVPageMask);
+                const std::int64_t code_offset = kv_cache_fp8_code_index(
+                    physical_page, kv_head, d, key & kPagedKVPageMask, kv_heads);
                 cp_async<16, Cache::cg>(k_dst, &cache_k[code_offset]);
             } else {
                 store_vec(k_dst, make_int4(0, 0, 0, 0));
@@ -341,8 +351,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int key       = tile_k0 + key_l;
             std::uint8_t* v_dst = &v_nvfp4[key_l * (D / 2) + d / 2];
             if (key >= split_start && key < load_end) {
-                const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
-                    physical_page, kv_head, d, key & kPagedKVPageMask);
+                const std::int64_t code_offset = kv_cache_nvfp4_code_index(
+                    physical_page, kv_head, d, key & kPagedKVPageMask, kv_heads);
                 cp_async<16, Cache::cg>(v_dst, &cache_v[code_offset]);
             } else {
                 store_vec(v_dst, make_int4(0, 0, 0, 0));
@@ -366,15 +376,28 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         }
     };
 
-    int physical_page = page_at(first_tile);
-    issue_kv_tile(first_tile, physical_page);
+    // A strided split sweeps the tiles of the rank's own pages.
+    if (strided) {
+        key_blocks = causal_small_t_own_pages<Bc>(physical_pages_s, page_count, split_end, partition);
+        if (key_blocks == 0) {
+            write_neutral();
+            return;
+        }
+    }
+    const auto tile_key = [&](int kb) {
+        return strided ? causal_small_t_owned_tile_key<Bc>(physical_pages_s, first_tile, kb)
+                       : first_tile + kb * Bc;
+    };
+    int physical_page =
+        strided ? causal_small_t_owned_tile_page<Bc>(physical_pages_s, 0) : page_at(first_tile);
+    issue_kv_tile(tile_key(0), physical_page);
     ninfer::ops::cp_wait<0>();
     __syncthreads();
     dequant_k_tile();
     __syncthreads();
 
     for (int kb = 0; kb < key_blocks; ++kb) {
-        const int k0 = first_tile + kb * Bc;
+        const int k0 = tile_key(kb);
         if (warp < RowTiles) {
             const int row_base = warp * 16;
             __half* p_sw       = &p_s[row_base * PStride];
@@ -521,8 +544,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
         const bool has_next = kb + 1 < key_blocks;
         if (has_next) {
-            const int next_k0 = k0 + Bc;
-            if ((next_k0 & kPagedKVPageMask) == 0) {
+            const int next_k0 = tile_key(kb + 1);
+            if (strided) {
+                physical_page = causal_small_t_owned_tile_page<Bc>(physical_pages_s, kb + 1);
+            } else if ((next_k0 & kPagedKVPageMask) == 0) {
                 physical_page = page_at(next_k0);
             }
             issue_kv_tile(next_k0, physical_page);
@@ -582,15 +607,15 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             int q_head = 0;
             int token  = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head, token);
-            partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = m0;
-            partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = l0;
+            partial_m[causal_partial_stat_index(q_head, token, split, TokenTile, q_heads)] = m0;
+            partial_l[causal_partial_stat_index(q_head, token, split, TokenTile, q_heads)] = l0;
         }
         if (row1 < RowCount) {
             int q_head = 0;
             int token  = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head, token);
-            partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = m1;
-            partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = l1;
+            partial_m[causal_partial_stat_index(q_head, token, split, TokenTile, q_heads)] = m1;
+            partial_l[causal_partial_stat_index(q_head, token, split, TokenTile, q_heads)] = l1;
         }
     }
 
@@ -607,7 +632,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             int token  = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head, token);
             const std::int64_t dst =
-                causal_partial_acc_index<Geometry>(q_head, d0, token, split, TokenTile);
+                causal_partial_acc_index(q_head, d0, token, split, TokenTile, q_heads);
             *reinterpret_cast<float2*>(&partial_acc[dst]) = make_float2(acc[n][0], acc[n][1]);
         }
         if (row1 < RowCount) {
@@ -615,7 +640,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             int token  = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head, token);
             const std::int64_t dst =
-                causal_partial_acc_index<Geometry>(q_head, d0, token, split, TokenTile);
+                causal_partial_acc_index(q_head, d0, token, split, TokenTile, q_heads);
             *reinterpret_cast<float2*>(&partial_acc[dst]) = make_float2(acc[n][2], acc[n][3]);
         }
     }
@@ -627,7 +652,10 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
     const float* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t visible_capacity, std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t visible_capacity, std::int32_t split_count, __nv_bfloat16* out,
+    CausalKeyPartition partition, float* partial_out) {
+    // The grid spans the call's query heads.
+    const int q_heads     = static_cast<int>(gridDim.x);
     const int q_head      = static_cast<int>(blockIdx.x);
     const int flat_column = static_cast<int>(blockIdx.y);
     int batch             = 0;
@@ -637,7 +665,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
         token = flat_column - batch * tokens;
     }
     const int tid = static_cast<int>(threadIdx.x);
-    if (q_head >= Geometry::QHeads || token >= tokens) return;
+    if (token >= tokens) return;
     if constexpr (MultiBatch) {
         if (batch >= batch_size) return;
     }
@@ -650,28 +678,37 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
     if constexpr (Masked) {
         const int absolute_column = token + (Offset ? column_begin : 0);
         if (absolute_column >= valid_columns[batch]) {
+            if (partial_out != nullptr) {
+                if (tid < kCausalHeadDim) {
+                    causal_store_partial_output(partial_out, q_head, tid, output_column, q_heads,
+                                                0.0f, -CUDART_INF_F, tid == 0);
+                }
+                return;
+            }
             if (tid < kCausalHeadDim)
-                out[causal_q_index<Geometry>(q_head, tid, output_column)] = __float2bfloat16(0.0f);
+                out[causal_q_index(q_head, tid, output_column, q_heads)] = __float2bfloat16(0.0f);
             return;
         }
     }
 
 
     if constexpr (MultiBatch) {
-        partial_acc += static_cast<std::int64_t>(batch) * kCausalHeadDim * Geometry::QHeads *
-                       tokens * split_count;
-        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
-        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+        partial_acc +=
+            static_cast<std::int64_t>(batch) * kCausalHeadDim * q_heads * tokens * split_count;
+        partial_m += static_cast<std::int64_t>(batch) * q_heads * tokens * split_count;
+        partial_l += static_cast<std::int64_t>(batch) * q_heads * tokens * split_count;
     }
-    const int active_splits =
-        causal_small_t_quantized_active_splits<Geometry>(window, split_count, tokens);
+    const int active_splits = causal_small_t_partition_active(
+        partition, window,
+        causal_small_t_quantized_active_splits<Geometry>(window, split_count, tokens), split_count);
     __shared__ float weights[256], warp_sums[8], scalars[2];
     __shared__ float normalized[256];
     const float head_l = causal_merge_split_statistics<Geometry>(
-        partial_m, partial_l, q_head, token, tokens, active_splits, weights, warp_sums, scalars);
+        partial_m, partial_l, q_head, token, tokens, active_splits, weights, warp_sums, scalars,
+        q_heads);
 
-    const float numerator = causal_weighted_split_sum<Geometry>(partial_acc, weights, q_head, tid,
-                                                                token, tokens, active_splits);
+    const float numerator = causal_weighted_split_sum(partial_acc, weights, q_head, tid, token,
+                                                      tokens, active_splits, q_heads);
     normalized[tid] = head_l > 0.0F ? numerator / head_l : 0.0F;
     __syncthreads();
 
@@ -683,8 +720,15 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
     normalized_hadamard_d256_inplace(values, tid);
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
-        const int d                                             = tid + 32 * r;
-        out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(values[r]);
+        const int d = tid + 32 * r;
+        if (partial_out != nullptr) {
+            causal_store_partial_output(partial_out, q_head, d, output_column, q_heads,
+                                        values[r],
+                                        head_l > 0.0f ? scalars[0] + logf(head_l) : -CUDART_INF_F,
+                                        d == 0);
+        } else {
+            out[causal_q_index(q_head, d, output_column, q_heads)] = __float2bfloat16(values[r]);
+        }
     }
 }
 
