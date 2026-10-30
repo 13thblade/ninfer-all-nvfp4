@@ -1,5 +1,6 @@
 #include "models/qwen3_5/load/bindings.h"
 
+#include "artifact/formats.h"
 #include "artifact/selection.h"
 #include "artifact/transcode.h"
 #include "artifact/views.h"
@@ -52,6 +53,30 @@ bool keeps_permission(const artifact::Binder& binder, const artifact::ParameterR
 
 } // namespace
 #endif
+
+namespace {
+
+// Only the GGUF linears read their input through a gather (Weight::input_columns): every other
+// format stores its columns in the logical order and has no route that applies one.
+void require_gguf_gather(const artifact::Binder& binder, const std::string& name,
+                         const std::string& input) {
+    const auto& bindings = binder.reader().directory().bindings;
+    const auto found     = bindings.find(name);
+    if (found == bindings.end()) {
+        throw artifact::ArtifactError("missing logical parameter " + name);
+    }
+    for (const auto& part : found->second.parts) {
+        const auto format = binder.reader().geometry(part.object).format;
+        if (!is_gguf(format)) {
+            throw artifact::ArtifactError(name + "@" + input +
+                                          ": an input gather (input_columns) needs GGUF blocks, "
+                                          "not " +
+                                          std::string(artifact::format_name(format)));
+        }
+    }
+}
+
+} // namespace
 
 void apply_rank_policies(Bindings& bindings, std::span<const ops::DeviceTier> rank_tiers) {
     // A build without 120a narrowed these permissions when it bound the weights.
@@ -125,7 +150,10 @@ WeightId Bindings::piece(const std::string& name, const artifact::Shape& shape,
     std::optional<artifact::Binding> gather;
     for (const auto& input : inputs) {
         for (const auto& [role, binding] : binder.use(name, input).auxiliaries) {
-            if (role == "input_columns") { gather = binding; }
+            if (role == "input_columns") {
+                require_gguf_gather(binder, name, input);
+                gather = binding;
+            }
         }
     }
     ParameterPiece stored_piece = piece;
@@ -434,7 +462,10 @@ std::vector<bool> Bindings::column_ends(const std::string& name, const artifact:
     std::optional<artifact::Binding> gather;
     for (const auto& input : inputs) {
         for (const auto& [role, binding] : binder.use(name, input).auxiliaries) {
-            if (role == "input_columns") { gather = binding; }
+            if (role == "input_columns") {
+                require_gguf_gather(binder, name, input);
+                gather = binding;
+            }
             if (role == "hadamard_signs") { unit = std::lcm<std::uint64_t>(unit, 1024); }
         }
     }
@@ -547,6 +578,7 @@ void Bindings::add_uses(PendingWeight& pending, const std::string& name,
                 continue;
             }
             if (role == "input_columns") {
+                require_gguf_gather(binder, name, input);
                 if (!whole_gathers) { continue; }
                 if (pending.reference.shape.size() != 2) {
                     throw artifact::ArtifactError(name + "@" + input +
