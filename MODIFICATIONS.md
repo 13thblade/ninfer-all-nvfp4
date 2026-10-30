@@ -13,7 +13,7 @@ the fork's git history remains the authoritative record.
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
 | Base commit | `78fd39aaeca75b454748d5a1281278112e34d5ce` (upstream master) |
-| Upstream sync | five merges: `f2675499` took `63428ac2`, `63b68fdc` took `b3402a6f`, `121f8283` took `a53a4f33`, `78a5bbc9` took `3d882fc1`, `ec07d895` took `78fd39aa`. The fork was cut at `e1f2d961`; the commits between those bases are recorded by the merge commits themselves |
+| Upstream sync | six merges: `f2675499` took `63428ac2`, `63b68fdc` took `b3402a6f`, `121f8283` took `a53a4f33`, `78a5bbc9` took `3d882fc1`, `ec07d895` took `78fd39aa`, `aa55653e` took `3fda3165`. The fork was cut at `e1f2d961`; the commits between those bases are recorded by the merge commits themselves |
 | Fork repository | https://github.com/13thblade/ninfer-all-nvfp4 |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
 
@@ -39,6 +39,15 @@ the fork's git history remains the authoritative record.
 | `78a5bbc9` | 2026-10-26 | Merge upstream master 3d882fc1 into the fork |
 | `9b3614e7` | 2026-10-26 | docs(readme): point the throughput table at its source model cards |
 | `ec07d895` | 2026-10-30 | Merge upstream master 78fd39aa into the fork |
+| `aa55653e` | 2026-10-30 | Merge upstream master 3fda3165 into the fork |
+| `b17f41aa` | 2026-10-31 | fix(nvfp4): route a tensor-parallel rank's FP32 partial away from the int8 family |
+| `b8715ea2` | 2026-10-31 | feat(nvfp4-int8): let the fused SwiGLU and linear_add kernels take a rank's share |
+| `7c25ab66` | 2026-10-31 | test: put the CUDA and vcpkg runtime DLLs on every test's PATH from CMake |
+| `9ed54e1f` | 2026-10-31 | feat(nvfp4-int8): let the fused attention and GDN input projections take a rank's share |
+| `5e6ef4cb` | 2026-10-31 | feat(nvfp4-a16): let the fused A16 routes take a tensor-parallel rank's share |
+| `557c6e9c` | 2026-10-31 | test(nvfp4): cover a rank's share in the fused SwiGLU and linear_add Op tests |
+| `1069d4d7` | 2026-10-31 | fix(nvfp4-a16): size the unified small-T SwiGLU's output stride from the weight |
+| `7aed8158` | 2026-10-31 | feat(qwen3_5): let --nvfp4-w4a8-int reach a tensor-parallel rank's input projections |
 
 `03b78d67` no longer shows in the file lists below: upstream `7cf5b2ae` fixed
 the same defect and the merge `121f8283` took upstream's side, so the fork keeps
@@ -55,7 +64,7 @@ from `b76d912e` only by the `gguf_only` gate named below.
 
 Relative to the fork base this fork:
 
-- modifies 106 existing upstream files;
+- modifies 111 existing upstream files;
 - adds 29 new files;
 - deletes no upstream files.
 
@@ -113,11 +122,47 @@ taken whole (the fork's `out.dtype == BF16` gate was dropped: it would have
 refused the FP32 shares the new work needs). `bench/ops/linear_bench.cu` keeps
 both usage lines, and `tests/ops/tests.cmake` keeps both new test registrations.
 
+The W4A16 and W4A8-int routes take a tensor-parallel rank's share of a projection
+(`--tensor-parallel`). Plain Linear already did -- `nvfp4_general_a16` reads both dimensions at
+launch time and selects its writer by output dtype -- but the fused ops did not, because their
+shapes were instances of the whole 27B parent. A share moves only the divided dimension (the dense
+FFN's gate and up rows, the down projection's input columns, and the attention and GDN input
+projections' head rows), so those routes now read that dimension from the weight or from the
+output tensors and keep the undivided one as the template argument every K-specialised schedule is
+built on. The A16 wide SwiGLU, its decode GEMV and its SIMT small-T band, `linear_add`'s per-K
+ladders (which gain a runtime-K MMA for a share) and the two input projections' segment adapters
+all follow the call.
+
+One defect had to be fixed before the int8 family was correct there at all. A row-split
+projection's partial sum is FP32, but `allows_nvfp4_int8` was tested before the output dtype, so
+an int8 call took the FP32 partial and stored it through a BF16 writer -- two bytes per element
+into a four-byte buffer, filling the front half and leaving the rest stale without raising
+anything, which the all-reduce then read back as garbage. FP32 now takes the general A16 route,
+which selects its writer by dtype, and the int8 entry asserts its own contract so a future misuse
+fails loudly instead of writing half a buffer.
+
+The two input projections' fused single-parent routes take a share too, but a rank reaches them as
+parts rather than as a fused parent, so what runs under `--tensor-parallel` is the parts route: one
+Linear per segment. The fused share handling is what a caller that binds a rank's fused parent
+needs, and the Op-level tests do not reach it yet.
+
+Under `--tensor-parallel` the `--nvfp4-w4a8-int` switch reaches the column-split attention and
+GDN input projections only, and it had to learn a second carrier to do even that: those
+projections arrive as `PartProjectionWeights` on a rank, where they are stored as their segments,
+and the promotion only knew `SingleProjectionWeight`. A row-split projection keeps running A16
+under the flag, because its partial sum is FP32 and the int8 family writes BF16.
+
+Tensor parallelism is not bit-identical to one device by construction: the ranks' FP32 partials
+are summed in rank order and rounded once, a different association of the same terms than a single
+device's chain. What is held is what `core/tensor_parallel.h` states -- every replica byte for byte
+identical, and one rounding where a single device rounds once -- and the README's measured
+perplexity shows the difference that leaves.
+
 The lists below are generated from `git diff --name-status upstream/master..HEAD`
-with `upstream/master` at `78fd39aa`. Files marked as modified are upstream
+with `upstream/master` at `3fda3165`. Files marked as modified are upstream
 files changed by this fork; files marked as added are new in this fork.
 
-## Modified files (106)
+## Modified files (111)
 
 ### Root, build and documentation (4)
 
@@ -160,18 +205,19 @@ files changed by this fork; files marked as added are new in this fork.
 - `src/models/qwen3_5/execution/parameters.cpp`
 - `src/models/qwen3_5/execution/text.cpp`
 
-### src/ops/attn_input_proj (8)
+### src/ops/attn_input_proj (9)
 
 - `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_a16.cu`
 - `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu`
 - `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode_unified.cu`
+- `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_output.cuh`
 - `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp`
 - `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h`
 - `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan_unified.cpp`
 - `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan_unified.h`
 - `src/ops/attn_input_proj/sources.cmake`
 
-### src/ops/gdn_input_proj (11)
+### src/ops/gdn_input_proj (12)
 
 - `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_a16.cu`
 - `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu`
@@ -179,6 +225,7 @@ files changed by this fork; files marked as added are new in this fork.
 - `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp`
 - `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan_unified.cpp`
 - `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan_unified.h`
+- `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output_unified.cuh`
 - `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode.cu`
 - `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode_unified.cu`
 - `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp`
@@ -255,14 +302,17 @@ files changed by this fork; files marked as added are new in this fork.
 - `src/serve/serve_options.cpp`
 - `src/serve/serve_options.h`
 
-### tests (11)
+### tests (14)
 
+- `tests/CMakeLists.txt`
+- `tests/cmake/NinferTests.cmake`
 - `tests/ops/linear/linear_test_common.cpp`
 - `tests/ops/linear/linear_test_common.h`
 - `tests/ops/linear/test_nvfp4_a16.cpp`
 - `tests/ops/linear/tests.cmake`
 - `tests/ops/linear_swiglu/linear_swiglu_test_common.cpp`
 - `tests/ops/linear_swiglu/linear_swiglu_test_common.h`
+- `tests/ops/linear_add/test_nvfp4.cpp`
 - `tests/ops/linear_swiglu/test_nvfp4.cpp`
 - `tests/ops/op_tester.h`
 - `tests/ops/quantized_weight.h`

@@ -12,12 +12,13 @@
 
 本仓库未改变上游已经支持的模型范围，仅新增。
 
-按时间顺序，一共四处改动：
+按时间顺序，一共五处改动：
 
 1. **新增 W4A16 宽 T fused SwiGLU 内核，让宽的 prompt 段落能 prefill 而不是抛异常；另外新增了 W4A8-int 内核。**
 2. **整条通路的 kernel 性能优化工作。**
 3. **把 W4A16 和 W4A8-int 通路的开关接进 `ninfer-calibrate`，最优化性能校准可在目标设备上首次启动时实测得出。**
 4. **顺带优化了无原生 FP4 路径的 KV NVFP4 和 k8v4 的性能。**
+5. **W4A16 与 W4A8-int 两条链的融合内核都支持张量并行**（`--devices ... --tensor-parallel`），一层的权重可以按卡切开分给多个 rank 同时算。
 
 本 fork 改动的上游文件不逐个在源码里标注，完整清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
 
@@ -46,14 +47,20 @@
 
 生产档（`--device-profile calibrate`）下的语料困惑度，同一制品、`perplexity-1m` 语料 `--quick`、16,384 token 窗口、打分 token 数 261,167、KV bf16：
 
-| 通路       | PPL      |
-| ---------- | -------- |
-| W4A16      | 4.158481 |
-| W4A8-int   | 4.157095 |
+| 通路       | 单卡 PPL | 张量并行 2 rank | 张量并行 4 rank |
+| ---------- | -------- | --------------- | --------------- |
+| W4A16      | 4.222596 | 4.224089        | 4.222890        |
+| W4A8-int   | 4.220410 | 4.223745        | 4.224811        |
+
+张量并行把同一层的权重按卡切开，每个 rank 只算自己那一份，再把各 rank 的 FP32 偏置和按 rank 序相加、只舍入一次。这与单卡的 FP32 链式求和是同一批项的不同结合顺序，因此**不会逐位一致**；要守的是 `core/tensor_parallel.h` 里那两条——各 rank 的副本逐字节相同、且只舍入一次。上表与单卡的差异最大 0.10%，属于这一类。
+
+本机只有一张卡，所以 2/4 rank 是让多个 rank **共享同一设备**跑的（`--devices 0,0` / `0,0,0,0`，传输走 Peer）：验证的是切分、规约与数值，跨卡的带宽差异测不出来。
+
+TP 下 W4A8-int 的覆盖范围比单卡窄：行切投影（FFN 的 gate/up、down 和 mixer 输出投影）的偏置和必须是 FP32，而 int8 族只写 BF16，所以这些走 A16 通用路径，只有输出为 BF16 的列切投影（attention 与 GDN 输入投影）走 int8 内核。这也让两行在 TP 下几乎相同。
 
 ### 下一步
 
-W4A16 与 W4A8-int 两条通路的内核均已完成，目前进入广泛测试阶段。
+W4A16 与 W4A8-int 两条通路的内核均已完成，两条链的融合内核也都吃得了张量并行的分片；目前进入广泛测试阶段。
 
 ---
 
@@ -69,12 +76,13 @@ Note: NVFP4 does not mean higher quality (that is NVIDIA marketing); any quantis
 
 This repository does not change the model scope upstream already supports; it only adds to it.
 
-Four changes, in order:
+Five changes, in order:
 
 1. **A W4A16 wide-T fused SwiGLU kernel, so a wide span prefills instead of throwing; W4A8-int kernels were added as well.**
 2. **Kernel work across the route.**
 3. **The W4A16 and W4A8-int route switches wired into `ninfer-calibrate`, so the optimal performance calibration is measured on first start on the target device.**
 4. **Alongside them, KV-cache performance for NVFP4 and k8v4 on cards without a native FP4 path was improved as well.**
+5. **The fused kernels of both the W4A16 and W4A8-int routes take tensor parallelism** (`--devices ... --tensor-parallel`): a layer's weights can be divided over the cards, one rank each.
 
 The upstream files this fork modifies are not marked one by one in the sources; the full list is in [MODIFICATIONS.md](MODIFICATIONS.md). Untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git log. This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license.
 
@@ -103,14 +111,30 @@ One thing about the table: **upstream throws**, hence the empty row. The fused N
 
 Corpus perplexity on the production profile (`--device-profile calibrate`): same artifact, the `--quick` stream set of the `perplexity-1m` corpus, 16,384-token window, 261,167 scored tokens, KV bf16.
 
-| Route      | PPL      |
-| ---------- | -------- |
-| W4A16      | 4.158481 |
-| W4A8-int   | 4.157095 |
+| Route      | PPL, one GPU | PPL, tensor parallel 2 ranks | PPL, tensor parallel 4 ranks |
+| ---------- | ------------ | ---------------------------- | ---------------------------- |
+| W4A16      | 4.222596     | 4.224089                     | 4.222890                     |
+| W4A8-int   | 4.220410     | 4.223745                     | 4.224811                     |
+
+Tensor parallelism divides a layer's weights over the ranks, each computing its own share, and
+sums the ranks' FP32 partials in rank order with one rounding. That is a different association of
+the same terms than a single device's FP32 chain, so it is **not bit-identical** by construction;
+what holds is what `core/tensor_parallel.h` states -- every replica byte for byte identical, and one
+rounding where a single device rounds once. The table's largest difference from one GPU is 0.10%.
+
+This machine has one card, so the two- and four-rank runs put several ranks on **one shared device**
+(`--devices 0,0` / `0,0,0,0`, Peer transport): they exercise the division, the reductions and the
+numerics, not the bandwidth between cards.
+
+Under tensor parallelism the W4A8-int route covers less than on one device: a row-split
+projection's partial sum (the FFN's gate/up, its down and the mixer output projection) must be
+FP32, and the int8 family writes BF16, so those run the general A16 route; only the column-split
+projections, whose output is BF16 (the attention and GDN input projections), run the int8 kernels.
+That is why the two rows nearly coincide there.
 
 ## Next steps
 
-The kernels for both the W4A16 and W4A8-int routes are complete, and broad testing is now underway.
+The kernels for both the W4A16 and W4A8-int routes are complete, and both routes' fused kernels take a tensor-parallel share; broad testing is now underway.
 
 ---
 
